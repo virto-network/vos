@@ -452,6 +452,32 @@ pub fn build_entries_from_side_note(side_note: &crate::side_note::SideNote) -> V
         }
     }
 
+    // Phase Z0: synthetic closing-read entries — one per register at
+    // ts=closing_ts. Pair with `RegisterMemoryClosingChip`'s producer
+    // emissions to consume them; read-consistency in this chip then
+    // forces each row's value to equal the previous ledger row's
+    // value (= the actual last write/initial value of that register),
+    // pinning `side_note.final_regs` to the trace's true final state.
+    //
+    // No-op for empty traces (no steps ⇒ no closing chip producers
+    // ⇒ no consumers needed) and for chip-isolated harnesses that
+    // didn't add the closing chip to their component slice (would
+    // emit unbalanced consumers and trip "claimed logup sum is not
+    // zero"). Otherwise `closing_ts > step.timestamp` for every real
+    // step, so the synthetic entries sort strictly after every real
+    // access and the prev_value chain works.
+    if side_note.closing_chip_active && !side_note.steps.is_empty() {
+        let closing_ts = crate::chips::register_memory_closing::closing_ts_for(side_note);
+        for (i, &val) in side_note.final_regs.iter().enumerate() {
+            entries.push(RegEntry {
+                reg_addr: i as u8,
+                value: val,
+                timestamp: closing_ts,
+                is_write: false,
+            });
+        }
+    }
+
     entries.sort_by_key(|e| (e.reg_addr, e.timestamp));
     entries
 }

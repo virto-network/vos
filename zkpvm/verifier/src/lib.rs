@@ -131,6 +131,26 @@ pub fn verify_standalone_with_options(
             PROOF_FORMAT_VERSION, proof.format_version,
         )));
     }
+    // Phase Z0 hardening: `component_mask = 0` was a Phase 60 back-compat
+    // sentinel meaning "fall back to count-based inference over the full
+    // BASE_COMPONENTS" — it's how older proofs reached the verifier
+    // before dynamic chip selection landed. With `format_version` now
+    // bumped past those proofs, the only producer of `mask = 0` is the
+    // chip-isolated `prove_with_explicit_components` path, whose proofs
+    // are documented as "not verifiable via verify_standalone".
+    //
+    // Reject early. Without this gate, a malicious prover could ship a
+    // chip-isolated proof (no FS-transcript mix on the prover side) to
+    // verify_standalone, slipping `proof.final_state.registers` past the
+    // Z0 binding — the standalone verifier would also skip the mix and
+    // tampered registers would verify cleanly.
+    if proof.component_mask == 0 {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask = 0 is invalid at format_version >= 2 \
+             (chip-isolated proofs must use verify_with_explicit_components)"
+                .to_string(),
+        ));
+    }
     // Phase 43: cap log_sizes so a malicious prover can't force the
     // verifier into arbitrarily large Merkle commitments.  We check
     // each component's log_size individually against the cap; the
@@ -158,6 +178,7 @@ pub fn verify_standalone_with_options(
         num_components,
         component_mask,
         pcs_config,
+        final_state,
         ..
     } = proof;
 
@@ -208,6 +229,22 @@ pub fn verify_standalone_with_options(
             &log_sizes[idx],
             verifier_channel,
         );
+    }
+
+    // Phase Z0: bind `proof.final_state.registers` into the FS transcript
+    // when the proof's component_mask indicates RegisterMemoryClosingChip
+    // (BASE_COMPONENTS index 6) is active. Mirrors the prover's mix
+    // immediately after the main-trace commit (see `prove.rs`). Any
+    // post-prove tamper of the metadata field shifts the lookup-element
+    // challenges drawn next, so the committed interaction trace no
+    // longer satisfies the constraint system — verify rejects. The mask
+    // gate avoids breaking chip-isolated proofs that travel through this
+    // function with `component_mask = 0`.
+    const CLOSING_CHIP_BIT: u32 = 1 << 6;
+    if component_mask & CLOSING_CHIP_BIT != 0 {
+        for r in &final_state.registers {
+            verifier_channel.mix_u64(*r);
+        }
     }
 
     let mut lookup_elements = AllLookupElements::default();

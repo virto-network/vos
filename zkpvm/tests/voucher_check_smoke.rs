@@ -451,6 +451,142 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Phase Z0 load-bearing test: a proof's `final_state.registers` is
+/// genuinely STARK-bound (not just decorative metadata the prover
+/// fills in). Tampering with any byte of any register post-prove
+/// must make `verify_standalone` reject.
+///
+/// Without this guarantee, the higher-level binding the
+/// clerk-prover-extension does (`blake2b(public_bytes)` written to
+/// designated registers, verifier checks the proof exposes the
+/// expected hash) is meaningless — a cheating prover could compute
+/// the proof for any witness then write whatever hash they want
+/// into the metadata field.
+///
+/// The chip closing the register-memory ledger (Phase Z0's
+/// `RegisterMemoryClosingChip`) consumes a synthetic per-register
+/// read at `closing_ts`; the read-consistency constraint forces
+/// each row's value to equal the previous ledger row's value
+/// (= the actual last-written value of that register), so any
+/// post-prove tamper to `final_state.registers` causes the
+/// closing chip's claimed values to diverge from what the ledger
+/// already pinned.
+#[test]
+fn final_state_registers_are_stark_bound() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    let mut side_note = side_note_for_trace(&blob, 100_000_000);
+    let proof = prove_mobile(&mut side_note).expect("prove voucher-check");
+    let prog_hash = program_commitment_of_proof(&proof);
+
+    // Sanity: pristine proof verifies.
+    use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
+    verify_standalone_with_pcs_policy(proof.clone(), prog_hash, &PcsPolicy::MOBILE)
+        .expect("pristine proof must verify");
+
+    // Tamper a single byte of register 0's claimed final value.
+    let mut tampered = proof.clone();
+    tampered.final_state.registers[0] ^= 1;
+    let result = verify_standalone_with_pcs_policy(tampered, prog_hash, &PcsPolicy::MOBILE);
+    assert!(
+        result.is_err(),
+        "tamper of final_state.registers[0] must make verify reject — \
+         got {result:?}; if this passes, the closing chip isn't \
+         actually constraining the field and the entire Phase Z0 \
+         binding is decorative"
+    );
+
+    // Tamper a different register to make sure it isn't just one
+    // privileged slot — the constraint must apply uniformly.
+    let mut tampered_late = proof.clone();
+    let last_idx = tampered_late.final_state.registers.len() - 1;
+    tampered_late.final_state.registers[last_idx] ^= 0x80;
+    let result_late =
+        verify_standalone_with_pcs_policy(tampered_late, prog_hash, &PcsPolicy::MOBILE);
+    assert!(
+        result_late.is_err(),
+        "tamper of final_state.registers[{last_idx}] must also make verify reject — \
+         got {result_late:?}"
+    );
+}
+
+/// Phase Z0 hardening: `verify_standalone` must reject any proof with
+/// `component_mask = 0` at the current `format_version`. The mask-zero
+/// sentinel is the chip-isolated `prove_with_explicit_components` marker,
+/// and chip-isolated proofs deliberately skip the FS-transcript mix of
+/// `final_state.registers` on the prover side. Without this reject, an
+/// attacker could ship a chip-isolated proof (no prover-side mix) to
+/// `verify_standalone` and tamper the metadata field unobserved —
+/// bypassing the entire Z0 binding.
+#[test]
+fn verify_standalone_rejects_mask_zero() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    let mut side_note = side_note_for_trace(&blob, 100_000_000);
+    let proof = prove_mobile(&mut side_note).expect("prove voucher-check");
+    let prog_hash = program_commitment_of_proof(&proof);
+
+    use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
+    // Sanity: pristine proof verifies (mask is non-zero on the default path).
+    verify_standalone_with_pcs_policy(proof.clone(), prog_hash, &PcsPolicy::MOBILE)
+        .expect("pristine proof must verify");
+
+    // Tamper: zero the component_mask. Emulates a chip-isolated proof
+    // being fed to verify_standalone.
+    let mut tampered = proof;
+    tampered.component_mask = 0;
+    let result = verify_standalone_with_pcs_policy(tampered, prog_hash, &PcsPolicy::MOBILE);
+    assert!(
+        matches!(result, Err(ref e) if format!("{e:?}").contains("component_mask = 0")),
+        "verify_standalone must reject component_mask = 0 with a specific error — \
+         got {result:?}; if this passes, the chip-isolated → standalone bypass \
+         documented in the Z0 follow-up is open"
+    );
+}
+
+/// Phase Z0 scope: registers only. The `pc` and `memory_commitment`
+/// fields on `proof.final_state` are NOT bound by Z0 — they travel as
+/// metadata alongside the proof. This test pins the scope: tampering
+/// either field leaves `verify_standalone` happily accepting the
+/// proof. The day someone wires those fields into the FS transcript
+/// (or a future "Z1" / "Z2" chip closes the program-memory and
+/// memory ledgers analogously), they'll need to update this test
+/// instead of inheriting a silent binding.
+///
+/// If this test starts failing, that's good news — *something* has
+/// taken responsibility for one of these fields. Find out what, and
+/// rewrite this test to reflect the new scope.
+#[test]
+fn final_state_non_register_fields_are_not_bound() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    let mut side_note = side_note_for_trace(&blob, 100_000_000);
+    let proof = prove_mobile(&mut side_note).expect("prove voucher-check");
+    let prog_hash = program_commitment_of_proof(&proof);
+
+    use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
+
+    // Tamper pc — Z0 doesn't bind it, so verify should still accept.
+    let mut tampered_pc = proof.clone();
+    tampered_pc.final_state.pc ^= 0x1000;
+    verify_standalone_with_pcs_policy(tampered_pc, prog_hash, &PcsPolicy::MOBILE).expect(
+        "Z0 binds registers only — tamper of final_state.pc must still verify. \
+         If this fails, something else is binding pc; update the test or the scope doc.",
+    );
+
+    // Tamper memory_commitment — also out of Z0's scope.
+    let mut tampered_mem = proof;
+    tampered_mem.final_state.memory_commitment[0] ^= 0xff;
+    verify_standalone_with_pcs_policy(tampered_mem, prog_hash, &PcsPolicy::MOBILE).expect(
+        "Z0 binds registers only — tamper of final_state.memory_commitment must \
+         still verify. If this fails, something else is binding it; update the \
+         test or the scope doc.",
+    );
+}
+
 /// Cribbed from `examples/extensions/clerk-prover/src/lib.rs`'s
 /// witness encoding so the test exercises the same layout the
 /// prover will use.

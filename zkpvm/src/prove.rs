@@ -342,6 +342,13 @@ fn prove_impl(
     config: PcsConfig,
     profile: bool,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
+    // Phase Z0: the default path always uses BASE_COMPONENTS which
+    // includes `RegisterMemoryClosingChip`. Mark the side_note so the
+    // ledger augmentation + FS-transcript mix engage and
+    // `proof.final_state.registers` becomes a load-bearing public
+    // output. Chip-isolated callers (`prove_with_explicit_components`)
+    // opt-in themselves only if their slice contains the closing chip.
+    side_note.closing_chip_active = true;
     // Phase 60: filter BASE_COMPONENTS to active chips for THIS trace.
     // Verifier reconstructs the same list via active_components_verifier().
     let components_owned = super::active_components(side_note);
@@ -384,6 +391,21 @@ fn prove_impl_with_components(
         let first = &side_note.steps[0];
         let n = crate::core::step::NUM_REGS.min(first.regs_before.len());
         side_note.initial_regs[..n].copy_from_slice(&first.regs_before[..n]);
+    }
+
+    // Phase Z0: backfill final_regs from the last step's regs_after
+    // when the closing chip is in the component set. Always overwrite
+    // (not gated on all-zero like initial_regs) so a caller that
+    // constructed the SideNote with stale final_regs can't accidentally
+    // produce a proof whose claimed final state diverges from the
+    // actual trace's last step. Skipped for chip-isolated harnesses
+    // that opted out of the closing chip — those proofs leave
+    // `final_regs` untouched (the field is unused without the chip).
+    if side_note.closing_chip_active && !side_note.steps.is_empty() {
+        let last = &side_note.steps[side_note.steps.len() - 1];
+        let n = crate::core::step::NUM_REGS.min(last.regs_after.len());
+        side_note.final_regs = [0u64; crate::core::step::NUM_REGS];
+        side_note.final_regs[..n].copy_from_slice(&last.regs_after[..n]);
     }
 
     // Trace gen — split into a sequential *producer* pass and a parallel
@@ -468,6 +490,20 @@ fn prove_impl_with_components(
     }
     tree_builder.commit(prover_channel);
     let main_commit = t.elapsed();
+
+    // Phase Z0: bind `proof.final_state.registers` into the FS transcript
+    // when the closing chip is in the component set. Mirrored by the
+    // verifier from `proof.final_state.registers`; any post-prove
+    // tamper of that field shifts the lookup-element challenges the
+    // verifier draws, so the committed interaction trace no longer
+    // satisfies the constraint system. Skipped for chip-isolated
+    // harnesses that opted out of the closing chip — those proofs
+    // don't expose a load-bearing `final_state.registers` field.
+    if side_note.closing_chip_active {
+        for r in &side_note.final_regs {
+            prover_channel.mix_u64(*r);
+        }
+    }
 
     let mut lookup_elements = AllLookupElements::default();
     components

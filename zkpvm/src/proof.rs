@@ -22,7 +22,16 @@ use stwo::core::{
 /// History:
 ///   1 — Phases 32-41 wrap (Rotate / BitManip / 32-bit-shift / Sbrk
 ///       all bound; PROG_MEMORY_N_FLAGS = 48; 14 components).
-pub const PROOF_FORMAT_VERSION: u32 = 1;
+///   2 — Phase Z0: `RegisterMemoryClosingChip` added at index 6,
+///       shifting every higher chip index by +1; closes the register-
+///       memory ledger by consuming a synthetic per-register read at
+///       `closing_ts = last_step.timestamp + 1`. Effect: `proof.
+///       final_state.registers` is now a load-bearing public output
+///       — read-consistency in the ledger forces it to match the
+///       trace's true final register values.  Older proofs cannot
+///       satisfy the new constraint set; reject at the
+///       `format_version` gate.
+pub const PROOF_FORMAT_VERSION: u32 = 2;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

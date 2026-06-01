@@ -79,6 +79,27 @@ pub struct SideNote {
     /// (ECALL tests, actor entry points with non-zero regs) override via
     /// with_initial_regs or direct assignment.
     pub initial_regs: [u64; NUM_REGS],
+    /// Final register state at the end of the traced execution.  Seeds
+    /// the RegisterMemoryClosingChip producers at `closing_ts =
+    /// last_step.timestamp + 1` and surfaces as `proof.final_state.
+    /// registers`.  Populated by `prove()` from `last_step.regs_after`
+    /// before component trace generation; callers that drive the prover
+    /// directly (chip-isolated tests) must set this themselves —
+    /// otherwise the closing chip claims all zeros and the
+    /// register-memory ledger's read-consistency constraint will
+    /// reject any non-zero final value.
+    pub final_regs: [u64; NUM_REGS],
+    /// Phase Z0: gate for the closing-chip ledger augmentation and the
+    /// `final_state.registers` FS-transcript mix.  Set to `true` by the
+    /// default `prove()` path because `BASE_COMPONENTS` includes
+    /// `RegisterMemoryClosingChip`; left `false` by chip-isolated
+    /// harnesses that pass an explicit component slice without the
+    /// closing chip — those would otherwise add unbalanced synthetic
+    /// closing-read consumers to the register-memory ledger and fail
+    /// the "claimed logup sum is not zero" check.  Tests that *do*
+    /// include the closing chip in an explicit slice should set this
+    /// to `true` themselves.
+    pub closing_chip_active: bool,
     /// Phase 13a: per-PC count of CpuChip steps that fetched the instruction
     /// at that PC.  Populated in Phase 13b once CpuChip emits the
     /// ProgramMemory consumer; in Phase 13a the chip exists with zero
@@ -301,6 +322,8 @@ impl SideNote {
             scalar_binop_calls: Vec::new(),
             scalar_binop_mem_ops: Vec::new(),
             initial_regs: [0u64; NUM_REGS],
+            final_regs: [0u64; NUM_REGS],
+            closing_chip_active: false,
             program_memory_counts: HashMap::new(),
             jump_table: Vec::new(),
             jump_table_counts: Vec::new(),

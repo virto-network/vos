@@ -158,6 +158,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::MemoryBoundaryChip,
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
+    &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip, // 13a — producer-only until CpuChip consumer in 13b
     &chips::JumpTableChip,     // 13d — producer of jump_table[] lookups
@@ -189,6 +190,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::MemoryBoundaryChip,
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
+    &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip,
     &chips::JumpTableChip,
@@ -362,18 +364,22 @@ struct ChipActivity {
 #[cfg(feature = "prover")]
 impl ChipActivity {
     fn is_active(&self, idx: usize) -> bool {
+        // Indices match `BASE_COMPONENTS`. The Phase Z0 insertion of
+        // RegisterMemoryClosingChip at index 6 shifted every chip at
+        // index >= 6 by +1; this map reflects the new positions.
+        // Always-active chips fall through to the default arm.
         match idx {
             1 => self.blake2b,
-            8 => self.jump_table,
-            12 => self.popcount,
-            13 => self.bitcount,
-            15 => self.mul,
-            16 => self.bitwise,
-            17 => self.compare,
-            18 => self.divrem,
-            19 => self.ristretto,
-            20 => self.ristretto_ecall,
-            21 | 22 | 23 | 24 | 25 | 26 => self.ristretto_comb,
+            9 => self.jump_table,
+            13 => self.popcount,
+            14 => self.bitcount,
+            16 => self.mul,
+            17 => self.bitwise,
+            18 => self.compare,
+            19 => self.divrem,
+            20 => self.ristretto,
+            21 => self.ristretto_ecall,
+            22 | 23 | 24 | 25 | 26 | 27 => self.ristretto_comb,
             _ => true,
         }
     }
