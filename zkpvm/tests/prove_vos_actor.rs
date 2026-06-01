@@ -1,6 +1,5 @@
 //! End-to-end test: trace a real VOS actor compiled from Rust.
 
-use javm::PVM_REGISTER_COUNT;
 use javm::interpreter::Interpreter;
 use javm::program::{self, CapEntryType};
 
@@ -27,70 +26,12 @@ fn load_fibonacci_blob() -> Vec<u8> {
     grey_transpiler::link_elf(&elf_data).expect("failed to transpile fibonacci ELF")
 }
 
-/// Set up an Interpreter from a JAR blob's CODE + DATA capabilities.
-/// Returns (interpreter, flat_mem) so flat_mem can be passed to SideNote.
+/// Test-side panicking wrapper over `zkpvm::actor::interpreter_from_blob`
+/// — every callsite below treats a missing CODE cap as a fixture bug,
+/// not a runtime condition, so the `Option<_>` ergonomics aren't worth
+/// the noise here.
 fn interpreter_from_blob(blob: &[u8], gas: u64) -> (Interpreter, Vec<u8>) {
-    let parsed = program::parse_blob(blob).expect("failed to parse JAR blob");
-
-    // Find CODE cap and extract code/bitmask/jump_table
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_data = code_data.expect("no CODE capability in blob");
-    let code_blob = program::parse_code_blob(&code_data).expect("failed to parse code blob");
-
-    // Build flat memory from DATA capabilities
-    let mut flat_mem_size: usize = 0;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Data {
-            let end = (entry.base_page as usize + entry.page_count as usize)
-                * javm::PVM_PAGE_SIZE as usize;
-            flat_mem_size = flat_mem_size.max(end);
-        }
-    }
-    let mut flat_mem = vec![0u8; flat_mem_size];
-
-    // Copy DATA cap contents into flat memory
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Data {
-            let addr = entry.base_page as usize * javm::PVM_PAGE_SIZE as usize;
-            let data = program::cap_data(entry, parsed.data_section);
-            let len = data.len().min(flat_mem.len().saturating_sub(addr));
-            if len > 0 {
-                flat_mem[addr..addr + len].copy_from_slice(&data[..len]);
-            }
-        }
-    }
-
-    // Set SP to the top of the largest DATA cap (stack)
-    let mut registers = [0u64; PVM_REGISTER_COUNT];
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Data {
-            let top =
-                (entry.base_page as u64 + entry.page_count as u64) * javm::PVM_PAGE_SIZE as u64;
-            if top > registers[1] {
-                registers[1] = top;
-            }
-        }
-    }
-
-    let mem_cycles = javm::compute_mem_cycles(parsed.header.memory_pages);
-
-    let flat_mem_copy = flat_mem.clone();
-    let interp = Interpreter::new(
-        code_blob.code.to_vec(),
-        code_blob.bitmask.to_vec(),
-        code_blob.jump_table.to_vec(),
-        registers,
-        flat_mem,
-        gas,
-        mem_cycles,
-    );
-    (interp, flat_mem_copy)
+    zkpvm::actor::interpreter_from_blob(blob, gas).expect("interpreter from blob")
 }
 
 #[test]

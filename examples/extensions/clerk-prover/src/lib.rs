@@ -54,12 +54,8 @@ use std::sync::OnceLock;
 use blake2::Blake2bVar;
 use blake2::digest::{Update, VariableOutput};
 use cipher_clerk::voucher::proof::{self as voucher_proof, Public};
-use javm::PVM_REGISTER_COUNT;
-use javm::interpreter::Interpreter;
-use javm::program::{self, CapEntryType};
 use object::{Object, ObjectSymbol};
 use vos::prelude::*;
-use zkpvm::SideNote;
 use zkpvm::core::tracing::TracingPvm;
 use zkpvm::{Proof, program_commitment_of_proof, prove_mobile};
 use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
@@ -206,7 +202,7 @@ fn cached_proof() -> Option<&'static Proof> {
             let path = voucher_check_elf_path();
             let elf = std::fs::read(&path).ok()?;
             let blob = grey_transpiler::link_elf(&elf).ok()?;
-            let mut side_note = side_note_for_blob(&blob)?;
+            let mut side_note = zkpvm::actor::trace_blob(&blob, 100_000_000)?;
             prove_mobile(&mut side_note).ok()
         })
         .as_ref()
@@ -224,60 +220,6 @@ fn cached_proof_bytes() -> Option<&'static Vec<u8>> {
 
 fn cached_program_commitment() -> Option<zkpvm_verifier::CommitmentHash> {
     cached_proof().map(program_commitment_of_proof)
-}
-
-/// Build a fully-populated SideNote for voucher-check.elf with the
-/// hardcoded witness (the actor falls back to it when WITNESS_BUFFER
-/// is zero).  Mirrors `zkpvm/tests/voucher_check_smoke.rs`'s
-/// `side_note_for_trace`.
-fn side_note_for_blob(blob: &[u8]) -> Option<SideNote> {
-    let (interp, flat_mem) = interpreter_from_blob(blob, 100_000_000)?;
-    let parsed = program::parse_blob(blob)?;
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_blob = program::parse_code_blob(&code_data?)?;
-    let mut tracing = TracingPvm::new(interp);
-    let _ = tracing.run_with_vos_stubs();
-    let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
-    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-    let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
-    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
-    let ristretto_add_records = tracing.ristretto_add_records.clone();
-    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
-    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
-    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
-    let scalar_binop_records = tracing.scalar_binop_records.clone();
-    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
-    let steps = tracing.into_trace();
-    let mut side_note = SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
-        .with_memory(flat_mem)
-        .with_jump_table(code_blob.jump_table.to_vec());
-    for c in &blake2b_calls {
-        side_note
-            .blake2b_calls
-            .push(zkpvm::chips::blake2b::Blake2bCall {
-                h: c.h,
-                m: c.m,
-                t: c.t,
-                f: c.f,
-            });
-    }
-    side_note.blake2b_mem_ops = blake2b_mem_ops;
-    side_note.ristretto_calls = ristretto_calls;
-    side_note.ristretto_mem_ops = ristretto_mem_ops;
-    side_note.ristretto_add_calls = ristretto_add_records;
-    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
-    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
-    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
-    side_note.scalar_binop_calls = scalar_binop_records;
-    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
-    side_note.ingest_ristretto_boundary();
-    Some(side_note)
 }
 
 /// Resolve the voucher-check.elf path relative to this extension's
@@ -317,7 +259,7 @@ fn load_and_trace_voucher_check(witness_bytes: Option<Vec<u8>>) -> Option<(usize
         .as_ref()
         .and_then(|_| find_symbol_addr(&elf, "WITNESS_BUFFER"));
     let blob = grey_transpiler::link_elf(&elf).ok()?;
-    let (interp, mut flat_mem) = interpreter_from_blob(&blob, 100_000_000)?;
+    let (interp, mut flat_mem) = zkpvm::actor::interpreter_from_blob(&blob, 100_000_000)?;
     // Patch the witness BEFORE TracingPvm takes ownership.
     if let (Some(bytes), Some(addr)) = (&witness_bytes, witness_addr) {
         let addr = addr as usize;
@@ -381,64 +323,6 @@ fn encode_witness_buffer(public_bytes: &[u8], secret_bytes: &[u8]) -> Option<Vec
     v.extend_from_slice(&(secret_bytes.len() as u32).to_le_bytes());
     v.extend_from_slice(secret_bytes);
     Some(v)
-}
-
-/// Build an `Interpreter` from a parsed PVM blob's CODE + DATA caps.
-/// Cribbed from `zkpvm/tests/voucher_check_smoke.rs` — same shape
-/// because the prove path here will eventually call this then
-/// `zkpvm::prove`.
-fn interpreter_from_blob(blob: &[u8], gas: u64) -> Option<(Interpreter, Vec<u8>)> {
-    let parsed = program::parse_blob(blob)?;
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_data = code_data?;
-    let code_blob = program::parse_code_blob(&code_data)?;
-    let mut flat_mem_size: usize = 0;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Data {
-            let end = (entry.base_page as usize + entry.page_count as usize)
-                * javm::PVM_PAGE_SIZE as usize;
-            flat_mem_size = flat_mem_size.max(end);
-        }
-    }
-    let mut flat_mem = vec![0u8; flat_mem_size];
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Data {
-            let addr = entry.base_page as usize * javm::PVM_PAGE_SIZE as usize;
-            let data = program::cap_data(entry, parsed.data_section);
-            let len = data.len().min(flat_mem.len().saturating_sub(addr));
-            if len > 0 {
-                flat_mem[addr..addr + len].copy_from_slice(&data[..len]);
-            }
-        }
-    }
-    let mut registers = [0u64; PVM_REGISTER_COUNT];
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Data {
-            let top =
-                (entry.base_page as u64 + entry.page_count as u64) * javm::PVM_PAGE_SIZE as u64;
-            if top > registers[1] {
-                registers[1] = top;
-            }
-        }
-    }
-    let mem_cycles = javm::compute_mem_cycles(parsed.header.memory_pages);
-    let flat_mem_copy = flat_mem.clone();
-    let interp = Interpreter::new(
-        code_blob.code.to_vec(),
-        code_blob.bitmask.to_vec(),
-        code_blob.jump_table.to_vec(),
-        registers,
-        flat_mem,
-        gas,
-        mem_cycles,
-    );
-    Some((interp, flat_mem_copy))
 }
 
 // `Public` / `voucher_proof::public_bytes` aren't used yet — they

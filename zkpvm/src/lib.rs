@@ -123,6 +123,8 @@ pub mod trace;
 pub mod side_note;
 
 #[cfg(feature = "prover")]
+pub mod actor;
+#[cfg(feature = "prover")]
 mod program_id;
 #[cfg(feature = "prover")]
 mod prove;
