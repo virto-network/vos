@@ -283,6 +283,13 @@ up` listing the offending names, so the mistake surfaces immediately.
 Use a wildcard (`"*:<role>"`) to grant authority broadly rather than
 per actor.
 
+**Actor-local grants travel too**: an
+[actor-local override](#add-an-actor-local-override) the caller holds
+on the relay's target is forwarded as well, so a call routed through an
+extension sees the same per-actor role it would on a direct call. The
+cap decides *whether* the extension may relay to that target; the
+caller's own per-actor grant (set by an admin) then applies unchanged.
+
 ### HTTP gateway and anonymous traffic
 
 The http-gateway proxies external HTTP into the daemon. Because the

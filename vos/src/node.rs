@@ -766,29 +766,7 @@ impl NodeService {
     /// unreachable (gate fires before registry boots), the reply
     /// times out, or the reply payload doesn't decode.
     fn probe_registry_for_u8(&self, payload: Vec<u8>) -> Option<u8> {
-        let registry_id = crate::abi::service::ServiceId::REGISTRY.local_id() as u32;
-        let tx = self.invoke_routes.lock().ok()?.get(&registry_id).cloned()?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if tx
-            .send(InvokeRequest {
-                // Internal host probe of a registry read handler
-                // — `Caller::System` lets the probe bypass any
-                // future role-gated read handlers without
-                // requiring an actor-level deny exception.
-                caller: crate::actors::Caller::System,
-                space_role: None,
-                actor_local_role: None,
-                msg: payload,
-                reply_tx,
-                chain: vec![],
-            })
-            .is_err()
-        {
-            return None;
-        }
-        let envelope = reply_rx.recv_timeout(Duration::from_secs(5)).ok()?;
-        let reply_bytes = unwrap_invoke_envelope(&envelope)?;
-        decode_u8_reply(&reply_bytes)
+        registry_probe_u8(&self.invoke_routes, payload)
     }
 
     /// Resolve a (possibly prefix-scoped) target `ServiceId` value back
@@ -803,6 +781,37 @@ impl NodeService {
             .get(&local_id_of(svc_id))
             .cloned()
     }
+}
+
+/// Send an already-encoded dynamic `Msg` to the local registry and
+/// decode the reply as a single `u8`. The free-function core of the
+/// auth probes, shared by [`NodeService::probe_registry_for_u8`] (the
+/// libp2p gate) and [`relay_actor_local_role`] (extension relays),
+/// which both have the routes table but not a `NodeService`. The probe
+/// asserts `Caller::System` so it bypasses any role-gated registry read
+/// handler. Returns `None` if the registry is unreachable, the reply
+/// times out, or the payload doesn't decode.
+#[cfg(feature = "network")]
+fn registry_probe_u8(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<u8> {
+    let registry_id = crate::abi::service::ServiceId::REGISTRY.local_id() as u32;
+    let tx = routes.lock().ok()?.get(&registry_id).cloned()?;
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if tx
+        .send(InvokeRequest {
+            caller: crate::actors::Caller::System,
+            space_role: None,
+            actor_local_role: None,
+            msg: payload,
+            reply_tx,
+            chain: vec![],
+        })
+        .is_err()
+    {
+        return None;
+    }
+    let envelope = reply_rx.recv_timeout(Duration::from_secs(5)).ok()?;
+    let reply_bytes = unwrap_invoke_envelope(&envelope)?;
+    decode_u8_reply(&reply_bytes)
 }
 
 /// Pull a `u8` out of the actor-framework reply bytes. Handles
@@ -3257,12 +3266,64 @@ fn current_relay_caller() -> Option<PropagatedCaller> {
 /// rather than via a special case.
 const REGISTRY_AGENT_NAME: &str = "space-registry";
 
+/// R4 — the propagated peer's actor-local grant on the relay's final
+/// target, to be carried on the relayed call so an explicit per-actor
+/// grant reaches the target through an extension exactly as it would on
+/// a direct libp2p call (which [`NodeService::dispatch_invoke`] now
+/// probes too). Returns `(peer_bytes, role)` when all hold:
+///
+/// - the extension's caps permit the relay at all (`cap_for` is `Some`
+///   for the target) — the cap gates *whether* the extension may reach
+///   the target, even though it can't bound the grant's magnitude;
+/// - the target resolved to a name (so the registry can be keyed);
+/// - the propagated caller is a `Peer` (only Peers have actor-local
+///   grants; trusted/anonymous callers carry none);
+/// - the registry has a non-`AUTH_ROLE_NONE` row for `(peer, target)`.
+///
+/// The role is in the **target actor's own role space** and is relayed
+/// *uncapped*: the host can't compare it to the SpaceRole ceiling, and
+/// it's faithful — the peer already holds exactly this on a direct
+/// call, so the relay is a conduit, not an amplifier. It overrides
+/// `space_role` at the target, so the caller must carry the matching
+/// `Peer` identity (the invoke_fn re-stamps it).
+#[cfg(feature = "network")]
+fn relay_actor_local_role(
+    routes: &InvokeRoutes,
+    propagated: Option<&PropagatedCaller>,
+    caps: &[crate::actors::IntraCap],
+    target_name: Option<&str>,
+) -> Option<(Vec<u8>, u8)> {
+    use crate::actors::{Caller, cap_for};
+    // The cap must permit the relay to this target at all.
+    cap_for(caps, target_name)?;
+    let name = target_name?;
+    let Caller::Peer(bytes) = &propagated?.caller else {
+        return None;
+    };
+    use crate::actors::codec::Encode;
+    use crate::value::{Msg, TAG_DYNAMIC};
+    let msg = Msg::new("actor_role")
+        .with("peer_id", bytes.clone())
+        .with("agent_name", name);
+    let mut payload = Vec::with_capacity(1 + 64);
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&msg.encode());
+    let role = registry_probe_u8(routes, payload)?;
+    // AUTH_ROLE_NONE (0) is "no row"; mirror the dispatch path and treat
+    // it as no grant (an actor whose lowest tier is 0 can't be granted
+    // actor-locally — a known, pre-existing limitation).
+    (role != AUTH_ROLE_NONE).then_some((bytes.clone(), role))
+}
+
 /// Compute the `(caller, space_role byte)` a service-mode extension
 /// relays for an outbound call to `target_name`, applying the
 /// intersection model: the effective authority is
 /// `min(caller's space role, the extension's declared cap ceiling for
 /// the target)`. The extension can never *amplify* the caller, and
 /// the caller can never reach actors the extension didn't declare.
+/// (Actor-local grants are handled separately by
+/// [`relay_actor_local_role`] — they're per-actor, in the target's own
+/// role space, and pass through faithfully rather than via this cap.)
 ///
 /// The returned caller is always NON-trusted (Peer or
 /// Unauthenticated) so the downstream actor's role check actually
@@ -3378,15 +3439,40 @@ fn run_service_extension(
                 .read()
                 .ok()
                 .and_then(|m| m.get(&local_id_of(target)).cloned());
-            let (caller, space_role) = resolve_relay_caller(
-                current_relay_caller().as_ref(),
+            let propagated = current_relay_caller();
+            #[allow(unused_mut)]
+            let (mut caller, space_role) =
+                resolve_relay_caller(propagated.as_ref(), &intra_caps, target_name.as_deref());
+            // R4 — faithfully propagate the propagated peer's actor-local
+            // grant on the *final target*. That grant is in the target
+            // actor's own role space (not a SpaceRole), so the host can't
+            // cap it against the SpaceRole ceiling; instead the cap gates
+            // *whether* the relay may reach the target at all (a non-None
+            // ceiling), and the grant — which the peer already holds on a
+            // direct libp2p call — passes through unchanged. It overrides
+            // space_role at the target, so the carrier must stay the Peer
+            // for the override to bind to the right identity. Only
+            // reachable under `network` (Peer callers come from the
+            // libp2p gate); a no-network node never has one to propagate.
+            #[cfg(feature = "network")]
+            let actor_local_role = match relay_actor_local_role(
+                &invoke_routes_for_ctx,
+                propagated.as_ref(),
                 &intra_caps,
                 target_name.as_deref(),
-            );
+            ) {
+                Some((peer_bytes, role)) => {
+                    caller = crate::actors::Caller::Peer(peer_bytes);
+                    Some(role)
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "network"))]
+            let actor_local_role: Option<u8> = None;
             tx.send(InvokeRequest {
                 caller,
                 space_role,
-                actor_local_role: None,
+                actor_local_role,
                 msg: payload.to_vec(),
                 reply_tx,
                 chain: vec![me],
@@ -4854,5 +4940,140 @@ mod tests {
         drop(service); // close the senders so the mock threads exit.
         reg.join().unwrap();
         sink.join().unwrap();
+    }
+
+    // ── R4: actor-local grant propagated through extension relays ──
+
+    /// Spawn a mock registry on route 0 that replies `role` to every
+    /// `actor_role` probe, recording each probe's `(agent_name,
+    /// peer_id)`. Returns the routes table, the record, and the thread.
+    #[cfg(feature = "network")]
+    fn mock_registry_actor_role(
+        role: u8,
+    ) -> (
+        InvokeRoutes,
+        Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        thread::JoinHandle<()>,
+    ) {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::actors::run::STATUS_DONE;
+        use crate::value::{Msg, Value};
+        let (reg_tx, reg_rx) = mpsc::channel::<InvokeRequest>();
+        let seen: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_w = seen.clone();
+        let h = thread::spawn(move || {
+            while let Ok(req) = reg_rx.recv() {
+                let msg = <Msg as Decode>::try_decode(&req.msg[1..]).expect("decode probe");
+                let peer = msg.args.get_bytes("peer_id").unwrap_or_default();
+                let name = msg.args.get_str("agent_name").unwrap_or_default();
+                seen_w.lock().unwrap().push((name, peer));
+                let reply = encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(role).encode());
+                let _ = req.reply_tx.send(reply);
+            }
+        });
+        let mut routes = HashMap::new();
+        routes.insert(ServiceId::REGISTRY.0, reg_tx);
+        (Arc::new(Mutex::new(routes)), seen, h)
+    }
+
+    /// The headline R4 property: a peer's actor-local grant on the final
+    /// target is relayed **faithfully and uncapped** when the cap merely
+    /// *permits* the relay. Here the cap ceiling is Member but the grant
+    /// is role 3 (the actor's own role space) — the returned role is 3,
+    /// not min(3, Member): the host can't compare the two spaces, and
+    /// the peer already holds the grant on a direct call.
+    #[cfg(feature = "network")]
+    #[test]
+    fn relay_actor_local_propagates_peer_grant_uncapped_when_cap_permits() {
+        use crate::actors::{Caller, IntraCap, SpaceRole};
+        let (routes, seen, h) = mock_registry_actor_role(3);
+        let caps = vec![IntraCap::parse("dev-project:member").unwrap()];
+        let pc = PropagatedCaller {
+            caller: Caller::Peer(vec![1, 2, 3]),
+            space_role: Some(SpaceRole::Guest.as_u8()),
+        };
+        let got = relay_actor_local_role(&routes, Some(&pc), &caps, Some("dev-project"));
+        assert_eq!(got, Some((vec![1, 2, 3], 3)));
+        // The probe was keyed on the propagated peer + the target name.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[("dev-project".to_string(), vec![1, 2, 3])]
+        );
+        drop(routes);
+        h.join().unwrap();
+    }
+
+    /// No cap for the target → the relay isn't permitted at all, so the
+    /// actor-local grant must NOT tunnel through (and no probe fires).
+    #[cfg(feature = "network")]
+    #[test]
+    fn relay_actor_local_denied_without_a_permitting_cap() {
+        use crate::actors::{Caller, SpaceRole};
+        let (routes, seen, h) = mock_registry_actor_role(3);
+        let pc = PropagatedCaller {
+            caller: Caller::Peer(vec![1]),
+            space_role: Some(SpaceRole::Admin.as_u8()),
+        };
+        assert_eq!(
+            relay_actor_local_role(&routes, Some(&pc), &[], Some("dev-project")),
+            None
+        );
+        assert!(seen.lock().unwrap().is_empty(), "no cap → no probe");
+        drop(routes);
+        h.join().unwrap();
+    }
+
+    /// Only Peer callers carry actor-local grants. A trusted incoming
+    /// caller (System/Actor) is relayed anonymously and has no peer
+    /// identity to key a grant on.
+    #[cfg(feature = "network")]
+    #[test]
+    fn relay_actor_local_skips_non_peer_callers() {
+        use crate::actors::{Caller, IntraCap};
+        let (routes, seen, h) = mock_registry_actor_role(3);
+        let caps = vec![IntraCap::parse("*:admin").unwrap()];
+        let pc = PropagatedCaller {
+            caller: Caller::System,
+            space_role: None,
+        };
+        assert_eq!(
+            relay_actor_local_role(&routes, Some(&pc), &caps, Some("dev-project")),
+            None
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        drop(routes);
+        h.join().unwrap();
+    }
+
+    /// `AUTH_ROLE_NONE` (no grant row) → `None`, mirroring the dispatch
+    /// path; an unresolved target name → `None` (nothing to key on).
+    #[cfg(feature = "network")]
+    #[test]
+    fn relay_actor_local_none_for_missing_grant_or_name() {
+        use crate::actors::{Caller, IntraCap, SpaceRole};
+        let caps = vec![IntraCap::parse("*:admin").unwrap()];
+        let peer = || PropagatedCaller {
+            caller: Caller::Peer(vec![9]),
+            space_role: Some(SpaceRole::Member.as_u8()),
+        };
+
+        // Registry has no row for the peer (replies AUTH_ROLE_NONE).
+        let (routes, _seen, h) = mock_registry_actor_role(AUTH_ROLE_NONE);
+        assert_eq!(
+            relay_actor_local_role(&routes, Some(&peer()), &caps, Some("dev-project")),
+            None
+        );
+        drop(routes);
+        h.join().unwrap();
+
+        // Unresolved target name → no key, no probe.
+        let (routes, seen, h) = mock_registry_actor_role(3);
+        assert_eq!(
+            relay_actor_local_role(&routes, Some(&peer()), &caps, None),
+            None
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        drop(routes);
+        h.join().unwrap();
     }
 }
