@@ -69,6 +69,13 @@ refresh-bundled-registry: build-registry
        vosx/blobs/space_registry.elf
     @echo "✓ refreshed vosx/blobs/space_registry.elf"
 
+# Build the space-bridge actor — built-in PVM actor that
+# every member space of a hyperspace runs as the cross-space
+# gateway. Same toolchain as the registry.
+build-bridge:
+    cd actors/space-bridge && cargo +nightly -Zjson-target-spec build --release
+
+
 # Live cross-node CRDT convergence demo. Spins up two networked
 # VosNodes in-process, registers the crdt-counter actor on both
 # under the same replication_id, drives one inc on each side,

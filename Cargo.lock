@@ -4694,6 +4694,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "space-bridge"
+version = "0.1.0"
+dependencies = [
+ "vos",
+]
+
+[[package]]
 name = "space-registry"
 version = "0.1.0"
 dependencies = [
@@ -5495,6 +5502,7 @@ dependencies = [
  "redb",
  "rkyv",
  "serde",
+ "space-bridge",
  "space-registry",
  "tokio",
  "toml",

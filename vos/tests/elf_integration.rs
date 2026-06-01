@@ -5257,3 +5257,304 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
         .sum();
     assert_eq!(panics, 0, "actor panics during hyperspace test: {panics}");
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn cross_space_bridge_forward_dispatches_to_local_target() {
+    // End-to-end test for the bridge actor — proves the load-bearing
+    // claim of the cross-space gateway pattern:
+    //
+    //   Bank A's caller resolves bank B's bridge through the
+    //   hyperspace registry, invokes bridge_b.forward("counter", ...),
+    //   bridge_b resolves "counter" locally (via hyperspace fall-
+    //   through since the counter is at a known ServiceId on B),
+    //   dispatches the payload, and returns the reply. Counter
+    //   state advances on B; A sees the new count.
+    //
+    // Also pins the three error statuses on `ForwardReply`:
+    //   - FORWARD_NOT_FOUND when the name is unknown
+    //   - FORWARD_SELF_TARGET when the name resolves to the bridge itself
+    //   - FORWARD_OK for the happy path
+    use space_bridge::{FORWARD_NOT_FOUND, FORWARD_OK, FORWARD_SELF_TARGET, SpaceBridgeRef};
+    use space_registry::SpaceRegistryRef;
+    use std::time::Duration;
+    use vos::Encode;
+    use vos::abi::service::ServiceId;
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let bridge_path = format!(
+        "{}/../actors/space-bridge/target/riscv64em-javm/release/space_bridge.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let counter_path = format!(
+        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let bridge_elf = match std::fs::read(&bridge_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-bridge not built (run `just build-bridge`)");
+            return;
+        }
+    };
+    let counter_elf = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter not built (run `just build-pvm`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile registry");
+    let bridge_blob = grey_transpiler::link_elf(&bridge_elf).expect("transpile bridge");
+    let counter_blob = grey_transpiler::link_elf(&counter_elf).expect("transpile counter");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_bridge_e2e_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let mk_id = |label: &[u8]| -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(label);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+    let space_a_rep = mk_id(b"bridge-test/space-a");
+    let space_b_rep = mk_id(b"bridge-test/space-b");
+    let hs_rep = mk_id(b"bridge-test/hyperspace");
+    let counter_rep = mk_id(b"bridge-test/counter");
+
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+    });
+
+    // Each bridge registers under a unique name in the hyperspace
+    // registry ("bridge-a", "bridge-b") so the two don't collide
+    // on the host_mappings key. ServiceIds are derived from the
+    // same name so resolve and registration agree on the slot.
+    // Bridges are stateless — Ephemeral consistency, no redb, no
+    // gossipsub topic, no replication overhead.
+    let bridge_a_id =
+        vos::abi::service::ServiceId(space_registry::instance_service_id("bridge-a", prefix_a));
+    let bridge_b_id =
+        vos::abi::service::ServiceId(space_registry::instance_service_id("bridge-b", prefix_b));
+    let counter_b_id =
+        vos::abi::service::ServiceId(space_registry::instance_service_id("counter", prefix_b));
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(space_a_rep),
+        ServiceId::REGISTRY,
+    );
+    node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(hs_rep),
+        ServiceId::HYPERSPACE_REGISTRY,
+    );
+    node_a.register_at_id(
+        AgentConfig::new(bridge_blob.clone()).with_consistency(Consistency::Ephemeral),
+        bridge_a_id,
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(space_b_rep),
+        ServiceId::REGISTRY,
+    );
+    node_b.register_at_id(
+        AgentConfig::new(registry_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(hs_rep),
+        ServiceId::HYPERSPACE_REGISTRY,
+    );
+    node_b.register_at_id(
+        AgentConfig::new(bridge_blob).with_consistency(Consistency::Ephemeral),
+        bridge_b_id,
+    );
+    // The forward target on B. Crdt + persist so the inc state
+    // sticks; replication_id is unique to this test so it doesn't
+    // collide with other crdt-counter-using tests in the same run.
+    node_b.register_at_id(
+        AgentConfig::new(counter_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(counter_rep),
+        counter_b_id,
+    );
+    node_b.attach_network(net_b);
+
+    let net_a_arc = node_a.network().expect("net_a attached");
+    let net_b_arc = node_b.network().expect("net_b attached");
+    wait_for(
+        || {
+            if net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()
+            {
+                Some(())
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .expect("Hello handshake");
+
+    // Advertise bridge_b and counter in node A's hyperspace registry.
+    // bridge_b: so A can resolve it by name. counter: so bridge_b
+    // resolves "counter" via the hyperspace fall-through (the local
+    // registry's agents catalog is empty since we bypass install()).
+    let hs_reg = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+    for (name, prefix) in [("bridge-b", prefix_b), ("counter", prefix_b)] {
+        let status =
+            vos::block_on(hs_reg.register_remote(&mut &node_a, name.to_string(), prefix as u32))
+                .expect("register_remote");
+        assert_eq!(status, space_registry::STATUS_OK, "register_remote {name}");
+    }
+
+    // Sanity: A's hyperspace registry resolves bridge-b to the
+    // right ServiceId before we exercise it.
+    let resolved =
+        vos::block_on(hs_reg.resolve(&mut &node_a, "bridge-b".to_string(), prefix_a as u64))
+            .expect("resolve bridge-b");
+    assert_eq!(resolved, bridge_b_id.0, "bridge-b resolves to B");
+
+    let bridge_remote = SpaceBridgeRef::at(bridge_b_id);
+
+    // 1) where_am_i — proves we reached bridge_b on B, not a
+    // local shadow.
+    let where_am_i = vos::block_on(bridge_remote.where_am_i(&mut &node_a))
+        .expect("cross-node where_am_i invoke");
+    assert_eq!(where_am_i, bridge_b_id.0, "where_am_i is bridge_b");
+    assert_ne!(where_am_i, bridge_a_id.0, "not bridge_a");
+
+    // 2) Happy path: forward inc + get to the counter on B.
+    let inc_payload = {
+        let m = Msg::new("inc");
+        let encoded = m.encode();
+        let mut out = Vec::with_capacity(1 + encoded.len());
+        out.push(TAG_DYNAMIC);
+        out.extend_from_slice(&encoded);
+        out
+    };
+    let get_payload = {
+        let m = Msg::new("get");
+        let encoded = m.encode();
+        let mut out = Vec::with_capacity(1 + encoded.len());
+        out.push(TAG_DYNAMIC);
+        out.extend_from_slice(&encoded);
+        out
+    };
+
+    let inc_reply =
+        vos::block_on(bridge_remote.forward(&mut &node_a, "counter".to_string(), inc_payload))
+            .expect("forward inc");
+    assert_eq!(
+        inc_reply.status, FORWARD_OK,
+        "inc forward should succeed, got status {}",
+        inc_reply.status
+    );
+
+    let get_reply =
+        vos::block_on(bridge_remote.forward(&mut &node_a, "counter".to_string(), get_payload))
+            .expect("forward get");
+    assert_eq!(
+        get_reply.status, FORWARD_OK,
+        "get forward should succeed, got status {}",
+        get_reply.status
+    );
+    let value: vos::value::Value = vos::Decode::decode(&get_reply.payload);
+    assert_eq!(
+        value.as_u64(),
+        Some(1),
+        "counter should be 1 after one inc through the bridge, got {value:?}",
+    );
+
+    // 3) Self-target check: forwarding to bridge-b's own name from
+    // bridge-b returns SELF_TARGET, not a recursive invoke.
+    let self_reply =
+        vos::block_on(bridge_remote.forward(&mut &node_a, "bridge-b".to_string(), Vec::new()))
+            .expect("forward self");
+    assert_eq!(
+        self_reply.status, FORWARD_SELF_TARGET,
+        "forwarding to bridge-b's own name must return SELF_TARGET, got status {}",
+        self_reply.status
+    );
+    assert!(self_reply.payload.is_empty());
+
+    // 4) Unknown name: NOT_FOUND.
+    let not_found = vos::block_on(bridge_remote.forward(
+        &mut &node_a,
+        "nonexistent-agent".to_string(),
+        Vec::new(),
+    ))
+    .expect("forward unknown");
+    assert_eq!(
+        not_found.status, FORWARD_NOT_FOUND,
+        "unknown name must return NOT_FOUND, got status {}",
+        not_found.status
+    );
+    assert!(not_found.payload.is_empty());
+
+    let results_a = node_a.collect();
+    let results_b = node_b.collect();
+    let panics: u32 = results_a
+        .iter()
+        .chain(results_b.iter())
+        .map(|r| r.panics)
+        .sum();
+    let _ = std::fs::remove_dir_all(&dir_root);
+    assert_eq!(panics, 0, "actor panics during bridge test: {panics}");
+}

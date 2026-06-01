@@ -324,6 +324,63 @@ mod tests {
     }
 
     #[test]
+    fn small_digest_matches_blake2_crate_n2() {
+        // `instance_service_id` uses blake2b_hash<2> to derive the
+        // 16-bit local id from a name. host (blake2b_simd) and
+        // PVM (per-block ECALL → host_compress_block) must produce
+        // identical 2-byte outputs for the same input.
+        use blake2::digest::consts::U2;
+        type Blake2b16 = blake2::Blake2b<U2>;
+        let ours: [u8; 2] = blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"bridge-b"]);
+        let mut h = Blake2b16::new();
+        h.update(b"vos-instance-svc-id/v1");
+        h.update(&[0u8]);
+        h.update(b"bridge-b");
+        let theirs = h.finalize();
+        assert_eq!(
+            &ours[..],
+            &theirs[..],
+            "blake2b_hash<2> diverges from blake2 reference for N=2"
+        );
+    }
+
+    #[test]
+    fn emulated_ecall_path_matches_blake2_n2() {
+        // Emulate `hash_via_ecall<2>` on the host (uses host_compress_block
+        // directly, the same primitive the ECALL handler delegates to).
+        // If this matches the blake2 reference, then host and PVM are
+        // algorithmically identical for the 2-byte-output path. If they
+        // diverge from blake2_simd on PVM, the bug is elsewhere (e.g.
+        // memory marshalling in the ECALL kernel handler).
+        const N: usize = 2;
+        let param_lo: u64 = 0x0101_0000 | (N as u64);
+        let mut h_words = BLAKE2B_IV;
+        h_words[0] ^= param_lo;
+        let mut h = [0u8; 64];
+        for i in 0..8 {
+            h[i * 8..i * 8 + 8].copy_from_slice(&h_words[i].to_le_bytes());
+        }
+        // Single block of 22+1+8 = 31 bytes, zero-padded to 128.
+        let domain = b"vos-instance-svc-id/v1";
+        let sep = b"\0";
+        let payload = b"bridge-b";
+        let mut buf = [0u8; 128];
+        buf[..domain.len()].copy_from_slice(domain);
+        buf[domain.len()..domain.len() + 1].copy_from_slice(sep);
+        buf[domain.len() + 1..domain.len() + 1 + payload.len()].copy_from_slice(payload);
+        let total = domain.len() + 1 + payload.len();
+        host_compress_block(&mut h, &buf, total as u128, true);
+        let emulated: [u8; 2] = [h[0], h[1]];
+
+        let direct: [u8; 2] = blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"bridge-b"]);
+
+        assert_eq!(
+            emulated, direct,
+            "emulated ECALL path diverges from direct blake2b_hash<2>",
+        );
+    }
+
+    #[test]
     fn host_compress_matches_blake2_crate_one_block() {
         // The host kernel handler's per-block compress is what
         // riscv64 actors hit via the ECALL. Sanity-check it
