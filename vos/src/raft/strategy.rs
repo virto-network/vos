@@ -19,7 +19,14 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
+// The multi-node path (the worker, propose-and-wait) needs libp2p; only
+// the `network` feature pulls it in. Single-node `RaftCommit` stays
+// available under `storage` alone, so these imports — and every
+// `Role::Multi` site below — are gated on `network` to keep the
+// storage-only build (and the public single-node API) compiling.
+#[cfg(feature = "network")]
 use std::sync::mpsc as std_mpsc;
+#[cfg(feature = "network")]
 use std::time::Duration;
 
 use redb::Database;
@@ -28,6 +35,7 @@ use crate::commit::{CommitError, CommitStrategy, STATE_KEY, STATE_TABLE};
 use crate::effect_log::EffectLog;
 
 use super::log::{RaftLog, RaftMeta};
+#[cfg(feature = "network")]
 use super::worker::{ProposeError, RaftWorker, WorkerHandle};
 
 /// Cluster role for a `RaftCommit`. Single-node mode is "self
@@ -41,6 +49,7 @@ enum Role {
     /// Cluster mode. Owns the worker thread and an apply receiver
     /// it drains in `commit_with_log` until the proposed entry's
     /// commit_index is reached.
+    #[cfg(feature = "network")]
     Multi {
         worker: RaftWorker,
         /// Receives every new `commit_index` value the worker
@@ -155,6 +164,7 @@ impl RaftCommit {
     /// observes (own quorum match OR follower receiving a higher
     /// `leader_commit` from a heartbeat). The receiver should be
     /// the matched half of the `Sender` handed to `RaftWorker::spawn`.
+    #[cfg(feature = "network")]
     pub fn from_worker(
         db: Arc<Database>,
         cfg: RaftConfig,
@@ -178,6 +188,7 @@ impl RaftCommit {
     /// Read-only access to the worker handle when in `Multi` mode.
     /// Useful for installing it as the `RaftRpcHandler` on a
     /// network. Returns `None` for `SingleNode`.
+    #[cfg(feature = "network")]
     pub fn worker_handle(&self) -> Option<WorkerHandle> {
         match &self.role {
             Role::Multi { worker, .. } => Some(worker.handler()),
@@ -284,12 +295,13 @@ impl CommitStrategy for RaftCommit {
             return Ok(());
         }
         let payload = log.to_bytes();
-        let propose_timeout = Duration::from_millis(self.cfg.propose_timeout_ms);
         match &self.role {
             Role::SingleNode => {
                 self.append_and_apply_single_node(state, &payload)?;
             }
+            #[cfg(feature = "network")]
             Role::Multi { worker, apply_rx } => {
+                let propose_timeout = Duration::from_millis(self.cfg.propose_timeout_ms);
                 let handle = worker.handler();
                 let idx = handle.propose(payload).map_err(|e| match e {
                     ProposeError::NotLeader => CommitError::Config(
@@ -430,6 +442,7 @@ impl CommitStrategy for RaftCommit {
             // Multi mode: writable iff this replica is currently
             // the leader. Lock-free atomic read — doesn't bounce
             // through the worker's mpsc inbox.
+            #[cfg(feature = "network")]
             Role::Multi { worker, .. } => worker.role() == super::worker::Role::Leader,
         }
     }
@@ -469,6 +482,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network")]
     fn cfg_multi(me: u16, members: Vec<u16>) -> RaftConfig {
         RaftConfig {
             me,
@@ -529,6 +543,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "network")]
     #[test]
     fn multi_mode_solo_cluster_propose_and_persist() {
         // Single-member "cluster": the worker self-elects in
