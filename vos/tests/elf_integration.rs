@@ -5043,3 +5043,217 @@ version = "0.1.0"
         Err(_) => {}
     }
 }
+
+#[test]
+#[cfg(feature = "network")]
+fn hyperspace_resolve_returns_remote_host_prefix() {
+    // End-to-end test for the hyperspace runtime — proves the
+    // load-bearing claim:
+    //
+    //   Two member-spaces (different per-space replication_ids,
+    //   different `space-registry` replicas at REGISTRY=0) share a
+    //   hyperspace by both spawning a `space-registry` replica at
+    //   HYPERSPACE_REGISTRY=1 with the same hyperspace replication
+    //   id. After a `register_remote("alice", host_prefix_a)` call
+    //   on A's hyperspace registry, B's hyperspace registry replica
+    //   converges via gossipsub-CRDT and `resolve("alice", _)`
+    //   returns a ServiceId whose top 16 bits == prefix_a — i.e.
+    //   the address routes to A's node, not B's local replica.
+    //
+    // Doesn't yet exercise full `Context::resolve`-driven invoke
+    // (that needs a peer-space agent that calls resolve from inside
+    // a handler — comes with the bridge actor). This test pins the
+    // registry's wire surface and the CRDT propagation.
+    use space_registry::SpaceRegistryRef;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry actor not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+
+    // Each node gets its own data dir + libp2p identity. The
+    // hyperspace replication_id is shared so both HYPERSPACE_REGISTRY
+    // replicas land in the same gossipsub group; the per-space
+    // replication_ids differ so the local REGISTRY replicas stay
+    // isolated (= different "spaces").
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_hyperspace_e2e_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let mk_id = |label: &[u8]| -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(label);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+    let space_a_rep = mk_id(b"hyperspace-test/space-a-registry");
+    let space_b_rep = mk_id(b"hyperspace-test/space-b-registry");
+    let hs_rep = mk_id(b"hyperspace-test/hyperspace-registry");
+
+    // ── Networks ───────────────────────────────────────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+    });
+
+    // ── Nodes + registries ─────────────────────────────────────
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    // Local space-A registry at REGISTRY=0
+    let _local_a = node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(space_a_rep),
+        ServiceId::REGISTRY,
+    );
+    // Hyperspace registry at HYPERSPACE_REGISTRY=1, shared rep id
+    let _hs_a = node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(hs_rep),
+        ServiceId::HYPERSPACE_REGISTRY,
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let _local_b = node_b.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(space_b_rep),
+        ServiceId::REGISTRY,
+    );
+    let _hs_b = node_b.register_at_id(
+        AgentConfig::new(registry_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(hs_rep),
+        ServiceId::HYPERSPACE_REGISTRY,
+    );
+    node_b.attach_network(net_b);
+
+    // Wait for Hello round-trip so peer prefixes are known.
+    let net_a_arc = node_a.network().expect("net_a attached");
+    let net_b_arc = node_b.network().expect("net_b attached");
+    wait_for(
+        || {
+            if net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some()
+            {
+                Some(())
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .expect("Hello handshake");
+
+    // ── Drive the test ─────────────────────────────────────────
+    // Node A advertises agent "alice" into the hyperspace registry
+    // with host_prefix = prefix_a. CRDT sync should propagate this
+    // to node B's hyperspace replica.
+    let hs_reg_a = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+    let status =
+        vos::block_on(hs_reg_a.register_remote(&mut &node_a, "alice".to_string(), prefix_a as u32))
+            .expect("register_remote on A");
+    assert_eq!(status, space_registry::STATUS_OK);
+
+    // ── Wait for convergence + assert ──────────────────────────
+    let hs_reg_b = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+    let mappings = wait_for(
+        || {
+            let m = vos::block_on(hs_reg_b.host_mappings(&mut &node_b)).ok()?;
+            if m.iter().any(|h| h.instance_name == "alice") {
+                Some(m)
+            } else {
+                None
+            }
+        },
+        Duration::from_secs(8),
+    )
+    .expect("hyperspace mapping for 'alice' did not propagate to B within deadline");
+
+    let alice = mappings
+        .iter()
+        .find(|h| h.instance_name == "alice")
+        .expect("alice in mappings");
+    assert_eq!(
+        alice.host_prefix, prefix_a,
+        "B's hyperspace replica records alice@prefix_a (got {:#06x})",
+        alice.host_prefix
+    );
+
+    // The load-bearing assertion: from B's perspective, resolve(alice)
+    // returns a ServiceId whose node_prefix is A's, not B's.
+    let resolved =
+        vos::block_on(hs_reg_b.resolve(&mut &node_b, "alice".to_string(), prefix_b as u64))
+            .expect("resolve on B");
+    assert_ne!(resolved, 0, "resolve did not find 'alice'");
+    let resolved_prefix = (resolved >> 16) as u16;
+    assert_eq!(
+        resolved_prefix, prefix_a,
+        "B's resolve('alice') must return A's prefix (got {resolved_prefix:#06x}, want {prefix_a:#06x})",
+    );
+    // Sanity: not B's prefix.
+    assert_ne!(
+        resolved_prefix, prefix_b,
+        "resolve must not return B's own prefix for a remote-hosted agent"
+    );
+
+    let results_a = node_a.collect();
+    let results_b = node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+    let panics: u32 = results_a
+        .iter()
+        .chain(results_b.iter())
+        .map(|r| r.panics)
+        .sum();
+    assert_eq!(panics, 0, "actor panics during hyperspace test: {panics}");
+}

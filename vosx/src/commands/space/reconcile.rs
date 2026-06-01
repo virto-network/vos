@@ -48,6 +48,14 @@ pub struct Manifest {
     /// `cap_policy` overrides. Omitted → host default
     /// ([`vos::extension::CapPolicy::Block`]).
     pub cap_policy: Option<String>,
+    /// Hyperspace this space belongs to. When set, the daemon
+    /// additionally spawns a registry replica into the
+    /// hyperspace's replication group so cross-space `resolve`
+    /// can fall through. See `derive_hyperspace_id` for the
+    /// replication-id derivation. Wired up in Phase 1.3 of the
+    /// hyperspace runtime; for now the parser just round-trips it.
+    #[allow(dead_code)]
+    pub hyperspace: Option<String>,
     #[serde(rename = "agent", default)]
     pub agents: Vec<AgentDef>,
     /// Native `.so` extension plugins. Each `[[extension]]` entry
@@ -906,9 +914,24 @@ mod tests {
         "#;
         let m: Manifest = toml::from_str(s).unwrap();
         assert_eq!(m.space.as_deref(), Some("demo"));
+        assert!(m.hyperspace.is_none());
         assert_eq!(m.agents.len(), 1);
         assert_eq!(m.agents[0].name, "counter");
         assert_eq!(m.agents[0].consistency, "crdt");
+    }
+
+    #[test]
+    fn parses_hyperspace_field() {
+        let s = r#"
+            space = "bank-a"
+            hyperspace = "bank-federation"
+            [[agent]]
+            name = "noop"
+            path = "actors/noop.elf"
+        "#;
+        let m: Manifest = toml::from_str(s).unwrap();
+        assert_eq!(m.space.as_deref(), Some("bank-a"));
+        assert_eq!(m.hyperspace.as_deref(), Some("bank-federation"));
     }
 
     #[test]

@@ -362,13 +362,55 @@ impl<A: Actor> Context<A> {
     ///     ctx.tell(ServiceId(counter), &Msg::new("inc"));
     /// }
     /// ```
-    pub fn resolve(&mut self, name: impl Into<alloc::string::String>) -> super::run::Resolve {
+    ///
+    /// **Hyperspace fall-through**: when the local registry returns 0
+    /// (not found), the call unconditionally re-asks
+    /// [`ServiceId::HYPERSPACE_REGISTRY`]. On nodes whose space
+    /// declared `hyperspace = "name"` in its manifest, that's a real
+    /// lookup against the shared cross-space registry. On nodes
+    /// without a hyperspace replica the second ask returns
+    /// `InvokeError::NotFound` cheaply, surfaced here as 0.
+    ///
+    /// Cost: every miss now pays two invokes instead of one. PVM
+    /// invokes are synchronous so this is small; if it ever shows up
+    /// in a profile, an explicit `resolve_in_hyperspace` could
+    /// replace the auto-fallthrough.
+    pub async fn resolve(&mut self, name: impl Into<alloc::string::String>) -> u32 {
+        let name = name.into();
         let prefix = self.id.node_prefix();
+
         let mut msg = super::value::Msg::new("resolve");
-        msg = msg.with("name", name.into());
+        msg = msg.with("name", name.clone());
         msg = msg.with("caller_prefix", prefix as u64);
-        let ask = self.ask(ServiceId::REGISTRY, &msg);
-        super::run::Resolve::new(ask)
+        let primary = self.ask(ServiceId::REGISTRY, &msg).await;
+        let local = match primary {
+            Ok(super::value::Value::U32(n)) => n,
+            Ok(other) => {
+                crate::log::warn!(
+                    "Context::resolve: local registry returned non-U32 reply ({other:?}); treating as not-found",
+                );
+                0
+            }
+            Err(e) => {
+                crate::log::warn!(
+                    "Context::resolve: local registry invoke failed: {e}; treating as not-found",
+                );
+                0
+            }
+        };
+        if local != 0 {
+            return local;
+        }
+
+        // Local miss — try the hyperspace registry. On nodes without
+        // one this errors with NotFound which we surface as 0.
+        let mut msg = super::value::Msg::new("resolve");
+        msg = msg.with("name", name);
+        msg = msg.with("caller_prefix", prefix as u64);
+        match self.ask(ServiceId::HYPERSPACE_REGISTRY, &msg).await {
+            Ok(super::value::Value::U32(n)) => n,
+            _ => 0,
+        }
     }
 
     // --- Host I/O (worker mode) ---

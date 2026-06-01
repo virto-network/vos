@@ -24,8 +24,17 @@
 pub struct ServiceId(pub u32);
 
 impl ServiceId {
-    /// The registry service — well-known ID 0 on every node.
+    /// The space-local registry service — well-known ID 0 on every
+    /// node. Holds the catalog for the space the node belongs to.
     pub const REGISTRY: Self = Self(0);
+
+    /// The hyperspace registry service — well-known ID 1 on every
+    /// node that participates in a hyperspace. Holds the catalog
+    /// shared across all member spaces of the hyperspace, so
+    /// `resolve` can fall through from the local registry to find
+    /// agents in peer spaces. Empty / not-spawned on nodes whose
+    /// space manifest doesn't set a hyperspace.
+    pub const HYPERSPACE_REGISTRY: Self = Self(1);
 
     /// Construct a ServiceId from a node prefix and local ID.
     pub const fn new(node_prefix: u16, local_id: u16) -> Self {
@@ -62,5 +71,19 @@ impl core::fmt::Display for ServiceId {
         } else {
             write!(f, "svc:{prefix:04x}:{local}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn well_known_slots_are_distinct() {
+        assert_ne!(ServiceId::REGISTRY, ServiceId::HYPERSPACE_REGISTRY);
+        assert_eq!(ServiceId::REGISTRY.local_id(), 0);
+        assert_eq!(ServiceId::HYPERSPACE_REGISTRY.local_id(), 1);
+        assert!(ServiceId::REGISTRY.is_local());
+        assert!(ServiceId::HYPERSPACE_REGISTRY.is_local());
     }
 }

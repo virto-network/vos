@@ -62,6 +62,20 @@ pub fn registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
     vos::crypto::blake2b_hash(b"vos-space-registry/v1", &[&[0u8], space_id])
 }
 
+/// Per-hyperspace registry replication-id: blake2b("vos-hyperspace/v1"
+/// || hyperspace_name). All member spaces of the same hyperspace
+/// derive the same id from the shared name and so subscribe to the
+/// same gossipsub topic for the hyperspace registry. Distinct from
+/// `registry_replication_id` (which is per-space) so a node hosting
+/// both replicas keeps them in separate replication groups.
+///
+/// Wired into the boot path in Phase 1.3 (`space up` spawns the
+/// hyperspace registry replica when a manifest sets the field).
+#[allow(dead_code)]
+pub fn derive_hyperspace_id(hyperspace_name: &str) -> [u8; 32] {
+    vos::crypto::blake2b_hash(b"vos-hyperspace/v1", &[&[0u8], hyperspace_name.as_bytes()])
+}
+
 /// Compute a space's id from the registry's genesis DAG root.
 /// Stable for the lifetime of the space and verifiable by any
 /// joiner that fetches the genesis snapshot. Host-only
@@ -186,6 +200,29 @@ mod tests {
         let s2 = [2u8; 32];
         assert_eq!(registry_replication_id(&s1), registry_replication_id(&s1));
         assert_ne!(registry_replication_id(&s1), registry_replication_id(&s2));
+    }
+
+    #[test]
+    fn hyperspace_id_is_deterministic_per_name() {
+        let a = derive_hyperspace_id("bank-federation");
+        let b = derive_hyperspace_id("bank-federation");
+        let c = derive_hyperspace_id("kunekt-test");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, [0u8; 32]);
+    }
+
+    #[test]
+    fn hyperspace_id_distinct_from_space_registry_id() {
+        // A space whose space_id, by improbable coincidence, contains
+        // the hyperspace name's bytes must NOT collide with the
+        // hyperspace registry's id. The two derivations use distinct
+        // domain tags, so this holds by construction; the test just
+        // pins the property.
+        let space_id = [0u8; 32];
+        let hs = derive_hyperspace_id("bank-federation");
+        let reg = registry_replication_id(&space_id);
+        assert_ne!(hs, reg);
     }
 
     #[test]

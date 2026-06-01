@@ -14,7 +14,7 @@ use vos::node::{AgentConfig, Consistency, VosNode};
 
 use crate::blob_store::{self, BlobHash};
 use crate::commands::space::common::{
-    consistency_from_u8, instance_service_id, registry_replication_id,
+    consistency_from_u8, derive_hyperspace_id, instance_service_id, registry_replication_id,
 };
 use crate::commands::space::payload_codec;
 use crate::spaces_index;
@@ -108,6 +108,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    // Pre-parse the manifest (if any) so we know whether to spawn
+    // the hyperspace registry alongside the local one. The manifest
+    // gets reconciled below — we only peek at it here.
+    let parsed_manifest = args
+        .manifest
+        .as_ref()
+        .map(|p| crate::commands::space::reconcile::parse_manifest_file(p))
+        .transpose()?;
+    let hyperspace = parsed_manifest
+        .as_ref()
+        .and_then(|(m, _)| m.hyperspace.clone());
+
     // Always attach a libp2p network — even local-only spaces
     // bind a loopback port so client commands (`space publish`,
     // `space install`, etc.) have an endpoint to dial.
@@ -115,26 +127,47 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let local_prefix = network.local_prefix();
 
     let mut node = VosNode::with_prefix(local_prefix);
-    let cfg = AgentConfig::new(blob)
+    let cfg = AgentConfig::new(blob.clone())
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
+    // Spawn the hyperspace registry replica if this space declares
+    // membership in one. Same blob as the local registry; distinct
+    // ServiceId slot (HYPERSPACE_REGISTRY = svc_id 1) and a
+    // replication_id derived from the hyperspace name so all member
+    // spaces' nodes converge on a single shared registry. The slot
+    // id is well-known so callers don't need the return value.
+    if let Some(name) = &hyperspace {
+        let hs_rep = derive_hyperspace_id(name);
+        let hs_cfg = AgentConfig::new(blob)
+            .with_consistency(Consistency::Crdt)
+            .with_replication_id(hs_rep)
+            .persist(&data_dir);
+        let hs_id = node.register_at_id(hs_cfg, ServiceId::HYPERSPACE_REGISTRY);
+        tracing::info!(
+            "hyperspace '{name}' registry as {hs_id} (rep={}…)",
+            &hex::encode(hs_rep)[..12],
+        );
+    }
+
     node.attach_network(network);
 
     tracing::info!(
-        "space '{}' (id={}…) registry as {id}",
+        "space '{}' (id={}…) registry as {id}{}",
         entry.name,
         &entry.id[..12],
+        hyperspace
+            .as_ref()
+            .map(|n| format!(" — hyperspace '{n}'"))
+            .unwrap_or_default(),
     );
 
     // Reconcile the optional --manifest BEFORE we spawn the
     // currently-installed agents, so manifest-introduced
     // agents land in the same boot.
-    if let Some(manifest_path) = &args.manifest {
-        let (manifest, manifest_dir) =
-            crate::commands::space::reconcile::parse_manifest_file(manifest_path)?;
+    if let Some((manifest, manifest_dir)) = parsed_manifest {
         crate::commands::space::reconcile::reconcile(
             &mut node,
             &manifest,
@@ -146,7 +179,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
     // path is stable across restarts.
-    spawn_installed_agents(&mut node, &data_dir, local_prefix)?;
+    spawn_installed_agents(&mut node, &data_dir, local_prefix, hyperspace.is_some())?;
 
     // Sprint 2 — first-boot admin bootstrap. `space new` records
     // the creator's client PeerId in `admin_bootstrap.txt`. We
@@ -358,8 +391,9 @@ fn spawn_installed_agents(
     node: &mut VosNode,
     data_dir: &std::path::Path,
     local_prefix: u16,
+    has_hyperspace: bool,
 ) -> anyhow::Result<()> {
-    use space_registry::SpaceRegistryRef;
+    use space_registry::{STATUS_OK, SpaceRegistryRef};
     use std::collections::HashSet;
 
     let local_cfg = crate::commands::space::subscriptions::load(data_dir).unwrap_or_default();
@@ -380,7 +414,13 @@ fn spawn_installed_agents(
     // blob, …) so we don't accidentally trash their state.
     let mut live_svc_ids: HashSet<u32> = HashSet::new();
     live_svc_ids.insert(ServiceId::REGISTRY.0);
+    if has_hyperspace {
+        // The hyperspace registry replica owns its own redb at
+        // svc_id 1; protect it from the orphan sweep.
+        live_svc_ids.insert(ServiceId::HYPERSPACE_REGISTRY.0);
+    }
 
+    let agent_names: Vec<String> = agents.iter().map(|a| a.instance_name.clone()).collect();
     for a in agents.iter() {
         let svc_id = instance_service_id(&a.instance_name, local_prefix);
         live_svc_ids.insert(svc_id.0);
@@ -456,6 +496,30 @@ fn spawn_installed_agents(
             a.instance_name,
             crate::commands::space::common::consistency_name(a.consistency),
         );
+    }
+
+    // Hyperspace mode: advertise every local agent into the
+    // hyperspace registry so cross-space `resolve` calls land on the
+    // right host. Best-effort — failures log a warning but don't
+    // abort boot, since the local space still works without
+    // cross-space addressing.
+    if has_hyperspace {
+        let hs_reg = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+        for name in agent_names {
+            match vos::block_on(hs_reg.register_remote(
+                &mut &*node,
+                name.clone(),
+                local_prefix as u32,
+            )) {
+                Ok(STATUS_OK) => {
+                    tracing::info!("hyperspace: registered '{name}' @ prefix {local_prefix:#06x}",)
+                }
+                Ok(other) => {
+                    tracing::warn!("hyperspace: register_remote('{name}') returned status {other}",)
+                }
+                Err(e) => tracing::warn!("hyperspace: register_remote('{name}') failed: {e}",),
+            }
+        }
     }
 
     // Sweep `agents/` for redbs whose svc_id no longer maps to

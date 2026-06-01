@@ -5495,6 +5495,7 @@ dependencies = [
  "redb",
  "rkyv",
  "serde",
+ "space-registry",
  "tokio",
  "toml",
  "tracing",

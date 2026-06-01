@@ -288,6 +288,32 @@ pub struct ActorAclRow {
     pub role: u8,
 }
 
+// ── Host mappings (hyperspace addressing) ───────────────────────
+//
+// In a space-local registry, every node hosts every agent so the
+// `resolve` formula `instance_service_id(name, caller_prefix)` lands
+// the caller on its own local replica. In a hyperspace registry that
+// breaks: peer-space agents have non-overlapping replica sets, so
+// the caller's prefix is the wrong host. `HostMapping` tracks where
+// each agent actually lives so cross-space resolve returns a
+// ServiceId that routes through libp2p to the right node.
+
+/// A single (instance_name → host node_prefix) mapping. Recorded
+/// in the hyperspace registry by `register_remote`; consulted by
+/// `resolve` to override `caller_prefix` when the agent isn't
+/// hosted on the asking node.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct HostMapping {
+    pub instance_name: String,
+    /// libp2p-derived 16-bit node prefix of the node hosting this
+    /// agent. Cross-space callers route to (host_prefix, derived_local).
+    pub host_prefix: u16,
+}
+
+
 // ── Result codes ─────────────────────────────────────────────────
 //
 // Mutation messages return a single u8 status. 0 always = ok.
@@ -303,6 +329,11 @@ pub const STATUS_BAD_HASH: u8 = 6;
 /// required for this handler. Distinct from `STATUS_NOT_FOUND`
 /// so clients can surface "permission denied" specifically.
 pub const STATUS_FORBIDDEN: u8 = 7;
+/// Hyperspace `register_remote`: the supplied `host_prefix`
+/// doesn't match any registered node prefix. Distinct from
+/// `STATUS_NOT_FOUND` so callers can distinguish "instance
+/// not found" from "host node not enrolled".
+pub const STATUS_BAD_PREFIX: u8 = 8;
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -376,6 +407,11 @@ pub struct SpaceRegistry {
     /// `auth_grants` (space-level) when no actor-local grant
     /// exists for `(peer, target_agent)`.
     actor_acls: Vec<ActorAclRow>,
+    /// Sorted by `instance_name`. Populated on the hyperspace
+    /// registry replica only — the local space-registry leaves
+    /// this empty so its `resolve` keeps the in-space behaviour
+    /// (caller_prefix == host).
+    host_mappings: Vec<HostMapping>,
 }
 
 #[messages]
@@ -390,6 +426,7 @@ impl SpaceRegistry {
             blobs: Vec::new(),
             auth_grants: Vec::new(),
             actor_acls: Vec::new(),
+            host_mappings: Vec::new(),
         }
     }
 
@@ -761,23 +798,104 @@ impl SpaceRegistry {
     }
 
     /// Resolve an installed agent's name to the `ServiceId` it
-    /// occupies on the caller's node, packed as a u32.
-    /// `caller_prefix` is the asking node's 16-bit identity
-    /// prefix (passed by `Context::resolve` from the caller's
-    /// own `id().node_prefix()`); the registry derives the
-    /// local half via `instance_service_id`. Returns 0 when no
-    /// agent with that name is installed.
+    /// occupies. Packed as a u32.
     ///
-    /// This is the runtime name → ServiceId lookup actors reach
-    /// for via `ctx.resolve(name)`. Same formula `space up`
-    /// uses host-side, so the derived id matches the actual
-    /// per-node registration.
+    /// Lookup order:
+    ///
+    /// 1. **Local catalog**: if the name is in `agents`, return
+    ///    `instance_service_id(name, caller_prefix)` so the caller
+    ///    lands on its own local replica — the in-space default.
+    /// 2. **Host mapping**: if the name has a recorded `HostMapping`
+    ///    (only populated on the hyperspace registry replica),
+    ///    return `instance_service_id(name, host_prefix)` so the
+    ///    caller's envelope routes through libp2p to the actual
+    ///    host node.
+    /// 3. Otherwise return 0.
+    ///
+    /// Local-first ordering matters: if a local replica of an
+    /// installed agent exists, we want callers to use it instead of
+    /// chasing a (potentially stale or attacker-supplied) cross-space
+    /// route. The hyperspace registry's `agents` table is empty in
+    /// practice — vosx never installs into it — so on a hyperspace
+    /// replica the lookup naturally falls through to host_mappings.
+    ///
+    /// `caller_prefix` is the asking node's 16-bit identity prefix
+    /// (passed by `Context::resolve` from the caller's own
+    /// `id().node_prefix()`).
     #[msg]
     async fn resolve(&self, name: String, caller_prefix: u64) -> u32 {
-        if !self.agents.iter().any(|a| a.instance_name == name) {
-            return 0;
+        // 1. Local catalog wins.
+        if self.agents.iter().any(|a| a.instance_name == name) {
+            return instance_service_id(&name, caller_prefix as u16);
         }
-        instance_service_id(&name, caller_prefix as u16)
+        // 2. Hyperspace host mapping (agent hosted on a peer node).
+        if let Some(h) = self
+            .host_mappings
+            .iter()
+            .find(|h| h.instance_name == name)
+        {
+            return instance_service_id(&name, h.host_prefix);
+        }
+        0
+    }
+
+    /// Record (or update) the host node-prefix for an agent. Called
+    /// on the **hyperspace registry** by each member space's daemon
+    /// at boot, advertising "this space's `<instance_name>` is
+    /// hosted at `host_prefix`." Cross-space `resolve` uses the
+    /// mapping to return a ServiceId that routes through libp2p to
+    /// the right node.
+    ///
+    /// Idempotent in `instance_name` — re-registering with a new
+    /// `host_prefix` overwrites (covers the case where a space
+    /// re-keys or migrates between nodes).
+    ///
+    /// **Trust gap**: this handler is currently unauthenticated. Any
+    /// actor on any hyperspace member can call `register_remote` for
+    /// any name, including one belonging to another member-space, and
+    /// silently redirect that name's resolution to a node of their
+    /// choosing. This is acceptable for trusted-deployments testing
+    /// (local development, single-operator federations) but NOT for
+    /// mixed-trust federations like the cipher-clerk bank case. The
+    /// bridge actor pattern is intended to address this by binding
+    /// register_remote calls to a known clerk pubkey signature; until
+    /// that lands, do not deploy this surface to untrusted peers.
+    ///
+    /// Returns `STATUS_BAD_PREFIX` when `host_prefix` doesn't fit in
+    /// a u16. Otherwise `STATUS_OK`.
+    #[msg]
+    async fn register_remote(&mut self, instance_name: String, host_prefix: u32) -> u8 {
+        if host_prefix > u16::MAX as u32 {
+            return STATUS_BAD_PREFIX;
+        }
+        let host_prefix = host_prefix as u16;
+        let mut idx = 0usize;
+        while idx < self.host_mappings.len() {
+            let cur = &self.host_mappings[idx];
+            if cur.instance_name == instance_name {
+                self.host_mappings[idx].host_prefix = host_prefix;
+                return STATUS_OK;
+            }
+            if cur.instance_name.as_str() > instance_name.as_str() {
+                break;
+            }
+            idx += 1;
+        }
+        self.host_mappings.insert(
+            idx,
+            HostMapping {
+                instance_name,
+                host_prefix,
+            },
+        );
+        STATUS_OK
+    }
+
+    /// Snapshot the host-mapping table. Diagnostic/test surface;
+    /// production callers use `resolve`.
+    #[msg]
+    async fn host_mappings(&self) -> Vec<HostMapping> {
+        self.host_mappings.clone()
     }
 
     // ── Members ────────────────────────────────────────────────
