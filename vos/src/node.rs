@@ -12,9 +12,17 @@
 //! matches this node, the message is delivered locally. Otherwise it's
 //! forwarded to the network layer (future).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+// HashSet is only used by the CRDT/Raft sync+replication paths (peer-set
+// and sync-head dedup), which need both features; OnceLock backs the
+// network-only manifest slot. Gating each to exactly the features its
+// users require keeps every reduced-feature build warning-clean.
+#[cfg(all(feature = "storage", feature = "network"))]
+use std::collections::HashSet;
+#[cfg(feature = "network")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1032,7 +1040,12 @@ fn replay_dag_into_runtime(
 /// sync notifier fires, so blocking is fine. Returns `Err(msg)`
 /// only on host-side errors (corrupt strategy, non-deterministic
 /// handler) — caller logs and tears the agent down.
-#[cfg(feature = "storage")]
+///
+/// Only the sync-driven CRDT/Raft restart path calls this, and that
+/// path needs the network (the sync notifier rides libp2p), so it's
+/// gated `all(storage, network)` to match its callers — otherwise it's
+/// dead code in a storage-only build.
+#[cfg(all(feature = "storage", feature = "network"))]
 fn soft_restart_crdt(
     runtime: &mut VosRuntime,
     svc_id: ServiceId,
@@ -1461,6 +1474,9 @@ impl VosNode {
         self.register_inner(config, id)
     }
 
+    // `config` is mutated only on the CRDT/Raft pre-open path (gated
+    // all(storage, network)); without both, the `mut` is unused.
+    #[cfg_attr(not(all(feature = "storage", feature = "network")), allow(unused_mut))]
     fn register_inner(&mut self, mut config: AgentConfig, id: ServiceId) -> ServiceId {
         let (tx, rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
@@ -2057,6 +2073,9 @@ impl Default for VosNode {
 // ── Agent thread ─────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+// `config` is mutated only on the CRDT/Raft pre-open path (gated
+// all(storage, network)); without both, the `mut` is unused.
+#[cfg_attr(not(all(feature = "storage", feature = "network")), allow(unused_mut))]
 fn agent_thread(
     id: ServiceId,
     mut config: AgentConfig,
@@ -2096,6 +2115,8 @@ fn agent_thread(
     let chain_for_ext = current_chain.clone();
     #[cfg(feature = "network")]
     let shared_network_for_ext = shared_network.clone();
+    // Only the cross-node routing branch (network) reads this.
+    #[cfg(feature = "network")]
     let local_prefix = id.node_prefix();
     runtime.set_external_invoke(Box::new(move |target, msg| {
         let chain_snapshot = chain_for_ext.lock().ok()?.clone();
@@ -2987,7 +3008,7 @@ fn build_agent_strategy(
     }
     #[cfg(not(feature = "storage"))]
     {
-        let _ = (config, id);
+        let _ = (config, id, self_node_prefix);
         match config.consistency {
             Consistency::Ephemeral => Ok(Box::new(crate::commit::NoCommit)),
             other => Err(crate::commit::CommitError::Config(format!(

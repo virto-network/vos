@@ -11,6 +11,8 @@
 //! [`CommitStrategy::restore`] once at startup and
 //! [`CommitStrategy::commit`] after every dispatch.
 
+// `Path` is only referenced by the storage-backed strategies' `open`.
+#[cfg(feature = "storage")]
 use std::path::Path;
 
 /// Error type for commit operations.
