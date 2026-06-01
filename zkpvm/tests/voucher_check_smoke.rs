@@ -384,6 +384,70 @@ fn final_state_registers_are_stark_bound() {
     );
 }
 
+/// ZK actor-IO ABI (halt-asm binding): the framework's
+/// `halt_with_output_bound` places a 32-byte `vos::zk::compute_io_hash`
+/// value into the final-state register window φ[9..12] as part of the
+/// halting ecall (the four hash words ride in `a2..a5` as inline-asm
+/// `in` operands).  Phase Z0 already binds `final_state.registers`, so
+/// the hash is a tamper-evident public output read back by
+/// `Proof::public_io_hash` — no new ECALL, no prover changes.
+///
+/// This pins the mechanism end-to-end at the zkpvm level: the binding is
+/// non-zero (the actor really bound a hash), deterministic across
+/// proves, and STARK-bound on every word of the φ[9..12] window
+/// (tampering any of registers 9,10,11,12 makes verify reject).  The
+/// exact value-match against a host-recomputed `compute_io_hash` is
+/// exercised in the clerk-prover extension e2e, where the verifier holds
+/// the matching actor/message types (`type_name`-based identity is only
+/// equal across builds that share the crate path).
+#[test]
+fn actor_io_hash_is_bound_and_nonzero() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
+
+    let mut side_note = side_note_for_trace(&blob, 100_000_000);
+    let proof = prove_mobile(&mut side_note).expect("prove voucher-check");
+    let prog_hash = program_commitment_of_proof(&proof);
+
+    verify_standalone_with_pcs_policy(proof.clone(), prog_hash, &PcsPolicy::MOBILE)
+        .expect("pristine proof must verify");
+
+    // 1. The halt-binding actually populated the φ[9..12] window.
+    let io_hash = proof.public_io_hash();
+    assert_ne!(
+        io_hash,
+        [0u8; 32],
+        "public_io_hash is the unbound [0u8;32] sentinel — the halt-asm \
+         binding in run_refine_service did not land in φ[9..12]"
+    );
+
+    // 2. Determinism: a second prove of the same blob binds the same hash.
+    let mut side_note2 = side_note_for_trace(&blob, 100_000_000);
+    let proof2 = prove_mobile(&mut side_note2).expect("re-prove voucher-check");
+    assert_eq!(
+        io_hash,
+        proof2.public_io_hash(),
+        "io-hash binding must be deterministic across proves"
+    );
+
+    // 3. STARK-binding across the whole φ[9..12] window: tampering any of
+    //    the four hash registers must make verify reject. (registers[12]
+    //    is also covered by final_state_registers_are_stark_bound's
+    //    last-index tamper; this pins all four uniformly as the io-hash.)
+    for idx in 9..13 {
+        let mut tampered = proof.clone();
+        tampered.final_state.registers[idx] ^= 1;
+        let result = verify_standalone_with_pcs_policy(tampered, prog_hash, &PcsPolicy::MOBILE);
+        assert!(
+            result.is_err(),
+            "tamper of io-hash register φ[{idx}] must make verify reject — \
+             got {result:?}; the binding is not actually STARK-bound"
+        );
+    }
+}
+
 /// Phase Z0-init load-bearing test: `proof.initial_state.registers`
 /// is STARK-bound, symmetric to `final_state.registers`. The boundary
 /// chip emits per-register tuples at `ts = 0` sourced from

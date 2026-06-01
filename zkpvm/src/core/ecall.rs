@@ -7,7 +7,7 @@
 //! so every precompile ID must fit in `0..=127`. The original layout used
 //! "categories by hundreds" (1xx hash, 2xx asymmetric crypto) but that
 //! exceeded the imm budget; everything is now packed into the contiguous
-//! `100..=115` block within javm's program-cap range (slots 64..=127). The
+//! `100..=114` block within javm's program-cap range (slots 64..=127). The
 //! categorisation is recoverable in comments — the wire ID is the only thing
 //! that matters for the chip surface.
 
@@ -79,24 +79,3 @@ pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
 /// Hostcall ID for scalar addition mod ℓ.  Mirrors dalek's
 /// `Scalar + Scalar` public API.  Same convention as MUL above.
 pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
-
-/// Hostcall ID for the ZK actor-IO binding (Phase ZK-ABI).
-///
-/// The guest computes a 32-byte hash
-/// `H = blake2b(b"vos/zk/io/v1" || actor_type_id || message_type_id ||
-/// rkyv(public) || rkyv(return))` (see `vos::zk::compute_io_hash`),
-/// writes it into guest memory, then issues `ecall_zk_bind(ptr, len)`.
-///
-/// Convention (matches the `vos::abi::pvm::ecall` shim → grey-transpiler
-/// register mapping, which routes `a0`/`a1` to φ[7]/φ[8] — not the
-/// φ[10..] the Ristretto doc-comments describe):
-///   φ[7] = ptr   (address of the 32-byte hash in flat_mem)
-///   φ[8] = len   (byte length; must be ≥ 32)
-///
-/// The tracer reads 32 bytes at `ptr` and writes them as four
-/// little-endian u64 words into φ[9..13] (A2-A5) — the exact window
-/// `Proof::public_io_hash` reconstructs from `final_state.registers`.
-/// Actors that never emit this ECALL leave φ[9..13] at their cold-start
-/// zero, so their `public_io_hash` is `[0u8; 32]` and fails any real
-/// `compute_io_hash` equality check.
-pub const ECALL_ZK_BIND: u32 = 115;

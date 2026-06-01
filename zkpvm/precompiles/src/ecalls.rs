@@ -7,7 +7,7 @@
 //!
 //! **Slot range**: javm's `dispatch_ecalli` rejects `imm > 127` with a
 //! fault, so every precompile ID fits in `0..=127` — packed into the
-//! contiguous `100..=115` block within javm's program-cap range
+//! contiguous `100..=114` block within javm's program-cap range
 //! (slots 64..=127). The original categorisation by hundreds
 //! (1xx hash, 2xx asymmetric crypto) didn't survive the imm budget.
 
@@ -34,15 +34,6 @@ pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 /// Convention: φ[10]=h_ptr (64B in/out), φ[11]=m_ptr (128B in),
 /// φ[12]=t_low (counter low 64 bits), φ[7]=f (finalize flag).
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
-
-/// ZK actor-IO binding (Phase ZK-ABI).
-/// Mirrors `zkpvm::core::ecall::ECALL_ZK_BIND`.  The guest shim for this
-/// ID lives in the `vos` crate (`vos::zk::ecall_zk_bind`), not here, but
-/// the constant is mirrored to keep the wire-ABI table complete and
-/// prevent a future precompile from re-using slot 115.
-/// Convention: φ[7]=ptr (32-byte hash in flat_mem), φ[8]=len (≥ 32);
-/// the tracer writes the hash into φ[9..13].
-pub const ECALL_ZK_BIND: u32 = 115;
 
 /// VOS object capability slot used by the inline-asm ECALL dispatch.
 /// Set into `a5` on every call.  Only referenced from

@@ -10,10 +10,14 @@
 //! ## How it fits together
 //!
 //! 1. The guest actor computes the 32-byte binding hash with
-//!    [`compute_io_hash`] and emits [`ecall_zk_bind`].
-//! 2. Under the zkpvm tracer, `handle_zk_bind_ecall` reads those 32
-//!    bytes and writes them into the final-state register window
-//!    φ[9..13]; Phase Z0's closing chip STARK-binds those registers.
+//!    [`compute_io_hash`].
+//! 2. The actor's halt sequence places that hash into the final-state
+//!    register window φ[9..12] (RISC-V `a2..a5`) via inline-asm `in`
+//!    operands on the halting `ecall` (see `actors::run`'s
+//!    `halt_with_output_bound`).  Phase Z0's closing chip already
+//!    STARK-binds `final_state.registers`, so the hash becomes a
+//!    tamper-evident public output with no tracer/host cooperation — no
+//!    new ECALL, no prover changes.
 //! 3. The verifier reconstructs the hash from the proof via
 //!    [`zkpvm::Proof::public_io_hash`] and compares it against a
 //!    locally recomputed [`compute_io_hash`] — see [`verify_actor_io`].
@@ -23,16 +27,6 @@
 //! proofs leave φ[9..13] at their cold-start zero, so their
 //! `public_io_hash` is `[0u8; 32]` and naturally fails the equality
 //! check.
-
-/// ECALL id for the ZK actor-IO binding hostcall.
-///
-/// MUST equal `zkpvm::core::ecall::ECALL_ZK_BIND` (and its mirror in
-/// `zkpvm/precompiles/src/ecalls.rs`): the guest emits `ecalli` with
-/// this immediate and the prover's tracer matches on it.  Defined here
-/// independently because the guest (riscv64, no_std) cannot depend on
-/// the host-only `zkpvm` crate — the same mirroring pattern as
-/// [`crate::crypto::blake2b`]'s local `ECALL_BLAKE2B_COMPRESS`.
-pub const ECALL_ZK_BIND: u32 = 115;
 
 /// Domain separator + ABI version for the actor-IO hash.  Bumping the
 /// trailing version rotates the binding so old proofs and old verifiers
@@ -96,24 +90,6 @@ where
             return_bytes.as_slice(),
         ],
     )
-}
-
-/// Guest-side: emit the ZK actor-IO binding hostcall.
-///
-/// `ptr`/`len` address a 32-byte hash (the output of [`compute_io_hash`])
-/// in guest memory; `len` must be ≥ 32.  Under the zkpvm tracer the host
-/// reads those 32 bytes and writes them into the final-state register
-/// window φ[9..13]; under the normal vos runtime the call is an inert
-/// binding marker (the runtime does not interpret ECALL 115).
-///
-/// Per the [`crate::abi::pvm::ecall`] shim → grey-transpiler mapping,
-/// `ecall2(id, ptr, len)` lands `ptr` in φ[7] and `len` in φ[8] — the
-/// registers the tracer's `handle_zk_bind_ecall` reads.  This call does
-/// not dereference `ptr` itself; the host reads the bytes out of
-/// `flat_mem`.
-#[cfg(feature = "pvm")]
-pub fn ecall_zk_bind(ptr: *const u8, len: usize) -> u64 {
-    crate::abi::pvm::ecall::ecall2(ECALL_ZK_BIND, ptr as u64, len as u64)
 }
 
 /// Verifier-side: check that `proof` is bound to the asserted
