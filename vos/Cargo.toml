@@ -17,6 +17,11 @@ std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
+# Host-side verifier support for the ZK actor-IO ABI: pulls the
+# no_std `zkpvm-verifier` so `vos::zk::verify_actor_io` can take a
+# `zkpvm_verifier::Proof`. Off by default — only proof-verifying hosts
+# (e.g. the clerk-prover extension) need it; guest/actor builds never do.
+zk-verify = ["dep:zkpvm-verifier"]
 extension = ["macros"]
 wasm = ["macros"]
 # WASM bootstrap: provides global allocator (dlmalloc) and panic
@@ -35,6 +40,11 @@ network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 [dependencies]
 vos-macros = { path = "../vos-macros", version = "0.1.0", optional = true }
 vos-raft = { path = "../vos-raft", version = "0.1.0", default-features = false, features = ["std"], optional = true }
+# Host-side STARK verifier for the ZK actor-IO ABI (`vos::zk`). Optional,
+# enabled by the `zk-verify` feature; pulls the no_std `zkpvm-verifier`
+# (which pulls `zkpvm` with default-features = false — verifier only, no
+# prover/rayon/dalek tree). Guest/actor builds never enable it.
+zkpvm-verifier = { workspace = true, optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 # Logging facade — re-exported as `vos::log` and pulled into
 # `vos::prelude::*`. `default-features = false` keeps it usable

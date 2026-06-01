@@ -78,6 +78,12 @@ pub mod __io {
 pub mod abi;
 pub mod crypto;
 
+/// ZK actor-IO ABI: bind a zkpvm proof to a `(public, return)` tuple.
+/// `compute_io_hash` is always available (guest + host); the guest
+/// `ecall_zk_bind` is `pvm`-gated and the verifier `verify_actor_io` is
+/// `zk-verify`-gated.
+pub mod zk;
+
 // --- Actor framework (always available, no_std compatible) ---
 
 pub mod actors;

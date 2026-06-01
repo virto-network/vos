@@ -5556,6 +5556,7 @@ dependencies = [
  "ureq",
  "vos-macros",
  "vos-raft",
+ "zkpvm-verifier",
 ]
 
 [[package]]
