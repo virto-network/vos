@@ -24,6 +24,7 @@ pub mod call;
 pub mod caps;
 pub mod client;
 pub mod common;
+pub mod console;
 pub mod describe;
 pub mod down;
 pub mod endpoint;
@@ -281,6 +282,14 @@ pub enum SpaceCommand {
         /// are auto-typed; everything else is a string.
         args: Vec<String>,
     },
+    /// Open the sandboxed nu-script console against a running
+    /// daemon. Actors appear as commands (`<agent> <method> …`);
+    /// the prompt runs real nu-script with no filesystem/network
+    /// access. Reads piped stdin non-interactively too.
+    Console {
+        /// Space id (full hex) or name.
+        space: String,
+    },
 }
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
@@ -388,5 +397,6 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             args,
         }),
         SpaceCommand::Subs { space, command } => subscriptions::run(&space, command),
+        SpaceCommand::Console { space } => console::run(&space),
     }
 }

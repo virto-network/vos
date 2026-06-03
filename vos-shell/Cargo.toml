@@ -1,0 +1,26 @@
+[package]
+name = "vos-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sandboxed nushell-backed console engine for VOS spaces"
+
+[dependencies]
+# Type-only dependency on vos: we need the dynamic value types, schema
+# decoder, ServiceId, Caller and status constants — all unconditional —
+# but NOT the `std` feature (which drags in javm/clap/libp2p). The host
+# binaries that link vos-shell (vosx, the ssh extension) enable those
+# features themselves; cargo unifies them at the leaf.
+vos = { path = "../vos", default-features = false }
+
+# nushell — pinned to 0.111.0, the highest release that resolves on the
+# workspace toolchain (nightly-2025-05-09 / rustc 1.88). 0.113+ requires
+# Rust 1.93. See the Phase 0 spike notes in the plan. NO nu-command /
+# nu-cli / nu-std: the sandbox is the *absence* of those command sets.
+nu-protocol = { version = "=0.111.0", default-features = false }
+nu-engine = { version = "=0.111.0", default-features = false }
+nu-parser = { version = "=0.111.0", default-features = false }
+nu-cmd-lang = { version = "=0.111.0", default-features = false }
+
+anyhow = "1"

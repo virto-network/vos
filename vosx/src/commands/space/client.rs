@@ -252,6 +252,22 @@ impl DaemonClient {
         target: ServiceId,
         msg: &vos::value::Msg,
     ) -> anyhow::Result<vos::value::Value> {
+        let reply = self.invoke_dyn_bytes(target, msg)?;
+        if reply.is_empty() {
+            return Ok(vos::value::Value::Unit);
+        }
+        Ok(vos::Decode::decode(&reply))
+    }
+
+    /// Like [`Self::invoke_dyn`] but returns the RAW reply bytes (empty when
+    /// the reply is empty). Callers that need to distinguish the daemon's
+    /// 5-byte `STATUS_FORBIDDEN` refusal envelope from a normal reply use
+    /// this — `invoke_dyn` decodes blindly and would mis-handle a refusal.
+    pub fn invoke_dyn_bytes(
+        &self,
+        target: ServiceId,
+        msg: &vos::value::Msg,
+    ) -> anyhow::Result<Vec<u8>> {
         use vos::Encode;
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -259,18 +275,13 @@ impl DaemonClient {
         payload.extend_from_slice(&encoded);
 
         let timeout = invoke_timeout();
-        let reply = self
-            .node
+        self.node
             .invoke_with_timeout(target, payload, timeout)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
                 )
-            })?;
-        if reply.is_empty() {
-            return Ok(vos::value::Value::Unit);
-        }
-        Ok(vos::Decode::decode(&reply))
+            })
     }
 
     /// Tear down the libp2p peer. Always call before exiting
