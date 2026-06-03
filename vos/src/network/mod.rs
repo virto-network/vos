@@ -35,7 +35,7 @@ pub use wire::{
     Frame, FrameError, MAX_FRAME_BYTES, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
 };
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -1052,6 +1052,13 @@ async fn network_main(
     // performs an immediate fetch from the publisher.
     let mut hint_senders: HashMap<[u8; 32], std_mpsc::Sender<PeerId>> = HashMap::new();
 
+    // Peers we've already logged an outbound-request dial failure for. A
+    // non-listening client (e.g. a connected `vosx space console`) or a peer
+    // that just departed gets re-targeted every sync/mesh tick; without this
+    // the "outbound request failed" WARN floods the daemon's log. Warn once
+    // per peer, then suppress until the peer reconnects (which clears it).
+    let mut warned_dial_failures: HashSet<PeerId> = HashSet::new();
+
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -1059,6 +1066,7 @@ async fn network_main(
                     &mut swarm, event, local_prefix,
                     &prefix_map, &listen_addrs, &inbox_tx,
                     &mut outbound_replies,
+                    &mut warned_dial_failures,
                     &service,
                     &raft_handlers,
                     &response_tx,
@@ -1377,6 +1385,7 @@ fn handle_swarm_event(
     listen_addrs: &ListenAddrs,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
+    warned_dial_failures: &mut HashSet<PeerId>,
     service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
     raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
@@ -1396,6 +1405,9 @@ fn handle_swarm_event(
             peer_id, endpoint, ..
         } => {
             info!(%peer_id, ?endpoint, "network: peer connected");
+            // Re-arm dial-failure warnings for this peer now that it's
+            // reachable again.
+            warned_dial_failures.remove(&peer_id);
             // Initiate the Hello handshake from the dialer side.
             // The listener's reply rides back as the response, so
             // both sides learn each other's prefix from one round
@@ -1454,6 +1466,7 @@ fn handle_swarm_event(
                 prefix_map,
                 inbox,
                 outbound_replies,
+                warned_dial_failures,
                 service,
                 raft_handlers,
                 response_tx,
@@ -1474,6 +1487,7 @@ fn handle_req_resp(
     prefix_map: &PrefixMap,
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
+    warned_dial_failures: &mut HashSet<PeerId>,
     service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
     raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
@@ -1903,7 +1917,15 @@ fn handle_req_resp(
             error,
             ..
         } => {
-            warn!(%peer, error = %error, "network: outbound request failed");
+            // Warn once per peer, then suppress: a non-listening client
+            // (e.g. a connected console) or a departed peer gets re-targeted
+            // every sync/mesh tick and would otherwise flood the log. The
+            // entry clears on the next ConnectionEstablished for that peer.
+            if warned_dial_failures.insert(peer) {
+                warn!(%peer, error = %error, "network: outbound request failed (suppressing repeats until reconnect)");
+            } else {
+                debug!(%peer, error = %error, "network: outbound request failed (suppressed)");
+            }
             // Drop the reply Sender so the caller's recv yields
             // Disconnected — surfaces as None / NotFound.
             let _ = outbound_replies.remove(&request_id);

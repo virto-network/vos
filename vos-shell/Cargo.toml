@@ -1,0 +1,38 @@
+[package]
+name = "vos-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sandboxed nushell-backed console engine for VOS spaces"
+
+[dependencies]
+# Type-only dependency on vos: we need the dynamic value types, schema
+# decoder, ServiceId, Caller and status constants — all unconditional —
+# but NOT the `std` feature (which drags in javm/clap/libp2p). The host
+# binaries that link vos-shell (vosx, the ssh extension) enable those
+# features themselves; cargo unifies them at the leaf.
+vos = { path = "../vos", default-features = false }
+
+# nushell — pinned to 0.111.0, the highest release that resolves on the
+# workspace toolchain (nightly-2025-05-09 / rustc 1.88). 0.113+ requires
+# Rust 1.93. See the Phase 0 spike notes in the plan. NO nu-command /
+# nu-cli / nu-std: the sandbox is the *absence* of those command sets.
+nu-protocol = { version = "=0.111.0", default-features = false }
+nu-engine = { version = "=0.111.0", default-features = false }
+nu-parser = { version = "=0.111.0", default-features = false }
+nu-cmd-lang = { version = "=0.111.0", default-features = false }
+# nu-command provides the safe data-manipulation built-ins (each/where/get/
+# select/str/math/sort/help/…). `default-features = false` turns OFF the `os`
+# and `network` features, so the filesystem (open/save/ls/cp/rm/…), network
+# (http/port), process (run-external/`^`/ps), and interactive (input/clear)
+# commands are NOT COMPILED — the sandbox stays structural, not a deny-list.
+nu-command = { version = "=0.111.0", default-features = false }
+
+anyhow = "1"
+
+# TUI. ratatui re-exports crossterm (default feature), so we don't pin
+# crossterm separately — avoids a version skew between the two. A custom
+# input line is used instead of reedline (which owns the terminal and
+# fights the ratatui draw loop).
+ratatui = "0.29"

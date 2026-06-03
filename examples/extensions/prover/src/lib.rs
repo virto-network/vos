@@ -24,6 +24,7 @@
 //!        valid STARK of the program the caller trusts (WHICH PROGRAM).
 //!     2. `proof.public_io_hash() == vos::zk::compute_io_hash(public,
 //!        return)` — the tagless io-binding (WHICH I/O).
+//!
 //!   Composing the two means the io-binding can never be checked without
 //!   validity, and program identity rests entirely on the caller-supplied
 //!   commitment (the tagless design — no actor/message tag in the hash).
@@ -181,6 +182,7 @@ fn prove_to_proof(program_id: &[u8], witness_bytes: &[u8]) -> Option<Proof> {
 ///   1. `verify_standalone(proof, commitment)` — which program.
 ///   2. `proof.public_io_hash() == compute_io_hash(public, return)` —
 ///      which I/O (tagless).
+///
 /// Returns `false` on any malformed input, decode failure, or rejection.
 pub fn verify_proof_bytes(
     commitment_bytes: &[u8],

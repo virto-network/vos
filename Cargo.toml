@@ -5,6 +5,7 @@ members = [
     "vos-macros",
     "vos-raft",
     "vosx",
+    "vos-shell",
     "merkle-crdt",
     "zkpvm",
     # zkpvm-{precompiles,derive,verifier} live nested inside the
