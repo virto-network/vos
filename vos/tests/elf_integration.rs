@@ -7826,9 +7826,28 @@ fn clerk_ledger_two_bank_federation() {
             .expect("rkyv encode Secret v3")
             .to_vec();
         let witness_v3 = encode_witness(&public_v3_bytes, &secret_v3_bytes);
-        let proof_v3_bytes =
-            vos::block_on(prover_ref.prove(&mut &node_b, b"voucher-check".to_vec(), witness_v3))
-                .expect("invoke prove");
+        // A real STARK prove runs well past the default 10s invoke
+        // timeout in a debug build (~15-20s), so dispatch `prove` with a
+        // generous explicit timeout rather than the Ref's default.
+        // (STARK proving is inherently slow; a production caller sizes the
+        // timeout to the program.) `prove` returns the proof bytes as a
+        // `Value::Bytes` reply.
+        let proof_v3_bytes = {
+            let msg = vos::value::Msg::new("prove")
+                .with("program_id", b"voucher-check".to_vec())
+                .with("witness_bytes", witness_v3);
+            let encoded = vos::Encode::encode(&msg);
+            let mut payload = Vec::with_capacity(1 + encoded.len());
+            payload.push(vos::value::TAG_DYNAMIC);
+            payload.extend_from_slice(&encoded);
+            let reply = node_b
+                .invoke_with_timeout(prover_id, payload, std::time::Duration::from_secs(180))
+                .expect("invoke prove (real STARK, long timeout)");
+            match <vos::value::Value as vos::Decode>::try_decode(&reply) {
+                Some(vos::value::Value::Bytes(b)) => b,
+                other => panic!("prove reply was not Value::Bytes: {other:?}"),
+            }
+        };
         assert!(
             proof_v3_bytes.len() > 32,
             "real STARK proof must be larger than the 32-byte content address"
