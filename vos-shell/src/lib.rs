@@ -18,6 +18,7 @@ pub mod actor_cmd;
 pub mod backend;
 pub mod discovery;
 pub mod engine;
+pub mod highlight;
 pub mod sandbox;
 pub mod tui;
 pub mod value_bridge;

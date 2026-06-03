@@ -23,6 +23,7 @@ use ratatui::{Frame, Terminal};
 use crate::backend::BackendError;
 use crate::discovery::SchemaCache;
 use crate::engine::ConsoleEngine;
+use crate::highlight::HlKind;
 
 /// Run the TUI on the real terminal until the user quits. `label` is shown in
 /// the prompt/title (typically the space name). Sets up/tears down the
@@ -501,11 +502,15 @@ impl App {
             .scroll((scroll, 0));
         frame.render_widget(output, out_area);
 
-        let input = Paragraph::new(Line::from(vec![
-            Span::from(format!("{}> ", self.space_label)).fg(Color::Cyan),
-            Span::from(self.input.as_str()),
-        ]))
-        .block(Block::bordered());
+        // Prompt + nu syntax-highlighted input.
+        let mut spans = vec![Span::from(format!("{}> ", self.space_label)).fg(Color::Cyan)];
+        for run in self.engine.highlight(&self.input) {
+            spans.push(Span::styled(
+                run.text,
+                Style::default().fg(hl_color(run.kind)),
+            ));
+        }
+        let input = Paragraph::new(Line::from(spans)).block(Block::bordered());
         frame.render_widget(input, in_area);
 
         // Place the cursor after the prompt + the byte-cursor (ASCII-width
@@ -579,6 +584,22 @@ impl App {
                 .wrap(Wrap { trim: false }),
             area,
         );
+    }
+}
+
+/// Map a syntax category to a prompt colour.
+fn hl_color(kind: HlKind) -> Color {
+    match kind {
+        HlKind::Command => Color::Cyan,
+        HlKind::External => Color::LightRed,
+        HlKind::Flag => Color::LightYellow,
+        HlKind::String => Color::Green,
+        HlKind::Number => Color::Magenta,
+        HlKind::Variable => Color::LightCyan,
+        HlKind::Keyword => Color::Blue,
+        HlKind::Operator => Color::Yellow,
+        HlKind::Garbage => Color::Red,
+        HlKind::Plain => Color::Reset,
     }
 }
 

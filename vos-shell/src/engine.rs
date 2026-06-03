@@ -78,6 +78,12 @@ impl ConsoleEngine {
         &self.client
     }
 
+    /// Syntax-highlight a line of input against the live command set (used by
+    /// the TUI prompt). Returns coloured runs covering the whole string.
+    pub fn highlight(&self, line: &str) -> Vec<crate::highlight::HlSpan> {
+        crate::highlight::highlight(&self.engine_state, line)
+    }
+
     /// (Re)discover installed agents and register their messages as commands.
     /// Idempotent and additive — safe to call when agents change. Returns the
     /// number of commands registered this pass.
