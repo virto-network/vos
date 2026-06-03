@@ -909,21 +909,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clerk-prover-extension"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "blake2",
- "cipher-clerk",
- "grey-transpiler 0.1.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
- "javm 0.4.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
- "object",
- "vos",
- "zkpvm",
- "zkpvm-verifier",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3898,6 +3883,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "prover-extension"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "cipher-clerk",
+ "grey-transpiler 0.1.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
+ "object",
+ "vos",
+ "zkpvm",
+ "zkpvm-verifier",
+]
+
+[[package]]
 name = "proxy-extension"
 version = "0.1.0"
 dependencies = [
@@ -5532,7 +5530,6 @@ dependencies = [
  "clap",
  "clerk-bridge",
  "clerk-ledger",
- "clerk-prover-extension",
  "crdt-counter",
  "dlmalloc",
  "futures-channel",
@@ -5544,6 +5541,7 @@ dependencies = [
  "log",
  "merkle-crdt",
  "pollster",
+ "prover-extension",
  "redb",
  "rkyv",
  "serde",
@@ -5556,7 +5554,6 @@ dependencies = [
  "ureq",
  "vos-macros",
  "vos-raft",
- "zkpvm-verifier",
 ]
 
 [[package]]

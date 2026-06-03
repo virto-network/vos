@@ -17,11 +17,12 @@ std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
-# Host-side verifier support for the ZK actor-IO ABI: pulls the
-# no_std `zkpvm-verifier` so `vos::zk::verify_actor_io` can take a
-# `zkpvm_verifier::Proof`. Off by default — only proof-verifying hosts
-# (e.g. the clerk-prover extension) need it; guest/actor builds never do.
-zk-verify = ["dep:zkpvm-verifier"]
+# NOTE: the ZK actor-IO binding is tagless (`vos::zk`) — the io-hash
+# primitive `compute_io_hash` is pure and always available (guest +
+# host).  Proof *verification* (STARK validity ∧ io-binding) lives in
+# the `prover` host extension, which depends on `zkpvm-verifier`
+# directly; vos itself no longer pulls a verifier, so there is no
+# `zk-verify` feature.
 extension = ["macros"]
 wasm = ["macros"]
 # WASM bootstrap: provides global allocator (dlmalloc) and panic
@@ -40,11 +41,6 @@ network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 [dependencies]
 vos-macros = { path = "../vos-macros", version = "0.1.0", optional = true }
 vos-raft = { path = "../vos-raft", version = "0.1.0", default-features = false, features = ["std"], optional = true }
-# Host-side STARK verifier for the ZK actor-IO ABI (`vos::zk`). Optional,
-# enabled by the `zk-verify` feature; pulls the no_std `zkpvm-verifier`
-# (which pulls `zkpvm` with default-features = false — verifier only, no
-# prover/rayon/dalek tree). Guest/actor builds never enable it.
-zkpvm-verifier = { workspace = true, optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 # Logging facade — re-exported as `vos::log` and pulled into
 # `vos::prelude::*`. `default-features = false` keeps it usable
@@ -115,11 +111,12 @@ clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
 # pre-built ELF separately and only need the Ref surface from
 # the rlib.
 clerk-bridge = { path = "../actors/clerk-bridge", default-features = false }
-# Host-side prover extension. Tests use ClerkProverRef to drive
-# prove_voucher from the federation flow (cycle A0: producer
-# calls prove_voucher → puts bytes in CAS → ships hash via
-# voucher.proof.bytes).
-clerk-prover-extension = { path = "../examples/extensions/clerk-prover" }
+# General-purpose host-side prover extension. Tests use ProverRef to
+# drive prove / verify / program_commitment from the federation flow
+# (producer calls prove(program_id, witness) → puts bytes in CAS →
+# ships hash via voucher.proof.bytes; verifier bridge dispatches
+# verify) and as a blob_get probe in proof_blob_cross_node.
+prover-extension = { path = "../examples/extensions/prover" }
 # Host-side cipher-clerk with `signing` so tests can build
 # signed CreateAccount events to push through the ledger. Pulls in
 # OsRng-backed signing — fine on host; the actor itself never

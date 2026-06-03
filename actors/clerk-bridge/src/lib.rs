@@ -117,8 +117,10 @@ pub enum Status {
     /// inflow correctly and retry.
     LedgerRejected = 9,
     /// Voucher carries `proof.mode == Mode::External` and the
-    /// configured prover extension rejected the proof bytes against
-    /// the voucher's canonical `public_bytes`. Distinguishes a
+    /// configured general `prover` extension rejected the proof —
+    /// either STARK validity against the trusted program commitment
+    /// or the io-binding to the voucher's `(public, return)` failed
+    /// (or the proof bytes weren't fetchable). Distinguishes a
     /// cryptographically-invalid External proof from a malformed
     /// voucher or a bad signature (those still map to
     /// `VoucherInvalid`). Only reachable when `set_prover` has
@@ -260,7 +262,7 @@ pub struct ClerkBridge {
     /// vos/tests/elf_integration.rs's voucher-replay coverage
     /// for the rationale.
     received: Vec<[u8; 32]>,
-    /// ServiceId of the `clerk-prover` extension this bridge
+    /// ServiceId of the general `prover` extension this bridge
     /// dispatches `Mode::External` voucher-proof verification
     /// against. `0` means "no prover wired" — External-mode
     /// vouchers then fall through the wire-signature check
@@ -268,6 +270,15 @@ pub struct ClerkBridge {
     /// `set_prover`; persisted across actor restarts as part of
     /// the rkyv archive.
     prover_id: u32,
+    /// Trusted program commitment (the 32-byte preprocessed-trace
+    /// Merkle root of the `voucher-check` program) the bridge hands
+    /// the general prover's `verify` as the program-identity anchor.
+    /// Obtained out-of-band from the prover's
+    /// `program_commitment(b"voucher-check")` and set alongside the
+    /// id via `set_prover`. Empty/short ⇒ External-mode dispatch is
+    /// rejected by the prover (`commitment.len() != 32`) — a
+    /// misconfigured commitment can never silently accept.
+    program_commitment: Vec<u8>,
 }
 
 #[messages]
@@ -279,6 +290,7 @@ impl ClerkBridge {
             peers: Vec::new(),
             received: Vec::new(),
             prover_id: 0,
+            program_commitment: Vec::new(),
         }
     }
 
@@ -324,21 +336,30 @@ impl ClerkBridge {
         }
     }
 
-    /// Configure the `clerk-prover` extension to dispatch
-    /// Mode::External voucher proofs to. Setting `prover_id = 0`
+    /// Configure the general `prover` extension to dispatch
+    /// Mode::External voucher proofs to, together with the trusted
+    /// `program_commitment` (the 32-byte program-identity anchor for
+    /// `voucher-check` — obtain it from the prover's
+    /// `program_commitment(b"voucher-check")`). Setting `prover_id = 0`
     /// disables prover dispatch (External-mode vouchers then fall
     /// through the wire-signature check, same as Signature-mode).
     ///
-    /// Idempotent in identical arguments. Separate from
-    /// `bootstrap` so the wire ABI stays additive: existing
-    /// callers that don't know about prover dispatch keep working
-    /// with `prover_id` defaulted to 0.
+    /// The commitment is the SOLE cross-program soundness anchor the
+    /// bridge supplies to `verify`; a wrong/empty one makes the prover
+    /// reject every External proof (deny-by-default) rather than
+    /// silently accept.
+    ///
+    /// Idempotent in identical arguments. Separate from `bootstrap` so
+    /// the wire ABI stays additive: existing callers that don't know
+    /// about prover dispatch keep working with `prover_id` defaulted to
+    /// 0.
     #[msg]
-    async fn set_prover(&mut self, prover_id: u32) -> Status {
+    async fn set_prover(&mut self, prover_id: u32, program_commitment: Vec<u8>) -> Status {
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
         self.prover_id = prover_id;
+        self.program_commitment = program_commitment;
         Status::Ok
     }
 
@@ -452,6 +473,7 @@ impl ClerkBridge {
         if dispatch_external_proof(
             ctx,
             self.prover_id,
+            &self.program_commitment,
             &voucher,
             &peer_clerk_pubkey,
             peer_prefix,
@@ -568,6 +590,7 @@ impl ClerkBridge {
         if dispatch_external_proof(
             ctx,
             self.prover_id,
+            &self.program_commitment,
             &voucher,
             &peer_clerk_pubkey,
             peer_prefix,
@@ -692,8 +715,8 @@ fn reply(status: Status) -> SubmitVoucherReply {
     }
 }
 
-/// Dispatch a Mode::External voucher's proof bytes to the configured
-/// `clerk-prover` extension for verification. Returns:
+/// Dispatch a Mode::External voucher's proof to the configured general
+/// `prover` extension for verification. Returns:
 ///   - `Status::Ok` if the voucher is Signature-mode, OR if
 ///     `prover_id == 0`, OR if the prover accepted the proof.
 ///   - `Status::ProofInvalid` on any rejection path (prover replied
@@ -703,15 +726,30 @@ fn reply(status: Status) -> SubmitVoucherReply {
 ///     unreachable" from "proof rejected" — same state-hiding
 ///     posture as `VoucherInvalid`.
 ///
-/// `peer_clerk_pubkey` is folded into the canonical `public_bytes`
-/// since `Voucher.signature` is over the bytes (including proof
-/// bytes) AND the issuer's identity is the clerk pubkey; the
-/// verifier must use the SAME `issuer` field that the prover used.
-/// This is why the bridge passes the peer's pubkey here rather than
-/// letting the extension reconstruct it from somewhere else.
+/// The prover's `verify` composes two checks: STARK validity against
+/// `program_commitment` (which program) AND the tagless io-binding
+/// `proof.public_io_hash() == compute_io_hash(public_bytes,
+/// return_bytes)` (which I/O). So the bridge must hand it:
+///   - `program_commitment`: the trusted commitment configured via
+///     `set_prover` (the verifier's program-identity anchor).
+///   - `public_bytes`: the rkyv encoding of `voucher::proof::Public`
+///     — byte-identical to what voucher-check's guest bound via
+///     `vos::zk::bind_io(&public, &1u8)` (`public.encode()`). The
+///     `issuer` MUST be the peer's clerk pubkey, the same field the
+///     producer proved over (the voucher signature covers it), which
+///     is why the bridge reconstructs `Public` here rather than
+///     trusting the extension to.
+///   - `return_bytes`: the rkyv encoding of voucher-check's `1u8`
+///     success return (`1u8.encode()`).
+///
+/// `voucher.proof.bytes` is the 32-byte content address of the actual
+/// STARK in the producer node's proof-blob store; the extension fetches
+/// the bytes via `ctx.blob_get` (with `peer_prefix` as a fan-out hint)
+/// rather than the bridge shipping multi-MB through PVM dispatch.
 async fn dispatch_external_proof(
     ctx: &mut vos::Context<ClerkBridge>,
     prover_id: u32,
+    program_commitment: &[u8],
     voucher: &Voucher,
     peer_clerk_pubkey: &AuthKey,
     peer_prefix: u16,
@@ -728,17 +766,17 @@ async fn dispatch_external_proof(
         state_root_before: voucher.state_root_before,
         state_root_after: voucher.state_root_after,
     };
-    let public_bytes = cipher_clerk::voucher::proof::public_bytes(&public);
-    // voucher.proof.bytes carries the 32-byte content address of
-    // the actual STARK proof in the producer node's proof-blob
-    // store; the extension fetches the bytes via ctx.blob_get
-    // rather than us trying to ship multi-MB through PVM dispatch.
-    // peer_prefix tells the extension's host where the bytes
-    // are most likely to live so the fetch doesn't have to fan
-    // out to every connected node.
-    let msg = vos::value::Msg::new("verify_voucher_proof")
-        .with("public_bytes", public_bytes)
+    // rkyv-encode the public + the `1u8` success return — exactly the
+    // bytes voucher-check's `bind_io(&public, &1u8)` hashed into the
+    // proof's STARK-bound io-hash. The prover recomputes
+    // `compute_io_hash(public_bytes, return_bytes)` and checks equality.
+    let public_bytes = public.encode();
+    let return_bytes = 1u8.encode();
+    let msg = vos::value::Msg::new("verify")
+        .with("program_commitment", program_commitment.to_vec())
         .with("proof_hash", voucher.proof.bytes.clone())
+        .with("public_bytes", public_bytes)
+        .with("return_bytes", return_bytes)
         .with("peer_prefix", peer_prefix as u32);
     match ctx.ask(ServiceId(prover_id), &msg).await {
         Ok(value) => {
