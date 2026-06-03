@@ -59,6 +59,16 @@ impl ConsoleEngine {
             stack: Stack::new(),
             client,
         };
+        // Override nushell's `help` with our space-specific one (registered
+        // after the base context so it wins).
+        {
+            let mut ws = StateWorkingSet::new(&me.engine_state);
+            ws.add_decl(Box::new(crate::actor_cmd::ConsoleHelp));
+            let delta = ws.render();
+            me.engine_state
+                .merge_delta(delta)
+                .map_err(|e| BackendError::Other(format!("register help: {e:?}")))?;
+        }
         me.refresh()?;
         Ok(me)
     }

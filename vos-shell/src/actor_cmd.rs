@@ -163,6 +163,35 @@ impl Command for AgentCommand {
     }
 }
 
+/// Overrides nushell's `help` with the VOS console help, so the prompt's
+/// `help` is space-specific rather than nushell-branded. (Subcommands like
+/// `help commands` still come from nushell and list the available set.)
+#[derive(Clone)]
+pub struct ConsoleHelp;
+
+impl Command for ConsoleHelp {
+    fn name(&self) -> &str {
+        "help"
+    }
+    fn description(&self) -> &str {
+        "Show the VOS console help."
+    }
+    fn signature(&self) -> Signature {
+        Signature::build("help")
+            .category(Category::Custom("space".into()))
+            .input_output_types(vec![(Type::Nothing, Type::String)])
+    }
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        Ok(Value::string(crate::sandbox::CONSOLE_HELP, call.head).into_pipeline_data())
+    }
+}
+
 fn arg_error(cmd: &str, field: &str, msg: &str, span: Span) -> ShellError {
     ShellError::GenericError {
         error: format!("invalid argument `{field}` for `{cmd}`"),

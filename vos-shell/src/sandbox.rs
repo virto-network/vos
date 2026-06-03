@@ -17,6 +17,29 @@
 
 use nu_protocol::engine::EngineState;
 
+/// VOS-specific console help — shown in the TUI Help tab AND returned by the
+/// `help` command (which overrides nushell's own nushell-branded help). Kept
+/// free of nushell jargon and of commands the sandbox doesn't provide.
+pub const CONSOLE_HELP: &str = "\
+VOS space console — the actors are the commands.
+
+  <agent>                  list an actor's messages
+  <agent> <method> <args>  call a message; the reply is a value
+  … | where / get / sort / length / str / math / each
+                           pipe values through data commands
+
+Sandboxed: no files, no network, no external programs.
+
+Keys
+  Shift-Tab            switch tab (Console · Browser · Help)
+  Ctrl-Left / Right    previous / next tab
+  Tab                  autocomplete agent / method
+  Up / Down            command history
+  Ctrl-Up / Down       scroll output
+  Enter                run (in Browser: insert the selected command)
+  clear                clear the screen
+  exit · Esc · Ctrl-C  quit";
+
 /// A fresh sandboxed engine: core language + safe data commands.
 pub fn base_engine_state() -> EngineState {
     let engine = nu_cmd_lang::add_default_context(EngineState::new());

@@ -108,8 +108,8 @@ impl App {
             should_quit: false,
         };
         app.output.push(Out::Ok(format!(
-            "{} actor command(s) available. Tab / Shift-Tab switch tabs; \
-             type a command and Tab to complete; F3 for help.",
+            "{} actor command(s). Shift-Tab switches tabs · type a command and Tab \
+             completes · `help` for keys.",
             app.cmds.len()
         )));
         Ok(app)
@@ -212,22 +212,36 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // Tab navigation works on any tab. `Tab` is reserved for completion,
+        // so switching uses Shift-Tab (cycle) and Ctrl-Left/Right.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::F(1) => self.tab = Tab::Console,
-            KeyCode::F(2) => self.tab = Tab::Browser,
-            KeyCode::F(3) => self.tab = Tab::Help,
-            KeyCode::BackTab => self.prev_tab(),
-            // Tab cycles tabs, EXCEPT when mid-typing in the Console, where it
-            // completes the current agent/method instead.
-            KeyCode::Tab if self.tab == Tab::Console && !self.input.trim().is_empty() => {
-                self.complete()
+            KeyCode::BackTab => {
+                self.next_tab();
+                return;
             }
-            KeyCode::Tab => self.next_tab(),
-            _ => match self.tab {
-                Tab::Console => self.console_key(key),
-                Tab::Browser => self.browser_key(key),
-                Tab::Help => {}
-            },
+            KeyCode::Right if ctrl => {
+                self.next_tab();
+                return;
+            }
+            KeyCode::Left if ctrl => {
+                self.prev_tab();
+                return;
+            }
+            KeyCode::Up if ctrl => {
+                self.scroll = self.scroll.saturating_sub(3);
+                return;
+            }
+            KeyCode::Down if ctrl => {
+                self.scroll = self.scroll.saturating_add(3);
+                return;
+            }
+            _ => {}
+        }
+        match self.tab {
+            Tab::Console => self.console_key(key),
+            Tab::Browser => self.browser_key(key),
+            Tab::Help => {}
         }
     }
 
@@ -250,13 +264,12 @@ impl App {
     fn console_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => self.submit(),
+            KeyCode::Tab => self.complete(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Left => self.cursor_left(),
             KeyCode::Right => self.cursor_right(),
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(5),
             KeyCode::Esc => self.should_quit = true,
             KeyCode::Char(c) => self.insert_char(c),
             _ => {}
@@ -428,11 +441,30 @@ impl App {
         let [tabs_area, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(frame.area());
 
-        let titles = ["1 Console", "2 Browser", "3 Help"];
-        let tabs = Tabs::new(titles.iter().map(|t| Line::from(*t)).collect::<Vec<_>>())
-            .select(self.tab.index())
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
-            .divider("│");
+        // Paint the whole header row a contrasting background, then lay the
+        // tab titles over it (active tab inverted). No numbers, no padding rows.
+        let header_bg = Color::DarkGray;
+        frame.render_widget(
+            Block::default().style(Style::default().bg(header_bg)),
+            tabs_area,
+        );
+        let titles = ["Console", "Browser", "Help"];
+        let tabs = Tabs::new(
+            titles
+                .iter()
+                .map(|t| Line::from(format!(" {t} ")))
+                .collect::<Vec<_>>(),
+        )
+        .select(self.tab.index())
+        .style(Style::default().fg(Color::Gray).bg(header_bg))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider("")
+        .padding("", "");
         frame.render_widget(tabs, tabs_area);
 
         match self.tab {
@@ -537,25 +569,12 @@ impl App {
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect) {
-        let text = vec![
-            Line::from("VOS space console").add_modifier(Modifier::BOLD),
-            Line::from(""),
-            Line::from("Actors are commands. Type `<agent> <method> <args…>` — real nu-script"),
-            Line::from("with safe built-ins (each, where, str, math, …); no filesystem, network,"),
-            Line::from("or external commands. Type just `<agent>` to list its messages."),
-            Line::from(""),
-            Line::from("  Tab / Shift-Tab   next / previous tab (when prompt is empty)"),
-            Line::from("  F1 / F2 / F3      jump to Console / Browser / Help"),
-            Line::from("  Tab               complete agent / method (when typing)"),
-            Line::from("  Up / Down         command history (Console) · select (Browser)"),
-            Line::from("  PageUp/PageDn     scroll output"),
-            Line::from("  Enter             run (Console) · insert command (Browser)"),
-            Line::from("  help              list available built-in commands"),
-            Line::from("  clear             clear the scrollback"),
-            Line::from("  Esc / Ctrl-C / Ctrl-D / exit   quit"),
-        ];
+        let lines: Vec<Line> = crate::sandbox::CONSOLE_HELP
+            .lines()
+            .map(|l| Line::from(l.to_string()))
+            .collect();
         frame.render_widget(
-            Paragraph::new(text)
+            Paragraph::new(lines)
                 .block(Block::bordered().title(" help "))
                 .wrap(Wrap { trim: false }),
             area,
@@ -684,7 +703,8 @@ mod tests {
     fn browser_lists_all_messages_and_enter_fills_prompt() {
         let mut a = app();
         assert_eq!(a.cmds.len(), 2, "counter has add + reset");
-        a.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)); // Browser
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)); // → Browser
+        assert_eq!(a.tab.index(), Tab::Browser.index());
         press(&mut a, KeyCode::Enter); // select first (add)
         assert_eq!(a.tab.index(), Tab::Console.index());
         assert_eq!(a.input, "counter add ");
@@ -702,13 +722,35 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_tabs_when_prompt_empty() {
+    fn shift_tab_and_ctrl_arrows_switch_tabs() {
         let mut a = app();
         assert_eq!(a.tab.index(), 0);
-        press(&mut a, KeyCode::Tab); // empty prompt → next tab
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)); // Console → Browser
         assert_eq!(a.tab.index(), 1);
-        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)); // → prev
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)); // → Console
         assert_eq!(a.tab.index(), 0);
+        a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)); // → Browser
+        assert_eq!(a.tab.index(), 1);
+    }
+
+    #[test]
+    fn help_command_is_vos_specific() {
+        let mut a = app();
+        typ(&mut a, "help");
+        press(&mut a, KeyCode::Enter);
+        let joined: String = a
+            .output
+            .iter()
+            .filter_map(|o| match o {
+                Out::Ok(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("VOS space console"),
+            "help should be VOS-specific, got: {joined}"
+        );
     }
 
     #[test]
@@ -778,7 +820,7 @@ mod tests {
         assert!(text.contains('5'), "result should be visible in the buffer");
 
         // Browser tab renders too.
-        a.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         terminal.draw(|f| a.render(f)).unwrap();
         let text: String = terminal
             .backend()
