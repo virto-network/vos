@@ -1,23 +1,27 @@
 //! The sandbox boundary.
 //!
-//! The console's `EngineState` is built from `nu-cmd-lang` ONLY — nushell's
-//! core language (control flow, bindings, `describe`, …). Because
-//! `nu-command` / `nu-cli` / `nu-std` are not dependencies, the filesystem
-//! (`open`, `ls`, `save`), network (`http`), and process (`run-external`,
-//! `^cmd`) command sets simply do not exist in the engine. The sandbox is
-//! the *absence* of those decls, enforced at compile time by the dependency
-//! graph — not a runtime allow/deny list that could be misconfigured.
+//! The console's `EngineState` gets nushell's core language (`nu-cmd-lang`:
+//! `if`/`let`/`for`/`match`/`def`/…) plus the SAFE data-manipulation built-ins
+//! from `nu-command` (`each`/`where`/`get`/`select`/`str`/`math`/`sort`/`help`/
+//! …). It deliberately does NOT get the filesystem (`open`/`save`/`ls`/`cp`/
+//! `rm`), network (`http`/`port`), process (`run-external`/`^cmd`/`ps`), or
+//! interactive (`input`/`clear`) commands: those live behind `nu-command`'s
+//! `os`/`network` Cargo features, which we turn OFF, so they are not even
+//! compiled in. The sandbox is the *absence* of those decls at the dependency
+//! level — not a runtime allow/deny list that could be misconfigured.
 //!
-//! A missing command parses as an external call and then fails to compile to
-//! IR (no external runner is registered), so nothing executes — verified in
-//! the Phase 0 spike. [`friendly_unknown_command`] turns that internal IR
-//! error into a clear message.
+//! A genuinely unknown command parses as an external call and then fails to
+//! compile to IR (no external runner is registered with `os` off), so nothing
+//! executes. [`friendly_unknown_command`] turns that internal IR error into a
+//! clear message.
 
 use nu_protocol::engine::EngineState;
 
-/// A fresh sandboxed engine: `nu-cmd-lang` core only.
+/// A fresh sandboxed engine: core language + safe data commands.
 pub fn base_engine_state() -> EngineState {
-    nu_cmd_lang::add_default_context(EngineState::new())
+    let engine = nu_cmd_lang::add_default_context(EngineState::new());
+    // Safe data commands only — `os`/`network` features are off (see Cargo.toml).
+    nu_command::add_shell_command_context(engine)
 }
 
 /// True if a `ShellError` text is the IR-compile failure nushell emits when a

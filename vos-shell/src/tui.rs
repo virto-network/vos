@@ -108,7 +108,8 @@ impl App {
             should_quit: false,
         };
         app.output.push(Out::Ok(format!(
-            "{} actor command(s) available — F2 to browse, F3 for help, Tab to complete.",
+            "{} actor command(s) available. Tab / Shift-Tab switch tabs; \
+             type a command and Tab to complete; F3 for help.",
             app.cmds.len()
         )));
         Ok(app)
@@ -215,6 +216,13 @@ impl App {
             KeyCode::F(1) => self.tab = Tab::Console,
             KeyCode::F(2) => self.tab = Tab::Browser,
             KeyCode::F(3) => self.tab = Tab::Help,
+            KeyCode::BackTab => self.prev_tab(),
+            // Tab cycles tabs, EXCEPT when mid-typing in the Console, where it
+            // completes the current agent/method instead.
+            KeyCode::Tab if self.tab == Tab::Console && !self.input.trim().is_empty() => {
+                self.complete()
+            }
+            KeyCode::Tab => self.next_tab(),
             _ => match self.tab {
                 Tab::Console => self.console_key(key),
                 Tab::Browser => self.browser_key(key),
@@ -223,10 +231,25 @@ impl App {
         }
     }
 
+    fn next_tab(&mut self) {
+        self.tab = match self.tab {
+            Tab::Console => Tab::Browser,
+            Tab::Browser => Tab::Help,
+            Tab::Help => Tab::Console,
+        };
+    }
+
+    fn prev_tab(&mut self) {
+        self.tab = match self.tab {
+            Tab::Console => Tab::Help,
+            Tab::Browser => Tab::Console,
+            Tab::Help => Tab::Browser,
+        };
+    }
+
     fn console_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => self.submit(),
-            KeyCode::Tab => self.complete(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Left => self.cursor_left(),
             KeyCode::Right => self.cursor_right(),
@@ -517,15 +540,18 @@ impl App {
         let text = vec![
             Line::from("VOS space console").add_modifier(Modifier::BOLD),
             Line::from(""),
-            Line::from("Actors are commands. Type `<agent> <method> <args…>` — real nu-script,"),
-            Line::from("sandboxed (no filesystem, network, or external commands)."),
+            Line::from("Actors are commands. Type `<agent> <method> <args…>` — real nu-script"),
+            Line::from("with safe built-ins (each, where, str, math, …); no filesystem, network,"),
+            Line::from("or external commands. Type just `<agent>` to list its messages."),
             Line::from(""),
-            Line::from("  F1 / F2 / F3   Console / Browser / Help"),
-            Line::from("  Tab            complete agent / method"),
-            Line::from("  Up / Down      command history (Console) · select (Browser)"),
-            Line::from("  PageUp/PageDn  scroll output"),
-            Line::from("  Enter          run (Console) · insert command (Browser)"),
-            Line::from("  clear          clear the scrollback"),
+            Line::from("  Tab / Shift-Tab   next / previous tab (when prompt is empty)"),
+            Line::from("  F1 / F2 / F3      jump to Console / Browser / Help"),
+            Line::from("  Tab               complete agent / method (when typing)"),
+            Line::from("  Up / Down         command history (Console) · select (Browser)"),
+            Line::from("  PageUp/PageDn     scroll output"),
+            Line::from("  Enter             run (Console) · insert command (Browser)"),
+            Line::from("  help              list available built-in commands"),
+            Line::from("  clear             clear the scrollback"),
             Line::from("  Esc / Ctrl-C / Ctrl-D / exit   quit"),
         ];
         frame.render_widget(
@@ -673,6 +699,51 @@ mod tests {
         typ(&mut a, "ad");
         press(&mut a, KeyCode::Tab);
         assert_eq!(a.input, "counter add ");
+    }
+
+    #[test]
+    fn tab_cycles_tabs_when_prompt_empty() {
+        let mut a = app();
+        assert_eq!(a.tab.index(), 0);
+        press(&mut a, KeyCode::Tab); // empty prompt → next tab
+        assert_eq!(a.tab.index(), 1);
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)); // → prev
+        assert_eq!(a.tab.index(), 0);
+    }
+
+    #[test]
+    fn bare_agent_name_lists_messages() {
+        let mut a = app();
+        typ(&mut a, "counter");
+        press(&mut a, KeyCode::Enter);
+        let shown: Vec<&str> = a
+            .output
+            .iter()
+            .filter_map(|o| match o {
+                Out::Ok(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            shown.iter().any(|l| l.contains("message(s)")),
+            "bare agent should list messages, got {shown:?}"
+        );
+    }
+
+    #[test]
+    fn nu_builtin_data_command_works() {
+        let mut a = app();
+        typ(&mut a, "[1 2 3] | length");
+        press(&mut a, KeyCode::Enter);
+        let shown: Vec<&str> = a
+            .output
+            .iter()
+            .filter_map(|o| match o {
+                Out::Ok(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(shown.contains(&"3"), "expected `length` → 3, got {shown:?}");
     }
 
     #[test]

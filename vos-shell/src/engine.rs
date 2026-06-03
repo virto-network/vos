@@ -96,6 +96,11 @@ impl ConsoleEngine {
                     )));
                     count += 1;
                 }
+                // A bare `<agent>` command that lists the actor's messages.
+                ws.add_decl(Box::new(crate::actor_cmd::AgentCommand::new(
+                    agent.instance_name.clone(),
+                    &meta.messages,
+                )));
             }
             ws.render()
         };

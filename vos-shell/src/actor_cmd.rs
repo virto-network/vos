@@ -110,6 +110,59 @@ impl Command for ActorCommand {
     }
 }
 
+/// A bare `<agent>` command: typing just the instance name lists the agent's
+/// messages and their signatures, so an actor reads like a program you can run
+/// with no args to discover its subcommands.
+#[derive(Clone)]
+pub struct AgentCommand {
+    agent: String,
+    listing: String,
+}
+
+impl AgentCommand {
+    pub fn new(agent: String, msgs: &[ParsedMessage]) -> Self {
+        let mut listing = format!("{agent} — {} message(s):\n", msgs.len());
+        for m in msgs {
+            let args = m
+                .fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, f.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let kind = if m.is_query { "query" } else { "action" };
+            listing.push_str(&format!("  {} {}({args})  [{kind}]\n", agent, m.name));
+        }
+        listing.push_str(&format!("run one with: {agent} <method> <args…>"));
+        Self { agent, listing }
+    }
+}
+
+impl Command for AgentCommand {
+    fn name(&self) -> &str {
+        &self.agent
+    }
+
+    fn description(&self) -> &str {
+        "list this actor's messages"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build(self.agent.clone())
+            .category(Category::Custom("space".into()))
+            .input_output_types(vec![(Type::Any, Type::String)])
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        Ok(Value::string(self.listing.clone(), call.head).into_pipeline_data())
+    }
+}
+
 fn arg_error(cmd: &str, field: &str, msg: &str, span: Span) -> ShellError {
     ShellError::GenericError {
         error: format!("invalid argument `{field}` for `{cmd}`"),

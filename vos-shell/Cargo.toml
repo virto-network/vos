@@ -22,6 +22,12 @@ nu-protocol = { version = "=0.111.0", default-features = false }
 nu-engine = { version = "=0.111.0", default-features = false }
 nu-parser = { version = "=0.111.0", default-features = false }
 nu-cmd-lang = { version = "=0.111.0", default-features = false }
+# nu-command provides the safe data-manipulation built-ins (each/where/get/
+# select/str/math/sort/help/…). `default-features = false` turns OFF the `os`
+# and `network` features, so the filesystem (open/save/ls/cp/rm/…), network
+# (http/port), process (run-external/`^`/ps), and interactive (input/clear)
+# commands are NOT COMPILED — the sandbox stays structural, not a deny-list.
+nu-command = { version = "=0.111.0", default-features = false }
 
 anyhow = "1"
 
