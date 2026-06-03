@@ -110,6 +110,33 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Decode a hex string (optional `0x` prefix, even length, `[0-9a-fA-F]`)
+/// into bytes; `None` on odd length or a non-hex digit. The inverse of
+/// [`hex_encode`], so a `Value::Bytes` reply rendered as hex can be passed
+/// straight back as a `Vec<u8>` argument (see `routing::coerce_to_type`).
+pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    fn nib(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        out.push((nib(bytes[i])? << 4) | nib(bytes[i + 1])?);
+        i += 2;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
