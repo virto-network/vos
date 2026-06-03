@@ -68,9 +68,14 @@ impl ConsoleEngine {
         &self.client
     }
 
-    /// (Re)discover installed agents and register their CLI-exposed methods as
-    /// commands. Idempotent and additive — safe to call when agents change.
-    /// Returns the number of commands registered this pass.
+    /// (Re)discover installed agents and register their messages as commands.
+    /// Idempotent and additive — safe to call when agents change. Returns the
+    /// number of commands registered this pass.
+    ///
+    /// Unlike the top-level `vosx` CLI (which curates its surface via the
+    /// `#[msg(cli)]` tag / `exposed_to_cli`), the console exposes an actor's
+    /// FULL message interface — it's the OS-like interactive surface, so every
+    /// message is a command, matching what the HTTP gateway dispatches.
     pub fn refresh(&mut self) -> Result<usize, BackendError> {
         let agents = self.client.list_agents()?;
         let mut count = 0;
@@ -84,9 +89,6 @@ impl ConsoleEngine {
                     Ok(None) | Err(_) => continue,
                 };
                 for msg in &meta.messages {
-                    if !msg.exposed_to_cli {
-                        continue;
-                    }
                     ws.add_decl(Box::new(ActorCommand::new(
                         agent.instance_name.clone(),
                         msg,

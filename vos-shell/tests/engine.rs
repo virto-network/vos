@@ -95,8 +95,9 @@ fn counter_schema() -> ParsedMeta {
         &[
             ("add", &[("a", "u64"), ("b", "u64")], false, true),
             ("boom", &[], false, true),
-            // not exposed to the CLI -> must NOT become a command
-            ("secret", &[], false, false),
+            // exposed_to_cli=false: the console still registers it (full
+            // interface), unlike the top-level vosx CLI surface.
+            ("ping", &[], true, false),
         ],
     )
 }
@@ -146,14 +147,18 @@ fn forbidden_surfaces_as_permission_denied() {
 }
 
 #[test]
-fn non_exposed_method_is_not_a_command() {
+fn full_interface_is_exposed_regardless_of_cli_tag() {
     let mut mock = Mock::default();
     mock.add("counter", 0x0101, counter_schema());
     let mut engine = ConsoleEngine::new(Arc::new(mock)).unwrap();
 
-    // `secret` was exposed_to_cli=false, so it must be an unknown command.
-    let r = engine.eval("counter secret");
-    assert!(r.is_error);
+    // `ping` has exposed_to_cli=false but the console exposes the full
+    // interface, so it IS a registered command (mock returns Unit → "").
+    let r = engine.eval("counter ping");
+    assert!(!r.is_error, "got error: {}", r.output);
+
+    // A genuinely unknown method is still an error.
+    assert!(engine.eval("counter no_such_method").is_error);
 }
 
 #[test]

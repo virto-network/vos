@@ -29,17 +29,12 @@ impl SchemaCache {
         Ok(Self { agents, schemas })
     }
 
-    /// CLI-exposed method names for an agent (for completion).
+    /// All message names for an agent (for completion). The console exposes
+    /// the full interface, so this is not filtered by `exposed_to_cli`.
     pub fn methods(&self, agent: &str) -> Vec<&str> {
         self.schemas
             .get(agent)
-            .map(|m| {
-                m.messages
-                    .iter()
-                    .filter(|msg| msg.exposed_to_cli)
-                    .map(|msg| msg.name.as_str())
-                    .collect()
-            })
+            .map(|m| m.messages.iter().map(|msg| msg.name.as_str()).collect())
             .unwrap_or_default()
     }
 }
