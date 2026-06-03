@@ -96,9 +96,11 @@ impl Proof {
     /// before halt and Phase Z0's closing chip STARK-binds
     /// `final_state.registers`.  No host/tracer cooperation is involved:
     /// the binding is just ordinary register state at halt, made
-    /// tamper-evident by the existing Z0 register ledger.  The verifier
-    /// (`vos::zk::verify_actor_io`) checks this hash against a locally
-    /// recomputed `compute_io_hash`.
+    /// tamper-evident by the existing Z0 register ledger.  The host
+    /// verifier (the `prover` extension's `verify`) checks this hash
+    /// against a locally recomputed `vos::zk::compute_io_hash`, composed
+    /// with the STARK-validity check against the trusted program
+    /// commitment — so the io-binding can't be checked without validity.
     ///
     /// Decoding is the exact inverse of the guest-side encoding: word
     /// φ[9] → bytes 0..8, φ[10] → 8..16, φ[11] → 16..24, φ[12] → 24..32,

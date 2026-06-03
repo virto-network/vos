@@ -9,11 +9,14 @@
 //! keeps the trace-assembly invariants in one place (precompile
 //! record forwarding, ristretto boundary ingest, stack-pointer seed).
 //!
-//! Callers that need to inject runtime witness state (patching
-//! flat_mem before tracing) should build the `Interpreter` with
+//! Callers that need to inject runtime witness state into a known
+//! flat_mem offset (e.g. the host prover patching an actor's
+//! `__VOS_WITNESS` buffer with opaque witness bytes) can use
+//! [`trace_blob_with_patches`], which applies the patches before tracing
+//! and still assembles the `SideNote` here.  Callers whose witness
+//! protocol is more bespoke build the `Interpreter` with
 //! [`interpreter_from_blob`], mutate `interp.flat_mem`, then drive
-//! `TracingPvm` directly — the witness protocol is callsite-specific
-//! and intentionally not part of this module.
+//! `TracingPvm` directly.
 
 use javm::{
     PVM_PAGE_SIZE, PVM_REGISTER_COUNT, compute_mem_cycles,
@@ -108,6 +111,25 @@ pub fn interpreter_from_blob(blob: &[u8], gas: u64) -> Option<(Interpreter, Vec<
 /// dropped — callers that need it should drive `TracingPvm`
 /// directly via [`interpreter_from_blob`].
 pub fn trace_blob(blob: &[u8], gas: u64) -> Option<SideNote> {
+    trace_blob_with_patches(blob, gas, &[])
+}
+
+/// Like [`trace_blob`], but writes each `(offset, bytes)` patch into the
+/// initial flat_mem (at `flat_mem[offset..offset + bytes.len()]`) before
+/// tracing — both the interpreter's execution image and the `SideNote`'s
+/// initial-memory binding see the patched bytes.
+///
+/// This is the host prover's opaque witness-injection path: `offset` is
+/// the actor's `__VOS_WITNESS` ELF symbol address (which equals its
+/// flat_mem offset) and `bytes` is the caller-supplied witness, which the
+/// prover never interprets.  A patch whose range exceeds flat_mem makes
+/// the call return `None`.  With an empty `patches` slice this is
+/// identical to [`trace_blob`].
+pub fn trace_blob_with_patches(
+    blob: &[u8],
+    gas: u64,
+    patches: &[(usize, &[u8])],
+) -> Option<SideNote> {
     let parsed = program::parse_blob(blob)?;
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -117,7 +139,22 @@ pub fn trace_blob(blob: &[u8], gas: u64) -> Option<SideNote> {
         }
     }
     let code_blob = program::parse_code_blob(&code_data?)?;
-    let (interp, flat_mem) = interpreter_from_blob(blob, gas)?;
+    let (mut interp, mut flat_mem) = interpreter_from_blob(blob, gas)?;
+
+    // Inject the witness into the initial image. `interpreter_from_blob`
+    // handed back a clone of the interpreter's flat_mem, so patch the
+    // clone and sync it back into the interpreter — otherwise the trace
+    // would execute over the unpatched original.
+    if !patches.is_empty() {
+        for (offset, bytes) in patches {
+            let end = offset.checked_add(bytes.len())?;
+            if end > flat_mem.len() {
+                return None;
+            }
+            flat_mem[*offset..end].copy_from_slice(bytes);
+        }
+        interp.flat_mem = flat_mem.clone();
+    }
 
     let mut tracing = TracingPvm::new(interp);
     let _ = tracing.run_with_vos_stubs();

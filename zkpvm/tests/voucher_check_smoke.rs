@@ -212,7 +212,7 @@ fn voucher_check_program_commitment_is_deterministic() {
     );
 }
 
-/// Dynamic-witness round-trip: patch WITNESS_BUFFER with two distinct
+/// Dynamic-witness round-trip: patch __VOS_WITNESS with two distinct
 /// (Public, Secret) tuples and assert the resulting traces differ.
 /// Pins that the voucher-check actor reads the witness from BSS and
 /// that the witness actually flows through `check`, so per-voucher
@@ -228,7 +228,7 @@ fn dynamic_witness_changes_trace() {
     ))
     .expect("read voucher-check ELF for symbol lookup");
     let witness_addr =
-        find_witness_buffer_addr(&elf).expect("WITNESS_BUFFER symbol in voucher-check ELF");
+        find_witness_buffer_addr(&elf).expect("__VOS_WITNESS symbol in voucher-check ELF");
 
     let trace_with = |amount: u64, blinding_byte: u8| -> (usize, [u8; 32]) {
         let amount_blinding =
@@ -260,7 +260,7 @@ fn dynamic_witness_changes_trace() {
             .expect("witness fits in usize");
         assert!(
             end <= flat_mem.len(),
-            "WITNESS_BUFFER {witness_addr:#x} + {} > flat_mem {}",
+            "__VOS_WITNESS {witness_addr:#x} + {} > flat_mem {}",
             witness.len(),
             flat_mem.len()
         );
@@ -328,8 +328,8 @@ fn hex(bytes: &[u8]) -> String {
 
 /// ZK actor-IO ABI input-sensitivity: the io-hash bound into φ[9..12]
 /// must actually depend on the `Public` the actor ran on — i.e. the
-/// `vos::zk::bind_io::<VoucherCheck, (), Public, u8>` call in `start`
-/// binds the real witness, not a constant.
+/// `vos::zk::bind_io(&public, &1u8)` call in `start` binds the real
+/// witness, not a constant.
 ///
 /// Cheap trace-level check (no prove): after `run_with_vos_stubs`, the
 /// guest's halt sequence has placed the io-hash in φ[9..12], so the
@@ -350,7 +350,7 @@ fn actor_io_hash_reflects_public_input() {
     ))
     .expect("read voucher-check ELF for symbol lookup");
     let witness_addr =
-        find_witness_buffer_addr(&elf).expect("WITNESS_BUFFER symbol in voucher-check ELF");
+        find_witness_buffer_addr(&elf).expect("__VOS_WITNESS symbol in voucher-check ELF");
 
     let io_hash_for = |amount: u64, blinding_byte: u8| -> [u8; 32] {
         let amount_blinding =
@@ -397,8 +397,7 @@ fn actor_io_hash_reflects_public_input() {
     let hash_b = io_hash_for(50, 5);
     eprintln!("io-hash A={}, B={}", hex(&hash_a), hex(&hash_b));
     assert_ne!(
-        hash_a,
-        [0u8; 32],
+        hash_a, [0u8; 32],
         "bind_io must place a non-zero io-hash in φ[9..12]"
     );
     assert_ne!(
@@ -418,10 +417,10 @@ fn actor_io_hash_reflects_public_input() {
 /// fills in). Tampering with any byte of any register post-prove
 /// must make `verify_standalone` reject.
 ///
-/// Without this guarantee, the higher-level binding the
-/// clerk-prover-extension does (`blake2b(public_bytes)` written to
-/// designated registers, verifier checks the proof exposes the
-/// expected hash) is meaningless — a cheating prover could compute
+/// Without this guarantee, the higher-level io-binding the prover
+/// extension checks (`proof.public_io_hash() == compute_io_hash(
+/// public, return)`, read from the φ[9..12] registers) is
+/// meaningless — a cheating prover could compute
 /// the proof for any witness then write whatever hash they want
 /// into the metadata field.
 ///
@@ -486,9 +485,10 @@ fn final_state_registers_are_stark_bound() {
 /// proves, and STARK-bound on every word of the φ[9..12] window
 /// (tampering any of registers 9,10,11,12 makes verify reject).  The
 /// exact value-match against a host-recomputed `compute_io_hash` is
-/// exercised in the clerk-prover extension e2e, where the verifier holds
-/// the matching actor/message types (`type_name`-based identity is only
-/// equal across builds that share the crate path).
+/// exercised in the `prover` extension e2e: the binding is tagless, so
+/// the verifier just recomputes `compute_io_hash(public_bytes,
+/// return_bytes)` over the asserted I/O bytes — no shared actor/message
+/// type is needed (the program commitment carries program identity).
 #[test]
 fn actor_io_hash_is_bound_and_nonzero() {
     let Some(blob) = load_voucher_check_blob() else {
@@ -506,8 +506,7 @@ fn actor_io_hash_is_bound_and_nonzero() {
     // 1. The halt-binding actually populated the φ[9..12] window.
     let io_hash = proof.public_io_hash();
     assert_ne!(
-        io_hash,
-        [0u8; 32],
+        io_hash, [0u8; 32],
         "public_io_hash is the unbound [0u8;32] sentinel — the halt-asm \
          binding in run_refine_service did not land in φ[9..12]"
     );
@@ -680,9 +679,9 @@ fn boundary_non_register_fields_are_not_bound() {
     );
 }
 
-/// Cribbed from `examples/extensions/clerk-prover/src/lib.rs`'s
-/// witness encoding so the test exercises the same layout the
-/// prover will use.
+/// Mirrors the prover extension's `__VOS_WITNESS` encoding so the
+/// test exercises the same length-prefixed `[u32 len][public][u32
+/// len][secret]` layout the prover patches in.
 fn encode_witness(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + public_bytes.len() + 4 + secret_bytes.len());
     v.extend_from_slice(&(public_bytes.len() as u32).to_le_bytes());
@@ -692,7 +691,7 @@ fn encode_witness(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Minimal ELF symbol lookup — just enough to find WITNESS_BUFFER's
+/// Minimal ELF symbol lookup — just enough to find __VOS_WITNESS's
 /// virtual address. Manual parsing instead of pulling `object` here
 /// since the integration test already has plenty of deps.
 fn find_witness_buffer_addr(elf: &[u8]) -> Option<u64> {
@@ -751,7 +750,7 @@ fn find_witness_buffer_addr(elf: &[u8]) -> Option<u64> {
             .map(|n| name_start + n)
             .unwrap_or(name_start);
         let name = core::str::from_utf8(&elf[name_start..name_end]).ok()?;
-        if name == "WITNESS_BUFFER" {
+        if name == "__VOS_WITNESS" {
             let value = u64::from_le_bytes(elf[s + 8..s + 16].try_into().ok()?);
             if value != 0 {
                 return Some(value);

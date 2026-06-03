@@ -321,15 +321,33 @@ fn halt_with_output_bound(data: &[u8], io_hash: &[u8; 32]) -> ! {
         io_hash[7],
     ]);
     let w1 = u64::from_le_bytes([
-        io_hash[8], io_hash[9], io_hash[10], io_hash[11], io_hash[12], io_hash[13], io_hash[14],
+        io_hash[8],
+        io_hash[9],
+        io_hash[10],
+        io_hash[11],
+        io_hash[12],
+        io_hash[13],
+        io_hash[14],
         io_hash[15],
     ]);
     let w2 = u64::from_le_bytes([
-        io_hash[16], io_hash[17], io_hash[18], io_hash[19], io_hash[20], io_hash[21], io_hash[22],
+        io_hash[16],
+        io_hash[17],
+        io_hash[18],
+        io_hash[19],
+        io_hash[20],
+        io_hash[21],
+        io_hash[22],
         io_hash[23],
     ]);
     let w3 = u64::from_le_bytes([
-        io_hash[24], io_hash[25], io_hash[26], io_hash[27], io_hash[28], io_hash[29], io_hash[30],
+        io_hash[24],
+        io_hash[25],
+        io_hash[26],
+        io_hash[27],
+        io_hash[28],
+        io_hash[29],
+        io_hash[30],
         io_hash[31],
     ]);
     // SAFETY: terminal PVM hostcall. The host reads `len` bytes from
@@ -517,15 +535,15 @@ pub fn run_refine_service<A: super::Actor>() {
         out_buf.extend_from_slice(&encoded);
         // encoded, new_state_bytes, reply_bytes, payload dropped here
     }
-    // ZK actor-IO ABI: bind this execution's (public, return) identity
-    // into the final-state register window φ[9..12] as part of the halt
-    // (see `crate::zk` and `halt_with_output_bound`).  A handler that
-    // called `vos::zk::bind_io` stashed the real `(public, return)` hash;
-    // drain it.  Otherwise fall back to binding the actor identity with
-    // empty public/return — every service actor always binds, so a proof
-    // is uniformly tied to at least its actor type.
-    let io_hash = crate::zk::__take_pending_io_hash()
-        .unwrap_or_else(|| crate::zk::compute_io_hash::<A, (), (), ()>(&(), &()));
+    // ZK actor-IO ABI: bind this execution's (public, return) into the
+    // final-state register window φ[9..12] as part of the halt (see
+    // `crate::zk` and `halt_with_output_bound`).  A handler that called
+    // `vos::zk::bind_io` stashed the real `(public, return)` hash; drain
+    // it.  Otherwise fall back to the tagless empty-public/empty-return
+    // default, so every proof carries a well-defined io-hash (the program
+    // commitment, not the io-hash, is what ties a proof to its actor).
+    let io_hash =
+        crate::zk::__take_pending_io_hash().unwrap_or_else(|| crate::zk::compute_io_hash(&[], &[]));
     halt_with_output_bound(out_buf, &io_hash);
 }
 
