@@ -1,15 +1,21 @@
 //! A ratatui console for a VOS space: a tabbed TUI driving the sandboxed
 //! [`ConsoleEngine`]. Tabs:
 //!
-//! * **Console** — a nu-script prompt + scrollback; actors are commands.
+//! * **<space>** — a nu-script prompt + scrollback; actors are commands. The
+//!   tab is titled with the space name (it's a session; later we'll open more
+//!   tabs for parallel sessions).
 //! * **Browser** — every installed actor's messages with their signatures;
 //!   Enter drops `<agent> <method> ` into the prompt.
 //! * **Help** — key bindings.
 //!
-//! The input editor is a small hand-rolled line widget (not reedline, which
-//! owns the terminal and conflicts with ratatui's draw loop). The whole state
-//! machine lives in [`App::on_key`] / [`App::render`] as pure functions so it
-//! is testable against a `TestBackend` without a real terminal — see the tests.
+//! The prompt is borderless — only a top and bottom rule separate it from the
+//! scrollback — and grows to multiple lines: a trailing `\` before Enter is a
+//! soft newline, so nu scripts can span lines before they're submitted.
+//!
+//! The input editor is a small hand-rolled widget (not reedline, which owns the
+//! terminal and conflicts with ratatui's draw loop). The whole state machine
+//! lives in [`App::on_key`] / [`App::render`] as pure functions so it is
+//! testable against a `TestBackend` without a real terminal — see the tests.
 
 use std::time::Duration;
 
@@ -17,7 +23,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::backend::BackendError;
@@ -35,6 +41,9 @@ pub fn run(engine: ConsoleEngine, label: &str) -> anyhow::Result<()> {
     ratatui::restore();
     result
 }
+
+/// Visible width of the `> ` prompt (and of the blank continuation prefix).
+const PROMPT_WIDTH: u16 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -264,7 +273,7 @@ impl App {
 
     fn console_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter => self.on_enter(),
             KeyCode::Tab => self.complete(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Left => self.cursor_left(),
@@ -398,6 +407,18 @@ impl App {
             .collect()
     }
 
+    /// Enter: a trailing `\` immediately before the cursor is a soft newline
+    /// (continue a multi-line nu script); otherwise submit the whole buffer.
+    fn on_enter(&mut self) {
+        if self.input[..self.cursor].ends_with('\\') {
+            self.cursor -= 1; // ASCII '\'
+            self.input.remove(self.cursor);
+            self.insert_char('\n');
+        } else {
+            self.submit();
+        }
+    }
+
     fn submit(&mut self) {
         let line = self.input.trim().to_string();
         self.input.clear();
@@ -406,7 +427,12 @@ impl App {
         if line.is_empty() {
             return;
         }
-        self.output.push(Out::Prompt(format!("> {line}")));
+        // Echo the (possibly multi-line) command, prompt on the first row and
+        // an aligned continuation prefix on the rest.
+        for (i, l) in line.lines().enumerate() {
+            let prefix = if i == 0 { "> " } else { "  " };
+            self.output.push(Out::Prompt(format!("{prefix}{l}")));
+        }
         self.history.push(line.clone());
         match line.as_str() {
             "exit" | "quit" => {
@@ -449,7 +475,9 @@ impl App {
             Block::default().style(Style::default().bg(header_bg)),
             tabs_area,
         );
-        let titles = ["Console", "Browser", "Help"];
+        // The first tab is the session, titled with the space name (later:
+        // multiple session tabs); then the fixed Browser / Help views.
+        let titles = [self.space_label.as_str(), "Browser", "Help"];
         let tabs = Tabs::new(
             titles
                 .iter()
@@ -476,8 +504,13 @@ impl App {
     }
 
     fn render_console(&mut self, frame: &mut Frame, area: Rect) {
+        // The prompt grows with the number of (soft) input lines; +2 for the
+        // top and bottom rules. Cap it so the scrollback never disappears.
+        let input_rows = self.input.split('\n').count() as u16;
+        let max_in = (area.height / 2).max(3);
+        let in_height = (input_rows + 2).clamp(3, max_in);
         let [out_area, in_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area);
+            Layout::vertical([Constraint::Min(0), Constraint::Length(in_height)]).areas(area);
 
         let lines: Vec<Line> = self
             .output
@@ -489,36 +522,72 @@ impl App {
             })
             .collect();
 
-        // Clamp scroll so the latest output is visible.
+        // Clamp scroll so the latest output is visible (no borders to subtract).
         let total = lines.len() as u16;
-        let view_h = out_area.height.saturating_sub(2); // borders
-        let max_scroll = total.saturating_sub(view_h);
+        let max_scroll = total.saturating_sub(out_area.height);
         let scroll = self.scroll.min(max_scroll);
         self.scroll = scroll;
 
+        // Borderless scrollback — clean, like the surrounding harness.
         let output = Paragraph::new(lines)
-            .block(Block::bordered().title(format!(" {} ", self.space_label)))
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
         frame.render_widget(output, out_area);
 
-        // Prompt + nu syntax-highlighted input.
-        let mut spans = vec![Span::from(format!("{}> ", self.space_label)).fg(Color::Cyan)];
-        for run in self.engine.highlight(&self.input) {
-            spans.push(Span::styled(
-                run.text,
-                Style::default().fg(hl_color(run.kind)),
-            ));
-        }
-        let input = Paragraph::new(Line::from(spans)).block(Block::bordered());
-        frame.render_widget(input, in_area);
+        // Prompt: only a top + bottom rule frame it (no box). nu-highlighted,
+        // possibly multi-line, with a `> ` prompt and aligned continuations.
+        let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
+        let inner = block.inner(in_area);
+        frame.render_widget(block, in_area);
+        frame.render_widget(Paragraph::new(self.input_lines()), inner);
 
-        // Place the cursor after the prompt + the byte-cursor (ASCII-width
-        // approximation; fine for the typical actor-command alphabet).
-        let prompt_w = self.space_label.chars().count() as u16 + 2;
-        let col = in_area.x + 1 + prompt_w + self.input[..self.cursor].chars().count() as u16;
-        let row = in_area.y + 1;
+        // Cursor: which soft-line it's on + the column past the `> ` prompt.
+        let before = &self.input[..self.cursor];
+        let line_idx = before.matches('\n').count() as u16;
+        let col_in_line = before.rsplit('\n').next().unwrap_or("").chars().count() as u16;
+        let col = inner.x + PROMPT_WIDTH + col_in_line;
+        let row = inner.y + line_idx;
         frame.set_cursor_position(Position::new(col, row));
+    }
+
+    /// Build the prompt's rendered lines: the nu-highlighted input split on
+    /// newlines, each row prefixed with the `> ` prompt (first) or an aligned
+    /// blank continuation (rest).
+    fn input_lines(&self) -> Vec<Line<'static>> {
+        // Distribute highlighted runs across visual rows, splitting on '\n'.
+        let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+        for run in self.engine.highlight(&self.input) {
+            let style = Style::default().fg(hl_color(run.kind));
+            let mut segs = run.text.split('\n');
+            if let Some(first) = segs.next() {
+                if !first.is_empty() {
+                    rows.last_mut()
+                        .unwrap()
+                        .push(Span::styled(first.to_string(), style));
+                }
+            }
+            for seg in segs {
+                let mut row = Vec::new();
+                if !seg.is_empty() {
+                    row.push(Span::styled(seg.to_string(), style));
+                }
+                rows.push(row);
+            }
+        }
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, mut spans)| {
+                let prefix = if i == 0 {
+                    Span::from("> ").fg(Color::Cyan)
+                } else {
+                    Span::from("  ")
+                };
+                let mut out = Vec::with_capacity(spans.len() + 1);
+                out.push(prefix);
+                out.append(&mut spans);
+                Line::from(out)
+            })
+            .collect()
     }
 
     fn render_browser(&mut self, frame: &mut Frame, area: Rect) {
@@ -810,6 +879,38 @@ mod tests {
     }
 
     #[test]
+    fn backslash_enter_continues_then_submits_multiline() {
+        let mut a = app();
+        typ(&mut a, "[1 2 3] |");
+        press(&mut a, KeyCode::Char('\\'));
+        press(&mut a, KeyCode::Enter); // soft newline, not a submit
+        assert_eq!(
+            a.input, "[1 2 3] |\n",
+            "backslash-enter should add a newline"
+        );
+        assert!(
+            !a.output.iter().any(|o| matches!(o, Out::Prompt(_))),
+            "continuation must not submit the command"
+        );
+
+        typ(&mut a, " length");
+        press(&mut a, KeyCode::Enter); // now submit the whole script
+        assert!(a.input.is_empty(), "the multi-line command should submit");
+        let shown: Vec<&str> = a
+            .output
+            .iter()
+            .filter_map(|o| match o {
+                Out::Ok(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            shown.contains(&"3"),
+            "multi-line pipeline should eval to 3, got {shown:?}"
+        );
+    }
+
+    #[test]
     fn history_recalls_previous_command() {
         let mut a = app();
         typ(&mut a, "counter reset");
@@ -837,7 +938,11 @@ mod tests {
         terminal.draw(|f| a.render(f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("Console"), "tab bar should render");
+        assert!(
+            text.contains("demo"),
+            "the session tab should be titled with the space name"
+        );
+        assert!(text.contains("Browser"), "tab bar should render");
         assert!(text.contains('5'), "result should be visible in the buffer");
 
         // Browser tab renders too.

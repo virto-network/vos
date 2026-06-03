@@ -31,11 +31,12 @@ VOS space console — the actors are the commands.
 Sandboxed: no files, no network, no external programs.
 
 Keys
-  Shift-Tab            switch tab (Console · Browser · Help)
+  Shift-Tab            switch tab (<space> · Browser · Help)
   Ctrl-Left / Right    previous / next tab
   Tab                  autocomplete agent / method
   Up / Down            command history
   Ctrl-Up / Down       scroll output
+  \\ then Enter         continue on a new line (multi-line script)
   Enter                run (in Browser: insert the selected command)
   clear                clear the screen
   exit · Esc · Ctrl-C  quit";
