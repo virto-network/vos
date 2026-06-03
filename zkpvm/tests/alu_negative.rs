@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Negative-test corpus for CpuChip's ALU constraints (Phase-15-prep).
 //!
 //! Each test crafts an honest trace of a ThreeReg ALU op, mutates

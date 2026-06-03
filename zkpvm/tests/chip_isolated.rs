@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Phase I.0 — chip-isolated prove harness smoke tests.
 //!
 //! These tests validate `prove_with_explicit_components` /

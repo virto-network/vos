@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Negative-test corpus for the register-memory ledger
 //! (RegisterMemoryChip + CpuChip producers — Phase 9 architecture).
 //!

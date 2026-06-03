@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Phase 13f: program-identity public API.
 //!
 //! In zkpvm, a proof's preprocessed-trace Merkle root IS the program

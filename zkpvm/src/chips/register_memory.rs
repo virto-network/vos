@@ -956,7 +956,9 @@ mod tests {
         entries.sort_by_key(|e| (e.reg_addr, e.timestamp));
 
         // Replicate analyze_dedup's cap-sweep math for M=B5_MERGE_CAP.
-        let mut histogram: std::collections::BTreeMap<usize, usize> = Default::default();
+        // `alloc::` (not `std::`) so this verifier-meaningful test still
+        // compiles in the no_std / no-prover build.
+        let mut histogram: alloc::collections::BTreeMap<usize, usize> = Default::default();
         let mut i = 0;
         while i < entries.len() {
             let head = &entries[i];

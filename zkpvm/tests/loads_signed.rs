@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Phase 20: signed-load inactive-byte sign-extension tests.
 //!
 //! Each test stores a byte/halfword/word with the high bit set, then

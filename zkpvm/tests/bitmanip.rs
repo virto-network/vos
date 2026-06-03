@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Phase 12b: BitManip TwoReg ops — positive + negative tests for the
 //! constraints added in CpuChip.  Helpers live in `tests/common/mod.rs`.
 

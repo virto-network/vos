@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Mode::External voucher-proof pipeline smoke test.
 //!
 //! Loads `examples/actors/voucher-check`'s PVM ELF (which runs

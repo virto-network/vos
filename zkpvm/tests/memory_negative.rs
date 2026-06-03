@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Negative-test corpus for CpuChip's memory constraints + MemoryChip
 //! ledger consistency (Phase 15-prep).
 //!

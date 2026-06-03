@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
 // Memory is now flat_mem in Interpreter

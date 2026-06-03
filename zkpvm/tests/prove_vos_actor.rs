@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! End-to-end test: trace a real VOS actor compiled from Rust.
 
 use javm::interpreter::Interpreter;

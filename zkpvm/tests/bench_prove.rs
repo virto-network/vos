@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Proving benchmarks at various trace sizes, comparable to Nexus prover-benches.
 //!
 //! Run with: cargo test -p zkpvm-machine --release bench_prove_ -- --nocapture
