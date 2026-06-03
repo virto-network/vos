@@ -19,8 +19,10 @@ pub mod backend;
 pub mod discovery;
 pub mod engine;
 pub mod sandbox;
+pub mod tui;
 pub mod value_bridge;
 
 pub use backend::{AgentInfo, BackendError, SpaceClient, is_forbidden_envelope};
 pub use discovery::SchemaCache;
 pub use engine::{ConsoleEngine, EvalResult};
+pub use tui::run as run_tui;

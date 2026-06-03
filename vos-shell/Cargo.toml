@@ -24,3 +24,9 @@ nu-parser = { version = "=0.111.0", default-features = false }
 nu-cmd-lang = { version = "=0.111.0", default-features = false }
 
 anyhow = "1"
+
+# TUI. ratatui re-exports crossterm (default feature), so we don't pin
+# crossterm separately — avoids a version skew between the two. A custom
+# input line is used instead of reedline (which owns the terminal and
+# fights the ratatui draw loop).
+ratatui = "0.29"

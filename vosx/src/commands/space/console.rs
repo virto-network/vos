@@ -8,7 +8,7 @@
 //! is a line REPL; a ratatui TUI replaces the loop in a follow-up, reusing the
 //! engine unchanged.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -96,26 +96,35 @@ pub fn run(space: &str) -> anyhow::Result<()> {
         client: Mutex::new(client),
     });
 
-    let mut engine = ConsoleEngine::new(backend.clone())
+    let engine = ConsoleEngine::new(backend.clone())
         .map_err(|e| anyhow::anyhow!("starting console: {e}"))?;
 
-    let stdin = io::stdin();
-    let interactive = stdin.is_terminal();
-    if interactive {
-        println!(
-            "vos space console — actors are commands (e.g. `<agent> <method> args…`); \
-             real nu-script, sandboxed (no fs/net). `exit` or Ctrl-D to quit."
-        );
-    }
+    // A real terminal gets the ratatui TUI; piped/redirected input gets a plain
+    // line REPL (so `echo '…' | vosx space console` and tests work).
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let result = if interactive {
+        vos_shell::run_tui(engine, space)
+    } else {
+        run_repl(engine)
+    };
 
-    let mut out = io::stdout();
+    // The engine (and its Arc clone) is dropped inside the branch above, so the
+    // backend can now be reclaimed and shut down cleanly, draining libp2p.
+    if let Ok(backend) = Arc::try_unwrap(backend) {
+        if let Ok(client) = backend.client.into_inner() {
+            client.shutdown().ok();
+        }
+    }
+    result
+}
+
+/// Non-interactive REPL: one line of nu-script per input line. Output to
+/// stdout, errors (including sandbox rejections) to stderr.
+fn run_repl(mut engine: ConsoleEngine) -> anyhow::Result<()> {
+    let stdin = io::stdin();
     let mut handle = stdin.lock();
     let mut line = String::new();
     loop {
-        if interactive {
-            print!("{space}> ");
-            out.flush().ok();
-        }
         line.clear();
         if handle.read_line(&mut line)? == 0 {
             break; // EOF
@@ -132,15 +141,6 @@ pub fn run(space: &str) -> anyhow::Result<()> {
             eprintln!("{}", result.output);
         } else if !result.output.is_empty() {
             println!("{}", result.output);
-        }
-    }
-
-    // Drop the engine's Arc clone so the backend (and its DaemonClient) can be
-    // reclaimed and shut down cleanly, draining libp2p threads.
-    drop(engine);
-    if let Ok(backend) = Arc::try_unwrap(backend) {
-        if let Ok(client) = backend.client.into_inner() {
-            client.shutdown().ok();
         }
     }
     Ok(())
