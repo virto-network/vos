@@ -1,0 +1,52 @@
+[package]
+name = "prover-extension"
+version = "0.1.0"
+edition = "2024"
+
+# General-purpose host-side zkpvm prover + verifier. Any actor that
+# exposes a `__VOS_WITNESS` buffer (via `vos::zk::witness_buffer!`) and
+# binds its `(public, return)` with `vos::zk::bind_io` can be proved and
+# verified here — the prover is PROGRAM-AGNOSTIC: it patches opaque
+# witness bytes into the buffer, proves the trace, and composes STARK
+# validity with the tagless io-binding. It carries no per-program crypto
+# knowledge (no cipher-clerk / voucher types). A bridge dispatches
+# `prove` / `verify` / `program_commitment` here by `program_id`.
+#
+# Lives as a native `.so` because zkpvm-verifier can't build for the PVM
+# guest (javm -> blst C-build + workspace stwo feature inheritance), so
+# in-actor verification isn't viable — see the general-prover plan.
+
+[features]
+default = ["bin", "extension"]
+bin = []
+extension = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../../vos", default-features = false, features = ["extension"] }
+# zkpvm prover (trace + prove_mobile) and the host-side standalone
+# verifier. The cdylib re-exports only prove / verify / program_commitment.
+zkpvm = { workspace = true }
+zkpvm-verifier = { workspace = true }
+# ELF -> PVM blob transpile (same path the zkpvm test harness takes).
+grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+bincode = "1"
+# Read an actor ELF's symbol table to locate `__VOS_WITNESS`.
+object = { version = "0.36", default-features = false, features = ["std", "read_core", "elf"] }
+
+[dev-dependencies]
+# The prove/verify e2e test proves the voucher-check guest and builds its
+# (Public, Secret) witness. cipher-clerk lives here ONLY for the test —
+# the extension itself stays voucher-agnostic. Witness bytes are encoded
+# with `vos::rkyv` so they match exactly what the guest decodes/rebinds.
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+    "viewing-keys",
+    "voucher",
+    "helpers",
+] }

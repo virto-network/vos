@@ -454,8 +454,8 @@ const MAX_CROSS_AGENT_DEPTH: usize = 32;
 /// concern. Replies exceeding this are dropped at the producer
 /// side and surface as `InvokeError::NotFound` at the caller.
 ///
-/// 8 MiB accommodates STARK proof bodies (clerk-prover-extension's
-/// `prove_voucher` returns ~1.4 MiB; future production-config
+/// 8 MiB accommodates STARK proof bodies (the prover extension's
+/// `prove` returns ~1.4 MiB; future production-config
 /// proofs may exceed 2 MiB) without admitting unboundedly large
 /// replies.
 const MAX_PRODUCER_REPLY: usize = 8 * 1024 * 1024;
@@ -1067,6 +1067,15 @@ fn replay_dag_into_runtime(
     }
     for (i, log) in logs.into_iter().enumerate() {
         let msg = log.msg.clone();
+        // A log entry with no dispatch message — a CRDT genesis /
+        // boundary node — has no handler to replay and no recorded
+        // state effect, so skip it. Replaying it would wrap an empty
+        // payload in the M7 caller prefix; the actor strips the prefix
+        // back to empty bytes and `Decode::decode` panics ("empty
+        // bytes"). The real operations live in the non-empty entries.
+        if msg.is_empty() {
+            continue;
+        }
         runtime.begin_replay(log);
         // M7 — recorded effects were authorised by *some* caller
         // at record time. For replay determinism, wrap with the

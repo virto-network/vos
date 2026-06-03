@@ -5125,6 +5125,7 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -5139,6 +5140,7 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     });
 
     // ── Nodes + registries ─────────────────────────────────────
@@ -5355,6 +5357,7 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -5369,6 +5372,7 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     });
 
     // Each bridge registers under a unique name in the hyperspace
@@ -6259,6 +6263,7 @@ fn clerk_ledger_two_bank_federation() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -6273,6 +6278,7 @@ fn clerk_ledger_two_bank_federation() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     });
 
     // ── ServiceIds derived from federation-visible names ────────
@@ -7721,14 +7727,12 @@ fn clerk_ledger_two_bank_federation() {
             "release"
         };
         std::path::PathBuf::from(format!(
-            "{}/../target/{profile}/libclerk_prover_extension.so",
+            "{}/../target/{profile}/libprover_extension.so",
             env!("CARGO_MANIFEST_DIR"),
         ))
     };
     if !prover_so.exists() {
-        eprintln!(
-            "SKIP 5h: clerk-prover-extension not built. Run: cargo build -p clerk-prover-extension"
-        );
+        eprintln!("SKIP 5h: prover-extension not built. Run: cargo build -p prover-extension");
     } else {
         use vos::node::ExtensionConfig;
 
@@ -7738,11 +7742,43 @@ fn clerk_ledger_two_bank_federation() {
         // immutable invocations with mutable registrations.
         let prover_id = node_b.register_extension(ExtensionConfig::new(prover_so));
 
-        // Wire bank B's bridge to the prover. `set_prover` is
-        // legal post-bootstrap (idempotent in identical args).
+        use prover_extension::ProverRef;
+        let prover_ref = ProverRef::at(prover_id);
+
+        // Length-prefixed `[u32 len][public][u32 len][secret]` witness
+        // buffer the general prover patches into voucher-check's
+        // `__VOS_WITNESS` before tracing.
+        let encode_witness = |pub_b: &[u8], sec_b: &[u8]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(8 + pub_b.len() + sec_b.len());
+            v.extend_from_slice(&(pub_b.len() as u32).to_le_bytes());
+            v.extend_from_slice(pub_b);
+            v.extend_from_slice(&(sec_b.len() as u32).to_le_bytes());
+            v.extend_from_slice(sec_b);
+            v
+        };
+
+        // The trusted program commitment is provenance: fetch it from the
+        // prover (v1 baked) and configure the bridge with it. It's the
+        // sole cross-program anchor the bridge hands `verify`.
+        let voucher_commitment =
+            vos::block_on(prover_ref.program_commitment(&mut &node_b, b"voucher-check".to_vec()))
+                .expect("invoke program_commitment");
         assert_eq!(
-            vos::block_on(bridge_actor.set_prover(&mut &node_b, prover_id.0))
-                .expect("invoke set_prover"),
+            voucher_commitment.len(),
+            32,
+            "voucher-check program commitment is the 32-byte Merkle root"
+        );
+
+        // Wire bank B's bridge to the prover + trusted commitment.
+        // `set_prover` is legal post-bootstrap (idempotent in identical
+        // args).
+        assert_eq!(
+            vos::block_on(bridge_actor.set_prover(
+                &mut &node_b,
+                prover_id.0,
+                voucher_commitment.clone()
+            ))
+            .expect("invoke set_prover"),
             BridgeStatus::Ok,
             "set_prover after bootstrap must succeed"
         );
@@ -7764,23 +7800,54 @@ fn clerk_ledger_two_bank_federation() {
             state_root_before: voucher_3.state_root_before,
             state_root_after: voucher_3.state_root_after,
         };
-        let public_v3_bytes = public_bytes(&public_v3);
 
-        // Happy-path producer wiring: drive the prover extension to
-        // produce a REAL STARK proof, stash it ONLY in bank A's
-        // store (bank A is the producer; bank B's verifier
-        // extension reaches across libp2p via the `peer_prefix`
-        // hint registered above), then ship the 32-byte content
-        // address as the voucher's `proof.bytes`.
+        // Happy-path producer wiring: drive the GENERAL prover to produce
+        // a REAL STARK over voucher-check with the caller's witness
+        // (Public_v3 + a valid Secret), stash it ONLY in bank A's store
+        // (bank A is the producer; bank B's verifier reaches across
+        // libp2p via the `peer_prefix` hint registered above), then ship
+        // the 32-byte content address as the voucher's `proof.bytes`.
         //
-        // This is the production-shape flow: producer-side stash,
-        // consumer-side cross-node fetch via `EFFECT_BLOB_GET`
-        // fan-out (with the hint going straight to bank A).
-        use clerk_prover_extension::ClerkProverRef;
-        let prover_ref = ClerkProverRef::at(prover_id);
-        let proof_v3_bytes =
-            vos::block_on(prover_ref.prove_voucher(&mut &node_b, public_v3_bytes.clone()))
-                .expect("invoke prove_voucher");
+        // The proof binds rkyv(Public_v3) + rkyv(1u8) into its STARK-bound
+        // io-hash; the bridge reconstructs the SAME Public from the
+        // voucher's public fields and recomputes the hash, so verify's
+        // io-binding leg matches. This is the production-shape flow:
+        // producer-side stash, consumer-side cross-node fetch via
+        // `EFFECT_BLOB_GET` fan-out (hint straight to bank A).
+        let public_v3_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&public_v3)
+            .expect("rkyv encode Public v3")
+            .to_vec();
+        let secret_v3 = cipher_clerk::voucher::proof::Secret {
+            amount: value3,
+            amount_blinding: blinding3,
+            sender_balance_before: value3 + 1,
+        };
+        let secret_v3_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&secret_v3)
+            .expect("rkyv encode Secret v3")
+            .to_vec();
+        let witness_v3 = encode_witness(&public_v3_bytes, &secret_v3_bytes);
+        // A real STARK prove runs well past the default 10s invoke
+        // timeout in a debug build (~15-20s), so dispatch `prove` with a
+        // generous explicit timeout rather than the Ref's default.
+        // (STARK proving is inherently slow; a production caller sizes the
+        // timeout to the program.) `prove` returns the proof bytes as a
+        // `Value::Bytes` reply.
+        let proof_v3_bytes = {
+            let msg = vos::value::Msg::new("prove")
+                .with("program_id", b"voucher-check".to_vec())
+                .with("witness_bytes", witness_v3);
+            let encoded = vos::Encode::encode(&msg);
+            let mut payload = Vec::with_capacity(1 + encoded.len());
+            payload.push(vos::value::TAG_DYNAMIC);
+            payload.extend_from_slice(&encoded);
+            let reply = node_b
+                .invoke_with_timeout(prover_id, payload, std::time::Duration::from_secs(180))
+                .expect("invoke prove (real STARK, long timeout)");
+            match <vos::value::Value as vos::Decode>::try_decode(&reply) {
+                Some(vos::value::Value::Bytes(b)) => b,
+                other => panic!("prove reply was not Value::Bytes: {other:?}"),
+            }
+        };
         assert!(
             proof_v3_bytes.len() > 32,
             "real STARK proof must be larger than the 32-byte content address"

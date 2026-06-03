@@ -123,7 +123,7 @@ const MANIFEST_MAX_BLOBS: usize = 256;
 /// the same boundary regardless of whether it's local or networked.
 ///
 /// 8 MiB accommodates STARK proof bodies riding a single
-/// [`Frame::ProofBlobReply`] (clerk-prover-extension's prove path
+/// [`Frame::ProofBlobReply`] (the prover extension's prove path
 /// produces ~1.4 MiB; future production-config proofs may exceed
 /// 2 MiB) without admitting unboundedly large frames. Other frame
 /// types stay tiny in practice; an attacker who tries to push 8 MiB

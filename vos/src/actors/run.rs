@@ -298,6 +298,77 @@ fn halt_with_output(data: &[u8]) -> ! {
     }
 }
 
+/// Halt with output (a0=ptr, a1=len) AND bind a 32-byte ZK actor-IO
+/// hash into the final-state register window φ[9..12] (RISC-V a2-a5).
+///
+/// This is the ZK actor-IO ABI binding mechanism (see [`crate::zk`]).
+/// The four little-endian hash words are passed as `in` operands on the
+/// halting `ecall`, so the compiler materialises them into a2-a5 via
+/// real instructions immediately before the ecall.  Because the halt
+/// (`t0=0`, RootHalt) only reads a0/a1, a2-a5 persist unchanged into
+/// `final_state.registers`, where Phase Z0's closing chip already
+/// STARK-binds them — making the hash a tamper-evident public output
+/// (`zkpvm::Proof::public_io_hash`).  No new ECALL, no tracer/prover
+/// cooperation, no register-ledger surgery: it is ordinary,
+/// already-bound register state at halt.
+///
+/// a2→φ[9], a3→φ[10], a4→φ[11], a5→φ[12] per grey-transpiler's RISC-V→PVM
+/// mapping — the exact window `public_io_hash` reconstructs.
+#[cfg(target_arch = "riscv64")]
+fn halt_with_output_bound(data: &[u8], io_hash: &[u8; 32]) -> ! {
+    let w0 = u64::from_le_bytes([
+        io_hash[0], io_hash[1], io_hash[2], io_hash[3], io_hash[4], io_hash[5], io_hash[6],
+        io_hash[7],
+    ]);
+    let w1 = u64::from_le_bytes([
+        io_hash[8],
+        io_hash[9],
+        io_hash[10],
+        io_hash[11],
+        io_hash[12],
+        io_hash[13],
+        io_hash[14],
+        io_hash[15],
+    ]);
+    let w2 = u64::from_le_bytes([
+        io_hash[16],
+        io_hash[17],
+        io_hash[18],
+        io_hash[19],
+        io_hash[20],
+        io_hash[21],
+        io_hash[22],
+        io_hash[23],
+    ]);
+    let w3 = u64::from_le_bytes([
+        io_hash[24],
+        io_hash[25],
+        io_hash[26],
+        io_hash[27],
+        io_hash[28],
+        io_hash[29],
+        io_hash[30],
+        io_hash[31],
+    ]);
+    // SAFETY: terminal PVM hostcall. The host reads `len` bytes from
+    // `data.as_ptr()` before we lose control; a2-a5 carry the io-hash
+    // (φ[9..12]) — ignored by the RootHalt handler but captured in
+    // `final_state`. `noreturn` — no liveness after.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a0") data.as_ptr() as u64,
+            in("a1") data.len() as u64,
+            in("a2") w0,
+            in("a3") w1,
+            in("a4") w2,
+            in("a5") w3,
+            in("t0") 0u64, // IPC_SLOT = REPLY → RootHalt
+            options(noreturn),
+        );
+    }
+}
+
 #[cfg(all(feature = "service", not(target_arch = "riscv64")))]
 fn halt() -> ! {
     panic!("halt is only supported on RISC-V targets");
@@ -306,6 +377,11 @@ fn halt() -> ! {
 #[cfg(all(feature = "pvm", not(target_arch = "riscv64")))]
 fn halt_with_output(_data: &[u8]) -> ! {
     panic!("halt_with_output is only supported on RISC-V targets");
+}
+
+#[cfg(all(feature = "service", not(target_arch = "riscv64")))]
+fn halt_with_output_bound(_data: &[u8], _io_hash: &[u8; 32]) -> ! {
+    panic!("halt_with_output_bound is only supported on RISC-V targets");
 }
 
 /// Exit status: actor processed all messages normally.
@@ -459,7 +535,16 @@ pub fn run_refine_service<A: super::Actor>() {
         out_buf.extend_from_slice(&encoded);
         // encoded, new_state_bytes, reply_bytes, payload dropped here
     }
-    halt_with_output(out_buf);
+    // ZK actor-IO ABI: bind this execution's (public, return) into the
+    // final-state register window φ[9..12] as part of the halt (see
+    // `crate::zk` and `halt_with_output_bound`).  A handler that called
+    // `vos::zk::bind_io` stashed the real `(public, return)` hash; drain
+    // it.  Otherwise fall back to the tagless empty-public/empty-return
+    // default, so every proof carries a well-defined io-hash (the program
+    // commitment, not the io-hash, is what ties a proof to its actor).
+    let io_hash =
+        crate::zk::__take_pending_io_hash().unwrap_or_else(|| crate::zk::compute_io_hash(&[], &[]));
+    halt_with_output_bound(out_buf, &io_hash);
 }
 
 // ── Service accumulate phase (PC=5, JAM-pure commit) ──────────────────

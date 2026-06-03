@@ -45,6 +45,19 @@ curve25519-dalek = { version = "4.1", default-features = false, features = ["all
 cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["viewing-keys", "voucher", "helpers"] }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
 
+# Both examples demonstrate the prover end-to-end; mark them
+# prover-only so a verifier-only build (`--no-default-features`) skips
+# them instead of failing on the unresolved prover surface. (Examples
+# can't use a `#![cfg]` gate like the integration tests — a cfg'd-out
+# example has no `main`.)
+[[example]]
+name = "multi_segment"
+required-features = ["prover"]
+
+[[example]]
+name = "prove_and_verify"
+required-features = ["prover"]
+
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }
 # AIR fill code is byte-position-indexed throughout (val_b[0..8],

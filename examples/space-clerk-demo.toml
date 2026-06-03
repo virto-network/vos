@@ -1,0 +1,37 @@
+# Clerk demo manifest — clerk-ledger + clerk-bridge behind the
+# http-gateway, single node, Local consistency. Paths are relative to
+# this manifest's directory (examples/), matching space-gateway.toml.
+#
+#   cargo build -p http-gateway -p vosx          # gateway is DEBUG only — release LTO hangs
+#   just build-clerk-ledger && just build-clerk-bridge
+#   ./target/debug/vosx space new --name clerk-demo      # bundles the registry
+#   RUST_LOG=warn ./target/debug/vosx space up clerk-demo \
+#       --manifest examples/space-clerk-demo.toml &       # SIGTERM to stop
+#
+#   curl -s http://127.0.0.1:18090/__schema                 # ["clerk-bridge","clerk-ledger"]
+#   curl -s -X POST http://127.0.0.1:18090/clerk-ledger/ping
+#   curl -s -X POST http://127.0.0.1:18090/clerk-ledger/bootstrap \
+#     -d '{"journal_id":"00112233445566778899aabbccddeeff",
+#          "registrar_pubkey":"1111111111111111111111111111111111111111111111111111111111111111",
+#          "code":0}'                                       # "00" = Status::Ok
+#   curl -s http://127.0.0.1:18090/clerk-ledger/journal_id   # round-trips the hex
+#
+# Vec<u8> handler args are hex strings (bootstrap wants a 16-byte
+# journal_id + 32-byte registrar_pubkey); byte replies render as hex too.
+space = "clerk-demo"
+version = "0.1.0"
+
+[[agent]]
+name = "clerk-ledger"
+path = "../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf"
+consistency = "local"
+
+[[agent]]
+name = "clerk-bridge"
+path = "../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf"
+consistency = "local"
+
+[[extension]]
+name = "gateway"
+path = "../target/debug/libhttp_gateway.so"
+init = { bind_addr = "127.0.0.1", port = 18090 }

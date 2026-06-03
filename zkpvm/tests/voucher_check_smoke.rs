@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Mode::External voucher-proof pipeline smoke test.
 //!
 //! Loads `examples/actors/voucher-check`'s PVM ELF (which runs
@@ -210,7 +212,7 @@ fn voucher_check_program_commitment_is_deterministic() {
     );
 }
 
-/// Dynamic-witness round-trip: patch WITNESS_BUFFER with two distinct
+/// Dynamic-witness round-trip: patch __VOS_WITNESS with two distinct
 /// (Public, Secret) tuples and assert the resulting traces differ.
 /// Pins that the voucher-check actor reads the witness from BSS and
 /// that the witness actually flows through `check`, so per-voucher
@@ -226,7 +228,7 @@ fn dynamic_witness_changes_trace() {
     ))
     .expect("read voucher-check ELF for symbol lookup");
     let witness_addr =
-        find_witness_buffer_addr(&elf).expect("WITNESS_BUFFER symbol in voucher-check ELF");
+        find_witness_buffer_addr(&elf).expect("__VOS_WITNESS symbol in voucher-check ELF");
 
     let trace_with = |amount: u64, blinding_byte: u8| -> (usize, [u8; 32]) {
         let amount_blinding =
@@ -258,7 +260,7 @@ fn dynamic_witness_changes_trace() {
             .expect("witness fits in usize");
         assert!(
             end <= flat_mem.len(),
-            "WITNESS_BUFFER {witness_addr:#x} + {} > flat_mem {}",
+            "__VOS_WITNESS {witness_addr:#x} + {} > flat_mem {}",
             witness.len(),
             flat_mem.len()
         );
@@ -324,15 +326,101 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// ZK actor-IO ABI input-sensitivity: the io-hash bound into φ[9..12]
+/// must actually depend on the `Public` the actor ran on — i.e. the
+/// `vos::zk::bind_io(&public, &1u8)` call in `start` binds the real
+/// witness, not a constant.
+///
+/// Cheap trace-level check (no prove): after `run_with_vos_stubs`, the
+/// guest's halt sequence has placed the io-hash in φ[9..12], so the
+/// final `tracing.pvm.registers[9..13]` reconstruct `public_io_hash`
+/// (same LE decode).  Two distinct witnesses must bind two distinct
+/// hashes; the same witness must rebind identically.  C3's
+/// `actor_io_hash_is_bound_and_nonzero` separately proves this same
+/// window is STARK-bound, so input-dependence here means the *proof*'s
+/// public output is tied to the public input.
+#[test]
+fn actor_io_hash_reflects_public_input() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    let elf = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
+    ))
+    .expect("read voucher-check ELF for symbol lookup");
+    let witness_addr =
+        find_witness_buffer_addr(&elf).expect("__VOS_WITNESS symbol in voucher-check ELF");
+
+    let io_hash_for = |amount: u64, blinding_byte: u8| -> [u8; 32] {
+        let amount_blinding =
+            Blinding::from_bytes([blinding_byte; 32]).expect("canonical Ristretto scalar");
+        let amount_commit = Amount::commit(amount, &amount_blinding);
+        let public = Public {
+            issuer: AuthKey([0x11u8; 32]),
+            amount_commit,
+            state_root_before: [0xAAu8; 32],
+            state_root_after: [0xBBu8; 32],
+        };
+        let secret = Secret {
+            amount,
+            amount_blinding,
+            sender_balance_before: amount + 1,
+        };
+        let public_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&public)
+            .expect("rkyv encode Public")
+            .to_vec();
+        let secret_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&secret)
+            .expect("rkyv encode Secret")
+            .to_vec();
+        let witness = encode_witness(&public_bytes, &secret_bytes);
+
+        let (interp, mut flat_mem) =
+            zkpvm::actor::interpreter_from_blob(&blob, 100_000_000).expect("interpreter from blob");
+        let end = (witness_addr as usize) + witness.len();
+        flat_mem[witness_addr as usize..end].copy_from_slice(&witness);
+        let mut interp = interp;
+        interp.flat_mem = flat_mem;
+        let mut tracing = TracingPvm::new(interp);
+        let _ = tracing.run_with_vos_stubs();
+
+        // Reconstruct the io-hash from final φ[9..12] — the same LE
+        // decode `Proof::public_io_hash` performs on final_state.registers.
+        let mut h = [0u8; 32];
+        for (i, w) in tracing.pvm.registers[9..13].iter().enumerate() {
+            h[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        h
+    };
+
+    let hash_a = io_hash_for(100, 2);
+    let hash_b = io_hash_for(50, 5);
+    eprintln!("io-hash A={}, B={}", hex(&hash_a), hex(&hash_b));
+    assert_ne!(
+        hash_a, [0u8; 32],
+        "bind_io must place a non-zero io-hash in φ[9..12]"
+    );
+    assert_ne!(
+        hash_a, hash_b,
+        "different Public must bind a different io-hash — the binding is \
+         not actually a function of the public input"
+    );
+    assert_eq!(
+        hash_a,
+        io_hash_for(100, 2),
+        "identical Public must bind an identical io-hash (determinism)"
+    );
+}
+
 /// Phase Z0 load-bearing test: a proof's `final_state.registers` is
 /// genuinely STARK-bound (not just decorative metadata the prover
 /// fills in). Tampering with any byte of any register post-prove
 /// must make `verify_standalone` reject.
 ///
-/// Without this guarantee, the higher-level binding the
-/// clerk-prover-extension does (`blake2b(public_bytes)` written to
-/// designated registers, verifier checks the proof exposes the
-/// expected hash) is meaningless — a cheating prover could compute
+/// Without this guarantee, the higher-level io-binding the prover
+/// extension checks (`proof.public_io_hash() == compute_io_hash(
+/// public, return)`, read from the φ[9..12] registers) is
+/// meaningless — a cheating prover could compute
 /// the proof for any witness then write whatever hash they want
 /// into the metadata field.
 ///
@@ -382,6 +470,70 @@ fn final_state_registers_are_stark_bound() {
         "tamper of final_state.registers[{last_idx}] must also make verify reject — \
          got {result_late:?}"
     );
+}
+
+/// ZK actor-IO ABI (halt-asm binding): the framework's
+/// `halt_with_output_bound` places a 32-byte `vos::zk::compute_io_hash`
+/// value into the final-state register window φ[9..12] as part of the
+/// halting ecall (the four hash words ride in `a2..a5` as inline-asm
+/// `in` operands).  Phase Z0 already binds `final_state.registers`, so
+/// the hash is a tamper-evident public output read back by
+/// `Proof::public_io_hash` — no new ECALL, no prover changes.
+///
+/// This pins the mechanism end-to-end at the zkpvm level: the binding is
+/// non-zero (the actor really bound a hash), deterministic across
+/// proves, and STARK-bound on every word of the φ[9..12] window
+/// (tampering any of registers 9,10,11,12 makes verify reject).  The
+/// exact value-match against a host-recomputed `compute_io_hash` is
+/// exercised in the `prover` extension e2e: the binding is tagless, so
+/// the verifier just recomputes `compute_io_hash(public_bytes,
+/// return_bytes)` over the asserted I/O bytes — no shared actor/message
+/// type is needed (the program commitment carries program identity).
+#[test]
+fn actor_io_hash_is_bound_and_nonzero() {
+    let Some(blob) = load_voucher_check_blob() else {
+        return;
+    };
+    use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
+
+    let mut side_note = side_note_for_trace(&blob, 100_000_000);
+    let proof = prove_mobile(&mut side_note).expect("prove voucher-check");
+    let prog_hash = program_commitment_of_proof(&proof);
+
+    verify_standalone_with_pcs_policy(proof.clone(), prog_hash, &PcsPolicy::MOBILE)
+        .expect("pristine proof must verify");
+
+    // 1. The halt-binding actually populated the φ[9..12] window.
+    let io_hash = proof.public_io_hash();
+    assert_ne!(
+        io_hash, [0u8; 32],
+        "public_io_hash is the unbound [0u8;32] sentinel — the halt-asm \
+         binding in run_refine_service did not land in φ[9..12]"
+    );
+
+    // 2. Determinism: a second prove of the same blob binds the same hash.
+    let mut side_note2 = side_note_for_trace(&blob, 100_000_000);
+    let proof2 = prove_mobile(&mut side_note2).expect("re-prove voucher-check");
+    assert_eq!(
+        io_hash,
+        proof2.public_io_hash(),
+        "io-hash binding must be deterministic across proves"
+    );
+
+    // 3. STARK-binding across the whole φ[9..12] window: tampering any of
+    //    the four hash registers must make verify reject. (registers[12]
+    //    is also covered by final_state_registers_are_stark_bound's
+    //    last-index tamper; this pins all four uniformly as the io-hash.)
+    for idx in 9..13 {
+        let mut tampered = proof.clone();
+        tampered.final_state.registers[idx] ^= 1;
+        let result = verify_standalone_with_pcs_policy(tampered, prog_hash, &PcsPolicy::MOBILE);
+        assert!(
+            result.is_err(),
+            "tamper of io-hash register φ[{idx}] must make verify reject — \
+             got {result:?}; the binding is not actually STARK-bound"
+        );
+    }
 }
 
 /// Phase Z0-init load-bearing test: `proof.initial_state.registers`
@@ -527,9 +679,9 @@ fn boundary_non_register_fields_are_not_bound() {
     );
 }
 
-/// Cribbed from `examples/extensions/clerk-prover/src/lib.rs`'s
-/// witness encoding so the test exercises the same layout the
-/// prover will use.
+/// Mirrors the prover extension's `__VOS_WITNESS` encoding so the
+/// test exercises the same length-prefixed `[u32 len][public][u32
+/// len][secret]` layout the prover patches in.
 fn encode_witness(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + public_bytes.len() + 4 + secret_bytes.len());
     v.extend_from_slice(&(public_bytes.len() as u32).to_le_bytes());
@@ -539,7 +691,7 @@ fn encode_witness(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Minimal ELF symbol lookup — just enough to find WITNESS_BUFFER's
+/// Minimal ELF symbol lookup — just enough to find __VOS_WITNESS's
 /// virtual address. Manual parsing instead of pulling `object` here
 /// since the integration test already has plenty of deps.
 fn find_witness_buffer_addr(elf: &[u8]) -> Option<u64> {
@@ -598,7 +750,7 @@ fn find_witness_buffer_addr(elf: &[u8]) -> Option<u64> {
             .map(|n| name_start + n)
             .unwrap_or(name_start);
         let name = core::str::from_utf8(&elf[name_start..name_end]).ok()?;
-        if name == "WITNESS_BUFFER" {
+        if name == "__VOS_WITNESS" {
             let value = u64::from_le_bytes(elf[s + 8..s + 16].try_into().ok()?);
             if value != 0 {
                 return Some(value);

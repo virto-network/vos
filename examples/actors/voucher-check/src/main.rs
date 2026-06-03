@@ -7,14 +7,13 @@
 //! how (Public, Secret) reach the function.
 //!
 //! 1. **`start` (lifecycle on_start hook)** — reads (Public, Secret)
-//!    from a static BSS buffer `WITNESS_BUFFER`. The prover writes
-//!    the rkyv-archived bytes into the flat-mem region backing that
-//!    buffer before `TracingPvm::run` and the trace ingests them via
-//!    a normal `volatile_read`. Falls back to a hardcoded witness
-//!    when the buffer is empty (e.g. a regular `vosx run` invocation,
-//!    or a v0 smoke test). The buffer's address is exposed via the
-//!    public `voucher_check_witness_addr` extern fn so the prover can
-//!    find it without parsing the ELF symbol table.
+//!    from the standard ZK witness buffer `__VOS_WITNESS` (declared via
+//!    `vos::zk::witness_buffer!`). The host `prover` extension writes the
+//!    rkyv-archived bytes into the flat-mem region backing that buffer
+//!    before `TracingPvm::run` (locating it by ELF symbol name), and the
+//!    trace ingests them via a normal `volatile_read`. Falls back to a
+//!    hardcoded witness when the buffer is empty (e.g. a regular
+//!    `vosx run` invocation, or a v0 smoke test).
 //!
 //! 2. **`verify_check(public_bytes, secret_bytes)` (mailbox message)**
 //!    — production-shape path: take the witness as message args. Used
@@ -32,36 +31,13 @@ use cipher_clerk::crypto::{Amount, AuthKey, Blinding};
 use cipher_clerk::voucher::proof::{self, Public, Secret};
 use vos::prelude::*;
 
-/// Static witness buffer the prover patches before tracing.
-///
-/// Layout (little-endian):
-///   bytes  0..4    public_bytes length (`u32`, 0 = no witness)
-///   bytes  4..N    public_bytes (rkyv archive of `Public`)
-///   bytes  N..N+4  secret_bytes length (`u32`)
-///   bytes  N+4..M  secret_bytes (rkyv archive of `Secret`)
-///
-/// `1024` bytes is enough for the current (Public, Secret) — Public
-/// is ~128 B archived, Secret is ~64 B. Bumped via the `static`
-/// declaration if either type grows.
-///
-/// Lives in `.bss` (initial value all zeros). The prover finds its
-/// runtime address via the `voucher_check_witness_addr` ABI fn and
-/// overwrites the leading bytes in flat_mem before tracing.
-#[unsafe(no_mangle)]
-static mut WITNESS_BUFFER: [u8; 1024] = [0u8; 1024];
-
-/// ABI: returns the address of `WITNESS_BUFFER`. The prover calls
-/// this once via host-side ELF symbol resolution (or runs the
-/// actor briefly with `Opcode::Trap` patched in to read the value
-/// from the trace) to learn where to inject the witness.
-///
-/// `#[no_mangle]` + `extern "C"` so the symbol survives strip and
-/// has a stable name across rustc versions.
-#[unsafe(no_mangle)]
-pub extern "C" fn voucher_check_witness_addr() -> usize {
-    let r = &raw const WITNESS_BUFFER;
-    r as usize
-}
+// Standard ZK witness-injection buffer `__VOS_WITNESS` (1024 bytes: the
+// current rkyv (Public ~128 B, Secret ~64 B) fits comfortably). The host
+// `prover` extension patches opaque witness bytes here before tracing,
+// located by the `__VOS_WITNESS` ELF symbol; `__vos_read_witness()` reads
+// the conventional length-prefixed `(public, secret)` payload back. Bump
+// the size if the witness grows.
+vos::zk::witness_buffer!(1024);
 
 #[actor]
 struct VoucherCheck;
@@ -73,17 +49,26 @@ impl VoucherCheck {
     }
 
     /// Lifecycle `on_start` hook. Reads (Public, Secret) from
-    /// `WITNESS_BUFFER`; falls back to a hardcoded witness when the
+    /// `__VOS_WITNESS`; falls back to a hardcoded witness when the
     /// buffer's length prefix is zero. Calls
     /// `cipher_clerk::voucher::proof::check` — Trap on success,
     /// panic on rule violation.
     #[msg]
     async fn start(&self, _ctx: &mut Context<Self>) -> u8 {
-        let (public, secret) = match read_witness_buffer() {
+        let (public, secret) = match read_witness() {
             Some((p, s)) => (p, s),
             None => hardcoded_witness(),
         };
         proof::check(&public, &secret);
+        // ZK actor-IO ABI (tagless): bind this proof to the asserted
+        // `Public` input and the `1` success return.  The hash lands in
+        // the Phase-Z0-bound final-state registers φ[9..12] at halt; the
+        // host verifier (the `prover` extension's `verify`) recomputes
+        // `vos::zk::compute_io_hash(public_bytes, return_bytes)` and
+        // checks equality, composed with the STARK-validity check against
+        // voucher-check's program commitment.  No actor/message tag is
+        // bound — the commitment is the program identity.
+        vos::zk::bind_io(&public, &1u8);
         1
     }
 
@@ -110,46 +95,16 @@ impl VoucherCheck {
     }
 }
 
-/// Decode (Public, Secret) from the static buffer if the length
-/// prefixes are non-zero and the rkyv archives decode cleanly.
-/// Returns `None` if the buffer is empty or any decode fails — the
-/// caller falls back to the hardcoded witness.
-fn read_witness_buffer() -> Option<(Public, Secret)> {
-    let buf_ptr = &raw const WITNESS_BUFFER as *const u8;
-    let buf_len = (&raw const WITNESS_BUFFER as *const [u8; 1024]).cast::<u8>();
-    let _ = buf_len; // suppress unused warning on non-RV builds
-    // SAFETY: WITNESS_BUFFER is a 1024-byte static; pointer arithmetic
-    // up to 1024 bytes stays in-bounds. `read_volatile` so the read
-    // isn't elided when the buffer is initially all-zero.
-    let public_len = unsafe { core::ptr::read_volatile(buf_ptr as *const u32) } as usize;
-    if public_len == 0 || public_len + 4 + 4 > 1024 {
-        return None;
-    }
-    let public_bytes = unsafe {
-        let mut v = Vec::with_capacity(public_len);
-        for i in 0..public_len {
-            v.push(core::ptr::read_volatile(buf_ptr.add(4 + i)));
-        }
-        v
-    };
-    let secret_len_off = 4 + public_len;
-    let secret_len = unsafe {
-        core::ptr::read_volatile(buf_ptr.add(secret_len_off) as *const u32)
-    } as usize;
-    if secret_len == 0 || secret_len_off + 4 + secret_len > 1024 {
-        return None;
-    }
-    let secret_bytes = unsafe {
-        let mut v = Vec::with_capacity(secret_len);
-        for i in 0..secret_len {
-            v.push(core::ptr::read_volatile(buf_ptr.add(secret_len_off + 4 + i)));
-        }
-        v
-    };
-    let public =
-        vos::rkyv::from_bytes::<Public, vos::rkyv::rancor::Error>(&public_bytes).ok()?;
-    let secret =
-        vos::rkyv::from_bytes::<Secret, vos::rkyv::rancor::Error>(&secret_bytes).ok()?;
+/// Decode (Public, Secret) from the prover-patched `__VOS_WITNESS`
+/// buffer (via the `witness_buffer!`-emitted `__vos_read_witness`).
+/// Returns `None` if the buffer is unpatched or either rkyv archive
+/// fails to decode — the caller falls back to the hardcoded witness.
+/// The framework owns the volatile length-prefixed read; this actor
+/// only owns the decode of its own `(Public, Secret)` layout.
+fn read_witness() -> Option<(Public, Secret)> {
+    let (public_bytes, secret_bytes) = __vos_read_witness()?;
+    let public = vos::rkyv::from_bytes::<Public, vos::rkyv::rancor::Error>(&public_bytes).ok()?;
+    let secret = vos::rkyv::from_bytes::<Secret, vos::rkyv::rancor::Error>(&secret_bytes).ok()?;
     Some((public, secret))
 }
 

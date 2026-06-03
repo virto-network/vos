@@ -709,7 +709,11 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
     } else {
         None
     };
-    match ty {
+    // The schema renders field types pretty-printed with spaces
+    // (e.g. `Vec < u8 >`); strip whitespace so the arms below can use
+    // the canonical spelling.
+    let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    match ty.as_str() {
         "u8" => as_str
             .and_then(|s| s.parse::<u8>().ok())
             .map(Value::U8)
@@ -742,6 +746,27 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
             Value::Str(_) => Some(v),
             _ => None,
         },
+        // `Vec<u8>` handler args need `Value::Bytes`, which the JSON
+        // layer never produces directly. Accept either a hex string
+        // (symmetric with how `Bytes` replies render — copy a hex
+        // value out of a reply and pass it straight back) or a JSON
+        // array of byte-valued numbers; pass an existing `Bytes`
+        // through. Without this, every `Vec<u8>`-arg handler (clerk's
+        // bootstrap / create_account / apply_transfer / account(id) /
+        // …) silently fails the actor's `from_dynamic` and round-trips
+        // to a misleading "200 null".
+        "Vec<u8>" => {
+            if let Some(s) = as_str {
+                crate::json::hex_decode(s).map(Value::Bytes)
+            } else if let Value::ListU32(ref nums) = v {
+                nums.iter()
+                    .map(|&n| u8::try_from(n).ok())
+                    .collect::<Option<Vec<u8>>>()
+                    .map(Value::Bytes)
+            } else {
+                v.as_bytes().map(|b| Value::Bytes(b.to_vec()))
+            }
+        }
         // Complex types we don't coerce — pass the original
         // through unchanged so the actor's `from_msg` accessor
         // gets a chance to evaluate the shape. Returning

@@ -62,6 +62,7 @@ fn proof_blob_fan_out_fetches_from_peer() {
         local_prefix: prefix_a,
         listen: vec![listen.clone()],
         bootstrap: vec![],
+        auto_dial_mdns: true,
     });
     let a_listen = wait_for(
         || net_a.listen_addrs().into_iter().next(),
@@ -76,6 +77,7 @@ fn proof_blob_fan_out_fetches_from_peer() {
         local_prefix: prefix_b,
         listen: vec![listen],
         bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
     });
 
     // ── Nodes ───────────────────────────────────────────────────
@@ -133,9 +135,9 @@ fn proof_blob_fan_out_fetches_from_peer() {
     );
 
     // ── Effect-level: extension's blob_get fans out + caches ────
-    // Use clerk-prover-extension as the convenient probe — its
-    // `verify_voucher_proof` calls `ctx.blob_get(hash).await`
-    // before trying to decode. With our arbitrary `blob`, the
+    // Use the general prover-extension as the convenient probe — its
+    // `verify` handler calls `ctx.blob_get(hash, hint).await` before
+    // trying to decode/verify. With our arbitrary `blob`, the
     // bincode-decode fails and the handler returns 0, but the
     // blob_get call itself runs to completion. The observable
     // side effect we assert on is: node_b's local proof_blobs
@@ -148,14 +150,14 @@ fn proof_blob_fan_out_fetches_from_peer() {
             "release"
         };
         std::path::PathBuf::from(format!(
-            "{}/../target/{profile}/libclerk_prover_extension.so",
+            "{}/../target/{profile}/libprover_extension.so",
             env!("CARGO_MANIFEST_DIR"),
         ))
     };
     if !prover_so.exists() {
         eprintln!(
-            "SKIP: clerk-prover-extension not built. \
-             Run: cargo build -p clerk-prover-extension"
+            "SKIP: prover-extension not built. \
+             Run: cargo build -p prover-extension"
         );
         let _ = node_a.collect();
         let _ = node_b.collect();
@@ -170,13 +172,18 @@ fn proof_blob_fan_out_fetches_from_peer() {
 
     let prover_id = node_b.register_extension(ExtensionConfig::new(prover_so));
 
-    // Build the `verify_voucher_proof` message by hand so the
-    // test doesn't depend on the typed Ref crate.
+    // Build the general prover's `verify` message by hand so the
+    // test doesn't depend on the typed Ref crate. `verify` does
+    // `blob_get` BEFORE any decode/verify, so even with a 32-byte
+    // dummy commitment and garbage proof bytes the fetch runs to
+    // completion (then the handler returns 0).
     use vos::Encode;
     use vos::value::{Msg, TAG_DYNAMIC};
-    let msg = Msg::new("verify_voucher_proof")
-        .with("public_bytes", b"unused-by-v0-prover".to_vec())
+    let msg = Msg::new("verify")
+        .with("program_commitment", vec![0u8; 32])
         .with("proof_hash", hash2.to_vec())
+        .with("public_bytes", b"probe".to_vec())
+        .with("return_bytes", b"probe".to_vec())
         // peer_prefix=0 → no hint, exercises pure fan-out path.
         .with("peer_prefix", 0u64);
     let encoded = msg.encode();

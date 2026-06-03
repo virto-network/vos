@@ -1,3 +1,5 @@
+#![cfg(feature = "prover")]
+
 //! Negative-test corpus for CpuChip's control-flow constraints
 //! (Phase 15-prep).
 //!
