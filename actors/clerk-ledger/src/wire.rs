@@ -7,26 +7,16 @@
 //! fields or changing types breaks anything persisted or sent over
 //! the wire by an older build.
 
-use cipher_clerk::crypto::{Amount, Blinding};
-
 /// One commitment opening — what value + blinding produce a given
 /// `Amount`. The transfer handler decodes a `Vec<Opening>` from
-/// rkyv-archived bytes and feeds it to the kernel's `Oracle`.
+/// rkyv-archived bytes and feeds each to the kernel's `Oracle`.
 ///
-/// Uses cipher-clerk's typed `Amount` / `Blinding` rather than raw
-/// `[u8; 32]` byte fields — the unified rkyv 0.8 crate makes the
-/// types embed cleanly in the actor's rkyv archive (same property
-/// we use for `accounts: Vec<Account>`), so the wire format gains
-/// type safety at no cost.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct Opening {
-    pub amount: Amount,
-    pub value: u64,
-    pub blinding: Blinding,
-}
+/// D7: the library owns this wire type now
+/// ([`cipher_clerk::state::Opening`]) so consumers don't re-spell it.
+/// Re-export rather than redeclare — the rkyv layout is byte-identical
+/// (unified rkyv 0.8: `vos::rkyv` IS cipher-clerk's `rkyv`), so the
+/// on-wire format is unchanged.
+pub use cipher_clerk::state::Opening;
 
 /// rkyv-archivable rendering of `cipher_clerk::state::PendingStatus`.
 /// Two-phase lifecycle: a transfer with `PENDING` flag enters
