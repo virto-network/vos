@@ -57,7 +57,7 @@
 //!   clerk-ledger. A future slice will add cross-actor dispatch
 //!   so the bridge owns the full ingress flow.
 
-use cipher_clerk::crypto::{AuthKey, blake2b_256};
+use cipher_clerk::crypto::AuthKey;
 use cipher_clerk::types::Transfer as CcTransfer;
 use cipher_clerk::viewing_keys::IncomingViewingKey;
 use cipher_clerk::voucher::Voucher;
@@ -461,7 +461,11 @@ impl ClerkBridge {
             None => return reply(Status::VoucherInvalid),
         };
 
-        if voucher.verify_signature(&peer_clerk_pubkey).is_err() {
+        // E5: consumer-facing acceptance check. `None` anchor → exactly
+        // `verify_signature` (the bridge has no per-peer expected pre-state
+        // to pin), so the rejection still collapses to `VoucherInvalid`.
+        // External-proof dispatch + replay/dedup stay actor-side below.
+        if voucher.verify(&peer_clerk_pubkey, None).is_err() {
             return reply(Status::VoucherInvalid);
         }
 
@@ -488,14 +492,7 @@ impl ClerkBridge {
         // has already been credited by the operator on a prior
         // call; opening again would just leak ciphertext analysis
         // surface to anyone monitoring the bridge.
-        let dedup_key = blake2b_256(
-            b"clerk-bridge/voucher-redemption/v1",
-            &[
-                &voucher.amount_commit.0,
-                &voucher.state_root_before,
-                &voucher.state_root_after,
-            ],
-        );
+        let dedup_key = voucher.redemption_key();
         if self.received.binary_search(&dedup_key).is_ok() {
             return reply(Status::VoucherReplayed);
         }
@@ -584,7 +581,9 @@ impl ClerkBridge {
         let Some(voucher) = Voucher::from_bytes(&voucher_bytes) else {
             return early_redeem(Status::VoucherInvalid);
         };
-        if voucher.verify_signature(&peer_clerk_pubkey).is_err() {
+        // E5: same consumer-facing check as submit_voucher (signature-only;
+        // `None` anchor ⇒ rejection is `VoucherInvalid`).
+        if voucher.verify(&peer_clerk_pubkey, None).is_err() {
             return early_redeem(Status::VoucherInvalid);
         }
         if dispatch_external_proof(
@@ -600,14 +599,7 @@ impl ClerkBridge {
         {
             return early_redeem(Status::ProofInvalid);
         }
-        let dedup_key = blake2b_256(
-            b"clerk-bridge/voucher-redemption/v1",
-            &[
-                &voucher.amount_commit.0,
-                &voucher.state_root_before,
-                &voucher.state_root_after,
-            ],
-        );
+        let dedup_key = voucher.redemption_key();
         if self.received.binary_search(&dedup_key).is_ok() {
             return early_redeem(Status::VoucherReplayed);
         }
@@ -629,24 +621,10 @@ impl ClerkBridge {
             CcTransfer,
             early_redeem(Status::BadInput)
         );
-        let expected_eid = cipher_clerk::ids::ExternalId(dedup_key);
-        if inflow.external_id != Some(expected_eid) {
-            return early_redeem(Status::InflowInconsistent);
-        }
-        if inflow.entries.len() != 2 {
-            return early_redeem(Status::InflowInconsistent);
-        }
-        use cipher_clerk::types::Direction;
-        let (debits, credits): (Vec<_>, Vec<_>) = inflow
-            .entries
-            .iter()
-            .partition(|e| matches!(e.direction, Direction::Debit));
-        if debits.len() != 1 || credits.len() != 1 {
-            return early_redeem(Status::InflowInconsistent);
-        }
-        if debits[0].amount != voucher.amount_commit
-            || credits[0].amount != voucher.amount_commit
-        {
+        // The voucher owns the inflow-link policy (external_id ==
+        // redemption_key; exactly 1 debit + 1 credit; both amounts ==
+        // amount_commit). See `cipher_clerk::voucher::Voucher::validate_inflow`.
+        if voucher.validate_inflow(&inflow).is_err() {
             return early_redeem(Status::InflowInconsistent);
         }
 
@@ -760,16 +738,19 @@ async fn dispatch_external_proof(
     if voucher.proof.mode != cipher_clerk::proof::Mode::External {
         return Status::Ok;
     }
-    let public = cipher_clerk::voucher::proof::Public {
-        issuer: *peer_clerk_pubkey,
-        amount_commit: voucher.amount_commit,
-        state_root_before: voucher.state_root_before,
-        state_root_after: voucher.state_root_after,
-    };
+    // The voucher attests to a `proof::Public`; cipher-clerk owns which
+    // one (field set + order) — see `Voucher::proof_public`. `issuer` is
+    // the peer's clerk pubkey (the field the producer proved over and the
+    // signature covers), so the bridge no longer hand-mirrors the guest's
+    // binding layout.
+    let public = voucher.proof_public(peer_clerk_pubkey);
     // rkyv-encode the public + the `1u8` success return — exactly the
     // bytes voucher-check's `bind_io(&public, &1u8)` hashed into the
     // proof's STARK-bound io-hash. The prover recomputes
     // `compute_io_hash(public_bytes, return_bytes)` and checks equality.
+    // `public.encode()` (vos Encode) is byte-identical to
+    // `public.canonical_bytes()` (cipher-clerk rkyv) — pinned by the
+    // vos-side cross-crate test `tests/clerk_proof_public_pin.rs`.
     let public_bytes = public.encode();
     let return_bytes = 1u8.encode();
     let msg = vos::value::Msg::new("verify")
