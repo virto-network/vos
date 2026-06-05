@@ -1,9 +1,15 @@
 # Architecture
 
-Kunekt is a layered protocol. Each layer has a clear responsibility
-and a clear integration point with existing technology. Upper layers
-don't know or care how lower layers work — only that they fulfill
-their contract.
+VOS is a layered system, and the applications on it (starting with
+[Messaging](messaging.md)) are layered protocols in turn. Each layer has a
+clear responsibility and a clear integration point with existing
+technology. Upper layers don't know or care how lower layers work — only
+that they fulfill their contract.
+
+> The diagram below is written from the perspective of a full private
+> application (messaging being the worked example). Read it as "what an app
+> stacks on the platform," not as the platform's own internals — those are
+> the rest of Part I.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

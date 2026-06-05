@@ -1,54 +1,39 @@
-# Kunekt — Private-by-Default Collaboration
+# Kunekt — Real-Time Collaboration (reserved)
 
-Kunekt is the headline application that the design of VOS was originally
-shaped around. It is a protocol — and a set of built-in actors and
-services — for private, decentralized real-time collaboration.
+> **Status: reserved / planned.** Kunekt is not a separate platform and no
+> longer names the whole project. It is reserved for a future, specialized
+> set of actors for **real-time collaborative applications** — shared rich-
+> text and structured documents, live cursors and presence, fine-grained
+> co-editing — built on the same substrate as [Messaging](messaging.md).
 
-If you are looking for the substrate that runs Kunekt, see
-[Part I — Platform](architecture.md). This chapter and the ones below
-it are the protocol-level treatment.
+## Where it came from
 
-## In one paragraph
+The VOS design was originally shaped around "Kunekt," a private-by-default
+collaboration protocol. As the work progressed, that single application
+split into two things:
 
-A **space** is a private collaboration group. Inside a space, all shared
-content is represented as **documents** (CRDTs that merge concurrent
-edits without conflicts). Document changes propagate via Merkle-CRDTs
-(no leader, no consensus on the user's path), are encrypted with a
-group ratchet (only members can decrypt — peers and storage backends
-see only opaque blobs), and persisted on any available untrusted
-backend (relay, DHT, DA layer).
+- **The platform** — the deterministic actor runtime, replication,
+  identity, encryption, and proofs — which became **VOS**
+  ([Part I](architecture.md)).
+- **The applications** — the actors you install into a space — of which
+  the general one is now [Messaging](messaging.md).
 
-## How it maps onto VOS
+Kunekt is what remains once you subtract those: the *specialized* real-time
+collaboration layer that goes beyond messaging.
 
-| Kunekt concept | VOS mechanism |
-|---|---|
-| Space | A VOS space (`space_id`, registry, daemon) |
-| Document | A `crdt`-mode agent backed by `merkle-crdt` |
-| Sync | The standard `crdt` consistency mode in VOS |
-| Group encryption | A built-in actor / service group inside the space |
-| Persistence backend | Any storage adapter the daemon's persistence layer can target |
-| Anonymous credentials | zkPVM-backed proofs (see [zkPVM](zkpvm.md)) |
+## How it will relate to Messaging
 
-In short: **Kunekt is a group of actors and services that runs on the
-plain VOS runtime.** It does not require a fork or a special build —
-it is what you get when you stack the right encryption / authorization
-/ persistence policy on top of `crdt`-mode agents.
+Messaging and Kunekt share almost everything below the application logic —
+the [Merkle-CRDT sync](sync.md) layer, [group encryption](encryption.md),
+and [anonymous moderation](zk-promises.md). Kunekt adds what real-time
+co-editing specifically needs:
 
-## Chapters
+- richer document CRDTs (e.g. Automerge for collaborative text/JSON) rather
+  than an append-only message log;
+- low-latency presence and awareness (cursors, selections);
+- per-keystroke batching tuned for live editing.
 
-The remaining chapters are the original Kunekt protocol design. They
-predate the VOS-first reframing and still talk in their own vocabulary
-in places — that's OK as scaffolding; they will be rewritten to lean
-on VOS primitives where they overlap.
-
-- [Vision: The Privacy Gap](privacy-gap.md)
-- [Threat Model & Design Principles](threat-model.md)
-- [User Journey](user-journey.md)
-- [Sync Layer: Merkle-CRDTs](sync.md)
-- [Encryption Layer: Group Key Management](encryption.md)
-- [Building Blocks](building-blocks.md)
-- [Nostr Integration](nostr.md)
-- [Privacy Analysis by Layer](privacy-layers.md)
-- [Private Economy: Payments, Voting, Governance](private-economy.md)
-- [zk-Promises for Anonymous Moderation](zk-promises.md)
-- [Security Analysis & Open Questions](security-analysis.md)
+Until Kunekt is built, treat [Messaging](messaging.md) as the canonical
+example of how applications sit on VOS. The deeper protocol chapters
+(sync, encryption, threat model, privacy analysis) live under Messaging and
+apply equally to a future Kunekt.

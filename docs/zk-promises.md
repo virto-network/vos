@@ -42,7 +42,7 @@ decentralized Merkle tree on-chain.
 user they're penalizing. They just issue a callback against a ticket.
 The user processes it privately.
 
-## How it fits into Kunekt
+## How it fits into the messaging protocol
 
 zk-promises sits at the **authorization layer**, below the CRDT sync
 but above the transport:

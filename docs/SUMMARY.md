@@ -20,18 +20,16 @@
 ## Part II — Applications
 
 - [Overview](applications.md)
-- [Kunekt — Private-by-Default Collaboration](kunekt.md)
-    - [Vision: The Privacy Gap](privacy-gap.md)
-    - [Threat Model & Design Principles](threat-model.md)
-    - [User Journey](user-journey.md)
+- [Messaging — Private Group Messaging](messaging.md)
     - [Sync Layer: Merkle-CRDTs](sync.md)
     - [Encryption Layer: Group Key Management](encryption.md)
-    - [Building Blocks](building-blocks.md)
-    - [Nostr Integration](nostr.md)
+    - [Anonymous Moderation: zk-promises](zk-promises.md)
     - [Privacy Analysis by Layer](privacy-layers.md)
-    - [Private Economy: Payments, Voting, Governance](private-economy.md)
-    - [zk-Promises for Anonymous Moderation](zk-promises.md)
+    - [Threat Model & Design Principles](threat-model.md)
+    - [Nostr Integration](nostr.md)
     - [Security Analysis & Open Questions](security-analysis.md)
+- [Private Economy: Payments, Voting, Governance](private-economy.md)
+- [Kunekt — Real-Time Collaboration (reserved)](kunekt.md)
 
 ## Part III — Implementation
 
@@ -40,5 +38,8 @@
 
 ## Appendices
 
+- [The Privacy Gap](privacy-gap.md)
+- [User Journey](user-journey.md)
+- [Building Blocks](building-blocks.md)
 - [Original Kunekt Introduction](introduction.md)
 - [Glossary](glossary.md)

@@ -1,5 +1,26 @@
 # Introduction
 
+## A new kind of internet, made of secret spaces
+
+The internet was built without privacy. Even when content is encrypted,
+*everything around it* leaks — who you talk to, when, how often, what
+groups you belong to — because the servers that route and store your data
+have to see it to do their job.
+
+VOS is a bet on a different shape: an internet made of **spaces** —
+private, sovereign groups that live on their members' own devices. Inside a
+space, people message, collaborate, store data, transact, and govern, and
+the infrastructure carrying the bytes is treated as an untrusted relay that
+learns as little as cryptography allows. No space depends on a server
+somebody owns.
+
+This book has two depths. If you want the **vision and the applications**
+— private messaging and beyond — start with [Applications](applications.md).
+If you want **how it's built**, read on: the rest of this introduction and
+[Part I](architecture.md) are the platform.
+
+## VOS, the platform
+
 VOS is a peer-to-peer operating system for collaborative, replicated
 applications.
 
@@ -61,5 +82,6 @@ per piece of state.
 - **[PVM Runtime](runtime.md)** — what runs your code.
 - **[Replication: CRDT vs Raft](replication.md)** — picking the right
   consistency mode per agent.
-- **Applications → [Kunekt](kunekt.md)** — the headline application VOS
-  was originally shaped around: private-by-default real-time collaboration.
+- **[Applications](applications.md)** — what you install into a space.
+  Start with **[Messaging](messaging.md)**, the flagship private-by-default
+  application built on the VOS primitives.
