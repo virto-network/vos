@@ -5,7 +5,7 @@ Encrypting content is not enough. If an adversary can see *who* talks to
 patterns even without reading a single message. The transport layer exists
 to hide these metadata signals.
 
-Kunekt is transport-agnostic. The protocol only needs to move encrypted
+VOS is transport-agnostic. The protocol only needs to move encrypted
 DAG nodes between peers and storage backends. Any channel that can carry
 bytes works. The interesting question is not *how* to deliver bytes, but
 how to do it without leaking who is delivering them.
@@ -83,10 +83,10 @@ most workflows.
 **Hidden services.** When both peers run Tor hidden services (`.onion`
 addresses), traffic never leaves the Tor network. There is no exit node,
 which removes the exit-node attack surface entirely. Peer-to-peer sync
-over hidden services is the recommended default for Kunekt.
+over hidden services is the recommended default for VOS.
 
 **Rust integration.** The [arti](https://gitlab.torproject.org/tpo/core/arti)
-crate provides a pure-Rust, embeddable Tor implementation. Kunekt peers
+crate provides a pure-Rust, embeddable Tor implementation. VOS peers
 can run an arti client in-process rather than depending on a system Tor
 daemon.
 
@@ -145,7 +145,7 @@ Not every operation needs the same level of anonymity. A real-time CRDT
 keystroke does not warrant 3 seconds of mix-network delay, but a
 credential proof that reveals group membership absolutely does.
 
-Kunekt uses a tiered strategy — different operation types route through
+VOS uses a tiered strategy — different operation types route through
 different transports:
 
 ```
@@ -186,7 +186,7 @@ regardless of actual activity.
 sends a configurable stream of loop messages that are cryptographically
 indistinguishable from real traffic. No application-level work needed.
 
-**Over Tor.** Tor does not provide cover traffic, so Kunekt generates it
+**Over Tor.** Tor does not provide cover traffic, so VOS generates it
 at the application level. The peer sends encrypted no-op DAG nodes (nodes
 with an empty payload and no causal dependencies) at fixed intervals.
 These no-ops are valid DAG nodes that relays store and other peers
@@ -207,7 +207,7 @@ complete view of a peer's access patterns — which CIDs are fetched,
 when, and how often. Even though the relay cannot decrypt the content,
 the access pattern itself is metadata.
 
-Kunekt mitigates this with relay diversity:
+VOS mitigates this with relay diversity:
 
 - **Rotate relay connections.** Don't maintain a persistent connection to
   a single relay. Periodically disconnect and reconnect to a different
@@ -227,7 +227,7 @@ link requests to the same peer.
 ## NAT traversal and connectivity
 
 Most peers are behind NATs and cannot accept incoming connections
-directly. Kunekt handles this at multiple levels:
+directly. VOS handles this at multiple levels:
 
 - **Relay-mediated.** The default path. Peers connect outward to Nostr
   relays and exchange messages through them. Since relays are public

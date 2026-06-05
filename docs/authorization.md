@@ -16,7 +16,7 @@ anonymous membership proofs, and moderator roles.
 
 ## The Authorization Gate
 
-Every operation in a Kunekt space passes through an authorization
+Every operation in a VOS space passes through an authorization
 check before it is accepted by peers:
 
 ```
@@ -161,7 +161,7 @@ the next action.
 ### Bulletin Board
 
 The bulletin board is an append-only log that serves as the shared
-state for the zk-promises protocol. In Kunekt, it is implemented as
+state for the zk-promises protocol. In VOS, it is implemented as
 a **moderation log document** — a CRDT within the space, synced via
 Merkle-CRDT like any other document.
 

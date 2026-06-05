@@ -1,6 +1,6 @@
 # Identity: Multi-Device, Recovery & Cross-Space
 
-Kunekt has no accounts, no usernames, no registration authority. A
+VOS has no accounts, no usernames, no registration authority. A
 user's identity is a root secret key generated on their device. Every
 other credential, membership, and capability derives from it. This
 design eliminates central points of trust but raises hard questions:
@@ -36,7 +36,7 @@ root_secret
 ```
 
 Derivation uses a KDF (e.g. HKDF-SHA256) with domain separation:
-`space_secret = HKDF(root_secret, "kunekt/space/" || space_id)`. The
+`space_secret = HKDF(root_secret, "vos/space/" || space_id)`. The
 root secret is never used directly for any protocol operation — it
 exists only to derive children.
 
@@ -81,7 +81,7 @@ committed under a known group element.
 
 The root secret lives on one device. Users have phones, laptops,
 tablets, and expect all of them to participate in the same spaces with
-the same identity. Kunekt has no server to mediate this. The protocol
+the same identity. VOS has no server to mediate this. The protocol
 must support multi-device use without introducing a central
 coordinator or breaking the per-space unlinkability guarantees.
 
@@ -202,8 +202,8 @@ linked by cross-signing each other's credentials.
 
 **Option A for the initial implementation.** It is the simplest to
 build, the easiest for users to understand ("scan this QR to link your
-phone"), and fits naturally into Kunekt's existing architecture — the
-device sync space is just another Kunekt space.
+phone"), and fits naturally into VOS's existing architecture — the
+device sync space is just another VOS space.
 
 The device sync space serves as a private coordination channel:
 
@@ -216,7 +216,7 @@ The device sync space serves as a private coordination channel:
   to that space.
 
 Option C should be revisited when the ZK infrastructure matures
-(Phase 3+), as it offers better security isolation between devices. A
+(later), as it offers better security isolation between devices. A
 hybrid approach is also possible: use Option A for the root secret but
 give each device its own MLS signing key (derived from the shared root
 with a device-specific path), so that MLS can distinguish devices for
@@ -260,7 +260,7 @@ and collects their shares.
    keypair.
 2. The user contacts `k` recovery contacts through an out-of-band
    channel (phone call, in-person meeting, another messaging app).
-3. Each contact's Kunekt app retrieves the stored share and sends it
+3. Each contact's VOS app retrieves the stored share and sends it
    to the new device (encrypted under the temporary public key).
 4. The new device reconstructs the root secret and resumes normal
    operation.
@@ -302,7 +302,7 @@ needs only the passphrase to recover on a new device.
   attacker who obtains the backup blob can brute-force it. Use a
   memory-hard KDF (Argon2id) with aggressive parameters.
 - The storage backend sees an opaque blob. It cannot determine whether
-  it is a Kunekt backup or random data (assuming uniform-size blobs).
+  it is a VOS backup or random data (assuming uniform-size blobs).
 
 **Risk:** Passphrase reuse, weak passphrases, phishing. This method
 shifts trust from the protocol to the user's passphrase discipline. It
@@ -381,7 +381,7 @@ credential holder to later prove possession of the signature while
 revealing only a chosen subset of attributes. The verifier learns
 nothing about the hidden attributes.
 
-**Application to Kunekt:**
+**Application to VOS:**
 
 A space can issue BBS+ credentials to its members attesting to their
 properties: membership duration, reputation score, roles held, actions
@@ -455,7 +455,7 @@ an aggregate proof claiming broad trust.
 This is the fundamental Sybil problem, and there is no purely
 cryptographic solution without some form of identity binding.
 
-**Approaches within Kunekt's design:**
+**Approaches within VOS's design:**
 
 - **Proof of personhood.** Require a proof-of-personhood credential
   (e.g. from a ceremony like Worldcoin's Orb or Idena's FLIP test)
@@ -494,12 +494,12 @@ proof-of-personhood for spaces that require stronger guarantees.
 
 ## 5. Identity Lifecycle
 
-An identity in Kunekt is not a static key — it is a living entity that
+An identity in VOS is not a static key — it is a living entity that
 evolves as devices are added, lost, and replaced. Understanding the
 full lifecycle is essential for building correct recovery and migration
 flows.
 
-### Phase 1: Creation
+### Creation
 
 ```
 Install app
@@ -514,7 +514,7 @@ At this point the user exists but has joined no spaces. The device
 sync space is the user's first and most private space — it will
 never have external members.
 
-### Phase 2: Active use
+### Active use
 
 ```
 Create or join spaces
@@ -527,7 +527,7 @@ Create or join spaces
 Each space is independent. The user's activity in one space is
 invisible to other spaces.
 
-### Phase 3: Device addition
+### Device addition
 
 ```
 New device scans QR / enters pairing code
@@ -545,7 +545,7 @@ The new device catches up to current state but cannot decrypt
 pre-join history (MLS forward secrecy). This is acceptable — the
 current CRDT state reflects the result of all past operations.
 
-### Phase 4: Device loss
+### Device loss
 
 ```
 Device is lost / stolen / destroyed
@@ -566,7 +566,7 @@ proposals as soon as loss is detected. In the worst case (single
 device, total loss), recovery must happen before the user can rejoin
 any space.
 
-### Phase 5: Recovery
+### Recovery
 
 ```
 New device installed
@@ -589,7 +589,7 @@ themselves to each space. This requires remembering (or having stored
 externally) which spaces they belonged to. The recovery setup flow
 should include backing up the space list alongside the root secret.
 
-### Phase 6: Credential migration
+### Credential migration
 
 When a device is replaced (loss + recovery, or voluntary upgrade):
 
@@ -628,7 +628,7 @@ further research or implementation experience:
 
 - **Concurrent device operations.** If two devices simultaneously
   issue MLS proposals in the same space (e.g., both try to add a
-  third device), the MLS protocol requires ordering. Since Kunekt
+  third device), the MLS protocol requires ordering. Since VOS
   uses CRDTs for the delivery service, the ordering semantics of
   concurrent MLS Commits need careful handling.
 

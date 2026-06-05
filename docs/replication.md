@@ -26,7 +26,7 @@ rather than merged.
 - The Merkle-CRDT layer: DAG nodes, anti-entropy, the `merkle-crdt` crate
 - Raft cluster setup, membership, and leader-only reads (today)
 - How the registry threads consistency-mode metadata into the runtime
-- The `crdt` consistency mode also underpins Kunekt's sync layer — see
+- The `crdt` consistency mode also underpins VOS's sync layer — see
   [Sync Layer: Merkle-CRDTs](sync.md) for the protocol-level treatment
 
 ## Source map

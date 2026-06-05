@@ -7,7 +7,7 @@ The `zkpvm/` crate produces succinct proofs of PVM execution using
 that a PVM program ran correctly without re-executing it — useful for
 trust-minimized off-critical-path computation, light-client
 verification of actor state transitions, and anonymous credentials in
-Kunekt-style applications.
+private collaborative applications.
 
 ## What this chapter will cover
 

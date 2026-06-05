@@ -1,6 +1,6 @@
 # Persistence
 
-Kunekt peers need a way to persist encrypted DAG nodes so that data
+VOS peers need a way to persist encrypted DAG nodes so that data
 survives restarts, device loss, and periods when all peers are offline.
 Because every piece of stored data is encrypted and content-addressed,
 the storage layer can be remarkably simple: backends are untrusted
@@ -32,7 +32,7 @@ This gives us three properties that the entire storage layer depends on:
 
 ### Hash function commitment
 
-Kunekt's CID scheme commits to a specific hash function (encoded in
+VOS's CID scheme commits to a specific hash function (encoded in
 the CID's multicodec prefix, following the CID specification). Changing
 the hash function — for instance moving from BLAKE3 to a
 post-quantum hash — constitutes a migration. All existing CIDs become
@@ -75,7 +75,7 @@ of the CID computation — they are local bookkeeping.
 
 ### Relay storage
 
-Nostr relays serve as dumb blob stores. Kunekt pushes encrypted DAG
+Nostr relays serve as dumb blob stores. VOS pushes encrypted DAG
 nodes as Nostr events, tagged with their CID. Peers pull nodes by
 querying for events matching a CID tag. See nostr for
 the event format and relay interaction protocol.
@@ -238,7 +238,7 @@ traffic.
 
 ### Remote garbage collection
 
-Kunekt cannot force remote backends to delete data. A Nostr relay
+VOS cannot force remote backends to delete data. A Nostr relay
 may keep events indefinitely; a DA layer certainly will. But this
 is acceptable because **all remote data is encrypted**. Without the
 decryption keys, stored blobs are indistinguishable from random bytes.
@@ -255,7 +255,7 @@ old data cannot be read.
 
 ### TTL-based expiry
 
-Some Nostr relays enforce a TTL (time-to-live) on events. If Kunekt
+Some Nostr relays enforce a TTL (time-to-live) on events. If VOS
 relies on such a relay, it must periodically re-publish important
 data — snapshots, recent DAG nodes, pending sync heads — before the
 TTL expires. The `MultiStore` adapter can handle this automatically
@@ -286,7 +286,7 @@ space's edit rate is simply too high for the configured storage.
 ### Erasure coding
 
 For spaces that require strong durability without fully trusting any
-single backend, Kunekt can split encrypted blobs into fragments using
+single backend, VOS can split encrypted blobs into fragments using
 Reed-Solomon erasure coding. A blob is encoded into *n* fragments
 such that any *k* of them are sufficient to reconstruct the original
 (where *k < n*). The fragments are distributed across different
@@ -315,10 +315,10 @@ on a random sample of CIDs. If a backend consistently fails probes,
 the peer marks it as degraded and increases replication to the
 remaining backends.
 
-In later phases (see roadmap), Kunekt may support
+Later, VOS may support
 cryptographic proof-of-storage via zero-knowledge challenges: a peer
 challenges a backend to prove it holds a specific blob without
-transferring the entire blob. This is a Phase 4 feature — the
+transferring the entire blob. This is a future feature — the
 protocol design is not yet finalized.
 
 ### Repair
@@ -433,7 +433,7 @@ the decryption key) and is not enabled by default.
 Storage costs real resources — disk space, bandwidth, electricity —
 and someone has to pay for them. This is one of the biggest open
 questions for real-world deployment of any decentralized storage
-system, and Kunekt is no exception.
+system, and VOS is no exception.
 
 ### Who pays?
 
@@ -457,7 +457,7 @@ Each storage tier has different cost bearers:
 
 ### Incentive models
 
-Kunekt aims to be **incentive-model agnostic**. The protocol does not
+VOS aims to be **incentive-model agnostic**. The protocol does not
 mandate a specific payment mechanism but provides hooks for different
 models:
 
@@ -477,7 +477,7 @@ models:
   trusted groups but requires that some members are online at any
   given time.
 - **DA layer fees**: determined by the blockchain's fee market. No
-  Kunekt-specific design needed — the peer simply pays the gas cost
+  VOS-specific design needed — the peer simply pays the gas cost
   for blob submission.
 
 ### Cost estimation
@@ -502,11 +502,10 @@ justifies the cost.
 
 - **How does a relay prove it is actually storing data?** Without
   proof-of-storage, a paid relay could accept payment and silently
-  discard blobs. ZK proof-of-storage (Phase 4 on the
-  roadmap) addresses this, but the mechanism is not
+  discard blobs. A future ZK proof-of-storage scheme would address this, but the mechanism is not
   yet designed.
 - **How are relay payments coordinated among space members?** Does one
-  member pay, or is the cost split? Kunekt's group key management
+  member pay, or is the cost split? VOS's group key management
   (MLS) could potentially be extended to coordinate payment splits,
   but this is unexplored.
 - **What happens when a free relay disappears?** The redundancy
@@ -515,12 +514,12 @@ justifies the cost.
 - **Can storage incentives be built into the protocol itself?** A
   token-based incentive layer is a common answer in the decentralized
   storage space (Filecoin, Arweave), but adding a token introduces
-  regulatory complexity and misaligned incentives. Kunekt's current
+  regulatory complexity and misaligned incentives. VOS's current
   position is to avoid a protocol-native token and instead support
   pluggable payment mechanisms.
 
 The honest answer is that sustainable decentralized storage economics
-are an unsolved problem industry-wide. Kunekt's design minimizes the
+are an unsolved problem industry-wide. VOS's design minimizes the
 surface area of this problem — encrypted, content-addressed blobs are
 the simplest possible unit of storage, compatible with any backend
 and any payment model — but it does not solve the economic question

@@ -3,7 +3,7 @@
 Encryption is necessary but not sufficient. Every existing system that
 claims to protect privacy solves part of the problem and leaves the
 rest exposed. This chapter examines what falls through the cracks —
-and why Kunekt exists to close them.
+and why VOS exists to close them.
 
 ---
 
@@ -267,7 +267,7 @@ timing, and collaboration intensity — even though every payload is
 encrypted. The gap between the sync layer and the encryption layer
 is where the leak happens.
 
-This is Kunekt's thesis: **sync, encryption, anonymity, credentials,
+This is VOS's thesis: **sync, encryption, anonymity, credentials,
 and storage must be designed together as a single coherent stack.**
 Privacy is not a feature you add on top. It is an architectural
 property that either holds across all layers or fails.
@@ -276,7 +276,7 @@ property that either holds across all layers or fails.
 
 ## 4. Summary Table
 
-| | Signal | Matrix | Briar | Session | Nostr | IPFS/OrbitDB | Veilid | **Kunekt** |
+| | Signal | Matrix | Briar | Session | Nostr | IPFS/OrbitDB | Veilid | **VOS** |
 |---|---|---|---|---|---|---|---|---|
 | **E2E encryption** | Yes | Yes (Megolm) | Yes | Yes | Partial (NIP-44) | No | Yes | Yes (MLS) |
 | **Metadata protection** | Partial | No | Partial (Tor) | Partial | No | No | Partial | Yes |
@@ -290,9 +290,9 @@ property that either holds across all layers or fails.
 | **Forward secrecy** | Yes | Partial | Yes | Partial | No | No | TBD | Yes (MLS) |
 | **Post-compromise security** | Yes | Partial | Yes | No | No | No | TBD | Yes (MLS) |
 
-No row in this table is unique to Kunekt. Other systems achieve
-individual properties — often better than a first version of Kunekt
+No row in this table is unique to VOS. Other systems achieve
+individual properties — often better than a first version of VOS
 will. What no other system achieves is every row simultaneously,
 designed as an integrated whole.
 
-That is the gap Kunekt aims to fill.
+That is the gap VOS aims to fill.

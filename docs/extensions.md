@@ -195,7 +195,7 @@ Conventional tokens (loose, not enforced):
 - [`extensions/http-gateway/`](https://github.com/virto-network/vos/tree/master/extensions/http-gateway) —
   the canonical Service-mode extension
 - [`examples/extensions/heartbeat/`](https://github.com/virto-network/vos/tree/master/examples/extensions/heartbeat) —
-  minimal Service-mode extension validating the Phase 3 ABI
+  minimal Service-mode extension validating the Service-mode ABI
 - [`examples/extensions/{echo,fetcher,proxy}/`](https://github.com/virto-network/vos/tree/master/examples/extensions) —
   Actor-mode extension examples
 - [`docs/design/extensions.md`](https://github.com/virto-network/vos/tree/master/docs/design/extensions.md) —

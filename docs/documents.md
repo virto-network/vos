@@ -1,6 +1,6 @@
 # Document Layer: CRDTs & Spaces
 
-Every piece of shared content in Kunekt is a document. Every document is
+Every piece of shared content in VOS is a document. Every document is
 a CRDT backed by a Merkle-DAG. This chapter explains how spaces organize
 documents, what CRDT types are available, how documents sync
 independently, and how developers define new document types.
@@ -9,7 +9,7 @@ independently, and how developers define new document types.
 
 ## Spaces
 
-A space is the top-level unit of collaboration in Kunekt. It is the
+A space is the top-level unit of collaboration in VOS. It is the
 container that ties together encryption, membership, moderation, and
 content. A space owns:
 
@@ -212,7 +212,7 @@ subscribe to lightweight documents (chat, settings) and defer heavy
 documents (file attachments, full kanban boards) until on Wi-Fi.
 
 **Privacy benefit.** The set of documents a peer subscribes to is not
-broadcast. When using PIR for storage retrieval (Phase 4), the storage
+broadcast. When using PIR for storage retrieval, the storage
 backend does not learn which documents a peer is interested in. Without
 PIR, the relay can observe fetch patterns per document — this is a
 known metadata leak addressed in the
@@ -341,7 +341,7 @@ happen.
 
 ## Custom CRDT Trait
 
-Kunekt is not limited to built-in document types. Developers can define
+VOS is not limited to built-in document types. Developers can define
 custom CRDTs by implementing the `Payload` trait from the `merkle-crdt`
 crate:
 
@@ -369,7 +369,7 @@ valid CRDT that syncs correctly through the Merkle-CRDT layer.
 ### Example: a custom rating CRDT
 
 ```rust
-use kunekt::prelude::*;
+use vos::prelude::*;
 
 #[derive(Encode, Decode)]
 enum RatingOp {
@@ -418,7 +418,7 @@ let space = node.create_space(SpaceConfig {
 })?;
 ```
 
-In Phase 6, the `#[derive(Crdt)]` macro will automate most of this
+A planned `#[derive(Crdt)]` macro will automate most of this
 boilerplate for simple cases. See Development Roadmap.
 
 ---

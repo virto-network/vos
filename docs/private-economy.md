@@ -1,6 +1,6 @@
 # Private Economy: Payments, Voting, Governance
 
-Kunekt spaces are not limited to documents and chat. The same
+VOS spaces are not limited to documents and chat. The same
 infrastructure — encrypted CRDTs, anonymous credentials, ZK proofs —
 extends to economic activity: payments, voting, governance, and
 marketplace interactions. This chapter covers how these systems work,
@@ -15,7 +15,7 @@ User Journey.
 ## Private Payment Channels
 
 A private payment channel is a bilateral (or multilateral) ledger
-maintained as a CRDT within a Kunekt space. Transfers are CRDT
+maintained as a CRDT within a VOS space. Transfers are CRDT
 operations encrypted under MLS. Balances are hidden behind
 cryptographic commitments. Settlement happens on-chain via ZK proofs.
 
@@ -305,7 +305,7 @@ member. The delegatee votes on the delegator's behalf. Delegation is:
 
 ## Marketplace Primitives
 
-Kunekt spaces can function as anonymous marketplaces. The building
+VOS spaces can function as anonymous marketplaces. The building
 blocks — anonymous credentials, private payments, and governance —
 combine to support buying, selling, and dispute resolution.
 
@@ -388,7 +388,7 @@ not know who voted.
 
 ## Economic Sustainability
 
-Kunekt is a protocol, not a company. The infrastructure — relays,
+VOS is a protocol, not a company. The infrastructure — relays,
 storage backends, mix network nodes — must be sustained by someone.
 This is an open design question with no single settled answer. We
 present the options honestly.
@@ -436,7 +436,7 @@ requests ("I need 1GB for 1 year") and storage providers bid on them:
   storing data.
 - Payment is via payment channels settled on-chain.
 
-This is a potential Phase 6+ feature. The design is speculative and
+This is a potential future feature. The design is speculative and
 depends on the maturity of proof-of-storage systems and the
 existence of a suitable settlement chain.
 

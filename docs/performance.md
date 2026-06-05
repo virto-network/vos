@@ -1,6 +1,6 @@
 # Performance & Scalability
 
-This chapter provides concrete performance analysis for Kunekt's
+This chapter provides concrete performance analysis for VOS's
 protocol stack. Every number is either measured, estimated from known
 properties of the underlying primitives, or clearly marked as
 uncertain. The goal is to give implementers a realistic understanding
@@ -58,7 +58,7 @@ Total end-to-end (Nym)                  ~1.1–5.1 s
 
 ### Anonymous mode overhead
 
-When Phase 3 anonymous mode is active, proof generation adds to the
+When anonymous mode (zk-promises) is active, proof generation adds to the
 latency — but only at session start, not per operation:
 
 ```
@@ -108,7 +108,7 @@ Commits causing epoch conflicts that require resolution.
 
 Automerge handles documents up to approximately 100MB in practice.
 Beyond that, memory consumption during merge operations becomes
-problematic on client devices. For Kunekt's typical use cases:
+problematic on client devices. For VOS's typical use cases:
 
 - Chat history: grows linearly, effectively unbounded (messages are
   append-only, individual messages are small).
@@ -196,7 +196,7 @@ These estimates assume average node sizes of ~500 bytes (chat) and
 
 Nostr relay storage is generally free today. Most relays accept events
 without payment. This is unlikely to hold at scale — a single active
-Kunekt space producing 50MB/month of encrypted, opaque events provides
+VOS space producing 50MB/month of encrypted, opaque events provides
 no value to the relay operator (they cannot index or display it).
 
 Expected evolution:
@@ -625,7 +625,7 @@ against the reference.
 
 ## Summary
 
-Kunekt's performance profile is dominated by the transport layer.
+VOS's performance profile is dominated by the transport layer.
 The protocol stack itself — CRDTs, Merkle-DAGs, MLS encryption — adds
 single-digit milliseconds per operation. The anonymity layer (Tor or
 Nym) adds hundreds of milliseconds to seconds. ZK proofs are expensive

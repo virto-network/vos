@@ -1,6 +1,6 @@
 # SDK & Developer Experience
 
-Kunekt exists so developers can build private applications without
+VOS exists so developers can build private applications without
 becoming cryptographers. This chapter describes the SDK's design,
 API surface, and the abstractions that let application code remain
 simple while the protocol handles encryption, anonymity, sync,
@@ -27,14 +27,14 @@ expertise.
 ### One dependency, one import
 
 ```rust
-use kunekt::prelude::*;
+use vos::prelude::*;
 ```
 
 A single crate brings in everything: CRDT types, space management,
 sync, encryption, storage, identity, and (when enabled) anonymous
 credentials. Feature flags control which layers are compiled in, but
-the API surface is unified. There is no separate crate for "Kunekt
-encryption" or "Kunekt sync" — these are internal layers, not
+the API surface is unified. There is no separate crate for "VOS
+encryption" or "VOS sync" — these are internal layers, not
 developer concerns.
 
 ### The developer's mental model
@@ -66,14 +66,14 @@ credential behavior at the protocol level.
 ### Initialization
 
 ```rust
-use kunekt::prelude::*;
+use vos::prelude::*;
 
 // Default config: privacy-by-default settings, local storage,
 // automatic relay discovery, Tor transport.
-let node = Kunekt::init(Config::default()).await?;
+let node = Vos::init(Config::default()).await?;
 
 // Custom config for specific requirements.
-let node = Kunekt::init(Config {
+let node = Vos::init(Config {
     privacy: PrivacyLevel::Maximum,
     storage: StoragePolicy::replicate(vec![
         Backend::Relay("wss://relay.example.com"),
@@ -84,7 +84,7 @@ let node = Kunekt::init(Config {
 }).await?;
 ```
 
-`Kunekt::init` handles: root secret generation (first launch) or
+`Vos::init` handles: root secret generation (first launch) or
 loading (subsequent launches), local store initialization, anonymity
 network bootstrap, and relay discovery. The returned `node` is the
 entry point for all further operations.
@@ -220,7 +220,7 @@ decrypting + applying incoming operations.
 A simple grow-only counter to illustrate the pattern:
 
 ```rust
-use kunekt::prelude::*;
+use vos::prelude::*;
 
 /// The CRDT type marker.
 struct CounterCrdt;
@@ -271,7 +271,7 @@ tracking) would be needed.
 A more complex example showing a practical document type:
 
 ```rust
-use kunekt::prelude::*;
+use vos::prelude::*;
 
 struct KanbanCrdt;
 
@@ -343,7 +343,7 @@ columns, the causally later operation wins.
 
 ### Future: `#[derive(Crdt)]` macro
 
-Phase 6 of the roadmap includes a procedural macro that generates
+A planned procedural macro will generate
 `Payload` implementations from annotated struct definitions:
 
 ```rust
@@ -357,7 +357,7 @@ struct Marketplace {
 ```
 
 The macro generates the operation enum, serialization, and apply
-logic from the field-level CRDT annotations. Until Phase 6, manual
+logic from the field-level CRDT annotations. Until then, manual
 `Payload` implementations (as shown above) are required.
 
 ---
@@ -449,10 +449,11 @@ enum Moderation {
     None,
 
     /// Admin-based moderation. Admins can remove members
-    /// from the MLS group (pre-Phase 3).
+    /// from the MLS group (before anonymous mode).
     Admin { admins: Vec<MemberRef> },
 
-    /// Anonymous moderation via zk-promises (Phase 3+).
+    /// Anonymous moderation via zk-promises.
+
     /// Members post anonymously, moderation enforced
     /// via ZK-proven reputation and rate limits.
     Anonymous {
@@ -613,10 +614,10 @@ used by egui, Dioxus, Leptos, Yew, and similar Rust UI libraries.
 ### Typed errors
 
 Each SDK layer has its own error type. Errors compose through a
-top-level `KunektError` enum:
+top-level `VosError` enum:
 
 ```rust
-enum KunektError {
+enum VosError {
     /// Space lifecycle errors (create, join, leave).
     Space(SpaceError),
     /// Document errors (CRDT apply, serialization).
@@ -672,7 +673,7 @@ An opt-in debug mode (`Config::debug(true)`) relaxes the logging
 restrictions for development:
 
 ```rust
-let node = Kunekt::init(Config {
+let node = Vos::init(Config {
     debug: true,  // DEVELOPMENT ONLY — logs sensitive data
     ..Default::default()
 }).await?;
@@ -684,7 +685,7 @@ debug mode from being enabled in release builds. The SDK prints a
 prominent warning at startup if debug mode is active:
 
 ```
-⚠ Kunekt debug mode is ON. Sensitive data will appear in logs.
+⚠ VOS debug mode is ON. Sensitive data will appear in logs.
   Do not use this in production.
 ```
 
