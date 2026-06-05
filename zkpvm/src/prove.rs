@@ -306,6 +306,61 @@ pub fn debug_assert_constraints_explicit(
     }
 }
 
+/// Memory-frugal variant of [`debug_assert_constraints_explicit`] for traces
+/// too large to materialise every component trace at once (the explicit
+/// version's `traces: Vec<ComponentTrace>` holds them all and OOMs on
+/// multi-million-step actor traces).
+///
+/// Builds + asserts **one component at a time**, dropping each trace before
+/// the next, so peak memory is the single largest chip's trace rather than
+/// the sum across all chips. Mirrors `prove_impl_with_components`'s
+/// producer/consumer split: the `is_producer()` chips run first
+/// (sequentially — they mutate `side_note`'s lookup-multiplicity counts),
+/// then the consumer chips read the now-complete counts via the immutable
+/// trace-gen path. Per-chip `debug_assert_constraints` is self-contained (it
+/// checks each chip's own constraints + logup against that chip's own
+/// `claimed_sum`), so the cross-chip lookup balance isn't needed here — only
+/// the per-chip constraint satisfaction, which is exactly what catches a
+/// `ConstraintsNotSatisfied`.
+#[cfg(feature = "debug-internals")]
+pub fn debug_assert_constraints_streaming(
+    side_note: &mut SideNote,
+    components: &[&dyn crate::framework::MachineProverComponent],
+) {
+    let mut lookup_elements = AllLookupElements::default();
+    let channel = &mut Blake2sChannel::default();
+    for c in components {
+        c.draw_lookup_elements(&mut lookup_elements, channel);
+    }
+
+    // Pass 1 — PRODUCERS (sequential, mutate counts → must complete before
+    // any consumer trace is built).
+    for (i, c) in components.iter().enumerate() {
+        if !c.is_producer() {
+            continue;
+        }
+        let trace = c.generate_component_trace(side_note);
+        let (interaction_trace, claimed_sum) =
+            c.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+        eprintln!("  [{i}] producer: asserting (claimed_sum={claimed_sum:?})…");
+        c.debug_assert_constraints(&trace, &interaction_trace, &lookup_elements, claimed_sum);
+        eprintln!("  [{i}] producer: OK");
+    }
+
+    // Pass 2 — CONSUMERS (read complete counts; no mutation).
+    for (i, c) in components.iter().enumerate() {
+        if c.is_producer() {
+            continue;
+        }
+        let trace = c.generate_component_trace_immut(side_note);
+        let (interaction_trace, claimed_sum) =
+            c.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+        eprintln!("  [{i}] consumer: asserting (claimed_sum={claimed_sum:?})…");
+        c.debug_assert_constraints(&trace, &interaction_trace, &lookup_elements, claimed_sum);
+        eprintln!("  [{i}] consumer: OK");
+    }
+}
+
 /// Compute blake3 hash of final memory state by applying all writes to
 /// initial memory.
 ///

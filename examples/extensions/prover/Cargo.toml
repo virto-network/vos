@@ -20,6 +20,10 @@ edition = "2024"
 default = ["bin", "extension"]
 bin = []
 extension = []
+# Forward zkpvm's row-by-row constraint asserter (no FRI/blowup/commit, so
+# far lighter than a full prove) for verifying large traces that OOM under
+# `prove`. Test-only: `cargo test -p prover-extension --features debug-constraints`.
+debug-constraints = ["zkpvm/debug-internals"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"

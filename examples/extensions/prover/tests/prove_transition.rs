@@ -196,6 +196,41 @@ fn measure_transition_trace() {
     }
 }
 
+/// Whole-trace constraint check (no FRI / no blowup / no Merkle commit, so
+/// far lighter than `prove`). Confirms EVERY chip's constraints hold across
+/// the full kernel-transition trace — i.e. that beyond the task-#7 comb fix
+/// there is no other `ConstraintsNotSatisfied` lurking, which the OOM-ing
+/// full prove can't tell us. Panics with `row #X, constraint #N` on the
+/// first violation. Run:
+///   cargo test -p prover-extension --features debug-constraints \
+///     --test prove_transition debug_transition_constraints -- --nocapture
+#[cfg(feature = "debug-constraints")]
+#[test]
+fn debug_transition_constraints() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(mut sn) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let n = sn.steps.len();
+    let components = zkpvm::active_components(&sn);
+    eprintln!(
+        "asserting constraints over {n} steps across {} active chips…",
+        components.len()
+    );
+    // Streaming variant: builds + asserts one chip at a time so peak memory
+    // is the largest single chip, not the sum (the explicit asserter holds
+    // all 26 traces and OOMs on a multi-million-step trace). Panics
+    // (row/constraint) on the first violation; returns on success.
+    zkpvm::debug_assert_constraints_streaming(&mut sn, &components);
+    eprintln!("ALL constraints satisfied across the full {n}-step transition trace");
+}
+
 #[test]
 fn prove_transition_roundtrip_and_forgery_rejected() {
     if !voucher_check_elf_path().exists() {

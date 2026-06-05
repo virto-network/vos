@@ -494,7 +494,9 @@ pub use prove::{
     prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
-pub use prove::{debug_assert_constraints_explicit, debug_claimed_sums};
+pub use prove::{
+    debug_assert_constraints_explicit, debug_assert_constraints_streaming, debug_claimed_sums,
+};
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
 pub use stwo::core::fri::FriConfig;
