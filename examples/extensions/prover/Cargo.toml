@@ -34,8 +34,13 @@ vos = { path = "../../../vos", default-features = false, features = ["extension"
 # verifier. The cdylib re-exports only prove / verify / program_commitment.
 zkpvm = { workspace = true }
 zkpvm-verifier = { workspace = true }
-# ELF -> PVM blob transpile (same path the zkpvm test harness takes).
-grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+# ELF -> PVM blob transpile. Pinned to match vos's grey rev (6075cec) —
+# 6db1168 predates `fix(transpiler): handle SLT rd, x0, rs2 in the
+# x0-as-rs1 op table`, which the kernel `apply_batch` balance-overflow
+# check needs lowered (it emits SLT rd, x0, rs2). The fix is additive
+# instruction handling (emits the existing `set_gt_s_imm` opcode), so the
+# blob stays format-compatible with zkpvm's 6db1168 tracer.
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "6075cec9989b5fe221051fb87be6664459a6148e" }
 bincode = "1"
 # Read an actor ELF's symbol table to locate `__VOS_WITNESS`.
 object = { version = "0.36", default-features = false, features = ["std", "read_core", "elf"] }
