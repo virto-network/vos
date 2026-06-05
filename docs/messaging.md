@@ -38,9 +38,8 @@ designed together, with no gaps between them.
 | **Metadata** | hide who-talks-to-whom, when | mix transport / cover traffic ([Transport](transport.md)) | open research |
 
 Writing flows down the stack (message → CRDT op → DAG node → encrypt →
-store → transport); reading flows back up. See the [Threat
-Model](threat-model.md) for the adversaries each layer defends against and
-what it hides from the one below.
+store → transport); reading flows back up. The [Security](#security)
+section below covers the adversaries each layer defends against.
 
 ## Why a DAG — and how it compares to Matrix
 
@@ -173,8 +172,50 @@ is.
    high-stakes governance actions and use a fixed circuit (and
    session-scoped, not per-keystroke, proofs) for routine posting.
 
-See the [Threat Model & Design Principles](threat-model.md) for the
-adversary model these problems are measured against.
+## Security
+
+The whole point is privacy, so the threat model belongs here rather than in
+a separate chapter. Three principles drive it: **privacy by default**
+(protection is automatic, never opt-in), **verify, don't trust** (no
+component — relay, storage, peer, or moderator — is trusted to behave;
+each claim is checked cryptographically), and **layers designed together**
+(the gaps *between* layers are where metadata leaks, so the stack above is
+specified as one piece).
+
+### Adversaries and what stops them
+
+| Adversary | What they can do | Defense |
+|---|---|---|
+| Network observer | see IPs, sizes, timing on their link | MLS ciphertext; metadata-protecting transport (open problem #2) |
+| Untrusted relay / storage | log, drop, or reorder the opaque blobs they carry | content-addressed encrypted nodes; replicate across many; verify by CID; never trusted for confidentiality |
+| Compromised member | decrypt current content, try to deanonymize posters | zk-promises: a posting proof reveals only a tag, not which member; per-channel identity blocks cross-channel linkage |
+| Expelled member | hold the keys from their membership era | MLS rekeys on removal (post-compromise security); their membership commitment is dropped, so no valid future proof |
+| Global passive adversary | correlate timing across all links | degrades gracefully — content stays encrypted; full traffic-analysis resistance needs the mix layer (open problem #2) |
+| Malicious moderator | issue penalties | callbacks target a ticket, not a person — the moderator never learns who they penalized; penalties are public and auditable |
+
+### What it guarantees (and the mechanism)
+
+- **Confidentiality** — only current members read content (MLS ratchet).
+- **Integrity** — tampering is detected (content-addressed DAG nodes).
+- **Anonymity / unlinkability** — actions aren't tied to an identity or to
+  each other (per-channel keys + zk-promises proofs).
+- **Forward secrecy & post-compromise security** — past content survives a
+  key leak; future content survives a removal (MLS key schedule).
+- **Availability** — converges with any one honest peer/relay reachable;
+  offline edits merge on reconnect (Merkle-CRDT).
+- **Accountability without identity** — abusers are rate-limited and
+  bannable via ZK-enforced state, with no deanonymization (zk-promises).
+
+### What it does *not* protect against
+
+Honesty about the perimeter: a **compromised device** (root keys are
+exposed — the standard E2E assumption), **stylometry** (writing style can
+deanonymize content the protocol faithfully hid), **coercion** (no protocol
+resists rubber-hose), **application bugs** above the SDK, **quantum
+adversaries** (today's primitives are pre-quantum), and **total
+infrastructure DoS** (if every relay refuses, distant peers can't sync —
+local editing continues). The privacy horizon under device compromise is
+bounded by callback expiry — see open problem #3 above.
 
 ## Installing messaging into a space
 
@@ -202,5 +243,4 @@ Concretely, a channel maps onto VOS as:
 - [Sync Layer: Merkle-CRDTs](sync.md) — the DAG and anti-entropy
 - [Encryption Layer](encryption.md) — MLS group key management
 - [Anonymous Moderation: zk-promises](zk-promises.md) — the governance layer
-- [Threat Model & Design Principles](threat-model.md) — adversaries and security goals
 - [Merkle-CRDTs paper](https://arxiv.org/abs/2004.00107) · [zk-promises paper](https://eprint.iacr.org/2024/1260)

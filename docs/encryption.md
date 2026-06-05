@@ -744,4 +744,4 @@ the storage/transport layer. It ensures that:
 For how encrypted DAG nodes are stored on Nostr relays, see
 Nostr Integration. For the anonymity layer that
 protects metadata beyond encryption, see
-[Privacy Layers](threat-model.md).
+[Privacy Layers](messaging.md#security).

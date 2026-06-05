@@ -24,7 +24,6 @@
     - [Sync Layer: Merkle-CRDTs](sync.md)
     - [Encryption Layer: Group Key Management](encryption.md)
     - [Anonymous Moderation: zk-promises](zk-promises.md)
-    - [Threat Model & Design Principles](threat-model.md)
 - [Private Economy: Payments, Voting, Governance](private-economy.md)
 - [Kunekt — Real-Time Collaboration (reserved)](kunekt.md)
 

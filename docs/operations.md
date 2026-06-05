@@ -472,7 +472,7 @@ empty string.
 
 - **Writing extensions** — see [`extensions.md`].
 - **Replication semantics** — see [`replication.md`].
-- **Threat model + privacy goals** — see [`threat-model.md`].
+- **Threat model + privacy goals** — see [`messaging.md`] (Security section).
 - **Kubernetes deployment** — out of scope; docker-compose
   covers single-host, and ops folks who want k8s typically
   bring their own helm chart.
@@ -482,4 +482,4 @@ empty string.
 
 [`extensions.md`]: ./extensions.md
 [`replication.md`]: ./replication.md
-[`threat-model.md`]: ./threat-model.md
+[`messaging.md`]: ./messaging.md

@@ -9,7 +9,7 @@ what is fundamentally constrained.
 
 For the protocol layers referenced here, see
 [Architecture Overview](./architecture.md). For security properties
-and their costs, see [Security Analysis](threat-model.md).
+and their costs, see [Security Analysis](messaging.md#security).
 
 ---
 
@@ -71,7 +71,7 @@ Per-operation (session token validation):  < 1 ms
 ```
 
 The session token amortizes the proof cost over the session's
-lifetime. See [Security Analysis](threat-model.md), section 2
+lifetime. See [Security Analysis](messaging.md#security), section 2
 for the anonymity tradeoff this introduces.
 
 ---
@@ -297,7 +297,7 @@ specific Arkworks gadgets employed.
 
 Operations are padded to fixed bucket sizes to prevent payload size
 from leaking information about content (see
-[Privacy Analysis](threat-model.md)). The smallest bucket is 1KB.
+[Privacy Analysis](messaging.md#security)). The smallest bucket is 1KB.
 
 ```
 Component                           Size

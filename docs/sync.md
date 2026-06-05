@@ -475,7 +475,7 @@ DAG from whichever source responds first for each node.
 ## 8. Sync Privacy Considerations
 
 The sync protocol, even with encrypted payloads, reveals metadata.
-This section summarizes the leaks; see [Privacy Analysis](threat-model.md)
+This section summarizes the leaks; see [Privacy Analysis](messaging.md#security)
 for countermeasures.
 
 **Root CID broadcasts reveal activity timing.** When a peer announces

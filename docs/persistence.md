@@ -381,7 +381,7 @@ scrolling back through chat history).
 
 Even though all stored data is encrypted, the *pattern* of storage
 operations can leak information. This section outlines the threats
-and mitigations. See [privacy-layers](threat-model.md) for a
+and mitigations. See [privacy-layers](messaging.md#security) for a
 comprehensive analysis.
 
 ### Read privacy

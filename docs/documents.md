@@ -216,7 +216,7 @@ broadcast. When using PIR for storage retrieval (Phase 4), the storage
 backend does not learn which documents a peer is interested in. Without
 PIR, the relay can observe fetch patterns per document — this is a
 known metadata leak addressed in the
-[Privacy Analysis](threat-model.md).
+[Privacy Analysis](messaging.md#security).
 
 **Root document exception.** Every peer must subscribe to the root
 document. It contains MLS state, membership tree updates, and
