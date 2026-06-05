@@ -7,8 +7,8 @@ marketplace interactions. This chapter covers how these systems work,
 what cryptographic primitives they use, and what remains open.
 
 These capabilities correspond to Phases 5-6 of the
-[Development Roadmap](./roadmap.md) and Phases 8-9 of the
-[User Journey](./user-journey.md).
+Development Roadmap and Phases 8-9 of the
+User Journey.
 
 ---
 
@@ -417,7 +417,7 @@ Relay operators need a reason to run infrastructure:
 - **Privacy-preserving payments.** Using ZK credentials, a member
   can pay a relay without revealing which space or user the storage
   is for. The relay sees "valid payment credential" and allocates
-  storage. See [Nostr Integration](./nostr.md) for relay privacy
+  storage. See Nostr Integration for relay privacy
   hardening.
 - **Relay-as-a-service.** Organizations run relays for their own
   spaces and optionally offer capacity to others. Similar to email

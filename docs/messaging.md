@@ -38,9 +38,9 @@ designed together, with no gaps between them.
 | **Metadata** | hide who-talks-to-whom, when | mix transport / cover traffic ([Transport](transport.md)) | open research |
 
 Writing flows down the stack (message → CRDT op → DAG node → encrypt →
-store → transport); reading flows back up. See [Privacy Analysis by
-Layer](privacy-layers.md) for exactly what each layer hides from the one
-below it, and the [Threat Model](threat-model.md) for the adversaries.
+store → transport); reading flows back up. See the [Threat
+Model](threat-model.md) for the adversaries each layer defends against and
+what it hides from the one below.
 
 ## Why a DAG — and how it compares to Matrix
 
@@ -173,8 +173,8 @@ is.
    high-stakes governance actions and use a fixed circuit (and
    session-scoped, not per-keystroke, proofs) for routine posting.
 
-See [Security Analysis & Open Questions](security-analysis.md) for the
-full treatment.
+See the [Threat Model & Design Principles](threat-model.md) for the
+adversary model these problems are measured against.
 
 ## Installing messaging into a space
 
@@ -202,5 +202,5 @@ Concretely, a channel maps onto VOS as:
 - [Sync Layer: Merkle-CRDTs](sync.md) — the DAG and anti-entropy
 - [Encryption Layer](encryption.md) — MLS group key management
 - [Anonymous Moderation: zk-promises](zk-promises.md) — the governance layer
-- [Privacy Analysis by Layer](privacy-layers.md) · [Threat Model](threat-model.md) · [Security Analysis](security-analysis.md)
+- [Threat Model & Design Principles](threat-model.md) — adversaries and security goals
 - [Merkle-CRDTs paper](https://arxiv.org/abs/2004.00107) · [zk-promises paper](https://eprint.iacr.org/2024/1260)

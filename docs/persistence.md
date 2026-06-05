@@ -77,7 +77,7 @@ of the CID computation — they are local bookkeeping.
 
 Nostr relays serve as dumb blob stores. Kunekt pushes encrypted DAG
 nodes as Nostr events, tagged with their CID. Peers pull nodes by
-querying for events matching a CID tag. See [nostr](nostr.md) for
+querying for events matching a CID tag. See nostr for
 the event format and relay interaction protocol.
 
 Relays are untrusted. They see encrypted blobs and CID tags — nothing
@@ -315,7 +315,7 @@ on a random sample of CIDs. If a backend consistently fails probes,
 the peer marks it as degraded and increases replication to the
 remaining backends.
 
-In later phases (see [roadmap](roadmap.md)), Kunekt may support
+In later phases (see roadmap), Kunekt may support
 cryptographic proof-of-storage via zero-knowledge challenges: a peer
 challenges a backend to prove it holds a specific blob without
 transferring the entire blob. This is a Phase 4 feature — the
@@ -381,7 +381,7 @@ scrolling back through chat history).
 
 Even though all stored data is encrypted, the *pattern* of storage
 operations can leak information. This section outlines the threats
-and mitigations. See [privacy-layers](privacy-layers.md) for a
+and mitigations. See [privacy-layers](threat-model.md) for a
 comprehensive analysis.
 
 ### Read privacy
@@ -503,7 +503,7 @@ justifies the cost.
 - **How does a relay prove it is actually storing data?** Without
   proof-of-storage, a paid relay could accept payment and silently
   discard blobs. ZK proof-of-storage (Phase 4 on the
-  [roadmap](roadmap.md)) addresses this, but the mechanism is not
+  roadmap) addresses this, but the mechanism is not
   yet designed.
 - **How are relay payments coordinated among space members?** Does one
   member pay, or is the cost split? Kunekt's group key management

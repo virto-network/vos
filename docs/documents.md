@@ -216,7 +216,7 @@ broadcast. When using PIR for storage retrieval (Phase 4), the storage
 backend does not learn which documents a peer is interested in. Without
 PIR, the relay can observe fetch patterns per document — this is a
 known metadata leak addressed in the
-[Privacy Analysis](./privacy-layers.md).
+[Privacy Analysis](threat-model.md).
 
 **Root document exception.** Every peer must subscribe to the root
 document. It contains MLS state, membership tree updates, and
@@ -419,7 +419,7 @@ let space = node.create_space(SpaceConfig {
 ```
 
 In Phase 6, the `#[derive(Crdt)]` macro will automate most of this
-boilerplate for simple cases. See [Development Roadmap](./roadmap.md).
+boilerplate for simple cases. See Development Roadmap.
 
 ---
 

@@ -85,6 +85,6 @@ Each technology is mature on its own. Kunekt's contribution is the
 integration — making them work together as a seamless private-by-default
 system with no gaps between layers.
 
-See [Building Blocks](./building-blocks.md) for details on each
-technology and how it integrates, and [Development Phases](./roadmap.md)
-for the order we build them in.
+> This is the original Kunekt introduction, kept for historical context.
+> For the current framing, see the [book introduction](vos.md) and
+> [Messaging](messaging.md).

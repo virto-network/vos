@@ -340,7 +340,7 @@ immediately detectable. See [Sync](./sync.md).
 
 **Mechanism:** Per-space keypairs (no cross-space linkage), anonymous
 routing (Tor/Nym), zk-promises anonymous credentials (Phase 3). See
-[Privacy Analysis](./privacy-layers.md).
+[Privacy Analysis](threat-model.md).
 
 ### Unlinkability
 
@@ -494,7 +494,7 @@ enough for production use.
 **Mitigation:** Phase 6 includes post-quantum migration: hybrid mode
 (classical + post-quantum proofs during transition), hash-based
 signatures for long-term data authenticity, and migration to lattice-
-based ZK systems as they mature. See [Development Phases](./roadmap.md).
+based ZK systems as they mature. See Development Phases.
 
 ### Denial of service by all relays
 

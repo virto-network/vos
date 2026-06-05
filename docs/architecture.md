@@ -100,8 +100,9 @@ Storage          Backend adapters         Nostr relays, SQLite, sled
 Transport        Anonymity routing        Tor (arti), Nym
 ```
 
-See [Building Blocks](./building-blocks.md) for details on each
-technology and [Development Phases](./roadmap.md) for the build order.
+Each layer is covered in its own chapter — see [Part I](architecture.md)
+for the platform layers and [Messaging](messaging.md) for how an
+application stacks on top.
 
 ## KryptOS mapping
 

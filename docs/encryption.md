@@ -461,7 +461,7 @@ Every member independently derives the same key. Any member can sign
 Nostr events on behalf of the space. The key rotates automatically
 with each epoch change, so removed members lose the ability to sign.
 
-See [Nostr Integration](./nostr.md) for a full discussion of signing
+See Nostr Integration for a full discussion of signing
 key options and their tradeoffs.
 
 ---
@@ -742,6 +742,6 @@ the storage/transport layer. It ensures that:
    without accessing the operation-level history.
 
 For how encrypted DAG nodes are stored on Nostr relays, see
-[Nostr Integration](./nostr.md). For the anonymity layer that
+Nostr Integration. For the anonymity layer that
 protects metadata beyond encryption, see
-[Privacy Layers](./privacy-layers.md).
+[Privacy Layers](threat-model.md).
