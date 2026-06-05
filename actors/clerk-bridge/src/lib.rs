@@ -710,15 +710,17 @@ fn reply(status: Status) -> SubmitVoucherReply {
 /// return_bytes)` (which I/O). So the bridge must hand it:
 ///   - `program_commitment`: the trusted commitment configured via
 ///     `set_prover` (the verifier's program-identity anchor).
-///   - `public_bytes`: the rkyv encoding of `voucher::proof::Public`
-///     — byte-identical to what voucher-check's guest bound via
-///     `vos::zk::bind_io(&public, &1u8)` (`public.encode()`). The
-///     `issuer` MUST be the peer's clerk pubkey, the same field the
-///     producer proved over (the voucher signature covers it), which
-///     is why the bridge reconstructs `Public` here rather than
-///     trusting the extension to.
-///   - `return_bytes`: the rkyv encoding of voucher-check's `1u8`
-///     success return (`1u8.encode()`).
+///   - `public_bytes`: cipher-clerk's explicit, domain-separated
+///     `voucher::proof::public_bytes(&public)` — THE canonical
+///     proof-input encoding, byte-identical to what voucher-check's
+///     guest bound via `vos::zk::bind_io_bytes(&public_bytes, &[1u8])`
+///     (both sides call the same `public_bytes`, so they agree by
+///     construction). The `issuer` MUST be the peer's clerk pubkey, the
+///     same field the producer proved over (the voucher signature covers
+///     it), which is why the bridge reconstructs `Public` here rather
+///     than trusting the extension to.
+///   - `return_bytes`: voucher-check's `1` success return as a raw byte
+///     (`vec![1u8]`).
 ///
 /// `voucher.proof.bytes` is the 32-byte content address of the actual
 /// STARK in the producer node's proof-blob store; the extension fetches
@@ -744,15 +746,16 @@ async fn dispatch_external_proof(
     // signature covers), so the bridge no longer hand-mirrors the guest's
     // binding layout.
     let public = voucher.proof_public(peer_clerk_pubkey);
-    // rkyv-encode the public + the `1u8` success return — exactly the
-    // bytes voucher-check's `bind_io(&public, &1u8)` hashed into the
-    // proof's STARK-bound io-hash. The prover recomputes
-    // `compute_io_hash(public_bytes, return_bytes)` and checks equality.
-    // `public.encode()` (vos Encode) is byte-identical to
-    // `public.canonical_bytes()` (cipher-clerk rkyv) — pinned by the
-    // vos-side cross-crate test `tests/clerk_proof_public_pin.rs`.
-    let public_bytes = public.encode();
-    let return_bytes = 1u8.encode();
+    // cipher-clerk's explicit, domain-separated `public_bytes` (THE
+    // canonical proof-input encoding) + the raw `1` success return —
+    // exactly the bytes voucher-check's `bind_io_bytes(&public_bytes,
+    // &[1u8])` hashed into the proof's STARK-bound io-hash. The prover
+    // recomputes `compute_io_hash(public_bytes, return_bytes)` and checks
+    // equality. The two sides agree by construction (both call the same
+    // `public_bytes`, no rkyv-layout / cross-crate coupling); the
+    // federation e2e is the guest↔bridge agreement gate.
+    let public_bytes = cipher_clerk::voucher::proof::public_bytes(&public);
+    let return_bytes = vec![1u8];
     let msg = vos::value::Msg::new("verify")
         .with("program_commitment", program_commitment.to_vec())
         .with("proof_hash", voucher.proof.bytes.clone())

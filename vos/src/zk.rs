@@ -293,6 +293,26 @@ where
     __set_pending_io_hash(compute_io_hash_typed(public, return_value));
 }
 
+/// Guest-side: bind this execution to an asserted `(public, return)`
+/// tuple supplied as **already-encoded bytes** — the raw-bytes
+/// counterpart to [`bind_io`].
+///
+/// The tagless io-ABI is fundamentally "bytes" (see [`compute_io_hash`]),
+/// so an actor that owns an explicit, canonical encoding of its public
+/// inputs (rather than relying on the rkyv archive [`bind_io`] derives)
+/// binds via this. The host verifier recomputes
+/// `compute_io_hash(public_bytes, return_bytes)` over the same bytes — so
+/// guest and verifier agree by construction, with no rkyv-layout /
+/// cross-crate coupling.
+///
+/// e.g. `vos::zk::bind_io_bytes(&cipher_clerk::voucher::proof::public_bytes(&p), &[1u8])`.
+/// Same halt/φ[9..12] placement and last-binding-wins semantics as
+/// [`bind_io`].
+#[cfg(feature = "pvm")]
+pub fn bind_io_bytes(public_bytes: &[u8], return_bytes: &[u8]) {
+    __set_pending_io_hash(compute_io_hash(public_bytes, return_bytes));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +372,28 @@ mod tests {
         assert_eq!(
             compute_io_hash_typed(&public, &ret),
             compute_io_hash(&public.encode(), &ret.encode()),
+        );
+    }
+
+    /// `bind_io_bytes(a, b)` stashes exactly `compute_io_hash(a, b)` for
+    /// the halt binding (and drains once). pvm-gated — the stash + drain
+    /// helpers only exist on the guest tier. Run with `--features pvm`.
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn bind_io_bytes_stashes_compute_io_hash() {
+        // No other test touches PENDING_IO_HASH, so the single-slot stash
+        // is uncontended; clear any leftover defensively.
+        let _ = __take_pending_io_hash();
+        bind_io_bytes(b"explicit-public", b"\x01");
+        assert_eq!(
+            __take_pending_io_hash(),
+            Some(compute_io_hash(b"explicit-public", b"\x01")),
+            "bind_io_bytes must stash compute_io_hash of the same bytes"
+        );
+        assert_eq!(
+            __take_pending_io_hash(),
+            None,
+            "the slot must drain after one take"
         );
     }
 }

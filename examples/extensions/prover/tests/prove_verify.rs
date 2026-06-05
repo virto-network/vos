@@ -15,9 +15,12 @@
 //!
 //! These are the first tests to assert a host-recomputed
 //! `vos::zk::compute_io_hash` equals a real proof's `public_io_hash`, so
-//! they also pin the guest/host encoding agreement. The witness is encoded
-//! with `vos::rkyv` so it matches byte-for-byte what the guest decodes and
-//! rebinds.
+//! they also pin the guest/host encoding agreement. Two distinct encodings
+//! are in play and must NOT be conflated: the *witness* is the rkyv
+//! `Public`/`Secret` archive (what the guest DECODES from `__VOS_WITNESS`),
+//! while the *io-binding* public half is cipher-clerk's explicit,
+//! domain-separated `public_bytes` (what the guest BINDS via
+//! `bind_io_bytes` and the verifier recomputes).
 //!
 //! Skips (does not fail) when the voucher-check ELF isn't built — mirror
 //! the zkpvm smoke-test convention. Build it with `just build-voucher-check`.
@@ -25,7 +28,7 @@
 use std::path::PathBuf;
 
 use cipher_clerk::crypto::{Amount, AuthKey, Blinding};
-use cipher_clerk::voucher::proof::{Public, Secret};
+use cipher_clerk::voucher::proof::{Public, Secret, public_bytes};
 use prover_extension::{
     program_commitment_bytes, prove_program, prove_with_details, verify_proof_bytes,
 };
@@ -93,12 +96,16 @@ fn prove_verify_roundtrip_mismatch_and_cross_program() {
 
     // Prove over the caller's witness P (amount 100, blinding 2).
     let (public, secret) = witness(100, 2);
-    // `.encode()` is `vos::Encode` (rkyv) — byte-identical to what the
-    // guest's `bind_io(&public, &1u8)` and `read_witness` produce.
-    let public_bytes = public.encode();
-    let secret_bytes = secret.encode();
-    let return_bytes = 1u8.encode(); // voucher-check binds the `1u8` success return.
-    let witness_buf = encode_witness(&public_bytes, &secret_bytes);
+    // WITNESS encoding: rkyv (`vos::Encode`) — what the guest DECODES from
+    // `__VOS_WITNESS` via `read_witness` (`from_bytes::<Public>`).
+    let witness_public = public.encode();
+    let witness_secret = secret.encode();
+    let witness_buf = encode_witness(&witness_public, &witness_secret);
+    // IO-BINDING encoding: cipher-clerk's explicit `public_bytes` + the raw
+    // `1` success return — what the guest BINDS via `bind_io_bytes` and the
+    // verifier recomputes. Distinct from the rkyv witness above.
+    let io_public = public_bytes(&public);
+    let return_bytes = vec![1u8];
 
     let (proof_bytes, proof_commitment, _io) =
         prove_with_details(PROGRAM, &witness_buf).expect("prove voucher-check over caller witness");
@@ -113,37 +120,27 @@ fn prove_verify_roundtrip_mismatch_and_cross_program() {
     );
 
     // 1. Happy path: valid STARK against the pinned commitment AND the
-    //    io-binding to the asserted (P, 1).
+    //    io-binding to the asserted (public_bytes(P), 1).
     assert!(
-        verify_proof_bytes(&commitment, &proof_bytes, &public_bytes, &return_bytes),
+        verify_proof_bytes(&commitment, &proof_bytes, &io_public, &return_bytes),
         "a proof of witness P must verify against the pinned commitment and \
-         the asserted (public, return)"
+         the asserted (public_bytes, return)"
     );
 
     // 2. Mismatch: a DIFFERENT public P′ must reject via the tagless
-    //    io-binding (proof.public_io_hash != compute_io_hash(P′, 1)). This
-    //    only bites because G5 bound the *caller's* P into the proof.
-    let other_public_bytes = witness(50, 5).0.encode();
+    //    io-binding (proof.public_io_hash != compute_io_hash(public_bytes(P′),
+    //    1)). This only bites because the guest bound the *caller's* P.
+    let other_io_public = public_bytes(&witness(50, 5).0);
     assert!(
-        !verify_proof_bytes(
-            &commitment,
-            &proof_bytes,
-            &other_public_bytes,
-            &return_bytes
-        ),
+        !verify_proof_bytes(&commitment, &proof_bytes, &other_io_public, &return_bytes),
         "verifying against a different public must reject — the io-binding \
          is not actually a function of the proven public input"
     );
 
     // 2b. A different asserted return must also reject.
-    let other_return_bytes = 0u8.encode();
+    let other_return_bytes = vec![0u8];
     assert!(
-        !verify_proof_bytes(
-            &commitment,
-            &proof_bytes,
-            &public_bytes,
-            &other_return_bytes
-        ),
+        !verify_proof_bytes(&commitment, &proof_bytes, &io_public, &other_return_bytes),
         "verifying against a different return value must reject"
     );
 
@@ -153,12 +150,7 @@ fn prove_verify_roundtrip_mismatch_and_cross_program() {
     let mut wrong_commitment = commitment;
     wrong_commitment[0] ^= 1;
     assert!(
-        !verify_proof_bytes(
-            &wrong_commitment,
-            &proof_bytes,
-            &public_bytes,
-            &return_bytes
-        ),
+        !verify_proof_bytes(&wrong_commitment, &proof_bytes, &io_public, &return_bytes),
         "verifying against the wrong program commitment must reject via \
          verify_standalone — program identity rests on the commitment, not \
          the (tagless) io-hash"

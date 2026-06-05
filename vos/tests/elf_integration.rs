@@ -7808,10 +7808,13 @@ fn clerk_ledger_two_bank_federation() {
         // libp2p via the `peer_prefix` hint registered above), then ship
         // the 32-byte content address as the voucher's `proof.bytes`.
         //
-        // The proof binds rkyv(Public_v3) + rkyv(1u8) into its STARK-bound
-        // io-hash; the bridge reconstructs the SAME Public from the
-        // voucher's public fields and recomputes the hash, so verify's
-        // io-binding leg matches. This is the production-shape flow:
+        // The proof binds proof::public_bytes(Public_v3) + the raw `1`
+        // return into its STARK-bound io-hash (the witness still arrives
+        // as rkyv(Public_v3)+rkyv(Secret_v3), which the guest decodes);
+        // the bridge reconstructs the SAME Public from the voucher's
+        // public fields and recomputes compute_io_hash(public_bytes, [1]),
+        // so verify's io-binding leg matches. This is the production-shape
+        // flow:
         // producer-side stash, consumer-side cross-node fetch via
         // `EFFECT_BLOB_GET` fan-out (hint straight to bank A).
         let public_v3_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&public_v3)

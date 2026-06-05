@@ -328,8 +328,8 @@ fn hex(bytes: &[u8]) -> String {
 
 /// ZK actor-IO ABI input-sensitivity: the io-hash bound into φ[9..12]
 /// must actually depend on the `Public` the actor ran on — i.e. the
-/// `vos::zk::bind_io(&public, &1u8)` call in `start` binds the real
-/// witness, not a constant.
+/// `vos::zk::bind_io_bytes(&public_bytes, &[1u8])` call in `start` binds
+/// the real witness, not a constant.
 ///
 /// Cheap trace-level check (no prove): after `run_with_vos_stubs`, the
 /// guest's halt sequence has placed the io-hash in φ[9..12], so the
@@ -398,7 +398,7 @@ fn actor_io_hash_reflects_public_input() {
     eprintln!("io-hash A={}, B={}", hex(&hash_a), hex(&hash_b));
     assert_ne!(
         hash_a, [0u8; 32],
-        "bind_io must place a non-zero io-hash in φ[9..12]"
+        "bind_io_bytes must place a non-zero io-hash in φ[9..12]"
     );
     assert_ne!(
         hash_a, hash_b,

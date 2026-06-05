@@ -61,14 +61,22 @@ impl VoucherCheck {
         };
         proof::check(&public, &secret);
         // ZK actor-IO ABI (tagless): bind this proof to the asserted
-        // `Public` input and the `1` success return.  The hash lands in
-        // the Phase-Z0-bound final-state registers φ[9..12] at halt; the
-        // host verifier (the `prover` extension's `verify`) recomputes
-        // `vos::zk::compute_io_hash(public_bytes, return_bytes)` and
-        // checks equality, composed with the STARK-validity check against
+        // `(public, return)`.  The public half is cipher-clerk's explicit,
+        // domain-separated `public_bytes` — THE canonical proof-input
+        // encoding (byte-identical to what a Signature-mode proof signs and
+        // what the bridge's verifier reconstructs, with no rkyv-layout
+        // coupling); the return half is the raw `1` success marker.  (The
+        // witness still arrives as the rkyv `Public` archive — see
+        // `read_witness` — this only changes what gets *bound*, not what
+        // gets *decoded*.)  The hash lands in the Phase-Z0-bound final-state
+        // registers φ[9..12] at halt; the host verifier (the `prover`
+        // extension's `verify`) recomputes
+        // `vos::zk::compute_io_hash(public_bytes, return_bytes)` and checks
+        // equality, composed with the STARK-validity check against
         // voucher-check's program commitment.  No actor/message tag is
         // bound — the commitment is the program identity.
-        vos::zk::bind_io(&public, &1u8);
+        let public_bytes = proof::public_bytes(&public);
+        vos::zk::bind_io_bytes(&public_bytes, &[1u8]);
         1
     }
 
