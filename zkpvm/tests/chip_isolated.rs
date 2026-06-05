@@ -1110,6 +1110,205 @@ fn harness_ristretto_output_mismatch_rejected() {
     }
 }
 
+/// task #7 regression — the Ristretto IDENTITY (`0·G`) must prove +
+/// verify through the full comb→compress→output chain.
+///
+/// This is THE case that gated conservation-of-value: every balanced
+/// double-entry layer's zero-sum reveal recomputes `Amount::commit(0,
+/// net_blinding)`, whose `0·G` term is the identity.  Its final
+/// accumulator is `(0:λ:λ:0)` so `u1 = (Z+Y)(Z−Y) = 0` and `u2 = X·Y =
+/// 0`, hence `tmp = u1·u2² = 0` and no `inv_sqrt` satisfies the unity
+/// check `inv_sqrt²·tmp = 1`.  The `IsIdentity` gate skips the unity
+/// check there; the field-op chain still forces `s = 0` ⇒ output
+/// `[0;32]` (the canonical identity encoding).  Before the fix this
+/// proof failed with `ConstraintsNotSatisfied` on the unity row.
+#[test]
+fn harness_ristretto_identity_compress_e2e() {
+    use zkpvm::chips::{
+        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
+        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
+        RistrettoFixedBaseConsumerChip,
+    };
+    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
+    use zkpvm::side_note::RistrettoCombCall;
+
+    let scalar_ptr: u32 = 0;
+    let point_ptr: u32 = 64;
+    let output_ptr: u32 = 128;
+    let ts: u64 = 1;
+
+    // scalar = 0 ⇒ 0·G = identity.
+    let scalar = curve25519_dalek::scalar::Scalar::from(0u64).to_bytes();
+    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    // compress(identity) is the all-zero encoding.
+    let out_bytes = (curve25519_dalek::scalar::Scalar::from(0u64)
+        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+        .compress()
+        .to_bytes();
+    assert_eq!(
+        out_bytes, [0u8; 32],
+        "compress(0·G) must be the zero encoding"
+    );
+
+    let mut initial_memory = vec![0u8; 256];
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    side_note.initial_memory = initial_memory;
+    side_note.ristretto_mem_ops.push(RistrettoMemOp {
+        scalar_ptr,
+        point_ptr,
+        output_ptr,
+        ts,
+        scalar_bytes: scalar,
+        point_bytes: basepoint,
+        out_bytes,
+        kind: ScalarMultKind::FixedBasepoint,
+    });
+    side_note.ristretto_comb_calls.push(RistrettoCombCall {
+        scalar,
+        out_bytes,
+        output_ptr,
+        ts,
+    });
+    side_note.populate_ristretto_comb_counts();
+    side_note.populate_ristretto_compress_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let components: &[&'static dyn MachineProverComponent] = &[
+        &MemoryChip,
+        &MemoryBoundaryChip,
+        &RistrettoEcallChip,
+        &RistrettoCombTableChip,
+        &RistrettoCombAnchorChip,
+        &RistrettoCombScalarBoundaryChip,
+        &RistrettoFixedBaseConsumerChip,
+        &RistrettoCombCompressChip,
+        &RistrettoCombCompressOutputChip,
+        &ByteToBitsChip,
+    ];
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("identity (0·G) compress: prove failed — the IsIdentity gate regressed");
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    verify_with_explicit_components(proof, &side_note, &verifier_components, components, &policy)
+        .expect("identity (0·G) compress: verify failed");
+}
+
+/// task #7 soundness — the identity encoding is BOUND: a prover cannot
+/// pass off a non-`[0;32]` output for the identity point.  The compress
+/// chain runs honestly on `0·G` (output `[0;32]`), but the actor's
+/// claimed `out_bytes` are non-zero.  The compress→output relation
+/// imbalances ⇒ verify rejects.  Pins that the `IsIdentity` skip does
+/// NOT free the output bytes — they are still forced to the canonical
+/// identity encoding.
+#[test]
+fn harness_ristretto_identity_output_forgery_rejected() {
+    use zkpvm::chips::{
+        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
+        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
+        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
+        RistrettoFixedBaseConsumerChip,
+    };
+    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
+    use zkpvm::side_note::RistrettoCombCall;
+
+    let scalar_ptr: u32 = 0;
+    let point_ptr: u32 = 64;
+    let output_ptr: u32 = 128;
+    let ts: u64 = 1;
+
+    let scalar = curve25519_dalek::scalar::Scalar::from(0u64).to_bytes();
+    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    // Forged output: non-zero bytes claimed for the identity point.
+    let mut forged = [0u8; 32];
+    forged[0] = 9;
+
+    let mut initial_memory = vec![0u8; 256];
+    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
+    initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    side_note.initial_memory = initial_memory;
+    side_note.ristretto_mem_ops.push(RistrettoMemOp {
+        scalar_ptr,
+        point_ptr,
+        output_ptr,
+        ts,
+        scalar_bytes: scalar,
+        point_bytes: basepoint,
+        out_bytes: forged,
+        kind: ScalarMultKind::FixedBasepoint,
+    });
+    side_note.ristretto_comb_calls.push(RistrettoCombCall {
+        scalar,
+        out_bytes: forged,
+        output_ptr,
+        ts,
+    });
+    side_note.populate_ristretto_comb_counts();
+    side_note.populate_ristretto_compress_counts();
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let components: &[&'static dyn MachineProverComponent] = &[
+        &MemoryChip,
+        &MemoryBoundaryChip,
+        &RistrettoEcallChip,
+        &RistrettoCombTableChip,
+        &RistrettoCombAnchorChip,
+        &RistrettoCombScalarBoundaryChip,
+        &RistrettoFixedBaseConsumerChip,
+        &RistrettoCombCompressChip,
+        &RistrettoCombCompressOutputChip,
+        &ByteToBitsChip,
+    ];
+    let proof = prove_with_explicit_components(&mut side_note, config, components)
+        .expect("identity output-forgery: prove unexpectedly failed — verify is the gate");
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    let verify_result = verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    );
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => {}
+        Err(e) => panic!("identity output-forgery: verify rejected for the wrong reason: {e:?}"),
+        Ok(()) => panic!(
+            "identity output-forgery: verify accepted a non-[0;32] output for 0·G — \
+             the identity encoding is not bound (soundness regression)"
+        ),
+    }
+}
+
 /// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
 /// Pinpoints the failing constraint by row + constraint-#, replacing the
 /// wave-by-wave bisection approach.  Requires the `debug-internals`

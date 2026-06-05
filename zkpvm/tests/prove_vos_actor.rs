@@ -2749,6 +2749,99 @@ fn prove_ristretto_via_ecall_boundary() {
         .expect("ristretto via ECALL boundary verification failed");
 }
 
+/// task #7 end-to-end — the IDENTITY (`0·G`) routed through the REAL
+/// ECALL → tracing → `ingest_ristretto_boundary` comb path, proved with
+/// the full active-component set.  This is the exact shape cipher-clerk
+/// produces: every balanced double-entry layer's zero-sum reveal
+/// (`reveal_and_check` → `verify_reveal`) recomputes
+/// `Amount::commit(0, net_blinding)`, whose `0·G` is a FixedBasepoint
+/// ECALL with scalar = 0.  `detect_scalar_mult_kind` routes it onto the
+/// comb path; `compress(0·G)` is the all-zero identity encoding.
+///
+/// Before the `IsIdentity` fix this proof failed with
+/// `ConstraintsNotSatisfied` on the compress chain's unity row.  A tiny
+/// single-ECALL trace, so it runs in seconds (the full kernel
+/// transition that contains this op is memory-bound for a separate,
+/// non-constraint reason — proof aggregation / fewer software SMT ops).
+#[test]
+fn prove_ristretto_identity_via_ecall_comb() {
+    use zkpvm::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
+
+    let scalar_addr: u64 = 0x1000;
+    let point_addr: u64 = 0x1020;
+    let output_addr: u64 = 0x1040;
+    // scalar = 0, point = basepoint ⇒ FixedBasepoint comb call for 0·G.
+    let scalar_bytes = [0u8; 32];
+    let point_bytes = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let mut flat_mem = vec![0u8; 0x2000];
+    flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
+    flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
+
+    let imm = ECALL_RISTRETTO_SCALAR_MULT;
+    let code = vec![
+        javm::instruction::Opcode::Ecalli as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
+        javm::instruction::Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 1];
+    let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
+    regs[7] = scalar_addr;
+    regs[8] = point_addr;
+    regs[9] = output_addr;
+
+    let pvm = javm::interpreter::Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run_with_precompiles();
+    assert_eq!(tracing.ristretto_records.len(), 1);
+    // The traced output is the canonical identity encoding.
+    assert_eq!(
+        tracing.ristretto_mem_ops[0].out_bytes, [0u8; 32],
+        "0·G must trace to the all-zero Ristretto identity encoding"
+    );
+
+    let steps = tracing.steps.clone();
+    let r_records = tracing.ristretto_records.clone();
+    let r_mem_ops = tracing.ristretto_mem_ops.clone();
+    let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
+    side_note.ristretto_calls = r_records;
+    side_note.ristretto_mem_ops = r_mem_ops;
+    // Route the FixedBasepoint call onto the comb→compress→output path.
+    side_note.ingest_ristretto_boundary();
+    assert_eq!(
+        side_note.ristretto_comb_calls.len(),
+        1,
+        "0·G must be routed onto the comb path (FixedBasepoint)"
+    );
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("identity 0·G via ECALL comb path: prove failed (task #7 regressed)");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("identity 0·G via ECALL comb path: verify failed");
+}
+
 /// Step 13: hand-built `ecalli 201` (point_add) isolation.
 #[test]
 fn prove_ristretto_point_add_via_ecall_boundary() {

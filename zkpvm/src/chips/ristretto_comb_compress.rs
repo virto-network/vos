@@ -354,6 +354,15 @@ pub enum Column {
     SignBit6,
     #[size = 1]
     SignBit7,
+    /// 1 iff this is the unity row (+12) of a call whose final
+    /// accumulator is the Ristretto identity (0·G).  For the identity
+    /// `tmp = u1·u2² = 0`, so no `inv_sqrt` satisfies `inv_sqrt²·tmp = 1`
+    /// and the unity check must be skipped (gate `IsUnityCheck −
+    /// IsIdentity`).  Bound to `tmp = 0` (the row's `b` operand) so a
+    /// non-identity point cannot claim it.  Boolean; 0 on every other
+    /// row.
+    #[size = 1]
+    IsIdentity,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -416,6 +425,10 @@ struct CompressRow {
     /// On sign-witness rows: bits 1..7 of `field.a[0]` (bit 0
     /// equals `field.out[0]`).
     sign_bits: [u8; 7],
+    /// 1 iff this is the unity row of an identity (0·G) call — drives
+    /// `Column::IsIdentity` to skip the unity check (see that column's
+    /// doc).  0 on every other row.
+    is_identity: u8,
 }
 
 #[cfg(feature = "prover")]
@@ -425,6 +438,7 @@ impl Default for CompressRow {
             field: crate::chips::ristretto::witness::FieldOpRow::default(),
             is_sign_witness: 0,
             sign_bits: [0u8; 7],
+            is_identity: 0,
         }
     }
 }
@@ -593,20 +607,32 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
             ..Default::default()
         });
 
-        // row+12: inv_sqrt²·tmp (must equal 1; the unity-check
-        // constraint on this row's `out` lands in a follow-up).
+        // row+12: inv_sqrt²·tmp — equals 1 for a non-identity point,
+        // 0 for the Ristretto identity (0·G, where tmp = u1·u2² = 0).
+        // The unity-check constraint on this row's `out` is gated by
+        // `IsUnityCheck − IsIdentity` in `add_constraints`.
         let mut fr = fill_mul(w.inv_sqrt_sq, w.u1_u2_sq);
         fr.a_source_row = r_invsq;
         fr.b_source_row = r_tmp;
-        // Sanity cross-check (assertion only — the constraint comes later).
-        let one_b = {
-            let mut o = [0u8; 32];
-            o[0] = 1;
-            o
-        };
-        debug_assert_eq!(fr.out, one_b, "inv_sqrt² · (u1·u2²) must equal 1");
+        // Honest dichotomy (assertion only): tmp = 0 ⇒ identity ⇒ out = 0;
+        // otherwise out = 1.
+        let is_identity = w.u1_u2_sq == [0u8; 32];
+        if is_identity {
+            debug_assert_eq!(
+                fr.out, [0u8; 32],
+                "identity (0·G) unity row must have inv_sqrt²·tmp = 0"
+            );
+        } else {
+            let one_b = {
+                let mut o = [0u8; 32];
+                o[0] = 1;
+                o
+            };
+            debug_assert_eq!(fr.out, one_b, "inv_sqrt² · (u1·u2²) must equal 1");
+        }
         rows.push(CompressRow {
             field: fr,
+            is_identity: is_identity as u8,
             ..Default::default()
         });
 
@@ -717,6 +743,7 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
             field: fr,
             is_sign_witness: 1,
             sign_bits,
+            is_identity: 0,
         });
         let r_sign_rotate = base + ROW_SIGN_ROTATE as u16;
         let r_ix = base + ROW_IX as u16;
@@ -851,6 +878,7 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
             field: fr,
             is_sign_witness: 1,
             sign_bits,
+            is_identity: 0,
         });
         let r_sign_y_negate = base + ROW_SIGN_Y_NEGATE as u16;
 
@@ -937,6 +965,7 @@ fn build_compress_rows(side_note: &SideNote) -> Vec<CompressRow> {
             field: fr,
             is_sign_witness: 1,
             sign_bits,
+            is_identity: 0,
         });
         let r_sign_s_neg = base + ROW_SIGN_S_NEG as u16;
 
@@ -1132,6 +1161,7 @@ impl BuiltInComponent for RistrettoCombCompressChip {
             crate::trace::trace_eval!(trace_eval, Column::ProducerEmissionMult);
 
         let is_sign_witness = crate::trace::trace_eval!(trace_eval, Column::IsSignWitness);
+        let is_identity = crate::trace::trace_eval!(trace_eval, Column::IsIdentity);
         let effective_consumer_a_gate_h =
             crate::trace::trace_eval!(trace_eval, Column::EffectiveConsumerAGateH);
         let sign_bit1 = crate::trace::trace_eval!(trace_eval, Column::SignBit1);
@@ -1219,16 +1249,49 @@ impl BuiltInComponent for RistrettoCombCompressChip {
         // The compress chain pins `inv_sqrt`'s correctness via this
         // single equality.  IsUnityCheck = 1 selects row +12 of every
         // *real* per-call block (preprocessed; padding rows have 0).
-        // Constraint set: `out[0] = 1, out[1..32] = 0` mod p25519.
-        // Output of an IsMul row is already canonical ∈ [0, p) by the
-        // FieldOp helper's final-form < p chain, so the bytewise
-        // equality with [1, 0, ..., 0] uniquely identifies the field
-        // element 1.
+        //
+        // The Ristretto identity (0·G — produced by every balanced
+        // double-entry layer's zero-sum reveal, `Amount::commit(0, b)`)
+        // is the one point where this check cannot hold: its final
+        // accumulator is (0:λ:λ:0), so u1 = (Z+Y)(Z−Y) = 0 and u2 =
+        // X·Y = 0, hence `tmp = u1·u2² = 0` and there is no inv_sqrt
+        // with `inv_sqrt²·tmp = 1`.  `IsIdentity` flags that row so the
+        // unity check is skipped there (gate `IsUnityCheck −
+        // IsIdentity`).  This is sound: the field-op chain already
+        // forces `i1 = inv_sqrt·u1 = 0` and `i2 = inv_sqrt·u2 = 0`
+        // (u1=u2=0), so den_inv = 0 ⇒ s = 0 ⇒ output [0;32] (the
+        // identity encoding) regardless of the witnessed inv_sqrt.
+        //
+        // IsIdentity ∈ {0,1}.
         eval.add_constraint(
-            is_unity_check[0].clone() * (out[0].clone() - E::F::from(BaseField::from(1u32))),
+            is_identity[0].clone() * (E::F::from(BaseField::from(1u32)) - is_identity[0].clone()),
+        );
+        // IsIdentity may only be set on a unity row (where `b` = tmp).
+        eval.add_constraint(
+            (E::F::from(BaseField::from(1u32)) - is_unity_check[0].clone())
+                * is_identity[0].clone(),
+        );
+        // Soundness binding: IsIdentity = 1 forces `tmp` (= u1·u2², the
+        // unity row's `b` operand) to 0 byte-wise.  Because the field-op
+        // chain binds `b` to the actual accumulator's (Z+Y)(Z−Y)·(X·Y)²,
+        // a *non*-identity point (tmp ≠ 0) cannot claim IsIdentity, so
+        // it cannot skip the unity check and forge a [0;32] output.
+        for k in 0..32 {
+            eval.add_constraint(is_identity[0].clone() * b[k].clone());
+        }
+        // Unity check, gated by `(IsUnityCheck − IsIdentity)`: active on
+        // every real non-identity unity row, skipped on the identity
+        // row (gate 0).  Constraint set: `out[0] = 1, out[1..32] = 0`
+        // mod p25519.  Output of an IsMul row is already canonical ∈
+        // [0, p) by the FieldOp helper's final-form < p chain, so the
+        // bytewise equality with [1, 0, ..., 0] uniquely identifies the
+        // field element 1.
+        let unity_gate = is_unity_check[0].clone() - is_identity[0].clone();
+        eval.add_constraint(
+            unity_gate.clone() * (out[0].clone() - E::F::from(BaseField::from(1u32))),
         );
         for k in 1..32 {
-            eval.add_constraint(is_unity_check[0].clone() * out[k].clone());
+            eval.add_constraint(unity_gate.clone() * out[k].clone());
         }
 
         // ── Sign-witness rows (Path γ) ──
@@ -1720,4 +1783,131 @@ fn fill_compress_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Compre
     trace.fill_columns(row_i, cr.sign_bits[4], Column::SignBit5);
     trace.fill_columns(row_i, cr.sign_bits[5], Column::SignBit6);
     trace.fill_columns(row_i, cr.sign_bits[6], Column::SignBit7);
+    trace.fill_columns(row_i, cr.is_identity, Column::IsIdentity);
+}
+
+/// task #7 soundness: the `IsIdentity` gate must NOT be a free pass.
+/// A malicious prover could try to skip the unity check for a
+/// *non*-identity point (witnessing `inv_sqrt = 0` to forge a `[0;32]`
+/// output) by flipping `IsIdentity = 1`.  The C4 constraint
+/// `IsIdentity · b[k] = 0` (b = tmp = u1·u2², bound to the real point
+/// by the field-op chain) makes that impossible: for a non-identity
+/// point tmp ≠ 0, so `1 · tmp ≠ 0` and the AssertEvaluator rejects.
+///
+/// This test tampers the honest trace directly (the only way to reach
+/// the adversarial column assignment, since honest trace-gen sets
+/// `IsIdentity = (tmp == 0)`) and confirms the constraint has teeth.
+#[cfg(all(test, feature = "debug-internals"))]
+mod identity_gate_soundness {
+    use super::{Column, PreprocessedColumn, RistrettoCombCompressChip};
+    use crate::air_column::AirColumn;
+    use crate::core::tracing::{RistrettoMemOp, ScalarMultKind};
+    use crate::framework::{MachineComponent, MachineProverComponent};
+    use crate::lookups::AllLookupElements;
+    use crate::side_note::{RistrettoCombCall, SideNote};
+    use crate::trace::component::ComponentTrace;
+    use stwo::core::channel::Blake2sChannel;
+    use stwo::core::fields::m31::BaseField;
+
+    /// Single non-identity `scalar·G` comb call routed onto the
+    /// compress path (mirrors `harness_ristretto_fixed_base_e2e`).
+    fn non_identity_side_note() -> SideNote {
+        let scalar_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678u64);
+        let scalar = scalar_value.to_bytes();
+        let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+        let out_bytes = (scalar_value * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
+            .compress()
+            .to_bytes();
+        let mut sn = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+        let mut initial_memory = vec![0u8; 256];
+        initial_memory[0..32].copy_from_slice(&scalar);
+        initial_memory[64..96].copy_from_slice(&basepoint);
+        sn.initial_memory = initial_memory;
+        sn.ristretto_mem_ops.push(RistrettoMemOp {
+            scalar_ptr: 0,
+            point_ptr: 64,
+            output_ptr: 128,
+            ts: 1,
+            scalar_bytes: scalar,
+            point_bytes: basepoint,
+            out_bytes,
+            kind: ScalarMultKind::FixedBasepoint,
+        });
+        sn.ristretto_comb_calls.push(RistrettoCombCall {
+            scalar,
+            out_bytes,
+            output_ptr: 128,
+            ts: 1,
+        });
+        sn.populate_ristretto_comb_counts();
+        sn.populate_ristretto_compress_counts();
+        sn
+    }
+
+    /// Row-by-row `AssertEvaluator` over the compress chip's trace.
+    /// Ok(()) if all constraints hold; Err(msg) on the first violation.
+    fn assert_compress(trace: &ComponentTrace, side_note: &SideNote) -> Result<(), String> {
+        let chip = RistrettoCombCompressChip;
+        let mut lookup_elements = AllLookupElements::default();
+        let channel = &mut Blake2sChannel::default();
+        chip.draw_lookup_elements(&mut lookup_elements, channel);
+        let (interaction_trace, claimed_sum) =
+            chip.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            chip.debug_assert_constraints(trace, &interaction_trace, &lookup_elements, claimed_sum);
+        }))
+        .map_err(|p| {
+            p.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "<non-string panic>".into())
+        })
+    }
+
+    #[test]
+    fn is_identity_flag_on_non_identity_point_is_rejected() {
+        let mut side_note = non_identity_side_note();
+        let chip = RistrettoCombCompressChip;
+        let mut trace = chip.generate_component_trace(&mut side_note);
+
+        // Locate the (single) unity row via the preprocessed selector.
+        let unity_off = PreprocessedColumn::IsUnityCheck.offset();
+        let unity_row = {
+            let col = trace.preprocessed_trace[unity_off].as_slice();
+            (0..col.len())
+                .find(|&r| col[r] == BaseField::from(1u32))
+                .expect("a real call must have exactly one unity row")
+        };
+
+        let id_off = Column::IsIdentity.offset();
+        let b_off = Column::FieldB.offset();
+
+        // Sanity: honest fill leaves IsIdentity = 0 here, and the
+        // unity row carries tmp = u1·u2² ≠ 0 (non-identity point).
+        assert_eq!(
+            trace.original_trace[id_off].as_slice()[unity_row],
+            BaseField::from(0u32),
+            "honest non-identity unity row must have IsIdentity = 0"
+        );
+        let tmp_nonzero = (0..32).any(|k| {
+            trace.original_trace[b_off + k].as_slice()[unity_row] != BaseField::from(0u32)
+        });
+        assert!(
+            tmp_nonzero,
+            "non-identity unity row must carry tmp = u1·u2² ≠ 0 (test setup)"
+        );
+
+        // Control: the honest trace satisfies every constraint.
+        assert_compress(&trace, &side_note)
+            .expect("honest non-identity compress trace must satisfy all constraints");
+
+        // Attack: claim IsIdentity = 1 to skip the unity check.
+        trace.original_trace[id_off].as_mut_slice()[unity_row] = BaseField::from(1u32);
+        let res = assert_compress(&trace, &side_note);
+        assert!(
+            res.is_err(),
+            "C4 soundness hole: IsIdentity = 1 on a non-identity unity row (tmp ≠ 0) \
+             was accepted — a prover could forge a [0;32] output for a real point"
+        );
+    }
 }
