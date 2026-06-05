@@ -22,7 +22,7 @@ use cipher_clerk::prelude::*;
 use cipher_clerk::snapshot::{OpeningsOracle, TransitionWitness, VecLedger};
 use cipher_clerk::state::Opening;
 use cipher_clerk::voucher::proof::{Public as VoucherPublic, public_bytes};
-use prover_extension::{prove_with_details, verify_proof_bytes};
+use prover_extension::{prove_with_details, trace_program, verify_proof_bytes};
 use vos::Encode;
 
 const PROGRAM: &[u8] = b"voucher-check";
@@ -129,6 +129,71 @@ fn build_transition() -> (VoucherPublic, TransitionWitness) {
         batch_seed_timestamp: BATCH_TS,
     };
     (public, witness)
+}
+
+/// Diagnostic (no prove): size the kernel-transition trace and break it
+/// down by op so we know what drives the prove's memory footprint. The
+/// full prove OOMs; this tells us whether it's software variable-base
+/// Ristretto (b·H, e·P), blake2b/SMT, or raw step count that dominates —
+/// i.e. what to precompile / segment next.
+#[test]
+fn measure_transition_trace() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+
+    let Some(sn) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed (grey link / symbol / trace error)");
+        return;
+    };
+
+    // Opcode histogram — the top families tell us where the steps go.
+    use std::collections::BTreeMap;
+    let mut hist: BTreeMap<String, u64> = BTreeMap::new();
+    for s in &sn.steps {
+        *hist.entry(format!("{:?}", s.opcode)).or_default() += 1;
+    }
+    let mut by_count: Vec<_> = hist.into_iter().collect();
+    by_count.sort_by(|a, b| b.1.cmp(&a.1));
+
+    eprintln!("=== kernel-transition trace breakdown ===");
+    eprintln!("total PVM steps          : {}", sn.steps.len());
+    eprintln!(
+        "ristretto scalar-mult ECALLs (records) : {}",
+        sn.ristretto_calls.len()
+    );
+    eprintln!(
+        "  ↳ fixed-base (comb) calls            : {}",
+        sn.ristretto_comb_calls.len()
+    );
+    eprintln!(
+        "  ↳ variable-base field rows (software): {}",
+        sn.ristretto_field_rows.len()
+    );
+    eprintln!("blake2b compression calls: {}", sn.blake2b_calls.len());
+    eprintln!("scalar binop calls       : {}", sn.scalar_binop_calls.len());
+    for (i, c) in sn.ristretto_comb_calls.iter().enumerate() {
+        let is_id = c.scalar == [0u8; 32];
+        eprintln!(
+            "  comb[{i}] scalar = {}{}",
+            c.scalar
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            if is_id {
+                "  <-- IDENTITY (0·G, task #7)"
+            } else {
+                ""
+            }
+        );
+    }
+    eprintln!("--- top 15 opcodes by step count ---");
+    for (op, n) in by_count.iter().take(15) {
+        eprintln!("  {op:24} {n:>10}");
+    }
 }
 
 #[test]

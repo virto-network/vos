@@ -163,16 +163,24 @@ pub fn prove_with_details(
 /// Resolve `program_id` to an ELF, inject the opaque `witness_bytes` into
 /// its `__VOS_WITNESS` buffer (empty = no injection; the actor uses its
 /// own default), trace, and prove. `None` on any failure.
-fn prove_to_proof(program_id: &[u8], witness_bytes: &[u8]) -> Option<Proof> {
+/// Resolve `program_id` to an ELF, inject the witness into `__VOS_WITNESS`,
+/// and TRACE only (no prove). Lets a caller size the trace / inspect the
+/// per-chip op breakdown before committing to a (potentially memory-heavy)
+/// prove. `None` on any failure.
+pub fn trace_program(program_id: &[u8], witness_bytes: &[u8]) -> Option<zkpvm::SideNote> {
     let path = program_id_to_elf_path(program_id)?;
     let elf = std::fs::read(&path).ok()?;
     let blob = grey_transpiler::link_elf(&elf).ok()?;
-    let mut side_note = if witness_bytes.is_empty() {
-        zkpvm::actor::trace_blob(&blob, TRACE_GAS)?
+    if witness_bytes.is_empty() {
+        zkpvm::actor::trace_blob(&blob, TRACE_GAS)
     } else {
         let addr = find_symbol_addr(&elf, "__VOS_WITNESS")? as usize;
-        zkpvm::actor::trace_blob_with_patches(&blob, TRACE_GAS, &[(addr, witness_bytes)])?
-    };
+        zkpvm::actor::trace_blob_with_patches(&blob, TRACE_GAS, &[(addr, witness_bytes)])
+    }
+}
+
+fn prove_to_proof(program_id: &[u8], witness_bytes: &[u8]) -> Option<Proof> {
+    let mut side_note = trace_program(program_id, witness_bytes)?;
     prove_mobile(&mut side_note).ok()
 }
 
