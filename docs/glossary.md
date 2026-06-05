@@ -1,29 +1,29 @@
 # Glossary
 
-Key terms used throughout the Kunekt protocol documentation,
+Key terms used throughout the VOS protocol documentation,
 listed alphabetically. Each entry includes a brief definition and the
-Kunekt layer(s) where it is relevant.
+VOS layer(s) where it is relevant.
 
 ---
 
 **Anti-entropy** — A synchronization protocol where peers compare their
-state and exchange missing data to converge. In Kunekt, anti-entropy
+state and exchange missing data to converge. In VOS, anti-entropy
 operates on the Merkle-DAG: peers exchange root CIDs, walk the DAG to
 discover missing nodes, and fetch them. *Sync layer.*
 
 **Automerge** — An open-source CRDT library for rich collaborative
-data structures (text, JSON, tables). Kunekt uses Automerge as the
+data structures (text, JSON, tables). VOS uses Automerge as the
 primary CRDT engine for rich text documents. Automerge changes are
 serialized as Merkle-CRDT payloads. *Document layer.*
 
 **BBS+ signatures** — A signature scheme that supports selective
 disclosure: the signer signs a set of attributes, and the holder later
 proves possession of the signature while revealing only a chosen subset
-of attributes. Used in Kunekt for cross-space reputation credentials.
+of attributes. Used in VOS for cross-space reputation credentials.
 *Authorization layer, Identity.*
 
 **Bulletin board** — An append-only log that serves as the shared state
-for the zk-promises protocol. In Kunekt, implemented as a moderation
+for the zk-promises protocol. In VOS, implemented as a moderation
 log document (a CRDT synced via Merkle-CRDT). Moderators post callbacks
 here; users scan it for penalties targeting their tickets.
 *Authorization layer.*
@@ -34,14 +34,14 @@ an action (reduce reputation, ban, warn). The post's author must
 process the callback before their next action. *Authorization layer.*
 
 **CID (Content Identifier)** — A self-describing hash of a piece of
-content. In Kunekt, every DAG node has a CID computed from its
+content. In VOS, every DAG node has a CID computed from its
 contents. CIDs are location-independent: the same content always
 produces the same CID regardless of where it is stored. *Sync layer,
 Storage layer.*
 
 **Commitment** — A cryptographic primitive that lets a party commit to
 a value without revealing it, and later prove properties about the
-committed value. Kunekt uses Pedersen commitments (`C = g^v * h^r`) for
+committed value. VOS uses Pedersen commitments (`C = g^v * h^r`) for
 membership credentials, balance proofs, and zk-object state.
 *Authorization layer, Document layer.*
 
@@ -52,16 +52,16 @@ traffic analysis from revealing activity patterns. *Transport layer.*
 **CRDT (Conflict-free Replicated Data Type)** — A data structure that
 can be replicated across peers and updated independently, with
 concurrent updates merging automatically without conflicts. Every
-Kunekt document is a CRDT. *Document layer.*
+VOS document is a CRDT. *Document layer.*
 
 **DAG (Directed Acyclic Graph)** — A graph where edges have direction
-and no cycles exist. In Kunekt, each document's edit history is stored
+and no cycles exist. In VOS, each document's edit history is stored
 as a Merkle-DAG: each node points to its causal predecessors via their
 CIDs. *Sync layer.*
 
 **Data availability (DA) layer** — A system that guarantees published
 data can be retrieved by anyone who needs it. Can be a blockchain or a
-specialized data availability network. Used in Kunekt as an optional
+specialized data availability network. Used in VOS as an optional
 storage backend with stronger availability guarantees than standalone
 relays. *Storage layer.*
 
@@ -74,7 +74,7 @@ epoch's keys cannot be decrypted with another epoch's keys.
 **Erasure coding** — A technique that splits data into `n` fragments
 such that any `k` fragments (where `k < n`) can reconstruct the
 original. Provides redundancy: data survives the loss of up to `n - k`
-fragments. Used in Kunekt for distributed storage across multiple
+fragments. Used in VOS for distributed storage across multiple
 backends. *Storage layer.*
 
 **Forward secrecy** — A security property ensuring that compromise of
@@ -91,40 +91,40 @@ Can be replaced with a universal-setup system like PLONK.
 **Homomorphic** — A property of an encryption or commitment scheme
 where operations on ciphertexts correspond to operations on
 plaintexts. For example, adding two ElGamal ciphertexts produces the
-encryption of the sum of the plaintexts. Used in Kunekt for
+encryption of the sum of the plaintexts. Used in VOS for
 anonymous voting tallies and balance conservation proofs.
 *Document layer (voting, payments).*
 
 **IPFS (InterPlanetary File System)** — A content-addressed distributed
-file system. Kunekt does not depend on IPFS directly but shares the
+file system. VOS does not depend on IPFS directly but shares the
 same content-addressing model (CIDs). IPFS could serve as a storage
 backend via the `Store` trait. *Storage layer.*
 
 **KeyPackage** — An MLS data structure containing a member's public
-keys and capabilities, used to add them to a group. In Kunekt, a
+keys and capabilities, used to add them to a group. In VOS, a
 joining member submits a KeyPackage to receive a Welcome message and
 join the space's MLS group. *Encryption layer.*
 
 **Leaky bucket** — A rate-limiting algorithm where a bucket of tokens
-drains at a fixed rate and is replenished over time. In Kunekt,
+drains at a fixed rate and is replenished over time. In VOS,
 members prove in ZK that their rate-limit bucket is non-empty,
 preventing spam without revealing activity history.
 *Authorization layer.*
 
 **MLS (Messaging Layer Security)** — An IETF standard (RFC 9420) for
 group key agreement. Provides forward secrecy, post-compromise
-security, and efficient key rotation for groups. Kunekt uses MLS to
+security, and efficient key rotation for groups. VOS uses MLS to
 manage encryption keys for each space. *Encryption layer.*
 
 **Merkle-CRDT** — The combination of a CRDT with a Merkle-DAG. CRDT
 operations are recorded as nodes in a hash-linked DAG. Sync reduces
 to exchanging DAG nodes. Merge is set union — commutative, associative,
-idempotent. The core replication mechanism of Kunekt. *Sync layer.*
+idempotent. The core replication mechanism of VOS. *Sync layer.*
 
 **Merkle tree** — A binary tree where each leaf contains a hash of
 data and each internal node contains the hash of its children. Enables
 efficient proofs that a leaf is included in the tree by providing a
-logarithmic-size path from leaf to root. Used in Kunekt for membership
+logarithmic-size path from leaf to root. Used in VOS for membership
 proofs. *Authorization layer, Document layer.*
 
 **Mix network** — An anonymity network where messages are batched,
@@ -134,7 +134,7 @@ mixed (shuffled) at each hop. Nym is a mix network. *Transport layer.*
 
 **Nym** — A mix network implementation providing network-level privacy.
 Messages are split into Sphinx packets, routed through three mix nodes
-with random delays, and reassembled at the destination. Used in Kunekt
+with random delays, and reassembled at the destination. Used in VOS
 for high-sensitivity operations (credential proofs, governance votes).
 *Transport layer.*
 
@@ -145,10 +145,9 @@ the secret. Used in voting (one-member-one-vote) and selective
 double-action prevention. *Authorization layer.*
 
 **Nostr** — A simple, open protocol for decentralized social networking
-based on signed events relayed through WebSocket servers. Kunekt uses
-Nostr relays as a storage and transport backend: DAG nodes are
-published as Nostr events and fetched by CID. *Storage layer,
-Transport layer.*
+based on signed events relayed through WebSocket servers. Considered as a
+possible untrusted storage/relay backend for encrypted DAG nodes, but not
+part of the current design (VOS replicates over libp2p). *Storage layer.*
 
 **ORAM (Oblivious RAM)** — A technique that hides access patterns from
 the storage medium. Every read or write is indistinguishable from any
@@ -162,12 +161,12 @@ uses onion routing. *Transport layer.*
 
 **OpenMLS** — A Rust implementation of the MLS protocol (RFC 9420).
 Handles group creation, key schedules, ratchet trees, proposals, and
-commits. Kunekt wraps OpenMLS for per-space group key management.
+commits. VOS wraps OpenMLS for per-space group key management.
 *Encryption layer.*
 
 **PIR (Private Information Retrieval)** — A protocol that lets a client
 fetch an item from a database without the server learning which item
-was requested. Used in Kunekt to fetch DAG nodes from storage backends
+was requested. Used in VOS to fetch DAG nodes from storage backends
 without revealing access patterns. *Storage layer.*
 
 **PLONK** — A universal zero-knowledge proof system (no per-circuit
@@ -180,7 +179,7 @@ the CRDT logic for a document type: how operations are applied to state
 and how states are merged. Developers implement this trait to create
 custom document types. *Sync layer, Document layer.*
 
-**Peer** — Any device participating in a Kunekt space. Peers are
+**Peer** — Any device participating in a VOS space. Peers are
 equal — there is no leader or primary replica. Each peer keeps a local
 encrypted copy of subscribed documents and syncs with other peers.
 *Sync layer.*
@@ -192,12 +191,12 @@ confidentiality for subsequent messages. *Encryption layer.*
 
 **Proposal (MLS)** — An MLS message that suggests a group change (add
 member, remove member, update keys). A proposal must be committed by a
-group member to take effect. In Kunekt, MLS proposals are recorded as
+group member to take effect. In VOS, MLS proposals are recorded as
 CRDT operations in the space's root document. *Encryption layer.*
 
 **Proxy re-encryption** — A technique where a proxy transforms a
 ciphertext encrypted under key A into a ciphertext encrypted under
-key B, without the proxy learning the plaintext. Used in Kunekt for
+key B, without the proxy learning the plaintext. Used in VOS for
 selective file sharing: re-encrypt a file's key under a space's MLS
 group key. *Storage layer, Encryption layer.*
 
@@ -208,7 +207,7 @@ rotation: updating one leaf requires updating only the path to the
 root (logarithmic in group size). *Encryption layer.*
 
 **Relay** — A server that stores and forwards encrypted data. In
-Kunekt, Nostr relays serve as storage backends for encrypted DAG
+VOS, untrusted relays may serve as storage backends for encrypted DAG
 nodes. Relays are untrusted: they see only opaque blobs and cannot
 read, correlate, or attribute content. *Storage layer.*
 
@@ -235,7 +234,7 @@ requiring a new ZK proof for each batch. Operations within a session
 are linkable to each other but not to the member's identity.
 *Authorization layer.*
 
-**Space** — The top-level unit of collaboration in Kunekt. A space
+**Space** — The top-level unit of collaboration in VOS. A space
 owns an MLS group, a membership Merkle tree, a set of documents,
 and a root document describing the space's configuration. All content
 within a space is end-to-end encrypted. *Document layer, Encryption
@@ -258,7 +257,7 @@ terminology). Used during sync to apply CRDT operations in causal
 order. *Sync layer.*
 
 **Tor** — An onion routing network for anonymous communication.
-Kunekt routes relay connections through Tor (via the `arti` Rust
+VOS routes relay connections through Tor (via the `arti` Rust
 crate) to hide users' IP addresses. Provides lower latency than a
 mix network but weaker metadata protection. *Transport layer.*
 
@@ -282,6 +281,6 @@ callbacks without learning who they are penalizing. Based on the
 
 **Zero-knowledge proof** — A cryptographic proof that a statement is
 true without revealing any information beyond the truth of the
-statement. Used throughout Kunekt for membership proofs, authorization,
+statement. Used throughout VOS for membership proofs, authorization,
 balance proofs, vote validity, credential verification, and more.
 *Authorization layer, Document layer, Identity.*

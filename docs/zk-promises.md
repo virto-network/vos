@@ -72,7 +72,7 @@ for every keystroke. Instead:
    Users process them next time they start a session or come online.
 4. **Rate limiting** — checked per-session or per-batch, not per-operation.
 
-### The bulletin board in Kunekt
+### The bulletin board on VOS
 
 The bulletin board can be implemented as:
 - A **special moderation document** in the space (itself a CRDT,
@@ -93,14 +93,17 @@ The bulletin board can be implemented as:
 
 ## Integration status
 
-**Future work.** The current plan is:
+**Future work.** The intended path:
 
-1. **Phase 1** — Ship with Merkle-CRDT sync + MLS encryption. Moderation
-   is explicit (admin removes members from MLS group).
-2. **Phase 2** — Add zk-promises as optional `kunekt-anon` crate for
-   spaces that want anonymous posting with moderation.
-3. **Phase 3** — Evaluate newer ZK proof systems (Jolt, SP1) that may
-   reduce client-side proving cost, especially in WASM.
+- **Baseline** — ship messaging with Merkle-CRDT sync + MLS encryption;
+  moderation is explicit (an admin removes members from the MLS group).
+- **Anonymous moderation** — add zk-promises as an optional actor set for
+  spaces that want anonymous posting with accountable consequences. The
+  bulletin-board ordering question (see
+  [Messaging → Open problems](messaging.md#open-problems)) is the gating
+  design work.
+- **Faster proving** — evaluate newer ZK proof systems (Jolt, SP1) to cut
+  client-side proving cost, especially in WASM.
 
 ## Further reading
 

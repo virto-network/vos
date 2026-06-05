@@ -3,8 +3,9 @@
 The sync layer is responsible for propagating changes between peers without
 any coordination. It is built on
 [Merkle-CRDTs](https://arxiv.org/abs/2004.00107) — the combination of
-CRDTs with Merkle-DAGs. This is the foundational layer of Kunekt: every
-document, every chat message, every configuration change flows through it.
+CRDTs with Merkle-DAGs. It is the foundation of the `crdt` consistency
+mode: every document, every chat message, every configuration change in a
+space flows through it.
 
 ---
 
@@ -418,7 +419,7 @@ can be changed by members with appropriate permissions.
 
 ## 7. Sync Over Unreliable Transports
 
-Kunekt peers operate in the real world: connections drop, peers go
+Peers operate in the real world: connections drop, peers go
 offline, relays restart, mobile devices lose signal mid-sync. The
 sync protocol is designed to tolerate all of this.
 
@@ -610,9 +611,9 @@ let cid4 = peer_a.record(MyPayload::Insert { pos: 2, ch: '?' });
 After the next sync, both peers will have `{ cid4 }` as their root set
 and identical CRDT state.
 
-### Integration in Kunekt
+### Integration in a space
 
-In Kunekt, each document in a space has its own `MerkleCrdt` instance:
+Each document in a space has its own `MerkleCrdt` instance:
 
 - The `Payload` implementation delegates to the document's CRDT. For
   collaborative text, this is an Automerge change. For a chat channel,

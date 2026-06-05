@@ -1,6 +1,6 @@
 # Encryption: Group Ratchet Keys
 
-All document content in Kunekt is end-to-end encrypted at the group level.
+All document content in VOS is end-to-end encrypted at the group level.
 Only space members can decrypt. Storage backends, relay nodes, and network
 observers see only opaque blobs.
 
@@ -14,9 +14,9 @@ reconciled with a protocol that has no ordering at all (Merkle-CRDTs).
 
 ### The problem
 
-A Kunekt space is a set of peers collaborating on shared documents. The
+A VOS space is a set of peers collaborating on shared documents. The
 content must be readable only by current members. Anyone else — relay
-operators, network observers, other Kunekt users — must see nothing
+operators, network observers, other VOS users — must see nothing
 but opaque ciphertext.
 
 ### Why not pairwise encryption
@@ -49,7 +49,7 @@ change. This provides:
 - **Efficient membership changes** — adding or removing a member costs
   O(log n) rather than O(n), thanks to the tree structure.
 
-Kunekt uses **MLS (Messaging Layer Security, RFC 9420)** for group
+VOS uses **MLS (Messaging Layer Security, RFC 9420)** for group
 key management. Each space is an MLS group.
 
 ---
@@ -101,7 +101,7 @@ epoch_secret
   └── init_secret         → seeds the next epoch
 ```
 
-Kunekt uses the `encryption_secret` to encrypt DAG node payloads and
+VOS uses the `encryption_secret` to encrypt DAG node payloads and
 the `exporter_secret` to derive application-specific keys (e.g., the
 Nostr relay signing key).
 
@@ -142,7 +142,7 @@ The flow:
 
 ## 3. MLS + Merkle-CRDT Reconciliation
 
-This is the hardest integration problem in the Kunekt protocol.
+This is the hardest integration problem in the VOS protocol.
 
 MLS was designed for a world with a **Delivery Service** — a server
 that sequences Commits so all members see them in the same order.
@@ -547,7 +547,7 @@ operations.
 
 ### The resolution: state vs. history
 
-Kunekt distinguishes between the **document state** (the current
+VOS distinguishes between the **document state** (the current
 value of the CRDT) and the **operation history** (the individual
 DAG nodes that built that state).
 
@@ -609,7 +609,7 @@ who holds the old epoch keys.
 
 ### Crate
 
-Kunekt uses the [`openmls`](https://github.com/openmls/openmls) crate,
+VOS uses the [`openmls`](https://github.com/openmls/openmls) crate,
 a Rust implementation of RFC 9420. OpenMLS is modular — it defines
 traits for pluggable backends (crypto, key store, delivery).
 
@@ -618,12 +618,12 @@ traits for pluggable backends (crypto, key store, delivery).
 | Parameter | Choice | Rationale |
 |---|---|---|
 | Ciphersuite | `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` | X25519 for key agreement, AES-128-GCM for encryption, Ed25519 for signatures. Well-supported, efficient, no RSA baggage. |
-| Credential type | `BasicCredential` (Phase 1-2), custom ZK credential (Phase 3+) | Basic credentials carry an opaque identity. ZK credentials will allow proving membership without revealing which member. |
+| Credential type | `BasicCredential` today; custom ZK credential later | Basic credentials carry an opaque identity. ZK credentials will allow proving membership without revealing which member. |
 | Protocol version | MLS 1.0 | Only version specified by RFC 9420. |
 
 ### Custom MLS backends
 
-OpenMLS requires three backend components. Kunekt provides custom
+OpenMLS requires three backend components. VOS provides custom
 implementations for each, backed by the Merkle-CRDT layer:
 
 **KeyStore** — persists key material (KeyPackages, ratchet tree
@@ -631,7 +631,7 @@ state, epoch secrets).
 
 ```rust
 /// KeyStore backed by local encrypted storage
-impl OpenMlsKeyStore for KunektKeyStore {
+impl OpenMlsKeyStore for VosKeyStore {
     type Error = KeyStoreError;
 
     fn store<V: MlsEntity>(&self, k: &[u8], v: &V) -> Result<(), Self::Error> {
@@ -649,7 +649,7 @@ impl OpenMlsKeyStore for KunektKeyStore {
 ```
 
 **DeliveryService** — in standard MLS, this is a server that receives
-Commits and distributes them to all members. In Kunekt, there is no
+Commits and distributes them to all members. In VOS, there is no
 server. The Merkle-CRDT sync layer *is* the delivery service.
 
 ```rust
@@ -681,7 +681,7 @@ impl MlsDelivery for CrdtDeliveryService {
 }
 ```
 
-**CryptoProvider** — the cryptographic backend. Kunekt uses
+**CryptoProvider** — the cryptographic backend. VOS uses
 OpenMLS's `openmls_rust_crypto` provider (based on the RustCrypto
 crates) for a pure-Rust, `no_std`-compatible implementation.
 
