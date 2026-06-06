@@ -117,6 +117,7 @@ mod framework;
 pub mod framework_access;
 mod lookups;
 pub mod proof;
+pub mod segment;
 pub mod trace;
 
 #[cfg(feature = "prover")]

@@ -196,6 +196,213 @@ fn measure_transition_trace() {
     }
 }
 
+/// Segmentation baseline: a single bounded segment of the kernel transition
+/// proves in bounded memory and is constraint-clean. The single-shot prove
+/// of the whole 5.3M-step trace OOMs a 64 GB host; one ~1M-step segment fits.
+/// Heavy; `#[ignore]` — run with `--ignored`.
+#[test]
+#[ignore]
+fn prove_one_transition_segment() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    let b = total.min(SEG_STEPS);
+    eprintln!("proving segment [0, {b}) of {total} steps (mobile config)…");
+    let mut sn = zkpvm::segment::segment_side_note(&full, 0, b);
+    let t = std::time::Instant::now();
+    // Mobile config: FRI log_blowup 2 (4×) vs default 4 (16×) — the blowup
+    // is the commit-phase memory driver, so mobile + a bounded segment fits.
+    let proof = zkpvm::prove_mobile(&mut sn).expect("segment [0, b) must prove (bounded memory)");
+    eprintln!("segment [0, {b}) proved in {:.1?}", t.elapsed());
+    zkpvm::verify_with_pcs_policy(proof, &sn, &zkpvm::PcsPolicy::MOBILE)
+        .expect("segment proof must verify (mobile policy)");
+}
+
+/// Per-segment step cap — sets each segment's `log_size`, hence its prove
+/// memory. The 5.3M-step transition's single-shot prove (even one chip)
+/// OOMs a 64 GB host; ~500K-step segments under the mobile FRI config fit
+/// in well under 16 GB.
+const SEG_STEPS: usize = 500_000;
+
+/// verify_chain with the MOBILE pcs policy: boundary continuity (each
+/// segment's `final_state` == the next's `initial_state`, Phase-Z0-bound)
+/// + per-segment `verify_with_pcs_policy(MOBILE)`. The crate `verify_chain`
+/// hardcodes the STANDARD policy and would reject mobile proofs.
+#[allow(dead_code)]
+fn verify_chain_mobile(proofs: &[zkpvm::Proof], sns: &[&zkpvm::SideNote]) -> Result<(), String> {
+    for w in proofs.windows(2) {
+        if w[0].final_state != w[1].initial_state {
+            return Err(format!(
+                "segment boundary mismatch (ts {} ≠ {})",
+                w[0].final_state.timestamp, w[1].initial_state.timestamp
+            ));
+        }
+    }
+    for (p, sn) in proofs.iter().zip(sns) {
+        zkpvm::verify_with_pcs_policy(p.clone(), sn, &zkpvm::PcsPolicy::MOBILE)
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Segmentation end-to-end: prove the FULL kernel transition as a chain of
+/// bounded segments and `verify_chain` it. This is the general capability —
+/// any actor trace too large for a single proof becomes provable in bounded
+/// memory. Also pins that a broken segment boundary is rejected.
+/// Heavy (minutes); `#[ignore]` — run with:
+///   cargo test -p prover-extension --test prove_transition \
+///     prove_transition_segmented_chain -- --ignored --nocapture
+#[test]
+#[ignore]
+fn prove_transition_segmented_chain() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    let bounds = zkpvm::segment::segment_bounds(total, SEG_STEPS);
+    eprintln!(
+        "segmenting {total} steps → {} segments of ≤ {SEG_STEPS}",
+        bounds.len()
+    );
+
+    let mut side_notes: Vec<zkpvm::SideNote> = Vec::new();
+    let mut proofs = Vec::new();
+    for (i, (a, b)) in bounds.iter().enumerate() {
+        let mut sn = zkpvm::segment::segment_side_note(&full, *a, *b);
+        let t = std::time::Instant::now();
+        let proof = zkpvm::prove_mobile(&mut sn)
+            .unwrap_or_else(|e| panic!("prove segment {i} [{a},{b}): {e:?}"));
+        eprintln!(
+            "  segment {i} [{a},{b}) ({} steps): proved in {:.1?}",
+            b - a,
+            t.elapsed()
+        );
+        side_notes.push(sn);
+        proofs.push(proof);
+    }
+
+    let sn_refs: Vec<&zkpvm::SideNote> = side_notes.iter().collect();
+    let t = std::time::Instant::now();
+    verify_chain_mobile(&proofs, &sn_refs).expect("verify_chain (mobile) over transition segments");
+    eprintln!(
+        "verify_chain over {} segments: ok ({:.1?})",
+        proofs.len(),
+        t.elapsed()
+    );
+
+    // A broken boundary (tampered initial-state timestamp) must be rejected.
+    if proofs.len() >= 2 {
+        let mut forged = proofs.clone();
+        forged[1].initial_state.timestamp ^= 1;
+        assert!(
+            verify_chain_mobile(&forged, &sn_refs).is_err(),
+            "verify_chain must reject a broken segment boundary"
+        );
+    }
+    eprintln!(
+        "ALL {total} steps PROVED + verify_chain green across {} segments",
+        proofs.len()
+    );
+}
+
+/// Pinpoint WHICH chip's constraints fail at log_size 19 (where the full
+/// prove returns ConstraintsNotSatisfied but the AssertEvaluator OOMs).
+/// `prove_with_explicit_components` over a single chip still runs the
+/// quotient/constraint check (→ Err(ConstraintsNotSatisfied) for the
+/// culprit) but fits in memory. DBG_CHIP selects the active-component index;
+/// DBG_SEG the segment size. Run:
+///   DBG_CHIP=0 DBG_SEG=500000 cargo test -p prover-extension \
+///     --test prove_transition pinpoint_segment_chip -- --ignored --nocapture
+#[test]
+#[ignore]
+fn pinpoint_segment_chip() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    let b = std::env::var("DBG_SEG")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(500_000)
+        .min(total);
+    let idx = std::env::var("DBG_CHIP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut sn = zkpvm::segment::segment_side_note(&full, 0, b);
+    let comps = zkpvm::active_components(&sn);
+    eprintln!(
+        "segment [0,{b}) has {} active chips; proving chip #{idx} alone…",
+        comps.len()
+    );
+    let single: Vec<&dyn zkpvm::harness::MachineProverComponent> = vec![comps[idx]];
+    // Mobile FRI config (blowup 2) so a single chip at log 19 fits.
+    let config = zkpvm::PcsConfig {
+        pow_bits: 20,
+        fri_config: zkpvm::FriConfig::new(0, 2, 38, 1),
+        lifting_log_size: None,
+    };
+    match zkpvm::prove_with_explicit_components(&mut sn, config, &single) {
+        Ok(_) => eprintln!("chip #{idx}: constraints OK at [0,{b})"),
+        Err(e) => eprintln!("chip #{idx}: FAILED at [0,{b}) — {e:?}"),
+    }
+}
+
+/// Pinpoint a constraint failure in a single segment (lighter than prove:
+/// no FRI). Run:
+///   cargo test -p prover-extension --features debug-constraints \
+///     --test prove_transition debug_one_transition_segment -- --ignored --nocapture
+#[cfg(feature = "debug-constraints")]
+#[test]
+#[ignore]
+fn debug_one_transition_segment() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    // DBG_SEG lets us shrink the segment so the AssertEvaluator fits while
+    // we pinpoint the failing chip/row.
+    let b = std::env::var("DBG_SEG")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(120_000)
+        .min(total);
+    let mut sn = zkpvm::segment::segment_side_note(&full, 0, b);
+    let comps = zkpvm::active_components(&sn);
+    eprintln!("asserting segment [0, {b}) across {} chips…", comps.len());
+    zkpvm::debug_assert_constraints_streaming(&mut sn, &comps);
+    eprintln!("segment [0, {b}) constraints OK");
+}
+
 /// Whole-trace constraint check (no FRI / no blowup / no Merkle commit, so
 /// far lighter than `prove`). Confirms EVERY chip's constraints hold across
 /// the full kernel-transition trace — i.e. that beyond the task-#7 comb fix
