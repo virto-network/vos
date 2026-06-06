@@ -576,13 +576,27 @@ impl BuiltInProverComponent for MemoryChip {
 
         // Inject initial memory writes at timestamp 0 for byte addresses read without prior write.
         if !side_note.initial_memory.is_empty() {
-            let mut first_access: BTreeMap<u32, bool> = BTreeMap::new();
+            // The boundary must reflect each address's TRUE first access (the
+            // one with the lowest timestamp), not collection order. `entries`
+            // is gathered steps-first then precompile mem_ops, so an address a
+            // precompile READS at a low ts but a later step WRITES at a higher
+            // ts would be misjudged "write-first" in collection order and
+            // wrongly skip its ts=0 boundary — leaving the precompile read to
+            // bottom out at prev_value 0 instead of the real initial byte.
+            let mut first_access: BTreeMap<u32, (u64, bool)> = BTreeMap::new();
             for e in &entries {
-                first_access.entry(e.address).or_insert(e.is_write);
+                first_access
+                    .entry(e.address)
+                    .and_modify(|fa| {
+                        if e.timestamp < fa.0 {
+                            *fa = (e.timestamp, e.is_write);
+                        }
+                    })
+                    .or_insert((e.timestamp, e.is_write));
             }
 
             let flat_mem = &side_note.initial_memory;
-            for (&addr, &first_is_write) in &first_access {
+            for (&addr, &(_, first_is_write)) in &first_access {
                 if first_is_write {
                     continue;
                 }
