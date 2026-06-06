@@ -131,6 +131,149 @@ fn build_transition() -> (VoucherPublic, TransitionWitness) {
     (public, witness)
 }
 
+/// Diagnostic (no prove): find the first segment memory read whose value
+/// disagrees with the threaded initial_memory (the boundary the MemoryChip
+/// read-consistency check uses), then report what (if anything) actually
+/// wrote that address in [0, a). Pinpoints the missing write source in the
+/// segment memory-threading. DBG_SEG_A selects the segment start.
+#[test]
+#[ignore]
+fn diag_segment_memory() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace");
+        return;
+    };
+    let total = full.steps.len();
+    let a = std::env::var("DBG_SEG_A")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(500_000)
+        .min(total - 1);
+    let b = (a + 262_144).min(total);
+    let sn = zkpvm::segment::segment_side_note(&full, a, b);
+    let mem = &sn.initial_memory; // the threaded boundary
+    let ts_lo = full.steps[a].timestamp;
+
+    // Walk the segment in order, tracking per-byte current value (init from
+    // the boundary). First read whose byte disagrees = the bug.
+    use std::collections::HashMap;
+    let mut cur: HashMap<u32, u8> = HashMap::new();
+    let byte_at = |cur: &HashMap<u32, u8>, mem: &[u8], addr: u32| -> u8 {
+        if let Some(v) = cur.get(&addr) {
+            *v
+        } else {
+            *mem.get(addr as usize).unwrap_or(&0)
+        }
+    };
+    for s in &full.steps[a..b] {
+        if let Some(r) = &s.mem_read {
+            let bytes = r.value.to_le_bytes();
+            for i in 0..r.size as usize {
+                let addr = r.address + i as u32;
+                let expect = byte_at(&cur, mem, addr);
+                if bytes[i] != expect {
+                    eprintln!(
+                        "MISMATCH at step ts={} addr={addr:#x}: read byte {:#x} but boundary/cur has {:#x}",
+                        s.timestamp, bytes[i], expect
+                    );
+                    // Full write history of this addr in [0, a) across ALL
+                    // sources, sorted by ts — reveals the missing/mis-ordered
+                    // write.
+                    let mut hist: Vec<(u64, &str, u8)> = Vec::new();
+                    for ws in &full.steps {
+                        if ws.timestamp >= ts_lo {
+                            break;
+                        }
+                        if let Some(w) = &ws.mem_write {
+                            let wb = w.value.to_le_bytes();
+                            for k in 0..w.size as usize {
+                                if w.address + k as u32 == addr {
+                                    hist.push((ws.timestamp, "step.store", wb[k]));
+                                }
+                            }
+                        }
+                    }
+                    for m in &full.blake2b_mem_ops {
+                        if m.ts < ts_lo && addr >= m.h_ptr && addr < m.h_ptr + 64 {
+                            hist.push((
+                                m.ts,
+                                "blake2b@h_ptr",
+                                m.out_bytes[(addr - m.h_ptr) as usize],
+                            ));
+                        }
+                    }
+                    for m in &full.ristretto_mem_ops {
+                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
+                            hist.push((
+                                m.ts,
+                                "ristretto@out",
+                                m.out_bytes[(addr - m.output_ptr) as usize],
+                            ));
+                        }
+                    }
+                    for m in &full.ristretto_add_mem_ops {
+                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
+                            hist.push((
+                                m.ts,
+                                "rist_add@out",
+                                m.out_bytes[(addr - m.output_ptr) as usize],
+                            ));
+                        }
+                    }
+                    for m in &full.scalar_reduce_wide_mem_ops {
+                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
+                            hist.push((
+                                m.ts,
+                                "scalar_reduce@out",
+                                m.out_bytes[(addr - m.output_ptr) as usize],
+                            ));
+                        }
+                    }
+                    for m in &full.scalar_binop_mem_ops {
+                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
+                            hist.push((
+                                m.ts,
+                                "scalar_binop@out",
+                                m.out_bytes[(addr - m.output_ptr) as usize],
+                            ));
+                        }
+                    }
+                    // Also: does any precompile READ this addr (input region)?
+                    for m in &full.blake2b_mem_ops {
+                        if m.ts < ts_lo && addr >= m.m_ptr && addr < m.m_ptr + 128 {
+                            hist.push((
+                                m.ts,
+                                "blake2b READS m here",
+                                m.m_bytes[(addr - m.m_ptr) as usize],
+                            ));
+                        }
+                    }
+                    hist.sort_by_key(|h| h.0);
+                    eprintln!("  write/access history of {addr:#x} in [0,{a}):");
+                    for (ts, src, byte) in hist.iter().rev().take(8).rev() {
+                        eprintln!("    ts={ts:>8} {src:24} byte={byte:#x}");
+                    }
+                    eprintln!("  → boundary={expect:#x}, real read={:#x}", bytes[i]);
+                    return;
+                }
+            }
+        }
+        if let Some(w) = &s.mem_write {
+            let wb = w.value.to_le_bytes();
+            for i in 0..w.size as usize {
+                cur.insert(w.address + i as u32, wb[i]);
+            }
+        }
+    }
+    eprintln!("no first-access read mismatch found in [{a},{b})");
+}
+
 /// Diagnostic (no prove): size the kernel-transition trace and break it
 /// down by op so we know what drives the prove's memory footprint. The
 /// full prove OOMs; this tells us whether it's software variable-base
@@ -389,18 +532,24 @@ fn debug_one_transition_segment() {
         return;
     };
     let total = full.steps.len();
-    // DBG_SEG lets us shrink the segment so the AssertEvaluator fits while
-    // we pinpoint the failing chip/row.
+    // DBG_SEG_A/DBG_SEG_B select a [a, b) window so the AssertEvaluator fits
+    // (≤ log 18) while we pinpoint the failing chip/row. DBG_SEG_A > 0
+    // exercises the memory-threading path (non-initial segment).
+    let a = std::env::var("DBG_SEG_A")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(total.saturating_sub(1));
     let b = std::env::var("DBG_SEG")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(120_000)
         .min(total);
-    let mut sn = zkpvm::segment::segment_side_note(&full, 0, b);
+    let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
     let comps = zkpvm::active_components(&sn);
-    eprintln!("asserting segment [0, {b}) across {} chips…", comps.len());
+    eprintln!("asserting segment [{a}, {b}) across {} chips…", comps.len());
     zkpvm::debug_assert_constraints_streaming(&mut sn, &comps);
-    eprintln!("segment [0, {b}) constraints OK");
+    eprintln!("segment [{a}, {b}) constraints OK");
 }
 
 /// Whole-trace constraint check (no FRI / no blowup / no Merkle commit, so

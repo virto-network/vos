@@ -31,7 +31,6 @@ pub fn segment_bounds(total: usize, max_steps: usize) -> alloc::vec::Vec<(usize,
 
 #[cfg(feature = "prover")]
 mod prover {
-    use crate::core::step::PvmStep;
     use crate::side_note::SideNote;
     use alloc::vec::Vec;
 
@@ -59,10 +58,11 @@ mod prover {
     /// re-derives the comb / variable-base routing + comb counts from the
     /// sliced scalar-mult records.
     ///
-    /// For chaining N segments efficiently, prefer threading the memory
-    /// image yourself (segment k+1's initial memory = segment k's initial
-    /// memory + segment k's writes) rather than calling this per segment,
-    /// which re-folds `steps[..a]` each time (O(N²) total).
+    /// Note: each call reconstructs the entering memory by replaying all
+    /// writes with `ts < steps[a].ts` (step stores + precompile outputs), so
+    /// proving N segments by calling this per segment is O(N²) in total
+    /// replay work. Fine for modest N; a streaming driver could thread the
+    /// memory image forward instead.
     ///
     /// Panics if `a >= b` or `b > full.steps.len()`.
     pub fn segment_side_note(full: &SideNote, a: usize, b: usize) -> SideNote {
@@ -76,9 +76,15 @@ mod prover {
         let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
         let in_window = move |ts: u64| ts >= ts_lo && ts < ts_hi;
 
-        // Memory state entering the segment: initial image + earlier writes.
-        let mut mem = full.initial_memory.clone();
-        apply_writes(&mut mem, &full.steps[..a]);
+        // Memory state entering the segment: replay EVERY write with
+        // `ts < ts_lo` in timestamp order — both regular stores
+        // (`step.mem_write`) AND precompile output writes (blake2b /
+        // ristretto / scalar-* `*_mem_ops`), which are NOT recorded in
+        // `step.mem_write`. Missing the precompile writes leaves stale bytes
+        // at their output addresses, so a later segment's read of an
+        // earlier-segment precompile result fails the memory-ledger
+        // read-consistency check (`is_read · (value − prev) = 0`).
+        let mem = reconstruct_initial_memory(full, ts_lo);
 
         let mut sn = SideNote::new(
             full.steps[a..b].to_vec(),
@@ -129,20 +135,82 @@ mod prover {
         sn
     }
 
-    /// Apply every `mem_write` in `steps` to `mem` in order.
-    pub fn apply_writes(mem: &mut Vec<u8>, steps: &[PvmStep]) {
-        for s in steps {
+    /// Reconstruct the flat memory state entering a segment at timestamp
+    /// `ts_lo`: the initial image with every write at `ts < ts_lo` applied in
+    /// timestamp order. Crucially this includes **precompile output writes**
+    /// (blake2b's 64-byte hash at `h_ptr`; ristretto / point-add /
+    /// scalar-reduce / scalar-binop's 32-byte result at `output_ptr`), which
+    /// the per-step `mem_write` does NOT capture — they live in the
+    /// `*_mem_ops` records.
+    fn reconstruct_initial_memory(full: &SideNote, ts_lo: u64) -> Vec<u8> {
+        // (ts, addr, 64-byte buffer, len). A fixed buffer avoids a heap
+        // allocation per write; 64 = blake2b's output, the widest write.
+        let mut writes: Vec<(u64, u32, [u8; 64], u8)> = Vec::new();
+
+        for s in &full.steps {
+            // steps are emitted in timestamp order.
+            if s.timestamp >= ts_lo {
+                break;
+            }
             if let Some(w) = &s.mem_write {
-                let addr = w.address as usize;
                 let sz = w.size as usize;
-                let end = addr + sz;
-                if end > mem.len() {
-                    mem.resize(end, 0);
-                }
-                let bytes = w.value.to_le_bytes();
-                mem[addr..end].copy_from_slice(&bytes[..sz]);
+                let mut buf = [0u8; 64];
+                buf[..sz].copy_from_slice(&w.value.to_le_bytes()[..sz]);
+                writes.push((s.timestamp, w.address, buf, sz as u8));
             }
         }
+        for m in &full.blake2b_mem_ops {
+            if m.ts < ts_lo {
+                let mut buf = [0u8; 64];
+                buf[..64].copy_from_slice(&m.out_bytes);
+                writes.push((m.ts, m.h_ptr, buf, 64));
+            }
+        }
+        for m in &full.ristretto_mem_ops {
+            if m.ts < ts_lo {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&m.out_bytes);
+                writes.push((m.ts, m.output_ptr, buf, 32));
+            }
+        }
+        for m in &full.ristretto_add_mem_ops {
+            if m.ts < ts_lo {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&m.out_bytes);
+                writes.push((m.ts, m.output_ptr, buf, 32));
+            }
+        }
+        for m in &full.scalar_reduce_wide_mem_ops {
+            if m.ts < ts_lo {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&m.out_bytes);
+                writes.push((m.ts, m.output_ptr, buf, 32));
+            }
+        }
+        for m in &full.scalar_binop_mem_ops {
+            if m.ts < ts_lo {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&m.out_bytes);
+                writes.push((m.ts, m.output_ptr, buf, 32));
+            }
+        }
+
+        // Each timestamp has at most one write (a step is either a regular
+        // store or exactly one ECALL precompile), so sorting by ts yields a
+        // well-defined replay order with later writes overwriting earlier.
+        writes.sort_by_key(|w| w.0);
+
+        let mut mem = full.initial_memory.clone();
+        for (_ts, addr, buf, len) in &writes {
+            let addr = *addr as usize;
+            let len = *len as usize;
+            let end = addr + len;
+            if end > mem.len() {
+                mem.resize(end, 0);
+            }
+            mem[addr..end].copy_from_slice(&buf[..len]);
+        }
+        mem
     }
 
     /// Keep the i-th `(call, mem_op)` pair iff `pred(mem_op)`. The inputs
@@ -170,4 +238,4 @@ mod prover {
 }
 
 #[cfg(feature = "prover")]
-pub use prover::{apply_writes, segment_side_note};
+pub use prover::segment_side_note;
