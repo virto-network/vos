@@ -1215,27 +1215,34 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Phi7 slot ← f_flag (a3 = x13 = PVM φ[10]).
         let phi7_u64 = step.regs_before[10];
         trace.fill_columns(row, phi7_u64, Column::Phi7);
-        let phi7_bool: u8 = if phi7_u64 != 0 { 1 } else { 0 };
-        trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
-        // Phi7Inv = field-element inverse of (Phi7 interpreted as u64, mod M31).
-        // If Phi7 == 0 we store 0; the boolean-identity constraint
-        //   Phi7Bool · (1 - Phi7_combined · Phi7Inv_combined) = 0
-        // forces Phi7Inv to be the real inverse whenever Phi7Bool = 1.
-        let phi7_inv_u64: u64 = if phi7_u64 != 0 {
-            // Combine bytes with powers of 256 modulo the M31 prime,
-            // then invert.  Rust's u128 multiplication + manual mod is
-            // enough since M31 = 2^31 - 1.
-            const M31_P: u64 = (1u64 << 31) - 1;
+        // The `Phi7` column holds the M31 field-reduction of this u64, and the
+        // boolean-identity constraints — `(1 − Phi7Bool) · Phi7 = 0` and
+        // `Phi7Bool · (Phi7 · Phi7Inv − 1) = 0` (mod.rs §Phase-9e) — operate
+        // on that *field* value. So `Phi7Bool` / `Phi7Inv` MUST be derived
+        // from the reduced field element, NOT the raw u64: a nonzero u64 that
+        // is ≡ 0 mod M31 (a nonzero multiple of 2³¹−1, e.g. 0x7FFF_FFFF in
+        // x13 on a non-ECALL row) reduces to the zero field element, so a
+        // u64-based `Phi7Bool = 1` leaves `Phi7·Phi7Inv = 0 ≠ 1` and makes
+        // the gadget unsatisfiable. (The sole real consumer, blake2b's
+        // `f_flag`, is 0/1, where field == u64 — this only corrects the
+        // otherwise-unconstrained x13 values on non-blake2b rows.)
+        const M31_P: u64 = (1u64 << 31) - 1;
+        let phi7_field: u64 = {
             let mut combined: u64 = 0;
-            let bytes = phi7_u64.to_le_bytes();
             let mut pow: u64 = 1;
-            for b in bytes {
+            for b in phi7_u64.to_le_bytes() {
                 combined = (combined + (b as u64) * pow) % M31_P;
                 pow = (pow * 256) % M31_P;
             }
-            // Fermat's little theorem: inverse = combined^(p-2) mod p.
+            combined
+        };
+        let phi7_bool: u8 = if phi7_field != 0 { 1 } else { 0 };
+        trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
+        // Phi7Inv = field inverse of the reduced value (0 when it is 0).
+        // Fermat's little theorem: inverse = v^(p-2) mod p.
+        let phi7_inv_u64: u64 = if phi7_field != 0 {
             let mut result: u64 = 1;
-            let mut base = combined;
+            let mut base = phi7_field;
             let mut exp = M31_P - 2;
             while exp > 0 {
                 if exp & 1 == 1 {
