@@ -497,6 +497,7 @@ pub use prove::{
 #[cfg(feature = "debug-internals")]
 pub use prove::{
     debug_assert_constraints_explicit, debug_assert_constraints_streaming, debug_claimed_sums,
+    debug_claimed_sums_streaming,
 };
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;

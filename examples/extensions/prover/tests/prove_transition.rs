@@ -131,6 +131,30 @@ fn build_transition() -> (VoucherPublic, TransitionWitness) {
     (public, witness)
 }
 
+/// Length-prefixed witness buffer for the transition, CACHED to disk so the
+/// trace is reproducible across runs. `build_transition` uses `OsRng`
+/// (`Keypair::generate`, `JournalId::random`, `AccountId::random`, signing
+/// nonces), so each call traces a DIFFERENT witness — segment boundaries land
+/// on different ops, and a boundary-sensitive bug lands in a different
+/// segment. Freezing one witness makes "which segment is unbalanced" and any
+/// subsequent bisection stable. Override the path with VOS_WITNESS_CACHE;
+/// delete the file to re-roll.
+#[allow(dead_code)]
+fn cached_witness_buf() -> Vec<u8> {
+    let path = std::env::var("VOS_WITNESS_CACHE")
+        .unwrap_or_else(|_| "/tmp/transition_witness.bin".to_string());
+    if let Ok(bytes) = std::fs::read(&path) {
+        eprintln!("loaded cached witness ({} B) from {path}", bytes.len());
+        return bytes;
+    }
+    let (public, witness) = build_transition();
+    let buf = encode_witness(&public.encode(), &witness.encode());
+    if std::fs::write(&path, &buf).is_ok() {
+        eprintln!("built + cached witness ({} B) to {path}", buf.len());
+    }
+    buf
+}
+
 /// Diagnostic (no prove): find the first segment memory read whose value
 /// disagrees with the threaded initial_memory (the boundary the MemoryChip
 /// read-consistency check uses), then report what (if anything) actually
@@ -559,6 +583,226 @@ fn debug_one_transition_segment() {
     eprintln!("asserting segment [{a}, {b}) across {} chips…", comps.len());
     zkpvm::debug_assert_constraints_streaming(&mut sn, &comps);
     eprintln!("segment [{a}, {b}) constraints OK");
+}
+
+/// Localize a `verify_chain` "claimed logup sum is not zero" failure WITHOUT
+/// proving. For each segment, generate every chip's interaction trace and sum
+/// the per-component claimed logup sums: a balanced segment totals zero; the
+/// segment that doesn't is the one whose proof fails to verify, and the
+/// per-component breakdown points at the imbalanced relation (e.g. a memory
+/// boundary mismatch, or a mis-derived ristretto-comb routing at a slice
+/// boundary). Trace-gen only (no FRI), so all 11 segments check in minutes,
+/// not the hour a full prove-chain costs. DBG_SEG_I=k restricts to one
+/// segment index. Run:
+///   cargo test -p prover-extension --features debug-constraints \
+///     --test prove_transition diag_segment_logup -- --ignored --nocapture
+#[cfg(feature = "debug-constraints")]
+#[test]
+#[ignore]
+fn diag_segment_logup() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    let witness_buf = cached_witness_buf();
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    let bounds = zkpvm::segment::segment_bounds(total, SEG_STEPS);
+    let only = std::env::var("DBG_SEG_I")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    eprintln!(
+        "checking logup balance of {} segments of ≤ {SEG_STEPS} ({total} steps)",
+        bounds.len()
+    );
+    let mut unbalanced = Vec::new();
+    for (i, (a, b)) in bounds.iter().enumerate() {
+        if only.is_some_and(|j| i != j) {
+            continue;
+        }
+        let mut sn = zkpvm::segment::segment_side_note(&full, *a, *b);
+        eprintln!("\n=== segment {i} [{a},{b}) ({} steps) ===", b - a);
+        // debug_claimed_sums prints per-component sums + the total and
+        // returns whether it balances; collect the verdict for a summary.
+        if !zkpvm::debug_claimed_sums(&mut sn) {
+            unbalanced.push(i);
+        }
+    }
+    eprintln!("\n=== summary ===");
+    if unbalanced.is_empty() {
+        eprintln!("all checked segments balance");
+    } else {
+        eprintln!("UNBALANCED segments (proof would fail verify): {unbalanced:?}");
+    }
+}
+
+/// Decide whether the segment-9 logup imbalance is a SEGMENTATION boundary
+/// artifact or a real per-chip bug in that region of the program: check
+/// whether the FULL (un-segmented) trace's logup balances. The single-shot
+/// prove OOMs, so this never got verified before; `debug_claimed_sums_streaming`
+/// accumulates the global claimed-sum one chip at a time (bounded memory).
+/// - BALANCES  → the full execution is sound; the segment imbalance is purely
+///   a boundary-reconstruction bug in `segment_side_note`.
+/// - DOES NOT  → a genuine chip bug fires on some op in the trace (like the
+///   SetGt / Phi7 bugs), independent of segmentation.
+/// Run:
+///   cargo test -p prover-extension --features debug-constraints \
+///     --test prove_transition debug_transition_full_logup -- --ignored --nocapture
+#[cfg(feature = "debug-constraints")]
+#[test]
+#[ignore]
+fn debug_transition_full_logup() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    let witness_buf = cached_witness_buf();
+    let Some(mut full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let n = full.steps.len();
+    let components = zkpvm::active_components(&full);
+    eprintln!(
+        "checking FULL-trace logup balance over {n} steps across {} chips…",
+        components.len()
+    );
+    let ok = zkpvm::debug_claimed_sums_streaming(&mut full, &components);
+    eprintln!(
+        "FULL trace ({n} steps): {}",
+        if ok {
+            "BALANCES → segment imbalance is a boundary artifact"
+        } else {
+            "DOES NOT BALANCE → real per-chip bug in the trace"
+        }
+    );
+}
+
+/// Pinpoint the buggy step behind an intrinsic (non-boundary) logup
+/// imbalance by bisecting a step window. Since boundary reconstruction is
+/// balanced (proven: segments not containing the bug balance), a sub-window
+/// is unbalanced IFF it contains the offending op — so binary search converges
+/// on it, and we dump the opcodes in the minimal window. DBG_A/DBG_B bound
+/// the search (default the unbalanced segment 9 range); DBG_MIN the stop
+/// width. Uses the cached (deterministic) witness. Run:
+///   cargo test -p prover-extension --features debug-constraints \
+///     --test prove_transition bisect_segment_logup -- --ignored --nocapture
+#[cfg(feature = "debug-constraints")]
+#[test]
+#[ignore]
+fn bisect_segment_logup() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    let witness_buf = cached_witness_buf();
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    let env_usize = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+            .min(total)
+    };
+    let min_w = env_usize("DBG_MIN", 200);
+    // Scan window (500K segments via segment_bounds) is bounded so
+    // debug_claimed_sums (which holds all chip traces) never OOMs. The bug
+    // is post-crypto (late), so scan from DBG_SCAN_FROM (default 4M) onward.
+    let scan_from = env_usize("DBG_SCAN_FROM", 4_000_000);
+
+    let balances = |a: usize, b: usize| -> bool {
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        zkpvm::debug_claimed_sums(&mut sn)
+    };
+
+    // 1) Locate the first ≤500K segment (at/after scan_from) that doesn't
+    //    balance — that's the one carrying the intrinsic bug.
+    let (mut lo, mut hi) = {
+        let mut found = None;
+        let mut a = scan_from;
+        while a < total {
+            let b = (a + SEG_STEPS).min(total);
+            eprintln!("scan segment [{a},{b})…");
+            if !balances(a, b) {
+                eprintln!("  → UNBALANCED; bisecting this segment");
+                found = Some((a, b));
+                break;
+            }
+            a = b;
+        }
+        found.unwrap_or_else(|| {
+            panic!("no unbalanced segment found at/after {scan_from}; lower DBG_SCAN_FROM")
+        })
+    };
+    eprintln!("bisecting [{lo},{hi}) for the intrinsic logup imbalance…");
+
+    while hi - lo > min_w {
+        let mid = lo + (hi - lo) / 2;
+        if !balances(lo, mid) {
+            eprintln!("  [{lo},{mid}) UNBALANCED → recurse left");
+            hi = mid;
+        } else if !balances(mid, hi) {
+            eprintln!("  [{mid},{hi}) UNBALANCED → recurse right");
+            lo = mid;
+        } else {
+            // Both halves balance but the parent doesn't → the offending
+            // producer/consumer pair straddles `mid`. Stop with a small
+            // window centred on mid.
+            eprintln!("  straddle at mid={mid}: both halves balance; centring window");
+            lo = mid.saturating_sub(min_w);
+            hi = (mid + min_w).min(total);
+            break;
+        }
+    }
+
+    eprintln!(
+        "\n=== minimal unbalanced window [{lo},{hi}) ({} steps) ===",
+        hi - lo
+    );
+    use std::collections::BTreeMap;
+    let mut hist: BTreeMap<String, u32> = BTreeMap::new();
+    for s in &full.steps[lo..hi] {
+        *hist.entry(format!("{:?}", s.opcode)).or_default() += 1;
+    }
+    eprintln!("--- opcode histogram of the window ---");
+    let mut by_n: Vec<_> = hist.into_iter().collect();
+    by_n.sort_by(|a, b| b.1.cmp(&a.1));
+    for (op, n) in &by_n {
+        eprintln!("  {op:28} {n:>5}");
+    }
+    eprintln!("--- step-by-step (opcode | regs a/b/d | imm | a,b vals → d val | mem) ---");
+    for (i, s) in full.steps[lo..hi].iter().enumerate() {
+        let av = s.regs_before.get(s.reg_a).copied().unwrap_or(0);
+        let bv = s.regs_before.get(s.reg_b).copied().unwrap_or(0);
+        let dv = s
+            .reg_write
+            .and_then(|w| s.regs_after.get(w).copied())
+            .unwrap_or(0);
+        let mem = match (&s.mem_read, &s.mem_write) {
+            (Some(r), _) => format!(" R[{:#x}]={:#x}/{}", r.address, r.value, r.size),
+            (_, Some(w)) => format!(" W[{:#x}]={:#x}/{}", w.address, w.value, w.size),
+            _ => String::new(),
+        };
+        eprintln!(
+            "  {:>8} {:<16?} a=r{} b=r{} d=r{} imm={:#x} | a={:#x} b={:#x} -> d={:#x}{mem}",
+            lo + i,
+            s.opcode,
+            s.reg_a,
+            s.reg_b,
+            s.reg_d,
+            s.imm,
+            av,
+            bv,
+            dv,
+        );
+    }
 }
 
 /// Whole-trace constraint check (no FRI / no blowup / no Merkle commit, so
