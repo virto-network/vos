@@ -273,6 +273,25 @@ pub enum Column {
     /// Per-byte active flags for memory lookup (1 if byte_i < mem_size)
     #[size = 8]
     MemByteActive,
+    /// Per-byte address carry chain for the memory lookup. Byte `i` of an
+    /// access at base address `MemAddr` lives at `MemAddr + i`, whose
+    /// canonical 4-byte little-endian decomposition needs carry propagation
+    /// (a misaligned multi-byte access can cross a 256-byte boundary, e.g.
+    /// an 8-byte store at `…fb`). `MemByteAddrCarry{1,2,3}[i]` are the carries
+    /// out of address bytes 0,1,2 when adding `i` — so the emitted byte
+    /// address is `(MemAddr[0]+i−256·c1, MemAddr[1]+c1−256·c2,
+    /// MemAddr[2]+c2−256·c3, MemAddr[3]+c3)`. The carries telescope (the
+    /// numeric address is always `base+i` for any boolean choice), and
+    /// matching the MemoryChip ledger's canonical bytes pins them. Without
+    /// this, byte addresses past a 256-boundary mismatched the ledger and the
+    /// memory logup didn't balance (aligned accesses never overflowed, so the
+    /// bug stayed latent until a misaligned cross-boundary store appeared).
+    #[size = 8]
+    MemByteAddrCarry1,
+    #[size = 8]
+    MemByteAddrCarry2,
+    #[size = 8]
+    MemByteAddrCarry3,
     // ── Program execution sequencing ──
     /// timestamp + 1 (8 limbs), used for the program execution lookup
     #[size = 8]

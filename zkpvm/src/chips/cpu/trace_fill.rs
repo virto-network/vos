@@ -1186,6 +1186,26 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 byte_active[i] = 1;
             }
             trace.fill_columns_bytes(row, &byte_active, Column::MemByteActive);
+            // Per-byte address carry chain: byte `i` lives at `address + i`,
+            // whose canonical little-endian bytes need carry propagation when
+            // the access crosses a 256/65536/16M boundary (a misaligned
+            // multi-byte access can). Emit the carries out of address bytes
+            // 0,1,2 for each of the 8 byte offsets so the lookup tuple's
+            // address matches the MemoryChip ledger's canonical decomposition.
+            let mut c1 = [0u8; 8];
+            let mut c2 = [0u8; 8];
+            let mut c3 = [0u8; 8];
+            let a0 = m.address & 0xff;
+            let a1 = (m.address >> 8) & 0xff;
+            let a2 = (m.address >> 16) & 0xff;
+            for i in 0..8u32 {
+                c1[i as usize] = ((a0 + i) >> 8) as u8;
+                c2[i as usize] = ((a1 + c1[i as usize] as u32) >> 8) as u8;
+                c3[i as usize] = ((a2 + c2[i as usize] as u32) >> 8) as u8;
+            }
+            trace.fill_columns_bytes(row, &c1, Column::MemByteAddrCarry1);
+            trace.fill_columns_bytes(row, &c2, Column::MemByteAddrCarry2);
+            trace.fill_columns_bytes(row, &c3, Column::MemByteAddrCarry3);
         }
 
         // NextTimestamp = timestamp + 1

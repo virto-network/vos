@@ -1598,16 +1598,31 @@ impl BuiltInComponent for CpuChip {
         let mem_value = crate::trace::trace_eval!(trace_eval, Column::MemValue);
         let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
         let mem_byte_active = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+        let mem_byte_carry1 = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry1);
+        let mem_byte_carry2 = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry2);
+        let mem_byte_carry3 = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry3);
+        let f256 = E::F::from(BaseField::from(256));
 
-        // Byte-level memory lookups: one per byte offset
+        // Byte-level memory lookups: one per byte offset. The address is the
+        // canonical little-endian decomposition of `MemAddr + byte_idx` with
+        // carry propagation across address bytes (MemByteAddrCarry{1,2,3}) —
+        // a misaligned multi-byte access can cross a 256/65536/16M boundary,
+        // so adding the offset to the low byte alone would mismatch the
+        // MemoryChip ledger's canonical address and the memory logup wouldn't
+        // balance. The carries telescope (numeric address is always
+        // `base + byte_idx`), and matching the canonical ledger bytes pins
+        // them; the booleanity constraints below keep them in {0,1}.
         for byte_idx in 0..WORD_SIZE {
             let byte_offset = E::F::from(BaseField::from(byte_idx as u32));
+            let c1 = mem_byte_carry1[byte_idx].clone();
+            let c2 = mem_byte_carry2[byte_idx].clone();
+            let c3 = mem_byte_carry3[byte_idx].clone();
             let mut tuple: Vec<E::F> = Vec::with_capacity(14);
-            // addr + byte_idx
-            tuple.push(mem_addr[0].clone() + byte_offset);
-            for j in 1..4 {
-                tuple.push(mem_addr[j].clone());
-            }
+            // Canonical bytes of MemAddr + byte_idx, with carry.
+            tuple.push(mem_addr[0].clone() + byte_offset - f256.clone() * c1.clone());
+            tuple.push(mem_addr[1].clone() + c1.clone() - f256.clone() * c2.clone());
+            tuple.push(mem_addr[2].clone() + c2.clone() - f256.clone() * c3.clone());
+            tuple.push(mem_addr[3].clone() + c3.clone());
             // value byte
             tuple.push(mem_value[byte_idx].clone());
             // timestamp
@@ -1620,6 +1635,19 @@ impl BuiltInComponent for CpuChip {
                 mem_byte_active[byte_idx].clone().into(),
                 &tuple,
             ));
+        }
+
+        // Booleanity of the per-byte address carries (unconditional; the
+        // carries are 0 on non-memory rows). The honest values are the true
+        // carry bits; ledger-match pins them to the canonical decomposition.
+        for byte_idx in 0..WORD_SIZE {
+            for c in [
+                mem_byte_carry1[byte_idx].clone(),
+                mem_byte_carry2[byte_idx].clone(),
+                mem_byte_carry3[byte_idx].clone(),
+            ] {
+                eval.add_constraint(c.clone() * (E::F::one() - c));
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
