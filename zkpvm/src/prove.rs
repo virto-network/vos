@@ -369,26 +369,15 @@ pub fn debug_assert_constraints_streaming(
 /// regions this dominates `prove`'s memory footprint.  Future work
 /// could swap this for an in-place Merkle commitment over the byte-
 /// level memory ledger (which we already build for the MemoryChip).
-fn compute_final_memory_commitment(
-    initial_memory: &[u8],
-    steps: &[crate::core::step::PvmStep],
-) -> [u8; 32] {
-    let mut mem = initial_memory.to_vec();
-    for step in steps {
-        if let Some(ref w) = step.mem_write {
-            let addr = w.address as usize;
-            let bytes = w.value.to_le_bytes();
-            let sz = w.size as usize;
-            // Grow `mem` if a write goes past the current end.  Honest
-            // PvmStep entries are bounded by the interpreter's memory
-            // size, so this should never fire in normal operation —
-            // but trust-but-verify since `steps` is caller-supplied.
-            if addr + sz > mem.len() {
-                mem.resize(addr + sz, 0);
-            }
-            mem[addr..addr + sz].copy_from_slice(&bytes[..sz]);
-        }
-    }
+fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
+    // Replay ALL of this (segment's) writes — regular stores AND precompile
+    // output writes (blake2b / ristretto / scalar-*, which live in
+    // `*_mem_ops`, not `step.mem_write`) — over the initial memory. Using
+    // step writes alone leaves precompile-output bytes stale, so a downstream
+    // segment's initial-memory commitment (which DOES reflect those writes,
+    // via `segment::replay_writes`) would mismatch and `verify_chain`'s
+    // boundary-continuity check would reject. `ts_upper = None` ⇒ all writes.
+    let mem = crate::segment::replay_writes(side_note, None);
     *blake3::hash(&mem).as_bytes()
 }
 
@@ -703,10 +692,7 @@ fn prove_impl_with_components(
             pc: last.next_pc,
             timestamp: last.timestamp + 1,
             registers: regs,
-            memory_commitment: compute_final_memory_commitment(
-                &side_note.initial_memory,
-                &side_note.steps,
-            ),
+            memory_commitment: compute_final_memory_commitment(side_note),
         }
     };
 

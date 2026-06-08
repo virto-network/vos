@@ -417,7 +417,16 @@ fn prove_transition_segmented_chain() {
         return;
     };
     let total = full.steps.len();
-    let bounds = zkpvm::segment::segment_bounds(total, SEG_STEPS);
+    let mut bounds = zkpvm::segment::segment_bounds(total, SEG_STEPS);
+    // DBG_MAX_SEGS limits the chain to the first N segments for a fast
+    // boundary-continuity check (a chain of mid-trace segments still
+    // exercises per-segment prove + verify_chain's boundary linkage).
+    if let Some(n) = std::env::var("DBG_MAX_SEGS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        bounds.truncate(n.max(1));
+    }
     eprintln!(
         "segmenting {total} steps → {} segments of ≤ {SEG_STEPS}",
         bounds.len()

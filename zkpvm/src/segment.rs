@@ -84,7 +84,7 @@ mod prover {
         // at their output addresses, so a later segment's read of an
         // earlier-segment precompile result fails the memory-ledger
         // read-consistency check (`is_read · (value − prev) = 0`).
-        let mem = reconstruct_initial_memory(full, ts_lo);
+        let mem = replay_writes(full, Some(ts_lo));
 
         let mut sn = SideNote::new(
             full.steps[a..b].to_vec(),
@@ -135,60 +135,64 @@ mod prover {
         sn
     }
 
-    /// Reconstruct the flat memory state entering a segment at timestamp
-    /// `ts_lo`: the initial image with every write at `ts < ts_lo` applied in
-    /// timestamp order. Crucially this includes **precompile output writes**
-    /// (blake2b's 64-byte hash at `h_ptr`; ristretto / point-add /
-    /// scalar-reduce / scalar-binop's 32-byte result at `output_ptr`), which
-    /// the per-step `mem_write` does NOT capture — they live in the
-    /// `*_mem_ops` records.
-    fn reconstruct_initial_memory(full: &SideNote, ts_lo: u64) -> Vec<u8> {
+    /// Replay a `SideNote`'s memory writes over its initial image, in
+    /// timestamp order, and return the resulting flat memory. `ts_upper`:
+    /// `Some(t)` applies only writes with `ts < t` (the memory state
+    /// ENTERING step `t`); `None` applies all writes (the FINAL memory).
+    ///
+    /// Crucially this includes **precompile output writes** (blake2b's
+    /// 64-byte hash at `h_ptr`; ristretto / point-add / scalar-reduce /
+    /// scalar-binop's 32-byte result at `output_ptr`), which the per-step
+    /// `mem_write` does NOT capture — they live in the `*_mem_ops` records.
+    /// Used both for a segment's threaded initial memory (`segment_side_note`)
+    /// and its final memory commitment (`prove`'s boundary state); the two
+    /// MUST agree or `verify_chain`'s boundary-continuity check rejects.
+    pub(crate) fn replay_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<u8> {
+        let keep = |ts: u64| ts_upper.is_none_or(|t| ts < t);
         // (ts, addr, 64-byte buffer, len). A fixed buffer avoids a heap
         // allocation per write; 64 = blake2b's output, the widest write.
         let mut writes: Vec<(u64, u32, [u8; 64], u8)> = Vec::new();
 
-        for s in &full.steps {
-            // steps are emitted in timestamp order.
-            if s.timestamp >= ts_lo {
-                break;
-            }
+        for s in &side_note.steps {
             if let Some(w) = &s.mem_write {
-                let sz = w.size as usize;
-                let mut buf = [0u8; 64];
-                buf[..sz].copy_from_slice(&w.value.to_le_bytes()[..sz]);
-                writes.push((s.timestamp, w.address, buf, sz as u8));
+                if keep(s.timestamp) {
+                    let sz = w.size as usize;
+                    let mut buf = [0u8; 64];
+                    buf[..sz].copy_from_slice(&w.value.to_le_bytes()[..sz]);
+                    writes.push((s.timestamp, w.address, buf, sz as u8));
+                }
             }
         }
-        for m in &full.blake2b_mem_ops {
-            if m.ts < ts_lo {
+        for m in &side_note.blake2b_mem_ops {
+            if keep(m.ts) {
                 let mut buf = [0u8; 64];
                 buf[..64].copy_from_slice(&m.out_bytes);
                 writes.push((m.ts, m.h_ptr, buf, 64));
             }
         }
-        for m in &full.ristretto_mem_ops {
-            if m.ts < ts_lo {
+        for m in &side_note.ristretto_mem_ops {
+            if keep(m.ts) {
                 let mut buf = [0u8; 64];
                 buf[..32].copy_from_slice(&m.out_bytes);
                 writes.push((m.ts, m.output_ptr, buf, 32));
             }
         }
-        for m in &full.ristretto_add_mem_ops {
-            if m.ts < ts_lo {
+        for m in &side_note.ristretto_add_mem_ops {
+            if keep(m.ts) {
                 let mut buf = [0u8; 64];
                 buf[..32].copy_from_slice(&m.out_bytes);
                 writes.push((m.ts, m.output_ptr, buf, 32));
             }
         }
-        for m in &full.scalar_reduce_wide_mem_ops {
-            if m.ts < ts_lo {
+        for m in &side_note.scalar_reduce_wide_mem_ops {
+            if keep(m.ts) {
                 let mut buf = [0u8; 64];
                 buf[..32].copy_from_slice(&m.out_bytes);
                 writes.push((m.ts, m.output_ptr, buf, 32));
             }
         }
-        for m in &full.scalar_binop_mem_ops {
-            if m.ts < ts_lo {
+        for m in &side_note.scalar_binop_mem_ops {
+            if keep(m.ts) {
                 let mut buf = [0u8; 64];
                 buf[..32].copy_from_slice(&m.out_bytes);
                 writes.push((m.ts, m.output_ptr, buf, 32));
@@ -200,7 +204,7 @@ mod prover {
         // well-defined replay order with later writes overwriting earlier.
         writes.sort_by_key(|w| w.0);
 
-        let mut mem = full.initial_memory.clone();
+        let mut mem = side_note.initial_memory.clone();
         for (_ts, addr, buf, len) in &writes {
             let addr = *addr as usize;
             let len = *len as usize;
@@ -237,5 +241,7 @@ mod prover {
     }
 }
 
+#[cfg(feature = "prover")]
+pub(crate) use prover::replay_writes;
 #[cfg(feature = "prover")]
 pub use prover::segment_side_note;
