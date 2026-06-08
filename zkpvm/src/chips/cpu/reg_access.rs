@@ -51,13 +51,17 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     // Phase 40: RotR64ImmAlt / RotR32ImmAlt swap the source convention
     // — val_b ← imm (no register read), val_d ← regs[rb].
     let is_rotate_r_imm_alt = classify_opcode(step.opcode).is_rotate_r_imm_alt;
+    // SetGtSImm/SetGtUImm use the same source swap as Phase 40 — val_b ← imm
+    // (no register read), val_d ← regs[rb] — so the SetLt comparison yields
+    // greater-than.
+    let is_set_gt = classify_opcode(step.opcode).is_set_gt;
     // Phase 9g: the previous skip for 32-bit Add/Sub/Mul/DivRem is lifted.
     // Cross-constraints in add_constraints handle the truncation: ValB low
     // 4 bytes match RegValB; upper 4 bytes match only when !IsTruncated.
     let val_b_read = match step.opcode.category() {
         ThreeReg => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
-        // Phase 40 swap: val_b is imm for RotR*ImmAlt, not a register.
-        TwoRegOneImm if is_rotate_r_imm_alt => None,
+        // Phase 40 / SetGt swap: val_b is imm, not a register.
+        TwoRegOneImm if is_rotate_r_imm_alt || is_set_gt => None,
         TwoRegOneImm => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
         OneRegImmOffset => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
         TwoReg => None,
@@ -68,8 +72,8 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     // ledger emission using the RegValD column (holds raw regs[reg_b]).
     let val_d_read = match step.opcode.category() {
         ThreeReg | TwoReg => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
-        // Phase 40 swap: val_d is regs[rb] (the shift) for RotR*ImmAlt.
-        TwoRegOneImm if is_rotate_r_imm_alt => {
+        // Phase 40 / SetGt swap: val_d is regs[rb] for RotR*ImmAlt / SetGt*.
+        TwoRegOneImm if is_rotate_r_imm_alt || is_set_gt => {
             Some((step.reg_b as u8, step.regs_before[step.reg_b]))
         }
         TwoRegOneImm | OneRegImmOffset => None,

@@ -84,6 +84,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 // Phase 40 swap.
                 (step.imm, step.regs_before[step.reg_b])
             }
+            javm::instruction::InstructionCategory::TwoRegOneImm if flags.is_set_gt => {
+                // SetGt swap: val_b ← imm, val_d ← regs[rb], so the SetLt
+                // comparison computes (imm < reg) = (reg > imm) = the GT result.
+                (step.imm, step.regs_before[step.reg_b])
+            }
             javm::instruction::InstructionCategory::TwoRegOneImm => {
                 (step.regs_before[step.reg_b], step.imm)
             }
@@ -430,6 +435,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // constraints now read `val_b[i] - val_d[i]` directly.
         trace.fill_columns(row, flags.is_set_lt_u, Column::IsSetLtU);
         trace.fill_columns(row, flags.is_set_lt_s, Column::IsSetLtS);
+        trace.fill_columns(row, flags.is_set_gt, Column::IsSetGt);
         trace.fill_columns(row, flags.is_cmov_iz, Column::IsCmovIz);
         trace.fill_columns(row, flags.is_cmov_nz, Column::IsCmovNz);
         trace.fill_columns(row, flags.is_min_s, Column::IsMinS);

@@ -117,6 +117,11 @@ pub enum Column {
     IsSetLtU,
     #[size = 1]
     IsSetLtS,
+    /// Swap modifier for SetGtSImm/SetGtUImm: when 1, val_b ← imm and
+    /// val_d ← regs[rb] (so the SetLt comparison yields the GT result).
+    /// Not a compare-partition sub-flag; co-occurs with IsSetLtS/IsSetLtU.
+    #[size = 1]
+    IsSetGt,
     #[size = 1]
     IsCmovIz,
     #[size = 1]

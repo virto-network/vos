@@ -684,6 +684,26 @@ impl BuiltInComponent for CpuChip {
                 }
             }
 
+            // SetGt operand swap: on SetGtSImm/SetGtUImm rows, val_b holds the
+            // immediate (the register is routed to val_d via ValDIsReg). Pin
+            // val_b to the canonical ImmBytes so the SetLt comparison computes
+            // (imm < reg) = (reg > imm) — the greater-than result, which the
+            // is_set_lt_s/u result constraints above then write to `result`.
+            // SetGt is a 64-bit compare (no truncation), so all 8 bytes bind.
+            {
+                let is_set_gt_flag = crate::trace::trace_eval!(trace_eval, Column::IsSetGt);
+                let imm_bytes_sg = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+                // Boolean.
+                eval.add_constraint(
+                    is_set_gt_flag[0].clone() * (E::F::one() - is_set_gt_flag[0].clone()),
+                );
+                for i in 0..WORD_SIZE {
+                    eval.add_constraint(
+                        is_set_gt_flag[0].clone() * (val_b[i].clone() - imm_bytes_sg[i].clone()),
+                    );
+                }
+            }
+
             // CmovIz / CmovNz — gated via the per-condition helpers.
             let _ = val_d_is_zero;
             for i in 0..WORD_SIZE {

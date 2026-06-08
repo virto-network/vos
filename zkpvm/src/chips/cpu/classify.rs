@@ -26,6 +26,14 @@ pub(crate) struct OpcodeFlags {
     pub is_neg_add: bool,
     pub is_set_lt_u: bool,
     pub is_set_lt_s: bool,
+    /// Swap modifier for `SetGtSImm`/`SetGtUImm` (`SLT rd, x0, rs2` lowers
+    /// to these). SetGt is computed as "swap operands + SetLt": the
+    /// instruction keeps `is_set_lt_s`/`is_set_lt_u` (so the existing result
+    /// constraint + compare partition apply), and `is_set_gt` swaps the
+    /// operand source so `val_b = imm`, `val_d = regs[rb]` — making the
+    /// signed/unsigned less-than comparison compute `imm < reg = reg > imm`,
+    /// the greater-than result. NOT a compare-partition sub-flag.
+    pub is_set_gt: bool,
     pub is_cmov_iz: bool,
     pub is_cmov_nz: bool,
     pub is_min_s: bool,
@@ -398,12 +406,17 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_set_lt_s = true;
         }
         Opcode::SetGtUImm => {
+            // SetGt = swap operands + SetLt: keep is_set_lt_u (drives the
+            // result + compare partition); is_set_gt swaps val_b/val_d so the
+            // unsigned less-than becomes unsigned greater-than.
             f.is_compare = true;
             f.is_set_lt_u = true;
-        } // SetGt = swap + SetLt
+            f.is_set_gt = true;
+        }
         Opcode::SetGtSImm => {
             f.is_compare = true;
             f.is_set_lt_s = true;
+            f.is_set_gt = true;
         }
         Opcode::CmovIz | Opcode::CmovIzImm => {
             f.is_compare = true;
