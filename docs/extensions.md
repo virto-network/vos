@@ -14,11 +14,18 @@ reads at load time:
 
 | Kind | Lifecycle | Use cases |
 |---|---|---|
-| **Actor** (default) | Request-driven. Each incoming message starts a handler that runs to completion. | `echo`, `fetcher`, `proxy` — small native helpers PVM agents call into for one-shot I/O. |
-| **Service** | Long-running. The host calls `run(ctx)` once; the extension owns its thread + any internal runtime (tokio, etc.) and exits when shutdown is signalled. | `http-gateway` — anything that binds a port, owns an event loop, or has internal state that doesn't fit per-message dispatch. |
+| **Actor** (default) | Request-driven. Each incoming message starts a handler that runs to completion. An optional `async fn tick` handler, driven by a manifest `tick_ms`, lets it originate periodic work. | `echo`, `fetcher`, `proxy`, `dev`, `ai`, `heartbeat` — native helpers PVM agents call into, plus timer-driven background work. |
+| **Transport** | Serves a network protocol. The host binds the listener, runs the accept loop, terminates TLS, and spawns one concurrent `handle_connection(&self, …)` task per connection — all sharing `&self` on one cooperative executor. | `http-gateway` — anything that binds a port and frames its own protocol off a byte stream. |
 
-A PVM agent can't tell the difference: in both cases, an extension is
-an entry in the address book that responds to `ctx.ask(target, msg)`.
+> The original **Service** kind (a self-spun `run(ServiceCtx)` poll loop)
+> was removed in the *unify* refactor: the host now owns concurrency, so
+> periodic work is a `tick` handler and listening servers are Transport
+> extensions.
+
+A PVM agent can't tell the difference between an Actor and a Transport
+target: in both cases, an extension is an entry in the address book that
+responds to `ctx.ask(target, msg)` (Transport extensions just don't expose
+`#[msg]` handlers — they serve connections).
 
 ## Authoring an Actor-mode extension
 
@@ -63,44 +70,86 @@ vos = { path = "...", default-features = false, features = ["extension"] }
 Build with `cargo build`; the resulting `target/debug/libecho.so` is
 the file an operator points the manifest at.
 
-## Authoring a Service-mode extension
+## Periodic work: the `tick` handler
 
-No `#[actor]` / `#[messages]` — service extensions are plain Rust
-structs with two methods: `fn new(args: &[u8])` and
-`fn run(&mut self, ctx: ServiceCtx) -> i32`. The
-`vos::service_main!` macro emits the C ABI glue.
+To originate work on a schedule (a heartbeat, a cache sweep) rather than
+only react to inbound messages, an actor declares an `async fn tick`. The
+host calls it about every `tick_ms` (set per-extension in the manifest) —
+no `run()` loop, no dedicated thread; the host owns the cadence and the
+generic `<agent> stop` quiesces it.
 
 ```rust
-use vos::extension::ServiceCtx;
-use vos::log;
+use vos::actors::context::ServiceId;
+use vos::prelude::*;
+use vos::value::Msg;
 
-pub struct Heartbeat {
-    pings_sent: u32,
-}
+#[actor(caps = ["net.libp2p.dial"])]
+pub struct Heartbeat { pings_sent: u32 }
 
+#[messages]
 impl Heartbeat {
-    pub fn new(_args: &[u8]) -> Self {
-        Self { pings_sent: 0 }
-    }
+    pub fn new() -> Self { Self { pings_sent: 0 } }
 
-    pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
-        while !ctx.is_shutdown() {
-            // originate calls into other actors with ctx.ask_raw
-            let _reply = ctx.ask_raw(/* target id */ 1, /* payload */ &[]);
+    /// Called by the host roughly every `tick_ms`. One tick = one ping.
+    #[msg]
+    async fn tick(&mut self, ctx: &mut Context<Self>) {
+        let echo = Msg::new("echo").with("text", "ping");
+        let mut payload = vec![vos::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&echo.encode());
+        if ctx.ask_dispatch(ServiceId(1), &payload).await.is_some() {
             self.pings_sent += 1;
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        log::info!("heartbeat: stopped after {} pings", self.pings_sent);
-        0
     }
 }
-
-vos::service_main!(Heartbeat, caps = ["thread.spawn"]);
 ```
 
-`ServiceCtx` is `Copy + Send + Sync` — clone it freely into spawned
-tasks. All methods are `&self`; the host serialises concurrent
-callers internally through its mpsc channels.
+```toml
+[[extension]]
+name = "heartbeat"
+path = "…/libheartbeat_extension.so"
+tick_ms = 100   # call `tick` ~every 100ms; omit / 0 = no ticking
+```
+
+Cadence is best-effort (a long invoke delays the next tick — the host
+never preempts a handler), and `tick` is sequential w.r.t. the actor's
+other `#[msg]` handlers.
+
+## Authoring a Transport extension
+
+A Transport extension serves connections; the host owns the listener.
+Declare `kind = "transport"`, take `&self` on `handle_connection` (many
+connection tasks run concurrently, sharing the actor), and keep live state
+behind a `#[rkyv(with = vos::rkyv::with::Skip)] OnceCell<…>` with
+single-threaded interior mutability (`Cell` / `RefCell`). It has **no
+`#[msg]` handlers** in v1.
+
+```rust
+use vos::prelude::*;
+
+#[actor(kind = "transport", caps = ["net.tcp.bind"])]
+pub struct EchoServer { /* rkyv state; live state behind Skip'd OnceCell */ }
+
+#[messages]
+impl EchoServer {
+    fn new(args: &[u8]) -> Self { /* parse init args */ }
+
+    /// One accepted connection. The host bound the listener (manifest
+    /// `bind_addr`/`port`), accepted + (optionally) terminated TLS, and
+    /// spawned this task. Read/write plaintext via `ctx`.
+    async fn handle_connection(&self, ctx: &mut Context<Self>, conn_id: u64) {
+        while let Some(bytes) = ctx.read(conn_id, 4096).await {
+            if bytes.is_empty() || ctx.write(conn_id, &bytes).await.is_none() {
+                break;
+            }
+        }
+        ctx.close(conn_id).await;
+    }
+}
+```
+
+See `extensions/http-gateway` for the full HTTP example (manifest
+`bind_addr`/`port`/`tls_cert`/`tls_key`, plus a `serves_max` connection
+cap).
 
 ### Init args
 
@@ -142,8 +191,8 @@ vosx space up <space> --manifest <path/to/space.toml>
 ```
 
 The manifest reconciler logs the load, registers the extension on
-the live `VosNode`, and the extension's `run()` (Service-kind) or
-dispatch loop (Actor-kind) starts immediately.
+the live `VosNode`, and the extension starts immediately — its message
+dispatch loop (Actor) or the host's accept loop (Transport).
 
 ## Capabilities
 
@@ -152,19 +201,11 @@ what OS-side superpowers it wants in its meta blob — log-only today,
 visible to anyone reviewing the manifest:
 
 ```rust
-vos::service_main!(MyGateway, caps = [
-    "net.tcp.bind",
-    "net.tcp.connect",
-    "tokio-runtime",
-    "thread.spawn",
-]);
-```
-
-Or, for actor-mode extensions:
-
-```rust
 #[actor(caps = ["fs.read:/etc/...", "net.tcp.connect"])]
 pub struct ConfigLoader { /* ... */ }
+
+#[actor(kind = "transport", caps = ["net.tcp.bind"])]
+pub struct MyServer { /* ... */ }
 ```
 
 The host logs `extension: declared capabilities caps=[...]` at load
@@ -178,37 +219,34 @@ Conventional tokens (loose, not enforced):
 | `net.tcp.bind` | binds a TCP listener |
 | `net.tcp.connect` | originates outbound TCP connections |
 | `net.udp.bind` / `net.udp.connect` | UDP analogues |
+| `net.libp2p.dial` | originates intra-space (libp2p) calls |
 | `fs.read:/path/...` | reads from a specific filesystem path |
 | `fs.write:/path/...` | writes to a specific filesystem path |
-| `tokio-runtime` | builds a tokio runtime internally |
-| `thread.spawn` | spawns OS threads |
+| `process.spawn` / `thread.spawn` | spawns subprocesses / OS threads |
 
 ## Source map
 
 - [`vos/src/extension.rs`](https://github.com/virto-network/vos/tree/master/vos/src/extension.rs) —
-  the C ABI primitives (`ExtensionPlugin`, `ServiceCtx`, host
-  vtable + callbacks)
+  the C ABI primitives (`ExtensionPlugin` + the per-task executor ABI)
+- [`vos/src/node.rs`](https://github.com/virto-network/vos/tree/master/vos/src/node.rs) —
+  the host-side driver: the cooperative executor, the byte-stream
+  reactor, and the transport accept loop
 - [`vos-macros/src/lib.rs`](https://github.com/virto-network/vos/tree/master/vos-macros/src/lib.rs) —
-  `#[actor(kind = …, caps = […])]` parsing
-- [`vos/src/lib.rs`](https://github.com/virto-network/vos/tree/master/vos/src/lib.rs) —
-  `service_main!` decl-macro
+  `#[actor(kind = …, caps = […])]` + `#[messages]` parsing
 - [`extensions/http-gateway/`](https://github.com/virto-network/vos/tree/master/extensions/http-gateway) —
-  the canonical Service-mode extension
-- [`examples/extensions/heartbeat/`](https://github.com/virto-network/vos/tree/master/examples/extensions/heartbeat) —
-  minimal Service-mode extension validating the Service-mode ABI
-- [`examples/extensions/{echo,fetcher,proxy}/`](https://github.com/virto-network/vos/tree/master/examples/extensions) —
-  Actor-mode extension examples
-- [`docs/design/extensions.md`](https://github.com/virto-network/vos/tree/master/docs/design/extensions.md) —
-  the original design plan, kept for context
+  the canonical Transport extension
+- [`examples/extensions/{echo,heartbeat,fetcher,proxy}/`](https://github.com/virto-network/vos/tree/master/examples/extensions) —
+  Actor-mode examples (`heartbeat` shows the `tick` handler);
+  [`tcp-echo`](https://github.com/virto-network/vos/tree/master/examples/extensions/tcp-echo) is a minimal Transport example
+- [`extensions/AUTHORING.md`](https://github.com/virto-network/vos/tree/master/extensions/AUTHORING.md) —
+  the full cookbook
 
 ## Open work
 
-- Per-extension shutdown signal (today: shared `node.shutdown` for
-  every extension on the node).
-- Multi-in-flight `ServiceCtx::ask` correlation by request_id —
-  current FIFO model serializes concurrent callers through a single
-  in-flight slot. Fine for the gateway; matters when an extension
-  needs hundreds of concurrent upstream calls.
+- Caps are declared but not host-enforced (log-only); a future
+  enforcement layer for the actor/transport host ABI will consult them.
+- `&self` concurrent inbound `#[msg]` handlers (Actor-mode is N=1 today;
+  Transport already runs `handle_connection(&self)` concurrently).
 - `vosx extension list` / `vosx extension info` operator commands
   to surface installed extensions + their declared caps without
   parsing the manifest by hand.

@@ -316,9 +316,9 @@ it for back-compat, but it has no effect beyond clearing any caps.
 ## Capability policy
 
 Every extension declares the host facilities it uses in its
-`service_main!(caps = [...])` block. The daemon enforces these
-at the host ABI boundary per the `cap_policy` set in the
-manifest:
+`#[actor(caps = [...])]` declaration. The host logs them at load
+time, and the manifest's `cap_policy` records the intended
+enforcement behaviour per extension:
 
 ```toml
 # Top-level — applies to every extension.
@@ -330,21 +330,22 @@ name = "ai"
 cap_policy = "log"
 ```
 
-| Policy | Behaviour |
+| Policy | Intended behaviour |
 |---|---|
-| `block` (default) | Refuse the syscall with `HOST_ERR_CAP_DENIED`. |
+| `block` (default) | Refuse a syscall outside the declared caps. |
 | `log`             | Allow + emit `tracing::warn!` once per cap. |
-| `kill`            | Refuse + flip the extension's shutdown flag. |
+| `kill`            | Refuse + wind the extension down. |
 
-The `log` setting is useful during initial rollout to
-inventory what your extensions actually use without blocking
-production traffic. Sprint 1 shipped only `log`; Sprint 2
-flipped the default to `block`.
-
-Only the host-ABI-gated caps (`net.libp2p.dial`, etc.) are
-enforced today. `fs.*` and `process.*` caps stay declarative
-and depend on the container sandbox (drop-all capabilities,
-read-only root FS — both already set in the compose file).
+> **Enforcement status.** The host-ABI cap gate lived on the
+> service-mode vtable, which was removed in the *unify* refactor
+> (extensions are now actor- or transport-mode, with the host owning
+> concurrency). So `cap_policy` is currently **recorded but not
+> enforced** at the host ABI — caps are a declaration / audit surface,
+> and `fs.*` / `process.*` confinement comes from the container sandbox
+> (drop-all capabilities, read-only root FS — both set in the compose
+> file). A future enforcement layer for the actor/transport ABI will
+> re-consult `cap_policy`. Declare caps honestly regardless: they're
+> what an operator review reads.
 
 ### Inspect what an extension declared
 
@@ -442,8 +443,8 @@ A non-admin called a gated handler. Either:
 
 Either:
 
-- Add the missing cap to the extension's `service_main!`
-  block.
+- Add the missing cap to the extension's `#[actor(caps = [...])]`
+  declaration.
 - Relax the policy for that one extension:
   `[[extension]] cap_policy = "log"` in the manifest.
 

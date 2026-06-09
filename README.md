@@ -157,25 +157,34 @@ async runtimes. PVM agents reach the outside world by `ctx.ask`-ing
 extensions. Two kinds:
 
 - **Actor** — request-driven, same `#[actor]` / `#[messages]` DSL
-  as PVM agents, just compiled as a cdylib.
-- **Service** — long-running, owns its own thread + runtime. Use
-  `vos::service_main!(MyService, caps = [...])` and provide a
-  `run(&mut self, ctx: ServiceCtx) -> i32`.
+  as PVM agents, just compiled as a cdylib. Add an `async fn tick`
+  handler (driven by a manifest `tick_ms`) to originate periodic work.
+- **Transport** — serves a network protocol on a socket the host
+  binds for it. You write `handle_connection(&self, ctx, conn_id)`;
+  the host owns the listener + accept loop and spawns one concurrent
+  connection task per accept, all sharing `&self`.
 
 ```rust
-use vos::extension::ServiceCtx;
+use vos::prelude::*;
 
-pub struct MyGateway { /* ... */ }
-impl MyGateway {
-    pub fn new(_args: &[u8]) -> Self { /* ... */ }
-    pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
-        while !ctx.is_shutdown() {
-            // do work, originate ctx.ask_raw(...) calls
+#[actor(kind = "transport", caps = ["net.tcp.bind"])]
+pub struct MyServer { /* state */ }
+
+#[messages]
+impl MyServer {
+    fn new(args: &[u8]) -> Self { /* parse init args */ }
+
+    // The host binds the listener (from the manifest's bind_addr/port),
+    // accepts + terminates TLS, and drives one task per connection.
+    async fn handle_connection(&self, ctx: &mut Context<Self>, conn_id: u64) {
+        while let Some(bytes) = ctx.read(conn_id, 4096).await {
+            if bytes.is_empty() || ctx.write(conn_id, &bytes).await.is_none() {
+                break;
+            }
         }
-        0
+        ctx.close(conn_id).await;
     }
 }
-vos::service_main!(MyGateway, caps = ["net.tcp.bind", "tokio-runtime"]);
 ```
 
 Install via the manifest:
@@ -184,12 +193,12 @@ Install via the manifest:
 [[extension]]
 name = "gateway"
 path = "../target/debug/libmy_gateway.so"
-init = { port = 8080 }
+init = { bind_addr = "127.0.0.1", port = 8080 }
 ```
 
 See [`extensions/AUTHORING.md`](extensions/AUTHORING.md) for the
 full cookbook and [`docs/extensions.md`](docs/extensions.md) for the
-book chapter. The canonical service-mode example is
+book chapter. The canonical transport example is
 [`extensions/http-gateway/`](extensions/http-gateway/).
 
 ## Applications
