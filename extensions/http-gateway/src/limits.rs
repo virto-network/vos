@@ -1,46 +1,29 @@
-//! Resource caps. Centralized here so they're easy to find and tune;
-//! eventually these should come from init args or env vars.
+//! Resource caps for the HTTP/1.1 parser. Centralized here so they're
+//! easy to find and tune; eventually these should come from init args.
+//!
+//! Connection-count backpressure is a host concern: the host owns the
+//! accept loop and caps concurrent connection tasks
+//! (`ExtensionConfig::serves_max`, default 1024).
 
-/// Hard cap on the request body size in bytes. Bodies larger than this
-/// terminate with a 413 before the gateway allocates the full payload.
-/// Picked to comfortably cover the JSON arg shape we accept and rule
-/// out trivial OOM via Content-Length.
+/// Hard cap on the request body size in bytes. Bodies whose declared
+/// `Content-Length` exceeds this terminate with `413` before the
+/// gateway buffers the payload. Picked to comfortably cover the JSON
+/// arg shape we accept and rule out trivial OOM via Content-Length.
 pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// Maximum concurrent transport-level connections per protocol
-/// (TCP for hyper, QUIC for h3). New connections beyond this are
-/// dropped. Each protocol has its own semaphore.
-pub(crate) const MAX_CONCURRENT_CONNS: usize = 1024;
-
-/// Capacity of the per-serve mpsc that ferries `Job`s from the
-/// connection tasks to the actor handler. Once full, connection tasks
-/// fail-fast with 503 (Retry-After) instead of growing memory.
-pub(crate) const JOB_QUEUE_CAP: usize = 256;
-
-/// Hard cap on the number of headers we copy out of an incoming
-/// request. Hyper / h3 already enforce per-header and total-size
-/// limits; this is a belt-and-suspenders guard against an attacker
-/// who somehow stuffs a many-header request through.
+/// Hard cap on the number of headers parsed out of an incoming request.
+/// A request with more terminates with `431` — a belt-and-suspenders
+/// guard against a header-flood, since the gateway parses the head by hand.
 pub(crate) const MAX_REQUEST_HEADERS: usize = 64;
 
-/// Maximum number of concurrent bidirectional streams a single QUIC
-/// connection can have open against the gateway. Caps stream-flood
-/// amplification within a single connection (per-connection limit
-/// `MAX_CONCURRENT_CONNS` × this is the total task ceiling).
-#[cfg(feature = "http3")]
-pub(crate) const MAX_STREAMS_PER_CONN: u32 = 64;
+/// Hard cap on the request **head** (request line + all header lines, up
+/// to and including the terminating blank line) in bytes. Bounds the
+/// buffer a peer can force us to hold while it dribbles headers without
+/// ever sending the `\r\n\r\n` terminator (slow-loris / header flood);
+/// exceeding it terminates with `431`.
+pub(crate) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-/// Maximum time a hyper connection may take to send the request line
-/// and headers. Slow-loris mitigation. Hyper closes the connection
-/// when this elapses without progress.
-pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Maximum time the h3 path waits between body chunks before it
-/// abandons the request. Equivalent slow-loris guard for QUIC streams.
-#[cfg(feature = "http3")]
-pub(crate) const H3_BODY_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Maximum time `accept_loop` waits for in-flight connection tasks
-/// to finish after the stop flag flips. Past this, the runtime drops
-/// regardless and remaining tasks are cancelled abruptly.
-pub(crate) const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How many bytes to request per `ctx.read` while filling the parse
+/// buffer. One MTU-ish chunk keeps small requests to a single read
+/// while still draining a large body promptly.
+pub(crate) const READ_CHUNK: u32 = 16 * 1024;

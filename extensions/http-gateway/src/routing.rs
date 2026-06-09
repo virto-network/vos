@@ -1,71 +1,56 @@
-//! Request routing.
+//! Request routing (transport mode).
 //!
-//! Two layers, outside in:
+//! A connection task ([`crate::HttpGateway::handle_connection`]) parses
+//! one HTTP/1.1 request off the byte stream and calls [`dispatch`], which
+//! runs the built-in intercepts + the bearer-auth gate and then hands
+//! `/<agent>/<method>` traffic to [`handle`]. Both layers run **in the
+//! same connection task**; the actor `Context<HttpGateway>` reaches the registry and
+//! target agents (via the async [`Context::ask_dispatch`]), and many
+//! connection tasks interleave on the host's one cooperative executor.
 //!
-//! 1. [`dispatch_request`] — wire-side entry. Runs the `/__metrics`
-//!    shortcut, enforces `Authorization: Bearer <token>` if
-//!    configured, then pushes a `Job` for the actor to handle.
-//!    Both the hyper and h3 paths land here after extracting an
-//!    internal [`Request`] from the wire format. Auth happens
-//!    here so failed requests never consume a job-queue slot.
-//! 2. [`handle`] — actor-side. Pulls the `Job`, resolves the agent
-//!    name through the registry, dispatches via `ctx.ask`, and packs
-//!    the reply.
+//! ## Built-in routes (precedence + auth)
 //!
-//! [`drain_jobs`] is the loop on the actor side that pumps `handle`.
-//!
-//! ## Built-in routes (precedence + layer + auth)
-//!
-//! Four intercepts handle traffic before it reaches the fallback
-//! `/<agent>/<method>` dispatcher. Connection-side intercepts run
-//! ahead of the auth gate + job-queue admission so they never burn
-//! a job slot; actor-side intercepts need [`ServiceCtx`] for a
-//! registry round-trip, so they ride the job queue.
-//!
-//! | # | layer      | path                        | method   | auth          |
-//! |---|------------|-----------------------------|----------|---------------|
-//! | 1 | connection | `/__metrics`                | GET      | public        |
-//! | 2 | actor      | `/__schema`, `/__schema/<a>`| GET      | public        |
-//! | 3 | actor      | `/openapi.json`             | GET      | public        |
-//! | 4 | actor      | `/<agent>/<method>`         | any      | varies†       |
+//! | # | path                        | method | ask?     | auth          |
+//! |---|-----------------------------|--------|----------|---------------|
+//! | 1 | `/__metrics`                | GET    | no       | public        |
+//! | 2 | `/__status`                 | GET    | no       | public        |
+//! | 3 | `/__schema`, `/__schema/<a>`| GET    | registry | public        |
+//! | 4 | `/openapi.json`             | GET    | registry | public        |
+//! | 5 | `/<agent>/<method>`         | any    | agent    | varies†       |
 //!
 //! † `/<agent>/<method>` uses the global `auth_token` unless the
 //! manifest declared a per-agent override in `agent_tokens`.
-//! Schema / metrics are unaffected by either token.
+//! Schema / metrics / status are unaffected by either token.
+//!
+//! `/__metrics` + `/__status` read only `Inner` atomics, so they're
+//! answered ahead of the auth gate (and never `ask`). `/__schema*` /
+//! `/openapi.json` are public-by-name ([`PUBLIC_NAMESPACES`]) but DO
+//! `ask` the registry, so they ride the same async path as dispatch.
 //!
 //! Adding a built-in: append a row here AND insert the `handle_*`
-//! call in either [`dispatch_inner`] (connection-side) or [`handle`]
-//! (actor-side) in the matching precedence slot.
+//! call in either [`dispatch`] (ask-free, pre-auth) or [`handle`]
+//! (registry/agent asks) in the matching precedence slot.
 //!
-//! ## Removed: `/__admin/*` (Phase 6)
+//! ## Lifecycle: `stop` / `describe`
 //!
-//! `POST /__admin/stop` and `GET /__admin/status` previously rode
-//! a connection-side intercept gated by `admin_token`. Both are
-//! now reachable as `vosx gateway stop` / `vosx gateway status`
-//! through the registry-driven dispatch sidecar (Phase 5). The
-//! HTTP namespace is gone; `admin_token` was removed from
-//! [`crate::config::GatewayConfig`]; operators upgrading from a
-//! pre-Phase-6 build should switch their tooling to `vosx`.
-//!
-//! TODO(post-stable): once VOS hits a release whose changelog
-//! readers won't have any pre-Phase-6 deployment, drop this
-//! section. The git history is enough beyond that point.
+//! In transport mode the **host** owns lifecycle: `vosx gateway stop` and
+//! `vosx gateway describe` are intercepted node-side as the generic
+//! `__stop` / `__describe` primitives (see `vos::node`), uniform across
+//! every agent kind. Rich live status stays in the gateway as the
+//! in-process `GET /__status` endpoint (no invoke round trip).
 
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
-use std::time::Duration;
-
-use tokio::sync::oneshot;
+use http::Method;
+use vos::Context;
+use vos::Encode;
 use vos::actors::context::ServiceId;
 use vos::actors::value::Msg;
-use vos::extension::ServiceCtx;
 use vos::log;
-use vos::{Decode, Encode};
 
-use crate::config::{ct_eq, header_value};
+use crate::HttpGateway;
+use crate::config::ct_eq;
 use crate::json::{parse_flat_json, value_to_json};
 use crate::state::Inner;
-use crate::types::{Job, Request, Response};
+use crate::types::{Request, Response, json, text, with_content_type};
 
 /// Per-request auth policy threaded through the wire path. The
 /// connection-side glue reads these from [`crate::config`] once and
@@ -83,80 +68,77 @@ pub(crate) struct Policy<'a> {
     pub agent_tokens: Option<&'a std::collections::HashMap<String, String>>,
 }
 
-/// Wire-side dispatch. Runs in the connection task; turns one
-/// internal [`Request`] into a [`Response`] using the metrics
-/// shortcut, the auth gate, and the actor's job queue in that order.
-pub(crate) async fn dispatch_request(
-    req: Request,
-    job_tx: &mpsc::SyncSender<Job>,
+/// Per-request entry point, called from a connection task with the
+/// parsed [`Request`] + the actor [`Context`]. Runs the ask-free public
+/// intercepts (`/__metrics`, `/__status`), the bearer-auth gate, then
+/// hands everything else to [`handle`] (registry + agent asks). The
+/// caller records the response status into `Inner::metrics`.
+pub(crate) async fn dispatch(
+    req: &Request,
     inner: &Inner,
+    ctx: &mut Context<HttpGateway>,
     policy: Policy<'_>,
 ) -> Response {
-    let response = dispatch_inner(req, job_tx, inner, policy).await;
-    // Record every response — connection-side intercepts, auth
-    // failures, job-queue rejections, and actor-dispatched results
-    // all count toward `vos_gateway_responses_total{status_class}`.
-    // `vos_gateway_requests_total` is the narrower
-    // dispatched-to-actor counter, bumped inside `drain_jobs`.
-    inner.metrics.record_response(response.status);
-    response
-}
-
-async fn dispatch_inner(
-    req: Request,
-    job_tx: &mpsc::SyncSender<Job>,
-    inner: &Inner,
-    policy: Policy<'_>,
-) -> Response {
-    if let Some(response) = handle_metrics(&req, inner) {
+    // A config error (today: malformed `agent_tokens`) means we'd be
+    // serving with weakened auth — refuse every request instead. In
+    // transport mode `new()` can't decline to boot (the host owns the
+    // listener), so the refusal lives here.
+    if let Some(reason) = &inner.config_error {
+        log::error!("http-gateway: refusing request — config error: {reason}");
+        return text(503, "gateway misconfigured");
+    }
+    // Ask-free public endpoints answer ahead of the auth gate.
+    if let Some(response) = handle_metrics(req, inner) {
+        return response;
+    }
+    if let Some(response) = handle_status(req, inner) {
         return response;
     }
     // Per-agent auth overrides the global gate. If the URL is
-    // `/<agent>/*` and `agent_tokens` has an entry for that
-    // name, the per-agent token replaces the global one for this
-    // request. Falls back to the global token otherwise.
-    let effective_auth = effective_auth_for(&req, &policy);
-    if let Some(response) = check_auth(&req, effective_auth) {
+    // `/<agent>/*` and `agent_tokens` has an entry for that name, the
+    // per-agent token replaces the global one. Falls back to the
+    // global token otherwise.
+    let effective_auth = effective_auth_for(req, &policy);
+    if let Some(response) = check_auth(req, effective_auth) {
         return response;
     }
-    let (resp_tx, resp_rx) = oneshot::channel::<Response>();
-    match job_tx.try_send(Job {
-        request: req,
-        resp_tx,
-    }) {
-        Ok(()) => {}
-        Err(mpsc::TrySendError::Full(_)) => {
-            return Response::text(503, "gateway saturated; retry");
-        }
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            return Response::text(503, "gateway stopped");
-        }
+    // Past the gates: this counts as a dispatched request and bumps
+    // `vos_gateway_requests_total` once (schema / openapi / agent dispatch
+    // alike; `/__metrics` + `/__status` short-circuit above and don't count).
+    inner.requests.set(inner.requests.get() + 1);
+    handle(req, inner, ctx).await
+}
+
+/// `GET /__status` — compact JSON liveness snapshot (port, running,
+/// request count, uptime). Reads only `Inner` atomics, so
+/// it needs no registry round trip and works regardless of upstream
+/// reachability. Public (no token), like `/__metrics`.
+fn handle_status(req: &Request, inner: &Inner) -> Option<Response> {
+    if req.uri().path() != "/__status" {
+        return None;
     }
-    resp_rx
-        .await
-        .unwrap_or_else(|_| Response::text(500, "no response from actor"))
+    if req.method() != Method::GET {
+        return Some(text(405, "/__status is GET-only"));
+    }
+    Some(json(200, crate::state::status_json(inner).into_bytes()))
 }
 
 /// `GET /__metrics` — Prometheus exposition format. Public, no
 /// admin gate (matches Prometheus convention: scrapers don't auth).
 /// Connection-side because the render only touches atomics on
-/// `Inner` — no `ServiceCtx` round trip required.
+/// `Inner` — no round trip required.
 fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
-    if req.path != "/__metrics" {
+    if req.uri().path() != "/__metrics" {
         return None;
     }
-    if req.method != "GET" {
-        return Some(Response::text(405, "/__metrics is GET-only"));
+    if req.method() != Method::GET {
+        return Some(text(405, "/__metrics is GET-only"));
     }
     let body = crate::state::render_prometheus(inner).into_bytes();
     // Prometheus exposition convention. Some scrapers tolerate
     // bare `text/plain` too, but the versioned content-type is
     // the canonical form.
-    Some(Response::with_content_type(
-        200,
-        "text/plain; version=0.0.4",
-        body,
-    ))
+    Some(with_content_type(200, "text/plain; version=0.0.4", body))
 }
 
 /// Public-namespace paths that skip the dispatch auth gate
@@ -169,7 +151,7 @@ fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
 const PUBLIC_NAMESPACES: &[&str] = &["__schema", "__metrics", "openapi.json"];
 
 /// Pick the auth token to enforce for this request. Inspects
-/// `req.path` for the leading `/<agent>/`; if the agent name has
+/// the URI path for the leading `/<agent>/`; if the agent name has
 /// an entry in `agent_tokens`, returns that token (per-agent
 /// override). Otherwise falls back to the global `auth_token`.
 ///
@@ -180,7 +162,7 @@ const PUBLIC_NAMESPACES: &[&str] = &["__schema", "__metrics", "openapi.json"];
 fn effective_auth_for<'a>(req: &Request, policy: &Policy<'a>) -> Option<&'a str> {
     // Only `/<agent>/<method>` URLs receive auth checks. The
     // dispatch handler will 400 on missing method later anyway.
-    let trimmed = req.path.trim_start_matches('/');
+    let trimmed = req.uri().path().trim_start_matches('/');
     let agent_name = trimmed.split_once('/').map(|(a, _)| a).unwrap_or(trimmed);
     if agent_name.is_empty() || PUBLIC_NAMESPACES.contains(&agent_name) {
         return None;
@@ -198,62 +180,57 @@ fn effective_auth_for<'a>(req: &Request, policy: &Policy<'a>) -> Option<&'a str>
 /// rejected.
 fn check_auth(req: &Request, expected: Option<&str>) -> Option<Response> {
     let expected = expected?;
-    let provided = header_value(&req.headers, "authorization").and_then(|v| {
-        v.strip_prefix("Bearer ")
-            .or_else(|| v.strip_prefix("bearer "))
-    });
+    let provided = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        });
     if provided.is_some_and(|t| ct_eq(t.trim(), expected)) {
         None
     } else {
-        Some(Response::text(401, "unauthorized"))
+        Some(text(401, "unauthorized"))
     }
 }
 
-/// Drain loop on the gateway's `run` thread. Pulls Jobs from the
-/// connection-side mpsc, dispatches via `ctx.ask_raw`, sends the
-/// reply back. Synchronous because `ServiceCtx::ask_raw` blocks the
-/// calling thread by design — no async bridge needed at this layer.
-///
-/// Exits when `inner.stop` is flipped (admin endpoint or
-/// `ctx.is_shutdown()` polled by the caller) or when the protocol
-/// thread closes the job channel.
-pub(crate) fn drain_jobs(job_rx: &mpsc::Receiver<Job>, inner: &Inner, ctx: &ServiceCtx) -> String {
-    loop {
-        if inner.stop.load(Ordering::Relaxed) || ctx.is_shutdown() {
-            return "stopped".into();
-        }
-        match job_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(job) => {
-                let response = handle(&job.request, inner, ctx);
-                inner.requests.fetch_add(1, Ordering::Relaxed);
-                let _ = job.resp_tx.send(response);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return "job channel closed".into(),
-        }
-    }
-}
-
-fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
-    // `/__schema*` and `/openapi.json` paths short-circuit the
-    // agent/method dispatcher. They live actor-side (not in
-    // dispatch_inner's connection-side metrics shortcut) because
-    // their renderers need `ServiceCtx` to round-trip the
-    // registry for schema lookups.
-    if let Some(resp) = handle_schema(req, inner, ctx) {
+/// Resolve `/<agent>/<method>` (and the `/__schema*` / `/openapi.json`
+/// registry-backed endpoints) by asking the registry + target agent
+/// through the async [`Context::ask_dispatch`]. Many connection tasks
+/// run this concurrently on the host's one cooperative executor —
+/// `&self` shared, all mutable runtime state behind `Inner`'s atomics /
+/// `Mutex`.
+async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) -> Response {
+    // `/__schema*` and `/openapi.json` short-circuit the agent/method
+    // dispatcher. They `ask` the registry for schema, so they live here
+    // (not in `dispatch`'s ask-free pre-auth shortcut).
+    if let Some(resp) = handle_schema(req, inner, ctx).await {
         return resp;
     }
-    if let Some(resp) = handle_openapi(req, inner, ctx) {
+    if let Some(resp) = handle_openapi(req, inner, ctx).await {
         return resp;
     }
 
-    let Some((agent, method)) = split_path(&req.path) else {
-        return Response::text(400, "expected /<agent>/<method>");
+    let Some((agent, method)) = split_path(req.uri().path()) else {
+        return text(400, "expected /<agent>/<method>");
     };
 
-    let target = match resolve(ctx, &agent) {
+    // Reserve the gateway's own namespaces. The exact built-in paths
+    // (`/__metrics`, `/__status`, `/__schema*`, `/openapi.json`) were handled
+    // above; a *sub-path* like `/__metrics/foo` falls through to here and would
+    // otherwise dispatch to an agent literally named `__metrics` — which
+    // `effective_auth_for` classifies as a public namespace, so it would reach
+    // that agent with NO token. Refuse dispatch to any `__`-prefixed name (or a
+    // public namespace) so a reserved-named agent can't be reached — let alone
+    // unauthenticated — through the gateway.
+    if agent.starts_with("__") || PUBLIC_NAMESPACES.contains(&agent.as_str()) {
+        return text(404, format!("'{agent}' is a reserved gateway namespace"));
+    }
+
+    let target = match resolve(ctx, &agent).await {
         Some(id) => id,
-        None => return Response::text(404, format!("unknown agent '{agent}'")),
+        None => return text(404, format!("unknown agent '{agent}'")),
     };
 
     // Look up (and lazily cache) the actor's schema. With it,
@@ -262,17 +239,17 @@ fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
     // up front. Without meta the gateway falls back to today's
     // permissive pass-through: pass whatever the wire produced
     // and let the actor's `from_msg` decide.
-    let meta = ensure_meta_cached(ctx, inner, target, &agent);
+    let meta = ensure_meta_cached(ctx, inner, target, &agent).await;
     let method_meta = meta
         .as_ref()
         .and_then(|m| m.messages.iter().find(|msg| msg.name == method).cloned());
 
     // Typed-error gate: when the actor's schema is known and the
     // requested method isn't in it, return 404 immediately. The
-    // legacy "200 null" path stays for actors that haven't
+    // permissive "200 null" fallback stays for actors that haven't
     // registered meta (older binaries, hash drift).
     if meta.is_some() && method_meta.is_none() {
-        return Response::text(404, format!("unknown method '{method}' on agent '{agent}'"));
+        return text(404, format!("unknown method '{method}' on agent '{agent}'"));
     }
 
     let msg = match build_msg(method, method_meta.as_ref(), req) {
@@ -287,16 +264,15 @@ fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
     payload.push(vos::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
 
-    match ctx.ask_raw(target.0, &payload) {
+    // `ask_dispatch` is status-framed (unlike the collapsing `ask_raw`):
+    // `Some(empty)` is a real `()` return → `200 null`; `None` is a
+    // dispatch failure (panic / non-DONE status / no route / timeout) →
+    // `502`. This is what preserves the panic→502 distinction in
+    // transport mode.
+    match ctx.ask_dispatch(target, &payload).await {
         Some(reply_bytes) if reply_bytes.is_empty() => {
-            // Empty reply = handler returned () successfully OR the
-            // worker dispatch errored (no such handler, type
-            // mismatch, panic). Indistinguishable on the wire
-            // today; render as JSON null. The host always sends a
-            // reply for ask-style traffic so the gateway doesn't
-            // hang for the 5-min ask timeout when a dispatch
-            // errors — see vos/src/node.rs's worker reply loop.
-            Response::json(200, value_to_json(&vos::value::Value::Unit))
+            // Handler returned `()` successfully → JSON null.
+            json(200, value_to_json(&vos::value::Value::Unit))
         }
         Some(reply_bytes) => {
             // try_decode runs rkyv's checked access — handles
@@ -305,11 +281,11 @@ fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
             // misaligned slices that came back through the invoke
             // envelope unwrap.
             match <vos::value::Value as vos::Decode>::try_decode(&reply_bytes) {
-                Some(value) => Response::json(200, value_to_json(&value)),
-                None => Response::text(502, "upstream returned malformed reply"),
+                Some(value) => json(200, value_to_json(&value)),
+                None => text(502, "upstream returned malformed reply"),
             }
         }
-        None => Response::text(502, "upstream error or shutdown"),
+        None => text(502, "upstream error or shutdown"),
     }
 }
 
@@ -324,51 +300,57 @@ fn handle(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Response {
 /// Non-GET methods 405; unknown agents 404; agents without
 /// registered meta (older binaries, hash mismatch) 404 with
 /// "no schema for".
-fn handle_schema(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Option<Response> {
-    if !req.path.starts_with("/__schema") {
+async fn handle_schema(
+    req: &Request,
+    inner: &Inner,
+    ctx: &mut Context<HttpGateway>,
+) -> Option<Response> {
+    let path = req.uri().path();
+    if !path.starts_with("/__schema") {
         return None;
     }
-    if req.method != "GET" {
-        return Some(Response::text(405, "schema endpoints are GET-only"));
+    if req.method() != Method::GET {
+        return Some(text(405, "schema endpoints are GET-only"));
     }
-    if req.path == "/__schema" || req.path == "/__schema/" {
-        return Some(list_schemas(ctx));
+    if path == "/__schema" || path == "/__schema/" {
+        return Some(list_schemas(ctx).await);
     }
-    let name = req
-        .path
-        .trim_start_matches("/__schema/")
-        .trim_end_matches('/');
+    let name = path.trim_start_matches("/__schema/").trim_end_matches('/');
     if name.is_empty() || name.contains('/') {
-        return Some(Response::text(400, "expected /__schema/<agent>"));
+        return Some(text(400, "expected /__schema/<agent>"));
     }
-    Some(schema_for_agent(name, inner, ctx))
+    Some(schema_for_agent(name, inner, ctx).await)
 }
 
-fn list_schemas(ctx: &ServiceCtx) -> Response {
+async fn list_schemas(ctx: &mut Context<HttpGateway>) -> Response {
     let msg = Msg::new("agent_names");
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(vos::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
-    let bytes = match ctx.ask_raw(ServiceId::REGISTRY.0, &payload) {
+    let bytes = match ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await {
         Some(b) if !b.is_empty() => b,
-        _ => return Response::text(502, "registry unreachable"),
+        _ => return text(502, "registry unreachable"),
     };
-    let value: vos::value::Value = vos::value::Value::decode(&bytes);
-    let names = value.as_list_str().map(|s| s.to_vec()).unwrap_or_default();
-    Response::json(
+    // try_decode (checked rkyv access) — a malformed/misaligned registry reply
+    // degrades to an empty list rather than panicking the connection task.
+    let names = match <vos::value::Value as vos::Decode>::try_decode(&bytes) {
+        Some(value) => value.as_list_str().map(|s| s.to_vec()).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    json(
         200,
         serde_json::to_vec(&names).unwrap_or_else(|_| b"[]".to_vec()),
     )
 }
 
-fn schema_for_agent(name: &str, inner: &Inner, ctx: &ServiceCtx) -> Response {
-    let Some(target) = resolve(ctx, name) else {
-        return Response::text(404, format!("unknown agent '{name}'"));
+async fn schema_for_agent(name: &str, inner: &Inner, ctx: &mut Context<HttpGateway>) -> Response {
+    let Some(target) = resolve(ctx, name).await else {
+        return text(404, format!("unknown agent '{name}'"));
     };
-    match ensure_meta_cached(ctx, inner, target, name) {
-        Some(meta) => Response::json(200, meta_to_json(&meta).into_bytes()),
-        None => Response::text(404, format!("no schema for agent '{name}'")),
+    match ensure_meta_cached(ctx, inner, target, name).await {
+        Some(meta) => json(200, meta_to_json(&meta).into_bytes()),
+        None => text(404, format!("no schema for agent '{name}'")),
     }
 }
 
@@ -427,17 +409,21 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
 ///   `Vec<u32>`        → `array` of integers
 ///   `Vec<String>`     → `array` of strings
 ///   any other         → `string` (fallback — generic UI still works)
-fn handle_openapi(req: &Request, inner: &Inner, ctx: &ServiceCtx) -> Option<Response> {
-    if req.path != "/openapi.json" {
+async fn handle_openapi(
+    req: &Request,
+    inner: &Inner,
+    ctx: &mut Context<HttpGateway>,
+) -> Option<Response> {
+    if req.uri().path() != "/openapi.json" {
         return None;
     }
-    if req.method != "GET" {
-        return Some(Response::text(405, "/openapi.json is GET-only"));
+    if req.method() != Method::GET {
+        return Some(text(405, "/openapi.json is GET-only"));
     }
-    Some(render_openapi(inner, ctx))
+    Some(render_openapi(inner, ctx).await)
 }
 
-fn render_openapi(inner: &Inner, ctx: &ServiceCtx) -> Response {
+async fn render_openapi(inner: &Inner, ctx: &mut Context<HttpGateway>) -> Response {
     // 1. Get every installed agent's name.
     let names = {
         let msg = Msg::new("agent_names");
@@ -445,14 +431,16 @@ fn render_openapi(inner: &Inner, ctx: &ServiceCtx) -> Response {
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
-        let Some(bytes) = ctx.ask_raw(ServiceId::REGISTRY.0, &payload) else {
-            return Response::text(502, "registry unreachable");
+        let Some(bytes) = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await else {
+            return text(502, "registry unreachable");
         };
         if bytes.is_empty() {
             Vec::new()
         } else {
-            let value: vos::value::Value = vos::value::Value::decode(&bytes);
-            value.as_list_str().map(|s| s.to_vec()).unwrap_or_default()
+            match <vos::value::Value as vos::Decode>::try_decode(&bytes) {
+                Some(value) => value.as_list_str().map(|s| s.to_vec()).unwrap_or_default(),
+                None => Vec::new(),
+            }
         }
     };
 
@@ -460,10 +448,10 @@ fn render_openapi(inner: &Inner, ctx: &ServiceCtx) -> Response {
     //    render the per-method routes.
     let mut paths_obj = serde_json::Map::new();
     for name in &names {
-        let Some(target) = resolve(ctx, name) else {
+        let Some(target) = resolve(ctx, name).await else {
             continue;
         };
-        let Some(meta) = ensure_meta_cached(ctx, inner, target, name) else {
+        let Some(meta) = ensure_meta_cached(ctx, inner, target, name).await else {
             continue;
         };
         for msg in &meta.messages {
@@ -482,7 +470,7 @@ fn render_openapi(inner: &Inner, ctx: &ServiceCtx) -> Response {
         "paths": paths_obj,
     });
 
-    Response::json(
+    json(
         200,
         serde_json::to_vec(&doc).unwrap_or_else(|_| b"{}".to_vec()),
     )
@@ -593,9 +581,9 @@ fn split_path(path: &str) -> Option<(String, String)> {
 /// `resolve(name, caller_prefix)` handler so it can derive the
 /// agent's ServiceId in the gateway's node namespace. We extract
 /// the prefix from the gateway's own ServiceId (high 16 bits via
-/// `ctx.me()`).
-fn resolve(ctx: &ServiceCtx, name: &str) -> Option<ServiceId> {
-    let caller_prefix = (ctx.me() >> 16) as u64;
+/// `ctx.id()`).
+async fn resolve(ctx: &mut Context<HttpGateway>, name: &str) -> Option<ServiceId> {
+    let caller_prefix = (ctx.id().0 >> 16) as u64;
     let msg = Msg::new("resolve")
         .with("name", name.to_string())
         .with("caller_prefix", caller_prefix);
@@ -603,11 +591,11 @@ fn resolve(ctx: &ServiceCtx, name: &str) -> Option<ServiceId> {
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(vos::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
-    let bytes = ctx.ask_raw(ServiceId::REGISTRY.0, &payload)?;
+    let bytes = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await?;
     if bytes.is_empty() {
         return None;
     }
-    let value: vos::value::Value = vos::value::Value::decode(&bytes);
+    let value = <vos::value::Value as vos::Decode>::try_decode(&bytes)?;
     let id = value.as_u32().unwrap_or(0);
     (id != 0).then_some(ServiceId(id))
 }
@@ -637,32 +625,32 @@ fn build_msg(
         };
         match coerce_to_type(v, &field.ty) {
             Some(coerced) => Ok(coerced),
-            None => Err(Response::text(
+            None => Err(text(
                 400,
                 format!("arg '{}' expects type '{}'", key, field.ty),
             )),
         }
     };
-    match req.method.as_str() {
+    match req.method().as_str() {
         "GET" => {
             // Query args arrive as `Value::Str` (no JSON typing
             // in a query string). With schema knowledge we can
             // parse them into the declared type — `?n=5` becomes
             // `Value::U64(5)` when the handler signature is u64.
-            for (k, v) in parse_query(&req.query) {
+            for (k, v) in parse_query(req.uri().query().unwrap_or("")) {
                 let typed = coerce(&k, Value::Str(v))?;
                 seen_keys.push(k.clone());
                 msg = msg.with(k, typed);
             }
         }
         "POST" | "PUT" | "PATCH" => {
-            if !req.body.is_empty() {
-                let pairs = parse_flat_json(&req.body).map_err(|e| {
+            if !req.body().is_empty() {
+                let pairs = parse_flat_json(req.body()).map_err(|e| {
                     // Detail (line/column, offending token) goes to logs;
                     // clients see a generic 400 so server internals don't
                     // leak via crafted-input probing.
                     log::debug!("http-gateway: invalid JSON body: {e}");
-                    Response::text(400, "invalid JSON body")
+                    text(400, "invalid JSON body")
                 })?;
                 for (k, v) in pairs {
                     let typed = coerce(&k, v)?;
@@ -671,23 +659,20 @@ fn build_msg(
                 }
             }
         }
-        other => return Err(Response::text(405, format!("method {other} not allowed"))),
+        other => return Err(text(405, format!("method {other} not allowed"))),
     }
     // Schema-aware missing-arg check. Every field the handler
     // declares must show up in the parsed args — otherwise the
     // actor's `from_msg` would silently return None and the
     // request would round-trip to a 502. Surface as 400 with
     // the missing field name so clients can fix their request.
-    // Skipped when no schema is registered (legacy permissive
-    // path): without meta the gateway has no way to know what
+    // Skipped when no schema is registered (the pre-schema
+    // permissive fallback): without meta the gateway has no way to know what
     // "required" means.
     if let Some(meta) = method_meta {
         for field in &meta.fields {
             if !seen_keys.iter().any(|k| k.as_str() == field.name) {
-                return Err(Response::text(
-                    400,
-                    format!("missing required arg '{}'", field.name),
-                ));
+                return Err(text(400, format!("missing required arg '{}'", field.name)));
             }
         }
     }
@@ -780,8 +765,8 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
 /// the cached entry on a hit. The cache distinguishes "not yet asked"
 /// (absent) from "asked, no schema available" (`Some(None)`), so a
 /// permanent miss costs at most one round trip per gateway lifetime.
-fn ensure_meta_cached(
-    ctx: &ServiceCtx,
+async fn ensure_meta_cached(
+    ctx: &mut Context<HttpGateway>,
     inner: &Inner,
     target: ServiceId,
     name: &str,
@@ -790,9 +775,11 @@ fn ensure_meta_cached(
     // `vosx space upgrade` case where the registry now has a
     // different schema but the gateway has no event-driven signal
     // to invalidate. Bounded staleness rather than per-request
-    // revalidation.
+    // revalidation. The `RefCell` borrow is dropped before the registry
+    // `ask` below (never held across an `.await` — the single-threaded
+    // executor would panic on a concurrent borrow).
     {
-        let cache = inner.meta_cache.lock().unwrap();
+        let cache = inner.meta_cache.borrow();
         if let Some(entry) = cache.get(&target.0)
             && entry.fetched_at.elapsed() < crate::state::META_CACHE_TTL
         {
@@ -803,8 +790,8 @@ fn ensure_meta_cached(
     // the registry does the agent → program_hash → meta join.
     // Empty reply means "no meta registered" → store `None` so we
     // don't retry on every request inside this TTL window.
-    let parsed = fetch_meta_from_registry(ctx, name);
-    let mut cache = inner.meta_cache.lock().unwrap();
+    let parsed = fetch_meta_from_registry(ctx, name).await;
+    let mut cache = inner.meta_cache.borrow_mut();
     cache.insert(
         target.0,
         crate::state::MetaEntry {
@@ -815,13 +802,16 @@ fn ensure_meta_cached(
     parsed
 }
 
-fn fetch_meta_from_registry(ctx: &ServiceCtx, name: &str) -> Option<vos::metadata::ParsedMeta> {
+async fn fetch_meta_from_registry(
+    ctx: &mut Context<HttpGateway>,
+    name: &str,
+) -> Option<vos::metadata::ParsedMeta> {
     let msg = Msg::new("meta_for_instance").with("name", name.to_string());
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(vos::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
-    let bytes = ctx.ask_raw(ServiceId::REGISTRY.0, &payload)?;
+    let bytes = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await?;
     if bytes.is_empty() {
         return None;
     }
@@ -829,7 +819,7 @@ fn fetch_meta_from_registry(ctx: &ServiceCtx, name: &str) -> Option<vos::metadat
     // `.vos_meta` section. Empty bytes means the registry didn't
     // find a meta entry (old binary, hash mismatch). `decode`
     // returns None on a malformed/empty section too.
-    let value: vos::value::Value = vos::value::Value::decode(&bytes);
+    let value = <vos::value::Value as vos::Decode>::try_decode(&bytes)?;
     let raw = value.as_bytes()?;
     if raw.is_empty() {
         return None;
@@ -924,7 +914,7 @@ mod tests {
 
         // Fresh entry: well within TTL.
         {
-            let mut cache = inner.meta_cache.lock().unwrap();
+            let mut cache = inner.meta_cache.borrow_mut();
             cache.insert(
                 target_id,
                 MetaEntry {
@@ -933,17 +923,18 @@ mod tests {
                 },
             );
         }
-        let cache = inner.meta_cache.lock().unwrap();
-        let entry = cache.get(&target_id).expect("entry");
-        assert!(
-            entry.fetched_at.elapsed() < META_CACHE_TTL,
-            "freshly-inserted entry must read as in-TTL",
-        );
-        drop(cache);
+        {
+            let cache = inner.meta_cache.borrow();
+            let entry = cache.get(&target_id).expect("entry");
+            assert!(
+                entry.fetched_at.elapsed() < META_CACHE_TTL,
+                "freshly-inserted entry must read as in-TTL",
+            );
+        }
 
         // Stale entry: past TTL by 1ms.
         {
-            let mut cache = inner.meta_cache.lock().unwrap();
+            let mut cache = inner.meta_cache.borrow_mut();
             cache.insert(
                 target_id,
                 MetaEntry {
@@ -952,7 +943,7 @@ mod tests {
                 },
             );
         }
-        let cache = inner.meta_cache.lock().unwrap();
+        let cache = inner.meta_cache.borrow();
         let entry = cache.get(&target_id).expect("entry");
         assert!(
             entry.fetched_at.elapsed() >= META_CACHE_TTL,
@@ -960,203 +951,43 @@ mod tests {
         );
     }
 
-    // ── Wire-level dispatch tests ─────────────────────────────────
+    // ── Auth-gate tests ───────────────────────────────────────────
     //
-    // Drive `dispatch_request` directly with hand-built `Request`s
-    // and assert on the returned `Response`. Bypasses the hyper /
-    // h3 wire-format extraction (covered by hyper's own tests) and
-    // the actor's `ctx.ask` (covered by vos), focusing on the
-    // policy/admin/auth/queue logic this crate owns.
+    // The connection-side gate is two pure functions: `effective_auth_for`
+    // (which token, if any, applies to this URL) + `check_auth` (does the
+    // request carry it). These are tested directly as pure functions.
+    // End-to-end dispatch (registry resolve → `ctx.ask` →
+    // reply) is covered by `dispatch_e2e` + `gateway_pvm_e2e` against a
+    // real VosNode; the parser is covered by `crate::http1`'s unit tests.
 
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
+    use std::cell::{Cell, RefCell};
 
     fn fresh_inner() -> Inner {
         Inner {
-            stop: AtomicBool::new(false),
-            bound_port: AtomicU16::new(8080),
-            requests: AtomicU64::new(0),
-            started_unix: AtomicU64::new(1_700_000_000),
-            in_flight: AtomicU16::new(0),
+            bound_port: 8080,
+            started_unix: 1_700_000_000,
+            requests: Cell::new(0),
             cfg: crate::config::GatewayConfig::default(),
-            meta_cache: Mutex::new(std::collections::HashMap::new()),
+            meta_cache: RefCell::new(std::collections::HashMap::new()),
             metrics: crate::state::Metrics::default(),
             agent_tokens: std::collections::HashMap::new(),
+            config_error: None,
         }
     }
 
     fn req(method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Request {
-        Request {
-            method: method.into(),
-            path: path.into(),
-            query: String::new(),
-            headers: headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: body.to_vec(),
+        let mut builder = http::Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
         }
+        builder.body(body.to_vec()).expect("valid test request")
     }
 
-    fn channel() -> (mpsc::SyncSender<Job>, mpsc::Receiver<Job>) {
-        mpsc::sync_channel::<Job>(4)
+    /// `None` if the request passes the gate, `Some(status)` if it's
+    /// rejected — the exact composition `dispatch` runs.
+    fn gate(r: &Request, policy: Policy<'_>) -> Option<u16> {
+        check_auth(r, effective_auth_for(r, &policy)).map(|resp| resp.status().as_u16())
     }
-
-    // /__admin/* admin namespace was removed in Phase 6; its
-    // stop / status semantics are now reachable as `vosx gateway
-    // stop` and `vosx gateway status` through the registry-driven
-    // dispatch path. Tests for the HTTP admin namespace deleted
-    // alongside the implementation; `gateway_pvm_e2e` step 12
-    // covers the replacement surface end-to-end.
-
-    #[tokio::test]
-    async fn auth_required_missing_returns_401() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req("GET", "/agent/method", &[], &[]),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("secret"),
-                agent_tokens: None,
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 401);
-    }
-
-    #[tokio::test]
-    async fn auth_required_wrong_bearer_returns_401() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/agent/method",
-                &[("authorization", "Bearer wrong")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("secret"),
-                agent_tokens: None,
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 401);
-    }
-
-    #[tokio::test]
-    async fn auth_required_correct_bearer_pushes_job() {
-        let inner = fresh_inner();
-        let (tx, rx) = channel();
-        // Fake actor: pull one Job and reply with a canned 200.
-        let actor = tokio::task::spawn_blocking(move || {
-            let job = rx.recv().expect("job");
-            let _ = job.resp_tx.send(Response::text(200, "from actor"));
-        });
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/agent/method",
-                &[("authorization", "Bearer secret")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("secret"),
-                agent_tokens: None,
-            },
-        )
-        .await;
-        actor.await.expect("actor task");
-        assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, b"from actor");
-    }
-
-    #[tokio::test]
-    async fn auth_bearer_lowercase_scheme_accepted() {
-        let inner = fresh_inner();
-        let (tx, rx) = channel();
-        let actor = tokio::task::spawn_blocking(move || {
-            let job = rx.recv().expect("job");
-            let _ = job.resp_tx.send(Response::text(200, "ok"));
-        });
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/agent/method",
-                &[("authorization", "bearer secret")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("secret"),
-                agent_tokens: None,
-            },
-        )
-        .await;
-        actor.await.expect("actor task");
-        assert_eq!(resp.status, 200);
-    }
-
-    #[tokio::test]
-    async fn closed_channel_returns_503() {
-        let inner = fresh_inner();
-        let (tx, rx) = channel();
-        drop(rx); // simulate the actor side having stopped
-        let resp = dispatch_request(
-            req("GET", "/agent/method", &[], &[]),
-            &tx,
-            &inner,
-            Policy::default(),
-        )
-        .await;
-        assert_eq!(resp.status, 503);
-        // Body distinguishes Full vs Disconnected so operators can
-        // tell saturation from shutdown apart in logs.
-        assert!(resp.body.starts_with(b"gateway stopped"));
-    }
-
-    #[tokio::test]
-    async fn saturated_channel_returns_503_retry() {
-        let inner = fresh_inner();
-        // Capacity-1 channel: pre-fill it, then dispatch — the
-        // second try_send must hit `Full`.
-        let (tx, _rx) = mpsc::sync_channel::<Job>(1);
-        let (resp_tx, _resp_rx) = oneshot::channel::<Response>();
-        tx.try_send(Job {
-            request: req("GET", "/x/y", &[], &[]),
-            resp_tx,
-        })
-        .expect("first send fits");
-        let resp = dispatch_request(
-            req("GET", "/agent/method", &[], &[]),
-            &tx,
-            &inner,
-            Policy::default(),
-        )
-        .await;
-        assert_eq!(resp.status, 503);
-        assert!(resp.body.starts_with(b"gateway saturated"));
-    }
-
-    // `admin_path_with_unknown_method_returns_404` was removed in
-    // Phase 6 alongside the `/__admin/*` namespace. Such a request
-    // now falls through to the agent dispatcher, where the leading-
-    // underscore name (`__admin`) bypasses auth and hits a registry
-    // lookup that misses — 404. The fall-through itself is exercised
-    // by `unknown_agent_returns_404` in dispatch_e2e against the
-    // real wire path.
-
-    // ── Per-agent Bearer auth ─────────────────────────────────────
-    //
-    // Validates the `agent_tokens` override against the global
-    // `auth_token` and the public namespaces.
 
     fn agent_tokens_for(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs
@@ -1165,175 +996,195 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn per_agent_token_requires_match_for_that_agent() {
-        let inner = fresh_inner();
-        let (tx, rx) = channel();
-        let actor = tokio::task::spawn_blocking(move || {
-            // Drain whatever job arrives — test only cares about
-            // the auth path, not what the actor returns.
-            if let Ok(job) = rx.recv() {
-                let _ = job.resp_tx.send(Response::text(200, "ok"));
-            }
-        });
-        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/secret-agent/whoami",
-                &[("authorization", "Bearer agent-only-token")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: None,
-                agent_tokens: Some(&tokens),
-            },
-        )
-        .await;
-        actor.await.expect("actor task");
-        assert_eq!(resp.status, 200);
-    }
-
-    #[tokio::test]
-    async fn per_agent_token_rejects_wrong_bearer() {
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/secret-agent/whoami",
-                &[("authorization", "Bearer wrong")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: None,
-                agent_tokens: Some(&tokens),
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 401);
-    }
-
-    #[tokio::test]
-    async fn per_agent_token_overrides_global_for_that_agent() {
-        // Global gate is `global-token`; the per-agent override
-        // for `special` is `agent-token`. Hitting `/special/...`
-        // with the global token must 401 — the agent token is the
-        // only one that opens this agent.
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let tokens = agent_tokens_for(&[("special", "agent-token")]);
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/special/foo",
-                &[("authorization", "Bearer global-token")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("global-token"),
-                agent_tokens: Some(&tokens),
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 401);
-    }
-
-    #[tokio::test]
-    async fn per_agent_falls_back_to_global_for_other_agents() {
-        // Only `special` is in the per-agent map. `regular` hits
-        // the global gate; the global token works.
-        let inner = fresh_inner();
-        let (tx, rx) = channel();
-        let actor = tokio::task::spawn_blocking(move || {
-            if let Ok(job) = rx.recv() {
-                let _ = job.resp_tx.send(Response::text(200, "ok"));
-            }
-        });
-        let tokens = agent_tokens_for(&[("special", "agent-token")]);
-        let resp = dispatch_request(
-            req(
-                "GET",
-                "/regular/foo",
-                &[("authorization", "Bearer global-token")],
-                &[],
-            ),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("global-token"),
-                agent_tokens: Some(&tokens),
-            },
-        )
-        .await;
-        actor.await.expect("actor task");
-        assert_eq!(resp.status, 200);
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_ignores_per_agent_tokens() {
-        // `/__metrics`, `/__schema`, `/openapi.json` are public —
-        // a per-agent gate shouldn't accidentally cover them.
-        let inner = fresh_inner();
-        let (tx, _rx) = channel();
-        let tokens = agent_tokens_for(&[("anything", "agent-token")]);
-        let resp = dispatch_request(
-            req("GET", "/__metrics", &[], &[]),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("global-token"),
-                agent_tokens: Some(&tokens),
-            },
-        )
-        .await;
-        assert_eq!(resp.status, 200);
-    }
-
-    #[tokio::test]
-    async fn openapi_endpoint_bypasses_global_auth() {
-        // `/openapi.json` doesn't start with `_`, so the original
-        // `agent_name.starts_with('_')` predicate auth-gated it
-        // by mistake whenever `auth_token` was set — making the
-        // self-doc URL unreachable on any production-shaped
-        // deployment. Lock the explicit `PUBLIC_NAMESPACES`
-        // allowlist behaviour: a fresh request to /openapi.json
-        // with no bearer should reach the actor side (here a
-        // 400 because the test-side router has no openapi
-        // handler wired, but specifically NOT a 401 from the
-        // auth gate).
-        let inner = fresh_inner();
-        let (tx, rx) = channel();
-        // Drain side: the openapi handler lives actor-side, but
-        // the test harness's job rx isn't actually wired to a
-        // handler. So we just receive the job and reply 200 —
-        // proving the request passed the auth gate.
-        let actor = tokio::spawn(async move {
-            if let Ok(job) = rx.recv() {
-                let _ = job.resp_tx.send(Response::text(200, "ok"));
-            }
-        });
-        let resp = dispatch_request(
-            req("GET", "/openapi.json", &[], &[]),
-            &tx,
-            &inner,
-            Policy {
-                auth_token: Some("global-token"),
-                agent_tokens: None,
-            },
-        )
-        .await;
-        actor.await.expect("actor task");
+    #[test]
+    fn auth_required_missing_returns_401() {
+        let r = req("GET", "/agent/method", &[], &[]);
         assert_eq!(
-            resp.status, 200,
-            "openapi.json should pass auth even with global auth_token set",
+            gate(
+                &r,
+                Policy {
+                    auth_token: Some("secret"),
+                    agent_tokens: None,
+                },
+            ),
+            Some(401),
         );
+    }
+
+    #[test]
+    fn auth_required_wrong_bearer_returns_401() {
+        let r = req(
+            "GET",
+            "/agent/method",
+            &[("authorization", "Bearer wrong")],
+            &[],
+        );
+        assert_eq!(
+            gate(
+                &r,
+                Policy {
+                    auth_token: Some("secret"),
+                    agent_tokens: None,
+                },
+            ),
+            Some(401),
+        );
+    }
+
+    #[test]
+    fn auth_correct_bearer_passes_gate() {
+        let r = req(
+            "GET",
+            "/agent/method",
+            &[("authorization", "Bearer secret")],
+            &[],
+        );
+        assert_eq!(
+            gate(
+                &r,
+                Policy {
+                    auth_token: Some("secret"),
+                    agent_tokens: None,
+                },
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn auth_bearer_lowercase_scheme_accepted() {
+        let r = req(
+            "GET",
+            "/agent/method",
+            &[("authorization", "bearer secret")],
+            &[],
+        );
+        assert_eq!(
+            gate(
+                &r,
+                Policy {
+                    auth_token: Some("secret"),
+                    agent_tokens: None,
+                },
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn no_token_configured_passes_gate() {
+        // Open dispatch (no `auth_token`): every request passes.
+        let r = req("GET", "/agent/method", &[], &[]);
+        assert_eq!(gate(&r, Policy::default()), None);
+    }
+
+    // ── Per-agent Bearer auth ─────────────────────────────────────
+    //
+    // Validates the `agent_tokens` override against the global
+    // `auth_token` and the public namespaces.
+
+    #[test]
+    fn per_agent_token_requires_match_for_that_agent() {
+        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
+        let r = req(
+            "GET",
+            "/secret-agent/whoami",
+            &[("authorization", "Bearer agent-only-token")],
+            &[],
+        );
+        assert_eq!(
+            gate(
+                &r,
+                Policy {
+                    auth_token: None,
+                    agent_tokens: Some(&tokens),
+                },
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn per_agent_token_rejects_wrong_bearer() {
+        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
+        let r = req(
+            "GET",
+            "/secret-agent/whoami",
+            &[("authorization", "Bearer wrong")],
+            &[],
+        );
+        assert_eq!(
+            gate(
+                &r,
+                Policy {
+                    auth_token: None,
+                    agent_tokens: Some(&tokens),
+                },
+            ),
+            Some(401),
+        );
+    }
+
+    #[test]
+    fn per_agent_token_overrides_global_for_that_agent() {
+        // Global gate is `global-token`; the per-agent override for
+        // `special` is `agent-token`. Hitting `/special/...` with the
+        // global token must 401 — the agent token is the only one that
+        // opens this agent.
+        let tokens = agent_tokens_for(&[("special", "agent-token")]);
+        let r = req(
+            "GET",
+            "/special/foo",
+            &[("authorization", "Bearer global-token")],
+            &[],
+        );
+        assert_eq!(
+            gate(
+                &r,
+                Policy {
+                    auth_token: Some("global-token"),
+                    agent_tokens: Some(&tokens),
+                },
+            ),
+            Some(401),
+        );
+    }
+
+    #[test]
+    fn per_agent_falls_back_to_global_for_other_agents() {
+        // Only `special` is in the per-agent map. `regular` hits the
+        // global gate; the global token works.
+        let tokens = agent_tokens_for(&[("special", "agent-token")]);
+        let r = req(
+            "GET",
+            "/regular/foo",
+            &[("authorization", "Bearer global-token")],
+            &[],
+        );
+        assert_eq!(
+            gate(
+                &r,
+                Policy {
+                    auth_token: Some("global-token"),
+                    agent_tokens: Some(&tokens),
+                },
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn public_endpoints_ignore_tokens() {
+        // `/__metrics`, `/__status`, `/__schema`, `/openapi.json` are
+        // public — neither the global nor a per-agent gate covers them.
+        let tokens = agent_tokens_for(&[("anything", "agent-token")]);
+        let policy = Policy {
+            auth_token: Some("global-token"),
+            agent_tokens: Some(&tokens),
+        };
+        for path in ["/__metrics", "/__schema", "/__schema/math", "/openapi.json"] {
+            let r = req("GET", path, &[], &[]);
+            assert_eq!(gate(&r, policy), None, "{path} should bypass auth");
+        }
     }
 }

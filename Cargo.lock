@@ -2901,6 +2901,7 @@ dependencies = [
 name = "http-gateway"
 version = "0.1.0"
 dependencies = [
+ "http",
  "httparse",
  "serde_json",
  "serde_urlencoded",

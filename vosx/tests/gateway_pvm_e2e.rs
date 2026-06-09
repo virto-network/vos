@@ -2,9 +2,10 @@
 //! real PVM actors + the http-gateway extension. Drives HTTP
 //! requests through the full production wire path:
 //!
-//!   curl → hyper → ServiceCtx::ask_raw → invoke channel →
+//!   curl → host TCP accept loop → gateway handle_connection →
+//!   ctx.ask_dispatch → invoke channel →
 //!   space-registry (PVM, resolves name via blake2b precompile) →
-//!   ask_raw → target actor (PVM, decodes Msg, runs handler) →
+//!   ask_dispatch → target actor (PVM, decodes Msg, runs handler) →
 //!   invoke envelope → unwrap → JSON
 //!
 //! Catches the failure class the in-process `dispatch_e2e` suite
@@ -743,10 +744,11 @@ fn pvm_actors_via_gateway() {
     //      of a PVM agent. Phase 3 wired vosx reconcile to forward
     //      `[[extension]]` meta to the registry's `register_extension_meta`;
     //      `meta_for_instance` falls through, so this round-trips
-    //      through the same libp2p path as math/greeter/counter
-    //      and renders the gateway's service-mode meta. Assertion
-    //      doubles as the Phase 2 check (cli_methods crosses over
-    //      into `exposed_to_cli=true` for `stop`/`status`).
+    //      through the same libp2p path as math/greeter/counter and
+    //      renders the gateway's meta. The gateway is a
+    //      TRANSPORT extension (`kind = 2`) with NO `#[msg]` handlers — so
+    //      it exposes no CLI methods (lifecycle moved to the generic
+    //      host-side `stop`/`describe`, exercised in step 11).
     let out = Command::new(vosx_bin())
         .args(["--format", "json", "space", "describe", "e2e", "gateway"])
         .env("XDG_DATA_HOME", daemon._data_home.path())
@@ -765,20 +767,23 @@ fn pvm_actors_via_gateway() {
         )
     });
     assert_eq!(ext_meta["actor_name"], "HttpGateway");
-    assert_eq!(ext_meta["kind"], 1, "gateway is a service-mode extension");
-    let ext_messages = ext_meta["messages"]
+    assert_eq!(
+        ext_meta["kind"], 2,
+        "gateway is now a transport-mode extension (kind 2)",
+    );
+    let exposed: Vec<&str> = ext_meta["messages"]
         .as_array()
-        .expect("gateway messages array");
-    let stop = ext_messages
-        .iter()
-        .find(|m| m["name"] == "stop")
-        .expect("gateway should expose `stop`");
-    let status_msg = ext_messages
-        .iter()
-        .find(|m| m["name"] == "status")
-        .expect("gateway should expose `status`");
-    assert_eq!(stop["exposed_to_cli"], true);
-    assert_eq!(status_msg["exposed_to_cli"], true);
+        .map(|ms| {
+            ms.iter()
+                .filter(|m| m["exposed_to_cli"] == true)
+                .filter_map(|m| m["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        exposed.is_empty(),
+        "a transport gateway declares no CLI methods; saw {exposed:?}",
+    );
 
     // 9b. /openapi.json — auto-generated from registered schemas.
     //      Asserts the doc shape: openapi version, math.add /
@@ -928,43 +933,57 @@ fn pvm_actors_via_gateway() {
         );
     }
 
-    // 11. Phase 5: `vosx gateway status` returns the same JSON
-    //     snapshot the removed `GET /__admin/status` did, and
-    //     `vosx gateway stop` actually flips the gateway's stop
-    //     flag — same wire path as Phase 4 dispatch, landing on
-    //     real `vos_service_handle_invoke` handlers backed by
-    //     `Inner`'s atomics. Lives at the end of the test
-    //     because stop tears the daemon down.
-    let out = Command::new(vosx_bin())
-        .args(["--format", "json", "--space", "e2e", "gateway", "status"])
-        .env("XDG_DATA_HOME", daemon._data_home.path())
-        .env("XDG_CONFIG_HOME", daemon._config_home.path())
-        .output()
-        .expect("spawn vosx gateway status");
-    assert!(
-        out.status.success(),
-        "vosx gateway status failed: stderr={}",
-        String::from_utf8_lossy(&out.stderr),
+    // 11. The lifecycle surface split in two.
+    //
+    //  (a) Rich live status stays IN the gateway as the public
+    //      `GET /__status` endpoint (reads only `Inner` atomics — no
+    //      registry round trip), replacing the old `vosx gateway status`
+    //      invoke sidecar.
+    let (status_code, body) = http_request(daemon.port(), "GET", "/__status", None, &[]);
+    assert_eq!(
+        status_code, 200,
+        "GET /__status expected 200, got {status_code}"
     );
-    let body = String::from_utf8_lossy(&out.stdout);
-    // Reply is `Value::Str(json_blob)`; vosx's `unwrap_json_string`
-    // heuristic strips the outer quoting so the operator sees a
-    // real JSON object instead of a string-containing-JSON.
     let status: serde_json::Value =
-        serde_json::from_str(body.trim()).expect("vosx gateway status returns JSON object");
-    assert!(
-        status.is_object(),
-        "status should render as JSON object, got: {status}",
-    );
+        serde_json::from_slice(&body).expect("/__status returns a JSON object");
     assert_eq!(
         status["running"], true,
-        "gateway should report running=true before stop",
+        "gateway should report running=true: {status}",
     );
     assert!(
         status["port"].is_number(),
-        "status should include port: {status}",
+        "/__status should include the bound port: {status}",
     );
 
+    //  (b) `vosx gateway describe` is the GENERIC host primitive
+    //      (`__describe`) — works for any agent, reports the live
+    //      running flag + transport kind + host-bound serve address.
+    let out = Command::new(vosx_bin())
+        .args(["--format", "json", "--space", "e2e", "gateway", "describe"])
+        .env("XDG_DATA_HOME", daemon._data_home.path())
+        .env("XDG_CONFIG_HOME", daemon._config_home.path())
+        .output()
+        .expect("spawn vosx gateway describe");
+    assert!(
+        out.status.success(),
+        "vosx gateway describe failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let desc: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("vosx gateway describe returns a JSON object");
+    assert_eq!(desc["running"], true, "describe before stop: {desc}");
+    assert_eq!(desc["kind"], 2, "gateway is transport-kind: {desc}");
+    assert!(
+        desc["serves_addr"]
+            .as_str()
+            .is_some_and(|a| a.contains(&port.to_string())),
+        "describe should report the host-bound serve addr: {desc}",
+    );
+
+    //  (c) `vosx gateway stop` is the GENERIC host primitive (`__stop`)
+    //      — flips the gateway agent's shutdown flag so its accept loop
+    //      exits, WITHOUT tearing down the node. Returns Value::Unit →
+    //      JSON `null`. Lives at the end because it stops serving.
     let out = Command::new(vosx_bin())
         .args(["--format", "json", "--space", "e2e", "gateway", "stop"])
         .env("XDG_DATA_HOME", daemon._data_home.path())
@@ -976,13 +995,30 @@ fn pvm_actors_via_gateway() {
         "vosx gateway stop failed: stderr={}",
         String::from_utf8_lossy(&out.stderr),
     );
-    // stop returns Value::Unit → vosx renders as JSON `null`.
     let body = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         body.trim(),
         "null",
         "stop should return Value::Unit → null, got: {body}",
     );
+
+    // The accept loop polls its shutdown flag every ~50ms; give it a
+    // moment, then confirm the listener is gone (connection refused) —
+    // proving `__stop` stopped the gateway agent specifically.
+    let mut closed = false;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(50));
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", daemon.port()).parse().unwrap(),
+            Duration::from_millis(100),
+        )
+        .is_err()
+        {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "gateway listener should close after `gateway stop`");
 
     // Daemon teardown via Drop.
 }

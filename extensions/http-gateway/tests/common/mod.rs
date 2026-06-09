@@ -166,10 +166,18 @@ impl TestNode {
             "kitchen should land at id 2 to match mock-registry"
         );
 
+        // The gateway is a transport extension — the HOST
+        // owns the listener. Configure `serves(addr, ..)` (mirrors what
+        // `vosx` reconcile derives from the manifest's bind_addr/port);
+        // the init args still carry bind_addr/port for the gateway's own
+        // `/__status` readout.
+        let addr = format!("127.0.0.1:{port}");
         let args = Args::new()
             .with("bind_addr", "127.0.0.1")
             .with("port", port as u32);
-        node.register_extension(ExtensionConfig::with_args(&paths.gateway, &args));
+        node.register_extension(
+            ExtensionConfig::with_args(&paths.gateway, &args).serves(addr, false),
+        );
 
         let node_thread = thread::spawn(move || {
             node.run_forever();

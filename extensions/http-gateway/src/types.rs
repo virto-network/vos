@@ -1,69 +1,52 @@
-//! Cross-protocol HTTP types.
+//! HTTP types — the gateway speaks the standard `http` crate's
+//! `Request`/`Response`, with an owned `Vec<u8>` body.
 //!
-//! `Request` and `Response` decouple the actor-side routing from the
-//! wire-side details — hyper, h3, and any future transport all
-//! parse into `Request` and serialize back from `Response`. `Job` is
-//! the mpsc envelope that ferries a `Request` from a connection task
-//! to the actor handler and the `Response` back.
+//! The hand-written HTTP/1.1 parser ([`crate::http1`]) fills a
+//! [`Request`] off the byte stream, the router produces a [`Response`],
+//! and the serializer turns it back into bytes for `ctx.write`.
+//!
+//! `http::Response` is a foreign type, so the response constructors live
+//! here as free functions rather than inherent methods.
 
-use tokio::sync::oneshot;
+use http::header::CONTENT_TYPE;
+use http::{HeaderValue, StatusCode};
 
-/// One HTTP exchange in flight. Connection task pushes onto the
-/// actor's mpsc; the actor handler fills `resp_tx` once `ctx.ask`
-/// completes; the task awaits the oneshot and writes the response.
-pub(crate) struct Job {
-    pub(crate) request: Request,
-    pub(crate) resp_tx: oneshot::Sender<Response>,
+/// A parsed HTTP request with an owned byte body.
+pub(crate) type Request = http::Request<Vec<u8>>;
+
+/// An HTTP response with an owned byte body.
+pub(crate) type Response = http::Response<Vec<u8>>;
+
+/// `application/json` response with the given status + body.
+pub(crate) fn json(status: u16, body: Vec<u8>) -> Response {
+    build(status, "application/json", body)
 }
 
-pub(crate) struct Request {
-    pub(crate) method: String,
-    pub(crate) path: String,
-    pub(crate) query: String,
-    /// Lower-case header names paired with their values. Capped at
-    /// `limits::MAX_REQUEST_HEADERS` by the wire-side parser.
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
+/// Plain-text response with a non-default Content-Type. Used by
+/// `/__metrics` to emit `text/plain; version=0.0.4` — Prometheus's
+/// convention. `content_type` must be `'static` (it's interned as a
+/// `HeaderValue::from_static`).
+pub(crate) fn with_content_type(
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> Response {
+    build(status, content_type, body)
 }
 
-pub(crate) struct Response {
-    pub(crate) status: u16,
-    pub(crate) content_type: &'static str,
-    pub(crate) body: Vec<u8>,
+/// `text/plain` response carrying `msg` as the body.
+pub(crate) fn text(status: u16, msg: impl Into<String>) -> Response {
+    build(status, "text/plain", msg.into().into_bytes())
 }
 
-impl Response {
-    pub(crate) fn json(status: u16, body: Vec<u8>) -> Self {
-        Self {
-            status,
-            content_type: "application/json",
-            body,
-        }
-    }
-
-    /// Plain-text response with a non-default Content-Type. Used by
-    /// `/__metrics` to emit `text/plain; version=0.0.4` —
-    /// Prometheus's convention. `ct` must be a `'static` slice
-    /// (matches the type's storage shape).
-    pub(crate) fn with_content_type(
-        status: u16,
-        content_type: &'static str,
-        body: Vec<u8>,
-    ) -> Self {
-        Self {
-            status,
-            content_type,
-            body,
-        }
-    }
-
-    pub(crate) fn text(status: u16, msg: impl Into<String>) -> Self {
-        Self {
-            status,
-            content_type: "text/plain",
-            body: msg.into().into_bytes(),
-        }
-    }
+/// Build a response with a single Content-Type header. The status codes
+/// the gateway emits are all valid, so `from_u16` never fails here.
+fn build(status: u16, content_type: &'static str, body: Vec<u8>) -> Response {
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::from_u16(status).expect("gateway emits valid status codes");
+    resp.headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp
 }
 
 /// Shared error type for the HTTP/codec helpers — distinct from the

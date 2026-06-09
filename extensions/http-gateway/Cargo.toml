@@ -7,17 +7,13 @@ license.workspace = true
 
 [features]
 # `bin` enables the cdylib's `vos_extension_*` extern-fn exports.
-# `extension` is matched by `#[actor]` to emit `impl Extension`
-# and the dispatch glue. Both default-on so a plain `cargo build`
-# produces a loadable extension .so. Cross-actor lib deps disable
-# default features.
+# `extension` is matched by `#[actor]` to emit the transport glue
+# (`vos_extension_conn_new` etc.). Both default-on so a plain
+# `cargo build` produces a loadable extension .so. Cross-actor lib
+# deps disable default features.
 default = ["bin", "extension"]
 bin = []
 extension = []
-# Add HTTP/3 (QUIC) on top of the default h1+h2c TCP stack. Adds
-# `serve_h3(port)` as an actor message and pulls in h3 + quinn
-# + rustls + rcgen (for dev-mode self-signed cert auto-gen).
-http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:http"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
@@ -26,40 +22,28 @@ check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+# The gateway is a TRANSPORT-mode extension: the host owns the listener +
+# accept loop and drives one `handle_connection` per connection on its
+# cooperative executor, and a hand-written HTTP/1.1 parser sits on the
+# plaintext byte stream. HTTP/2 and HTTP/3 are not supported; the deps are
+# just codecs + types.
 [dependencies]
 vos = { path = "../../vos", default-features = false, features = ["extension"] }
-# Connection-side I/O runs on tokio so the extension can accept many
-# clients concurrently. Dispatch through `ctx.ask` is still serial
-# (the actor's `ctx` is single-threaded), but accept/parse/write
-# parallelizes across the runtime's extension tasks.
-tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
-# HTTP layer. hyper handles parsing, serialization, keep-alive, h2c
-# multiplexing — none of which we want to maintain by hand. The h2
-# feature also enables h2c (cleartext) for non-TLS clients with
-# prior-knowledge negotiation. HTTP/3 will live behind a feature
-# gate (h3 + quinn + rustls) in a follow-up.
-hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["server", "server-auto", "http1", "http2", "tokio"] }
-http-body-util = "0.1"
-bytes = "1"
+# Battle-tested zero-alloc HTTP/1.x request-line + header parser (the same
+# one hyper uses). We drive it incrementally off the byte stream and keep
+# body framing (Content-Length) + keep-alive ourselves — see http1.rs.
+httparse = "1"
+# The standard `http` crate — types only (Method, StatusCode, Uri,
+# HeaderMap, Request/Response). No I/O or runtime; `httparse` parses the
+# wire bytes, then we fill an `http::Request` from them.
+http = "1"
 serde_json = "1"
 serde_urlencoded = "0.7"
-# Constant-time byte comparison for token checks. Tiny dep, also
-# in the transitive tree via rustls/ring on the http3 build.
+# Constant-time byte comparison for bearer-token checks.
 subtle = "2"
-# HTTP/3 stack — only pulled in when `feature = "http3"`. Pre-1.0
-# crates are exact about minor versions because the h3/quinn/rustls
-# trio is tightly coupled.
-h3 = { version = "0.0.8", optional = true }
-h3-quinn = { version = "0.0.10", optional = true }
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "log"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-rustls-pemfile = { version = "2", optional = true }
-rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"], optional = true }
-http = { version = "1", optional = true }
 
 [dev-dependencies]
-# tests/service_mode.rs drives the gateway via VosNode's host APIs
+# tests/dispatch_e2e.rs drives the gateway via VosNode's host APIs
 # (register_extension, run_forever, shutdown), all behind vos's
 # `std` feature. The cdylib build keeps default-features off so the
 # .so stays lean; this dev-dep brings std + storage + http back in

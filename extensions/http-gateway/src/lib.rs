@@ -8,111 +8,113 @@
 //! ```
 //!
 //! The `<agent-name>` segment resolves through the registry actor at
-//! [`vos::actors::context::ServiceId::REGISTRY`]. The `<method>`
-//! segment becomes the dynamic [`Msg::name`]; query params (GET) or
-//! top-level JSON keys (POST/PUT/PATCH) become the [`Msg::args`]. The
-//! reply [`Value`] from `ctx.ask_raw` is rendered as JSON.
+//! [`vos::actors::context::ServiceId::REGISTRY`]. The `<method>` segment
+//! becomes the dynamic [`vos::value::Msg::name`]; query params (GET) or
+//! top-level JSON keys (POST/PUT/PATCH) become the args. The reply is
+//! rendered as JSON.
 //!
-//! ## HTTP stack
+//! ## Transport mode
 //!
-//! - **HTTP/1.1 + HTTP/2 (cleartext)** via [`hyper`] —
-//!   keep-alive, chunked transfer, h2c multiplexing.
-//! - **HTTP/3** behind `feature = "http3"` via `h3` + `quinn` +
-//!   `rustls`, with a self-signed cert auto-minted for `localhost`.
+//! The gateway is a **transport-mode** extension. The **host** owns the
+//! TCP listener + accept loop (configured via
+//! `ExtensionConfig::serves(addr, tls)` from the manifest's
+//! `bind_addr`/`port`/`tls_*` init args) and terminates TLS, then drives
+//! one [`HttpGateway::handle_connection`] task per accepted connection on
+//! its single cooperative executor. The receiver is `&self` (shared), so
+//! many connections interleave while parked on I/O — all per-instance
+//! state lives behind [`state::Inner`]'s atomics + `Mutex`.
 //!
-//! Both protocols share the same `Job → ctx.ask_raw → Response` bridge.
+//! `handle_connection` reads the plaintext byte stream (`ctx.read`),
+//! feeds an HTTP/1.1 parser ([`http1`], `httparse` head + our framing),
+//! routes each request
+//! through [`routing::dispatch`] (which `ctx.ask`s the registry + target
+//! agent), serializes the reply, and writes it back (`ctx.write`),
+//! keeping the connection alive until EOF or `Connection: close`.
 //!
-//! ## Concurrency
+//! The host owns the TCP listener + accept loop and terminates TLS; the
+//! gateway frames HTTP/1.1 off the plaintext byte stream. HTTP/2 and
+//! HTTP/3 are not supported.
 //!
-//! Each protocol owns a tokio runtime in its own OS thread; per-
-//! connection tasks parse, look up the route, and either short-circuit
-//! into the admin handler or push a `Job` onto an mpsc the gateway
-//! drains in its `run` loop. Wire-side I/O scales horizontally; the
-//! drain loop calling `ctx.ask_raw` is serial, so dispatch throughput
-//! is bounded by upstream latency.
+//! ## Lifecycle (`stop` / `describe`)
 //!
-//! ## Lifecycle (service-mode extension)
-//!
-//! The gateway is a **service-mode extension** — the host calls
-//! `vos_extension_run` once and the gateway's `run(ctx)` body owns
-//! the lifecycle until shutdown.
-//!
-//! - `run(ctx)` — install config, bind on the configured port, drain
-//!   jobs until shutdown is signalled (via `ctx.is_shutdown()` or
-//!   `vosx gateway stop`).
-//! - `vos_service_handle_invoke` runs on a sidecar dispatch thread
-//!   and handles `stop` / `status` — the operator-facing surface
-//!   reachable as `vosx gateway stop` / `vosx gateway status`.
+//! A transport extension has no inbound `#[msg]` handlers, so the gateway
+//! does not answer its own `stop` / `status` invokes. Instead the host
+//! provides generic per-agent primitives: `vosx gateway stop` and
+//! `vosx gateway describe` are intercepted node-side as `__stop` /
+//! `__describe` (see `vos::node`). Rich live status stays in-gateway as
+//! the public `GET /__status` endpoint (no invoke round trip), alongside
+//! the Prometheus `GET /__metrics`.
 //!
 //! ## Operator config (manifest init args)
-//!
-//! Five knobs are passed via the manifest as a rkyv-encoded
-//! `vos::value::Args`. Each one is empty by default; an empty value
-//! means "use the in-code default":
 //!
 //! ```toml
 //! [[extension]]
 //! name = "gateway"
 //! path = "target/release/libhttp_gateway.so"
-//! init = {
-//!     bind_addr   = "0.0.0.0",
-//!     auth_token  = "...",
-//!     tls_cert    = "/etc/tls/cert.pem",
-//!     tls_key     = "/etc/tls/key.pem",
-//!     port        = 8080,
-//! }
+//! init = { bind_addr = "0.0.0.0", port = 8080, auth_token = "…" }
 //! ```
 //!
-//! | Field         | Default                                       |
-//! |---------------|-----------------------------------------------|
-//! | `bind_addr`   | `127.0.0.1` (loopback)                        |
-//! | `auth_token`  | none — open dispatch + WARN at startup        |
-//! | `tls_cert`    | none — h3 self-signs `localhost` (dev only)   |
-//! | `tls_key`     | none — paired with `tls_cert`                 |
-//! | `port`        | `8080`                                        |
+//! | Field          | Default                                        |
+//! |----------------|------------------------------------------------|
+//! | `bind_addr`    | `127.0.0.1` (loopback)                         |
+//! | `port`         | `8080`                                         |
+//! | `auth_token`   | none — open dispatch + WARN at startup         |
+//! | `tls_cert`     | none — host terminates TLS when paired with…   |
+//! | `tls_key`      | none — …`tls_cert`                             |
+//! | `agent_tokens` | empty — `agent:tok,agent:tok` per-agent override|
 //!
-//! Defaults make a bare deployment loopback-only with dispatch open.
-//! A public deployment **must** set `auth_token` and override
-//! `bind_addr`.
+//! Each field is empty-means-default. `bind_addr`/`port`/`tls_*` are read
+//! host-side (in `vosx` reconcile) to configure `serves(..)`; the gateway
+//! itself uses `auth_token`/`agent_tokens` (+ `port` for `/__status`).
+//! A public deployment **must** set `auth_token` and override `bind_addr`.
 
 mod config;
-mod hyper_io;
+mod http1;
 mod json;
 mod limits;
 mod routing;
-mod runtime;
 mod state;
 mod types;
 
-#[cfg(feature = "http3")]
-mod http3;
+use std::cell::OnceCell;
 
-use vos::extension::ServiceCtx;
-use vos::log;
-
-use crate::types::Job;
+use vos::prelude::*;
 
 /// Default bind port when `init.port` is unset or zero.
 const DEFAULT_PORT: u16 = 8080;
 
-pub struct HttpGateway {
+#[actor(kind = "transport", caps = ["net.tcp.bind"])]
+struct HttpGateway {
+    /// Operator config, parsed from the init args. Plain rkyv-serializable
+    /// fields — these are the persistable part of the actor's state.
     cfg: config::GatewayConfig,
+    /// Host-bound listen port (the host owns the listener; we keep it for
+    /// `/__status` + `/__metrics` reporting).
     port: u16,
-    /// Live runtime state, populated by `run()` once the config
-    /// passes validation. The dispatch sidecar
-    /// (`vos_service_handle_invoke`) reads this through a shared
-    /// reference, so `stop` / `status` invokes from
-    /// `vosx gateway stop` / `vosx gateway status` see the same
-    /// atomics. Empty until `run()` runs — invokes before then
-    /// come back `STATUS_NOT_FOUND` (handler responds "not ready").
-    inner: std::sync::OnceLock<std::sync::Arc<state::Inner>>,
+    /// Live runtime state (counters + schema cache + parsed tokens), shared
+    /// by every connection task via `&self` (single-threaded — `Cell` /
+    /// `RefCell` interior mutability, no `Arc`/`Mutex`). **Skipped by rkyv**
+    /// — `Cell`/`RefCell` aren't serializable, and a transport extension
+    /// never warm-restarts, so the
+    /// `Actor: Encode + Decode` bound only needs to be *satisfied*, not
+    /// meaningfully exercised. Built eagerly in `new()`; `handle_connection`
+    /// reaches it via `get_or_init` (the single-threaded executor makes the
+    /// `OnceCell` access race-free — `Inner::new` never `.await`s, so two
+    /// connection tasks can't init concurrently).
+    #[rkyv(with = vos::rkyv::with::Skip)]
+    inner: OnceCell<state::Inner>,
 }
 
+#[messages]
 impl HttpGateway {
-    /// Constructor invoked by `vos_extension_create`. Init args are
-    /// rkyv-encoded `vos::value::Args` with the six string knobs +
-    /// `port`. Empty / missing fields fall back to in-code defaults.
-    pub fn new(args: &[u8]) -> Self {
+    /// Constructor invoked by `vos_extension_create` with the raw
+    /// rkyv-encoded `vos::value::Args` init blob. Every knob is optional
+    /// (empty ⇒ in-code default), so we parse the blob ourselves rather
+    /// than via named constructor params (which would `expect` each to be
+    /// present). A malformed `agent_tokens` lands in
+    /// [`state::Inner::config_error`] and makes the gateway answer `503`
+    /// to every request rather than boot with weakened auth.
+    fn new(args: &[u8]) -> Self {
         use vos::Decode;
         let parsed: vos::value::Args = if args.is_empty() {
             vos::value::Args::default()
@@ -130,240 +132,104 @@ impl HttpGateway {
             .get_u32("port")
             .map(|p| p as u16)
             .unwrap_or(DEFAULT_PORT);
-        Self {
-            cfg,
-            port,
-            inner: std::sync::OnceLock::new(),
-        }
+        let inner = OnceCell::new();
+        // Eager build so metrics/status are live immediately and a config
+        // error is logged at boot (not deferred to the first request).
+        let _ = inner.set(state::Inner::new(cfg.clone(), port));
+        HttpGateway { cfg, port, inner }
     }
 
-    /// Live runtime state, if `run()` has populated it. Used by
-    /// the `vos_service_handle_invoke` sidecar to back the
-    /// `vosx gateway stop` / `vosx gateway status` handlers.
-    pub(crate) fn inner(&self) -> Option<&std::sync::Arc<state::Inner>> {
-        self.inner.get()
-    }
-
-    /// Service entry point. Builds a per-instance `Inner` carrying
-    /// this gateway's config + atomics, spins up the protocol
-    /// threads (h1+h2c always; h3 too when built with `feature =
-    /// "http3"`) against a shared Job queue, drains jobs through
-    /// `ctx.ask_raw` until shutdown, then waits for protocol
-    /// threads to exit cleanly. Returns 0 on clean exit; non-zero
-    /// on bind failure of the always-on h1 path.
-    pub fn run(&mut self, ctx: ServiceCtx) -> i32 {
-        use crate::limits::JOB_QUEUE_CAP;
-        use std::sync::mpsc;
-
-        let port = self.port;
-        log::info!("http-gateway: starting on port {port}");
-
-        let inner = match state::Inner::new(self.cfg.clone()) {
-            Ok(i) => i,
-            Err(e) => {
-                // Bearer-auth config failure: refuse to boot
-                // rather than continue with weakened protection.
-                // `2` distinguishes this from a port-bind failure
-                // (`1`) so an operator inspecting `wait_status`
-                // can tell the two apart without scraping logs.
-                log::error!("http-gateway: config error: {e}");
-                return 2;
-            }
-        };
-        // Publish to the OnceLock so the invoke-dispatch sidecar
-        // (`vos_service_handle_invoke`) can read the same atomics
-        // the HTTP-side admin handlers do. set() can fail only if
-        // a previous run() already populated it; gateway lifecycle
-        // is one-shot so this should never fire, but the Err arm
-        // surfaces the bug rather than silently mismatched state.
-        if let Err(_existing) = self.inner.set(inner.clone()) {
-            log::error!(
-                "http-gateway: run() called twice on the same instance — \
-                 invoke sidecar would target stale state"
-            );
-            return 3;
-        }
-        if !runtime::claim_port(&inner, port) {
-            return 1;
-        }
-
-        // Single shared Job queue feeding all protocol threads. The
-        // drain loop on this thread services both h1 and h3.
-        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(JOB_QUEUE_CAP);
-
-        let h1_handle = match hyper_io::spawn(port, job_tx.clone(), inner.clone()) {
-            Ok(h) => {
-                runtime::log_listening(&inner, port, "tcp");
-                h
-            }
-            Err(e) => {
-                log::error!("http-gateway: h1+h2c bind failed: {e}");
-                inner
-                    .bound_port
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                return 1;
-            }
-        };
-
-        // h3 is additive — bind failure logs a warning and continues
-        // serving h1 only, so an operator misconfiguring TLS doesn't
-        // take down the gateway.
-        #[cfg(feature = "http3")]
-        let h3_handle = match http3::spawn(port, job_tx.clone(), inner.clone()) {
-            Ok(h) => {
-                runtime::log_listening(&inner, port, "udp/h3");
-                Some(h)
-            }
-            Err(e) => {
-                log::warn!("http-gateway: h3 bind failed (continuing without h3): {e}");
-                None
-            }
-        };
-
-        // Drop the bootstrap sender so the channel auto-closes once
-        // every protocol thread's clone goes away. drain_jobs sees
-        // RecvTimeoutError::Disconnected and exits cleanly.
-        drop(job_tx);
-
-        runtime::mark_listening(&inner, port);
-        runtime::log_auth_warnings(&inner, port);
-
-        let stop_msg = routing::drain_jobs(&job_rx, &inner, &ctx);
-
-        // Wait for protocol threads to drain + close. Each accept
-        // loop self-limits via DRAIN_TIMEOUT; the wait is bounded.
-        runtime::wait_for_thread(h1_handle);
-        #[cfg(feature = "http3")]
-        if let Some(h) = h3_handle {
-            runtime::wait_for_thread(h);
-        }
-
-        inner
-            .bound_port
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        log::info!("http-gateway: stopped ({stop_msg})");
-        0
+    /// Serve one HTTP/1.1 connection to completion (`&self`, shared — the
+    /// host runs one of these per connection, concurrently). Loops
+    /// parse → dispatch → write, keeping the connection alive across
+    /// requests until the peer closes it or asks for `Connection: close`,
+    /// then closes.
+    async fn handle_connection(&self, ctx: &mut Context<Self>, conn_id: u64) {
+        let inner = self
+            .inner
+            .get_or_init(|| state::Inner::new(self.cfg.clone(), self.port));
+        serve_connection(inner, ctx, conn_id).await;
+        ctx.close(conn_id).await;
     }
 }
 
-/// Service-mode invoke dispatch (Phase 5). Wires
-/// `vosx gateway stop` / `vosx gateway status` to the same atomics
-/// the HTTP `/__admin/*` namespace toggles. Hand-rolled (no macro)
-/// because service_main! doesn't generate per-message dispatch yet
-/// — the gateway is the lone consumer right now, so the manual
-/// shape is fine; the macro can subsume this in a follow-up that
-/// touches more than one service.
-///
-/// Wire shape: caller (vosx) encodes a `vos::value::Msg` prefixed
-/// with `TAG_DYNAMIC`; we decode, match on `msg.name`, dispatch,
-/// then return the reply as rkyv-encoded `vos::value::Value`
-/// (which `DaemonClient::invoke_dyn` already decodes). Unknown
-/// method → POLL_ERR_NO_FUTURE so the daemon's sidecar wraps it
-/// as STATUS_NOT_FOUND.
-///
-/// Thread-safety: the daemon's sidecar calls this on its own
-/// thread, in parallel with `run()`'s drain loop. We only touch
-/// `HttpGateway.inner` (a `OnceLock<Arc<Inner>>`) and `Inner`'s
-/// atomics — both are explicitly designed for cross-thread access.
-///
-/// # Safety
-///
-/// * `state` must be a live `HttpGateway` pointer produced by
-///   `vos_extension_create` and not yet freed via
-///   `vos_extension_drop`.
-/// * `msg_ptr` / `msg_len` must describe a valid byte slice or
-///   `(null, 0)`. Any other shape is a soundness violation.
-/// * Only the host's service-mode dispatch sidecar should call
-///   this — external callers can't satisfy either invariant.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vos_service_handle_invoke(
-    state: *mut (),
-    msg_ptr: *const u8,
-    msg_len: usize,
-) -> vos::extension::ExtensionPollResult {
-    use vos::Encode;
-    use vos::extension::{ExtensionPollResult, POLL_ERR_HANDLER, POLL_ERR_NO_FUTURE};
-    use vos::value::{Msg, TAG_DYNAMIC, Value};
+/// The per-connection serve loop. Factored out of `handle_connection` so
+/// it can use crate-local helpers; takes `&Inner` (shared, immutable) +
+/// the mutable connection `Context`.
+async fn serve_connection(inner: &state::Inner, ctx: &mut Context<HttpGateway>, conn_id: u64) {
+    let policy = routing::Policy {
+        auth_token: inner.cfg.auth_token(),
+        agent_tokens: (!inner.agent_tokens.is_empty()).then_some(&inner.agent_tokens),
+    };
 
-    let result = std::panic::catch_unwind(|| {
-        if state.is_null() || msg_ptr.is_null() || msg_len == 0 {
-            return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
+    // Buffer accumulates bytes across `ctx.read`s; leftover after one
+    // request (a pipelined next request) carries into the next iteration.
+    let mut buf: Vec<u8> = Vec::new();
+
+    loop {
+        // 1. Parse a request head, reading more as needed.
+        let head = loop {
+            match http1::parse_head(&buf) {
+                http1::HeadOutcome::Complete(h) => break h,
+                http1::HeadOutcome::Error(resp) => {
+                    // Protocol error: answer it, then close.
+                    inner.metrics.record_response(resp.status().as_u16());
+                    let bytes = http1::serialize_response(&resp, false);
+                    let _ = write_all(ctx, conn_id, &bytes).await;
+                    return;
+                }
+                http1::HeadOutcome::NeedMore => match ctx.read(conn_id, limits::READ_CHUNK).await {
+                    Some(data) if !data.is_empty() => buf.extend_from_slice(&data),
+                    // `Some(empty)` is a clean EOF (peer closed at a request
+                    // boundary, or mid-head — either way we're done); `None`
+                    // is a read error. Both end the connection.
+                    _ => return,
+                },
+            }
+        };
+
+        // 2. Read the full Content-Length body into the buffer.
+        let total = head.head_len + head.content_length;
+        while buf.len() < total {
+            match ctx.read(conn_id, limits::READ_CHUNK).await {
+                Some(data) if !data.is_empty() => buf.extend_from_slice(&data),
+                // EOF / error before the declared body arrived → truncated
+                // request; drop the connection.
+                _ => return,
+            }
         }
-        // SAFETY: state pointer is the live HttpGateway instance
-        // the host allocated via `vos_extension_create`; the
-        // sidecar holds the only other reference and never mutates.
-        let gateway = unsafe { &*(state as *const HttpGateway) };
 
-        // SAFETY: msg_ptr / msg_len describe a host-borrowed slice
-        // valid for the duration of this call (FFI contract).
-        let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
-        let body = if raw.first() == Some(&TAG_DYNAMIC) {
-            &raw[1..]
-        } else {
-            raw
-        };
-        // `try_decode` is the validating rkyv path — a malformed
-        // payload (truncated, schema-mismatched, hostile) returns
-        // None instead of panicking through the FFI boundary and
-        // looking like a handler bug in metrics/logs.
-        let Some(msg) = <Msg as vos::Decode>::try_decode(body) else {
-            log::warn!("http-gateway: vos_service_handle_invoke received malformed payload");
-            return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
-        };
+        // 3. Carve out the Request; retain any pipelined leftover bytes.
+        //    `parse_head` already filled the head into an `http::Request<()>`;
+        //    attach the body we just read.
+        let keep_alive = head.keep_alive;
+        let body = buf[head.head_len..total].to_vec();
+        let req: types::Request = head.request.map(|()| body);
+        buf.drain(..total);
 
-        let reply: Value = match msg.name.as_str() {
-            "stop" => {
-                let Some(inner) = gateway.inner() else {
-                    // Pre-run() race: between `vos_extension_create`
-                    // returning and `run()` populating the OnceLock.
-                    // Caller sees STATUS_NOT_FOUND, indistinguishable
-                    // from "method doesn't exist" — but the window is
-                    // microseconds wide, and the next retry hits the
-                    // populated OnceLock cleanly. Better fix needs a
-                    // SERVICE_UNAVAILABLE status code in the envelope.
-                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
-                };
-                inner.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                log::info!("http-gateway: stop requested via vosx gateway stop");
-                Value::Unit
-            }
-            "status" => {
-                let Some(inner) = gateway.inner() else {
-                    return ExtensionPollResult::error(POLL_ERR_NO_FUTURE);
-                };
-                Value::Str(state::status_json(inner))
-            }
-            _ => return ExtensionPollResult::error(POLL_ERR_NO_FUTURE),
-        };
-
-        let bytes = reply.encode();
-        ExtensionPollResult::ready(bytes)
-    });
-    match result {
-        Ok(r) => r,
-        Err(_) => ExtensionPollResult::error(POLL_ERR_HANDLER),
+        // 4. Route, record, write.
+        let resp = routing::dispatch(&req, inner, ctx, policy).await;
+        inner.metrics.record_response(resp.status().as_u16());
+        let bytes = http1::serialize_response(&resp, keep_alive);
+        if write_all(ctx, conn_id, &bytes).await.is_none() {
+            return; // write error → give up on this connection
+        }
+        if !keep_alive {
+            return;
+        }
     }
 }
 
-// Capability declarations — log-only today, but logged at load
-// time so an operator review can spot the OS access this
-// extension wants. The HTTP gateway needs to bind a TCP port,
-// originate outbound TCP/TLS to peers (h3 + future webhooks), own
-// a tokio runtime + spawn protocol threads.
-//
-// `cli = [stop, status]` exposes the gateway's lifecycle ops as
-// `vosx gateway stop` / `vosx gateway status` through the
-// registry-driven dispatch sidecar (vos_service_handle_invoke
-// above). These replaced the pre-Phase-6 `/__admin/*` HTTP
-// namespace.
-vos::service_main!(
-    HttpGateway,
-    caps = [
-        "net.libp2p.dial",
-        "net.tcp.bind",
-        "net.tcp.connect",
-        "thread.spawn",
-        "tokio-runtime",
-    ],
-    cli = [stop, status],
-);
+/// Write all of `bytes` to `conn_id`, looping over partial writes.
+/// `None` on a write error (or a zero-length write, which the host only
+/// returns on a broken connection).
+async fn write_all(ctx: &mut Context<HttpGateway>, conn_id: u64, mut bytes: &[u8]) -> Option<()> {
+    while !bytes.is_empty() {
+        let n = ctx.write(conn_id, bytes).await?;
+        if n == 0 {
+            return None;
+        }
+        bytes = &bytes[n..];
+    }
+    Some(())
+}
