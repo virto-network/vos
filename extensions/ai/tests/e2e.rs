@@ -355,6 +355,53 @@ fn ai_generate_e2e() {
     );
 }
 
+/// No-model actor-mode smoke. Boots a daemon with the ai
+/// extension and asserts it loads as an **actor-mode** plugin
+/// (`kind=Actor`) — a loadable plugin with the right kind — *without* paying the
+/// 470MB model fetch the generate e2e needs. The actor-mode cli-dispatch +
+/// reply round-trip itself is the same host path the dev e2e exercises
+/// (`#[msg(cli)]` handlers), and the real inference path is covered by the
+/// (model-gated) `ai_generate_e2e` above. `boot_daemon` only returns after
+/// the daemon has reconciled the manifest and written its `.endpoint`, so
+/// the plugin-load log line is already present.
+#[test]
+fn ai_loads_as_actor_mode() {
+    ensure_built();
+    let daemon = boot_daemon();
+
+    let log_path = daemon.data_home.path().join("daemon.stderr");
+    let raw = fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("read daemon stderr {}: {e}", log_path.display()));
+    // tracing interleaves ANSI SGR codes between a field's name and value
+    // (`actor\x1b[0m\x1b[2m=\x1b[0mAiExtension`), so strip them before
+    // substring-matching the `name=value` pairs.
+    let log = strip_ansi(&raw);
+    assert!(
+        log.contains("actor=AiExtension") && log.contains("kind=Actor"),
+        "ai extension did not load as actor-mode (expected `actor=AiExtension kind=Actor`); \
+         daemon log:\n{log}"
+    );
+}
+
+/// Strip ANSI SGR escape sequences (`\x1b[..m`) so log assertions match the
+/// plain `field=value` text regardless of tracing's colourised output.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c2 in chars.by_ref() {
+                if c2 == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// End-to-end for the full dev+ai pairing: provision a project,
 /// seed source on `main`, ask the AI to extend it with --apply
 /// on the default per-identity side branch, verify the head of

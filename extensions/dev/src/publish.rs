@@ -24,9 +24,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dev_project::{BuildIntent, HASH_BYTES, HashResult, INTENT_PUBLISH, PublishIntent, STATUS_OK};
 use vos::Encode;
-use vos::extension::ServiceCtx;
+use vos::actors::context::ServiceId;
 use vos::log;
 use vos::value::{Msg, Value};
+
+use crate::DevCtx;
 
 use crate::compile::{
     COMPILE_STATUS_BAD_REPLY, COMPILE_STATUS_TRANSPORT, bytes_to_32_or_zero, decode_value,
@@ -81,15 +83,15 @@ fn map_registry_status(s: u8) -> u8 {
 /// Publish a build's PVM blob under `(name, version)` in the space
 /// registry. Returns the dev-project commit hash for the
 /// `INTENT_PUBLISH` record on success.
-pub fn publish(
-    ctx: &ServiceCtx,
+pub async fn publish(
+    ctx: &mut DevCtx,
     project_id: u32,
     build_commit: Vec<u8>,
     name: String,
     version: String,
 ) -> HashResult {
     // ── 1. Resolve the build commit
-    let commit = match fetch_commit(ctx, project_id, &build_commit) {
+    let commit = match fetch_commit(ctx, project_id, &build_commit).await {
         Ok(Some(c)) => c,
         Ok(None) => {
             return HashResult {
@@ -165,7 +167,7 @@ pub fn publish(
     //    The CLI surfaces specific codes (tag conflict, bad
     //    hash) so the operator gets actionable diagnostics
     //    rather than a flat "rejected".
-    match registry_publish(ctx, &name, &version, &registry_hash) {
+    match registry_publish(ctx, &name, &version, &registry_hash).await {
         Ok(s) if s == STATUS_OK => {}
         Ok(s) => {
             log::warn!("dev: registry.publish returned status {s}");
@@ -191,7 +193,7 @@ pub fn publish(
     };
     let intent_data = <PublishIntent as Encode>::encode(&publish_intent);
 
-    let publishes_head = match fetch_head(ctx, project_id, "publishes") {
+    let publishes_head = match fetch_head(ctx, project_id, "publishes").await {
         Ok(b) => b,
         Err(_) => {
             return HashResult {
@@ -218,7 +220,9 @@ pub fn publish(
         Vec::new(),
         ts_ms,
         Vec::new(),
-    ) {
+    )
+    .await
+    {
         Ok(commit_hash) => HashResult {
             status: STATUS_OK,
             hash: commit_hash,
@@ -230,13 +234,19 @@ pub fn publish(
     }
 }
 
-fn registry_publish(ctx: &ServiceCtx, name: &str, version: &str, hash: &[u8]) -> Result<u8, u8> {
+async fn registry_publish(
+    ctx: &mut DevCtx,
+    name: &str,
+    version: &str,
+    hash: &[u8],
+) -> Result<u8, u8> {
     let msg = Msg::new("publish")
         .with("name", name.to_string())
         .with("version", version.to_string())
         .with("hash", hash.to_vec());
     let raw = ctx
-        .ask_raw(REGISTRY_ID, &dyn_payload(&msg))
+        .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
+        .await
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     match value {

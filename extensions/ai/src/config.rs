@@ -20,7 +20,13 @@
 
 use vos::value::Args;
 
-#[derive(Clone, Debug)]
+/// Persisted as part of the actor's rkyv state: a warm
+/// restart restores the operator's configured model rather than reverting
+/// to the defaults, since actor-mode `load_state` does not re-run
+/// `new(init_args)`. The live `Inner` (model handle, worker threads) is
+/// rebuilt lazily from this on the first generate after a restart.
+#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug)]
+#[rkyv(crate = vos::rkyv)]
 pub struct InitConfig {
     pub model_repo: String,
     pub model_file: String,

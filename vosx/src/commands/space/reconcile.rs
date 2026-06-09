@@ -106,6 +106,11 @@ pub struct ExtensionDef {
     /// than silently dropping authority bounds.
     #[serde(default)]
     pub intra_caps: Vec<String>,
+    /// Periodic `tick` interval in milliseconds. When set
+    /// (and > 0), the host calls the extension's `tick` handler roughly this
+    /// often, between inbound work — the actor-mode way to originate periodic
+    /// work (a heartbeat ping, a cache sweep). Omitted / `0` → no ticking.
+    pub tick_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -163,7 +168,7 @@ fn default_consistency() -> String {
 /// Also pulls the `.so`'s `vos_extension_meta` blob out via a one-
 /// shot `ExtensionPlugin::load` and forwards it to the registry's
 /// `register_extension_meta` keyed by the manifest instance name.
-/// `vosx <ext> <cmd>` (Phase 4) reads back through the same name to
+/// `vosx <ext> <cmd>` reads back through the same name to
 /// drive its dynamic clap surface. Double-loading the .so here is
 /// trivial: cdylibs are small and meta extraction doesn't run any
 /// extension code.
@@ -214,7 +219,7 @@ fn register_extension(
     // a stronger fix would have `node.register_extension` return
     // the meta blob itself, which is the right Phase 5+ shape.
     // SAFETY: dlopen on a vos-built extension .so; the manifest's
-    // path is operator-supplied. See node.rs:run_service_extension
+    // path is operator-supplied. See `vos::extension::ExtensionPlugin::load`
     // for the full FFI contract docstring.
     let plugin = match unsafe { vos::extension::ExtensionPlugin::load(&so_path) } {
         Ok(p) => Some(p),
@@ -305,6 +310,28 @@ fn register_extension(
         cfg.with_intra_caps(intra_caps)
     };
 
+    // Periodic `tick` cadence. `with_tick_ms` treats 0 as off.
+    let cfg = match ext.tick_ms {
+        Some(ms) if ms > 0 => {
+            tracing::info!("extension '{}' tick_ms = {}", ext.name, ms);
+            cfg.with_tick_ms(ms)
+        }
+        _ => cfg,
+    };
+
+    // A transport-mode extension (the http-gateway) has the
+    // HOST own its listener + accept loop. Pull bind_addr/port (+ optional
+    // TLS PEM paths) out of the init args and hand them to `serves(..)` so
+    // the host binds the socket + terminates TLS for it, then drives one
+    // `handle_connection` task per accepted connection. (Backpressure is
+    // the host's `serves_max_conns` default of 1024.)
+    let cfg = match plugin.as_ref().map(|p| p.kind()) {
+        Some(vos::extension::ExtensionKind::Transport) => {
+            configure_transport_serves(cfg, ext, manifest_dir)?
+        }
+        _ => cfg,
+    };
+
     // Install at a *deterministic* ServiceId derived from the
     // extension's manifest name + daemon prefix, identical to the
     // shape `instance_service_id` gives PVM agents. Without this,
@@ -342,6 +369,62 @@ fn register_extension(
     drop(plugin);
 
     Ok(effective_tokens)
+}
+
+/// Configure a transport-mode extension's host-owned listener from its
+/// Init args. `bind_addr` (default `127.0.0.1`) + `port`
+/// (default `8080`) become the `serves(..)` endpoint; `tls_cert`/`tls_key`
+/// (relative to the manifest dir, or absolute) — when both are set — make
+/// the host terminate TLS on each accepted connection. The extension's
+/// own `new()` still receives the full init args (for `auth_token` /
+/// `agent_tokens` / its `/__status` port readout).
+fn configure_transport_serves(
+    cfg: ExtensionConfig,
+    ext: &ExtensionDef,
+    manifest_dir: &Path,
+) -> anyhow::Result<ExtensionConfig> {
+    let init_str = |k: &str| ext.init.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+    let bind_addr = {
+        let b = init_str("bind_addr");
+        if b.is_empty() { "127.0.0.1" } else { b }
+    };
+    let port = ext
+        .init
+        .get("port")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(8080);
+    let addr = format!("{bind_addr}:{port}");
+
+    let tls_cert = init_str("tls_cert");
+    let tls_key = init_str("tls_key");
+    let tls = !tls_cert.is_empty() && !tls_key.is_empty();
+    let cfg = cfg.serves(addr, tls);
+
+    if tls {
+        let cert_path = manifest_dir.join(tls_cert);
+        let key_path = manifest_dir.join(tls_key);
+        let cert_pem = std::fs::read(&cert_path).map_err(|e| {
+            anyhow::anyhow!(
+                "extension '{}': reading tls_cert {}: {e}",
+                ext.name,
+                cert_path.display(),
+            )
+        })?;
+        let key_pem = std::fs::read(&key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "extension '{}': reading tls_key {}: {e}",
+                ext.name,
+                key_path.display(),
+            )
+        })?;
+        tracing::info!(
+            "extension '{}': host-terminated TLS on {bind_addr}:{port}",
+            ext.name,
+        );
+        Ok(cfg.tls_pem(cert_pem, key_pem))
+    } else {
+        Ok(cfg)
+    }
 }
 
 /// Render an extension's declared intra_caps for the operator-facing

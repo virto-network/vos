@@ -20,8 +20,10 @@ use std::fs;
 use std::path::Path;
 
 use dev_project::{CommitNode, DepEntry, DepRef, HASH_BYTES, ProjectMetadata};
-use vos::extension::ServiceCtx;
+use vos::actors::context::ServiceId;
 use vos::value::{Msg, Value};
+
+use crate::DevCtx;
 
 use crate::compile::{
     COMPILE_STATUS_BAD_REPLY, COMPILE_STATUS_COMMIT_NOT_FOUND, COMPILE_STATUS_TRANSPORT,
@@ -71,12 +73,12 @@ pub struct ResolvedDep {
 /// list of every reachable dev-project dep. Order is breadth-
 /// first; same-name deps deduplicate (must point at the same
 /// commit when they do).
-pub fn resolve(
-    ctx: &ServiceCtx,
+pub async fn resolve(
+    ctx: &mut DevCtx,
     _root_project_id: u32,
     root_metadata: &ProjectMetadata,
 ) -> Result<Vec<ResolvedDep>, (u8, String)> {
-    let local_prefix = (ctx.me() >> 16) as u16;
+    let local_prefix = (ctx.id().0 >> 16) as u16;
     let mut resolved: Vec<ResolvedDep> = Vec::new();
     let mut queue: Vec<(String, DepRef)> = root_metadata
         .deps
@@ -148,7 +150,7 @@ pub fn resolve(
         pinned.insert(project_name.clone(), commit);
 
         // Resolve project_name → ServiceId via the space registry.
-        let dep_project_id = match registry_resolve(ctx, &project_name, local_prefix) {
+        let dep_project_id = match registry_resolve(ctx, &project_name, local_prefix).await {
             Ok(id) if id != 0 => id,
             Ok(_) => {
                 return Err((
@@ -161,7 +163,7 @@ pub fn resolve(
             }
         };
 
-        let commit_node = match fetch_commit(ctx, dep_project_id, &commit) {
+        let commit_node = match fetch_commit(ctx, dep_project_id, &commit).await {
             Ok(Some(c)) => c,
             Ok(None) => {
                 return Err((
@@ -172,7 +174,7 @@ pub fn resolve(
             Err(status) => return Err((status, "fetch_commit for dep failed".to_string())),
         };
 
-        let metadata = match fetch_metadata_from_tree(ctx, dep_project_id, &commit_node) {
+        let metadata = match fetch_metadata_from_tree(ctx, dep_project_id, &commit_node).await {
             Ok(m) => m,
             Err(status) => return Err((status, "fetch_metadata for dep failed".to_string())),
         };
@@ -214,12 +216,12 @@ pub fn resolve(
 /// skip the fetch path entirely and copy from the cache. v1
 /// never garbage-collects the cache — that's a TODO for whenever
 /// disk-pressure becomes a real concern.
-pub fn write_to_workspace(
-    ctx: &ServiceCtx,
+pub async fn write_to_workspace(
+    ctx: &mut DevCtx,
     root: &Path,
     resolved: &[ResolvedDep],
 ) -> Result<(), (u8, String)> {
-    let local_prefix = (ctx.me() >> 16) as u16;
+    let local_prefix = (ctx.id().0 >> 16) as u16;
     let vendor_dir = root.join("vendor");
     fs::create_dir_all(&vendor_dir)
         .map_err(|e| (crate::compile::COMPILE_STATUS_IO, e.to_string()))?;
@@ -254,7 +256,7 @@ pub fn write_to_workspace(
             // Cache miss: fetch + materialise into the vendor
             // dir, then mirror to the cache so the next compile
             // hits.
-            let dep_project_id = match registry_resolve(ctx, &r.project_name, local_prefix) {
+            let dep_project_id = match registry_resolve(ctx, &r.project_name, local_prefix).await {
                 Ok(id) if id != 0 => id,
                 _ => {
                     return Err((
@@ -264,6 +266,7 @@ pub fn write_to_workspace(
                 }
             };
             materialise_to_path(ctx, dep_project_id, &r.commit_node, &dep_root)
+                .await
                 .map_err(|outcome| (outcome.status, "materialise dep failed".to_string()))?;
             if let Err(e) = mirror_to_cache(&dep_root, &cache_dir) {
                 vos::log::warn!(
@@ -471,15 +474,15 @@ pub fn synthesise_root_dependencies(deps: &[DepEntry]) -> String {
 /// committed (project is dep-less) or when its bytes fail to
 /// decode (treated as "ignore the malformed metadata, fall back
 /// to no deps"). Surface a status only on transport errors.
-pub(crate) fn fetch_metadata_from_tree(
-    ctx: &ServiceCtx,
+pub(crate) async fn fetch_metadata_from_tree(
+    ctx: &mut DevCtx,
     project_id: u32,
     commit: &CommitNode,
 ) -> Result<ProjectMetadata, u8> {
     let Some(entry) = commit.files.iter().find(|f| f.path == METADATA_PATH) else {
         return Ok(ProjectMetadata::default());
     };
-    let blob = match fetch_blob(ctx, project_id, &entry.blob) {
+    let blob = match fetch_blob(ctx, project_id, &entry.blob).await {
         Ok(Some(b)) => b,
         Ok(None) => return Ok(ProjectMetadata::default()),
         Err(status) => return Err(status),
@@ -490,13 +493,14 @@ pub(crate) fn fetch_metadata_from_tree(
     Ok(<ProjectMetadata as vos::Decode>::try_decode(&blob.bytes).unwrap_or_default())
 }
 
-fn registry_resolve(ctx: &ServiceCtx, name: &str, caller_prefix: u16) -> Result<u32, u8> {
+async fn registry_resolve(ctx: &mut DevCtx, name: &str, caller_prefix: u16) -> Result<u32, u8> {
     const REGISTRY_ID: u32 = 0;
     let msg = Msg::new("resolve")
         .with("name", name.to_string())
         .with("caller_prefix", caller_prefix as u64);
     let raw = ctx
-        .ask_raw(REGISTRY_ID, &dyn_payload(&msg))
+        .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
+        .await
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     match value {

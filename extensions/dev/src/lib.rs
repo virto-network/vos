@@ -19,17 +19,68 @@
 //!
 //! ## Lifecycle
 //!
-//! Service-mode extension — `run()` idles in a shutdown poll,
-//! every actual work item is driven through
-//! `vos_service_handle_invoke` from the registry-driven CLI
-//! dispatch path. v1 of `run()` is a sleep loop; once an actual
-//! background task arrives (cache eviction, dep prefetch, …),
-//! it'll claim ownership of `run()` instead.
+//! Plain **actor-mode** extension (`#[actor]` / `#[messages]`) — request-driven,
+//! no `run()` loop. The host drives one invoke (`compile` / `publish`) to
+//! completion at a time on this agent's thread; each handler `ctx.ask_dispatch`s
+//! the dev-project + registry actors over the host invoke path (reaches the PVM
+//! actors, status-framed so a failed ask is distinguishable from an empty
+//! reply). There is no `run()` loop and no `stop` handler — the host's generic
+//! `__stop` (`vosx dev stop`) quiesces this one agent — and no shared state: the
+//! handlers reach the host purely through their `&mut Context`.
+
+use vos::prelude::*;
 
 mod compile;
 mod deps;
-mod ext;
 mod publish;
+
+#[actor(caps = ["fs.cache", "fs.tempdir", "net.libp2p.dial", "process.spawn"])]
+pub struct DevExtension {}
+
+#[messages]
+impl DevExtension {
+    pub fn new() -> Self {
+        DevExtension {}
+    }
+
+    /// Compile a project commit → PVM ELF, persist it to the blob cache, and
+    /// record a build commit on the project's `builds` branch. Replies with the
+    /// rkyv-encoded [`dev_project::HashResult`] (build commit hash on success,
+    /// or a `COMPILE_STATUS_*` code) — `Value::Bytes` on the wire, as the
+    /// `vosx dev compile` command decodes.
+    #[msg(cli)]
+    async fn compile(
+        &mut self,
+        project_id: u32,
+        commit: Vec<u8>,
+        ctx: &mut Context<Self>,
+    ) -> Vec<u8> {
+        let result = compile::compile_and_record(ctx, project_id, commit).await;
+        result.encode()
+    }
+
+    /// Publish a build commit's ELF to the space registry + record an
+    /// INTENT_PUBLISH commit on the project's `publishes` branch. Replies with
+    /// the rkyv-encoded [`dev_project::HashResult`] (publish commit hash on
+    /// success, or a `PUBLISH_STATUS_*` code).
+    #[msg(cli)]
+    async fn publish(
+        &mut self,
+        project_id: u32,
+        build_commit: Vec<u8>,
+        name: String,
+        version: String,
+        ctx: &mut Context<Self>,
+    ) -> Vec<u8> {
+        let result = publish::publish(ctx, project_id, build_commit, name, version).await;
+        result.encode()
+    }
+}
+
+/// The dev extension's actor [`vos::Context`] — the handle every helper threads
+/// through to reach the dev-project + space-registry actors via
+/// `ctx.ask_dispatch` (the host invoke path).
+pub(crate) type DevCtx = vos::Context<DevExtension>;
 
 pub use compile::{
     COMPILE_STATUS_BAD_PATH, COMPILE_STATUS_BAD_REPLY, COMPILE_STATUS_BLOB_NOT_FOUND,
@@ -42,15 +93,3 @@ pub use publish::{
     PUBLISH_STATUS_BUILD_FAILED, PUBLISH_STATUS_BUILD_NOT_FOUND, PUBLISH_STATUS_RECORD_FAILED,
     PUBLISH_STATUS_REGISTRY_REJECTED,
 };
-
-vos::service_main!(
-    ext::DevExtension,
-    caps = [
-        "fs.cache",
-        "fs.tempdir",
-        "net.libp2p.dial",
-        "process.spawn",
-        "tokio-runtime",
-    ],
-    cli = [stop],
-);

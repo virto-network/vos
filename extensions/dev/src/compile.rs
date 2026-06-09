@@ -25,9 +25,11 @@ use dev_project::{
     BlobKind, BlobObject, BuildIntent, CommitNode, HASH_BYTES, HashResult, INTENT_BUILD, STATUS_OK,
 };
 use vos::Encode;
-use vos::extension::ServiceCtx;
+use vos::actors::context::ServiceId;
 use vos::log;
 use vos::value::{Msg, TAG_DYNAMIC, Value};
+
+use crate::DevCtx;
 
 // ── Embedded build infra (synced from the workspace at build time) ───
 
@@ -132,8 +134,12 @@ fn log_outcome_stderr(o: &CompileOutcome) {
 ///   * `status == COMPILE_STATUS_RECORD_FAILED` + empty hash →
 ///     we couldn't even record the build attempt (most often a
 ///     transport error or a malformed `source_commit` arg).
-pub fn compile_and_record(ctx: &ServiceCtx, project_id: u32, source_commit: Vec<u8>) -> HashResult {
-    let outcome = compile_project(ctx, project_id, source_commit.clone());
+pub async fn compile_and_record(
+    ctx: &mut DevCtx,
+    project_id: u32,
+    source_commit: Vec<u8>,
+) -> HashResult {
+    let outcome = compile_project(ctx, project_id, source_commit.clone()).await;
     log_outcome_stderr(&outcome);
 
     // Resolve the artifact-hash slot for the build commit:
@@ -146,7 +152,7 @@ pub fn compile_and_record(ctx: &ServiceCtx, project_id: u32, source_commit: Vec<
     let artifact_bytes = if outcome.status == STATUS_OK {
         outcome.hash.clone()
     } else if !outcome.stderr.is_empty() {
-        match put_blob(ctx, project_id, &outcome.stderr) {
+        match put_blob(ctx, project_id, &outcome.stderr).await {
             Ok(h) => h,
             Err(_) => {
                 return HashResult {
@@ -168,7 +174,7 @@ pub fn compile_and_record(ctx: &ServiceCtx, project_id: u32, source_commit: Vec<
     };
     let intent_data = <BuildIntent as Encode>::encode(&intent);
 
-    let builds_head = match fetch_head(ctx, project_id, "builds") {
+    let builds_head = match fetch_head(ctx, project_id, "builds").await {
         Ok(b) => b,
         Err(_) => {
             return HashResult {
@@ -195,7 +201,9 @@ pub fn compile_and_record(ctx: &ServiceCtx, project_id: u32, source_commit: Vec<
         Vec::new(),
         ts_ms,
         Vec::new(),
-    ) {
+    )
+    .await
+    {
         Ok(commit_hash) => HashResult {
             status: STATUS_OK,
             hash: commit_hash,
@@ -242,9 +250,13 @@ pub(crate) fn bytes_to_32_or_zero(b: &[u8]) -> [u8; HASH_BYTES] {
 /// Compile the tree at `commit_hash` from the dev-project actor at
 /// `project_id`. Returns the resulting PVM blob's hash (also
 /// inserted back into the project's blob store) on success.
-pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) -> CompileOutcome {
+pub async fn compile_project(
+    ctx: &mut DevCtx,
+    project_id: u32,
+    commit_hash: Vec<u8>,
+) -> CompileOutcome {
     // ── 1. Fetch the commit
-    let commit = match fetch_commit(ctx, project_id, &commit_hash) {
+    let commit = match fetch_commit(ctx, project_id, &commit_hash).await {
         Ok(Some(c)) => c,
         Ok(None) => {
             return CompileOutcome::err(COMPILE_STATUS_COMMIT_NOT_FOUND, "commit not found");
@@ -258,7 +270,7 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
     //    projects (no metadata file in the tree) get a default
     //    metadata back and the rest of the compile pipeline
     //    short-circuits the dep-resolution path.
-    let metadata = match crate::deps::fetch_metadata_from_tree(ctx, project_id, &commit) {
+    let metadata = match crate::deps::fetch_metadata_from_tree(ctx, project_id, &commit).await {
         Ok(m) => m,
         Err(status) => return CompileOutcome::err(status, "fetch_metadata failed"),
     };
@@ -269,20 +281,20 @@ pub fn compile_project(ctx: &ServiceCtx, project_id: u32, commit_hash: Vec<u8>) 
         Err(e) => return CompileOutcome::err(COMPILE_STATUS_IO, e.to_string()),
     };
     let project_root = tempdir.path();
-    if let Err(e) = materialise_tree(ctx, project_id, &commit, project_root) {
+    if let Err(e) = materialise_tree(ctx, project_id, &commit, project_root).await {
         return e;
     }
 
     // ── 4. Resolve + materialise cross-project deps. No-op when
     //    `metadata.deps` is empty (which the v1 happy-path test
     //    relies on).
-    let resolved_deps = match crate::deps::resolve(ctx, project_id, &metadata) {
+    let resolved_deps = match crate::deps::resolve(ctx, project_id, &metadata).await {
         Ok(d) => d,
         Err((status, msg)) => return CompileOutcome::err(status, msg),
     };
     if !resolved_deps.is_empty()
         && let Err((status, msg)) =
-            crate::deps::write_to_workspace(ctx, project_root, &resolved_deps)
+            crate::deps::write_to_workspace(ctx, project_root, &resolved_deps).await
     {
         return CompileOutcome::err(status, msg);
     }
@@ -408,14 +420,15 @@ pub(crate) fn value_to_bytes(v: Value) -> Option<Vec<u8>> {
     }
 }
 
-pub(crate) fn fetch_commit(
-    ctx: &ServiceCtx,
+pub(crate) async fn fetch_commit(
+    ctx: &mut DevCtx,
     project_id: u32,
     hash: &[u8],
 ) -> Result<Option<CommitNode>, u8> {
     let msg = Msg::new("get_commit").with("hash", hash.to_vec());
     let raw = ctx
-        .ask_raw(project_id, &dyn_payload(&msg))
+        .ask_dispatch(ServiceId(project_id), &dyn_payload(&msg))
+        .await
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     let inner = value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)?;
@@ -426,14 +439,15 @@ pub(crate) fn fetch_commit(
     Ok(Some(commit))
 }
 
-pub(crate) fn fetch_blob(
-    ctx: &ServiceCtx,
+pub(crate) async fn fetch_blob(
+    ctx: &mut DevCtx,
     project_id: u32,
     hash: &[u8],
 ) -> Result<Option<BlobObject>, u8> {
     let msg = Msg::new("get_blob").with("hash", hash.to_vec());
     let raw = ctx
-        .ask_raw(project_id, &dyn_payload(&msg))
+        .ask_dispatch(ServiceId(project_id), &dyn_payload(&msg))
+        .await
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     let inner = value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)?;
@@ -444,27 +458,37 @@ pub(crate) fn fetch_blob(
     Ok(Some(blob))
 }
 
-pub(crate) fn put_blob(ctx: &ServiceCtx, project_id: u32, bytes: &[u8]) -> Result<Vec<u8>, u8> {
+pub(crate) async fn put_blob(
+    ctx: &mut DevCtx,
+    project_id: u32,
+    bytes: &[u8],
+) -> Result<Vec<u8>, u8> {
     let msg = Msg::new("put_blob").with("bytes", bytes.to_vec());
     let raw = ctx
-        .ask_raw(project_id, &dyn_payload(&msg))
+        .ask_dispatch(ServiceId(project_id), &dyn_payload(&msg))
+        .await
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)
 }
 
-pub(crate) fn fetch_head(ctx: &ServiceCtx, project_id: u32, branch: &str) -> Result<Vec<u8>, u8> {
+pub(crate) async fn fetch_head(
+    ctx: &mut DevCtx,
+    project_id: u32,
+    branch: &str,
+) -> Result<Vec<u8>, u8> {
     let msg = Msg::new("head").with("branch", branch.to_string());
     let raw = ctx
-        .ask_raw(project_id, &dyn_payload(&msg))
+        .ask_dispatch(ServiceId(project_id), &dyn_payload(&msg))
+        .await
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn remote_commit(
-    ctx: &ServiceCtx,
+pub(crate) async fn remote_commit(
+    ctx: &mut DevCtx,
     project_id: u32,
     parent: Vec<u8>,
     paths: Vec<String>,
@@ -487,7 +511,8 @@ pub(crate) fn remote_commit(
         .with("ts_ms", ts_ms)
         .with("change_id", change_id);
     let raw = ctx
-        .ask_raw(project_id, &dyn_payload(&msg))
+        .ask_dispatch(ServiceId(project_id), &dyn_payload(&msg))
+        .await
         .ok_or(COMPILE_STATUS_TRANSPORT)?;
     let value = decode_value(&raw).ok_or(COMPILE_STATUS_BAD_REPLY)?;
     let inner = value_to_bytes(value).ok_or(COMPILE_STATUS_BAD_REPLY)?;
@@ -503,13 +528,13 @@ pub(crate) fn remote_commit(
 
 // ── Filesystem layout ────────────────────────────────────────────────
 
-fn materialise_tree(
-    ctx: &ServiceCtx,
+async fn materialise_tree(
+    ctx: &mut DevCtx,
     project_id: u32,
     commit: &CommitNode,
     root: &Path,
 ) -> Result<(), CompileOutcome> {
-    materialise_to_path(ctx, project_id, commit, root)
+    materialise_to_path(ctx, project_id, commit, root).await
 }
 
 /// Inner: materialise a commit's tree under an arbitrary
@@ -517,14 +542,14 @@ fn materialise_tree(
 /// project (writes into the tempdir's root) and by
 /// `deps::write_to_workspace` for each dep (writes into
 /// `vendor/<name>/`).
-pub(crate) fn materialise_to_path(
-    ctx: &ServiceCtx,
+pub(crate) async fn materialise_to_path(
+    ctx: &mut DevCtx,
     project_id: u32,
     commit: &CommitNode,
     root: &Path,
 ) -> Result<(), CompileOutcome> {
     for file in &commit.files {
-        let blob = match fetch_blob(ctx, project_id, &file.blob) {
+        let blob = match fetch_blob(ctx, project_id, &file.blob).await {
             Ok(Some(b)) => b,
             Ok(None) => {
                 return Err(CompileOutcome::err(
