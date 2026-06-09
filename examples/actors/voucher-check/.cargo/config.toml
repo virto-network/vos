@@ -6,6 +6,11 @@ rustflags = [
     "-Zcrate-attr=no_main",
     "-Aduplicate-macro-attributes",
     "-Aunused-attributes",
+    # Reproducible builds: remap the build directory (the worktree checkout
+    # path) to a fixed virtual root so `file!()` panic locations + debuginfo
+    # don't bake the absolute path into the ELF — keeping the program bytes
+    # (and the prover's pinned commitment over them) stable across checkouts.
+    "-Zremap-cwd-prefix=.",
 ]
 
 [unstable]
