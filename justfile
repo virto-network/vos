@@ -15,7 +15,7 @@ build-crates:
 
 # Build native extension plugins (.so files)
 build-extensions:
-    cargo build -p echo-extension -p proxy-extension -p fetcher-extension
+    cargo build -p echo-extension -p proxy-extension -p fetcher-extension -p byte-echo-extension -p tcp-echo-extension
 
 # Build WASM actors (wasm32-unknown-unknown target)
 build-wasm:
