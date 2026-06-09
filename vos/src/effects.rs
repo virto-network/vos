@@ -15,8 +15,21 @@ use alloc::vec::Vec;
 
 /// Send a message to another service. Synchronous request-reply.
 /// Payload: `[target:u32 LE][message_bytes...]`
-/// Result: rkyv-encoded `Value` (the reply).
+/// Result: rkyv-encoded `Value` (the reply); an empty result decodes
+/// to `Value::Unit` — a dispatch failure (no route / panic / timeout)
+/// is **indistinguishable** from a `()`-returning handler on this path.
 pub const EFFECT_ASK: u8 = 0x01;
+
+/// Like [`EFFECT_ASK`], but the response is **status-framed** so the
+/// caller can tell a real reply from a dispatch failure (used by the
+/// http-gateway's `ctx.ask_dispatch`). Payload is identical
+/// (`[target:u32 LE][message_bytes...]`); the result leads with a
+/// [`RESP_OK`]/[`RESP_ERR`] byte (same convention as the byte-stream
+/// effects): `[RESP_OK][reply…]` on a `STATUS_DONE` envelope (reply may
+/// be empty for a `()` return), `[RESP_ERR]` on any failure (no route /
+/// non-DONE status / timeout). The host's transport `ConnFulfiller`
+/// fulfils this; actor/service hosts don't.
+pub const EFFECT_ASK_DISPATCH: u8 = 0x04;
 
 /// HTTP request. Synchronous from the handler's perspective; the
 /// host performs the request asynchronously and returns the response.
@@ -28,6 +41,178 @@ pub const EFFECT_FETCH: u8 = 0x02;
 /// Payload: `[hash: 32 bytes]`.
 /// Result: blob bytes when found, empty bytes when missing.
 pub const EFFECT_BLOB_GET: u8 = 0x03;
+
+// ── Byte-stream effects ──────────────────────────────────
+//
+// Raw TCP via the host reactor (`smol::Async` in `node.rs`). The host
+// assigns opaque `u64` listener / connection ids. Each request is
+// `[tag][body]`; each response leads with a status byte (`RESP_OK` /
+// `RESP_ERR`) — on error the rest is a UTF-8 message. The `bytestream`
+// module below has the encoders (Context side) + decoders (host side).
+// These only do anything against the native extension host; WASM / PVM
+// builds don't expose them.
+
+/// Bind a TCP listener. Body `[tls: u8][addr: str]` (`tls = 1` → the host
+/// wraps every accepted connection in its configured TLS acceptor, so the
+/// extension reads/writes plaintext). Ok resp `[1][listener_id: u64]`.
+pub const EFFECT_LISTEN: u8 = 0x10;
+/// Accept one connection. Body `[listener_id: u64]`. Ok resp `[1][conn_id: u64]`.
+pub const EFFECT_ACCEPT: u8 = 0x11;
+/// Read up to `max` bytes. Body `[conn_id: u64][max: u32]`. Ok resp `[1][bytes…]`
+/// (empty bytes = EOF / peer closed).
+pub const EFFECT_READ: u8 = 0x12;
+/// Write bytes. Body `[conn_id: u64][bytes…]`. Ok resp `[1][n: u32]` (bytes written).
+pub const EFFECT_WRITE: u8 = 0x13;
+/// Close a connection. Body `[conn_id: u64]`. Ok resp `[1]`. Idempotent.
+pub const EFFECT_CLOSE: u8 = 0x14;
+
+/// Response status byte: the op succeeded; the rest is the typed payload.
+pub const RESP_OK: u8 = 1;
+/// Response status byte: the op failed; the rest is a UTF-8 error message.
+pub const RESP_ERR: u8 = 0;
+
+/// Byte-stream effect wire codecs, shared by the extension `Context`
+/// (encodes requests / decodes responses) and the host reactor
+/// (decodes requests / encodes responses).
+pub mod bytestream {
+    use super::{
+        Cursor, EFFECT_ACCEPT, EFFECT_CLOSE, EFFECT_LISTEN, EFFECT_READ, EFFECT_WRITE, RESP_ERR,
+        RESP_OK, write_str, write_u32, write_u64,
+    };
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    // ── Request encoders (extension `Context` side) ─────────────────
+
+    /// Plaintext listener.
+    pub fn encode_listen(addr: &str) -> Vec<u8> {
+        encode_listen_inner(addr, false)
+    }
+    /// TLS listener — the host terminates TLS with its configured cert.
+    pub fn encode_listen_tls(addr: &str) -> Vec<u8> {
+        encode_listen_inner(addr, true)
+    }
+    fn encode_listen_inner(addr: &str, tls: bool) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.push(EFFECT_LISTEN);
+        o.push(tls as u8);
+        write_str(&mut o, addr);
+        o
+    }
+    pub fn encode_accept(listener_id: u64) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.push(EFFECT_ACCEPT);
+        write_u64(&mut o, listener_id);
+        o
+    }
+    pub fn encode_read(conn_id: u64, max: u32) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.push(EFFECT_READ);
+        write_u64(&mut o, conn_id);
+        write_u32(&mut o, max);
+        o
+    }
+    pub fn encode_write(conn_id: u64, data: &[u8]) -> Vec<u8> {
+        let mut o = Vec::with_capacity(9 + data.len());
+        o.push(EFFECT_WRITE);
+        write_u64(&mut o, conn_id);
+        o.extend_from_slice(data);
+        o
+    }
+    pub fn encode_close(conn_id: u64) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.push(EFFECT_CLOSE);
+        write_u64(&mut o, conn_id);
+        o
+    }
+
+    // ── Request decoders (host reactor side; `rest` = body after tag) ─
+
+    /// `(tls, addr)`.
+    pub fn decode_listen(rest: &[u8]) -> Option<(bool, String)> {
+        let mut c = Cursor::new(rest);
+        let tls = c.u8()? != 0;
+        Some((tls, c.str()?))
+    }
+    pub fn decode_accept(rest: &[u8]) -> Option<u64> {
+        Cursor::new(rest).u64()
+    }
+    /// `(conn_id, max)`.
+    pub fn decode_read(rest: &[u8]) -> Option<(u64, u32)> {
+        let mut c = Cursor::new(rest);
+        Some((c.u64()?, c.u32()?))
+    }
+    /// `(conn_id, data)`. `data` is the remainder after the id.
+    pub fn decode_write(rest: &[u8]) -> Option<(u64, Vec<u8>)> {
+        let mut c = Cursor::new(rest);
+        let cid = c.u64()?;
+        Some((cid, c.rest().to_vec()))
+    }
+    pub fn decode_close(rest: &[u8]) -> Option<u64> {
+        Cursor::new(rest).u64()
+    }
+
+    // ── Response encoders (host reactor side) ───────────────────────
+
+    pub fn resp_ok_u64(id: u64) -> Vec<u8> {
+        let mut o = Vec::with_capacity(9);
+        o.push(RESP_OK);
+        write_u64(&mut o, id);
+        o
+    }
+    pub fn resp_ok_u32(n: u32) -> Vec<u8> {
+        let mut o = Vec::with_capacity(5);
+        o.push(RESP_OK);
+        write_u32(&mut o, n);
+        o
+    }
+    pub fn resp_ok_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut o = Vec::with_capacity(1 + bytes.len());
+        o.push(RESP_OK);
+        o.extend_from_slice(bytes);
+        o
+    }
+    pub fn resp_ok_empty() -> Vec<u8> {
+        alloc::vec![RESP_OK]
+    }
+    pub fn resp_err(msg: &str) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.push(RESP_ERR);
+        o.extend_from_slice(msg.as_bytes());
+        o
+    }
+
+    // ── Response decoders (extension `Context` side) ────────────────
+
+    /// `Some(id)` on `RESP_OK`, `None` on error/short.
+    pub fn decode_resp_u64(resp: &[u8]) -> Option<u64> {
+        let mut c = Cursor::new(resp);
+        match c.u8()? {
+            RESP_OK => c.u64(),
+            _ => None,
+        }
+    }
+    /// `Some(n)` written on `RESP_OK`, `None` on error/short.
+    pub fn decode_resp_u32(resp: &[u8]) -> Option<u32> {
+        let mut c = Cursor::new(resp);
+        match c.u8()? {
+            RESP_OK => c.u32(),
+            _ => None,
+        }
+    }
+    /// `Some(bytes)` (possibly empty = EOF) on `RESP_OK`, `None` on error/short.
+    pub fn decode_resp_bytes(resp: &[u8]) -> Option<Vec<u8>> {
+        let mut c = Cursor::new(resp);
+        match c.u8()? {
+            RESP_OK => Some(c.rest().to_vec()),
+            _ => None,
+        }
+    }
+    /// `true` on `RESP_OK` (for close — body-less ok).
+    pub fn decode_resp_ok(resp: &[u8]) -> bool {
+        resp.first() == Some(&RESP_OK)
+    }
+}
 
 // ── HTTP types ──────────────────────────────────────────────────────
 
@@ -221,6 +406,9 @@ fn write_u16(out: &mut Vec<u8>, v: u16) {
 fn write_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
+fn write_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
 fn write_str(out: &mut Vec<u8>, s: &str) {
     write_u32(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
@@ -252,10 +440,18 @@ impl<'a> Cursor<'a> {
         self.take(4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+    fn u64(&mut self) -> Option<u64> {
+        self.take(8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
     fn str(&mut self) -> Option<String> {
         let len = self.u32()? as usize;
         let bytes = self.take(len)?;
         core::str::from_utf8(bytes).ok().map(String::from)
+    }
+    /// The unconsumed remainder.
+    fn rest(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
     }
 }
 
@@ -306,5 +502,63 @@ mod tests {
         assert_eq!(bytes[0], EFFECT_FETCH);
         let decoded = FetchRequest::decode(&bytes[1..]).unwrap();
         assert_eq!(decoded.url, "https://x.com");
+    }
+
+    #[test]
+    fn bytestream_request_roundtrips() {
+        use super::bytestream as bs;
+
+        let listen = bs::encode_listen("127.0.0.1:7000");
+        assert_eq!(listen[0], EFFECT_LISTEN);
+        assert_eq!(
+            bs::decode_listen(&listen[1..]),
+            Some((false, "127.0.0.1:7000".to_string()))
+        );
+        let listen_tls = bs::encode_listen_tls("127.0.0.1:7443");
+        assert_eq!(listen_tls[0], EFFECT_LISTEN);
+        assert_eq!(
+            bs::decode_listen(&listen_tls[1..]),
+            Some((true, "127.0.0.1:7443".to_string()))
+        );
+
+        let accept = bs::encode_accept(42);
+        assert_eq!(accept[0], EFFECT_ACCEPT);
+        assert_eq!(bs::decode_accept(&accept[1..]), Some(42));
+
+        let read = bs::encode_read(7, 1024);
+        assert_eq!(read[0], EFFECT_READ);
+        assert_eq!(bs::decode_read(&read[1..]), Some((7, 1024)));
+
+        let write = bs::encode_write(7, b"hello");
+        assert_eq!(write[0], EFFECT_WRITE);
+        assert_eq!(bs::decode_write(&write[1..]), Some((7, b"hello".to_vec())));
+
+        let close = bs::encode_close(9);
+        assert_eq!(close[0], EFFECT_CLOSE);
+        assert_eq!(bs::decode_close(&close[1..]), Some(9));
+    }
+
+    #[test]
+    fn bytestream_response_roundtrips() {
+        use super::bytestream as bs;
+
+        assert_eq!(bs::decode_resp_u64(&bs::resp_ok_u64(123)), Some(123));
+        assert_eq!(bs::decode_resp_u32(&bs::resp_ok_u32(5)), Some(5));
+        assert_eq!(
+            bs::decode_resp_bytes(&bs::resp_ok_bytes(b"data")),
+            Some(b"data".to_vec())
+        );
+        // Empty ok-bytes = EOF.
+        assert_eq!(
+            bs::decode_resp_bytes(&bs::resp_ok_bytes(b"")),
+            Some(Vec::new())
+        );
+        assert!(bs::decode_resp_ok(&bs::resp_ok_empty()));
+
+        // Errors decode to None / false.
+        let err = bs::resp_err("boom");
+        assert_eq!(bs::decode_resp_u64(&err), None);
+        assert_eq!(bs::decode_resp_bytes(&err), None);
+        assert!(!bs::decode_resp_ok(&err));
     }
 }

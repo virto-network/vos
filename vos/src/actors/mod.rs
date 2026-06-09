@@ -22,6 +22,11 @@ pub mod metadata;
 pub mod run;
 pub mod value;
 
+/// Cooperative multi-task executor for native extensions. Only compiled in an
+/// extension build.
+#[cfg(feature = "extension")]
+pub mod exec;
+
 pub use actor::{Actor, Message};
 pub use auth::{
     Caller, Forbidden, IntraCap, IntraCapParseError, NO_ROLES_MAP, NoRoles, RoleByte, SpaceRole,
@@ -30,6 +35,8 @@ pub use auth::{
 pub use codec::{Decode, Encode};
 pub mod context;
 pub use context::{Context, Extension, ExtensionCtx};
+#[cfg(feature = "extension")]
+pub use exec::{ExecIo, TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
 pub use run::{

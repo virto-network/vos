@@ -54,6 +54,13 @@ pub mod prelude {
     pub use crate::lifecycle;
     pub use crate::value::Msg;
     pub use crate::{Decode, Encode};
+    // `Context` is named directly in a transport extension's
+    // `handle_connection(&self, ctx: &mut Context<Self>, conn_id)` signature
+    //. Actor `#[msg]` handlers don't need it — the macro
+    // qualifies their generated `Message::handle` as `vos::Context` — but a
+    // `handle_connection` body is kept verbatim, so it must resolve via the
+    // prelude like the rest of an extension's surface.
+    pub use crate::Context;
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
     // Guest-side stdout shims backed by DEBUG_WRITE. Available at
@@ -145,6 +152,12 @@ pub use actors::{
     STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED,
     service_code_hash,
 };
+// Per-task future machinery for native extensions: the scheduler lives
+// host-side (see node.rs). Re-exported at the crate root so the
+// `__vos_emit_worker_glue!` macro can name `$crate::TaskTable` / `$crate::TaskState`
+// / `$crate::TaskFut` / `$crate::task_waker` from the user crate.
+#[cfg(feature = "extension")]
+pub use actors::exec::{TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
 pub use actors::{run_accumulate_entry, run_refine_entry};
 #[cfg(feature = "macros")]
@@ -385,10 +398,24 @@ macro_rules! __vos_emit_worker_glue {
             use core::future::Future;
             use core::pin::Pin;
 
+            // The scheduler now lives HOST-SIDE (smol). The `.so`
+            // keeps only the per-task future slab.
+            //
+            // `tasks` is declared FIRST so field-order drop frees the in-flight
+            // futures before `actor` even if `tasks.clear()` is ever skipped (a
+            // future captures `*mut actor`; dropping it never polls, so the
+            // pointer is only released, not dereferenced).
+            //
+            // `actor` is BOXED so it lives in its OWN heap allocation, disjoint
+            // from `WorkerState` and from each boxed `TaskState`. Soundness
+            // invariant: `vos_extension_task_poll` takes a brief
+            // `&mut WorkerState` to find a task slot, but the handler future
+            // reaches the actor through a raw `*mut` captured at task-build time
+            // — pointing into the actor's separate allocation, so the brief
+            // `&mut WorkerState` cannot alias it under any borrow model.
             struct WorkerState {
-                actor: $actor_name,
-                ctx: $crate::Context<$actor_name>,
-                in_flight: Option<Pin<Box<dyn Future<Output = bool>>>>,
+                tasks: $crate::TaskTable,
+                actor: Box<$actor_name>,
             }
 
             static _VOS_WORKER_META: [u8; _VOS_META_ENCODED.1] = {
@@ -459,23 +486,33 @@ macro_rules! __vos_emit_worker_glue {
                     let args_bytes = unsafe { core::slice::from_raw_parts(args_ptr, args_len) };
                     <$actor_name>::__vos_create_with_args(args_bytes)
                 };
-                let mut ctx =
+                // Run on_start on a throwaway ctx, exactly as before (its
+                // effects / host-IO are unsupported at on_start time, so the
+                // discarded ctx preserves behaviour).
+                let mut tmp =
                     $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
-                let _ = $crate::run_blocking(actor.on_start(&mut ctx));
+                let _ = $crate::run_blocking(actor.on_start(&mut tmp));
                 let state = Box::new(WorkerState {
-                    actor,
-                    ctx,
-                    in_flight: None,
+                    tasks: $crate::TaskTable::new(),
+                    actor: Box::new(actor),
                 });
                 Box::into_raw(state) as *mut ()
             }
 
+            // Per-task ABI: `task_new` builds a handler future and slots
+            // it (returning a non-zero handle), `task_poll` injects the host's
+            // fulfilment of the previous PENDING and polls the future once,
+            // `task_drop` frees the slot, `take_spawned` drains spawned children
+            // (reserved). This supersedes an earlier
+            // `submit`/`poll_event`/`provide` set whose scheduler lived in the
+            // `.so`; the scheduler now runs host-side.
+
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_dispatch(
+            pub extern "C" fn vos_extension_task_new(
                 state: *mut (),
                 msg_ptr: *const u8,
                 msg_len: usize,
-            ) {
+            ) -> u64 {
                 let ws = unsafe { &mut *(state as *mut WorkerState) };
                 let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
 
@@ -483,115 +520,180 @@ macro_rules! __vos_emit_worker_glue {
                     let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
                     match <$enum_name as $crate::value::FromDynamic>::from_dynamic(&dynamic) {
                         Some(m) => m,
-                        None => return,
+                        // Unknown method → no future built; return 0 so the host
+                        // maps it to an error (the POLL_ERR_NO_FUTURE behaviour).
+                        None => return 0,
                     }
                 } else {
                     $crate::Decode::decode(raw)
                 };
 
-                let actor_ptr = &mut ws.actor as *mut $actor_name;
-                let ctx_ptr = &mut ws.ctx as *mut $crate::Context<$actor_name>;
-                let future: Pin<Box<dyn Future<Output = bool>>> = Box::pin(async move {
+                // Raw pointer into the actor's OWN heap allocation (Box<actor>),
+                // disjoint from WorkerState — so the brief &mut WorkerState a
+                // later task_poll takes to find the task slot cannot alias this
+                // pointer (soundness invariant; see the WorkerState comment).
+                let actor_ptr = &mut *ws.actor as *mut $actor_name;
+                // Per-task Context, moved into the future (no raw ptr into it
+                // outlives the task; host I/O flows through the TaskState the
+                // waker hands ExecIo). Output = the reply bytes, so the
+                // (non-generic) per-task machinery never touches this Context.
+                let future: Pin<Box<dyn Future<Output = Vec<u8>>>> = Box::pin(async move {
+                    let mut ctx =
+                        $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
+                    // SAFETY: actor-mode is driven N=1 by the host (one root task
+                    // at a time, to completion), so this is the only live &mut to
+                    // the actor.
                     let actor = unsafe { &mut *actor_ptr };
-                    let ctx = unsafe { &mut *ctx_ptr };
-                    msg.deliver(actor, ctx).await
+                    let _stop = msg.deliver(actor, &mut ctx).await;
+                    ctx.take_reply_bytes()
                 });
-                ws.in_flight = Some(future);
+                ws.tasks.install(future)
             }
 
+            // Build a handle_connection task for an accepted
+            // connection. Transport-only — the host calls this (never the
+            // &mut self task_new path) for a `kind = Transport` instance, once
+            // per accept; many such tasks run concurrently on the host
+            // executor, all sharing `&actor`.
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_poll(
+            // `2` suffix: this signature carries `svc_id`, which an earlier
+            // 2-arg `conn_new` lacked. This ABI renames a symbol on any
+            // incompatible change so a stale `.so` fails to LOAD (clear
+            // missing-symbol error) rather than be called through a mismatched
+            // pointer — a 2-arg callee would otherwise silently get
+            // `ServiceId(0)` and mis-scope `ctx.resolve`.
+            pub extern "C" fn vos_extension_conn_new2(
                 state: *mut (),
-            ) -> $crate::extension::ExtensionPollResult {
+                conn_id: u64,
+                svc_id: u32,
+            ) -> u64 {
                 let ws = unsafe { &mut *(state as *mut WorkerState) };
-                if ws.in_flight.is_none() {
-                    return $crate::extension::ExtensionPollResult::error(
-                        $crate::extension::POLL_ERR_NO_FUTURE,
+                // SHARED *const into the actor's OWN heap box (disjoint from
+                // WorkerState) — transport reconstructs &*actor_ptr in each
+                // concurrent conn future. There is NO &mut actor for a
+                // transport instance (the &mut new_task path is unreachable),
+                // so N shared reborrows never alias a unique one.
+                let actor_ptr = &*ws.actor as *const $actor_name;
+                let future: Pin<Box<dyn Future<Output = Vec<u8>>>> = Box::pin(async move {
+                    // The host passes the agent's real (prefix-scoped) ServiceId
+                    // so `ctx.resolve` / `ctx.id()` scope correctly to this node
+                    // (a `ServiceId(0)` placeholder mis-scopes the registry
+                    // lookup on a non-zero-prefix daemon).
+                    let mut ctx = $crate::Context::<$actor_name>::new(
+                        $crate::actors::context::ServiceId(svc_id),
                     );
-                }
-
-                // catch_unwind around the handler poll: panicking
-                // through extern "C" is UB and aborts the host
-                // process. Treat a panic as a completed dispatch
-                // with an empty reply — the caller (gateway via
-                // ServiceCtx::ask_raw) sees Some(empty) and renders
-                // null instead of hanging or crashing the host.
-                // The handler's state is toast either way; clearing
-                // in_flight prevents repeated polls of a poisoned
-                // future.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let future = ws.in_flight.as_mut().unwrap();
-                    let waker = $crate::__extension::noop_waker();
-                    let mut cx = core::task::Context::from_waker(&waker);
-                    future.as_mut().poll(&mut cx)
-                }));
-                match result {
-                    Ok(core::task::Poll::Ready(_stop)) => {
-                        ws.in_flight = None;
-                        let reply_bytes = ws.ctx.take_reply_bytes();
-                        if reply_bytes.is_empty() {
-                            $crate::extension::ExtensionPollResult::ready_empty()
-                        } else {
-                            $crate::extension::ExtensionPollResult::ready(reply_bytes)
-                        }
-                    }
-                    Ok(core::task::Poll::Pending) => {
-                        $crate::extension::ExtensionPollResult::pending()
-                    }
-                    Err(_panic) => {
-                        // Handler panicked — `catch_unwind` keeps the
-                        // host alive but the in-flight future is
-                        // poisoned. Surface as POLL_ERR_HANDLER so the
-                        // host can encode STATUS_PANICKED in the
-                        // invoke envelope (distinguishing "panic" from
-                        // a legitimate `() -> ()` return).
-                        ws.in_flight = None;
-                        $crate::extension::ExtensionPollResult::error(
-                            $crate::extension::POLL_ERR_HANDLER,
-                        )
-                    }
-                }
+                    // SAFETY: shared (&), single-threaded executor, no &mut
+                    // actor exists for a transport instance.
+                    let actor = unsafe { &*actor_ptr };
+                    let _: () = actor.__vos_build_connection(&mut ctx, conn_id).await;
+                    ctx.take_reply_bytes()
+                });
+                ws.tasks.install(future)
             }
 
             #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_pending_effect(
+            pub extern "C" fn vos_extension_task_poll(
                 state: *mut (),
-                out_ptr: *mut *const u8,
-                out_len: *mut usize,
-            ) {
-                let ws = unsafe { &mut *(state as *mut WorkerState) };
-                if let Some(request) = ws.ctx.peek_host_io_request() {
-                    unsafe {
-                        *out_ptr = request.as_ptr();
-                        *out_len = request.len();
-                    }
-                } else {
-                    unsafe {
-                        *out_ptr = core::ptr::null();
-                        *out_len = 0;
-                    }
+                handle: u64,
+                result_ptr: *const u8,
+                result_len: usize,
+            ) -> $crate::extension::TaskPoll {
+                // Find the task's stable pointer, then DROP the WorkerState
+                // borrow before polling — see the across-poll discipline below.
+                let ts_ptr: *mut $crate::TaskState = {
+                    let ws = unsafe { &mut *(state as *mut WorkerState) };
+                    ws.tasks.ptr(handle)
+                };
+                if ts_ptr.is_null() {
+                    // 0 / out-of-range / already-dropped handle.
+                    return $crate::extension::TaskPoll::panic();
                 }
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_provide_result(
-                state: *mut (),
-                ptr: *const u8,
-                len: usize,
-            ) {
-                let ws = unsafe { &mut *(state as *mut WorkerState) };
-                let result = if ptr.is_null() || len == 0 {
+                // Inject the host's fulfilment of the previous PENDING (empty on
+                // the first poll). Copied immediately; the borrowed result_ptr is
+                // never retained past this call.
+                let result = if result_ptr.is_null() || result_len == 0 {
                     Vec::new()
                 } else {
-                    unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+                    unsafe { core::slice::from_raw_parts(result_ptr, result_len) }.to_vec()
                 };
-                ws.ctx.set_host_io_result(result);
+                // SAFETY / ACROSS-POLL ALIASING DISCIPLINE (load-bearing):
+                //  * `ts_ptr` points at a live, BOXED TaskState (stable address);
+                //  * the WorkerState borrow above is already dropped, and we hold
+                //    NO &/&mut to WorkerState, the TaskTable, or the Box across
+                //    the bare `fut.poll` below;
+                //  * the future is TAKEN OUT of the slot (`take_fut`) so no &mut
+                //    to it is alive across the poll either;
+                //  * during the poll, ExecIo reconstructs the SOLE &mut TaskState
+                //    from the waker (this ts_ptr); the handler reconstructs the
+                //    actor from the ptr captured in its future — `&mut *actor_ptr`
+                //    for an actor-mode task (N=1, exclusive; task_new path) but a
+                //    SHARED `&*actor_ptr` for a transport conn task (N>1 concurrent
+                //    conn_new tasks, NEVER &mut — promoting it would alias). Either
+                //    way TaskState, the actor box, and WorkerState are three
+                //    disjoint allocations; single-threaded → no aliasing under any
+                //    borrow model.
+                unsafe { (*ts_ptr).set_result(result) };
+                loop {
+                    let mut fut = match unsafe { (*ts_ptr).take_fut() } {
+                        Some(f) => f,
+                        // Future already consumed (buggy double-poll) — surface
+                        // as PANIC rather than UB.
+                        None => return $crate::extension::TaskPoll::panic(),
+                    };
+                    let waker = $crate::task_waker(ts_ptr as *const ());
+                    let mut cx = core::task::Context::from_waker(&waker);
+                    // Per-task catch_unwind keeps a handler panic from unwinding
+                    // through this extern "C" boundary (which would abort the
+                    // host) and isolates it to this one task. Lives here in the
+                    // glue because the user crate has std (vos itself is no_std in
+                    // an extension build).
+                    let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fut.as_mut().poll(&mut cx)
+                    }));
+                    match polled {
+                        Ok(core::task::Poll::Ready(reply)) => {
+                            // Future done — moved its reply into the stable `out`
+                            // slot; `fut` is NOT put back (dropped here).
+                            let (ptr, len) = unsafe { (*ts_ptr).finish_ready(reply) };
+                            return $crate::extension::TaskPoll::ready(ptr, len);
+                        }
+                        Ok(core::task::Poll::Pending) => {
+                            match unsafe { (*ts_ptr).step_pending(fut) } {
+                                Some((ptr, len)) => {
+                                    return $crate::extension::TaskPoll::pending(ptr, len);
+                                }
+                                // Pending with no host-I/O request filed = a bare
+                                // cooperative yield; re-poll without the host.
+                                None => continue,
+                            }
+                        }
+                        Err(_panic) => return $crate::extension::TaskPoll::panic(),
+                    }
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_extension_task_drop(state: *mut (), handle: u64) {
+                let ws = unsafe { &mut *(state as *mut WorkerState) };
+                ws.tasks.drop_task(handle);
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_extension_take_spawned(state: *mut ()) -> u64 {
+                let ws = unsafe { &mut *(state as *mut WorkerState) };
+                ws.tasks.take_spawned()
             }
 
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_extension_drop(state: *mut ()) {
                 if !state.is_null() {
-                    unsafe { drop(Box::from_raw(state as *mut WorkerState)) };
+                    let mut ws = unsafe { Box::from_raw(state as *mut WorkerState) };
+                    // Drop all in-flight futures before the actor is freed, so no
+                    // parked task can deref the soon-dead actor pointer. (Belt and
+                    // braces with the field-order drop: `tasks` is declared before
+                    // `actor`, so this is redundant but explicit.)
+                    ws.tasks.clear();
+                    drop(ws);
                 }
             }
 
@@ -611,13 +713,12 @@ macro_rules! __vos_emit_worker_glue {
                 let bytes = unsafe { core::slice::from_raw_parts(state_ptr, state_len) };
                 let mut actor: $actor_name = $crate::Decode::try_decode(bytes)
                     .unwrap_or_else(<$actor_name as $crate::Actor>::create);
-                let mut ctx =
+                let mut tmp =
                     $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
-                let _ = $crate::run_blocking(actor.on_start(&mut ctx));
+                let _ = $crate::run_blocking(actor.on_start(&mut tmp));
                 let state = Box::new(WorkerState {
-                    actor,
-                    ctx,
-                    in_flight: None,
+                    tasks: $crate::TaskTable::new(),
+                    actor: Box::new(actor),
                 });
                 Box::into_raw(state) as *mut ()
             }
@@ -630,7 +731,12 @@ macro_rules! __vos_emit_worker_glue {
             ) {
                 use $crate::Encode;
                 let ws = unsafe { &*(state as *const WorkerState) };
-                let mut bytes = ws.actor.encode();
+                // Encode the INNER actor, not the `Box` — the blanket
+                // `impl<T> Encode for T` also covers `Box<actor>` (rkyv would
+                // archive a relative pointer), but `vos_extension_load` decodes
+                // straight into `$actor_name`, so the two must agree on the bare
+                // actor's layout.
+                let mut bytes = (*ws.actor).encode();
                 bytes.shrink_to_fit();
                 unsafe {
                     *out_ptr = bytes.as_mut_ptr();
@@ -646,363 +752,6 @@ macro_rules! __vos_emit_worker_glue {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __vos_emit_worker_glue {
-    ($($_:tt)*) => {};
-}
-
-/// Declare a service-mode extension entry point.
-///
-/// Service extensions own their thread + originate calls back into
-/// the host's actor address book via a `ServiceCtx` handle. Unlike
-/// actor-mode extensions, they don't dispatch per-message — the
-/// host calls `run` once and the extension blocks until shutdown.
-///
-/// Usage in an extension's `lib.rs`:
-///
-/// ```ignore
-/// use vos::ServiceCtx;
-///
-/// pub struct MyGateway { /* state */ }
-///
-/// impl MyGateway {
-///     pub fn new() -> Self { MyGateway { /* … */ } }
-///
-///     pub async fn run(&mut self, ctx: ServiceCtx) -> i32 {
-///         while !ctx.is_shutdown() {
-///             // do work, originate `ctx.ask_raw(target, payload)` calls,
-///             // sleep, etc.
-///         }
-///         0
-///     }
-/// }
-///
-/// vos::service_main!(MyGateway);
-/// ```
-///
-/// Emits the C ABI symbols (`vos_extension_meta`,
-/// `vos_extension_create`, `vos_extension_drop`,
-/// `vos_extension_run`, `vos_extension_free`) the host's
-/// `ExtensionPlugin::load` looks up.
-///
-/// Constructor takes `fn new(args: &[u8]) -> Self` — init args
-/// come from the `[[extension]] init = {...}` block in the
-/// manifest, rkyv-encoded as `vos::value::Args`. Constructors
-/// that don't need args declare `_args: &[u8]`.
-///
-/// Per-invoke dispatch (`vosx <ext> <method>`) is opt-in by
-/// hand-writing a `vos_service_handle_invoke` extern fn — there's
-/// no `#[messages]`-style codegen for service mode yet. The
-/// extension is responsible for thread-safe state access between
-/// its run thread and the dispatch sidecar; see HttpGateway's
-/// `OnceLock<Arc<Inner>>` pattern in `extensions/http-gateway`.
-///
-/// Persistent state stays opt-in per service (each service owns
-/// its own redb / disk layout, if any).
-#[cfg(feature = "extension")]
-#[macro_export]
-macro_rules! service_main {
-    ($actor_ty:ty $(,)?) => {
-        $crate::service_main!($actor_ty, caps = [], cli = []);
-    };
-    ($actor_ty:ty, caps = [$($cap:literal),* $(,)?] $(,)?) => {
-        $crate::service_main!($actor_ty, caps = [$($cap),*], cli = []);
-    };
-    ($actor_ty:ty, cli = [$($cli:ident),* $(,)?] $(,)?) => {
-        $crate::service_main!($actor_ty, caps = [], cli = [$($cli),*]);
-    };
-    ($actor_ty:ty, caps = [$($cap:literal),* $(,)?], cli = [$($cli:ident),* $(,)?] $(,)?) => {
-        // SAFETY contract with the host (same as the actor-mode glue):
-        // - `state: *mut ()` is a `Box::into_raw($actor_ty)` from
-        //   `vos_extension_create`; the host owns the raw pointer
-        //   and hands it back to every subsequent call, ending with
-        //   `vos_extension_destroy`. No concurrent access — one
-        //   thread per extension.
-        // - `handle: HostCtxHandle` is a borrowed pointer to a
-        //   `HostCtx` the host pins for the lifetime of `run`.
-        //   ServiceCtx::from_raw wraps it; we never store the raw
-        //   pointer past the call.
-        // - The cli-method shims read `(state, args_ptr, args_len)`
-        //   and return a `*mut u8 + len + cap` triple that the host
-        //   must return via `vos_extension_free_buf`.
-        #[cfg(feature = "bin")]
-        const _: () = {
-            extern crate alloc;
-            use alloc::boxed::Box;
-
-            // Service-mode meta blob. Hand-encoded so we don't need
-            // the user to also use #[actor] / #[messages]. Format
-            // matches what `vos::metadata::decode` reads:
-            //   [name_len:u16 LE][name_bytes...]
-            //   [msg_count:u16 LE]
-            //     [name_len:u16 LE][name_bytes...]
-            //     [is_query:u8 = 0]
-            //     [field_count:u16 LE = 0]
-            //   ...
-            //   [ctor_count:u16 LE = 0]
-            //   [kind:u8 = 1]
-            //   [caps_count:u16 LE]
-            //     [cap_len:u16 LE][cap_bytes...]
-            //   ...
-            //   [cli_methods_count:u16 LE]
-            //     [name_len:u16 LE][name_bytes...]
-            //   ...
-            //
-            // CLI-exposed handler names ride in both `messages` and
-            // `cli_methods`. The decoder cross-references the latter
-            // against the former by name to set
-            // `ParsedMessage.exposed_to_cli`, so a CLI name without
-            // a matching message entry would silently disappear.
-            // Each emitted message is 0-arg / !is_query — the
-            // service-mode dispatch loop will gain arg types in a
-            // later phase if a CLI command needs them; today's
-            // gateway `stop` / `status` are both nullary.
-            const __VOS_SERVICE_NAME: &str = stringify!($actor_ty);
-            const __VOS_SERVICE_CAPS: &[&str] = &[ $( $cap ),* ];
-            const __VOS_SERVICE_CLI: &[&str] = &[ $( stringify!($cli) ),* ];
-
-            // Reject duplicates in `cli = [...]` at compile time —
-            // otherwise the decoder silently sees each name twice
-            // (once per duplicated MessageMeta, once per duplicated
-            // cli_methods entry) and the second pass through
-            // `iter_mut().find()` is a no-op on a no-op. Catching
-            // it here turns "your `vosx <ext> <cmd>` ambiguously
-            // dispatches the wrong handler" into a build error.
-            const fn __vos_check_unique_cli_names() {
-                let names = __VOS_SERVICE_CLI;
-                let mut i = 0;
-                while i < names.len() {
-                    let a = names[i].as_bytes();
-                    let mut j = i + 1;
-                    while j < names.len() {
-                        let b = names[j].as_bytes();
-                        if a.len() == b.len() {
-                            let mut k = 0;
-                            let mut eq = true;
-                            while k < a.len() {
-                                if a[k] != b[k] {
-                                    eq = false;
-                                    break;
-                                }
-                                k += 1;
-                            }
-                            if eq {
-                                panic!("service_main!: duplicate name in `cli = [...]`");
-                            }
-                        }
-                        j += 1;
-                    }
-                    i += 1;
-                }
-            }
-            const _: () = __vos_check_unique_cli_names();
-
-            const fn __vos_build_service_meta<const N: usize>() -> ([u8; N], usize) {
-                let mut buf = [0u8; N];
-                let mut pos = 0;
-                let bytes = __VOS_SERVICE_NAME.as_bytes();
-                let [lo, hi] = (bytes.len() as u16).to_le_bytes();
-                buf[pos] = lo;
-                buf[pos + 1] = hi;
-                pos += 2;
-                let mut i = 0;
-                while i < bytes.len() {
-                    buf[pos + i] = bytes[i];
-                    i += 1;
-                }
-                pos += bytes.len();
-                // msg_count = N (one entry per CLI method, all 0-arg)
-                let [lo, hi] = (__VOS_SERVICE_CLI.len() as u16).to_le_bytes();
-                buf[pos] = lo;
-                buf[pos + 1] = hi;
-                pos += 2;
-                let mut k = 0;
-                while k < __VOS_SERVICE_CLI.len() {
-                    let m = __VOS_SERVICE_CLI[k].as_bytes();
-                    let [lo, hi] = (m.len() as u16).to_le_bytes();
-                    buf[pos] = lo;
-                    buf[pos + 1] = hi;
-                    pos += 2;
-                    let mut j = 0;
-                    while j < m.len() {
-                        buf[pos + j] = m[j];
-                        j += 1;
-                    }
-                    pos += m.len();
-                    // is_query = false
-                    buf[pos] = 0;
-                    pos += 1;
-                    // field_count = 0
-                    buf[pos] = 0;
-                    buf[pos + 1] = 0;
-                    pos += 2;
-                    k += 1;
-                }
-                // ctor_count = 0
-                buf[pos] = 0;
-                buf[pos + 1] = 0;
-                pos += 2;
-                // kind = 1 (Service)
-                buf[pos] = 1;
-                pos += 1;
-                // caps_count + caps
-                let [lo, hi] = (__VOS_SERVICE_CAPS.len() as u16).to_le_bytes();
-                buf[pos] = lo;
-                buf[pos + 1] = hi;
-                pos += 2;
-                let mut k = 0;
-                while k < __VOS_SERVICE_CAPS.len() {
-                    let cap = __VOS_SERVICE_CAPS[k].as_bytes();
-                    let [lo, hi] = (cap.len() as u16).to_le_bytes();
-                    buf[pos] = lo;
-                    buf[pos + 1] = hi;
-                    pos += 2;
-                    let mut j = 0;
-                    while j < cap.len() {
-                        buf[pos + j] = cap[j];
-                        j += 1;
-                    }
-                    pos += cap.len();
-                    k += 1;
-                }
-                // cli_methods_count + names (cross-references the
-                // messages emitted above; the decoder uses this to
-                // flip `exposed_to_cli` on each named message).
-                let [lo, hi] = (__VOS_SERVICE_CLI.len() as u16).to_le_bytes();
-                buf[pos] = lo;
-                buf[pos + 1] = hi;
-                pos += 2;
-                let mut k = 0;
-                while k < __VOS_SERVICE_CLI.len() {
-                    let m = __VOS_SERVICE_CLI[k].as_bytes();
-                    let [lo, hi] = (m.len() as u16).to_le_bytes();
-                    buf[pos] = lo;
-                    buf[pos + 1] = hi;
-                    pos += 2;
-                    let mut j = 0;
-                    while j < m.len() {
-                        buf[pos + j] = m[j];
-                        j += 1;
-                    }
-                    pos += m.len();
-                    k += 1;
-                }
-                (buf, pos)
-            }
-            // 4096 matches the actor-mode buffer in `vos-macros` so
-            // an extension with many CLI methods or long capability
-            // strings doesn't hit a const-eval panic on `buf[pos]`.
-            // Actual usage today is ~150 bytes; the headroom is for
-            // future growth, not current need.
-            const __VOS_SERVICE_META_ENCODED: ([u8; 4096], usize) =
-                __vos_build_service_meta::<4096>();
-            static __VOS_SERVICE_META: [u8; __VOS_SERVICE_META_ENCODED.1] = {
-                let (src, len) = __VOS_SERVICE_META_ENCODED;
-                let mut out = [0u8; __VOS_SERVICE_META_ENCODED.1];
-                let mut i = 0;
-                while i < len {
-                    out[i] = src[i];
-                    i += 1;
-                }
-                out
-            };
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_meta(out_ptr: *mut *const u8, out_len: *mut usize) {
-                unsafe {
-                    *out_ptr = __VOS_SERVICE_META.as_ptr();
-                    *out_len = __VOS_SERVICE_META.len();
-                }
-            }
-
-            // Same stderr-backed logger pattern as the worker glue.
-            // First-installer wins; gives the host a chance to swap
-            // in tracing-log etc. before run() starts.
-            struct __VosServiceLogger;
-            impl $crate::log::Log for __VosServiceLogger {
-                fn enabled(&self, _: &$crate::log::Metadata<'_>) -> bool {
-                    true
-                }
-                fn log(&self, record: &$crate::log::Record<'_>) {
-                    use std::io::Write as _;
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "[{} {}] {}",
-                        record.level(),
-                        record.target(),
-                        record.args(),
-                    );
-                }
-                fn flush(&self) {
-                    use std::io::Write as _;
-                    let _ = std::io::stderr().flush();
-                }
-            }
-            static __VOS_SERVICE_LOGGER: __VosServiceLogger = __VosServiceLogger;
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_create(
-                args_ptr: *const u8,
-                args_len: usize,
-            ) -> *mut () {
-                let _ = $crate::log::set_logger(&__VOS_SERVICE_LOGGER);
-                $crate::log::set_max_level($crate::log::LevelFilter::Trace);
-                let args: &[u8] = if args_ptr.is_null() || args_len == 0 {
-                    &[]
-                } else {
-                    unsafe { core::slice::from_raw_parts(args_ptr, args_len) }
-                };
-                // User-provided constructor takes the raw init-args
-                // byte slice. Constructors that don't need args
-                // declare `fn new(_args: &[u8]) -> Self` and ignore
-                // the slice; constructors that do declare it parse
-                // rkyv-encoded `vos::value::Args` from the bytes.
-                let state = Box::new(<$actor_ty>::new(args));
-                Box::into_raw(state) as *mut ()
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_drop(state: *mut ()) {
-                if state.is_null() {
-                    return;
-                }
-                unsafe {
-                    let _ = Box::from_raw(state as *mut $actor_ty);
-                }
-            }
-
-            /// Free a `Vec<u8>` buffer the extension previously
-            /// handed to the host via `vos_service_handle_invoke`.
-            /// Required when the extension exports per-invoke
-            /// dispatch so the host can reclaim reply buffers
-            /// using the same allocator that produced them. Always
-            /// emitted (cost: a tiny fn) so future service-mode
-            /// dispatchers don't need to hand-roll it.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_free(ptr: *mut u8, len: usize, cap: usize) {
-                if !ptr.is_null() && cap > 0 {
-                    unsafe { drop(Vec::from_raw_parts(ptr, len, cap)) };
-                }
-            }
-
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_run(
-                state: *mut (),
-                handle: *const $crate::extension::HostCtxHandle,
-            ) -> i32 {
-                let inst = unsafe { &mut *(state as *mut $actor_ty) };
-                let ctx = unsafe { $crate::extension::ServiceCtx::from_raw(handle) };
-                // Service `run` is synchronous — extensions manage
-                // their own runtime (tokio etc.) inside the body if
-                // they need async. Keeps the macro from depending
-                // on a pollster/runtime feature.
-                <$actor_ty>::run(inst, ctx)
-            }
-        };
-    };
-}
-
-#[cfg(not(feature = "extension"))]
-#[macro_export]
-macro_rules! service_main {
     ($($_:tt)*) => {};
 }
 

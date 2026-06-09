@@ -79,15 +79,16 @@ pub trait Actor: Sized + Encode + Decode {
     const SPACE_ROLE_MAP: super::auth::SpaceRoleMap<Self::Role>;
 
     /// Extension kind discriminant — `0 = Actor` (request-driven,
-    /// the default) or `1 = Service` (long-running). Overridden by
-    /// `#[actor(kind = "service")]`. Mirrors
+    /// the default) or `2 = Transport` (a `handle_connection(&self, …)`
+    /// server). Overridden by `#[actor(kind = "transport")]`. Mirrors
     /// [`crate::extension::ExtensionKind`] and lands in the
     /// `.vos_meta` blob for the loader to read at boot. PVM actors
-    /// always leave this at `0` — services are a host-side concept.
+    /// always leave this at `0`. (`1 = Service` is not a valid kind —
+    /// only `Actor` and `Transport` exist.)
     const KIND_BYTE: u8 = 0;
 
-    /// Capability tokens the actor / extension wants to use. Phase 6
-    /// declarative-only: the host logs them at load time and surfaces
+    /// Capability tokens the actor / extension wants to use.
+    /// Declarative-only: the host logs them at load time and surfaces
     /// them in operator-facing tools. PVM actors leave this empty —
     /// they live in the deterministic universe and have no OS access
     /// by construction. Override via `#[actor(caps = [...])]`.

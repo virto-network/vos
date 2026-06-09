@@ -1,0 +1,27 @@
+# Standalone Miri gate for transport-mode `handle_connection` soundness.
+#
+# This crate is DELIBERATELY detached from the main workspace (own empty
+# `[workspace]` table + listed in the root `exclude`) and has ZERO dependencies.
+# `cargo miri test -p vos` is unusable for the gate: vos's `prover-extension`
+# dev-dep pulls `stwo`, which doesn't build on the Miri nightly. So we copy the
+# minimal `actors::exec` machinery here and model the shared-actor
+# (`*const actor` → `&*actor_ptr`) pattern faithfully (three disjoint
+# allocations: `WorkerState`, each `TaskState` box, the actor box), then run two
+# interleaved connection tasks under BOTH Tree and Stacked Borrows.
+#
+# Run (Miri lives on nightly-2026-03-20 here):
+#   cd miri/transport-soundness
+#   cargo +nightly-2026-03-20 miri test                                   # stacked borrows
+#   MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly-2026-03-20 miri test   # tree borrows
+[workspace]
+
+[package]
+name = "transport-soundness-miri"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

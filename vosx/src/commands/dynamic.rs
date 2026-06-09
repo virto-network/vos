@@ -102,6 +102,19 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
             return print_method_surface(target, method, meta.as_ref());
         }
 
+        // Universal lifecycle verbs (`stop` / `describe`) are handled
+        // host-side as `__stop` / `__describe` for ANY agent, so they
+        // bypass the per-agent schema check below — a transport extension
+        // (the gateway) declares no `#[msg]` for the schema to list.
+        if let Some(wire) = universal_verb(method) {
+            if !method_args.is_empty() {
+                bail!("`{method}` takes no arguments");
+            }
+            let target_id = client.resolve_target(target)?;
+            let reply = client.invoke_dyn(target_id, &Msg::new(wire))?;
+            return render_reply(reply);
+        }
+
         let method_meta = meta
             .as_ref()
             .and_then(|m| m.messages.iter().find(|msg| msg.name == *method));
@@ -130,25 +143,41 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         let target_id = client.resolve_target(target)?;
         tracing::debug!("invoking {method} on {target_id}");
         let reply = client.invoke_dyn(target_id, &msg)?;
-
-        if output::is_json() {
-            output::print_json(&unwrap_json_string(output::value_to_json(&reply)));
-        } else {
-            match reply {
-                Value::Unit => println!("()"),
-                Value::Str(s) if looks_like_json_object_or_array(&s) => {
-                    // `vosx gateway status` returns a JSON-shaped
-                    // string; in text mode the user is most
-                    // likely scanning for fields, so print the
-                    // payload verbatim rather than rust-Debug-
-                    // formatting the wrapping `Str(...)`.
-                    println!("{s}");
-                }
-                other => println!("{other:?}"),
-            }
-        }
-        Ok(())
+        render_reply(reply)
     })
+}
+
+/// Render an invoke reply to stdout, JSON or text per the global format.
+fn render_reply(reply: Value) -> anyhow::Result<()> {
+    if output::is_json() {
+        output::print_json(&unwrap_json_string(output::value_to_json(&reply)));
+    } else {
+        match reply {
+            Value::Unit => println!("()"),
+            Value::Str(s) if looks_like_json_object_or_array(&s) => {
+                // `vosx gateway describe` returns a JSON-shaped string;
+                // in text mode the user is most likely scanning for
+                // fields, so print the payload verbatim rather than
+                // rust-Debug-formatting the wrapping `Str(...)`.
+                println!("{s}");
+            }
+            other => println!("{other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// Map a universal lifecycle verb to its reserved host-side wire method
+///. `stop` / `describe` work on ANY installed agent —
+/// the host intercepts the `__`-prefixed names at the dispatch boundary
+/// (see `vos::node`) — so they don't appear in any agent's declared
+/// schema and must bypass the per-agent method check.
+fn universal_verb(method: &str) -> Option<&'static str> {
+    match method {
+        "stop" => Some("__stop"),
+        "describe" => Some("__describe"),
+        _ => None,
+    }
 }
 
 /// `true` when `s` starts with `{` or `[` (after whitespace) —

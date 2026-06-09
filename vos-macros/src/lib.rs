@@ -49,7 +49,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse optional attributes:
     //   #[actor]                       — defaults to `Error = ()`, kind = Actor
     //   #[actor(error = Type)]         — custom error type for Actor::Error
-    //   #[actor(kind = "service")]     — opt into Service-mode (long-running)
+    //   #[actor(kind = "transport")]   — opt into transport-mode (handle_connection)
     //   #[actor(caps = ["net.tcp.bind", ...])] — declarative capability list
     let parsed = parse_actor_attrs(attr);
     let error_ty = parsed.error_ty;
@@ -99,9 +99,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // PVM entry-point block — emitted only on riscv64 actor builds
-    // with the `bin` feature on. Same shape `pvm_main!` used to
-    // produce; lives here so the user's lib.rs needs neither a
-    // `pvm_main!()` invocation nor a separate `main.rs`. The
+    // with the `bin` feature on. The macro emits these entries here,
+    // so the user's lib.rs needs neither a `pvm_main!()` invocation
+    // nor a separate `main.rs`. The
     // helper symbols (`__VOS_ACTOR_META_ENCODED`,
     // `_KEEP_ACCUMULATE`) are named with leading underscores /
     // a `__VOS_` prefix so they don't shadow anything in the
@@ -158,12 +158,12 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             const DEFAULT_ROLE: <Self as vos::Actor>::Role = #default_role;
             const SPACE_ROLE_MAP: vos::SpaceRoleMap<<Self as vos::Actor>::Role> = #space_role_map;
 
-            // Phase 2 — extension kind discriminant; defaulted on the
-            // trait, overridden here from `#[actor(kind = "...")]`.
+            // Extension kind discriminant; defaulted on the trait,
+            // overridden here from `#[actor(kind = "...")]`.
             const KIND_BYTE: u8 = #kind_byte;
 
-            // Phase 6 — capability declarations. Empty by default;
-            // overridden from `#[actor(caps = [...])]`.
+            // Declared capability tokens. Empty by default; overridden
+            // from `#[actor(caps = [...])]`.
             const CAPS: &'static [&'static str] = &[ #( #caps_lits ),* ];
 
             fn create() -> Self {
@@ -259,6 +259,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut client_methods: Vec<ClientMethodInfo> = Vec::new();
     let mut has_start_handler = false;
     let mut start_returns_result = false;
+    // A transport extension declares a single
+    // `handle_connection(&self, ctx: &mut Context<Self>, conn_id: u64)`
+    // method (not `#[msg]`). Its presence flips the extension to
+    // transport-mode: the host owns a listener + accept loop and spawns one
+    // concurrent `&self` connection task per accept. A transport extension
+    // must have NO inbound `#[msg]` handlers (v1).
+    let mut has_handle_connection = false;
+    let mut msg_handler_count: usize = 0;
 
     for item in &input.items {
         let ImplItem::Fn(method) = item else {
@@ -313,10 +321,32 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
+            // The transport connection handler. Detected by name; the
+            // body is kept verbatim (passthrough) and wrapped by the emitted
+            // `__vos_build_connection` builder below. Its receiver must be
+            // `&self` (shared — many concurrent conn tasks); a `&mut self`
+            // handle_connection would alias under N>1.
+            if method.sig.ident == "handle_connection" {
+                has_handle_connection = true;
+                let shared_receiver = matches!(
+                    method.sig.inputs.first(),
+                    Some(FnArg::Receiver(r)) if r.mutability.is_none()
+                );
+                if !shared_receiver {
+                    return syn::Error::new_spanned(
+                        &method.sig,
+                        "handle_connection must take `&self` (shared) — many connection tasks run \
+                         concurrently sharing the actor; use `RefCell`/`Cell` for mutable state",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
             passthrough_items.push(item.clone());
             continue;
         }
 
+        msg_handler_count += 1;
         let method_name = &method.sig.ident;
         if method_name == "start" {
             has_start_handler = true;
@@ -652,20 +682,59 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    // A `fn new(args: &[u8])` constructor receives the raw init-args
+    // blob verbatim (see `is_byte_slice`). It owns its own parsing, so
+    // it has no named init fields to surface in meta and bypasses the
+    // per-param `.expect()` extraction below.
+    let raw_args_ctor = constructor_params.len() == 1 && is_byte_slice(&constructor_params[0].1);
+
     // Constructor field metadata
-    let ctor_field_metas: Vec<_> = constructor_params
-        .iter()
-        .map(|(name, ty)| {
-            let name_str = name.to_string();
-            let ty_str = quote!(#ty).to_string();
-            quote! {
-                vos::metadata::FieldMeta {
-                    name: #name_str,
-                    ty: #ty_str,
+    let ctor_field_metas: Vec<_> = if raw_args_ctor {
+        Vec::new()
+    } else {
+        constructor_params
+            .iter()
+            .map(|(name, ty)| {
+                let name_str = name.to_string();
+                let ty_str = quote!(#ty).to_string();
+                quote! {
+                    vos::metadata::FieldMeta {
+                        name: #name_str,
+                        ty: #ty_str,
+                    }
                 }
-            }
-        })
-        .collect();
+            })
+            .collect()
+    };
+
+    // A transport-mode extension (one with `handle_connection`
+    // and — enforced above — no `#[msg]` handlers) has NO messages, so all the
+    // arm vectors are empty and the aggregated enum would be zero-variant. A
+    // zero-variant enum can't derive rkyv (`#[repr]` is unsupported on it,
+    // E0084) and can't be matched (`match self {}` is non-exhaustive against a
+    // `&Self`, E0004). Inject a single never-constructed placeholder variant so
+    // the `Message` type is well-formed. It is unreachable in practice:
+    // `from_msg` never yields it (its `_ => None` catch-all covers every wire
+    // message), and a transport instance is driven via `conn_new`, never
+    // `deliver`. (Actor/service extensions always have ≥1 handler, so this
+    // branch is transport-only.)
+    if enum_variants.is_empty() {
+        enum_variants.push(quote! {
+            #[doc(hidden)]
+            __VosNoMessages
+        });
+        deliver_arms.push(quote! {
+            #enum_name::__VosNoMessages => ::core::unreachable!(
+                "deliver on a transport extension (no message handlers)"
+            )
+        });
+        is_query_arms.push(quote! {
+            #enum_name::__VosNoMessages => false
+        });
+        required_role_arms.push(quote! {
+            #enum_name::__VosNoMessages => ::core::option::Option::None
+        });
+    }
 
     // Generate the aggregated enum
     let aggregated_enum = quote! {
@@ -747,12 +816,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 actor_name: #actor_name_str,
                 messages: &[ #( #meta_messages ),* ],
                 constructor: &[ #( #ctor_field_metas ),* ],
-                // The kind byte lives on the Actor trait — Phase 2's
-                // #[actor(kind = "service")] sets it via the `KIND_BYTE`
+                // The kind byte lives on the Actor trait —
+                // #[actor(kind = "transport")] sets it via the `KIND_BYTE`
                 // associated const override.
                 kind: <#actor_ty as vos::Actor>::KIND_BYTE,
-                // Phase 6 — declared capability tokens. Defaults to
-                // empty on the trait; overridden by #[actor(caps = [...])].
+                // Declared capability tokens. Defaults to empty on the
+                // trait; overridden by #[actor(caps = [...])].
                 caps: <#actor_ty as vos::Actor>::CAPS,
                 // CLI dispatch surface — names of handlers marked
                 // `#[msg(cli)]`. Emitted into the trailing
@@ -770,6 +839,17 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn __vos_create() -> Self {
                 Self::new()
+            }
+        }
+    } else if raw_args_ctor {
+        // Raw-args constructor: the no-args create path (a manifest entry
+        // with no `init = {}`, so the host hands a null/empty arg blob) is
+        // valid — hand `new` an EMPTY slice so it applies its own defaults.
+        // (Panicking here would unwind out of the `extern "C"`
+        // `vos_extension_create` boundary and abort the whole daemon.)
+        quote! {
+            fn __vos_create() -> Self {
+                Self::new(&[])
             }
         }
     } else {
@@ -819,6 +899,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn __vos_create_with_args(_args_bytes: &[u8]) -> Self {
                 Self::new()
+            }
+        }
+    } else if raw_args_ctor {
+        // Hand the raw init-args blob straight to `new(args: &[u8])`.
+        quote! {
+            fn __vos_create_with_args(args_bytes: &[u8]) -> Self {
+                Self::new(args_bytes)
             }
         }
     } else {
@@ -913,7 +1000,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // `cfg(all(target_arch = "riscv64", feature = "bin"))` so:
     //   - host / worker / wasm builds skip them (different arch),
     //   - cross-actor lib deps skip them (`bin` feature off).
-    // The user's lib.rs no longer needs `pvm_main!()`; one
+    // The user's lib.rs does not need a separate `pvm_main!()`; one
     // `#[actor]` is the whole story.
     let pvm_entries = quote! {};
 
@@ -1020,11 +1107,63 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // A transport extension (one with `handle_connection`) must have
+    // NO inbound `#[msg]` handlers in v1 — it serves connections only.
+    if has_handle_connection && msg_handler_count > 0 {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "a transport extension (one with `handle_connection`) must have NO `#[msg]` handlers \
+             in v1 — it serves connections only; concurrent request/reply handlers are not yet supported",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // The `__vos_build_connection` builder the glue's
+    // `vos_extension_conn_new` calls. Emitted for EVERY actor so `conn_new`
+    // always compiles; non-transport actors get an `unreachable!()` stub the
+    // loader never reaches (it only calls conn_new on `kind = Transport`).
+    let conn_build_impl = if has_handle_connection {
+        quote! {
+            impl #actor_name {
+                #[doc(hidden)]
+                #[allow(clippy::manual_async_fn)]
+                pub fn __vos_build_connection<'a>(
+                    &'a self,
+                    ctx: &'a mut vos::Context<#actor_name>,
+                    conn_id: u64,
+                ) -> ::core::pin::Pin<vos::__alloc::boxed::Box<
+                    dyn ::core::future::Future<Output = ()> + 'a,
+                >> {
+                    vos::__alloc::boxed::Box::pin(self.handle_connection(ctx, conn_id))
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl #actor_name {
+                #[doc(hidden)]
+                pub fn __vos_build_connection<'a>(
+                    &'a self,
+                    _ctx: &'a mut vos::Context<#actor_name>,
+                    _conn_id: u64,
+                ) -> ::core::pin::Pin<vos::__alloc::boxed::Box<
+                    dyn ::core::future::Future<Output = ()> + 'a,
+                >> {
+                    ::core::unreachable!(
+                        "__vos_build_connection on a non-transport extension"
+                    )
+                }
+            }
+        }
+    };
+
     let expanded = quote! {
         #( #msg_structs )*
         #aggregated_enum
         #( #msg_impls )*
         #passthrough_impl
+        #conn_build_impl
         #preamble
         #pvm_entries
         #worker_entries
@@ -1051,6 +1190,23 @@ fn is_context_type(ty: &syn::Type) -> bool {
     false
 }
 
+/// `true` for a `&[u8]` constructor parameter. A `fn new(args: &[u8])`
+/// receives the **raw** init-args blob verbatim (not a single
+/// `vos::value::Args` field), letting an extension parse its own
+/// optional/defaulted config without the named-param path's
+/// `.expect("missing init arg")` (every named param must be present).
+/// Used by transport extensions like the http-gateway whose init knobs
+/// are all "empty ⇒ default".
+fn is_byte_slice(ty: &syn::Type) -> bool {
+    if let syn::Type::Reference(r) = ty
+        && let syn::Type::Slice(s) = r.elem.as_ref()
+        && let syn::Type::Path(p) = s.elem.as_ref()
+    {
+        return p.path.is_ident("u8");
+    }
+    false
+}
+
 /// Parsed `#[actor(...)]` attribute payload.
 struct ActorAttrs {
     /// Token stream for the actor's `Error` associated type — `()`
@@ -1059,7 +1215,7 @@ struct ActorAttrs {
     /// Encoded kind byte that lands in the `.vos_meta` blob — 0 for
     /// `Actor` (the default), 1 for `Service`.
     kind_byte: u8,
-    /// Declared capability tokens (Phase 6). Each element is a
+    /// Declared capability tokens. Each element is a
     /// string literal that goes into the `Actor::CAPS` slice.
     caps: Vec<String>,
     /// M7 — token stream for the actor's `Role` associated type
@@ -1079,12 +1235,12 @@ struct ActorAttrs {
 ///
 /// Recognised keys:
 /// - `error = Type` — custom Actor::Error type (default `()`)
-/// - `kind = "actor" | "service"` — extension kind discriminant
-///   (default `"actor"`). `"service"` opts into the long-running
-///   shape — the host's `run_service_extension` calls the
-///   extension's `run()` body once and (optionally) spawns a
-///   per-invoke dispatch sidecar against
-///   `vos_service_handle_invoke`.
+/// - `kind = "actor" | "transport"` — extension kind discriminant
+///   (default `"actor"`). `"transport"` opts into the
+///   `handle_connection(&self, …)` server shape (the host owns the
+///   listener + accept loop). Only `"actor"` and `"transport"` are
+///   supported; any other string (e.g. `"service"`) falls back to
+///   `"actor"`.
 fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     use syn::Token;
     use syn::parse::Parser;
@@ -1164,10 +1320,12 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
 fn parse_kind_str(s: &str) -> u8 {
     match s {
         "actor" => 0,
-        "service" => 1,
-        _ => 0, // unknown → fall back to actor; macro doesn't fail
-                // at compile time so that older toolchains still
-                // build crates that name future kinds.
+        "transport" => 2,
+        // Only `actor` and `transport` are supported: discriminant 1
+        // (service-mode) is rejected, and like any unknown kind it falls
+        // back to actor. The macro doesn't fail at compile time so older
+        // toolchains still build crates naming future kinds.
+        _ => 0,
     }
 }
 

@@ -173,6 +173,14 @@ impl Future for Ask {
     }
 }
 
+/// In an **extension** build, `HostIo` is the executor-backed [`ExecIo`]
+/// future: it carries the request bytes and registers them with the
+/// per-instance `Exec` (reached via the task waker) instead of a ctx slot, so
+/// many tasks can each have an op in flight. The single-slot future below is
+/// used for the WASM / plain-host builds, which stay single-task.
+#[cfg(feature = "extension")]
+pub use crate::actors::exec::ExecIo as HostIo;
+
 /// A future that yields once to let the host fulfill an I/O request,
 /// then returns the result on re-poll.
 ///
@@ -180,11 +188,13 @@ impl Future for Ask {
 /// The request is stored in `Context::host_io_request` before this
 /// future is created. The host reads it, performs the I/O, writes
 /// the result to the result slot, then re-polls.
+#[cfg(not(feature = "extension"))]
 pub struct HostIo {
     polled: bool,
     result_slot: *mut Option<alloc::vec::Vec<u8>>,
 }
 
+#[cfg(not(feature = "extension"))]
 impl HostIo {
     /// Create a new HostIo future that reads its result from `result_slot`.
     ///
@@ -204,8 +214,10 @@ impl HostIo {
     }
 }
 
+#[cfg(not(feature = "extension"))]
 impl Unpin for HostIo {}
 
+#[cfg(not(feature = "extension"))]
 impl Future for HostIo {
     type Output = alloc::vec::Vec<u8>;
 

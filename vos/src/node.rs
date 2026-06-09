@@ -296,7 +296,46 @@ pub struct ExtensionConfig {
     /// role-gated handlers refuse it. See [`IntraCap`] for the
     /// intersection model and wildcard semantics.
     pub intra_caps: Vec<crate::actors::IntraCap>,
+    /// PEM-encoded server certificate chain for host-terminated
+    /// TLS on this extension's byte-stream listeners. When both this and
+    /// [`Self::tls_key_pem`] are set, the host builds a TLS acceptor and a
+    /// `ctx.listen_tls(addr)` listener wraps every accepted connection so
+    /// the extension reads/writes plaintext. `None` → `listen_tls` fails
+    /// (no cert configured). Operator-supplied (manifest / secret file).
+    pub tls_cert_pem: Option<Vec<u8>>,
+    /// PEM-encoded private key paired with [`Self::tls_cert_pem`].
+    pub tls_key_pem: Option<Vec<u8>>,
+    /// The address the host binds a
+    /// listener on for a `kind = Transport` extension (one declaring
+    /// `handle_connection`). `None` for actor/service extensions. The
+    /// host owns the accept loop and spawns one concurrent `&self`
+    /// connection task per accept. When [`Self::serves_tls`] is set the
+    /// host terminates TLS on each accepted connection (so the extension
+    /// reads/writes plaintext), which additionally requires
+    /// [`Self::tls_cert_pem`]/[`Self::tls_key_pem`].
+    pub serves_addr: Option<String>,
+    /// Whether the transport listener terminates TLS host-side.
+    pub serves_tls: bool,
+    /// Backpressure cap: the maximum number of connection tasks the
+    /// transport driver runs concurrently. At the cap the accept loop
+    /// refuses new connections (accept-then-close) rather than spawning
+    /// unboundedly. Defaults to [`DEFAULT_TRANSPORT_MAX_CONNS`].
+    pub serves_max_conns: usize,
+    /// Periodic `tick()` interval, in milliseconds. When
+    /// `Some`, the actor-mode driver dispatches a synthetic `tick` message
+    /// (routed to the extension's `#[msg] async fn tick(&mut self, ctx)`
+    /// handler) roughly every `tick_ms`, between inbound invokes/messages —
+    /// how an actor-mode extension originates periodic work (e.g. a
+    /// heartbeat ping) without a self-spun loop. `None` (default) →
+    /// no ticking. Best-effort: a long-running invoke legitimately delays
+    /// the next tick (the driver never preempts a handler).
+    pub tick_ms: Option<u64>,
 }
+
+/// Default backpressure cap for a transport-mode extension's accept loop
+/// (max concurrent connection tasks). Overridable via
+/// [`ExtensionConfig::serves_max`].
+pub const DEFAULT_TRANSPORT_MAX_CONNS: usize = 1024;
 
 impl ExtensionConfig {
     /// Build a config with no init args and no persistence.
@@ -309,6 +348,12 @@ impl ExtensionConfig {
             cap_policy: crate::extension::CapPolicy::default(),
             relay_unauthenticated: false,
             intra_caps: Vec::new(),
+            tls_cert_pem: None,
+            tls_key_pem: None,
+            serves_addr: None,
+            serves_tls: false,
+            serves_max_conns: DEFAULT_TRANSPORT_MAX_CONNS,
+            tick_ms: None,
         }
     }
 
@@ -325,7 +370,53 @@ impl ExtensionConfig {
             cap_policy: crate::extension::CapPolicy::default(),
             relay_unauthenticated: false,
             intra_caps: Vec::new(),
+            tls_cert_pem: None,
+            tls_key_pem: None,
+            serves_addr: None,
+            serves_tls: false,
+            serves_max_conns: DEFAULT_TRANSPORT_MAX_CONNS,
+            tick_ms: None,
         }
+    }
+
+    /// Set the periodic [`tick`](Self::tick_ms) interval in milliseconds.
+    /// The actor-mode driver then dispatches a synthetic `tick` message to
+    /// the extension's `tick` handler roughly every `ms` between inbound
+    /// work. Zero is treated as "no ticking" (same as `None`).
+    pub fn with_tick_ms(mut self, ms: u64) -> Self {
+        self.tick_ms = (ms > 0).then_some(ms);
+        self
+    }
+
+    /// Configure a transport-mode extension's listen endpoint.
+    /// The host binds `addr`, owns the accept loop, and spawns
+    /// one concurrent `&self` connection task per accept against the
+    /// extension's `handle_connection`. With `tls = true` the host
+    /// terminates TLS on each connection (the extension sees plaintext),
+    /// which also requires [`Self::tls_pem`].
+    pub fn serves(mut self, addr: impl Into<String>, tls: bool) -> Self {
+        self.serves_addr = Some(addr.into());
+        self.serves_tls = tls;
+        self
+    }
+
+    /// Override the transport backpressure cap (max concurrent connection
+    /// tasks). A value of `0` is treated as [`DEFAULT_TRANSPORT_MAX_CONNS`].
+    pub fn serves_max(mut self, max_conns: usize) -> Self {
+        self.serves_max_conns = if max_conns == 0 {
+            DEFAULT_TRANSPORT_MAX_CONNS
+        } else {
+            max_conns
+        };
+        self
+    }
+
+    /// Configure host-terminated TLS for this extension's `listen_tls`
+    /// byte-stream listeners with a PEM cert chain + private key.
+    pub fn tls_pem(mut self, cert_pem: impl Into<Vec<u8>>, key_pem: impl Into<Vec<u8>>) -> Self {
+        self.tls_cert_pem = Some(cert_pem.into());
+        self.tls_key_pem = Some(key_pem.into());
+        self
     }
 
     /// Record the extension's installed instance name so the node's
@@ -430,12 +521,39 @@ struct InvokeRequest {
     #[allow(dead_code)] // Consumer wired in M3/M5.
     actor_local_role: Option<u8>,
     msg: Vec<u8>,
-    reply_tx: mpsc::Sender<Vec<u8>>,
+    reply: ReplyChannel,
     // Read by agent_thread via `&req.chain` before moving `req`
     // into handle_invoke_request; rustc's read analysis misses
     // that pattern when the rest of the struct is then consumed.
     #[allow(dead_code)]
     chain: Vec<u32>,
+}
+
+/// The reply sink of an [`InvokeRequest`]. `Sync` (std mpsc) is the default for
+/// every caller (actor/service/registry/libp2p replies) — its receiver is
+/// awaited with a blocking `recv_timeout`. `Async` (a `futures_channel::oneshot`) lets a
+/// Transport-mode connection task await its reply *on the
+/// cooperative executor* — no blocking-pool thread, correlated per-call — so
+/// many concurrent connections keep serving while one waits for its `ctx.ask`.
+enum ReplyChannel {
+    Sync(mpsc::Sender<Vec<u8>>),
+    Async(futures_channel::oneshot::Sender<Vec<u8>>),
+}
+
+impl ReplyChannel {
+    /// Deliver `reply` to the waiting caller. Single-use for `Async` (a
+    /// `oneshot` consumes its sender). A closed/canceled receiver — the caller
+    /// already timed out or gave up — is ignored, never panics.
+    fn send(self, reply: Vec<u8>) {
+        match self {
+            ReplyChannel::Sync(tx) => {
+                let _ = tx.send(reply);
+            }
+            ReplyChannel::Async(tx) => {
+                let _ = tx.send(reply);
+            }
+        }
+    }
 }
 
 /// Maximum number of cross-agent invoke hops in one synchronous
@@ -464,17 +582,17 @@ const MAX_PRODUCER_REPLY: usize = 8 * 1024 * 1024;
 /// cap; otherwise log and drop the channel so the caller gets a
 /// disconnect-shaped failure. Pulled out to share between
 /// `handle_invoke_request` and `extension_thread`.
-fn send_reply_capped(reply_tx: mpsc::Sender<Vec<u8>>, reply: Vec<u8>, svc_id: ServiceId) {
-    if reply.len() > MAX_PRODUCER_REPLY {
+fn send_reply_capped(reply: ReplyChannel, bytes: Vec<u8>, svc_id: ServiceId) {
+    if bytes.len() > MAX_PRODUCER_REPLY {
         warn!(
             %svc_id,
-            size = reply.len(),
+            size = bytes.len(),
             cap = MAX_PRODUCER_REPLY,
             "reply exceeds producer-side cap; dropping channel",
         );
-        drop(reply_tx);
+        drop(reply); // disconnect (Sync) / cancel (Async) → caller sees failure
     } else {
-        let _ = reply_tx.send(reply);
+        reply.send(bytes);
     }
 }
 
@@ -534,7 +652,29 @@ pub struct VosNode {
     /// their main loop and exit cleanly. Replaces the per-agent
     /// "exit after N seconds idle" heuristic with explicit
     /// node-driven lifecycle.
+    ///
+    /// NOTE: agent threads do NOT poll this directly — they each poll their
+    /// own [`Self::agent_shutdown`] flag (which a node-wide shutdown fans out
+    /// to via [`Self::signal_node_shutdown`]). This field is still the
+    /// node-wide signal for non-agent machinery (network bridge, sync ticker,
+    /// `InvokeHandle::is_shutting_down`).
     shutdown: Arc<AtomicBool>,
+    /// Per-agent shutdown flags (`local_id → flag`), allocated at
+    /// register time. Each agent/extension thread polls ITS OWN flag instead of
+    /// the node-wide one, so the daemon can stop a single agent
+    /// ([`Self::stop_agent`]) without tearing down the node — the generic
+    /// lifecycle primitive that subsumes the http-gateway's bespoke `inner.stop`.
+    /// A node-wide shutdown sets every flag here (see
+    /// [`Self::signal_node_shutdown`]), so existing teardown is unchanged.
+    agent_shutdown: AgentShutdown,
+    /// Per-agent descriptive metadata (`id.0 → info`), populated
+    /// at register time. Backs the generic `__describe` host primitive
+    /// ([`Self::describe_agent`]) so `vosx <agent> describe` can report an
+    /// agent's name / kind / serve address / running flag uniformly — the
+    /// liveness half of the lifecycle surface that replaces the http-gateway's
+    /// bespoke `status` invoke sidecar. Keyed on the full (prefix-scoped) id,
+    /// matching [`Self::agent_shutdown`].
+    agent_info: AgentInfos,
     /// Last time anything happened on the node — outbox routing,
     /// agent dispatch, worker dispatch, invoke handling. Updated
     /// by both threads and the routing loop. Read by
@@ -638,7 +778,7 @@ type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
 /// auth path: where `InvokeRoutes` answers "which channel reaches this
 /// ServiceId?", this answers "what instance name *is* this ServiceId?"
 /// so the libp2p gate ([`NodeService::dispatch_invoke`]) and extension
-/// relays ([`run_service_extension`]'s `invoke_fn`) can resolve a
+/// relays (the actor-mode `EFFECT_ASK_DISPATCH` fulfiller) can resolve a
 /// target's name for actor-local grant probes and `intra_caps`
 /// enforcement.
 ///
@@ -653,6 +793,53 @@ type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
 /// name. `RwLock` because reads are hot (every dispatch / relay) and
 /// writes happen once per `register`.
 type AgentNames = Arc<std::sync::RwLock<HashMap<u16, String>>>;
+
+/// Descriptive metadata for one registered agent, captured at register
+/// Time for the generic `__describe` host primitive.
+/// `kind` mirrors [`crate::extension::ExtensionKind`] as a byte
+/// (`0` actor, `2` transport; `1` service is unused);
+/// `serves_addr` is the host-bound listen endpoint for a transport
+/// extension (`None` otherwise).
+#[derive(Clone)]
+struct AgentInfo {
+    name: Option<String>,
+    kind: u8,
+    serves_addr: Option<String>,
+}
+
+/// Shared per-agent shutdown flags (`id.0 → flag`). `Arc<Mutex>` so the
+/// network-side [`NodeService`] sees agents registered after
+/// `attach_network` — the `__stop` interceptor flips a flag here.
+type AgentShutdown = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
+
+/// Shared per-agent descriptive metadata (`id.0 → info`). `Arc<RwLock>`
+/// for the same reason as [`AgentShutdown`]; the `__describe`
+/// interceptor reads it.
+type AgentInfos = Arc<std::sync::RwLock<HashMap<u32, AgentInfo>>>;
+
+/// Render one agent's [`AgentInfo`] + live `running` flag as the JSON
+/// object the `__describe` primitive replies with (hand-built — vos has
+/// no `serde_json` dep). Shape:
+/// `{"id":N,"name":"…","kind":K,"serves_addr":"…"|null,"running":bool}`.
+fn describe_agent_json(id: u32, info: &AgentInfo, running: bool) -> String {
+    let name = json_escape(info.name.as_deref().unwrap_or(""));
+    let serves = match &info.serves_addr {
+        Some(a) => format!("\"{}\"", json_escape(a)),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"id\":{id},\"name\":\"{name}\",\"kind\":{},\"serves_addr\":{serves},\"running\":{running}}}",
+        info.kind,
+    )
+}
+
+/// Minimal JSON string escaper for the handful of fields `__describe`
+/// emits (agent names + listen addresses). Escapes the two characters
+/// that would break a JSON string literal; other control characters are
+/// not expected in manifest-derived identifiers.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
 /// Mask a (possibly prefix-scoped) `ServiceId` value down to its
 /// prefix-independent local id — the key space of [`AgentNames`].
@@ -699,7 +886,7 @@ impl InvokeHandle {
             space_role: None,
             actor_local_role: None,
             msg,
-            reply_tx,
+            reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
         })
         .ok()?;
@@ -745,6 +932,12 @@ struct NodeService {
     /// actor-local grant enforces for *any* installed agent, not just
     /// the registry.
     agent_names: AgentNames,
+    /// Clones of the node's per-agent shutdown flags +
+    /// descriptive metadata so the `__stop` / `__describe` interceptor in
+    /// [`Self::dispatch_invoke`] can stop/describe ANY agent by id —
+    /// generic across actor / service / transport agents.
+    agent_shutdown: AgentShutdown,
+    agent_info: AgentInfos,
     #[cfg(feature = "storage")]
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
@@ -836,6 +1029,100 @@ impl NodeService {
             .get(&local_id_of(svc_id))
             .cloned()
     }
+
+    /// Host-side handler for the reserved `__stop` / `__describe` wire
+    /// Methods. Returns `Some(reply_bytes)` when the
+    /// invoke's `Msg.name` is one of them (already answered), `None` to let
+    /// `dispatch_invoke` forward the invoke normally. The reply matches the
+    /// raw-`Value` shape `dispatch_invoke` otherwise returns: empty (→
+    /// `Value::Unit` → client renders `null`) for `__stop`, an rkyv
+    /// `Value::Str(json)` for `__describe`. Tries the scoped id first, then the
+    /// unscoped fallback (a locally-registered agent lives under the low 16
+    /// bits) — same two-step lookup as the route table.
+    ///
+    /// **Authorized**: these are host-enforced control ops that bypass the
+    /// target actor's own `#[msg(role=…)]` gate, so they carry their own
+    /// space-role check against the caller's grant (`lookup_caller_role`):
+    /// `__stop` (privileged — stops an agent) requires **ADMIN**; `__describe`
+    /// (reads name/kind/listen-addr) requires any space member (≥ read-only).
+    /// An unauthorized caller (incl. an anonymous / non-member peer) gets a
+    /// `STATUS_FORBIDDEN` envelope, NOT a silent stop/enumerate. The role
+    /// lookup runs only after a reserved name matches, so normal dispatch
+    /// pays nothing.
+    fn try_intercept_lifecycle(
+        &self,
+        to: u32,
+        to_unscoped: u32,
+        msg: &[u8],
+        caller_peer_id: Option<&libp2p::PeerId>,
+    ) -> Option<Vec<u8>> {
+        let name = intercepted_method_name(msg)?;
+        match name.as_str() {
+            "__stop" => {
+                if self.lookup_caller_role(caller_peer_id) < AUTH_ROLE_ADMIN {
+                    warn!(target = to, "__stop refused: caller lacks ADMIN role");
+                    return Some(forbidden_envelope());
+                }
+                let stopped = self.stop_agent_id(to)
+                    || (to != to_unscoped && self.stop_agent_id(to_unscoped));
+                if !stopped {
+                    warn!(target = to, "__stop: no agent registered under id");
+                }
+                // Value::Unit ⇒ empty reply (the client decodes empty as Unit).
+                Some(Vec::new())
+            }
+            "__describe" => {
+                if self.lookup_caller_role(caller_peer_id) == AUTH_ROLE_NONE {
+                    warn!(
+                        target = to,
+                        "__describe refused: caller is not a space member"
+                    );
+                    return Some(forbidden_envelope());
+                }
+                let json = self.describe_agent_id(to).or_else(|| {
+                    (to != to_unscoped)
+                        .then(|| self.describe_agent_id(to_unscoped))
+                        .flatten()
+                });
+                match json {
+                    Some(j) => Some(crate::Encode::encode(&crate::value::Value::Str(j))),
+                    // Unknown agent ⇒ empty (Unit); the CLI surfaces "no such agent".
+                    None => Some(Vec::new()),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Flip one agent's shutdown flag by id (the `__stop` primitive's core).
+    /// `false` when no agent is registered under `id`.
+    fn stop_agent_id(&self, id: u32) -> bool {
+        match self
+            .agent_shutdown
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).cloned())
+        {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Render an agent's describe JSON by id (the `__describe` primitive's
+    /// core). `None` when no agent is registered under `id`.
+    fn describe_agent_id(&self, id: u32) -> Option<String> {
+        let info = self.agent_info.read().ok()?.get(&id).cloned()?;
+        let running = self
+            .agent_shutdown
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).map(|f| !f.load(Ordering::Relaxed)))
+            .unwrap_or(true);
+        Some(describe_agent_json(id, &info, running))
+    }
 }
 
 /// Send an already-encoded dynamic `Msg` to the local registry and
@@ -857,7 +1144,7 @@ fn registry_probe_u8(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<u8> {
             space_role: None,
             actor_local_role: None,
             msg: payload,
-            reply_tx,
+            reply: ReplyChannel::Sync(reply_tx),
             chain: vec![],
         })
         .is_err()
@@ -886,6 +1173,20 @@ fn decode_u8_reply(bytes: &[u8]) -> Option<u8> {
     }
 }
 
+/// Peek the dynamic-dispatch `Msg.name` out of an invoke payload
+/// (`[TAG_DYNAMIC][rkyv Msg]`) for the lifecycle interceptor, without
+/// disturbing the original bytes (they're still forwarded verbatim on a
+/// non-match). `None` when the payload isn't a dynamic `Msg` (a raw/typed
+/// invoke is never a reserved lifecycle verb) or fails to decode.
+#[cfg(feature = "network")]
+fn intercepted_method_name(msg: &[u8]) -> Option<String> {
+    use crate::value::{Msg, TAG_DYNAMIC};
+    if msg.first() != Some(&TAG_DYNAMIC) {
+        return None;
+    }
+    <Msg as crate::Decode>::try_decode(&msg[1..]).map(|m| m.name)
+}
+
 #[cfg(feature = "network")]
 impl crate::network::NetworkService for NodeService {
     fn dispatch_invoke(
@@ -909,6 +1210,22 @@ impl crate::network::NetworkService for NodeService {
         // matches our own node — same routing decision the local
         // path makes via `is_on_node || is_local`.
         let to_unscoped = to & 0xFFFF;
+
+        // Reserved generic lifecycle methods are answered
+        // host-side, so `vosx <agent> stop|describe` works for ANY agent —
+        // including transport extensions (the gateway) that have no inbound
+        // `#[msg]` handler / invoke route at all. The method name lives inside
+        // the rkyv `Msg`; this is the one place the host peeks it. The `__`
+        // prefix keeps `__stop`/`__describe` from colliding with an actor's own
+        // handler names. Replaces the gateway's deleted `vos_service_handle_invoke`
+        // stop/status sidecar with a primitive uniform across all agent kinds.
+        // It carries its OWN space-role gate (admin for stop, member for
+        // describe) since it bypasses the target actor's `#[msg(role)]` check.
+        if let Some(reply) =
+            self.try_intercept_lifecycle(to, to_unscoped, &msg, caller_peer_id.as_ref())
+        {
+            return reply;
+        }
 
         // M7 — Sprint-2's dispatch-layer auth gate retires here.
         // The actor's own macro-emitted #[msg(role = X)] check
@@ -973,7 +1290,7 @@ impl crate::network::NetworkService for NodeService {
                 space_role,
                 actor_local_role,
                 msg,
-                reply_tx,
+                reply: ReplyChannel::Sync(reply_tx),
                 chain,
             })
             .is_err()
@@ -1383,6 +1700,8 @@ impl VosNode {
             invoke_routes: Arc::new(Mutex::new(HashMap::new())),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
+            agent_info: Arc::new(std::sync::RwLock::new(HashMap::new())),
             last_activity: Arc::new(Mutex::new(Instant::now())),
             #[cfg(feature = "network")]
             shared_network: Arc::new(Mutex::new(None)),
@@ -1499,6 +1818,8 @@ impl VosNode {
         let service = Arc::new(NodeService {
             invoke_routes: self.invoke_routes.clone(),
             agent_names: self.agent_names.clone(),
+            agent_shutdown: self.agent_shutdown.clone(),
+            agent_info: self.agent_info.clone(),
             #[cfg(feature = "storage")]
             replicas: self.crdt_replicas.clone(),
             manifest: self.manifest.clone(),
@@ -1624,6 +1945,15 @@ impl VosNode {
         self.routes.insert(id.0, tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
         self.record_agent_name(id, config.name.clone());
+        // Actor-mode agent: kind 0, no serve endpoint. Backs `__describe`.
+        self.agent_info.write().unwrap().insert(
+            id.0,
+            AgentInfo {
+                name: config.name.clone(),
+                kind: crate::extension::ExtensionKind::Actor as u8,
+                serves_addr: None,
+            },
+        );
 
         // Pre-open the redb database for CRDT actors that declare
         // a replication group, so the same `Arc<Database>` powers
@@ -1729,7 +2059,9 @@ impl VosNode {
         };
 
         let invoke_routes = self.invoke_routes.clone();
-        let shutdown = self.shutdown.clone();
+        // This agent polls its OWN shutdown flag (a node-wide
+        // shutdown fans out to it), so the daemon can stop it individually.
+        let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
         #[cfg(feature = "network")]
         let shared_network = self.shared_network.clone();
@@ -1785,8 +2117,27 @@ impl VosNode {
         self.routes.insert(id.0, tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
         self.record_agent_name(id, config.name.clone());
+        // A serving (transport) extension carries a host-bound listen
+        // endpoint; otherwise it's an actor-mode extension. We can't cheaply read the exact `.so`
+        // kind here without a second dlopen, so derive transport-vs-actor from
+        // whether the host was asked to serve. Backs the `__describe` primitive.
+        self.agent_info.write().unwrap().insert(
+            id.0,
+            AgentInfo {
+                name: config.name.clone(),
+                kind: if config.serves_addr.is_some() {
+                    crate::extension::ExtensionKind::Transport as u8
+                } else {
+                    crate::extension::ExtensionKind::Actor as u8
+                },
+                serves_addr: config.serves_addr.clone(),
+            },
+        );
 
-        let shutdown = self.shutdown.clone();
+        // Per-agent shutdown flag (node-wide shutdown fans out to
+        // it) so the daemon can stop this extension individually — the generic
+        // primitive replacing the gateway's bespoke `inner.stop`.
+        let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
         let invoke_routes = self.invoke_routes.clone();
         let agent_names = self.agent_names.clone();
@@ -1855,7 +2206,7 @@ impl VosNode {
 
                     let idle = self.last_activity.lock().unwrap().elapsed();
                     if idle >= threshold {
-                        self.shutdown.store(true, Ordering::Relaxed);
+                        self.signal_node_shutdown();
                         break;
                     }
                 }
@@ -1891,11 +2242,89 @@ impl VosNode {
         }
     }
 
-    /// Trigger an explicit shutdown. Threads notice on their next
-    /// iteration (≤ 50 ms) and exit cleanly. Safe to call from a
-    /// signal handler or another thread.
+    /// Trigger an explicit node-wide shutdown. Threads notice on their next
+    /// iteration (≤ 50 ms) and exit cleanly. Safe to call from a signal handler
+    /// or another thread.
     pub fn shutdown(&self) {
+        self.signal_node_shutdown();
+    }
+
+    /// Set the node-wide shutdown flag AND fan it out to every per-agent flag
+    ///. Agent threads poll their own flag, so the fan-out is
+    /// what actually stops them on a node-wide shutdown; non-agent machinery
+    /// (network bridge, sync ticker) still reads the node-wide flag directly.
+    fn signal_node_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Ok(map) = self.agent_shutdown.lock() {
+            for flag in map.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Allocate (and register) this agent's own shutdown flag.
+    /// Returned to the spawn site as the thread's `shutdown` signal; retained in
+    /// [`Self::agent_shutdown`] so [`Self::stop_agent`] / a node-wide shutdown
+    /// can flip it. Idempotent per id (re-registering returns a fresh flag).
+    fn register_agent_shutdown(&mut self, id: ServiceId) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        if self
+            .agent_shutdown
+            .lock()
+            .unwrap()
+            .insert(id.0, flag.clone())
+            .is_some()
+        {
+            // Two agents at the same full id.0 (a ~15-bit instance-name hash
+            // collision under one node prefix; same root cause as the
+            // `record_agent_name` collision WARN). The evicted flag is no
+            // longer reachable from `signal_node_shutdown`'s fan-out, so a
+            // transport agent left on the evicted flag could miss a node-wide
+            // shutdown (its accept loop polls only this flag) — surface it.
+            warn!(
+                id = id.0,
+                "register: shutdown-flag collision on service id; node-wide shutdown \
+                 may not reach the evicted agent (rename one of the colliding instances)"
+            );
+        }
+        flag
+    }
+
+    /// Stop a SINGLE agent by id without tearing down the node.
+    /// Flips that agent's shutdown flag; its thread exits on the next poll
+    /// (≤ 50 ms) — the generic lifecycle primitive behind `vosx <agent> stop`,
+    /// uniform across actor / service / transport agents. Returns `false` when
+    /// no agent is registered under `id`.
+    pub fn stop_agent(&self, id: ServiceId) -> bool {
+        match self
+            .agent_shutdown
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id.0).cloned())
+        {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Describe a SINGLE agent by id: a JSON snapshot of its
+    /// registered metadata + live running flag, backing `vosx <agent> describe`.
+    /// Generic across actor / service / transport agents (the in-process twin of
+    /// the `__describe` host interceptor). `None` when no agent is registered
+    /// under `id`.
+    pub fn describe_agent(&self, id: ServiceId) -> Option<String> {
+        let info = self.agent_info.read().ok()?.get(&id.0).cloned()?;
+        let running = self
+            .agent_shutdown
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id.0).map(|f| !f.load(Ordering::Relaxed)))
+            .unwrap_or(true)
+            && !self.shutdown.load(Ordering::Relaxed);
+        Some(describe_agent_json(id.0, &info, running))
     }
 
     /// Clone of the attached network, if any. Lets external code
@@ -2017,7 +2446,7 @@ impl VosNode {
                 // the reply parses as `InvokeResult::Done` on the
                 // caller side, matching real worker/agent shape.
                 let envelope = encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply);
-                let _ = req.reply_tx.send(envelope);
+                let _ = req.reply.send(envelope);
             }
         });
         id
@@ -2089,7 +2518,7 @@ impl VosNode {
                 space_role: None,
                 actor_local_role: None,
                 msg,
-                reply_tx,
+                reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),
             })
             .ok()?;
@@ -2177,7 +2606,10 @@ impl VosNode {
     /// "Database already open. Cannot acquire lock." Restart
     /// scenarios depend on this join happening.
     pub fn collect(mut self) -> Vec<AgentResult> {
-        self.shutdown.store(true, Ordering::Relaxed);
+        // Fan the node-wide shutdown out to every per-agent flag
+        // so agent threads polling their OWN flag — notably the transport accept
+        // loop, which has no inbox to disconnect — exit cleanly.
+        self.signal_node_shutdown();
         drop(self.outbox_tx);
         drop(self.routes); // drop agent inboxes so threads can detect disconnect
         // Drain the invoke routes too so threads' invoke_rx
@@ -2305,7 +2737,7 @@ fn agent_thread(
                 space_role: None,
                 actor_local_role: None,
                 msg: msg.to_vec(),
-                reply_tx,
+                reply: ReplyChannel::Sync(reply_tx),
                 chain: chain_snapshot,
             })
             .ok()?;
@@ -2738,7 +3170,7 @@ fn handle_invoke_request(
         // the durable log. Don't bubble the error — a transient
         // `NotLeader` shouldn't kill the agent thread.
         warn!(%svc_id, error = %e, "commit failed; soft-restarting and dropping reply");
-        drop(req.reply_tx);
+        drop(req.reply);
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Err(restart_err) = soft_restart_crdt(runtime, svc_id, strategy) {
             error!(%svc_id, "soft restart after commit failure: {restart_err}");
@@ -2762,7 +3194,7 @@ fn handle_invoke_request(
     let reply = match runtime.take_last_reply(svc_id) {
         Some(bytes) => bytes,
         None => {
-            drop(req.reply_tx);
+            drop(req.reply);
             return Ok(());
         }
     };
@@ -2779,7 +3211,7 @@ fn handle_invoke_request(
         crate::actors::run::STATUS_DONE
     };
     let envelope = encode_invoke_envelope(status, &state, &reply);
-    send_reply_capped(req.reply_tx, envelope, svc_id);
+    send_reply_capped(req.reply, envelope, svc_id);
     Ok(())
 }
 
@@ -2790,6 +3222,12 @@ fn handle_invoke_request(
 /// single byte.
 #[cfg(feature = "network")]
 pub(crate) const AUTH_ROLE_NONE: u8 = 0;
+
+/// Wire-byte for the space-level ADMIN grant (the highest role). Mirrors
+/// `space_registry::AUTH_ROLE_ADMIN`; used by the `__stop` lifecycle gate
+/// — only an admin may stop an agent host-side.
+#[cfg(feature = "network")]
+pub(crate) const AUTH_ROLE_ADMIN: u8 = 3;
 
 /// Build a failure envelope the libp2p layer relays back to
 /// the caller when the dispatch-layer auth gate refuses a call.
@@ -3220,28 +3658,22 @@ fn extension_thread(
         }
     }
 
-    // Phase 3: dispatch on plugin kind. Service-mode extensions
-    // own their thread + originate calls via ServiceCtx; the
-    // actor-mode dispatch loop below is unused for them. Phase 5
-    // adds a dispatch sidecar: when the .so exports
-    // `vos_service_handle_invoke`, run_service_extension spawns a
-    // helper thread that consumes `invoke_rx` and routes each
-    // inbound invoke through it, so `vosx <ext> <method>` reaches
-    // a real handler instead of sitting in the channel until the
-    // caller times out.
-    if plugin.kind() == crate::extension::ExtensionKind::Service {
-        return run_service_extension(
-            id,
-            plugin,
-            config,
-            inbox,
-            invoke_rx,
-            outbox,
-            invoke_routes,
-            agent_names,
-            shutdown,
-            activity,
-        );
+    // Dispatch on plugin kind: every extension is actor-mode or
+    // transport-mode, both
+    // driven below. A stale `kind = Service` byte from an old blob decodes
+    // back to `Actor` (see `ExtensionKind::from_byte`), so it loads on the
+    // actor-mode path rather than failing.
+    //
+    // Transport-mode extensions (a `handle_connection(&self,
+    // …)` actor) get a dedicated driver — the host owns a listener + accept
+    // loop and spawns one concurrent `&self` connection task per accept on a
+    // single executor thread. There are no inbound `#[msg]` handlers (the
+    // macro rejects them), so `inbox`/`invoke_rx`/`outbox` go unused and drop
+    // when this frame returns; callers of a transport extension get no reply.
+    // `invoke_routes` IS passed: a conn task's `ctx.ask` routes
+    // an outbound `InvokeRequest` through it with a per-call async reply channel.
+    if plugin.kind() == crate::extension::ExtensionKind::Transport {
+        return run_transport_extension(id, plugin, config, shutdown, activity, invoke_routes);
     }
 
     let bump = || *activity.lock().unwrap() = Instant::now();
@@ -3274,9 +3706,80 @@ fn extension_thread(
         shared_network: &shared_network,
     };
 
+    // Host-side cooperative executor. Created once on THIS thread
+    // (the thread that owns the instance) and driven per-message via
+    // `block_on(ex.run(..))`. The `!Send` per-task futures stay local to it.
+    // Actor-mode is N=1 (one root task to completion before the next message),
+    // so no task is ever spawned on it here; `&self` transport services add
+    // `ex.spawn`. async-io's single process-global reactor (shared across all
+    // extension threads) doubles as the byte-stream reactor.
+    let ex = async_executor::LocalExecutor::new();
+    // Per-instance byte-stream reactor state (open TCP listeners +
+    // connections). Lives across dispatches so a listener bound in one invoke
+    // stays open for later accepts; dropped (closing all fds) at thread end.
+    // Build the TLS acceptor once from the configured cert/key so
+    // `listen_tls` listeners can terminate TLS host-side.
+    let tls_acceptor = match (
+        config.tls_cert_pem.as_deref(),
+        config.tls_key_pem.as_deref(),
+    ) {
+        (Some(cert), Some(key)) => build_tls_acceptor(cert, key, id),
+        _ => None,
+    };
+    let mut reactor = ReactorTables::new(tls_acceptor);
+
+    // Periodic `tick()`. When the manifest set `tick_ms`, the
+    // driver dispatches a synthetic `tick` message to the actor's `tick`
+    // handler about every interval, *between* inbound work. Best-effort cadence: a
+    // long invoke delays the next tick (the driver never preempts a handler).
+    // `tick_disabled` latches if the extension declares `tick_ms` but has no
+    // `tick` handler (the synthetic dispatch returns `Err`), so a misconfig
+    // logs once instead of re-dispatching every interval.
+    let tick_interval = config.tick_ms.map(Duration::from_millis);
+    let mut tick_deadline = tick_interval.map(|iv| Instant::now() + iv);
+    let mut tick_disabled = false;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Fire a due periodic tick before servicing inbound work, so a
+        // backlog of invokes can't starve the heartbeat indefinitely.
+        if let (Some(deadline), false) = (tick_deadline, tick_disabled) {
+            if Instant::now() >= deadline {
+                bump();
+                let payload = encode_tick_payload();
+                // No external caller → RELAY_CALLER unset → a tick's
+                // `ctx.ask_dispatch` relays as `Unauthenticated`
+                // (no authenticated caller to propagate).
+                let outcome = dispatch_and_poll(
+                    &ex,
+                    &mut instance,
+                    &payload,
+                    &inbox,
+                    &outbox,
+                    id,
+                    &mut deferred,
+                    &blob_fetch,
+                    &mut reactor,
+                    &invoke_routes,
+                    &config.intra_caps,
+                    &agent_names,
+                );
+                if matches!(outcome, DispatchOutcome::Err) {
+                    warn!(
+                        %id,
+                        "extension: tick_ms set but `tick` dispatch failed (no `tick` handler?) \
+                         — disabling periodic ticks"
+                    );
+                    tick_disabled = true;
+                }
+                persist(strategy.as_mut(), &instance, id);
+                // Re-arm from *now* (not deadline+iv) so a slow tick doesn't
+                // build up a burst of catch-up ticks.
+                tick_deadline = tick_interval.map(|iv| Instant::now() + iv);
+            }
         }
 
         // Process up to a few invoke requests per iteration to avoid
@@ -3285,15 +3788,34 @@ fn extension_thread(
             match invoke_rx.try_recv() {
                 Ok(req) => {
                     bump();
-                    let outcome = dispatch_and_poll(
-                        &mut instance,
-                        &req.msg,
-                        &inbox,
-                        &outbox,
-                        id,
-                        &mut deferred,
-                        &blob_fetch,
-                    );
+                    // Stamp the real caller of this invoke for
+                    // the duration of the dispatch, so an `EFFECT_ASK_DISPATCH`
+                    // raised by the handler relays it (bounded by `intra_caps`)
+                    // instead of the `Caller::Actor` bypass. RAII-cleared after
+                    // the dispatch (and on panic, via the catch in run_ext_task)
+                    // so it never leaks to the next invoke or a self-originated
+                    // call. The envelope path below leaves it unstamped → such
+                    // calls relay as `Unauthenticated`.
+                    let outcome = {
+                        let _relay = RelayCallerGuard::stamp(PropagatedCaller {
+                            caller: req.caller.clone(),
+                            space_role: req.space_role,
+                        });
+                        dispatch_and_poll(
+                            &ex,
+                            &mut instance,
+                            &req.msg,
+                            &inbox,
+                            &outbox,
+                            id,
+                            &mut deferred,
+                            &blob_fetch,
+                            &mut reactor,
+                            &invoke_routes,
+                            &config.intra_caps,
+                            &agent_names,
+                        )
+                    };
                     // Workers don't yield — pack as DONE with no
                     // state so the caller's invoke_raw decodes
                     // `InvokeResult::Done { state: empty, reply }`.
@@ -3310,19 +3832,28 @@ fn extension_thread(
                             encode_invoke_envelope(crate::actors::run::STATUS_PANICKED, &[], &[])
                         }
                     };
-                    send_reply_capped(req.reply_tx, envelope, id);
+                    send_reply_capped(req.reply, envelope, id);
                     persist(strategy.as_mut(), &instance, id);
                 }
                 Err(_) => break,
             }
         }
 
-        // Take next message: deferred first, then inbox
+        // Take next message: deferred first, then inbox. Cap the inbox wait
+        // at the time remaining until the next tick (when ticking) so the
+        // heartbeat cadence holds even with an otherwise-idle inbox; floor at
+        // the regular 50ms poll otherwise.
+        let recv_timeout = match tick_deadline {
+            Some(deadline) if !tick_disabled => deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+            _ => Duration::from_millis(50),
+        };
         let envelope = if let Some(e) = deferred.pop_front() {
             bump();
             e
         } else {
-            match inbox.recv_timeout(Duration::from_millis(50)) {
+            match inbox.recv_timeout(recv_timeout) {
                 Ok(e) => {
                     bump();
                     e
@@ -3332,7 +3863,11 @@ fn extension_thread(
             }
         };
 
+        // Envelope path: actor-to-actor messaging carries no external caller,
+        // so `RELAY_CALLER` stays unset → any `ctx.ask_dispatch` here relays as
+        // `Unauthenticated` (no authenticated caller to propagate).
         let outcome = dispatch_and_poll(
+            &ex,
             &mut instance,
             &envelope.payload,
             &inbox,
@@ -3340,6 +3875,10 @@ fn extension_thread(
             id,
             &mut deferred,
             &blob_fetch,
+            &mut reactor,
+            &invoke_routes,
+            &config.intra_caps,
+            &agent_names,
         );
         // Envelope-mode replies don't carry the `[status][state][reply]`
         // wrapper — that's an invoke-channel detail. On the envelope
@@ -3369,7 +3908,7 @@ fn extension_thread(
     }
 }
 
-// ── Service-mode extension runner (Phase 3) ──────────────────────────
+// ── Service-mode extension runner ──────────────────────────
 
 /// Caller context an extension relays on an outbound call: the
 /// identity that invoked the extension's handler plus its space-wide
@@ -3389,34 +3928,24 @@ struct PropagatedCaller {
 }
 
 thread_local! {
-    /// The caller of the invoke the service-mode dispatch sidecar is
-    /// *currently* handling on this thread. The sidecar stamps it
-    /// before handing the payload to the extension (which calls back
-    /// synchronously on the same thread via `ctx.ask_raw` →
-    /// `invoke_fn`) and clears it after. `invoke_fn` reads its own
-    /// thread's slot: `Some` for sidecar-driven relays, `None` for
-    /// calls originating on the extension's `run()` thread (HTTP
-    /// serving, ping loops) — those have no external caller and relay
-    /// as `Unauthenticated`. Keyed implicitly by thread, so the
-    /// sidecar and `run()` threads never clobber each other's caller.
-    ///
-    /// Limitation: a handler that hands its `ask_raw` off to a
-    /// *different* thread (its own tokio pool) won't carry the slot —
-    /// `invoke_fn` there reads `None` and relays as `Unauthenticated`.
-    /// That is fail-*safe* (deny), never fail-open. Today's
-    /// sidecar-dispatched handlers (dev `compile`/`publish`) call
-    /// `ask_raw` synchronously on the sidecar thread, so the slot is
-    /// always present where it matters.
+    /// The caller of the invoke the actor-mode driver is *currently*
+    /// handling on this agent's thread. `extension_thread` stamps it (via
+    /// [`RelayCallerGuard`]) before driving an invoke-path `dispatch_and_poll`
+    /// and clears it after; the `EFFECT_ASK_DISPATCH` fulfiller reads its own
+    /// thread's slot to relay the real caller (bounded by `intra_caps`). `Some`
+    /// for an inbound invoke, `None` for self-originated work — the envelope
+    /// path and a periodic `tick` leave it unstamped — which relays as
+    /// `Unauthenticated`. Keyed implicitly by thread, so concurrent agents
+    /// never clobber each other's caller.
     static RELAY_CALLER: core::cell::RefCell<Option<PropagatedCaller>> =
         const { core::cell::RefCell::new(None) };
 }
 
-/// RAII guard: stamp the current relay caller for the duration of a
-/// service-mode dispatch, clearing it on drop. Drop runs even if the
-/// dispatched handler panics (the sidecar wraps dispatch in
-/// `catch_unwind`, which absorbs the panic before this guard's scope
-/// ends), so a refused/exploding call never leaves a stale caller to
-/// poison the next dispatch on this thread.
+/// RAII guard: stamp the current relay caller for the duration of one
+/// actor-mode invoke dispatch, clearing it on drop. Drop runs even if the
+/// dispatched handler panics (it unwinds past this guard's scope), so a
+/// refused/exploding call never leaves a stale caller to poison the next
+/// dispatch on this thread.
 struct RelayCallerGuard;
 
 impl RelayCallerGuard {
@@ -3432,7 +3961,7 @@ impl Drop for RelayCallerGuard {
     }
 }
 
-/// Read this thread's current relay caller, if a service-mode
+/// Read this thread's current relay caller, if an actor-mode invoke
 /// dispatch is in flight on it.
 fn current_relay_caller() -> Option<PropagatedCaller> {
     RELAY_CALLER.with(|c| c.borrow().clone())
@@ -3495,8 +4024,8 @@ fn relay_actor_local_role(
     (role != AUTH_ROLE_NONE).then_some((bytes.clone(), role))
 }
 
-/// Compute the `(caller, space_role byte)` a service-mode extension
-/// relays for an outbound call to `target_name`, applying the
+/// Compute the `(caller, space_role byte)` an extension relays for an
+/// outbound `ctx.ask_dispatch` to `target_name`, applying the
 /// intersection model: the effective authority is
 /// `min(caller's space role, the extension's declared cap ceiling for
 /// the target)`. The extension can never *amplify* the caller, and
@@ -3556,291 +4085,6 @@ fn resolve_relay_caller(
     (carrier, Some(effective.as_u8()))
 }
 
-/// Drive a service-mode extension: build a HostCtx, hand it to the
-/// extension's `vos_extension_run` entry, block until it returns.
-///
-/// The extension owns its own concurrency (typically tokio inside).
-/// Control flow back here only happens when the extension's run
-/// loop exits — either because `shutdown` was flipped or because
-/// the extension hit an unrecoverable error.
-#[allow(clippy::too_many_arguments)]
-fn run_service_extension(
-    id: ServiceId,
-    plugin: crate::extension::ExtensionPlugin,
-    config: ExtensionConfig,
-    inbox: mpsc::Receiver<Envelope>,
-    invoke_rx: mpsc::Receiver<InvokeRequest>,
-    outbox: mpsc::Sender<Envelope>,
-    invoke_routes: InvokeRoutes,
-    agent_names: AgentNames,
-    shutdown: Arc<AtomicBool>,
-    activity: ActivityClock,
-) -> AgentResult {
-    use crate::extension::{HostCtx, HostCtxHandle, SERVICE_VTABLE};
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
-    *activity.lock().unwrap() = Instant::now();
-
-    // Wrap the node's invoke_routes table in a closure the
-    // extension layer can call without knowing about
-    // `InvokeRequest`. The closure: look up target's invoke channel,
-    // send the request with this extension's own id as the chain
-    // root, block on reply with the extension's timeout. Returns
-    // None on transport error / timeout / unknown target.
-    let invoke_routes_for_ctx = invoke_routes.clone();
-    let me = id.0;
-    let invoke_shutdown = shutdown.clone();
-    // M3 — the extension's declared intra-system caps. Empty (the
-    // default, and what `relay_unauthenticated` collapses to) means
-    // every outbound call relays as `Caller::Unauthenticated`.
-    let intra_caps = config.intra_caps.clone();
-    // R3 — the node's reverse map, read live so an `intra_cap` naming
-    // *any* installed actor (not just the registry) resolves and binds.
-    let relay_agent_names = agent_names.clone();
-    let invoke_fn: std::sync::Arc<crate::extension::InvokeFn> = std::sync::Arc::new(
-        move |target: u32, payload: &[u8], timeout_ms: u64| -> Option<Vec<u8>> {
-            let tx = invoke_routes_for_ctx
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&target).cloned())?;
-            let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
-            // M2 + M3 + R3 — transparent, *bounded* relay. Forward the
-            // caller of the invoke this extension is currently handling
-            // (not the extension's own id — the C2 bypass), intersected
-            // with the extension's declared cap ceiling for the target.
-            // The target's name comes from the host's reverse map, so a
-            // declared cap binds for any installed actor; an unresolved
-            // target (anonymous / not yet registered) matches only `*`
-            // caps. One path: a relay-mode / no-caps extension and a
-            // run()-thread call both resolve to `Unauthenticated` here,
-            // so role-gated handlers refuse.
-            let target_name = relay_agent_names
-                .read()
-                .ok()
-                .and_then(|m| m.get(&local_id_of(target)).cloned());
-            let propagated = current_relay_caller();
-            #[allow(unused_mut)]
-            let (mut caller, space_role) =
-                resolve_relay_caller(propagated.as_ref(), &intra_caps, target_name.as_deref());
-            // R4 — faithfully propagate the propagated peer's actor-local
-            // grant on the *final target*. That grant is in the target
-            // actor's own role space (not a SpaceRole), so the host can't
-            // cap it against the SpaceRole ceiling; instead the cap gates
-            // *whether* the relay may reach the target at all (a non-None
-            // ceiling), and the grant — which the peer already holds on a
-            // direct libp2p call — passes through unchanged. It overrides
-            // space_role at the target, so the carrier must stay the Peer
-            // for the override to bind to the right identity. Only
-            // reachable under `network` (Peer callers come from the
-            // libp2p gate); a no-network node never has one to propagate.
-            #[cfg(feature = "network")]
-            let actor_local_role = match relay_actor_local_role(
-                &invoke_routes_for_ctx,
-                propagated.as_ref(),
-                &intra_caps,
-                target_name.as_deref(),
-            ) {
-                Some((peer_bytes, role)) => {
-                    caller = crate::actors::Caller::Peer(peer_bytes);
-                    Some(role)
-                }
-                None => None,
-            };
-            #[cfg(not(feature = "network"))]
-            let actor_local_role: Option<u8> = None;
-            tx.send(InvokeRequest {
-                caller,
-                space_role,
-                actor_local_role,
-                msg: payload.to_vec(),
-                reply_tx,
-                chain: vec![me],
-            })
-            .ok()?;
-            // Default timeout: a generous 5 minutes; explicit 0
-            // means "wait forever" but we still poll in 50ms ticks
-            // so shutdown signal is honored promptly.
-            let deadline = if timeout_ms == 0 {
-                Instant::now() + Duration::from_secs(300)
-            } else {
-                Instant::now() + Duration::from_millis(timeout_ms)
-            };
-            loop {
-                if invoke_shutdown.load(Ordering::Relaxed) {
-                    return None;
-                }
-                match reply_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(envelope) => {
-                        // PVM agent and actor-mode extension both
-                        // reply with the wrapped invoke envelope
-                        // `[status][state_len:u32][state][reply]`.
-                        // `unwrap_invoke_envelope` returns Some(reply)
-                        // for DONE/YIELDED (legitimate completions —
-                        // empty bytes are fine for a `()` return) and
-                        // None for failure statuses (PANICKED /
-                        // NOT_FOUND / OOG). Passing the None through
-                        // lets `ServiceCtx::ask_raw` surface failures
-                        // as None at the caller — the gateway then
-                        // distinguishes "handler succeeded with no
-                        // value" (200 null) from "handler failed"
-                        // (502). Before this distinction, every
-                        // failure shape collapsed into 200 null.
-                        return unwrap_invoke_envelope(&envelope);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if Instant::now() >= deadline {
-                            return None;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return None,
-                }
-            }
-        },
-    );
-
-    // Read declared caps off the plugin's meta blob so the
-    // vtable shims can gate / log at the syscall boundary
-    // (Sprint 2 — see HostCtx::check_cap_or_deny). cap_policy
-    // flows in from ExtensionConfig (operator-set via space
-    // manifest).
-    let (declared_caps, actor_name) = match plugin.meta() {
-        Some(m) => (m.caps.clone(), m.actor_name.clone()),
-        None => (Vec::new(), format!("svc:{:#06x}", id.0)),
-    };
-    let cap_policy = config.cap_policy;
-    let host_ctx = Box::new(HostCtx {
-        me: id.0,
-        outbox: outbox.clone(),
-        inbox: Mutex::new(inbox),
-        deferred: Mutex::new(VecDeque::new()),
-        shutdown: shutdown.clone(),
-        invoke: invoke_fn,
-        declared_caps,
-        cap_policy,
-        cap_warns_logged: std::sync::Mutex::new(std::collections::BTreeSet::new()),
-        actor_name,
-    });
-    let host_ptr = Box::into_raw(host_ctx);
-    let handle = HostCtxHandle {
-        state: host_ptr as *mut core::ffi::c_void,
-        vtable: &SERVICE_VTABLE as *const _,
-    };
-
-    // SAFETY: create_state pairs with drop_state below; both use
-    // the plugin's symbol pair so the allocator matches.
-    let state = unsafe { plugin.create_state(&config.init_args) };
-    if state.is_null() {
-        // SAFETY: host_ptr was just allocated above; nothing else
-        // observed it, so reclaiming it is safe.
-        unsafe {
-            let _ = Box::from_raw(host_ptr);
-        }
-        let err = "service-mode extension: create_state returned null";
-        error!(%id, "{err}");
-        return AgentResult {
-            id,
-            panics: 1,
-            error: Some(err.into()),
-        };
-    }
-
-    // Phase 5: if the extension exports `vos_service_handle_invoke`,
-    // spawn a sidecar dispatch thread that consumes `invoke_rx` in
-    // parallel with `run()`. Each request is dispatched through
-    // the extension's fn and the reply wrapped in the standard
-    // invoke envelope (STATUS_DONE / STATUS_NOT_FOUND / STATUS_PANICKED).
-    // Extensions without the symbol get the legacy behaviour — the
-    // channel goes unread and callers time out. State pointer is
-    // shared across threads as `*mut ()`; the extension is
-    // responsible for thread-safe access between its run thread
-    // and the dispatch path (HttpGateway uses an OnceLock + Arc).
-    //
-    // Plugin handle is `Arc`-shared with the sidecar rather than
-    // re-loaded — `Library`'s fn-ptr fields are `Send+Sync`, and
-    // a single dlopen is cheaper than two. The Arc also keeps the
-    // library mapped for the sidecar's lifetime even if `run()`
-    // exits first.
-    let plugin = std::sync::Arc::new(plugin);
-    let sidecar = if plugin.service_has_invoke_dispatch() {
-        let state_ptr = SendState(state);
-        let plugin_for_sidecar = plugin.clone();
-        let shutdown_for_sidecar = shutdown.clone();
-        Some(std::thread::spawn(move || {
-            run_service_invoke_sidecar(
-                id,
-                plugin_for_sidecar,
-                state_ptr,
-                invoke_rx,
-                shutdown_for_sidecar,
-            );
-        }))
-    } else {
-        // No dispatch handler — drop the receiver so any sender
-        // sees Disconnected on send and the channel doesn't leak.
-        drop(invoke_rx);
-        None
-    };
-
-    // Capture panics inside run so we can clean up state + host_ptr
-    // even if the extension blows up.
-    let plugin_ref = &*plugin;
-    let handle_ptr: *const HostCtxHandle = &handle;
-    let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: state is a live instance from create_state above;
-        // handle_ptr lives on this stack frame and outlives the call.
-        unsafe { plugin_ref.run_service(state, handle_ptr) }
-    }));
-
-    // After run() returns we need the sidecar to exit too. The
-    // process-wide `shutdown` flag would do it but is shared by
-    // every other agent/extension on this daemon — flipping it
-    // here would take them down too. Instead we drop the sender
-    // half of the invoke channel by removing the entry from
-    // `invoke_routes`; the sidecar's `recv_timeout` sees
-    // `Disconnected` and exits. Other clones of the Sender (e.g.
-    // a thread mid-send) keep the channel briefly alive, but
-    // they're short-lived and the sidecar exits within one
-    // timeout tick (50ms) after the last clone drops. Falls back
-    // to global shutdown anyway if a stray sender lingers.
-    if let Some(handle) = sidecar {
-        invoke_routes.lock().unwrap().remove(&id.0);
-        let _ = handle.join();
-    }
-
-    // Drop state regardless of panic.
-    // SAFETY: state was returned by this plugin's create_state and
-    // hasn't been dropped yet.
-    unsafe {
-        plugin.drop_state(state);
-    }
-    // SAFETY: host_ptr is the unique live pointer to the HostCtx;
-    // service_thread is single-threaded after run returns.
-    unsafe {
-        let _ = Box::from_raw(host_ptr);
-    }
-
-    *activity.lock().unwrap() = Instant::now();
-
-    match exit {
-        Ok(code) if code >= 0 => AgentResult {
-            id,
-            panics: 0,
-            error: None,
-        },
-        Ok(code) => AgentResult {
-            id,
-            panics: 1,
-            error: Some(format!("service-mode extension: run returned {code}")),
-        },
-        Err(_) => AgentResult {
-            id,
-            panics: 1,
-            error: Some("service-mode extension: run panicked".into()),
-        },
-    }
-}
-
 /// Outcome of a single extension dispatch. `Ok(bytes)` means the
 /// handler completed with the given reply (`bytes` may be empty
 /// for a `()` return). `Err` covers the cases that can't be
@@ -3864,82 +4108,1053 @@ struct BlobFetchCtx<'a> {
     shared_network: &'a SharedNetwork,
 }
 
-/// `*mut ()` newtype that implements `Send` so the service-mode
-/// invoke dispatch sidecar can carry the extension's state across
-/// thread boundaries. The pointer aliases the same state the
-/// `run()` thread reads; coordination across the two threads is
-/// the extension's responsibility (HttpGateway uses interior
-/// `Arc`/`AtomicBool` for that).
-struct SendState(*mut ());
-// SAFETY: the underlying state lives in the extension's address
-// space and is accessed via the extension's own thread-safe
-// primitives — the host doesn't dereference it.
-unsafe impl Send for SendState {}
+/// One accepted byte-stream connection: either a plaintext TCP stream or a
+/// host-terminated TLS stream over one. Both impl `futures_io::AsyncRead/Write`,
+/// So the extension reads/writes plaintext bytes either way.
+enum Conn {
+    Plain(async_io::Async<std::net::TcpStream>),
+    // Boxed — a rustls `TlsStream` is large; keep the enum small.
+    Tls(Box<futures_rustls::server::TlsStream<async_io::Async<std::net::TcpStream>>>),
+}
 
-/// Pull invokes off the channel and dispatch each through the
-/// extension's `vos_service_handle_invoke`. Wrap replies in the
-/// standard invoke envelope so the calling actor's
-/// `unwrap_invoke_envelope` decodes them the same way it does
-/// for PVM and actor-mode-extension replies. Exits when
-/// `shutdown` is set or the channel disconnects (the latter is
-/// the per-extension wake signal — `run_service_extension`
-/// drops the Sender out of `invoke_routes` after `run()`
-/// returns).
-fn run_service_invoke_sidecar(
-    id: ServiceId,
-    plugin: std::sync::Arc<crate::extension::ExtensionPlugin>,
-    state: SendState,
-    invoke_rx: mpsc::Receiver<InvokeRequest>,
-    shutdown: Arc<AtomicBool>,
-) {
-    use crate::actors::run::{STATUS_DONE, STATUS_NOT_FOUND, STATUS_PANICKED};
-    use crate::extension::{POLL_ERR_NO_FUTURE, POLL_READY};
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return;
+impl Conn {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use futures_lite::AsyncReadExt;
+        match self {
+            Conn::Plain(s) => s.read(buf).await,
+            Conn::Tls(s) => s.read(buf).await,
         }
-        match invoke_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(req) => {
-                // M2 — stamp this thread's relay caller so any
-                // synchronous `ctx.ask_raw` the handler makes (on this
-                // same thread, via `invoke_fn`) forwards the real
-                // caller rather than the extension's own id. Cleared
-                // on drop, panic-safe (catch_unwind absorbs panics
-                // before the guard's scope ends).
-                let relay_guard = RelayCallerGuard::stamp(PropagatedCaller {
-                    caller: req.caller.clone(),
-                    space_role: req.space_role,
-                });
-                // SAFETY: the extension's state ptr is alive for
-                // the duration of run_service_extension, which
-                // joins this sidecar before dropping state.
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                    plugin.dispatch_service_invoke(state.0, &req.msg)
-                }));
-                drop(relay_guard);
-                let envelope = match outcome {
-                    Ok((POLL_READY, Some(bytes))) => {
-                        encode_invoke_envelope(STATUS_DONE, &[], &bytes)
-                    }
-                    Ok((POLL_ERR_NO_FUTURE, _)) => {
-                        encode_invoke_envelope(STATUS_NOT_FOUND, &[], &[])
-                    }
-                    _ => encode_invoke_envelope(STATUS_PANICKED, &[], &[]),
-                };
-                send_reply_capped(req.reply_tx, envelope, id);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+    }
+
+    async fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        use futures_lite::AsyncWriteExt;
+        let n = match self {
+            Conn::Plain(s) => s.write(data).await,
+            Conn::Tls(s) => s.write(data).await,
+        }?;
+        // Flush so TLS records (which rustls buffers) actually reach the peer
+        // before the handler moves on / closes. A no-op on a plain TCP stream.
+        match self {
+            Conn::Plain(s) => s.flush().await,
+            Conn::Tls(s) => s.flush().await,
+        }?;
+        Ok(n)
+    }
+}
+
+/// One open listener + whether the host terminates TLS on its connections.
+struct ListenerEntry {
+    listener: async_io::Async<std::net::TcpListener>,
+    tls: bool,
+}
+
+/// Per-instance host reactor state for the byte-stream effects.
+/// Holds the extension's open TCP listeners + connections as `async_io::Async`
+/// handles (registered with async-io's single process-global reactor); lives
+/// for the extension thread's lifetime so a listener bound in one dispatch can
+/// be accepted-on in a later one. Dropping it closes every fd.
+///
+/// `tls_acceptor` is built once (in `extension_thread`) from the extension's
+/// configured cert/key; `listen_tls` listeners wrap each accepted connection
+/// with it so the extension only ever sees plaintext.
+struct ReactorTables {
+    listeners: std::collections::HashMap<u64, ListenerEntry>,
+    conns: std::collections::HashMap<u64, Conn>,
+    next_id: u64,
+    tls_acceptor: Option<futures_rustls::TlsAcceptor>,
+}
+
+impl ReactorTables {
+    fn new(tls_acceptor: Option<futures_rustls::TlsAcceptor>) -> Self {
+        Self {
+            listeners: std::collections::HashMap::new(),
+            conns: std::collections::HashMap::new(),
+            next_id: 1,
+            tls_acceptor,
+        }
+    }
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+/// Build a TLS acceptor from PEM cert chain + private key. Returns `None` (with
+/// a logged warning) on any parse/config error so a misconfigured cert degrades
+/// to "no TLS" rather than killing the extension thread.
+fn build_tls_acceptor(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    id: ServiceId,
+) -> Option<futures_rustls::TlsAcceptor> {
+    use futures_rustls::rustls::{self, pki_types::CertificateDer};
+    // Install the ring provider once (idempotent — matches http-gateway/http3).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut cert_rd = cert_pem;
+    let certs: Vec<CertificateDer<'static>> = match rustls_pemfile::certs(&mut cert_rd).collect() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(%id, "extension: TLS cert PEM parse failed: {e}");
+            return None;
+        }
+    };
+    if certs.is_empty() {
+        error!(%id, "extension: TLS cert PEM contained no certificates");
+        return None;
+    }
+    let mut key_rd = key_pem;
+    let key = match rustls_pemfile::private_key(&mut key_rd) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            error!(%id, "extension: TLS key PEM contained no private key");
+            return None;
+        }
+        Err(e) => {
+            error!(%id, "extension: TLS key PEM parse failed: {e}");
+            return None;
+        }
+    };
+    match rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+    {
+        Ok(config) => Some(futures_rustls::TlsAcceptor::from(std::sync::Arc::new(
+            config,
+        ))),
+        Err(e) => {
+            error!(%id, "extension: rustls server config failed: {e}");
+            None
         }
     }
 }
 
-/// Dispatch a message to an actor-mode extension instance and poll
-/// to completion. Returns the reply bytes on success or a
-/// `POLL_ERR_*` status on a poisoned future (panic, missing future,
-/// etc).
+/// Largest single `read` the host will buffer, capping a handler-supplied
+/// `max` so a bad value can't request a huge allocation.
+const MAX_READ: u32 = 1 << 20;
+
+/// Idle deadline on a transport connection's `read`. A peer
+/// that opens a connection and then sends nothing (or dribbles bytes more
+/// slowly than this) gets its read error out, so the handler drops the
+/// connection and frees its host slot — bounding slow-loris / idle
+/// keep-alive exhaustion (the
+/// transport substrate has no extension-facing timer effect, so the deadline
+/// lives host-side). Resets on every read, so a steadily-progressing transfer
+/// is never cut off.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound a transport conn task waits for an invoke reply
+/// on BOTH `EFFECT_ASK` (`ctx.ask`) and `EFFECT_ASK_DISPATCH` (`ctx.ask_dispatch`)
+/// before giving up (empty / RESP_ERR). Matches the 300 s the cross-node
+/// `dispatch_invoke` uses, so
+/// a legitimately long-running upstream handler (e.g. a STARK prove, ~3 min)
+/// still returns 200 rather than a premature 502. The await yields
+/// cooperatively, so a parked ask never pins the executor thread; the only
+/// cost of a slow/missing target is one of the host's bounded connection slots.
+const ASK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The async effect router handed to [`run_ext_task`]. Bundles the host-side
+/// channels + blob store + byte-stream reactor a `TASK_PENDING` is fulfilled
+/// against.
+///
+/// Request-reply effects (EFFECT_ASK / FETCH / BLOB_GET) stay on the
+/// synchronous [`handle_effect`] transport (EFFECT_ASK rides the envelope path —
+/// `outbox.send` + `wait_for_reply` — preserving the deferred-queue semantics
+/// `extension_to_extension_ask` depends on). Calling it inline is
+/// behaviour-identical because actor-mode is **N=1**.
+/// The **byte-stream** effects genuinely `await` `smol::Async` TCP ops on
+/// the executor thread, driven by `block_on(ex.run(..))` polling async-io's
+/// reactor — this is where the host executor + reactor earn their keep.
+struct Fulfiller<'a> {
+    inbox: &'a mpsc::Receiver<Envelope>,
+    outbox: &'a mpsc::Sender<Envelope>,
+    extension_id: ServiceId,
+    deferred: &'a mut std::collections::VecDeque<Envelope>,
+    blob_fetch: &'a BlobFetchCtx<'a>,
+    reactor: &'a mut ReactorTables,
+    /// Outbound-invoke routing table — an actor-mode
+    /// extension's `ctx.ask_dispatch` routes through the host invoke substrate
+    /// (per-call async reply, status-framed, reaches PVM targets) rather than
+    /// the message-envelope `wait_for_reply` path that `ctx.ask` uses.
+    invoke_routes: &'a InvokeRoutes,
+    /// The extension's declared intra-system caps. An
+    /// `EFFECT_ASK_DISPATCH` relays the real caller of the invoke in flight
+    /// (read from `RELAY_CALLER`), bounded by `min(caller role, cap ceiling)`
+    /// for the target — never the `Caller::Actor` intra-system bypass — so a
+    /// role-gated target (e.g. the registry's admin-gated `publish`) still
+    /// consults the caller's real role.
+    intra_caps: &'a [crate::actors::IntraCap],
+    /// Host reverse map `local_id → instance_name` — resolves
+    /// the ask target's name so `intra_caps` (declared by name) bind, and so
+    /// the propagated peer's actor-local grant can be looked up.
+    agent_names: &'a AgentNames,
+}
+
+impl Fulfiller<'_> {
+    async fn fulfill(&mut self, effect: &[u8]) -> Vec<u8> {
+        use crate::effects::{
+            EFFECT_ACCEPT, EFFECT_ASK_DISPATCH, EFFECT_CLOSE, EFFECT_LISTEN, EFFECT_READ,
+            EFFECT_WRITE,
+        };
+        match effect.first().copied() {
+            Some(EFFECT_LISTEN | EFFECT_ACCEPT | EFFECT_READ | EFFECT_WRITE | EFFECT_CLOSE) => {
+                self.fulfill_bytestream(effect[0], &effect[1..]).await
+            }
+            // Status-framed invoke-path ask: routes through
+            // `invoke_routes`, returning `[RESP_OK][reply]` / `[RESP_ERR]` —
+            // the `Option<Vec<u8>>` contract `ctx.ask_dispatch` decodes (the
+            // old `ServiceCtx::ask_raw` shape).
+            //
+            // SECURITY: the relayed caller is NOT `Caller::Actor` (that's the
+            // intra-system role-bypass — it would let any caller's `dev
+            // publish` reach the registry's admin-gated handler as trusted).
+            // Instead relay the real caller of the invoke currently in flight
+            // on this thread (`RELAY_CALLER`, stamped by `extension_thread`
+            // before driving this dispatch), bounded by `min(caller role,
+            // intra_cap ceiling for the target)`. A target the extension declared
+            // no cap for collapses to `Unauthenticated`; a self-originated
+            // call (no stamp) likewise relays anonymously. Deny-by-default.
+            Some(EFFECT_ASK_DISPATCH) => {
+                use crate::effects::bytestream as bs;
+                let rest = &effect[1..];
+                if rest.len() < 4 {
+                    return bs::resp_err("");
+                }
+                let target = u32::from_le_bytes(rest[..4].try_into().unwrap());
+                let target_name = self
+                    .agent_names
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(&local_id_of(target)).cloned());
+                let propagated = current_relay_caller();
+                #[allow(unused_mut)]
+                let (mut caller, space_role) = resolve_relay_caller(
+                    propagated.as_ref(),
+                    self.intra_caps,
+                    target_name.as_deref(),
+                );
+                // Faithfully propagate the propagated peer's actor-local grant
+                // on the final target (in the target's own role space, relayed
+                // uncapped — the cap only gates *whether* the relay may reach
+                // the target). Overrides `space_role`, so the carrier must stay
+                // the Peer for the override to bind. Only Peer callers (libp2p
+                // gate) carry one, so this is `network`-only.
+                #[cfg(feature = "network")]
+                let actor_local_role = match relay_actor_local_role(
+                    self.invoke_routes,
+                    propagated.as_ref(),
+                    self.intra_caps,
+                    target_name.as_deref(),
+                ) {
+                    Some((peer_bytes, role)) => {
+                        caller = crate::actors::Caller::Peer(peer_bytes);
+                        Some(role)
+                    }
+                    None => None,
+                };
+                #[cfg(not(feature = "network"))]
+                let actor_local_role: Option<u8> = None;
+                match route_invoke(
+                    self.invoke_routes,
+                    self.extension_id,
+                    caller,
+                    space_role,
+                    actor_local_role,
+                    rest,
+                )
+                .await
+                {
+                    Some(reply) => bs::resp_ok_bytes(&reply),
+                    None => bs::resp_err(""),
+                }
+            }
+            // Other request-reply effects (EFFECT_ASK / FETCH / BLOB_GET) keep
+            // the synchronous envelope transport.
+            _ => handle_effect(
+                effect,
+                self.inbox,
+                self.outbox,
+                self.extension_id,
+                self.deferred,
+                self.blob_fetch,
+            ),
+        }
+    }
+
+    /// Run one byte-stream op against the reactor tables. Each arm `await`s the
+    /// matching `async_io::Async` operation; the result is encoded back to the
+    /// handler via the `bytestream` response codec (status-led; errors carry a
+    /// message the handler sees as `None`).
+    async fn fulfill_bytestream(&mut self, tag: u8, rest: &[u8]) -> Vec<u8> {
+        use crate::effects::bytestream as bs;
+        use crate::effects::{
+            EFFECT_ACCEPT, EFFECT_CLOSE, EFFECT_LISTEN, EFFECT_READ, EFFECT_WRITE,
+        };
+
+        match tag {
+            EFFECT_LISTEN => {
+                let Some((tls, addr)) = bs::decode_listen(rest) else {
+                    return bs::resp_err("listen: bad request");
+                };
+                if tls && self.reactor.tls_acceptor.is_none() {
+                    return bs::resp_err("listen_tls: no TLS cert configured for this extension");
+                }
+                match std::net::TcpListener::bind(&addr)
+                    .and_then(async_io::Async::<std::net::TcpListener>::new)
+                {
+                    Ok(listener) => {
+                        let id = self.reactor.alloc_id();
+                        self.reactor
+                            .listeners
+                            .insert(id, ListenerEntry { listener, tls });
+                        bs::resp_ok_u64(id)
+                    }
+                    Err(e) => bs::resp_err(&format!("listen {addr}: {e}")),
+                }
+            }
+            EFFECT_ACCEPT => {
+                let Some(lid) = bs::decode_accept(rest) else {
+                    return bs::resp_err("accept: bad request");
+                };
+                let (accepted, tls) = match self.reactor.listeners.get(&lid) {
+                    Some(entry) => (entry.listener.accept().await, entry.tls),
+                    None => return bs::resp_err("accept: unknown listener"),
+                };
+                let stream = match accepted {
+                    Ok((stream, _addr)) => stream,
+                    Err(e) => return bs::resp_err(&format!("accept: {e}")),
+                };
+                // Terminate TLS host-side for `listen_tls` listeners; the
+                // extension then reads/writes plaintext through `Conn`.
+                let conn = if tls {
+                    // Acceptor presence was checked at listen time.
+                    let acceptor = self.reactor.tls_acceptor.clone().unwrap();
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => Conn::Tls(Box::new(tls_stream)),
+                        Err(e) => return bs::resp_err(&format!("tls handshake: {e}")),
+                    }
+                } else {
+                    Conn::Plain(stream)
+                };
+                let id = self.reactor.alloc_id();
+                self.reactor.conns.insert(id, conn);
+                bs::resp_ok_u64(id)
+            }
+            EFFECT_READ => {
+                let Some((cid, max)) = bs::decode_read(rest) else {
+                    return bs::resp_err("read: bad request");
+                };
+                let Some(conn) = self.reactor.conns.get_mut(&cid) else {
+                    return bs::resp_err("read: unknown conn");
+                };
+                let mut buf = alloc::vec![0u8; max.min(MAX_READ) as usize];
+                // Race the read against an idle deadline, same as the transport
+                // `ConnFulfiller`: a silent / dribbling peer must not park this
+                // agent thread forever (slow-loris) — `block_on(ex.run(..))` is
+                // this actor's only thread, so a stuck read blocks the whole
+                // agent (incl. its ability to be stopped).
+                let outcome: Option<std::io::Result<usize>> =
+                    futures_lite::future::or(async { Some(conn.read(&mut buf).await) }, async {
+                        async_io::Timer::after(READ_IDLE_TIMEOUT).await;
+                        None
+                    })
+                    .await;
+                match outcome {
+                    // n == 0 → EOF → ok-empty (the handler reads `Some(empty)`).
+                    Some(Ok(n)) => {
+                        buf.truncate(n);
+                        bs::resp_ok_bytes(&buf)
+                    }
+                    Some(Err(e)) => bs::resp_err(&format!("read: {e}")),
+                    None => {
+                        warn!(extension_id = %self.extension_id, cid, "actor-mode read idle timeout");
+                        bs::resp_err("read: idle timeout")
+                    }
+                }
+            }
+            EFFECT_WRITE => {
+                let Some((cid, data)) = bs::decode_write(rest) else {
+                    return bs::resp_err("write: bad request");
+                };
+                let Some(conn) = self.reactor.conns.get_mut(&cid) else {
+                    return bs::resp_err("write: unknown conn");
+                };
+                match conn.write(&data).await {
+                    Ok(n) => bs::resp_ok_u32(n as u32),
+                    Err(e) => bs::resp_err(&format!("write: {e}")),
+                }
+            }
+            EFFECT_CLOSE => {
+                if let Some(cid) = bs::decode_close(rest) {
+                    // Drop closes the fd; idempotent on an unknown id.
+                    self.reactor.conns.remove(&cid);
+                }
+                bs::resp_ok_empty()
+            }
+            _ => bs::resp_err("bytestream: unknown tag"),
+        }
+    }
+}
+
+/// Per-connection effect fulfiller for a transport-mode connection task
+///. Where the actor-mode [`Fulfiller`] services byte ops
+/// against a shared [`ReactorTables`], a `ConnFulfiller` **owns its single
+/// [`Conn`]** — moved in from the host accept loop, never inserted into any
+/// shared table — so the N concurrent connection tasks never contend on a
+/// reactor map across an `await` (the shared `conns` map can't be borrowed by
+/// two parked tasks at once). Its `ReactorTables.conns` stays empty for a
+/// transport instance by construction.
+///
+/// It services [`EFFECT_READ`]/[`EFFECT_WRITE`]/[`EFFECT_CLOSE`] against the
+/// owned conn, validating the handler-supplied `conn_id` matches its own (a
+/// Foreign id → the handler decodes `None`), and
+/// [`EFFECT_ASK`] by routing an outbound `InvokeRequest` through
+/// `invoke_routes` with a per-call **async** reply channel
+/// ([`ReplyChannel::Async`]) — correlated per-call (no shared-inbox sender-id
+/// ambiguity) and awaited on the executor (no blocking-pool thread), so other
+/// connection tasks keep serving. The relayed caller is
+/// [`Caller::Unauthenticated`] (a conn task has no inbound authenticated
+/// caller). The remaining effects are still rejected in v1:
+///   - `EFFECT_LISTEN`/`ACCEPT` — the host owns the accept loop; a connection
+///     task cannot bind or accept.
+///   - `EFFECT_FETCH`/`BLOB_GET` — synchronous/blocking on the executor thread;
+///     not supported from a connection task.
+struct ConnFulfiller {
+    /// The owned connection. `None` after an explicit `close` of the matching
+    /// `cid`; a byte op against a closed conn returns an error (handler sees
+    /// `None`). Dropping the `ConnFulfiller` (on conn-task exit, including an
+    /// executor cancel-drop) closes the fd.
+    conn: Option<Conn>,
+    /// This task's connection id. The host accept loop assigned it and passed
+    /// the same value to `conn_new`, so the handler's `ctx.read(cid)` carries
+    /// it; a mismatch is a handler bug and yields an error.
+    cid: u64,
+    extension_id: ServiceId,
+    /// Outbound-invoke routing table — a conn task's
+    /// `ctx.ask(target, msg)` looks the target up here (scoped→unscoped) and
+    /// sends an `InvokeRequest` with a per-call async reply.
+    invoke_routes: InvokeRoutes,
+}
+
+impl ConnFulfiller {
+    async fn fulfill(&mut self, effect: &[u8]) -> Vec<u8> {
+        use crate::effects::bytestream as bs;
+        use crate::effects::{
+            EFFECT_ACCEPT, EFFECT_ASK, EFFECT_ASK_DISPATCH, EFFECT_CLOSE, EFFECT_LISTEN,
+            EFFECT_READ, EFFECT_WRITE,
+        };
+        let extension_id = self.extension_id;
+        match effect.first().copied() {
+            // Outbound `ctx.ask` from a transport conn task.
+            // Plain ASK → raw reply bytes (failure collapses to empty →
+            // `Value::Unit`); dispatching ASK → status-framed so the
+            // caller (the gateway) can tell a real reply from a failure.
+            Some(EFFECT_ASK) => self.fulfill_ask(&effect[1..]).await,
+            Some(EFFECT_ASK_DISPATCH) => self.fulfill_ask_dispatch(&effect[1..]).await,
+            Some(EFFECT_READ) => {
+                let Some((cid, max)) = bs::decode_read(&effect[1..]) else {
+                    return bs::resp_err("read: bad request");
+                };
+                if cid != self.cid {
+                    return bs::resp_err("read: foreign conn id in a transport connection task");
+                }
+                let Some(conn) = self.conn.as_mut() else {
+                    return bs::resp_err("read: connection already closed");
+                };
+                let mut buf = alloc::vec![0u8; max.min(MAX_READ) as usize];
+                // Race the read against an idle deadline so a silent / dribbling
+                // peer can't park this connection task forever (slow-loris).
+                let outcome: Option<std::io::Result<usize>> =
+                    futures_lite::future::or(async { Some(conn.read(&mut buf).await) }, async {
+                        async_io::Timer::after(READ_IDLE_TIMEOUT).await;
+                        None
+                    })
+                    .await;
+                match outcome {
+                    // n == 0 → EOF → ok-empty (the handler reads `Some(empty)`).
+                    Some(Ok(n)) => {
+                        buf.truncate(n);
+                        bs::resp_ok_bytes(&buf)
+                    }
+                    Some(Err(e)) => bs::resp_err(&format!("read: {e}")),
+                    None => {
+                        warn!(%extension_id, cid = self.cid, "transport read idle timeout");
+                        bs::resp_err("read: idle timeout")
+                    }
+                }
+            }
+            Some(EFFECT_WRITE) => {
+                let Some((cid, data)) = bs::decode_write(&effect[1..]) else {
+                    return bs::resp_err("write: bad request");
+                };
+                if cid != self.cid {
+                    return bs::resp_err("write: foreign conn id in a transport connection task");
+                }
+                let Some(conn) = self.conn.as_mut() else {
+                    return bs::resp_err("write: connection already closed");
+                };
+                match conn.write(&data).await {
+                    Ok(n) => bs::resp_ok_u32(n as u32),
+                    Err(e) => bs::resp_err(&format!("write: {e}")),
+                }
+            }
+            Some(EFFECT_CLOSE) => {
+                // Idempotent: only our own cid closes our conn; a foreign id is
+                // a no-op. Drop closes the fd.
+                if bs::decode_close(&effect[1..]) == Some(self.cid) {
+                    self.conn = None;
+                }
+                bs::resp_ok_empty()
+            }
+            Some(EFFECT_LISTEN | EFFECT_ACCEPT) => {
+                error!(
+                    %extension_id,
+                    "transport conn task attempted listen/accept — the host owns the accept loop"
+                );
+                bs::resp_err(
+                    "listen/accept is not available in a transport connection task \
+                     (the host owns the accept loop)",
+                )
+            }
+            other => {
+                // EFFECT_FETCH / BLOB_GET (and anything else) stay rejected in
+                // v1: they take the synchronous `handle_effect` transport and
+                // would block the single executor thread. (ASK is handled above
+                // via the async invoke route.) Returning empty bytes makes the
+                // handler's fetch/blob decode yield `None`/default, not hang.
+                error!(
+                    %extension_id,
+                    tag = ?other,
+                    "transport conn task attempted an unsupported request/reply effect \
+                     (FETCH/BLOB) — deferred to a later phase"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Fulfil a plain `EFFECT_ASK` from a transport connection task:
+    /// the raw reply bytes the `Ask` future's `decode_reply` expects.
+    /// Any failure (no route / send error / timeout / non-DONE status) degrades
+    /// to empty bytes → `Value::Unit`, which the handler already tolerates —
+    /// callers that must distinguish a failure use `EFFECT_ASK_DISPATCH`.
+    async fn fulfill_ask(&self, rest: &[u8]) -> Vec<u8> {
+        self.invoke_route(rest).await.unwrap_or_default()
+    }
+
+    /// Fulfil an `EFFECT_ASK_DISPATCH`: same routing as
+    /// [`fulfill_ask`], but **status-framed** so the caller (the http-gateway)
+    /// can tell a real reply (`Some`) from a dispatch failure (`None`) —
+    /// `[RESP_OK][reply…]` vs `[RESP_ERR]`, the byte-stream convention. Lets a
+    /// gateway render a handler panic as `502` instead of `200 null`.
+    async fn fulfill_ask_dispatch(&self, rest: &[u8]) -> Vec<u8> {
+        use crate::effects::bytestream as bs;
+        match self.invoke_route(rest).await {
+            Some(reply) => bs::resp_ok_bytes(&reply),
+            None => bs::resp_err(""),
+        }
+    }
+
+    /// Transport conn tasks have no inbound caller — they serve raw external
+    /// (HTTP/TCP) traffic with no authenticated VOS principal — so they relay
+    /// [`Caller::Unauthenticated`] (reaches only `*`/public targets via the M5
+    /// gate), matching the gateway's relay posture. See [`route_invoke`].
+    ///
+    /// NOTE: a transport extension's declared `intra_caps` are therefore NOT a
+    /// confinement boundary — there is no caller authority to bound, so the
+    /// relay is always the `Unauthenticated` floor regardless of `intra_caps`.
+    /// Confinement of what a transport-fronted request can reach is the *target*
+    /// actor's own role gate, not the gateway's caps. (`intra_caps` bound only
+    /// the actor-mode `ctx.ask_dispatch` relay, which carries a real caller.)
+    async fn invoke_route(&self, rest: &[u8]) -> Option<Vec<u8>> {
+        route_invoke(
+            &self.invoke_routes,
+            self.extension_id,
+            crate::actors::Caller::Unauthenticated,
+            None,
+            None,
+            rest,
+        )
+        .await
+    }
+}
+
+/// Route `[target:u32 LE][payload]` through the host invoke substrate with a
+/// per-call **async** reply (`ReplyChannel::Async`), awaited on the executor
+/// (no blocking-pool thread, correlated per-call). `caller` + `space_role` +
+/// `actor_local_role` are the relayed authority the caller already computed —
+/// `Caller::Unauthenticated` (no role) for a transport conn task (no inbound
+/// caller); for an actor-mode extension's `ctx.ask_dispatch`, the *bounded*
+/// real caller (`resolve_relay_caller`), NOT the `Caller::Actor` bypass, so a
+/// role-gated target consults the caller's capped role. Returns the unwrapped reply
+/// bytes on a `STATUS_DONE`/`STATUS_YIELDED` envelope (`Some`, possibly empty
+/// for a `()` return) or `None` on any failure (no route / send error / timeout
+/// / non-DONE status). Shared by [`ConnFulfiller`] (transport) + [`Fulfiller`]
+/// (actor-mode `EFFECT_ASK_DISPATCH`).
+async fn route_invoke(
+    invoke_routes: &InvokeRoutes,
+    extension_id: ServiceId,
+    caller: crate::actors::Caller,
+    space_role: Option<u8>,
+    actor_local_role: Option<u8>,
+    rest: &[u8],
+) -> Option<Vec<u8>> {
+    if rest.len() < 4 {
+        return None;
+    }
+    let target = u32::from_le_bytes(rest[..4].try_into().unwrap());
+    let payload = rest[4..].to_vec();
+
+    // Route lookup with two-way prefix fallback against the local table:
+    //
+    // - **scoped→unscoped** (`target & 0xFFFF`): the registry's `resolve`
+    //   returns a node-prefix-scoped id while special unscoped agents (the
+    //   registry at local_id 0) register themselves bare. Mirrors
+    //   `dispatch_invoke`.
+    // - **unscoped→scoped** (`extension_prefix | local`): the inverse case an
+    //   actor-mode extension hits — the in-`.so` `Context::id()` carries no
+    //   node prefix, so the extension passes `caller_prefix = 0` to the
+    //   registry's `resolve`, which then hands back an *unscoped* id; but
+    //   locally-registered agents live under the host's prefix. Re-scope with
+    //   the calling extension's own prefix (the host knows it even though the
+    //   `.so` doesn't) so a same-space dep resolves. A 0-prefix host collapses
+    //   this to the unscoped form (harmless).
+    let scoped = (extension_id.0 & 0xFFFF_0000) | (target & 0xFFFF);
+    let tx = {
+        let map = invoke_routes.lock().ok()?;
+        match map
+            .get(&target)
+            .or_else(|| map.get(&(target & 0xFFFF)))
+            .or_else(|| map.get(&scoped))
+        {
+            Some(tx) => tx.clone(),
+            None => {
+                warn!(%extension_id, target, "ext ask: no route for target");
+                return None;
+            }
+        }
+    };
+
+    let (reply_tx, reply_rx) = futures_channel::oneshot::channel::<Vec<u8>>();
+    if tx
+        .send(InvokeRequest {
+            caller,
+            space_role,
+            actor_local_role,
+            msg: payload,
+            reply: ReplyChannel::Async(reply_tx),
+            chain: Vec::new(),
+        })
+        .is_err()
+    {
+        return None; // target route dropped between lookup and send
+    }
+
+    // Await the reply on the executor, raced against a timeout — no thread is
+    // blocked, so sibling tasks keep running while we wait.
+    let envelope = futures_lite::future::or(async { reply_rx.await.ok() }, async {
+        async_io::Timer::after(ASK_TIMEOUT).await;
+        None
+    })
+    .await;
+
+    envelope.and_then(|env| unwrap_invoke_envelope(&env))
+}
+
+/// Drive one actor-mode task to completion on the host executor: poll it,
+/// fulfil each effect it parks on, until it is READY / PANIC. The `.so`'s
+/// `task_poll` advances the future (the host never polls a `.so` future
+/// directly — vtable layout is not a stable cross-artifact ABI).
+async fn run_ext_task(
+    instance: &mut crate::extension::ExtensionInstance<'_>,
+    handle: u64,
+    fulfiller: &mut Fulfiller<'_>,
+) -> DispatchOutcome {
+    use crate::extension::TaskOutcome;
+
+    let extension_id = fulfiller.extension_id;
+
+    // Free the task slot on EVERY exit path — including an unwind from a
+    // panicking effect fulfilment — not just the normal READY/PANIC returns.
+    // (The instance's own Drop is the ultimate backstop: it clears the whole
+    // slab before the actor, so no future ever outlives the actor regardless.)
+    struct TaskGuard<'i, 'p> {
+        inst: &'i mut crate::extension::ExtensionInstance<'p>,
+        handle: u64,
+        done: bool,
+    }
+    impl TaskGuard<'_, '_> {
+        fn finish(&mut self) {
+            if !self.done {
+                self.inst.drop_task(self.handle);
+                self.done = true;
+            }
+        }
+    }
+    impl Drop for TaskGuard<'_, '_> {
+        fn drop(&mut self) {
+            if !self.done {
+                self.inst.drop_task(self.handle);
+            }
+        }
+    }
+
+    let mut guard = TaskGuard {
+        inst: instance,
+        handle,
+        done: false,
+    };
+    let mut result: Vec<u8> = Vec::new();
+    let outcome = loop {
+        match guard.inst.poll_task(handle, &result) {
+            TaskOutcome::Ready(reply) => break DispatchOutcome::Ok(reply),
+            TaskOutcome::Pending(effect) => {
+                result = fulfiller.fulfill(&effect).await;
+            }
+            TaskOutcome::Panic => {
+                error!(%extension_id, "extension: task panicked during dispatch");
+                break DispatchOutcome::Err;
+            }
+        }
+    };
+    guard.finish();
+    outcome
+}
+
+/// Drive one transport connection task to completion on the host executor
+///. Mirror of [`run_ext_task`] but: it polls via a `Copy`
+/// [`SharedInstance`] (the N conn tasks run concurrently on the one executor,
+/// all sharing `&actor`), and fulfils byte effects against an **owned** [`Conn`]
+/// held by a per-connection [`ConnFulfiller`] — no shared reactor map, so no
+/// cross-task borrow across an `await`.
+///
+/// A `LiveGuard` decrements the backpressure counter on EVERY exit path:
+/// normal completion, a `.so`-task panic surfaced as [`TaskOutcome::Panic`], or
+/// an executor cancel-drop at shutdown (the future is dropped between awaits and
+/// `Drop` still runs). On a cancel-drop the `.so`'s slab entry for `handle` is
+/// NOT freed here (no `drop_task` call) — the instance's `vos_extension_drop`
+/// (run by `drop_state`, after `drop(ex)`) clears the whole slab as the
+/// backstop. The owned `Conn` drops with the `ConnFulfiller`, closing the fd.
+async fn run_conn_task(
+    shared: crate::extension::SharedInstance<'_>,
+    handle: u64,
+    cid: u64,
+    conn: Conn,
+    live: std::rc::Rc<std::cell::Cell<usize>>,
+    extension_id: ServiceId,
+    invoke_routes: InvokeRoutes,
+) {
+    use crate::extension::TaskOutcome;
+
+    struct LiveGuard(std::rc::Rc<std::cell::Cell<usize>>);
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_sub(1));
+        }
+    }
+    let _live = LiveGuard(live);
+
+    let mut fulfiller = ConnFulfiller {
+        conn: Some(conn),
+        cid,
+        extension_id,
+        invoke_routes,
+    };
+    let mut result: Vec<u8> = Vec::new();
+    loop {
+        match shared.poll_task(handle, &result) {
+            // handle_connection returns `()`; the reply is empty and there is no
+            // caller to send it to (a transport conn has no request/reply
+            // envelope). Free the slab slot and end the task.
+            TaskOutcome::Ready(_reply) => {
+                shared.drop_task(handle);
+                return;
+            }
+            TaskOutcome::Panic => {
+                error!(%extension_id, cid, "transport: connection task panicked");
+                shared.drop_task(handle);
+                return;
+            }
+            TaskOutcome::Pending(effect) => {
+                result = fulfiller.fulfill(&effect).await;
+            }
+        }
+    }
+}
+
+/// Transport-mode extension driver. The host owns the listener
+/// and accept loop, spawning one concurrent connection task per accept; the
+/// extension supplies only `handle_connection(&self, ctx, conn_id)`.
+///
+/// Lifetime / soundness shape:
+/// - The instance `state` is created here and OWNED by this frame; the accept
+///   loop + every conn task hold `Copy` [`SharedInstance`] views that never
+///   free it.
+/// - `block_on(ex.run(accept_loop))` drives the executor; `accept_loop` spawns
+///   detached conn tasks onto the same `ex`.
+/// - On shutdown we `drop(ex)` FIRST (cancelling + dropping every parked conn
+///   task, releasing its `*const actor` + owned `Conn`), THEN `drop_state` —
+///   see the load-bearing comment at the drop site. `async-executor`'s `run()`
+///   returning does not drop detached tasks; only dropping the executor does.
+///
+/// `drop_state` runs from [`StateGuard`] rather than a bare statement so a
+/// panic unwinding out of `block_on(ex.run(..))` still frees the instance: the
+/// guard is created *before* `ex`, so on both the normal path and an unwind it
+/// drops *after* `ex` (locals drop in reverse declaration order), preserving the
+/// load-bearing "executor gone before state freed" ordering with no UAF.
+struct StateGuard<'p> {
+    plugin: &'p crate::extension::ExtensionPlugin,
+    state: *mut (),
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `state` came from `self.plugin.create_state` and is dropped
+        // exactly once (here). The executor — and thus every `SharedInstance`
+        // copy referencing `state` — is already gone by the time this runs (see
+        // the type doc), so this is the sole final owner.
+        unsafe { self.plugin.drop_state(self.state) };
+    }
+}
+
+fn run_transport_extension(
+    id: ServiceId,
+    plugin: crate::extension::ExtensionPlugin,
+    config: ExtensionConfig,
+    shutdown: Arc<AtomicBool>,
+    activity: ActivityClock,
+    invoke_routes: InvokeRoutes,
+) -> AgentResult {
+    use crate::extension::{ExtensionKind, SharedInstance};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // The `&mut self` `new_task` path is structurally unreachable for a
+    // transport instance — this driver only ever calls `conn_new`/`poll_task`/
+    // `drop_task` (all via `SharedInstance`, which exposes no `new_task`).
+    debug_assert_eq!(plugin.kind(), ExtensionKind::Transport);
+
+    let Some(addr) = config.serves_addr.clone() else {
+        let err = "transport extension has no serve address (ExtensionConfig::serves)";
+        error!(%id, "{err}");
+        return AgentResult {
+            id,
+            panics: 1,
+            error: Some(err.into()),
+        };
+    };
+
+    // Bind the listener host-side.
+    let listener = match std::net::TcpListener::bind(&addr)
+        .and_then(async_io::Async::<std::net::TcpListener>::new)
+    {
+        Ok(l) => l,
+        Err(e) => {
+            let err = format!("transport extension failed to bind {addr}: {e}");
+            error!(%id, "{err}");
+            return AgentResult {
+                id,
+                panics: 1,
+                error: Some(err),
+            };
+        }
+    };
+
+    // TLS acceptor when the listener terminates TLS.
+    let tls_acceptor = if config.serves_tls {
+        match (
+            config.tls_cert_pem.as_deref(),
+            config.tls_key_pem.as_deref(),
+        ) {
+            (Some(cert), Some(key)) => match build_tls_acceptor(cert, key, id) {
+                Some(a) => Some(a),
+                None => {
+                    let err = "transport extension serves_tls but the TLS acceptor failed to build";
+                    error!(%id, "{err}");
+                    return AgentResult {
+                        id,
+                        panics: 1,
+                        error: Some(err.into()),
+                    };
+                }
+            },
+            _ => {
+                let err = "transport extension serves_tls but no TLS cert/key configured \
+                     (ExtensionConfig::tls_pem)";
+                error!(%id, "{err}");
+                return AgentResult {
+                    id,
+                    panics: 1,
+                    error: Some(err.into()),
+                };
+            }
+        }
+    } else {
+        None
+    };
+
+    // Clamp at use-site: the `serves_max` builder maps 0 → default, but the
+    // field is public and a caller can set it to 0 directly, which would make
+    // `live.get() >= 0` always true and refuse *every* connection (self-DoS).
+    let max_conns = config.serves_max_conns.max(1);
+
+    // SAFETY: create_state pairs with drop_state (via `StateGuard` below); both
+    // go through the plugin's symbol pair so the allocator matches.
+    let state = unsafe { plugin.create_state(&config.init_args) };
+    if state.is_null() {
+        let err = "transport extension: create_state returned null";
+        error!(%id, "{err}");
+        return AgentResult {
+            id,
+            panics: 1,
+            error: Some(err.into()),
+        };
+    }
+    // Free `state` on every exit path including a panic unwinding out of the
+    // accept loop. Declared before `ex` so it drops after `ex` (reverse-order
+    // drop), upholding the load-bearing teardown ordering. See `StateGuard`.
+    let _state_guard = StateGuard {
+        plugin: &plugin,
+        state,
+    };
+
+    let ex = async_executor::LocalExecutor::new();
+    // SAFETY: `state` is a live instance just produced by `create_state`, used
+    // only on this thread, and outlives every `SharedInstance` copy — the
+    // executor (hence all conn tasks holding copies) is dropped before
+    // `drop_state` below. `SharedInstance` is `!Send`, never leaving this
+    // thread / the `LocalExecutor`.
+    let shared = unsafe { SharedInstance::new(&plugin, state) };
+
+    // Backpressure / live-task count. Single-threaded → an `Rc<Cell>` suffices;
+    // each conn task decrements via a `Drop`-guard on every exit path.
+    let live = Rc::new(Cell::new(0usize));
+
+    info!(
+        %id, %addr, tls = config.serves_tls, max_conns,
+        "transport: listening"
+    );
+
+    async_io::block_on(ex.run(async {
+        let mut next_cid: u64 = 1;
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            // Race accept against a short timer so the loop re-checks `shutdown`
+            // even while idle (`accept().await` otherwise parks forever).
+            let accepted =
+                futures_lite::future::or(async { Some(listener.accept().await) }, async {
+                    async_io::Timer::after(Duration::from_millis(50)).await;
+                    None
+                })
+                .await;
+            let Some(accept_res) = accepted else {
+                continue; // timer tick → re-check shutdown
+            };
+            let stream = match accept_res {
+                Ok((stream, _addr)) => stream,
+                Err(e) => {
+                    warn!(%id, "transport accept: {e}");
+                    continue;
+                }
+            };
+            *activity.lock().unwrap() = Instant::now();
+
+            // Mandatory backpressure: at the cap, refuse (accept-then-close)
+            // rather than spawn unboundedly. Dropping the stream closes the fd.
+            if live.get() >= max_conns {
+                warn!(%id, max_conns, "transport: at connection cap, refusing");
+                drop(stream);
+                continue;
+            }
+
+            // Terminate TLS host-side for a TLS listener; the `.so` reads/writes
+            // plaintext through `Conn`. Inline handshake (consistent with the
+            // actor-mode accept): a slow handshake stalls only new
+            // accepts, not already-spawned conn tasks.
+            let conn = if let Some(acceptor) = &tls_acceptor {
+                match acceptor.accept(stream).await {
+                    Ok(t) => Conn::Tls(Box::new(t)),
+                    Err(e) => {
+                        warn!(%id, "transport tls handshake: {e}");
+                        continue;
+                    }
+                }
+            } else {
+                Conn::Plain(stream)
+            };
+
+            let cid = next_cid;
+            next_cid += 1;
+            // Build the per-connection `handle_connection` task. The same `cid`
+            // is validated by the conn's `ConnFulfiller` for every byte effect;
+            // `id.0` gives the conn `Context` the agent's real (prefix-scoped)
+            // ServiceId so `ctx.resolve` scopes to this node.
+            let handle = shared.conn_new(cid, id.0);
+            if handle == 0 {
+                warn!(%id, "transport: conn_new returned 0 (no handle_connection?)");
+                continue; // conn drops, closing the fd
+            }
+            live.set(live.get() + 1);
+            ex.spawn(run_conn_task(
+                shared,
+                handle,
+                cid,
+                conn,
+                live.clone(),
+                id,
+                invoke_routes.clone(),
+            ))
+            .detach();
+        }
+    }));
+
+    // ── Shutdown ordering (LOAD-BEARING) ──────────────────────────────────
+    // `async-executor`'s `run()` returning does NOT drop detached tasks — they
+    // are dropped only when the `LocalExecutor` itself is dropped (verified
+    // async-executor 1.x). So we MUST `drop(ex)` here, BEFORE `drop_state`, to
+    // cancel + drop every still-parked conn task — releasing each task's
+    // `SharedInstance` copy (its `*const actor`) and its owned `Conn`. Only then
+    // is `state` unreferenced and safe to free. Dropping in the other order
+    // would leave parked conn tasks holding a `*const actor` into freed memory:
+    // a use-after-free on the next poll.
+    drop(ex);
+    // `state` is freed by `_state_guard` when this frame ends (here on the
+    // normal path, or during an unwind) — after `drop(ex)` either way, so the
+    // executor and all `SharedInstance` copies are gone before the free.
+
+    *activity.lock().unwrap() = Instant::now();
+
+    AgentResult {
+        id,
+        panics: 0,
+        error: None,
+    }
+}
+
+/// Encode the host's synthetic periodic-tick message — a bare `tick` dynamic
+/// `Msg` with no args, framed exactly like an inbound invoke (a `TAG_DYNAMIC`
+/// byte followed by the encoded `Msg`) so the actor's macro-generated
+/// `deliver` routes it to its `#[msg] async fn tick(&mut self, ctx)` handler.
+fn encode_tick_payload() -> Vec<u8> {
+    use crate::actors::codec::Encode;
+    use crate::value::{Msg, TAG_DYNAMIC};
+    let msg = Msg::new("tick");
+    let encoded = msg.encode();
+    let mut payload = Vec::with_capacity(1 + encoded.len());
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&encoded);
+    payload
+}
+
+/// Dispatch a message to an actor-mode extension instance and drive it to
+/// completion on the host executor `ex`. Returns the reply bytes on success or
+/// `DispatchOutcome::Err` on a poisoned future (panic) or an unknown method.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_and_poll(
+    ex: &async_executor::LocalExecutor<'_>,
     instance: &mut crate::extension::ExtensionInstance<'_>,
     msg: &[u8],
     inbox: &mpsc::Receiver<Envelope>,
@@ -3947,38 +5162,37 @@ fn dispatch_and_poll(
     extension_id: ServiceId,
     deferred: &mut std::collections::VecDeque<Envelope>,
     blob_fetch: &BlobFetchCtx<'_>,
+    reactor: &mut ReactorTables,
+    invoke_routes: &InvokeRoutes,
+    intra_caps: &[crate::actors::IntraCap],
+    agent_names: &AgentNames,
 ) -> DispatchOutcome {
-    use crate::extension::{POLL_PENDING, POLL_READY};
-
-    instance.dispatch_start(msg);
-
-    loop {
-        let result = instance.poll_once();
-        match result.status {
-            POLL_READY => {
-                // SAFETY: `result.ptr` was just returned by the
-                // extension's poll-once shim with the matching len;
-                // it's a Vec we own until `free_reply` releases it.
-                let reply = if !result.ptr.is_null() && result.len > 0 {
-                    unsafe { std::slice::from_raw_parts(result.ptr, result.len) }.to_vec()
-                } else {
-                    Vec::new()
-                };
-                instance.free_reply(&result);
-                return DispatchOutcome::Ok(reply);
-            }
-            POLL_PENDING => {
-                let effect = instance.pending_effect();
-                let result =
-                    handle_effect(&effect, inbox, outbox, extension_id, deferred, blob_fetch);
-                instance.provide_result(&result);
-            }
-            err => {
-                error!(%extension_id, status = err, "extension: poll returned error");
-                return DispatchOutcome::Err;
-            }
-        }
+    // Actor-mode stays N=1: build exactly one root task and run it to completion
+    // before the next message. Running a second root task while this one holds
+    // `&mut actor` would alias — concurrency is reserved for the `&self` service
+    // model (later phases).
+    let handle = instance.new_task(msg);
+    if handle == 0 {
+        // No handler matched (unknown / undecodable method) — the old
+        // POLL_ERR_NO_FUTURE / "went idle" path.
+        error!(%extension_id, "extension: no handler matched message");
+        return DispatchOutcome::Err;
     }
+
+    let mut fulfiller = Fulfiller {
+        inbox,
+        outbox,
+        extension_id,
+        deferred,
+        blob_fetch,
+        reactor,
+        invoke_routes,
+        intra_caps,
+        agent_names,
+    };
+    // block_on(ex.run(..)) drives the root task (and any future spawned tasks)
+    // on this thread — the one that owns the instance. Actor-mode spawns none.
+    async_io::block_on(ex.run(run_ext_task(instance, handle, &mut fulfiller)))
 }
 
 /// Fulfill a host I/O effect. Dispatches by the effect tag byte.
@@ -4769,7 +5983,7 @@ mod tests {
     #[test]
     fn send_reply_capped_passes_normal_payload() {
         let (tx, rx) = mpsc::channel();
-        send_reply_capped(tx, vec![0u8; 100], ServiceId(1));
+        send_reply_capped(ReplyChannel::Sync(tx), vec![0u8; 100], ServiceId(1));
         let received = rx.recv().expect("received");
         assert_eq!(received.len(), 100);
     }
@@ -4778,7 +5992,11 @@ mod tests {
     fn send_reply_capped_drops_oversized_payload() {
         let (tx, rx) = mpsc::channel();
         // One byte over the cap.
-        send_reply_capped(tx, vec![0u8; MAX_PRODUCER_REPLY + 1], ServiceId(1));
+        send_reply_capped(
+            ReplyChannel::Sync(tx),
+            vec![0u8; MAX_PRODUCER_REPLY + 1],
+            ServiceId(1),
+        );
         // Sender dropped without sending → recv yields Err(Disconnected).
         // External_invoke maps that to None, surfacing as
         // InvokeError::NotFound at the caller's PVM.
@@ -5109,6 +6327,750 @@ mod tests {
         }
     }
 
+    /// Drive raw TCP through the host byte-stream reactor. The
+    /// byte-echo extension's `serve` handler does
+    /// `listen → accept → read → write → close` for one connection over the
+    /// `EFFECT_LISTEN/ACCEPT/READ/WRITE/CLOSE` effects, which the host fulfils
+    /// on `smol::Async` driven by `block_on(ex.run(..))`. A real TCP client
+    /// connects and sees its bytes echoed — end-to-end proof the reactor +
+    /// effect plumbing work. (Concurrent interleaving across connections is
+    /// handled by the host accept loop + a spawned task per accept.)
+    #[test]
+    fn byte_echo_round_trips_through_the_host_reactor() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let so = workspace
+            .join("target")
+            .join(profile)
+            .join("libbyte_echo_extension.so");
+        if !so.exists() {
+            eprintln!("skipping byte_echo_round_trips: build byte-echo-extension first");
+            return;
+        }
+
+        // Pick a free port by binding :0, reading the assignment, then dropping
+        // it so the extension can re-bind. (Tiny TOCTOU window; fine for a test.)
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let mut node = VosNode::new();
+        // register_extension spawns the extension thread immediately, so it's
+        // already looping on its inbox while this test connects below.
+        let id = node.register_extension(ExtensionConfig::new(so));
+
+        // Send `serve` via the envelope route (non-blocking); the handler will
+        // bind `addr` and park on accept.
+        use crate::actors::codec::Encode;
+        use crate::actors::value::Msg;
+        let msg = Msg::new("serve").with("addr", addr.clone());
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(crate::actors::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        node.routes
+            .get(&id.0)
+            .unwrap()
+            .send(Envelope {
+                from: ServiceId(0),
+                to: id,
+                payload,
+            })
+            .unwrap();
+
+        // Connect, retrying until the handler's listener is up (a couple of
+        // 50ms inbox poll ticks).
+        let mut stream = None;
+        for _ in 0..100 {
+            if let Ok(s) = TcpStream::connect(&addr) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut stream = stream.expect("connect to byte-echo listener");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // The handler reads first, then echoes — buffered either way.
+        stream.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping", "byte-echo must echo the bytes back");
+
+        drop(stream);
+        let results = node.collect();
+        for r in &results {
+            assert_eq!(r.panics, 0, "byte-echo extension {} panicked", r.id);
+        }
+    }
+
+    /// Host-terminated TLS over the byte-stream reactor. The host is
+    /// configured with a self-signed cert; the byte-echo extension's
+    /// `serve_tls` handler binds a `listen_tls` listener; a real rustls client
+    /// completes a TLS handshake against the host, and the extension echoes the
+    /// PLAINTEXT bytes back (it never sees the TLS layer). Proves the host
+    /// wraps `Async<TcpStream>` in rustls transparently to the `.so`.
+    #[test]
+    fn byte_echo_terminates_tls_host_side() {
+        use futures_rustls::rustls;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let so = workspace
+            .join("target")
+            .join(profile)
+            .join("libbyte_echo_extension.so");
+        if !so.exists() {
+            eprintln!("skipping byte_echo_terminates_tls: build byte-echo-extension first");
+            return;
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Self-signed `localhost` cert for the host to terminate TLS with.
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen self-signed");
+        let cert_pem = ck.cert.pem();
+        let key_pem = ck.key_pair.serialize_pem();
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let mut node = VosNode::new();
+        let id = node.register_extension(
+            ExtensionConfig::new(so).tls_pem(cert_pem.into_bytes(), key_pem.into_bytes()),
+        );
+
+        // Kick off the TLS listener via `serve_tls`.
+        use crate::actors::codec::Encode;
+        use crate::actors::value::Msg;
+        let msg = Msg::new("serve_tls").with("addr", addr.clone());
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(crate::actors::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        node.routes
+            .get(&id.0)
+            .unwrap()
+            .send(Envelope {
+                from: ServiceId(0),
+                to: id,
+                payload,
+            })
+            .unwrap();
+
+        // Test-only verifier that accepts the host's self-signed cert (we're
+        // exercising the SERVER side, not client trust).
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end: &rustls::pki_types::CertificateDer<'_>,
+                _inter: &[rustls::pki_types::CertificateDer<'_>],
+                _name: &rustls::pki_types::ServerName<'_>,
+                _ocsp: &[u8],
+                _now: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _m: &[u8],
+                _c: &rustls::pki_types::CertificateDer<'_>,
+                _d: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _m: &[u8],
+                _c: &rustls::pki_types::CertificateDer<'_>,
+                _d: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        // Retry the TCP connect until the handler's listener is up.
+        let mut tcp = None;
+        for _ in 0..100 {
+            if let Ok(s) = TcpStream::connect(&addr) {
+                tcp = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut tcp = tcp.expect("connect to byte-echo TLS listener");
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+        let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+        tls.write_all(b"ping").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping", "byte-echo must echo plaintext back over TLS");
+
+        drop(tls);
+        let results = node.collect();
+        for r in &results {
+            assert_eq!(r.panics, 0, "byte-echo extension {} panicked", r.id);
+        }
+    }
+
+    /// The transport-mode concurrency guard. A TRANSPORT-mode
+    /// extension (`tcp-echo`'s `handle_connection(&self, …)`) is driven by the
+    /// HOST accept loop, which binds the listener (from `ExtensionConfig::serves`)
+    /// and spawns one `&self` connection task per accept on a single cooperative
+    /// executor thread. We open N concurrent TCP clients and, each round, write a
+    /// distinct payload on EVERY client BEFORE reading any echo back. If the host
+    /// served connections one-at-a-time-to-EOF (actor-mode N=1), `clients[1..]`
+    /// would never be accepted while `clients[0]` stayed open, so these reads
+    /// would hang. They don't: all N connection tasks are live and interleave —
+    /// client A's later-round request is served while client B is mid-stream
+    /// (open, parked between rounds). Per-connection ordering is also asserted
+    /// (each client reads back exactly what it wrote, in order).
+    #[test]
+    fn tcp_echo_interleaves_concurrent_connections() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let so = workspace
+            .join("target")
+            .join(profile)
+            .join("libtcp_echo_extension.so");
+        if !so.exists() {
+            eprintln!("skipping tcp_echo_interleaves: build tcp-echo-extension first");
+            return;
+        }
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let mut node = VosNode::new();
+        // Transport-mode: the HOST owns the listener (from `serves`) + accept
+        // loop — no `serve` message is sent (a transport extension has no
+        // inbound `#[msg]` handlers).
+        let _id = node.register_extension(ExtensionConfig::new(so).serves(addr.clone(), false));
+
+        const N: usize = 6;
+        const ROUNDS: usize = 4;
+
+        // Connect N clients, retrying until the host's listener is up.
+        let mut clients: Vec<TcpStream> = Vec::with_capacity(N);
+        for _ in 0..N {
+            let mut s = None;
+            for _ in 0..100 {
+                if let Ok(c) = TcpStream::connect(&addr) {
+                    s = Some(c);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let s = s.expect("connect to tcp-echo transport listener");
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            clients.push(s);
+        }
+
+        for round in 0..ROUNDS {
+            // Write a per-(client, round) payload on EVERY client first — now
+            // every connection task has pending data and is parked mid-stream.
+            let payloads: Vec<Vec<u8>> = (0..N)
+                .map(|i| format!("c{i}-r{round}-ping").into_bytes())
+                .collect();
+            for (i, c) in clients.iter_mut().enumerate() {
+                c.write_all(&payloads[i]).unwrap();
+                c.flush().unwrap();
+            }
+            // THEN read every echo. All N connection tasks must be live and
+            // parked-then-ready concurrently for this to complete.
+            for (i, c) in clients.iter_mut().enumerate() {
+                let mut buf = alloc::vec![0u8; payloads[i].len()];
+                c.read_exact(&mut buf).unwrap();
+                assert_eq!(
+                    buf, payloads[i],
+                    "client {i} round {round}: echo mismatch (interleave/ordering broken)"
+                );
+            }
+        }
+
+        // Close all clients → each conn task sees EOF, echoes nothing, closes.
+        drop(clients);
+        let results = node.collect();
+        for r in &results {
+            assert_eq!(
+                r.panics, 0,
+                "tcp-echo transport extension {} panicked",
+                r.id
+            );
+        }
+    }
+
+    /// The transport accept loop enforces a MANDATORY
+    /// backpressure cap: at `serves_max` live connection tasks it refuses
+    /// further accepts (accept-then-close) rather than spawning unboundedly.
+    /// We cap at 2, hold 2 connections live (proven by a round-trip, so their
+    /// tasks are spawned and `live == 2 == cap`), then a 3rd connection is
+    /// accepted-then-closed — the client sees EOF (0 bytes) with no echo.
+    #[test]
+    fn tcp_echo_backpressure_refuses_at_cap() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let so = workspace
+            .join("target")
+            .join(profile)
+            .join("libtcp_echo_extension.so");
+        if !so.exists() {
+            eprintln!("skipping tcp_echo_backpressure: build tcp-echo-extension first");
+            return;
+        }
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let mut node = VosNode::new();
+        let _id = node.register_extension(
+            ExtensionConfig::new(so)
+                .serves(addr.clone(), false)
+                .serves_max(2),
+        );
+
+        // Establish 2 live connections; a round-trip on each proves its task is
+        // spawned (so `live` reached 2 == cap) before we probe the 3rd.
+        let mut held: Vec<TcpStream> = Vec::new();
+        for _ in 0..2 {
+            let mut s = None;
+            for _ in 0..100 {
+                if let Ok(c) = TcpStream::connect(&addr) {
+                    s = Some(c);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let mut c = s.expect("connect held client");
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.write_all(b"hold").unwrap();
+            c.flush().unwrap();
+            let mut buf = [0u8; 4];
+            c.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"hold", "held connection must echo");
+            held.push(c);
+        }
+
+        // 3rd connection past the cap: accept-then-close. The kernel may complete
+        // the handshake, but the host drops the stream immediately, so a read
+        // sees EOF (0 bytes) / a reset — never an echo.
+        let mut third = TcpStream::connect(&addr).expect("connect 3rd client");
+        third
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = third.write_all(b"nope"); // peer may RST; ignore.
+        let mut buf = [0u8; 8];
+        let n = third.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "a connection past the backpressure cap must be refused (EOF), not echoed"
+        );
+
+        drop(held);
+        drop(third);
+        let results = node.collect();
+        for r in &results {
+            assert_eq!(
+                r.panics, 0,
+                "tcp-echo transport extension {} panicked",
+                r.id
+            );
+        }
+    }
+
+    /// A stub invoke target on its own thread: replies to each `InvokeRequest`
+    /// by echoing its `msg` bytes inside a `STATUS_DONE` envelope (what the real
+    /// invoke route produces). Returns the routes table + the join handle.
+    /// Dropping every clone of the returned routes disconnects it so the thread
+    /// exits. `reply_order` lets a test force REVERSE reply ordering to stress
+    /// per-call correlation.
+    #[cfg(test)]
+    fn spawn_stub_invoke_target(
+        target: u32,
+        buffer_n: usize,
+    ) -> (InvokeRoutes, std::thread::JoinHandle<()>) {
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(target, tx);
+        let handle = std::thread::spawn(move || {
+            if buffer_n > 1 {
+                // Collect `buffer_n` requests, then reply in REVERSE order — a
+                // shared-inbox sender-id match would mis-route here; the per-call
+                // oneshot must still deliver each reply to its own caller.
+                let mut reqs: Vec<InvokeRequest> = Vec::new();
+                for _ in 0..buffer_n {
+                    match rx.recv() {
+                        Ok(r) => reqs.push(r),
+                        Err(_) => return,
+                    }
+                }
+                for req in reqs.into_iter().rev() {
+                    let env =
+                        encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &req.msg);
+                    req.reply.send(env);
+                }
+            }
+            // Then serve any further requests one-at-a-time until disconnect.
+            while let Ok(req) = rx.recv() {
+                let env = encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &req.msg);
+                req.reply.send(env);
+            }
+        });
+        (routes, handle)
+    }
+
+    fn ask_effect(target: u32, payload: &[u8]) -> Vec<u8> {
+        let mut effect = alloc::vec![crate::effects::EFFECT_ASK];
+        effect.extend_from_slice(&target.to_le_bytes());
+        effect.extend_from_slice(payload);
+        effect
+    }
+
+    fn dispatch_effect(target: u32, payload: &[u8]) -> Vec<u8> {
+        let mut effect = alloc::vec![crate::effects::EFFECT_ASK_DISPATCH];
+        effect.extend_from_slice(&target.to_le_bytes());
+        effect.extend_from_slice(payload);
+        effect
+    }
+
+    /// A stub invoke target that replies to each request with a fixed status
+    /// envelope (reply = the request's `msg` bytes). Lets a test drive the
+    /// success (`STATUS_DONE`) vs failure (`STATUS_PANICKED`) framing of the
+    /// status-framed `EFFECT_ASK_DISPATCH` path.
+    #[cfg(test)]
+    fn spawn_stub_invoke_target_status(
+        target: u32,
+        status: u8,
+    ) -> (InvokeRoutes, std::thread::JoinHandle<()>) {
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(target, tx);
+        let handle = std::thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                req.reply
+                    .send(encode_invoke_envelope(status, &[], &req.msg));
+            }
+        });
+        (routes, handle)
+    }
+
+    /// `EFFECT_ASK_DISPATCH` is **status-framed** so the
+    /// gateway can tell a real reply from a dispatch failure — `[RESP_OK]
+    /// [reply…]` on a `STATUS_DONE` envelope (this is what `ctx.ask_dispatch`
+    /// decodes to `Some(reply)` → 200), vs `[RESP_ERR]` on any failure
+    /// (`None` → 502). Locks in the panic→502 distinction the plain
+    /// `EFFECT_ASK` (collapse-to-empty) path can't make.
+    #[test]
+    fn conn_task_dispatch_ask_frames_done_reply_with_resp_ok() {
+        let target = 51u32;
+        let (routes, stub) =
+            spawn_stub_invoke_target_status(target, crate::actors::run::STATUS_DONE);
+        let reply = async_io::block_on(async {
+            let mut f = ConnFulfiller {
+                conn: None,
+                cid: 0,
+                extension_id: ServiceId(7),
+                invoke_routes: routes.clone(),
+            };
+            f.fulfill(&dispatch_effect(target, b"payload-x")).await
+        });
+        assert_eq!(reply.first(), Some(&crate::effects::RESP_OK));
+        assert_eq!(&reply[1..], b"payload-x");
+        drop(routes);
+        stub.join().unwrap();
+    }
+
+    #[test]
+    fn conn_task_dispatch_ask_frames_panic_as_resp_err() {
+        let target = 52u32;
+        let (routes, stub) =
+            spawn_stub_invoke_target_status(target, crate::actors::run::STATUS_PANICKED);
+        let reply = async_io::block_on(async {
+            let mut f = ConnFulfiller {
+                conn: None,
+                cid: 0,
+                extension_id: ServiceId(7),
+                invoke_routes: routes.clone(),
+            };
+            f.fulfill(&dispatch_effect(target, b"x")).await
+        });
+        assert_eq!(
+            reply,
+            alloc::vec![crate::effects::RESP_ERR],
+            "a panic envelope must frame as RESP_ERR so the gateway renders 502, not 200 null"
+        );
+        drop(routes);
+        stub.join().unwrap();
+    }
+
+    #[test]
+    fn conn_task_dispatch_ask_unknown_target_is_resp_err() {
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let reply = async_io::block_on(async {
+            let mut f = ConnFulfiller {
+                conn: None,
+                cid: 0,
+                extension_id: ServiceId(7),
+                invoke_routes: routes,
+            };
+            f.fulfill(&dispatch_effect(999, b"x")).await
+        });
+        assert_eq!(
+            reply,
+            alloc::vec![crate::effects::RESP_ERR],
+            "no route must frame as RESP_ERR (→ gateway 502), not RESP_OK-empty"
+        );
+    }
+
+    /// A transport conn task's `ctx.ask` (EFFECT_ASK)
+    /// routes through the host invoke substrate with a per-call ASYNC (oneshot)
+    /// reply, awaited on the executor, then unwrapped from the invoke envelope to
+    /// the raw reply bytes the `Ask` future expects.
+    #[test]
+    fn conn_task_ask_routes_through_invoke_and_unwraps_reply() {
+        let target: u32 = 42;
+        let (routes, stub) = spawn_stub_invoke_target(target, 0);
+
+        let payload = b"hello-ask".to_vec();
+        let reply = async_io::block_on(async {
+            let mut f = ConnFulfiller {
+                conn: None,
+                cid: 0,
+                extension_id: ServiceId(7),
+                invoke_routes: routes.clone(),
+            };
+            f.fulfill(&ask_effect(target, &payload)).await
+        });
+        assert_eq!(
+            reply, payload,
+            "conn-task ask must return the unwrapped reply bytes"
+        );
+
+        drop(routes);
+        stub.join().unwrap();
+    }
+
+    /// Two transport conn tasks ask CONCURRENTLY on one
+    /// executor; the stub replies in REVERSE order. Each task must still receive
+    /// ITS OWN reply (per-call oneshot correlation) and neither blocks the other.
+    #[test]
+    fn conn_task_asks_correlate_under_concurrency() {
+        let target: u32 = 99;
+        let (routes, stub) = spawn_stub_invoke_target(target, 2);
+
+        let ex = async_executor::LocalExecutor::new();
+        let mk = |payload: Vec<u8>| {
+            let routes = routes.clone();
+            async move {
+                let mut f = ConnFulfiller {
+                    conn: None,
+                    cid: 0,
+                    extension_id: ServiceId(7),
+                    invoke_routes: routes,
+                };
+                f.fulfill(&ask_effect(target, &payload)).await
+            }
+        };
+        let (a, b) = async_io::block_on(ex.run(async {
+            let ta = ex.spawn(mk(b"AAAA".to_vec()));
+            let tb = ex.spawn(mk(b"BBBB".to_vec()));
+            futures_lite::future::zip(ta, tb).await
+        }));
+        assert_eq!(a, b"AAAA", "task A must get its OWN reply (correlation)");
+        assert_eq!(b, b"BBBB", "task B must get its OWN reply (correlation)");
+
+        drop(routes);
+        stub.join().unwrap();
+    }
+
+    /// An ask to an unknown / unregistered target degrades
+    /// to an empty reply (which the handler decodes as `Value::Unit`), never
+    /// hangs or panics.
+    #[test]
+    fn conn_task_ask_unknown_target_returns_empty() {
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let reply = async_io::block_on(async {
+            let mut f = ConnFulfiller {
+                conn: None,
+                cid: 0,
+                extension_id: ServiceId(7),
+                invoke_routes: routes,
+            };
+            f.fulfill(&ask_effect(12345, b"x")).await
+        });
+        assert!(
+            reply.is_empty(),
+            "ask to an unknown target must return empty, got {reply:?}"
+        );
+    }
+
+    /// `stop_agent(id)` stops ONE transport agent — its
+    /// accept loop exits and its listener closes — WITHOUT tearing down the node:
+    /// a sibling transport agent keeps serving. The generic per-agent lifecycle
+    /// primitive behind `vosx <agent> stop`.
+    #[test]
+    fn stop_agent_stops_one_transport_agent_not_the_node() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let so = workspace
+            .join("target")
+            .join(profile)
+            .join("libtcp_echo_extension.so");
+        if !so.exists() {
+            eprintln!("skipping stop_agent: build tcp-echo-extension first");
+            return;
+        }
+
+        let free_port = || {
+            TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let addr_a = format!("127.0.0.1:{}", free_port());
+        let addr_b = format!("127.0.0.1:{}", free_port());
+
+        let roundtrip = |addr: &str, msg: &[u8]| -> bool {
+            let Ok(mut s) = TcpStream::connect(addr) else {
+                return false;
+            };
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            if s.write_all(msg).is_err() {
+                return false;
+            }
+            let mut buf = alloc::vec![0u8; msg.len()];
+            s.read_exact(&mut buf).is_ok() && buf == msg
+        };
+        let connect_until = |addr: &str, want_serving: bool| -> bool {
+            for _ in 0..150 {
+                if roundtrip(addr, b"ping") == want_serving {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+
+        let mut node = VosNode::new();
+        let id_a =
+            node.register_extension(ExtensionConfig::new(so.clone()).serves(addr_a.clone(), false));
+        let _id_b = node.register_extension(ExtensionConfig::new(so).serves(addr_b.clone(), false));
+
+        // Both serving.
+        assert!(connect_until(&addr_a, true), "agent A must come up");
+        assert!(connect_until(&addr_b, true), "agent B must come up");
+
+        // Stop ONLY A.
+        assert!(node.stop_agent(id_a), "stop_agent must find A");
+
+        // A stops serving (listener closed → round-trip fails); B keeps serving.
+        assert!(
+            connect_until(&addr_a, false),
+            "stopped agent A must stop serving"
+        );
+        assert!(
+            roundtrip(&addr_b, b"still-here"),
+            "sibling agent B must keep serving after A is stopped (per-agent, not node-wide)"
+        );
+
+        let results = node.collect();
+        for r in &results {
+            assert_eq!(r.panics, 0, "transport extension {} panicked", r.id);
+        }
+    }
+
     #[test]
     fn display_format() {
         assert_eq!(format!("{}", ServiceId(3)), "svc:3");
@@ -5116,13 +7078,16 @@ mod tests {
         assert_eq!(format!("{}", ServiceId::REGISTRY), "svc:0");
     }
 
-    /// Phase 3 — service-mode extension end-to-end. Loads echo
-    /// (kind=Actor) at id 1, then heartbeat (kind=Service) which
-    /// pings echo every 100ms. After 500ms, asserts that echo's
-    /// reply count grew (heartbeat actually originated calls), then
-    /// signals shutdown and confirms heartbeat exits cleanly.
+    /// Actor-mode periodic `tick()` end-to-end. Loads echo (kind=Actor)
+    /// at id 1, then heartbeat (now also kind=Actor) configured with a 100ms
+    /// `tick_ms`. The host's tick timer dispatches heartbeat's `tick`, which
+    /// pings echo once per tick via `ctx.ask_dispatch`. After letting it tick
+    /// for ~550ms, reads echo's `count` through an `InvokeHandle` and asserts
+    /// the host actually drove ≥2 ticks (real asks landed) — proving actor-mode
+    /// subsumes the periodic-work pattern. Then signals shutdown and confirms
+    /// every extension exits cleanly (no panic).
     #[test]
-    fn service_extension_originates_asks_via_ctx() {
+    fn tick_extension_originates_asks() {
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -5143,7 +7108,7 @@ mod tests {
 
         if !echo_path.exists() || !heartbeat_path.exists() {
             eprintln!(
-                "skipping service_extension_originates_asks_via_ctx: \
+                "skipping tick_extension_originates_asks: \
                  build echo-extension and heartbeat-extension first"
             );
             return;
@@ -5158,24 +7123,55 @@ mod tests {
             "echo should land at id 1 (heartbeat default target)"
         );
 
-        let _heartbeat_id = node.register_extension(ExtensionConfig::new(heartbeat_path));
+        // The whole point of the phase: the host timer drives the ping, not a
+        // self-spun `run()` loop. 100ms cadence → ~5 ticks in the window below.
+        let _heartbeat_id =
+            node.register_extension(ExtensionConfig::new(heartbeat_path).with_tick_ms(100));
 
-        // Let the heartbeat tick for ~500ms — at PING_EVERY=100ms
-        // that's ~5 round trips. Use run_until_idle with a
-        // generous threshold; the heartbeat keeps the node busy so
-        // it won't go idle until shutdown.
-        std::thread::spawn({
-            let shutdown = node.shutdown.clone();
+        // Reader thread: let several ticks elapse, read echo's ping count
+        // through a thread-safe invoke handle (the node itself is busy in
+        // `run_forever` on this thread), stash it, then wind the node down.
+        let handle = node.invoke_handle();
+        let shutdown = node.shutdown_handle();
+        let pings = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let reader = std::thread::spawn({
+            let pings = pings.clone();
             move || {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(550));
+                use crate::Decode;
+                use crate::actors::codec::Encode;
+                use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+                let msg = Msg::new("count");
+                let mut payload = vec![TAG_DYNAMIC];
+                payload.extend_from_slice(&msg.encode());
+                if let Some(reply) = handle.invoke_with_timeout(
+                    ServiceId(1),
+                    payload,
+                    std::time::Duration::from_secs(2),
+                ) {
+                    let n = match <Value as Decode>::try_decode(&reply) {
+                        Some(Value::U32(n)) => n,
+                        Some(Value::U64(n)) => n as u32,
+                        _ => 0,
+                    };
+                    pings.store(n, std::sync::atomic::Ordering::Relaxed);
+                }
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         });
+
         node.run_forever();
+        reader.join().expect("reader thread");
         let results = node.collect();
         for r in &results {
             assert_eq!(r.panics, 0, "extension {} panicked: {:?}", r.id, r.error);
         }
+        let pings = pings.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            pings >= 2,
+            "host tick timer should have driven ≥2 heartbeat→echo pings in ~550ms @100ms; \
+             echo.count = {pings}"
+        );
     }
 
     // ── R1: host-side local_id → name reverse map ──────────────────
@@ -5310,7 +7306,7 @@ mod tests {
                     _ => AUTH_ROLE_NONE, // peer_role and anything else
                 };
                 let reply = encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(role).encode());
-                let _ = req.reply_tx.send(reply);
+                let _ = req.reply.send(reply);
             }
         });
 
@@ -5323,7 +7319,7 @@ mod tests {
             if let Ok(req) = tgt_rx.recv() {
                 *delivered_w.lock().unwrap() = Some(req.actor_local_role);
                 let _ = req
-                    .reply_tx
+                    .reply
                     .send(encode_invoke_envelope(STATUS_DONE, &[], &[]));
             }
         });
@@ -5337,6 +7333,8 @@ mod tests {
         let service = NodeService {
             invoke_routes: Arc::new(Mutex::new(routes)),
             agent_names: Arc::new(std::sync::RwLock::new(names)),
+            agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
+            agent_info: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "storage")]
             replicas: Arc::new(Mutex::new(HashMap::new())),
             manifest: Arc::new(OnceLock::new()),
@@ -5368,6 +7366,162 @@ mod tests {
         sink.join().unwrap();
     }
 
+    /// A stub registry on route 0 that answers the `peer_role` probe with a
+    /// fixed role byte — so the lifecycle interceptor's `lookup_caller_role`
+    /// gate sees a known grant. Returns (routes, join handle).
+    #[cfg(feature = "network")]
+    fn spawn_stub_peer_role_registry(role: u8) -> (InvokeRoutes, thread::JoinHandle<()>) {
+        use crate::actors::codec::Encode;
+        use crate::value::Value;
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let handle = thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                let reply = encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE,
+                    &[],
+                    &Value::U8(role).encode(),
+                );
+                let _ = req.reply.send(reply);
+            }
+        });
+        (routes, handle)
+    }
+
+    #[cfg(feature = "network")]
+    fn lifecycle_service(
+        routes: InvokeRoutes,
+        shutdown: AgentShutdown,
+        info: AgentInfos,
+    ) -> NodeService {
+        NodeService {
+            invoke_routes: routes,
+            agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            agent_shutdown: shutdown,
+            agent_info: info,
+            #[cfg(feature = "storage")]
+            replicas: Arc::new(Mutex::new(HashMap::new())),
+            manifest: Arc::new(OnceLock::new()),
+            proof_blobs: Arc::new(RwLock::new(HashMap::new())),
+            proof_blobs_dir: None,
+        }
+    }
+
+    /// The node-level `__stop` / `__describe`
+    /// interceptor answers those reserved wire methods host-side — for an
+    /// agent with **no invoke route** (a transport extension like the
+    /// gateway) — when the caller is authorized (ADMIN for stop, member for
+    /// describe). `__describe` returns the JSON snapshot; `__stop` flips the
+    /// agent's shutdown flag and replies Unit.
+    #[cfg(feature = "network")]
+    #[test]
+    fn lifecycle_interceptor_admin_stops_and_describes() {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::network::NetworkService;
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        let target = ServiceId::new(0x00ab, 0x0123);
+        let flag = Arc::new(AtomicBool::new(false));
+        let shutdown: AgentShutdown =
+            Arc::new(Mutex::new(HashMap::from([(target.0, flag.clone())])));
+        let info: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            target.0,
+            AgentInfo {
+                name: Some("gateway".into()),
+                kind: crate::extension::ExtensionKind::Transport as u8,
+                serves_addr: Some("127.0.0.1:8080".into()),
+            },
+        )])));
+
+        // Registry grants this peer ADMIN. NOTE: the target itself has NO
+        // route — the interceptor must answer before the route lookup.
+        let (routes, reg) = spawn_stub_peer_role_registry(AUTH_ROLE_ADMIN);
+        let service = lifecycle_service(routes, shutdown, info);
+        let peer = libp2p::PeerId::random();
+
+        // __describe → rkyv Value::Str(json) with the live running flag.
+        let mut payload = vec![TAG_DYNAMIC];
+        payload.extend_from_slice(&Msg::new("__describe").encode());
+        let reply = service.dispatch_invoke(Some(peer), 0, target.0, vec![], payload);
+        let json = match <Value as Decode>::decode(&reply) {
+            Value::Str(s) => s,
+            other => panic!("__describe should reply Value::Str, got {other:?}"),
+        };
+        assert!(
+            json.contains("\"name\":\"gateway\"")
+                && json.contains("\"kind\":2")
+                && json.contains("\"running\":true")
+                && json.contains("127.0.0.1:8080"),
+            "describe json: {json}",
+        );
+
+        // __stop → empty reply (Unit) + flag flipped.
+        assert!(!flag.load(Ordering::Relaxed));
+        let mut payload = vec![TAG_DYNAMIC];
+        payload.extend_from_slice(&Msg::new("__stop").encode());
+        let reply = service.dispatch_invoke(Some(peer), 0, target.0, vec![], payload);
+        assert!(
+            reply.is_empty(),
+            "__stop replies empty (Value::Unit → null)"
+        );
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "__stop must flip the agent's shutdown flag",
+        );
+
+        drop(service);
+        reg.join().unwrap();
+    }
+
+    /// A non-admin / non-member caller is REFUSED —
+    /// `__stop`/`__describe` return a `STATUS_FORBIDDEN` envelope and the
+    /// agent's shutdown flag is NOT touched. Closes the "any dialable peer
+    /// can stop/enumerate any agent" hole.
+    #[cfg(feature = "network")]
+    #[test]
+    fn lifecycle_interceptor_refuses_non_member() {
+        use crate::actors::codec::Encode;
+        use crate::network::NetworkService;
+        use crate::value::{Msg, TAG_DYNAMIC};
+
+        let target = ServiceId::new(0x00ab, 0x0123);
+        let flag = Arc::new(AtomicBool::new(false));
+        let shutdown: AgentShutdown =
+            Arc::new(Mutex::new(HashMap::from([(target.0, flag.clone())])));
+        let info: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            target.0,
+            AgentInfo {
+                name: Some("gateway".into()),
+                kind: 2,
+                serves_addr: Some("127.0.0.1:8080".into()),
+            },
+        )])));
+
+        // Registry grants this peer NO role (non-member).
+        let (routes, reg) = spawn_stub_peer_role_registry(AUTH_ROLE_NONE);
+        let service = lifecycle_service(routes, shutdown, info);
+        let peer = libp2p::PeerId::random();
+
+        for method in ["__stop", "__describe"] {
+            let mut payload = vec![TAG_DYNAMIC];
+            payload.extend_from_slice(&Msg::new(method).encode());
+            let reply = service.dispatch_invoke(Some(peer), 0, target.0, vec![], payload);
+            assert_eq!(
+                reply.first().copied(),
+                Some(crate::actors::run::STATUS_FORBIDDEN),
+                "{method} from a non-member must return a STATUS_FORBIDDEN envelope",
+            );
+        }
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a refused __stop must NOT flip the shutdown flag",
+        );
+
+        drop(service);
+        reg.join().unwrap();
+    }
+
     // ── R4: actor-local grant propagated through extension relays ──
 
     /// Spawn a mock registry on route 0 that replies `role` to every
@@ -5394,7 +7548,7 @@ mod tests {
                 let name = msg.args.get_str("agent_name").unwrap_or_default();
                 seen_w.lock().unwrap().push((name, peer));
                 let reply = encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(role).encode());
-                let _ = req.reply_tx.send(reply);
+                let _ = req.reply.send(reply);
             }
         });
         let mut routes = HashMap::new();

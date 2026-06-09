@@ -13,7 +13,7 @@ readme.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -21,7 +21,7 @@ service = ["pvm"]
 # primitive `compute_io_hash` is pure and always available (guest +
 # host).  Proof *verification* (STARK validity ∧ io-binding) lives in
 # the `prover` host extension, which depends on `zkpvm-verifier`
-# directly; vos itself no longer pulls a verifier, so there is no
+# directly; vos itself does not pull a verifier, so there is no
 # `zk-verify` feature.
 extension = ["macros"]
 wasm = ["macros"]
@@ -68,6 +68,29 @@ merkle-crdt = { path = "../merkle-crdt", version = "0.1.0", features = ["redb"],
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
+# Host-side extension executor: the cooperative scheduler runs host-side,
+# driven by `async-io::block_on(LocalExecutor::run(..))`. `LocalExecutor`
+# keeps the extension's `!Send` per-task futures on the one thread that owns
+# the instance; `async-io`'s single process-global reactor doubles as the
+# byte-stream reactor. These sit in the `std` feature tier (NOT
+# `network`) because EVERY extension host needs the executor, including
+# single-node `std,http,storage` builds with no libp2p. Versions are
+# pinned to what libp2p already resolved (async-io 2.6) so the network
+# build doesn't fork the dep tree. The no_std extension/wasm builds
+# (default-features = false) never enable `std`, so the .so itself stays
+# free of these deps.
+async-io = { version = "2.6", optional = true }
+async-executor = { version = "1.14", optional = true }
+# `AsyncReadExt`/`AsyncWriteExt` over `async_io::Async<TcpStream>` for the
+# host byte-stream reactor. Already in the tree via async-io; no tree fork.
+futures-lite = { version = "2.6", optional = true }
+# Host-terminated TLS over the byte-stream reactor. `futures-rustls`
+# wraps an accepted `Async<TcpStream>` in a rustls server stream (the `.so` still
+# sees plaintext read/write); it re-exports rustls so we don't add a second copy.
+# `ring` provider to match the http-gateway's existing choice. `rustls-pemfile`
+# parses the operator-supplied cert/key PEM.
+futures-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+rustls-pemfile = { version = "2", optional = true }
 # Drives vos-raft's async Storage / Transport futures from inside
 # the existing sync Network::set_raft_handler / RaftCommit code
 # paths. Std-only — gated behind the `storage` feature so no_std
@@ -130,3 +153,7 @@ redb = "2"
 # vos::crypto software fallback. Dev-only; the in-tree fallback
 # is self-contained.
 blake2 = "0.10"
+# Generates a self-signed `localhost` cert for the host-TLS
+# byte-stream guard (the test acts as the rustls client; the host
+# terminates TLS and the extension echoes plaintext).
+rcgen = "0.13"
