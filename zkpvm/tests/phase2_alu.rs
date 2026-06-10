@@ -879,6 +879,62 @@ fn prove_cmov_nz_taken() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
+/// CmovIzImm/CmovNzImm move the IMMEDIATE into regs[ra] guarded by regs[rb]
+/// — operand roles differ from the register cmovs (the moved value is the
+/// imm, the condition is rb, the destination is ra). Exercises the
+/// `is_cmov_imm` operand swap: val_b ← imm (pinned to ImmBytes), val_d ←
+/// regs[rb] (gates ValDIsZero).
+fn test_cmov_imm(opcode: Opcode, cond: u64, imm: i32, expected: u64) {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 99; // old destination value (kept on a not-taken cmov)
+    regs[1] = cond;
+    let steps = run_two_reg_imm(opcode, 0, 1, imm as i64, regs);
+    assert_eq!(
+        steps[0].regs_after[0], expected,
+        "{opcode:?}: cond={cond} imm={imm} → {:#x}, expected {expected:#x}",
+        steps[0].regs_after[0]
+    );
+    let imm_bytes = (imm as u32).to_le_bytes();
+    let code = vec![
+        opcode as u8,
+        0x10,
+        imm_bytes[0],
+        imm_bytes[1],
+        imm_bytes[2],
+        imm_bytes[3],
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_cmov_iz_imm_taken() {
+    test_cmov_imm(Opcode::CmovIzImm, 0, 42, 42);
+}
+
+#[test]
+fn prove_cmov_iz_imm_not_taken() {
+    test_cmov_imm(Opcode::CmovIzImm, 5, 42, 99);
+}
+
+#[test]
+fn prove_cmov_nz_imm_taken() {
+    test_cmov_imm(Opcode::CmovNzImm, 5, 42, 42);
+}
+
+#[test]
+fn prove_cmov_nz_imm_not_taken() {
+    test_cmov_imm(Opcode::CmovNzImm, 0, 42, 99);
+}
+
+#[test]
+fn prove_cmov_nz_imm_taken_negative_imm() {
+    // Sign-extended immediate: all 8 ImmBytes are nonzero, so the
+    // val_b ↔ ImmBytes binding is exercised beyond the low 4 bytes.
+    test_cmov_imm(Opcode::CmovNzImm, 7, -2, 0xFFFF_FFFF_FFFF_FFFE);
+}
+
 // ── MinU/MaxU tests ──
 
 #[test]

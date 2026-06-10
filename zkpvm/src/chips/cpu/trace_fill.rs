@@ -89,6 +89,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 // comparison computes (imm < reg) = (reg > imm) = the GT result.
                 (step.imm, step.regs_before[step.reg_b])
             }
+            javm::instruction::InstructionCategory::TwoRegOneImm if flags.is_cmov_imm => {
+                // CmovIzImm/CmovNzImm swap: val_b ← imm (the moved value, so
+                // the cmov result constraint `result = val_b` binds it),
+                // val_d ← regs[rb] (the condition ValDIsZero gates).
+                (step.imm, step.regs_before[step.reg_b])
+            }
             javm::instruction::InstructionCategory::TwoRegOneImm => {
                 (step.regs_before[step.reg_b], step.imm)
             }
@@ -438,6 +444,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_set_gt, Column::IsSetGt);
         trace.fill_columns(row, flags.is_cmov_iz, Column::IsCmovIz);
         trace.fill_columns(row, flags.is_cmov_nz, Column::IsCmovNz);
+        trace.fill_columns(row, flags.is_cmov_imm, Column::IsCmovImm);
         trace.fill_columns(row, flags.is_min_s, Column::IsMinS);
         trace.fill_columns(row, flags.is_min_u, Column::IsMinU);
         trace.fill_columns(row, flags.is_max_s, Column::IsMaxS);

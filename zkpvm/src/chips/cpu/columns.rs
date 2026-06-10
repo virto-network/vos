@@ -126,6 +126,11 @@ pub enum Column {
     IsCmovIz,
     #[size = 1]
     IsCmovNz,
+    /// CmovIzImm/CmovNzImm operand-swap modifier: val_b ← imm (the moved
+    /// value, pinned to ImmBytes), val_d ← regs[rb] (the condition).
+    /// Not a compare-partition sub-flag; co-occurs with IsCmovIz/IsCmovNz.
+    #[size = 1]
+    IsCmovImm,
     #[size = 1]
     IsMinS,
     #[size = 1]

@@ -16,6 +16,61 @@ use common::*;
 
 use javm::instruction::Opcode;
 
+// ── CmovIzImm/CmovNzImm ────────────────────────────────────────────────────
+// Operand-swapped conditional moves: the moved value is the IMMEDIATE, the
+// condition is regs[rb], the destination regs[ra]. The is_cmov_imm swap pins
+// val_b ↔ ImmBytes, so a forged destination value must be rejected.
+
+fn trace_cmov_imm(
+    op: Opcode,
+    cond: u64,
+    imm: i32,
+) -> (Vec<zkpvm::core::step::PvmStep>, Vec<u8>, Vec<u8>) {
+    let imm_bytes = (imm as u32).to_le_bytes();
+    let code = vec![
+        op as u8,
+        0x10, // ra=0 (dest), rb=1 (condition)
+        imm_bytes[0],
+        imm_bytes[1],
+        imm_bytes[2],
+        imm_bytes[3],
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
+    regs[0] = 99; // old destination value
+    regs[1] = cond;
+    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    (steps, code, bitmask)
+}
+
+#[test]
+fn cmov_nz_imm_positive_smoke() {
+    let (steps, code, bitmask) = trace_cmov_imm(Opcode::CmovNzImm, 5, 42);
+    assert_eq!(steps[0].regs_after[0], 42);
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn cmov_nz_imm_forged_result_rejected() {
+    // Taken move: the destination must hold the canonical immediate.
+    let (mut steps, code, bitmask) = trace_cmov_imm(Opcode::CmovNzImm, 5, 42);
+    assert_eq!(steps[0].regs_after[0], 42);
+    steps[0].regs_after[0] = 1337;
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn cmov_nz_imm_forged_skip_rejected() {
+    // Nonzero condition but the prover claims the move didn't happen
+    // (keeps the old destination value).
+    let (mut steps, code, bitmask) = trace_cmov_imm(Opcode::CmovNzImm, 5, 42);
+    steps[0].regs_after[0] = 99;
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 // ── Add ───────────────────────────────────────────────────────────────────
 
 #[test]

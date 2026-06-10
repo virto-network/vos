@@ -704,6 +704,28 @@ impl BuiltInComponent for CpuChip {
                 }
             }
 
+            // CmovIzImm/CmovNzImm operand swap: the register cmov convention
+            // puts the moved value in val_b and the condition in val_d (which
+            // ValDIsZero gates), but the imm variants move the IMMEDIATE
+            // guarded by regs[rb]. The swap routes the condition register to
+            // val_d (via ValDIsReg) and pins val_b to the canonical ImmBytes
+            // so the gated `result = val_b` constraints below bind the real
+            // moved value. Full 8 bytes bind — the imm is the 64-bit value
+            // written to the destination.
+            {
+                let is_cmov_imm_flag = crate::trace::trace_eval!(trace_eval, Column::IsCmovImm);
+                let imm_bytes_ci = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+                // Boolean.
+                eval.add_constraint(
+                    is_cmov_imm_flag[0].clone() * (E::F::one() - is_cmov_imm_flag[0].clone()),
+                );
+                for i in 0..WORD_SIZE {
+                    eval.add_constraint(
+                        is_cmov_imm_flag[0].clone() * (val_b[i].clone() - imm_bytes_ci[i].clone()),
+                    );
+                }
+            }
+
             // CmovIz / CmovNz — gated via the per-condition helpers.
             let _ = val_d_is_zero;
             for i in 0..WORD_SIZE {

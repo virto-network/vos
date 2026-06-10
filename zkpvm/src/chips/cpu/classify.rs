@@ -36,6 +36,14 @@ pub(crate) struct OpcodeFlags {
     pub is_set_gt: bool,
     pub is_cmov_iz: bool,
     pub is_cmov_nz: bool,
+    /// CmovIzImm/CmovNzImm operand swap: the register cmov convention puts
+    /// the moved value in `val_b` and the condition in `val_d` (which
+    /// `ValDIsZero` gates), but the imm variants move the IMMEDIATE guarded
+    /// by `regs[rb]`. `is_cmov_imm` swaps the source so `val_b = imm`,
+    /// `val_d = regs[rb]` — the same model as `is_set_gt` /
+    /// `is_rotate_r_imm_alt`. NOT a compare-partition sub-flag; co-occurs
+    /// with `is_cmov_iz`/`is_cmov_nz`.
+    pub is_cmov_imm: bool,
     pub is_min_s: bool,
     pub is_min_u: bool,
     pub is_max_s: bool,
@@ -421,10 +429,12 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         Opcode::CmovIz | Opcode::CmovIzImm => {
             f.is_compare = true;
             f.is_cmov_iz = true;
+            f.is_cmov_imm = op == Opcode::CmovIzImm;
         }
         Opcode::CmovNz | Opcode::CmovNzImm => {
             f.is_compare = true;
             f.is_cmov_nz = true;
+            f.is_cmov_imm = op == Opcode::CmovNzImm;
         }
         Opcode::Min => {
             f.is_compare = true;
