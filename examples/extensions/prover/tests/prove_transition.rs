@@ -363,6 +363,155 @@ fn measure_transition_trace() {
     }
 }
 
+/// Honest 1-debit transition over a ledger padded with `n_padding` extra
+/// untouched accounts (inserted directly, bypassing the kernel — they only
+/// inflate the ledger / `root_before`, not the batch). Returns the pieces
+/// from which either witness flavour can be built.
+#[allow(dead_code)]
+fn build_padded(
+    n_padding: usize,
+) -> (
+    VoucherPublic,
+    VecLedger,
+    Vec<cipher_clerk::types::Transfer>,
+    OpeningsOracle,
+) {
+    let registrar = Keypair::generate();
+    let journal = Journal::new(JournalId::random(), registrar.public, 1);
+    let jid = journal.id;
+    let mut ledger = VecLedger::new();
+    ledger.set_journal(journal);
+
+    let value: u64 = 100;
+    let blinding = Blinding::from_bytes([3u8; 32]).expect("canonical scalar");
+    let amount_commit = Amount::commit(value, &blinding);
+    let mut oracle = OpeningsOracle::new(vec![Opening {
+        amount: amount_commit,
+        value,
+        blinding,
+    }]);
+
+    let alice_kp = Keypair::generate();
+    let bob_kp = Keypair::generate();
+    let alice = Account::open(
+        AccountKind::Asset,
+        jid,
+        alice_kp.public,
+        Iso4217::USD,
+        BankCode::Vault,
+    );
+    let bob = Account::open(
+        AccountKind::Liability,
+        jid,
+        bob_kp.public,
+        Iso4217::USD,
+        BankCode::Checking,
+    );
+    let creates = cipher_clerk::apply_account_creations(
+        &mut ledger,
+        &[
+            CreateAccount::signed(alice.clone(), &registrar.secret),
+            CreateAccount::signed(bob.clone(), &registrar.secret),
+        ],
+        &mut oracle,
+        500_000,
+    );
+    for r in &creates {
+        assert_eq!(r.status, EventStatus::Created);
+    }
+
+    // Pad the ledger with untouched accounts (direct insert — no kernel/sig).
+    let mut pad_oracle = oracle.clone();
+    for _ in 0..n_padding {
+        let kp = Keypair::generate();
+        let acct = Account::open(
+            AccountKind::Asset,
+            jid,
+            kp.public,
+            Iso4217::USD,
+            BankCode::Vault,
+        );
+        cipher_clerk::state::LedgerState::put_account(&mut ledger, acct, &mut pad_oracle);
+    }
+
+    let t = Transfer::builder(jid)
+        .debit(&alice, Layer::Settled, amount_commit)
+        .credit(&bob, Layer::Settled, amount_commit)
+        .signed_with(&[(&alice, &alice_kp.secret)]);
+
+    let root_before = ledger.root();
+    let events = vec![t];
+    let mut probe = ledger.clone();
+    let mut probe_oracle = oracle.clone();
+    let _ = cipher_clerk::apply_batch(&mut probe, &events, &mut probe_oracle, BATCH_TS);
+    let root_after = probe.root();
+
+    let public = VoucherPublic {
+        issuer: registrar.public,
+        amount_commit,
+        state_root_before: root_before,
+        state_root_after: root_after,
+    };
+    (public, ledger, events, oracle)
+}
+
+/// THE PAYOFF, measured end-to-end: trace the succinct guest over the SAME
+/// 1-debit batch against ledgers of growing size. The succinct guest's step
+/// count stays ~flat (cost = O(touched · log N), the touched leaves' paths),
+/// while the full-snapshot witness BYTES grow ~linearly (the whole ledger).
+/// Tracing only — no prove. Run:
+///   cargo test -p prover-extension --test prove_transition \
+///     measure_succinct_ledger_size_independence -- --ignored --nocapture
+#[test]
+#[ignore]
+fn measure_succinct_ledger_size_independence() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    use cipher_clerk::snapshot::TransitionWitness;
+    eprintln!(
+        "{:>9} {:>16} {:>16} {:>13}",
+        "ledger_N", "full_wit_bytes", "succ_wit_bytes", "succ_steps"
+    );
+    let mut steps_curve: Vec<(usize, usize)> = Vec::new();
+    for &pad in &[0usize, 100, 1000, 5000] {
+        let (public, snapshot, events, oracle) = build_padded(pad);
+        let n = snapshot.accounts.len();
+        // Full-snapshot witness = the whole ledger → bytes grow O(N).
+        let full = TransitionWitness {
+            snapshot: snapshot.clone(),
+            oracle: oracle.clone(),
+            events: events.clone(),
+            batch_seed_timestamp: BATCH_TS,
+        };
+        let full_bytes = full.encode().len();
+        // Succinct witness: touched leaves + log-depth paths.
+        let succ = SuccinctTransitionWitness::from_full(&snapshot, &events, &oracle, BATCH_TS);
+        let succ_bytes = succ.encode().len();
+        let witness_buf = encode_witness(&public.encode(), &succ.encode());
+        let steps = trace_program(PROGRAM, &witness_buf)
+            .map(|sn| sn.steps.len())
+            .expect("trace");
+        eprintln!("{n:>9} {full_bytes:>16} {succ_bytes:>16} {steps:>13}");
+        steps_curve.push((n, steps));
+    }
+    // The succinct guest's cost must NOT scale with ledger size: a 5000-account
+    // ledger traces within 1.5× of the baseline (only the log-depth paths grow).
+    let base = steps_curve.first().unwrap().1 as f64;
+    let max = steps_curve.iter().map(|(_, s)| *s).max().unwrap() as f64;
+    assert!(
+        max <= base * 1.5,
+        "succinct trace scaled with ledger size: {steps_curve:?} (max {max} > 1.5×{base})"
+    );
+    eprintln!(
+        "succinct trace is ledger-size-independent ({}→{} accounts within {:.2}×)",
+        steps_curve.first().unwrap().0,
+        steps_curve.last().unwrap().0,
+        max / base
+    );
+}
+
 /// Segmentation baseline: a single bounded segment of the kernel transition
 /// proves in bounded memory and is constraint-clean. The single-shot prove
 /// of the whole 5.3M-step trace OOMs a 64 GB host; one ~1M-step segment fits.
