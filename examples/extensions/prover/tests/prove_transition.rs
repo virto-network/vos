@@ -22,7 +22,7 @@ use cipher_clerk::prelude::*;
 use cipher_clerk::snapshot::{OpeningsOracle, VecLedger};
 use cipher_clerk::state::Opening;
 use cipher_clerk::succinct::SuccinctTransitionWitness;
-use cipher_clerk::voucher::proof::{public_bytes, Public as VoucherPublic};
+use cipher_clerk::voucher::proof::{Public as VoucherPublic, public_bytes};
 use prover_extension::{prove_with_details, trace_program, verify_proof_bytes};
 use vos::Encode;
 
@@ -660,8 +660,7 @@ fn pinpoint_segment_chip() {
         eprintln!("SKIP: voucher-check ELF not built");
         return;
     }
-    let (public, witness) = build_transition();
-    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let witness_buf = cached_witness_buf();
     let Some(full) = trace_program(PROGRAM, &witness_buf) else {
         eprintln!("SKIP: trace failed");
         return;
@@ -695,6 +694,125 @@ fn pinpoint_segment_chip() {
     }
 }
 
+/// Dump the traced steps around given indices (comma-separated DBG_ROWS) —
+/// maps an AssertEvaluator `row #X` back to the opcode/operands that filled
+/// it. Uses the cached witness so rows line up with the failing assert run.
+///   DBG_ROWS=88816,31176 cargo test -p prover-extension \
+///     --test prove_transition dump_steps -- --ignored --nocapture
+#[test]
+#[ignore]
+fn dump_steps() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    let witness_buf = cached_witness_buf();
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let rows: Vec<usize> = std::env::var("DBG_ROWS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    for &r in &rows {
+        eprintln!("=== rows around #{r} ===");
+        for i in r.saturating_sub(3)..=(r + 3).min(full.steps.len() - 1) {
+            let s = &full.steps[i];
+            let av = s.regs_before.get(s.reg_a).copied().unwrap_or(0);
+            let bv = s.regs_before.get(s.reg_b).copied().unwrap_or(0);
+            let dv = s.regs_before.get(s.reg_d).copied().unwrap_or(0);
+            let wr = s
+                .reg_write
+                .map(|w| format!(" → r{w}={:#x}", s.regs_after[w]))
+                .unwrap_or_default();
+            eprintln!(
+                "  {i:>8}{} {:?} a=r{}({av:#x}) b=r{}({bv:#x}) d=r{}({dv:#x}) imm={:#x}{wr}",
+                if i == r { "*" } else { " " },
+                s.opcode,
+                s.reg_a,
+                s.reg_b,
+                s.reg_d,
+                s.imm,
+            );
+        }
+    }
+}
+
+/// Emulate the CpuChip cmov constraints over the raw trace: for every
+/// CmovIz/CmovNz/CmovIzImm/CmovNzImm step, fill val_b/val_d the way
+/// trace_fill's operand matrix does (incl. the is_cmov_imm swap: val_b ←
+/// imm, val_d ← regs[rb]) and check the result-binding constraint the AIR
+/// enforces (`helper · (result − val_b)`). Asserts zero violations — a
+/// cheap trace-level regression for cmov operand routing that needs no
+/// assert row↔step mapping. (This is the tool that pinpointed the
+/// CmovNzImm routing bug: grey lowers `SLTU rd, x0, rs2` (snez) to
+/// LoadImm rd,0 + CmovNzImm rd, rs2, 1.)
+#[test]
+#[ignore]
+fn scan_cmov() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built");
+        return;
+    }
+    let witness_buf = cached_witness_buf();
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new(); // (steps, violations)
+    let mut shown = 0;
+    for (i, s) in full.steps.iter().enumerate() {
+        let name = format!("{:?}", s.opcode);
+        if !name.starts_with("Cmov") {
+            continue;
+        }
+        let is_imm = name.ends_with("Imm");
+        let is_nz = name.contains("Nz");
+        // trace_fill routing: ThreeReg → (regs[ra], regs[rb]);
+        // Cmov*Imm (is_cmov_imm swap) → (imm, regs[rb]).
+        let (val_b, val_d) = if is_imm {
+            (s.imm, s.regs_before[s.reg_b])
+        } else {
+            (s.regs_before[s.reg_a], s.regs_before[s.reg_b])
+        };
+        // dest_reg: ThreeReg → rd, otherwise ra.
+        let dr = if is_imm { s.reg_a } else { s.reg_d };
+        let result = s.regs_after[dr];
+        let taken_helper = if is_nz { val_d != 0 } else { val_d == 0 };
+        let e = counts.entry(name.clone()).or_default();
+        e.0 += 1;
+        if taken_helper && result != val_b {
+            e.1 += 1;
+            if shown < 10 {
+                shown += 1;
+                eprintln!(
+                    "VIOLATION step {i}: {name} a=r{}({:#x}) b=r{}({:#x}) imm={:#x} \
+                     result={result:#x} val_b={val_b:#x} val_d={val_d:#x} (Δ byte0 = {})",
+                    s.reg_a,
+                    s.regs_before[s.reg_a],
+                    s.reg_b,
+                    s.regs_before[s.reg_b],
+                    s.imm,
+                    (result as u8).wrapping_sub(val_b as u8) as i8,
+                );
+            }
+        }
+    }
+    eprintln!("--- cmov census (steps, constraint-violations under chip routing) ---");
+    let mut total_violations = 0;
+    for (op, (n, v)) in &counts {
+        eprintln!("  {op:12} steps={n:>7} violations={v}");
+        total_violations += v;
+    }
+    assert_eq!(
+        total_violations, 0,
+        "cmov operand routing disagrees with execution on {total_violations} steps"
+    );
+}
+
 /// Pinpoint a constraint failure in a single segment (lighter than prove:
 /// no FRI). Run:
 ///   cargo test -p prover-extension --features debug-constraints \
@@ -707,8 +825,7 @@ fn debug_one_transition_segment() {
         eprintln!("SKIP: voucher-check ELF not built");
         return;
     }
-    let (public, witness) = build_transition();
-    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let witness_buf = cached_witness_buf();
     let Some(full) = trace_program(PROGRAM, &witness_buf) else {
         eprintln!("SKIP: trace failed");
         return;
@@ -969,8 +1086,7 @@ fn debug_transition_constraints() {
         eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
         return;
     }
-    let (public, witness) = build_transition();
-    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let witness_buf = cached_witness_buf();
     let Some(mut sn) = trace_program(PROGRAM, &witness_buf) else {
         eprintln!("SKIP: trace failed");
         return;
