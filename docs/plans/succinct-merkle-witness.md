@@ -1,10 +1,30 @@
 # Succinct Merkle witness for the conservation-of-value proof
 
-Status: PLAN (not started). Prereq landed: the full-snapshot transition now
-proves end-to-end as a bounded-memory segment chain (branch
-`voucher-state-transition`). This plan replaces the **full-ledger** witness with
-a **touched-leaves + Merkle-paths** witness so proving cost scales with the
-batch, not the ledger.
+Status: **LANDED** (branch `voucher-state-transition`) — Phases 0–3 plus the
+measurement. Phase 1 host verify: cipher-clerk `merkle.rs` BatchProof +
+`succinct.rs` (differential tests vs the full snapshot). Phases 2/3: the
+voucher-check guest decodes `SuccinctTransitionWitness` and the producer
+builds it via `from_full`. Phase 4 measurement: witness bytes O(N)→O(touched·
+log N) (1.56 MB → 2.5 KB at 5k accounts), trace flat beyond the log-depth
+onset. Phase 0: the composite root now commits all six state components —
+`node(node(node(accounts,transfers),journals), node(node(external_ids,
+voided),pending))` — so idempotency/double-void/pending-lifecycle bind to
+`root_before` (gate test: hiding a seen external id breaks the root). The
+prover-side capstone is `prove_transition_segmented_chain` (the ~7.5M-step
+transition as a bounded-memory chain).
+
+**Open follow-up — verifier-side chain verification.** The transition trace
+is crypto-dominated and ledger-size-independent at ~7.5M steps: it cannot
+single-shot prove on a development host, so it proves as a segment chain.
+But `verify_chain` needs prover-side side notes and the segment-boundary
+`memory_commitment` is unbound metadata (Phase Z0 binds registers only) — so
+the chain CANNOT yet be verified across a trust boundary (the clerk-bridge's
+`verify` checks one standalone proof against one program commitment). Until a
+verifier-side aggregation lands (per-segment commitment binding + STARK-bound
+boundary memory commitments, or recursive aggregation into one proof), the
+federation e2e's real-STARK happy path is skipped and conservation-of-value
+remains prover-side-proven only. That aggregation is the next project on
+this track.
 
 ## Why
 
