@@ -61,7 +61,19 @@ impl<'a> LedgerView<'a> {
 
 impl LedgerState for LedgerView<'_> {
     fn root(&self) -> [u8; 32] {
-        compute_state_root(self.accounts, self.transfers, self.journal)
+        let pending: Vec<([u8; 16], u8)> = self
+            .pending_statuses
+            .iter()
+            .map(|p| (p.id, p.status))
+            .collect();
+        compute_state_root(
+            self.accounts,
+            self.transfers,
+            self.journal,
+            self.external_ids,
+            self.voided_transfers,
+            &pending,
+        )
     }
 
     fn get_account(&self, id: &CcAccountId, _o: &mut dyn Oracle) -> Option<CcAccount> {

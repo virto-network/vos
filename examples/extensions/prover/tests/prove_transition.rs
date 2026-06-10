@@ -590,6 +590,15 @@ fn prove_transition_segmented_chain() {
         return;
     };
     let total = full.steps.len();
+    // The real kernel transition is millions of steps. A tiny trace means
+    // the guest early-exited WITHOUT verifying (witness decode failed —
+    // stale voucher-check ELF vs the current cipher-clerk witness layout),
+    // and proving it would be a vacuous green. Rebuild the ELF.
+    assert!(
+        total > 1_000_000,
+        "trace is only {total} steps — guest early-exited (stale voucher-check ELF? \
+         run `just build-voucher-check`)"
+    );
     let mut bounds = zkpvm::segment::segment_bounds(total, SEG_STEPS);
     // DBG_MAX_SEGS limits the chain to the first N segments for a fast
     // boundary-continuity check (a chain of mid-trace segments still
