@@ -552,8 +552,16 @@ const SEG_STEPS: usize = 500_000;
 /// segment's `final_state` == the next's `initial_state`, Phase-Z0-bound)
 /// + per-segment `verify_with_pcs_policy(MOBILE)`. The crate `verify_chain`
 /// hardcodes the STANDARD policy and would reject mobile proofs.
+///
+/// Segment side notes are RE-DERIVED one at a time via `segment` (a
+/// deterministic slice of the full trace) instead of being retained from
+/// the prove loop — holding all of them at once costs GBs per segment and
+/// is what pushes the multi-million-step chain past the host's memory.
 #[allow(dead_code)]
-fn verify_chain_mobile(proofs: &[zkpvm::Proof], sns: &[&zkpvm::SideNote]) -> Result<(), String> {
+fn verify_chain_mobile(
+    proofs: &[zkpvm::Proof],
+    mut segment: impl FnMut(usize) -> zkpvm::SideNote,
+) -> Result<(), String> {
     for w in proofs.windows(2) {
         if w[0].final_state != w[1].initial_state {
             return Err(format!(
@@ -562,8 +570,9 @@ fn verify_chain_mobile(proofs: &[zkpvm::Proof], sns: &[&zkpvm::SideNote]) -> Res
             ));
         }
     }
-    for (p, sn) in proofs.iter().zip(sns) {
-        zkpvm::verify_with_pcs_policy(p.clone(), sn, &zkpvm::PcsPolicy::MOBILE)
+    for (i, p) in proofs.iter().enumerate() {
+        let sn = segment(i);
+        zkpvm::verify_with_pcs_policy(p.clone(), &sn, &zkpvm::PcsPolicy::MOBILE)
             .map_err(|e| format!("{e:?}"))?;
     }
     Ok(())
@@ -614,7 +623,9 @@ fn prove_transition_segmented_chain() {
         bounds.len()
     );
 
-    let mut side_notes: Vec<zkpvm::SideNote> = Vec::new();
+    // Prove segment-by-segment, dropping each side note after its proof:
+    // the side notes are deterministic slices of `full`, re-derived at
+    // verify time, so peak memory holds the full trace + ONE segment.
     let mut proofs = Vec::new();
     for (i, (a, b)) in bounds.iter().enumerate() {
         let mut sn = zkpvm::segment::segment_side_note(&full, *a, *b);
@@ -626,13 +637,28 @@ fn prove_transition_segmented_chain() {
             b - a,
             t.elapsed()
         );
-        side_notes.push(sn);
         proofs.push(proof);
     }
 
-    let sn_refs: Vec<&zkpvm::SideNote> = side_notes.iter().collect();
+    let resegment = |i: usize| {
+        let (a, b) = bounds[i];
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        // Mirror the side-note normalization `prove` applies before trace
+        // generation: the closing chip's activation and the final-regs
+        // backfill feed component selection, the Z0 ledger augmentation,
+        // and the Fiat-Shamir transcript — verifying against a raw
+        // re-derived slice diverges at OODS.
+        sn.closing_chip_active = true;
+        if let Some(last) = sn.steps.last() {
+            let n = sn.final_regs.len().min(last.regs_after.len());
+            let mut final_regs = [0u64; zkpvm::core::step::NUM_REGS];
+            final_regs[..n].copy_from_slice(&last.regs_after[..n]);
+            sn.final_regs = final_regs;
+        }
+        sn
+    };
     let t = std::time::Instant::now();
-    verify_chain_mobile(&proofs, &sn_refs).expect("verify_chain (mobile) over transition segments");
+    verify_chain_mobile(&proofs, resegment).expect("verify_chain (mobile) over transition segments");
     eprintln!(
         "verify_chain over {} segments: ok ({:.1?})",
         proofs.len(),
@@ -644,7 +670,7 @@ fn prove_transition_segmented_chain() {
         let mut forged = proofs.clone();
         forged[1].initial_state.timestamp ^= 1;
         assert!(
-            verify_chain_mobile(&forged, &sn_refs).is_err(),
+            verify_chain_mobile(&forged, resegment).is_err(),
             "verify_chain must reject a broken segment boundary"
         );
     }
