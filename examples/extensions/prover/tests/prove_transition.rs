@@ -19,9 +19,10 @@ use std::path::PathBuf;
 
 use cipher_clerk::crypto::{Amount, Blinding};
 use cipher_clerk::prelude::*;
-use cipher_clerk::snapshot::{OpeningsOracle, TransitionWitness, VecLedger};
+use cipher_clerk::snapshot::{OpeningsOracle, VecLedger};
 use cipher_clerk::state::Opening;
-use cipher_clerk::voucher::proof::{Public as VoucherPublic, public_bytes};
+use cipher_clerk::succinct::SuccinctTransitionWitness;
+use cipher_clerk::voucher::proof::{public_bytes, Public as VoucherPublic};
 use prover_extension::{prove_with_details, trace_program, verify_proof_bytes};
 use vos::Encode;
 
@@ -56,8 +57,9 @@ fn encode_witness(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
 
 /// Build an honest 2-account, 1-settled-debit transition and return the
 /// voucher `Public` (with the real before/after roots) + the
-/// `TransitionWitness` the guest re-executes.
-fn build_transition() -> (VoucherPublic, TransitionWitness) {
+/// `SuccinctTransitionWitness` the guest re-executes (touched leaves +
+/// Merkle paths against `root_before`, not the full ledger).
+fn build_transition() -> (VoucherPublic, SuccinctTransitionWitness) {
     let registrar = Keypair::generate();
     let journal = Journal::new(JournalId::random(), registrar.public, 1);
     let jid = journal.id;
@@ -122,12 +124,10 @@ fn build_transition() -> (VoucherPublic, TransitionWitness) {
         state_root_before: root_before,
         state_root_after: root_after,
     };
-    let witness = TransitionWitness {
-        snapshot: ledger,
-        oracle,
-        events,
-        batch_seed_timestamp: BATCH_TS,
-    };
+    // Build the succinct witness from the snapshot at `root_before`: only
+    // the touched leaves + their Merkle paths, discovered by replaying the
+    // batch. Size and re-execution cost scale with the batch, not `ledger`.
+    let witness = SuccinctTransitionWitness::from_full(&ledger, &events, &oracle, BATCH_TS);
     (public, witness)
 }
 
