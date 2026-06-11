@@ -412,22 +412,17 @@ fn verify_standalone_rejects_mask_zero() {
     );
 }
 
-/// Phase Z0 + Z0-init scope: registers only, both ends. The `pc` and
-/// `memory_commitment` fields on `proof.initial_state` and
-/// `proof.final_state` are NOT bound — they travel as metadata
-/// alongside the proof. This test pins the scope: tampering any of
-/// the four leaves `verify_standalone` happily accepting the proof.
-///
-/// The day someone wires these into the FS transcript (or a future
-/// "Z1" / "Z2" chip closes the program-memory and memory ledgers
-/// analogously), they'll need to update this test instead of
-/// inheriting a silent binding.
-///
-/// If this test starts failing, that's good news — *something* has
-/// taken responsibility for one of these fields. Find out what, and
-/// rewrite this test to reflect the new scope.
+/// Boundary-field binding scope at format v4: registers, pc and
+/// timestamp on BOTH `proof.initial_state` and `proof.final_state` are
+/// FS-mixed (registers since Z0/Z0-init; pc + timestamp since v4 —
+/// their in-circuit commitments come from ProgramBoundaryChip), so
+/// tampering any of them must reject. `memory_commitment` is the one
+/// remaining metadata field on each end: it is computed OUTSIDE the
+/// circuit, so mixing it would assert nothing — binding it needs a
+/// memory-ledger closing argument (future work; when that lands,
+/// rewrite this test again rather than inheriting a silent binding).
 #[test]
-fn boundary_non_register_fields_are_not_bound() {
+fn boundary_field_binding_scope() {
     let Some(blob) = load_voucher_check_blob() else {
         return;
     };
@@ -437,35 +432,46 @@ fn boundary_non_register_fields_are_not_bound() {
 
     use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
 
-    // Final-state pc — unbound.
+    // pc — bound on both ends (v4).
     let mut tampered_pc = proof.clone();
     tampered_pc.final_state.pc ^= 0x1000;
-    verify_standalone_with_pcs_policy(tampered_pc, prog_hash, &PcsPolicy::MOBILE).expect(
-        "Z0 binds registers only — tamper of final_state.pc must still verify. \
-         If this fails, something else is binding pc; update the test or the scope doc.",
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_pc, prog_hash, &PcsPolicy::MOBILE).is_err(),
+        "v4 mixes final_state.pc — tampering it must reject"
+    );
+    let mut tampered_initial_pc = proof.clone();
+    tampered_initial_pc.initial_state.pc ^= 0x1000;
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_initial_pc, prog_hash, &PcsPolicy::MOBILE)
+            .is_err(),
+        "v4 mixes initial_state.pc — tampering it must reject"
     );
 
-    // Final-state memory_commitment — unbound.
+    // timestamp — bound on both ends (v4).
+    let mut tampered_ts = proof.clone();
+    tampered_ts.final_state.timestamp ^= 1;
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_ts, prog_hash, &PcsPolicy::MOBILE).is_err(),
+        "v4 mixes final_state.timestamp — tampering it must reject"
+    );
+    let mut tampered_initial_ts = proof.clone();
+    tampered_initial_ts.initial_state.timestamp ^= 1;
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_initial_ts, prog_hash, &PcsPolicy::MOBILE)
+            .is_err(),
+        "v4 mixes initial_state.timestamp — tampering it must reject"
+    );
+
+    // memory_commitment — still unbound metadata on both ends.
     let mut tampered_mem = proof.clone();
     tampered_mem.final_state.memory_commitment[0] ^= 0xff;
     verify_standalone_with_pcs_policy(tampered_mem, prog_hash, &PcsPolicy::MOBILE).expect(
-        "Z0 binds registers only — tamper of final_state.memory_commitment must \
-         still verify. If this fails, something else is binding it; update the \
-         test or the scope doc.",
+        "memory_commitment is not circuit-derived — tamper must still verify. \
+         If this fails, a memory-ledger closing landed; update the scope doc.",
     );
-
-    // Initial-state pc — unbound (Z0-init's FS-mix covers only
-    // initial_state.registers).
-    let mut tampered_initial_pc = proof.clone();
-    tampered_initial_pc.initial_state.pc ^= 0x1000;
-    verify_standalone_with_pcs_policy(tampered_initial_pc, prog_hash, &PcsPolicy::MOBILE)
-        .expect("Z0-init binds registers only — tamper of initial_state.pc must still verify.");
-
-    // Initial-state memory_commitment — unbound.
     let mut tampered_initial_mem = proof;
     tampered_initial_mem.initial_state.memory_commitment[0] ^= 0xff;
     verify_standalone_with_pcs_policy(tampered_initial_mem, prog_hash, &PcsPolicy::MOBILE).expect(
-        "Z0-init binds registers only — tamper of initial_state.memory_commitment \
-         must still verify.",
+        "initial_state.memory_commitment is not circuit-derived — tamper must still verify.",
     );
 }

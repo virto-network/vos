@@ -464,18 +464,10 @@ fn prove_transition_segmented_chain() {
     let resegment = |i: usize| {
         let (a, b) = bounds[i];
         let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
-        // Mirror the side-note normalization `prove` applies before trace
-        // generation: the closing chip's activation and the final-regs
-        // backfill feed component selection, the Z0 ledger augmentation,
-        // and the Fiat-Shamir transcript — verifying against a raw
-        // re-derived slice diverges at OODS.
-        sn.closing_chip_active = true;
-        if let Some(last) = sn.steps.last() {
-            let n = sn.final_regs.len().min(last.regs_after.len());
-            let mut final_regs = [0u64; zkpvm::core::step::NUM_REGS];
-            final_regs[..n].copy_from_slice(&last.regs_after[..n]);
-            sn.final_regs = final_regs;
-        }
+        // A re-derived slice must be normalized the way `prove` does it
+        // (closing-chip activation + register-image backfills) or the
+        // verifier's Fiat-Shamir transcript diverges at OODS.
+        zkpvm::prepare_side_note_for_verification(&mut sn);
         sn
     };
     let t = std::time::Instant::now();

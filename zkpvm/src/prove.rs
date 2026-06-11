@@ -462,11 +462,18 @@ fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
     *blake3::hash(&mem).as_bytes()
 }
 
-fn prove_impl(
-    side_note: &mut SideNote,
-    config: PcsConfig,
-    profile: bool,
-) -> Result<(Proof, ProveProfile), ProvingError> {
+/// Normalize a `SideNote` the way the production prove path does before
+/// trace generation: activate the closing chip (Z0 ledger augmentation +
+/// FS-transcript mix + component selection all key off it) and backfill
+/// the initial/final register images from the trace.
+///
+/// Verification paths that RE-DERIVE a side note — e.g. re-slicing a
+/// segment of a fully-traced run to check a proof chain — MUST apply the
+/// same normalization before calling `verify`/`verify_with_pcs_policy`,
+/// or the verifier's Fiat-Shamir transcript diverges from the prover's
+/// and honest proofs fail with `OodsNotMatching`. `prove` applies it
+/// itself; calling this twice is idempotent.
+pub fn prepare_side_note_for_verification(side_note: &mut SideNote) {
     // Phase Z0: the default path always uses BASE_COMPONENTS which
     // includes `RegisterMemoryClosingChip`. Mark the side_note so the
     // ledger augmentation + FS-transcript mix engage and
@@ -474,6 +481,39 @@ fn prove_impl(
     // output. Chip-isolated callers (`prove_with_explicit_components`)
     // opt-in themselves only if their slice contains the closing chip.
     side_note.closing_chip_active = true;
+    backfill_initial_regs(side_note);
+    backfill_final_regs(side_note);
+}
+
+/// Backfill `initial_regs` from the first step's `regs_before` if the
+/// caller left it at the default all-zero but the tracer recorded
+/// non-zero initial state (segment slicers set it explicitly).
+fn backfill_initial_regs(side_note: &mut SideNote) {
+    if !side_note.steps.is_empty() && side_note.initial_regs.iter().all(|&r| r == 0) {
+        let first = &side_note.steps[0];
+        let n = crate::core::step::NUM_REGS.min(first.regs_before.len());
+        side_note.initial_regs[..n].copy_from_slice(&first.regs_before[..n]);
+    }
+}
+
+/// Backfill `final_regs` from the last step's `regs_after`. Always
+/// overwrites (not gated on all-zero like `initial_regs`) so a stale
+/// value can never ship as the claimed final state.
+fn backfill_final_regs(side_note: &mut SideNote) {
+    if !side_note.steps.is_empty() {
+        let last = &side_note.steps[side_note.steps.len() - 1];
+        let n = crate::core::step::NUM_REGS.min(last.regs_after.len());
+        side_note.final_regs = [0u64; crate::core::step::NUM_REGS];
+        side_note.final_regs[..n].copy_from_slice(&last.regs_after[..n]);
+    }
+}
+
+fn prove_impl(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+    profile: bool,
+) -> Result<(Proof, ProveProfile), ProvingError> {
+    prepare_side_note_for_verification(side_note);
     // Phase 60: filter BASE_COMPONENTS to active chips for THIS trace.
     // Verifier reconstructs the same list via active_components_verifier().
     let components_owned = super::active_components(side_note);
@@ -508,29 +548,19 @@ fn prove_impl_with_components(
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
 
-    // Phase 9a: backfill initial_regs from the first step's regs_before if the
-    // caller left it at the default all-zero but the tracer recorded non-zero
-    // initial state.  Pre-Phase-9 tests won't notice since nothing consumes
-    // this yet; downstream RegisterMemoryBoundaryChip (9b) needs it populated.
-    if !side_note.steps.is_empty() && side_note.initial_regs.iter().all(|&r| r == 0) {
-        let first = &side_note.steps[0];
-        let n = crate::core::step::NUM_REGS.min(first.regs_before.len());
-        side_note.initial_regs[..n].copy_from_slice(&first.regs_before[..n]);
-    }
+    // Phase 9a: RegisterMemoryBoundaryChip needs `initial_regs`
+    // populated.
+    backfill_initial_regs(side_note);
 
-    // Phase Z0: backfill final_regs from the last step's regs_after
-    // when the closing chip is in the component set. Always overwrite
-    // (not gated on all-zero like initial_regs) so a caller that
-    // constructed the SideNote with stale final_regs can't accidentally
-    // produce a proof whose claimed final state diverges from the
-    // actual trace's last step. Skipped for chip-isolated harnesses
-    // that opted out of the closing chip — those proofs leave
-    // `final_regs` untouched (the field is unused without the chip).
-    if side_note.closing_chip_active && !side_note.steps.is_empty() {
-        let last = &side_note.steps[side_note.steps.len() - 1];
-        let n = crate::core::step::NUM_REGS.min(last.regs_after.len());
-        side_note.final_regs = [0u64; crate::core::step::NUM_REGS];
-        side_note.final_regs[..n].copy_from_slice(&last.regs_after[..n]);
+    // Phase Z0: refresh `final_regs` when the closing chip is in the
+    // component set, so a caller that constructed the SideNote with
+    // stale final_regs can't accidentally produce a proof whose
+    // claimed final state diverges from the actual trace's last step.
+    // Skipped for chip-isolated harnesses that opted out of the
+    // closing chip — those proofs leave `final_regs` untouched (the
+    // field is unused without the chip).
+    if side_note.closing_chip_active {
+        backfill_final_regs(side_note);
     }
 
     // Trace gen — split into a sequential *producer* pass and a parallel
@@ -630,6 +660,20 @@ fn prove_impl_with_components(
     //
     // Order is initial-then-final, deterministic and stable across
     // versions. Verifier must mix in the same order.
+    //
+    // Format v4 extends the mix with the segment-boundary pc and
+    // timestamp. Their in-circuit commitments already exist:
+    // ProgramBoundaryChip commits (InitialPc, InitialTimestamp) and
+    // (FinalNextPc, FinalNextTimestamp), telescoped through CpuChip's
+    // program-execution relation — exactly the values
+    // `initial_state`/`final_state` carry. Mixing them gives those
+    // proof fields the same tamper-evidence the registers have, which
+    // is what makes `verify_chain`'s boundary equality on pc/timestamp
+    // load-bearing. `memory_commitment` stays unmixed: it is computed
+    // OUTSIDE the circuit (a hash of the memory image) and mixing it
+    // would assert nothing the constraint system checks — binding it
+    // needs a memory-ledger closing argument (future work, see
+    // docs/plans/succinct-merkle-witness.md).
     if side_note.closing_chip_active {
         for r in &side_note.initial_regs {
             prover_channel.mix_u64(*r);
@@ -637,6 +681,22 @@ fn prove_impl_with_components(
         for r in &side_note.final_regs {
             prover_channel.mix_u64(*r);
         }
+        let (initial_pc, initial_ts, final_pc, final_ts) = if side_note.steps.is_empty() {
+            (0, 0, 0, 0)
+        } else {
+            let first = &side_note.steps[0];
+            let last = &side_note.steps[side_note.steps.len() - 1];
+            (
+                first.pc as u64,
+                first.timestamp,
+                last.next_pc as u64,
+                last.timestamp + 1,
+            )
+        };
+        prover_channel.mix_u64(initial_pc);
+        prover_channel.mix_u64(initial_ts);
+        prover_channel.mix_u64(final_pc);
+        prover_channel.mix_u64(final_ts);
     }
 
     let mut lookup_elements = AllLookupElements::default();

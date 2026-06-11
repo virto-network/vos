@@ -35,12 +35,21 @@ use stwo::core::{
 ///       `proof.initial_state.registers` (before the existing
 ///       `final_state.registers` mix). The boundary chip already
 ///       commits to `initial_regs` in its trace; this binding closes
-///       the matching metadata-field gap on the initial side. Effect:
-///       segment chaining (`verify_chain`) is now safe in both
-///       directions — both `initial_state` and `final_state` of every
-///       segment are STARK-bound. Transcript shape diverges from v2;
-///       v2 proofs cannot verify here and reject at this gate.
-pub const PROOF_FORMAT_VERSION: u32 = 3;
+///       the matching metadata-field gap on the initial side.
+///       Registers of both boundary states are STARK-bound; pc,
+///       timestamp and memory_commitment remained free metadata.
+///   4 — Boundary pc + timestamp join the FS mix (after the register
+///       mixes; order: initial regs, final regs, initial pc, initial
+///       ts, final pc, final ts). Their in-circuit commitments already
+///       existed — ProgramBoundaryChip commits (InitialPc,
+///       InitialTimestamp) and (FinalNextPc, FinalNextTimestamp),
+///       telescoped through CpuChip's program-execution relation —
+///       so the mix makes the proof fields tamper-evident and
+///       `verify_chain`'s whole-struct boundary equality load-bearing
+///       for pc and timestamp. `memory_commitment` remains free
+///       metadata: it is computed outside the circuit; binding it
+///       requires a memory-ledger closing argument (future work).
+pub const PROOF_FORMAT_VERSION: u32 = 4;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

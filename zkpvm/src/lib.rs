@@ -490,9 +490,9 @@ pub use proof::{
 };
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, install_thread_pool, production_pcs_config, production_pcs_config_mobile, prove,
-    prove_mobile, prove_profiled, prove_profiled_with_config, prove_with_config,
-    prove_with_explicit_components,
+    ProveProfile, install_thread_pool, prepare_side_note_for_verification, production_pcs_config,
+    production_pcs_config_mobile, prove, prove_mobile, prove_profiled, prove_profiled_with_config,
+    prove_with_config, prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{
