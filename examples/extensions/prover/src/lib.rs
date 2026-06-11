@@ -162,11 +162,9 @@ pub fn prove_with_details(
 
 /// Resolve `program_id` to an ELF, inject the opaque `witness_bytes` into
 /// its `__VOS_WITNESS` buffer (empty = no injection; the actor uses its
-/// own default), trace, and prove. `None` on any failure.
-/// Resolve `program_id` to an ELF, inject the witness into `__VOS_WITNESS`,
-/// and TRACE only (no prove). Lets a caller size the trace / inspect the
-/// per-chip op breakdown before committing to a (potentially memory-heavy)
-/// prove. `None` on any failure.
+/// own default), and TRACE only (no prove). Lets a caller size the trace /
+/// inspect the per-chip op breakdown before committing to a (potentially
+/// memory-heavy) prove. `None` on any failure.
 pub fn trace_program(program_id: &[u8], witness_bytes: &[u8]) -> Option<zkpvm::SideNote> {
     let path = program_id_to_elf_path(program_id)?;
     let elf = std::fs::read(&path).ok()?;

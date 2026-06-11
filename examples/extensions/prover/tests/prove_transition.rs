@@ -1,16 +1,14 @@
-//! Feasibility + correctness probe for the kernel state-transition guest.
+//! End-to-end harness for the conservation-of-value transition guest.
 //!
-//! Builds a tiny honest transition (2 accounts, 1 settled debit) host-side,
-//! packages it as the `(voucher::Public, TransitionWitness)` witness the
-//! voucher-check guest now expects, proves it through the GENERAL prover
-//! path, and asserts the composed io-binding verify accepts it — and that a
-//! FORGED voucher (overstated root_after) is rejected.
-//!
-//! This is the Phase-A go/no-go: if the kernel transition proves in
-//! acceptable wall-clock and fits the 64 KB PVM heap, the full-snapshot
-//! approach is viable for small/pilot ledgers. The harness prints the
-//! witness sizes and the freshly-proven program commitment (for re-pinning
-//! `VOUCHER_CHECK_COMMITMENT`).
+//! Builds an honest transition (2 accounts, 1 settled debit) host-side,
+//! packages it as the `(voucher::Public, SuccinctTransitionWitness)` pair
+//! the voucher-check guest decodes from `__VOS_WITNESS`, and exercises it
+//! through the general prover path. The transition trace is millions of
+//! steps (crypto + Merkle-path re-execution), so the load-bearing prove is
+//! the bounded-memory SEGMENT CHAIN (`prove_transition_segmented_chain`);
+//! the always-on regressions are trace-level (io-binding, witness size,
+//! ledger-size independence). The `debug-constraints`-gated tests are the
+//! constraint/logup pinpointing toolkit for when a prove regresses.
 //!
 //! Skips (does not fail) when the voucher-check ELF isn't built — build it
 //! with `just build-voucher-check`.
@@ -155,155 +153,12 @@ fn cached_witness_buf() -> Vec<u8> {
     buf
 }
 
-/// Diagnostic (no prove): find the first segment memory read whose value
-/// disagrees with the threaded initial_memory (the boundary the MemoryChip
-/// read-consistency check uses), then report what (if anything) actually
-/// wrote that address in [0, a). Pinpoints the missing write source in the
-/// segment memory-threading. DBG_SEG_A selects the segment start.
+/// Diagnostic (no prove): size the kernel-transition trace and break it
+/// down by op so we know what drives the prove's cost — software curve
+/// math, blake2b/SMT, or raw step count — i.e. what to precompile /
+/// segment next. On-demand: traces the full multi-million-step program.
 #[test]
 #[ignore]
-fn diag_segment_memory() {
-    if !voucher_check_elf_path().exists() {
-        eprintln!("SKIP");
-        return;
-    }
-    let (public, witness) = build_transition();
-    let witness_buf = encode_witness(&public.encode(), &witness.encode());
-    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
-        eprintln!("SKIP: trace");
-        return;
-    };
-    let total = full.steps.len();
-    let a = std::env::var("DBG_SEG_A")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(500_000)
-        .min(total - 1);
-    let b = (a + 262_144).min(total);
-    let sn = zkpvm::segment::segment_side_note(&full, a, b);
-    let mem = &sn.initial_memory; // the threaded boundary
-    let ts_lo = full.steps[a].timestamp;
-
-    // Walk the segment in order, tracking per-byte current value (init from
-    // the boundary). First read whose byte disagrees = the bug.
-    use std::collections::HashMap;
-    let mut cur: HashMap<u32, u8> = HashMap::new();
-    let byte_at = |cur: &HashMap<u32, u8>, mem: &[u8], addr: u32| -> u8 {
-        if let Some(v) = cur.get(&addr) {
-            *v
-        } else {
-            *mem.get(addr as usize).unwrap_or(&0)
-        }
-    };
-    for s in &full.steps[a..b] {
-        if let Some(r) = &s.mem_read {
-            let bytes = r.value.to_le_bytes();
-            for i in 0..r.size as usize {
-                let addr = r.address + i as u32;
-                let expect = byte_at(&cur, mem, addr);
-                if bytes[i] != expect {
-                    eprintln!(
-                        "MISMATCH at step ts={} addr={addr:#x}: read byte {:#x} but boundary/cur has {:#x}",
-                        s.timestamp, bytes[i], expect
-                    );
-                    // Full write history of this addr in [0, a) across ALL
-                    // sources, sorted by ts — reveals the missing/mis-ordered
-                    // write.
-                    let mut hist: Vec<(u64, &str, u8)> = Vec::new();
-                    for ws in &full.steps {
-                        if ws.timestamp >= ts_lo {
-                            break;
-                        }
-                        if let Some(w) = &ws.mem_write {
-                            let wb = w.value.to_le_bytes();
-                            for k in 0..w.size as usize {
-                                if w.address + k as u32 == addr {
-                                    hist.push((ws.timestamp, "step.store", wb[k]));
-                                }
-                            }
-                        }
-                    }
-                    for m in &full.blake2b_mem_ops {
-                        if m.ts < ts_lo && addr >= m.h_ptr && addr < m.h_ptr + 64 {
-                            hist.push((
-                                m.ts,
-                                "blake2b@h_ptr",
-                                m.out_bytes[(addr - m.h_ptr) as usize],
-                            ));
-                        }
-                    }
-                    for m in &full.ristretto_mem_ops {
-                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
-                            hist.push((
-                                m.ts,
-                                "ristretto@out",
-                                m.out_bytes[(addr - m.output_ptr) as usize],
-                            ));
-                        }
-                    }
-                    for m in &full.ristretto_add_mem_ops {
-                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
-                            hist.push((
-                                m.ts,
-                                "rist_add@out",
-                                m.out_bytes[(addr - m.output_ptr) as usize],
-                            ));
-                        }
-                    }
-                    for m in &full.scalar_reduce_wide_mem_ops {
-                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
-                            hist.push((
-                                m.ts,
-                                "scalar_reduce@out",
-                                m.out_bytes[(addr - m.output_ptr) as usize],
-                            ));
-                        }
-                    }
-                    for m in &full.scalar_binop_mem_ops {
-                        if m.ts < ts_lo && addr >= m.output_ptr && addr < m.output_ptr + 32 {
-                            hist.push((
-                                m.ts,
-                                "scalar_binop@out",
-                                m.out_bytes[(addr - m.output_ptr) as usize],
-                            ));
-                        }
-                    }
-                    // Also: does any precompile READ this addr (input region)?
-                    for m in &full.blake2b_mem_ops {
-                        if m.ts < ts_lo && addr >= m.m_ptr && addr < m.m_ptr + 128 {
-                            hist.push((
-                                m.ts,
-                                "blake2b READS m here",
-                                m.m_bytes[(addr - m.m_ptr) as usize],
-                            ));
-                        }
-                    }
-                    hist.sort_by_key(|h| h.0);
-                    eprintln!("  write/access history of {addr:#x} in [0,{a}):");
-                    for (ts, src, byte) in hist.iter().rev().take(8).rev() {
-                        eprintln!("    ts={ts:>8} {src:24} byte={byte:#x}");
-                    }
-                    eprintln!("  → boundary={expect:#x}, real read={:#x}", bytes[i]);
-                    return;
-                }
-            }
-        }
-        if let Some(w) = &s.mem_write {
-            let wb = w.value.to_le_bytes();
-            for i in 0..w.size as usize {
-                cur.insert(w.address + i as u32, wb[i]);
-            }
-        }
-    }
-    eprintln!("no first-access read mismatch found in [{a},{b})");
-}
-
-/// Diagnostic (no prove): size the kernel-transition trace and break it
-/// down by op so we know what drives the prove's memory footprint. The
-/// full prove OOMs; this tells us whether it's software variable-base
-/// Ristretto (b·H, e·P), blake2b/SMT, or raw step count that dominates —
-/// i.e. what to precompile / segment next.
-#[test]
 fn measure_transition_trace() {
     if !voucher_check_elf_path().exists() {
         eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
@@ -350,11 +205,7 @@ fn measure_transition_trace() {
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>(),
-            if is_id {
-                "  <-- IDENTITY (0·G, task #7)"
-            } else {
-                ""
-            }
+            if is_id { "  (identity, 0·G)" } else { "" }
         );
     }
     eprintln!("--- top 15 opcodes by step count ---");
@@ -512,36 +363,6 @@ fn measure_succinct_ledger_size_independence() {
     );
 }
 
-/// Segmentation baseline: a single bounded segment of the kernel transition
-/// proves in bounded memory and is constraint-clean. The single-shot prove
-/// of the whole 5.3M-step trace OOMs a 64 GB host; one ~1M-step segment fits.
-/// Heavy; `#[ignore]` — run with `--ignored`.
-#[test]
-#[ignore]
-fn prove_one_transition_segment() {
-    if !voucher_check_elf_path().exists() {
-        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
-        return;
-    }
-    let (public, witness) = build_transition();
-    let witness_buf = encode_witness(&public.encode(), &witness.encode());
-    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
-        eprintln!("SKIP: trace failed");
-        return;
-    };
-    let total = full.steps.len();
-    let b = total.min(SEG_STEPS);
-    eprintln!("proving segment [0, {b}) of {total} steps (mobile config)…");
-    let mut sn = zkpvm::segment::segment_side_note(&full, 0, b);
-    let t = std::time::Instant::now();
-    // Mobile config: FRI log_blowup 2 (4×) vs default 4 (16×) — the blowup
-    // is the commit-phase memory driver, so mobile + a bounded segment fits.
-    let proof = zkpvm::prove_mobile(&mut sn).expect("segment [0, b) must prove (bounded memory)");
-    eprintln!("segment [0, {b}) proved in {:.1?}", t.elapsed());
-    zkpvm::verify_with_pcs_policy(proof, &sn, &zkpvm::PcsPolicy::MOBILE)
-        .expect("segment proof must verify (mobile policy)");
-}
-
 /// Per-segment step cap — sets each segment's `log_size`, hence its prove
 /// memory. The 5.3M-step transition's single-shot prove (even one chip)
 /// OOMs a 64 GB host; ~500K-step segments under the mobile FRI config fit
@@ -658,7 +479,8 @@ fn prove_transition_segmented_chain() {
         sn
     };
     let t = std::time::Instant::now();
-    verify_chain_mobile(&proofs, resegment).expect("verify_chain (mobile) over transition segments");
+    verify_chain_mobile(&proofs, resegment)
+        .expect("verify_chain (mobile) over transition segments");
     eprintln!(
         "verify_chain over {} segments: ok ({:.1?})",
         proofs.len(),
@@ -678,55 +500,6 @@ fn prove_transition_segmented_chain() {
         "ALL {total} steps PROVED + verify_chain green across {} segments",
         proofs.len()
     );
-}
-
-/// Pinpoint WHICH chip's constraints fail at log_size 19 (where the full
-/// prove returns ConstraintsNotSatisfied but the AssertEvaluator OOMs).
-/// `prove_with_explicit_components` over a single chip still runs the
-/// quotient/constraint check (→ Err(ConstraintsNotSatisfied) for the
-/// culprit) but fits in memory. DBG_CHIP selects the active-component index;
-/// DBG_SEG the segment size. Run:
-///   DBG_CHIP=0 DBG_SEG=500000 cargo test -p prover-extension \
-///     --test prove_transition pinpoint_segment_chip -- --ignored --nocapture
-#[test]
-#[ignore]
-fn pinpoint_segment_chip() {
-    if !voucher_check_elf_path().exists() {
-        eprintln!("SKIP: voucher-check ELF not built");
-        return;
-    }
-    let witness_buf = cached_witness_buf();
-    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
-        eprintln!("SKIP: trace failed");
-        return;
-    };
-    let total = full.steps.len();
-    let b = std::env::var("DBG_SEG")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(500_000)
-        .min(total);
-    let idx = std::env::var("DBG_CHIP")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut sn = zkpvm::segment::segment_side_note(&full, 0, b);
-    let comps = zkpvm::active_components(&sn);
-    eprintln!(
-        "segment [0,{b}) has {} active chips; proving chip #{idx} alone…",
-        comps.len()
-    );
-    let single: Vec<&dyn zkpvm::harness::MachineProverComponent> = vec![comps[idx]];
-    // Mobile FRI config (blowup 2) so a single chip at log 19 fits.
-    let config = zkpvm::PcsConfig {
-        pow_bits: 20,
-        fri_config: zkpvm::FriConfig::new(0, 2, 38, 1),
-        lifting_log_size: None,
-    };
-    match zkpvm::prove_with_explicit_components(&mut sn, config, &single) {
-        Ok(_) => eprintln!("chip #{idx}: constraints OK at [0,{b})"),
-        Err(e) => eprintln!("chip #{idx}: FAILED at [0,{b}) — {e:?}"),
-    }
 }
 
 /// Dump the traced steps around given indices (comma-separated DBG_ROWS) —
@@ -773,79 +546,6 @@ fn dump_steps() {
             );
         }
     }
-}
-
-/// Emulate the CpuChip cmov constraints over the raw trace: for every
-/// CmovIz/CmovNz/CmovIzImm/CmovNzImm step, fill val_b/val_d the way
-/// trace_fill's operand matrix does (incl. the is_cmov_imm swap: val_b ←
-/// imm, val_d ← regs[rb]) and check the result-binding constraint the AIR
-/// enforces (`helper · (result − val_b)`). Asserts zero violations — a
-/// cheap trace-level regression for cmov operand routing that needs no
-/// assert row↔step mapping. (This is the tool that pinpointed the
-/// CmovNzImm routing bug: grey lowers `SLTU rd, x0, rs2` (snez) to
-/// LoadImm rd,0 + CmovNzImm rd, rs2, 1.)
-#[test]
-#[ignore]
-fn scan_cmov() {
-    if !voucher_check_elf_path().exists() {
-        eprintln!("SKIP: voucher-check ELF not built");
-        return;
-    }
-    let witness_buf = cached_witness_buf();
-    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
-        eprintln!("SKIP: trace failed");
-        return;
-    };
-    use std::collections::BTreeMap;
-    let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new(); // (steps, violations)
-    let mut shown = 0;
-    for (i, s) in full.steps.iter().enumerate() {
-        let name = format!("{:?}", s.opcode);
-        if !name.starts_with("Cmov") {
-            continue;
-        }
-        let is_imm = name.ends_with("Imm");
-        let is_nz = name.contains("Nz");
-        // trace_fill routing: ThreeReg → (regs[ra], regs[rb]);
-        // Cmov*Imm (is_cmov_imm swap) → (imm, regs[rb]).
-        let (val_b, val_d) = if is_imm {
-            (s.imm, s.regs_before[s.reg_b])
-        } else {
-            (s.regs_before[s.reg_a], s.regs_before[s.reg_b])
-        };
-        // dest_reg: ThreeReg → rd, otherwise ra.
-        let dr = if is_imm { s.reg_a } else { s.reg_d };
-        let result = s.regs_after[dr];
-        let taken_helper = if is_nz { val_d != 0 } else { val_d == 0 };
-        let e = counts.entry(name.clone()).or_default();
-        e.0 += 1;
-        if taken_helper && result != val_b {
-            e.1 += 1;
-            if shown < 10 {
-                shown += 1;
-                eprintln!(
-                    "VIOLATION step {i}: {name} a=r{}({:#x}) b=r{}({:#x}) imm={:#x} \
-                     result={result:#x} val_b={val_b:#x} val_d={val_d:#x} (Δ byte0 = {})",
-                    s.reg_a,
-                    s.regs_before[s.reg_a],
-                    s.reg_b,
-                    s.regs_before[s.reg_b],
-                    s.imm,
-                    (result as u8).wrapping_sub(val_b as u8) as i8,
-                );
-            }
-        }
-    }
-    eprintln!("--- cmov census (steps, constraint-violations under chip routing) ---");
-    let mut total_violations = 0;
-    for (op, (n, v)) in &counts {
-        eprintln!("  {op:12} steps={n:>7} violations={v}");
-        total_violations += v;
-    }
-    assert_eq!(
-        total_violations, 0,
-        "cmov operand routing disagrees with execution on {total_violations} steps"
-    );
 }
 
 /// Pinpoint a constraint failure in a single segment (lighter than prove:
@@ -940,15 +640,15 @@ fn diag_segment_logup() {
     }
 }
 
-/// Decide whether the segment-9 logup imbalance is a SEGMENTATION boundary
+/// Decide whether a per-segment logup imbalance is a SEGMENTATION boundary
 /// artifact or a real per-chip bug in that region of the program: check
-/// whether the FULL (un-segmented) trace's logup balances. The single-shot
-/// prove OOMs, so this never got verified before; `debug_claimed_sums_streaming`
-/// accumulates the global claimed-sum one chip at a time (bounded memory).
+/// whether the FULL (un-segmented) trace's logup balances.
+/// `debug_claimed_sums_streaming` accumulates the global claimed-sum one
+/// chip at a time, so it fits where a single-shot prove cannot.
 /// - BALANCES  → the full execution is sound; the segment imbalance is purely
 ///   a boundary-reconstruction bug in `segment_side_note`.
-/// - DOES NOT  → a genuine chip bug fires on some op in the trace (like the
-///   SetGt / Phi7 bugs), independent of segmentation.
+/// - DOES NOT  → a genuine chip bug fires on some op in the trace,
+///   independent of segmentation.
 /// Run:
 ///   cargo test -p prover-extension --features debug-constraints \
 ///     --test prove_transition debug_transition_full_logup -- --ignored --nocapture
@@ -983,11 +683,11 @@ fn debug_transition_full_logup() {
 }
 
 /// Pinpoint the buggy step behind an intrinsic (non-boundary) logup
-/// imbalance by bisecting a step window. Since boundary reconstruction is
-/// balanced (proven: segments not containing the bug balance), a sub-window
-/// is unbalanced IFF it contains the offending op — so binary search converges
-/// on it, and we dump the opcodes in the minimal window. DBG_A/DBG_B bound
-/// the search (default the unbalanced segment 9 range); DBG_MIN the stop
+/// imbalance by bisecting a step window. When boundary reconstruction is
+/// balanced (segments not containing the bug balance), a sub-window is
+/// unbalanced IFF it contains the offending op — so binary search converges
+/// on it, and we dump the opcodes in the minimal window. DBG_SCAN_FROM
+/// skips ahead when the rough region is known; DBG_MIN sets the stop
 /// width. Uses the cached (deterministic) witness. Run:
 ///   cargo test -p prover-extension --features debug-constraints \
 ///     --test prove_transition bisect_segment_logup -- --ignored --nocapture
@@ -1014,9 +714,9 @@ fn bisect_segment_logup() {
     };
     let min_w = env_usize("DBG_MIN", 200);
     // Scan window (500K segments via segment_bounds) is bounded so
-    // debug_claimed_sums (which holds all chip traces) never OOMs. The bug
-    // is post-crypto (late), so scan from DBG_SCAN_FROM (default 4M) onward.
-    let scan_from = env_usize("DBG_SCAN_FROM", 4_000_000);
+    // debug_claimed_sums (which holds all chip traces) never OOMs.
+    // DBG_SCAN_FROM skips ahead when the rough region is known.
+    let scan_from = env_usize("DBG_SCAN_FROM", 0);
 
     let balances = |a: usize, b: usize| -> bool {
         let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
@@ -1140,7 +840,68 @@ fn debug_transition_constraints() {
     eprintln!("ALL constraints satisfied across the full {n}-step transition trace");
 }
 
+/// Trace-level io-binding regression (no prove): the guest must bind a
+/// DIFFERENT io-hash for a different voucher `Public`, and each hash must
+/// equal `compute_io_hash(public_bytes(public), [1])`. Reads φ[9..12]
+/// from the trace's final register state — the same registers the Z0
+/// closing chip pins into `proof.final_state.registers` — so it covers
+/// the guest's binding end-to-end without a (segment-chain-sized) prove.
+/// Also asserts the cipher-clerk precompile path is wired (ristretto
+/// ECALLs present).
 #[test]
+fn traced_io_hash_reflects_public_input() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let mut hashes = Vec::new();
+    for _ in 0..2 {
+        // build_transition draws fresh random ids/keys, so the two
+        // iterations bind different `Public`s.
+        let (public, witness) = build_transition();
+        let public_bytes_rkyv = public.encode();
+        let witness_bytes = witness.encode();
+        assert!(
+            4 + public_bytes_rkyv.len() + 4 + witness_bytes.len() <= 16384,
+            "witness exceeds the guest __VOS_WITNESS buffer (grow witness_buffer!)"
+        );
+        let witness_buf = encode_witness(&public_bytes_rkyv, &witness_bytes);
+        let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+            eprintln!("SKIP: trace failed");
+            return;
+        };
+        assert!(
+            !full.ristretto_calls.is_empty(),
+            "kernel re-execution must reach the ristretto precompile ECALLs"
+        );
+        let last = full.steps.last().expect("non-empty trace");
+        let mut bound = [0u8; 32];
+        for (k, reg) in (9..13).enumerate() {
+            bound[k * 8..(k + 1) * 8].copy_from_slice(&last.regs_after[reg].to_le_bytes());
+        }
+        let expected = vos::zk::compute_io_hash(&public_bytes(&public), &[1u8]);
+        assert_eq!(
+            bound, expected,
+            "guest-bound φ[9..12] must equal compute_io_hash(public_bytes, [1])"
+        );
+        hashes.push(bound);
+    }
+    assert_ne!(
+        hashes[0], hashes[1],
+        "different Public must bind a different io-hash"
+    );
+}
+
+/// Proof-level roundtrip + forgery rejection through the single-shot
+/// prover path. The transition trace is millions of steps and only
+/// proves as a segment chain, so the single-shot path cannot complete
+/// here — `#[ignore]`d until chain-aware prove/verify is exposed through
+/// the prover extension (see docs/plans/succinct-merkle-witness.md).
+/// Until then: the chain capstone (`prove_transition_segmented_chain`)
+/// covers honest proving, and `traced_io_hash_reflects_public_input`
+/// covers the io-binding the forgery case relies on.
+#[test]
+#[ignore]
 fn prove_transition_roundtrip_and_forgery_rejected() {
     if !voucher_check_elf_path().exists() {
         eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
@@ -1148,50 +909,17 @@ fn prove_transition_roundtrip_and_forgery_rejected() {
     }
 
     let (public, witness) = build_transition();
-    let public_bytes_rkyv = public.encode(); // witness public half (rkyv)
-    let witness_bytes = witness.encode(); // witness secret half (rkyv TransitionWitness)
-    eprintln!(
-        "witness sizes: public={} B, transition={} B, buffer=16384 B",
-        public_bytes_rkyv.len(),
-        witness_bytes.len()
-    );
-    assert!(
-        4 + public_bytes_rkyv.len() + 4 + witness_bytes.len() <= 16384,
-        "witness exceeds the guest __VOS_WITNESS buffer (grow witness_buffer!)"
-    );
-    let witness_buf = encode_witness(&public_bytes_rkyv, &witness_bytes);
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
 
-    // The io-binding public half is the explicit voucher public_bytes (D1),
+    // The io-binding public half is the explicit voucher public_bytes,
     // distinct from the rkyv witness public above.
     let io_public = public_bytes(&public);
     let return_bytes = vec![1u8];
 
     let Some((proof_bytes, commitment, _io)) = prove_with_details(PROGRAM, &witness_buf) else {
-        // Known blocker (Phase A): the kernel `apply_batch` transition is not
-        // yet PVM-provable because `grey-transpiler` errors lowering
-        // `SLT rd, x0, rs2` (signed-compare-against-zero in the kernel's
-        // balance-overflow check) on its main OP-decode path
-        // (riscv.rs:~1135) — even though grey's `translate_op` already
-        // handles that exact encoding (regression test
-        // `translates_slt_x0_rs2_to_set_gt_s_imm`). The incomplete fix needs
-        // the main OP path to delegate x0-as-rs1 SLT/SLTU to `translate_op`,
-        // then a grey rev bump in vos. The transition LOGIC is host-verified
-        // in `cipher_clerk::snapshot` (VecLedger / TransitionWitness). This
-        // gate goes green once grey lowers SLT-x0.
-        eprintln!(
-            "SKIP: kernel transition not yet PVM-provable (grey-transpiler SLT-x0 gap). \
-             witness OK ({} B). See project_voucher_state_transition_phaseA memory.",
-            witness_bytes.len()
-        );
+        eprintln!("SKIP: single-shot prove did not complete (expected — chain-sized trace)");
         return;
     };
-    eprintln!(
-        "FRESH VOUCHER_CHECK_COMMITMENT = {:?}",
-        commitment
-            .iter()
-            .map(|b| format!("0x{b:02x}"))
-            .collect::<Vec<_>>()
-    );
 
     // Happy path: valid STARK against the proof's own commitment AND the
     // io-binding to the asserted voucher public.
