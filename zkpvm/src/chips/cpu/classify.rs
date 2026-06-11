@@ -40,9 +40,17 @@ pub(crate) struct OpcodeFlags {
     /// the moved value in `val_b` and the condition in `val_d` (which
     /// `ValDIsZero` gates), but the imm variants move the IMMEDIATE guarded
     /// by `regs[rb]`. `is_cmov_imm` swaps the source so `val_b = imm`,
-    /// `val_d = regs[rb]` — the same model as `is_set_gt` /
-    /// `is_rotate_r_imm_alt`. NOT a compare-partition sub-flag; co-occurs
-    /// with `is_cmov_iz`/`is_cmov_nz`.
+    /// `val_d = regs[rb]`. The swap mechanism mirrors `is_set_gt` /
+    /// `is_rotate_r_imm_alt`, BUT — unlike `is_rotate_r_imm_alt`, which is
+    /// packed into the 48-flag program-memory bag (opcode-bound) — neither
+    /// `is_cmov_imm` nor `is_set_gt` is in that bag, so they are free
+    /// witness columns bound only transitively via the register-pinned
+    /// `result` (the same model as the other unpacked compare sub-flags
+    /// `is_set_lt_s/u`, `is_cmov_iz/nz`). Sound because each flag only
+    /// ADDS a pin (`flag·(val_b−ImmBytes)=0`) and gates nothing else:
+    /// asserting it spuriously can only over-constrain, and omitting it on
+    /// a real swapped row reduces to the pre-existing compare-operand model.
+    /// NOT a compare-partition sub-flag; co-occurs with `is_cmov_iz/nz`.
     pub is_cmov_imm: bool,
     pub is_min_s: bool,
     pub is_min_u: bool,

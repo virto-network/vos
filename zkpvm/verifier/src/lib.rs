@@ -248,9 +248,9 @@ pub fn verify_standalone_with_options(
     for r in &final_state.registers {
         verifier_channel.mix_u64(*r);
     }
-    // Format v4: boundary pc + timestamp ride the same binding
-    // (chip-committed by ProgramBoundaryChip; see prove.rs).
-    // memory_commitment deliberately stays unmixed.
+    // Format v4: boundary pc + timestamp join the mix (tamper-evidence
+    // only — see the prover-side note in prove.rs; not a binding
+    // constraint). memory_commitment stays unmixed.
     verifier_channel.mix_u64(initial_state.pc as u64);
     verifier_channel.mix_u64(initial_state.timestamp);
     verifier_channel.mix_u64(final_state.pc as u64);

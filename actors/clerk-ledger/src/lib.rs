@@ -477,13 +477,14 @@ impl ClerkLedger {
         self.transfers.len() as u32
     }
 
-    /// Composite SMT root: `smt_node_hash(smt_node_hash(accounts_root,
-    /// transfers_root), journals_root)`. This is the 32-byte state
-    /// anchor every voucher / disclosure proof / cross-clerk
-    /// message will commit to. Returns an empty `Vec` if the ledger
-    /// isn't bootstrapped — the all-zero root would be a forgeable
-    /// anchor, so callers must distinguish "no root" from "this is
-    /// the root".
+    /// Composite SMT root over the full kernel-checked state (accounts,
+    /// transfers, journal + the external-id / voided / pending
+    /// bookkeeping sub-SMTs) — see [`ClerkLedger::composite_root`]. This
+    /// is the 32-byte state anchor every voucher / disclosure proof /
+    /// cross-clerk message commits to. Returns an empty `Vec` if the
+    /// ledger isn't bootstrapped — the all-zero root would be a
+    /// forgeable anchor, so callers must distinguish "no root" from
+    /// "this is the root".
     ///
     /// Runtime cost: O(N · log N) per call (rebuilds sorted leaf
     /// hashes then walks 128 SMT levels). Allocation-free recursion

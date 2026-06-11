@@ -33,23 +33,32 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 /// (one past the last real step). Mirrors `RegisterMemoryBoundaryChip`
 /// at the other end of the trace.
 ///
-/// Why it exists: without this chip, `proof.final_state.registers` is
-/// metadata the prover writes after the trace runs — nothing in the
-/// constraint system pins the values there. A cheating prover could
-/// claim any final register state. The closing chip closes the loop:
-/// it produces (reg, claimed_final_val, closing_ts) into the
-/// register-memory relation. The augmented ledger
-/// (`build_entries_from_side_note` appends 13 synthetic closing
-/// reads — see `chips/register_memory.rs`) consumes the same tuples
-/// AND forces `value == prev_value` via the read-consistency
-/// constraint, where `prev_value` is the previous ledger row for that
-/// register (= the actual last-written value). So the chip's claimed
-/// value is forced to equal the trace's actual final register value.
+/// Why it exists: it pins the trace's final register state inside the
+/// constraint system. The chip produces (reg, final_val_column,
+/// closing_ts) into the register-memory relation; the augmented ledger
+/// (`build_entries_from_side_note` appends 13 synthetic closing reads —
+/// see `chips/register_memory.rs`) consumes the same tuples AND forces
+/// `value == prev_value` via the read-consistency constraint, where
+/// `prev_value` is the previous ledger row for that register (= the
+/// actual last-written value). So the chip's final-value COLUMN is
+/// forced to equal the trace's actual final register state.
 ///
-/// Effect: `proof.final_state.registers` becomes a load-bearing
-/// public output. Verifiers that need to bind a specific final state
-/// (e.g. cipher-clerk's voucher proof binding to public_bytes hash)
-/// can now do so via a one-line equality check after `verify`.
+/// SCOPE — what this does and does NOT bind. It binds the COLUMN. It
+/// does NOT, on its own, bind the separate `proof.final_state.registers`
+/// metadata field: no constraint relates that field to the column, and
+/// the FS-transcript mix of the field (see `prove.rs`) only makes a
+/// *finished* proof tamper-evident (editing the field post-prove shifts
+/// the verifier's challenges and breaks the openings). A malicious
+/// from-scratch prover can commit the real final-value column (passing
+/// this chip) yet mix and ship an arbitrary `final_state.registers`,
+/// and `verify` accepts — the metadata is self-consistent with the
+/// challenges but unrelated to the column. So a verifier that reads
+/// `proof.final_state.registers` to bind a public output (e.g.
+/// cipher-clerk's voucher io-hash in φ[9..12]) is trusting the prover,
+/// not the proof. Closing that requires a boundary constraint that
+/// evaluates the public field as a constant at the OODS point and
+/// equates it to the committed column — see the soundness note in
+/// `docs/plans/succinct-merkle-witness.md`.
 ///
 /// Format version: bumped 1 → 2 alongside this chip's introduction;
 /// older proofs (no closing chip in their component set) are

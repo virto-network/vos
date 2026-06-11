@@ -16,15 +16,60 @@ transition as a bounded-memory chain).
 **Open follow-up — verifier-side chain verification.** The transition trace
 is crypto-dominated and ledger-size-independent at ~7.5M steps: it cannot
 single-shot prove on a development host, so it proves as a segment chain.
-But `verify_chain` needs prover-side side notes and the segment-boundary
-`memory_commitment` is unbound metadata (Phase Z0 binds registers only) — so
+`verify_chain` needs prover-side side notes, and — more fundamentally — the
+boundary states it chains on are not soundly bound (see the gap below). So
 the chain CANNOT yet be verified across a trust boundary (the clerk-bridge's
-`verify` checks one standalone proof against one program commitment). Until a
-verifier-side aggregation lands (per-segment commitment binding + STARK-bound
-boundary memory commitments, or recursive aggregation into one proof), the
-federation e2e's real-STARK happy path is skipped and conservation-of-value
-remains prover-side-proven only. That aggregation is the next project on
-this track.
+`verify` checks one standalone proof against one program commitment). Until
+that lands, the federation e2e's real-STARK happy path is skipped and
+conservation-of-value remains prover-side-proven only.
+
+### Soundness prerequisite #1 — bind the boundary public outputs (not just mix them)
+
+A code review (2026-06-11) confirmed a pre-existing gap the chain work
+inherits and must close. `proof.{initial,final}_state` (registers, pc,
+timestamp, memory_commitment) are mixed into the Fiat–Shamir transcript
+(`prove.rs`), which makes a *finished* proof tamper-evident — but **no
+constraint relates those metadata fields to the committed boundary
+columns**. `RegisterMemoryClosingChip` / `ProgramBoundaryChip` pin the
+COLUMNS to the real trace via logup read-consistency, yet the verifier
+never compares the mixed metadata field to a column opening. Consequence:
+a malicious from-scratch prover can commit the real columns (passing every
+chip) and mix+ship an arbitrary self-consistent `final_state` — `verify`
+accepts. This breaks two things the money path depends on:
+
+- **The voucher io-hash is forgeable.** `verify_proof_bytes` reads the
+  io-hash from `final_state.registers[9..13]` (metadata). An attacker
+  proves *any* valid voucher-check execution (even the trivial
+  no-witness early-exit) and ships forged io-hash metadata equal to
+  `compute_io_hash(public_B, [1])` for a chosen `public_B`; the bridge's
+  `public_io_hash() == compute_io_hash(public_B)` check passes. So the
+  external-voucher verify is **not sound against a malicious prover**
+  today, independent of the chain work.
+- **`verify_chain` continuity is metadata-vs-metadata.** Its
+  `final_state == next.initial_state` check compares free fields, so it
+  does not actually force a continuous execution.
+
+This is *not* a regression introduced by the succinct-witness branch — it
+is the Z0 boundary-binding mechanism as shipped (the branch's v4 work
+extended the same tamper-evidence to pc/timestamp). But it is the **#1
+correctness requirement** of this project: the per-segment proof must
+*bind* its boundary states with a constraint, not just mix them. Concretely,
+add a boundary public-input constraint — evaluate `initial_state` /
+`final_state` as constants at the OODS point and equate them to the
+committed boundary columns (`ProgramBoundaryChip` InitialPc/FinalNextPc/
+timestamps, `RegisterMemoryClosingChip` final RegVal, boundary chip initial
+RegVal). That is another format bump and wants a from-scratch-forgery test
+(prove a real trace, mix a lie, assert `verify` REJECTS) as its gate.
+`memory_commitment` is weaker still (computed outside the circuit, not even
+mixed) and needs an in-circuit memory-image commitment or a shared-challenge
+memory-handoff argument — the same work the proving-time plan couples to
+distributed proving.
+
+The rest of the project (side-note-free `verify_chain_standalone`,
+shape-aware program identity, prover-extension + clerk-bridge plumbing) sits
+on top of that binding. Until it lands, treat every conservation-of-value
+proof as **prover-side only** — do not present `verify_proof_bytes`
+acceptance as a trust boundary between mutually-distrusting banks.
 
 ## Why
 

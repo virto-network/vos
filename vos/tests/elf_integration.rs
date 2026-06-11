@@ -7717,6 +7717,14 @@ fn clerk_ledger_two_bank_federation() {
     // sufficient: bank B's verifier extension reaches across the
     // wire (via the `peer_prefix` hint registered with `register_
     // peer`) to fetch the bytes on demand. No bank-B pre-seed.
+    //
+    // NOTE: section 5h's real-STARK HAPPY path is currently skipped
+    // (the transition proof is segment-chain-sized and chain-aware
+    // verify isn't wired — see the SKIP below). What this section
+    // still exercises is the prover registration + commitment
+    // plumbing and the ADVERSARIAL reject paths (forged content
+    // address, local + cross-node), which need no real proof. The
+    // cross-MiB blob-fetch happy path returns once chain verify lands.
 
     // Load clerk-prover-extension's .so. Skip if not built;
     // matches the SKIP pattern used by other actor ELFs above.

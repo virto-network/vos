@@ -48,6 +48,18 @@ pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), Ve
 /// reject at the same threshold.
 pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
 
+/// Verify a proof against a `side_note` describing the SAME program +
+/// segment the prover ran.
+///
+/// PRECONDITION: `side_note` must be in the state `prove` left it in —
+/// `closing_chip_active` set and the register images backfilled. `prove`
+/// applies this via [`crate::prepare_side_note_for_verification`]; a
+/// caller that RE-DERIVES a side note (e.g. re-slicing a segment of a
+/// traced run to check a chain) MUST call that helper first, or the
+/// verifier's Fiat-Shamir transcript diverges from the prover's and an
+/// honest proof fails with `OodsNotMatching`. (This is a host-side
+/// re-derivation path only; `zkpvm_verifier::verify_standalone` needs no
+/// side note at all.)
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
     verify_with_options(
         proof,
@@ -237,9 +249,9 @@ fn verify_with_options_explicit_components(
         for r in &final_state.registers {
             verifier_channel.mix_u64(*r);
         }
-        // Format v4: boundary pc + timestamp ride the same binding
-        // (chip-committed by ProgramBoundaryChip; see prove.rs).
-        // memory_commitment deliberately stays unmixed.
+        // Format v4: boundary pc + timestamp join the mix (tamper-
+        // evidence only — see the prover-side note in prove.rs; not a
+        // binding constraint). memory_commitment stays unmixed.
         verifier_channel.mix_u64(initial_state.pc as u64);
         verifier_channel.mix_u64(initial_state.timestamp);
         verifier_channel.mix_u64(final_state.pc as u64);

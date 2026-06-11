@@ -646,34 +646,33 @@ fn prove_impl_with_components(
     tree_builder.commit(prover_channel);
     let main_commit = t.elapsed();
 
-    // Phase Z0: bind `proof.initial_state.registers` and
-    // `proof.final_state.registers` into the FS transcript. Mirrored
-    // by the verifier; any post-prove tamper of either field shifts
-    // the lookup-element challenges the verifier draws, so the
-    // committed interaction trace no longer satisfies the constraint
-    // system. Both are gated on `closing_chip_active` because the
-    // initial-state binding ships paired with the closing chip in
-    // production (BASE_COMPONENTS includes both the boundary and
-    // closing chips, set together by `prove_impl`). Chip-isolated
-    // harnesses that opted out leave both bindings off, matching
-    // their `component_mask = 0` proof shape.
+    // Mix the boundary `SegmentState` fields into the FS transcript so
+    // a FINISHED proof is tamper-evident: editing initial/final
+    // registers, pc or timestamp post-prove shifts the challenges the
+    // verifier draws, so the committed interaction trace no longer
+    // satisfies the constraint system. Gated on `closing_chip_active`
+    // because production always ships the boundary + closing chips
+    // together (BASE_COMPONENTS, set by `prove_impl`); chip-isolated
+    // harnesses that opted out leave the mix off, matching their
+    // `component_mask = 0` proof shape.
     //
-    // Order is initial-then-final, deterministic and stable across
-    // versions. Verifier must mix in the same order.
+    // Order (initial regs, final regs, initial pc, initial ts, final
+    // pc, final ts) is deterministic and stable; the verifier MUST mix
+    // identically. `memory_commitment` is NOT mixed (it is a hash
+    // computed outside the circuit).
     //
-    // Format v4 extends the mix with the segment-boundary pc and
-    // timestamp. Their in-circuit commitments already exist:
-    // ProgramBoundaryChip commits (InitialPc, InitialTimestamp) and
-    // (FinalNextPc, FinalNextTimestamp), telescoped through CpuChip's
-    // program-execution relation — exactly the values
-    // `initial_state`/`final_state` carry. Mixing them gives those
-    // proof fields the same tamper-evidence the registers have, which
-    // is what makes `verify_chain`'s boundary equality on pc/timestamp
-    // load-bearing. `memory_commitment` stays unmixed: it is computed
-    // OUTSIDE the circuit (a hash of the memory image) and mixing it
-    // would assert nothing the constraint system checks — binding it
-    // needs a memory-ledger closing argument (future work, see
-    // docs/plans/succinct-merkle-witness.md).
+    // IMPORTANT — this is tamper-evidence, NOT binding. No constraint
+    // relates these proof METADATA fields to the committed boundary
+    // columns (ProgramBoundaryChip / RegisterMemoryClosingChip pin the
+    // COLUMNS to the real trace, but the verifier never compares the
+    // mixed field against a column opening). A from-scratch prover can
+    // commit the real columns and mix+ship arbitrary self-consistent
+    // boundary metadata; `verify` accepts. So `verify_chain` continuity
+    // and any consumer of `proof.{initial,final}_state` (e.g. the
+    // voucher io-hash in φ[9..12]) trust the prover for these values.
+    // Real binding needs a boundary public-input constraint — see the
+    // SCOPE note in `chips/register_memory_closing.rs` and
+    // `docs/plans/succinct-merkle-witness.md`.
     if side_note.closing_chip_active {
         for r in &side_note.initial_regs {
             prover_channel.mix_u64(*r);
@@ -681,18 +680,16 @@ fn prove_impl_with_components(
         for r in &side_note.final_regs {
             prover_channel.mix_u64(*r);
         }
-        let (initial_pc, initial_ts, final_pc, final_ts) = if side_note.steps.is_empty() {
-            (0, 0, 0, 0)
-        } else {
-            let first = &side_note.steps[0];
-            let last = &side_note.steps[side_note.steps.len() - 1];
-            (
-                first.pc as u64,
-                first.timestamp,
-                last.next_pc as u64,
-                last.timestamp + 1,
-            )
-        };
+        let (initial_pc, initial_ts, final_pc, final_ts) =
+            match (side_note.steps.first(), side_note.steps.last()) {
+                (Some(first), Some(last)) => (
+                    first.pc as u64,
+                    first.timestamp,
+                    last.next_pc as u64,
+                    last.timestamp + 1,
+                ),
+                _ => (0, 0, 0, 0),
+            };
         prover_channel.mix_u64(initial_pc);
         prover_channel.mix_u64(initial_ts);
         prover_channel.mix_u64(final_pc);

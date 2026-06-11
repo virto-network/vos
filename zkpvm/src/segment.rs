@@ -7,9 +7,22 @@
 //! state-transition re-execution) exceeds a 64 GB host even for a *single*
 //! chip. Segmentation caps each segment's step count — and hence its
 //! `log_size` — so the prover fits on modest hardware, while `verify_chain`
-//! re-checks per-segment validity plus boundary continuity (Phase Z0 /
-//! Z0-init bind each segment's first/last registers and the memory
-//! commitment, so segments cannot be re-stitched dishonestly).
+//! re-checks per-segment validity plus boundary continuity.
+//!
+//! SOUNDNESS SCOPE. `verify_chain`'s continuity check compares each
+//! segment's `final_state` to the next's `initial_state` (registers, pc,
+//! timestamp, memory_commitment). Those `SegmentState` fields are proof
+//! METADATA: the FS-transcript mix (registers + pc + timestamp; see
+//! `prove.rs`) makes a finished proof tamper-evident, but NO constraint
+//! binds the metadata to the committed boundary columns, so a malicious
+//! from-scratch prover can ship arbitrary self-consistent boundary
+//! states (see `chips/register_memory_closing.rs`). `memory_commitment`
+//! is weaker still — it is a hash computed outside the circuit and is
+//! not even mixed. So this slicer + `verify_chain` is the bounded-memory
+//! PROVING capability; it is NOT yet a trustworthy verifier-side chain
+//! check. Making it one (real boundary-public-input binding) is the
+//! conservation-of-value chain-verification project — see
+//! `docs/plans/succinct-merkle-witness.md`.
 //!
 //! This is program-agnostic: any actor whose trace is too large for one
 //! proof becomes provable as a chain.

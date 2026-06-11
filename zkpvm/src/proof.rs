@@ -25,30 +25,34 @@ use stwo::core::{
 ///   2 — Phase Z0: `RegisterMemoryClosingChip` added at index 6,
 ///       shifting every higher chip index by +1; closes the register-
 ///       memory ledger by consuming a synthetic per-register read at
-///       `closing_ts = last_step.timestamp + 1`. Effect: `proof.
-///       final_state.registers` is now a load-bearing public output
-///       — read-consistency in the ledger forces it to match the
-///       trace's true final register values.  Older proofs cannot
-///       satisfy the new constraint set; reject at the
-///       `format_version` gate.
+///       `closing_ts = last_step.timestamp + 1`, pinning the final
+///       register COLUMN to the trace's true final register values.
+///       The FS-transcript also mixes `final_state.registers`, making
+///       a finished proof tamper-evident. (See the SCOPE note in
+///       `chips/register_memory_closing.rs`: the mix does NOT bind the
+///       separate metadata FIELD against a from-scratch prover.) Older
+///       proofs reject at the `format_version` gate.
 ///   3 — Phase Z0-init: FS-transcript also mixes
 ///       `proof.initial_state.registers` (before the existing
-///       `final_state.registers` mix). The boundary chip already
-///       commits to `initial_regs` in its trace; this binding closes
-///       the matching metadata-field gap on the initial side.
-///       Registers of both boundary states are STARK-bound; pc,
-///       timestamp and memory_commitment remained free metadata.
+///       `final_state.registers` mix) — same tamper-evidence on the
+///       initial side; the boundary chip already commits `initial_regs`
+///       in its trace.
 ///   4 — Boundary pc + timestamp join the FS mix (after the register
 ///       mixes; order: initial regs, final regs, initial pc, initial
 ///       ts, final pc, final ts). Their in-circuit commitments already
 ///       existed — ProgramBoundaryChip commits (InitialPc,
 ///       InitialTimestamp) and (FinalNextPc, FinalNextTimestamp),
-///       telescoped through CpuChip's program-execution relation —
-///       so the mix makes the proof fields tamper-evident and
-///       `verify_chain`'s whole-struct boundary equality load-bearing
-///       for pc and timestamp. `memory_commitment` remains free
-///       metadata: it is computed outside the circuit; binding it
-///       requires a memory-ledger closing argument (future work).
+///       telescoped through CpuChip's program-execution relation. So
+///       the mix extends the SAME tamper-evidence the registers have to
+///       pc and timestamp; `verify_chain`'s whole-struct boundary
+///       equality stops comparing pure metadata for those fields.
+///       LIMITATION (shared with the register mix since v2): the mix is
+///       tamper-evidence, NOT a binding constraint — a from-scratch
+///       prover can still ship self-consistent boundary metadata that
+///       differs from the committed columns. True binding needs a
+///       boundary public-input constraint (the conservation-of-value
+///       chain-verification project). `memory_commitment` is weaker
+///       still — computed outside the circuit, not even mixed.
 pub const PROOF_FORMAT_VERSION: u32 = 4;
 
 /// Execution state at a segment boundary (initial or final).

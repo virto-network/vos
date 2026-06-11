@@ -11,7 +11,9 @@
 //!   - A witness-less run is NOT a proving run: the guest returns
 //!     early with a small trace and no io-hash binding.
 //!   - The prove/verify pipeline accepts the resulting trace, and the
-//!     proof's boundary fields are bound per the current format scope.
+//!     proof's boundary fields are tamper-evident per the format scope
+//!     (`boundary_fields_are_tamper_evident` — note: tamper-evidence,
+//!     not binding; see that test's doc).
 //!   - The proof's program commitment is deterministic — a second prove
 //!     of the same blob yields the same commitment, which is what
 //!     `verify_standalone` checks against.
@@ -412,17 +414,21 @@ fn verify_standalone_rejects_mask_zero() {
     );
 }
 
-/// Boundary-field binding scope at format v4: registers, pc and
-/// timestamp on BOTH `proof.initial_state` and `proof.final_state` are
-/// FS-mixed (registers since Z0/Z0-init; pc + timestamp since v4 —
-/// their in-circuit commitments come from ProgramBoundaryChip), so
-/// tampering any of them must reject. `memory_commitment` is the one
-/// remaining metadata field on each end: it is computed OUTSIDE the
-/// circuit, so mixing it would assert nothing — binding it needs a
-/// memory-ledger closing argument (future work; when that lands,
-/// rewrite this test again rather than inheriting a silent binding).
+/// Boundary-field TAMPER-EVIDENCE scope at format v4. Registers, pc and
+/// timestamp on both `proof.initial_state` and `proof.final_state` are
+/// FS-mixed (registers since Z0/Z0-init; pc + timestamp since v4), so
+/// editing any of them on a FINISHED proof shifts the verifier's
+/// challenges and the proof rejects — this test exercises exactly that
+/// post-prove edit. `memory_commitment` is not mixed, so editing it
+/// still verifies.
+///
+/// NOTE — this is tamper-evidence, NOT binding. It does not (and cannot,
+/// by mutating a finished proof) cover the from-scratch prover who mixes
+/// a lie from the start: no constraint relates these metadata fields to
+/// the committed boundary columns, so such a prover is NOT rejected.
+/// See the SCOPE note in `chips/register_memory_closing.rs`.
 #[test]
-fn boundary_field_binding_scope() {
+fn boundary_fields_are_tamper_evident() {
     let Some(blob) = load_voucher_check_blob() else {
         return;
     };
@@ -432,34 +438,34 @@ fn boundary_field_binding_scope() {
 
     use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
 
-    // pc — bound on both ends (v4).
+    // pc — tamper-evident on both ends (v4).
     let mut tampered_pc = proof.clone();
     tampered_pc.final_state.pc ^= 0x1000;
     assert!(
         verify_standalone_with_pcs_policy(tampered_pc, prog_hash, &PcsPolicy::MOBILE).is_err(),
-        "v4 mixes final_state.pc — tampering it must reject"
+        "v4 mixes final_state.pc — editing a finished proof must reject"
     );
     let mut tampered_initial_pc = proof.clone();
     tampered_initial_pc.initial_state.pc ^= 0x1000;
     assert!(
         verify_standalone_with_pcs_policy(tampered_initial_pc, prog_hash, &PcsPolicy::MOBILE)
             .is_err(),
-        "v4 mixes initial_state.pc — tampering it must reject"
+        "v4 mixes initial_state.pc — editing a finished proof must reject"
     );
 
-    // timestamp — bound on both ends (v4).
+    // timestamp — tamper-evident on both ends (v4).
     let mut tampered_ts = proof.clone();
     tampered_ts.final_state.timestamp ^= 1;
     assert!(
         verify_standalone_with_pcs_policy(tampered_ts, prog_hash, &PcsPolicy::MOBILE).is_err(),
-        "v4 mixes final_state.timestamp — tampering it must reject"
+        "v4 mixes final_state.timestamp — editing a finished proof must reject"
     );
     let mut tampered_initial_ts = proof.clone();
     tampered_initial_ts.initial_state.timestamp ^= 1;
     assert!(
         verify_standalone_with_pcs_policy(tampered_initial_ts, prog_hash, &PcsPolicy::MOBILE)
             .is_err(),
-        "v4 mixes initial_state.timestamp — tampering it must reject"
+        "v4 mixes initial_state.timestamp — editing a finished proof must reject"
     );
 
     // memory_commitment — still unbound metadata on both ends.

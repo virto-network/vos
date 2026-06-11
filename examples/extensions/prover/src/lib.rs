@@ -231,8 +231,21 @@ pub fn program_commitment_bytes(program_id: &[u8]) -> Option<[u8; 32]> {
 
 /// v1 baked `program_id -> trusted commitment` map. The commitment is the
 /// preprocessed-trace Merkle root of a representative witness-injected
-/// proof of the program; stable across witness values, so it verifies
-/// every real proof of that build.
+/// proof of the program.
+///
+/// STALE / vestigial for `voucher-check`. This single-commitment model
+/// fit the old single-shot proof. The guest now proves the
+/// conservation-of-value transition, whose trace is segment-chain-sized
+/// (the single-shot prove this commitment was pinned against no longer
+/// completes), AND the preprocessed commitment is shape-dependent (it
+/// varies with `log_sizes`/segment size) — so one baked constant does
+/// not identify the chain. The value below is the PRE-Phase-0 ELF's
+/// commitment and is not re-pinned: nothing on the live path consumes
+/// it (the federation happy path is skipped pending chain-aware verify;
+/// the drift-guard test was retired with the single-shot roundtrip).
+/// Program identity for the chain is `(commitment, log_sizes)` per
+/// segment — see `program_id.rs` and the chain-verification section of
+/// `docs/plans/succinct-merkle-witness.md`.
 fn baked_commitment(program_id: &[u8]) -> Option<[u8; 32]> {
     match program_id {
         b"voucher-check" => Some(VOUCHER_CHECK_COMMITMENT),
@@ -240,15 +253,10 @@ fn baked_commitment(program_id: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
-/// Pinned program commitment for the v1 `voucher-check` build (the
-/// preprocessed-trace Merkle root of any witness-injected proof). Re-pin
-/// via the `prove_verify` drift-guard if voucher-check.elf is rebuilt with
-/// a shape-changing source/toolchain change.
-///
-/// Stable across checkouts/machines: voucher-check's build is path-independent
-/// (`-Zremap-cwd-prefix` in its `.cargo/config.toml`), so the program bytes — and
-/// hence this commitment — don't depend on where the repo lives, and this pin
-/// holds regardless of the build path.
+/// Pinned program commitment for the pre-Phase-0 `voucher-check` build.
+/// See [`baked_commitment`] — vestigial; not re-pinned because the live
+/// path no longer consumes it and a single commitment can't identify the
+/// segment chain.
 const VOUCHER_CHECK_COMMITMENT: [u8; 32] = [
     0x20, 0x5f, 0x2e, 0x4f, 0x0d, 0x88, 0x26, 0x30, 0xbd, 0xed, 0x72, 0x52, 0xea, 0x90, 0x9f, 0x36,
     0xa0, 0xde, 0x25, 0x2c, 0x62, 0xba, 0x8a, 0x6d, 0xd1, 0xa7, 0x8c, 0x04, 0xb3, 0xea, 0x0b, 0x0d,
