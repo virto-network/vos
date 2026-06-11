@@ -292,6 +292,11 @@ pub(super) fn generate_interaction_trace(
     let result_is_reg = crate::trace::original_base_column!(component_trace, Column::ResultIsReg);
     let result_reg_idx = crate::trace::original_base_column!(component_trace, Column::ResultRegIdx);
     let result_cols = crate::trace::original_base_column!(component_trace, Column::Result);
+    // is_write is the last register-tuple limb (binds reads vs writes — see
+    // RegisterMemoryChip).  Constant per emission: 0 for reads, 1 for the
+    // result write.
+    let is_write_read = crate::trace::component::FinalizedColumn::Constant(BaseField::from(0u32));
+    let is_write_write = crate::trace::component::FinalizedColumn::Constant(BaseField::from(1u32));
     {
         // Phase 9g: use RegValB (raw register value) rather than ValB so
         // 32-bit-truncated ops still emit the authentic register value.
@@ -299,6 +304,7 @@ pub(super) fn generate_interaction_trace(
         let mut tuple: Vec<_> = vec![val_b_reg_idx[0].clone()];
         tuple.extend_from_slice(&reg_val_b_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_read.clone());
         logup.add_to_relation_with(
             reg_lookup,
             [val_b_is_reg[0].clone()],
@@ -313,6 +319,7 @@ pub(super) fn generate_interaction_trace(
         let mut tuple: Vec<_> = vec![val_d_reg_idx[0].clone()];
         tuple.extend_from_slice(&reg_val_d_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_read.clone());
         logup.add_to_relation_with(
             reg_lookup,
             [val_d_is_reg[0].clone()],
@@ -329,6 +336,7 @@ pub(super) fn generate_interaction_trace(
         let mut tuple: Vec<_> = vec![reg_a_cols[0].clone()];
         tuple.extend_from_slice(&reg_val_a_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_read.clone());
         for _ in 0..2 {
             logup.add_to_relation_with(
                 reg_lookup,
@@ -342,6 +350,7 @@ pub(super) fn generate_interaction_trace(
         let mut tuple: Vec<_> = vec![result_reg_idx[0].clone()];
         tuple.extend_from_slice(&result_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_write.clone());
         logup.add_to_relation_with(
             reg_lookup,
             [result_is_reg[0].clone()],
@@ -374,9 +383,9 @@ pub(super) fn generate_interaction_trace(
             reg_lookup,
             [is_blake_ecall[0].clone()],
             |[active]| active.into(),
-            17,
+            18,
             move |v| {
-                let mut t = Vec::with_capacity(17);
+                let mut t = Vec::with_capacity(18);
                 t.push(idx_const);
                 for c in &val_c {
                     t.push(c.at(v));
@@ -384,6 +393,8 @@ pub(super) fn generate_interaction_trace(
                 for c in &ts_c {
                     t.push(c.at(v));
                 }
+                // is_write = 0 (blake2b ECALL register accesses are reads).
+                t.push(PackedBaseField::broadcast(BaseField::from(0u32)));
                 t
             },
         );

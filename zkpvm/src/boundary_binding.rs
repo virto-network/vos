@@ -127,15 +127,19 @@ pub fn check_boundary_claimed_sums(
             .ok_or("boundary chip position out of claimed_sums bounds")
     };
 
-    let expected = expected_register_file_sum(&initial.registers, 0, reg_elements)
+    let expected = expected_register_file_sum(&initial.registers, 0, 1, reg_elements)
         .ok_or("degenerate lookup combination for initial register state")?;
     if claimed(positions.register_boundary)? != expected {
         return Err("initial_state.registers do not match the committed boundary columns");
     }
 
-    let expected =
-        expected_register_file_sum(&final_state.registers, final_state.timestamp, reg_elements)
-            .ok_or("degenerate lookup combination for final register state")?;
+    let expected = expected_register_file_sum(
+        &final_state.registers,
+        final_state.timestamp,
+        0,
+        reg_elements,
+    )
+    .ok_or("degenerate lookup combination for final register state")?;
     if claimed(positions.register_closing)? != expected {
         return Err("final_state registers/timestamp do not match the committed closing columns");
     }
@@ -183,15 +187,19 @@ pub fn expected_program_boundary_sum(
 pub fn expected_register_file_sum(
     registers: &[u64; 13],
     ts: u64,
+    is_write: u64,
     elements: &RegisterMemoryLookupElements,
 ) -> Option<SecureField> {
     let ts_limbs = le_byte_limbs_u64(ts);
     let mut sum = SecureField::zero();
     for (reg, &val) in registers.iter().enumerate() {
-        let mut t = Vec::with_capacity(17);
+        let mut t = Vec::with_capacity(18);
         t.push(BaseField::from(reg as u32));
         t.extend(le_byte_limbs_u64(val));
         t.extend(ts_limbs);
+        // is_write is the last tuple limb (1 for the initial-write boundary
+        // seeds, 0 for the closing reads) — matches the chips' 18-limb tuple.
+        t.push(BaseField::from(is_write as u32));
         sum += inv_combined(<RegisterMemoryLookupElements as Relation<
             BaseField,
             SecureField,

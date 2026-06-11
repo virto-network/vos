@@ -43,36 +43,26 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 /// actual last-written value). So the chip's final-value COLUMN is
 /// forced to equal the trace's actual final register state.
 ///
-/// SCOPE — `proof.final_state.registers` is bound to THIS chip's
-/// committed RegVal COLUMN by the verifier-side boundary-binding check
-/// (`boundary_binding`): the chip's per-component logup claimed sum is a
-/// closed-form function of its thirteen (reg, value, closing_ts) tuples,
-/// so the verifier recomputes it from the PUBLIC
-/// `final_state.registers`/`timestamp` and requires equality with
-/// `proof.claimed_sums`. That closes the lying-METADATA attack (commit
-/// honest columns, ship a lie) — gate: `tests/boundary_binding.rs`.
+/// BINDING — `proof.final_state.registers` is bound to the trace's TRUE
+/// final register state end-to-end:
+/// 1. metadata → column: the verifier-side boundary-binding check
+///    (`boundary_binding`) recomputes this chip's per-component logup
+///    claimed sum from the PUBLIC `final_state.registers`/`timestamp`
+///    (a closed-form function of its thirteen (reg, value, closing_ts,
+///    is_write=0) tuples) and requires equality with `proof.claimed_sums`
+///    — closing the lying-METADATA attack (gate: `tests/boundary_binding.rs`).
+/// 2. column → trace: this chip's RegVal column is pinned to the trace's
+///    actual final register value by `RegisterMemoryChip` read-consistency,
+///    which is now SOUND against a from-scratch prover — the closing read
+///    sorts last (max ts) via the ledger's `(reg, ts)` sortedness gadget, its
+///    `is_write = 0` is bound by the logup tuple, and the cross-row
+///    `prev_value` binding forces its value to equal the previous (= last
+///    real) row's value (see `RegisterMemoryChip` and
+///    `docs/plans/ledger-read-consistency.md`).
 ///
-/// LIMITATION — this chip's RegVal column is itself pinned to the
-/// trace's TRUE final register value only by `RegisterMemoryChip`
-/// read-consistency, and that link is currently VACUOUS against a
-/// from-scratch prover: `prev_value` there is a free witness (no
-/// `#[mask_next_row]`, no (reg,ts) sortedness), so a malicious prover
-/// can fill this closing read's value with a lie L, set the ledger
-/// row's `prev_value = L` (read-consistency holds), ship
-/// `final_state.registers = L`, and pass the boundary-binding check
-/// (metadata == column == L). So the io-hash read from φ[9..12] is NOT
-/// yet sound against a malicious prover — closing it needs the register-
-/// ledger read-consistency fix (cross-row `prev_value` binding +
-/// sortedness; see `project_register_ledger_readconsistency_gap` and
-/// `docs/plans/succinct-merkle-witness.md`). The FS-transcript mix of
-/// the field (see `prove.rs`) makes a finished proof tamper-evident and
-/// feeds the boundary states into the lookup-element draw the binding
-/// check relies on.
-///
-/// Format version: bumped 1 → 2 alongside this chip's introduction;
-/// older proofs (no closing chip in their component set) are
-/// rejected at the `format_version` gate before any cryptographic
-/// work, by design.
+/// The FS-transcript mix of the field (see `prove.rs`) makes a finished proof
+/// tamper-evident and feeds the boundary states into the lookup-element draw
+/// the binding check relies on.
 pub struct RegisterMemoryClosingChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -114,11 +104,11 @@ impl BuiltInComponent for RegisterMemoryClosingChip {
         let ts = crate::trace::trace_eval!(trace_eval, Column::Ts);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
 
-        // Tuple shape: (reg_addr[1], reg_val[8], timestamp[8]) = 17 limbs.
-        // Mirrors the boundary chip's emission so consumers see the
-        // same shape; differs only in that `ts` is a runtime value
-        // here (per-row column) instead of a hardcoded zero.
-        let mut tuple: Vec<E::F> = Vec::with_capacity(17);
+        // Tuple shape: (reg_addr[1], reg_val[8], timestamp[8], is_write[1]) =
+        // 18 limbs.  Mirrors the boundary chip's emission so consumers see the
+        // same shape; differs in that `ts` is a runtime value here (per-row
+        // column) instead of a hardcoded zero, and `is_write = 0` (a read).
+        let mut tuple: Vec<E::F> = Vec::with_capacity(18);
         tuple.push(reg_addr[0].clone());
         for col in &reg_val {
             tuple.push(col.clone());
@@ -126,6 +116,8 @@ impl BuiltInComponent for RegisterMemoryClosingChip {
         for col in &ts {
             tuple.push(col.clone());
         }
+        // is_write = 0 (the closing entries are synthetic register reads).
+        tuple.push(E::F::from(BaseField::from(0u32)));
 
         // Positive multiplicity = producer (matches boundary chip).
         // The augmented ledger row at ts=closing_ts consumes this with
@@ -183,6 +175,7 @@ impl BuiltInProverComponent for RegisterMemoryClosingChip {
         ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
         SecureField,
     ) {
+        use stwo::prover::backend::simd::m31::PackedBaseField;
         let log_size = component_trace.log_size();
         let mut logup = LogupTraceBuilder::new(log_size);
 
@@ -192,15 +185,15 @@ impl BuiltInProverComponent for RegisterMemoryClosingChip {
         let ts = crate::trace::original_base_column!(component_trace, Column::Ts);
         let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
 
-        // Tuple: (reg_addr[1], reg_val[8], timestamp[8]) — 17 limbs.
+        // Tuple: (reg_addr[1], reg_val[8], timestamp[8], is_write=0) — 18 limbs.
         // Same emission order as `add_constraints` above — must match.
         logup.add_to_relation_computed(
             reg_lookup,
             [is_real[0].clone()],
             |[real]| real.into(),
-            17,
+            18,
             |vec_idx| {
-                let mut tuple = Vec::with_capacity(17);
+                let mut tuple = Vec::with_capacity(18);
                 tuple.push(reg_addr[0].at(vec_idx));
                 for col in &reg_val {
                     tuple.push(col.at(vec_idx));
@@ -208,6 +201,7 @@ impl BuiltInProverComponent for RegisterMemoryClosingChip {
                 for col in &ts {
                     tuple.push(col.at(vec_idx));
                 }
+                tuple.push(PackedBaseField::broadcast(BaseField::from(0u32)));
                 tuple
             },
         );

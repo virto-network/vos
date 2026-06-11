@@ -9,9 +9,11 @@ const TS_SIZE: usize = WORD_SIZE; // 8
 const REL_PROG_EXEC_LOOKUP_SIZE: usize = TS_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(ProgramExecutionLookupElements, REL_PROG_EXEC_LOOKUP_SIZE);
 
-// (reg-addr, reg-val, reg-ts)
-// Address is 1 column, value is 8 bytes, timestamp is 8 bytes.
-const REL_REG_MEMORY_LOOKUP_SIZE: usize = 1 + WORD_SIZE + TS_SIZE;
+// (reg-addr, reg-val, reg-ts, is-write)
+// Address is 1 column, value is 8 bytes, timestamp is 8 bytes, is_write is 1.
+// is_write binds reads vs writes so a read can't masquerade as a write to skip
+// the ledger's read-consistency constraint.
+const REL_REG_MEMORY_LOOKUP_SIZE: usize = 1 + WORD_SIZE + TS_SIZE + 1;
 stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMORY_LOOKUP_SIZE);
 
 // (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8],

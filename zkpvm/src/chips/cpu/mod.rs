@@ -1855,6 +1855,7 @@ impl BuiltInComponent for CpuChip {
             for ts in &timestamp {
                 tuple.push(ts.clone());
             }
+            tuple.push(E::F::from(BaseField::from(0u32))); // is_write = 0 (read)
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 val_b_is_reg[0].clone().into(),
@@ -1871,6 +1872,7 @@ impl BuiltInComponent for CpuChip {
             for ts in &timestamp {
                 tuple.push(ts.clone());
             }
+            tuple.push(E::F::from(BaseField::from(0u32))); // is_write = 0 (read)
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 val_d_is_reg[0].clone().into(),
@@ -1894,6 +1896,7 @@ impl BuiltInComponent for CpuChip {
             for ts in &timestamp {
                 tuple_a.push(ts.clone());
             }
+            tuple_a.push(E::F::from(BaseField::from(0u32))); // is_write = 0 (read)
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 is_store_ind_col[0].clone().into(),
@@ -1998,6 +2001,7 @@ impl BuiltInComponent for CpuChip {
             for ts in &timestamp {
                 tuple.push(ts.clone());
             }
+            tuple.push(E::F::from(BaseField::from(1u32))); // is_write = 1 (result write)
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
                 result_is_reg[0].clone().into(),
@@ -2029,7 +2033,7 @@ impl BuiltInComponent for CpuChip {
             const ECALL_REG_IDXS: [u32; 4] = [10, 7, 8, 9];
             let phi_cols: [&[E::F]; 4] = [&phi7, &phi10, &phi11, &phi12];
             for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
-                let mut tuple: Vec<E::F> = Vec::with_capacity(17);
+                let mut tuple: Vec<E::F> = Vec::with_capacity(18);
                 tuple.push(E::F::from(BaseField::from(reg_idx)));
                 for c in phi_cols[slot] {
                     tuple.push(c.clone());
@@ -2037,6 +2041,7 @@ impl BuiltInComponent for CpuChip {
                 for c in &timestamp {
                     tuple.push(c.clone());
                 }
+                tuple.push(E::F::from(BaseField::from(0u32))); // is_write = 0 (read)
                 eval.add_to_relation(RelationEntry::new(
                     reg_lookup,
                     is_blake_ecall[0].clone().into(),

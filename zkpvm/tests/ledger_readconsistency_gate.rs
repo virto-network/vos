@@ -24,18 +24,18 @@
 //! Run with: `cargo test -p zkpvm --features debug-internals --test
 //! ledger_readconsistency_gate`.
 
+use javm::PVM_REGISTER_COUNT;
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
-use javm::PVM_REGISTER_COUNT;
 
+use zkpvm::AirColumn;
+use zkpvm::SideNote;
 use zkpvm::chips::{MemoryChip, RegisterMemoryChip};
 use zkpvm::core::step::NUM_REGS;
 use zkpvm::core::tracing::TracingPvm;
 use zkpvm::framework_access::AllLookupElements;
 use zkpvm::harness::MachineProverComponent;
 use zkpvm::trace::component::ComponentTrace;
-use zkpvm::AirColumn;
-use zkpvm::SideNote;
 
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
@@ -127,11 +127,10 @@ fn register_side_note() -> SideNote {
     sn
 }
 
+// GREEN since the register-ledger fix landed (cross-row prev_value binding +
+// (reg,ts) sortedness + is_write tuple-binding).  See
+// docs/plans/ledger-read-consistency.md.
 #[test]
-#[ignore = "RED gate for the register-ledger read-consistency soundness gap — flips GREEN \
-            once the cross-row prev_value binding + (reg,ts) sortedness + is_write tuple-binding \
-            land. See docs/plans/ledger-read-consistency.md. Run with `--ignored` to confirm the \
-            gap is still open (the forge is accepted today)."]
 fn register_forged_read_value_is_rejected() {
     use zkpvm::chips::register_memory::Column;
 
