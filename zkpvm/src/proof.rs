@@ -77,7 +77,20 @@ use stwo::core::{
 ///       contain the three binding chips and to popcount-match
 ///       `num_components`. `memory_commitment` remains outside the
 ///       binding (no committed column; see `segment.rs`).
-pub const PROOF_FORMAT_VERSION: u32 = 5;
+///   6 — Register/RAM ledger read-consistency bound (closes the v5
+///       register column→trace gap). `RegisterMemoryChip` and `MemoryChip`
+///       gain a cross-row `prev_value` binding (`#[mask_next_row]`) and a
+///       `(key, ts)` sortedness range-check (self-contained 24-bit
+///       decomposition), and the register ledger tuple gains an `is_write`
+///       limb (17→18; CpuChip / boundary / closing producers + the verifier
+///       boundary-binding recompute updated). The B5 register read-run merge
+///       is disabled (one entry per row). So a from-scratch prover can no
+///       longer forge a register/RAM read — in particular the closing read
+///       that pins `final_state.registers` / the voucher io-hash is now
+///       sound. AIR change: new columns + the wider register relation, so
+///       the proof bytes differ (gate: `tests/ledger_readconsistency_gate.rs`).
+///       `memory_commitment` is still outside the binding.
+pub const PROOF_FORMAT_VERSION: u32 = 6;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

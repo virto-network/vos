@@ -178,21 +178,21 @@ commit.
 
 ## Open soundness gaps
 
-**Register / RAM ledger read-consistency is honest-prover-only
-(confirmed 2026-06-11).**  `RegisterMemoryChip` and `MemoryChip`
-enforce read-after-write via `is_read·(value − prev_value) = 0`, but
-`prev_value` is a FREE witness — no `#[mask_next_row]` ties it to the
-previous ledger row's value, and there is no `(reg|addr, ts)`
-sortedness range-check.  So a from-scratch prover can set
-`prev_value := value` and make any read return any value (the honest
-trace filler is what catches forgeries today; the negative-test corpus
-tests the filler, not the constraint).  This forges the closing read
-(`final_state.registers`) and hence the voucher io-hash, so it is the
-#1 money-path soundness task.  Fix: cross-row `prev_value` binding +
-ledger sortedness on both ledgers (AIR change / format bump / capstone
-re-prove).  See `project_register_ledger_readconsistency_gap` and
-`docs/plans/succinct-merkle-witness.md`.  `proof.memory_commitment` is
-separately unbound (computed outside the circuit).
+**Register / RAM ledger read-consistency is BOUND (format v6).**
+`RegisterMemoryChip` and `MemoryChip` enforce read-after-write
+soundly against a from-scratch prover: each read's value is bound
+cross-row to the previous same-key row's value (`#[mask_next_row]`
+`prev_value` binding), the ledger is sorted by `(key, ts)` via a
+range-checked sortedness gadget (self-contained 24-bit decomposition),
+and `is_write` is part of the logup tuple (register ledger widened to
+18 limbs; the RAM tuple already carried it) so a read can't masquerade
+as a write to skip the check.  This closes the previously-honest-only
+gap — in particular the closing read that pins `final_state.registers`
+/ the voucher io-hash is now sound.  Gate:
+`tests/ledger_readconsistency_gate.rs`; see
+`docs/plans/ledger-read-consistency.md`.  `proof.memory_commitment`
+remains separately unbound (computed outside the circuit — an
+in-circuit memory-image commitment is still future work).
 
 **Per-opcode ISA coverage: no known gaps.**  Every PVM ISA opcode
 reachable from RISC-V actor code (or from synthetic forge tests) is

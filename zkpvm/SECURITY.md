@@ -19,7 +19,7 @@ soundness reasoning.
 | `proof.stark_proof`                              | NO       | Cryptographically verified by stwo.           |
 | `proof.claimed_sums`                             | NO       | Constrained: per-component logup must sum to 0. |
 | `proof.log_sizes`                                | NO       | Capped by `DEFAULT_MAX_LOG_SIZE` (overridable). |
-| `proof.initial_state` / `proof.final_state`      | partial  | registers/pc/timestamp bound to the committed boundary columns (boundary-binding check, v5); pc/timestamp also pinned to the trace, registers only via the register-ledger read-consistency caveat below; `memory_commitment` UNBOUND. Deployer must publish what *should* match. |
+| `proof.initial_state` / `proof.final_state`      | partial  | registers/pc/timestamp bound to the committed boundary columns (boundary-binding check, v5) AND to the trace (pc/timestamp via CpuChip chaining; registers via the v6 register-ledger read-consistency); `memory_commitment` UNBOUND. Deployer must publish what *should* match. |
 | `proof.pcs_config`                               | partial  | Used as-is; affects security level.  See "Proof shape" below. |
 | `hash` (preprocessed commitment)                 | YES      | Caller-supplied: this IS the program identity. |
 
@@ -55,9 +55,10 @@ A proof verified against `hash = H(P)` for program `P` proves that:
   `proof.final_state` is the same at trace end.  The boundary-binding
   check (v5) binds the registers/pc/timestamp METADATA to the committed
   boundary columns.  pc/timestamp columns are pinned to the trace
-  (CpuChip program-execution chaining), so those are fully bound.  The
-  register columns are pinned to the trace only by the register-ledger
-  read-consistency — see the caveat under "Register consistency".
+  (CpuChip program-execution chaining); the register columns are pinned
+  to the trace by the v6 register-ledger read-consistency (cross-row
+  `prev_value` binding + `(reg, ts)` sortedness + `is_write` tuple
+  binding).  So registers/pc/timestamp are fully bound public inputs.
   `memory_commitment` is computed outside the circuit and is NOT bound.
 
 - **Per-step semantics**: each ALU / branch / load / store / shift
@@ -67,28 +68,25 @@ A proof verified against `hash = H(P)` for program `P` proves that:
   *which* semantic property is bound.
 
 - **Memory consistency**: every byte read at `(addr, ts)` matches
-  the most recent write to that byte at `ts' < ts`, plus the
-  initial memory image at `ts = 0`.  CAVEAT: `MemoryChip` enforces
-  this via the same `is_read·(value − prev_value)` read-consistency
-  as the register ledger, whose cross-row `prev_value` binding is
-  vacuous against a from-scratch prover (see below) — so this holds
-  against an honest prover but not yet against a malicious one.
+  the most recent write to that byte at `ts' ≤ ts`, plus the
+  initial memory image at `ts = 0`.  Enforced by `MemoryChip` (format
+  v6): the byte ledger is sorted by `(addr, ts)` (a range-checked
+  sortedness gadget), each read's value is bound cross-row to the
+  previous same-address row's value (`#[mask_next_row]` `prev_value`
+  binding), and `is_write` is opcode-pinned in the logup tuple.  Sound
+  against a from-scratch prover.
 
 - **Register consistency**: every `regs_before[r]` at step n
   matches `regs_after[r]` at the most recent step that wrote `r`,
-  or `initial_regs[r]` if no prior step wrote it.  **CAVEAT
-  (soundness gap, 2026-06-11):** this is enforced by `RegisterMemoryChip`
-  read-consistency `is_read·(value − prev_value) = 0`, but `prev_value`
-  is a FREE witness — no `#[mask_next_row]` ties it to the previous
-  ledger row's value, and there is no `(reg,ts)` sortedness range-check.
-  So the guarantee holds against an HONEST prover (the trace filler sets
-  `prev_value` correctly) but NOT against a from-scratch prover, who can
-  set `prev_value := value` and make any read return any value —
-  including forging the closing read (`final_state.registers`, hence the
-  voucher io-hash).  Empirically confirmed.  The fix (cross-row
-  `prev_value` binding + ledger sortedness, on both register and RAM
-  ledgers) is the #1 remaining money-path soundness task — see
-  `project_register_ledger_readconsistency_gap`.
+  or `initial_regs[r]` if no prior step wrote it.  Enforced by
+  `RegisterMemoryChip` (format v6) the same way as the RAM ledger: the
+  ledger is sorted by `(reg, ts)` (range-checked sortedness), each
+  read's value is bound cross-row to the previous same-reg row's value
+  (`#[mask_next_row]` `prev_value` binding), and `is_write` is part of
+  the logup tuple so a read can't masquerade as a write to skip the
+  check.  Sound against a from-scratch prover — in particular the
+  closing read that pins `final_state.registers` / the voucher io-hash
+  (gate: `tests/ledger_readconsistency_gate.rs`).
 
 - **Control-flow continuity**: step n+1's `pc` equals step n's
   `next_pc`; static branch / jump targets equal `pc + sign-
@@ -107,9 +105,9 @@ A proof verified against `hash = H(P)` for program `P` proves that:
   responsibility.
 
 - **Public input authenticity**: `proof.initial_state.registers` is
-  bound to the committed boundary column (subject to the register
-  read-consistency caveat above), and `proof.initial_state.pc/timestamp`
-  to the trace; but `proof.initial_state.memory_commitment` is UNBOUND
+  bound to the committed boundary column and to the trace (v6
+  read-consistency), and `proof.initial_state.pc/timestamp` to the
+  trace; but `proof.initial_state.memory_commitment` is UNBOUND
   (computed outside the circuit).  Regardless, the verifier has no way
   to check whether the boundary states match what the deployer
   *intended* as the public input.  The deployer publishes `(hash,

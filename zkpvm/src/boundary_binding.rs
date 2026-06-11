@@ -41,20 +41,18 @@
 //!   (init_pc, init_ts) / (final_pc, final_ts) columns are pinned to the
 //!   trace by CpuChip's `#[mask_next_row]` program-execution chaining +
 //!   telescoping. So pc/timestamp are genuine bound public inputs.
-//! - **registers: column-bound, trace-link OPEN.** The
+//! - **registers: fully bound (v6).** The
 //!   `RegisterMemory{Boundary,Closing}Chip` register columns are pinned
-//!   to the trace ONLY by `RegisterMemoryChip` read-consistency, whose
-//!   cross-row `prev_value` binding is NOT enforced at the constraint
-//!   level (`prev_value` is a free witness — no `#[mask_next_row]`, no
-//!   (reg,ts) sortedness check). A from-scratch prover can forge the
-//!   closing read's value — and hence the voucher io-hash in
-//!   `final_state.registers[9..13]` — by setting `prev_value` to match.
-//!   This binding therefore closes the lying-METADATA attack (commit
-//!   honest columns, ship a lie) but the register/io-hash binding is
-//!   complete only once that read-consistency gap is also closed (see
-//!   `project_register_ledger_readconsistency_gap` and
-//!   `docs/plans/succinct-merkle-witness.md`). `memory_commitment` has
-//!   no committed column and stays OUTSIDE this binding entirely.
+//!   to the trace by `RegisterMemoryChip` read-consistency, which is now
+//!   sound against a from-scratch prover: a cross-row `#[mask_next_row]`
+//!   `prev_value` binding, a range-checked `(reg, ts)` sortedness gadget,
+//!   and an `is_write` tuple limb together force the closing read's value
+//!   — and hence the voucher io-hash in `final_state.registers[9..13]` —
+//!   to equal the trace's actual final register state. Combined with the
+//!   metadata→column binding here, registers are a fully bound public
+//!   input (gate: `tests/ledger_readconsistency_gate.rs`).
+//!   `memory_commitment` has no committed column and stays OUTSIDE this
+//!   binding entirely.
 //!
 //! A consequence of the closing-chip equality: a proof over an EMPTY
 //! trace (no steps, all-zero boundary metadata) is now rejected — the

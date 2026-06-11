@@ -70,18 +70,17 @@ boundary COLUMNS equal the trace's true boundary state is per-field:
   are pinned to the trace by CpuChip's `#[mask_next_row]` program-
   execution chaining + telescoping. So pc/timestamp are genuine bound
   public inputs end-to-end.
-- **registers — column→trace link OPEN.** The
+- **registers — column→trace link BOUND (format v6).** The
   `RegisterMemory{Boundary,Closing}Chip` columns are pinned to the
-  trace only by `RegisterMemoryChip` read-consistency, and that link is
-  VACUOUS against a from-scratch prover: `prev_value` there is a free
-  witness (no `#[mask_next_row]`, no (reg,ts) sortedness check), so a
-  malicious prover can forge the closing read's value — and hence the
-  voucher io-hash — by setting `prev_value` to match (empirically
-  confirmed 2026-06-11; the honest filler is what catches forgeries
-  today). Closing it needs cross-row `prev_value` binding + sortedness
-  range-checks on the register (and RAM) ledgers — another AIR change /
-  format bump / capstone re-prove. This is the **#1 remaining money-path
-  soundness task**; see `project_register_ledger_readconsistency_gap`.
+  trace by `RegisterMemoryChip` read-consistency, now sound against a
+  from-scratch prover: a cross-row `#[mask_next_row]` `prev_value`
+  binding, a range-checked `(reg, ts)` sortedness gadget, and an
+  `is_write` tuple limb force the closing read's value (hence the
+  voucher io-hash) to equal the trace's actual final register state.
+  The RAM ledger got the same treatment. Gate:
+  `tests/ledger_readconsistency_gate.rs`; see
+  `docs/plans/ledger-read-consistency.md` and
+  `project_register_ledger_readconsistency_gap`.
 - **`memory_commitment` — unbound.** Computed outside the circuit
   (blake3 of flat memory), not mixed, no committed column. Needs an
   in-circuit memory-image commitment or a shared-challenge
@@ -90,12 +89,13 @@ boundary COLUMNS equal the trace's true boundary state is per-field:
 
 The rest of the project (side-note-free `verify_chain_standalone`,
 shape-aware program identity, prover-extension + clerk-bridge plumbing)
-sits on top of this binding. Until the register read-consistency and
-memory continuity are bound, a chain accepted across a trust boundary
-proves per-segment validity plus pc/timestamp continuity only; the
-single-segment voucher io-hash path has its metadata bound to the
-columns but inherits the same register read-consistency caveat (sound
-against an honest prover, forgeable by a from-scratch one).
+sits on top of this binding. With register AND RAM read-consistency now
+bound (v6), the single-segment voucher io-hash path is fully sound
+against a from-scratch prover. What remains for a chain accepted across
+a trust boundary is segment-boundary `memory_commitment` continuity
+(no committed column yet) — until that lands, a chain proves per-segment
+validity plus pc/timestamp/register continuity, but not that one
+segment's final memory image is the next segment's initial one.
 
 ## Why
 

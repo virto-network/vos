@@ -1,10 +1,26 @@
 # Ledger read-consistency soundness fix (register + RAM)
 
-**Status:** GATE TESTS LANDED (RED, both ledgers); fix DESIGNED + blast-radius
-enumerated; NOT yet implemented. This is the **#1 money-path soundness task**
-on branch `voucher-state-transition` — it is the column→trace half of the v5
-boundary public-input binding, without which `final_state.registers` (and hence
-the voucher io-hash in φ[9..13]) is forgeable by a from-scratch prover.
+**Status:** LANDED (format v6). Both ledgers fixed — register
+(`fix(zkpvm): bind register-ledger read-consistency`) and RAM
+(`fix(zkpvm): bind RAM-ledger read-consistency`). The gate tests
+(`tests/ledger_readconsistency_gate.rs`) are GREEN; the segment-chain
+capstone re-prove validates the full ~7.5M-step workload against the new AIR.
+This was the **#1 money-path soundness task** on branch
+`voucher-state-transition` — the column→trace half of the v5 boundary
+public-input binding, without which `final_state.registers` (and hence the
+voucher io-hash in φ[9..13]) was forgeable by a from-scratch prover.
+
+The implementation differs from the original design below in three ways worth
+noting: (1) the sortedness range-check uses self-contained **boolean
+bit-decomposition**, not Range256 (the consumer pass runs with an immutable
+`&SideNote` and cannot bump multiplicities); (2) `LOG_CONSTRAINT_DEGREE_BOUND`
+was NOT raised — the prover rejects any value > 1 on these chips, so the gadget
+is flattened to degree ≤ 2 with helper columns (register: `BothRealH` +
+`OrderValH`; RAM: `AdvLoH` + `AdvHiH` for the 16-bit-half lexicographic address
+compare); (3) a `≥ 1 padding row` guarantee makes the cyclic last→row-0
+wraparound always a padding transition, so the gadget never fires across it.
+
+Original design (for reference):
 
 ## The gap (empirically confirmed)
 
