@@ -19,7 +19,7 @@ soundness reasoning.
 | `proof.stark_proof`                              | NO       | Cryptographically verified by stwo.           |
 | `proof.claimed_sums`                             | NO       | Constrained: per-component logup must sum to 0. |
 | `proof.log_sizes`                                | NO       | Capped by `DEFAULT_MAX_LOG_SIZE` (overridable). |
-| `proof.initial_state` / `proof.final_state`      | partial  | Merkle-committed with the trace; deployer must publish what *should* match. |
+| `proof.initial_state` / `proof.final_state`      | partial  | registers/pc/timestamp bound to the committed boundary columns (boundary-binding check, v5); pc/timestamp also pinned to the trace, registers only via the register-ledger read-consistency caveat below; `memory_commitment` UNBOUND. Deployer must publish what *should* match. |
 | `proof.pcs_config`                               | partial  | Used as-is; affects security level.  See "Proof shape" below. |
 | `hash` (preprocessed commitment)                 | YES      | Caller-supplied: this IS the program identity. |
 
@@ -33,6 +33,12 @@ The verifier accepts the proof iff:
 5. Per-component logup sums total exactly zero (no lookup imbalance).
 6. The STARK proof verifies under the proof's own `pcs_config` and
    the deterministically-drawn lookup challenges.
+7. (v5) Each boundary chip's claimed sum equals the value recomputed
+   from `proof.{initial,final}_state` with the FS-drawn lookup
+   elements (boundary-binding check) — binds the boundary metadata to
+   the committed columns; empty-trace proofs are rejected.
+8. (v5, standalone) `component_mask` contains the three boundary-binding
+   chips and its popcount equals `num_components`.
 
 ## What a verified proof guarantees
 
@@ -46,8 +52,13 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 
 - **Boundary state**: `proof.initial_state` is the register file +
   PC + timestamp + memory commitment at trace start;
-  `proof.final_state` is the same at trace end.  Both are bound to
-  the actual trace contents by the boundary chips.
+  `proof.final_state` is the same at trace end.  The boundary-binding
+  check (v5) binds the registers/pc/timestamp METADATA to the committed
+  boundary columns.  pc/timestamp columns are pinned to the trace
+  (CpuChip program-execution chaining), so those are fully bound.  The
+  register columns are pinned to the trace only by the register-ledger
+  read-consistency — see the caveat under "Register consistency".
+  `memory_commitment` is computed outside the circuit and is NOT bound.
 
 - **Per-step semantics**: each ALU / branch / load / store / shift
   / rotate / bitmanip / divrem / mul / compare / cmov / move /
@@ -57,14 +68,27 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 
 - **Memory consistency**: every byte read at `(addr, ts)` matches
   the most recent write to that byte at `ts' < ts`, plus the
-  initial memory image at `ts = 0`.  The byte-level
-  `MemoryAccessLookup` enforces this independently of the
-  per-step memory address calculation.
+  initial memory image at `ts = 0`.  CAVEAT: `MemoryChip` enforces
+  this via the same `is_read·(value − prev_value)` read-consistency
+  as the register ledger, whose cross-row `prev_value` binding is
+  vacuous against a from-scratch prover (see below) — so this holds
+  against an honest prover but not yet against a malicious one.
 
 - **Register consistency**: every `regs_before[r]` at step n
   matches `regs_after[r]` at the most recent step that wrote `r`,
-  or `initial_regs[r]` if no prior step wrote it.  Enforced by the
-  per-step `RegisterMemoryLookup` (Phase 9).
+  or `initial_regs[r]` if no prior step wrote it.  **CAVEAT
+  (soundness gap, 2026-06-11):** this is enforced by `RegisterMemoryChip`
+  read-consistency `is_read·(value − prev_value) = 0`, but `prev_value`
+  is a FREE witness — no `#[mask_next_row]` ties it to the previous
+  ledger row's value, and there is no `(reg,ts)` sortedness range-check.
+  So the guarantee holds against an HONEST prover (the trace filler sets
+  `prev_value` correctly) but NOT against a from-scratch prover, who can
+  set `prev_value := value` and make any read return any value —
+  including forging the closing read (`final_state.registers`, hence the
+  voucher io-hash).  Empirically confirmed.  The fix (cross-row
+  `prev_value` binding + ledger sortedness, on both register and RAM
+  ledgers) is the #1 remaining money-path soundness task — see
+  `project_register_ledger_readconsistency_gap`.
 
 - **Control-flow continuity**: step n+1's `pc` equals step n's
   `next_pc`; static branch / jump targets equal `pc + sign-
@@ -82,13 +106,15 @@ A proof verified against `hash = H(P)` for program `P` proves that:
   user thinks it's doing.  Auditing the bytecode is the deployer's
   responsibility.
 
-- **Public input authenticity**: `proof.initial_state.registers` and
-  `proof.initial_state.memory_commitment` are committed to the
-  trace, but the verifier has no way to check whether they match
-  what the deployer *intended* to be the public input.  The
-  deployer publishes `(hash, expected_initial_state,
-  expected_final_state)` out of band and rejects any proof whose
-  boundary states don't match.
+- **Public input authenticity**: `proof.initial_state.registers` is
+  bound to the committed boundary column (subject to the register
+  read-consistency caveat above), and `proof.initial_state.pc/timestamp`
+  to the trace; but `proof.initial_state.memory_commitment` is UNBOUND
+  (computed outside the circuit).  Regardless, the verifier has no way
+  to check whether the boundary states match what the deployer
+  *intended* as the public input.  The deployer publishes `(hash,
+  expected_initial_state, expected_final_state)` out of band and rejects
+  any proof whose boundary states don't match.
 
 - **Liveness / termination**: a proof is only generated for traces
   that the prover decided to trace.  A malicious prover can refuse

@@ -178,11 +178,26 @@ commit.
 
 ## Open soundness gaps
 
-None known on the common path.  Every PVM ISA opcode reachable
-from RISC-V actor code (or from synthetic forge tests) is bound
-by an algebraic constraint or terminally constrained.  The
-items the earlier draft of this file listed have all been
-closed:
+**Register / RAM ledger read-consistency is honest-prover-only
+(confirmed 2026-06-11).**  `RegisterMemoryChip` and `MemoryChip`
+enforce read-after-write via `is_read·(value − prev_value) = 0`, but
+`prev_value` is a FREE witness — no `#[mask_next_row]` ties it to the
+previous ledger row's value, and there is no `(reg|addr, ts)`
+sortedness range-check.  So a from-scratch prover can set
+`prev_value := value` and make any read return any value (the honest
+trace filler is what catches forgeries today; the negative-test corpus
+tests the filler, not the constraint).  This forges the closing read
+(`final_state.registers`) and hence the voucher io-hash, so it is the
+#1 money-path soundness task.  Fix: cross-row `prev_value` binding +
+ledger sortedness on both ledgers (AIR change / format bump / capstone
+re-prove).  See `project_register_ledger_readconsistency_gap` and
+`docs/plans/succinct-merkle-witness.md`.  `proof.memory_commitment` is
+separately unbound (computed outside the circuit).
+
+**Per-opcode ISA coverage: no known gaps.**  Every PVM ISA opcode
+reachable from RISC-V actor code (or from synthetic forge tests) is
+bound by an algebraic constraint or terminally constrained.  The
+items the earlier draft of this file listed have all been closed:
 
 - Memory: MemValue on indirect stores `[28]`; MemValue on
   StoreImm / StoreImmInd `[27]`; MemAddr on direct StoreImm
