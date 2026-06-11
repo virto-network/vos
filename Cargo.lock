@@ -1754,7 +1754,7 @@ version = "0.1.0"
 dependencies = [
  "dev-ast",
  "dev-project",
- "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6664459a6148e)",
+ "grey-transpiler",
  "libp2p",
  "serde",
  "tempfile",
@@ -2617,18 +2617,6 @@ source = "git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6
 dependencies = [
  "javm 0.4.0 (git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6664459a6148e)",
  "scale 0.1.0 (git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6664459a6148e)",
- "thiserror 2.0.18",
- "tracing",
- "tracing-test",
-]
-
-[[package]]
-name = "grey-transpiler"
-version = "0.1.0"
-source = "git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168d4021cd924d13e1a6963af77049055a47"
-dependencies = [
- "javm 0.4.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
- "scale 0.1.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
  "thiserror 2.0.18",
  "tracing",
  "tracing-test",
@@ -5408,7 +5396,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "cipher-clerk",
- "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6664459a6148e)",
+ "grey-transpiler",
  "object",
  "vos",
  "zkpvm",
@@ -7618,7 +7606,7 @@ dependencies = [
  "futures-executor",
  "futures-lite",
  "futures-rustls",
- "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6664459a6148e)",
+ "grey-transpiler",
  "javm 0.4.0 (git+https://github.com/olanod/jar.git?rev=e8861917c03d8f277a03ad8c079acf95c531b3d6)",
  "libloading",
  "libp2p",
@@ -7683,7 +7671,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dev-project",
- "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6664459a6148e)",
+ "grey-transpiler",
  "hex",
  "libc",
  "libp2p",
@@ -8752,7 +8740,7 @@ dependencies = [
  "blake3",
  "cipher-clerk",
  "curve25519-dalek",
- "grey-transpiler 0.1.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
+ "grey-transpiler",
  "impl-trait-for-tuples",
  "javm 0.4.0 (git+ssh://git@github.com/olanod/jar.git?rev=6db1168)",
  "num-traits",

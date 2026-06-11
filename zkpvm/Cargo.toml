@@ -35,7 +35,9 @@ blake3 = { version = "1", optional = true }
 curve25519-dalek = { version = "4.1", optional = true, default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 
 [dev-dependencies]
-grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+# Same rev the prover extension pins — it carries the `SLT rd, x0, rs2`
+# x0-as-rs1 lowering the voucher-check ELF's kernel code needs.
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "6075cec9989b5fe221051fb87be6664459a6148e" }
 bincode = "1"
 zkpvm-verifier = { workspace = true }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
