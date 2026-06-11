@@ -1,7 +1,7 @@
 use alloc::collections::BTreeMap;
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use num_traits::One;
+use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
@@ -40,27 +40,55 @@ pub struct MemoryChip;
 /// Multi-byte accesses are decomposed into N byte entries.
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Byte address (4 limbs, u32)
+    /// Byte address (4 limbs, u32).  `#[mask_next_row]` so the sortedness /
+    /// read-consistency gadget can read the next ledger row's address.
     #[size = 4]
+    #[mask_next_row]
     Address,
     /// Single byte value
     #[size = 1]
     Value,
-    /// Timestamp of this access (8 limbs)
+    /// Timestamp of this access (8 limbs).  `#[mask_next_row]` for the
+    /// same-address ts-monotonicity check.
     #[size = 8]
+    #[mask_next_row]
     Timestamp,
     /// 1 = write, 0 = read
     #[size = 1]
     IsWrite,
-    /// Previous byte value at same address
+    /// Previous byte value at same address.  `#[mask_next_row]` so a row can
+    /// bind the *next* row's prev_value to this row's value (cross-row
+    /// read-consistency).
     #[size = 1]
+    #[mask_next_row]
     PrevValue,
-    /// 1 if the next row accesses the same address
+    /// BOUND boolean: 1 iff the next ledger row is real AND accesses the same
+    /// address.  No longer a free witness — pinned by the sortedness gadget
+    /// and it gates the cross-row `prev_value` value binding.
     #[size = 1]
     IsSameAddrNext,
-    /// 1 if padding row
+    /// 1 if padding row.  `#[mask_next_row]` so a row can tell whether its
+    /// successor is real (the gadget only fires between two real rows).
     #[size = 1]
+    #[mask_next_row]
     IsPadding,
+    /// BOUND boolean: 1 iff this real→real transition advances the address via
+    /// the LOW 16-bit half (hi halves equal, lo strictly increases).
+    #[size = 1]
+    AdvLoH,
+    /// BOUND boolean: 1 iff this real→real transition advances the address via
+    /// the HIGH 16-bit half (hi strictly increases).  Exactly one of
+    /// {IsSameAddrNext, AdvLoH, AdvHiH} holds on a real→real transition.
+    #[size = 1]
+    AdvHiH,
+    /// 24-bit little-endian decomposition of the per-transition ordering delta
+    /// `OrderDelta = IsSameAddrNext·ts_diff + AdvLoH·(lo_diff−1) +
+    /// AdvHiH·(hi_diff−1)`, a SELF-CONTAINED non-negativity range-check (no
+    /// Range256 lookup — the consumer pass runs with an immutable `&SideNote`).
+    /// 24 bits covers `ts_diff < 2^24` and the 16-bit half diffs, and `2^24 ≪ p`
+    /// so a field-wrapped negative cannot alias a valid small positive.
+    #[size = 24]
+    OrderBits,
     // (B3 audit dropped RealReadH — read-consistency now uses an
     // unconditional `(1 - is_write) · (value - prev_value) = 0`
     // constraint.  Padding rows have value=0 and prev_value=0, so the
@@ -124,6 +152,84 @@ impl BuiltInComponent for MemoryChip {
         // value=prev_value=0 so 1·0=0 holds.
         let is_read = E::F::one() - is_write[0].clone();
         eval.add_constraint(is_read * (value[0].clone() - prev_value[0].clone()));
+
+        // ── Cross-row read-consistency + (addr, ts) sortedness gadget ────
+        // The ledger is sorted by (Address, Timestamp).  These constraints pin
+        // that ordering and bind each read to the immediately-preceding
+        // same-address row (closing the read-consistency soundness gap —
+        // prev_value used to be a free witness).  All constraints stay ≤ degree
+        // 2.  See docs/plans/ledger-read-consistency.md.
+        let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
+        let address_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Address);
+        let timestamp_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Timestamp);
+        let prev_value_next = crate::trace::trace_eval_next_row!(trace_eval, Column::PrevValue);
+        let is_same_addr = crate::trace::trace_eval!(trace_eval, Column::IsSameAddrNext);
+        let adv_lo = crate::trace::trace_eval!(trace_eval, Column::AdvLoH);
+        let adv_hi = crate::trace::trace_eval!(trace_eval, Column::AdvHiH);
+        let order_bits = crate::trace::trace_eval!(trace_eval, Column::OrderBits);
+
+        // 16-bit address halves (each < 2^16 < p, so the field diffs are exact —
+        // a full u32 address would wrap the field).
+        let b256 = E::F::from(BaseField::from(256u32));
+        let a_lo = address[0].clone() + address[1].clone() * b256.clone();
+        let a_hi = address[2].clone() + address[3].clone() * b256.clone();
+        let a_lo_next = address_next[0].clone() + address_next[1].clone() * b256.clone();
+        let a_hi_next = address_next[2].clone() + address_next[3].clone() * b256.clone();
+        let lo_diff = a_lo_next - a_lo;
+        let hi_diff = a_hi_next - a_hi;
+
+        // Booleans.
+        eval.add_constraint(is_same_addr[0].clone() * (is_same_addr[0].clone() - E::F::one()));
+        eval.add_constraint(adv_lo[0].clone() * (adv_lo[0].clone() - E::F::one()));
+        eval.add_constraint(adv_hi[0].clone() * (adv_hi[0].clone() - E::F::one()));
+
+        // is_same_addr ⇒ both real, and addresses equal (both halves).
+        eval.add_constraint(is_same_addr[0].clone() * is_pad[0].clone());
+        eval.add_constraint(is_same_addr[0].clone() * is_pad_next[0].clone());
+        eval.add_constraint(is_same_addr[0].clone() * hi_diff.clone());
+        eval.add_constraint(is_same_addr[0].clone() * lo_diff.clone());
+        // AdvLoH ⇒ hi halves equal (the advance is in the low half).
+        eval.add_constraint(adv_lo[0].clone() * hi_diff.clone());
+        // Exactly one of {same, lo-advance, hi-advance} on a real→real
+        // transition; none on a padding boundary or the cyclic wraparound.
+        let both_real = (E::F::one() - is_pad[0].clone()) * (E::F::one() - is_pad_next[0].clone());
+        eval.add_constraint(
+            is_same_addr[0].clone() + adv_lo[0].clone() + adv_hi[0].clone() - both_real,
+        );
+
+        // OrderDelta = same·ts_diff + lo·(lo_diff−1) + hi·(hi_diff−1), 24-bit
+        // range-checked ≥ 0.  same=1 ⇒ ts non-decreasing; lo=1 ⇒ lo strictly
+        // increases (hi equal) ⇒ addr↑; hi=1 ⇒ hi strictly increases ⇒ addr↑.
+        // 0 on every non-real→real transition (all three coeffs are 0 there).
+        let combine_ts = |bytes: &[E::F; 8]| -> E::F {
+            let mut acc = E::F::zero();
+            let mut pow = E::F::one();
+            for b in bytes {
+                acc += b.clone() * pow.clone();
+                pow *= b256.clone();
+            }
+            acc
+        };
+        let ts_diff = combine_ts(&timestamp_next) - combine_ts(&timestamp);
+        let order_delta = is_same_addr[0].clone() * ts_diff
+            + adv_lo[0].clone() * (lo_diff - E::F::one())
+            + adv_hi[0].clone() * (hi_diff - E::F::one());
+        let two = E::F::from(BaseField::from(2u32));
+        let mut recomposed = E::F::zero();
+        let mut pow2 = E::F::one();
+        for bit in &order_bits {
+            eval.add_constraint(bit.clone() * (bit.clone() - E::F::one()));
+            recomposed += bit.clone() * pow2.clone();
+            pow2 *= two.clone();
+        }
+        eval.add_constraint(recomposed - order_delta);
+
+        // Cross-row value binding: same-address ⇒ the next row's prev_value
+        // equals this row's value.  Combined with read-consistency, forces every
+        // read to return the most-recent same-address write / initial byte.
+        eval.add_constraint(
+            is_same_addr[0].clone() * (prev_value_next[0].clone() - value[0].clone()),
+        );
 
         // Consumer lookup (negative multiplicity)
         // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1])
@@ -624,10 +730,20 @@ impl BuiltInProverComponent for MemoryChip {
         entries.sort_by_key(|e| (e.address, e.timestamp));
 
         let num_entries = entries.len();
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_entries);
+        let mut log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_entries);
+        // Guarantee ≥ 1 padding row so the cyclic last→row-0 wraparound is
+        // always a padding row (the sortedness gadget must not fire across it).
+        if (1usize << log_size) == num_entries {
+            log_size += 1;
+        }
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
+        // Pass 1: base columns; track (addr, ts, is_same_addr) per row so the
+        // ordering helpers (pass 2) can read the cyclic next row.
+        let mut addrs = vec![0u32; num_rows];
+        let mut tss = vec![0u64; num_rows];
+        let mut same_addr = vec![false; num_rows];
         for (row, entry) in entries.iter().enumerate() {
             trace.fill_columns_bytes(row, &entry.address.to_le_bytes(), Column::Address);
             trace.fill_columns(row, entry.value, Column::Value);
@@ -644,12 +760,40 @@ impl BuiltInProverComponent for MemoryChip {
             let same_addr_next = row + 1 < num_entries && entries[row + 1].address == entry.address;
             trace.fill_columns(row, same_addr_next, Column::IsSameAddrNext);
             trace.fill_columns(row, false, Column::IsPadding);
-            // Phase I-mem helper.  IsRead = 1 - IsWrite; on real rows
-            // (B3 audit dropped RealReadH fill.)
-        }
 
+            addrs[row] = entry.address;
+            tss[row] = entry.timestamp;
+            same_addr[row] = same_addr_next;
+        }
         for row in num_entries..num_rows {
             trace.fill_columns(row, true, Column::IsPadding);
+        }
+
+        // Pass 2: ordering helpers, reading the cyclic next = (row+1) % num_rows.
+        //   AdvLoH / AdvHiH: which 16-bit half advances (when not same address).
+        //   OrderBits: 24-bit decomposition of OrderDelta = same·ts_diff +
+        //   lo·(lo_diff−1) + hi·(hi_diff−1), all ≥ 0.
+        for row in 0..num_rows {
+            let next = (row + 1) % num_rows;
+            let both_real = row < num_entries && next < num_entries;
+            let hi_eq = (addrs[row] >> 16) == (addrs[next] >> 16);
+            let adv_lo = both_real && !same_addr[row] && hi_eq;
+            let adv_hi = both_real && !same_addr[row] && !hi_eq;
+            trace.fill_columns(row, adv_lo, Column::AdvLoH);
+            trace.fill_columns(row, adv_hi, Column::AdvHiH);
+
+            let order_delta: u64 = if same_addr[row] {
+                tss[next] - tss[row]
+            } else if adv_lo {
+                ((addrs[next] & 0xFFFF) - (addrs[row] & 0xFFFF)) as u64 - 1
+            } else if adv_hi {
+                ((addrs[next] >> 16) - (addrs[row] >> 16)) as u64 - 1
+            } else {
+                0
+            };
+            let bits: [BaseField; 24] =
+                core::array::from_fn(|b| BaseField::from(((order_delta >> b) & 1) as u32));
+            trace.fill_columns_base_field(row, &bits, Column::OrderBits);
         }
 
         trace.finalize_bit_reversed()

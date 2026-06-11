@@ -222,11 +222,9 @@ fn memory_side_note() -> SideNote {
     SideNote::new(steps, code, bitmask)
 }
 
+// GREEN since the RAM-ledger fix landed (cross-row prev_value binding +
+// (addr,ts) sortedness).  See docs/plans/ledger-read-consistency.md.
 #[test]
-#[ignore = "RED gate for the RAM-ledger read-consistency soundness gap — flips GREEN once the \
-            cross-row prev_value binding + (addr,ts) sortedness land. See \
-            docs/plans/ledger-read-consistency.md. Run with `--ignored` to confirm the gap is \
-            still open (the forge is accepted today)."]
 fn memory_forged_read_value_is_rejected() {
     use zkpvm::chips::memory::Column;
 
