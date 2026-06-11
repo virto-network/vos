@@ -2,10 +2,11 @@
 //!
 //! A framework-level convention for binding a zkpvm proof of an actor
 //! handler to the specific `(public_inputs, return_value)` tuple a
-//! caller asserts it ran on — turning Phase Z0's STARK-bound
-//! `final_state.registers` from "the registers are bound" into "the
-//! caller can assert this proof corresponds to this exact `(public,
-//! return)`".
+//! caller asserts it ran on — placing that tuple's hash in
+//! `final_state.registers` (φ[9..12]) so the caller can assert this
+//! proof corresponds to this exact `(public, return)`. (SOUNDNESS
+//! CAVEAT below: the register binding is currently complete only
+//! against an honest prover — see step 2.)
 //!
 //! ## What the hash binds (and what it deliberately does NOT)
 //!
@@ -49,10 +50,17 @@
 //! 2. The actor's halt sequence places that hash into the final-state
 //!    register window φ[9..12] (RISC-V `a2..a5`) via inline-asm `in`
 //!    operands on the halting `ecall` (see `actors::run`'s
-//!    `halt_with_output_bound`).  Phase Z0's closing chip already
-//!    STARK-binds `final_state.registers`, so the hash becomes a
-//!    tamper-evident public output with no tracer/host cooperation — no
-//!    new ECALL, no prover changes.
+//!    `halt_with_output_bound`).  Phase Z0's closing chip pins the
+//!    final-register columns and the verifier's boundary-binding check
+//!    (`zkpvm::boundary_binding`, v5) equates `final_state.registers` to
+//!    them — no new ECALL, no prover changes.  SOUNDNESS CAVEAT: that
+//!    column is pinned to the trace's true final registers only by the
+//!    register-ledger read-consistency, which is currently vacuous
+//!    against a from-scratch prover (`prev_value` is a free witness), so
+//!    a malicious prover can still forge this hash; closing that needs
+//!    the register-ledger read-consistency fix (see
+//!    `zkpvm::chips::register_memory_closing`). Sound against an honest
+//!    prover today.
 //! 3. The host verifier reconstructs the hash from the proof via
 //!    [`zkpvm::Proof::public_io_hash`] and compares it against a locally
 //!    recomputed [`compute_io_hash`] — alongside the STARK validity

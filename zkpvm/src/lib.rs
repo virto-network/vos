@@ -111,6 +111,7 @@
 extern crate alloc;
 
 pub mod air_column;
+pub mod boundary_binding;
 pub mod chips;
 pub mod core;
 mod framework;
@@ -154,7 +155,10 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 // hash.  Both prover and verifier must agree on inclusion — `active_components`
 // is the single source of truth and is deterministic from `SideNote`.
 /// Indices into [`BASE_COMPONENTS`] for chips referenced by name in
-/// `ChipActivity::is_active` and other bit-position-sensitive sites.
+/// `ChipActivity::is_active`, `Proof::component_mask` bit positions,
+/// and other bit-position-sensitive sites (e.g. the boundary-binding
+/// check in `boundary_binding`, which the standalone verifier also
+/// uses — hence public and feature-ungated).
 ///
 /// Indexed positions are coupled to the declaration order of
 /// `BASE_COMPONENTS`. If you reorder the array, update these constants
@@ -163,9 +167,8 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 /// constants double as documentation for which chip each match arm
 /// in `is_active` refers to, so they're kept even for chips that
 /// don't currently appear in a match arm.
-#[cfg(feature = "prover")]
 #[allow(dead_code)]
-pub(crate) mod chip_idx {
+pub mod chip_idx {
     pub const CPU: usize = 0;
     pub const BLAKE2B: usize = 1;
     pub const MEMORY: usize = 2;
@@ -260,6 +263,8 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::ByteToBitsChip, // Phase 55a
     &chips::MulChip,
     &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip, // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
+    &chips::DivRemChip,  // Phase 54g — consumer of DivRemLookup
     &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, mirrored in verifier-only build
     &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, mirrored in verifier-only build
     &chips::RistrettoCombTableChip,
@@ -269,6 +274,15 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::RistrettoCombCompressChip,
     &chips::RistrettoCombCompressOutputChip,
 ];
+
+#[cfg(not(feature = "prover"))]
+const _: () = {
+    assert!(
+        BASE_COMPONENTS.len() == chip_idx::COUNT,
+        "BASE_COMPONENTS length must match chip_idx::COUNT — chip added or removed without \
+         updating the constants in chip_idx",
+    );
+};
 
 /// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
 /// Returns the components active for THIS trace, in declaration order.
@@ -488,6 +502,9 @@ pub use proof::{
     PcsPolicy, Proof, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
     SegmentState, check_pcs_policy,
 };
+#[doc(hidden)]
+#[cfg(feature = "prover")]
+pub use prove::prove_with_boundary_override;
 #[cfg(feature = "prover")]
 pub use prove::{
     ProveProfile, install_thread_pool, prepare_side_note_for_verification, production_pcs_config,

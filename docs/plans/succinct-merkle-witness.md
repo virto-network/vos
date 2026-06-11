@@ -16,60 +16,86 @@ transition as a bounded-memory chain).
 **Open follow-up — verifier-side chain verification.** The transition trace
 is crypto-dominated and ledger-size-independent at ~7.5M steps: it cannot
 single-shot prove on a development host, so it proves as a segment chain.
-`verify_chain` needs prover-side side notes, and — more fundamentally — the
-boundary states it chains on are not soundly bound (see the gap below). So
-the chain CANNOT yet be verified across a trust boundary (the clerk-bridge's
-`verify` checks one standalone proof against one program commitment). Until
-that lands, the federation e2e's real-STARK happy path is skipped and
-conservation-of-value remains prover-side-proven only.
+`verify_chain` needs prover-side side notes, and the boundary states it
+chains on are now metadata→column bound (format v5, below) but their
+column→trace binding is complete only for pc/timestamp — register and memory
+continuity still trust the prover (see the binding section and the
+read-consistency gap below). So the chain CANNOT yet be verified across a
+trust boundary (the clerk-bridge's `verify` checks one standalone proof
+against one program commitment). Until that lands, the federation e2e's
+real-STARK happy path is skipped and conservation-of-value remains
+prover-side-proven only.
 
-### Soundness prerequisite #1 — bind the boundary public outputs (not just mix them)
+### Soundness prerequisite #1 — bind the boundary metadata to the columns — LANDED (format v5, metadata→column half)
 
 A code review (2026-06-11) confirmed a pre-existing gap the chain work
-inherits and must close. `proof.{initial,final}_state` (registers, pc,
-timestamp, memory_commitment) are mixed into the Fiat–Shamir transcript
-(`prove.rs`), which makes a *finished* proof tamper-evident — but **no
-constraint relates those metadata fields to the committed boundary
-columns**. `RegisterMemoryClosingChip` / `ProgramBoundaryChip` pin the
-COLUMNS to the real trace via logup read-consistency, yet the verifier
-never compares the mixed metadata field to a column opening. Consequence:
-a malicious from-scratch prover can commit the real columns (passing every
-chip) and mix+ship an arbitrary self-consistent `final_state` — `verify`
-accepts. This breaks two things the money path depends on:
+inherits: `proof.{initial,final}_state` (registers, pc, timestamp) were
+mixed into the Fiat–Shamir transcript (`prove.rs`) — tamper-evidence on a
+*finished* proof — but **no check related those metadata fields to the
+committed boundary columns**, so a from-scratch prover could commit the
+real columns and mix+ship arbitrary self-consistent boundary metadata,
+including a forged voucher io-hash in `final_state.registers[9..13]`.
 
-- **The voucher io-hash is forgeable.** `verify_proof_bytes` reads the
-  io-hash from `final_state.registers[9..13]` (metadata). An attacker
-  proves *any* valid voucher-check execution (even the trivial
-  no-witness early-exit) and ships forged io-hash metadata equal to
-  `compute_io_hash(public_B, [1])` for a chosen `public_B`; the bridge's
-  `public_io_hash() == compute_io_hash(public_B)` check passes. So the
-  external-voucher verify is **not sound against a malicious prover**
-  today, independent of the chain work.
-- **`verify_chain` continuity is metadata-vs-metadata.** Its
-  `final_state == next.initial_state` check compares free fields, so it
-  does not actually force a continuous execution.
+**The binding now ships.** Mechanism (the stwo-canonical public-input
+idiom, used by stwo's own state-machine example, rather than the
+per-row OODS-constant constraint this section originally sketched —
+which would have needed either preprocessed `is_first` columns,
+breaking every pinned program commitment, or ~13 selector columns for
+the per-register chips):
 
-This is *not* a regression introduced by the succinct-witness branch — it
-is the Z0 boundary-binding mechanism as shipped (the branch's v4 work
-extended the same tamper-evidence to pc/timestamp). But it is the **#1
-correctness requirement** of this project: the per-segment proof must
-*bind* its boundary states with a constraint, not just mix them. Concretely,
-add a boundary public-input constraint — evaluate `initial_state` /
-`final_state` as constants at the OODS point and equate them to the
-committed boundary columns (`ProgramBoundaryChip` InitialPc/FinalNextPc/
-timestamps, `RegisterMemoryClosingChip` final RegVal, boundary chip initial
-RegVal). That is another format bump and wants a from-scratch-forgery test
-(prove a real trace, mix a lie, assert `verify` REJECTS) as its gate.
-`memory_commitment` is weaker still (computed outside the circuit, not even
-mixed) and needs an in-circuit memory-image commitment or a shared-challenge
-memory-handoff argument — the same work the proving-time plan couples to
-distributed proving.
+- The three boundary chips emit ONLY boundary tuples, so each one's
+  per-component logup claimed sum is a closed-form function of the
+  public boundary states and the FS-drawn lookup elements.
+- Both verifiers (`zkpvm::verify`, `zkpvm_verifier::verify_standalone`)
+  recompute those sums from `proof.{initial,final}_state` and require
+  equality with `proof.claimed_sums` (`zkpvm/src/boundary_binding.rs`).
+  The logup AIR already binds each claimed sum to the committed
+  interaction trace at the OODS point; the lookup elements are drawn
+  after the metadata mix, so Schwartz–Zippel forces the committed
+  boundary tuples to equal the public ones.
+- Gate test: `zkpvm/tests/boundary_binding.rs` — a from-scratch
+  forgery (honest columns, lying metadata via
+  `prove_with_boundary_override`) is rejected by both verify paths for
+  registers, pc and timestamp, on both ends; honest proofs and the
+  honest-values override still verify. PROOF_FORMAT_VERSION 4 → 5.
+- No AIR change: proof bytes are unchanged apart from the version
+  field; no re-pinning of program commitments needed. Side effects:
+  proofs over EMPTY traces (which bind nothing) now reject, and the
+  standalone verifier requires `component_mask` to contain the three
+  binding chips and popcount-match `num_components`.
+
+**This is the metadata→column half only.** Whether the committed
+boundary COLUMNS equal the trace's true boundary state is per-field:
+- **pc/timestamp — fully bound.** Their `ProgramBoundaryChip` columns
+  are pinned to the trace by CpuChip's `#[mask_next_row]` program-
+  execution chaining + telescoping. So pc/timestamp are genuine bound
+  public inputs end-to-end.
+- **registers — column→trace link OPEN.** The
+  `RegisterMemory{Boundary,Closing}Chip` columns are pinned to the
+  trace only by `RegisterMemoryChip` read-consistency, and that link is
+  VACUOUS against a from-scratch prover: `prev_value` there is a free
+  witness (no `#[mask_next_row]`, no (reg,ts) sortedness check), so a
+  malicious prover can forge the closing read's value — and hence the
+  voucher io-hash — by setting `prev_value` to match (empirically
+  confirmed 2026-06-11; the honest filler is what catches forgeries
+  today). Closing it needs cross-row `prev_value` binding + sortedness
+  range-checks on the register (and RAM) ledgers — another AIR change /
+  format bump / capstone re-prove. This is the **#1 remaining money-path
+  soundness task**; see `project_register_ledger_readconsistency_gap`.
+- **`memory_commitment` — unbound.** Computed outside the circuit
+  (blake3 of flat memory), not mixed, no committed column. Needs an
+  in-circuit memory-image commitment or a shared-challenge
+  memory-handoff argument — the work the proving-time plan couples to
+  distributed proving.
 
 The rest of the project (side-note-free `verify_chain_standalone`,
-shape-aware program identity, prover-extension + clerk-bridge plumbing) sits
-on top of that binding. Until it lands, treat every conservation-of-value
-proof as **prover-side only** — do not present `verify_proof_bytes`
-acceptance as a trust boundary between mutually-distrusting banks.
+shape-aware program identity, prover-extension + clerk-bridge plumbing)
+sits on top of this binding. Until the register read-consistency and
+memory continuity are bound, a chain accepted across a trust boundary
+proves per-segment validity plus pc/timestamp continuity only; the
+single-segment voucher io-hash path has its metadata bound to the
+columns but inherits the same register read-consistency caveat (sound
+against an honest prover, forgeable by a from-scratch one).
 
 ## Why
 

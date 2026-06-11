@@ -43,22 +43,31 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 /// actual last-written value). So the chip's final-value COLUMN is
 /// forced to equal the trace's actual final register state.
 ///
-/// SCOPE — what this does and does NOT bind. It binds the COLUMN. It
-/// does NOT, on its own, bind the separate `proof.final_state.registers`
-/// metadata field: no constraint relates that field to the column, and
-/// the FS-transcript mix of the field (see `prove.rs`) only makes a
-/// *finished* proof tamper-evident (editing the field post-prove shifts
-/// the verifier's challenges and breaks the openings). A malicious
-/// from-scratch prover can commit the real final-value column (passing
-/// this chip) yet mix and ship an arbitrary `final_state.registers`,
-/// and `verify` accepts — the metadata is self-consistent with the
-/// challenges but unrelated to the column. So a verifier that reads
-/// `proof.final_state.registers` to bind a public output (e.g.
-/// cipher-clerk's voucher io-hash in φ[9..12]) is trusting the prover,
-/// not the proof. Closing that requires a boundary constraint that
-/// evaluates the public field as a constant at the OODS point and
-/// equates it to the committed column — see the soundness note in
-/// `docs/plans/succinct-merkle-witness.md`.
+/// SCOPE — `proof.final_state.registers` is bound to THIS chip's
+/// committed RegVal COLUMN by the verifier-side boundary-binding check
+/// (`boundary_binding`): the chip's per-component logup claimed sum is a
+/// closed-form function of its thirteen (reg, value, closing_ts) tuples,
+/// so the verifier recomputes it from the PUBLIC
+/// `final_state.registers`/`timestamp` and requires equality with
+/// `proof.claimed_sums`. That closes the lying-METADATA attack (commit
+/// honest columns, ship a lie) — gate: `tests/boundary_binding.rs`.
+///
+/// LIMITATION — this chip's RegVal column is itself pinned to the
+/// trace's TRUE final register value only by `RegisterMemoryChip`
+/// read-consistency, and that link is currently VACUOUS against a
+/// from-scratch prover: `prev_value` there is a free witness (no
+/// `#[mask_next_row]`, no (reg,ts) sortedness), so a malicious prover
+/// can fill this closing read's value with a lie L, set the ledger
+/// row's `prev_value = L` (read-consistency holds), ship
+/// `final_state.registers = L`, and pass the boundary-binding check
+/// (metadata == column == L). So the io-hash read from φ[9..12] is NOT
+/// yet sound against a malicious prover — closing it needs the register-
+/// ledger read-consistency fix (cross-row `prev_value` binding +
+/// sortedness; see `project_register_ledger_readconsistency_gap` and
+/// `docs/plans/succinct-merkle-witness.md`). The FS-transcript mix of
+/// the field (see `prove.rs`) makes a finished proof tamper-evident and
+/// feeds the boundary states into the lookup-element draw the binding
+/// check relies on.
 ///
 /// Format version: bumped 1 → 2 alongside this chip's introduction;
 /// older proofs (no closing chip in their component set) are

@@ -53,7 +53,31 @@ use stwo::core::{
 ///       boundary public-input constraint (the conservation-of-value
 ///       chain-verification project). `memory_commitment` is weaker
 ///       still — computed outside the circuit, not even mixed.
-pub const PROOF_FORMAT_VERSION: u32 = 4;
+///   5 — Boundary public-input binding (metadata→column): closes the
+///       v2–v4 metadata-vs-column gap. Verifiers recompute each boundary
+///       chip's logup claimed sum from `proof.{initial,final}_state`
+///       (registers, pc, timestamp) with the FS-drawn lookup elements
+///       and require equality with `proof.claimed_sums` — binding the
+///       metadata fields to the committed boundary COLUMNS. A
+///       from-scratch prover that commits honest columns and ships lying
+///       metadata is now rejected (gate: `tests/boundary_binding.rs`).
+///       pc/timestamp become genuine bound public inputs (their columns
+///       are pinned to the trace by CpuChip program-execution chaining).
+///       REGISTERS are bound metadata→column only: their column→trace
+///       link is `RegisterMemoryChip` read-consistency, which is NOT
+///       enforced cross-row (a separate, pre-existing gap — a malicious
+///       prover can still forge the closing read's value and hence the
+///       io-hash; see `chips/register_memory_closing.rs` and
+///       `docs/plans/succinct-merkle-witness.md`). No AIR change — the
+///       proof bytes an honest prover produces are unchanged apart from
+///       this version field; the bump exists because older verifiers
+///       ACCEPT metadata forgeries that v5 verifiers reject, and proofs
+///       over EMPTY traces (which bind nothing) now reject. The
+///       standalone verifier additionally requires `component_mask` to
+///       contain the three binding chips and to popcount-match
+///       `num_components`. `memory_commitment` remains outside the
+///       binding (no committed column; see `segment.rs`).
+pub const PROOF_FORMAT_VERSION: u32 = 5;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.
@@ -62,7 +86,7 @@ pub struct SegmentState {
     pub pc: u32,
     pub timestamp: u64,
     pub registers: [u64; 13],
-    pub memory_commitment: [u8; 32], // blake2b-256(flat_mem)
+    pub memory_commitment: [u8; 32], // blake3(flat_mem); computed outside the circuit, unbound
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,9 +110,13 @@ pub struct Proof {
     #[serde(default)]
     pub component_mask: u32,
     pub pcs_config: PcsConfig,
-    /// State at segment start (publicly committed)
+    /// State at segment start. registers/pc/timestamp are bound to the
+    /// committed boundary columns (boundary-binding check, v5; pc/ts
+    /// further pinned to the trace, registers subject to the
+    /// read-consistency caveat in `chips/register_memory_closing.rs`);
+    /// `memory_commitment` is unbound metadata (see `SegmentState`).
     pub initial_state: SegmentState,
-    /// State at segment end (publicly committed)
+    /// State at segment end. Same binding scope as `initial_state`.
     pub final_state: SegmentState,
 }
 
@@ -106,14 +134,20 @@ impl Proof {
     /// `vos::zk`) into φ[9..12] as part of its halting `ecall` — the four
     /// hash words are passed as inline-asm `in` operands (`a2..a5`), so
     /// the compiler materialises them via real instructions immediately
-    /// before halt and Phase Z0's closing chip STARK-binds
-    /// `final_state.registers`.  No host/tracer cooperation is involved:
-    /// the binding is just ordinary register state at halt, made
-    /// tamper-evident by the existing Z0 register ledger.  The host
-    /// verifier (the `prover` extension's `verify`) checks this hash
-    /// against a locally recomputed `vos::zk::compute_io_hash`, composed
-    /// with the STARK-validity check against the trusted program
-    /// commitment — so the io-binding can't be checked without validity.
+    /// before halt.  No host/tracer cooperation is involved: the binding
+    /// is just ordinary register state at halt.  The verifier's
+    /// boundary-binding check (`boundary_binding`, format v5) equates
+    /// this metadata field to the closing chip's committed RegVal column.
+    /// CAVEAT: that column is pinned to the trace's true final registers
+    /// only by `RegisterMemoryChip` read-consistency, which is currently
+    /// vacuous against a from-scratch prover (`prev_value` is a free
+    /// witness) — so this hash is NOT yet sound against a malicious
+    /// prover; closing that needs the register-ledger read-consistency
+    /// fix (see `chips/register_memory_closing.rs`). The host verifier
+    /// (the `prover` extension's `verify`) checks this hash against a
+    /// locally recomputed `vos::zk::compute_io_hash`, composed with the
+    /// STARK-validity check against the trusted program commitment — so
+    /// the io-binding can't be checked without validity.
     ///
     /// Decoding is the exact inverse of the guest-side encoding: word
     /// φ[9] → bytes 0..8, φ[10] → 8..16, φ[11] → 16..24, φ[12] → 24..32,

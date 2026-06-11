@@ -10,10 +10,11 @@
 //! Pins:
 //!   - A witness-less run is NOT a proving run: the guest returns
 //!     early with a small trace and no io-hash binding.
-//!   - The prove/verify pipeline accepts the resulting trace, and the
-//!     proof's boundary fields are tamper-evident per the format scope
-//!     (`boundary_fields_are_tamper_evident` — note: tamper-evidence,
-//!     not binding; see that test's doc).
+//!   - The prove/verify pipeline accepts the resulting trace, and
+//!     post-prove edits of the proof's boundary fields reject while
+//!     `memory_commitment` stays unbound
+//!     (`boundary_fields_are_tamper_evident`; the from-scratch-prover
+//!     binding gate lives in `tests/boundary_binding.rs`).
 //!   - The proof's program commitment is deterministic — a second prove
 //!     of the same blob yields the same commitment, which is what
 //!     `verify_standalone` checks against.
@@ -205,26 +206,19 @@ fn voucher_check_program_commitment_is_deterministic() {
     );
 }
 
-/// Phase Z0 load-bearing test: a proof's `final_state.registers` is
-/// genuinely STARK-bound (not just decorative metadata the prover
-/// fills in). Tampering with any byte of any register post-prove
-/// must make `verify_standalone` reject.
+/// Tamper-evidence + binding test for `final_state.registers`:
+/// flipping any byte of any register on a FINISHED proof must make
+/// `verify_standalone` reject. Two mechanisms fire: the FS-transcript
+/// mix (post-prove edits shift the verifier's challenges) and, since
+/// v5, the boundary-binding claimed-sum check (the edited metadata no
+/// longer matches the committed closing-chip column).
 ///
-/// Without this guarantee, the higher-level io-binding the prover
-/// extension checks (`proof.public_io_hash() == compute_io_hash(
-/// public, return)`, read from the φ[9..12] registers) is
-/// meaningless — a cheating prover could compute
-/// the proof for any witness then write whatever hash they want
-/// into the metadata field.
-///
-/// The chip closing the register-memory ledger (Phase Z0's
-/// `RegisterMemoryClosingChip`) consumes a synthetic per-register
-/// read at `closing_ts`; the read-consistency constraint forces
-/// each row's value to equal the previous ledger row's value
-/// (= the actual last-written value of that register), so any
-/// post-prove tamper to `final_state.registers` causes the
-/// closing chip's claimed values to diverge from what the ledger
-/// already pinned.
+/// SCOPE: this exercises POST-PROVE tampering only. It does NOT cover a
+/// from-scratch prover who forges the closing read's COLUMN via the
+/// register ledger's free `prev_value` — that column→trace gap is open
+/// (see `chips/register_memory_closing.rs`), so the io-binding the
+/// prover extension checks is sound against an honest prover but not yet
+/// against a malicious one.
 #[test]
 fn final_state_registers_are_stark_bound() {
     let Some(blob) = load_voucher_check_blob() else {
@@ -269,9 +263,14 @@ fn final_state_registers_are_stark_bound() {
 /// `halt_with_output_bound` places a 32-byte `vos::zk::compute_io_hash`
 /// value into the final-state register window φ[9..12] as part of the
 /// halting ecall (the four hash words ride in `a2..a5` as inline-asm
-/// `in` operands).  Phase Z0 already binds `final_state.registers`, so
-/// the hash is a tamper-evident public output read back by
-/// `Proof::public_io_hash` — no new ECALL, no prover changes.
+/// `in` operands).  The Z0 closing chip pins the final-register columns
+/// and the boundary-binding check equates `final_state.registers` to
+/// them, so the hash is read back by `Proof::public_io_hash` — no new
+/// ECALL, no prover changes.  (The column→trace link rests on the
+/// register-ledger read-consistency, sound against an honest prover;
+/// the from-scratch-prover gap is tracked in
+/// `chips/register_memory_closing.rs`. These honest-prover tests are
+/// unaffected.)
 ///
 /// This pins the mechanism end-to-end at the zkpvm level: the binding is
 /// non-zero (the actor really bound a hash), deterministic across
@@ -414,19 +413,16 @@ fn verify_standalone_rejects_mask_zero() {
     );
 }
 
-/// Boundary-field TAMPER-EVIDENCE scope at format v4. Registers, pc and
-/// timestamp on both `proof.initial_state` and `proof.final_state` are
-/// FS-mixed (registers since Z0/Z0-init; pc + timestamp since v4), so
-/// editing any of them on a FINISHED proof shifts the verifier's
-/// challenges and the proof rejects — this test exercises exactly that
-/// post-prove edit. `memory_commitment` is not mixed, so editing it
-/// still verifies.
-///
-/// NOTE — this is tamper-evidence, NOT binding. It does not (and cannot,
-/// by mutating a finished proof) cover the from-scratch prover who mixes
-/// a lie from the start: no constraint relates these metadata fields to
-/// the committed boundary columns, so such a prover is NOT rejected.
-/// See the SCOPE note in `chips/register_memory_closing.rs`.
+/// Boundary-field tamper-evidence: registers, pc and timestamp on both
+/// `proof.initial_state` and `proof.final_state` are FS-mixed
+/// (registers since Z0/Z0-init; pc + timestamp since v4), so editing
+/// any of them on a FINISHED proof shifts the verifier's challenges and
+/// the proof rejects — this test exercises exactly that post-prove
+/// edit. (Since v5 such edits ALSO fail the boundary-binding
+/// claimed-sum check; the from-scratch prover that mixes a lie from the
+/// start is covered by `tests/boundary_binding.rs`.)
+/// `memory_commitment` is neither mixed nor bound, so editing it still
+/// verifies.
 #[test]
 fn boundary_fields_are_tamper_evident() {
     let Some(blob) = load_voucher_check_blob() else {

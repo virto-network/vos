@@ -20,6 +20,16 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 /// Verify a chain of segment proofs. Each segment's final state must match
 /// the next segment's initial state. Each segment is verified independently.
+///
+/// The compared `SegmentState` fields are bound to the committed boundary
+/// columns (boundary-binding check — see `boundary_binding`). pc/timestamp
+/// columns are pinned to the trace, so the continuity equality forces real
+/// pc/timestamp continuity; register columns are pinned only by the
+/// register-ledger read-consistency (vacuous against a from-scratch prover
+/// today — see `chips/register_memory_closing.rs`), and `memory_commitment`
+/// is computed outside the circuit. So register and memory continuity still
+/// trust the prover. This is also a host-side capability, not a
+/// trust-boundary check (it consumes prover-derived side notes).
 pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), VerificationError> {
     if proofs.len() != side_notes.len() {
         return Err(VerificationError::InvalidStructure(
@@ -110,6 +120,12 @@ pub fn verify_with_options(
     let prover_components_owned = super::active_components(side_note);
     let prover_components: &[&dyn crate::framework::MachineProverComponent] =
         &prover_components_owned;
+    // Locate the boundary-binding chips in the same active order the
+    // claimed sums are indexed by; all three are unconditionally active,
+    // so this is always `Some` for the production component selection.
+    let boundary_positions = crate::boundary_binding::boundary_positions_in_mask(
+        super::active_component_mask(side_note),
+    );
     verify_with_options_explicit_components(
         proof,
         side_note,
@@ -117,6 +133,7 @@ pub fn verify_with_options(
         policy,
         components,
         prover_components,
+        boundary_positions,
     )
 }
 
@@ -132,6 +149,11 @@ pub fn verify_with_options(
 /// `policy` lets the harness use a cheap `PcsConfig` for fast chip-rewrite
 /// validation cycles (e.g. `pow_bits = 5`) without tripping the production
 /// `PcsPolicy::STANDARD` floor.
+///
+/// The boundary-binding claimed-sum check is SKIPPED on this path (the
+/// caller's arbitrary chip slice has no stable component positions);
+/// chip-isolated proofs are not verifiable across a trust boundary
+/// anyway — `verify_standalone` rejects their `component_mask = 0`.
 pub fn verify_with_explicit_components(
     proof: Proof,
     side_note: &SideNote,
@@ -146,6 +168,7 @@ pub fn verify_with_explicit_components(
         policy,
         components,
         prover_components,
+        None,
     )
 }
 
@@ -156,6 +179,7 @@ fn verify_with_options_explicit_components(
     policy: &crate::proof::PcsPolicy,
     components: &[&dyn crate::framework::MachineComponent],
     prover_components: &[&dyn crate::framework::MachineProverComponent],
+    boundary_positions: Option<crate::boundary_binding::BoundaryChipPositions>,
 ) -> Result<(), VerificationError> {
     // Phase 42: reject proofs from a different AIR shape early, before
     // any cryptographic work.  `format_version` is bumped whenever the
@@ -233,15 +257,16 @@ fn verify_with_options_explicit_components(
         commitment_scheme.commit(proof.commitments[idx], &log_sizes[idx], verifier_channel);
     }
 
-    // Phase Z0: bind `proof.initial_state.registers` and
-    // `proof.final_state.registers` into the FS transcript. Mirrors
-    // the prover-side mix in `prove.rs` immediately after the main-
-    // trace commit. Gated on `side_note.closing_chip_active` — the
-    // default `verify` path sees the flag via the prover-mutated
-    // side_note, and chip-isolated `verify_with_explicit_components`
-    // only flips it when the caller's slice includes the boundary +
-    // closing chip pair. Order MUST match the prover (initial first,
-    // then final).
+    // Phase Z0: mix `proof.{initial,final}_state` (registers, pc,
+    // timestamp) into the FS transcript. Mirrors the prover-side mix in
+    // `prove.rs` immediately after the main-trace commit, so the lookup
+    // elements drawn next depend on the claimed boundary states. Gated
+    // on `side_note.closing_chip_active` — the default `verify` path
+    // sees the flag via the prover-mutated side_note, and chip-isolated
+    // `verify_with_explicit_components` only flips it when the caller's
+    // slice includes the boundary + closing chip pair. Order MUST match
+    // the prover (initial first, then final). `memory_commitment` stays
+    // unmixed (computed outside the circuit).
     if side_note.closing_chip_active {
         for r in &initial_state.registers {
             verifier_channel.mix_u64(*r);
@@ -249,9 +274,6 @@ fn verify_with_options_explicit_components(
         for r in &final_state.registers {
             verifier_channel.mix_u64(*r);
         }
-        // Format v4: boundary pc + timestamp join the mix (tamper-
-        // evidence only — see the prover-side note in prove.rs; not a
-        // binding constraint). memory_commitment stays unmixed.
         verifier_channel.mix_u64(initial_state.pc as u64);
         verifier_channel.mix_u64(initial_state.timestamp);
         verifier_channel.mix_u64(final_state.pc as u64);
@@ -268,6 +290,30 @@ fn verify_with_options_explicit_components(
         return Err(VerificationError::InvalidStructure(
             "claimed logup sum is not zero".to_string(),
         ));
+    }
+
+    // Boundary public-input binding (format v5): each boundary chip's
+    // claimed sum must equal the value recomputed from the proof's
+    // public boundary states with the just-drawn lookup elements. This
+    // is what BINDS `proof.{initial,final}_state` to the committed
+    // boundary columns — the mix above alone is only tamper-evidence
+    // against post-prove edits, not against a from-scratch prover. See
+    // `boundary_binding` for the soundness argument and
+    // `tests/boundary_binding.rs` for the forgery gate. `None`
+    // positions = the chip-isolated explicit-components path, which has
+    // no stable component order and is not a trust boundary; the
+    // production path always supplies `Some`.
+    if side_note.closing_chip_active {
+        if let Some(positions) = &boundary_positions {
+            crate::boundary_binding::check_boundary_claimed_sums(
+                &initial_state,
+                &final_state,
+                &lookup_elements,
+                &claimed_sums,
+                positions,
+            )
+            .map_err(|msg| VerificationError::InvalidStructure(msg.to_string()))?;
+        }
     }
 
     let tree_span_provider = &mut TraceLocationAllocator::default();

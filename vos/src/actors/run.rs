@@ -318,11 +318,14 @@ fn halt_with_output(data: &[u8]) -> ! {
 /// halting `ecall`, so the compiler materialises them into a2-a5 via
 /// real instructions immediately before the ecall.  Because the halt
 /// (`t0=0`, RootHalt) only reads a0/a1, a2-a5 persist unchanged into
-/// `final_state.registers`, where Phase Z0's closing chip already
-/// STARK-binds them — making the hash a tamper-evident public output
-/// (`zkpvm::Proof::public_io_hash`).  No new ECALL, no tracer/prover
-/// cooperation, no register-ledger surgery: it is ordinary,
-/// already-bound register state at halt.
+/// `final_state.registers`, where Phase Z0's closing chip pins the
+/// columns and the verifier's boundary-binding check equates the
+/// metadata to them (`zkpvm::Proof::public_io_hash`).  No new ECALL, no
+/// tracer/prover cooperation, no register-ledger surgery: it is ordinary
+/// register state at halt.  (Soundness caveat: the closing-read column
+/// binds to the true final register only via the register-ledger
+/// read-consistency, vacuous against a from-scratch prover today — see
+/// `crate::zk` and `zkpvm::chips::register_memory_closing`.)
 ///
 /// a2→φ[9], a3→φ[10], a4→φ[11], a5→φ[12] per grey-transpiler's RISC-V→PVM
 /// mapping — the exact window `public_io_hash` reconstructs.

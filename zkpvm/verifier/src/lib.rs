@@ -193,6 +193,14 @@ pub fn verify_standalone_with_options(
             "log sizes len mismatch".to_string(),
         ));
     }
+    // The active-component reconstruction zips mask-selected chips with
+    // the claimed sums/log sizes; require the counts to agree so a
+    // mask/num_components mismatch can't silently truncate either side.
+    if component_mask.count_ones() as usize != num_components {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask popcount does not match num_components".to_string(),
+        ));
+    }
 
     // Use the proof's own PCS config — `prove()` uses production_pcs_config
     // by default (blowup=16, 19 queries, 20-bit PoW), not PcsConfig::default(),
@@ -232,25 +240,20 @@ pub fn verify_standalone_with_options(
         );
     }
 
-    // Phase Z0: bind `proof.initial_state.registers` and
-    // `proof.final_state.registers` into the FS transcript. The
-    // `component_mask = 0` reject at the top of this function
-    // guarantees we only reach here for production proofs that
-    // included the boundary + closing chip pair, so the mix is
-    // unconditional. Any post-prove tamper of either field shifts
-    // the lookup-element challenges drawn next; the committed
-    // interaction trace then no longer satisfies the constraint
-    // system and verify rejects. Order MUST match the prover (see
-    // `prove.rs`): initial first, then final.
+    // Phase Z0: mix `proof.{initial,final}_state` (registers, pc,
+    // timestamp) into the FS transcript. The `component_mask = 0`
+    // reject at the top of this function guarantees we only reach here
+    // for production proofs that included the boundary + closing chip
+    // pair, so the mix is unconditional. The lookup elements drawn next
+    // therefore depend on the claimed boundary states. Order MUST match
+    // the prover (see `prove.rs`): initial first, then final.
+    // `memory_commitment` stays unmixed (computed outside the circuit).
     for r in &initial_state.registers {
         verifier_channel.mix_u64(*r);
     }
     for r in &final_state.registers {
         verifier_channel.mix_u64(*r);
     }
-    // Format v4: boundary pc + timestamp join the mix (tamper-evidence
-    // only — see the prover-side note in prove.rs; not a binding
-    // constraint). memory_commitment stays unmixed.
     verifier_channel.mix_u64(initial_state.pc as u64);
     verifier_channel.mix_u64(initial_state.timestamp);
     verifier_channel.mix_u64(final_state.pc as u64);
@@ -265,6 +268,38 @@ pub fn verify_standalone_with_options(
             "claimed logup sum is not zero".to_string(),
         ));
     }
+
+    // Boundary public-input binding (format v5): each boundary chip's
+    // claimed sum must equal the value recomputed from the proof's
+    // public boundary states with the just-drawn lookup elements. This
+    // BINDS `proof.{initial,final}_state` to the committed boundary
+    // COLUMNS; the mix above alone is only tamper-evidence against
+    // post-prove edits, not against a from-scratch prover. pc/timestamp
+    // columns are pinned to the trace, so those become genuine bound
+    // public inputs; the register columns (and the voucher io-hash read
+    // from `final_state.registers[9..13]`) are pinned to the trace only
+    // by the register-ledger read-consistency, which is vacuous against
+    // a from-scratch prover today — see `zkpvm::boundary_binding` and
+    // `chips/register_memory_closing.rs`. A mask missing any binding
+    // chip cannot bind its boundary states and is rejected outright (all
+    // three are unconditionally active in the production prove path).
+    let Some(boundary_positions) =
+        zkpvm::boundary_binding::boundary_positions_in_mask(component_mask)
+    else {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask lacks a boundary-binding chip \
+             (RegisterMemoryBoundary / RegisterMemoryClosing / ProgramBoundary)"
+                .to_string(),
+        ));
+    };
+    zkpvm::boundary_binding::check_boundary_claimed_sums(
+        &initial_state,
+        &final_state,
+        &lookup_elements,
+        &claimed_sums,
+        &boundary_positions,
+    )
+    .map_err(|msg| VerificationError::InvalidStructure(msg.to_string()))?;
 
     let tree_span_provider = &mut TraceLocationAllocator::default();
     let verifier_components: Vec<Box<dyn Component>> = create_verifier_components::components(

@@ -11,18 +11,26 @@
 //!
 //! SOUNDNESS SCOPE. `verify_chain`'s continuity check compares each
 //! segment's `final_state` to the next's `initial_state` (registers, pc,
-//! timestamp, memory_commitment). Those `SegmentState` fields are proof
-//! METADATA: the FS-transcript mix (registers + pc + timestamp; see
-//! `prove.rs`) makes a finished proof tamper-evident, but NO constraint
-//! binds the metadata to the committed boundary columns, so a malicious
-//! from-scratch prover can ship arbitrary self-consistent boundary
-//! states (see `chips/register_memory_closing.rs`). `memory_commitment`
-//! is weaker still — it is a hash computed outside the circuit and is
-//! not even mixed. So this slicer + `verify_chain` is the bounded-memory
-//! PROVING capability; it is NOT yet a trustworthy verifier-side chain
-//! check. Making it one (real boundary-public-input binding) is the
-//! conservation-of-value chain-verification project — see
-//! `docs/plans/succinct-merkle-witness.md`.
+//! timestamp, memory_commitment). Each segment's verification binds those
+//! metadata fields to the committed boundary COLUMNS (boundary-binding
+//! check; see `boundary_binding`). Per field:
+//!   - pc/timestamp columns are pinned to the trace (CpuChip
+//!     program-execution chaining), so the continuity equality forces
+//!     real pc/timestamp continuity.
+//!   - register columns are pinned to the trace only by the register
+//!     ledger's read-consistency, which is currently vacuous against a
+//!     from-scratch prover (`prev_value` is a free witness) — so
+//!     register continuity is NOT yet enforced against a malicious
+//!     prover (see `chips/register_memory_closing.rs`).
+//!   - `memory_commitment` is a hash computed outside the circuit (not
+//!     even FS-mixed), so memory continuity trusts the prover. Closing
+//!     it needs an in-circuit memory-image commitment (couples with the
+//!     memory-continuity work in `docs/plans/proving-time.md`).
+//! Independently, `verify_chain` itself is a HOST-SIDE capability, not a
+//! trust-boundary check: it consumes prover-derived `SideNote`s and
+//! anchors no per-segment program commitment. Making it a trust boundary
+//! (a side-note-free `verify_chain_standalone`) is the
+//! chain-verification work in `docs/plans/succinct-merkle-witness.md`.
 //!
 //! This is program-agnostic: any actor whose trace is too large for one
 //! proof becomes provable as a chain.

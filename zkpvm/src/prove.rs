@@ -546,6 +546,58 @@ fn prove_impl_with_components(
     components: &[&dyn crate::framework::MachineProverComponent],
     component_mask: u32,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
+    prove_impl_with_components_overridden(
+        side_note,
+        config,
+        profile,
+        components,
+        component_mask,
+        None,
+    )
+}
+
+/// Prove with caller-supplied boundary metadata in place of the
+/// trace-derived `proof.{initial,final}_state`: the chips commit the
+/// honest trace columns, but the FS-transcript mix and the shipped
+/// metadata fields carry the caller's values instead.
+///
+/// This reproduces exactly what a from-scratch malicious prover can do —
+/// run the whole pipeline with lying boundary metadata that is
+/// self-consistent with its own transcript. It exists so the
+/// boundary-binding gate test (`tests/boundary_binding.rs`) can assert
+/// such proofs are REJECTED by `verify` / `verify_standalone`. It grants
+/// no capability an adversary lacks, but it is not part of the supported
+/// proving API.
+#[doc(hidden)]
+pub fn prove_with_boundary_override(
+    side_note: &mut SideNote,
+    initial_state: SegmentState,
+    final_state: SegmentState,
+) -> Result<Proof, ProvingError> {
+    install_thread_pool();
+    prepare_side_note_for_verification(side_note);
+    let components_owned = super::active_components(side_note);
+    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
+    let component_mask = super::active_component_mask(side_note);
+    let (proof, _) = prove_impl_with_components_overridden(
+        side_note,
+        production_pcs_config(),
+        false,
+        components,
+        component_mask,
+        Some((initial_state, final_state)),
+    )?;
+    Ok(proof)
+}
+
+fn prove_impl_with_components_overridden(
+    side_note: &mut SideNote,
+    config: PcsConfig,
+    profile: bool,
+    components: &[&dyn crate::framework::MachineProverComponent],
+    component_mask: u32,
+    boundary_override: Option<(SegmentState, SegmentState)>,
+) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
 
     // Phase 9a: RegisterMemoryBoundaryChip needs `initial_regs`
@@ -646,42 +698,40 @@ fn prove_impl_with_components(
     tree_builder.commit(prover_channel);
     let main_commit = t.elapsed();
 
-    // Mix the boundary `SegmentState` fields into the FS transcript so
-    // a FINISHED proof is tamper-evident: editing initial/final
-    // registers, pc or timestamp post-prove shifts the challenges the
-    // verifier draws, so the committed interaction trace no longer
-    // satisfies the constraint system. Gated on `closing_chip_active`
-    // because production always ships the boundary + closing chips
-    // together (BASE_COMPONENTS, set by `prove_impl`); chip-isolated
-    // harnesses that opted out leave the mix off, matching their
+    // Mix the boundary `SegmentState` fields into the FS transcript.
+    // Two effects: a FINISHED proof is tamper-evident (editing
+    // initial/final registers, pc or timestamp post-prove shifts the
+    // challenges the verifier draws, so the committed interaction trace
+    // no longer satisfies the constraint system), and the lookup
+    // elements drawn next depend on the claimed boundary states — the
+    // precondition for the verifier-side boundary-binding check, which
+    // recomputes each boundary chip's claimed sum from
+    // `proof.{initial,final}_state` and rejects from-scratch provers
+    // that ship metadata diverging from the committed boundary columns
+    // (see `boundary_binding`). Gated on `closing_chip_active` because
+    // production always ships the boundary + closing chips together
+    // (BASE_COMPONENTS, set by `prove_impl`); chip-isolated harnesses
+    // that opted out leave the mix off, matching their
     // `component_mask = 0` proof shape.
     //
     // Order (initial regs, final regs, initial pc, initial ts, final
     // pc, final ts) is deterministic and stable; the verifier MUST mix
     // identically. `memory_commitment` is NOT mixed (it is a hash
-    // computed outside the circuit).
-    //
-    // IMPORTANT — this is tamper-evidence, NOT binding. No constraint
-    // relates these proof METADATA fields to the committed boundary
-    // columns (ProgramBoundaryChip / RegisterMemoryClosingChip pin the
-    // COLUMNS to the real trace, but the verifier never compares the
-    // mixed field against a column opening). A from-scratch prover can
-    // commit the real columns and mix+ship arbitrary self-consistent
-    // boundary metadata; `verify` accepts. So `verify_chain` continuity
-    // and any consumer of `proof.{initial,final}_state` (e.g. the
-    // voucher io-hash in φ[9..12]) trust the prover for these values.
-    // Real binding needs a boundary public-input constraint — see the
-    // SCOPE note in `chips/register_memory_closing.rs` and
-    // `docs/plans/succinct-merkle-witness.md`.
+    // computed outside the circuit) and stays OUTSIDE the binding.
     if side_note.closing_chip_active {
-        for r in &side_note.initial_regs {
+        let (initial_regs, final_regs) = match &boundary_override {
+            Some((ini, fin)) => (ini.registers, fin.registers),
+            None => (side_note.initial_regs, side_note.final_regs),
+        };
+        for r in &initial_regs {
             prover_channel.mix_u64(*r);
         }
-        for r in &side_note.final_regs {
+        for r in &final_regs {
             prover_channel.mix_u64(*r);
         }
-        let (initial_pc, initial_ts, final_pc, final_ts) =
-            match (side_note.steps.first(), side_note.steps.last()) {
+        let (initial_pc, initial_ts, final_pc, final_ts) = match &boundary_override {
+            Some((ini, fin)) => (ini.pc as u64, ini.timestamp, fin.pc as u64, fin.timestamp),
+            None => match (side_note.steps.first(), side_note.steps.last()) {
                 (Some(first), Some(last)) => (
                     first.pc as u64,
                     first.timestamp,
@@ -689,7 +739,8 @@ fn prove_impl_with_components(
                     last.timestamp + 1,
                 ),
                 _ => (0, 0, 0, 0),
-            };
+            },
+        };
         prover_channel.mix_u64(initial_pc);
         prover_channel.mix_u64(initial_ts);
         prover_channel.mix_u64(final_pc);
@@ -824,14 +875,20 @@ fn prove_impl_with_components(
         let mut regs = [0u64; 13];
         regs[..last.regs_after.len().min(13)]
             .copy_from_slice(&last.regs_after[..13.min(last.regs_after.len())]);
-        // Final memory = initial memory with all writes applied
-        // For now, hash the initial memory (full memory tracking is future work)
+        // Final memory = initial memory with all writes applied.
         SegmentState {
             pc: last.next_pc,
             timestamp: last.timestamp + 1,
             registers: regs,
             memory_commitment: compute_final_memory_commitment(side_note),
         }
+    };
+
+    // The forgery seam ships the caller's states verbatim — the same
+    // values the mix above committed to the transcript.
+    let (initial_state, final_state) = match boundary_override {
+        Some((ini, fin)) => (ini, fin),
+        None => (initial_state, final_state),
     };
 
     // Phase 60: caller supplies the bitmask (empty for chip-isolated harness).
