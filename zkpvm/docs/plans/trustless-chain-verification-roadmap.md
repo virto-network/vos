@@ -29,63 +29,93 @@ the STARK PCS (Phase C1). So A ships on today's stack.
 ## Phase A — Merkle-ize the zkVM RAM, bind `memory_commitment` (SOUNDNESS; ships now)
 
 Goal: replace `memory_commitment = blake3(flat 4MB image)` (unbound metadata)
-with an in-circuit-bound Merkle root of the RAM, so
-`verify_chain_standalone`'s boundary continuity becomes SOUND for memory. This
-closes the last money-path gap and composes to C.
+with an in-circuit-bound Merkle root of the RAM, so `verify_chain_standalone`'s
+boundary continuity becomes SOUND for memory. Closes the last money-path gap;
+composes to C. **No PCS / stwo change** — uses blake2b (the existing chip).
 
-Mechanism (reuses the succinct-merkle BatchProof DESIGN, now IN-AIR instead of
-host-side): intra-segment memory consistency is already sound (the v6 offline
-memory-checking ledger). What's unbound is the boundary IMAGE. Prove, per
-segment, a Merkle MULTIPROOF over the touched pages:
-- the segment's initial-memory reads (read-before-write) are the leaves of
-  `initial_root` at their page addresses (recompute `initial_root` from the
-  read leaf values + witnessed shared siblings);
-- applying the segment's net writes to those leaves, with the SAME siblings
-  (untouched subtrees are unchanged), recomputes `final_root`.
-Bind `initial_root` / `final_root` into the boundary states via the
-boundary-binding mechanism (mirror RegisterMemoryBoundaryChip / Closing).
-Hashes = blake2b via Blake2bChip. Cost ≈ (touched pages + frontier siblings)
-blake2b per segment — NOT per-page-full-depth.
+### Why it's cheap (MEASURED on the real 7.5M-step workload, `measure_memory_boundary`)
 
-Tasks:
-1. **MEASURE** the per-segment touched-memory boundary (`first_access.len()` /
-   distinct touched pages at each segment cut) on the real 7.5M-step workload.
-   Decides page granularity + sizes the blake2b cost (KBs of pages = cheap;
-   MBs = painful but still sound). This is the one concrete next step; it also
-   retroactively confirms A was the right call vs B.
-2. **Page granularity** decision (e.g. 64–256-byte pages → sparse Merkle keyed
-   by page address, depth = page-address bits; bigger pages = shallower tree
-   but a write re-hashes a whole page). Lay a page abstraction over the
-   byte-granular ledger.
-3. **Memory-Merkle subsystem in the AIR**: a chip (or chips) that verifies the
-   boundary multiproof against `initial_root`/`final_root` using Blake2bChip;
-   wire the touched-page set from the existing memory ledger.
-4. **Boundary chips + binding**: `initial_root`/`final_root` become bound public
-   inputs (boundary_binding recompute). SegmentState gains the roots (keep
-   `memory_commitment` as the root, or add fields); `verify_chain` /
-   `verify_chain_standalone` continuity now bound for memory.
-5. **Format bump (v7)** + history; capstone re-prove (`--release`, box quiet);
-   rebuild prover .so before federation e2e. Same playbook as the v6
-   read-consistency fix.
-6. **Gate test**: a from-scratch prover that ships a forged boundary memory
-   (initial ≠ prior final) is REJECTED — mirrors `ledger_readconsistency_gate`.
+Intra-segment memory consistency is already sound (the v6 offline-memory ledger,
+zero hashing per access). We only bind the boundary IMAGE — and the cross-segment
+boundary is SPARSE: per segment, distinct touched PAGES are
 
-Open design Qs: page size; sparse-Merkle vs fixed-depth; whether to verify the
-multiproof in a dedicated chip vs. fold into the memory ledger; how the root
-threads across segments at trace-gen (segment.rs `replay_writes` already
-reconstructs the entering image — it would compute the entering root too).
+| page size | max touched pages/seg | avg |
+|---|---|---|
+| 256 B | 227 | 113 |
+| 1024 B | 66 | 34 |
+| **4096 B** | **23** | **12** |
 
-## Phase C1 — switch the STARK PCS to Poseidon2-over-M31 (RECURSION PREP)
+So a boundary multiproof is over ~tens of page-leaves, not millions of accesses.
 
-Make zkpvm proofs cheap to verify in a circuit: replace the blake2s Merkle +
-Fiat-Shamir channel in zkpvm's `PcsConfig` with **Poseidon2-over-M31** (the
-recursion-friendly hash; < 10K hashes ⇒ sub-second recursive proving per the
-L2IV/StarkWare work). stwo ships poseidon hashers + a Poseidon2 hash-AIR
-example; the M31 Poseidon2 path may need wiring. Tradeoff: base proving slows
-(blake2s is faster per-hash on a CPU); only worth it once committed to C.
-Independent of Phase A (A's memory tree stays blake2b).
+### Mechanism — a boundary Merkle MULTIPROOF (reuse the BatchProof DESIGN, in-AIR)
 
-## Phase C2 — the recursive verifier / aggregator (SUCCINCTNESS)
+Reuse cipher-clerk's `BatchProof` algorithm (`merkle.rs`: recompute ONE root from
+N touched leaves + a `frontier` of cached untouched-subtree hashes; `root_after`
+from updated leaves + the SAME frontier — soundness rests on `root==root_before`).
+But express it as AIR constraints + the Blake2bChip, over a tree keyed by PAGE
+ADDRESS (NOT 128-bit hashed keys). Per segment, prove:
+- recompute `initial_root` from the read-before-write page leaves (leaf =
+  blake2b(page bytes)) + witnessed frontier siblings;
+- recompute `final_root` from the written page leaves (updated) + the SAME
+  frontier.
+Bind `initial_root`/`final_root` as boundary public inputs (boundary-binding).
+
+### Cost (CRITICAL design lever: tree DEPTH, set by page size)
+
+Blake2bChip = **96 rows / compression**; NO Poseidon in zkpvm (blake2b is the
+only in-AIR hash). Cost ≈ (touched-page leaf hashes + ~touched·depth node hashes)
+× 96 rows. DEPTH = address_bits − page_bits — so KEY BY PAGE ADDRESS to keep
+depth ~10–20 (a 128-deep hashed-key tree like cipher-clerk's would cost ~K·128
+hashes — too much). With **4096-B pages** (≤23 touched pages, depth ~10–20):
+≈ (23 leaf×32 blocks + 23×~20 nodes) ≈ ~1–2K compressions/segment ≈ **log_size
+~17–18** for the boundary Merkle — NON-dominant vs the CpuChip (~2^19–20). Larger
+pages → shallower + fewer leaves but bigger leaf hashes; 4096 is the sweet spot
+from the measurement. (256-B pages → ~6K comps, log_size ~20: avoid.)
+
+### Surfaces (mapped)
+
+1. **Page abstraction** over the byte ledger; sparse Merkle keyed by page addr.
+2. **MemoryMerkleChip** (new): verifies the boundary multiproof as constraints,
+   driving blake2b for leaf+node hashes. The Blake2bChip is currently
+   ECALL-driven (`blake2b_calls` + `blake2b_mem_ops` binding h/m/out to the
+   MEMORY ledger) — the Merkle hashes are NOT guest memory, so EITHER inject
+   synthetic `blake2b_calls` from the new chip (like RegisterMemoryClosingChip
+   injects synthetic ledger entries) WITHOUT the mem-op binding, OR add a
+   separate "boundary-blake2b" path. **OPEN: cleanest blake2b-for-Merkle wiring**
+   (the mem-op binding assumption is the one snag — `blake2b/mod.rs` Phase-8
+   ECALL binding).
+3. **MemoryRootBoundaryChip** (new, mirror `register_memory_boundary.rs`):
+   commits `initial_root`/`final_root` columns, bound via boundary_binding.
+   `chip_idx` + `BASE_COMPONENTS`: insert `MEMORY_ROOT_BOUNDARY`, shift indices,
+   bump `COUNT` (breaks `component_mask` bit positions ⇒ format bump anyway).
+4. **SegmentState** (`proof.rs`): ADD `initial_root:[u8;32]`, `final_root:[u8;32]`
+   (do NOT reuse `memory_commitment` — keep it as the unbound blake3 hash). FS
+   mix in `prove.rs` (after pc/ts) + verifier mirror in `verify.rs`.
+   `boundary_binding`: add `expected_memory_root_sum` + `BoundaryChipPositions
+   .memory_root_boundary` + a check in `check_boundary_claimed_sums`.
+5. **segment.rs** `replay_writes` already reconstructs the entering image — make
+   it also compute the entering root + the touched-page frontier witness.
+6. **Format bump v6→v7** + history; capstone re-prove (`--release`, box quiet);
+   gate test (forged boundary memory REJECTED — mirror
+   `ledger_readconsistency_gate`); rebuild prover .so before federation e2e.
+
+## Phase C1 — switch the STARK PCS to Poseidon2-over-M31 (RECURSION PREP; GATED)
+
+Make zkpvm proofs cheap to verify in a circuit: swap the blake2s Merkle +
+Fiat-Shamir channel for **Poseidon2-over-M31** (< 10K hashes ⇒ sub-second
+recursion, per L2IV/StarkWare). GOOD NEWS: the hash is a TYPE PARAMETER
+(`CommitmentSchemeProver<B, MC: MerkleChannel>` / `…Verifier<MC>`), so the swap
+is mostly threading the `MC` type through ~22 sites + bumping the wire format
+(`Proof.stark_proof: StarkProof<…Hasher>` changes ⇒ verifier-crate lockstep +
+format bump). Tradeoff: base proving slows (blake2s is faster per-hash).
+**BLOCKER:** stwo has **no M31-native Poseidon2** — only `Poseidon252` over the
+252-bit Starknet field (converts M31→felt252; plus a "no SIMD poseidon yet"
+TODO). So C1 requires BUILDING/obtaining a `Poseidon2M31MerkleHasher` + channel +
+the Poseidon2-over-M31 permutation in stwo. StarkWare's recursion work targets
+exactly this hash, so **C is gated on M31-Poseidon2 landing upstream (watch the
+stwo `dev` branch) or us building it** — a real external dependency, not a flip.
+
+## Phase C2 — the recursive verifier / aggregator (SUCCINCTNESS; gated on C1)
 
 Fold the N Poseidon2-committed segment proofs into one. Two routes:
 - **Native AIR** (Plonk component + Poseidon2-over-M31 builtin, per the L2IV
@@ -93,16 +123,18 @@ Fold the N Poseidon2-committed segment proofs into one. Two routes:
   stwo-verifier reference, though emitted as Bitcoin Script). Most control,
   biggest build.
 - **Via `stwo-cairo`** (StarkWare-supported): verify zkpvm segment proofs inside
-  a Cairo program, prove that. Cross-VM dependency, less control, but reuses
-  StarkWare's shipping recursive-proving pipeline.
+  a Cairo program, prove that. Cross-VM dependency, less control, reuses
+  StarkWare's shipping pipeline.
 The aggregator verifies each segment + chains the bound memory roots (Phase A) +
 register/pc/ts continuity → one proof, one commitment (also dissolves the
-variable-segment-size program-identity nuance noted in `verify_chain_standalone`).
+variable-segment-size identity nuance from `verify_chain_standalone`).
 
 ## Sequencing
 
-A (soundness, ships now, no stwo change) → C1 (PCS swap) → C2 (aggregator).
-A is independently valuable (closes the money-path gap on the existing flat
-chain) AND is the foundation C stands on. C1+C2 are the succinctness end-state,
-pursued when the one-proof aggregation is worth the build. First concrete action:
-the Phase-A boundary measurement.
+**A (now — soundness, no stwo change, MEASURED cheap) → C1 (gated on M31-Poseidon2
+existing) → C2 (gated on C1).** A is independently valuable (closes the money-path
+gap on the existing flat chain + `verify_chain_standalone`) AND is the substrate
+C stands on. C is the succinctness end-state, externally gated on upstream stwo
+shipping M31-Poseidon2 (or us building it) — so A is the clear near-term build
+and C is "design now, execute when the hash lands". Within A, the natural first
+code step is the page abstraction + the MemoryMerkleChip multiproof gadget.
