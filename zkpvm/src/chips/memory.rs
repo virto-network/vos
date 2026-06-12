@@ -273,6 +273,18 @@ pub struct MemoryDedupReport {
     /// After-dedup row count under fixed per-row cap M.
     /// `cap_after_dedup[k] = (m, rows, log_size)`.
     pub cap_after_dedup: Vec<(usize, usize, u32)>,
+    // ── Memory-Merkle boundary sizing (trustless-chain-verification Phase A) ──
+    /// Distinct byte addresses touched in this segment.
+    pub distinct_addresses: usize,
+    /// Distinct addresses whose FIRST access is a read (read-before-write) —
+    /// the leaves a segment must include against `initial_root`.
+    pub read_before_write: usize,
+    /// Distinct addresses written at least once — the leaves that change for
+    /// `final_root`.
+    pub written_addresses: usize,
+    /// Distinct touched PAGES per granularity: `(page_size_bytes, count)`.
+    /// The touched-page count drives the boundary Merkle-multiproof size.
+    pub distinct_pages: Vec<(usize, usize)>,
 }
 
 /// Build the same `entries: Vec<MemEntry>` `generate_main_trace_immut` would
@@ -483,6 +495,53 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         i += run_len;
     }
 
+    // Boundary sizing: walk the (address, ts)-sorted entries grouped by
+    // address. The group head is the first access (lowest ts) → classifies
+    // read-before-write; any write in the group marks the address as written.
+    let page_sizes = [64usize, 256, 1024, 4096];
+    let mut distinct_addresses = 0usize;
+    let mut read_before_write = 0usize;
+    let mut written_addresses = 0usize;
+    let mut page_counts = vec![0usize; page_sizes.len()];
+    let mut last_page = vec![u64::MAX; page_sizes.len()];
+    let mut g = 0usize;
+    while g < entries.len() {
+        let addr = entries[g].address;
+        // Within an address group (sorted by ts asc), ts=0 entries are the
+        // injected initial-memory boundary writes — skip them so we classify
+        // the first REAL (ts≥1) access. (The tracer starts ts at 1.)
+        let mut h = g;
+        let mut first_real_is_write: Option<bool> = None;
+        let mut any_real_write = false;
+        while h < entries.len() && entries[h].address == addr {
+            if entries[h].timestamp != 0 {
+                if first_real_is_write.is_none() {
+                    first_real_is_write = Some(entries[h].is_write);
+                }
+                any_real_write |= entries[h].is_write;
+            }
+            h += 1;
+        }
+        if let Some(first_is_write) = first_real_is_write {
+            distinct_addresses += 1;
+            if !first_is_write {
+                read_before_write += 1;
+            }
+            if any_real_write {
+                written_addresses += 1;
+            }
+            for (pi, &ps) in page_sizes.iter().enumerate() {
+                let page = addr as u64 / ps as u64;
+                if last_page[pi] != page {
+                    page_counts[pi] += 1;
+                    last_page[pi] = page;
+                }
+            }
+        }
+        g = h;
+    }
+    let distinct_pages: Vec<(usize, usize)> = page_sizes.iter().copied().zip(page_counts).collect();
+
     let current_log_size = crate::trace::utils::ceil_log2_at_least_lanes(total_entries);
     let after_dedup_log_size = crate::trace::utils::ceil_log2_at_least_lanes(after_dedup);
 
@@ -506,6 +565,10 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         flood_length_histogram: histogram.into_iter().collect(),
         longest_flood,
         cap_after_dedup,
+        distinct_addresses,
+        read_before_write,
+        written_addresses,
+        distinct_pages,
     }
 }
 

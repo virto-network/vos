@@ -399,6 +399,77 @@ fn verify_chain_mobile(
     Ok(())
 }
 
+/// Phase-A sizing (trustless-chain-verification roadmap): measure the
+/// per-segment touched-memory BOUNDARY on the REAL transition workload —
+/// distinct touched pages (the Merkle-multiproof leaf count that drives the
+/// in-circuit blake2b cost of binding `memory_commitment`) + read-before-write
+/// / written address counts. Informs page granularity and whether Phase A is
+/// cheap (KBs of pages) or notable (MBs). Measurement only — no proving.
+///   cargo test -p prover-extension --test prove_transition \
+///     measure_memory_boundary -- --ignored --nocapture
+#[test]
+#[ignore]
+fn measure_memory_boundary() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    assert!(total > 1_000_000, "trace only {total} steps — stale ELF?");
+    let bounds = zkpvm::segment::segment_bounds(total, SEG_STEPS);
+    eprintln!(
+        "total steps: {total}; {} segments of <= {SEG_STEPS}",
+        bounds.len()
+    );
+    eprintln!();
+    eprintln!("seg    steps     bytes      rbw  written  pg@64  pg@256  pg@1024  pg@4096");
+    let mut max_pages = [0usize; 4];
+    let mut sum_pages = [0usize; 4];
+    let mut max_rbw = 0usize;
+    let mut max_written = 0usize;
+    for (i, &(a, b)) in bounds.iter().enumerate() {
+        let sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let r = zkpvm::chips::memory::analyze_dedup(&sn);
+        let p: Vec<usize> = r.distinct_pages.iter().map(|&(_, c)| c).collect();
+        eprintln!(
+            "{i:>3}  {:>8}  {:>8}  {:>7}  {:>7}  {:>5}  {:>6}  {:>7}  {:>7}",
+            b - a,
+            r.distinct_addresses,
+            r.read_before_write,
+            r.written_addresses,
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+        );
+        for k in 0..4 {
+            max_pages[k] = max_pages[k].max(p[k]);
+            sum_pages[k] += p[k];
+        }
+        max_rbw = max_rbw.max(r.read_before_write);
+        max_written = max_written.max(r.written_addresses);
+    }
+    let n = bounds.len().max(1);
+    eprintln!();
+    eprintln!(
+        "PER-SEGMENT MAX:  rbw={max_rbw}  written={max_written}  pages: @64={} @256={} @1024={} @4096={}",
+        max_pages[0], max_pages[1], max_pages[2], max_pages[3]
+    );
+    eprintln!(
+        "PER-SEGMENT AVG:  pages: @64={} @256={} @1024={} @4096={}",
+        sum_pages[0] / n,
+        sum_pages[1] / n,
+        sum_pages[2] / n,
+        sum_pages[3] / n
+    );
+}
+
 /// Segmentation end-to-end: prove the FULL kernel transition as a chain of
 /// bounded segments and `verify_chain` it. This is the general capability —
 /// any actor trace too large for a single proof becomes provable in bounded
