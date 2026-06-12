@@ -325,3 +325,83 @@ pub fn verify_standalone_with_options(
         stark_proof,
     )
 }
+
+/// Verify a CHAIN of segment proofs WITHOUT any side note — the trustless
+/// counterpart to `zkpvm::verify_chain` (which needs prover-supplied
+/// `SideNote`s and never pins program identity).
+///
+/// Each segment is verified via [`verify_standalone`] against the SAME
+/// `preprocessed_commitment`, so the chain (a) needs no prover-supplied
+/// trace data and (b) pins every segment to ONE program identity (a
+/// from-scratch prover cannot splice in a segment of a different program).
+/// Consecutive segments must chain: `proofs[i].final_state ==
+/// proofs[i+1].initial_state`.
+///
+/// SOUNDNESS SCOPE — the boundary-continuity equality is BOUND for the
+/// fields `verify_standalone` binds in-circuit: registers (v6
+/// register-ledger read-consistency) and pc/timestamp (CpuChip
+/// program-execution chaining + the boundary-binding check). It is
+/// TAMPER-EVIDENT ONLY for `SegmentState.memory_commitment`, which is
+/// `blake3(flat_mem)` computed OUTSIDE the circuit and unbound — a
+/// from-scratch prover can put any matching hash on both sides of a
+/// boundary while the actual memory image diverges. So a chain accepted
+/// here proves: one program, per-segment validity, and register/pc/
+/// timestamp continuity — NOT memory continuity. Binding memory
+/// continuity (in-circuit memory commitment / Merkle memory / chain-level
+/// handoff) is the remaining work; see
+/// `docs/plans/ledger-read-consistency.md`.
+///
+/// PRECONDITION — every segment must share `preprocessed_commitment`, i.e.
+/// have the SAME per-component `log_sizes` (the program commitment is the
+/// preprocessed-trace Merkle root, which is size-dependent). Deployments
+/// that segment a long trace should pad all segments to one uniform size
+/// so a single published commitment pins them all; a chain whose last
+/// segment is smaller would currently need its own commitment (a
+/// per-segment-commitment variant is future work).
+pub fn verify_chain_standalone(
+    proofs: &[Proof],
+    preprocessed_commitment: CommitmentHash,
+) -> Result<(), VerificationError> {
+    verify_chain_standalone_with_options(
+        proofs,
+        preprocessed_commitment,
+        DEFAULT_MAX_LOG_SIZE,
+        &PcsPolicy::STANDARD,
+    )
+}
+
+/// [`verify_chain_standalone`] with explicit `max_log_size` cap + `PcsPolicy`.
+pub fn verify_chain_standalone_with_options(
+    proofs: &[Proof],
+    preprocessed_commitment: CommitmentHash,
+    max_log_size: u32,
+    policy: &PcsPolicy,
+) -> Result<(), VerificationError> {
+    if proofs.is_empty() {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone: empty proof chain".to_string(),
+        ));
+    }
+    // Boundary continuity: each segment's final state must equal the next
+    // segment's initial state.  Bound for registers/pc/timestamp;
+    // tamper-evident only for memory_commitment (see the doc above).
+    for window in proofs.windows(2) {
+        if window[0].final_state != window[1].initial_state {
+            return Err(VerificationError::InvalidStructure(format!(
+                "segment chain broken: final state at ts={} does not match next initial at ts={}",
+                window[0].final_state.timestamp, window[1].initial_state.timestamp,
+            )));
+        }
+    }
+    // Each segment verifies standalone against the SAME program commitment:
+    // no side note, and program identity is pinned across the whole chain.
+    for proof in proofs {
+        verify_standalone_with_options(
+            proof.clone(),
+            preprocessed_commitment,
+            max_log_size,
+            policy,
+        )?;
+    }
+    Ok(())
+}
