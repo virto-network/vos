@@ -46,7 +46,8 @@ mod interaction;
 mod trace_fill;
 
 pub(crate) use classify::classify_opcode_for_program_memory;
-use columns::{Column, PreprocessedColumn};
+pub use columns::Column;
+use columns::PreprocessedColumn;
 pub(crate) use reg_access::step_reg_accesses;
 
 pub struct CpuChip;
@@ -138,6 +139,50 @@ impl BuiltInComponent for CpuChip {
         let _ = bitwise_and_lookup;
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
+
+        // ── Step-timestamp chaining: NextTimestamp = Timestamp + 1 ──
+        // Limb-canonical via a boolean carry chain.  The program-execution
+        // lookup (further down) sequences steps as a multiset permutation
+        // over (ts, pc) → (next_ts, next_pc) pairs anchored by the
+        // ProgramBoundaryChip's (initial_ts, initial_pc) / (final_ts,
+        // final_pc).  Without this binding the permutation also balances
+        // disjoint timestamp cycles (rows producing/consuming each other at
+        // attacker-chosen timestamps), letting a forged step emit a
+        // register/memory tuple OUTSIDE [initial_ts, final_ts) — notably
+        // ts = 0 or ts = closing_ts, which the boundary/closing chips reserve.
+        // Chaining collapses the permutation to a single path from the
+        // boundary-pinned initial timestamp to the final one, so every real
+        // row's timestamp provably lies in [initial_ts, final_ts).  Limb 7
+        // has no outgoing carry, so the increment cannot wrap; closing a
+        // cycle would require every carry level to overflow (≥ 2^24 rows —
+        // far above any trace).  Kept ahead of every `add_to_relation` so a
+        // constraint failure unwinds cleanly (before the logup guard exists).
+        {
+            let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
+            let next_ts = crate::trace::trace_eval!(trace_eval, Column::NextTimestamp);
+            let ts_carry = crate::trace::trace_eval!(trace_eval, Column::TsCarry);
+            let f256_ts = E::F::from(BaseField::from(256));
+            for c in ts_carry.iter() {
+                eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
+            }
+            eval.add_constraint(
+                is_real.clone()
+                    * (next_ts[0].clone() + ts_carry[0].clone() * f256_ts.clone()
+                        - timestamp[0].clone()
+                        - E::F::one()),
+            );
+            for i in 1..7 {
+                eval.add_constraint(
+                    is_real.clone()
+                        * (next_ts[i].clone() + ts_carry[i].clone() * f256_ts.clone()
+                            - timestamp[i].clone()
+                            - ts_carry[i - 1].clone()),
+                );
+            }
+            eval.add_constraint(
+                is_real.clone() * (next_ts[7].clone() - timestamp[7].clone() - ts_carry[6].clone()),
+            );
+        }
 
         // ── Phase I-cpu Wave-8 helper trace_eval (hoisted to top scope) ──
         // Used by Phase 31 (~line 825), CountSetBits (~line 950), Phase 13e

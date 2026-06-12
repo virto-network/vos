@@ -25,6 +25,19 @@ use super::classify::{classify_opcode, dest_reg, uses_immediate};
 use super::columns::Column;
 use super::reg_access::step_reg_accesses;
 
+/// Carry chain for `NextTimestamp = Timestamp + 1`: carry i is 1 iff
+/// limbs 0..=i of `ts` are all 0xff (the increment overflows through
+/// them).  Limb 7 has no outgoing carry.
+fn fill_ts_carry(trace: &mut TraceBuilder<Column>, row: usize, ts: u64) {
+    let mut carry = [0u8; 7];
+    let mut all_ff = true;
+    for (i, c) in carry.iter_mut().enumerate() {
+        all_ff = all_ff && ((ts >> (8 * i)) & 0xff) == 0xff;
+        *c = all_ff as u8;
+    }
+    trace.fill_columns_bytes(row, &carry, Column::TsCarry);
+}
+
 pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
     let num_steps = side_note.num_steps();
     let log_size = (num_steps as f64).log2().ceil().max(LOG_N_LANES as f64) as u32;
@@ -1217,6 +1230,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
 
         // NextTimestamp = timestamp + 1
         trace.fill_columns(row, step.timestamp + 1, Column::NextTimestamp);
+        fill_ts_carry(&mut trace, row, step.timestamp);
 
         // ── Blake2b ECALL binding (Phase 8c) ──
         // Detect Ecalli with imm == ECALL_BLAKE2B_COMPRESS and snapshot the
@@ -1903,6 +1917,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, true, Column::IsPadding);
         trace.fill_columns(row, ts, Column::Timestamp);
         trace.fill_columns(row, ts + 1, Column::NextTimestamp);
+        fill_ts_carry(&mut trace, row, ts);
         // Wave-2 helper GateDivH = (DivRemOp - 2)·(DivRemOp - 3).
         // Constraint is unconditional (no is_real gate); on padding
         // rows DivRemOp = 0, so GateDivH must be filled with

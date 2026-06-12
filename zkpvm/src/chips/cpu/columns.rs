@@ -301,6 +301,18 @@ pub enum Column {
     /// timestamp + 1 (8 limbs), used for the program execution lookup
     #[size = 8]
     NextTimestamp,
+    /// Boolean carry chain pinning `NextTimestamp` to the canonical
+    /// limb-wise increment of `Timestamp`.  Without it the program
+    /// execution lookup is a bare multiset permutation over
+    /// (ts, pc) → (next_ts, next_pc) pairs, which balanced phantom
+    /// cycles at arbitrary timestamps can satisfy — letting forged
+    /// rows emit register/memory tuples outside [initial_ts,
+    /// final_ts).  Limb 7 takes carry 6 and has no outgoing carry, so
+    /// the increment can never wrap back to a small tuple; closing a
+    /// cycle would need ≥ 2^24 rows (every carry level must overflow),
+    /// far above any trace size.
+    #[size = 7]
+    TsCarry,
     // ── Blake2b ECALL binding (Phase 8c) ──
     /// 1 iff this step is the blake2b hostcall (Ecalli opcode with imm =
     /// ECALL_BLAKE2B_COMPRESS).  Prover-witnessed; logup balance with
