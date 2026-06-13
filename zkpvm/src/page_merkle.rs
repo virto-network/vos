@@ -234,6 +234,12 @@ pub struct MergeNode {
     pub index: u32,
     pub left: Child,
     pub right: Child,
+    /// `[left, right]` child hashes in the before pass (witness children carry
+    /// their shared witness value); `node(child_before) == hash_before`.
+    pub child_before: [[u8; 32]; 2],
+    /// `[left, right]` child hashes in the after pass; `node(child_after) ==
+    /// hash_after`.  A witness child's entry equals its `child_before` entry.
+    pub child_after: [[u8; 32]; 2],
     pub hash_before: [u8; 32],
     pub hash_after: [u8; 32],
 }
@@ -324,6 +330,8 @@ pub fn build_multiproof_from_leaves(
                     index: parent as u32,
                     left: Child::Computed,
                     right: Child::Computed,
+                    child_before: [hb, hb2],
+                    child_after: [ha, ha2],
                     hash_before: pb,
                     hash_after: pa,
                 });
@@ -332,10 +340,12 @@ pub fn build_multiproof_from_leaves(
             } else {
                 let sib_idx = idx ^ 1;
                 let w = subtree_root(level, sib_idx, entering_leaves);
-                let (left, right, pb, pa) = if idx & 1 == 0 {
+                let (left, right, child_before, child_after, pb, pa) = if idx & 1 == 0 {
                     (
                         Child::Computed,
                         Child::Witness(w),
+                        [hb, w],
+                        [ha, w],
                         node_hash(&hb, &w),
                         node_hash(&ha, &w),
                     )
@@ -343,6 +353,8 @@ pub fn build_multiproof_from_leaves(
                     (
                         Child::Witness(w),
                         Child::Computed,
+                        [w, hb],
+                        [w, ha],
                         node_hash(&w, &hb),
                         node_hash(&w, &ha),
                     )
@@ -352,6 +364,8 @@ pub fn build_multiproof_from_leaves(
                     index: parent as u32,
                     left,
                     right,
+                    child_before,
+                    child_after,
                     hash_before: pb,
                     hash_after: pa,
                 });
@@ -426,6 +440,97 @@ pub fn touched_pages(side_note: &crate::side_note::SideNote) -> BTreeSet<u32> {
         add_range(&mut pages, op.output_ptr, op.out_bytes.len() as u32);
     }
     pages
+}
+
+/// Blake2b chaining state after compressing a tag's full 128-byte first block
+/// (`t = 128`, not final): the precomputed prefix every leaf/node hash starts
+/// from, so the circuit proves only the payload blocks.
+fn h_after_tag(tag: &[u8]) -> [u64; 8] {
+    blake2b_compress(
+        &iv_param_256(),
+        &block_words(&tagged_first_block(tag)),
+        128,
+        false,
+    )
+}
+
+/// A tag padded to exactly one 128-byte block.
+fn tagged_first_block(tag: &[u8]) -> [u8; BLOCK] {
+    let mut b = [0u8; BLOCK];
+    b[..tag.len()].copy_from_slice(tag);
+    b
+}
+
+fn h_after_leaf_tag() -> [u64; 8] {
+    use std::sync::OnceLock;
+    static H: OnceLock<[u64; 8]> = OnceLock::new();
+    *H.get_or_init(|| h_after_tag(TAG_LEAF))
+}
+
+fn h_after_node_tag() -> [u64; 8] {
+    use std::sync::OnceLock;
+    static H: OnceLock<[u64; 8]> = OnceLock::new();
+    *H.get_or_init(|| h_after_tag(TAG_NODE))
+}
+
+/// First 32 bytes (4 LE words) of a chaining state — the truncated digest a
+/// leaf/node compression chain produces.
+pub fn trunc32(h: &[u64; 8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        out[i * 8..i * 8 + 8].copy_from_slice(&h[i].to_le_bytes());
+    }
+    out
+}
+
+/// The 32 chained compressions that hash one page into its leaf digest,
+/// starting from `h_after_leaf_tag()`.  Appends to `calls`.
+fn push_leaf_calls(page: &[u8; PAGE_SIZE], calls: &mut Vec<crate::chips::Blake2bCall>) {
+    let mut h = h_after_leaf_tag();
+    for block in 0..32usize {
+        let m = block_words(&page[block * BLOCK..block * BLOCK + BLOCK]);
+        let t = (128 * (block as u128 + 2)) as u128;
+        let f = block == 31;
+        calls.push(crate::chips::Blake2bCall { h, m, t, f });
+        h = blake2b_compress(&h, &m, t, f);
+    }
+}
+
+/// The single compression that hashes two child digests into a node digest.
+fn node_call(left: &[u8; 32], right: &[u8; 32]) -> crate::chips::Blake2bCall {
+    let mut payload = [0u8; BLOCK];
+    payload[..32].copy_from_slice(left);
+    payload[32..64].copy_from_slice(right);
+    // bytes 64..128 are the zero pad
+    crate::chips::Blake2bCall {
+        h: h_after_node_tag(),
+        m: block_words(&payload),
+        t: 192,
+        f: true,
+    }
+}
+
+/// Every blake2b compression the Blake2bBoundaryChip must prove for a segment:
+/// for each touched leaf, the 32-block chain over the entering page then the
+/// exit page; for each merge node, the before-pass then the after-pass node
+/// compression.  Duplicates are kept (one call per in-circuit consumption —
+/// identical compressions, e.g. two all-zero pages or an unchanged page whose
+/// passes coincide, each need their own producer block for logup balance).
+pub fn boundary_blake2b_calls(
+    mp: &MerkleMultiproof,
+    entering: &[u8],
+    exiting: &[u8],
+) -> Vec<crate::chips::Blake2bCall> {
+    let mut calls = Vec::new();
+    for &(p, _, _) in &mp.leaves {
+        push_leaf_calls(&page_bytes(entering, p), &mut calls); // before pass
+        push_leaf_calls(&page_bytes(exiting, p), &mut calls); // after pass
+    }
+    for node in &mp.merges {
+        calls.push(node_call(&node.child_before[0], &node.child_before[1]));
+        calls.push(node_call(&node.child_after[0], &node.child_after[1]));
+    }
+    calls
 }
 
 /// Build the boundary multiproof for a segment from its side note: enumerate
@@ -667,6 +772,92 @@ mod tests {
         let exiting = crate::segment::replay_writes(&sn, None);
         assert_eq!(mp.root_before, image_root(&sn.initial_memory));
         assert_eq!(mp.root_after, image_root(&exiting));
+    }
+
+    fn replay(call: &crate::chips::Blake2bCall) -> [u64; 8] {
+        blake2b_compress(&call.h, &call.m, call.t, call.f)
+    }
+
+    #[test]
+    fn leaf_call_chain_reproduces_leaf_hash() {
+        // The tag-precompute (start from h_after_leaf_tag, prove 32 page blocks)
+        // must equal the full-message blake2b256(TAG_LEAF ‖ page).
+        let mut page = [0u8; PAGE_SIZE];
+        for (i, b) in page.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut calls = Vec::new();
+        push_leaf_calls(&page, &mut calls);
+        assert_eq!(calls.len(), 32);
+        let mut h = calls[0].h;
+        for call in &calls {
+            // each call's h_in must chain from the previous h_out
+            assert_eq!(call.h, h);
+            h = replay(call);
+        }
+        assert_eq!(trunc32(&h), leaf_hash(&page));
+    }
+
+    #[test]
+    fn node_call_reproduces_node_hash() {
+        let l = [0x11u8; 32];
+        let r = [0x22u8; 32];
+        let call = node_call(&l, &r);
+        assert_eq!(trunc32(&replay(&call)), node_hash(&l, &r));
+    }
+
+    #[test]
+    fn boundary_calls_reproduce_all_multiproof_hashes() {
+        let entering = make_image(&[(1, 0xAA), (2, 0xBB), (1000, 0xCC)]);
+        let mut exiting = entering.clone();
+        for b in &mut exiting[2 * PAGE_SIZE..3 * PAGE_SIZE] {
+            *b = 0xDD;
+        }
+        for b in &mut exiting[5 * PAGE_SIZE..6 * PAGE_SIZE] {
+            *b = 0xEE;
+        }
+        let touched: BTreeSet<u32> = [2u32, 5].into_iter().collect();
+        let mp = build_multiproof(&entering, &exiting, &touched);
+
+        // Every merge node's stored child hashes hash to its parent hashes.
+        for node in &mp.merges {
+            assert_eq!(
+                node_hash(&node.child_before[0], &node.child_before[1]),
+                node.hash_before
+            );
+            assert_eq!(
+                node_hash(&node.child_after[0], &node.child_after[1]),
+                node.hash_after
+            );
+        }
+
+        // The full call list: one block-chain per leaf-pass + one call per
+        // node-pass.  Count and replay-consistency.
+        let calls = boundary_blake2b_calls(&mp, &entering, &exiting);
+        let expected = mp.leaves.len() * 2 * 32 + mp.merges.len() * 2;
+        assert_eq!(calls.len(), expected);
+
+        // Leaf chains replay to the leaf digests recorded in the multiproof.
+        let mut idx = 0;
+        for &(_, before_leaf, after_leaf) in &mp.leaves {
+            for want in [before_leaf, after_leaf] {
+                let mut h = calls[idx].h;
+                for _ in 0..32 {
+                    assert_eq!(calls[idx].h, h);
+                    h = replay(&calls[idx]);
+                    idx += 1;
+                }
+                assert_eq!(trunc32(&h), want);
+            }
+        }
+        // Node calls replay to the node digests.
+        for node in &mp.merges {
+            assert_eq!(trunc32(&replay(&calls[idx])), node.hash_before);
+            idx += 1;
+            assert_eq!(trunc32(&replay(&calls[idx])), node.hash_after);
+            idx += 1;
+        }
+        assert_eq!(idx, calls.len());
     }
 
     #[test]
