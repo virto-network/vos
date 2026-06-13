@@ -26,6 +26,7 @@ use stwo::{
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
+use crate::air_column::PreprocessedAirColumn;
 use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
 use crate::trace::{
@@ -62,6 +63,101 @@ use trace::{GRow, fill_output_witnesses, g_traced, row_v_after};
 
 pub struct Blake2bChip;
 
+/// The row-index-derived schedule selectors the compression core needs,
+/// pulled out of the preprocessed trace by the caller so the core is
+/// agnostic to which chip's `PreprocessedColumn` (i.e. which
+/// `preprocessed_prefix`) backs them.  `Blake2bChip` and
+/// `Blake2bBoundaryChip` carry structurally identical selectors under
+/// distinct prefixes (distinct preprocessed-tree IDs are mandatory — stwo
+/// dedups preprocessed columns by ID but the prover commits each
+/// component's preprocessed trace positionally).
+pub(super) struct Blake2bSchedule<F> {
+    pub is_first: [F; 1],
+    pub is_last: [F; 1],
+    pub is_gidx: [[F; 1]; 8],
+    pub is_mx_slot: [[F; 1]; 16],
+    pub is_my_slot: [[F; 1]; 16],
+}
+
+/// A `PreprocessedColumn` enum exposing the blake2b compression schedule
+/// selectors by name.  Implemented by both the main and boundary chips'
+/// preprocessed columns (same variants, distinct prefix).
+pub(super) trait ScheduleColumns: PreprocessedAirColumn + Copy {
+    const IS_FIRST: Self;
+    const IS_LAST: Self;
+    const IS_GIDX: [Self; 8];
+    const IS_MX_SLOT: [Self; 16];
+    const IS_MY_SLOT: [Self; 16];
+}
+
+impl ScheduleColumns for PreprocessedColumn {
+    const IS_FIRST: Self = PreprocessedColumn::IsFirstOfCompression;
+    const IS_LAST: Self = PreprocessedColumn::IsLastOfCompression;
+    const IS_GIDX: [Self; 8] = [
+        PreprocessedColumn::IsGIdx0,
+        PreprocessedColumn::IsGIdx1,
+        PreprocessedColumn::IsGIdx2,
+        PreprocessedColumn::IsGIdx3,
+        PreprocessedColumn::IsGIdx4,
+        PreprocessedColumn::IsGIdx5,
+        PreprocessedColumn::IsGIdx6,
+        PreprocessedColumn::IsGIdx7,
+    ];
+    const IS_MX_SLOT: [Self; 16] = [
+        PreprocessedColumn::IsMxSlot0,
+        PreprocessedColumn::IsMxSlot1,
+        PreprocessedColumn::IsMxSlot2,
+        PreprocessedColumn::IsMxSlot3,
+        PreprocessedColumn::IsMxSlot4,
+        PreprocessedColumn::IsMxSlot5,
+        PreprocessedColumn::IsMxSlot6,
+        PreprocessedColumn::IsMxSlot7,
+        PreprocessedColumn::IsMxSlot8,
+        PreprocessedColumn::IsMxSlot9,
+        PreprocessedColumn::IsMxSlot10,
+        PreprocessedColumn::IsMxSlot11,
+        PreprocessedColumn::IsMxSlot12,
+        PreprocessedColumn::IsMxSlot13,
+        PreprocessedColumn::IsMxSlot14,
+        PreprocessedColumn::IsMxSlot15,
+    ];
+    const IS_MY_SLOT: [Self; 16] = [
+        PreprocessedColumn::IsMySlot0,
+        PreprocessedColumn::IsMySlot1,
+        PreprocessedColumn::IsMySlot2,
+        PreprocessedColumn::IsMySlot3,
+        PreprocessedColumn::IsMySlot4,
+        PreprocessedColumn::IsMySlot5,
+        PreprocessedColumn::IsMySlot6,
+        PreprocessedColumn::IsMySlot7,
+        PreprocessedColumn::IsMySlot8,
+        PreprocessedColumn::IsMySlot9,
+        PreprocessedColumn::IsMySlot10,
+        PreprocessedColumn::IsMySlot11,
+        PreprocessedColumn::IsMySlot12,
+        PreprocessedColumn::IsMySlot13,
+        PreprocessedColumn::IsMySlot14,
+        PreprocessedColumn::IsMySlot15,
+    ];
+}
+
+/// Read the compression schedule selectors from a chip's preprocessed trace.
+pub(super) fn read_schedule<P: ScheduleColumns, E: EvalAtRow>(
+    trace_eval: &TraceEval<P, Column, E>,
+) -> Blake2bSchedule<E::F> {
+    Blake2bSchedule {
+        is_first: trace_eval.preprocessed_column_eval::<1>(P::IS_FIRST),
+        is_last: trace_eval.preprocessed_column_eval::<1>(P::IS_LAST),
+        is_gidx: core::array::from_fn(|j| trace_eval.preprocessed_column_eval::<1>(P::IS_GIDX[j])),
+        is_mx_slot: core::array::from_fn(|k| {
+            trace_eval.preprocessed_column_eval::<1>(P::IS_MX_SLOT[k])
+        }),
+        is_my_slot: core::array::from_fn(|k| {
+            trace_eval.preprocessed_column_eval::<1>(P::IS_MY_SLOT[k])
+        }),
+    }
+}
+
 /// The blake2b compression arithmetic core: G-function steps, nibble-AND
 /// derivations, carry / rotation bounds, V-state row chaining, message
 /// authentication, initial-state derivation, and the row-95 output
@@ -71,26 +167,23 @@ pub struct Blake2bChip;
 /// memory-ledger + CPU-call bindings) and `Blake2bBoundaryChip` (which adds
 /// its own IsReal anchor + Blake2bCompression producer instead).  Re-reads
 /// every column it needs from `trace_eval`; does NOT finalize the logup.
-pub(super) fn add_compression_core<E: EvalAtRow>(
+pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     eval: &mut E,
-    trace_eval: &TraceEval<PreprocessedColumn, Column, E>,
+    trace_eval: &TraceEval<P, Column, E>,
+    sched: &Blake2bSchedule<E::F>,
     range256_lookup: &Range256LookupElements,
     bitwise_lookup: &BitwiseAndLookupElements,
 ) {
     let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
     // Phase I-blake2b-1 gate helpers — Stwo v2.x lifted-protocol degree
     // flatten.  Pull in `IsFirstOfCompression` / `IsLastOfCompression`
-    // (preprocessed) and the 3 main-column helpers; tie them together
+    // (from `sched`) and the 3 main-column helpers; tie them together
     // with degree-2 definition constraints; thereafter all gated
     // constraint sites use the helpers directly so the gate's
     // contribution to algebraic degree drops from 2 to 1.  Subphases
     // 2-7 finish flattening the rest of the chip.
-    let is_first = crate::trace::preprocessed_trace_eval!(
-        trace_eval,
-        PreprocessedColumn::IsFirstOfCompression
-    );
-    let is_last =
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLastOfCompression);
+    let is_first = &sched.is_first;
+    let is_last = &sched.is_last;
     let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
     let init_gate_h = crate::trace::trace_eval!(trace_eval, Column::InitGateH);
     let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
@@ -478,16 +571,7 @@ pub(super) fn add_compression_core<E: EvalAtRow>(
     // IsGIdx[j] (preprocessed) = 1 iff (r % 8) == j.  G_INDICES[j] gives the
     // 4 touched slots (ai,bi,ci,di) for that G-call.  IsLastOfCompression
     // (preprocessed) = 1 iff r is the 95th row of some compression.
-    let is_gidx: [_; 8] = [
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx0),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx1),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx2),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx3),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx4),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx5),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx6),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx7),
-    ];
+    let is_gidx = &sched.is_gidx;
 
     let v_cols: [_; 16] = [
         crate::trace::trace_eval!(trace_eval, Column::V0),
@@ -652,42 +736,8 @@ pub(super) fn add_compression_core<E: EvalAtRow>(
         crate::trace::trace_eval_next_row!(trace_eval, Column::M14),
         crate::trace::trace_eval_next_row!(trace_eval, Column::M15),
     ];
-    let is_mx_slot: [_; 16] = [
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot0),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot1),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot2),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot3),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot4),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot5),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot6),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot7),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot8),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot9),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot10),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot11),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot12),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot13),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot14),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot15),
-    ];
-    let is_my_slot: [_; 16] = [
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot0),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot1),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot2),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot3),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot4),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot5),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot6),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot7),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot8),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot9),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot10),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot11),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot12),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot13),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot14),
-        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot15),
-    ];
+    let is_mx_slot = &sched.is_mx_slot;
+    let is_my_slot = &sched.is_my_slot;
 
     // Mx / My selection from M by preprocessed selector
     // (Phase I-blake2b-5 helper-flattened).
@@ -929,7 +979,8 @@ impl BuiltInComponent for Blake2bChip {
         // Arithmetic compression core (G-function, V-chain, output
         // derivation, BitwiseAnd / Range256 lookups, the GateH / InitGateH /
         // OutputGateH helper definitions) — shared with Blake2bBoundaryChip.
-        add_compression_core(eval, &trace_eval, range256_lookup, bitwise_lookup);
+        let sched = read_schedule(&trace_eval);
+        add_compression_core(eval, &trace_eval, &sched, range256_lookup, bitwise_lookup);
 
         // Re-read the core-local columns the memory-ledger / CPU-call
         // bindings below consume.
@@ -1167,7 +1218,7 @@ impl BuiltInComponent for Blake2bChip {
 }
 
 #[cfg(feature = "prover")]
-pub(super) fn add_compression_interaction_core(
+pub(super) fn add_compression_interaction_core<P: ScheduleColumns>(
     logup: &mut LogupTraceBuilder,
     component_trace: &ComponentTrace,
     range256: &Range256LookupElements,
@@ -1435,10 +1486,7 @@ pub(super) fn add_compression_interaction_core(
     // Snapshot V[0..16] and H[0..8] columns upfront — we dispatch by
     // numeric index below because the column-fetch macro requires a
     // literal path.
-    let is_last_pp = crate::trace::preprocessed_base_column!(
-        component_trace,
-        PreprocessedColumn::IsLastOfCompression
-    );
+    let is_last_pp = component_trace.preprocessed_base_column::<1, P>(P::IS_LAST);
     let h_hi_cols = crate::trace::original_base_column!(component_trace, Column::HHi);
     let v_after_hi_cols = crate::trace::original_base_column!(component_trace, Column::VAfterHi);
     let out_and1_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1);
@@ -2071,7 +2119,12 @@ impl BuiltInProverComponent for Blake2bChip {
         let bitwise: &BitwiseAndLookupElements = lookup_elements.as_ref();
         // Arithmetic-core lookups (BitwiseAnd / Range256 nibble lookups +
         // Phase 2b output-AND lookups) — shared with Blake2bBoundaryChip.
-        add_compression_interaction_core(&mut logup, &component_trace, range256, bitwise);
+        add_compression_interaction_core::<PreprocessedColumn>(
+            &mut logup,
+            &component_trace,
+            range256,
+            bitwise,
+        );
 
         // Re-read the columns Phase 8b/8c consume from the core region.
         let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
