@@ -62,6 +62,843 @@ use trace::{GRow, fill_output_witnesses, g_traced, row_v_after};
 
 pub struct Blake2bChip;
 
+/// The blake2b compression arithmetic core: G-function steps, nibble-AND
+/// derivations, carry / rotation bounds, V-state row chaining, message
+/// authentication, initial-state derivation, and the row-95 output
+/// derivation — together with the BitwiseAnd / Range256 lookups those
+/// witnesses require, plus the GateH / InitGateH / OutputGateH helper
+/// definitions.  Shared verbatim by `Blake2bChip` (which adds the
+/// memory-ledger + CPU-call bindings) and `Blake2bBoundaryChip` (which adds
+/// its own IsReal anchor + Blake2bCompression producer instead).  Re-reads
+/// every column it needs from `trace_eval`; does NOT finalize the logup.
+pub(super) fn add_compression_core<E: EvalAtRow>(
+    eval: &mut E,
+    trace_eval: &TraceEval<PreprocessedColumn, Column, E>,
+    range256_lookup: &Range256LookupElements,
+    bitwise_lookup: &BitwiseAndLookupElements,
+) {
+    let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+    // Phase I-blake2b-1 gate helpers — Stwo v2.x lifted-protocol degree
+    // flatten.  Pull in `IsFirstOfCompression` / `IsLastOfCompression`
+    // (preprocessed) and the 3 main-column helpers; tie them together
+    // with degree-2 definition constraints; thereafter all gated
+    // constraint sites use the helpers directly so the gate's
+    // contribution to algebraic degree drops from 2 to 1.  Subphases
+    // 2-7 finish flattening the rest of the chip.
+    let is_first = crate::trace::preprocessed_trace_eval!(
+        trace_eval,
+        PreprocessedColumn::IsFirstOfCompression
+    );
+    let is_last =
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsLastOfCompression);
+    let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
+    let init_gate_h = crate::trace::trace_eval!(trace_eval, Column::InitGateH);
+    let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
+    let f1_top = E::F::one();
+    eval.add_constraint(
+        gate_h[0].clone() - is_real[0].clone() * (f1_top.clone() - is_last[0].clone()),
+    );
+    eval.add_constraint(init_gate_h[0].clone() - is_real[0].clone() * is_first[0].clone());
+    eval.add_constraint(output_gate_h[0].clone() - is_real[0].clone() * is_last[0].clone());
+    let a_in = crate::trace::trace_eval!(trace_eval, Column::AIn);
+    let b_in = crate::trace::trace_eval!(trace_eval, Column::BIn);
+    let c_in = crate::trace::trace_eval!(trace_eval, Column::CIn);
+    let d_in = crate::trace::trace_eval!(trace_eval, Column::DIn);
+    let mx = crate::trace::trace_eval!(trace_eval, Column::Mx);
+    let my = crate::trace::trace_eval!(trace_eval, Column::My);
+    let a1 = crate::trace::trace_eval!(trace_eval, Column::A1);
+    let carry1 = crate::trace::trace_eval!(trace_eval, Column::Carry1);
+    let and1 = crate::trace::trace_eval!(trace_eval, Column::And1);
+    let c1 = crate::trace::trace_eval!(trace_eval, Column::C1);
+    let carry2 = crate::trace::trace_eval!(trace_eval, Column::Carry2);
+    let and2 = crate::trace::trace_eval!(trace_eval, Column::And2);
+    let a_out = crate::trace::trace_eval!(trace_eval, Column::AOut);
+    let carry3 = crate::trace::trace_eval!(trace_eval, Column::Carry3);
+    let and3 = crate::trace::trace_eval!(trace_eval, Column::And3);
+    let c_out = crate::trace::trace_eval!(trace_eval, Column::COut);
+    let carry4 = crate::trace::trace_eval!(trace_eval, Column::Carry4);
+    let and4 = crate::trace::trace_eval!(trace_eval, Column::And4);
+    let b_out = crate::trace::trace_eval!(trace_eval, Column::BOut);
+    let rot63_carry = crate::trace::trace_eval!(trace_eval, Column::Rot63Carry);
+
+    let f256 = E::F::from(BaseField::from(256u32));
+    let f2 = E::F::from(BaseField::from(2u32));
+
+    // ── Step 1: a1 = a_in + b_in + mx (3-input addition) ──
+    for i in 0..8 {
+        let carry_in = if i == 0 {
+            E::F::zero()
+        } else {
+            carry1[i - 1].clone()
+        };
+        eval.add_constraint(
+            is_real[0].clone()
+                * (a1[i].clone() + carry1[i].clone() * f256.clone()
+                    - a_in[i].clone()
+                    - b_in[i].clone()
+                    - mx[i].clone()
+                    - carry_in),
+        );
+    }
+
+    // ── Step 2: xor1 = d ^ a1, d1 = xor1 >>> 32 (byte permutation) ──
+    // xor1[i] = d_in[i] + a1[i] - 2*and1[i]
+    // d1[i] = xor1[(i+4)%8]
+
+    // ── Step 3: c1 = c_in + d1 ──
+    // d1[i] = xor1[(i+4)%8] = d_in[(i+4)%8] + a1[(i+4)%8] - 2*and1[(i+4)%8]
+    for i in 0..8 {
+        let carry_in = if i == 0 {
+            E::F::zero()
+        } else {
+            carry2[i - 1].clone()
+        };
+        let j = (i + 4) % 8; // byte permutation for >>>32
+        let d1_i = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
+        eval.add_constraint(
+            is_real[0].clone()
+                * (c1[i].clone() + carry2[i].clone() * f256.clone()
+                    - c_in[i].clone()
+                    - d1_i
+                    - carry_in),
+        );
+    }
+
+    // ── Step 4: xor2 = b ^ c1, b1 = xor2 >>> 24 ──
+    // b1[i] = xor2[(i+3)%8] = b_in[(i+3)%8] + c1[(i+3)%8] - 2*and2[(i+3)%8]
+
+    // ── Step 5: a_out = a1 + b1 + my ──
+    for i in 0..8 {
+        let carry_in = if i == 0 {
+            E::F::zero()
+        } else {
+            carry3[i - 1].clone()
+        };
+        let j = (i + 3) % 8; // byte permutation for >>>24
+        let b1_i = b_in[j].clone() + c1[j].clone() - f2.clone() * and2[j].clone();
+        eval.add_constraint(
+            is_real[0].clone()
+                * (a_out[i].clone() + carry3[i].clone() * f256.clone()
+                    - a1[i].clone()
+                    - b1_i
+                    - my[i].clone()
+                    - carry_in),
+        );
+    }
+
+    // ── Step 6: xor3 = d1 ^ a_out, d_out = xor3 >>> 16 ──
+    // d1[i] = d_in[(i+4)%8] + a1[(i+4)%8] - 2*and1[(i+4)%8] (from step 2)
+    // d_out[i] = xor3[(i+2)%8]
+
+    // ── Step 7: c_out = c1 + d_out ──
+    for i in 0..8 {
+        let carry_in = if i == 0 {
+            E::F::zero()
+        } else {
+            carry4[i - 1].clone()
+        };
+        // d_out[i] = xor3[(i+2)%8] where xor3[k] = d1[k] + a_out[k] - 2*and3[k]
+        // d1[k] = d_in[(k+4)%8] + a1[(k+4)%8] - 2*and1[(k+4)%8]
+        let k = (i + 2) % 8; // byte perm for >>>16
+        let j = (k + 4) % 8; // byte perm for >>>32 (d1)
+        let d1_k = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
+        let d_out_i = d1_k + a_out[k].clone() - f2.clone() * and3[k].clone();
+        eval.add_constraint(
+            is_real[0].clone()
+                * (c_out[i].clone() + carry4[i].clone() * f256.clone()
+                    - c1[i].clone()
+                    - d_out_i
+                    - carry_in),
+        );
+    }
+
+    // ── Step 8: xor4 = b1 ^ c_out, b_out = xor4 >>> 63 ──
+    // >>>63 = left rotate by 1. At byte level:
+    //   b_out[i] = ((xor4[i] << 1) | (xor4[(i+7)%8] >> 7)) & 0xFF
+    // = (xor4[i] * 2 + rot63_carry[(i+7)%8]) mod 256
+    // where rot63_carry[j] = xor4[j] >> 7 (high bit)
+    for i in 0..8 {
+        let j = (i + 3) % 8; // b1 byte perm (>>>24)
+        let b1_i = b_in[j].clone() + c1[j].clone() - f2.clone() * and2[j].clone();
+        let xor4_i = b1_i + c_out[i].clone() - f2.clone() * and4[i].clone();
+        let prev_carry = rot63_carry[(i + 7) % 8].clone();
+        // b_out[i] + rot63_overflow * 256 = xor4[i] * 2 + prev_carry
+        // But rot63_carry[i] = xor4[i] >> 7, so xor4[i] * 2 + prev_carry can be:
+        // If xor4[i] < 128: result = xor4[i]*2 + prev_carry, carry_out = 0
+        // If xor4[i] >= 128: result = xor4[i]*2 + prev_carry - 256, carry_out = 1
+        // Constraint: b_out[i] + rot63_carry[i] * 256 = xor4[i] * 2 + prev_carry
+        eval.add_constraint(
+            is_real[0].clone()
+                * (b_out[i].clone() + rot63_carry[i].clone() * f256.clone()
+                    - f2.clone() * xor4_i
+                    - prev_carry),
+        );
+    }
+
+    // ── Nibble AND lookups ───────────────────────────────────
+    // Mirror of generate_interaction_trace: for each byte i, emit 8 entries
+    // in the exact order (And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3
+    // lo, And4 hi, And4 lo).  finalize_logup_in_pairs combines (hi, lo) per
+    // AND into a single fraction, so ordering MUST match the prover side.
+    let f16 = E::F::from(BaseField::from(16u32));
+    let and1_a_hi = crate::trace::trace_eval!(trace_eval, Column::And1AHi);
+    let and1_b_hi = crate::trace::trace_eval!(trace_eval, Column::And1BHi);
+    let and1_res_hi = crate::trace::trace_eval!(trace_eval, Column::And1ResHi);
+    let and2_a_hi = crate::trace::trace_eval!(trace_eval, Column::And2AHi);
+    let and2_b_hi = crate::trace::trace_eval!(trace_eval, Column::And2BHi);
+    let and2_res_hi = crate::trace::trace_eval!(trace_eval, Column::And2ResHi);
+    let and3_a_hi = crate::trace::trace_eval!(trace_eval, Column::And3AHi);
+    let and3_b_hi = crate::trace::trace_eval!(trace_eval, Column::And3BHi);
+    let and3_res_hi = crate::trace::trace_eval!(trace_eval, Column::And3ResHi);
+    let and4_a_hi = crate::trace::trace_eval!(trace_eval, Column::And4AHi);
+    let and4_b_hi = crate::trace::trace_eval!(trace_eval, Column::And4BHi);
+    let and4_res_hi = crate::trace::trace_eval!(trace_eval, Column::And4ResHi);
+
+    for i in 0..8 {
+        // And1 hi
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                and1_a_hi[i].clone(),
+                and1_b_hi[i].clone(),
+                and1_res_hi[i].clone(),
+            ],
+        ));
+        // And1 lo — (d_in - hi·16, a1 - hi·16, and1 - hi·16)
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                d_in[i].clone() - and1_a_hi[i].clone() * f16.clone(),
+                a1[i].clone() - and1_b_hi[i].clone() * f16.clone(),
+                and1[i].clone() - and1_res_hi[i].clone() * f16.clone(),
+            ],
+        ));
+
+        // And2 hi
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                and2_a_hi[i].clone(),
+                and2_b_hi[i].clone(),
+                and2_res_hi[i].clone(),
+            ],
+        ));
+        // And2 lo — (b_in - hi·16, c1 - hi·16, and2 - hi·16)
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                b_in[i].clone() - and2_a_hi[i].clone() * f16.clone(),
+                c1[i].clone() - and2_b_hi[i].clone() * f16.clone(),
+                and2[i].clone() - and2_res_hi[i].clone() * f16.clone(),
+            ],
+        ));
+
+        // And3 hi
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                and3_a_hi[i].clone(),
+                and3_b_hi[i].clone(),
+                and3_res_hi[i].clone(),
+            ],
+        ));
+        // And3 lo — A-side is derived D1[i] = D_in[j] + A1[j] - 2·And1[j], j=(i+4)%8
+        let j3 = (i + 4) % 8;
+        let d1_i = d_in[j3].clone() + a1[j3].clone() - f2.clone() * and1[j3].clone();
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                d1_i - and3_a_hi[i].clone() * f16.clone(),
+                a_out[i].clone() - and3_b_hi[i].clone() * f16.clone(),
+                and3[i].clone() - and3_res_hi[i].clone() * f16.clone(),
+            ],
+        ));
+
+        // And4 hi
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                and4_a_hi[i].clone(),
+                and4_b_hi[i].clone(),
+                and4_res_hi[i].clone(),
+            ],
+        ));
+        // And4 lo — A-side is derived B1[i] = B_in[j] + C1[j] - 2·And2[j], j=(i+3)%8
+        let j4 = (i + 3) % 8;
+        let b1_i = b_in[j4].clone() + c1[j4].clone() - f2.clone() * and2[j4].clone();
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                b1_i - and4_a_hi[i].clone() * f16.clone(),
+                c_out[i].clone() - and4_b_hi[i].clone() * f16.clone(),
+                and4[i].clone() - and4_res_hi[i].clone() * f16.clone(),
+            ],
+        ));
+
+        // ── AndTLo = IV[4] & T[i] ──
+        let t_hi_e = crate::trace::trace_eval!(trace_eval, Column::THi);
+        let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
+        let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
+        let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
+        let and_t_lo_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTLoHi);
+        let and_t_hi_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHiHi);
+        let iv4_byte = IV[4].to_le_bytes()[i];
+        let iv4_hi_f = E::F::from(BaseField::from((iv4_byte >> 4) as u32));
+        let iv4_lo_f = E::F::from(BaseField::from((iv4_byte & 0x0F) as u32));
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                iv4_hi_f.clone(),
+                t_hi_e[i].clone(),
+                and_t_lo_hi_e[i].clone(),
+            ],
+        ));
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                iv4_lo_f.clone(),
+                t_e[i].clone() - t_hi_e[i].clone() * f16.clone(),
+                and_t_lo_e[i].clone() - and_t_lo_hi_e[i].clone() * f16.clone(),
+            ],
+        ));
+
+        // ── AndTHi = IV[5] & T[8+i] ──
+        let iv5_byte = IV[5].to_le_bytes()[i];
+        let iv5_hi_f = E::F::from(BaseField::from((iv5_byte >> 4) as u32));
+        let iv5_lo_f = E::F::from(BaseField::from((iv5_byte & 0x0F) as u32));
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                iv5_hi_f.clone(),
+                t_hi_e[8 + i].clone(),
+                and_t_hi_hi_e[i].clone(),
+            ],
+        ));
+        eval.add_to_relation(RelationEntry::new(
+            bitwise_lookup,
+            is_real[0].clone().into(),
+            &[
+                iv5_lo_f.clone(),
+                t_e[8 + i].clone() - t_hi_e[8 + i].clone() * f16.clone(),
+                and_t_hi_e[i].clone() - and_t_hi_hi_e[i].clone() * f16.clone(),
+            ],
+        ));
+    }
+
+    // ── Range256 for non-AND-covered byte columns ──
+    // Must match the prover-side order from generate_interaction_trace.
+    let a_in_e = crate::trace::trace_eval!(trace_eval, Column::AIn);
+    let c_in_e = crate::trace::trace_eval!(trace_eval, Column::CIn);
+    let mx_e = crate::trace::trace_eval!(trace_eval, Column::Mx);
+    let my_e = crate::trace::trace_eval!(trace_eval, Column::My);
+    let b_out_e = crate::trace::trace_eval!(trace_eval, Column::BOut);
+    for col in [&a_in_e, &c_in_e, &mx_e, &my_e, &b_out_e] {
+        for i in 0..8 {
+            eval.add_to_relation(RelationEntry::new(
+                range256_lookup,
+                is_real[0].clone().into(),
+                &[col[i].clone()],
+            ));
+        }
+    }
+
+    // NOTE: finalize_logup_in_pairs is called at the very end of this
+    // method so Phase 2b relation entries are included in the pairing.
+
+    // ── Carry / rot-carry bounds (Phase I-blake2b-2 helper-flattened) ──
+    // 3-input additions (steps 1, 5) produce Carry ∈ {0,1,2}: a+b+c+cin ≤ 767.
+    // 2-input additions (steps 3, 7) produce Carry ∈ {0,1}: a+b+cin ≤ 511.
+    // Rot63Carry is the top bit of xor4, bounded to {0,1}.
+    //
+    // Original formulation `is_real · c · (c-1) · (c-2)` (deg 4) and
+    // `is_real · c · (c-1)` (deg 3) flattened via XcM1 / Full helper
+    // columns (`Column::Carry{1,2,3,4}XcM1`, `Carry{1,3}Full`, `Rot63XcM1`).
+    let f1 = E::F::one();
+    let carry1_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry1XcM1);
+    let carry1_full = crate::trace::trace_eval!(trace_eval, Column::Carry1Full);
+    let carry3_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry3XcM1);
+    let carry3_full = crate::trace::trace_eval!(trace_eval, Column::Carry3Full);
+    let carry2_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry2XcM1);
+    let carry4_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry4XcM1);
+    let rot63_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Rot63XcM1);
+    for i in 0..8 {
+        // Carry1: degree-4 → degree-2 via 2 helpers.
+        let c1_v = carry1[i].clone();
+        eval.add_constraint(carry1_xcm1[i].clone() - c1_v.clone() * (c1_v.clone() - f1.clone()));
+        eval.add_constraint(carry1_full[i].clone() - carry1_xcm1[i].clone() * (c1_v - f2.clone()));
+        eval.add_constraint(is_real[0].clone() * carry1_full[i].clone());
+
+        // Carry3: same.
+        let c3_v = carry3[i].clone();
+        eval.add_constraint(carry3_xcm1[i].clone() - c3_v.clone() * (c3_v.clone() - f1.clone()));
+        eval.add_constraint(carry3_full[i].clone() - carry3_xcm1[i].clone() * (c3_v - f2.clone()));
+        eval.add_constraint(is_real[0].clone() * carry3_full[i].clone());
+
+        // Carry2: degree-3 → degree-2 via 1 helper.
+        let c2_v = carry2[i].clone();
+        eval.add_constraint(carry2_xcm1[i].clone() - c2_v.clone() * (c2_v - f1.clone()));
+        eval.add_constraint(is_real[0].clone() * carry2_xcm1[i].clone());
+
+        // Carry4: same.
+        let c4_v = carry4[i].clone();
+        eval.add_constraint(carry4_xcm1[i].clone() - c4_v.clone() * (c4_v - f1.clone()));
+        eval.add_constraint(is_real[0].clone() * carry4_xcm1[i].clone());
+
+        // Rot63Carry: same.
+        let r_v = rot63_carry[i].clone();
+        eval.add_constraint(rot63_xcm1[i].clone() - r_v.clone() * (r_v - f1.clone()));
+        eval.add_constraint(is_real[0].clone() * rot63_xcm1[i].clone());
+    }
+
+    // ── D_out reification ──
+    // d_out[i] = xor3[(i+2)%8] where xor3[k] = d1[k] + a_out[k] - 2·and3[k]
+    // and d1[k] = d_in[(k+4)%8] + a1[(k+4)%8] - 2·and1[(k+4)%8].
+    // Reify so it can flow into V_next[di] via the row-chain update.
+    let d_out = crate::trace::trace_eval!(trace_eval, Column::DOut);
+    for i in 0..8 {
+        let k = (i + 2) % 8;
+        let j = (k + 4) % 8;
+        let d1_k = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
+        let xor3_k = d1_k + a_out[k].clone() - f2.clone() * and3[k].clone();
+        eval.add_constraint(is_real[0].clone() * (d_out[i].clone() - xor3_k));
+    }
+
+    // ── Row chaining: preprocessed schedule + V-state inputs and update ──
+    // IsGIdx[j] (preprocessed) = 1 iff (r % 8) == j.  G_INDICES[j] gives the
+    // 4 touched slots (ai,bi,ci,di) for that G-call.  IsLastOfCompression
+    // (preprocessed) = 1 iff r is the 95th row of some compression.
+    let is_gidx: [_; 8] = [
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx0),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx1),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx2),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx3),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx4),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx5),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx6),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx7),
+    ];
+
+    let v_cols: [_; 16] = [
+        crate::trace::trace_eval!(trace_eval, Column::V0),
+        crate::trace::trace_eval!(trace_eval, Column::V1),
+        crate::trace::trace_eval!(trace_eval, Column::V2),
+        crate::trace::trace_eval!(trace_eval, Column::V3),
+        crate::trace::trace_eval!(trace_eval, Column::V4),
+        crate::trace::trace_eval!(trace_eval, Column::V5),
+        crate::trace::trace_eval!(trace_eval, Column::V6),
+        crate::trace::trace_eval!(trace_eval, Column::V7),
+        crate::trace::trace_eval!(trace_eval, Column::V8),
+        crate::trace::trace_eval!(trace_eval, Column::V9),
+        crate::trace::trace_eval!(trace_eval, Column::V10),
+        crate::trace::trace_eval!(trace_eval, Column::V11),
+        crate::trace::trace_eval!(trace_eval, Column::V12),
+        crate::trace::trace_eval!(trace_eval, Column::V13),
+        crate::trace::trace_eval!(trace_eval, Column::V14),
+        crate::trace::trace_eval!(trace_eval, Column::V15),
+    ];
+    let v_cols_next: [_; 16] = [
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V0),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V1),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V2),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V3),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V4),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V5),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V6),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V7),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V8),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V9),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V10),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V11),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V12),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V13),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V14),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::V15),
+    ];
+
+    // Input match (Phase I-blake2b-4 helper-flattened): a_in[i] = V[G_INDICES[j][0]][i]
+    // when IsGIdx[j]=1, etc.  Written as a_in[i] = Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i]
+    // and routed through `InMatch{A,B,C,D}` sum helpers so the gate × sum product
+    // sits at degree 2 instead of 3.
+    let in_match_a = crate::trace::trace_eval!(trace_eval, Column::InMatchA);
+    let in_match_b = crate::trace::trace_eval!(trace_eval, Column::InMatchB);
+    let in_match_c = crate::trace::trace_eval!(trace_eval, Column::InMatchC);
+    let in_match_d = crate::trace::trace_eval!(trace_eval, Column::InMatchD);
+    for i in 0..8 {
+        let mut exp_a = E::F::zero();
+        let mut exp_b = E::F::zero();
+        let mut exp_c = E::F::zero();
+        let mut exp_d = E::F::zero();
+        for (j, &[aj, bj, cj, dj]) in G_INDICES.iter().enumerate() {
+            exp_a += is_gidx[j][0].clone() * v_cols[aj][i].clone();
+            exp_b += is_gidx[j][0].clone() * v_cols[bj][i].clone();
+            exp_c += is_gidx[j][0].clone() * v_cols[cj][i].clone();
+            exp_d += is_gidx[j][0].clone() * v_cols[dj][i].clone();
+        }
+        // Helper-defining (deg 2): InMatchX[i] = Σ IsGIdx[j] · V[…][i].
+        eval.add_constraint(in_match_a[i].clone() - exp_a);
+        eval.add_constraint(in_match_b[i].clone() - exp_b);
+        eval.add_constraint(in_match_c[i].clone() - exp_c);
+        eval.add_constraint(in_match_d[i].clone() - exp_d);
+        // Main (deg 2): is_real · (input_byte - InMatchX[i]) = 0.
+        eval.add_constraint(is_real[0].clone() * (a_in[i].clone() - in_match_a[i].clone()));
+        eval.add_constraint(is_real[0].clone() * (b_in[i].clone() - in_match_b[i].clone()));
+        eval.add_constraint(is_real[0].clone() * (c_in[i].clone() - in_match_c[i].clone()));
+        eval.add_constraint(is_real[0].clone() * (d_in[i].clone() - in_match_d[i].clone()));
+    }
+
+    // V_next update (Phase I-blake2b-6 helper-flattened): for slot k
+    // at byte i, V_next[k][i] equals
+    //   Σ_j IsGIdx[j] · (a_out/b_out/c_out/d_out if k is touched by G_j,
+    //                    else V[k]).
+    // Gated by is_real · (1 - is_last_of_compression) so the constraint
+    // does not cross a compression boundary or fire on padding.
+    // Gate substitution (Phase I-blake2b-1): gate ← GateH.
+    let gate = gate_h[0].clone();
+    let v_next_sum: [_; 16] = [
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum0),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum1),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum2),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum3),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum4),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum5),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum6),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum7),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum8),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum9),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum10),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum11),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum12),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum13),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum14),
+        crate::trace::trace_eval!(trace_eval, Column::VNextSum15),
+    ];
+    for k in 0..16 {
+        for i in 0..8 {
+            let mut update = E::F::zero();
+            for (j, &[aj, bj, cj, dj]) in G_INDICES.iter().enumerate() {
+                let contribution = if k == aj {
+                    a_out[i].clone()
+                } else if k == bj {
+                    b_out[i].clone()
+                } else if k == cj {
+                    c_out[i].clone()
+                } else if k == dj {
+                    d_out[i].clone()
+                } else {
+                    v_cols[k][i].clone()
+                };
+                update += is_gidx[j][0].clone() * contribution;
+            }
+            // Helper-defining (deg 2): VNextSumK[i] = Σ_j IsGIdx[j] · contribution_j(k, i).
+            eval.add_constraint(v_next_sum[k][i].clone() - update);
+            // Main (deg 2): GateH · (V_next[k][i] - VNextSumK[i]) = 0.
+            eval.add_constraint(
+                gate.clone() * (v_cols_next[k][i].clone() - v_next_sum[k][i].clone()),
+            );
+        }
+    }
+
+    // ── Message authentication ──────────────────────────────
+    // M[0..16] witness columns hold the message for this compression.
+    // IsMxSlot_k / IsMySlot_k preprocessed selectors encode
+    // SIGMA[round][2·g_idx] and SIGMA[round][2·g_idx + 1], so Mx / My
+    // become a linear combination of the 16 M slots weighted by the
+    // selectors.  Inter-row M_k_next = M_k keeps the message constant
+    // across the 96 rows of a single compression.
+    let m_cols: [_; 16] = [
+        crate::trace::trace_eval!(trace_eval, Column::M0),
+        crate::trace::trace_eval!(trace_eval, Column::M1),
+        crate::trace::trace_eval!(trace_eval, Column::M2),
+        crate::trace::trace_eval!(trace_eval, Column::M3),
+        crate::trace::trace_eval!(trace_eval, Column::M4),
+        crate::trace::trace_eval!(trace_eval, Column::M5),
+        crate::trace::trace_eval!(trace_eval, Column::M6),
+        crate::trace::trace_eval!(trace_eval, Column::M7),
+        crate::trace::trace_eval!(trace_eval, Column::M8),
+        crate::trace::trace_eval!(trace_eval, Column::M9),
+        crate::trace::trace_eval!(trace_eval, Column::M10),
+        crate::trace::trace_eval!(trace_eval, Column::M11),
+        crate::trace::trace_eval!(trace_eval, Column::M12),
+        crate::trace::trace_eval!(trace_eval, Column::M13),
+        crate::trace::trace_eval!(trace_eval, Column::M14),
+        crate::trace::trace_eval!(trace_eval, Column::M15),
+    ];
+    let m_cols_next: [_; 16] = [
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M0),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M1),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M2),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M3),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M4),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M5),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M6),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M7),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M8),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M9),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M10),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M11),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M12),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M13),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M14),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::M15),
+    ];
+    let is_mx_slot: [_; 16] = [
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot0),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot1),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot2),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot3),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot4),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot5),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot6),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot7),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot8),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot9),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot10),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot11),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot12),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot13),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot14),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot15),
+    ];
+    let is_my_slot: [_; 16] = [
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot0),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot1),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot2),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot3),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot4),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot5),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot6),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot7),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot8),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot9),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot10),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot11),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot12),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot13),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot14),
+        crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot15),
+    ];
+
+    // Mx / My selection from M by preprocessed selector
+    // (Phase I-blake2b-5 helper-flattened).
+    let mx = crate::trace::trace_eval!(trace_eval, Column::Mx);
+    let my = crate::trace::trace_eval!(trace_eval, Column::My);
+    let mx_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MxSlotSum);
+    let my_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MySlotSum);
+    for i in 0..8 {
+        let mut exp_mx = E::F::zero();
+        let mut exp_my = E::F::zero();
+        for k in 0..16 {
+            exp_mx += is_mx_slot[k][0].clone() * m_cols[k][i].clone();
+            exp_my += is_my_slot[k][0].clone() * m_cols[k][i].clone();
+        }
+        // Helper-defining (deg 2): SlotSum[i] = Σ_k IsXSlot[k] · M[k][i].
+        eval.add_constraint(mx_slot_sum[i].clone() - exp_mx);
+        eval.add_constraint(my_slot_sum[i].clone() - exp_my);
+        // Main (deg 2): is_real · (mx[i] - MxSlotSum[i]) = 0.
+        eval.add_constraint(is_real[0].clone() * (mx[i].clone() - mx_slot_sum[i].clone()));
+        eval.add_constraint(is_real[0].clone() * (my[i].clone() - my_slot_sum[i].clone()));
+    }
+
+    // Inter-row: M[k] stays constant within a compression.  Gate identical
+    // to the V-state update so message slots reset at compression boundary.
+    for k in 0..16 {
+        for i in 0..8 {
+            eval.add_constraint(gate.clone() * (m_cols_next[k][i].clone() - m_cols[k][i].clone()));
+        }
+    }
+
+    // ── Initial state derivation + compression-input consistency ────
+    // H, T, F are replicated on every row of a compression (inter-row
+    // equality below) so we can anchor the V state at row 0 of a
+    // compression to the Blake2b initial state:
+    //   V[0..8][i]  = H_k[i]
+    //   V[8..12][i] = IV[k-8][i]
+    //   V[12][i]    = IV[4][i] XOR T[i]
+    //                 = IV[4][i] + T[i] - 2·AndTLo[i]
+    //   V[13][i]    = IV[5][i] XOR T[8+i]
+    //                 = IV[5][i] + T[8+i] - 2·AndTHi[i]
+    //   V[14][i]    = IV[6][i] XOR (F ? 0xFF : 0)
+    //                 = IV[6][i] + F·(255 - 2·IV[6][i])
+    //   V[15][i]    = IV[7][i]
+    let h_cols: [_; 8] = [
+        crate::trace::trace_eval!(trace_eval, Column::H0),
+        crate::trace::trace_eval!(trace_eval, Column::H1),
+        crate::trace::trace_eval!(trace_eval, Column::H2),
+        crate::trace::trace_eval!(trace_eval, Column::H3),
+        crate::trace::trace_eval!(trace_eval, Column::H4),
+        crate::trace::trace_eval!(trace_eval, Column::H5),
+        crate::trace::trace_eval!(trace_eval, Column::H6),
+        crate::trace::trace_eval!(trace_eval, Column::H7),
+    ];
+    let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
+    let f_e = crate::trace::trace_eval!(trace_eval, Column::F);
+    let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
+    let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
+
+    // F ∈ {0,1} (Phase I-blake2b-3 helper-flattened).
+    let f_bound_h = crate::trace::trace_eval!(trace_eval, Column::FBoundH);
+    eval.add_constraint(f_bound_h[0].clone() - f_e[0].clone() * (f_e[0].clone() - f1.clone()));
+    eval.add_constraint(is_real[0].clone() * f_bound_h[0].clone());
+
+    // Gate substitution (Phase I-blake2b-1): init_gate ← InitGateH.
+    let init_gate = init_gate_h[0].clone();
+    let f255 = E::F::from(BaseField::from(255u32));
+    for i in 0..8 {
+        let iv4_i = E::F::from(BaseField::from(IV[4].to_le_bytes()[i] as u32));
+        let iv5_i = E::F::from(BaseField::from(IV[5].to_le_bytes()[i] as u32));
+        let iv6_i = E::F::from(BaseField::from(IV[6].to_le_bytes()[i] as u32));
+        let iv7_i = E::F::from(BaseField::from(IV[7].to_le_bytes()[i] as u32));
+        let iv0_i = E::F::from(BaseField::from(IV[0].to_le_bytes()[i] as u32));
+        let iv1_i = E::F::from(BaseField::from(IV[1].to_le_bytes()[i] as u32));
+        let iv2_i = E::F::from(BaseField::from(IV[2].to_le_bytes()[i] as u32));
+        let iv3_i = E::F::from(BaseField::from(IV[3].to_le_bytes()[i] as u32));
+        // V[0..8] = H_k
+        for k in 0..8 {
+            eval.add_constraint(init_gate.clone() * (v_cols[k][i].clone() - h_cols[k][i].clone()));
+        }
+        // V[8..12] = IV[0..4]
+        eval.add_constraint(init_gate.clone() * (v_cols[8][i].clone() - iv0_i.clone()));
+        eval.add_constraint(init_gate.clone() * (v_cols[9][i].clone() - iv1_i.clone()));
+        eval.add_constraint(init_gate.clone() * (v_cols[10][i].clone() - iv2_i.clone()));
+        eval.add_constraint(init_gate.clone() * (v_cols[11][i].clone() - iv3_i.clone()));
+        // V[12] = IV[4] XOR T[i] via XOR identity using AndTLo.
+        let v12_expected = iv4_i.clone() + t_e[i].clone() - f2.clone() * and_t_lo_e[i].clone();
+        eval.add_constraint(init_gate.clone() * (v_cols[12][i].clone() - v12_expected));
+        // V[13] = IV[5] XOR T[8+i] via XOR identity using AndTHi.
+        let v13_expected = iv5_i.clone() + t_e[8 + i].clone() - f2.clone() * and_t_hi_e[i].clone();
+        eval.add_constraint(init_gate.clone() * (v_cols[13][i].clone() - v13_expected));
+        // V[14] = IV[6] XOR (F·0xFF).
+        // = IV[6] + F·0xFF - 2·F·IV[6]  (since F∈{0,1}, F·IV[6] = AND(IV[6], F·0xFF))
+        // = IV[6]·(1 - 2F) + 255F
+        let v14_expected =
+            iv6_i.clone() + f_e[0].clone() * (f255.clone() - f2.clone() * iv6_i.clone());
+        eval.add_constraint(init_gate.clone() * (v_cols[14][i].clone() - v14_expected));
+        // V[15] = IV[7]
+        eval.add_constraint(init_gate.clone() * (v_cols[15][i].clone() - iv7_i.clone()));
+    }
+
+    // ── Inter-row: H, T, F stay constant within a compression ──
+    let h_cols_next: [_; 8] = [
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H0),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H1),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H2),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H3),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H4),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H5),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H6),
+        crate::trace::trace_eval_next_row!(trace_eval, Column::H7),
+    ];
+    let t_e_next = crate::trace::trace_eval_next_row!(trace_eval, Column::T);
+    let f_e_next = crate::trace::trace_eval_next_row!(trace_eval, Column::F);
+    for k in 0..8 {
+        for i in 0..8 {
+            eval.add_constraint(gate.clone() * (h_cols_next[k][i].clone() - h_cols[k][i].clone()));
+        }
+    }
+    for i in 0..16 {
+        eval.add_constraint(gate.clone() * (t_e_next[i].clone() - t_e[i].clone()));
+    }
+    eval.add_constraint(gate.clone() * (f_e_next[0].clone() - f_e[0].clone()));
+
+    // ── Phase 2b: output derivation at row 95 of each compression ──
+    // output[i][j] = H[i][j] XOR V_after[i][j] XOR V_after[i+8][j]
+    //              = H[i][j] + V_after[i][j] - 2·OutAnd1[i*8+j]
+    //                         + V_after[i+8][j] - 2·OutAnd2[i*8+j]
+    // V_after[k][j] is an expression: at row 95 IsGIdx_7=1, so
+    //   V_after[3] ← a_out, V_after[4] ← b_out,
+    //   V_after[9] ← c_out, V_after[14] ← d_out,  else V[k].
+    let output_e = crate::trace::trace_eval!(trace_eval, Column::Output);
+    let h_hi_e = crate::trace::trace_eval!(trace_eval, Column::HHi);
+    let v_after_hi_e = crate::trace::trace_eval!(trace_eval, Column::VAfterHi);
+    let out_and1_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd1);
+    let out_and1_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd1Hi);
+    let out_xor1_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutXor1Hi);
+    let out_and2_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2);
+    let out_and2_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2Hi);
+    // Gate substitution (Phase I-blake2b-1): output_gate ← OutputGateH.
+    let output_gate = output_gate_h[0].clone();
+
+    // V_after source picker for the constraint side (mirror of the
+    // interaction-trace v_after_byte closure).
+    let v_after_e = |k: usize, byte: usize| -> E::F {
+        match k {
+            3 => a_out[byte].clone(),
+            4 => b_out[byte].clone(),
+            9 => c_out[byte].clone(),
+            14 => d_out[byte].clone(),
+            _ => v_cols[k][byte].clone(),
+        }
+    };
+
+    for word in 0..8 {
+        for byte in 0..8 {
+            let slot = word * 8 + byte;
+            let v1 = v_after_e(word, byte);
+            let v2 = v_after_e(word + 8, byte);
+            let h_b = h_cols[word][byte].clone();
+
+            // Output derivation (gated at row 95).
+            let expected_out = h_b.clone() + v1.clone() - f2.clone() * out_and1_e[slot].clone()
+                + v2.clone()
+                - f2.clone() * out_and2_e[slot].clone();
+            eval.add_constraint(output_gate.clone() * (output_e[slot].clone() - expected_out));
+
+            // OutAnd1 hi
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_lookup,
+                output_gate.clone().into(),
+                &[
+                    h_hi_e[slot].clone(),
+                    v_after_hi_e[word * 8 + byte].clone(),
+                    out_and1_hi_e[slot].clone(),
+                ],
+            ));
+            // OutAnd1 lo
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_lookup,
+                output_gate.clone().into(),
+                &[
+                    h_b.clone() - h_hi_e[slot].clone() * f16.clone(),
+                    v1.clone() - v_after_hi_e[word * 8 + byte].clone() * f16.clone(),
+                    out_and1_e[slot].clone() - out_and1_hi_e[slot].clone() * f16.clone(),
+                ],
+            ));
+            // OutAnd2 hi — operands are Xor1 (expression) and V_after[word+8]
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_lookup,
+                output_gate.clone().into(),
+                &[
+                    out_xor1_hi_e[slot].clone(),
+                    v_after_hi_e[(word + 8) * 8 + byte].clone(),
+                    out_and2_hi_e[slot].clone(),
+                ],
+            ));
+            // OutAnd2 lo — xor1_expr = H + v1 - 2·OutAnd1
+            let xor1 = h_b.clone() + v1.clone() - f2.clone() * out_and1_e[slot].clone();
+            eval.add_to_relation(RelationEntry::new(
+                bitwise_lookup,
+                output_gate.clone().into(),
+                &[
+                    xor1 - out_xor1_hi_e[slot].clone() * f16.clone(),
+                    v2.clone() - v_after_hi_e[(word + 8) * 8 + byte].clone() * f16.clone(),
+                    out_and2_e[slot].clone() - out_and2_hi_e[slot].clone() * f16.clone(),
+                ],
+            ));
+        }
+    }
+}
+
 impl BuiltInComponent for Blake2bChip {
     // Carry bound identity is_real · c · (c-1) · (c-2) is degree 4, so require
     // the same bound that CpuChip uses.
@@ -88,555 +925,32 @@ impl BuiltInComponent for Blake2bChip {
         ),
     ) {
         let (range256_lookup, bitwise_lookup, mem_lookup, blake2b_call_lookup) = lookup_elements;
+
+        // Arithmetic compression core (G-function, V-chain, output
+        // derivation, BitwiseAnd / Range256 lookups, the GateH / InitGateH /
+        // OutputGateH helper definitions) — shared with Blake2bBoundaryChip.
+        add_compression_core(eval, &trace_eval, range256_lookup, bitwise_lookup);
+
+        // Re-read the core-local columns the memory-ledger / CPU-call
+        // bindings below consume.
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
-        // Phase I-blake2b-1 gate helpers — Stwo v2.x lifted-protocol degree
-        // flatten.  Pull in `IsFirstOfCompression` / `IsLastOfCompression`
-        // (preprocessed) and the 3 main-column helpers; tie them together
-        // with degree-2 definition constraints; thereafter all gated
-        // constraint sites use the helpers directly so the gate's
-        // contribution to algebraic degree drops from 2 to 1.  Subphases
-        // 2-7 finish flattening the rest of the chip.
-        let is_first = crate::trace::preprocessed_trace_eval!(
-            trace_eval,
-            PreprocessedColumn::IsFirstOfCompression
-        );
-        let is_last = crate::trace::preprocessed_trace_eval!(
-            trace_eval,
-            PreprocessedColumn::IsLastOfCompression
-        );
-        let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
         let init_gate_h = crate::trace::trace_eval!(trace_eval, Column::InitGateH);
         let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
-        let f1_top = E::F::one();
-        eval.add_constraint(
-            gate_h[0].clone() - is_real[0].clone() * (f1_top.clone() - is_last[0].clone()),
-        );
-        eval.add_constraint(init_gate_h[0].clone() - is_real[0].clone() * is_first[0].clone());
-        eval.add_constraint(output_gate_h[0].clone() - is_real[0].clone() * is_last[0].clone());
-        let a_in = crate::trace::trace_eval!(trace_eval, Column::AIn);
-        let b_in = crate::trace::trace_eval!(trace_eval, Column::BIn);
-        let c_in = crate::trace::trace_eval!(trace_eval, Column::CIn);
-        let d_in = crate::trace::trace_eval!(trace_eval, Column::DIn);
-        let mx = crate::trace::trace_eval!(trace_eval, Column::Mx);
-        let my = crate::trace::trace_eval!(trace_eval, Column::My);
-        let a1 = crate::trace::trace_eval!(trace_eval, Column::A1);
-        let carry1 = crate::trace::trace_eval!(trace_eval, Column::Carry1);
-        let and1 = crate::trace::trace_eval!(trace_eval, Column::And1);
-        let c1 = crate::trace::trace_eval!(trace_eval, Column::C1);
-        let carry2 = crate::trace::trace_eval!(trace_eval, Column::Carry2);
-        let and2 = crate::trace::trace_eval!(trace_eval, Column::And2);
-        let a_out = crate::trace::trace_eval!(trace_eval, Column::AOut);
-        let carry3 = crate::trace::trace_eval!(trace_eval, Column::Carry3);
-        let and3 = crate::trace::trace_eval!(trace_eval, Column::And3);
-        let c_out = crate::trace::trace_eval!(trace_eval, Column::COut);
-        let carry4 = crate::trace::trace_eval!(trace_eval, Column::Carry4);
-        let and4 = crate::trace::trace_eval!(trace_eval, Column::And4);
-        let b_out = crate::trace::trace_eval!(trace_eval, Column::BOut);
-        let rot63_carry = crate::trace::trace_eval!(trace_eval, Column::Rot63Carry);
-
-        let f256 = E::F::from(BaseField::from(256u32));
-        let f2 = E::F::from(BaseField::from(2u32));
-
-        // ── Step 1: a1 = a_in + b_in + mx (3-input addition) ──
-        for i in 0..8 {
-            let carry_in = if i == 0 {
-                E::F::zero()
-            } else {
-                carry1[i - 1].clone()
-            };
-            eval.add_constraint(
-                is_real[0].clone()
-                    * (a1[i].clone() + carry1[i].clone() * f256.clone()
-                        - a_in[i].clone()
-                        - b_in[i].clone()
-                        - mx[i].clone()
-                        - carry_in),
-            );
-        }
-
-        // ── Step 2: xor1 = d ^ a1, d1 = xor1 >>> 32 (byte permutation) ──
-        // xor1[i] = d_in[i] + a1[i] - 2*and1[i]
-        // d1[i] = xor1[(i+4)%8]
-
-        // ── Step 3: c1 = c_in + d1 ──
-        // d1[i] = xor1[(i+4)%8] = d_in[(i+4)%8] + a1[(i+4)%8] - 2*and1[(i+4)%8]
-        for i in 0..8 {
-            let carry_in = if i == 0 {
-                E::F::zero()
-            } else {
-                carry2[i - 1].clone()
-            };
-            let j = (i + 4) % 8; // byte permutation for >>>32
-            let d1_i = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
-            eval.add_constraint(
-                is_real[0].clone()
-                    * (c1[i].clone() + carry2[i].clone() * f256.clone()
-                        - c_in[i].clone()
-                        - d1_i
-                        - carry_in),
-            );
-        }
-
-        // ── Step 4: xor2 = b ^ c1, b1 = xor2 >>> 24 ──
-        // b1[i] = xor2[(i+3)%8] = b_in[(i+3)%8] + c1[(i+3)%8] - 2*and2[(i+3)%8]
-
-        // ── Step 5: a_out = a1 + b1 + my ──
-        for i in 0..8 {
-            let carry_in = if i == 0 {
-                E::F::zero()
-            } else {
-                carry3[i - 1].clone()
-            };
-            let j = (i + 3) % 8; // byte permutation for >>>24
-            let b1_i = b_in[j].clone() + c1[j].clone() - f2.clone() * and2[j].clone();
-            eval.add_constraint(
-                is_real[0].clone()
-                    * (a_out[i].clone() + carry3[i].clone() * f256.clone()
-                        - a1[i].clone()
-                        - b1_i
-                        - my[i].clone()
-                        - carry_in),
-            );
-        }
-
-        // ── Step 6: xor3 = d1 ^ a_out, d_out = xor3 >>> 16 ──
-        // d1[i] = d_in[(i+4)%8] + a1[(i+4)%8] - 2*and1[(i+4)%8] (from step 2)
-        // d_out[i] = xor3[(i+2)%8]
-
-        // ── Step 7: c_out = c1 + d_out ──
-        for i in 0..8 {
-            let carry_in = if i == 0 {
-                E::F::zero()
-            } else {
-                carry4[i - 1].clone()
-            };
-            // d_out[i] = xor3[(i+2)%8] where xor3[k] = d1[k] + a_out[k] - 2*and3[k]
-            // d1[k] = d_in[(k+4)%8] + a1[(k+4)%8] - 2*and1[(k+4)%8]
-            let k = (i + 2) % 8; // byte perm for >>>16
-            let j = (k + 4) % 8; // byte perm for >>>32 (d1)
-            let d1_k = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
-            let d_out_i = d1_k + a_out[k].clone() - f2.clone() * and3[k].clone();
-            eval.add_constraint(
-                is_real[0].clone()
-                    * (c_out[i].clone() + carry4[i].clone() * f256.clone()
-                        - c1[i].clone()
-                        - d_out_i
-                        - carry_in),
-            );
-        }
-
-        // ── Step 8: xor4 = b1 ^ c_out, b_out = xor4 >>> 63 ──
-        // >>>63 = left rotate by 1. At byte level:
-        //   b_out[i] = ((xor4[i] << 1) | (xor4[(i+7)%8] >> 7)) & 0xFF
-        // = (xor4[i] * 2 + rot63_carry[(i+7)%8]) mod 256
-        // where rot63_carry[j] = xor4[j] >> 7 (high bit)
-        for i in 0..8 {
-            let j = (i + 3) % 8; // b1 byte perm (>>>24)
-            let b1_i = b_in[j].clone() + c1[j].clone() - f2.clone() * and2[j].clone();
-            let xor4_i = b1_i + c_out[i].clone() - f2.clone() * and4[i].clone();
-            let prev_carry = rot63_carry[(i + 7) % 8].clone();
-            // b_out[i] + rot63_overflow * 256 = xor4[i] * 2 + prev_carry
-            // But rot63_carry[i] = xor4[i] >> 7, so xor4[i] * 2 + prev_carry can be:
-            // If xor4[i] < 128: result = xor4[i]*2 + prev_carry, carry_out = 0
-            // If xor4[i] >= 128: result = xor4[i]*2 + prev_carry - 256, carry_out = 1
-            // Constraint: b_out[i] + rot63_carry[i] * 256 = xor4[i] * 2 + prev_carry
-            eval.add_constraint(
-                is_real[0].clone()
-                    * (b_out[i].clone() + rot63_carry[i].clone() * f256.clone()
-                        - f2.clone() * xor4_i
-                        - prev_carry),
-            );
-        }
-
-        // ── Nibble AND lookups ───────────────────────────────────
-        // Mirror of generate_interaction_trace: for each byte i, emit 8 entries
-        // in the exact order (And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3
-        // lo, And4 hi, And4 lo).  finalize_logup_in_pairs combines (hi, lo) per
-        // AND into a single fraction, so ordering MUST match the prover side.
-        let f16 = E::F::from(BaseField::from(16u32));
-        let and1_a_hi = crate::trace::trace_eval!(trace_eval, Column::And1AHi);
-        let and1_b_hi = crate::trace::trace_eval!(trace_eval, Column::And1BHi);
-        let and1_res_hi = crate::trace::trace_eval!(trace_eval, Column::And1ResHi);
-        let and2_a_hi = crate::trace::trace_eval!(trace_eval, Column::And2AHi);
-        let and2_b_hi = crate::trace::trace_eval!(trace_eval, Column::And2BHi);
-        let and2_res_hi = crate::trace::trace_eval!(trace_eval, Column::And2ResHi);
-        let and3_a_hi = crate::trace::trace_eval!(trace_eval, Column::And3AHi);
-        let and3_b_hi = crate::trace::trace_eval!(trace_eval, Column::And3BHi);
-        let and3_res_hi = crate::trace::trace_eval!(trace_eval, Column::And3ResHi);
-        let and4_a_hi = crate::trace::trace_eval!(trace_eval, Column::And4AHi);
-        let and4_b_hi = crate::trace::trace_eval!(trace_eval, Column::And4BHi);
-        let and4_res_hi = crate::trace::trace_eval!(trace_eval, Column::And4ResHi);
-
-        for i in 0..8 {
-            // And1 hi
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    and1_a_hi[i].clone(),
-                    and1_b_hi[i].clone(),
-                    and1_res_hi[i].clone(),
-                ],
-            ));
-            // And1 lo — (d_in - hi·16, a1 - hi·16, and1 - hi·16)
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    d_in[i].clone() - and1_a_hi[i].clone() * f16.clone(),
-                    a1[i].clone() - and1_b_hi[i].clone() * f16.clone(),
-                    and1[i].clone() - and1_res_hi[i].clone() * f16.clone(),
-                ],
-            ));
-
-            // And2 hi
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    and2_a_hi[i].clone(),
-                    and2_b_hi[i].clone(),
-                    and2_res_hi[i].clone(),
-                ],
-            ));
-            // And2 lo — (b_in - hi·16, c1 - hi·16, and2 - hi·16)
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    b_in[i].clone() - and2_a_hi[i].clone() * f16.clone(),
-                    c1[i].clone() - and2_b_hi[i].clone() * f16.clone(),
-                    and2[i].clone() - and2_res_hi[i].clone() * f16.clone(),
-                ],
-            ));
-
-            // And3 hi
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    and3_a_hi[i].clone(),
-                    and3_b_hi[i].clone(),
-                    and3_res_hi[i].clone(),
-                ],
-            ));
-            // And3 lo — A-side is derived D1[i] = D_in[j] + A1[j] - 2·And1[j], j=(i+4)%8
-            let j3 = (i + 4) % 8;
-            let d1_i = d_in[j3].clone() + a1[j3].clone() - f2.clone() * and1[j3].clone();
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    d1_i - and3_a_hi[i].clone() * f16.clone(),
-                    a_out[i].clone() - and3_b_hi[i].clone() * f16.clone(),
-                    and3[i].clone() - and3_res_hi[i].clone() * f16.clone(),
-                ],
-            ));
-
-            // And4 hi
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    and4_a_hi[i].clone(),
-                    and4_b_hi[i].clone(),
-                    and4_res_hi[i].clone(),
-                ],
-            ));
-            // And4 lo — A-side is derived B1[i] = B_in[j] + C1[j] - 2·And2[j], j=(i+3)%8
-            let j4 = (i + 3) % 8;
-            let b1_i = b_in[j4].clone() + c1[j4].clone() - f2.clone() * and2[j4].clone();
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    b1_i - and4_a_hi[i].clone() * f16.clone(),
-                    c_out[i].clone() - and4_b_hi[i].clone() * f16.clone(),
-                    and4[i].clone() - and4_res_hi[i].clone() * f16.clone(),
-                ],
-            ));
-
-            // ── AndTLo = IV[4] & T[i] ──
-            let t_hi_e = crate::trace::trace_eval!(trace_eval, Column::THi);
-            let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
-            let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
-            let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
-            let and_t_lo_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTLoHi);
-            let and_t_hi_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHiHi);
-            let iv4_byte = IV[4].to_le_bytes()[i];
-            let iv4_hi_f = E::F::from(BaseField::from((iv4_byte >> 4) as u32));
-            let iv4_lo_f = E::F::from(BaseField::from((iv4_byte & 0x0F) as u32));
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    iv4_hi_f.clone(),
-                    t_hi_e[i].clone(),
-                    and_t_lo_hi_e[i].clone(),
-                ],
-            ));
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    iv4_lo_f.clone(),
-                    t_e[i].clone() - t_hi_e[i].clone() * f16.clone(),
-                    and_t_lo_e[i].clone() - and_t_lo_hi_e[i].clone() * f16.clone(),
-                ],
-            ));
-
-            // ── AndTHi = IV[5] & T[8+i] ──
-            let iv5_byte = IV[5].to_le_bytes()[i];
-            let iv5_hi_f = E::F::from(BaseField::from((iv5_byte >> 4) as u32));
-            let iv5_lo_f = E::F::from(BaseField::from((iv5_byte & 0x0F) as u32));
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    iv5_hi_f.clone(),
-                    t_hi_e[8 + i].clone(),
-                    and_t_hi_hi_e[i].clone(),
-                ],
-            ));
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_real[0].clone().into(),
-                &[
-                    iv5_lo_f.clone(),
-                    t_e[8 + i].clone() - t_hi_e[8 + i].clone() * f16.clone(),
-                    and_t_hi_e[i].clone() - and_t_hi_hi_e[i].clone() * f16.clone(),
-                ],
-            ));
-        }
-
-        // ── Range256 for non-AND-covered byte columns ──
-        // Must match the prover-side order from generate_interaction_trace.
-        let a_in_e = crate::trace::trace_eval!(trace_eval, Column::AIn);
-        let c_in_e = crate::trace::trace_eval!(trace_eval, Column::CIn);
-        let mx_e = crate::trace::trace_eval!(trace_eval, Column::Mx);
-        let my_e = crate::trace::trace_eval!(trace_eval, Column::My);
-        let b_out_e = crate::trace::trace_eval!(trace_eval, Column::BOut);
-        for col in [&a_in_e, &c_in_e, &mx_e, &my_e, &b_out_e] {
-            for i in 0..8 {
-                eval.add_to_relation(RelationEntry::new(
-                    range256_lookup,
-                    is_real[0].clone().into(),
-                    &[col[i].clone()],
-                ));
-            }
-        }
-
-        // NOTE: finalize_logup_in_pairs is called at the very end of this
-        // method so Phase 2b relation entries are included in the pairing.
-
-        // ── Carry / rot-carry bounds (Phase I-blake2b-2 helper-flattened) ──
-        // 3-input additions (steps 1, 5) produce Carry ∈ {0,1,2}: a+b+c+cin ≤ 767.
-        // 2-input additions (steps 3, 7) produce Carry ∈ {0,1}: a+b+cin ≤ 511.
-        // Rot63Carry is the top bit of xor4, bounded to {0,1}.
-        //
-        // Original formulation `is_real · c · (c-1) · (c-2)` (deg 4) and
-        // `is_real · c · (c-1)` (deg 3) flattened via XcM1 / Full helper
-        // columns (`Column::Carry{1,2,3,4}XcM1`, `Carry{1,3}Full`, `Rot63XcM1`).
-        let f1 = E::F::one();
-        let carry1_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry1XcM1);
-        let carry1_full = crate::trace::trace_eval!(trace_eval, Column::Carry1Full);
-        let carry3_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry3XcM1);
-        let carry3_full = crate::trace::trace_eval!(trace_eval, Column::Carry3Full);
-        let carry2_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry2XcM1);
-        let carry4_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry4XcM1);
-        let rot63_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Rot63XcM1);
-        for i in 0..8 {
-            // Carry1: degree-4 → degree-2 via 2 helpers.
-            let c1_v = carry1[i].clone();
-            eval.add_constraint(
-                carry1_xcm1[i].clone() - c1_v.clone() * (c1_v.clone() - f1.clone()),
-            );
-            eval.add_constraint(
-                carry1_full[i].clone() - carry1_xcm1[i].clone() * (c1_v - f2.clone()),
-            );
-            eval.add_constraint(is_real[0].clone() * carry1_full[i].clone());
-
-            // Carry3: same.
-            let c3_v = carry3[i].clone();
-            eval.add_constraint(
-                carry3_xcm1[i].clone() - c3_v.clone() * (c3_v.clone() - f1.clone()),
-            );
-            eval.add_constraint(
-                carry3_full[i].clone() - carry3_xcm1[i].clone() * (c3_v - f2.clone()),
-            );
-            eval.add_constraint(is_real[0].clone() * carry3_full[i].clone());
-
-            // Carry2: degree-3 → degree-2 via 1 helper.
-            let c2_v = carry2[i].clone();
-            eval.add_constraint(carry2_xcm1[i].clone() - c2_v.clone() * (c2_v - f1.clone()));
-            eval.add_constraint(is_real[0].clone() * carry2_xcm1[i].clone());
-
-            // Carry4: same.
-            let c4_v = carry4[i].clone();
-            eval.add_constraint(carry4_xcm1[i].clone() - c4_v.clone() * (c4_v - f1.clone()));
-            eval.add_constraint(is_real[0].clone() * carry4_xcm1[i].clone());
-
-            // Rot63Carry: same.
-            let r_v = rot63_carry[i].clone();
-            eval.add_constraint(rot63_xcm1[i].clone() - r_v.clone() * (r_v - f1.clone()));
-            eval.add_constraint(is_real[0].clone() * rot63_xcm1[i].clone());
-        }
-
-        // ── D_out reification ──
-        // d_out[i] = xor3[(i+2)%8] where xor3[k] = d1[k] + a_out[k] - 2·and3[k]
-        // and d1[k] = d_in[(k+4)%8] + a1[(k+4)%8] - 2·and1[(k+4)%8].
-        // Reify so it can flow into V_next[di] via the row-chain update.
-        let d_out = crate::trace::trace_eval!(trace_eval, Column::DOut);
-        for i in 0..8 {
-            let k = (i + 2) % 8;
-            let j = (k + 4) % 8;
-            let d1_k = d_in[j].clone() + a1[j].clone() - f2.clone() * and1[j].clone();
-            let xor3_k = d1_k + a_out[k].clone() - f2.clone() * and3[k].clone();
-            eval.add_constraint(is_real[0].clone() * (d_out[i].clone() - xor3_k));
-        }
-
-        // ── Row chaining: preprocessed schedule + V-state inputs and update ──
-        // IsGIdx[j] (preprocessed) = 1 iff (r % 8) == j.  G_INDICES[j] gives the
-        // 4 touched slots (ai,bi,ci,di) for that G-call.  IsLastOfCompression
-        // (preprocessed) = 1 iff r is the 95th row of some compression.
-        let is_gidx: [_; 8] = [
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx0),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx1),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx2),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx3),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx4),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx5),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx6),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsGIdx7),
-        ];
-
-        let v_cols: [_; 16] = [
-            crate::trace::trace_eval!(trace_eval, Column::V0),
-            crate::trace::trace_eval!(trace_eval, Column::V1),
-            crate::trace::trace_eval!(trace_eval, Column::V2),
-            crate::trace::trace_eval!(trace_eval, Column::V3),
-            crate::trace::trace_eval!(trace_eval, Column::V4),
-            crate::trace::trace_eval!(trace_eval, Column::V5),
-            crate::trace::trace_eval!(trace_eval, Column::V6),
-            crate::trace::trace_eval!(trace_eval, Column::V7),
-            crate::trace::trace_eval!(trace_eval, Column::V8),
-            crate::trace::trace_eval!(trace_eval, Column::V9),
-            crate::trace::trace_eval!(trace_eval, Column::V10),
-            crate::trace::trace_eval!(trace_eval, Column::V11),
-            crate::trace::trace_eval!(trace_eval, Column::V12),
-            crate::trace::trace_eval!(trace_eval, Column::V13),
-            crate::trace::trace_eval!(trace_eval, Column::V14),
-            crate::trace::trace_eval!(trace_eval, Column::V15),
-        ];
-        let v_cols_next: [_; 16] = [
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V0),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V1),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V2),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V3),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V4),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V5),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V6),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V7),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V8),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V9),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V10),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V11),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V12),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V13),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V14),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::V15),
-        ];
-
-        // Input match (Phase I-blake2b-4 helper-flattened): a_in[i] = V[G_INDICES[j][0]][i]
-        // when IsGIdx[j]=1, etc.  Written as a_in[i] = Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i]
-        // and routed through `InMatch{A,B,C,D}` sum helpers so the gate × sum product
-        // sits at degree 2 instead of 3.
-        let in_match_a = crate::trace::trace_eval!(trace_eval, Column::InMatchA);
-        let in_match_b = crate::trace::trace_eval!(trace_eval, Column::InMatchB);
-        let in_match_c = crate::trace::trace_eval!(trace_eval, Column::InMatchC);
-        let in_match_d = crate::trace::trace_eval!(trace_eval, Column::InMatchD);
-        for i in 0..8 {
-            let mut exp_a = E::F::zero();
-            let mut exp_b = E::F::zero();
-            let mut exp_c = E::F::zero();
-            let mut exp_d = E::F::zero();
-            for (j, &[aj, bj, cj, dj]) in G_INDICES.iter().enumerate() {
-                exp_a += is_gidx[j][0].clone() * v_cols[aj][i].clone();
-                exp_b += is_gidx[j][0].clone() * v_cols[bj][i].clone();
-                exp_c += is_gidx[j][0].clone() * v_cols[cj][i].clone();
-                exp_d += is_gidx[j][0].clone() * v_cols[dj][i].clone();
-            }
-            // Helper-defining (deg 2): InMatchX[i] = Σ IsGIdx[j] · V[…][i].
-            eval.add_constraint(in_match_a[i].clone() - exp_a);
-            eval.add_constraint(in_match_b[i].clone() - exp_b);
-            eval.add_constraint(in_match_c[i].clone() - exp_c);
-            eval.add_constraint(in_match_d[i].clone() - exp_d);
-            // Main (deg 2): is_real · (input_byte - InMatchX[i]) = 0.
-            eval.add_constraint(is_real[0].clone() * (a_in[i].clone() - in_match_a[i].clone()));
-            eval.add_constraint(is_real[0].clone() * (b_in[i].clone() - in_match_b[i].clone()));
-            eval.add_constraint(is_real[0].clone() * (c_in[i].clone() - in_match_c[i].clone()));
-            eval.add_constraint(is_real[0].clone() * (d_in[i].clone() - in_match_d[i].clone()));
-        }
-
-        // V_next update (Phase I-blake2b-6 helper-flattened): for slot k
-        // at byte i, V_next[k][i] equals
-        //   Σ_j IsGIdx[j] · (a_out/b_out/c_out/d_out if k is touched by G_j,
-        //                    else V[k]).
-        // Gated by is_real · (1 - is_last_of_compression) so the constraint
-        // does not cross a compression boundary or fire on padding.
-        // Gate substitution (Phase I-blake2b-1): gate ← GateH.
+        let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
         let gate = gate_h[0].clone();
-        let v_next_sum: [_; 16] = [
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum0),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum1),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum2),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum3),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum4),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum5),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum6),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum7),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum8),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum9),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum10),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum11),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum12),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum13),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum14),
-            crate::trace::trace_eval!(trace_eval, Column::VNextSum15),
+        let output_e = crate::trace::trace_eval!(trace_eval, Column::Output);
+        let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
+        let f1 = E::F::one();
+        let h_cols: [_; 8] = [
+            crate::trace::trace_eval!(trace_eval, Column::H0),
+            crate::trace::trace_eval!(trace_eval, Column::H1),
+            crate::trace::trace_eval!(trace_eval, Column::H2),
+            crate::trace::trace_eval!(trace_eval, Column::H3),
+            crate::trace::trace_eval!(trace_eval, Column::H4),
+            crate::trace::trace_eval!(trace_eval, Column::H5),
+            crate::trace::trace_eval!(trace_eval, Column::H6),
+            crate::trace::trace_eval!(trace_eval, Column::H7),
         ];
-        for k in 0..16 {
-            for i in 0..8 {
-                let mut update = E::F::zero();
-                for (j, &[aj, bj, cj, dj]) in G_INDICES.iter().enumerate() {
-                    let contribution = if k == aj {
-                        a_out[i].clone()
-                    } else if k == bj {
-                        b_out[i].clone()
-                    } else if k == cj {
-                        c_out[i].clone()
-                    } else if k == dj {
-                        d_out[i].clone()
-                    } else {
-                        v_cols[k][i].clone()
-                    };
-                    update += is_gidx[j][0].clone() * contribution;
-                }
-                // Helper-defining (deg 2): VNextSumK[i] = Σ_j IsGIdx[j] · contribution_j(k, i).
-                eval.add_constraint(v_next_sum[k][i].clone() - update);
-                // Main (deg 2): GateH · (V_next[k][i] - VNextSumK[i]) = 0.
-                eval.add_constraint(
-                    gate.clone() * (v_cols_next[k][i].clone() - v_next_sum[k][i].clone()),
-                );
-            }
-        }
-
-        // ── Message authentication ──────────────────────────────
-        // M[0..16] witness columns hold the message for this compression.
-        // IsMxSlot_k / IsMySlot_k preprocessed selectors encode
-        // SIGMA[round][2·g_idx] and SIGMA[round][2·g_idx + 1], so Mx / My
-        // become a linear combination of the 16 M slots weighted by the
-        // selectors.  Inter-row M_k_next = M_k keeps the message constant
-        // across the 96 rows of a single compression.
         let m_cols: [_; 16] = [
             crate::trace::trace_eval!(trace_eval, Column::M0),
             crate::trace::trace_eval!(trace_eval, Column::M1),
@@ -655,276 +969,6 @@ impl BuiltInComponent for Blake2bChip {
             crate::trace::trace_eval!(trace_eval, Column::M14),
             crate::trace::trace_eval!(trace_eval, Column::M15),
         ];
-        let m_cols_next: [_; 16] = [
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M0),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M1),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M2),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M3),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M4),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M5),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M6),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M7),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M8),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M9),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M10),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M11),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M12),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M13),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M14),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::M15),
-        ];
-        let is_mx_slot: [_; 16] = [
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot0),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot1),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot2),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot3),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot4),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot5),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot6),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot7),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot8),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot9),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot10),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot11),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot12),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot13),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot14),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMxSlot15),
-        ];
-        let is_my_slot: [_; 16] = [
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot0),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot1),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot2),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot3),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot4),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot5),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot6),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot7),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot8),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot9),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot10),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot11),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot12),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot13),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot14),
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsMySlot15),
-        ];
-
-        // Mx / My selection from M by preprocessed selector
-        // (Phase I-blake2b-5 helper-flattened).
-        let mx = crate::trace::trace_eval!(trace_eval, Column::Mx);
-        let my = crate::trace::trace_eval!(trace_eval, Column::My);
-        let mx_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MxSlotSum);
-        let my_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MySlotSum);
-        for i in 0..8 {
-            let mut exp_mx = E::F::zero();
-            let mut exp_my = E::F::zero();
-            for k in 0..16 {
-                exp_mx += is_mx_slot[k][0].clone() * m_cols[k][i].clone();
-                exp_my += is_my_slot[k][0].clone() * m_cols[k][i].clone();
-            }
-            // Helper-defining (deg 2): SlotSum[i] = Σ_k IsXSlot[k] · M[k][i].
-            eval.add_constraint(mx_slot_sum[i].clone() - exp_mx);
-            eval.add_constraint(my_slot_sum[i].clone() - exp_my);
-            // Main (deg 2): is_real · (mx[i] - MxSlotSum[i]) = 0.
-            eval.add_constraint(is_real[0].clone() * (mx[i].clone() - mx_slot_sum[i].clone()));
-            eval.add_constraint(is_real[0].clone() * (my[i].clone() - my_slot_sum[i].clone()));
-        }
-
-        // Inter-row: M[k] stays constant within a compression.  Gate identical
-        // to the V-state update so message slots reset at compression boundary.
-        for k in 0..16 {
-            for i in 0..8 {
-                eval.add_constraint(
-                    gate.clone() * (m_cols_next[k][i].clone() - m_cols[k][i].clone()),
-                );
-            }
-        }
-
-        // ── Initial state derivation + compression-input consistency ────
-        // H, T, F are replicated on every row of a compression (inter-row
-        // equality below) so we can anchor the V state at row 0 of a
-        // compression to the Blake2b initial state:
-        //   V[0..8][i]  = H_k[i]
-        //   V[8..12][i] = IV[k-8][i]
-        //   V[12][i]    = IV[4][i] XOR T[i]
-        //                 = IV[4][i] + T[i] - 2·AndTLo[i]
-        //   V[13][i]    = IV[5][i] XOR T[8+i]
-        //                 = IV[5][i] + T[8+i] - 2·AndTHi[i]
-        //   V[14][i]    = IV[6][i] XOR (F ? 0xFF : 0)
-        //                 = IV[6][i] + F·(255 - 2·IV[6][i])
-        //   V[15][i]    = IV[7][i]
-        let h_cols: [_; 8] = [
-            crate::trace::trace_eval!(trace_eval, Column::H0),
-            crate::trace::trace_eval!(trace_eval, Column::H1),
-            crate::trace::trace_eval!(trace_eval, Column::H2),
-            crate::trace::trace_eval!(trace_eval, Column::H3),
-            crate::trace::trace_eval!(trace_eval, Column::H4),
-            crate::trace::trace_eval!(trace_eval, Column::H5),
-            crate::trace::trace_eval!(trace_eval, Column::H6),
-            crate::trace::trace_eval!(trace_eval, Column::H7),
-        ];
-        let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
-        let f_e = crate::trace::trace_eval!(trace_eval, Column::F);
-        let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
-        let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
-
-        // F ∈ {0,1} (Phase I-blake2b-3 helper-flattened).
-        let f_bound_h = crate::trace::trace_eval!(trace_eval, Column::FBoundH);
-        eval.add_constraint(f_bound_h[0].clone() - f_e[0].clone() * (f_e[0].clone() - f1.clone()));
-        eval.add_constraint(is_real[0].clone() * f_bound_h[0].clone());
-
-        // Gate substitution (Phase I-blake2b-1): init_gate ← InitGateH.
-        let init_gate = init_gate_h[0].clone();
-        let f255 = E::F::from(BaseField::from(255u32));
-        for i in 0..8 {
-            let iv4_i = E::F::from(BaseField::from(IV[4].to_le_bytes()[i] as u32));
-            let iv5_i = E::F::from(BaseField::from(IV[5].to_le_bytes()[i] as u32));
-            let iv6_i = E::F::from(BaseField::from(IV[6].to_le_bytes()[i] as u32));
-            let iv7_i = E::F::from(BaseField::from(IV[7].to_le_bytes()[i] as u32));
-            let iv0_i = E::F::from(BaseField::from(IV[0].to_le_bytes()[i] as u32));
-            let iv1_i = E::F::from(BaseField::from(IV[1].to_le_bytes()[i] as u32));
-            let iv2_i = E::F::from(BaseField::from(IV[2].to_le_bytes()[i] as u32));
-            let iv3_i = E::F::from(BaseField::from(IV[3].to_le_bytes()[i] as u32));
-            // V[0..8] = H_k
-            for k in 0..8 {
-                eval.add_constraint(
-                    init_gate.clone() * (v_cols[k][i].clone() - h_cols[k][i].clone()),
-                );
-            }
-            // V[8..12] = IV[0..4]
-            eval.add_constraint(init_gate.clone() * (v_cols[8][i].clone() - iv0_i.clone()));
-            eval.add_constraint(init_gate.clone() * (v_cols[9][i].clone() - iv1_i.clone()));
-            eval.add_constraint(init_gate.clone() * (v_cols[10][i].clone() - iv2_i.clone()));
-            eval.add_constraint(init_gate.clone() * (v_cols[11][i].clone() - iv3_i.clone()));
-            // V[12] = IV[4] XOR T[i] via XOR identity using AndTLo.
-            let v12_expected = iv4_i.clone() + t_e[i].clone() - f2.clone() * and_t_lo_e[i].clone();
-            eval.add_constraint(init_gate.clone() * (v_cols[12][i].clone() - v12_expected));
-            // V[13] = IV[5] XOR T[8+i] via XOR identity using AndTHi.
-            let v13_expected =
-                iv5_i.clone() + t_e[8 + i].clone() - f2.clone() * and_t_hi_e[i].clone();
-            eval.add_constraint(init_gate.clone() * (v_cols[13][i].clone() - v13_expected));
-            // V[14] = IV[6] XOR (F·0xFF).
-            // = IV[6] + F·0xFF - 2·F·IV[6]  (since F∈{0,1}, F·IV[6] = AND(IV[6], F·0xFF))
-            // = IV[6]·(1 - 2F) + 255F
-            let v14_expected =
-                iv6_i.clone() + f_e[0].clone() * (f255.clone() - f2.clone() * iv6_i.clone());
-            eval.add_constraint(init_gate.clone() * (v_cols[14][i].clone() - v14_expected));
-            // V[15] = IV[7]
-            eval.add_constraint(init_gate.clone() * (v_cols[15][i].clone() - iv7_i.clone()));
-        }
-
-        // ── Inter-row: H, T, F stay constant within a compression ──
-        let h_cols_next: [_; 8] = [
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H0),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H1),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H2),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H3),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H4),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H5),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H6),
-            crate::trace::trace_eval_next_row!(trace_eval, Column::H7),
-        ];
-        let t_e_next = crate::trace::trace_eval_next_row!(trace_eval, Column::T);
-        let f_e_next = crate::trace::trace_eval_next_row!(trace_eval, Column::F);
-        for k in 0..8 {
-            for i in 0..8 {
-                eval.add_constraint(
-                    gate.clone() * (h_cols_next[k][i].clone() - h_cols[k][i].clone()),
-                );
-            }
-        }
-        for i in 0..16 {
-            eval.add_constraint(gate.clone() * (t_e_next[i].clone() - t_e[i].clone()));
-        }
-        eval.add_constraint(gate.clone() * (f_e_next[0].clone() - f_e[0].clone()));
-
-        // ── Phase 2b: output derivation at row 95 of each compression ──
-        // output[i][j] = H[i][j] XOR V_after[i][j] XOR V_after[i+8][j]
-        //              = H[i][j] + V_after[i][j] - 2·OutAnd1[i*8+j]
-        //                         + V_after[i+8][j] - 2·OutAnd2[i*8+j]
-        // V_after[k][j] is an expression: at row 95 IsGIdx_7=1, so
-        //   V_after[3] ← a_out, V_after[4] ← b_out,
-        //   V_after[9] ← c_out, V_after[14] ← d_out,  else V[k].
-        let output_e = crate::trace::trace_eval!(trace_eval, Column::Output);
-        let h_hi_e = crate::trace::trace_eval!(trace_eval, Column::HHi);
-        let v_after_hi_e = crate::trace::trace_eval!(trace_eval, Column::VAfterHi);
-        let out_and1_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd1);
-        let out_and1_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd1Hi);
-        let out_xor1_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutXor1Hi);
-        let out_and2_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2);
-        let out_and2_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2Hi);
-        // Gate substitution (Phase I-blake2b-1): output_gate ← OutputGateH.
-        let output_gate = output_gate_h[0].clone();
-
-        // V_after source picker for the constraint side (mirror of the
-        // interaction-trace v_after_byte closure).
-        let v_after_e = |k: usize, byte: usize| -> E::F {
-            match k {
-                3 => a_out[byte].clone(),
-                4 => b_out[byte].clone(),
-                9 => c_out[byte].clone(),
-                14 => d_out[byte].clone(),
-                _ => v_cols[k][byte].clone(),
-            }
-        };
-
-        for word in 0..8 {
-            for byte in 0..8 {
-                let slot = word * 8 + byte;
-                let v1 = v_after_e(word, byte);
-                let v2 = v_after_e(word + 8, byte);
-                let h_b = h_cols[word][byte].clone();
-
-                // Output derivation (gated at row 95).
-                let expected_out = h_b.clone() + v1.clone() - f2.clone() * out_and1_e[slot].clone()
-                    + v2.clone()
-                    - f2.clone() * out_and2_e[slot].clone();
-                eval.add_constraint(output_gate.clone() * (output_e[slot].clone() - expected_out));
-
-                // OutAnd1 hi
-                eval.add_to_relation(RelationEntry::new(
-                    bitwise_lookup,
-                    output_gate.clone().into(),
-                    &[
-                        h_hi_e[slot].clone(),
-                        v_after_hi_e[word * 8 + byte].clone(),
-                        out_and1_hi_e[slot].clone(),
-                    ],
-                ));
-                // OutAnd1 lo
-                eval.add_to_relation(RelationEntry::new(
-                    bitwise_lookup,
-                    output_gate.clone().into(),
-                    &[
-                        h_b.clone() - h_hi_e[slot].clone() * f16.clone(),
-                        v1.clone() - v_after_hi_e[word * 8 + byte].clone() * f16.clone(),
-                        out_and1_e[slot].clone() - out_and1_hi_e[slot].clone() * f16.clone(),
-                    ],
-                ));
-                // OutAnd2 hi — operands are Xor1 (expression) and V_after[word+8]
-                eval.add_to_relation(RelationEntry::new(
-                    bitwise_lookup,
-                    output_gate.clone().into(),
-                    &[
-                        out_xor1_hi_e[slot].clone(),
-                        v_after_hi_e[(word + 8) * 8 + byte].clone(),
-                        out_and2_hi_e[slot].clone(),
-                    ],
-                ));
-                // OutAnd2 lo — xor1_expr = H + v1 - 2·OutAnd1
-                let xor1 = h_b.clone() + v1.clone() - f2.clone() * out_and1_e[slot].clone();
-                eval.add_to_relation(RelationEntry::new(
-                    bitwise_lookup,
-                    output_gate.clone().into(),
-                    &[
-                        xor1 - out_xor1_hi_e[slot].clone() * f16.clone(),
-                        v2.clone() - v_after_hi_e[(word + 8) * 8 + byte].clone() * f16.clone(),
-                        out_and2_e[slot].clone() - out_and2_hi_e[slot].clone() * f16.clone(),
-                    ],
-                ));
-            }
-        }
 
         // ── Phase 8b: ECALL memory binding ──────────────────────
         // HPtr / MPtr / CallTs are witnessed per row (inter-row equality)
@@ -1119,6 +1163,412 @@ impl BuiltInComponent for Blake2bChip {
         }
 
         eval.finalize_logup_in_pairs();
+    }
+}
+
+#[cfg(feature = "prover")]
+pub(super) fn add_compression_interaction_core(
+    logup: &mut LogupTraceBuilder,
+    component_trace: &ComponentTrace,
+    range256: &Range256LookupElements,
+    bitwise: &BitwiseAndLookupElements,
+) {
+    let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
+    let a_in = crate::trace::original_base_column!(component_trace, Column::AIn);
+    let c_in = crate::trace::original_base_column!(component_trace, Column::CIn);
+    let mx = crate::trace::original_base_column!(component_trace, Column::Mx);
+    let my = crate::trace::original_base_column!(component_trace, Column::My);
+    let b_out = crate::trace::original_base_column!(component_trace, Column::BOut);
+    let d_in = crate::trace::original_base_column!(component_trace, Column::DIn);
+    let a1 = crate::trace::original_base_column!(component_trace, Column::A1);
+    let and1 = crate::trace::original_base_column!(component_trace, Column::And1);
+    let b_in = crate::trace::original_base_column!(component_trace, Column::BIn);
+    let c1 = crate::trace::original_base_column!(component_trace, Column::C1);
+    let and2 = crate::trace::original_base_column!(component_trace, Column::And2);
+    let a_out = crate::trace::original_base_column!(component_trace, Column::AOut);
+    let and3 = crate::trace::original_base_column!(component_trace, Column::And3);
+    let c_out = crate::trace::original_base_column!(component_trace, Column::COut);
+    let d_out = crate::trace::original_base_column!(component_trace, Column::DOut);
+    let and4 = crate::trace::original_base_column!(component_trace, Column::And4);
+    let and1_a_hi = crate::trace::original_base_column!(component_trace, Column::And1AHi);
+    let and1_b_hi = crate::trace::original_base_column!(component_trace, Column::And1BHi);
+    let and1_res_hi = crate::trace::original_base_column!(component_trace, Column::And1ResHi);
+    let and2_a_hi = crate::trace::original_base_column!(component_trace, Column::And2AHi);
+    let and2_b_hi = crate::trace::original_base_column!(component_trace, Column::And2BHi);
+    let and2_res_hi = crate::trace::original_base_column!(component_trace, Column::And2ResHi);
+    let and3_a_hi = crate::trace::original_base_column!(component_trace, Column::And3AHi);
+    let and3_b_hi = crate::trace::original_base_column!(component_trace, Column::And3BHi);
+    let and3_res_hi = crate::trace::original_base_column!(component_trace, Column::And3ResHi);
+    let and4_a_hi = crate::trace::original_base_column!(component_trace, Column::And4AHi);
+    let and4_b_hi = crate::trace::original_base_column!(component_trace, Column::And4BHi);
+    let and4_res_hi = crate::trace::original_base_column!(component_trace, Column::And4ResHi);
+
+    let sixteen = PackedBaseField::broadcast(BaseField::from(16));
+    let two = PackedBaseField::broadcast(BaseField::from(2));
+
+    // For each byte i, emit 8 nibble lookups in order:
+    //   And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3 lo, And4 hi, And4 lo
+    // The constraint-side emission MUST match this order exactly;
+    // finalize_logup_in_pairs will pair (hi, lo) per AND.
+    for i in 0..8usize {
+        // ── And1 = D_in & A1, bytes at position i ──
+        logup.add_to_relation_with(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            &[
+                and1_a_hi[i].clone(),
+                and1_b_hi[i].clone(),
+                and1_res_hi[i].clone(),
+            ],
+        );
+        let (d_in_i, a1_i, and1_i) = (d_in[i].clone(), a1[i].clone(), and1[i].clone());
+        let (and1_a_hi_i, and1_b_hi_i, and1_res_hi_i) = (
+            and1_a_hi[i].clone(),
+            and1_b_hi[i].clone(),
+            and1_res_hi[i].clone(),
+        );
+        logup.add_to_relation_computed(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            3,
+            move |v| {
+                let a_lo = d_in_i.at(v) - and1_a_hi_i.at(v) * sixteen;
+                let b_lo = a1_i.at(v) - and1_b_hi_i.at(v) * sixteen;
+                let r_lo = and1_i.at(v) - and1_res_hi_i.at(v) * sixteen;
+                vec![a_lo, b_lo, r_lo]
+            },
+        );
+
+        // ── And2 = B_in & C1, bytes at position i ──
+        logup.add_to_relation_with(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            &[
+                and2_a_hi[i].clone(),
+                and2_b_hi[i].clone(),
+                and2_res_hi[i].clone(),
+            ],
+        );
+        let (b_in_i, c1_i, and2_i) = (b_in[i].clone(), c1[i].clone(), and2[i].clone());
+        let (and2_a_hi_i, and2_b_hi_i, and2_res_hi_i) = (
+            and2_a_hi[i].clone(),
+            and2_b_hi[i].clone(),
+            and2_res_hi[i].clone(),
+        );
+        logup.add_to_relation_computed(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            3,
+            move |v| {
+                let a_lo = b_in_i.at(v) - and2_a_hi_i.at(v) * sixteen;
+                let b_lo = c1_i.at(v) - and2_b_hi_i.at(v) * sixteen;
+                let r_lo = and2_i.at(v) - and2_res_hi_i.at(v) * sixteen;
+                vec![a_lo, b_lo, r_lo]
+            },
+        );
+
+        // ── And3 = D1 & A_out, bytes at position i ──
+        // D1[i] is derived: D1[i] = D_in[j] + A1[j] - 2·And1[j] where j=(i+4)%8.
+        logup.add_to_relation_with(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            &[
+                and3_a_hi[i].clone(),
+                and3_b_hi[i].clone(),
+                and3_res_hi[i].clone(),
+            ],
+        );
+        let j3 = (i + 4) % 8;
+        let (d_in_j, a1_j, and1_j) = (d_in[j3].clone(), a1[j3].clone(), and1[j3].clone());
+        let (a_out_i, and3_i) = (a_out[i].clone(), and3[i].clone());
+        let (and3_a_hi_i, and3_b_hi_i, and3_res_hi_i) = (
+            and3_a_hi[i].clone(),
+            and3_b_hi[i].clone(),
+            and3_res_hi[i].clone(),
+        );
+        logup.add_to_relation_computed(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            3,
+            move |v| {
+                let d1_i = d_in_j.at(v) + a1_j.at(v) - two * and1_j.at(v);
+                let a_lo = d1_i - and3_a_hi_i.at(v) * sixteen;
+                let b_lo = a_out_i.at(v) - and3_b_hi_i.at(v) * sixteen;
+                let r_lo = and3_i.at(v) - and3_res_hi_i.at(v) * sixteen;
+                vec![a_lo, b_lo, r_lo]
+            },
+        );
+
+        // ── And4 = B1 & C_out, bytes at position i ──
+        // B1[i] is derived: B1[i] = B_in[j] + C1[j] - 2·And2[j] where j=(i+3)%8.
+        logup.add_to_relation_with(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            &[
+                and4_a_hi[i].clone(),
+                and4_b_hi[i].clone(),
+                and4_res_hi[i].clone(),
+            ],
+        );
+        let j4 = (i + 3) % 8;
+        let (b_in_j, c1_j, and2_j) = (b_in[j4].clone(), c1[j4].clone(), and2[j4].clone());
+        let (c_out_i, and4_i) = (c_out[i].clone(), and4[i].clone());
+        let (and4_a_hi_i, and4_b_hi_i, and4_res_hi_i) = (
+            and4_a_hi[i].clone(),
+            and4_b_hi[i].clone(),
+            and4_res_hi[i].clone(),
+        );
+        logup.add_to_relation_computed(
+            bitwise,
+            [is_real[0].clone()],
+            |[r]| r.into(),
+            3,
+            move |v| {
+                let b1_i = b_in_j.at(v) + c1_j.at(v) - two * and2_j.at(v);
+                let a_lo = b1_i - and4_a_hi_i.at(v) * sixteen;
+                let b_lo = c_out_i.at(v) - and4_b_hi_i.at(v) * sixteen;
+                let r_lo = and4_i.at(v) - and4_res_hi_i.at(v) * sixteen;
+                vec![a_lo, b_lo, r_lo]
+            },
+        );
+
+        // ── AndTLo = IV[4] & T_lo at byte i ──
+        // IV[4] is constant, so a_hi / a_lo are inline.
+        let iv4_byte = IV[4].to_le_bytes()[i];
+        let iv4_hi = PackedBaseField::broadcast(BaseField::from((iv4_byte >> 4) as u32));
+        let iv4_lo = PackedBaseField::broadcast(BaseField::from((iv4_byte & 0x0F) as u32));
+        let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
+        let t_hi_cols = crate::trace::original_base_column!(component_trace, Column::THi);
+        let and_t_lo_cols = crate::trace::original_base_column!(component_trace, Column::AndTLo);
+        let and_t_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHi);
+        let and_t_lo_hi_cols =
+            crate::trace::original_base_column!(component_trace, Column::AndTLoHi);
+        let and_t_hi_hi_cols =
+            crate::trace::original_base_column!(component_trace, Column::AndTHiHi);
+        let iv4_hi_bcast_tuple = iv4_hi;
+        logup.add_to_relation_computed(bitwise, [is_real[0].clone()], |[r]| r.into(), 3, {
+            let t_hi_i = t_hi_cols[i].clone();
+            let and_hi_i = and_t_lo_hi_cols[i].clone();
+            move |v| vec![iv4_hi_bcast_tuple, t_hi_i.at(v), and_hi_i.at(v)]
+        });
+        {
+            let iv4_lo_const = iv4_lo;
+            let t_i = t_cols[i].clone();
+            let t_hi_i = t_hi_cols[i].clone();
+            let and_i = and_t_lo_cols[i].clone();
+            let and_hi_i = and_t_lo_hi_cols[i].clone();
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                move |v| {
+                    let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
+                    let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
+                    vec![iv4_lo_const, b_lo, r_lo]
+                },
+            );
+        }
+
+        // ── AndTHi = IV[5] & T_hi (bytes 8..16 of T) at byte i ──
+        let iv5_byte = IV[5].to_le_bytes()[i];
+        let iv5_hi = PackedBaseField::broadcast(BaseField::from((iv5_byte >> 4) as u32));
+        let iv5_lo = PackedBaseField::broadcast(BaseField::from((iv5_byte & 0x0F) as u32));
+        let iv5_hi_bcast = iv5_hi;
+        {
+            let t_hi_i = t_hi_cols[8 + i].clone();
+            let and_hi_i = and_t_hi_hi_cols[i].clone();
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                move |v| vec![iv5_hi_bcast, t_hi_i.at(v), and_hi_i.at(v)],
+            );
+        }
+        {
+            let iv5_lo_const = iv5_lo;
+            let t_i = t_cols[8 + i].clone();
+            let t_hi_i = t_hi_cols[8 + i].clone();
+            let and_i = and_t_hi_cols[i].clone();
+            let and_hi_i = and_t_hi_hi_cols[i].clone();
+            logup.add_to_relation_computed(
+                bitwise,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                3,
+                move |v| {
+                    let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
+                    let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
+                    vec![iv5_lo_const, b_lo, r_lo]
+                },
+            );
+        }
+    }
+
+    // ── Range256 lookups for non-AND-constrained byte columns ──
+    // A_in, C_in, Mx, My, B_out.  Issued in a fixed (column, byte) order
+    // that the constraint side mirrors.
+    for col_cols in [&a_in, &c_in, &mx, &my, &b_out] {
+        for i in 0..8 {
+            logup.add_to_relation_with(
+                range256,
+                [is_real[0].clone()],
+                |[r]| r.into(),
+                &[col_cols[i].clone()],
+            );
+        }
+    }
+
+    // ── Phase 2b: output-derivation AND-nibble lookups ──────
+    // Fire only at IsLastOfCompression · IsReal.  128 AND bytes
+    // (And1 and And2 pairs) × 2 nibbles = 256 lookup entries per row
+    // (non-last rows have multiplicity 0).
+    //
+    // Snapshot V[0..16] and H[0..8] columns upfront — we dispatch by
+    // numeric index below because the column-fetch macro requires a
+    // literal path.
+    let is_last_pp = crate::trace::preprocessed_base_column!(
+        component_trace,
+        PreprocessedColumn::IsLastOfCompression
+    );
+    let h_hi_cols = crate::trace::original_base_column!(component_trace, Column::HHi);
+    let v_after_hi_cols = crate::trace::original_base_column!(component_trace, Column::VAfterHi);
+    let out_and1_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1);
+    let out_and1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1Hi);
+    let out_xor1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutXor1Hi);
+    let out_and2_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2);
+    let out_and2_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2Hi);
+    let h_by_word: [_; 8] = [
+        crate::trace::original_base_column!(component_trace, Column::H0),
+        crate::trace::original_base_column!(component_trace, Column::H1),
+        crate::trace::original_base_column!(component_trace, Column::H2),
+        crate::trace::original_base_column!(component_trace, Column::H3),
+        crate::trace::original_base_column!(component_trace, Column::H4),
+        crate::trace::original_base_column!(component_trace, Column::H5),
+        crate::trace::original_base_column!(component_trace, Column::H6),
+        crate::trace::original_base_column!(component_trace, Column::H7),
+    ];
+    let v_by_slot: [_; 16] = [
+        crate::trace::original_base_column!(component_trace, Column::V0),
+        crate::trace::original_base_column!(component_trace, Column::V1),
+        crate::trace::original_base_column!(component_trace, Column::V2),
+        crate::trace::original_base_column!(component_trace, Column::V3),
+        crate::trace::original_base_column!(component_trace, Column::V4),
+        crate::trace::original_base_column!(component_trace, Column::V5),
+        crate::trace::original_base_column!(component_trace, Column::V6),
+        crate::trace::original_base_column!(component_trace, Column::V7),
+        crate::trace::original_base_column!(component_trace, Column::V8),
+        crate::trace::original_base_column!(component_trace, Column::V9),
+        crate::trace::original_base_column!(component_trace, Column::V10),
+        crate::trace::original_base_column!(component_trace, Column::V11),
+        crate::trace::original_base_column!(component_trace, Column::V12),
+        crate::trace::original_base_column!(component_trace, Column::V13),
+        crate::trace::original_base_column!(component_trace, Column::V14),
+        crate::trace::original_base_column!(component_trace, Column::V15),
+    ];
+
+    // G_INDICES[7] = [3, 4, 9, 14] — at row 95 (g_idx=7, always true at
+    // IsLastOfCompression) slot k is touched iff k ∈ {3,4,9,14}:
+    //   slot 3 ← a_out;  slot 4 ← b_out;
+    //   slot 9 ← c_out;  slot 14 ← d_out;
+    //   else slot k keeps V[k].
+    // Pick the column for V_after[slot][byte] — element type mirrors
+    // whatever `original_base_column!` returns (a FinalizedColumn clone).
+    let v_after_byte = |k: usize, byte: usize| match k {
+        3 => a_out[byte].clone(),
+        4 => b_out[byte].clone(),
+        9 => c_out[byte].clone(),
+        14 => d_out[byte].clone(),
+        _ => v_by_slot[k][byte].clone(),
+    };
+
+    for word in 0..8 {
+        for byte in 0..8 {
+            let slot = word * 8 + byte;
+            let v1_src = v_after_byte(word, byte);
+            let v2_src = v_after_byte(word + 8, byte);
+            let h_b = h_by_word[word][byte].clone();
+
+            // And1 hi
+            {
+                let h_hi_s = h_hi_cols[slot].clone();
+                let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
+                let and1_hi_s = out_and1_hi_cols[slot].clone();
+                logup.add_to_relation_computed(
+                    bitwise,
+                    [is_real[0].clone(), is_last_pp[0].clone()],
+                    |[r, l]| (r * l).into(),
+                    3,
+                    move |v| vec![h_hi_s.at(v), v_after_hi_s.at(v), and1_hi_s.at(v)],
+                );
+            }
+            // And1 lo
+            {
+                let h_b2 = h_b.clone();
+                let h_hi_s = h_hi_cols[slot].clone();
+                let v1_src2 = v1_src.clone();
+                let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
+                let and1_s = out_and1_cols[slot].clone();
+                let and1_hi_s = out_and1_hi_cols[slot].clone();
+                logup.add_to_relation_computed(
+                    bitwise,
+                    [is_real[0].clone(), is_last_pp[0].clone()],
+                    |[r, l]| (r * l).into(),
+                    3,
+                    move |v| {
+                        let a_lo = h_b2.at(v) - h_hi_s.at(v) * sixteen;
+                        let b_lo = v1_src2.at(v) - v_after_hi_s.at(v) * sixteen;
+                        let r_lo = and1_s.at(v) - and1_hi_s.at(v) * sixteen;
+                        vec![a_lo, b_lo, r_lo]
+                    },
+                );
+            }
+            // And2 hi
+            {
+                let xor1_hi_s = out_xor1_hi_cols[slot].clone();
+                let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
+                let and2_hi_s = out_and2_hi_cols[slot].clone();
+                logup.add_to_relation_computed(
+                    bitwise,
+                    [is_real[0].clone(), is_last_pp[0].clone()],
+                    |[r, l]| (r * l).into(),
+                    3,
+                    move |v| vec![xor1_hi_s.at(v), v_after_hi_s2.at(v), and2_hi_s.at(v)],
+                );
+            }
+            // And2 lo with xor1_expr = H + v1 - 2·And1
+            {
+                let h_b2 = h_b.clone();
+                let v1_src2 = v1_src.clone();
+                let v2_src2 = v2_src.clone();
+                let xor1_hi_s = out_xor1_hi_cols[slot].clone();
+                let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
+                let and1_s = out_and1_cols[slot].clone();
+                let and2_s = out_and2_cols[slot].clone();
+                let and2_hi_s = out_and2_hi_cols[slot].clone();
+                logup.add_to_relation_computed(
+                    bitwise,
+                    [is_real[0].clone(), is_last_pp[0].clone()],
+                    |[r, l]| (r * l).into(),
+                    3,
+                    move |v| {
+                        let xor1_v = h_b2.at(v) + v1_src2.at(v) - two * and1_s.at(v);
+                        let a_lo = xor1_v - xor1_hi_s.at(v) * sixteen;
+                        let b_lo = v2_src2.at(v) - v_after_hi_s2.at(v) * sixteen;
+                        let r_lo = and2_s.at(v) - and2_hi_s.at(v) * sixteen;
+                        vec![a_lo, b_lo, r_lo]
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1619,409 +2069,16 @@ impl BuiltInProverComponent for Blake2bChip {
 
         let range256: &Range256LookupElements = lookup_elements.as_ref();
         let bitwise: &BitwiseAndLookupElements = lookup_elements.as_ref();
+        // Arithmetic-core lookups (BitwiseAnd / Range256 nibble lookups +
+        // Phase 2b output-AND lookups) — shared with Blake2bBoundaryChip.
+        add_compression_interaction_core(&mut logup, &component_trace, range256, bitwise);
+
+        // Re-read the columns Phase 8b/8c consume from the core region.
         let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
-        let a_in = crate::trace::original_base_column!(component_trace, Column::AIn);
-        let c_in = crate::trace::original_base_column!(component_trace, Column::CIn);
-        let mx = crate::trace::original_base_column!(component_trace, Column::Mx);
-        let my = crate::trace::original_base_column!(component_trace, Column::My);
-        let b_out = crate::trace::original_base_column!(component_trace, Column::BOut);
-        let d_in = crate::trace::original_base_column!(component_trace, Column::DIn);
-        let a1 = crate::trace::original_base_column!(component_trace, Column::A1);
-        let and1 = crate::trace::original_base_column!(component_trace, Column::And1);
-        let b_in = crate::trace::original_base_column!(component_trace, Column::BIn);
-        let c1 = crate::trace::original_base_column!(component_trace, Column::C1);
-        let and2 = crate::trace::original_base_column!(component_trace, Column::And2);
-        let a_out = crate::trace::original_base_column!(component_trace, Column::AOut);
-        let and3 = crate::trace::original_base_column!(component_trace, Column::And3);
-        let c_out = crate::trace::original_base_column!(component_trace, Column::COut);
-        let d_out = crate::trace::original_base_column!(component_trace, Column::DOut);
-        let and4 = crate::trace::original_base_column!(component_trace, Column::And4);
-        let and1_a_hi = crate::trace::original_base_column!(component_trace, Column::And1AHi);
-        let and1_b_hi = crate::trace::original_base_column!(component_trace, Column::And1BHi);
-        let and1_res_hi = crate::trace::original_base_column!(component_trace, Column::And1ResHi);
-        let and2_a_hi = crate::trace::original_base_column!(component_trace, Column::And2AHi);
-        let and2_b_hi = crate::trace::original_base_column!(component_trace, Column::And2BHi);
-        let and2_res_hi = crate::trace::original_base_column!(component_trace, Column::And2ResHi);
-        let and3_a_hi = crate::trace::original_base_column!(component_trace, Column::And3AHi);
-        let and3_b_hi = crate::trace::original_base_column!(component_trace, Column::And3BHi);
-        let and3_res_hi = crate::trace::original_base_column!(component_trace, Column::And3ResHi);
-        let and4_a_hi = crate::trace::original_base_column!(component_trace, Column::And4AHi);
-        let and4_b_hi = crate::trace::original_base_column!(component_trace, Column::And4BHi);
-        let and4_res_hi = crate::trace::original_base_column!(component_trace, Column::And4ResHi);
-
-        let sixteen = PackedBaseField::broadcast(BaseField::from(16));
-        let two = PackedBaseField::broadcast(BaseField::from(2));
-
-        // For each byte i, emit 8 nibble lookups in order:
-        //   And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3 lo, And4 hi, And4 lo
-        // The constraint-side emission MUST match this order exactly;
-        // finalize_logup_in_pairs will pair (hi, lo) per AND.
-        for i in 0..8usize {
-            // ── And1 = D_in & A1, bytes at position i ──
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[
-                    and1_a_hi[i].clone(),
-                    and1_b_hi[i].clone(),
-                    and1_res_hi[i].clone(),
-                ],
-            );
-            let (d_in_i, a1_i, and1_i) = (d_in[i].clone(), a1[i].clone(), and1[i].clone());
-            let (and1_a_hi_i, and1_b_hi_i, and1_res_hi_i) = (
-                and1_a_hi[i].clone(),
-                and1_b_hi[i].clone(),
-                and1_res_hi[i].clone(),
-            );
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let a_lo = d_in_i.at(v) - and1_a_hi_i.at(v) * sixteen;
-                    let b_lo = a1_i.at(v) - and1_b_hi_i.at(v) * sixteen;
-                    let r_lo = and1_i.at(v) - and1_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── And2 = B_in & C1, bytes at position i ──
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[
-                    and2_a_hi[i].clone(),
-                    and2_b_hi[i].clone(),
-                    and2_res_hi[i].clone(),
-                ],
-            );
-            let (b_in_i, c1_i, and2_i) = (b_in[i].clone(), c1[i].clone(), and2[i].clone());
-            let (and2_a_hi_i, and2_b_hi_i, and2_res_hi_i) = (
-                and2_a_hi[i].clone(),
-                and2_b_hi[i].clone(),
-                and2_res_hi[i].clone(),
-            );
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let a_lo = b_in_i.at(v) - and2_a_hi_i.at(v) * sixteen;
-                    let b_lo = c1_i.at(v) - and2_b_hi_i.at(v) * sixteen;
-                    let r_lo = and2_i.at(v) - and2_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── And3 = D1 & A_out, bytes at position i ──
-            // D1[i] is derived: D1[i] = D_in[j] + A1[j] - 2·And1[j] where j=(i+4)%8.
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[
-                    and3_a_hi[i].clone(),
-                    and3_b_hi[i].clone(),
-                    and3_res_hi[i].clone(),
-                ],
-            );
-            let j3 = (i + 4) % 8;
-            let (d_in_j, a1_j, and1_j) = (d_in[j3].clone(), a1[j3].clone(), and1[j3].clone());
-            let (a_out_i, and3_i) = (a_out[i].clone(), and3[i].clone());
-            let (and3_a_hi_i, and3_b_hi_i, and3_res_hi_i) = (
-                and3_a_hi[i].clone(),
-                and3_b_hi[i].clone(),
-                and3_res_hi[i].clone(),
-            );
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let d1_i = d_in_j.at(v) + a1_j.at(v) - two * and1_j.at(v);
-                    let a_lo = d1_i - and3_a_hi_i.at(v) * sixteen;
-                    let b_lo = a_out_i.at(v) - and3_b_hi_i.at(v) * sixteen;
-                    let r_lo = and3_i.at(v) - and3_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── And4 = B1 & C_out, bytes at position i ──
-            // B1[i] is derived: B1[i] = B_in[j] + C1[j] - 2·And2[j] where j=(i+3)%8.
-            logup.add_to_relation_with(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                &[
-                    and4_a_hi[i].clone(),
-                    and4_b_hi[i].clone(),
-                    and4_res_hi[i].clone(),
-                ],
-            );
-            let j4 = (i + 3) % 8;
-            let (b_in_j, c1_j, and2_j) = (b_in[j4].clone(), c1[j4].clone(), and2[j4].clone());
-            let (c_out_i, and4_i) = (c_out[i].clone(), and4[i].clone());
-            let (and4_a_hi_i, and4_b_hi_i, and4_res_hi_i) = (
-                and4_a_hi[i].clone(),
-                and4_b_hi[i].clone(),
-                and4_res_hi[i].clone(),
-            );
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| {
-                    let b1_i = b_in_j.at(v) + c1_j.at(v) - two * and2_j.at(v);
-                    let a_lo = b1_i - and4_a_hi_i.at(v) * sixteen;
-                    let b_lo = c_out_i.at(v) - and4_b_hi_i.at(v) * sixteen;
-                    let r_lo = and4_i.at(v) - and4_res_hi_i.at(v) * sixteen;
-                    vec![a_lo, b_lo, r_lo]
-                },
-            );
-
-            // ── AndTLo = IV[4] & T_lo at byte i ──
-            // IV[4] is constant, so a_hi / a_lo are inline.
-            let iv4_byte = IV[4].to_le_bytes()[i];
-            let iv4_hi = PackedBaseField::broadcast(BaseField::from((iv4_byte >> 4) as u32));
-            let iv4_lo = PackedBaseField::broadcast(BaseField::from((iv4_byte & 0x0F) as u32));
-            let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
-            let t_hi_cols = crate::trace::original_base_column!(component_trace, Column::THi);
-            let and_t_lo_cols =
-                crate::trace::original_base_column!(component_trace, Column::AndTLo);
-            let and_t_hi_cols =
-                crate::trace::original_base_column!(component_trace, Column::AndTHi);
-            let and_t_lo_hi_cols =
-                crate::trace::original_base_column!(component_trace, Column::AndTLoHi);
-            let and_t_hi_hi_cols =
-                crate::trace::original_base_column!(component_trace, Column::AndTHiHi);
-            let iv4_hi_bcast_tuple = iv4_hi;
-            logup.add_to_relation_computed(bitwise, [is_real[0].clone()], |[r]| r.into(), 3, {
-                let t_hi_i = t_hi_cols[i].clone();
-                let and_hi_i = and_t_lo_hi_cols[i].clone();
-                move |v| vec![iv4_hi_bcast_tuple, t_hi_i.at(v), and_hi_i.at(v)]
-            });
-            {
-                let iv4_lo_const = iv4_lo;
-                let t_i = t_cols[i].clone();
-                let t_hi_i = t_hi_cols[i].clone();
-                let and_i = and_t_lo_cols[i].clone();
-                let and_hi_i = and_t_lo_hi_cols[i].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    3,
-                    move |v| {
-                        let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
-                        let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
-                        vec![iv4_lo_const, b_lo, r_lo]
-                    },
-                );
-            }
-
-            // ── AndTHi = IV[5] & T_hi (bytes 8..16 of T) at byte i ──
-            let iv5_byte = IV[5].to_le_bytes()[i];
-            let iv5_hi = PackedBaseField::broadcast(BaseField::from((iv5_byte >> 4) as u32));
-            let iv5_lo = PackedBaseField::broadcast(BaseField::from((iv5_byte & 0x0F) as u32));
-            let iv5_hi_bcast = iv5_hi;
-            {
-                let t_hi_i = t_hi_cols[8 + i].clone();
-                let and_hi_i = and_t_hi_hi_cols[i].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    3,
-                    move |v| vec![iv5_hi_bcast, t_hi_i.at(v), and_hi_i.at(v)],
-                );
-            }
-            {
-                let iv5_lo_const = iv5_lo;
-                let t_i = t_cols[8 + i].clone();
-                let t_hi_i = t_hi_cols[8 + i].clone();
-                let and_i = and_t_hi_cols[i].clone();
-                let and_hi_i = and_t_hi_hi_cols[i].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    3,
-                    move |v| {
-                        let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
-                        let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
-                        vec![iv5_lo_const, b_lo, r_lo]
-                    },
-                );
-            }
-        }
-
-        // ── Range256 lookups for non-AND-constrained byte columns ──
-        // A_in, C_in, Mx, My, B_out.  Issued in a fixed (column, byte) order
-        // that the constraint side mirrors.
-        for col_cols in [&a_in, &c_in, &mx, &my, &b_out] {
-            for i in 0..8 {
-                logup.add_to_relation_with(
-                    range256,
-                    [is_real[0].clone()],
-                    |[r]| r.into(),
-                    &[col_cols[i].clone()],
-                );
-            }
-        }
-
-        // ── Phase 2b: output-derivation AND-nibble lookups ──────
-        // Fire only at IsLastOfCompression · IsReal.  128 AND bytes
-        // (And1 and And2 pairs) × 2 nibbles = 256 lookup entries per row
-        // (non-last rows have multiplicity 0).
-        //
-        // Snapshot V[0..16] and H[0..8] columns upfront — we dispatch by
-        // numeric index below because the column-fetch macro requires a
-        // literal path.
         let is_last_pp = crate::trace::preprocessed_base_column!(
             component_trace,
             PreprocessedColumn::IsLastOfCompression
         );
-        let h_hi_cols = crate::trace::original_base_column!(component_trace, Column::HHi);
-        let v_after_hi_cols =
-            crate::trace::original_base_column!(component_trace, Column::VAfterHi);
-        let out_and1_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1);
-        let out_and1_hi_cols =
-            crate::trace::original_base_column!(component_trace, Column::OutAnd1Hi);
-        let out_xor1_hi_cols =
-            crate::trace::original_base_column!(component_trace, Column::OutXor1Hi);
-        let out_and2_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2);
-        let out_and2_hi_cols =
-            crate::trace::original_base_column!(component_trace, Column::OutAnd2Hi);
-        let h_by_word: [_; 8] = [
-            crate::trace::original_base_column!(component_trace, Column::H0),
-            crate::trace::original_base_column!(component_trace, Column::H1),
-            crate::trace::original_base_column!(component_trace, Column::H2),
-            crate::trace::original_base_column!(component_trace, Column::H3),
-            crate::trace::original_base_column!(component_trace, Column::H4),
-            crate::trace::original_base_column!(component_trace, Column::H5),
-            crate::trace::original_base_column!(component_trace, Column::H6),
-            crate::trace::original_base_column!(component_trace, Column::H7),
-        ];
-        let v_by_slot: [_; 16] = [
-            crate::trace::original_base_column!(component_trace, Column::V0),
-            crate::trace::original_base_column!(component_trace, Column::V1),
-            crate::trace::original_base_column!(component_trace, Column::V2),
-            crate::trace::original_base_column!(component_trace, Column::V3),
-            crate::trace::original_base_column!(component_trace, Column::V4),
-            crate::trace::original_base_column!(component_trace, Column::V5),
-            crate::trace::original_base_column!(component_trace, Column::V6),
-            crate::trace::original_base_column!(component_trace, Column::V7),
-            crate::trace::original_base_column!(component_trace, Column::V8),
-            crate::trace::original_base_column!(component_trace, Column::V9),
-            crate::trace::original_base_column!(component_trace, Column::V10),
-            crate::trace::original_base_column!(component_trace, Column::V11),
-            crate::trace::original_base_column!(component_trace, Column::V12),
-            crate::trace::original_base_column!(component_trace, Column::V13),
-            crate::trace::original_base_column!(component_trace, Column::V14),
-            crate::trace::original_base_column!(component_trace, Column::V15),
-        ];
-
-        // G_INDICES[7] = [3, 4, 9, 14] — at row 95 (g_idx=7, always true at
-        // IsLastOfCompression) slot k is touched iff k ∈ {3,4,9,14}:
-        //   slot 3 ← a_out;  slot 4 ← b_out;
-        //   slot 9 ← c_out;  slot 14 ← d_out;
-        //   else slot k keeps V[k].
-        // Pick the column for V_after[slot][byte] — element type mirrors
-        // whatever `original_base_column!` returns (a FinalizedColumn clone).
-        let v_after_byte = |k: usize, byte: usize| match k {
-            3 => a_out[byte].clone(),
-            4 => b_out[byte].clone(),
-            9 => c_out[byte].clone(),
-            14 => d_out[byte].clone(),
-            _ => v_by_slot[k][byte].clone(),
-        };
-
-        for word in 0..8 {
-            for byte in 0..8 {
-                let slot = word * 8 + byte;
-                let v1_src = v_after_byte(word, byte);
-                let v2_src = v_after_byte(word + 8, byte);
-                let h_b = h_by_word[word][byte].clone();
-
-                // And1 hi
-                {
-                    let h_hi_s = h_hi_cols[slot].clone();
-                    let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
-                    let and1_hi_s = out_and1_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| vec![h_hi_s.at(v), v_after_hi_s.at(v), and1_hi_s.at(v)],
-                    );
-                }
-                // And1 lo
-                {
-                    let h_b2 = h_b.clone();
-                    let h_hi_s = h_hi_cols[slot].clone();
-                    let v1_src2 = v1_src.clone();
-                    let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
-                    let and1_s = out_and1_cols[slot].clone();
-                    let and1_hi_s = out_and1_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| {
-                            let a_lo = h_b2.at(v) - h_hi_s.at(v) * sixteen;
-                            let b_lo = v1_src2.at(v) - v_after_hi_s.at(v) * sixteen;
-                            let r_lo = and1_s.at(v) - and1_hi_s.at(v) * sixteen;
-                            vec![a_lo, b_lo, r_lo]
-                        },
-                    );
-                }
-                // And2 hi
-                {
-                    let xor1_hi_s = out_xor1_hi_cols[slot].clone();
-                    let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
-                    let and2_hi_s = out_and2_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| vec![xor1_hi_s.at(v), v_after_hi_s2.at(v), and2_hi_s.at(v)],
-                    );
-                }
-                // And2 lo with xor1_expr = H + v1 - 2·And1
-                {
-                    let h_b2 = h_b.clone();
-                    let v1_src2 = v1_src.clone();
-                    let v2_src2 = v2_src.clone();
-                    let xor1_hi_s = out_xor1_hi_cols[slot].clone();
-                    let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
-                    let and1_s = out_and1_cols[slot].clone();
-                    let and2_s = out_and2_cols[slot].clone();
-                    let and2_hi_s = out_and2_hi_cols[slot].clone();
-                    logup.add_to_relation_computed(
-                        bitwise,
-                        [is_real[0].clone(), is_last_pp[0].clone()],
-                        |[r, l]| (r * l).into(),
-                        3,
-                        move |v| {
-                            let xor1_v = h_b2.at(v) + v1_src2.at(v) - two * and1_s.at(v);
-                            let a_lo = xor1_v - xor1_hi_s.at(v) * sixteen;
-                            let b_lo = v2_src2.at(v) - v_after_hi_s2.at(v) * sixteen;
-                            let r_lo = and2_s.at(v) - and2_hi_s.at(v) * sixteen;
-                            vec![a_lo, b_lo, r_lo]
-                        },
-                    );
-                }
-            }
-        }
 
         // ── Phase 8b: per-byte memory-access consumer lookups ──
         // Tuple (addr[4], value[1], ts[8], is_write[1]) mirroring the
