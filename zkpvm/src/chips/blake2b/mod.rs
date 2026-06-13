@@ -1620,6 +1620,37 @@ pub(super) fn add_compression_interaction_core<P: ScheduleColumns>(
     }
 }
 
+/// Fill the deterministic compression schedule into a chip's preprocessed
+/// trace: `r mod 8` picks the G-index, `r mod 96` the position in a
+/// compression, SIGMA the Mx/My message-slot selectors.  Generic over the
+/// chip's `PreprocessedColumn` so Blake2bChip and Blake2bBoundaryChip emit
+/// the same schedule under their own distinct prefixes.
+#[cfg(feature = "prover")]
+pub(in crate::chips::blake2b) fn build_schedule_preprocessed<P: ScheduleColumns>(
+    log_size: u32,
+) -> FinalizedTrace {
+    let mut trace = TraceBuilder::<P>::new(log_size);
+    let num_rows = trace.num_rows();
+    for row in 0..num_rows {
+        let g_idx = row % 8;
+        trace.fill_columns(row, true, P::IS_GIDX[g_idx]);
+        let pos_in_compression = row % 96;
+        if pos_in_compression == 0 {
+            trace.fill_columns(row, true, P::IS_FIRST);
+        }
+        if pos_in_compression == 95 {
+            trace.fill_columns(row, true, P::IS_LAST);
+        }
+        // Derive mx_idx / my_idx from SIGMA: round = (r%96)/8, g_idx = r%8.
+        let round = pos_in_compression / 8;
+        let mx_idx = SIGMA[round][2 * g_idx];
+        let my_idx = SIGMA[round][2 * g_idx + 1];
+        trace.fill_columns(row, true, P::IS_MX_SLOT[mx_idx]);
+        trace.fill_columns(row, true, P::IS_MY_SLOT[my_idx]);
+    }
+    trace.finalize_bit_reversed()
+}
+
 #[cfg(feature = "prover")]
 pub(in crate::chips::blake2b) fn build_compression_rows(
     calls: &[Blake2bCall],
@@ -2031,76 +2062,7 @@ pub(in crate::chips::blake2b) fn fill_compression_trace(
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for Blake2bChip {
     fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        // Schedule is deterministic per-row: r mod 8 picks g_idx, r mod 96
-        // identifies position in a compression.  Every row gets a value
-        // (including padding rows past the real compression span) — the
-        // IsReal witness gates the state-chain constraint.
-        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        let num_rows = trace.num_rows();
-        const GIDX_COLS: [PreprocessedColumn; 8] = [
-            PreprocessedColumn::IsGIdx0,
-            PreprocessedColumn::IsGIdx1,
-            PreprocessedColumn::IsGIdx2,
-            PreprocessedColumn::IsGIdx3,
-            PreprocessedColumn::IsGIdx4,
-            PreprocessedColumn::IsGIdx5,
-            PreprocessedColumn::IsGIdx6,
-            PreprocessedColumn::IsGIdx7,
-        ];
-        const MX_SLOT_COLS: [PreprocessedColumn; 16] = [
-            PreprocessedColumn::IsMxSlot0,
-            PreprocessedColumn::IsMxSlot1,
-            PreprocessedColumn::IsMxSlot2,
-            PreprocessedColumn::IsMxSlot3,
-            PreprocessedColumn::IsMxSlot4,
-            PreprocessedColumn::IsMxSlot5,
-            PreprocessedColumn::IsMxSlot6,
-            PreprocessedColumn::IsMxSlot7,
-            PreprocessedColumn::IsMxSlot8,
-            PreprocessedColumn::IsMxSlot9,
-            PreprocessedColumn::IsMxSlot10,
-            PreprocessedColumn::IsMxSlot11,
-            PreprocessedColumn::IsMxSlot12,
-            PreprocessedColumn::IsMxSlot13,
-            PreprocessedColumn::IsMxSlot14,
-            PreprocessedColumn::IsMxSlot15,
-        ];
-        const MY_SLOT_COLS: [PreprocessedColumn; 16] = [
-            PreprocessedColumn::IsMySlot0,
-            PreprocessedColumn::IsMySlot1,
-            PreprocessedColumn::IsMySlot2,
-            PreprocessedColumn::IsMySlot3,
-            PreprocessedColumn::IsMySlot4,
-            PreprocessedColumn::IsMySlot5,
-            PreprocessedColumn::IsMySlot6,
-            PreprocessedColumn::IsMySlot7,
-            PreprocessedColumn::IsMySlot8,
-            PreprocessedColumn::IsMySlot9,
-            PreprocessedColumn::IsMySlot10,
-            PreprocessedColumn::IsMySlot11,
-            PreprocessedColumn::IsMySlot12,
-            PreprocessedColumn::IsMySlot13,
-            PreprocessedColumn::IsMySlot14,
-            PreprocessedColumn::IsMySlot15,
-        ];
-        for row in 0..num_rows {
-            let g_idx = row % 8;
-            trace.fill_columns(row, true, GIDX_COLS[g_idx]);
-            let pos_in_compression = row % 96;
-            if pos_in_compression == 0 {
-                trace.fill_columns(row, true, PreprocessedColumn::IsFirstOfCompression);
-            }
-            if pos_in_compression == 95 {
-                trace.fill_columns(row, true, PreprocessedColumn::IsLastOfCompression);
-            }
-            // Derive mx_idx / my_idx from SIGMA: round = (r%96)/8, g_idx = r%8.
-            let round = pos_in_compression / 8;
-            let mx_idx = SIGMA[round][2 * g_idx];
-            let my_idx = SIGMA[round][2 * g_idx + 1];
-            trace.fill_columns(row, true, MX_SLOT_COLS[mx_idx]);
-            trace.fill_columns(row, true, MY_SLOT_COLS[my_idx]);
-        }
-        trace.finalize_bit_reversed()
+        build_schedule_preprocessed::<PreprocessedColumn>(log_size)
     }
 
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
