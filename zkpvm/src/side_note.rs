@@ -51,6 +51,12 @@ pub struct SideNote {
     /// writes for output).  MemoryChip ingests these into the ledger so the
     /// Blake2bChip memory-consumer lookups balance.
     pub blake2b_mem_ops: Vec<crate::core::tracing::Blake2bMemOp>,
+    /// Synthetic blake2b compressions for the in-AIR memory-page Merkle
+    /// boundary multiproof, proven by `Blake2bBoundaryChip`.  Unlike
+    /// `blake2b_calls` these hash page images (leaves) and node pairs, with
+    /// no memory-ledger binding.  Built on the prove path from
+    /// `page_merkle::boundary_blake2b_calls`.
+    pub merkle_blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     /// R1f: Ristretto255 scalar-mult ECALL records (scalar / input
     /// point / output point as 32 LE bytes each).  Populated by the
     /// trace driver after `TracingPvm::run_with_precompiles`; consumed
@@ -313,6 +319,7 @@ impl SideNote {
             ristretto_comb_calls: Vec::new(),
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
+            merkle_blake2b_calls: Vec::new(),
             ristretto_calls: Vec::new(),
             ristretto_mem_ops: Vec::new(),
             ristretto_add_calls: Vec::new(),

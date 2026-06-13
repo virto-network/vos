@@ -179,6 +179,75 @@ fn harness_blake2b_isolated() {
     }
 }
 
+/// Blake2bBoundaryChip-isolated harness.  The boundary chip reuses the
+/// shared compression core over a distinct `"blake2bnd"` preprocessed
+/// prefix and adds its own IsReal anchor + Blake2bCompression producer.
+/// This validates its algebra (anchor + production at row 95 + the schedule
+/// fill under the distinct prefix) reaches a clean prove, then expects the
+/// open-chain rejection at verify (the Blake2bCompression productions and
+/// the BitwiseAnd / Range256 consumers have no balancing chips in scope —
+/// `MemoryPageChip` / `MemoryMerkleChip` land in step 5).
+#[test]
+fn harness_blake2b_boundary_isolated() {
+    use zkpvm::chips::Blake2bCall;
+
+    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
+
+    // One synthetic Merkle compression — arbitrary (h, m, t, f); the harness
+    // validates the boundary chip's algebra, not the specific hash value.
+    side_note.merkle_blake2b_calls.push(Blake2bCall {
+        h: [0u64; 8],
+        m: [0u64; 16],
+        t: 0,
+        f: true,
+    });
+
+    let config = PcsConfig {
+        pow_bits: 5,
+        fri_config: FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+
+    let components: &[&'static dyn MachineProverComponent] = &[&chips::Blake2bBoundaryChip];
+
+    let proof = prove_with_explicit_components(&mut side_note, config, components).expect(
+        "Blake2bBoundaryChip harness: prove failed — IsReal anchor / production / \
+         shared-core-under-distinct-prefix regression (OODS sanity check fired)",
+    );
+
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+
+    let policy = PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+
+    let verify_result = verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    );
+
+    use stwo::core::verifier::VerificationError;
+    match verify_result {
+        Err(VerificationError::InvalidStructure(msg))
+            if msg.contains("claimed logup sum is not zero") => {}
+        Err(e) => {
+            panic!("Blake2bBoundaryChip harness: verify rejected for the wrong reason: {e:?}")
+        }
+        Ok(()) => panic!(
+            "Blake2bBoundaryChip harness: verify accepted unexpectedly — \
+             something is balancing the lookups that shouldn't be"
+        ),
+    }
+}
+
 /// CpuChip-isolated harness: prove `[&CpuChip]` alone with a real Add64
 /// PVM step.  Validates that CpuChip's algebra (post Phase-I flatten)
 /// is sound on the new Stwo pin.  Verify is open-chain — lookups don't

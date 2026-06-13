@@ -48,16 +48,20 @@ use crate::{
     },
 };
 
+mod boundary;
 mod call;
 mod columns;
 mod consts;
 mod sw;
 mod trace;
 
+pub use boundary::Blake2bBoundaryChip;
 pub use call::Blake2bCall;
 pub use sw::blake2b_compress;
 
-use columns::{Column, PreprocessedColumn};
+use columns::PreprocessedColumn;
+// Re-exported (gate tests reach `Column::IsReal`/`Output` offsets to tamper).
+pub use columns::Column;
 use consts::{G_INDICES, IV, SIGMA};
 use trace::{GRow, fill_output_witnesses, g_traced, row_v_after};
 
@@ -1621,15 +1625,16 @@ pub(super) fn add_compression_interaction_core<P: ScheduleColumns>(
 }
 
 /// Fill the deterministic compression schedule into a chip's preprocessed
-/// trace: `r mod 8` picks the G-index, `r mod 96` the position in a
+/// trace builder: `r mod 8` picks the G-index, `r mod 96` the position in a
 /// compression, SIGMA the Mx/My message-slot selectors.  Generic over the
 /// chip's `PreprocessedColumn` so Blake2bChip and Blake2bBoundaryChip emit
-/// the same schedule under their own distinct prefixes.
+/// the same schedule under their own distinct prefixes.  Does NOT finalize —
+/// the caller may add further preprocessed columns (e.g. the boundary chip's
+/// ContinuityGate) before finalizing.
 #[cfg(feature = "prover")]
-pub(in crate::chips::blake2b) fn build_schedule_preprocessed<P: ScheduleColumns>(
-    log_size: u32,
-) -> FinalizedTrace {
-    let mut trace = TraceBuilder::<P>::new(log_size);
+pub(in crate::chips::blake2b) fn fill_schedule_preprocessed<P: ScheduleColumns>(
+    trace: &mut TraceBuilder<P>,
+) {
     let num_rows = trace.num_rows();
     for row in 0..num_rows {
         let g_idx = row % 8;
@@ -1648,7 +1653,6 @@ pub(in crate::chips::blake2b) fn build_schedule_preprocessed<P: ScheduleColumns>
         trace.fill_columns(row, true, P::IS_MX_SLOT[mx_idx]);
         trace.fill_columns(row, true, P::IS_MY_SLOT[my_idx]);
     }
-    trace.finalize_bit_reversed()
 }
 
 #[cfg(feature = "prover")]
@@ -2062,7 +2066,9 @@ pub(in crate::chips::blake2b) fn fill_compression_trace(
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for Blake2bChip {
     fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        build_schedule_preprocessed::<PreprocessedColumn>(log_size)
+        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
+        fill_schedule_preprocessed(&mut trace);
+        trace.finalize_bit_reversed()
     }
 
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {

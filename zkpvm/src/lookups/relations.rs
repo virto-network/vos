@@ -169,6 +169,17 @@ stwo_constraint_framework::relation!(ByteToBitsLookupElements, REL_BYTE_TO_BITS_
 const REL_BLAKE2B_CALL_LOOKUP_SIZE: usize = 4 + 4 + WORD_SIZE + 1 + TS_SIZE;
 stwo_constraint_framework::relation!(Blake2bCallLookupElements, REL_BLAKE2B_CALL_LOOKUP_SIZE);
 
+// (h_in[64], m[128], t[8], f[1], h_out[64]) — one tuple per blake2b
+// compression of the in-AIR memory-page Merkle boundary multiproof, bound
+// WITHOUT a memory-ledger / CPU-call binding.  Blake2bBoundaryChip PRODUCES
+// one per compression at its row-95 output; MemoryPageChip (leaf h-chain)
+// and MemoryMerkleChip (node hashes) CONSUME them (step 5).
+const REL_BLAKE2B_COMPRESSION_LOOKUP_SIZE: usize = 64 + 128 + 8 + 1 + 64;
+stwo_constraint_framework::relation!(
+    Blake2bCompressionLookupElements,
+    REL_BLAKE2B_COMPRESSION_LOOKUP_SIZE
+);
+
 // R1e-pent: RistrettoChip register-file lookup.  Each row's `out`
 // bytes are PRODUCERS keyed by (row_index, byte_index, byte_value);
 // each row's `a` and `b` input bytes are CONSUMERS keyed by

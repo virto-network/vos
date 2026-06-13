@@ -324,8 +324,10 @@ pub enum Column {
     HWrAddrB2,
     #[size = 64]
     HWrAddrB3,
-    // Row type
+    // Row type.  mask_next_row so Blake2bBoundaryChip's IsReal-continuity
+    // anchor can read the next row; Blake2bChip leaves the next value unused.
     #[size = 1]
+    #[mask_next_row]
     IsReal,
     // Phase I gate helpers — Stwo v2.x lifted-protocol degree flatten.
     // GateH        = IsReal · (1 - IsLastOfCompression)

@@ -30,7 +30,7 @@ pub mod ristretto_fixed_base_consumer;
 pub use bitcount::BitcountChip;
 pub use bitwise::BitwiseChip;
 pub use bitwise_lookup::BitwiseLookupChip;
-pub use blake2b::{Blake2bCall, Blake2bChip, blake2b_compress};
+pub use blake2b::{Blake2bBoundaryChip, Blake2bCall, Blake2bChip, blake2b_compress};
 pub use byte_to_bits::ByteToBitsChip;
 pub use compare::CompareChip;
 pub use cpu::CpuChip;
