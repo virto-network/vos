@@ -500,7 +500,14 @@ fn prove_transition_segmented_chain() {
         "trace is only {total} steps — guest early-exited (stale voucher-check ELF? \
          run `just build-voucher-check`)"
     );
-    let mut bounds = zkpvm::segment::segment_bounds(total, SEG_STEPS);
+    // SEG_STEPS env override: smaller segments cap per-segment prover RAM (the
+    // Phase-A memory machinery — per-page boundary injection + Blake2bBoundary —
+    // pushes a 500k-step segment to ~37 GB peak, OOM-prone on a 62 GB box).
+    let seg_steps = std::env::var("SEG_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(SEG_STEPS);
+    let mut bounds = zkpvm::segment::segment_bounds(total, seg_steps);
     // DBG_MAX_SEGS limits the chain to the first N segments for a fast
     // boundary-continuity check (a chain of mid-trace segments still
     // exercises per-segment prove + verify_chain's boundary linkage).
@@ -511,7 +518,7 @@ fn prove_transition_segmented_chain() {
         bounds.truncate(n.max(1));
     }
     eprintln!(
-        "segmenting {total} steps → {} segments of ≤ {SEG_STEPS}",
+        "segmenting {total} steps → {} segments of ≤ {seg_steps}",
         bounds.len()
     );
 
