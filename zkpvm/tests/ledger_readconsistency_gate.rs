@@ -219,7 +219,12 @@ fn memory_side_note() -> SideNote {
     assert_eq!(tr.run(), javm::ExitReason::Trap);
     let steps: Vec<PvmStep> = tr.into_trace();
     assert_eq!(steps[1].regs_after[2], 0x42);
-    SideNote::new(steps, code, bitmask)
+    let mut sn = SideNote::new(steps, code, bitmask);
+    // Phase A: MemoryChip now injects the per-page `ts=0` boundary writes +
+    // closing reads and enforces the group-start/group-end constraints, so the
+    // honest trace requires the memory-page payload the prove path builds.
+    sn.ingest_memory_pages();
+    sn
 }
 
 // GREEN since the RAM-ledger fix landed (cross-row prev_value binding +

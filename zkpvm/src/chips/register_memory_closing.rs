@@ -210,20 +210,41 @@ impl BuiltInProverComponent for RegisterMemoryClosingChip {
     }
 }
 
-/// Closing-read timestamp for `side_note`'s synthetic register-final
-/// ledger entries. One past the last real step's timestamp so the
-/// synthetic entries sort strictly after every real access.
+/// Closing-read timestamp for `side_note`'s synthetic register-final and
+/// per-page memory-boundary ledger entries. One past the last real step's
+/// timestamp so the synthetic entries sort strictly after every real access.
 ///
-/// `0` for empty traces — the boundary chip then has no producers
-/// either, the augmented ledger has no synthetic closing-read
-/// entries, and the closing chip produces nothing (every row is
-/// padding with `IsReal = 0`). Defined here (not on `SideNote`)
-/// so `chips/register_memory.rs` can call the same helper without
-/// pulling the chip module into a circular import.
+/// In real traces every precompile mem-op executes during a step, so its
+/// timestamp is `<= last_step.timestamp` and `last_step.timestamp + 1`
+/// already dominates them. Step-less synthetic harnesses (e.g. the ristretto
+/// chip-isolated tests) inject precompile mem-ops with no steps; the per-page
+/// closing read must still sort strictly after every such access, so fall back
+/// to one past the latest precompile mem-op timestamp.
+///
+/// `0` for genuinely empty traces (no steps and no precompile mem-ops) — the
+/// boundary chip then has no producers either, the augmented ledger has no
+/// synthetic closing-read entries, and the closing chip produces nothing
+/// (every row is padding with `IsReal = 0`). Defined here (not on `SideNote`)
+/// so `chips/register_memory.rs` can call the same helper without pulling the
+/// chip module into a circular import.
 #[cfg(feature = "prover")]
 pub fn closing_ts_for(side_note: &SideNote) -> u64 {
     match side_note.steps.last() {
         Some(last) => last.timestamp + 1,
-        None => 0,
+        None => {
+            let max_precompile_ts = side_note
+                .blake2b_mem_ops
+                .iter()
+                .map(|m| m.ts)
+                .chain(side_note.ristretto_mem_ops.iter().map(|m| m.ts))
+                .chain(side_note.ristretto_add_mem_ops.iter().map(|m| m.ts))
+                .chain(side_note.scalar_binop_mem_ops.iter().map(|m| m.ts))
+                .chain(side_note.scalar_reduce_wide_mem_ops.iter().map(|m| m.ts))
+                .max();
+            match max_precompile_ts {
+                Some(ts) => ts + 1,
+                None => 0,
+            }
+        }
     }
 }

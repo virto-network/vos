@@ -712,6 +712,9 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
         &MemoryMerkleChip,
         &MemoryRootBoundaryChip,
         &Blake2bBoundaryChip,
+        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::BitwiseLookupChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -841,6 +844,9 @@ fn harness_ristretto_fixed_base_three_calls() {
         &MemoryMerkleChip,
         &MemoryRootBoundaryChip,
         &Blake2bBoundaryChip,
+        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::BitwiseLookupChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -958,6 +964,9 @@ fn harness_ristretto_scalar_memory_mismatch_rejected() {
         &MemoryMerkleChip,
         &MemoryRootBoundaryChip,
         &Blake2bBoundaryChip,
+        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::BitwiseLookupChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -1144,6 +1153,9 @@ fn harness_ristretto_output_mismatch_rejected() {
         &MemoryMerkleChip,
         &MemoryRootBoundaryChip,
         &Blake2bBoundaryChip,
+        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::BitwiseLookupChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -1269,6 +1281,9 @@ fn harness_ristretto_identity_compress_e2e() {
         &MemoryMerkleChip,
         &MemoryRootBoundaryChip,
         &Blake2bBoundaryChip,
+        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::BitwiseLookupChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -1358,6 +1373,9 @@ fn harness_ristretto_identity_output_forgery_rejected() {
         &MemoryMerkleChip,
         &MemoryRootBoundaryChip,
         &Blake2bBoundaryChip,
+        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::BitwiseLookupChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
