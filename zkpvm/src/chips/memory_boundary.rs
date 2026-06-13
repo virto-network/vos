@@ -67,13 +67,14 @@ impl BuiltInComponent for MemoryBoundaryChip {
         let value = crate::trace::trace_eval!(trace_eval, Column::Value);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
 
-        // Byte-level tuple: (addr[4], value[1], timestamp[8]=0, is_write=1)
+        // Byte-level tuple: (addr[4], value[1], timestamp[8]=0, is_write=1, is_closing=0)
         let mut tuple: Vec<E::F> = addr.to_vec();
         tuple.push(value[0].clone());
         for _ in 0..8 {
             tuple.push(E::F::zero());
         }
         tuple.push(E::F::one());
+        tuple.push(E::F::zero()); // is_closing = 0
 
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -130,14 +131,14 @@ impl BuiltInProverComponent for MemoryBoundaryChip {
 
         use stwo::prover::backend::simd::m31::PackedBaseField;
 
-        // Byte-level tuple: (addr[4], value[1], timestamp[8]=0, is_write=1)
+        // Byte-level tuple: (addr[4], value[1], timestamp[8]=0, is_write=1, is_closing=0)
         logup.add_to_relation_computed(
             mem_lookup,
             [is_real[0].clone()],
             |[real]| real.into(),
-            14,
+            15,
             |vec_idx| {
-                let mut tuple = Vec::with_capacity(14);
+                let mut tuple = Vec::with_capacity(15);
                 for col in &addr {
                     tuple.push(col.at(vec_idx));
                 }
@@ -146,6 +147,7 @@ impl BuiltInProverComponent for MemoryBoundaryChip {
                     tuple.push(PackedBaseField::zero());
                 } // timestamp = 0
                 tuple.push(PackedBaseField::one()); // is_write = 1
+                tuple.push(PackedBaseField::zero()); // is_closing = 0
                 tuple
             },
         );

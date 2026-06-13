@@ -1684,7 +1684,7 @@ impl BuiltInComponent for CpuChip {
             let c1 = mem_byte_carry1[byte_idx].clone();
             let c2 = mem_byte_carry2[byte_idx].clone();
             let c3 = mem_byte_carry3[byte_idx].clone();
-            let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+            let mut tuple: Vec<E::F> = Vec::with_capacity(15);
             // Canonical bytes of MemAddr + byte_idx, with carry.
             tuple.push(mem_addr[0].clone() + byte_offset - f256.clone() * c1.clone());
             tuple.push(mem_addr[1].clone() + c1.clone() - f256.clone() * c2.clone());
@@ -1696,6 +1696,8 @@ impl BuiltInComponent for CpuChip {
             tuple.extend_from_slice(&timestamp);
             // is_write
             tuple.push(is_store_e());
+            // is_closing = 0 (CpuChip never emits closing reads)
+            tuple.push(E::F::zero());
 
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,

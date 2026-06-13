@@ -68,8 +68,11 @@ stwo_constraint_framework::relation!(ProgramMemoryLookupElements, REL_PROG_MEMOR
 const REL_JUMP_TABLE_LOOKUP_SIZE: usize = PC_SIZE + PC_SIZE;
 stwo_constraint_framework::relation!(JumpTableLookupElements, REL_JUMP_TABLE_LOOKUP_SIZE);
 
-// Byte-level: (addr[4], value[1], timestamp[8], is_write[1])
-const REL_MEMORY_ACCESS_LOOKUP_SIZE: usize = PC_SIZE + 1 + TS_SIZE + 1;
+// Byte-level: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1]).
+// is_closing distinguishes the §2 per-page closing read (emitted only by
+// MemoryPageChip) from every other entry (which emit 0), so MemoryChip's
+// group-end constraint can require each address group to end on a closing row.
+const REL_MEMORY_ACCESS_LOOKUP_SIZE: usize = PC_SIZE + 1 + TS_SIZE + 1 + 1;
 stwo_constraint_framework::relation!(MemoryAccessLookupElements, REL_MEMORY_ACCESS_LOOKUP_SIZE);
 
 // (shift_amount[1], power_val[8]) — proves val_d = 2^shift_amount

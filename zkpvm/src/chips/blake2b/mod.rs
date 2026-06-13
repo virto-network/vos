@@ -1124,7 +1124,7 @@ impl BuiltInComponent for Blake2bChip {
         for i in 0..64usize {
             let word = i / 8;
             let byte = i % 8;
-            let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+            let mut tuple: Vec<E::F> = Vec::with_capacity(15);
             tuple.push(h_rd_b0[i].clone());
             tuple.push(h_rd_b1[i].clone());
             tuple.push(h_rd_b2[i].clone());
@@ -1134,6 +1134,7 @@ impl BuiltInComponent for Blake2bChip {
                 tuple.push(call_ts_e[tb].clone());
             }
             tuple.push(f_zero.clone());
+            tuple.push(f_zero.clone()); // is_closing = 0
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
                 init_gate_8b.clone().into(),
@@ -1144,7 +1145,7 @@ impl BuiltInComponent for Blake2bChip {
         for k in 0..128usize {
             let word = k / 8;
             let byte = k % 8;
-            let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+            let mut tuple: Vec<E::F> = Vec::with_capacity(15);
             tuple.push(m_rd_b0[k].clone());
             tuple.push(m_rd_b1[k].clone());
             tuple.push(m_rd_b2[k].clone());
@@ -1154,6 +1155,7 @@ impl BuiltInComponent for Blake2bChip {
                 tuple.push(call_ts_e[tb].clone());
             }
             tuple.push(f_zero.clone());
+            tuple.push(f_zero.clone()); // is_closing = 0
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
                 init_gate_8b.clone().into(),
@@ -1166,7 +1168,7 @@ impl BuiltInComponent for Blake2bChip {
         // Gate substitution (Phase I-blake2b-1): write_gate_8b ← OutputGateH (alias).
         let write_gate_8b = output_gate_h[0].clone();
         for i in 0..64usize {
-            let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+            let mut tuple: Vec<E::F> = Vec::with_capacity(15);
             tuple.push(h_wr_b0[i].clone());
             tuple.push(h_wr_b1[i].clone());
             tuple.push(h_wr_b2[i].clone());
@@ -1176,6 +1178,7 @@ impl BuiltInComponent for Blake2bChip {
                 tuple.push(call_ts_e[tb].clone());
             }
             tuple.push(f_one.clone());
+            tuple.push(f_zero.clone()); // is_closing = 0
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
                 write_gate_8b.clone().into(),
@@ -2182,9 +2185,9 @@ impl BuiltInProverComponent for Blake2bChip {
                 mem_lookup,
                 [is_real[0].clone(), is_first_pp[0].clone()],
                 |[r, f]| (r * f).into(),
-                14,
+                15,
                 move |v| {
-                    let mut t = Vec::with_capacity(14);
+                    let mut t = Vec::with_capacity(15);
                     t.push(addr0.at(v));
                     t.push(addr1.at(v));
                     t.push(addr2.at(v));
@@ -2193,7 +2196,8 @@ impl BuiltInProverComponent for Blake2bChip {
                     for ts_col in &ts_c {
                         t.push(ts_col.at(v));
                     }
-                    t.push(zero_val);
+                    t.push(zero_val); // is_write = 0
+                    t.push(zero_val); // is_closing = 0
                     t
                 },
             );
@@ -2213,9 +2217,9 @@ impl BuiltInProverComponent for Blake2bChip {
                 mem_lookup,
                 [is_real[0].clone(), is_first_pp[0].clone()],
                 |[r, f]| (r * f).into(),
-                14,
+                15,
                 move |v| {
-                    let mut t = Vec::with_capacity(14);
+                    let mut t = Vec::with_capacity(15);
                     t.push(addr0.at(v));
                     t.push(addr1.at(v));
                     t.push(addr2.at(v));
@@ -2224,7 +2228,8 @@ impl BuiltInProverComponent for Blake2bChip {
                     for ts_col in &ts_c {
                         t.push(ts_col.at(v));
                     }
-                    t.push(zero_val);
+                    t.push(zero_val); // is_write = 0
+                    t.push(zero_val); // is_closing = 0
                     t
                 },
             );
@@ -2245,9 +2250,9 @@ impl BuiltInProverComponent for Blake2bChip {
                 mem_lookup,
                 [is_real[0].clone(), is_last_pp[0].clone()],
                 |[r, l]| (r * l).into(),
-                14,
+                15,
                 move |v| {
-                    let mut t = Vec::with_capacity(14);
+                    let mut t = Vec::with_capacity(15);
                     t.push(addr0.at(v));
                     t.push(addr1.at(v));
                     t.push(addr2.at(v));
@@ -2256,7 +2261,8 @@ impl BuiltInProverComponent for Blake2bChip {
                     for ts_col in &ts_c {
                         t.push(ts_col.at(v));
                     }
-                    t.push(one_val);
+                    t.push(one_val); // is_write = 1
+                    t.push(PackedBaseField::broadcast(BaseField::from(0u32))); // is_closing = 0
                     t
                 },
             );

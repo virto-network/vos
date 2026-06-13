@@ -183,11 +183,12 @@ impl BuiltInComponent for RistrettoCombScalarBoundaryChip {
         // matches the consumer side in MemoryChip exactly.  is_write
         // is the constant 0 (scalar bytes are read).
         let zero = E::F::from(BaseField::from(0u32));
-        let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+        let mut tuple: Vec<E::F> = Vec::with_capacity(15);
         tuple.extend_from_slice(&addr);
         tuple.push(scalar_byte[0].clone());
         tuple.extend_from_slice(&ts);
-        tuple.push(zero);
+        tuple.push(zero.clone()); // is_write = 0
+        tuple.push(zero); // is_closing = 0
         eval.add_to_relation(RelationEntry::new(
             memory_lookup,
             is_real[0].clone().into(),
@@ -329,11 +330,12 @@ impl BuiltInProverComponent for RistrettoCombScalarBoundaryChip {
         );
 
         // ── Memory ledger producer (+is_real) ──
-        let mut tuple: Vec<FinalizedColumn<'_>> = Vec::with_capacity(14);
+        let mut tuple: Vec<FinalizedColumn<'_>> = Vec::with_capacity(15);
         tuple.extend(addr.iter().cloned());
         tuple.push(scalar_byte[0].clone());
         tuple.extend(ts.iter().cloned());
-        tuple.push(zero);
+        tuple.push(zero.clone()); // is_write = 0
+        tuple.push(zero); // is_closing = 0
         logup.add_to_relation_with(memory, [is_real[0].clone()], |[r]| r.into(), &tuple);
 
         logup.finalize()

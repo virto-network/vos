@@ -95,13 +95,14 @@ impl BuiltInComponent for RistrettoEcallChip {
         eval.add_constraint(is_real[0].clone() * (E::F::one() - is_real[0].clone()));
         eval.add_constraint(is_write[0].clone() * (E::F::one() - is_write[0].clone()));
 
-        // Producer tuple: (addr[4], value[1], ts[8], is_write[1]) — 14 elements,
-        // matches MemoryChip's consumer side exactly.
-        let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+        // Producer tuple: (addr[4], value[1], ts[8], is_write[1], is_closing[1]) —
+        // 15 elements, matches MemoryChip's consumer side exactly.
+        let mut tuple: Vec<E::F> = Vec::with_capacity(15);
         tuple.extend_from_slice(&addr);
         tuple.push(value[0].clone());
         tuple.extend_from_slice(&ts);
         tuple.push(is_write[0].clone());
+        tuple.push(E::F::from(BaseField::from(0u32))); // is_closing = 0
 
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -317,6 +318,10 @@ impl BuiltInProverComponent for RistrettoEcallChip {
         tuple.push(value[0].clone());
         tuple.extend_from_slice(&ts);
         tuple.push(is_write[0].clone());
+        // is_closing = 0
+        tuple.push(crate::trace::component::FinalizedColumn::Constant(
+            BaseField::from(0u32),
+        ));
 
         logup.add_to_relation_with(
             mem_lookup,

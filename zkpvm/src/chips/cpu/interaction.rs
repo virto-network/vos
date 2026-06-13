@@ -131,9 +131,9 @@ pub(super) fn generate_interaction_trace(
             mem_lookup,
             [mem_byte_active[byte_idx].clone()],
             |[active]| active.into(),
-            14, // tuple size: addr[4] + value[1] + timestamp[8] + is_write[1]
+            15, // tuple: addr[4] + value[1] + timestamp[8] + is_write[1] + is_closing[1]
             |vec_idx| {
-                let mut tuple = Vec::with_capacity(14);
+                let mut tuple = Vec::with_capacity(15);
                 let cy1 = c1.at(vec_idx);
                 let cy2 = c2.at(vec_idx);
                 let cy3 = c3.at(vec_idx);
@@ -150,6 +150,8 @@ pub(super) fn generate_interaction_trace(
                 }
                 // is_write = IsStoreDirect + IsStoreImmAny + IsStoreInd
                 tuple.push(is_sd_c.at(vec_idx) + is_sia_c.at(vec_idx) + is_si_c.at(vec_idx));
+                // is_closing = 0 (CpuChip never emits closing reads)
+                tuple.push(PackedBaseField::broadcast(BaseField::from(0u32)));
                 tuple
             },
         );

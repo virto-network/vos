@@ -89,6 +89,12 @@ pub enum Column {
     /// so a field-wrapped negative cannot alias a valid small positive.
     #[size = 24]
     OrderBits,
+    /// 1 iff this is a per-page closing read (the §2 boundary injection),
+    /// produced only by MemoryPageChip; 0 for every step / precompile /
+    /// ts=0-write entry.  Part of the logup tuple (so producers and consumer
+    /// agree) and, once MemoryPageChip lands, gates the group-end constraint.
+    #[size = 1]
+    IsClosing,
     // (B3 audit dropped RealReadH — read-consistency now uses an
     // unconditional `(1 - is_write) · (value - prev_value) = 0`
     // constraint.  Padding rows have value=0 and prev_value=0, so the
@@ -145,7 +151,11 @@ impl BuiltInComponent for MemoryChip {
         let value = crate::trace::trace_eval!(trace_eval, Column::Value);
         let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
         let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
+        let is_closing = crate::trace::trace_eval!(trace_eval, Column::IsClosing);
         let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
+
+        // IsClosing is a bound boolean (only MemoryPageChip ever sets it).
+        eval.add_constraint(is_closing[0].clone() * (is_closing[0].clone() - E::F::one()));
 
         // B3 audit: read consistency unconditional (was via
         // RealReadH = is_real · (1 - is_write)).  On padding rows
@@ -232,11 +242,12 @@ impl BuiltInComponent for MemoryChip {
         );
 
         // Consumer lookup (negative multiplicity)
-        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1])
+        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1])
         let mut tuple: Vec<E::F> = address.to_vec();
         tuple.push(value[0].clone());
         tuple.extend_from_slice(&timestamp);
         tuple.push(is_write[0].clone());
+        tuple.push(is_closing[0].clone());
 
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -880,12 +891,14 @@ impl BuiltInProverComponent for MemoryChip {
         let value = crate::trace::original_base_column!(component_trace, Column::Value);
         let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
         let is_write = crate::trace::original_base_column!(component_trace, Column::IsWrite);
+        let is_closing = crate::trace::original_base_column!(component_trace, Column::IsClosing);
 
-        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1])
+        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1])
         let mut tuple: Vec<_> = address.to_vec();
         tuple.push(value[0].clone());
         tuple.extend_from_slice(&timestamp);
         tuple.push(is_write[0].clone());
+        tuple.push(is_closing[0].clone());
 
         // Consumer side (negative multiplicity)
         logup.add_to_relation_with(

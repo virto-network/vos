@@ -133,14 +133,15 @@ impl BuiltInComponent for RistrettoCombCompressOutputChip {
         ));
 
         // ── MemoryAccess producer ──
-        // +IsReal × (Addr[0..4], Value, Ts[0..8], is_write=1).  The
-        // 14-limb tuple matches `MemoryChip`'s consumer side exactly.
+        // +IsReal × (Addr[0..4], Value, Ts[0..8], is_write=1, is_closing=0).
+        // The 15-limb tuple matches `MemoryChip`'s consumer side exactly.
         let one = E::F::one();
-        let mut tuple: Vec<E::F> = Vec::with_capacity(14);
+        let mut tuple: Vec<E::F> = Vec::with_capacity(15);
         tuple.extend_from_slice(&addr);
         tuple.push(value[0].clone());
         tuple.extend_from_slice(&ts);
         tuple.push(one);
+        tuple.push(E::F::from(BaseField::from(0u32))); // is_closing = 0
         eval.add_to_relation(RelationEntry::new(
             memory_lookup,
             is_real[0].clone().into(),
@@ -245,11 +246,12 @@ impl BuiltInProverComponent for RistrettoCombCompressOutputChip {
         );
 
         // MemoryAccess producer (+IsReal).
-        let mut tuple: Vec<FinalizedColumn<'_>> = Vec::with_capacity(14);
+        let mut tuple: Vec<FinalizedColumn<'_>> = Vec::with_capacity(15);
         tuple.extend(addr.iter().cloned());
         tuple.push(value[0].clone());
         tuple.extend(ts.iter().cloned());
         tuple.push(one_col);
+        tuple.push(FinalizedColumn::Constant(BaseField::from(0u32))); // is_closing = 0
         logup.add_to_relation_with(memory, [is_real[0].clone()], |[r]| r.into(), &tuple);
 
         logup.finalize()
