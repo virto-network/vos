@@ -122,6 +122,9 @@ pub mod segment;
 pub mod trace;
 
 #[cfg(feature = "prover")]
+pub mod page_merkle;
+
+#[cfg(feature = "prover")]
 pub mod side_note;
 
 #[cfg(feature = "prover")]
