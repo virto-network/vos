@@ -1621,6 +1621,414 @@ pub(super) fn add_compression_interaction_core<P: ScheduleColumns>(
 }
 
 #[cfg(feature = "prover")]
+pub(in crate::chips::blake2b) fn build_compression_rows(
+    calls: &[Blake2bCall],
+    mem_ops: &[crate::core::tracing::Blake2bMemOp],
+) -> Vec<GRow> {
+    let mut rows: Vec<GRow> = Vec::new();
+    for (call_idx, call) in calls.iter().enumerate() {
+        let mut v = [0u64; 16];
+        v[..8].copy_from_slice(&call.h);
+        v[8..].copy_from_slice(&IV);
+        v[12] ^= call.t as u64;
+        v[13] ^= (call.t >> 64) as u64;
+        if call.f {
+            v[14] = !v[14];
+        }
+
+        // Phase 8b ECALL-binding data for this compression, if a matching
+        // blake2b_mem_op was recorded by the tracer.
+        let mem_op = mem_ops.get(call_idx);
+        let h_ptr = mem_op.map(|o| o.h_ptr).unwrap_or(0).to_le_bytes();
+        let m_ptr = mem_op.map(|o| o.m_ptr).unwrap_or(0).to_le_bytes();
+        let call_ts_u = mem_op.map(|o| o.ts).unwrap_or(0);
+        let call_ts = call_ts_u.to_le_bytes();
+        let h_ptr_u32 = u32::from_le_bytes(h_ptr);
+        let m_ptr_u32 = u32::from_le_bytes(m_ptr);
+        let mut h_rd_addr = [0u8; 256];
+        for i in 0..64 {
+            let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
+            h_rd_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
+        }
+        let mut m_rd_addr = [0u8; 512];
+        for k in 0..128 {
+            let addr = m_ptr_u32.wrapping_add(k as u32).to_le_bytes();
+            m_rd_addr[k * 4..k * 4 + 4].copy_from_slice(&addr);
+        }
+        let mut h_wr_addr = [0u8; 256];
+        for i in 0..64 {
+            let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
+            h_wr_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
+        }
+
+        for round in 0..12 {
+            let s = &SIGMA[round];
+            for g_idx in 0..8 {
+                let [ai, bi, ci, di] = G_INDICES[g_idx];
+                let mx = call.m[s[2 * g_idx]];
+                let my = call.m[s[2 * g_idx + 1]];
+
+                let mut row = g_traced(
+                    &v, &call.m, &call.h, call.t, call.f, v[ai], v[bi], v[ci], v[di], mx, my,
+                );
+
+                v[ai] = u64::from_le_bytes(row.a_out);
+                v[bi] = u64::from_le_bytes(row.b_out);
+                v[ci] = u64::from_le_bytes(row.c_out);
+                v[di] = u64::from_le_bytes(row.d_out);
+
+                // Final G-call of this compression → populate Phase 2b
+                // output witnesses from the just-updated v.
+                if round == 11 && g_idx == 7 {
+                    fill_output_witnesses(&mut row, &v);
+                }
+
+                // Phase 8b ECALL-binding fields, constant across 96 rows.
+                row.h_ptr = h_ptr;
+                row.m_ptr = m_ptr;
+                row.call_ts = call_ts;
+                row.h_rd_addr = h_rd_addr;
+                row.m_rd_addr = m_rd_addr;
+                row.h_wr_addr = h_wr_addr;
+
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+#[cfg(feature = "prover")]
+pub(in crate::chips::blake2b) fn fill_compression_trace(
+    trace: &mut TraceBuilder<Column>,
+    side_note: &mut SideNote,
+    rows: &[GRow],
+) {
+    for (row_idx, r) in rows.iter().enumerate() {
+        trace.fill_columns_bytes(row_idx, &r.a_in, Column::AIn);
+        trace.fill_columns_bytes(row_idx, &r.b_in, Column::BIn);
+        trace.fill_columns_bytes(row_idx, &r.c_in, Column::CIn);
+        trace.fill_columns_bytes(row_idx, &r.d_in, Column::DIn);
+        trace.fill_columns_bytes(row_idx, &r.mx, Column::Mx);
+        trace.fill_columns_bytes(row_idx, &r.my, Column::My);
+        trace.fill_columns_bytes(row_idx, &r.a1, Column::A1);
+        trace.fill_columns_bytes(row_idx, &r.carry1, Column::Carry1);
+        trace.fill_columns_bytes(row_idx, &r.and1, Column::And1);
+        trace.fill_columns_bytes(row_idx, &r.c1, Column::C1);
+        trace.fill_columns_bytes(row_idx, &r.carry2, Column::Carry2);
+        trace.fill_columns_bytes(row_idx, &r.and2, Column::And2);
+        trace.fill_columns_bytes(row_idx, &r.a_out, Column::AOut);
+        trace.fill_columns_bytes(row_idx, &r.carry3, Column::Carry3);
+        trace.fill_columns_bytes(row_idx, &r.and3, Column::And3);
+        trace.fill_columns_bytes(row_idx, &r.c_out, Column::COut);
+        trace.fill_columns_bytes(row_idx, &r.carry4, Column::Carry4);
+        trace.fill_columns_bytes(row_idx, &r.and4, Column::And4);
+        trace.fill_columns_bytes(row_idx, &r.b_out, Column::BOut);
+        trace.fill_columns_bytes(row_idx, &r.rot63_carry, Column::Rot63Carry);
+        trace.fill_columns_bytes(row_idx, &r.and1_a_hi, Column::And1AHi);
+        trace.fill_columns_bytes(row_idx, &r.and1_b_hi, Column::And1BHi);
+        trace.fill_columns_bytes(row_idx, &r.and1_res_hi, Column::And1ResHi);
+        trace.fill_columns_bytes(row_idx, &r.and2_a_hi, Column::And2AHi);
+        trace.fill_columns_bytes(row_idx, &r.and2_b_hi, Column::And2BHi);
+        trace.fill_columns_bytes(row_idx, &r.and2_res_hi, Column::And2ResHi);
+        trace.fill_columns_bytes(row_idx, &r.and3_a_hi, Column::And3AHi);
+        trace.fill_columns_bytes(row_idx, &r.and3_b_hi, Column::And3BHi);
+        trace.fill_columns_bytes(row_idx, &r.and3_res_hi, Column::And3ResHi);
+        trace.fill_columns_bytes(row_idx, &r.and4_a_hi, Column::And4AHi);
+        trace.fill_columns_bytes(row_idx, &r.and4_b_hi, Column::And4BHi);
+        trace.fill_columns_bytes(row_idx, &r.and4_res_hi, Column::And4ResHi);
+        trace.fill_columns_bytes(row_idx, &r.d_out, Column::DOut);
+        const V_COLS: [Column; 16] = [
+            Column::V0,
+            Column::V1,
+            Column::V2,
+            Column::V3,
+            Column::V4,
+            Column::V5,
+            Column::V6,
+            Column::V7,
+            Column::V8,
+            Column::V9,
+            Column::V10,
+            Column::V11,
+            Column::V12,
+            Column::V13,
+            Column::V14,
+            Column::V15,
+        ];
+        for k in 0..16 {
+            trace.fill_columns_bytes(row_idx, &r.v[k], V_COLS[k]);
+        }
+        const M_COLS: [Column; 16] = [
+            Column::M0,
+            Column::M1,
+            Column::M2,
+            Column::M3,
+            Column::M4,
+            Column::M5,
+            Column::M6,
+            Column::M7,
+            Column::M8,
+            Column::M9,
+            Column::M10,
+            Column::M11,
+            Column::M12,
+            Column::M13,
+            Column::M14,
+            Column::M15,
+        ];
+        for k in 0..16 {
+            trace.fill_columns_bytes(row_idx, &r.m[k], M_COLS[k]);
+        }
+        // Compression-level inputs.
+        const H_COLS: [Column; 8] = [
+            Column::H0,
+            Column::H1,
+            Column::H2,
+            Column::H3,
+            Column::H4,
+            Column::H5,
+            Column::H6,
+            Column::H7,
+        ];
+        for k in 0..8 {
+            trace.fill_columns_bytes(row_idx, &r.h[k], H_COLS[k]);
+        }
+        trace.fill_columns_bytes(row_idx, &r.t, Column::T);
+        trace.fill_columns(row_idx, r.f, Column::F);
+        trace.fill_columns_bytes(row_idx, &r.t_hi, Column::THi);
+        trace.fill_columns_bytes(row_idx, &r.and_t_lo, Column::AndTLo);
+        trace.fill_columns_bytes(row_idx, &r.and_t_hi, Column::AndTHi);
+        trace.fill_columns_bytes(row_idx, &r.and_t_lo_hi, Column::AndTLoHi);
+        trace.fill_columns_bytes(row_idx, &r.and_t_hi_hi, Column::AndTHiHi);
+        // Phase 2b output-derivation witnesses (0 on non-last rows).
+        trace.fill_columns_bytes(row_idx, &r.output, Column::Output);
+        trace.fill_columns_bytes(row_idx, &r.h_hi, Column::HHi);
+        trace.fill_columns_bytes(row_idx, &r.v_after_hi, Column::VAfterHi);
+        trace.fill_columns_bytes(row_idx, &r.out_and1, Column::OutAnd1);
+        trace.fill_columns_bytes(row_idx, &r.out_and1_hi, Column::OutAnd1Hi);
+        trace.fill_columns_bytes(row_idx, &r.out_xor1_hi, Column::OutXor1Hi);
+        trace.fill_columns_bytes(row_idx, &r.out_and2, Column::OutAnd2);
+        trace.fill_columns_bytes(row_idx, &r.out_and2_hi, Column::OutAnd2Hi);
+        // Phase 8b ECALL-binding witnesses.
+        trace.fill_columns_bytes(row_idx, &r.h_ptr, Column::HPtr);
+        trace.fill_columns_bytes(row_idx, &r.m_ptr, Column::MPtr);
+        trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
+        // Split 4-byte-wide address arrays into per-byte slices.
+        {
+            let mut b0 = [0u8; 64];
+            let mut b1 = [0u8; 64];
+            let mut b2 = [0u8; 64];
+            let mut b3 = [0u8; 64];
+            for i in 0..64 {
+                b0[i] = r.h_rd_addr[i * 4];
+                b1[i] = r.h_rd_addr[i * 4 + 1];
+                b2[i] = r.h_rd_addr[i * 4 + 2];
+                b3[i] = r.h_rd_addr[i * 4 + 3];
+            }
+            trace.fill_columns_bytes(row_idx, &b0, Column::HRdAddrB0);
+            trace.fill_columns_bytes(row_idx, &b1, Column::HRdAddrB1);
+            trace.fill_columns_bytes(row_idx, &b2, Column::HRdAddrB2);
+            trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
+        }
+        {
+            let mut b0 = [0u8; 128];
+            let mut b1 = [0u8; 128];
+            let mut b2 = [0u8; 128];
+            let mut b3 = [0u8; 128];
+            for k in 0..128 {
+                b0[k] = r.m_rd_addr[k * 4];
+                b1[k] = r.m_rd_addr[k * 4 + 1];
+                b2[k] = r.m_rd_addr[k * 4 + 2];
+                b3[k] = r.m_rd_addr[k * 4 + 3];
+            }
+            trace.fill_columns_bytes(row_idx, &b0, Column::MRdAddrB0);
+            trace.fill_columns_bytes(row_idx, &b1, Column::MRdAddrB1);
+            trace.fill_columns_bytes(row_idx, &b2, Column::MRdAddrB2);
+            trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
+        }
+        {
+            let mut b0 = [0u8; 64];
+            let mut b1 = [0u8; 64];
+            let mut b2 = [0u8; 64];
+            let mut b3 = [0u8; 64];
+            for i in 0..64 {
+                b0[i] = r.h_wr_addr[i * 4];
+                b1[i] = r.h_wr_addr[i * 4 + 1];
+                b2[i] = r.h_wr_addr[i * 4 + 2];
+                b3[i] = r.h_wr_addr[i * 4 + 3];
+            }
+            trace.fill_columns_bytes(row_idx, &b0, Column::HWrAddrB0);
+            trace.fill_columns_bytes(row_idx, &b1, Column::HWrAddrB1);
+            trace.fill_columns_bytes(row_idx, &b2, Column::HWrAddrB2);
+            trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
+        }
+        trace.fill_columns(row_idx, true, Column::IsReal);
+
+        // Phase I-blake2b-2 carry-bound helpers.  Carries c ∈ {0,1,2}
+        // for Carry1/3 and ∈ {0,1} for Carry2/4/Rot63 — see DESIGN
+        // notes on `Column::Carry1XcM1` etc.  XcM1 = c·(c-1) is 0 for
+        // c ∈ {0,1} and 2 for c=2.  Full = XcM1·(c-2) is 0 for any
+        // valid c (so the runtime values are always 0; the helpers
+        // exist purely to flatten the constraint degree).  All math
+        // in i32 to dodge u8 underflow on `c - 1` when c=0.
+        let xcm1 = |c: u8| -> u8 {
+            let c = c as i32;
+            (c * (c - 1)) as u8
+        };
+        let full = |c: u8| -> u8 {
+            let c = c as i32;
+            (c * (c - 1) * (c - 2)) as u8
+        };
+        let mut c1_xcm1 = [0u8; 8];
+        let mut c1_full = [0u8; 8];
+        let mut c3_xcm1 = [0u8; 8];
+        let mut c3_full = [0u8; 8];
+        let mut c2_xcm1 = [0u8; 8];
+        let mut c4_xcm1 = [0u8; 8];
+        let mut rot_xcm1 = [0u8; 8];
+        for i in 0..8 {
+            c1_xcm1[i] = xcm1(r.carry1[i]);
+            c1_full[i] = full(r.carry1[i]);
+            c3_xcm1[i] = xcm1(r.carry3[i]);
+            c3_full[i] = full(r.carry3[i]);
+            c2_xcm1[i] = xcm1(r.carry2[i]);
+            c4_xcm1[i] = xcm1(r.carry4[i]);
+            rot_xcm1[i] = xcm1(r.rot63_carry[i]);
+        }
+        trace.fill_columns_bytes(row_idx, &c1_xcm1, Column::Carry1XcM1);
+        trace.fill_columns_bytes(row_idx, &c1_full, Column::Carry1Full);
+        trace.fill_columns_bytes(row_idx, &c3_xcm1, Column::Carry3XcM1);
+        trace.fill_columns_bytes(row_idx, &c3_full, Column::Carry3Full);
+        trace.fill_columns_bytes(row_idx, &c2_xcm1, Column::Carry2XcM1);
+        trace.fill_columns_bytes(row_idx, &c4_xcm1, Column::Carry4XcM1);
+        trace.fill_columns_bytes(row_idx, &rot_xcm1, Column::Rot63XcM1);
+
+        // Phase I-blake2b-3 F-bound helper.  F ∈ {0,1} ⇒ F·(F-1) = 0.
+        trace.fill_columns(row_idx, false, Column::FBoundH);
+
+        // Phase I-blake2b-4 input-match sum helpers.  Exactly one
+        // `IsGIdx[j_active] = 1` per row, so the sum equals the active
+        // V slot's byte — which is what `r.{a,b,c,d}_in` already hold.
+        trace.fill_columns_bytes(row_idx, &r.a_in, Column::InMatchA);
+        trace.fill_columns_bytes(row_idx, &r.b_in, Column::InMatchB);
+        trace.fill_columns_bytes(row_idx, &r.c_in, Column::InMatchC);
+        trace.fill_columns_bytes(row_idx, &r.d_in, Column::InMatchD);
+
+        // Phase I-blake2b-5 Mx / My slot-selection helpers.  Exactly
+        // one IsMxSlot[k_mx] = 1 per row (k_mx = SIGMA[round][2·g_idx]),
+        // so MxSlotSum[i] = M[k_mx][i] = mx[i].  Same shape for My.
+        trace.fill_columns_bytes(row_idx, &r.mx, Column::MxSlotSum);
+        trace.fill_columns_bytes(row_idx, &r.my, Column::MySlotSum);
+
+        // Phase I-blake2b-6 V_next sum helpers.  At row r with
+        // j_active = row_idx % 8, the sum collapses to v_after[k][i]
+        // where v_after equals r.v with G_INDICES[j_active] slots
+        // replaced by the G-call outputs.
+        let g_idx_active = row_idx % 8;
+        let [ai_v, bi_v, ci_v, di_v] = G_INDICES[g_idx_active];
+        let mut v_after_bytes = r.v;
+        v_after_bytes[ai_v] = r.a_out;
+        v_after_bytes[bi_v] = r.b_out;
+        v_after_bytes[ci_v] = r.c_out;
+        v_after_bytes[di_v] = r.d_out;
+        const V_NEXT_SUM_COLS: [Column; 16] = [
+            Column::VNextSum0,
+            Column::VNextSum1,
+            Column::VNextSum2,
+            Column::VNextSum3,
+            Column::VNextSum4,
+            Column::VNextSum5,
+            Column::VNextSum6,
+            Column::VNextSum7,
+            Column::VNextSum8,
+            Column::VNextSum9,
+            Column::VNextSum10,
+            Column::VNextSum11,
+            Column::VNextSum12,
+            Column::VNextSum13,
+            Column::VNextSum14,
+            Column::VNextSum15,
+        ];
+        for k in 0..16 {
+            trace.fill_columns_bytes(row_idx, &v_after_bytes[k], V_NEXT_SUM_COLS[k]);
+        }
+
+        // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
+        // the helper values reduce to the preprocessed selector value:
+        //   GateH        = 1 - is_last     (1 except at row 95)
+        //   InitGateH    = is_first        (1 only at row 0)
+        //   OutputGateH  = is_last         (1 only at row 95)
+        // Padding rows have IsReal=0, so all helpers are 0 there
+        // (default trace fill).  Constraints below tie these to the
+        // algebraic expressions at the AIR level.
+        let pos = row_idx % 96;
+        let is_first = pos == 0;
+        let is_last = pos == 95;
+        trace.fill_columns(row_idx, !is_last, Column::GateH);
+        trace.fill_columns(row_idx, is_first, Column::InitGateH);
+        trace.fill_columns(row_idx, is_last, Column::OutputGateH);
+
+        // Emit per-byte nibble counts.  add_bitwise_and increments both the
+        // hi-nibble and lo-nibble (a, b) cell in the 16×16 BitwiseLookup
+        // multiplicity table.
+        //
+        // And3 A-side is d1[k] = (d^a1 rotated right 32) = xor byte at
+        // position (k+4)%8.  We reconstruct the true byte value from the
+        // trace columns via the XOR identity d_in + a1 - 2·and1 so the
+        // multiplicity table stays in sync with the constraint-side
+        // derivation.  Same story for And4 A-side (b1).
+        for i in 0..8 {
+            side_note.add_bitwise_and(r.d_in[i], r.a1[i]);
+            side_note.add_bitwise_and(r.b_in[i], r.c1[i]);
+            let k3 = (i + 4) % 8;
+            let d1_i = r.d_in[k3] ^ r.a1[k3];
+            side_note.add_bitwise_and(d1_i, r.a_out[i]);
+            let k4 = (i + 3) % 8;
+            let b1_i = r.b_in[k4] ^ r.c1[k4];
+            side_note.add_bitwise_and(b1_i, r.c_out[i]);
+            // Initial-state XOR witnesses: IV[4]/IV[5] are constants, so the
+            // nibble multiplicity for their hi/lo nibbles is added here.
+            let iv4 = IV[4].to_le_bytes();
+            let iv5 = IV[5].to_le_bytes();
+            side_note.add_bitwise_and(iv4[i], r.t[i]);
+            side_note.add_bitwise_and(iv5[i], r.t[8 + i]);
+        }
+
+        // Range-check the inputs/outputs that are not covered by an AND
+        // lookup.  D_in/B_in/A1/C1/A_out/C_out/And{1-4} and the derived
+        // D1/B1 are all nibble-and-lookup-constrained (hi+lo*16 = byte).
+        // The remaining bytes need an explicit Range256 consumer:
+        //   A_in, C_in, Mx, My — add-chain operands read by the prover
+        //   B_out — rotation output derived from xor4
+        for i in 0..8 {
+            side_note.add_range256(r.a_in[i]);
+            side_note.add_range256(r.c_in[i]);
+            side_note.add_range256(r.mx[i]);
+            side_note.add_range256(r.my[i]);
+            side_note.add_range256(r.b_out[i]);
+        }
+
+        // Phase 2b AND counts — only at the last row of each compression.
+        // 64 And1 bytes (H & V_after[0..8]) + 64 And2 bytes (Xor1 &
+        // V_after[8..16]) = 128 nibble-AND multiplicity increments.
+        if row_idx % 96 == 95 {
+            let v_after = row_v_after(r);
+            for word in 0..8 {
+                for byte in 0..8 {
+                    let h_b = r.h[word][byte];
+                    let v1 = v_after[word][byte];
+                    let v2 = v_after[word + 8][byte];
+                    let xor1 = h_b ^ v1;
+                    side_note.add_bitwise_and(h_b, v1);
+                    side_note.add_bitwise_and(xor1, v2);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "prover")]
 impl BuiltInProverComponent for Blake2bChip {
     fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         // Schedule is deterministic per-row: r mod 8 picks g_idx, r mod 96
@@ -1701,405 +2109,11 @@ impl BuiltInProverComponent for Blake2bChip {
             let trace = TraceBuilder::<Column>::new(log_size);
             return trace.finalize_bit_reversed();
         }
-
-        let mut rows: Vec<GRow> = Vec::new();
-        for (call_idx, call) in side_note.blake2b_calls.iter().enumerate() {
-            let mut v = [0u64; 16];
-            v[..8].copy_from_slice(&call.h);
-            v[8..].copy_from_slice(&IV);
-            v[12] ^= call.t as u64;
-            v[13] ^= (call.t >> 64) as u64;
-            if call.f {
-                v[14] = !v[14];
-            }
-
-            // Phase 8b ECALL-binding data for this compression, if a matching
-            // blake2b_mem_op was recorded by the tracer.
-            let mem_op = side_note.blake2b_mem_ops.get(call_idx);
-            let h_ptr = mem_op.map(|o| o.h_ptr).unwrap_or(0).to_le_bytes();
-            let m_ptr = mem_op.map(|o| o.m_ptr).unwrap_or(0).to_le_bytes();
-            let call_ts_u = mem_op.map(|o| o.ts).unwrap_or(0);
-            let call_ts = call_ts_u.to_le_bytes();
-            let h_ptr_u32 = u32::from_le_bytes(h_ptr);
-            let m_ptr_u32 = u32::from_le_bytes(m_ptr);
-            let mut h_rd_addr = [0u8; 256];
-            for i in 0..64 {
-                let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
-                h_rd_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
-            }
-            let mut m_rd_addr = [0u8; 512];
-            for k in 0..128 {
-                let addr = m_ptr_u32.wrapping_add(k as u32).to_le_bytes();
-                m_rd_addr[k * 4..k * 4 + 4].copy_from_slice(&addr);
-            }
-            let mut h_wr_addr = [0u8; 256];
-            for i in 0..64 {
-                let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
-                h_wr_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
-            }
-
-            for round in 0..12 {
-                let s = &SIGMA[round];
-                for g_idx in 0..8 {
-                    let [ai, bi, ci, di] = G_INDICES[g_idx];
-                    let mx = call.m[s[2 * g_idx]];
-                    let my = call.m[s[2 * g_idx + 1]];
-
-                    let mut row = g_traced(
-                        &v, &call.m, &call.h, call.t, call.f, v[ai], v[bi], v[ci], v[di], mx, my,
-                    );
-
-                    v[ai] = u64::from_le_bytes(row.a_out);
-                    v[bi] = u64::from_le_bytes(row.b_out);
-                    v[ci] = u64::from_le_bytes(row.c_out);
-                    v[di] = u64::from_le_bytes(row.d_out);
-
-                    // Final G-call of this compression → populate Phase 2b
-                    // output witnesses from the just-updated v.
-                    if round == 11 && g_idx == 7 {
-                        fill_output_witnesses(&mut row, &v);
-                    }
-
-                    // Phase 8b ECALL-binding fields, constant across 96 rows.
-                    row.h_ptr = h_ptr;
-                    row.m_ptr = m_ptr;
-                    row.call_ts = call_ts;
-                    row.h_rd_addr = h_rd_addr;
-                    row.m_rd_addr = m_rd_addr;
-                    row.h_wr_addr = h_wr_addr;
-
-                    rows.push(row);
-                }
-            }
-        }
-
+        let rows = build_compression_rows(&side_note.blake2b_calls, &side_note.blake2b_mem_ops);
         let num_rows = rows.len();
         let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows);
         let mut trace = TraceBuilder::<Column>::new(log_size);
-
-        for (row_idx, r) in rows.iter().enumerate() {
-            trace.fill_columns_bytes(row_idx, &r.a_in, Column::AIn);
-            trace.fill_columns_bytes(row_idx, &r.b_in, Column::BIn);
-            trace.fill_columns_bytes(row_idx, &r.c_in, Column::CIn);
-            trace.fill_columns_bytes(row_idx, &r.d_in, Column::DIn);
-            trace.fill_columns_bytes(row_idx, &r.mx, Column::Mx);
-            trace.fill_columns_bytes(row_idx, &r.my, Column::My);
-            trace.fill_columns_bytes(row_idx, &r.a1, Column::A1);
-            trace.fill_columns_bytes(row_idx, &r.carry1, Column::Carry1);
-            trace.fill_columns_bytes(row_idx, &r.and1, Column::And1);
-            trace.fill_columns_bytes(row_idx, &r.c1, Column::C1);
-            trace.fill_columns_bytes(row_idx, &r.carry2, Column::Carry2);
-            trace.fill_columns_bytes(row_idx, &r.and2, Column::And2);
-            trace.fill_columns_bytes(row_idx, &r.a_out, Column::AOut);
-            trace.fill_columns_bytes(row_idx, &r.carry3, Column::Carry3);
-            trace.fill_columns_bytes(row_idx, &r.and3, Column::And3);
-            trace.fill_columns_bytes(row_idx, &r.c_out, Column::COut);
-            trace.fill_columns_bytes(row_idx, &r.carry4, Column::Carry4);
-            trace.fill_columns_bytes(row_idx, &r.and4, Column::And4);
-            trace.fill_columns_bytes(row_idx, &r.b_out, Column::BOut);
-            trace.fill_columns_bytes(row_idx, &r.rot63_carry, Column::Rot63Carry);
-            trace.fill_columns_bytes(row_idx, &r.and1_a_hi, Column::And1AHi);
-            trace.fill_columns_bytes(row_idx, &r.and1_b_hi, Column::And1BHi);
-            trace.fill_columns_bytes(row_idx, &r.and1_res_hi, Column::And1ResHi);
-            trace.fill_columns_bytes(row_idx, &r.and2_a_hi, Column::And2AHi);
-            trace.fill_columns_bytes(row_idx, &r.and2_b_hi, Column::And2BHi);
-            trace.fill_columns_bytes(row_idx, &r.and2_res_hi, Column::And2ResHi);
-            trace.fill_columns_bytes(row_idx, &r.and3_a_hi, Column::And3AHi);
-            trace.fill_columns_bytes(row_idx, &r.and3_b_hi, Column::And3BHi);
-            trace.fill_columns_bytes(row_idx, &r.and3_res_hi, Column::And3ResHi);
-            trace.fill_columns_bytes(row_idx, &r.and4_a_hi, Column::And4AHi);
-            trace.fill_columns_bytes(row_idx, &r.and4_b_hi, Column::And4BHi);
-            trace.fill_columns_bytes(row_idx, &r.and4_res_hi, Column::And4ResHi);
-            trace.fill_columns_bytes(row_idx, &r.d_out, Column::DOut);
-            const V_COLS: [Column; 16] = [
-                Column::V0,
-                Column::V1,
-                Column::V2,
-                Column::V3,
-                Column::V4,
-                Column::V5,
-                Column::V6,
-                Column::V7,
-                Column::V8,
-                Column::V9,
-                Column::V10,
-                Column::V11,
-                Column::V12,
-                Column::V13,
-                Column::V14,
-                Column::V15,
-            ];
-            for k in 0..16 {
-                trace.fill_columns_bytes(row_idx, &r.v[k], V_COLS[k]);
-            }
-            const M_COLS: [Column; 16] = [
-                Column::M0,
-                Column::M1,
-                Column::M2,
-                Column::M3,
-                Column::M4,
-                Column::M5,
-                Column::M6,
-                Column::M7,
-                Column::M8,
-                Column::M9,
-                Column::M10,
-                Column::M11,
-                Column::M12,
-                Column::M13,
-                Column::M14,
-                Column::M15,
-            ];
-            for k in 0..16 {
-                trace.fill_columns_bytes(row_idx, &r.m[k], M_COLS[k]);
-            }
-            // Compression-level inputs.
-            const H_COLS: [Column; 8] = [
-                Column::H0,
-                Column::H1,
-                Column::H2,
-                Column::H3,
-                Column::H4,
-                Column::H5,
-                Column::H6,
-                Column::H7,
-            ];
-            for k in 0..8 {
-                trace.fill_columns_bytes(row_idx, &r.h[k], H_COLS[k]);
-            }
-            trace.fill_columns_bytes(row_idx, &r.t, Column::T);
-            trace.fill_columns(row_idx, r.f, Column::F);
-            trace.fill_columns_bytes(row_idx, &r.t_hi, Column::THi);
-            trace.fill_columns_bytes(row_idx, &r.and_t_lo, Column::AndTLo);
-            trace.fill_columns_bytes(row_idx, &r.and_t_hi, Column::AndTHi);
-            trace.fill_columns_bytes(row_idx, &r.and_t_lo_hi, Column::AndTLoHi);
-            trace.fill_columns_bytes(row_idx, &r.and_t_hi_hi, Column::AndTHiHi);
-            // Phase 2b output-derivation witnesses (0 on non-last rows).
-            trace.fill_columns_bytes(row_idx, &r.output, Column::Output);
-            trace.fill_columns_bytes(row_idx, &r.h_hi, Column::HHi);
-            trace.fill_columns_bytes(row_idx, &r.v_after_hi, Column::VAfterHi);
-            trace.fill_columns_bytes(row_idx, &r.out_and1, Column::OutAnd1);
-            trace.fill_columns_bytes(row_idx, &r.out_and1_hi, Column::OutAnd1Hi);
-            trace.fill_columns_bytes(row_idx, &r.out_xor1_hi, Column::OutXor1Hi);
-            trace.fill_columns_bytes(row_idx, &r.out_and2, Column::OutAnd2);
-            trace.fill_columns_bytes(row_idx, &r.out_and2_hi, Column::OutAnd2Hi);
-            // Phase 8b ECALL-binding witnesses.
-            trace.fill_columns_bytes(row_idx, &r.h_ptr, Column::HPtr);
-            trace.fill_columns_bytes(row_idx, &r.m_ptr, Column::MPtr);
-            trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
-            // Split 4-byte-wide address arrays into per-byte slices.
-            {
-                let mut b0 = [0u8; 64];
-                let mut b1 = [0u8; 64];
-                let mut b2 = [0u8; 64];
-                let mut b3 = [0u8; 64];
-                for i in 0..64 {
-                    b0[i] = r.h_rd_addr[i * 4];
-                    b1[i] = r.h_rd_addr[i * 4 + 1];
-                    b2[i] = r.h_rd_addr[i * 4 + 2];
-                    b3[i] = r.h_rd_addr[i * 4 + 3];
-                }
-                trace.fill_columns_bytes(row_idx, &b0, Column::HRdAddrB0);
-                trace.fill_columns_bytes(row_idx, &b1, Column::HRdAddrB1);
-                trace.fill_columns_bytes(row_idx, &b2, Column::HRdAddrB2);
-                trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
-            }
-            {
-                let mut b0 = [0u8; 128];
-                let mut b1 = [0u8; 128];
-                let mut b2 = [0u8; 128];
-                let mut b3 = [0u8; 128];
-                for k in 0..128 {
-                    b0[k] = r.m_rd_addr[k * 4];
-                    b1[k] = r.m_rd_addr[k * 4 + 1];
-                    b2[k] = r.m_rd_addr[k * 4 + 2];
-                    b3[k] = r.m_rd_addr[k * 4 + 3];
-                }
-                trace.fill_columns_bytes(row_idx, &b0, Column::MRdAddrB0);
-                trace.fill_columns_bytes(row_idx, &b1, Column::MRdAddrB1);
-                trace.fill_columns_bytes(row_idx, &b2, Column::MRdAddrB2);
-                trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
-            }
-            {
-                let mut b0 = [0u8; 64];
-                let mut b1 = [0u8; 64];
-                let mut b2 = [0u8; 64];
-                let mut b3 = [0u8; 64];
-                for i in 0..64 {
-                    b0[i] = r.h_wr_addr[i * 4];
-                    b1[i] = r.h_wr_addr[i * 4 + 1];
-                    b2[i] = r.h_wr_addr[i * 4 + 2];
-                    b3[i] = r.h_wr_addr[i * 4 + 3];
-                }
-                trace.fill_columns_bytes(row_idx, &b0, Column::HWrAddrB0);
-                trace.fill_columns_bytes(row_idx, &b1, Column::HWrAddrB1);
-                trace.fill_columns_bytes(row_idx, &b2, Column::HWrAddrB2);
-                trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
-            }
-            trace.fill_columns(row_idx, true, Column::IsReal);
-
-            // Phase I-blake2b-2 carry-bound helpers.  Carries c ∈ {0,1,2}
-            // for Carry1/3 and ∈ {0,1} for Carry2/4/Rot63 — see DESIGN
-            // notes on `Column::Carry1XcM1` etc.  XcM1 = c·(c-1) is 0 for
-            // c ∈ {0,1} and 2 for c=2.  Full = XcM1·(c-2) is 0 for any
-            // valid c (so the runtime values are always 0; the helpers
-            // exist purely to flatten the constraint degree).  All math
-            // in i32 to dodge u8 underflow on `c - 1` when c=0.
-            let xcm1 = |c: u8| -> u8 {
-                let c = c as i32;
-                (c * (c - 1)) as u8
-            };
-            let full = |c: u8| -> u8 {
-                let c = c as i32;
-                (c * (c - 1) * (c - 2)) as u8
-            };
-            let mut c1_xcm1 = [0u8; 8];
-            let mut c1_full = [0u8; 8];
-            let mut c3_xcm1 = [0u8; 8];
-            let mut c3_full = [0u8; 8];
-            let mut c2_xcm1 = [0u8; 8];
-            let mut c4_xcm1 = [0u8; 8];
-            let mut rot_xcm1 = [0u8; 8];
-            for i in 0..8 {
-                c1_xcm1[i] = xcm1(r.carry1[i]);
-                c1_full[i] = full(r.carry1[i]);
-                c3_xcm1[i] = xcm1(r.carry3[i]);
-                c3_full[i] = full(r.carry3[i]);
-                c2_xcm1[i] = xcm1(r.carry2[i]);
-                c4_xcm1[i] = xcm1(r.carry4[i]);
-                rot_xcm1[i] = xcm1(r.rot63_carry[i]);
-            }
-            trace.fill_columns_bytes(row_idx, &c1_xcm1, Column::Carry1XcM1);
-            trace.fill_columns_bytes(row_idx, &c1_full, Column::Carry1Full);
-            trace.fill_columns_bytes(row_idx, &c3_xcm1, Column::Carry3XcM1);
-            trace.fill_columns_bytes(row_idx, &c3_full, Column::Carry3Full);
-            trace.fill_columns_bytes(row_idx, &c2_xcm1, Column::Carry2XcM1);
-            trace.fill_columns_bytes(row_idx, &c4_xcm1, Column::Carry4XcM1);
-            trace.fill_columns_bytes(row_idx, &rot_xcm1, Column::Rot63XcM1);
-
-            // Phase I-blake2b-3 F-bound helper.  F ∈ {0,1} ⇒ F·(F-1) = 0.
-            trace.fill_columns(row_idx, false, Column::FBoundH);
-
-            // Phase I-blake2b-4 input-match sum helpers.  Exactly one
-            // `IsGIdx[j_active] = 1` per row, so the sum equals the active
-            // V slot's byte — which is what `r.{a,b,c,d}_in` already hold.
-            trace.fill_columns_bytes(row_idx, &r.a_in, Column::InMatchA);
-            trace.fill_columns_bytes(row_idx, &r.b_in, Column::InMatchB);
-            trace.fill_columns_bytes(row_idx, &r.c_in, Column::InMatchC);
-            trace.fill_columns_bytes(row_idx, &r.d_in, Column::InMatchD);
-
-            // Phase I-blake2b-5 Mx / My slot-selection helpers.  Exactly
-            // one IsMxSlot[k_mx] = 1 per row (k_mx = SIGMA[round][2·g_idx]),
-            // so MxSlotSum[i] = M[k_mx][i] = mx[i].  Same shape for My.
-            trace.fill_columns_bytes(row_idx, &r.mx, Column::MxSlotSum);
-            trace.fill_columns_bytes(row_idx, &r.my, Column::MySlotSum);
-
-            // Phase I-blake2b-6 V_next sum helpers.  At row r with
-            // j_active = row_idx % 8, the sum collapses to v_after[k][i]
-            // where v_after equals r.v with G_INDICES[j_active] slots
-            // replaced by the G-call outputs.
-            let g_idx_active = row_idx % 8;
-            let [ai_v, bi_v, ci_v, di_v] = G_INDICES[g_idx_active];
-            let mut v_after_bytes = r.v;
-            v_after_bytes[ai_v] = r.a_out;
-            v_after_bytes[bi_v] = r.b_out;
-            v_after_bytes[ci_v] = r.c_out;
-            v_after_bytes[di_v] = r.d_out;
-            const V_NEXT_SUM_COLS: [Column; 16] = [
-                Column::VNextSum0,
-                Column::VNextSum1,
-                Column::VNextSum2,
-                Column::VNextSum3,
-                Column::VNextSum4,
-                Column::VNextSum5,
-                Column::VNextSum6,
-                Column::VNextSum7,
-                Column::VNextSum8,
-                Column::VNextSum9,
-                Column::VNextSum10,
-                Column::VNextSum11,
-                Column::VNextSum12,
-                Column::VNextSum13,
-                Column::VNextSum14,
-                Column::VNextSum15,
-            ];
-            for k in 0..16 {
-                trace.fill_columns_bytes(row_idx, &v_after_bytes[k], V_NEXT_SUM_COLS[k]);
-            }
-
-            // Phase I-blake2b-1 gate helpers.  Each row, IsReal=1 here, so
-            // the helper values reduce to the preprocessed selector value:
-            //   GateH        = 1 - is_last     (1 except at row 95)
-            //   InitGateH    = is_first        (1 only at row 0)
-            //   OutputGateH  = is_last         (1 only at row 95)
-            // Padding rows have IsReal=0, so all helpers are 0 there
-            // (default trace fill).  Constraints below tie these to the
-            // algebraic expressions at the AIR level.
-            let pos = row_idx % 96;
-            let is_first = pos == 0;
-            let is_last = pos == 95;
-            trace.fill_columns(row_idx, !is_last, Column::GateH);
-            trace.fill_columns(row_idx, is_first, Column::InitGateH);
-            trace.fill_columns(row_idx, is_last, Column::OutputGateH);
-
-            // Emit per-byte nibble counts.  add_bitwise_and increments both the
-            // hi-nibble and lo-nibble (a, b) cell in the 16×16 BitwiseLookup
-            // multiplicity table.
-            //
-            // And3 A-side is d1[k] = (d^a1 rotated right 32) = xor byte at
-            // position (k+4)%8.  We reconstruct the true byte value from the
-            // trace columns via the XOR identity d_in + a1 - 2·and1 so the
-            // multiplicity table stays in sync with the constraint-side
-            // derivation.  Same story for And4 A-side (b1).
-            for i in 0..8 {
-                side_note.add_bitwise_and(r.d_in[i], r.a1[i]);
-                side_note.add_bitwise_and(r.b_in[i], r.c1[i]);
-                let k3 = (i + 4) % 8;
-                let d1_i = r.d_in[k3] ^ r.a1[k3];
-                side_note.add_bitwise_and(d1_i, r.a_out[i]);
-                let k4 = (i + 3) % 8;
-                let b1_i = r.b_in[k4] ^ r.c1[k4];
-                side_note.add_bitwise_and(b1_i, r.c_out[i]);
-                // Initial-state XOR witnesses: IV[4]/IV[5] are constants, so the
-                // nibble multiplicity for their hi/lo nibbles is added here.
-                let iv4 = IV[4].to_le_bytes();
-                let iv5 = IV[5].to_le_bytes();
-                side_note.add_bitwise_and(iv4[i], r.t[i]);
-                side_note.add_bitwise_and(iv5[i], r.t[8 + i]);
-            }
-
-            // Range-check the inputs/outputs that are not covered by an AND
-            // lookup.  D_in/B_in/A1/C1/A_out/C_out/And{1-4} and the derived
-            // D1/B1 are all nibble-and-lookup-constrained (hi+lo*16 = byte).
-            // The remaining bytes need an explicit Range256 consumer:
-            //   A_in, C_in, Mx, My — add-chain operands read by the prover
-            //   B_out — rotation output derived from xor4
-            for i in 0..8 {
-                side_note.add_range256(r.a_in[i]);
-                side_note.add_range256(r.c_in[i]);
-                side_note.add_range256(r.mx[i]);
-                side_note.add_range256(r.my[i]);
-                side_note.add_range256(r.b_out[i]);
-            }
-
-            // Phase 2b AND counts — only at the last row of each compression.
-            // 64 And1 bytes (H & V_after[0..8]) + 64 And2 bytes (Xor1 &
-            // V_after[8..16]) = 128 nibble-AND multiplicity increments.
-            if row_idx % 96 == 95 {
-                let v_after = row_v_after(r);
-                for word in 0..8 {
-                    for byte in 0..8 {
-                        let h_b = r.h[word][byte];
-                        let v1 = v_after[word][byte];
-                        let v2 = v_after[word + 8][byte];
-                        let xor1 = h_b ^ v1;
-                        side_note.add_bitwise_and(h_b, v1);
-                        side_note.add_bitwise_and(xor1, v2);
-                    }
-                }
-            }
-        }
-
+        fill_compression_trace(&mut trace, side_note, &rows);
         trace.finalize_bit_reversed()
     }
 
