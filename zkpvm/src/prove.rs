@@ -243,8 +243,11 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
     let component_names = [
         "CpuChip",
         "Blake2b",
+        "Blake2bBoundary",
         "MemoryChip",
-        "MemBoundary",
+        "MemoryPage",
+        "MemoryMerkle",
+        "MemoryRootBoundary",
         "RegMemory",
         "RegMemBoundary",
         "RegMemClosing",
@@ -450,6 +453,16 @@ pub fn debug_claimed_sums_streaming(
 /// regions this dominates `prove`'s memory footprint.  Future work
 /// could swap this for an in-place Merkle commitment over the byte-
 /// level memory ledger (which we already build for the MemoryChip).
+/// Phase A: the entering / exit RAM page-Merkle roots for this segment, from
+/// the ingested page payload.  Falls back to the all-zero root only on the
+/// never-proved empty path (no payload).
+fn segment_memory_roots(side_note: &SideNote) -> ([u8; 32], [u8; 32]) {
+    match &side_note.memory_pages {
+        Some(p) => (p.multiproof.root_before, p.multiproof.root_after),
+        None => ([0u8; 32], [0u8; 32]),
+    }
+}
+
 fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
     // Replay ALL of this (segment's) writes — regular stores AND precompile
     // output writes (blake2b / ristretto / scalar-*, which live in
@@ -615,6 +628,14 @@ fn prove_impl_with_components_overridden(
         backfill_final_regs(side_note);
     }
 
+    // Phase A: build the memory-page Merkle boundary payload (listed pages,
+    // entering/exit images, multiproof, merge schedule, `merkle_blake2b_calls`)
+    // before trace generation — `MemoryChip` injects the per-page ledger entries
+    // from it, `MemoryPageChip` / `MemoryMerkleChip` / `MemoryRootBoundaryChip`
+    // produce the leaf/merge/root tuples, and `Blake2bBoundaryChip` proves the
+    // compressions.  Prove-path only; idempotent.
+    side_note.ingest_memory_pages();
+
     // Trace gen — split into a sequential *producer* pass and a parallel
     // *consumer* pass.  Producers (CpuChip, Blake2bChip) write per-row
     // multiplicities + entries into `side_note` while filling their main
@@ -745,6 +766,22 @@ fn prove_impl_with_components_overridden(
         prover_channel.mix_u64(initial_ts);
         prover_channel.mix_u64(final_pc);
         prover_channel.mix_u64(final_ts);
+
+        // Phase A (format v7): mix the entering / exit RAM Merkle roots right
+        // after final_ts and before the lookup-element draw, so the verifier's
+        // MemoryRootBoundary claimed-sum recomputation is sound (the roots are
+        // public inputs the lookup elements are drawn against).  Order: entering
+        // root, then exit root, each as 4 LE u64 words.
+        let (initial_root, final_root) = match &boundary_override {
+            Some((ini, fin)) => (ini.memory_root, fin.memory_root),
+            None => segment_memory_roots(side_note),
+        };
+        for chunk in initial_root.chunks_exact(8) {
+            prover_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        for chunk in final_root.chunks_exact(8) {
+            prover_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
     }
 
     let mut lookup_elements = AllLookupElements::default();
@@ -847,12 +884,17 @@ fn prove_impl_with_components_overridden(
     // because the constraint system already requires
     // `initial_regs == first.regs_before` (boundary chip producers
     // balance CpuChip first-step read consumers via the ledger).
+    // Phase A roots: entering root on initial_state, exit root on final_state —
+    // the same values mixed into the FS transcript above and bound by
+    // MemoryRootBoundaryChip, so the proof fields equal the committed columns.
+    let (root_before, root_after) = segment_memory_roots(side_note);
     let initial_state = if side_note.steps.is_empty() {
         SegmentState {
             pc: 0,
             timestamp: 0,
             registers: [0; 13],
             memory_commitment: [0; 32],
+            memory_root: root_before,
         }
     } else {
         let first = &side_note.steps[0];
@@ -861,6 +903,7 @@ fn prove_impl_with_components_overridden(
             timestamp: first.timestamp,
             registers: side_note.initial_regs,
             memory_commitment: *blake3::hash(&side_note.initial_memory).as_bytes(),
+            memory_root: root_before,
         }
     };
     let final_state = if side_note.steps.is_empty() {
@@ -869,6 +912,7 @@ fn prove_impl_with_components_overridden(
             timestamp: 0,
             registers: [0; 13],
             memory_commitment: [0; 32],
+            memory_root: root_after,
         }
     } else {
         let last = &side_note.steps[side_note.steps.len() - 1];
@@ -881,6 +925,7 @@ fn prove_impl_with_components_overridden(
             timestamp: last.timestamp + 1,
             registers: regs,
             memory_commitment: compute_final_memory_commitment(side_note),
+            memory_root: root_after,
         }
     };
 

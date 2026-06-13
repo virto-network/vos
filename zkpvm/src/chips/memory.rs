@@ -53,8 +53,10 @@ pub enum Column {
     #[size = 8]
     #[mask_next_row]
     Timestamp,
-    /// 1 = write, 0 = read
+    /// 1 = write, 0 = read.  `#[mask_next_row]` so the group-start constraint
+    /// can require the first row of every address group to be a `ts=0` write.
     #[size = 1]
+    #[mask_next_row]
     IsWrite,
     /// Previous byte value at same address.  `#[mask_next_row]` so a row can
     /// bind the *next* row's prev_value to this row's value (cross-row
@@ -92,9 +94,21 @@ pub enum Column {
     /// 1 iff this is a per-page closing read (the §2 boundary injection),
     /// produced only by MemoryPageChip; 0 for every step / precompile /
     /// ts=0-write entry.  Part of the logup tuple (so producers and consumer
-    /// agree) and, once MemoryPageChip lands, gates the group-end constraint.
+    /// agree) and gates the group-end constraint.
     #[size = 1]
     IsClosing,
+    /// BOUND helper: `IsGroupStart = is_real_next · (1 − IsSameAddrNext)` — 1
+    /// iff the NEXT ledger row begins a new address group (next row real and a
+    /// different address, OR the cyclic padding→row-0 wrap).  Flattens the
+    /// group-start gate to degree 1 so `IsGroupStart · ts_next` stays degree 2.
+    #[size = 1]
+    IsGroupStart,
+    /// BOUND helper: `IsGroupEnd = is_real · (1 − IsSameAddrNext)` — 1 iff THIS
+    /// real row ends its address group (next row is a different address or
+    /// padding).  The group-end constraint forces such a row to be a closing
+    /// read, so every accessed address lands in a listed page (design §2).
+    #[size = 1]
+    IsGroupEnd,
     // (B3 audit dropped RealReadH — read-consistency now uses an
     // unconditional `(1 - is_write) · (value - prev_value) = 0`
     // constraint.  Padding rows have value=0 and prev_value=0, so the
@@ -240,6 +254,42 @@ impl BuiltInComponent for MemoryChip {
         eval.add_constraint(
             is_same_addr[0].clone() * (prev_value_next[0].clone() - value[0].clone()),
         );
+
+        // ── Per-page boundary group constraints (design §2) ──────────────
+        // The per-page ledger injection (MemoryPageChip producers) puts a
+        // `ts=0` boundary write and a closing read on EVERY byte of every
+        // listed page.  After (addr, ts) sorting each address group is
+        // `[ts=0 write, real accesses…, closing read]`.  These constraints
+        // force that shape, so a prover cannot carry forged values across a
+        // boundary by omitting a touched page: every accessed address must be
+        // a listed page (else its group lacks the ts=0 write / closing read
+        // producer → group-start violation or logup imbalance).
+        let is_write_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsWrite);
+        let is_group_start = crate::trace::trace_eval!(trace_eval, Column::IsGroupStart);
+        let is_group_end = crate::trace::trace_eval!(trace_eval, Column::IsGroupEnd);
+        let is_real_next = E::F::one() - is_pad_next[0].clone();
+
+        // Helper definitions (degree 2) — keep the gates below degree 2.
+        //   IsGroupStart = is_real_next · (1 − IsSameAddrNext)
+        //   IsGroupEnd   = is_real     · (1 − IsSameAddrNext)
+        eval.add_constraint(
+            is_group_start[0].clone()
+                - is_real_next.clone() * (E::F::one() - is_same_addr[0].clone()),
+        );
+        eval.add_constraint(
+            is_group_end[0].clone() - is_real.clone() * (E::F::one() - is_same_addr[0].clone()),
+        );
+
+        // Group start: the next row (first of a new address group) is a ts=0
+        // write.  The guaranteed ≥1 padding row makes the cyclic last→row-0
+        // wrap a group start, so natural row 0 is covered.
+        for limb in &timestamp_next {
+            eval.add_constraint(is_group_start[0].clone() * limb.clone());
+        }
+        eval.add_constraint(is_group_start[0].clone() * (E::F::one() - is_write_next[0].clone()));
+
+        // Group end: the last real row of every address group is a closing read.
+        eval.add_constraint(is_group_end[0].clone() * (E::F::one() - is_closing[0].clone()));
 
         // Consumer lookup (negative multiplicity)
         // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1])
@@ -754,40 +804,34 @@ impl BuiltInProverComponent for MemoryChip {
             }
         }
 
-        // Inject initial memory writes at timestamp 0 for byte addresses read without prior write.
-        if !side_note.initial_memory.is_empty() {
-            // The boundary must reflect each address's TRUE first access (the
-            // one with the lowest timestamp), not collection order. `entries`
-            // is gathered steps-first then precompile mem_ops, so an address a
-            // precompile READS at a low ts but a later step WRITES at a higher
-            // ts would be misjudged "write-first" in collection order and
-            // wrongly skip its ts=0 boundary — leaving the precompile read to
-            // bottom out at prev_value 0 instead of the real initial byte.
-            let mut first_access: BTreeMap<u32, (u64, bool)> = BTreeMap::new();
-            for e in &entries {
-                first_access
-                    .entry(e.address)
-                    .and_modify(|fa| {
-                        if e.timestamp < fa.0 {
-                            *fa = (e.timestamp, e.is_write);
-                        }
-                    })
-                    .or_insert((e.timestamp, e.is_write));
-            }
-
-            let flat_mem = &side_note.initial_memory;
-            for (&addr, &(_, first_is_write)) in &first_access {
-                if first_is_write {
-                    continue;
+        // Inject the per-page Merkle boundary entries (design §2): for every
+        // byte of every listed page, a `ts=0` boundary write carrying the
+        // ENTERING image byte and a closing read carrying the EXIT image byte.
+        // Read-consistency + (addr, ts) sortedness then force the closing read
+        // to chain to the byte's last written value (or, for never-written
+        // bytes, to the ts=0 write so `after == before`), and the
+        // group-start/group-end constraints force every accessed address into a
+        // listed page.  Subsumes the old read-before-write ts=0 injection
+        // (MemoryBoundaryChip is deleted); the producers are MemoryPageChip.
+        let closing_ts = crate::chips::register_memory_closing::closing_ts_for(side_note);
+        if let Some(payload) = &side_note.memory_pages {
+            for page in &payload.pages {
+                let base = page.page_idx as u64 * crate::page_merkle::PAGE_SIZE as u64;
+                for i in 0..crate::page_merkle::PAGE_SIZE {
+                    let addr = (base + i as u64) as u32;
+                    entries.push(MemEntry {
+                        address: addr,
+                        value: page.before[i],
+                        timestamp: 0,
+                        is_write: true,
+                    });
+                    entries.push(MemEntry {
+                        address: addr,
+                        value: page.after[i],
+                        timestamp: closing_ts,
+                        is_write: false,
+                    });
                 }
-                let a = addr as usize;
-                let value = if a < flat_mem.len() { flat_mem[a] } else { 0 };
-                entries.push(MemEntry {
-                    address: addr,
-                    value,
-                    timestamp: 0,
-                    is_write: true,
-                });
             }
         }
 
@@ -835,6 +879,14 @@ impl BuiltInProverComponent for MemoryChip {
             trace.fill_columns(row, same_addr_next, Column::IsSameAddrNext);
             trace.fill_columns(row, false, Column::IsPadding);
 
+            // Closing read = the per-page exit-byte read at `closing_ts` (the
+            // unique max ts, one per byte).  No real step / precompile entry
+            // shares it (they sit at ts ≤ last_step.ts), so ts-equality is an
+            // exact closing-row marker; guard the empty-trace `closing_ts == 0`
+            // collision with the ts=0 boundary writes.
+            let is_closing = closing_ts != 0 && entry.timestamp == closing_ts;
+            trace.fill_columns(row, is_closing, Column::IsClosing);
+
             addrs[row] = entry.address;
             tss[row] = entry.timestamp;
             same_addr[row] = same_addr_next;
@@ -855,6 +907,16 @@ impl BuiltInProverComponent for MemoryChip {
             let adv_hi = both_real && !same_addr[row] && !hi_eq;
             trace.fill_columns(row, adv_lo, Column::AdvLoH);
             trace.fill_columns(row, adv_hi, Column::AdvHiH);
+
+            // Group boundary helpers: a row ends a group iff it is real and the
+            // next address differs (or next is padding); the NEXT row starts a
+            // group iff it is real and the address differs from this row (or
+            // this row is padding — the cyclic wrap covers natural row 0).
+            let next_real = next < num_entries;
+            let is_group_start = next_real && !same_addr[row];
+            let is_group_end = row < num_entries && !same_addr[row];
+            trace.fill_columns(row, is_group_start, Column::IsGroupStart);
+            trace.fill_columns(row, is_group_end, Column::IsGroupEnd);
 
             let order_delta: u64 = if same_addr[row] {
                 tss[next] - tss[row]

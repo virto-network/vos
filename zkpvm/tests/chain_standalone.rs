@@ -93,20 +93,36 @@ fn chain_standalone_accepts_honest_chain_and_rejects_forgeries() {
         "this test assumes uniform-size segments share a commitment"
     );
 
-    // Honest chain verifies with NO side notes — just proofs + the commitment.
-    verify_chain_standalone(&[proof1.clone(), proof2.clone()], commit1)
-        .expect("honest 2-segment chain must verify standalone");
+    // Phase A: the chain anchors on proofs[0]'s entering RAM root (the memory
+    // analogue of program identity).
+    let expected_root = proof1.initial_state.memory_root;
+
+    // Honest chain verifies with NO side notes — just proofs + the commitment +
+    // the entering root; it returns the chain's final root.
+    let final_root =
+        verify_chain_standalone(&[proof1.clone(), proof2.clone()], commit1, expected_root)
+            .expect("honest 2-segment chain must verify standalone");
+    assert_eq!(
+        final_root, proof2.final_state.memory_root,
+        "verify_chain_standalone returns the chain's final root"
+    );
 
     // Broken boundary continuity is rejected.
     let mut proof2_forged = proof2.clone();
     proof2_forged.initial_state.timestamp += 1;
-    verify_chain_standalone(&[proof1.clone(), proof2_forged], commit1)
+    verify_chain_standalone(&[proof1.clone(), proof2_forged], commit1, expected_root)
         .expect_err("a tampered segment boundary must be rejected");
 
     // A WRONG program commitment is rejected (program identity is pinned across
     // every segment — a from-scratch prover can't splice in a foreign program).
     let mut wrong = commit1;
     wrong.0[0] ^= 0xFF;
-    verify_chain_standalone(&[proof1, proof2], wrong)
+    verify_chain_standalone(&[proof1.clone(), proof2.clone()], wrong, expected_root)
         .expect_err("a wrong program commitment must be rejected");
+
+    // A WRONG expected entering root is rejected (the memory anchor).
+    let mut wrong_root = expected_root;
+    wrong_root[0] ^= 0xFF;
+    verify_chain_standalone(&[proof1, proof2], commit1, wrong_root)
+        .expect_err("a wrong expected_initial_root must be rejected");
 }

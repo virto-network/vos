@@ -644,10 +644,10 @@ fn harness_ristretto_comb_balance() {
 #[test]
 fn harness_ristretto_fixed_base_e2e_with_memory() {
     use zkpvm::chips::{
-        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
-        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
-        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
-        RistrettoFixedBaseConsumerChip,
+        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
+        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
+        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
     use zkpvm::side_note::RistrettoCombCall;
@@ -708,7 +708,10 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
 
     let components: &[&'static dyn MachineProverComponent] = &[
         &MemoryChip,
-        &MemoryBoundaryChip,
+        &MemoryPageChip,
+        &MemoryMerkleChip,
+        &MemoryRootBoundaryChip,
+        &Blake2bBoundaryChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -761,10 +764,10 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
 #[test]
 fn harness_ristretto_fixed_base_three_calls() {
     use zkpvm::chips::{
-        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
-        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
-        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
-        RistrettoFixedBaseConsumerChip,
+        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
+        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
+        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
     use zkpvm::side_note::RistrettoCombCall;
@@ -834,7 +837,10 @@ fn harness_ristretto_fixed_base_three_calls() {
 
     let components: &[&'static dyn MachineProverComponent] = &[
         &MemoryChip,
-        &MemoryBoundaryChip,
+        &MemoryPageChip,
+        &MemoryMerkleChip,
+        &MemoryRootBoundaryChip,
+        &Blake2bBoundaryChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -888,8 +894,9 @@ fn harness_ristretto_fixed_base_three_calls() {
 #[test]
 fn harness_ristretto_scalar_memory_mismatch_rejected() {
     use zkpvm::chips::{
-        MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip, RistrettoCombScalarBoundaryChip,
-        RistrettoCombTableChip, RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
+        Blake2bBoundaryChip, MemoryChip, MemoryMerkleChip, MemoryPageChip, MemoryRootBoundaryChip,
+        RistrettoCombAnchorChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
     use zkpvm::side_note::RistrettoCombCall;
@@ -947,7 +954,10 @@ fn harness_ristretto_scalar_memory_mismatch_rejected() {
 
     let components: &[&'static dyn MachineProverComponent] = &[
         &MemoryChip,
-        &MemoryBoundaryChip,
+        &MemoryPageChip,
+        &MemoryMerkleChip,
+        &MemoryRootBoundaryChip,
+        &Blake2bBoundaryChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -1062,10 +1072,10 @@ fn harness_ristretto_compress_isolated_empty() {
 #[test]
 fn harness_ristretto_output_mismatch_rejected() {
     use zkpvm::chips::{
-        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
-        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
-        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
-        RistrettoFixedBaseConsumerChip,
+        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
+        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
+        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
     use zkpvm::side_note::RistrettoCombCall;
@@ -1130,7 +1140,10 @@ fn harness_ristretto_output_mismatch_rejected() {
 
     let components: &[&'static dyn MachineProverComponent] = &[
         &MemoryChip,
-        &MemoryBoundaryChip,
+        &MemoryPageChip,
+        &MemoryMerkleChip,
+        &MemoryRootBoundaryChip,
+        &Blake2bBoundaryChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -1194,10 +1207,10 @@ fn harness_ristretto_output_mismatch_rejected() {
 #[test]
 fn harness_ristretto_identity_compress_e2e() {
     use zkpvm::chips::{
-        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
-        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
-        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
-        RistrettoFixedBaseConsumerChip,
+        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
+        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
+        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
     use zkpvm::side_note::RistrettoCombCall;
@@ -1252,7 +1265,10 @@ fn harness_ristretto_identity_compress_e2e() {
     };
     let components: &[&'static dyn MachineProverComponent] = &[
         &MemoryChip,
-        &MemoryBoundaryChip,
+        &MemoryPageChip,
+        &MemoryMerkleChip,
+        &MemoryRootBoundaryChip,
+        &Blake2bBoundaryChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,
@@ -1287,10 +1303,10 @@ fn harness_ristretto_identity_compress_e2e() {
 #[test]
 fn harness_ristretto_identity_output_forgery_rejected() {
     use zkpvm::chips::{
-        ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
-        RistrettoCombCompressChip, RistrettoCombCompressOutputChip,
-        RistrettoCombScalarBoundaryChip, RistrettoCombTableChip, RistrettoEcallChip,
-        RistrettoFixedBaseConsumerChip,
+        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
+        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
+        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
     };
     use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
     use zkpvm::side_note::RistrettoCombCall;
@@ -1338,7 +1354,10 @@ fn harness_ristretto_identity_output_forgery_rejected() {
     };
     let components: &[&'static dyn MachineProverComponent] = &[
         &MemoryChip,
-        &MemoryBoundaryChip,
+        &MemoryPageChip,
+        &MemoryMerkleChip,
+        &MemoryRootBoundaryChip,
+        &Blake2bBoundaryChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,

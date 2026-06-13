@@ -278,6 +278,13 @@ fn verify_with_options_explicit_components(
         verifier_channel.mix_u64(initial_state.timestamp);
         verifier_channel.mix_u64(final_state.pc as u64);
         verifier_channel.mix_u64(final_state.timestamp);
+        // Phase A (v7): entering then exit RAM Merkle root, 4 LE u64 each.
+        for chunk in initial_state.memory_root.chunks_exact(8) {
+            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        for chunk in final_state.memory_root.chunks_exact(8) {
+            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
     }
 
     let mut lookup_elements = AllLookupElements::default();

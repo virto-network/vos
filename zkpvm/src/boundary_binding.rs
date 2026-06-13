@@ -72,7 +72,8 @@ use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::Relation;
 
 use crate::lookups::{
-    AllLookupElements, ProgramExecutionLookupElements, RegisterMemoryLookupElements,
+    AllLookupElements, MerkleNodeLookupElements, ProgramExecutionLookupElements,
+    RegisterMemoryLookupElements,
 };
 use crate::proof::SegmentState;
 
@@ -83,6 +84,9 @@ pub struct BoundaryChipPositions {
     pub register_boundary: usize,
     pub register_closing: usize,
     pub program_boundary: usize,
+    /// Position of `MemoryRootBoundaryChip` (Phase A / format v7), which
+    /// consumes the single root `MerkleNode` `(0, 0, initial_root, final_root)`.
+    pub memory_root_boundary: usize,
 }
 
 /// Locate the three boundary-binding chips in a proof's active-component
@@ -99,6 +103,7 @@ pub fn boundary_positions_in_mask(mask: u32) -> Option<BoundaryChipPositions> {
         register_boundary: pos(crate::chip_idx::REGISTER_MEMORY_BOUNDARY)?,
         register_closing: pos(crate::chip_idx::REGISTER_MEMORY_CLOSING)?,
         program_boundary: pos(crate::chip_idx::PROGRAM_BOUNDARY)?,
+        memory_root_boundary: pos(crate::chip_idx::MEMORY_ROOT_BOUNDARY)?,
     })
 }
 
@@ -148,7 +153,42 @@ pub fn check_boundary_claimed_sums(
         return Err("boundary pc/timestamp do not match the committed program-boundary columns");
     }
 
+    let merkle_elements: &MerkleNodeLookupElements = lookup_elements.as_ref();
+    let expected = expected_memory_root_sum(
+        &initial.memory_root,
+        &final_state.memory_root,
+        merkle_elements,
+    )
+    .ok_or("degenerate lookup combination for boundary memory roots")?;
+    if claimed(positions.memory_root_boundary)? != expected {
+        return Err("boundary memory roots do not match the committed root-boundary columns");
+    }
+
     Ok(())
+}
+
+/// Expected claimed sum of `MemoryRootBoundaryChip`: it CONSUMES exactly one
+/// root `MerkleNode` tuple `(0, 0, initial_root[32], final_root[32])` with
+/// multiplicity −1, so the closed form is `−1/⟨z, tuple⟩`.  `initial_root` is
+/// `initial_state.memory_root` (the entering image root), `final_root` is
+/// `final_state.memory_root` (the exit image root).
+pub fn expected_memory_root_sum(
+    initial_root: &[u8; 32],
+    final_root: &[u8; 32],
+    elements: &MerkleNodeLookupElements,
+) -> Option<SecureField> {
+    let mut t: Vec<BaseField> = Vec::with_capacity(66);
+    t.push(BaseField::from(0u32)); // level
+    t.push(BaseField::from(0u32)); // index
+    for &b in initial_root {
+        t.push(BaseField::from(b as u32));
+    }
+    for &b in final_root {
+        t.push(BaseField::from(b as u32));
+    }
+    let combined =
+        <MerkleNodeLookupElements as Relation<BaseField, SecureField>>::combine(elements, &t);
+    inv_combined(combined).map(|inv| -inv)
 }
 
 /// Expected claimed sum of `ProgramBoundaryChip`: one produced

@@ -14,9 +14,10 @@
 
 use zkpvm::SideNote;
 use zkpvm::chips::{
-    ByteToBitsChip, MemoryBoundaryChip, MemoryChip, RistrettoCombAnchorChip,
-    RistrettoCombCompressChip, RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip,
-    RistrettoCombTableChip, RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
+    Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
+    MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
+    RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
+    RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
 };
 use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
 use zkpvm::harness::MachineProverComponent;
@@ -72,7 +73,10 @@ fn check_scalar(scalar_value: curve25519_dalek::scalar::Scalar) -> Result<(), St
 
     let components: &[&'static dyn MachineProverComponent] = &[
         &MemoryChip,
-        &MemoryBoundaryChip,
+        &MemoryPageChip,
+        &MemoryMerkleChip,
+        &MemoryRootBoundaryChip,
+        &Blake2bBoundaryChip,
         &RistrettoEcallChip,
         &RistrettoCombTableChip,
         &RistrettoCombAnchorChip,

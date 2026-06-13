@@ -90,7 +90,22 @@ use stwo::core::{
 ///       sound. AIR change: new columns + the wider register relation, so
 ///       the proof bytes differ (gate: `tests/ledger_readconsistency_gate.rs`).
 ///       `memory_commitment` is still outside the binding.
-pub const PROOF_FORMAT_VERSION: u32 = 6;
+///   7 — In-circuit RAM-image binding (Phase A; closes the memory-continuity
+///       gap `memory_commitment` left open). RAM is committed as a page-keyed
+///       blake2b Merkle tree; per segment the prover proves a boundary
+///       multiproof binding the entering page images to `initial_state
+///       .memory_root` and the exit images to `final_state.memory_root`
+///       (`Memory{Page,Merkle,RootBoundary}Chip` + `Blake2bBoundaryChip`), and
+///       the RAM ledger forces every accessed address into a listed page
+///       (per-page ts=0 boundary write + closing read, group-start/end
+///       constraints). The roots join the FS mix and `MemoryRootBoundaryChip`'s
+///       claimed sum is bound to them closed-form (`boundary_binding`). So
+///       `verify_chain_standalone(proofs, commitment, expected_initial_root)`
+///       becomes sound for memory continuity, not only tamper-evident. New
+///       components (`COUNT` 28 → 31, `MemoryBoundaryChip` deleted), a wider
+///       `MemoryAccess` tuple (`is_closing`), and a new `MerkleNode` relation,
+///       so the proof bytes differ.
+pub const PROOF_FORMAT_VERSION: u32 = 7;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.
@@ -100,6 +115,14 @@ pub struct SegmentState {
     pub timestamp: u64,
     pub registers: [u64; 13],
     pub memory_commitment: [u8; 32], // blake3(flat_mem); computed outside the circuit, unbound
+    /// Page-Merkle root of the RAM image AT THIS boundary (Phase A, format v7):
+    /// bound in-circuit by the boundary multiproof + `MemoryRootBoundaryChip`,
+    /// so cross-segment continuity (`final_state == next.initial_state`)
+    /// genuinely forces memory continuity.  A segment binds `initial_state
+    /// .memory_root` (entering image) and `final_state.memory_root` (exit
+    /// image); the two are equal across a chain boundary by struct-eq.
+    #[serde(default)]
+    pub memory_root: [u8; 32],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

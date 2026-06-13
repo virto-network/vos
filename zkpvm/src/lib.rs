@@ -121,7 +121,9 @@ pub mod proof;
 pub mod segment;
 pub mod trace;
 
-#[cfg(feature = "prover")]
+// The page-hash spec constants + tag chaining states are needed by the new
+// memory-Merkle chips' `add_constraints` (verifier-side, `no_std`); the
+// `SideNote` / segment / host-tree-building parts are `#[cfg(prover)]` within.
 pub mod page_merkle;
 
 #[cfg(feature = "prover")]
@@ -174,32 +176,35 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 pub mod chip_idx {
     pub const CPU: usize = 0;
     pub const BLAKE2B: usize = 1;
-    pub const MEMORY: usize = 2;
-    pub const MEMORY_BOUNDARY: usize = 3;
-    pub const REGISTER_MEMORY: usize = 4;
-    pub const REGISTER_MEMORY_BOUNDARY: usize = 5;
-    pub const REGISTER_MEMORY_CLOSING: usize = 6;
-    pub const PROGRAM_BOUNDARY: usize = 7;
-    pub const PROGRAM_MEMORY: usize = 8;
-    pub const JUMP_TABLE: usize = 9;
-    pub const RANGE_MULTIPLICITY_256: usize = 10;
-    pub const BITWISE_LOOKUP: usize = 11;
-    pub const POWER_OF_TWO: usize = 12;
-    pub const POPCOUNT: usize = 13;
-    pub const BITCOUNT: usize = 14;
-    pub const BYTE_TO_BITS: usize = 15;
-    pub const MUL: usize = 16;
-    pub const BITWISE: usize = 17;
-    pub const COMPARE: usize = 18;
-    pub const DIVREM: usize = 19;
-    pub const RISTRETTO: usize = 20;
-    pub const RISTRETTO_ECALL: usize = 21;
-    pub const RISTRETTO_COMB_TABLE: usize = 22;
-    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 23;
-    pub const RISTRETTO_COMB_ANCHOR: usize = 24;
-    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 25;
-    pub const RISTRETTO_COMB_COMPRESS: usize = 26;
-    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 27;
+    pub const BLAKE2B_BOUNDARY: usize = 2;
+    pub const MEMORY: usize = 3;
+    pub const MEMORY_PAGE: usize = 4;
+    pub const MEMORY_MERKLE: usize = 5;
+    pub const MEMORY_ROOT_BOUNDARY: usize = 6;
+    pub const REGISTER_MEMORY: usize = 7;
+    pub const REGISTER_MEMORY_BOUNDARY: usize = 8;
+    pub const REGISTER_MEMORY_CLOSING: usize = 9;
+    pub const PROGRAM_BOUNDARY: usize = 10;
+    pub const PROGRAM_MEMORY: usize = 11;
+    pub const JUMP_TABLE: usize = 12;
+    pub const RANGE_MULTIPLICITY_256: usize = 13;
+    pub const BITWISE_LOOKUP: usize = 14;
+    pub const POWER_OF_TWO: usize = 15;
+    pub const POPCOUNT: usize = 16;
+    pub const BITCOUNT: usize = 17;
+    pub const BYTE_TO_BITS: usize = 18;
+    pub const MUL: usize = 19;
+    pub const BITWISE: usize = 20;
+    pub const COMPARE: usize = 21;
+    pub const DIVREM: usize = 22;
+    pub const RISTRETTO: usize = 23;
+    pub const RISTRETTO_ECALL: usize = 24;
+    pub const RISTRETTO_COMB_TABLE: usize = 25;
+    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 26;
+    pub const RISTRETTO_COMB_ANCHOR: usize = 27;
+    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 28;
+    pub const RISTRETTO_COMB_COMPRESS: usize = 29;
+    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 30;
     /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
     /// assertion in `lib.rs` checks this against the actual array length.
     pub const COUNT: usize = RISTRETTO_COMB_COMPRESS_OUTPUT + 1;
@@ -209,8 +214,11 @@ pub mod chip_idx {
 const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::CpuChip,
     &chips::Blake2bChip, // OPTIONAL — gated by !side_note.blake2b_calls.is_empty()
+    &chips::Blake2bBoundaryChip, // Phase A — proves the memory-page Merkle blake2b compressions
     &chips::MemoryChip,
-    &chips::MemoryBoundaryChip,
+    &chips::MemoryPageChip, // Phase A — per-page boundary writes/reads + leaf hashes
+    &chips::MemoryMerkleChip, // Phase A — Merkle merge rows
+    &chips::MemoryRootBoundaryChip, // Phase A — root sink (bound to public roots)
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
     &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers
@@ -250,8 +258,11 @@ const _: () = {
 const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::CpuChip,
     &chips::Blake2bChip,
+    &chips::Blake2bBoundaryChip,
     &chips::MemoryChip,
-    &chips::MemoryBoundaryChip,
+    &chips::MemoryPageChip,
+    &chips::MemoryMerkleChip,
+    &chips::MemoryRootBoundaryChip,
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
     &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers

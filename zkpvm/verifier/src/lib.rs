@@ -201,6 +201,16 @@ pub fn verify_standalone_with_options(
             "component_mask popcount does not match num_components".to_string(),
         ));
     }
+    // Phase A (v7): reject `initial_state.timestamp < 1` per segment (the
+    // production consumer verifies single proofs here, not only the chain
+    // wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
+    // ts=0 per-page boundary writes from being forged as real steps, and (with
+    // the CpuChip ts-chain) lands every step ts in [initial_ts, final_ts).
+    if initial_state.timestamp < 1 {
+        return Err(VerificationError::InvalidStructure(
+            "initial_state.timestamp must be >= 1 (Phase A memory-boundary anchoring)".to_string(),
+        ));
+    }
 
     // Use the proof's own PCS config — `prove()` uses production_pcs_config
     // by default (blowup=16, 19 queries, 20-bit PoW), not PcsConfig::default(),
@@ -258,6 +268,15 @@ pub fn verify_standalone_with_options(
     verifier_channel.mix_u64(initial_state.timestamp);
     verifier_channel.mix_u64(final_state.pc as u64);
     verifier_channel.mix_u64(final_state.timestamp);
+    // Phase A (v7): entering then exit RAM Merkle root, 4 LE u64 each.
+    // Unconditional — the component_mask=0 reject above guarantees a
+    // production proof with the Phase-A chips.
+    for chunk in initial_state.memory_root.chunks_exact(8) {
+        verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    for chunk in final_state.memory_root.chunks_exact(8) {
+        verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
 
     let mut lookup_elements = AllLookupElements::default();
     draw_all_lookup_elements(&mut lookup_elements, verifier_channel, component_mask);
@@ -361,30 +380,49 @@ pub fn verify_standalone_with_options(
 pub fn verify_chain_standalone(
     proofs: &[Proof],
     preprocessed_commitment: CommitmentHash,
-) -> Result<(), VerificationError> {
+    expected_initial_root: [u8; 32],
+) -> Result<[u8; 32], VerificationError> {
     verify_chain_standalone_with_options(
         proofs,
         preprocessed_commitment,
+        expected_initial_root,
         DEFAULT_MAX_LOG_SIZE,
         &PcsPolicy::STANDARD,
     )
 }
 
 /// [`verify_chain_standalone`] with explicit `max_log_size` cap + `PcsPolicy`.
+///
+/// `expected_initial_root` is the page-Merkle root of the program's starting
+/// RAM image — the memory analogue of the program commitment — checked against
+/// `proofs[0].initial_state.memory_root`.  On success returns the chain's final
+/// root (`proofs.last().final_state.memory_root`) so the caller can pin the
+/// post-state.  Callers compute `expected_initial_root` host-side via
+/// `zkpvm::page_merkle::image_root` over the input image.
 pub fn verify_chain_standalone_with_options(
     proofs: &[Proof],
     preprocessed_commitment: CommitmentHash,
+    expected_initial_root: [u8; 32],
     max_log_size: u32,
     policy: &PcsPolicy,
-) -> Result<(), VerificationError> {
+) -> Result<[u8; 32], VerificationError> {
     if proofs.is_empty() {
         return Err(VerificationError::InvalidStructure(
             "verify_chain_standalone: empty proof chain".to_string(),
         ));
     }
+    // Phase A: anchor the chain's entering image — proofs[0] must start from the
+    // verifier-supplied expected root (the memory analogue of program identity).
+    if proofs[0].initial_state.memory_root != expected_initial_root {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone: proofs[0].initial_state.memory_root \
+             does not match expected_initial_root"
+                .to_string(),
+        ));
+    }
     // Boundary continuity: each segment's final state must equal the next
-    // segment's initial state.  Bound for registers/pc/timestamp;
-    // tamper-evident only for memory_commitment (see the doc above).
+    // segment's initial state.  Bound for registers/pc/timestamp (and, Phase A,
+    // the memory root) by each segment's in-circuit boundary binding.
     for window in proofs.windows(2) {
         if window[0].final_state != window[1].initial_state {
             return Err(VerificationError::InvalidStructure(format!(
@@ -403,5 +441,5 @@ pub fn verify_chain_standalone_with_options(
             policy,
         )?;
     }
-    Ok(())
+    Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }

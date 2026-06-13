@@ -183,6 +183,18 @@ stwo_constraint_framework::relation!(
     REL_BLAKE2B_COMPRESSION_LOOKUP_SIZE
 );
 
+// (level[1], index[1], hash_before[32], hash_after[32]) — one tuple per node
+// of the in-AIR memory-page Merkle trie (design §1).  `index` is a SINGLE M31
+// limb (2^DEPTH − 1 < p), NOT byte limbs — logup tuples match per-limb and a
+// byte-limbed index would break the degree-1 child doubling on merge rows.
+// MemoryPageChip PRODUCES one leaf tuple `(DEPTH, page_idx, leaf_before,
+// leaf_after)` per listed page; MemoryMerkleChip CONSUMES two children and
+// PRODUCES the parent per merge row; MemoryRootBoundaryChip CONSUMES exactly
+// one root tuple `(0, 0, initial_root, final_root)`.  Logup balance over this
+// relation is what enforces the trie schedule.
+const REL_MERKLE_NODE_LOOKUP_SIZE: usize = 1 + 1 + 32 + 32;
+stwo_constraint_framework::relation!(MerkleNodeLookupElements, REL_MERKLE_NODE_LOOKUP_SIZE);
+
 // R1e-pent: RistrettoChip register-file lookup.  Each row's `out`
 // bytes are PRODUCERS keyed by (row_index, byte_index, byte_value);
 // each row's `a` and `b` input bytes are CONSUMERS keyed by

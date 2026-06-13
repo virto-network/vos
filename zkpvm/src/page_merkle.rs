@@ -139,6 +139,7 @@ pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 
 /// `default_hashes()[ℓ]` = root of an all-zero (absent) subtree at level `ℓ`;
 /// `[DEPTH]` is the empty leaf, `[0]` is the empty-tree root.
+#[cfg(feature = "prover")]
 pub fn default_hashes() -> &'static [[u8; 32]; (DEPTH + 1) as usize] {
     use std::sync::OnceLock;
     static DEFAULTS: OnceLock<[[u8; 32]; (DEPTH + 1) as usize]> = OnceLock::new();
@@ -165,6 +166,7 @@ pub fn page_bytes(image: &[u8], page_idx: u32) -> [u8; PAGE_SIZE] {
 
 /// Map of page index → leaf hash for every page that differs from the default
 /// (i.e. has at least one non-zero byte) in a flat image.
+#[cfg(feature = "prover")]
 fn nondefault_leaves(image: &[u8]) -> BTreeMap<u32, [u8; 32]> {
     let mut leaves = BTreeMap::new();
     let n_pages = image.len().div_ceil(PAGE_SIZE) as u32;
@@ -180,6 +182,7 @@ fn nondefault_leaves(image: &[u8]) -> BTreeMap<u32, [u8; 32]> {
 /// Root of the subtree rooted at `(level, node_idx)` given the non-default
 /// leaf hashes of the whole tree.  Short-circuits all-default subtrees, so the
 /// cost is `O(non-default pages × DEPTH)`.
+#[cfg(feature = "prover")]
 fn subtree_root(level: u32, node_idx: u64, leaves: &BTreeMap<u32, [u8; 32]>) -> [u8; 32] {
     if level == DEPTH {
         return *leaves
@@ -202,11 +205,13 @@ fn subtree_root(level: u32, node_idx: u64, leaves: &BTreeMap<u32, [u8; 32]>) -> 
 
 /// Root of the page tree given a map of page index → leaf hash for every
 /// non-default page (absent pages use the empty-leaf default).
+#[cfg(feature = "prover")]
 pub fn sparse_root(leaves: &BTreeMap<u32, [u8; 32]>) -> [u8; 32] {
     subtree_root(0, 0, leaves)
 }
 
 /// Root of the full page tree for a flat image.
+#[cfg(feature = "prover")]
 pub fn image_root(image: &[u8]) -> [u8; 32] {
     sparse_root(&nondefault_leaves(image))
 }
@@ -263,6 +268,7 @@ pub struct MerkleMultiproof {
 /// indices the segment accessed, `entering`/`exiting` are the flat RAM images
 /// at the segment's start/end.  The witness siblings are computed from
 /// `entering` (untouched subtrees are identical in `exiting`).
+#[cfg(feature = "prover")]
 pub fn build_multiproof(
     entering: &[u8],
     exiting: &[u8],
@@ -279,6 +285,7 @@ pub fn build_multiproof(
 /// hash).  `before`/`after` must agree on every page outside `touched`
 /// (the soundness condition the in-circuit ledger enforces); witness siblings
 /// are taken from `before`.
+#[cfg(feature = "prover")]
 pub fn build_multiproof_from_leaves(
     before: &BTreeMap<u32, [u8; 32]>,
     after: &BTreeMap<u32, [u8; 32]>,
@@ -388,6 +395,7 @@ pub fn build_multiproof_from_leaves(
 }
 
 /// Insert every page overlapped by the byte range `[ptr, ptr + len)`.
+#[cfg(feature = "prover")]
 fn add_range(set: &mut BTreeSet<u32>, ptr: u32, len: u32) {
     if len == 0 {
         return;
@@ -405,6 +413,7 @@ fn add_range(set: &mut BTreeSet<u32>, ptr: u32, len: u32) {
 /// boundary injection and the boundary multiproof must agree on; it enumerates
 /// exactly the address sources that [`crate::chips::memory`]'s ledger builder
 /// consumes.
+#[cfg(feature = "prover")]
 pub fn touched_pages(side_note: &crate::side_note::SideNote) -> BTreeSet<u32> {
     let mut pages = BTreeSet::new();
     for step in &side_note.steps {
@@ -461,16 +470,38 @@ fn tagged_first_block(tag: &[u8]) -> [u8; BLOCK] {
     b
 }
 
+// Cheap (one compression) and `no_std`-friendly — recomputed rather than
+// cached, since the verifier-side `add_constraints` needs them without `std`.
 fn h_after_leaf_tag() -> [u64; 8] {
-    use std::sync::OnceLock;
-    static H: OnceLock<[u64; 8]> = OnceLock::new();
-    *H.get_or_init(|| h_after_tag(TAG_LEAF))
+    h_after_tag(TAG_LEAF)
 }
 
 fn h_after_node_tag() -> [u64; 8] {
-    use std::sync::OnceLock;
-    static H: OnceLock<[u64; 8]> = OnceLock::new();
-    *H.get_or_init(|| h_after_tag(TAG_NODE))
+    h_after_tag(TAG_NODE)
+}
+
+/// The 8-word blake2b chaining state after compressing the leaf tag's first
+/// block — the constant `h_in` of `MemoryPageChip`'s first (block-0) leaf
+/// compression.
+pub fn h_after_leaf_tag_words() -> [u64; 8] {
+    h_after_leaf_tag()
+}
+
+/// The 8-word chaining state after the node tag's first block — the constant
+/// `h_in` of every `MemoryMerkleChip` node compression.
+pub fn h_after_node_tag_words() -> [u64; 8] {
+    h_after_node_tag()
+}
+
+/// 64-byte little-endian serialization of an 8-word chaining state, matching
+/// the `Blake2bCompression` tuple's `h_in` / `h_out` byte layout (word-major,
+/// 8 LE bytes per word).
+pub fn state_to_bytes(h: &[u64; 8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for (i, w) in h.iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    out
 }
 
 /// First 32 bytes (4 LE words) of a chaining state — the truncated digest a
@@ -494,6 +525,38 @@ fn push_leaf_calls(page: &[u8; PAGE_SIZE], calls: &mut Vec<crate::chips::Blake2b
         calls.push(crate::chips::Blake2bCall { h, m, t, f });
         h = blake2b_compress(&h, &m, t, f);
     }
+}
+
+/// The 32 running chaining states a page's leaf hash passes through: index `k`
+/// is the output of compressing block `k` (so it is block `k+1`'s `h_in`, and
+/// `[31]`'s first 32 bytes are the leaf digest).  Each is 64 LE bytes — the
+/// `h_out` columns `MemoryPageChip` witnesses per block.
+pub fn leaf_block_outputs(page: &[u8; PAGE_SIZE]) -> Vec<[u8; 64]> {
+    let mut h = h_after_leaf_tag();
+    let mut outs = Vec::with_capacity(32);
+    for block in 0..32usize {
+        let m = block_words(&page[block * BLOCK..block * BLOCK + BLOCK]);
+        let t = (128 * (block as u128 + 2)) as u128;
+        let f = block == 31;
+        h = blake2b_compress(&h, &m, t, f);
+        outs.push(state_to_bytes(&h));
+    }
+    outs
+}
+
+/// Full 64-byte (8-word) output of the node compression of two child digests —
+/// the `h_out` columns `MemoryMerkleChip` witnesses (first 32 bytes = the node
+/// hash).
+pub fn node_full_output(left: &[u8; 32], right: &[u8; 32]) -> [u8; 64] {
+    let mut payload = [0u8; BLOCK];
+    payload[..32].copy_from_slice(left);
+    payload[32..64].copy_from_slice(right);
+    state_to_bytes(&blake2b_compress(
+        &h_after_node_tag(),
+        &block_words(&payload),
+        192,
+        true,
+    ))
 }
 
 /// The single compression that hashes two child digests into a node digest.
@@ -539,6 +602,7 @@ pub fn boundary_blake2b_calls(
 /// entering image (`side_note.initial_memory`, already threaded by
 /// `segment_side_note`) and the exit image (`replay_writes(.., None)`), and
 /// recompute both roots.
+#[cfg(feature = "prover")]
 pub fn segment_multiproof(side_note: &crate::side_note::SideNote) -> MerkleMultiproof {
     let mut touched = touched_pages(side_note);
     touched.insert(0); // never-empty page set (design §0)
@@ -546,7 +610,7 @@ pub fn segment_multiproof(side_note: &crate::side_note::SideNote) -> MerkleMulti
     build_multiproof(&side_note.initial_memory, &exiting, &touched)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prover"))]
 mod tests {
     use super::*;
 
