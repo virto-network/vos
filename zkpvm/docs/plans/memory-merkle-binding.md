@@ -370,8 +370,12 @@ expected_initial_root)`:
 
 ## Appendix A — Prerequisite step 0.2: ristretto mem-op ts binding
 
-**Status: NOT YET BUILT — needs its own deep-read + adversarial pass before
-implementation (the multiplicity accounting below is the open problem).**
+**SUPERSEDED by the dedicated design `ristretto-ts-binding.md` (v4 — converged,
+adversarially validated over two rounds, implementation-ready). The multiplicity
+problem this appendix flags is solved there (universal anchor + kind-aware
+tier-2). Read that doc to implement; the notes below are kept for context.**
+
+**Status: NOT YET BUILT — design done (see `ristretto-ts-binding.md`).**
 
 ### The gap (verified in code)
 
