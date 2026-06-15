@@ -470,6 +470,134 @@ fn measure_memory_boundary() {
     );
 }
 
+/// Canonical-shape sizing (federation wire-through W0): prove a few segments
+/// of the real transition and dump each one's `(num_components, component_mask,
+/// log_sizes, program_commitment)`. Confirms the load-bearing finding — that
+/// structurally-different segments produce DIFFERENT commitments (so a single
+/// published commitment can't pin a witness-varying chain without forcing a
+/// canonical per-chip log_size profile) — and prints the per-chip MAX log_size
+/// across the proved segments (the canonical profile the padding mode targets).
+/// Also the proving-time release re-measure (lever 0).
+///   DBG_MAX_SEGS=4 SEG_STEPS=200000 cargo test -p prover-extension --release \
+///     --test prove_transition measure_segment_log_sizes -- --ignored --nocapture
+#[test]
+#[ignore]
+fn measure_segment_log_sizes() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    assert!(total > 1_000_000, "trace only {total} steps — stale ELF?");
+    let seg_steps = std::env::var("SEG_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(SEG_STEPS);
+    let all_bounds = zkpvm::segment::segment_bounds(total, seg_steps);
+    let n_all = all_bounds.len();
+    // Map a step ts to its segment index.
+    let seg_of = |ts: u64| -> Option<usize> {
+        all_bounds
+            .iter()
+            .position(|&(a, b)| (ts as usize) >= a && (ts as usize) < b)
+    };
+    // Bucket the precompile ECALLs by segment (cheap — no proving) so we can
+    // sample the crypto-bearing segments (where the ristretto / blake2b chips
+    // peak), not just an even spread that misses the ~7 clustered scalar_mults.
+    let mut rist = std::collections::BTreeSet::new();
+    for op in &full.ristretto_mem_ops {
+        if let Some(s) = seg_of(op.ts) {
+            rist.insert(s);
+        }
+    }
+    let mut blake_per_seg = vec![0usize; n_all];
+    for op in &full.blake2b_mem_ops {
+        if let Some(s) = seg_of(op.ts) {
+            blake_per_seg[s] += 1;
+        }
+    }
+    let max_blake_seg = (0..n_all).max_by_key(|&i| blake_per_seg[i]).unwrap_or(0);
+    eprintln!(
+        "ristretto-bearing segments: {:?}; max-blake2b segment: #{max_blake_seg} ({} calls)",
+        rist, blake_per_seg[max_blake_seg]
+    );
+    // DBG_SEGS=0,25,... overrides; else auto-pick {0, last, max-blake2b,
+    // ristretto segments} — the archetypes whose union sets the canonical max.
+    let idxs: Vec<usize> = match std::env::var("DBG_SEGS").ok() {
+        Some(s) => s
+            .split(',')
+            .filter_map(|x| x.trim().parse::<usize>().ok())
+            .filter(|&i| i < n_all)
+            .collect(),
+        None => {
+            let mut set: std::collections::BTreeSet<usize> = rist.clone();
+            set.insert(0);
+            set.insert(n_all.saturating_sub(1));
+            set.insert(max_blake_seg);
+            set.into_iter().collect()
+        }
+    };
+    let bounds: Vec<(usize, usize)> = idxs.iter().map(|&i| all_bounds[i]).collect();
+    eprintln!(
+        "segmenting {total} steps → {n_all} segments of ≤ {seg_steps}; proving indices {idxs:?}"
+    );
+
+    // chip index -> max log_size seen across the proved segments.
+    let mut per_chip_max = [0u32; 32];
+    let mut commitments: Vec<String> = Vec::new();
+    for (i, &(a, b)) in bounds.iter().enumerate() {
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let t = std::time::Instant::now();
+        let proof = zkpvm::prove_mobile(&mut sn)
+            .unwrap_or_else(|e| panic!("prove segment {i} [{a},{b}): {e:?}"));
+        let elapsed = t.elapsed();
+        let commit = zkpvm::program_commitment_of_proof(&proof).to_string();
+        // Expand log_sizes (ordered by active components) onto chip indices via
+        // the component mask.
+        let mask = proof.component_mask;
+        let mut per_chip = [0u32; 32];
+        let mut j = 0usize;
+        for chip_i in 0..32 {
+            if (mask >> chip_i) & 1 == 1 {
+                let ls = proof.log_sizes[j];
+                per_chip[chip_i] = ls;
+                per_chip_max[chip_i] = per_chip_max[chip_i].max(ls);
+                j += 1;
+            }
+        }
+        eprintln!(
+            "seg #{} [{a},{b}) {} steps  ncomp={} mask={:#010x}  proved {:.1?}\n     log_sizes={:?}\n     commitment={commit}",
+            idxs[i],
+            b - a,
+            proof.num_components,
+            mask,
+            elapsed,
+            proof.log_sizes,
+        );
+        commitments.push(commit);
+    }
+
+    let distinct: std::collections::BTreeSet<&String> = commitments.iter().collect();
+    eprintln!();
+    eprintln!(
+        "DISTINCT COMMITMENTS across {} proved segments: {} (=> {})",
+        commitments.len(),
+        distinct.len(),
+        if distinct.len() > 1 {
+            "HETEROGENEOUS — one published commitment needs canonical-shape padding"
+        } else {
+            "uniform (these segments share a shape)"
+        }
+    );
+    eprintln!("PER-CHIP MAX log_size (canonical profile target): {per_chip_max:?}");
+}
+
 /// Segmentation end-to-end: prove the FULL kernel transition as a chain of
 /// bounded segments and `verify_chain` it. This is the general capability —
 /// any actor trace too large for a single proof becomes provable in bounded
