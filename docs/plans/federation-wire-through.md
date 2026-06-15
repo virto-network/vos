@@ -71,12 +71,44 @@ Receiving bank (verifier, FAST — sub-second):
 - **Policy = MOBILE** end-to-end (prove + verify) — the chain proofs are
   mobile-shape; the verifier must use the matching policy.
 
+## ⚠ FINDING (2026-06-15, while grounding W0): canonical-shape proving is a HARD prereq
+
+`prove` collects `log_sizes` per-component from `active_components` (ONLY active
+chips) at each chip's natural trace height (`src/prove.rs:532,672`);
+`verify_standalone` requires the whole `log_sizes` vector to match the published
+commitment (the preprocessed Merkle root). Therefore:
+
+- The transition's segments are HETEROGENEOUS (e.g. the scalar_mult segment has
+  RistrettoEcallChip huge; the SMT-recompute segment has it absent) → different
+  active sets + different per-chip heights → **different `log_sizes` → different
+  commitments**, and the shapes are **witness-dependent** (different vouchers
+  trace differently).
+- So one shared commitment is NOT obtainable by "padding the last segment"
+  (`chain_standalone.rs` only works because both tiny segments hit the
+  `LOG_N_LANES` floor), and per-segment commitments shipped with the voucher are
+  NOT verifiable (the verifier can't confirm an opaque root is "voucher-check at
+  shape X", and shapes vary per voucher).
+- The only sound, witness-independent way to publish ONE commitment that
+  verifies every voucher's chain is **canonical-shape proving**: force every
+  chip in every segment to a fixed per-chip `log_size` (worst-case maxima, all
+  components present). This is `program_id.rs`'s flagged future-work, and it is
+  a PREREQUISITE for the trustless-chain federation, not optional.
+
+W0 is therefore a sub-project, not a re-pin. Open design + decision needed
+before W1-W4.
+
 ## Steps
 
-- **W0 — uniform sizing + commitment.** Determine whether `prove`/`prove_mobile`
-  can force a `min_log_size`; if not, add it (pad the trace). Pick the segment
-  size. Prove one uniform segment, capture the v8 commitment, re-pin
-  `VOUCHER_CHECK_COMMITMENT`, add a drift-guard test.
+- **W0 — CANONICAL-SHAPE PROVING (was: re-pin).** Define a canonical per-chip
+  `log_sizes` profile (each chip's worst-case height for a bounded segment, all
+  31 components present even if their main trace is empty). Add a prove mode
+  that pads each chip's trace to its canonical `log_size` so the proof's
+  `log_sizes` == the canonical profile regardless of segment content/witness →
+  one stable commitment. Validate: two structurally-different real segments now
+  produce the SAME commitment. Then prove one canonical segment, re-pin
+  `VOUCHER_CHECK_COMMITMENT`, add a drift-guard test. (Soundness: padding rows
+  are `is_real=0`, inert — but confirm no chip's constraints break at a forced
+  larger log_size, and that an always-present-but-empty chip is sound.)
 - **W1 — prover extension `prove_chain` + `verify_chain`.** New `#[msg]`s:
   `prove_chain(program_id, witness) -> Vec<u8>` (bincode `ChainProof`),
   `verify_chain(program_commitment, chain_hash, public_bytes, return_bytes,
