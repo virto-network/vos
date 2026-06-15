@@ -53,6 +53,10 @@ pub struct ScalarBinopRecord {
 
 #[derive(Clone, Debug)]
 pub struct ScalarBinopMemOp {
+    /// ECALL id (113 = SCALAR_MUL_MOD_L, 114 = SCALAR_ADD_MOD_L).  Carried so
+    /// RistrettoEcallChip can emit the matching RELATION-A `id` limb (the two
+    /// share an identical memory layout but CpuChip produces a per-imm id).
+    pub op_id: u32,
     pub a_ptr: u32,
     pub b_ptr: u32,
     pub output_ptr: u32,
@@ -569,6 +573,7 @@ impl TracingPvm {
             output: out_bytes,
         });
         self.scalar_binop_mem_ops.push(ScalarBinopMemOp {
+            op_id,
             a_ptr,
             b_ptr,
             output_ptr,

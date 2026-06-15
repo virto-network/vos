@@ -7,7 +7,10 @@
 //! derivation here keeps them in sync.
 
 use super::classify::{classify_opcode, uses_immediate};
-use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
+use crate::core::ecall::{
+    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
+    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+};
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 
@@ -99,10 +102,24 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     // `map_register`.  CpuChip's `ECALL_REG_IDXS` (in `mod.rs` and
     // `interaction.rs`) emits register-file producers at [10, 7, 8, 9]
     // — matching this ledger consumer per blake2b ECALL step.
-    let is_blake_ecall = matches!(
+    // ECALL register-read ledger consumers (Phase 9e / Phase A prereq 0.2).
+    // These must match the producers CpuChip emits gated by the matching
+    // Is*Ecall column, otherwise the register-memory logup balance breaks.
+    //   blake2b: φ[7,8,9,10] (h_ptr/m_ptr/t_low/f_flag).
+    //   ristretto scalar_mult/point_add/scalar_binop: φ[7,8,9].
+    //   ristretto reduce_wide (112): φ[7,8] only.
+    let is_ecall = matches!(
         step.opcode,
         crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
-    ) && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
+    );
+    let imm = step.imm;
+    let is_blake_ecall = is_ecall && imm == ECALL_BLAKE2B_COMPRESS as u64;
+    let is_ristretto_reduce = is_ecall && imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64;
+    let is_ristretto_three = is_ecall
+        && (imm == ECALL_RISTRETTO_SCALAR_MULT as u64
+            || imm == ECALL_RISTRETTO_POINT_ADD as u64
+            || imm == ECALL_SCALAR_MUL_MOD_L as u64
+            || imm == ECALL_SCALAR_ADD_MOD_L as u64);
     let ecall_reads = if is_blake_ecall {
         vec![
             (7u8, step.regs_before[7]),
@@ -110,6 +127,14 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
             (9u8, step.regs_before[9]),
             (10u8, step.regs_before[10]),
         ]
+    } else if is_ristretto_three {
+        vec![
+            (7u8, step.regs_before[7]),
+            (8u8, step.regs_before[8]),
+            (9u8, step.regs_before[9]),
+        ]
+    } else if is_ristretto_reduce {
+        vec![(7u8, step.regs_before[7]), (8u8, step.regs_before[8])]
     } else {
         Vec::new()
     };

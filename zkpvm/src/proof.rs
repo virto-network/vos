@@ -105,7 +105,21 @@ use stwo::core::{
 ///       components (`COUNT` 28 → 31, `MemoryBoundaryChip` deleted), a wider
 ///       `MemoryAccess` tuple (`is_closing`), and a new `MerkleNode` relation,
 ///       so the proof bytes differ.
-pub const PROOF_FORMAT_VERSION: u32 = 7;
+///   8 — Ristretto memory-op `ts` binding (Phase A prereq 0.2; closes the
+///       money-path ts-forgery gap where the three ristretto memory producers
+///       set `ts` as a free witness). CpuChip gains five `Is{110..114}Ecall`
+///       gates that emit a `RistrettoCall` (RELATION A) producer + register
+///       reads (φ[7,8,9]) per ristretto ECALL step; RistrettoEcallChip moves
+///       to a uniform 96-row preprocessed period that consumes RELATION A at a
+///       preprocessed-pinned `InitGate` (so its block `ts` == the chained CpuChip
+///       step ts ∈ [initial_ts, final_ts), excluding 0 and `closing_ts`) and
+///       re-emits the anchored ts to the two comb chips via `RistrettoFixedScalarTs`
+///       / `RistrettoFixedOutTs` (Tier-2); the comb chips consume those and add
+///       intra-call ts/ptr equality + per-byte authenticated `Addr`. Three new
+///       relations, a wider CpuChip, and restructured ristretto chips — no new
+///       CHIPS (`COUNT` unchanged at 31) — so the proof bytes differ and older
+///       verifiers must reject.
+pub const PROOF_FORMAT_VERSION: u32 = 8;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

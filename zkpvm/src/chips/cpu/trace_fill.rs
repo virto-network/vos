@@ -16,7 +16,10 @@
 
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 
-use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
+use crate::core::ecall::{
+    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
+    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+};
 use crate::core::step::WORD_SIZE;
 use crate::side_note::SideNote;
 use crate::trace::builder::{FinalizedTrace, TraceBuilder};
@@ -1253,6 +1256,38 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
         ) && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
         trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
+        // Ristretto ECALL gates (Phase A prereq 0.2): one boolean per id.
+        // Same imm-match shape as IsBlakeEcall; the operand pointers reuse the
+        // Phi10/Phi11/Phi12 slots (= regs_before[7,8,9]) filled below.
+        let is_ecall = matches!(
+            step.opcode,
+            crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64,
+            Column::Is110Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_RISTRETTO_POINT_ADD as u64,
+            Column::Is111Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64,
+            Column::Is112Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_SCALAR_MUL_MOD_L as u64,
+            Column::Is113Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_SCALAR_ADD_MOD_L as u64,
+            Column::Is114Ecall,
+        );
         // Phi10 slot ← h_ptr (a0 = x10 = PVM φ[7]).
         trace.fill_columns(row, step.regs_before[7], Column::Phi10);
         // Phi11 slot ← m_ptr (a1 = x11 = PVM φ[8]).

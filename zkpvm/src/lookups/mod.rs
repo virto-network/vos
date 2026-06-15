@@ -20,10 +20,12 @@ pub use self::{
         JumpTableLookupElements, MemoryAccessLookupElements, MerkleNodeLookupElements,
         MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, ProgramMemoryLookupElements, RegisterMemoryLookupElements,
-        RistrettoCombCompressOutputLookupElements, RistrettoCombCompressRegFileLookupElements,
+        RistrettoCallLookupElements, RistrettoCombCompressOutputLookupElements,
+        RistrettoCombCompressRegFileLookupElements,
         RistrettoCombConsumerRegisterFileLookupElements, RistrettoCombCoordBoundaryLookupElements,
         RistrettoCombFinalAccLookupElements, RistrettoCombLookupElements,
-        RistrettoCombScalarBoundaryLookupElements, RistrettoRegisterFileLookupElements,
+        RistrettoCombScalarBoundaryLookupElements, RistrettoFixedOutTsLookupElements,
+        RistrettoFixedScalarTsLookupElements, RistrettoRegisterFileLookupElements,
     },
 };
 
@@ -56,6 +58,9 @@ macros::register_relation! {
         RistrettoCombCompressRegFileLookupElements,
         RistrettoCombCompressOutputLookupElements,
         RistrettoCombFinalAccLookupElements,
+        RistrettoCallLookupElements,
+        RistrettoFixedScalarTsLookupElements,
+        RistrettoFixedOutTsLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

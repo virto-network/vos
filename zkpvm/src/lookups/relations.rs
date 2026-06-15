@@ -374,3 +374,55 @@ stwo_constraint_framework::relation!(
     RistrettoCombFinalAccLookupElements,
     REL_RISTRETTO_COMB_FINAL_ACC_SIZE
 );
+
+// Phase A prereq 0.2 (ristretto ts-binding): RELATION A — ties every
+// ristretto-family ECALL step to the RistrettoEcallChip block that produces
+// its memory tuples, so the block's `ts` is the genuine ECALL-step ts.
+//
+// Tuple: (id[1], ptr0[4], ptr1[4], ptr2[4], ts[8]) — 21 limbs.
+//
+// `id` ∈ {110,111,112,113,114} disambiguates the call kind (one relation +
+// an id limb is sound and simpler than five disjoint relations — a 111-block
+// consumer cannot satisfy a 110-step producer).  `ptr0/ptr1/ptr2` are the
+// base pointers of the three 32-byte sub-blocks IN TRACE-LAYOUT ORDER
+// (ByteIdx 0-31 / 32-63 / 64-95 of the 96-row RistrettoEcallChip block), so
+// the chip's per-byte Addr authentication is id-agnostic; CpuChip fills the
+// slots per id from the register snapshots φ[7,8,9].  `ts` is the chained
+// CpuChip step Timestamp.
+//
+// PRODUCER (CpuChip, +Is{id}Ecall): one per ristretto ECALL step.
+// CONSUMER (RistrettoEcallChip, -InitGate): one per non-empty 96-row block
+// (the point reads at ByteIdx 0 are universal across fixed/variable base, so
+// every call has a real ByteIdx-0 row).
+const REL_RISTRETTO_CALL_LOOKUP_SIZE: usize = 1 + 4 + 4 + 4 + TS_SIZE; // 21
+stwo_constraint_framework::relation!(RistrettoCallLookupElements, REL_RISTRETTO_CALL_LOOKUP_SIZE);
+
+// Phase A prereq 0.2: Tier-2 scalar-ptr binding for FIXED-BASE scalar_mult.
+// RistrettoEcallChip (which sees `op.kind`) re-emits the already-anchored
+// call ts keyed on the authenticated scalar pointer; RistrettoCombScalarBoundaryChip
+// consumes it, forcing its 32-row block's `Ts` == the anchored ECALL ts.
+//
+// Tuple: (scalar_ptr[4], ts[8]) — 12 limbs.  Distinct type from the output
+// binding below so the two comb consumers can't collide on a shared key.
+//
+// PRODUCER (RistrettoEcallChip, +InitGate·IsFixedBase).
+// CONSUMER (RistrettoCombScalarBoundaryChip, -1 at the block's first row).
+const REL_RISTRETTO_FIXED_SCALAR_TS_SIZE: usize = 4 + TS_SIZE; // 12
+stwo_constraint_framework::relation!(
+    RistrettoFixedScalarTsLookupElements,
+    REL_RISTRETTO_FIXED_SCALAR_TS_SIZE
+);
+
+// Phase A prereq 0.2: Tier-2 output-ptr binding for FIXED-BASE scalar_mult.
+// Same mechanism as the scalar binding, keyed on the authenticated output
+// pointer; RistrettoCombCompressOutputChip consumes it.
+//
+// Tuple: (output_ptr[4], ts[8]) — 12 limbs.
+//
+// PRODUCER (RistrettoEcallChip, +InitGate·IsFixedBase).
+// CONSUMER (RistrettoCombCompressOutputChip, -1 at the block's first row).
+const REL_RISTRETTO_FIXED_OUT_TS_SIZE: usize = 4 + TS_SIZE; // 12
+stwo_constraint_framework::relation!(
+    RistrettoFixedOutTsLookupElements,
+    REL_RISTRETTO_FIXED_OUT_TS_SIZE
+);

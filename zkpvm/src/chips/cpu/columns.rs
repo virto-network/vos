@@ -357,6 +357,31 @@ pub enum Column {
     /// the Blake2bChip.F column at the matching compression.
     #[size = 1]
     Phi7Bool,
+    // ── Ristretto ECALL binding (Phase A prereq 0.2) ──
+    //
+    // One boolean per ristretto-family ECALL id (Ecalli with imm = id),
+    // prover-witnessed; logup balance with RistrettoEcallChip (RELATION A)
+    // and the register-file ledger forces each to be set correctly for every
+    // genuine ristretto ECALL step.  All five ids read the operand pointers
+    // from φ[7,8,9] (reduce_wide: φ[7,8] only) — already snapshotted in the
+    // Phi10/Phi11/Phi12 slots above (= regs_before[7,8,9]), so no new ptr
+    // columns are needed; the per-id RELATION-A producer arranges those
+    // slots into trace-layout order (see chips/cpu/mod.rs).
+    /// 1 iff Ecalli with imm == ECALL_RISTRETTO_SCALAR_MULT (110).
+    #[size = 1]
+    Is110Ecall,
+    /// 1 iff Ecalli with imm == ECALL_RISTRETTO_POINT_ADD (111).
+    #[size = 1]
+    Is111Ecall,
+    /// 1 iff Ecalli with imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE (112).
+    #[size = 1]
+    Is112Ecall,
+    /// 1 iff Ecalli with imm == ECALL_SCALAR_MUL_MOD_L (113).
+    #[size = 1]
+    Is113Ecall,
+    /// 1 iff Ecalli with imm == ECALL_SCALAR_ADD_MOD_L (114).
+    #[size = 1]
+    Is114Ecall,
     // ── Register-memory binding (Phase 9d) ──
     /// 1 iff ValB was sourced from a register read at this step.  See
     /// `val_b_read_reg` for the per-category mapping.  Gates the ValB
