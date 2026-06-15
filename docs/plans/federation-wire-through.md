@@ -97,6 +97,54 @@ commitment (the preprocessed Merkle root). Therefore:
 W0 is therefore a sub-project, not a re-pin. Open design + decision needed
 before W1-W4.
 
+### Measured (2026-06-15, `measure_segment_log_sizes`, release, 100K segments)
+
+76 segments; **4 distinct commitments** across the proved archetype sample
+(masks 21/22/27 components). Per-chip max `log_size` profile (chip_idx 0..30):
+`[CPU 17, BLAKE2B 14, BLAKE2B_BOUNDARY 17, MEMORY 19, MEMORY_PAGE 10,
+MEMORY_MERKLE 6, MEM_ROOT_BND 4, REG_MEM 18, REG_BND 4, REG_CLOSING 4,
+PROG_BND 4, PROG_MEMORY 18, JUMP_TABLE 12, RANGE256 8, BITWISE_LOOKUP 8,
+POWER_OF_TWO 6, POPCOUNT 0, BITCOUNT 0, BYTE_TO_BITS 8, MUL 15, BITWISE 14,
+COMPARE 14, DIVREM 13, RISTRETTO 4, RIST_ECALL 7, COMB_TABLE 10,
+FIXED_BASE_CONSUMER 11, COMB_ANCHOR 6, COMB_SCALAR_BND 5, COMB_COMPRESS 6,
+COMB_COMPRESS_OUTPUT 5]`. Release prove ~5-12s per 100K segment.
+
+**Forcing set** = the *variable* preprocessed-bearing chips (those whose
+preprocessed period scales with op count): `BLAKE2B(1)`, `BLAKE2B_BOUNDARY(2)`,
+`MEMORY_PAGE(4)`, and the ristretto chips `RISTRETTO(23)..COMB_COMPRESS_OUTPUT(30)`
+(except the fixed `COMB_TABLE(25)`). The fixed-table preprocessed chips
+(`PROG_MEMORY`, `JUMP_TABLE`, `RANGE256`, `BITWISE_LOOKUP`, `POWER_OF_TWO`,
+`BYTE_TO_BITS`, `COMB_TABLE`) are already uniform. The big non-preprocessed
+chips (`CPU`, `MEMORY`, `REGISTER_MEMORY`, `MUL`/`BITWISE`/`COMPARE`/`DIVREM`)
+do NOT affect the commitment and need no forcing.
+
+**Cost driver:** `BLAKE2B_BOUNDARY(2)` peaks at **log 17 (131072 rows)** in the
+crypto segments and is active (variable) in every segment. Forcing it
+present+uniform at log 17 everywhere roughly **2× per-segment prove cost**
+(blake2b is the priciest chip/row). The ristretto chips are small (log ≤ 11),
+so forcing them is cheap; Blake2bBoundary is the expensive one.
+
+### Two implementation paths (DECISION NEEDED)
+
+- **(A) Canonical-shape proving.** Thread a per-chip `min_log_size` into the
+  ~12 variable preprocessed-bearing chips' trace-gen (`TraceBuilder::new(
+  natural.max(min))`), force them always-present (empty→floor), prove every
+  segment at the canonical profile → one stable commitment. Aligned with the
+  existing one-commitment model + `verify_chain_standalone`. Cost: cross-cutting
+  prover refactor (~12 chips + erased layer + prove path) AND ~2× per-segment
+  prove time (Blake2bBoundary @ log 17 everywhere). Tightly couples with
+  `proving-time.md`.
+- **(B) Separate program-identity commitment.** Commit `PROGRAM_MEMORY`'s
+  preprocessed columns as their own value bound by the STARK, and have
+  `verify_chain` pin program identity to THAT (per segment) while letting the
+  shape-dependent rest of the preprocessed root vary freely. No canonical-shape
+  forcing → no cost blowup. Cost: a PCS/commitment-structure + proof-format
+  change with its own soundness surface (the sub-commitment must be bound to
+  the committed columns, not a free side-hash). Decouples identity from shape.
+
+Recommendation: lean (A) for alignment unless the ~2× cost is unacceptable, in
+which case (B) is the cost-avoiding alternative (heavier proof-structure work).
+
 ## Steps
 
 - **W0 — CANONICAL-SHAPE PROVING (was: re-pin).** Define a canonical per-chip
