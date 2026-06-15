@@ -626,108 +626,117 @@ fn harness_ristretto_comb_balance() {
     }
 }
 
-/// Session 2.1 step 8 — fully-closed soundness chain for a synthesized
-/// FixedBasepoint scalar mult call.  Drains every relation the chip
-/// pair touches by including `MemoryChip` + `MemoryBoundaryChip` +
-/// `RistrettoEcallChip` alongside the comb chips.
+/// Build a full-system `SideNote` for `n` FIXED-BASE scalar_mult ECALLs by
+/// running a real PVM trace.  Each call writes its scalar pointer into φ[7]
+/// (the basepoint and output pointers are fixed reusable buffers) via a
+/// `LoadImm64` before the `Ecalli`, so CpuChip produces one RELATION-A tuple
+/// per call — the producer that anchors each RistrettoEcallChip block ts.
 ///
-/// What this validates that `harness_ristretto_comb_balance` cannot:
-/// - The scalar-boundary chip's `MemoryAccessLookupElements` producer
-///   pairs cleanly with `MemoryChip`'s consumer for each scalar byte
-///   address — no off-by-one or addr/ts witness divergence.
-/// - The skip-scalar-bytes branch in `RistrettoEcallChip::collect_accesses`
-///   keeps the ledger balanced (32 byte producers move from EcallChip
-///   to ScalarBoundaryChip; total emissions per call unchanged).
-/// - `MemoryBoundaryChip` injects matching initial-write tuples at
-///   ts=0 for the scalar's first reads, drawing from
-///   `side_note.initial_memory`.
-#[test]
-fn harness_ristretto_fixed_base_e2e_with_memory() {
-    use zkpvm::chips::{
-        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
-        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
-        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
-        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
-    };
-    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
-    use zkpvm::side_note::RistrettoCombCall;
+/// `scalars[i]` lands at `scalar_base + i*0x40`; the basepoint at `point_addr`;
+/// every call shares one `output_addr` buffer (distinct ECALL timestamps keep
+/// the comb chips' per-call tuples distinct).  Asserts every call classified
+/// as `FixedBasepoint`.
+#[cfg(feature = "prover")]
+fn fixed_base_real_side_note(scalars: &[curve25519_dalek::scalar::Scalar]) -> SideNote {
+    use javm::PVM_REGISTER_COUNT;
+    use javm::instruction::Opcode;
+    use javm::interpreter::Interpreter;
+    use zkpvm::core::tracing::{ECALL_RISTRETTO_SCALAR_MULT, ScalarMultKind, TracingPvm};
 
-    // Memory layout for the synthesized call.  Pick non-zero bytes
-    // for the scalar so the comb chain hits non-identity table rows.
-    let scalar_ptr: u32 = 0;
-    let point_ptr: u32 = 64;
-    let output_ptr: u32 = 128;
-    let ts: u64 = 1;
-
-    // Canonical scalar with non-zero bytes in the first half so the
-    // comb chain hits non-identity table rows on the first ~16 windows
-    // (rest stay at T[i][0] = identity).  Higher-order bytes stay zero
-    // to keep the scalar within the curve25519 group order.
-    let scalar_value = curve25519_dalek::scalar::Scalar::from(0x1234_5678_9abc_def0_u64);
-    let scalar = scalar_value.to_bytes();
+    let point_addr: u64 = 0x1000;
+    let output_addr: u64 = 0x1020;
+    let scalar_base: u64 = 0x1040;
+    let mut flat_mem = vec![0u8; 0x4000];
     let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-    let out_bytes = (scalar_value * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
-        .compress()
-        .to_bytes();
+    flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&basepoint);
+    for (i, s) in scalars.iter().enumerate() {
+        let addr = scalar_base as usize + i * 0x40;
+        flat_mem[addr..addr + 32].copy_from_slice(&s.to_bytes());
+    }
+    let initial_memory = flat_mem.clone();
 
-    // initial_memory must contain the scalar + point bytes so
-    // MemoryBoundaryChip's ts=0 producers carry the actor-observed
-    // values (the prev_value chain in MemoryChip bottoms out at the
-    // initial-memory byte).  Output region needs no initial value
-    // since its first access is a write.
-    let mut initial_memory = vec![0u8; 256];
-    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
-    initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
+    // Program: for each call, `LoadImm φ[7] = scalar_base + i*0x40` then
+    // `Ecalli 110`; finally `Trap`.  φ[8] (point) and φ[9] (output) are set
+    // once via the initial register file.  LoadImm (opcode 51) is a
+    // OneRegOneImm op: opcode byte, reg byte, then a 4-byte LE immediate
+    // (the small scalar addresses fit in 32 bits, sign-extended positive).
+    let imm = ECALL_RISTRETTO_SCALAR_MULT;
+    let mut code: Vec<u8> = Vec::new();
+    let mut bitmask: Vec<u8> = Vec::new();
+    for i in 0..scalars.len() {
+        let scalar_addr = (scalar_base + (i as u64) * 0x40) as u32;
+        // LoadImm φ[7] = scalar_addr (1 opcode + 1 reg + 4 imm = 6 bytes).
+        code.push(Opcode::LoadImm as u8);
+        code.push(7u8);
+        code.extend_from_slice(&scalar_addr.to_le_bytes());
+        bitmask.push(1);
+        bitmask.extend_from_slice(&[0u8; 5]);
+        // Ecalli 110 (1 opcode + 4 imm = 5 bytes).
+        code.push(Opcode::Ecalli as u8);
+        code.push((imm & 0xff) as u8);
+        code.push(((imm >> 8) & 0xff) as u8);
+        code.push(((imm >> 16) & 0xff) as u8);
+        code.push(((imm >> 24) & 0xff) as u8);
+        bitmask.push(1);
+        bitmask.extend_from_slice(&[0u8; 4]);
+    }
+    code.push(Opcode::Trap as u8);
+    bitmask.push(1);
 
-    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
-    side_note.initial_memory = initial_memory;
-    side_note.ristretto_mem_ops.push(RistrettoMemOp {
-        scalar_ptr,
-        point_ptr,
-        output_ptr,
-        ts,
-        scalar_bytes: scalar,
-        point_bytes: basepoint,
-        out_bytes,
-        kind: ScalarMultKind::FixedBasepoint,
-    });
-    side_note.ristretto_comb_calls.push(RistrettoCombCall {
-        scalar,
-        out_bytes,
-        output_ptr,
-        ts,
-    });
-    side_note.populate_ristretto_comb_counts();
-    side_note.populate_ristretto_compress_counts();
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[7] = scalar_base; // overwritten by the first LoadImm
+    regs[8] = point_addr;
+    regs[9] = output_addr;
 
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem,
+        1_000_000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run_with_precompiles();
+    assert_eq!(
+        tracing.ristretto_records.len(),
+        scalars.len(),
+        "expected one record per scalar"
+    );
+    for (i, r) in tracing.ristretto_records.iter().enumerate() {
+        assert_eq!(r.kind, ScalarMultKind::FixedBasepoint);
+        // Confirms the per-call LoadImm actually retargeted φ[7].
+        assert_eq!(
+            r.scalar,
+            scalars[i].to_bytes(),
+            "call {i} read the wrong scalar — register setup regressed"
+        );
+    }
+
+    let ristretto_records = std::mem::take(&mut tracing.ristretto_records);
+    let ristretto_mem_ops = std::mem::take(&mut tracing.ristretto_mem_ops);
+    let steps = tracing.into_trace();
+
+    let mut side_note = SideNote::new(steps, code, bitmask).with_memory(initial_memory);
+    side_note.ristretto_calls = ristretto_records;
+    side_note.ristretto_mem_ops = ristretto_mem_ops;
+    side_note.ingest_ristretto_boundary();
+    side_note
+}
+
+/// Prove + verify `side_note` through the full ACTIVE component set (so the
+/// CpuChip RELATION-A producer balances RistrettoEcallChip's consumer).
+#[cfg(feature = "prover")]
+fn prove_verify_active(side_note: &mut SideNote) {
     let config = PcsConfig {
         pow_bits: 5,
         fri_config: FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
-
-    let components: &[&'static dyn MachineProverComponent] = &[
-        &MemoryChip,
-        &MemoryPageChip,
-        &MemoryMerkleChip,
-        &MemoryRootBoundaryChip,
-        &Blake2bBoundaryChip,
-        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
-        &zkpvm::chips::RangeMultiplicity256,
-        &zkpvm::chips::BitwiseLookupChip,
-        &RistrettoEcallChip,
-        &RistrettoCombTableChip,
-        &RistrettoCombAnchorChip,
-        &RistrettoCombScalarBoundaryChip,
-        &RistrettoFixedBaseConsumerChip,
-        &RistrettoCombCompressChip,
-        &RistrettoCombCompressOutputChip,
-        &ByteToBitsChip,
-    ];
-
-    let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect("fixed-base e2e harness: prove failed — chip algebra or witness regression");
-
+    let components = zkpvm::active_components(side_note);
+    let proof = prove_with_explicit_components(side_note, config, &components)
+        .expect("full-system prove failed");
     let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
         .iter()
         .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
@@ -737,11 +746,25 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
         min_fri_queries: 3,
         min_fri_log_blowup: 0,
     };
-    verify_with_explicit_components(proof, &side_note, &verifier_components, components, &policy)
-        .expect(
-            "fixed-base e2e harness: verify failed — memory ledger or comb-chain \
-         lookup balance regression",
-        );
+    verify_with_explicit_components(proof, side_note, &verifier_components, &components, &policy)
+        .expect("full-system verify failed — ristretto ts-binding / comb-chain / ledger imbalance");
+}
+
+/// Fully-closed soundness chain for a FixedBasepoint scalar mult, driven by a
+/// REAL PVM trace through the full active component set.  Since the
+/// ristretto-`ts` binding (Phase A prereq 0.2), RistrettoEcallChip consumes a
+/// `RistrettoCall` (RELATION A) tuple per call that only CpuChip produces, so
+/// the comb-chain + ledger balance can no longer be exercised with a synthetic
+/// side_note — a real CpuChip trace is required.  This validates: the
+/// scalar-boundary / output producers pair cleanly with MemoryChip; the
+/// skip-scalar-bytes split keeps the ledger balanced; and the new RELATION-A +
+/// Tier-2 ts anchoring closes end-to-end.
+#[test]
+fn harness_ristretto_fixed_base_e2e_with_memory() {
+    let mut side_note = fixed_base_real_side_note(&[curve25519_dalek::scalar::Scalar::from(
+        0x1234_5678_9abc_def0_u64,
+    )]);
+    prove_verify_active(&mut side_note);
 }
 
 /// Session 2.1 step 8 — multi-call coverage for the comb chip pair.
@@ -766,116 +789,16 @@ fn harness_ristretto_fixed_base_e2e_with_memory() {
 /// sum is not zero` here.
 #[test]
 fn harness_ristretto_fixed_base_three_calls() {
-    use zkpvm::chips::{
-        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
-        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
-        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
-        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
-    };
-    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
-    use zkpvm::side_note::RistrettoCombCall;
-
-    // Three calls with distinct scalars + non-overlapping memory regions.
-    let calls: [(curve25519_dalek::scalar::Scalar, u32, u32, u32, u64); 3] = [
-        (
-            curve25519_dalek::scalar::Scalar::from(7u64),
-            0x000,
-            0x040,
-            0x080,
-            1,
-        ),
-        (
-            curve25519_dalek::scalar::Scalar::from(0x1234_5678u64),
-            0x100,
-            0x140,
-            0x180,
-            5,
-        ),
-        (
-            curve25519_dalek::scalar::Scalar::from(0xdead_beef_cafe_babe_u64),
-            0x200,
-            0x240,
-            0x280,
-            11,
-        ),
-    ];
-
-    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-    let mut initial_memory = vec![0u8; 1024];
-    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
-
-    for &(scalar_value, scalar_ptr, point_ptr, output_ptr, ts) in &calls {
-        let scalar = scalar_value.to_bytes();
-        let out_bytes = (scalar_value * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
-            .compress()
-            .to_bytes();
-        initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
-        initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
-        side_note.ristretto_mem_ops.push(RistrettoMemOp {
-            scalar_ptr,
-            point_ptr,
-            output_ptr,
-            ts,
-            scalar_bytes: scalar,
-            point_bytes: basepoint,
-            out_bytes,
-            kind: ScalarMultKind::FixedBasepoint,
-        });
-        side_note.ristretto_comb_calls.push(RistrettoCombCall {
-            scalar,
-            out_bytes,
-            output_ptr,
-            ts,
-        });
-    }
-    side_note.initial_memory = initial_memory;
-    side_note.populate_ristretto_comb_counts();
-    side_note.populate_ristretto_compress_counts();
-
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-
-    let components: &[&'static dyn MachineProverComponent] = &[
-        &MemoryChip,
-        &MemoryPageChip,
-        &MemoryMerkleChip,
-        &MemoryRootBoundaryChip,
-        &Blake2bBoundaryChip,
-        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
-        &zkpvm::chips::RangeMultiplicity256,
-        &zkpvm::chips::BitwiseLookupChip,
-        &RistrettoEcallChip,
-        &RistrettoCombTableChip,
-        &RistrettoCombAnchorChip,
-        &RistrettoCombScalarBoundaryChip,
-        &RistrettoFixedBaseConsumerChip,
-        &RistrettoCombCompressChip,
-        &RistrettoCombCompressOutputChip,
-        &ByteToBitsChip,
-    ];
-
-    let proof = prove_with_explicit_components(&mut side_note, config, components).expect(
-        "3-call harness: prove failed — likely a per-call indexing or \
-             trace-fill misalignment regression",
-    );
-
-    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
-        .iter()
-        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
-        .collect();
-    let policy = PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    verify_with_explicit_components(proof, &side_note, &verifier_components, components, &policy)
-        .expect(
-            "3-call harness: verify failed — comb-chain or memory ledger \
-         imbalance under multi-call",
-        );
+    // Three distinct FixedBasepoint scalar mults in ONE real PVM trace
+    // (per-call LoadImm retargets φ[7]), proved through the full active set.
+    // Exercises the comb chips' per-call CallIdx enumeration + the
+    // RistrettoEcallChip 96-row blocks + RELATION-A anchoring under multi-call.
+    let mut side_note = fixed_base_real_side_note(&[
+        curve25519_dalek::scalar::Scalar::from(7u64),
+        curve25519_dalek::scalar::Scalar::from(0x1234_5678u64),
+        curve25519_dalek::scalar::Scalar::from(0xdead_beef_cafe_babe_u64),
+    ]);
+    prove_verify_active(&mut side_note);
 }
 
 /// Session 2.1 step 8 — soundness regression net for the scalar /
@@ -1218,94 +1141,16 @@ fn harness_ristretto_output_mismatch_rejected() {
 /// proof failed with `ConstraintsNotSatisfied` on the unity row.
 #[test]
 fn harness_ristretto_identity_compress_e2e() {
-    use zkpvm::chips::{
-        Blake2bBoundaryChip, ByteToBitsChip, MemoryChip, MemoryMerkleChip, MemoryPageChip,
-        MemoryRootBoundaryChip, RistrettoCombAnchorChip, RistrettoCombCompressChip,
-        RistrettoCombCompressOutputChip, RistrettoCombScalarBoundaryChip, RistrettoCombTableChip,
-        RistrettoEcallChip, RistrettoFixedBaseConsumerChip,
-    };
-    use zkpvm::core::tracing::{RistrettoMemOp, ScalarMultKind};
-    use zkpvm::side_note::RistrettoCombCall;
-
-    let scalar_ptr: u32 = 0;
-    let point_ptr: u32 = 64;
-    let output_ptr: u32 = 128;
-    let ts: u64 = 1;
-
-    // scalar = 0 ⇒ 0·G = identity.
-    let scalar = curve25519_dalek::scalar::Scalar::from(0u64).to_bytes();
-    let basepoint = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-    // compress(identity) is the all-zero encoding.
-    let out_bytes = (curve25519_dalek::scalar::Scalar::from(0u64)
-        * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT)
-        .compress()
-        .to_bytes();
+    // scalar = 0 ⇒ 0·G = identity, driven by a real PVM trace through the full
+    // active set.  Confirms the IsIdentity gate + the compress→output chain +
+    // the RELATION-A / Tier-2 ts anchoring all close for the identity case.
+    let mut side_note = fixed_base_real_side_note(&[curve25519_dalek::scalar::Scalar::from(0u64)]);
+    // compress(0·G) is the all-zero encoding.
     assert_eq!(
-        out_bytes, [0u8; 32],
+        side_note.ristretto_calls[0].output, [0u8; 32],
         "compress(0·G) must be the zero encoding"
     );
-
-    let mut initial_memory = vec![0u8; 256];
-    initial_memory[scalar_ptr as usize..scalar_ptr as usize + 32].copy_from_slice(&scalar);
-    initial_memory[point_ptr as usize..point_ptr as usize + 32].copy_from_slice(&basepoint);
-
-    let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
-    side_note.initial_memory = initial_memory;
-    side_note.ristretto_mem_ops.push(RistrettoMemOp {
-        scalar_ptr,
-        point_ptr,
-        output_ptr,
-        ts,
-        scalar_bytes: scalar,
-        point_bytes: basepoint,
-        out_bytes,
-        kind: ScalarMultKind::FixedBasepoint,
-    });
-    side_note.ristretto_comb_calls.push(RistrettoCombCall {
-        scalar,
-        out_bytes,
-        output_ptr,
-        ts,
-    });
-    side_note.populate_ristretto_comb_counts();
-    side_note.populate_ristretto_compress_counts();
-
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let components: &[&'static dyn MachineProverComponent] = &[
-        &MemoryChip,
-        &MemoryPageChip,
-        &MemoryMerkleChip,
-        &MemoryRootBoundaryChip,
-        &Blake2bBoundaryChip,
-        // Consumers for Blake2bBoundaryChip's Range256 + BitwiseAnd lookups.
-        &zkpvm::chips::RangeMultiplicity256,
-        &zkpvm::chips::BitwiseLookupChip,
-        &RistrettoEcallChip,
-        &RistrettoCombTableChip,
-        &RistrettoCombAnchorChip,
-        &RistrettoCombScalarBoundaryChip,
-        &RistrettoFixedBaseConsumerChip,
-        &RistrettoCombCompressChip,
-        &RistrettoCombCompressOutputChip,
-        &ByteToBitsChip,
-    ];
-    let proof = prove_with_explicit_components(&mut side_note, config, components)
-        .expect("identity (0·G) compress: prove failed — the IsIdentity gate regressed");
-    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
-        .iter()
-        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
-        .collect();
-    let policy = PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    verify_with_explicit_components(proof, &side_note, &verifier_components, components, &policy)
-        .expect("identity (0·G) compress: verify failed");
+    prove_verify_active(&mut side_note);
 }
 
 /// task #7 soundness — the identity encoding is BOUND: a prover cannot
