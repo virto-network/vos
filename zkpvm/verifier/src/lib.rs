@@ -356,19 +356,21 @@ pub fn verify_standalone_with_options(
 /// Consecutive segments must chain: `proofs[i].final_state ==
 /// proofs[i+1].initial_state`.
 ///
-/// SOUNDNESS SCOPE — the boundary-continuity equality is BOUND for the
-/// fields `verify_standalone` binds in-circuit: registers (v6
-/// register-ledger read-consistency) and pc/timestamp (CpuChip
-/// program-execution chaining + the boundary-binding check). It is
-/// TAMPER-EVIDENT ONLY for `SegmentState.memory_commitment`, which is
-/// `blake3(flat_mem)` computed OUTSIDE the circuit and unbound — a
-/// from-scratch prover can put any matching hash on both sides of a
-/// boundary while the actual memory image diverges. So a chain accepted
-/// here proves: one program, per-segment validity, and register/pc/
-/// timestamp continuity — NOT memory continuity. Binding memory
-/// continuity (in-circuit memory commitment / Merkle memory / chain-level
-/// handoff) is the remaining work; see
-/// `docs/plans/ledger-read-consistency.md`.
+/// SOUNDNESS SCOPE — the boundary-continuity equality is BOUND in-circuit
+/// for every continued field, so an accepted chain proves genuine state
+/// continuity (not mere tamper-evidence): registers via the register-ledger
+/// read-consistency binding, pc/timestamp via CpuChip program-execution
+/// chaining, and `SegmentState.memory_root` via the in-AIR page-Merkle trie
+/// (`Memory{Page,Merkle,RootBoundary}Chip` force `memory_root` to be the
+/// genuine blake2b Merkle root of the listed RAM pages, and
+/// `check_boundary_claimed_sums` pins it to the public boundary state). The
+/// entering image is anchored by `expected_initial_root`; the returned final
+/// root pins the post-state. (`SegmentState.memory_commitment`, a
+/// `blake3(flat_mem)` field, is unbound but vestigial — `memory_root`
+/// supersedes it for continuity.) So a chain accepted here proves: one
+/// program, per-segment validity, and full register / pc / timestamp /
+/// memory continuity from `expected_initial_root` to the returned final
+/// root.
 ///
 /// PRECONDITION — every segment must share `preprocessed_commitment`, i.e.
 /// have the SAME per-component `log_sizes` (the program commitment is the

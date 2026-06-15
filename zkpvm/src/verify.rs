@@ -21,15 +21,15 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 /// Verify a chain of segment proofs. Each segment's final state must match
 /// the next segment's initial state. Each segment is verified independently.
 ///
-/// The compared `SegmentState` fields are bound to the committed boundary
-/// columns (boundary-binding check — see `boundary_binding`). pc/timestamp
-/// columns are pinned to the trace, so the continuity equality forces real
-/// pc/timestamp continuity; register columns are pinned only by the
-/// register-ledger read-consistency (vacuous against a from-scratch prover
-/// today — see `chips/register_memory_closing.rs`), and `memory_commitment`
-/// is computed outside the circuit. So register and memory continuity still
-/// trust the prover. This is also a host-side capability, not a
-/// trust-boundary check (it consumes prover-derived side notes).
+/// The continued `SegmentState` fields are bound to the committed boundary
+/// columns (boundary-binding check — see `boundary_binding`), so the
+/// continuity equality forces real state continuity: pc/timestamp via CpuChip
+/// trace pinning, registers via the register-ledger read-consistency binding,
+/// and `memory_root` via the in-AIR page-Merkle trie. (`memory_commitment`,
+/// a blake3 of the image, is also compared but is unbound/vestigial —
+/// `memory_root` carries continuity.) This is a host-side capability (it
+/// consumes prover-derived side notes); `zkpvm_verifier::verify_chain_standalone`
+/// is the side-note-free, trust-boundary variant.
 pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), VerificationError> {
     if proofs.len() != side_notes.len() {
         return Err(VerificationError::InvalidStructure(
