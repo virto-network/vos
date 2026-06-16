@@ -532,7 +532,7 @@ fn prove_impl(
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
     let component_mask = super::active_component_mask(side_note);
-    prove_impl_with_components(side_note, config, profile, components, component_mask)
+    prove_impl_with_components(side_note, config, profile, components, component_mask, &[])
 }
 
 /// Phase I.0: chip-isolated prove path.  Bypasses `active_components` so
@@ -548,8 +548,72 @@ pub fn prove_with_explicit_components(
     components: &[&'static dyn crate::framework::MachineProverComponent],
 ) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) = prove_impl_with_components(side_note, config, false, components, 0)?;
+    let (proof, _) = prove_impl_with_components(side_note, config, false, components, 0, &[])?;
     Ok(proof)
+}
+
+/// Canonical-shape proving (federation wire-through W0).
+///
+/// Proves with the FULL `BASE_COMPONENTS` set present (constant
+/// `component_mask`, all 31 bits) and every forcing-set chip's main trace
+/// padded up to the per-chip floor in `min_log_sizes` (indexed by
+/// [`chip_idx`](crate::chip_idx)), so the preprocessed-trace commitment —
+/// the program identity — is identical for every segment of a program
+/// regardless of the witness.  That is what lets ONE published program
+/// commitment pin a whole *heterogeneous* segment chain via
+/// `verify_chain_standalone`: the per-segment active set is constant (full
+/// mask) and the preprocessed-bearing chips' `log_size`s are pinned.
+///
+/// Uses the MOBILE PCS config (the federation policy — verifiers must use
+/// `PcsPolicy::MOBILE`).  `min_log_sizes` shorter than the component count
+/// is zero-padded; a 0 floor means "natural size" (the fixed-table chips,
+/// already uniform, need no floor).  Forced sizes MUST stay `<=
+/// DEFAULT_MAX_LOG_SIZE` (24) or the verifier rejects.
+pub fn prove_canonical(
+    side_note: &mut SideNote,
+    min_log_sizes: &[u32],
+) -> Result<Proof, ProvingError> {
+    install_thread_pool();
+    prepare_side_note_for_verification(side_note);
+    let components = super::all_components();
+    // Full set present ⇒ constant mask = all 31 component bits set.
+    let component_mask = (1u32 << super::chip_idx::COUNT) - 1;
+    let (proof, _) = prove_impl_with_components_overridden(
+        side_note,
+        production_pcs_config_mobile(),
+        false,
+        components,
+        component_mask,
+        None,
+        min_log_sizes,
+    )?;
+    Ok(proof)
+}
+
+/// Canonical-shape profiling (federation wire-through W0): the NATURAL
+/// (unforced) main-trace `log_size` each of the given components would use for
+/// `side_note`. The per-segment max of these over a full trace is the
+/// `min_log_size` profile `prove_canonical` pads to (so every segment's forced
+/// chips share one `log_size`). Mirrors `prove`'s trace-gen prep (`prepare` +
+/// `ingest_memory_pages`, so page/merkle-bearing chips report their real size)
+/// but stops at `log_size` — no commit, no FRI. `indices` are positions in
+/// [`all_components`](crate::all_components) / [`chip_idx`](crate::chip_idx).
+pub fn natural_log_sizes_for(side_note: &mut SideNote, indices: &[usize]) -> Vec<u32> {
+    prepare_side_note_for_verification(side_note);
+    side_note.ingest_memory_pages();
+    let comps = super::all_components();
+    indices
+        .iter()
+        .map(|&i| {
+            let c = comps[i];
+            let trace = if c.is_producer() {
+                c.generate_component_trace(side_note)
+            } else {
+                c.generate_component_trace_immut(side_note)
+            };
+            trace.log_size()
+        })
+        .collect()
 }
 
 fn prove_impl_with_components(
@@ -558,6 +622,7 @@ fn prove_impl_with_components(
     profile: bool,
     components: &[&dyn crate::framework::MachineProverComponent],
     component_mask: u32,
+    min_log_sizes: &[u32],
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     prove_impl_with_components_overridden(
         side_note,
@@ -566,6 +631,7 @@ fn prove_impl_with_components(
         components,
         component_mask,
         None,
+        min_log_sizes,
     )
 }
 
@@ -599,10 +665,12 @@ pub fn prove_with_boundary_override(
         components,
         component_mask,
         Some((initial_state, final_state)),
+        &[],
     )?;
     Ok(proof)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prove_impl_with_components_overridden(
     side_note: &mut SideNote,
     config: PcsConfig,
@@ -610,6 +678,7 @@ fn prove_impl_with_components_overridden(
     components: &[&dyn crate::framework::MachineProverComponent],
     component_mask: u32,
     boundary_override: Option<(SegmentState, SegmentState)>,
+    min_log_sizes: &[u32],
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
 
@@ -647,9 +716,12 @@ fn prove_impl_with_components_overridden(
     // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
     let mut traces: Vec<Option<ComponentTrace>> = (0..components.len()).map(|_| None).collect();
+    // `min_log_sizes` (canonical-shape proving) is empty on the natural
+    // paths ⇒ `unwrap_or(0)` ⇒ each chip proves at its natural size.
     for (i, c) in components.iter().enumerate() {
         if c.is_producer() {
-            traces[i] = Some(c.generate_component_trace(side_note));
+            let min_log_size = min_log_sizes.get(i).copied().unwrap_or(0);
+            traces[i] = Some(c.generate_component_trace_min(side_note, min_log_size));
         }
     }
     {
@@ -662,7 +734,13 @@ fn prove_impl_with_components_overridden(
         let snr: &SideNote = side_note;
         let consumer_traces: Vec<(usize, ComponentTrace)> = consumer_idxs
             .par_iter()
-            .map(|&i| (i, components[i].generate_component_trace_immut(snr)))
+            .map(|&i| {
+                let min_log_size = min_log_sizes.get(i).copied().unwrap_or(0);
+                (
+                    i,
+                    components[i].generate_component_trace_immut_min(snr, min_log_size),
+                )
+            })
             .collect();
         for (i, t) in consumer_traces {
             traces[i] = Some(t);

@@ -83,6 +83,25 @@ pub trait MachineProverComponent: MachineComponent {
     /// parallel consumer pass in `prove_impl_with_components`.
     fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace;
 
+    /// Canonical-shape variant of `generate_component_trace` threading a
+    /// per-chip `min_log_size` floor (federation wire-through W0; see
+    /// `BuiltInProverComponent::generate_main_trace_min`).  The
+    /// preprocessed trace is built at the (possibly forced) main `log_size`,
+    /// so a forcing-set chip's preprocessed columns track the canonical
+    /// height.
+    fn generate_component_trace_min(
+        &self,
+        side_note: &mut SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace;
+
+    /// Canonical-shape variant of `generate_component_trace_immut`.
+    fn generate_component_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace;
+
     fn generate_interaction_trace(
         &self,
         component_trace: ComponentTrace,
@@ -212,6 +231,43 @@ where
     fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace {
         let original_trace =
             <C as BuiltInProverComponent>::generate_main_trace_immut(self, side_note);
+        let log_size = original_trace.log_size;
+        let preprocessed_trace =
+            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
+        ComponentTrace {
+            log_size,
+            preprocessed_trace: preprocessed_trace.cols,
+            original_trace: original_trace.cols,
+        }
+    }
+
+    fn generate_component_trace_min(
+        &self,
+        side_note: &mut SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace {
+        let original_trace =
+            <C as BuiltInProverComponent>::generate_main_trace_min(self, side_note, min_log_size);
+        let log_size = original_trace.log_size;
+        let preprocessed_trace =
+            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
+        ComponentTrace {
+            log_size,
+            preprocessed_trace: preprocessed_trace.cols,
+            original_trace: original_trace.cols,
+        }
+    }
+
+    fn generate_component_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace {
+        let original_trace = <C as BuiltInProverComponent>::generate_main_trace_immut_min(
+            self,
+            side_note,
+            min_log_size,
+        );
         let log_size = original_trace.log_size;
         let preprocessed_trace =
             <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);

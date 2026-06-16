@@ -291,8 +291,10 @@ fn addr_with_carries(ptr: u32, offset: u32) -> ([u8; 4], [u8; 3]) {
 impl BuiltInProverComponent for RistrettoCombCompressOutputChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = output_log_size(side_note);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        // Canonical-shape: use the (possibly forced) main-trace `log_size`.
+        // CallIdx/ByteIdx/IsByteIdx0/IsLast are pure-positional ⇒
+        // witness-independent preprocessed trace.
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
@@ -311,7 +313,15 @@ impl BuiltInProverComponent for RistrettoCombCompressOutputChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = output_log_size(side_note);
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
+        let log_size = output_log_size(side_note).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let mut row = 0usize;
         for call in side_note.ristretto_comb_calls.iter() {

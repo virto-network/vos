@@ -617,8 +617,10 @@ impl BuiltInComponent for RistrettoChip {
 impl BuiltInProverComponent for RistrettoChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = ristretto_log_size(side_note);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        // Canonical-shape: use the (possibly forced) main-trace `log_size`.
+        // The Reserved / RowIndex / ByteIdx columns are pure-positional, so
+        // the preprocessed trace is witness-independent at any `log_size`.
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
@@ -637,10 +639,18 @@ impl BuiltInProverComponent for RistrettoChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         // R1e-quat: lay each FieldOpRow into its column slots.
         // Padding rows beyond rows.len() have is_real = 0 and all
         // cells zero — chip's gating constraints make them inert.
-        let log_size = ristretto_log_size(side_note);
+        let log_size = ristretto_log_size(side_note).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
         // Borrow the rows — the side_note is shared with the

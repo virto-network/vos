@@ -145,6 +145,43 @@ so forcing them is cheap; Blake2bBoundary is the expensive one.
 Recommendation: lean (A) for alignment unless the ~2× cost is unacceptable, in
 which case (B) is the cost-avoiding alternative (heavier proof-structure work).
 
+### W0 outcome (built 2026-06-16): canonical-shape (A) + a 2-entry allowlist
+
+Implementing (A) surfaced a refinement the fork above missed: forcing each
+chip's `log_size` is NOT sufficient for a single commitment, because TWO
+forcing-set chips — `RistrettoFixedBaseConsumerChip` (idx 26,
+`IsFinalAccProducer`/`FinalAcc*` gated on `real_n_rows`) and
+`RistrettoCombCompressChip` (idx 29, `IsUnityCheck`/`IsOutputProducer`/
+`CallIdx`/`IsCoordInputConsumer` gated on `real_n_rows`) — have preprocessed
+*content* (not just size) that depends on the per-segment fixed-base-scalar-mult
+("comb") count. So a comb-free segment and a comb-bearing segment get different
+commitments even at the same forced `log_size`. The other 8 forcing-set chips
+are pure-positional (witness-independent preprocessed period/table).
+
+Rather than the risky positional-at-fixed-M comb-chip surgery (which would touch
+the just-landed ristretto-ts AIR) OR path (B), we MEASURED the shape count:
+`measure_comb_preproc_shapes` over the reference transition (7.56M steps, 76
+segments of 100k) found comb calls in **exactly 1 of 76 segments** (histogram
+`{0 calls: 75, 1 call: 1}`) ⇒ **only 2 distinct commitments**. The locked
+canonical profile (`measure_canonical_profile`, per-chip MAX natural `log_size`
+over ALL 76 segments) is `VOUCHER_CHECK_CANONICAL_PROFILE` =
+`[0,14,17,0,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,7,0,11,6,5,6,5]`
+(only the forcing set is non-zero; `BLAKE2B_BOUNDARY` @ 17 is the cost driver,
+confirmed as the global max — it ranges 15-17).
+
+**Chosen: (A) + commitment ALLOWLIST.** `zkpvm::prove_canonical(side_note,
+profile)` forces the full 31-component set present (constant mask) + the
+forcing-set chips to the profile. The chain ships its segments as before; the
+verifier uses `zkpvm_verifier::verify_chain_standalone_allowlist(proofs,
+&{C_0,C_1}, expected_initial_root, max_log_size, MOBILE)` — each segment's
+commitment must be in the small published set. `{C_0, C_1}` is witness-
+independent (a function of the comb count + profile, not of the scalars), and a
+foreign program matches no `C_k`, so program identity is still pinned. Larger
+transfer batches (more comb calls per segment) extend the allowlist with
+`C_2, …` (a documented scaling follow-up; bounded by segment-size / comb-cost).
+This adds NO AIR/constraint changes and NO proof-format change — only the
+`min_log_size` threading + the allowlist verifier.
+
 ## Steps
 
 - **W0 — CANONICAL-SHAPE PROVING (was: re-pin).** Define a canonical per-chip

@@ -81,6 +81,38 @@ pub trait BuiltInProverComponent: BuiltInComponent {
         unimplemented!("non-producer chip must override generate_main_trace_immut")
     }
 
+    /// Canonical-shape proving (federation wire-through W0): like
+    /// `generate_main_trace`, but pads the main trace to at least
+    /// `min_log_size` rows (`TraceBuilder::new(natural.max(min_log_size))`)
+    /// so the program commitment is witness-independent.  The default
+    /// ignores the floor (natural size); only the canonical *forcing set* —
+    /// the variable preprocessed-bearing chips whose `log_size` must be
+    /// pinned for ONE stable commitment across a heterogeneous segment
+    /// chain — override it.  Padding rows are `is_real = 0` and inert, so a
+    /// forced larger trace proves the identical statement; a forcing-set
+    /// chip whose `generate_preprocessed_trace` re-derives its own
+    /// `log_size` from `side_note` must switch to the passed (forced)
+    /// `log_size` param so its preprocessed trace tracks the forced main
+    /// height.  Producers override this; consumers override
+    /// `generate_main_trace_immut_min`.
+    fn generate_main_trace_min(
+        &self,
+        side_note: &mut SideNote,
+        _min_log_size: u32,
+    ) -> FinalizedTrace {
+        self.generate_main_trace(side_note)
+    }
+
+    /// Consumer counterpart of [`generate_main_trace_min`] (see
+    /// `generate_main_trace_immut`).
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        _min_log_size: u32,
+    ) -> FinalizedTrace {
+        self.generate_main_trace_immut(side_note)
+    }
+
     fn generate_interaction_trace(
         &self,
         component_trace: ComponentTrace,

@@ -642,8 +642,14 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
 impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = log_size_for(consumer_n_rows(side_note));
+    fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
+        // Canonical-shape: use the (possibly forced) main-trace `log_size`
+        // (threaded by the erased layer). The RowIndex/ByteIdx columns are
+        // pure-positional; `IsFinalAccProducer`/`FinalAcc*` stay gated on the
+        // real call-blocks (`real_n_rows` below), so this chip's preprocessed
+        // CONTENT still depends on the per-segment comb-call count — which is
+        // why a segment chain needs the small published commitment allowlist
+        // {C_0, C_1, …} rather than a single commitment.
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         let real_n_rows = consumer_n_rows(side_note);
@@ -690,8 +696,16 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         let rows = build_consumer_rows(side_note);
-        let log_size = log_size_for(rows.len());
+        let log_size = log_size_for(rows.len()).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
         for row_i in 0..num_rows {

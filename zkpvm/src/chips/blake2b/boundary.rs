@@ -347,8 +347,17 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
     }
 
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+        self.generate_main_trace_min(side_note, 0)
+    }
+
+    fn generate_main_trace_min(
+        &self,
+        side_note: &mut SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         if side_note.merkle_blake2b_calls.is_empty() {
-            let log_size = stwo::prover::backend::simd::m31::LOG_N_LANES;
+            // Canonical-shape: forced present-but-empty (all-padding).
+            let log_size = stwo::prover::backend::simd::m31::LOG_N_LANES.max(min_log_size);
             return TraceBuilder::<Column>::new(log_size).finalize_bit_reversed();
         }
         // No memory-op binding: these compressions hash page images / node
@@ -356,7 +365,7 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
         // stay zeroed (unconstrained dead width).
         let rows = build_compression_rows(&side_note.merkle_blake2b_calls, &[]);
         let num_rows = rows.len();
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows);
+        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         fill_compression_trace(&mut trace, side_note, &rows);
         trace.finalize_bit_reversed()

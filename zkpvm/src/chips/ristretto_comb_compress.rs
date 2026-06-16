@@ -1448,8 +1448,13 @@ impl BuiltInComponent for RistrettoCombCompressChip {
 impl BuiltInProverComponent for RistrettoCombCompressChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = log_size_for(compress_n_rows(side_note));
+    fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
+        // Canonical-shape: use the (possibly forced) main-trace `log_size`.
+        // RowIndex/ByteIdx are pure-positional; `IsUnityCheck`/
+        // `IsOutputProducer`/`CallIdx`/`IsCoordInputConsumer` stay gated on the
+        // real call-blocks (`real_n_rows` below), so this chip's preprocessed
+        // CONTENT still depends on the per-segment comb-call count (handled by
+        // the published commitment allowlist).
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         let real_n_rows = compress_n_rows(side_note);
@@ -1503,8 +1508,16 @@ impl BuiltInProverComponent for RistrettoCombCompressChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         let rows = build_compress_rows(side_note);
-        let log_size = log_size_for(rows.len());
+        let log_size = log_size_for(rows.len()).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
         for row_i in 0..num_rows {

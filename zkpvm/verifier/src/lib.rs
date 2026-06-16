@@ -445,3 +445,81 @@ pub fn verify_chain_standalone_with_options(
     }
     Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }
+
+/// Like [`verify_chain_standalone`], but pins program identity to a small
+/// published SET of allowed commitments instead of a single one.
+///
+/// WHY a set: canonical-shape proving (forcing each preprocessed-bearing chip
+/// to a fixed `log_size`) makes most chips' preprocessed columns identical
+/// across segments, but two chips — `RistrettoFixedBaseConsumerChip` and
+/// `RistrettoCombCompressChip` — have preprocessed selectors gated on the
+/// per-segment fixed-base-scalar-mult ("comb") count, so a segment with `k`
+/// comb calls gets a distinct commitment `C_k` even at the forced `log_size`.
+/// The number of distinct `C_k` is small and bounded (a `SEG_STEPS`-sized
+/// segment can hold only a few comb calls), so a deployment publishes the
+/// allowlist `{C_0, C_1, …, C_max}` — one canonical commitment per comb-call
+/// count.  Each `C_k` is WITNESS-INDEPENDENT (a function of `k` + the forced
+/// profile, not of the scalars/account contents), so the allowlist is a fixed
+/// per-program constant.
+///
+/// SOUNDNESS: every segment's commitment must be IN the allowlist (a
+/// from-scratch prover splicing a foreign program produces a commitment in no
+/// `C_k`), and each segment then verifies standalone against its own
+/// commitment.  Combined with the same boundary-continuity + anchoring as
+/// [`verify_chain_standalone`], an accepted chain proves: the program is one
+/// of the published canonical voucher-check shapes, per-segment validity, and
+/// full register / pc / timestamp / memory continuity.
+///
+/// PRECONDITION: the prover used canonical-shape proving (`zkpvm::prove_canonical`
+/// with the deployment's per-chip `min_log_size` profile) so the forced
+/// `log_size`s are constant across the chain; otherwise log_size variation
+/// would produce commitments outside the allowlist.
+pub fn verify_chain_standalone_allowlist(
+    proofs: &[Proof],
+    allowed_commitments: &[CommitmentHash],
+    expected_initial_root: [u8; 32],
+    max_log_size: u32,
+    policy: &PcsPolicy,
+) -> Result<[u8; 32], VerificationError> {
+    if proofs.is_empty() {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone_allowlist: empty proof chain".to_string(),
+        ));
+    }
+    if allowed_commitments.is_empty() {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone_allowlist: empty commitment allowlist".to_string(),
+        ));
+    }
+    // Anchor the entering image (memory analogue of program identity).
+    if proofs[0].initial_state.memory_root != expected_initial_root {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone_allowlist: proofs[0].initial_state.memory_root \
+             does not match expected_initial_root"
+                .to_string(),
+        ));
+    }
+    // Boundary continuity across the chain.
+    for window in proofs.windows(2) {
+        if window[0].final_state != window[1].initial_state {
+            return Err(VerificationError::InvalidStructure(format!(
+                "segment chain broken: final state at ts={} does not match next initial at ts={}",
+                window[0].final_state.timestamp, window[1].initial_state.timestamp,
+            )));
+        }
+    }
+    // Each segment's program commitment must be in the published allowlist,
+    // then it verifies standalone against that (its own) commitment.
+    for proof in proofs {
+        let actual = proof.stark_proof.commitments[0];
+        if !allowed_commitments.contains(&actual) {
+            return Err(VerificationError::InvalidStructure(
+                "verify_chain_standalone_allowlist: a segment's program commitment \
+                 is not in the published allowlist"
+                    .to_string(),
+            ));
+        }
+        verify_standalone_with_options(proof.clone(), actual, max_log_size, policy)?;
+    }
+    Ok(proofs[proofs.len() - 1].final_state.memory_root)
+}

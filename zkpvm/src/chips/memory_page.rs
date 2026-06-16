@@ -367,6 +367,14 @@ impl BuiltInProverComponent for MemoryPageChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         use crate::page_merkle::{leaf_block_outputs, state_to_bytes};
 
         let empty = Vec::new();
@@ -378,7 +386,8 @@ impl BuiltInProverComponent for MemoryPageChip {
         let leaf_tag = state_to_bytes(&crate::page_merkle::h_after_leaf_tag_words());
 
         let num_rows_real = pages.len() * BLOCKS_PER_PAGE;
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real.max(1));
+        let log_size =
+            crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real.max(1)).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         for (pi, page) in pages.iter().enumerate() {

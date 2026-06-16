@@ -286,8 +286,10 @@ impl BuiltInComponent for RistrettoCombScalarBoundaryChip {
 impl BuiltInProverComponent for RistrettoCombScalarBoundaryChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = boundary_log_size(side_note);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        // Canonical-shape: use the (possibly forced) main-trace `log_size`.
+        // WindowEven/Odd/ByteIdx/IsByteIdx0/IsLast are pure-positional
+        // (row % ROWS_PER_CALL) ⇒ witness-independent preprocessed trace.
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
@@ -314,8 +316,16 @@ impl BuiltInProverComponent for RistrettoCombScalarBoundaryChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         use crate::core::tracing::ScalarMultKind;
-        let log_size = boundary_log_size(side_note);
+        let log_size = boundary_log_size(side_note).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         // Walk `ristretto_comb_calls` and the parallel `ristretto_mem_ops`

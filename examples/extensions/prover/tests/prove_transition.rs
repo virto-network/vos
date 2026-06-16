@@ -369,6 +369,24 @@ fn measure_succinct_ledger_size_independence() {
 /// in well under 16 GB.
 const SEG_STEPS: usize = 500_000;
 
+/// Run `f` on a thread with a large (512 MiB) stack.
+///
+/// The standalone STARK verifier on a CANONICAL proof (all 31 components
+/// present + forced large `log_size`s — `BLAKE2B_BOUNDARY` @ 17, plus the
+/// natural `CPU`/`MEMORY` @ 17-19) uses far more stack than libtest's default
+/// ~2 MiB test-thread stack and aborts with "stack overflow" otherwise.
+/// PRODUCTION verifiers must likewise run `verify_chain_standalone_allowlist`
+/// on an adequate stack (set `RUST_MIN_STACK`, or spawn a large-stack thread) —
+/// a federation wire-through W1/W2 wiring requirement, not just a test detail.
+fn run_with_large_stack(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn large-stack thread")
+        .join()
+        .expect("large-stack test body panicked");
+}
+
 /// verify_chain with the MOBILE pcs policy: boundary continuity (each
 /// segment's `final_state` == the next's `initial_state`, Phase-Z0-bound)
 /// + per-segment `verify_with_pcs_policy(MOBILE)`. The crate `verify_chain`
@@ -467,6 +485,213 @@ fn measure_memory_boundary() {
         sum_pages[1] / n,
         sum_pages[2] / n,
         sum_pages[3] / n
+    );
+}
+
+/// Canonical-shape BLOCKER measurement (federation wire-through W0, "measure
+/// first"): how many DISTINCT preprocessed-commitment shapes would canonical
+/// proving produce across the whole segment chain?
+///
+/// Forcing each preprocessed-bearing chip to a fixed per-chip `log_size` pins
+/// every chip whose preprocessed COLUMNS are a pure function of `log_size`
+/// (a period/table) — blake2b, blake2b-boundary, memory-page, and 5 of the 7
+/// ristretto chips (ecall, comb-anchor, comb-scalar-boundary,
+/// comb-compress-output, the field-op chip): all positional, so at a fixed
+/// forced `log_size` they emit identical preprocessed columns for every
+/// segment. The TWO exceptions are `RistrettoFixedBaseConsumerChip`
+/// (`IsFinalAccProducer`/`FinalAccCallIdx`/`FinalAccCoordKind` set only on the
+/// real call-blocks, `ristretto_fixed_base_consumer.rs:675`) and
+/// `RistrettoCombCompressChip` (`IsUnityCheck`/`IsOutputProducer`/`CallIdx`/
+/// `IsCoordInputConsumer` gated on `real_n_rows`,
+/// `ristretto_comb_compress.rs:1468`): their preprocessed CONTENT is a pure
+/// function of the per-segment comb-call count, so two segments with different
+/// comb-call counts get DIFFERENT preprocessed commitments even at the same
+/// forced `log_size`.
+///
+/// Therefore the number of distinct per-segment comb-call counts == the number
+/// of distinct canonical program commitments the chain would need. This
+/// measures that (trace-gen only, NO proving): a small bounded set ⇒ a
+/// commitment-allowlist is viable; a large/varying set ⇒ canonical proving (A)
+/// needs the positional-at-fixed-M comb-chip rework, or (B) the separate
+/// program-identity commitment.
+///   SEG_STEPS=100000 cargo test -p prover-extension --release \
+///     --test prove_transition measure_comb_preproc_shapes -- --ignored --nocapture
+#[test]
+#[ignore]
+fn measure_comb_preproc_shapes() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    assert!(total > 1_000_000, "trace only {total} steps — stale ELF?");
+    let seg_steps = std::env::var("SEG_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(SEG_STEPS);
+    let bounds = zkpvm::segment::segment_bounds(total, seg_steps);
+    let n_seg = bounds.len();
+    eprintln!("total steps: {total}; {n_seg} segments of <= {seg_steps}");
+
+    // Bucket every precompile record into its segment by timestamp, using the
+    // SAME [ts_lo, ts_hi) window `segment_side_note` uses (so the counts equal
+    // what each segment's chips see).
+    let seg_of = |ts: u64| -> Option<usize> {
+        bounds.iter().position(|&(a, b)| {
+            let ts_lo = full.steps[a].timestamp;
+            let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
+            ts >= ts_lo && ts < ts_hi
+        })
+    };
+    let mut comb = vec![0usize; n_seg];
+    let mut ecall = vec![0usize; n_seg];
+    let mut blake = vec![0usize; n_seg];
+    for c in &full.ristretto_comb_calls {
+        if let Some(s) = seg_of(c.ts) {
+            comb[s] += 1;
+        }
+    }
+    // RistrettoEcallChip block count (positional chip — drives its SIZE only).
+    for op in &full.ristretto_mem_ops {
+        if let Some(s) = seg_of(op.ts) {
+            ecall[s] += 1;
+        }
+    }
+    for op in &full.blake2b_mem_ops {
+        if let Some(s) = seg_of(op.ts) {
+            blake[s] += 1;
+        }
+    }
+
+    eprintln!();
+    eprintln!("seg    steps   comb_calls  ristretto_mem_ops  blake2b_mem_ops");
+    for (i, &(a, b)) in bounds.iter().enumerate() {
+        if comb[i] > 0 || ecall[i] > 0 || blake[i] > 0 {
+            eprintln!(
+                "{i:>3}  {:>8}  {:>10}  {:>17}  {:>15}",
+                b - a,
+                comb[i],
+                ecall[i],
+                blake[i]
+            );
+        }
+    }
+
+    use std::collections::BTreeMap;
+    let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
+    for &c in &comb {
+        *hist.entry(c).or_default() += 1;
+    }
+    let distinct = hist.len();
+    let comb_segments = comb.iter().filter(|&&c| c > 0).count();
+    let max_comb = comb.iter().copied().max().unwrap_or(0);
+    eprintln!();
+    eprintln!("comb-call-count histogram (calls -> #segments): {hist:?}");
+    eprintln!("segments with >=1 comb call: {comb_segments} / {n_seg}");
+    eprintln!("max comb calls in any single segment: {max_comb}");
+    eprintln!();
+    eprintln!(
+        "==> DISTINCT comb-call counts = {distinct} => canonical-shape proving \
+         (forcing log_size) yields {distinct} distinct program commitments \
+         (the 2 comb chips are the only witness-dependent-preprocessed chips)."
+    );
+    if distinct <= 3 {
+        eprintln!(
+            "    SMALL bounded set: a {distinct}-entry commitment allowlist is viable, \
+             OR pad the comb witness to the canonical max ({max_comb}) call-blocks."
+        );
+    } else {
+        eprintln!(
+            "    LARGE set: needs the positional-at-fixed-M comb-chip rework (A) \
+             or the separate program-identity commitment (B)."
+        );
+    }
+}
+
+/// Lock the canonical forcing profile (federation wire-through W0): the
+/// per-chip MAX natural `log_size` of each forcing-set chip across ALL
+/// segments. `prove_canonical` pads each forcing-set chip up to this value, so
+/// every segment's forced chips share one `log_size` and the only remaining
+/// commitment variation is the 2 comb chips' witness-gated CONTENT (handled by
+/// the allowlist). The profile MUST be >= every segment's natural size or that
+/// segment lands on a third (unlisted) commitment. Trace-gen only (no FRI),
+/// but heavy (per-segment page-merkle ingest + per-chip trace-gen).
+///   SEG_STEPS=100000 cargo test -p prover-extension --release \
+///     --test prove_transition measure_canonical_profile -- --ignored --nocapture
+#[test]
+#[ignore]
+fn measure_canonical_profile() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    assert!(total > 1_000_000, "trace only {total} steps — stale ELF?");
+    let seg_steps = std::env::var("SEG_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(SEG_STEPS);
+    let bounds = zkpvm::segment::segment_bounds(total, seg_steps);
+    // chip_idx of the forcing set (variable preprocessed-bearing chips).
+    const FORCING: [usize; 10] = [1, 2, 4, 23, 24, 26, 27, 28, 29, 30];
+    const NAMES: [&str; 10] = [
+        "BLAKE2B",
+        "BLAKE2B_BOUNDARY",
+        "MEMORY_PAGE",
+        "RISTRETTO",
+        "RIST_ECALL",
+        "FIXED_BASE_CONSUMER",
+        "COMB_ANCHOR",
+        "COMB_SCALAR_BOUNDARY",
+        "COMB_COMPRESS",
+        "COMB_COMPRESS_OUTPUT",
+    ];
+    eprintln!(
+        "profiling {} segments of <= {seg_steps} ({total} steps)…",
+        bounds.len()
+    );
+    let mut maxes = [0u32; 10];
+    for (i, &(a, b)) in bounds.iter().enumerate() {
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let sizes = zkpvm::natural_log_sizes_for(&mut sn, &FORCING);
+        for k in 0..10 {
+            maxes[k] = maxes[k].max(sizes[k]);
+        }
+        if i % 10 == 0 || !sn.ristretto_comb_calls.is_empty() {
+            eprintln!("  seg {i:>3}: {sizes:?}");
+        }
+    }
+    eprintln!();
+    eprintln!("=== per-chip MAX natural log_size across all segments ===");
+    for k in 0..10 {
+        eprintln!(
+            "  chip_idx {:>2} {:<22} = {}",
+            FORCING[k], NAMES[k], maxes[k]
+        );
+    }
+    // Emit the full chip_idx-indexed profile literal (0 for non-forcing chips).
+    let mut arr = [0u32; 31];
+    for k in 0..10 {
+        arr[FORCING[k]] = maxes[k];
+    }
+    eprintln!();
+    eprintln!("VOUCHER_CHECK_CANONICAL_PROFILE (chip_idx 0..31) = {arr:?}");
+    let cap = *maxes.iter().max().unwrap();
+    assert!(
+        cap <= 24,
+        "a forcing-set chip needs log_size {cap} > DEFAULT_MAX_LOG_SIZE (24)"
     );
 }
 
@@ -598,6 +823,243 @@ fn measure_segment_log_sizes() {
     eprintln!("PER-CHIP MAX log_size (canonical profile target): {per_chip_max:?}");
 }
 
+/// W0 validation gate (federation wire-through): canonical-shape proving with
+/// [`prover_extension::VOUCHER_CHECK_CANONICAL_PROFILE`] collapses the
+/// conservation transition's heterogeneous segments onto the small published
+/// commitment allowlist `{C_0, C_1}`.
+///
+/// Asserts:
+///  - two structurally-DIFFERENT comb-free segments (different natural blake2b
+///    / page sizes) produce the SAME commitment `C_0` — canonical forcing
+///    unified their non-comb shape variation;
+///  - the segment carrying a fixed-base scalar mult produces `C_1 != C_0` (the
+///    2 comb chips' `real_n_rows`-gated preprocessed content — the only
+///    residual variation, which the allowlist absorbs);
+///  - every segment verifies standalone (MOBILE) against its own commitment;
+///  - `verify_chain_standalone_allowlist` accepts a contiguous chain whose
+///    segments are all in `{C_0, C_1}`, and rejects one outside the set.
+///
+/// Prints `C_0` / `C_1` for re-pinning `VOUCHER_CHECK_COMMITMENTS`.
+///   SEG_STEPS=100000 cargo test -p prover-extension --release \
+///     --test prove_transition canonical_commitment_allowlist -- --ignored --nocapture
+#[test]
+#[ignore]
+fn canonical_commitment_allowlist() {
+    run_with_large_stack(canonical_commitment_allowlist_impl);
+}
+
+fn canonical_commitment_allowlist_impl() {
+    use zkpvm_verifier::{
+        DEFAULT_MAX_LOG_SIZE, PcsPolicy, verify_chain_standalone_allowlist,
+        verify_standalone_with_pcs_policy,
+    };
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    assert!(total > 1_000_000, "trace only {total} steps — stale ELF?");
+    let seg_steps = std::env::var("SEG_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(SEG_STEPS);
+    let bounds = zkpvm::segment::segment_bounds(total, seg_steps);
+    let n = bounds.len();
+    assert!(n >= 3, "need >= 3 segments to exercise the allowlist");
+
+    // The comb (fixed-base scalar mult) segment — the only shape carrying C_1.
+    let comb_seg = (0..n)
+        .find(|&i| {
+            let (a, b) = bounds[i];
+            !zkpvm::segment::segment_side_note(&full, a, b)
+                .ristretto_comb_calls
+                .is_empty()
+        })
+        .expect("the conservation transition must contain a fixed-base scalar mult (comb) segment");
+    eprintln!("comb segment = #{comb_seg} of {n}");
+
+    let profile = &prover_extension::VOUCHER_CHECK_CANONICAL_PROFILE;
+    let prove_seg = |i: usize| -> zkpvm::Proof {
+        let (a, b) = bounds[i];
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        zkpvm::prove_canonical(&mut sn, profile)
+            .unwrap_or_else(|e| panic!("prove_canonical seg {i} [{a},{b}): {e:?}"))
+    };
+
+    // Two comb-free segments as far apart as possible (very different natural
+    // blake2b / page sizes) — both must collapse to C_0 under forcing.
+    let cf_a = 0usize;
+    let mut cf_b = n - 1;
+    if cf_b == comb_seg {
+        cf_b = n - 2;
+    }
+    assert!(cf_a != comb_seg && cf_b != comb_seg && cf_a != cf_b);
+
+    let p_a = prove_seg(cf_a);
+    let p_b = prove_seg(cf_b);
+    let p_comb = prove_seg(comb_seg);
+    let c0_a = zkpvm::program_commitment_of_proof(&p_a);
+    let c0_b = zkpvm::program_commitment_of_proof(&p_b);
+    let c1 = zkpvm::program_commitment_of_proof(&p_comb);
+    eprintln!("C(seg {cf_a}, comb-free) = {c0_a}");
+    eprintln!("C(seg {cf_b}, comb-free) = {c0_b}");
+    eprintln!("C(seg {comb_seg}, comb)  = {c1}");
+
+    assert_eq!(
+        c0_a, c0_b,
+        "canonical forcing must unify structurally-different comb-free segments \
+         onto ONE commitment C_0 (segments {cf_a} and {cf_b})"
+    );
+    assert_ne!(
+        c0_a, c1,
+        "the comb segment's witness-gated preprocessed content must yield a \
+         distinct commitment C_1 (this is why the chain needs an allowlist)"
+    );
+
+    verify_standalone_with_pcs_policy(p_a.clone(), c0_a, &PcsPolicy::MOBILE)
+        .expect("comb-free segment must verify standalone (MOBILE)");
+    verify_standalone_with_pcs_policy(p_b, c0_b, &PcsPolicy::MOBILE)
+        .expect("comb-free segment must verify standalone (MOBILE)");
+    verify_standalone_with_pcs_policy(p_comb.clone(), c1, &PcsPolicy::MOBILE)
+        .expect("comb segment must verify standalone (MOBILE)");
+
+    // A contiguous comb-free chain (seg 0 + seg 1, both C_0) verifies under the
+    // {C_0, C_1} allowlist.
+    let p0 = p_a;
+    let p1 = prove_seg(1);
+    let allowlist = [c0_a, c1];
+    let expected_root = p0.initial_state.memory_root;
+    verify_chain_standalone_allowlist(
+        &[p0.clone(), p1.clone()],
+        &allowlist,
+        expected_root,
+        DEFAULT_MAX_LOG_SIZE,
+        &PcsPolicy::MOBILE,
+    )
+    .expect("contiguous comb-free chain must verify under the {C_0, C_1} allowlist");
+
+    // A commitment outside the allowlist is rejected.
+    let mut bad = c0_a;
+    bad.0[0] ^= 0xFF;
+    verify_chain_standalone_allowlist(
+        &[p0, p1],
+        &[bad],
+        expected_root,
+        DEFAULT_MAX_LOG_SIZE,
+        &PcsPolicy::MOBILE,
+    )
+    .expect_err("a chain whose segment commitments are not in the allowlist must be rejected");
+
+    // Heterogeneous chain: a CONTIGUOUS run spanning the comb segment
+    // (comb_seg-1 = C_0, comb_seg = C_1, comb_seg+1 = C_0) — the real federation
+    // case, a chain carrying BOTH canonical shapes — must verify under the
+    // {C_0, C_1} allowlist (boundary continuity holds across the C_0→C_1→C_0
+    // shape change; only the commitment differs).
+    if comb_seg >= 1 && comb_seg + 1 < n {
+        let p_before = prove_seg(comb_seg - 1);
+        let p_after = prove_seg(comb_seg + 1);
+        let het = [p_before, p_comb, p_after];
+        let het_commits: Vec<_> = het
+            .iter()
+            .map(zkpvm::program_commitment_of_proof)
+            .collect();
+        assert!(
+            het_commits.contains(&c1),
+            "the heterogeneous chain must actually include the C_1 (comb) shape"
+        );
+        verify_chain_standalone_allowlist(
+            &het,
+            &allowlist,
+            het[0].initial_state.memory_root,
+            DEFAULT_MAX_LOG_SIZE,
+            &PcsPolicy::MOBILE,
+        )
+        .expect("a contiguous C_0–C_1–C_0 chain must verify under the {C_0, C_1} allowlist");
+        eprintln!(
+            "heterogeneous chain [{},{},{}] verified under the allowlist",
+            comb_seg - 1,
+            comb_seg,
+            comb_seg + 1
+        );
+    }
+
+    eprintln!("\nW0 GATE GREEN — canonical proving yields the 2-entry allowlist.");
+    eprintln!(
+        "VOUCHER_CHECK_COMMITMENTS[0] (C_0, comb-free) = {:?}",
+        c0_a.0
+    );
+    eprintln!("VOUCHER_CHECK_COMMITMENTS[1] (C_1, one comb)  = {:?}", c1.0);
+}
+
+/// Drift guard for the re-pinned canonical commitment allowlist (federation
+/// wire-through W0). Re-derives `C_0` (a comb-free segment) and `C_1` (the comb
+/// segment) via canonical proving and asserts they equal the baked
+/// [`prover_extension::VOUCHER_CHECK_COMMITMENTS`]. Fails loudly if the AIR, the
+/// canonical profile, or the voucher-check ELF changes the program commitment —
+/// re-run `canonical_commitment_allowlist`, paste the printed values, and bump
+/// the proof-format version if the change is an AIR change.
+///   SEG_STEPS=100000 cargo test -p prover-extension --release \
+///     --test prove_transition canonical_commitment_drift_guard -- --ignored --nocapture
+#[test]
+#[ignore]
+fn canonical_commitment_drift_guard() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let Some(full) = trace_program(PROGRAM, &witness_buf) else {
+        eprintln!("SKIP: trace failed");
+        return;
+    };
+    let total = full.steps.len();
+    assert!(total > 1_000_000, "trace only {total} steps — stale ELF?");
+    let seg_steps = std::env::var("SEG_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(SEG_STEPS);
+    let bounds = zkpvm::segment::segment_bounds(total, seg_steps);
+    let n = bounds.len();
+    let comb_seg = (0..n)
+        .find(|&i| {
+            let (a, b) = bounds[i];
+            !zkpvm::segment::segment_side_note(&full, a, b)
+                .ristretto_comb_calls
+                .is_empty()
+        })
+        .expect("conservation transition must contain a comb segment");
+
+    let profile = &prover_extension::VOUCHER_CHECK_CANONICAL_PROFILE;
+    let prove_seg = |i: usize| {
+        let (a, b) = bounds[i];
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let proof = zkpvm::prove_canonical(&mut sn, profile)
+            .unwrap_or_else(|e| panic!("prove_canonical seg {i}: {e:?}"));
+        zkpvm::program_commitment_of_proof(&proof).0
+    };
+    let c0 = prove_seg(0);
+    let c1 = prove_seg(comb_seg);
+
+    let baked = prover_extension::VOUCHER_CHECK_COMMITMENTS;
+    assert_eq!(
+        c0, baked[0],
+        "C_0 (comb-free canonical commitment) drifted — re-run \
+         canonical_commitment_allowlist and re-pin VOUCHER_CHECK_COMMITMENTS[0]"
+    );
+    assert_eq!(
+        c1, baked[1],
+        "C_1 (one-comb canonical commitment) drifted — re-pin \
+         VOUCHER_CHECK_COMMITMENTS[1]"
+    );
+}
+
 /// Segmentation end-to-end: prove the FULL kernel transition as a chain of
 /// bounded segments and `verify_chain` it. This is the general capability —
 /// any actor trace too large for a single proof becomes provable in bounded
@@ -608,6 +1070,10 @@ fn measure_segment_log_sizes() {
 #[test]
 #[ignore]
 fn prove_transition_segmented_chain() {
+    run_with_large_stack(prove_transition_segmented_chain_impl);
+}
+
+fn prove_transition_segmented_chain_impl() {
     if !voucher_check_elf_path().exists() {
         eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
         return;
@@ -650,37 +1116,50 @@ fn prove_transition_segmented_chain() {
         bounds.len()
     );
 
-    // Prove segment-by-segment, dropping each side note after its proof:
-    // the side notes are deterministic slices of `full`, re-derived at
-    // verify time, so peak memory holds the full trace + ONE segment.
+    // Prove segment-by-segment with CANONICAL-SHAPE proving (the federation
+    // path): every segment shares VOUCHER_CHECK_CANONICAL_PROFILE and lands on
+    // one of the small commitment allowlist {C_0, C_1}. Drop each side note
+    // after its proof (peak memory holds the full trace + ONE segment); collect
+    // the distinct commitments observed — that IS the chain's allowlist.
+    use zkpvm_verifier::{DEFAULT_MAX_LOG_SIZE, PcsPolicy, verify_chain_standalone_allowlist};
+    let profile = &prover_extension::VOUCHER_CHECK_CANONICAL_PROFILE;
     let mut proofs = Vec::new();
+    let mut allowlist: Vec<zkpvm::ProgramCommitment> = Vec::new();
     for (i, (a, b)) in bounds.iter().enumerate() {
         let mut sn = zkpvm::segment::segment_side_note(&full, *a, *b);
         let t = std::time::Instant::now();
-        let proof = zkpvm::prove_mobile(&mut sn)
-            .unwrap_or_else(|e| panic!("prove segment {i} [{a},{b}): {e:?}"));
+        let proof = zkpvm::prove_canonical(&mut sn, profile)
+            .unwrap_or_else(|e| panic!("prove_canonical segment {i} [{a},{b}): {e:?}"));
+        let c = zkpvm::program_commitment_of_proof(&proof);
+        if !allowlist.contains(&c) {
+            allowlist.push(c);
+        }
         eprintln!(
-            "  segment {i} [{a},{b}) ({} steps): proved in {:.1?}",
+            "  segment {i} [{a},{b}) ({} steps): proved canonical in {:.1?} ({c})",
             b - a,
             t.elapsed()
         );
         proofs.push(proof);
     }
-
-    let resegment = |i: usize| {
-        let (a, b) = bounds[i];
-        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
-        // A re-derived slice must be normalized the way `prove` does it
-        // (closing-chip activation + register-image backfills) or the
-        // verifier's Fiat-Shamir transcript diverges at OODS.
-        zkpvm::prepare_side_note_for_verification(&mut sn);
-        sn
-    };
-    let t = std::time::Instant::now();
-    verify_chain_mobile(&proofs, resegment)
-        .expect("verify_chain (mobile) over transition segments");
     eprintln!(
-        "verify_chain over {} segments: ok ({:.1?})",
+        "distinct canonical commitments across the chain: {} ({allowlist:?})",
+        allowlist.len()
+    );
+
+    // Side-note-FREE chain verification against the (self-derived) allowlist —
+    // the trustless federation path, NOT the test-local verify_chain_mobile.
+    let expected_root = proofs[0].initial_state.memory_root;
+    let t = std::time::Instant::now();
+    verify_chain_standalone_allowlist(
+        &proofs,
+        &allowlist,
+        expected_root,
+        DEFAULT_MAX_LOG_SIZE,
+        &PcsPolicy::MOBILE,
+    )
+    .expect("verify_chain_standalone_allowlist over canonical transition segments");
+    eprintln!(
+        "verify_chain_standalone_allowlist over {} segments: ok ({:.1?})",
         proofs.len(),
         t.elapsed()
     );
@@ -690,12 +1169,20 @@ fn prove_transition_segmented_chain() {
         let mut forged = proofs.clone();
         forged[1].initial_state.timestamp ^= 1;
         assert!(
-            verify_chain_mobile(&forged, resegment).is_err(),
+            verify_chain_standalone_allowlist(
+                &forged,
+                &allowlist,
+                expected_root,
+                DEFAULT_MAX_LOG_SIZE,
+                &PcsPolicy::MOBILE,
+            )
+            .is_err(),
             "verify_chain must reject a broken segment boundary"
         );
     }
     eprintln!(
-        "ALL {total} steps PROVED + verify_chain green across {} segments",
+        "ALL {total} steps PROVED canonical + verify_chain_standalone_allowlist \
+         green across {} segments",
         proofs.len()
     );
 }

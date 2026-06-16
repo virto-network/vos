@@ -229,38 +229,69 @@ pub fn program_commitment_bytes(program_id: &[u8]) -> Option<[u8; 32]> {
     baked_commitment(program_id)
 }
 
-/// v1 baked `program_id -> trusted commitment` map. The commitment is the
-/// preprocessed-trace Merkle root of a representative witness-injected
-/// proof of the program.
+/// Canonical-shape forcing profile for `voucher-check` (federation wire-through
+/// W0), indexed by [`zkpvm::chip_idx`]. `zkpvm::prove_canonical` pads each
+/// forcing-set chip's main trace up to `PROFILE[chip_idx]` so every segment's
+/// preprocessed-bearing chips share one `log_size`; `0` = not forced (the chip
+/// proves at its natural / fixed-table size).
 ///
-/// STALE / vestigial for `voucher-check`. This single-commitment model
-/// fit the old single-shot proof. The guest now proves the
-/// conservation-of-value transition, whose trace is segment-chain-sized
-/// (the single-shot prove this commitment was pinned against no longer
-/// completes), AND the preprocessed commitment is shape-dependent (it
-/// varies with `log_sizes`/segment size) — so one baked constant does
-/// not identify the chain. The value below is the PRE-Phase-0 ELF's
-/// commitment and is not re-pinned: nothing on the live path consumes
-/// it (the federation happy path is skipped pending chain-aware verify;
-/// the drift-guard test was retired with the single-shot roundtrip).
-/// Program identity for the chain is `(commitment, log_sizes)` per
-/// segment — see `program_id.rs` and the chain-verification section of
-/// `docs/plans/succinct-merkle-witness.md`.
-fn baked_commitment(program_id: &[u8]) -> Option<[u8; 32]> {
+/// Locked by `measure_canonical_profile` (the per-chip MAX natural `log_size`
+/// over the whole conservation transition at SEG_STEPS = 100_000) — re-measure
+/// and re-pin (and re-pin [`VOUCHER_CHECK_COMMITMENTS`]) if the segment-step
+/// bound or the voucher-check ELF changes. Forcing set: BLAKE2B(1),
+/// BLAKE2B_BOUNDARY(2), MEMORY_PAGE(4), RISTRETTO(23), RIST_ECALL(24),
+/// FIXED_BASE_CONSUMER(26), COMB_ANCHOR(27), COMB_SCALAR_BOUNDARY(28),
+/// COMB_COMPRESS(29), COMB_COMPRESS_OUTPUT(30).
+pub const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; zkpvm::chip_idx::COUNT] = [
+    0, 14, 17, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 0, 11, 6, 5, 6, 5,
+];
+
+/// Published canonical-shape program-commitment ALLOWLIST for `voucher-check`
+/// (federation wire-through W0). The commitment is the preprocessed-trace
+/// Merkle root; under canonical proving (`zkpvm::prove_canonical` with
+/// [`VOUCHER_CHECK_CANONICAL_PROFILE`]) every segment of the conservation
+/// transition collapses to one of these — `[0]` = a comb-free segment (the
+/// vast majority), `[1]` = a segment carrying one fixed-base scalar mult. The
+/// two comb chips' `real_n_rows`-gated preprocessed content is the ONLY
+/// remaining shape variation, so the set is small and witness-independent;
+/// `zkpvm_verifier::verify_chain_standalone_allowlist` accepts a chain whose
+/// every segment commitment is in this set. (Larger transfer batches with more
+/// comb calls per segment extend the allowlist with `C_2, …`.) Re-pinned by
+/// the `canonical_commitment_drift_guard` test.
+pub const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
+    // C_0 — comb-free canonical shape (75 of 76 segments).
+    // blake2s 35a231e8f5317023f5637f603becd36122fe9e6945f169f5a5d6177c4bb0ee90
+    [
+        0x35, 0xa2, 0x31, 0xe8, 0xf5, 0x31, 0x70, 0x23, 0xf5, 0x63, 0x7f, 0x60, 0x3b, 0xec, 0xd3,
+        0x61, 0x22, 0xfe, 0x9e, 0x69, 0x45, 0xf1, 0x69, 0xf5, 0xa5, 0xd6, 0x17, 0x7c, 0x4b, 0xb0,
+        0xee, 0x90,
+    ],
+    // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
+    // blake2s 1de878a78374b8a14c5700e6cfeda13bbcd67edb6398a10d7ffb3e77e9a15567
+    [
+        0x1d, 0xe8, 0x78, 0xa7, 0x83, 0x74, 0xb8, 0xa1, 0x4c, 0x57, 0x00, 0xe6, 0xcf, 0xed, 0xa1,
+        0x3b, 0xbc, 0xd6, 0x7e, 0xdb, 0x63, 0x98, 0xa1, 0x0d, 0x7f, 0xfb, 0x3e, 0x77, 0xe9, 0xa1,
+        0x55, 0x67,
+    ],
+];
+
+/// The published canonical commitment allowlist for `program_id` (or `None`
+/// for an unknown program). Chain verification pins every segment to one of
+/// these via `verify_chain_standalone_allowlist`.
+pub fn baked_commitments(program_id: &[u8]) -> Option<&'static [[u8; 32]]> {
     match program_id {
-        b"voucher-check" => Some(VOUCHER_CHECK_COMMITMENT),
+        b"voucher-check" => Some(&VOUCHER_CHECK_COMMITMENTS),
         _ => None,
     }
 }
 
-/// Pinned program commitment for the pre-Phase-0 `voucher-check` build.
-/// See [`baked_commitment`] — vestigial; not re-pinned because the live
-/// path no longer consumes it and a single commitment can't identify the
-/// segment chain.
-const VOUCHER_CHECK_COMMITMENT: [u8; 32] = [
-    0x20, 0x5f, 0x2e, 0x4f, 0x0d, 0x88, 0x26, 0x30, 0xbd, 0xed, 0x72, 0x52, 0xea, 0x90, 0x9f, 0x36,
-    0xa0, 0xde, 0x25, 0x2c, 0x62, 0xba, 0x8a, 0x6d, 0xd1, 0xa7, 0x8c, 0x04, 0xb3, 0xea, 0x0b, 0x0d,
-];
+/// Single-commitment view of the canonical allowlist: the PRIMARY shape
+/// (`[0]`, the comb-free segment that the vast majority of segments hit). The
+/// single-shot `verify` API + the `program_commitment` message use this; chain
+/// verification uses the full allowlist via [`baked_commitments`].
+fn baked_commitment(program_id: &[u8]) -> Option<[u8; 32]> {
+    baked_commitments(program_id).map(|cs| cs[0])
+}
 
 /// Resolve an opaque `program_id` to an actor ELF path.
 ///
