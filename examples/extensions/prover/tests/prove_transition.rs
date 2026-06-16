@@ -965,10 +965,7 @@ fn canonical_commitment_allowlist_impl() {
         let p_before = prove_seg(comb_seg - 1);
         let p_after = prove_seg(comb_seg + 1);
         let het = [p_before, p_comb, p_after];
-        let het_commits: Vec<_> = het
-            .iter()
-            .map(zkpvm::program_commitment_of_proof)
-            .collect();
+        let het_commits: Vec<_> = het.iter().map(zkpvm::program_commitment_of_proof).collect();
         assert!(
             het_commits.contains(&c1),
             "the heterogeneous chain must actually include the C_1 (comb) shape"
@@ -1058,6 +1055,61 @@ fn canonical_commitment_drift_guard() {
         "C_1 (one-comb canonical commitment) drifted — re-pin \
          VOUCHER_CHECK_COMMITMENTS[1]"
     );
+}
+
+/// W1 round-trip (federation wire-through): prove the conservation transition
+/// as a canonical segment CHAIN through `prove_chain_blob`, then verify it
+/// through `verify_chain_blob` against the baked canonical commitment
+/// allowlist + the io-binding — the federation happy path minus the
+/// runtime/bridge/libp2p plumbing. `verify_chain_blob` runs the (stack-heavy)
+/// canonical chain verify on its own large-stack thread, so this test needs
+/// no `run_with_large_stack` wrapper.
+///   SEG_STEPS unused here (prove_chain_blob pins CHAIN_SEG_STEPS); heavy.
+///   cargo test -p prover-extension --release --test prove_transition \
+///     chain_blob_roundtrip -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn chain_blob_roundtrip() {
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (public, witness) = build_transition();
+    let witness_buf = encode_witness(&public.encode(), &witness.encode());
+    let chain_blob = prover_extension::prove_chain_blob(PROGRAM, &witness_buf)
+        .expect("prove_chain_blob over the conservation transition (stale ELF?)");
+
+    let io_public = public_bytes(&public);
+    let c0 = prover_extension::VOUCHER_CHECK_COMMITMENTS[0];
+    let c1 = prover_extension::VOUCHER_CHECK_COMMITMENTS[1];
+
+    // Happy: honest chain + an allowlisted commitment + the correct io-binding.
+    assert!(
+        prover_extension::verify_chain_blob(&c0[..], &chain_blob, &io_public, &[1u8]),
+        "an honest canonical chain must verify against C_0 + the io-binding"
+    );
+    // Passing C_1 resolves the SAME {C_0, C_1} allowlist → also accepts (the
+    // chain's per-segment commitments are matched by SET membership).
+    assert!(
+        prover_extension::verify_chain_blob(&c1[..], &chain_blob, &io_public, &[1u8]),
+        "passing C_1 must resolve the same allowlist and accept"
+    );
+    // Forged io: a different root_after → public_bytes differ → the final
+    // segment's STARK-bound io-hash no longer matches → reject.
+    let mut forged = public.clone();
+    forged.state_root_after = [0xEE; 32];
+    assert!(
+        !prover_extension::verify_chain_blob(&c0[..], &chain_blob, &public_bytes(&forged), &[1u8]),
+        "a forged root_after (io-hash mismatch) must reject"
+    );
+    // A commitment outside every published allowlist → reverse-lookup misses → reject.
+    let mut wrong = c0;
+    wrong[0] ^= 0xFF;
+    assert!(
+        !prover_extension::verify_chain_blob(&wrong[..], &chain_blob, &io_public, &[1u8]),
+        "a commitment outside the allowlist must reject"
+    );
+    eprintln!("chain_blob_roundtrip GREEN: canonical chain verifies via the allowlist");
 }
 
 /// Segmentation end-to-end: prove the FULL kernel transition as a chain of

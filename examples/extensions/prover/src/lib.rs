@@ -60,8 +60,11 @@ use std::path::PathBuf;
 
 use object::{Object, ObjectSymbol};
 use vos::prelude::*;
-use zkpvm::{Proof, program_commitment_of_proof, prove_mobile};
-use zkpvm_verifier::{CommitmentHash, PcsPolicy, verify_standalone_with_pcs_policy};
+use zkpvm::{Proof, program_commitment_of_proof, prove_canonical, prove_mobile};
+use zkpvm_verifier::{
+    CommitmentHash, DEFAULT_MAX_LOG_SIZE, PcsPolicy, verify_chain_standalone_allowlist,
+    verify_standalone_with_pcs_policy,
+};
 
 /// Gas bound for tracing a provable actor. Generous — the voucher-check
 /// workload traces in well under this; an actor that exceeds it traces to
@@ -119,6 +122,62 @@ impl Prover {
         verify_proof_bytes(
             &program_commitment,
             &proof_bytes,
+            &public_bytes,
+            &return_bytes,
+        ) as u8
+    }
+
+    /// Prove `program_id` over `witness_bytes` as a canonical-shape SEGMENT
+    /// CHAIN — the federation path for traces too large for a single proof
+    /// (the conservation transition is millions of steps). Segments at a
+    /// fixed step bound, proves each with canonical-shape proving against the
+    /// program's pinned profile, and returns the bincode-encoded `Vec<Proof>`
+    /// (the chain blob). Empty `Vec` on any failure. The caller CASes the
+    /// bytes; the 32-byte content address rides in the voucher's `proof.bytes`
+    /// (unchanged wire shape — still one hash, now addressing the chain blob).
+    /// Heavy + offline (the issuing bank proves before sending the voucher).
+    #[msg]
+    async fn prove_chain(
+        &self,
+        _ctx: &mut Context<Self>,
+        program_id: Vec<u8>,
+        witness_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        prove_chain_blob(&program_id, &witness_bytes).unwrap_or_default()
+    }
+
+    /// Verify a canonical-shape chain proof fetched from the host CAS by
+    /// `chain_hash` (`proof_hash`), composing: (1) every segment's program
+    /// commitment is in the published canonical ALLOWLIST resolved from
+    /// `program_commitment` (a from-scratch prover splicing a foreign program
+    /// matches none); (2) chain continuity + entering-image anchor
+    /// (`verify_chain_standalone_allowlist`); (3) the tagless io-binding on
+    /// the FINAL segment (`compute_io_hash(public_bytes, return_bytes)`),
+    /// which the chain verifier does NOT check itself. Returns 1/0
+    /// (0 includes "blob unavailable", indistinguishable from tampering).
+    /// `peer_prefix` is the `node_prefix` fan-out hint for the blob fetch.
+    #[msg]
+    async fn verify_chain(
+        &self,
+        ctx: &mut Context<Self>,
+        program_commitment: Vec<u8>,
+        proof_hash: Vec<u8>,
+        public_bytes: Vec<u8>,
+        return_bytes: Vec<u8>,
+        peer_prefix: u32,
+    ) -> u8 {
+        if proof_hash.len() != 32 {
+            return 0;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&proof_hash);
+        let hint: u16 = (peer_prefix & 0xFFFF) as u16;
+        let Some(chain_blob) = ctx.blob_get(hash, hint).await else {
+            return 0;
+        };
+        verify_chain_blob(
+            &program_commitment,
+            &chain_blob,
             &public_bytes,
             &return_bytes,
         ) as u8
@@ -212,6 +271,124 @@ pub fn verify_proof_bytes(
     // 2. Tagless io-binding: the proof's STARK-bound public output must
     //    equal the hash recomputed over the asserted I/O bytes.
     proof.public_io_hash() == vos::zk::compute_io_hash(public_bytes, return_bytes)
+}
+
+/// Per-segment step bound for canonical chain proving. MUST match the bound
+/// the canonical profile + commitment allowlist were measured/pinned against
+/// (the W0 `measure_canonical_profile` / `canonical_commitment_allowlist`
+/// runs used 100_000) — a different segment size reshapes the segments and
+/// lands the chain on commitments outside the published allowlist.
+const CHAIN_SEG_STEPS: usize = 100_000;
+
+/// Prove `program_id` over `witness_bytes` as a canonical-shape segment
+/// chain: trace, segment at [`CHAIN_SEG_STEPS`], prove each segment with
+/// [`zkpvm::prove_canonical`] against the program's pinned profile, and
+/// return `bincode(Vec<Proof>)` — the chain blob. `None` on any failure.
+/// Each segment's side note is dropped after its proof, so peak memory holds
+/// the full trace + one segment.
+pub fn prove_chain_blob(program_id: &[u8], witness_bytes: &[u8]) -> Option<Vec<u8>> {
+    let profile = baked_profile(program_id)?;
+    let full = trace_program(program_id, witness_bytes)?;
+    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), CHAIN_SEG_STEPS);
+    let mut segments: Vec<Proof> = Vec::with_capacity(bounds.len());
+    for (a, b) in bounds {
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let proof = prove_canonical(&mut sn, profile).ok()?;
+        segments.push(proof);
+    }
+    bincode::serialize(&segments).ok()
+}
+
+/// Verify a `bincode(Vec<Proof>)` chain blob against the trusted
+/// `commitment_bytes` (one of the program's canonical allowlist entries) and
+/// the asserted `(public_bytes, return_bytes)`. Composes three checks so none
+/// is meaningful without the others:
+///   1. allowlist membership — every segment's commitment must be in the
+///      canonical allowlist that CONTAINS `commitment_bytes` (a foreign
+///      program matches no entry);
+///   2. chain validity — `verify_chain_standalone_allowlist` (per-segment
+///      STARK validity + continuity + the self-anchored entering root);
+///   3. tagless io-binding on the FINAL segment — `public_io_hash() ==
+///      compute_io_hash(public, return)` (the chain verifier itself does NOT
+///      check the io-hash; the guest binds it at halt, i.e. the last segment).
+///
+/// Verifying a canonical proof (all 31 components + forced large log_sizes)
+/// overflows the default ~2 MiB stack, so the chain verification runs on a
+/// large-stack thread. Returns `false` on any malformed input or rejection.
+pub fn verify_chain_blob(
+    commitment_bytes: &[u8],
+    chain_blob: &[u8],
+    public_bytes: &[u8],
+    return_bytes: &[u8],
+) -> bool {
+    if commitment_bytes.len() != 32 {
+        return false;
+    }
+    let mut commitment = [0u8; 32];
+    commitment.copy_from_slice(commitment_bytes);
+    let Some(allowed) = allowlist_for_commitment(&commitment) else {
+        return false;
+    };
+    let Ok(segments) = bincode::deserialize::<Vec<Proof>>(chain_blob) else {
+        return false;
+    };
+    if segments.is_empty() {
+        return false;
+    }
+    // 3. The final segment carries the guest's halt-bound io-hash.
+    if segments.last().unwrap().public_io_hash()
+        != vos::zk::compute_io_hash(public_bytes, return_bytes)
+    {
+        return false;
+    }
+    let allowlist: Vec<CommitmentHash> = allowed
+        .iter()
+        .map(|c| CommitmentHash::from(&c[..]))
+        .collect();
+    let expected_root = segments[0].initial_state.memory_root;
+    // 1 + 2: allowlist membership + chain validity, on a large stack.
+    let verdict = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || {
+            verify_chain_standalone_allowlist(
+                &segments,
+                &allowlist,
+                expected_root,
+                DEFAULT_MAX_LOG_SIZE,
+                &PcsPolicy::MOBILE,
+            )
+            .is_ok()
+        });
+    match verdict {
+        Ok(handle) => handle.join().unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// The canonical `min_log_size` profile [`prove_chain`] pads each forcing-set
+/// chip to, per program. `None` for an unknown program.
+fn baked_profile(program_id: &[u8]) -> Option<&'static [u32]> {
+    match program_id {
+        b"voucher-check" => Some(&VOUCHER_CHECK_CANONICAL_PROFILE),
+        _ => None,
+    }
+}
+
+/// The published canonical commitment allowlist that CONTAINS `commitment`
+/// (reverse lookup over the baked programs). `None` if no program's allowlist
+/// contains it — so a commitment outside every published canonical shape
+/// cannot be chain-verified. Lets the bridge keep passing the single
+/// `program_commitment` it already holds (the primary shape) while the chain
+/// is verified against the full allowlist.
+fn allowlist_for_commitment(commitment: &[u8; 32]) -> Option<&'static [[u8; 32]]> {
+    for program in [b"voucher-check".as_slice()] {
+        if let Some(commitments) = baked_commitments(program) {
+            if commitments.iter().any(|c| c == commitment) {
+                return Some(commitments);
+            }
+        }
+    }
+    None
 }
 
 /// The 32-byte trusted program commitment for `program_id` — the program

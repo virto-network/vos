@@ -6116,6 +6116,115 @@ fn clerk_ledger_bootstrap_and_create_account() {
     assert_eq!(panics, 0, "actor panics during clerk-ledger test: {panics}");
 }
 
+/// Federation wire-through W3 producer: build a self-contained
+/// conservation transition (2 accounts, 1 settled debit) on a `VecLedger`,
+/// REGISTERED BY `registrar` so the resulting `voucher::proof::Public.issuer
+/// == registrar.public` — the field the receiving bridge reconstructs
+/// `public_bytes` from (issuer = the peer clerk pubkey it verified the
+/// voucher signature against). This is the in-circuit conservation workload
+/// the voucher-check guest re-runs; its OWN ledger roots / `amount_commit`
+/// are what the External voucher attests (NOT bank A's clerk-ledger redb).
+/// Returns the public, the succinct witness, and the `(value, blinding)` to
+/// seal the value envelope. Mirrors the prover-extension's `build_transition`
+/// test fixture; the chain commitment is witness-independent (canonical-shape
+/// proving), so the OsRng-drawn account keys don't shift the {C_0, C_1}
+/// allowlist the chain proves against.
+fn build_conservation_transition(
+    registrar: &cipher_clerk::crypto::Keypair,
+) -> (
+    cipher_clerk::voucher::proof::Public,
+    cipher_clerk::succinct::SuccinctTransitionWitness,
+    u64,
+    cipher_clerk::crypto::Blinding,
+) {
+    use cipher_clerk::crypto::{Amount, Blinding};
+    use cipher_clerk::prelude::*;
+    use cipher_clerk::snapshot::{OpeningsOracle, VecLedger};
+    use cipher_clerk::state::Opening;
+    use cipher_clerk::succinct::SuccinctTransitionWitness;
+    use cipher_clerk::voucher::proof::Public as VoucherPublic;
+
+    // Same batch-seed timestamp + 2-account/1-debit shape as the canonical
+    // profile + commitment allowlist were pinned against (W0).
+    const BATCH_TS: u64 = 600_000;
+
+    let journal = Journal::new(JournalId::random(), registrar.public, 1);
+    let jid = journal.id;
+    let mut ledger = VecLedger::new();
+    ledger.set_journal(journal);
+
+    let value: u64 = 100;
+    let blinding = Blinding::from_bytes([3u8; 32]).expect("canonical scalar");
+    let amount_commit = Amount::commit(value, &blinding);
+    let mut oracle = OpeningsOracle::new(vec![Opening {
+        amount: amount_commit,
+        value,
+        blinding,
+    }]);
+
+    let alice_kp = Keypair::generate();
+    let bob_kp = Keypair::generate();
+    let alice = Account::open(
+        AccountKind::Asset,
+        jid,
+        alice_kp.public,
+        Iso4217::USD,
+        BankCode::Vault,
+    );
+    let bob = Account::open(
+        AccountKind::Liability,
+        jid,
+        bob_kp.public,
+        Iso4217::USD,
+        BankCode::Checking,
+    );
+    let creates = cipher_clerk::apply_account_creations(
+        &mut ledger,
+        &[
+            CreateAccount::signed(alice.clone(), &registrar.secret),
+            CreateAccount::signed(bob.clone(), &registrar.secret),
+        ],
+        &mut oracle,
+        500_000,
+    );
+    for r in &creates {
+        assert_eq!(r.status, EventStatus::Created);
+    }
+
+    let t = Transfer::builder(jid)
+        .debit(&alice, Layer::Settled, amount_commit)
+        .credit(&bob, Layer::Settled, amount_commit)
+        .signed_with(&[(&alice, &alice_kp.secret)]);
+
+    let root_before = ledger.root();
+    let events = vec![t];
+    let mut probe = ledger.clone();
+    let mut probe_oracle = oracle.clone();
+    let _ = cipher_clerk::apply_batch(&mut probe, &events, &mut probe_oracle, BATCH_TS);
+    let root_after = probe.root();
+
+    let public = VoucherPublic {
+        issuer: registrar.public,
+        amount_commit,
+        state_root_before: root_before,
+        state_root_after: root_after,
+    };
+    let witness = SuccinctTransitionWitness::from_full(&ledger, &events, &oracle, BATCH_TS);
+    (public, witness, value, blinding)
+}
+
+/// Length-prefixed `[u32 public_len][public][u32 secret_len][secret]` — the
+/// `__VOS_WITNESS` payload the voucher-check guest decodes (mirrors
+/// `vos::zk::read_witness_buffer`).
+fn encode_witness_payload(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + public_bytes.len() + secret_bytes.len());
+    v.extend_from_slice(&(public_bytes.len() as u32).to_le_bytes());
+    v.extend_from_slice(public_bytes);
+    v.extend_from_slice(&(secret_bytes.len() as u32).to_le_bytes());
+    v.extend_from_slice(secret_bytes);
+    v
+}
+
 #[test]
 fn clerk_ledger_two_bank_federation() {
     // End-to-end federation demo. Two bank spaces (A, B), each
@@ -7796,10 +7905,122 @@ fn clerk_ledger_two_bank_federation() {
         // built yet. Until then the happy path lives in the prover's
         // segmented-chain test, and the bridge dispatch below is pinned
         // by the adversarial (reject) cases, which need no real proof.
-        eprintln!(
-            "SKIP 5h happy-path: the succinct-transition proof needs the segmented \
-             verify_chain path, not yet wired through prover-extension/clerk-bridge"
-        );
+        // Real-STARK happy path (federation wire-through W3) — opt-in via
+        // VOS_FEDERATION_REAL_STARK (the canonical chain prove is minutes: the
+        // conservation transition is ~76 bounded segments). RUN WITH
+        // RUST_MIN_STACK=268435456: the canonical prove's rayon workers + the
+        // extension's verify thread need ample stack in the runtime context
+        // (the default ~2 MiB overflows; the standalone prover test doesn't
+        // hit this because nothing pre-builds the rayon pool there). Build a real
+        // conservation transition, prove it as a canonical segment chain
+        // through the prover extension, CAS the chain blob on bank A, and
+        // submit an External voucher attesting the transition's roots; bank B's
+        // bridge dispatches verify_chain, which fetches the blob over libp2p,
+        // verifies the chain against the program's canonical commitment
+        // allowlist + the io-binding, and redeems.
+        if std::env::var("VOS_FEDERATION_REAL_STARK").is_ok() {
+            use vos::Encode;
+            let dedup_before_happy = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+                .expect("redeemed_count pre-happy");
+            // Issued by registrar_a so the witness's Public.issuer == the peer
+            // clerk pubkey the bridge reconstructs public_bytes from.
+            let (public, witness, value, blinding) = build_conservation_transition(&registrar_a);
+            let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
+            assert!(
+                witness_buf.len() <= 16384,
+                "conservation witness exceeds the guest __VOS_WITNESS buffer ({} B)",
+                witness_buf.len()
+            );
+            // Offline: prove the canonical segment chain (minutes).
+            let chain_bytes = prover_extension::prove_chain_blob(b"voucher-check", &witness_buf)
+                .expect(
+                    "prove_chain over the conservation transition \
+                     (stale voucher-check ELF? run `just build-voucher-check`)",
+                );
+            // Seed the chain blob on bank B's node so verify_chain fetches it
+            // LOCALLY. The full ChainProof (~N×1 MiB ≈ tens of MiB) exceeds the
+            // 8 MiB single-shot cross-node frame cap (MAX_FRAME_BYTES; no
+            // chunked transport yet), so the cross-node fetch can't carry it.
+            // The real cross-bank delivery path is RECURSION (which collapses
+            // the N-segment chain into one ~1 MiB aggregate proof, well under
+            // the cap — and supersedes verify_chain), or chunked transport;
+            // both are out of scope here. The crypto under test — bank B
+            // verifying bank A's conservation chain against the canonical
+            // allowlist + io-binding — is delivery-agnostic.
+            let chain_hash = node_b.put_proof_blob(chain_bytes);
+            let envelope_happy = EncryptedEnvelope::seal(value, &blinding, &bank_b_ivk_pk)
+                .expect("seal envelope (happy)");
+            let voucher_happy = Voucher::sign(
+                public.amount_commit,
+                envelope_happy,
+                public.state_root_before,
+                public.state_root_after,
+                CcProof {
+                    mode: CcProofMode::External,
+                    bytes: chain_hash.to_vec(),
+                },
+                &registrar_a.secret,
+            );
+            let reply_happy = vos::block_on(bridge_actor.submit_voucher(
+                &mut &node_b,
+                voucher_happy.to_bytes(),
+                b"bank-a".to_vec(),
+            ))
+            .expect("invoke submit_voucher (Mode::External, real canonical chain)");
+            assert_eq!(
+                reply_happy.status,
+                BridgeStatus::Ok,
+                "a real canonical-chain External voucher must verify + redeem (got {:?})",
+                reply_happy.status
+            );
+            let dedup_after_happy = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+                .expect("redeemed_count post-happy");
+            assert_eq!(
+                dedup_after_happy,
+                dedup_before_happy + 1,
+                "the real-STARK happy path must advance the redeemed/dedup count"
+            );
+
+            // Forged-on-real-STARK: the SAME (valid) chain blob, but the
+            // voucher LIES about root_after (re-signed, so the signature is
+            // valid and the triple dedup key is fresh). The bridge reconstructs
+            // public_bytes with the lie, so the prover's io-binding
+            // (compute_io_hash over the asserted public) no longer matches the
+            // proof's STARK-bound io-hash → reject. This is exactly the
+            // conservation property a bare signature check could NOT enforce.
+            let envelope_forge = EncryptedEnvelope::seal(value, &blinding, &bank_b_ivk_pk)
+                .expect("seal envelope (forge)");
+            let voucher_forge = Voucher::sign(
+                public.amount_commit,
+                envelope_forge,
+                public.state_root_before,
+                [0xEEu8; 32],
+                CcProof {
+                    mode: CcProofMode::External,
+                    bytes: chain_hash.to_vec(),
+                },
+                &registrar_a.secret,
+            );
+            let reply_forge = vos::block_on(bridge_actor.submit_voucher(
+                &mut &node_b,
+                voucher_forge.to_bytes(),
+                b"bank-a".to_vec(),
+            ))
+            .expect("invoke submit_voucher (forged root_after on a real chain)");
+            assert_eq!(
+                reply_forge.status,
+                BridgeStatus::ProofInvalid,
+                "a voucher with a forged root_after must reject — the real chain proof's \
+                 io-binding pins the genuine roots (got {:?})",
+                reply_forge.status
+            );
+        } else {
+            eprintln!(
+                "SKIP 5h happy-path: set VOS_FEDERATION_REAL_STARK=1 RUST_MIN_STACK=268435456 \
+                 to run the real canonical segment-chain prove (minutes) + verify_chain accept \
+                 / forged-root reject"
+            );
+        }
         let dedup_after_5h = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
             .expect("redeemed_count baseline");
 

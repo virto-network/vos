@@ -213,6 +213,52 @@ This adds NO AIR/constraint changes and NO proof-format change — only the
 - **W4 — validation.** `chain_standalone` + the new W1 unit test + the e2e
   happy/forgery; rebuild the prover cdylib; confirm fmt/clippy clean.
 
+## W1-W3 outcome (built 2026-06-16)
+
+Landed on `voucher-state-transition`. A receiving bank verifies a peer's
+segmented conservation chain end-to-end.
+
+- **W1 (prover extension).** `prove_chain(program_id, witness) -> Vec<u8>`
+  (trace → `segment_bounds` → per-segment `prove_canonical` against the pinned
+  `VOUCHER_CHECK_CANONICAL_PROFILE` → `bincode(Vec<Proof>)` chain blob; caller
+  CASes it) + `verify_chain(program_commitment, chain_hash, public_bytes,
+  return_bytes, peer_prefix) -> u8` (`blob_get` → reverse-resolve the canonical
+  commitment ALLOWLIST from `program_commitment` →
+  `verify_chain_standalone_allowlist` on a 512 MiB-stack thread → io-binding on
+  the final segment). Context-free cores `prove_chain_blob` / `verify_chain_blob`;
+  single-shot `prove`/`verify` kept.
+- **W2 (clerk-bridge).** `dispatch_external_proof` dispatches `verify_chain`
+  (was `verify`); `voucher.proof.bytes` now addresses the chain blob — wire
+  shape unchanged (one hash). The allowlist reverse-lookup means no bridge data
+  change.
+- **W3 (federation e2e).** `build_conservation_transition` producer (a
+  self-contained `VecLedger` transition registered by bank A's clerk key, so
+  the witness's `issuer` matches the peer pubkey the bridge reconstructs
+  `public_bytes` from); §5h happy path un-skipped + gated on
+  `VOS_FEDERATION_REAL_STARK`: build witness → `prove_chain` → CAS → External
+  voucher → bridge `verify_chain` → redeem, plus a forged-root-on-real-STARK
+  reject (the proof's io-binding pins the genuine roots — the property a bare
+  signature could not enforce). Validated: `chain_blob_roundtrip` (accept /
+  forged-io reject / non-allowlist reject) + the e2e happy path.
+
+### Cross-node blob delivery — gated on RECURSION, not a manifest
+
+The single `bincode(Vec<Proof>)` chain blob is ~N×1 MiB (tens of MiB for the
+~76-segment transition), exceeding the **8 MiB single-shot cross-node frame
+cap** (`MAX_FRAME_BYTES`; chunked transport unimplemented). So the e2e seeds
+the chain blob on the receiver's node locally — the verification it exercises
+is delivery-agnostic.
+
+The deferred "manifest-of-hashes + per-segment fetch" fallback was considered
+but NOT built: **recursion** (`recursion-spike.md`) collapses the N-segment
+chain into ONE ~1 MiB aggregate proof — under the 8 MiB cap, a single-blob
+fetch, a one-proof verify that also relieves the 512 MiB-stack pressure — and
+supersedes `verify_chain` entirely, so a manifest would be throwaway.
+Performance work (precompiling the guest's dominant blake2b) shrinks the chain
+(fewer segments) but won't reliably reach a single sub-8-MiB blob; recursion
+is the delivery fix. Cross-bank delivery is gated on recursion (preferred) or
+generic chunked transport.
+
 ## Non-goals
 
 - Proving-time optimization (`docs/plans/proving-time.md`) — separate, after.
