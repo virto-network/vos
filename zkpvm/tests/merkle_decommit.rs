@@ -770,7 +770,8 @@ fn decommit_proves_through_lifted_protocol() {
 /// composition to mis-compose) — which is the P4 join-AIR shape anyway. Until
 /// then the gates above are the decommit's validation.
 #[test]
-#[ignore = "blocked on a stwo multi-component multi-fraction lifted-OODS issue — see doc"]
+#[ignore = "superseded: the custom-stack blocker was re-characterized (NOT multi-fraction) \
+            and UN-BLOCKED via the one-uniform-component shape — see merkle_decommit_merged.rs"]
 fn poseidon2_merkle_decommit() {
     let config = mobile_config();
 

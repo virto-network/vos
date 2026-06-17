@@ -135,13 +135,22 @@ Two structural facts that pin the design:
 > together through the lifted protocol on CpuBackend with the Poseidon2-M31
 > channel; the **MerkleDecommit chip AIR validated** (`merkle_decommit.rs`,
 > commit c209b31): AIR satisfied + each component proves alone through the
-> lifted protocol. OPEN: the COMBINED two-component prove is `#[ignore]`'d on a
-> stwo lifted-protocol/MOBILE-config interaction with multi-fraction logup
-> across multiple components (NOT a chip soundness gap — see the test doc +
-> `[[project_recursion_build]]` for the bisection + un-block paths). Remaining
-> within P1: vetted width-16 M31 round constants (+ known-answer check).
-> **Next within P3:** un-block the combined prove, then Channel/FriFold/Oods
-> chips → integrate → measure log_size (the make-or-break).
+> lifted protocol. **BLOCKER RE-CHARACTERIZED + UN-BLOCKED**
+> (`merkle_decommit_merged.rs`): the earlier "multi-component multi-fraction"
+> theory was wrong (that combination passes generally). The real trigger is the
+> custom **Poseidon2-M31 lifted stack** rejecting a SINGLE component that mixes
+> the perm with constraints referencing the perm's I/O when the proof has **no
+> interaction tree** (Blake2s accepts the identical AIR → not a degree/soundness
+> defect; perm-only and perm+920-free-bool pass without a tree → not width/count;
+> distinct round constants don't change it). Adding an interaction (logup) tree is
+> the enabler. UN-BLOCK (GREEN + sound, tampered path rejected):
+> `merged_decommit_logup_gate` re-hashes a Merkle path leaf→root in ONE uniform
+> component (perm inline) + an interaction tree. Build the rest of the verifier-AIR
+> the same way (one uniform component, NOT producer/consumer — multi-component has
+> a separate residual custom-stack failure). Remaining within P1: vetted width-16
+> M31 round constants (+ known-answer check). **Next within P3:** Channel/FriFold/
+> Oods chips into the one-uniform-component verifier-AIR → integrate → measure
+> log_size (the make-or-break).
 
 - **P1 — Poseidon2-M31 transcript + vetted constants.** Replace the spike's
   Blake2sM31 transcript with a full Poseidon2-M31 sponge using vetted (not 1234)

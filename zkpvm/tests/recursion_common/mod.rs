@@ -54,7 +54,8 @@ pub const RATE: usize = 8;
 /// round (only state[0] gets the S-box).
 pub const N_PERM_COLS: usize = N_STATE + FULL_ROUNDS * (N_STATE * 3) + N_PARTIAL_ROUNDS * 3;
 
-// Placeholder constants (P1 swaps in vetted width-16 M31 constants).
+// Placeholder constants (P1 swaps in vetted width-16 M31 constants). Their value
+// is independent of the protocol/degree/logup plumbing exercised here.
 pub const EXTERNAL_ROUND_CONSTS: [[BaseField; N_STATE]; FULL_ROUNDS] =
     [[BaseField::from_u32_unchecked(1234); N_STATE]; FULL_ROUNDS];
 pub const INTERNAL_ROUND_CONSTS: [BaseField; N_PARTIAL_ROUNDS] =
