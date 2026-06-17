@@ -458,7 +458,12 @@ const MAIN_COLS: usize = N_PERM_COLS // perm (init[16] + S-box helpers)
     + 8 // carry_lo = out[0..8]
     + 8 // carry_hi = out[8..16]
     + 8 // digest_next
-    + 1; // n_draws_next
+    + 1 // n_draws_next
+    + 31; // pow_bits: 31-bit decomposition of s2[0] (the pow2 perm output[0])
+
+/// Number of bits in an M31 value — the width of the `s2[0]` difficulty
+/// decomposition.
+const M31_BITS: usize = 31;
 
 const IS_FIRST_ID: &str = "channel_is_first";
 const NOT_LAST_ID: &str = "channel_not_last";
@@ -518,6 +523,10 @@ impl FrameworkEval for ChannelEval {
 
         let digest_next: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
         let n_draws_next = eval.next_trace_mask();
+
+        // The 31-bit decomposition of the pow2 perm output `s2[0]` (= out[0] on
+        // is_pow2 rows), for the PoW difficulty check.
+        let s2_bits: [E::F; M31_BITS] = std::array::from_fn(|_| eval.next_trace_mask());
 
         // ── Selectors: booleans; exactly one op per row; cont ⇒ absorb. ──
         for sel in [&is_absorb, &is_squeeze, &is_pow1, &is_pow2, &is_cont] {
@@ -586,6 +595,26 @@ impl FrameworkEval for ChannelEval {
         }
         eval.add_constraint(is_first.clone() * ndi_cur.clone());
 
+        // ── PoW difficulty: on is_pow2 rows the pow2 permutation's output[0] (=
+        //    `s2[0]`, the value `verify_pow_nonce` checks) must have ≥ POW_BITS
+        //    trailing zeros.  Bit-decompose out[0] into 31 booleans, bind their
+        //    weighted sum to out[0] (gated by is_pow2), and force the low POW_BITS
+        //    bits to zero.  Together with the bound+chained pow rows this is the
+        //    full PoW check.  (out[0] = the perm output[0] from eval_permutation,
+        //    also bound to carry_lo[0][1].)  All constraints degree ≤ 2.
+        let mut recompose = E::F::zero();
+        let mut coeff = BaseField::one();
+        for (k, bit) in s2_bits.iter().enumerate() {
+            eval.add_constraint(bit.clone() * (bit.clone() - one.clone())); // boolean
+            recompose += bit.clone() * coeff;
+            if (k as u32) < POW_BITS {
+                // The low POW_BITS bits of s2[0] are zero ⇒ trailing_zeros ≥ POW_BITS.
+                eval.add_constraint(is_pow2.clone() * bit.clone());
+            }
+            coeff += coeff; // 2^(k+1)
+        }
+        eval.add_constraint(is_pow2.clone() * (recompose - out[0].clone()));
+
         eval
     }
 }
@@ -627,6 +656,18 @@ fn channel_row_values(
     row.extend_from_slice(&output[8..16]); // carry_hi 8
     row.extend_from_slice(&digest_next); // 8
     row.push(BaseField::from(n_draws_next)); // 1
+
+    // pow_bits: 31-bit decomposition of the pow2 perm output[0] (= s2[0]); only
+    // meaningful on is_pow2 rows (sel[3]==1), zero elsewhere. The honest pow2
+    // output has ≥ POW_BITS trailing zeros (the real proof's PoW), so the low
+    // bits are genuinely zero.
+    let is_pow2 = sel[3] == BaseField::one();
+    let s2_0 = output[0].0;
+    for k in 0..M31_BITS {
+        let bit = if is_pow2 { (s2_0 >> k) & 1 } else { 0 };
+        row.push(BaseField::from(bit));
+    }
+
     debug_assert_eq!(row.len(), MAIN_COLS);
     row
 }
@@ -922,6 +963,59 @@ fn channel_chip_gate() {
          (no interaction tree) through the lifted Poseidon2-M31 protocol; in-AIR \
          challenges match the host channel; a perturbed absorbed value is rejected.",
         records.len()
+    );
+}
+
+/// THE DIFFICULTY GATE: a pow2 permutation that is internally valid (output ==
+/// permute(input), so the perm + chaining + recompose constraints all hold) but
+/// whose output `s2[0]` does NOT have `POW_BITS` trailing zeros must be rejected
+/// — i.e. the bit-decomposition difficulty constraint genuinely enforces the PoW
+/// threshold, not just the binding. Forge a low-difficulty nonce, recompute the
+/// perm honestly, and confirm prove/verify fails.
+#[test]
+fn channel_chip_pow_difficulty_enforced() {
+    const LOG_N_ROWS: u32 = 5;
+    let config = mobile_config();
+    let proven = prove_representative(LOG_N_ROWS, config);
+    let mut records = record_verify_transcript(&proven, config);
+
+    // The second Pow record is the pow2 permutation (the one whose output[0] is
+    // the difficulty target). Keep its chained input[0..8]; change only the
+    // nonce so the recomputed output overwhelmingly lacks POW_BITS trailing zeros.
+    let pow2 = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == PermKind::Pow)
+        .map(|(i, _)| i)
+        .next_back()
+        .expect("the representative transcript performs a PoW check");
+    let mut input = records[pow2].input;
+    input[8] = BaseField::from(1u32); // a nonce that (almost surely) fails the PoW
+    let mut output = input;
+    permute(&mut output);
+    assert!(
+        output[0].0.trailing_zeros() < POW_BITS,
+        "forged nonce must yield a sub-threshold output[0]"
+    );
+    records[pow2] = PermRecord {
+        kind: PermKind::Pow,
+        input,
+        output,
+        first_chunk: true,
+    };
+
+    // The forged trace is internally consistent everywhere EXCEPT the difficulty
+    // constraint (low POW_BITS bits of s2[0] are no longer all zero) ⇒ rejected.
+    let trace = gen_channel_trace(&records, None);
+    assert!(
+        prove_and_verify_channel(trace).is_err(),
+        "a pow2 output without POW_BITS trailing zeros must be rejected"
+    );
+
+    eprintln!(
+        "channel_chip_pow_difficulty_enforced GREEN: a valid-but-sub-threshold \
+         pow2 perm (output[0] trailing_zeros < {POW_BITS}) is rejected by the \
+         in-AIR bit-decomposition difficulty check."
     );
 }
 
