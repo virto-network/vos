@@ -1057,27 +1057,76 @@ fn canonical_commitment_drift_guard() {
     );
 }
 
+/// Fast (no-prove) coverage of the manifest codec + the `verify_chain_segments`
+/// guard/reject paths that short-circuit before any STARK work. Complements the
+/// heavy `chain_manifest_roundtrip` (which exercises the accept path on a real
+/// chain) so a regression in the cheap logic is caught without a ~13-min prove.
+#[test]
+fn manifest_codec_and_verify_guards() {
+    // Manifest codec round-trips an ordered hash list (order-preserving).
+    let hashes: Vec<[u8; 32]> = (0u8..5).map(|i| [i; 32]).collect();
+    let blob = prover_extension::encode_chain_manifest(&hashes);
+    assert_eq!(
+        prover_extension::decode_chain_manifest(&blob).as_deref(),
+        Some(&hashes[..]),
+        "manifest encode→decode must preserve the ordered segment hashes"
+    );
+    // A garbled manifest blob decodes to None (not a panic, not a partial list).
+    assert!(
+        prover_extension::decode_chain_manifest(&[0xFFu8; 7]).is_none(),
+        "a malformed manifest blob must decode to None"
+    );
+
+    let c0 = prover_extension::VOUCHER_CHECK_COMMITMENTS[0];
+    let io = b"some-public-bytes";
+    // Empty chain → reject (no segments to anchor/verify).
+    assert!(
+        !prover_extension::verify_chain_segments(&c0[..], &[], io, &[1u8]),
+        "an empty segment list must reject"
+    );
+    // Non-32-byte commitment → reject before any work.
+    assert!(
+        !prover_extension::verify_chain_segments(&[0u8; 16], &[vec![0u8; 4]], io, &[1u8]),
+        "a non-32-byte commitment must reject"
+    );
+    // A commitment outside every published allowlist → reverse-lookup miss →
+    // reject before decoding any segment.
+    let mut foreign = c0;
+    foreign[0] ^= 0xFF;
+    assert!(
+        !prover_extension::verify_chain_segments(&foreign[..], &[vec![0u8; 4]], io, &[1u8]),
+        "a commitment outside the allowlist must reject"
+    );
+    // A valid allowlisted commitment but garbage segment bytes → per-segment
+    // decode fails → reject (no panic).
+    assert!(
+        !prover_extension::verify_chain_segments(&c0[..], &[vec![0xABu8; 32]], io, &[1u8]),
+        "an undecodable segment blob must reject"
+    );
+}
+
 /// W1 round-trip (federation wire-through): prove the conservation transition
-/// as a canonical segment CHAIN through `prove_chain_blob`, then verify it
-/// through `verify_chain_blob` against the baked canonical commitment
+/// as a canonical segment CHAIN through `prove_chain_segments`, then verify it
+/// through `verify_chain_segments` against the baked canonical commitment
 /// allowlist + the io-binding — the federation happy path minus the
-/// runtime/bridge/libp2p plumbing. `verify_chain_blob` runs the (stack-heavy)
-/// canonical chain verify on its own large-stack thread, so this test needs
-/// no `run_with_large_stack` wrapper.
-///   SEG_STEPS unused here (prove_chain_blob pins CHAIN_SEG_STEPS); heavy.
+/// runtime/bridge/libp2p plumbing (the manifest CAS round-trip is exercised by
+/// the federation e2e §5h). `verify_chain_segments` runs the (stack-heavy)
+/// canonical chain verify on its own large-stack thread, so this test needs no
+/// `run_with_large_stack` wrapper.
+///   SEG_STEPS unused here (prove_chain_segments pins CHAIN_SEG_STEPS); heavy.
 ///   cargo test -p prover-extension --release --test prove_transition \
-///     chain_blob_roundtrip -- --ignored --nocapture --test-threads=1
+///     chain_manifest_roundtrip -- --ignored --nocapture --test-threads=1
 #[test]
 #[ignore]
-fn chain_blob_roundtrip() {
+fn chain_manifest_roundtrip() {
     if !voucher_check_elf_path().exists() {
         eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
         return;
     }
     let (public, witness) = build_transition();
     let witness_buf = encode_witness(&public.encode(), &witness.encode());
-    let chain_blob = prover_extension::prove_chain_blob(PROGRAM, &witness_buf)
-        .expect("prove_chain_blob over the conservation transition (stale ELF?)");
+    let segments = prover_extension::prove_chain_segments(PROGRAM, &witness_buf)
+        .expect("prove_chain_segments over the conservation transition (stale ELF?)");
 
     let io_public = public_bytes(&public);
     let c0 = prover_extension::VOUCHER_CHECK_COMMITMENTS[0];
@@ -1085,13 +1134,13 @@ fn chain_blob_roundtrip() {
 
     // Happy: honest chain + an allowlisted commitment + the correct io-binding.
     assert!(
-        prover_extension::verify_chain_blob(&c0[..], &chain_blob, &io_public, &[1u8]),
+        prover_extension::verify_chain_segments(&c0[..], &segments, &io_public, &[1u8]),
         "an honest canonical chain must verify against C_0 + the io-binding"
     );
     // Passing C_1 resolves the SAME {C_0, C_1} allowlist → also accepts (the
     // chain's per-segment commitments are matched by SET membership).
     assert!(
-        prover_extension::verify_chain_blob(&c1[..], &chain_blob, &io_public, &[1u8]),
+        prover_extension::verify_chain_segments(&c1[..], &segments, &io_public, &[1u8]),
         "passing C_1 must resolve the same allowlist and accept"
     );
     // Forged io: a different root_after → public_bytes differ → the final
@@ -1099,17 +1148,41 @@ fn chain_blob_roundtrip() {
     let mut forged = public.clone();
     forged.state_root_after = [0xEE; 32];
     assert!(
-        !prover_extension::verify_chain_blob(&c0[..], &chain_blob, &public_bytes(&forged), &[1u8]),
+        !prover_extension::verify_chain_segments(
+            &c0[..],
+            &segments,
+            &public_bytes(&forged),
+            &[1u8]
+        ),
         "a forged root_after (io-hash mismatch) must reject"
     );
     // A commitment outside every published allowlist → reverse-lookup misses → reject.
     let mut wrong = c0;
     wrong[0] ^= 0xFF;
     assert!(
-        !prover_extension::verify_chain_blob(&wrong[..], &chain_blob, &io_public, &[1u8]),
+        !prover_extension::verify_chain_segments(&wrong[..], &segments, &io_public, &[1u8]),
         "a commitment outside the allowlist must reject"
     );
-    eprintln!("chain_blob_roundtrip GREEN: canonical chain verifies via the allowlist");
+    // Truncated chain: drop the final segment → the (now-)last segment's
+    // halt-bound io-hash no longer matches the asserted io (and continuity to
+    // the dropped segment is gone) → reject. A short manifest cannot pass.
+    if segments.len() > 1 {
+        let truncated = &segments[..segments.len() - 1];
+        assert!(
+            !prover_extension::verify_chain_segments(&c0[..], truncated, &io_public, &[1u8]),
+            "a truncated chain (missing final segment) must reject"
+        );
+    }
+    // Also round-trip the manifest codec itself (the tiny blob the voucher
+    // addresses): encoding N hashes and decoding them must be order-preserving.
+    let hashes: Vec<[u8; 32]> = (0..segments.len() as u8).map(|i| [i; 32]).collect();
+    let manifest_blob = prover_extension::encode_chain_manifest(&hashes);
+    assert_eq!(
+        prover_extension::decode_chain_manifest(&manifest_blob).as_deref(),
+        Some(&hashes[..]),
+        "manifest encode/decode must round-trip the ordered segment hashes"
+    );
+    eprintln!("chain_manifest_roundtrip GREEN: canonical chain verifies via the allowlist");
 }
 
 /// Segmentation end-to-end: prove the FULL kernel transition as a chain of

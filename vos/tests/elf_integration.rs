@@ -7814,26 +7814,27 @@ fn clerk_ledger_two_bank_federation() {
     // bridge dispatches via `ctx.ask`; same trust boundary in
     // effect — the actor still decides whether to accept.
     //
-    // Cross-MiB proof delivery (2026-05-13): the voucher's
-    // `proof.bytes` carries the 32-byte content address of the
-    // actual ~1.4 MiB STARK in the producer node's proof-blob
-    // store (`VosNode::put_proof_blob`). The extension's
-    // `verify_voucher_proof` uses `ctx.blob_get(hash, hint)` to
-    // fetch those bytes host-side; the bridge → extension
-    // dispatch only ever ships the 32-byte hash, well inside the
-    // PVM actor's 4 KiB input buffer. The federation test has
-    // libp2p attached, so the producer-side stash on bank A is
-    // sufficient: bank B's verifier extension reaches across the
-    // wire (via the `peer_prefix` hint registered with `register_
-    // peer`) to fetch the bytes on demand. No bank-B pre-seed.
+    // Cross-MiB proof delivery: the voucher's `proof.bytes` carries
+    // the 32-byte content address of a chain MANIFEST (the list of
+    // per-segment proof CAS hashes) in the producer node's proof-blob
+    // store (`VosNode::put_proof_blob`). The extension's `verify_chain`
+    // uses `ctx.blob_get(hash, hint)` to fetch the manifest and then
+    // each per-segment proof host-side; the bridge → extension dispatch
+    // only ever ships the 32-byte hash, well inside the PVM actor's
+    // 4 KiB input buffer. The federation test has libp2p attached, so
+    // the producer-side stash on bank A is sufficient: bank B's verifier
+    // extension reaches across the wire (via the `peer_prefix` hint
+    // registered with `register_peer`) to fetch the manifest + every
+    // segment on demand. No bank-B pre-seed — each segment proof (~3 MiB)
+    // is under the 8 MiB single-shot cross-node frame cap, which the
+    // single concatenated chain blob (~N×3 MiB) is not.
     //
-    // NOTE: section 5h's real-STARK HAPPY path is currently skipped
-    // (the transition proof is segment-chain-sized and chain-aware
-    // verify isn't wired — see the SKIP below). What this section
-    // still exercises is the prover registration + commitment
-    // plumbing and the ADVERSARIAL reject paths (forged content
-    // address, local + cross-node), which need no real proof. The
-    // cross-MiB blob-fetch happy path returns once chain verify lands.
+    // Section 5h exercises the prover registration + commitment plumbing,
+    // the ADVERSARIAL reject paths (forged content address, local +
+    // cross-node), and — gated on VOS_FEDERATION_REAL_STARK — the
+    // real-STARK HAPPY path: bank B verifies bank A's conservation chain
+    // against the canonical commitment allowlist + io-binding, fetched
+    // per-segment cross-node, then redeems.
 
     // Load clerk-prover-extension's .so. Skip if not built;
     // matches the SKIP pattern used by other actor ELFs above.
@@ -7893,31 +7894,22 @@ fn clerk_ledger_two_bank_federation() {
             "diagnostic getter must return the configured id"
         );
 
-        // Real-STARK happy path — not runnable end-to-end here:
-        // voucher-check now proves the full conservation-of-value
-        // transition (a multi-million-step trace) which only proves as a
-        // CHAIN of bounded segments (`prove_transition_segmented_chain`
-        // is that capstone), while the bridge's verify leg checks ONE
-        // standalone proof against ONE program commitment. Verifying a
-        // segment chain across the trust boundary needs a verifier-side
-        // aggregation step (per-segment commitment binding + STARK-bound
-        // memory commitments at the segment boundaries) that is not
-        // built yet. Until then the happy path lives in the prover's
-        // segmented-chain test, and the bridge dispatch below is pinned
-        // by the adversarial (reject) cases, which need no real proof.
-        // Real-STARK happy path (federation wire-through W3) — opt-in via
+        // Real-STARK happy path (federation wire-through) — opt-in via
         // VOS_FEDERATION_REAL_STARK (the canonical chain prove is minutes: the
-        // conservation transition is ~76 bounded segments). RUN WITH
-        // RUST_MIN_STACK=268435456: the canonical prove's rayon workers + the
-        // extension's verify thread need ample stack in the runtime context
-        // (the default ~2 MiB overflows; the standalone prover test doesn't
-        // hit this because nothing pre-builds the rayon pool there). Build a real
-        // conservation transition, prove it as a canonical segment chain
-        // through the prover extension, CAS the chain blob on bank A, and
-        // submit an External voucher attesting the transition's roots; bank B's
-        // bridge dispatches verify_chain, which fetches the blob over libp2p,
-        // verifies the chain against the program's canonical commitment
-        // allowlist + the io-binding, and redeems.
+        // conservation transition is ~76 bounded segments). voucher-check proves
+        // the full conservation-of-value transition (a multi-million-step trace)
+        // as a CHAIN of bounded canonical-shape segments; the bridge dispatches
+        // verify_chain, which verifies the whole chain against the program's
+        // canonical commitment ALLOWLIST + boundary continuity + the io-binding.
+        // RUN WITH RUST_MIN_STACK=268435456: the canonical prove's rayon workers
+        // + the extension's verify thread need ample stack in the runtime context
+        // (the default ~2 MiB overflows; the standalone prover test doesn't hit
+        // this because nothing pre-builds the rayon pool there). Build a real
+        // conservation transition, prove it as a canonical segment chain through
+        // the prover extension, CAS each segment proof + a manifest on bank A,
+        // and submit an External voucher attesting the transition's roots; bank
+        // B's bridge fetches the manifest + every segment cross-node over libp2p,
+        // verifies the chain, and redeems.
         if std::env::var("VOS_FEDERATION_REAL_STARK").is_ok() {
             use vos::Encode;
             let dedup_before_happy = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
@@ -7931,23 +7923,29 @@ fn clerk_ledger_two_bank_federation() {
                 "conservation witness exceeds the guest __VOS_WITNESS buffer ({} B)",
                 witness_buf.len()
             );
-            // Offline: prove the canonical segment chain (minutes).
-            let chain_bytes = prover_extension::prove_chain_blob(b"voucher-check", &witness_buf)
+            // Offline: prove the canonical segment chain (minutes), as
+            // per-segment proof bytes.
+            let segments = prover_extension::prove_chain_segments(b"voucher-check", &witness_buf)
                 .expect(
-                    "prove_chain over the conservation transition \
+                    "prove_chain_segments over the conservation transition \
                      (stale voucher-check ELF? run `just build-voucher-check`)",
                 );
-            // Seed the chain blob on bank B's node so verify_chain fetches it
-            // LOCALLY. The full ChainProof (~N×1 MiB ≈ tens of MiB) exceeds the
-            // 8 MiB single-shot cross-node frame cap (MAX_FRAME_BYTES; no
-            // chunked transport yet), so the cross-node fetch can't carry it.
-            // The real cross-bank delivery path is RECURSION (which collapses
-            // the N-segment chain into one ~1 MiB aggregate proof, well under
-            // the cap — and supersedes verify_chain), or chunked transport;
-            // both are out of scope here. The crypto under test — bank B
-            // verifying bank A's conservation chain against the canonical
-            // allowlist + io-binding — is delivery-agnostic.
-            let chain_hash = node_b.put_proof_blob(chain_bytes);
+            // Seed each segment proof on bank A (the SENDER) and ship a MANIFEST.
+            // Each canonical segment proof (~3 MiB) is under the 8 MiB single-shot
+            // cross-node frame cap (MAX_FRAME_BYTES), so bank B's verifier fetches
+            // them ON DEMAND across the wire via the existing proof-blob CAS
+            // fan-out (the `bank-a` peer_prefix hint registered with
+            // register_peer) — a REAL cross-node delivery, not a receiver-side
+            // pre-seed. The single concatenated chain blob (~N×3 MiB ≈ hundreds
+            // of MiB) could not cross one frame; the per-segment manifest is the
+            // delivery fix. The voucher's `proof.bytes` carries the single 32-byte
+            // hash of the manifest blob (unchanged wire shape — one hash).
+            let seg_hashes: Vec<[u8; 32]> = segments
+                .into_iter()
+                .map(|s| node_a.put_proof_blob(s))
+                .collect();
+            let manifest_bytes = prover_extension::encode_chain_manifest(&seg_hashes);
+            let manifest_hash = node_a.put_proof_blob(manifest_bytes);
             let envelope_happy = EncryptedEnvelope::seal(value, &blinding, &bank_b_ivk_pk)
                 .expect("seal envelope (happy)");
             let voucher_happy = Voucher::sign(
@@ -7957,7 +7955,7 @@ fn clerk_ledger_two_bank_federation() {
                 public.state_root_after,
                 CcProof {
                     mode: CcProofMode::External,
-                    bytes: chain_hash.to_vec(),
+                    bytes: manifest_hash.to_vec(),
                 },
                 &registrar_a.secret,
             );
@@ -7981,7 +7979,7 @@ fn clerk_ledger_two_bank_federation() {
                 "the real-STARK happy path must advance the redeemed/dedup count"
             );
 
-            // Forged-on-real-STARK: the SAME (valid) chain blob, but the
+            // Forged-on-real-STARK: the SAME (valid) chain manifest, but the
             // voucher LIES about root_after (re-signed, so the signature is
             // valid and the triple dedup key is fresh). The bridge reconstructs
             // public_bytes with the lie, so the prover's io-binding
@@ -7997,7 +7995,7 @@ fn clerk_ledger_two_bank_federation() {
                 [0xEEu8; 32],
                 CcProof {
                     mode: CcProofMode::External,
-                    bytes: chain_hash.to_vec(),
+                    bytes: manifest_hash.to_vec(),
                 },
                 &registrar_a.secret,
             );

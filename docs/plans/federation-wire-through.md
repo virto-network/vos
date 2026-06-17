@@ -218,6 +218,14 @@ This adds NO AIR/constraint changes and NO proof-format change — only the
 Landed on `voucher-state-transition`. A receiving bank verifies a peer's
 segmented conservation chain end-to-end.
 
+> **Delivery note (superseded 2026-06-16):** W1-W3 originally shipped the chain
+> as one concatenated `bincode(Vec<Proof>)` blob, which the e2e seeded on the
+> *receiver* because it exceeds the 8 MiB frame cap. That was replaced the same
+> day by the per-segment **manifest** (see "Cross-node delivery — the
+> per-segment MANIFEST" below): `prove_chain_segments` + `verify_chain_segments`,
+> segments seeded on the *sender* and fetched cross-node on demand. The text
+> below describes the original blob shape for history.
+
 - **W1 (prover extension).** `prove_chain(program_id, witness) -> Vec<u8>`
   (trace → `segment_bounds` → per-segment `prove_canonical` against the pinned
   `VOUCHER_CHECK_CANONICAL_PROFILE` → `bincode(Vec<Proof>)` chain blob; caller
@@ -241,23 +249,88 @@ segmented conservation chain end-to-end.
   signature could not enforce). Validated: `chain_blob_roundtrip` (accept /
   forged-io reject / non-allowlist reject) + the e2e happy path.
 
-### Cross-node blob delivery — gated on RECURSION, not a manifest
+### Cross-node delivery — the per-segment MANIFEST (built 2026-06-16)
 
-The single `bincode(Vec<Proof>)` chain blob is ~N×1 MiB (tens of MiB for the
-~76-segment transition), exceeding the **8 MiB single-shot cross-node frame
-cap** (`MAX_FRAME_BYTES`; chunked transport unimplemented). So the e2e seeds
-the chain blob on the receiver's node locally — the verification it exercises
-is delivery-agnostic.
+**Corrected from the earlier "gated on recursion" framing.** Cross-node
+delivery is a per-segment **manifest** — a days-scale change, no cryptography
+touched — NOT recursion. The earlier framing rested on two wrong premises that
+a code-grounded investigation refuted:
 
-The deferred "manifest-of-hashes + per-segment fetch" fallback was considered
-but NOT built: **recursion** (`recursion-spike.md`) collapses the N-segment
-chain into ONE ~1 MiB aggregate proof — under the 8 MiB cap, a single-blob
-fetch, a one-proof verify that also relieves the 512 MiB-stack pressure — and
-supersedes `verify_chain` entirely, so a manifest would be throwaway.
-Performance work (precompiling the guest's dominant blake2b) shrinks the chain
-(fewer segments) but won't reliably reach a single sub-8-MiB blob; recursion
-is the delivery fix. Cross-bank delivery is gated on recursion (preferred) or
-generic chunked transport.
+- The 8 MiB cap is **self-imposed**: `MAX_FRAME_BYTES` (`vos/src/network/wire.rs:132`)
+  is a plain DoS-alloc guard in vos's *own* custom codec (`codec.rs:78/97`);
+  libp2p imposes no max of its own. Per-segment proof blobs (~3 MiB each — see
+  the measured size below) ride a single frame trivially.
+- Per-segment proofs verify **independently and statelessly**:
+  `verify_chain_standalone_allowlist` loops one proof at a time; the only
+  cross-segment linkage is a ~120-byte `SegmentState` struct-eq (continuity) +
+  the entering-root anchor + the final-segment io-hash. A verifier can fetch
+  segment *i*, verify it, and move on.
+
+So the delivery fix is: the producer puts **each segment proof** into the
+proof-blob CAS separately and ships a tiny `ChainManifest` (`Vec<[u8;32]>` of
+the per-segment hashes, ~2.4 KiB), itself CASed; the voucher carries the single
+32-byte manifest hash (**unchanged wire shape**). The verifier
+(`verify_chain` in the prover extension) `blob_get`s the manifest, then
+`blob_get`s each segment (each < the frame cap, cross-node via the existing
+proof-blob CAS fan-out + `peer_prefix` hint), and runs the **unchanged**
+allowlist + continuity + io-binding checks. The federation e2e §5h now seeds
+the segments on bank **A** (the sender) and fetches them cross-node on demand —
+a real cross-node delivery, no receiver-side pre-seed. `prove_chain_blob` →
+`prove_chain_segments` (returns per-segment bytes); `verify_chain_blob` →
+`verify_chain_segments` (takes the fetched per-segment bytes). No AIR / PCS /
+proof-format / allowlist / voucher-check-ELF change.
+
+**Measured size budget (2026-06-16, empirical):** one canonical segment proof
+is **~2.98 MiB** (76.6% `queried_values`: 38 FRI queries × the 31-component
+canonical trace, dominated by MEMORY@2^19 / REG_MEM@2^18 / CPU@2^17 /
+Blake2bBoundary@2^17); the 76-segment chain is **~227 MiB** — ~28× the 8 MiB
+cap, and ~7-8× larger than the "tens of MiB" the earlier comments assumed. Each
+*segment* is well under the cap, which is exactly why the manifest works.
+
+### Recursion — re-scoped to a LATER succinctness/settlement layer (NOT delivery)
+
+A 6-branch code-grounded feasibility investigation (2026-06-16) re-verified
+`recursion-spike.md` against the current stwo pin (`e1286720`) and concluded the
+spike's verdict **HOLDS and is strengthened**: native AIR recursion for this
+M31/Blake2s zkpvm is a multi-person-month build, with no shortcut —
+- **stwo** (the pinned source): no `EvalAtRow`-based verifier-AIR in core, no
+  usable Poseidon2-over-M31 Merkle hasher/channel (only Blake2s / Blake2s-M31
+  *non-algebraic* / Keccak256 / Poseidon-252-bit-Starknet); nothing
+  recursion-related shipped upstream since the pin.
+- **Nexus zkVM** (this zkpvm's lineage): its famous recursion is dead
+  curve/folding code (Nova/HyperNova, `sdk/src/legacy/`) from the abandoned
+  1.0/2.0 era; the live stwo-era Nexus shares our exact M31+Blake2s backend and
+  has *zero* aggregation/verifier-AIR. Nothing to port.
+- **stwo-cairo**: verifies *Cairo-execution* proofs only, not arbitrary stwo
+  AIRs — using it means re-implementing the zkpvm verifier *as a Cairo program*
+  (the verifier-in-circuit problem relocated) plus a second VM toolchain.
+  Strictly ≥ the native build.
+- **Folding/accumulation**: Nova-family is mathematically inapplicable
+  (FRI/Blake2s-Merkle commitments are non-homomorphic); the only
+  hash-commitment accumulation research (ARC/AWH) still needs an in-circuit
+  recursive verifier, is unimplemented, and isn't stwo-specialized.
+
+Recursion's only *exclusive* payoff is true succinctness — one ~1-2 MiB proof
+verifiable in one shot regardless of N — which matters for an **on-chain /
+settlement-venue** check, not the current bank-to-bank delivery. (Note: its
+claimed "512 MiB-stack relief" is largely illusory — that stack pressure is
+*per-proof* canonical shape, and an aggregate proof embeds a verifier → its own
+large `log_sizes`.) **That on-chain settlement venue IS on the roadmap (confirmed
+2026-06-17): cross-bank finality will anchor on-chain via a single verifiable
+proof.** The likely route is a final **STARK→SNARK wrap** (verify the STARK
+inside a Groth16/Plonk circuit → a tiny pairing-checkable proof; the EVM cannot
+verify a FRI-STARK directly), with native M31 recursion as an OPTIONAL
+aggregation step beneath the wrap (so the SNARK verifies one STARK, not 76). The
+first de-risking step — "can
+stwo's PCS be instantiated with a custom M31-algebraic hasher at all?" — is
+**DONE + GREEN (2026-06-17, `zkpvm/tests/poseidon2_pcs_spike.rs`):** a custom
+Poseidon2-over-M31 `MerkleHasherLifted` + `MerkleChannel` proves and verifies a
+degree-1 toy AIR on `CpuBackend` with NO stwo source edits (the lifted backend
+ops are blanket; only a one-line orphan-legal `BackendForChannel` marker is
+needed; a tampered commitment is rejected). So the foundation is sound — the
+multi-person-month work is what sits ON it: the verifier-as-AIR
+(FRI+Merkle+OODS+composition as constraints), an M31-algebraic Fiat-Shamir
+transcript, and vetted Poseidon2-M31 constants. See `recursion-spike.md`.
 
 ## Non-goals
 

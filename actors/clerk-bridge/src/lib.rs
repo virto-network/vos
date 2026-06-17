@@ -726,11 +726,13 @@ fn reply(status: Status) -> SubmitVoucherReply {
 ///   - `return_bytes`: voucher-check's `1` success return as a raw byte
 ///     (`vec![1u8]`).
 ///
-/// `voucher.proof.bytes` is the 32-byte content address of the
-/// `bincode(Vec<Proof>)` chain blob in the producer node's proof-blob store
-/// (unchanged wire shape — one hash, now addressing the whole segment chain);
-/// the extension fetches it via `ctx.blob_get` (with `peer_prefix` as a
-/// fan-out hint) rather than the bridge shipping multi-MB through PVM dispatch.
+/// `voucher.proof.bytes` is the 32-byte content address of the chain MANIFEST
+/// (the list of per-segment proof CAS hashes) in the producer node's proof-blob
+/// store (unchanged wire shape — one hash); the extension fetches the manifest
+/// via `ctx.blob_get` (with `peer_prefix` as a fan-out hint) and then each
+/// per-segment proof the same way, rather than the bridge shipping multi-MB
+/// through PVM dispatch. Per-segment delivery keeps every cross-node blob under
+/// the 8 MiB frame cap, which the single concatenated chain blob exceeds.
 async fn dispatch_external_proof(
     ctx: &mut vos::Context<ClerkBridge>,
     prover_id: u32,

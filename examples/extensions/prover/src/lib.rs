@@ -131,11 +131,17 @@ impl Prover {
     /// CHAIN — the federation path for traces too large for a single proof
     /// (the conservation transition is millions of steps). Segments at a
     /// fixed step bound, proves each with canonical-shape proving against the
-    /// program's pinned profile, and returns the bincode-encoded `Vec<Proof>`
-    /// (the chain blob). Empty `Vec` on any failure. The caller CASes the
-    /// bytes; the 32-byte content address rides in the voucher's `proof.bytes`
-    /// (unchanged wire shape — still one hash, now addressing the chain blob).
-    /// Heavy + offline (the issuing bank proves before sending the voucher).
+    /// program's pinned profile, and returns `bincode(Vec<Vec<u8>>)` — the
+    /// per-segment `bincode(Proof)` bytes (one entry per segment, in chain
+    /// order). Empty `Vec` on any failure.
+    ///
+    /// The caller content-addresses each segment SEPARATELY (`put_proof_blob`),
+    /// assembles + CASes a [`ChainManifest`] of the hashes, and ships the
+    /// manifest's single 32-byte hash in the voucher's `proof.bytes` (unchanged
+    /// wire shape — one hash). Per-segment delivery keeps every cross-node blob
+    /// under the 8 MiB frame cap, which the single concatenated chain blob
+    /// cannot. Heavy + offline (the issuing bank proves before sending the
+    /// voucher).
     #[msg]
     async fn prove_chain(
         &self,
@@ -143,19 +149,25 @@ impl Prover {
         program_id: Vec<u8>,
         witness_bytes: Vec<u8>,
     ) -> Vec<u8> {
-        prove_chain_blob(&program_id, &witness_bytes).unwrap_or_default()
+        match prove_chain_segments(&program_id, &witness_bytes) {
+            Some(segments) => bincode::serialize(&segments).unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
-    /// Verify a canonical-shape chain proof fetched from the host CAS by
-    /// `chain_hash` (`proof_hash`), composing: (1) every segment's program
-    /// commitment is in the published canonical ALLOWLIST resolved from
-    /// `program_commitment` (a from-scratch prover splicing a foreign program
-    /// matches none); (2) chain continuity + entering-image anchor
-    /// (`verify_chain_standalone_allowlist`); (3) the tagless io-binding on
-    /// the FINAL segment (`compute_io_hash(public_bytes, return_bytes)`),
-    /// which the chain verifier does NOT check itself. Returns 1/0
-    /// (0 includes "blob unavailable", indistinguishable from tampering).
-    /// `peer_prefix` is the `node_prefix` fan-out hint for the blob fetch.
+    /// Verify a canonical-shape chain delivered as a MANIFEST. `proof_hash`
+    /// addresses a [`ChainManifest`] blob in the host CAS; the extension fetches
+    /// the manifest (tiny — one frame), then fetches each listed per-segment
+    /// proof blob (each ~3 MiB — one frame, well under the 8 MiB cross-node
+    /// frame cap), and composes: (1) every segment's program commitment is in
+    /// the published canonical ALLOWLIST resolved from `program_commitment` (a
+    /// from-scratch prover splicing a foreign program matches none); (2) chain
+    /// continuity + entering-image anchor (`verify_chain_standalone_allowlist`);
+    /// (3) the tagless io-binding on the FINAL segment
+    /// (`compute_io_hash(public_bytes, return_bytes)`), which the chain verifier
+    /// does NOT check itself. Returns 1/0 (0 includes "manifest or any segment
+    /// unavailable", indistinguishable from tampering). `peer_prefix` is the
+    /// `node_prefix` fan-out hint for every blob fetch (manifest + segments).
     #[msg]
     async fn verify_chain(
         &self,
@@ -172,12 +184,28 @@ impl Prover {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&proof_hash);
         let hint: u16 = (peer_prefix & 0xFFFF) as u16;
-        let Some(chain_blob) = ctx.blob_get(hash, hint).await else {
+        // 1) Fetch the manifest (the single voucher hash addresses it).
+        let Some(manifest_bytes) = ctx.blob_get(hash, hint).await else {
             return 0;
         };
-        verify_chain_blob(
+        let Some(manifest) = decode_chain_manifest(&manifest_bytes) else {
+            return 0;
+        };
+        if manifest.is_empty() {
+            return 0;
+        }
+        // 2) Fetch each per-segment proof blob (any miss ⇒ reject — the verifier
+        //    must see EVERY listed segment for the continuity check to bind).
+        let mut segment_blobs: Vec<Vec<u8>> = Vec::with_capacity(manifest.len());
+        for seg_hash in &manifest {
+            let Some(blob) = ctx.blob_get(*seg_hash, hint).await else {
+                return 0;
+            };
+            segment_blobs.push(blob);
+        }
+        verify_chain_segments(
             &program_commitment,
-            &chain_blob,
+            &segment_blobs,
             &public_bytes,
             &return_bytes,
         ) as u8
@@ -280,29 +308,62 @@ pub fn verify_proof_bytes(
 /// lands the chain on commitments outside the published allowlist.
 const CHAIN_SEG_STEPS: usize = 100_000;
 
-/// Prove `program_id` over `witness_bytes` as a canonical-shape segment
-/// chain: trace, segment at [`CHAIN_SEG_STEPS`], prove each segment with
-/// [`zkpvm::prove_canonical`] against the program's pinned profile, and
-/// return `bincode(Vec<Proof>)` — the chain blob. `None` on any failure.
-/// Each segment's side note is dropped after its proof, so peak memory holds
-/// the full trace + one segment.
-pub fn prove_chain_blob(program_id: &[u8], witness_bytes: &[u8]) -> Option<Vec<u8>> {
+/// Prove `program_id` over `witness_bytes` as a canonical-shape segment chain,
+/// returning the per-segment `bincode(Proof)` bytes — one `Vec<u8>` per segment,
+/// in chain order. Trace, segment at [`CHAIN_SEG_STEPS`], prove each segment
+/// with [`zkpvm::prove_canonical`] against the program's pinned profile. `None`
+/// on any failure. Each segment's side note is dropped after its proof, so peak
+/// memory holds the full trace + one segment.
+///
+/// PER-SEGMENT DELIVERY: the caller content-addresses each segment SEPARATELY
+/// (`put_proof_blob`), assembles a [`ChainManifest`] of the resulting hashes,
+/// CASes the manifest, and ships the manifest's single 32-byte hash in the
+/// voucher (unchanged wire shape — one hash). This keeps every cross-node blob
+/// under the 8 MiB frame cap (`MAX_FRAME_BYTES`): one canonical segment proof is
+/// ~3 MiB, whereas the single concatenated `bincode(Vec<Proof>)` chain blob
+/// (~N × 3 MiB ≈ hundreds of MiB) is not deliverable in one frame. The verifier
+/// re-assembles the chain by fetching each segment via the manifest (see
+/// [`verify_chain_segments`]).
+pub fn prove_chain_segments(program_id: &[u8], witness_bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     let profile = baked_profile(program_id)?;
     let full = trace_program(program_id, witness_bytes)?;
     let bounds = zkpvm::segment::segment_bounds(full.steps.len(), CHAIN_SEG_STEPS);
-    let mut segments: Vec<Proof> = Vec::with_capacity(bounds.len());
+    let mut segments: Vec<Vec<u8>> = Vec::with_capacity(bounds.len());
     for (a, b) in bounds {
         let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
         let proof = prove_canonical(&mut sn, profile).ok()?;
-        segments.push(proof);
+        segments.push(bincode::serialize(&proof).ok()?);
     }
-    bincode::serialize(&segments).ok()
+    Some(segments)
 }
 
-/// Verify a `bincode(Vec<Proof>)` chain blob against the trusted
-/// `commitment_bytes` (one of the program's canonical allowlist entries) and
-/// the asserted `(public_bytes, return_bytes)`. Composes three checks so none
-/// is meaningful without the others:
+/// A chain delivered as per-segment proof CAS hashes, in chain order. The
+/// producer puts each segment proof into the host proof-blob store SEPARATELY
+/// and lists the resulting 32-byte hashes here; the manifest is itself CASed and
+/// its single hash rides in the voucher's `proof.bytes`. Because the manifest is
+/// content-addressed, its segment list (count + order) is integrity-bound to
+/// that hash — a verifier that fetches and verifies EVERY listed segment, plus
+/// the chain's boundary-continuity + entering-root anchor + final io-binding,
+/// cannot be fooled by a truncated, reordered, or spliced manifest.
+pub type ChainManifest = Vec<[u8; 32]>;
+
+/// Encode a [`ChainManifest`] for the proof-blob store. Tiny (`32·N` bytes;
+/// ~2.4 KiB for the ~76-segment conservation transition), so it always rides a
+/// single cross-node frame.
+pub fn encode_chain_manifest(segment_hashes: &[[u8; 32]]) -> Vec<u8> {
+    bincode::serialize(&segment_hashes.to_vec()).unwrap_or_default()
+}
+
+/// Decode a [`ChainManifest`] blob. `None` on a malformed blob.
+pub fn decode_chain_manifest(bytes: &[u8]) -> Option<ChainManifest> {
+    bincode::deserialize::<ChainManifest>(bytes).ok()
+}
+
+/// Verify a chain delivered as per-segment proof bytes (each fetched from the
+/// host CAS via the manifest) against the trusted `commitment_bytes` (one of the
+/// program's canonical allowlist entries) and the asserted `(public_bytes,
+/// return_bytes)`. Composes three checks so none is meaningful without the
+/// others:
 ///   1. allowlist membership — every segment's commitment must be in the
 ///      canonical allowlist that CONTAINS `commitment_bytes` (a foreign
 ///      program matches no entry);
@@ -314,10 +375,11 @@ pub fn prove_chain_blob(program_id: &[u8], witness_bytes: &[u8]) -> Option<Vec<u
 ///
 /// Verifying a canonical proof (all 31 components + forced large log_sizes)
 /// overflows the default ~2 MiB stack, so the chain verification runs on a
-/// large-stack thread. Returns `false` on any malformed input or rejection.
-pub fn verify_chain_blob(
+/// large-stack thread. Returns `false` on any malformed input, missing/garbled
+/// segment, or rejection.
+pub fn verify_chain_segments(
     commitment_bytes: &[u8],
-    chain_blob: &[u8],
+    segment_blobs: &[Vec<u8>],
     public_bytes: &[u8],
     return_bytes: &[u8],
 ) -> bool {
@@ -329,11 +391,15 @@ pub fn verify_chain_blob(
     let Some(allowed) = allowlist_for_commitment(&commitment) else {
         return false;
     };
-    let Ok(segments) = bincode::deserialize::<Vec<Proof>>(chain_blob) else {
+    if segment_blobs.is_empty() {
         return false;
-    };
-    if segments.is_empty() {
-        return false;
+    }
+    let mut segments: Vec<Proof> = Vec::with_capacity(segment_blobs.len());
+    for blob in segment_blobs {
+        let Ok(proof) = bincode::deserialize::<Proof>(blob) else {
+            return false;
+        };
+        segments.push(proof);
     }
     // 3. The final segment carries the guest's halt-bound io-hash.
     if segments.last().unwrap().public_io_hash()
