@@ -147,8 +147,16 @@ Two structural facts that pin the design:
 > producer/consumer SPLIT (`merkle_decommit.rs::poseidon2_merkle_decommit`), which
 > fails on a clean build too — so build the verifier-AIR as ONE uniform component,
 > not producer/consumer. Remaining within P1: vetted width-16 M31 round constants.
-> **Next within P3:** Channel/FriFold/Oods chips into the one-uniform-component
-> verifier-AIR → integrate → measure log_size (the make-or-break).
+> **LOG_SIZE MEASURED — make-or-break GATE PASSES** (`perm_scale.rs`): the
+> verifier-AIR is ~99.5% perms, so log_size = ceil(log2(#perms)). Rigorous count
+> (config-derived exact for the dominant terms at canonical trace log 19): FRI
+> auth 38×228 = 8,664; trace-tree auth 4×38×21 = 3,192; + ~3,040 leaf + ~397
+> transcript ≈ 15.3K ⇒ **log_size 14**. The perm chip proves+verifies through the
+> lifted protocol at log 12 (145s) on a clean build (log 14 via `perm_scale_large`).
+> **VERDICT: ≈14 ≤ canonical 19, ~5 bits margin ⇒ the recursion fixed point is
+> REACHABLE.** **Next within P3:** build Channel/FriFold/Oods into the
+> one-uniform-component verifier-AIR → integrate → re-measure the integrated
+> log_size (should hold ~14; those chips are field-arithmetic, not perms).
 
 - **P1 — Poseidon2-M31 transcript + vetted constants.** Replace the spike's
   Blake2sM31 transcript with a full Poseidon2-M31 sponge using vetted (not 1234)
