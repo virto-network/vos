@@ -49,9 +49,10 @@
 //! - `*_proves_through_lifted_protocol` (`--ignored`, slow) — EACH component
 //!   produces a real STARK that verifies through the lifted Poseidon2-M31 PCS.
 //! - `poseidon2_merkle_decommit` (`#[ignore]`) — the COMBINED two-component
-//!   prove is blocked on a stwo lifted-protocol/MOBILE-config interaction with
-//!   multi-fraction logup across multiple components (NOT a chip soundness gap;
-//!   see that test's doc for the bisection and the un-block paths).
+//!   prove is blocked on a stwo lifted-protocol interaction: any component
+//!   emitting ≥2 logup fractions fails the combined OODS, under every batching
+//!   and config tried (NOT a chip soundness gap; see that test's doc for the
+//!   exhaustive bisection and the un-block paths).
 //!
 //! Run: `cargo test -p zkpvm --test merkle_decommit -- --nocapture`
 
@@ -737,21 +738,37 @@ fn decommit_proves_through_lifted_protocol() {
 /// What is blocked is only the *combined* prove of the two together — it trips
 /// the prover's OODS composition sanity check (`ConstraintsNotSatisfied`).
 ///
-/// The trigger is narrow and reproducible (bisected here):
+/// The trigger is narrow and reproducible (bisected exhaustively):
 /// - the keystone (`cross_chip_logup.rs`) proves two components combine fine
-///   when each emits exactly ONE logup fraction;
+///   when each emits exactly ONE logup fraction (a degree-2 batch);
 /// - producer-alone and decommit-alone each prove fine with DEPTH fractions;
-/// - but COMBINING two components that each emit MULTIPLE fractions fails the
-///   MOBILE-config combined OODS. `finalize_logup` (plain) mis-composes;
-///   `finalize_logup_in_pairs` instead overflows the degree-3 evaluation domain
-///   (`cpu/mod.rs` index-out-of-bounds) under MOBILE's blowup-4 + small log_size.
-/// - Independently, a component's logup tuple must cover its FIRST columns or
-///   the combined OODS also rejects (hence the front-loaded decommit layout).
+/// - but COMBINING two components where EITHER emits ≥2 fractions fails the
+///   combined OODS — even DEPTH=2 (one degree-3 in_pairs batch per component,
+///   i.e. the exact `state_machine` shape) fails.
 ///
-/// This is a stwo lifted-protocol/config interaction, NOT a soundness gap in the
-/// chip. Resolving it (a focused stwo investigation, or folding perm+decommit
-/// into ONE uniform component — which is the P4 join-AIR shape anyway) un-blocks
-/// this test. Until then the gates above are the decommit's validation.
+/// Ruled OUT as the fix (each retested to the combined prove):
+/// - batching: BOTH `finalize_logup` (plain, degree-2, DEPTH cols) and
+///   `finalize_logup_in_pairs` (degree-3, ⌈DEPTH/2⌉ cols) fail;
+/// - config: BOTH `mobile_config()` (blowup-4) and `PcsConfig::default()` fail
+///   with `ConstraintsNotSatisfied`;
+/// - `commitment_scheme.set_store_polynomials_coefficients()` (the one
+///   orchestration step `state_machine` does that single-component tests omit) —
+///   no effect;
+/// - tuple column position — the consumed tuple must cover the component's FIRST
+///   columns (hence the front-loaded layout), but that fixes only the 1-fraction
+///   case; ≥2 fractions still fail.
+///
+/// Note `state_machine` (2 components × 2 fractions, in_pairs) works — but it
+/// commits under **Blake2s**, NOT the custom lifted **Poseidon2-M31** PCS this
+/// recursion needs, so it is not a true precedent. The remaining suspect is the
+/// lifted protocol + a custom M31-algebraic hasher + ≥2 logup fractions per
+/// component interacting in the composition/OODS path.
+///
+/// This is a stwo lifted-protocol interaction, NOT a soundness gap in the chip.
+/// Un-block paths: (a) a focused stwo-level investigation of that path; (b) fold
+/// perm+decommit into ONE uniform component (then there is no cross-component
+/// composition to mis-compose) — which is the P4 join-AIR shape anyway. Until
+/// then the gates above are the decommit's validation.
 #[test]
 #[ignore = "blocked on a stwo multi-component multi-fraction lifted-OODS issue — see doc"]
 fn poseidon2_merkle_decommit() {
