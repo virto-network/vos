@@ -1,5 +1,55 @@
 # Spike: recursive aggregation (approach C) feasibility
 
+> **RE-CONFIRMED + RE-SCOPED 2026-06-16** (6-branch code-grounded investigation
+> vs the current pin `e1286720`). The verdict below HOLDS and is strengthened:
+> native AIR recursion for this M31/Blake2s zkpvm is a multi-person-month build
+> with **no shortcut** — stwo core has no verifier-AIR and no usable
+> Poseidon2-over-M31 PCS hasher (verified against source); Nexus's recursion is
+> dead curve/folding legacy and its live stwo-era prover has none (nothing to
+> port); stwo-cairo verifies *Cairo* proofs only (re-implementing our verifier
+> in Cairo + a 2nd VM = ≥ the native build); Nova-family folding is
+> mathematically inapplicable (FRI/Blake2s commitments are non-homomorphic), and
+> ARC/AWH hash-accumulation still needs an in-circuit verifier and is
+> unimplemented. **Crucially, recursion is NOT the cross-node delivery fix** the
+> §"dependency that reframes C" implied: the 8 MiB `MAX_FRAME_BYTES` is a
+> self-imposed app constant and per-segment proofs verify independently, so a
+> per-segment **manifest** (`docs/plans/federation-wire-through.md`) delivers the
+> chain cross-node in days with no crypto change — DONE 2026-06-16. Recursion's
+> only exclusive payoff is true succinctness (one proof for an on-chain /
+> settlement-venue check). **That venue is on the roadmap (confirmed
+> 2026-06-17): cross-bank settlement WILL anchor on-chain via a single
+> verifiable proof.** Note the likely route is a final **STARK→SNARK wrap**
+> (verify the STARK inside a Groth16/Plonk circuit → a constant-size,
+> pairing-checkable proof — cf. the Herodotus `stwo-gnark-verifier` in the
+> Ecosystem section), because the EVM cannot verify a FRI-STARK directly *at
+> all* — so a wrap is needed regardless of whether segments are first aggregated.
+> Native M31 recursion is then an OPTIONAL aggregation step *beneath* that wrap
+> (shrink N segments → 1 STARK so the SNARK circuit verifies one, not 76); the
+> wrap itself is the load-bearing on-chain piece. Either way the de-risked
+> M31-algebraic PCS foundation (below) is the substrate. Measured size budget
+> (for any recursion sizing): one canonical segment proof ≈ **2.98 MiB**, the
+> 76-segment chain ≈ **227 MiB** (the "~1 MiB/segment, tens of MiB" figures below
+> were ~7-8× low).
+>
+> **DE-RISK SPIKE BUILT + GREEN 2026-06-17** (`zkpvm/tests/poseidon2_pcs_spike.rs`).
+> The recursion FOUNDATION — "can stwo's PCS be instantiated with a custom
+> M31-algebraic hasher at all?" — is **plumbing-feasible**. A custom
+> Poseidon2-over-M31 `MerkleHasherLifted` + `MerkleChannel` proves AND verifies a
+> degree-1 toy AIR on `CpuBackend` (tampered commitment correctly rejected), with
+> **no stwo source edits**: the prover rides the LIFTED VCS whose `CpuBackend`
+> ops (`MerkleOpsLifted`/`GrindOps`/`ColumnOps`/`PackLeavesOps`) are all BLANKET,
+> so a new hasher needs only one orphan-legal marker `impl
+> BackendForChannel<MyMC> for CpuBackend {}`. (The earlier worry about a closed
+> per-hasher `MerkleOps<H>` set was about the wrong, non-lifted trait family.)
+> Scope of the GREEN: the Merkle COMMITMENT hash is Poseidon2-M31; the transcript
+> reuses `Blake2sM31Channel`, and constants are the example's placeholder `1234`
+> (deterministic, not collision-resistant). So the *foundation* is sound; the
+> multi-person-month estimate is for what sits ON it — the verifier-as-AIR
+> (FRI+Merkle+OODS+composition as constraints), an M31-algebraic Fiat-Shamir
+> transcript, and vetted Poseidon2-M31 constants — none of which the spike
+> builds. SimdBackend (per-hasher ops) is NOT free; the spike + any near-term
+> recursion stay on CpuBackend.
+
 **Question:** can we fold the N segment proofs of a `verify_chain` into ONE
 recursive proof — verifying each segment + the boundary continuity (incl.
 memory) inside a recursive STARK circuit — on this stwo?
