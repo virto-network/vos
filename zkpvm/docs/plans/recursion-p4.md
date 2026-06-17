@@ -100,27 +100,40 @@ query/sample/path.
 
 ### The three WIRING GAPS (the hard sub-problems)
 
-- **GAP 1 — query-position → leaf-index plumbing (highest risk).** Two index
-  spaces co-exist: a drawn query `q` IS the Merkle leaf index (bit-reversed
-  order); the geometric domain point is at NATURAL index `bit_reverse_index(q,
-  log_size)` (`utils.rs:79`, used at `fri.rs:283,760,809`). The join-AIR must
-  derive, in-circuit from the drawn `q`: the decommitment subset
-  `subset_start..subset_start + 2^fold_step`, `subset_start = (q>>fold_step)<<fold_step`
-  (`fri.rs:611-614`), AND the FriFold twiddle via `bit_reverse_index(q<<FOLD_STEP,
-  log)` → `domain.at()` → `.inverse()` (line) / `.y.inverse()` (circle). Today
-  `itwid` is a free column — wiring this from `q` in-circuit is the crux.
+- **GAP 1 — query-position → leaf-index plumbing.** Two index spaces co-exist:
+  a drawn query `q` IS the Merkle leaf index (bit-reversed order); the geometric
+  domain point is at NATURAL index `bit_reverse_index(q, log_size)` (`utils.rs:79`,
+  used at `fri.rs:283,760,809`). The join-AIR must derive, in-circuit from the
+  drawn `q`: the decommitment subset `subset_start..subset_start + 2^fold_step`,
+  `subset_start = (q>>fold_step)<<fold_step` (`fri.rs:611-614`), AND the FriFold
+  twiddle via `bit_reverse_index(q<<FOLD_STEP, log)` → `domain.at()` → `.inverse()`
+  (line) / `.y.inverse()` (circle).
+  **The twiddle half is DE-RISKED ✅ (2026-06-18, commit 11baf35,
+  `tests/fri_twiddle_chip.rs`):** since `Coset::at(j) = (initial_index +
+  step_size·j).to_point()` and `to_point` is a group hom,
+  `domain_point(q) = initial + Σ_{q_k=1} (step_size·2^{L-1-k}).to_point()` — a
+  bit-selected sum of L FIXED coset points. Adding a constant point is degree 1;
+  the per-bit select is degree 2; so the twiddle is a depth-L chain of degree-2
+  conditional point-adds + a witnessed inverse, derived from the bound query bits
+  (no free column, no scalar-mult circuit). GREEN for all 32 indices vs stwo
+  `domain.at(bit_reverse(q)).inverse()`. The remaining GAP-1 work is the
+  subset/leaf-index bookkeeping (`q>>fold_step`, `subset_start`) wired into the
+  Merkle decommit (gates 2+3), which is integer shifts on the same query bits.
 - **GAP 2 — fold-consistency is the (i)+(ii)+(iii) coupling above**, not one
   equation. Wire all three or it is unsound.
 - **GAP 3 — last-layer poly eval (chip 4 above)** closes the FRI tail.
 
 ### P4.1 incremental gates (each GREEN before the next)
 
-1. **DEEP-quotient chip** — re-derive a real proof's `fri_answers` in-AIR
-   (extracted by replicating the verifier transcript), prove+verify, reject a
-   perturbed queried value. *(most tractable; the missing field-arith piece.)*
+1. **DEEP-quotient chip** — ✅ **DONE (2026-06-18, commit 6cd544b)**,
+   `tests/deep_quotient_chip.rs`: `accumulate_row_quotients` arithmetized in-AIR
+   over a real proof's OODS batch (complex-conjugate line coeffs + α-power chain
+   + CM31 denom, all witnessed, degree ≤ 2), matching stwo's own
+   `accumulate_row_quotients`; prove+verify; perturbed queried value rejected.
+   (Per-batch demo; full multi-tree/all-query aggregation is the assembly.)
 2. **Cross-layer FRI fold chain** — fold one real proof's FRI across all layers,
    query indices halving, each `folded` feeding the next layer; reject a
-   perturbed fold.
+   perturbed fold. **GAP 1 (the twiddle) is now de-risked** — see below.
 3. **Multi-tree Merkle decommit** — verify the 4 trace trees + per-layer FRI
    trees against the proof's real decommitment witnesses; reject a tampered path.
 4. **Assemble** (1)+(2)+(3)+ChannelChip+OODS in ONE uniform component verifying
