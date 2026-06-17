@@ -137,20 +137,18 @@ Two structural facts that pin the design:
 > commit c209b31): AIR satisfied + each component proves alone through the
 > lifted protocol. **BLOCKER RE-CHARACTERIZED + UN-BLOCKED**
 > (`merkle_decommit_merged.rs`): the earlier "multi-component multi-fraction"
-> theory was wrong (that combination passes generally). The real trigger is the
-> custom **Poseidon2-M31 lifted stack** rejecting a SINGLE component that mixes
-> the perm with constraints referencing the perm's I/O when the proof has **no
-> interaction tree** (Blake2s accepts the identical AIR → not a degree/soundness
-> defect; perm-only and perm+920-free-bool pass without a tree → not width/count;
-> distinct round constants don't change it). Adding an interaction (logup) tree is
-> the enabler. UN-BLOCK (GREEN + sound, tampered path rejected):
-> `merged_decommit_logup_gate` re-hashes a Merkle path leaf→root in ONE uniform
-> component (perm inline) + an interaction tree. Build the rest of the verifier-AIR
-> the same way (one uniform component, NOT producer/consumer — multi-component has
-> a separate residual custom-stack failure). Remaining within P1: vetted width-16
-> M31 round constants (+ known-answer check). **Next within P3:** Channel/FriFold/
-> Oods chips into the one-uniform-component verifier-AIR → integrate → measure
-> log_size (the make-or-break).
+> theory was wrong (that combination passes generally). The session-long "single
+> component needs an interaction tree" turned out to be a **stale / incrementally-
+> miscompiled cached stwo rlib** — a BUILD ARTIFACT (deterministic, one code path,
+> fixed by `cargo clean -p stwo`; proven by 3 fresh builds). On a clean build the
+> single uniform component proves+verifies with NO interaction tree
+> (`merged_decommit_gate`, tampered path rejected). GOTCHA: clean-rebuild stwo on
+> an inexplicable `ConstraintsNotSatisfied`. The REAL residual bug is the
+> producer/consumer SPLIT (`merkle_decommit.rs::poseidon2_merkle_decommit`), which
+> fails on a clean build too — so build the verifier-AIR as ONE uniform component,
+> not producer/consumer. Remaining within P1: vetted width-16 M31 round constants.
+> **Next within P3:** Channel/FriFold/Oods chips into the one-uniform-component
+> verifier-AIR → integrate → measure log_size (the make-or-break).
 
 - **P1 — Poseidon2-M31 transcript + vetted constants.** Replace the spike's
   Blake2sM31 transcript with a full Poseidon2-M31 sponge using vetted (not 1234)

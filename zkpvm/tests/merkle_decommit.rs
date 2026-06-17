@@ -770,8 +770,9 @@ fn decommit_proves_through_lifted_protocol() {
 /// composition to mis-compose) — which is the P4 join-AIR shape anyway. Until
 /// then the gates above are the decommit's validation.
 #[test]
-#[ignore = "superseded: the custom-stack blocker was re-characterized (NOT multi-fraction) \
-            and UN-BLOCKED via the one-uniform-component shape — see merkle_decommit_merged.rs"]
+#[ignore = "real residual bug: the producer/consumer SPLIT trips ConstraintsNotSatisfied on a \
+            CLEAN build too (not the stale-rlib artifact). Superseded by the one-uniform-component \
+            shape that proves fine — see merkle_decommit_merged.rs"]
 fn poseidon2_merkle_decommit() {
     let config = mobile_config();
 
