@@ -127,6 +127,17 @@ Two structural facts that pin the design:
 
 ## Phased build plan (each phase has a de-risk gate)
 
+> **Progress (2026-06-17):** the PCS-foundation gates are GREEN.
+> `poseidon2_pcs_spike.rs` = the M31-algebraic Merkle commitment plugs into stwo.
+> **P2 DONE** (`poseidon2_chip_degree2.rs`): a flattened degree-2 width-16
+> Poseidon2-M31 permutation proves+verifies through the lifted protocol at
+> blowup 4 (442 cols, corrupted witness rejected). **P1 DONE**
+> (`poseidon2_m31_channel.rs`): a Poseidon2-M31 Fiat-Shamir channel → a toy AIR
+> proves+verifies with NO Blake2s on commit OR transcript. Remaining within P1:
+> swap placeholder `1234` constants for vetted width-16 M31 constants (+ a
+> known-answer check). **Next: P3** — the make-or-break (measure the in-AIR
+> verifier log_size).
+
 - **P1 — Poseidon2-M31 transcript + vetted constants.** Replace the spike's
   Blake2sM31 transcript with a full Poseidon2-M31 sponge using vetted (not 1234)
   width-16 M31 round constants. **Gate:** a toy AIR proves+verifies with NO
