@@ -125,9 +125,16 @@ query/sample/path.
    trees against the proof's real decommitment witnesses; reject a tampered path.
 4. **Assemble** (1)+(2)+(3)+ChannelChip+OODS in ONE uniform component verifying
    a real small child proof end-to-end: ACCEPT valid, REJECT tampered
-   query/sample/path. Fold in the deferred `verify_pow_nonce` difficulty
-   bit-decomp (witness 31 bits of `s2[0]`, low `POW_BITS` == 0; spec in
-   `channel-chip-spec.md §verify_pow_nonce`).
+   query/sample/path.
+
+**DONE (2026-06-17, commit 4c6c901):** the `verify_pow_nonce` difficulty
+bit-decomp — previously the only deferred ChannelChip item. The pow2 perm
+output `s2[0]` is bit-decomposed (31 booleans, weighted-sum == `out[0]` gated by
+`is_pow2`), and the low `POW_BITS` (=20) bits are forced to zero — so PoW
+difficulty is now enforced in-AIR (step C2 above), not just bound. Gates:
+`channel_chip_{air_satisfied,gate}` (honest) + `channel_chip_pow_difficulty_enforced`
+(a valid-but-sub-threshold pow2 perm is rejected — the difficulty constraint
+bites). Folds into the assembled verifier for free.
 
 ---
 
