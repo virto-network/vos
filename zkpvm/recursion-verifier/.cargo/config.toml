@@ -1,0 +1,25 @@
+# Cross-build commands for the P4.3 buildability spike.
+#
+#   wasm32 (GREEN — Substrate-pallet fallback venue):
+#       cargo build --release --target wasm32-unknown-unknown
+#
+#   PVM / JAM-refine (riscv64em-javm, os:none):
+#       cargo +nightly build --release --target riscv64em-javm.json \
+#         -Zbuild-std=core,alloc,compiler_builtins \
+#         -Zbuild-std-features=compiler-builtins-mem
+#     Requires the rolling `nightly` (JSON target-spec schema) + rust-src.
+#     CURRENTLY BLOCKED — see docs/plans/recursion-p4.md §build-spike:
+#       (1) upstream stwo pulls dashmap/tracing-subscriber/default-rand
+#           unconditionally (all need std) — fixed by feature-gating them in
+#           the stwo fork (validated: drops them from a default-features=false
+#           build), THEN
+#       (2) the os:none target has max-atomic-width:0, so stwo's verify graph
+#           (hashbrown→foldhash, tracing-core, alloc::sync::Arc) fails to
+#           resolve core atomics — needs portable_atomic routing (the vos
+#           messenger's single-core approach).  NOT blst/rayon (eliminated).
+#
+# build-std and json-target-spec are intentionally NOT set as active keys here
+# (build-std would force a slow std rebuild on every host `cargo build`, and the
+# json-target-spec key warns as "unused" on stable).  The rolling `nightly`
+# accepts the `.json` target path directly; pass build-std on the command line
+# as shown above.  This file is documentation-only.

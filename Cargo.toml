@@ -52,6 +52,12 @@ exclude = [
     # Excluded so `cargo build --workspace` + the pre-commit hook never try to
     # build it on the default toolchain.
     "miri/transport-soundness",
+    # P4.3 native-recursion build spike: a verify-only Poseidon2-M31 stwo
+    # verifier with its OWN `[workspace]`, pinning stwo with
+    # `default-features = false`.  Excluded so its feature resolution never
+    # co-resolves with javm/prover-stwo (which would drag blst/rayon) — that
+    # isolation is the whole point of the wasm32/PVM buildability spike.
+    "zkpvm/recursion-verifier",
 ]
 
 [workspace.package]

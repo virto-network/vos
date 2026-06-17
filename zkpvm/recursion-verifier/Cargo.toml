@@ -1,0 +1,35 @@
+# P4.3 build spike — a SEPARATE, self-contained workspace for a verify-only
+# Poseidon2-M31 stwo verifier that must compile for wasm32 AND the PVM
+# (riscv64em-javm) target with NO blst and NO rayon.
+#
+# It is its OWN `[workspace]` (and is in the vos root `exclude` list) so its
+# Cargo feature resolution never co-resolves with `javm`/prover-stwo: feature
+# unification is per-workspace-per-target, and the vos workspace pins stwo with
+# `std,prover,parallel` (which drag rayon, and javm drags blst).  Here stwo and
+# stwo-constraint-framework are pinned at the SAME git rev as vos but with
+# `default-features = false` — no std, no prover, no parallel.
+[package]
+name = "recursion-verifier"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Verify-only Poseidon2-M31 stwo verifier — wasm32/PVM buildability spike for native recursion (P4.3)"
+
+[workspace]
+
+[dependencies]
+# Same rev the vos workspace pins (Cargo.toml:97), but default-features = false:
+# drops `std` (→ core+alloc only), `prover` (→ no rayon/blake3), and `parallel`
+# (→ no rayon).  This is the `ensure-verifier-no_std` pattern from the stwo repo.
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
+num-traits = { version = "0.2", default-features = false }
+# stwo's `vcs::hash::Hash` supertrait requires Serialize + Deserialize (proofs
+# serialize); serde+derive is no_std-friendly, so it is not a wasm/PVM blocker.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
