@@ -7,15 +7,19 @@ log_size-14 measurement (`verifier_air_integration.rs`). Reads on
 `recursion-design.md` (the lift→join architecture) — this doc is the concrete,
 source-grounded P4 build sequence.
 
-**All four P4.1 gates GREEN (2026-06-18, LOCAL, voucher-state-transition):**
-gate 1 DEEP-quotient (`6cd544b`), gate 2 FRI fold chain (`0a0cfab`), gate 3
-multi-tree Merkle decommit (`ddabe1b`), gate 4 assembled join driver (`eaa08bd`).
-The headline result: the **single-uniform-component join with latched-challenge
-cross-chip propagation** proves+verifies against a real child and re-verifies at
-log_size ≤ canonical 19 ⇒ the recursion fixed point closes. P4.2 (the fixed-point
-seam + allowlist) and P4.3 (wasm32 GREEN, PVM portable_atomic deferred) below;
-NEXT = **P5** (re-prove the 76 conservation segments under Poseidon2-M31 + the
-tree driver + scale the join's OODS embed to all 31 components).
+**P4 COMPLETE (P4.1 + P4.2 + P4.3-wasm32 GREEN, 2026-06-18, LOCAL,
+voucher-state-transition):** P4.1 gate 1 DEEP-quotient (`6cd544b`), gate 2 FRI
+fold chain (`0a0cfab`), gate 3 multi-tree Merkle decommit (`ddabe1b`), gate 4
+assembled join driver (`eaa08bd`); **P4.2 fixed-point node (`1fe6a39`)**; P4.3
+wasm32 verify-only build (`51ed57e`, PVM portable_atomic deferred). The headline:
+the **single-uniform-component join with latched-challenge cross-chip
+propagation** proves+verifies against a real child (P4.1) AND, as the fixed-point
+NODE, verifies TWO children of its own shape + threads the SegmentState seam +
+checks the allowlist + exposes aggregate public inputs (P4.2) — so a join proof
+has the same shape as its children and re-verifies at log ≤ canonical 19 ⇒ the
+recursion fixed point CLOSES. NEXT = **P5** (re-prove the 76 conservation segments
+under Poseidon2-M31 + the tree driver + scale the per-child verify depth to all 31
+inner components).
 
 All `verifier.rs`/`fri.rs`/`pcs/*`/`vcs_lifted/*` line numbers below are in the
 stwo checkout the workspace pins (rev `e1286720`):
@@ -195,6 +199,22 @@ bites). Folds into the assembled verifier for free.
 ---
 
 ## P4.2 — The fixed point (verify 2 children + seam + allowlist)
+
+✅ **DONE (2026-06-18, commit 1fe6a39, `tests/fixed_point_join.rs`)** — the
+fixed-point NODE. ONE uniform component verifies TWO real children of its own
+shape: both Fiat-Shamir transcripts replayed in one component (per-child
+`is_child_start` anchor ⇒ digest=0, cross-row chain broken at the child boundary
+via `chain_ok`); each child's main-root commitment bound at its commit-absorb row
+(`is_commit·(id−absorbed)`) and checked ∈ `{C_0,C_1}` via a 2-way selector
+membership (allowlist); the seam equates `child_L.final == child_R.initial` on the
+four bound `SegmentState` fields; `expected_initial_root`/`final_memory_root`/
+`io_hash` exposed as aggregate public inputs bound at row 0. Gates
+`fixed_point_join_{air_satisfied,gate}` @ log 7: prove+verify through the lifted
+protocol; a broken seam, an out-of-allowlist commitment, AND a corrupted
+transcript each rejected. A join proof has the SAME shape as its children ⇒ the
+recursion fixed point closes at the node level (canonical 2-child ≈ log 15 ≤ 19).
+The per-child verify DEPTH (full OODS/FRI/Merkle to all 31 components) is the P5
+scale. The design that guided it:
 
 ### Seam
 `SegmentState` (`proof.rs:126-140`): `pc:u32`, `timestamp:u64`,
