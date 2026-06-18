@@ -56,12 +56,14 @@ pub const RATE: usize = 8;
 /// round (only state[0] gets the S-box).
 pub const N_PERM_COLS: usize = N_STATE + FULL_ROUNDS * (N_STATE * 3) + N_PARTIAL_ROUNDS * 3;
 
-// Placeholder constants (P1 swaps in vetted width-16 M31 constants). Their value
-// is independent of the protocol/degree/logup plumbing exercised here.
-pub const EXTERNAL_ROUND_CONSTS: [[BaseField; N_STATE]; FULL_ROUNDS] =
-    [[BaseField::from_u32_unchecked(1234); N_STATE]; FULL_ROUNDS];
-pub const INTERNAL_ROUND_CONSTS: [BaseField; N_PARTIAL_ROUNDS] =
-    [BaseField::from_u32_unchecked(1234); N_PARTIAL_ROUNDS];
+// Round constants: re-export the PROVER's vetted Grain-LFSR constants from the
+// lib module (`zkpvm::poseidon2`) so this module's in-AIR `eval_permutation`,
+// host `permute`, and `record_permutation` use the SAME constants the segment
+// prover commits under — the verify-AIR (P5.2+) replays the real prover
+// transcript, so they MUST match. (The permutation/hasher below is a
+// behaviorally-identical copy reading these shared constants; collapsing the
+// duplicate logic into re-exports too is optional follow-up cleanup.)
+pub use zkpvm::poseidon2::{EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS};
 
 // ── Linear layers (generic: BaseField for the host, E::F for constraints) ──
 

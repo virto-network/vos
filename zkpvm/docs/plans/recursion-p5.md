@@ -289,6 +289,14 @@ bumped in P5.0.
 
 ## Session P5.2 — the 31-component OODS-embed harness (THE hard one)
 
+> **PREREQ DONE 2026-06-18 (commit `6d0cd77`, LOCAL):** `recursion_common`
+> re-exports the prover's vetted Grain constants from `zkpvm::poseidon2` (was
+> placeholder `1234`), so the verify-AIR's `eval_permutation` / `record_permutation`
+> match the segment prover's committed transcript. Validated: the constant-sensitive
+> recursion gates (channel_chip transcript-replay, cross_chip_logup, fri_twiddle_chip,
+> qm31_constraints) pass with the real constants. The MAIN harness below is unstarted
+> — it is the biggest block (likely 2 sessions); start it fresh with full context.
+
 **GOAL.** Replace GATE 4's representative 2-constraint OODS consumer with a harness that
 re-evaluates the FULL canonical segment AIR (31 components, **530 `add_constraint` sites**,
 grounding §31comp.2) at the OODS point, in-AIR, degree ≤ 2. This is the verify *depth* the
