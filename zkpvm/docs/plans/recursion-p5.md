@@ -338,6 +338,50 @@ join-AIR needs degree ≤ 2 with every QM31 product WITNESSED. Two options:
    (`verify.rs:313-324`, `boundary_binding.rs:116-168`, the 4 boundary chips). Wire these as
    their own constraints driven by the latched challenges (the GATE 4 latch pattern).
 
+**AS-GROUNDED DESIGN (the auto-witnessing evaluator, 2026-06-18 sweep).** The
+mechanism is a **two-pass walk of the chip's own generic `evaluate<E: EvalAtRow>`**, the
+SAME walk both times so the column layout agrees by construction (the sequential
+`next_interaction_mask` cursor is the coupling). Anchors below are stwo rev e128672
+(`~/.cargo/git/checkouts/stwo-59e22971a65c0edb/e128672/crates`) unless noted.
+- **Ground truth to match:** `PointEvaluator` (`constraint-framework/src/point.rs:38-65`)
+  IS the reference `EvalAtRow` — `F=EF=SecureField`; `next_interaction_mask` (`:42-52`) is a
+  per-tree cursor (offsets ignored, one pre-sampled QM31/col); `add_constraint` (`:53-59`) is
+  exactly `acc.accumulate(denom_inverse * constraint)`; `combine_ef` = `from_partial_evals`.
+  The accumulator (`core/air/accumulation.rs:29`) is Horner: `acc = acc*random_coeff + eval`
+  (earliest constraint → highest power); components fold in `BASE_COMPONENTS` order
+  (`air/components.rs:54-71`). `denom_inverse = coset_vanishing(CanonicCoset::new(mlbd).coset,
+  oods).inverse()` (`component.rs:257`); `mlbd` + `oods_point` + `random_coeff` extracted by
+  the GATE-4 replay (`oods_composition_chip.rs:177-248`).
+- **Entry point:** build `BuiltInComponentEval{ component:&chip, log_size, lookup_elements }`
+  (`framework/eval.rs:24-49`) and call `.evaluate(my_E)`. `TraceEval::new` (`trace/eval.rs:21-45`)
+  pulls EVERY mask up front (preproc via `get_preprocessed_column`, main via
+  `next_interaction_mask(1,[0]|[0,1])`) BEFORE any constraint runs ⇒ clean two-phase: all mask
+  reads, then a stream of `add_constraint`/`add_to_relation`.
+- **The hard core = a degree-reducing symbolic `F`/`EF`.** Plain `SecureField` loses the
+  expression structure needed to spot degree-2 products, so `E::F` must be an expression handle
+  that tracks degree. On `Mul` of two degree-1 handles → allocate the next witness column +
+  record its native value (Pass A) / read it back via `next_trace_mask` + emit
+  `add_constraint(witness − a*b)` (Pass B), so every product stays the GATE-4 witnessed-idiom
+  (`oods_composition_chip.rs:289-340`: `ab=a*b`, `t=rc*c0`, `p=dinv*inner`, final `p−lhs`).
+  **LEVERAGE:** stwo already has a symbolic `ExprEvaluator` (the `CPU_EXPR_DUMP` path in
+  `framework/traits/erased.rs:368-391`) — start from its AST + add the degree-track + product
+  → witness lowering, rather than an AST from scratch.
+- **Two passes:** (A) host-side recording E → ordered witness schedule (native QM31 values,
+  appended AFTER the chip's committed cols) + the Horner accumulator value; (B) the join's
+  `FrameworkEval::evaluate` re-walks with the in-AIR E, reads the witnesses via `next_trace_mask`
+  in the SAME order, emits the deg-2 bindings + the fold, asserts `acc − composition_value`
+  (ground truth from the replay). Witness columns live ONLY in the join's host-filled main
+  trace — a custom E cannot allocate committed cols mid-eval (`add_intermediate` is a no-op,
+  `lib.rs:133-141`).
+- **CpuChip caveat (the de-risk target, `chips/cpu/mod.rs:93-118`):** 187 `add_constraint` +
+  **45 `add_to_relation`** (logup, interaction tree 2) across 17 relations. To walk it the E
+  MUST implement the logup path (`super::logup_proxy!()` + a `LogupAtRow` field, else
+  `write_logup_frac`/`finalize_logup*` hit `unimplemented!()`, `lib.rs:162-175`); each logup
+  denominator is another deg-2 witness. Many CpuChip constraints are ALREADY deg-2 (booleanity,
+  gated helpers) — witness products ONLY where the chip expression exceeds degree 1, or the
+  column count explodes. **De-risk the EVALUATOR first on the GATE-4 small AIR (a·b / a·inv),
+  auto-generated == the manual version, BEFORE CpuChip's logup scale.**
+
 **GREEN GATE.** The harness re-evaluates a REAL Poseidon2-M31 conservation segment's full
 31-component OODS composition in-AIR and matches the proof's `composition_oods_eval`
 (extracted via the GATE-4 transcript-replay pattern); `assert_constraints` green; it
