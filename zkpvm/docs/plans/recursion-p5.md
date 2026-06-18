@@ -356,8 +356,11 @@ bumped in P5.0.
 >   `OodsEval`, the Horner accumulator running continuously across them (logup reset
 >   per component), reproducing the GLOBAL `PointEvaluationAccumulator` (one
 >   composition value, not a sum of per-component contributions) — the exact shape
->   the join takes; `assert_constraints` green; embed 40150 QM31. Full prove
->   `#[ignore]` (160K-M31 width × scalar hasher; P5.3 layout).
+>   the join takes; `assert_constraints` green; embed 40150 QM31. **The full
+>   single-uniform-component join proves+verifies at degree ≤ 2 (~23s release,
+>   `#[ignore]` for the debug suite) AND rejects a tampered column — even as PURE
+>   width (160600 M31 columns, no distribution across perm rows), so the design's
+>   "unmeasured width" make-or-break resolves FAVOURABLY.**
 >
 > **P5.2b REMAINING:** (a) the **claimed-sum balance** — `claimed_sums.sum()==0`
 > (`verify.rs:299`) + the boundary-binding claimed sums (`verify.rs:316-327`,

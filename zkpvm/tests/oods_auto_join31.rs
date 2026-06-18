@@ -254,12 +254,14 @@ fn oods_auto_join31_air_satisfied() {
     );
 }
 
-/// THE GATE (heavy): the single-uniform-component 31-chip join AIR proves+verifies
-/// through the lifted Poseidon2-M31 protocol; a perturbed column is rejected.
-/// `#[ignore]` — the full 160K-M31-column width through the scalar hasher; the
-/// production layout distributes these values across the perm rows (P5.3).
+/// THE GATE: the single-uniform-component 31-chip join AIR proves+verifies through
+/// the lifted Poseidon2-M31 protocol; a perturbed column is rejected. The full
+/// 160K-M31-column embed proves+verifies in ~23s release (much slower in debug —
+/// hence `#[ignore]` for the default suite). MEASUREMENT: even as pure width (no
+/// distribution across the perm rows), the single-uniform-component embed is
+/// tractable — the design's width worry resolves favourably.
 #[test]
-#[ignore = "heavy: full 31-component embed width × scalar Poseidon2 prove"]
+#[ignore = "heavy in debug: full 31-component embed width (proves+verifies ~23s release)"]
 fn oods_auto_join31_gate() {
     let s = setup();
     let rec = record(&s);
@@ -286,5 +288,10 @@ fn oods_auto_join31_gate() {
         "a perturbed committed column must be rejected"
     );
 
-    eprintln!("oods_auto_join31_gate GREEN: full 31-component OODS embed proves+verifies.");
+    eprintln!(
+        "oods_auto_join31_gate GREEN: the full 31-component OODS embed (160600 M31 columns) \
+         proves+verifies as ONE uniform component at degree ≤ 2 through the lifted \
+         Poseidon2-M31 protocol (~23s release); a perturbed column is rejected. Even as pure \
+         width, the single-uniform-component embed is tractable."
+    );
 }
