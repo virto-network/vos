@@ -43,6 +43,10 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo_constraint_framework::{EvalAtRow, relation};
 
+/// The auto-witnessing OODS re-evaluator (degree-reducing symbolic `EvalAtRow`)
+/// that drives a chip's own `evaluate` to embed its OODS composition in-AIR.
+pub mod oods_auto;
+
 // ── Poseidon2-over-M31 parameters (width 16; eprint 2023/323 §5) ──────────
 
 pub const N_STATE: usize = 16;
