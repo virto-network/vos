@@ -1,11 +1,21 @@
 # P4 build plan: the assembled join-AIR, the fixed point, and the build spike
 
-Status: **IN PROGRESS (2026-06-17).** Branch `voucher-state-transition`. Builds on
+Status: **P4.1 COMPLETE (2026-06-18).** Branch `voucher-state-transition`. Builds on
 the four GREEN P3 verifier-AIR chips (`channel_chip.rs`, `fri_fold_chip.rs`,
 `oods_composition_chip.rs`, `merkle_decommit_merged.rs`) + the integrated
 log_size-14 measurement (`verifier_air_integration.rs`). Reads on
 `recursion-design.md` (the lift→join architecture) — this doc is the concrete,
 source-grounded P4 build sequence.
+
+**All four P4.1 gates GREEN (2026-06-18, LOCAL, voucher-state-transition):**
+gate 1 DEEP-quotient (`6cd544b`), gate 2 FRI fold chain (`0a0cfab`), gate 3
+multi-tree Merkle decommit (`ddabe1b`), gate 4 assembled join driver (`eaa08bd`).
+The headline result: the **single-uniform-component join with latched-challenge
+cross-chip propagation** proves+verifies against a real child and re-verifies at
+log_size ≤ canonical 19 ⇒ the recursion fixed point closes. P4.2 (the fixed-point
+seam + allowlist) and P4.3 (wasm32 GREEN, PVM portable_atomic deferred) below;
+NEXT = **P5** (re-prove the 76 conservation segments under Poseidon2-M31 + the
+tree driver + scale the join's OODS embed to all 31 components).
 
 All `verifier.rs`/`fri.rs`/`pcs/*`/`vcs_lifted/*` line numbers below are in the
 stwo checkout the workspace pins (rev `e1286720`):
@@ -131,14 +141,47 @@ query/sample/path.
    + CM31 denom, all witnessed, degree ≤ 2), matching stwo's own
    `accumulate_row_quotients`; prove+verify; perturbed queried value rejected.
    (Per-batch demo; full multi-tree/all-query aggregation is the assembly.)
-2. **Cross-layer FRI fold chain** — fold one real proof's FRI across all layers,
-   query indices halving, each `folded` feeding the next layer; reject a
-   perturbed fold. **GAP 1 (the twiddle) is now de-risked** — see below.
-3. **Multi-tree Merkle decommit** — verify the 4 trace trees + per-layer FRI
-   trees against the proof's real decommitment witnesses; reject a tampered path.
-4. **Assemble** (1)+(2)+(3)+ChannelChip+OODS in ONE uniform component verifying
-   a real small child proof end-to-end: ACCEPT valid, REJECT tampered
-   query/sample/path.
+2. **Cross-layer FRI fold chain** — ✅ **DONE (2026-06-18, commit 0a0cfab)**,
+   `tests/fri_fold_chain.rs`: a real low-degree FRI instance folded across all
+   layers (1 circle + 2 line folds), query index halving each layer, each
+   `folded` feeding the next layer's queried eval via a bit-driven select, every
+   twiddle DERIVED in-AIR from `q` via the conditional point-add gadget over that
+   layer's coset (line layers take `x`, circle takes `y`), the surviving eval
+   checked against the degree-1 last-layer poly (`c0 + c1·x`). Every host fold
+   cross-checked vs stwo `fold_circle_into_line`/`fold_line`. ONE uniform
+   component, prove+verify, perturbed fold rejected. (GAP 1 twiddle + GAP 3
+   last-layer both closed here.)
+3. **Multi-tree Merkle decommit** — ✅ **DONE (2026-06-18, commit ddabe1b)**,
+   `tests/merkle_decommit_trees.rs`: reproduces `MerkleVerifierLifted::verify`
+   for a real proof's main (16-col) + composition (8-col) trace trees. The
+   compressed `hash_witness` + co-queried sub-paths are expanded host-side by
+   replaying verify's exact bottom-up fold (sibling `chunk_by`, `idx&1` ordering,
+   witness-fetch-on-singletons) into a node map cross-checked vs the real root;
+   each query's leaf→root path re-hashes in-AIR with a real sponge leaf
+   (`update_leaf`+`finalize` over real `queried_values`) + `hash_children` +
+   bit-ordering + pinned root. Generic `DecommitEval` (ONE uniform component)
+   handles both leaf widths; all 32+32 paths AIR-satisfied; honest paths
+   prove+verify; tampered queried value AND tampered sibling rejected. (FRI-layer
+   trees = the identical gadget on QM31 leaves from the fold reconstruction →
+   GATE 4 / P5.)
+4. **Assemble** — ✅ **DONE (2026-06-18, commit eaa08bd)**,
+   `tests/join_assembly.rs`: ONE uniform component replays a REAL child's
+   Poseidon2-M31 transcript (ChannelChip) and drives the OODS + DEEP-quotient +
+   FriFold consumers off the challenges it DERIVES, in-circuit. **The
+   architectural unlock = LATCHED challenge columns** (held constant by the
+   `not_last` cross-row eq, bound at the draw row to the squeeze output via a
+   preprocessed `is_draw` indicator) — cross-chip challenge propagation inside ONE
+   `FrameworkEval`, NO relation, NO interaction tree, NO producer/consumer split,
+   degree ≤ 2. Channel derives rc(sq0)/oods-t(sq1)/deep(sq2)/fold_alpha(sq3); the
+   OODS point is derived in-AIR from latched `t` (`get_random_point` map,
+   `circle.rs:169`); consumers + `io_hash` public inputs read the latched
+   challenges (pinned to oracle constants from the REAL challenges). Gate @
+   log_size 6: proves+verifies through the lifted protocol; a corrupted transcript
+   value AND a corrupted consumer value rejected. **MAKE-OR-BREAK: log 6
+   (per-child scale) ≤ canonical 19; the full 16K-perm scale holds log ~14
+   (`verifier_air_integration.rs`) ⇒ the recursion fixed point CLOSES.** The full
+   31-component OODS embed + FRI-Merkle real-leaf coupling at canonical scale is
+   the P5 reach (the wiring is now proven; P5 scales the data).
 
 **DONE (2026-06-17, commit 4c6c901):** the `verify_pow_nonce` difficulty
 bit-decomp — previously the only deferred ChannelChip item. The pow2 perm
