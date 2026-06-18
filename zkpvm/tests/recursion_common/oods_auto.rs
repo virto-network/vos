@@ -39,7 +39,9 @@ use stwo::core::fields::FieldExpOps;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use stwo_constraint_framework::logup::LogupAtRow;
-use stwo_constraint_framework::{EvalAtRow, FrameworkEval, INTERACTION_TRACE_IDX};
+use stwo_constraint_framework::{
+    EvalAtRow, FrameworkEval, INTERACTION_TRACE_IDX, PREPROCESSED_TRACE_IDX,
+};
 
 // ── The mode abstraction (host record vs in-AIR verify) ────────────────────
 
@@ -455,10 +457,11 @@ pub fn drive<B: WitBackend>(
         logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, inner_log_size),
     };
     let eval = walk(eval);
+    // A constraint-free component contributes 0 to the composition.
     let acc = eval
         .acc
         .clone()
-        .expect("chip emitted at least one constraint");
+        .unwrap_or_else(|| B::v_const(SecureField::zero()));
     drop(eval); // release the strong ctx clone so the caller can reclaim the backend
 
     let w = Rc::downgrade(ctx);
@@ -483,7 +486,12 @@ pub fn drive<B: WitBackend>(
 // ── Host-record backend (V = SecureField) ──────────────────────────────────
 
 /// The OODS data a [`RecordBackend`] replays: the inner proof's mask samples
-/// (`mask[interaction][column][offset]`) plus the protocol scalars.
+/// (`mask[interaction][column][offset]`) plus the protocol scalars. The
+/// preprocessed tree (`mask[PREPROCESSED_TRACE_IDX]`) is the FULL preprocessed
+/// column set; a component's reads index into it via its
+/// `preprocessed_column_indices` ([`RecordBackend::set_preproc_indices`]), the
+/// same remap stwo applies — needed when a chip's preprocessed reads aren't a
+/// contiguous identity range.
 pub struct OodsInputs {
     pub mask: Vec<Vec<Vec<SecureField>>>,
     pub random_coeff: SecureField,
@@ -498,6 +506,10 @@ pub struct OodsInputs {
 pub struct RecordBackend {
     inputs: OodsInputs,
     col_cursor: Vec<usize>,
+    /// Per-read preprocessed column indices (stwo's `preprocessed_column_indices`).
+    /// Empty ⇒ read the preprocessed tree sequentially (identity).
+    preproc_indices: Vec<usize>,
+    preproc_cursor: usize,
     /// Every committed join column's value, in allocation order.
     pub schedule: Vec<SecureField>,
     /// Count of witnessed products (degree-2 reductions).
@@ -513,11 +525,19 @@ impl RecordBackend {
         Self {
             inputs,
             col_cursor: vec![0; n_interactions],
+            preproc_indices: Vec::new(),
+            preproc_cursor: 0,
             schedule: Vec::new(),
             witnessed: 0,
             final_lhs: None,
             final_rhs: None,
         }
+    }
+
+    /// Map preprocessed reads through the component's `preprocessed_column_indices`
+    /// (stwo's remap) instead of reading the preprocessed tree sequentially.
+    pub fn set_preproc_indices(&mut self, indices: Vec<usize>) {
+        self.preproc_indices = indices;
     }
 
     fn push(&mut self, v: SecureField) -> SecureField {
@@ -550,6 +570,20 @@ impl WitBackend for RecordBackend {
         interaction: usize,
         _offsets: [isize; N],
     ) -> [Self::V; N] {
+        // Preprocessed reads remap through `preprocessed_column_indices` (when set)
+        // — the same the verifier applies; a column may be re-read or skipped, so a
+        // sequential cursor would diverge. (Each preprocessed read is offset [0].)
+        if interaction == PREPROCESSED_TRACE_IDX && !self.preproc_indices.is_empty() {
+            let col = self.preproc_indices[self.preproc_cursor];
+            self.preproc_cursor += 1;
+            let samples = self.inputs.mask[interaction][col].clone();
+            assert_eq!(
+                samples.len(),
+                N,
+                "preprocessed OODS mask offset count mismatch"
+            );
+            return std::array::from_fn(|i| self.push(samples[i]));
+        }
         let col = self.col_cursor[interaction];
         self.col_cursor[interaction] += 1;
         let samples = self.inputs.mask[interaction][col].clone();
