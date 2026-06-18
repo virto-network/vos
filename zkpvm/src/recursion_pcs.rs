@@ -47,6 +47,20 @@ mod selected {
 
 pub use selected::*;
 
+/// The canonical 32-byte serialization of a program commitment, channel-agnostic
+/// (`Blake2sHash` → its `[u8; 32]`; `P2Hash` → its 8 little-endian `u32` limbs).
+/// The inverse is `ProverMerkleHash::from(&[u8])`. The program-commitment
+/// allowlist (bake + drift guard) uses this so the recipe is identical under
+/// either PCS — the wire form stays a fixed 32 bytes.
+#[cfg(not(feature = "poseidon2-channel"))]
+pub fn commitment_bytes(h: &ProverMerkleHash) -> [u8; 32] {
+    h.0
+}
+#[cfg(feature = "poseidon2-channel")]
+pub fn commitment_bytes(h: &ProverMerkleHash) -> [u8; 32] {
+    h.to_bytes()
+}
+
 // ── The trace-column transplant at the commit boundary (prover only) ───────
 //
 // Trace + interaction generation always ride `SimdBackend` (the framework's

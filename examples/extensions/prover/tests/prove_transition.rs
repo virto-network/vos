@@ -944,9 +944,12 @@ fn canonical_commitment_allowlist_impl() {
     )
     .expect("contiguous comb-free chain must verify under the {C_0, C_1} allowlist");
 
-    // A commitment outside the allowlist is rejected.
-    let mut bad = c0_a;
-    bad.0[0] ^= 0xFF;
+    // A commitment outside the allowlist is rejected. Tamper via the canonical
+    // 32-byte form so this is channel-agnostic (a commitment is `[u8; 32]` under
+    // Blake2s but `[M31; 8]` under Poseidon2-M31).
+    let mut bad_bytes = zkpvm::recursion_pcs::commitment_bytes(&c0_a);
+    bad_bytes[0] ^= 0xFF;
+    let bad = zkpvm::ProgramCommitment::from(&bad_bytes[..]);
     verify_chain_standalone_allowlist(
         &[p0, p1],
         &[bad],
@@ -987,11 +990,16 @@ fn canonical_commitment_allowlist_impl() {
     }
 
     eprintln!("\nW0 GATE GREEN — canonical proving yields the 2-entry allowlist.");
-    eprintln!(
-        "VOUCHER_CHECK_COMMITMENTS[0] (C_0, comb-free) = {:?}",
-        c0_a.0
-    );
-    eprintln!("VOUCHER_CHECK_COMMITMENTS[1] (C_1, one comb)  = {:?}", c1.0);
+    // Print the canonical 32-byte form (channel-agnostic) ready to paste into
+    // VOUCHER_CHECK_COMMITMENTS — under Poseidon2-M31 these are the P2Hash limbs
+    // serialized LE, NOT a Blake2s digest.
+    let c0_bytes = zkpvm::recursion_pcs::commitment_bytes(&c0_a);
+    let c1_bytes = zkpvm::recursion_pcs::commitment_bytes(&c1);
+    let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    eprintln!("VOUCHER_CHECK_COMMITMENTS[0] (C_0, comb-free) bytes = {c0_bytes:?}");
+    eprintln!("  C_0 hex = {}", hex(&c0_bytes));
+    eprintln!("VOUCHER_CHECK_COMMITMENTS[1] (C_1, one comb)  bytes = {c1_bytes:?}");
+    eprintln!("  C_1 hex = {}", hex(&c1_bytes));
 }
 
 /// Drift guard for the re-pinned canonical commitment allowlist (federation
@@ -1039,7 +1047,9 @@ fn canonical_commitment_drift_guard() {
         let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
         let proof = zkpvm::prove_canonical(&mut sn, profile)
             .unwrap_or_else(|e| panic!("prove_canonical seg {i}: {e:?}"));
-        zkpvm::program_commitment_of_proof(&proof).0
+        // Canonical 32-byte form (channel-agnostic) to compare against the baked
+        // allowlist — `[u8; 32]` under Blake2s, `[M31; 8]` LE under Poseidon2-M31.
+        zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof))
     };
     let c0 = prove_seg(0);
     let c1 = prove_seg(comb_seg);

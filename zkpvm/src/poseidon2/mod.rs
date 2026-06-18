@@ -327,6 +327,36 @@ impl core::fmt::Display for P2Hash {
 }
 impl Hash for P2Hash {}
 
+impl P2Hash {
+    /// The canonical 32-byte serialization: the 8 M31 limbs as little-endian
+    /// `u32`s. Inverse of [`P2Hash::from`] for canonical limbs (`< p`), which is
+    /// always the case for a real commitment. This is the 32-byte wire form the
+    /// program-commitment allowlist bakes (mirrors `Blake2sHash`'s `[u8; 32]`).
+    pub fn to_bytes(&self) -> [u8; 8 * 4] {
+        let mut out = [0u8; 32];
+        for (i, limb) in self.0.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&limb.0.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Parse a 32-byte commitment (8 little-endian `u32` limbs, each reduced mod
+/// `p`) back into a `P2Hash`. Mirrors `Blake2sHash: From<&[u8]>` so the
+/// channel-agnostic `CommitmentHash::from(&[u8])` in the prover extension works
+/// under the Poseidon2-M31 stack. Panics on a non-32-byte slice (callers guard).
+impl From<&[u8]> for P2Hash {
+    fn from(bytes: &[u8]) -> Self {
+        assert_eq!(bytes.len(), 32, "P2Hash requires exactly 32 bytes");
+        let mut limbs = [BaseField::zero(); 8];
+        for (i, limb) in limbs.iter_mut().enumerate() {
+            let w = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            *limb = BaseField::reduce(w as u64);
+        }
+        P2Hash(limbs)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct P2MerkleHasher {
     state: [BaseField; N_STATE],

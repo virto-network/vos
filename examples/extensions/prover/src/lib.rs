@@ -241,7 +241,7 @@ pub fn prove_with_details(
     witness_bytes: &[u8],
 ) -> Option<(Vec<u8>, [u8; 32], [u8; 32])> {
     let proof = prove_to_proof(program_id, witness_bytes)?;
-    let commitment = program_commitment_of_proof(&proof).0;
+    let commitment = zkpvm::recursion_pcs::commitment_bytes(&program_commitment_of_proof(&proof));
     let io_hash = proof.public_io_hash();
     let bytes = bincode::serialize(&proof).ok()?;
     Some((bytes, commitment, io_hash))
@@ -501,6 +501,7 @@ pub const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; zkpvm::chip_idx::COUNT] = [
 /// every segment commitment is in this set. (Larger transfer batches with more
 /// comb calls per segment extend the allowlist with `C_2, …`.) Re-pinned by
 /// the `canonical_commitment_drift_guard` test.
+#[cfg(not(feature = "poseidon2-channel"))]
 pub const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
     // C_0 — comb-free canonical shape (75 of 76 segments).
     // blake2s 35a231e8f5317023f5637f603becd36122fe9e6945f169f5a5d6177c4bb0ee90
@@ -515,6 +516,30 @@ pub const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
         0x1d, 0xe8, 0x78, 0xa7, 0x83, 0x74, 0xb8, 0xa1, 0x4c, 0x57, 0x00, 0xe6, 0xcf, 0xed, 0xa1,
         0x3b, 0xbc, 0xd6, 0x7e, 0xdb, 0x63, 0x98, 0xa1, 0x0d, 0x7f, 0xfb, 0x3e, 0x77, 0xe9, 0xa1,
         0x55, 0x67,
+    ],
+];
+
+/// Poseidon2-M31 variant of the canonical allowlist (native-recursion Stage-0).
+/// The commitment is the preprocessed-trace Merkle root under the Poseidon2-M31
+/// PCS — a `P2Hash` (8 M31 limbs) serialized as little-endian `u32`s, NOT a
+/// Blake2s digest. Re-pinned 2026-06-18 by `canonical_commitment_allowlist` /
+/// `canonical_commitment_drift_guard` under `--features poseidon2-channel`
+/// (comb segment #57 of 76; seg 0 and seg 75 both collapse to C_0).
+#[cfg(feature = "poseidon2-channel")]
+pub const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
+    // C_0 — comb-free canonical shape (75 of 76 segments).
+    // P2Hash LE c8ebc64c73b600790984c72c87c2e0502750510f2d46cf5fa6afe71bc5cfdb7a
+    [
+        0xc8, 0xeb, 0xc6, 0x4c, 0x73, 0xb6, 0x00, 0x79, 0x09, 0x84, 0xc7, 0x2c, 0x87, 0xc2, 0xe0,
+        0x50, 0x27, 0x50, 0x51, 0x0f, 0x2d, 0x46, 0xcf, 0x5f, 0xa6, 0xaf, 0xe7, 0x1b, 0xc5, 0xcf,
+        0xdb, 0x7a,
+    ],
+    // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
+    // P2Hash LE 5b1cdb6ec0409e2221859f4916ef76381fa41d1e8cf9e43f51abe80c26925538
+    [
+        0x5b, 0x1c, 0xdb, 0x6e, 0xc0, 0x40, 0x9e, 0x22, 0x21, 0x85, 0x9f, 0x49, 0x16, 0xef, 0x76,
+        0x38, 0x1f, 0xa4, 0x1d, 0x1e, 0x8c, 0xf9, 0xe4, 0x3f, 0x51, 0xab, 0xe8, 0x0c, 0x26, 0x92,
+        0x55, 0x38,
     ],
 ];
 

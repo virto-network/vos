@@ -1,7 +1,7 @@
 # P5 build plan: data-scaling the proven recursion to the real 76-segment chain
 
-Status: **P5.0 LANDED 2026-06-18 (LOCAL); P5.1–P5.5 + P5-perf PLANNED.** Branch
-`voucher-state-transition`. P4 is COMPLETE —
+Status: **P5.0 + P5.1 LANDED 2026-06-18 (LOCAL); P5.2–P5.5 + P5-perf PLANNED.**
+Branch `voucher-state-transition`. P4 is COMPLETE —
 the recursion *machinery* is proven (`recursion-p4.md`): the single-uniform-component
 join with latched-challenge cross-chip propagation verifies a real child (P4.1) and,
 as the fixed-point NODE, verifies two children of its own shape + seam + allowlist +
@@ -220,6 +220,34 @@ trip). Only after the backend mechanism is chosen does the alias threading begin
 ---
 
 ## Session P5.1 — re-pin `{C_0,C_1}` + verify_chain under Poseidon2-M31
+
+> **MOSTLY DONE 2026-06-18 (voucher-state-transition, LOCAL).** `{C_0,C_1}` re-pinned
+> under Poseidon2-M31 + `verify_chain_standalone_allowlist` GREEN.
+> - **P2Hash ↔ 32-byte ABI:** `P2Hash::{from(&[u8]), to_bytes()}` (8 LE-`u32` limbs,
+>   reduced mod p) + a channel-agnostic `recursion_pcs::commitment_bytes(&hash)`
+>   bridge (Blake2s → `.0`; P2 → `to_bytes`). The prover-extension lib + the
+>   re-bake recipe / drift guard now use the bridge instead of `.0`, so they
+>   compile + run under BOTH stacks. `poseidon2-channel` forwarded to
+>   `prover-extension` (→ zkpvm + zkpvm-verifier).
+> - **Re-pinned `{C_0,C_1}`** (feature-gated `VOUCHER_CHECK_COMMITMENTS` —
+>   default keeps the Blake2s values; the P2 const is a SEPARATE `#[cfg]` arm):
+>   `canonical_commitment_allowlist` under `--features poseidon2-channel`
+>   (SEG_STEPS=100000, ~34 min, release) re-derived them as `P2Hash` LE bytes:
+>   `C_0 = c8ebc64c73b600790984c72c87c2e0502750510f2d46cf5fa6afe71bc5cfdb7a`
+>   (comb-free; seg 0 AND seg 75 unify), `C_1 = 5b1cdb6ec0409e2221859f4916ef76381fa41d1e8cf9e43f51abe80c26925538`
+>   (comb seg #57 of 76). W0 GATE GREEN — the 2-entry allowlist + the
+>   C_0–C_1–C_0 heterogeneous chain verify under P2. The CANONICAL PROFILE is
+>   UNCHANGED (hash swap doesn't move log_sizes — trace-gen is identical).
+> - **DRIFT GUARD:** `canonical_commitment_drift_guard` under the feature
+>   re-derives + asserts the baked `{C_0,C_1}` (confirms the bake).
+> - **CAPSTONE DEFERRED to P5-perf:** `chain_manifest_roundtrip` proves the FULL
+>   76-segment chain (`prove_chain_segments`) — at ~34 min for the 6-segment
+>   recipe, that is ~7 h under the scalar Poseidon2 hasher, impractical until the
+>   SIMD commit op (P5-perf) lands. The federation `verify_chain_segments` LOGIC
+>   (allowlist lookup, io-binding, guards) is channel-independent: the io-binding
+>   is a register-bytes hash check (not the PCS), and the guards are covered by
+>   `manifest_codec_and_verify_guards`. `verify_chain_standalone_allowlist` itself
+>   is already GREEN under P2 via the recipe's real C_0–C_1–C_0 chain.
 
 **GOAL.** Recompute the 2-entry canonical allowlist under the new hash, re-bake the const,
 and get `verify_chain_standalone_allowlist` + the federation chain e2e green under

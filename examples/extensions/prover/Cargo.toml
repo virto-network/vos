@@ -24,6 +24,10 @@ extension = []
 # far lighter than a full prove) for verifying large traces that OOM under
 # `prove`. Test-only: `cargo test -p prover-extension --features debug-constraints`.
 debug-constraints = ["zkpvm/debug-internals"]
+# Native-recursion Stage-0 (P5.0/P5.1): prove + verify under the Poseidon2-M31
+# PCS. Flips `CommitmentHash` to `P2Hash`; the re-bake recipe + drift guard
+# recompute `{C_0,C_1}` under the new hash. Off by default (production Blake2s).
+poseidon2-channel = ["zkpvm/poseidon2-channel", "zkpvm-verifier/poseidon2-channel"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
