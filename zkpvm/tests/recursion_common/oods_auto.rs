@@ -90,6 +90,11 @@ pub trait WitBackend: Sized {
 
     /// Discharge the final DEEP-ALI equality `lhs == rhs` (degree 1).
     fn assert_eq(&mut self, lhs: Self::V, rhs: Self::V);
+
+    /// Advance to the next component's mask (multi-component walks via
+    /// [`drive_multi`]). Default no-op — single-component backends and the
+    /// sequential-reading in-AIR backend don't switch masks.
+    fn start_component(&mut self) {}
 }
 
 // ── The degree-tracking field handle ───────────────────────────────────────
@@ -311,6 +316,16 @@ pub struct OodsEval<B: WitBackend> {
     logup: LogupAtRow<Self>,
 }
 
+impl<B: WitBackend> OodsEval<B> {
+    /// Reset the logup for the next component (its own `claimed_sum`/`log_size`),
+    /// leaving the Horner accumulator intact — the multi-component continuous fold.
+    /// The previous logup must already be finalized (every component finalizes its
+    /// own; constraint-free ones start finalized).
+    pub fn set_logup(&mut self, claimed_sum: SecureField, log_size: u32) {
+        self.logup = LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size);
+    }
+}
+
 impl<B: WitBackend> EvalAtRow for OodsEval<B> {
     type F = Handle<B>;
     type EF = Handle<B>;
@@ -463,12 +478,49 @@ pub fn drive<B: WitBackend>(
         .clone()
         .unwrap_or_else(|| B::v_const(SecureField::zero()));
     drop(eval); // release the strong ctx clone so the caller can reclaim the backend
+    finalize_composition(ctx, acc);
+}
 
+/// Walk the FULL canonical AIR (all 31 components in `BASE_COMPONENTS` order)
+/// through ONE evaluator, accumulating their constraints into a SINGLE Horner
+/// fold — the single-uniform-component shape the recursion join takes. `comps`
+/// is `(chip_idx, log_size, claimed_sum)` per component; `walk(idx, log_size,
+/// eval)` runs that component's `evaluate`. The backend advances to each
+/// component's mask via [`WitBackend::start_component`]; the logup is reset per
+/// component (its own `claimed_sum`/`log_size`), while the Horner accumulator
+/// runs continuously across all of them.
+pub fn drive_multi<B: WitBackend>(
+    ctx: &Rc<RefCell<B>>,
+    comps: &[(usize, u32, SecureField)],
+    walk: impl Fn(usize, u32, OodsEval<B>) -> OodsEval<B>,
+) {
+    let rc = ctx.borrow_mut().aux(AuxKind::Rc);
+    let mut eval = OodsEval {
+        ctx: Rc::clone(ctx),
+        rc,
+        acc: None,
+        logup: LogupAtRow::dummy(),
+    };
+    for &(idx, log_size, claimed_sum) in comps {
+        ctx.borrow_mut().start_component();
+        eval.set_logup(claimed_sum, log_size);
+        eval = walk(idx, log_size, eval);
+    }
+    let acc = eval
+        .acc
+        .clone()
+        .unwrap_or_else(|| B::v_const(SecureField::zero()));
+    drop(eval);
+    finalize_composition(ctx, acc);
+}
+
+/// Scale the Horner sum by `dinv`, recombine the composition mask, and discharge
+/// the DEEP-ALI equality `dinv·Σ rcᵏ·cₖ == left + ox·right`. The denominator
+/// inverse is the same for every component, so it factors out of the whole fold.
+fn finalize_composition<B: WitBackend>(ctx: &Rc<RefCell<B>>, acc: B::V) {
     let w = Rc::downgrade(ctx);
     let acc = Handle::lift(acc, 1, w.clone());
     let dinv = Handle::lift(ctx.borrow_mut().aux(AuxKind::Dinv), 1, w.clone());
-    // composition_value = dinv · (Horner sum). The denominator inverse is the
-    // same for every component, so it factors out of the whole Horner fold.
     let comp = dinv * acc;
 
     let comp_mask: [Handle<B>; 2 * SECURE_EXTENSION_DEGREE] =
@@ -609,6 +661,135 @@ impl WitBackend for RecordBackend {
     fn assert_eq(&mut self, lhs: Self::V, rhs: Self::V) {
         self.final_lhs = Some(lhs);
         self.final_rhs = Some(rhs);
+    }
+}
+
+// ── Multi-component host-record backend (the full canonical AIR) ────────────
+
+/// One component's OODS mask for a [`MultiRecordBackend`] walk. The preprocessed
+/// tree (`mask[PREPROCESSED_TRACE_IDX]`) is the full column set; reads index into
+/// it via `preproc_indices` (stwo's preprocessed remap).
+pub struct ComponentMask {
+    pub mask: Vec<Vec<Vec<SecureField>>>,
+    pub preproc_indices: Vec<usize>,
+}
+
+/// Like [`RecordBackend`] but for [`drive_multi`]: one mask per component,
+/// advanced by [`WitBackend::start_component`]. The shared aux columns (rc, dinv,
+/// ox, composition mask) and the growing `schedule` span all components; the
+/// per-interaction + preprocessed cursors reset at each component boundary.
+pub struct MultiRecordBackend {
+    components: Vec<ComponentMask>,
+    cur: usize, // usize::MAX until the first start_component
+    random_coeff: SecureField,
+    denom_inverse: SecureField,
+    oods_x_doubled: SecureField,
+    comp: [SecureField; 2 * SECURE_EXTENSION_DEGREE],
+    col_cursor: Vec<usize>,
+    preproc_cursor: usize,
+    /// Every committed join column's value, in allocation order.
+    pub schedule: Vec<SecureField>,
+    /// Count of witnessed products across all components.
+    pub witnessed: usize,
+    pub final_lhs: Option<SecureField>,
+    pub final_rhs: Option<SecureField>,
+}
+
+impl MultiRecordBackend {
+    pub fn new(
+        components: Vec<ComponentMask>,
+        random_coeff: SecureField,
+        denom_inverse: SecureField,
+        oods_x_doubled: SecureField,
+        comp: [SecureField; 2 * SECURE_EXTENSION_DEGREE],
+    ) -> Self {
+        Self {
+            components,
+            cur: usize::MAX,
+            random_coeff,
+            denom_inverse,
+            oods_x_doubled,
+            comp,
+            col_cursor: vec![0; 3],
+            preproc_cursor: 0,
+            schedule: Vec::new(),
+            witnessed: 0,
+            final_lhs: None,
+            final_rhs: None,
+        }
+    }
+
+    fn push(&mut self, v: SecureField) -> SecureField {
+        self.schedule.push(v);
+        v
+    }
+}
+
+impl WitBackend for MultiRecordBackend {
+    type V = SecureField;
+
+    fn v_const(x: SecureField) -> Self::V {
+        x
+    }
+    fn v_add(a: Self::V, b: Self::V) -> Self::V {
+        a + b
+    }
+    fn v_sub(a: Self::V, b: Self::V) -> Self::V {
+        a - b
+    }
+    fn v_mul(a: Self::V, b: Self::V) -> Self::V {
+        a * b
+    }
+    fn v_neg(a: Self::V) -> Self::V {
+        -a
+    }
+
+    fn next_mask<const N: usize>(
+        &mut self,
+        interaction: usize,
+        _offsets: [isize; N],
+    ) -> [Self::V; N] {
+        let cur = self.cur;
+        let col = if interaction == PREPROCESSED_TRACE_IDX
+            && !self.components[cur].preproc_indices.is_empty()
+        {
+            let c = self.components[cur].preproc_indices[self.preproc_cursor];
+            self.preproc_cursor += 1;
+            c
+        } else {
+            let c = self.col_cursor[interaction];
+            self.col_cursor[interaction] += 1;
+            c
+        };
+        let samples = self.components[cur].mask[interaction][col].clone();
+        assert_eq!(samples.len(), N, "OODS mask offset count mismatch");
+        std::array::from_fn(|i| self.push(samples[i]))
+    }
+
+    fn aux(&mut self, kind: AuxKind) -> Self::V {
+        let v = match kind {
+            AuxKind::Rc => self.random_coeff,
+            AuxKind::Dinv => self.denom_inverse,
+            AuxKind::Ox => self.oods_x_doubled,
+            AuxKind::Comp(i) => self.comp[i],
+        };
+        self.push(v)
+    }
+
+    fn witness_mul(&mut self, a: Self::V, b: Self::V) -> Self::V {
+        self.witnessed += 1;
+        self.push(a * b)
+    }
+
+    fn assert_eq(&mut self, lhs: Self::V, rhs: Self::V) {
+        self.final_lhs = Some(lhs);
+        self.final_rhs = Some(rhs);
+    }
+
+    fn start_component(&mut self) {
+        self.cur = self.cur.wrapping_add(1);
+        self.col_cursor = vec![0; 3];
+        self.preproc_cursor = 0;
     }
 }
 
