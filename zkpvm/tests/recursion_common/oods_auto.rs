@@ -29,14 +29,17 @@
 //! in [`drive`], so they too land in a deterministic order.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub};
 use std::rc::{Rc, Weak};
 
 use num_traits::{One, Zero};
+use stwo::core::Fraction;
 use stwo::core::fields::FieldExpOps;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
-use stwo_constraint_framework::{EvalAtRow, FrameworkEval};
+use stwo_constraint_framework::logup::LogupAtRow;
+use stwo_constraint_framework::{EvalAtRow, FrameworkEval, INTERACTION_TRACE_IDX};
 
 // ── The mode abstraction (host record vs in-AIR verify) ────────────────────
 
@@ -300,6 +303,10 @@ pub struct OodsEval<B: WitBackend> {
     ctx: Rc<RefCell<B>>,
     rc: B::V,
     acc: Option<B::V>,
+    /// Logup state for chips that emit lookups (`add_to_relation`): the prefix-sum
+    /// constraints are folded into the same Horner accumulator, with every QM31
+    /// denominator product witnessed.
+    logup: LogupAtRow<Self>,
 }
 
 impl<B: WitBackend> EvalAtRow for OodsEval<B> {
@@ -334,6 +341,80 @@ impl<B: WitBackend> EvalAtRow for OodsEval<B> {
     fn combine_ef(values: [Self::F; SECURE_EXTENSION_DEGREE]) -> Self::EF {
         combine4(values)
     }
+
+    // The logup path, replicating stwo's `logup_proxy!()` (which is `pub(crate)`
+    // and so cannot be imported). Lookups (`add_to_relation`, the default impl)
+    // push fractions; `finalize_logup*` emits the cumulative-sum constraints.
+    // Each `diff·denominator` is a degree-2 product → witnessed by `Handle`'s
+    // `Mul`, like every other product, and the constraints fold into the same
+    // Horner accumulator as the chip's `add_constraint`s.
+
+    fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
+        if self.logup.fracs.is_empty() {
+            self.logup.is_finalized = false;
+        }
+        self.logup.fracs.push(fraction);
+    }
+
+    #[allow(clippy::ptr_arg)] // signature must match the trait's `&Batching` (= &Vec<usize>)
+    fn finalize_logup_batched(&mut self, batching: &Vec<usize>) {
+        assert!(!self.logup.is_finalized, "LogupAtRow was already finalized");
+        let fracs = self.logup.fracs.clone();
+        let interaction = self.logup.interaction;
+        let cumsum_shift = self.logup.cumsum_shift;
+        assert_eq!(
+            batching.len(),
+            fracs.len(),
+            "Batching must match the number of logup entries"
+        );
+
+        let last_batch = *batching.iter().max().unwrap();
+
+        type Frac<B> = Fraction<Handle<B>, Handle<B>>;
+        let mut fracs_by_batch: HashMap<usize, Vec<Frac<B>>> = HashMap::new();
+        for (batch, frac) in batching.iter().zip(fracs.iter()) {
+            fracs_by_batch.entry(*batch).or_default().push(frac.clone());
+        }
+
+        let keys: HashSet<usize> = fracs_by_batch.keys().copied().collect();
+        let all_batches: HashSet<usize> = (0..last_batch + 1).collect();
+        assert_eq!(
+            keys, all_batches,
+            "Batching must contain all consecutive batches"
+        );
+
+        let mut prev_col_cumsum = <Handle<B> as Zero>::zero();
+        for batch_id in 0..last_batch {
+            let cur_frac: Frac<B> = fracs_by_batch[&batch_id].iter().cloned().sum();
+            let [cur_cumsum] = self.next_extension_interaction_mask(interaction, [0]);
+            let diff = cur_cumsum.clone() - prev_col_cumsum.clone();
+            prev_col_cumsum = cur_cumsum;
+            self.add_constraint(diff * cur_frac.denominator - cur_frac.numerator);
+        }
+
+        let frac: Frac<B> = fracs_by_batch[&last_batch].clone().into_iter().sum();
+        let [prev_row_cumsum, cur_cumsum] =
+            self.next_extension_interaction_mask(interaction, [-1, 0]);
+        let diff = cur_cumsum - prev_row_cumsum - prev_col_cumsum.clone();
+        // `cumsum_shift = claimed_sum / n_rows` makes the per-row constraint
+        // uniform (sum-zero) so it applies on every row.
+        let shifted_diff = diff + cumsum_shift;
+        self.add_constraint(shifted_diff * frac.denominator - frac.numerator);
+
+        self.logup.is_finalized = true;
+    }
+
+    fn finalize_logup(&mut self) {
+        let batches = (0..self.logup.fracs.len()).collect::<Vec<_>>();
+        self.finalize_logup_batched(&batches)
+    }
+
+    fn finalize_logup_in_pairs(&mut self) {
+        let batches = (0..self.logup.fracs.len())
+            .map(|n| n / 2)
+            .collect::<Vec<_>>();
+        self.finalize_logup_batched(&batches)
+    }
 }
 
 /// `from_partial_evals`: combine four QM31-coordinate column handles into one
@@ -348,22 +429,32 @@ fn combine4<B: WitBackend>(values: [Handle<B>; SECURE_EXTENSION_DEGREE]) -> Hand
 
 // ── The shared walk: the chip's `evaluate` sandwiched by aux reads ─────────
 
-/// Re-evaluate `chip`'s constraints at the OODS point, in walk order: read the
+/// Re-evaluate a chip's constraints at the OODS point, in walk order: read the
 /// random coefficient, run the chip (samples + witnessed products + the Horner
-/// fold), then recombine against the composition mask and discharge the
-/// DEEP-ALI equality `dinv·Σ rcᵏ·cₖ == composition_value`.
+/// fold, plus any logup cumulative-sum constraints), then recombine against the
+/// composition mask and discharge the DEEP-ALI equality
+/// `dinv·Σ rcᵏ·cₖ == composition_value`.
 ///
-/// `chip` must expose its constraints through the generic `evaluate<E>`; the
+/// `walk` runs the chip's generic `evaluate<E>` against the supplied
+/// [`OodsEval`] — for a [`FrameworkEval`] that is `|e| chip.evaluate(e)`; for a
+/// chip reachable only through a crate seam it is the seam call. `claimed_sum`
+/// and `inner_log_size` are the chip's own (for the logup `cumsum_shift`); the
 /// composition value is `dinv · acc` where `acc` is the Horner sum the chip's
-/// `add_constraint` calls accumulate.
-pub fn drive<B: WitBackend, C: FrameworkEval>(ctx: &Rc<RefCell<B>>, chip: &C) {
+/// `add_constraint`s accumulate.
+pub fn drive<B: WitBackend>(
+    ctx: &Rc<RefCell<B>>,
+    claimed_sum: SecureField,
+    inner_log_size: u32,
+    walk: impl FnOnce(OodsEval<B>) -> OodsEval<B>,
+) {
     let rc = ctx.borrow_mut().aux(AuxKind::Rc);
     let eval = OodsEval {
         ctx: Rc::clone(ctx),
         rc,
         acc: None,
+        logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, inner_log_size),
     };
-    let eval = chip.evaluate(eval);
+    let eval = walk(eval);
     let acc = eval
         .acc
         .clone()
@@ -562,11 +653,16 @@ impl<E: EvalAtRow> WitBackend for VerifyBackend<E> {
 // ── The join AIR: one uniform component re-evaluating the OODS composition ──
 
 /// A [`FrameworkEval`] that re-evaluates `chip`'s OODS composition in-AIR by
-/// driving its `evaluate` through a [`VerifyBackend`]. Degree ≤ 2.
+/// driving its `evaluate` through a [`VerifyBackend`]. Degree ≤ 2. `log_size` is
+/// the join trace's row count; `inner_log_size`/`claimed_sum` are the inner
+/// chip's, for the logup `cumsum_shift` (use `0`/anything when the chip has no
+/// lookups).
 #[derive(Clone)]
 pub struct OodsJoinEval<C: FrameworkEval + Clone> {
     pub chip: C,
     pub log_size: u32,
+    pub inner_log_size: u32,
+    pub claimed_sum: SecureField,
 }
 
 impl<C: FrameworkEval + Clone> FrameworkEval for OodsJoinEval<C> {
@@ -578,10 +674,100 @@ impl<C: FrameworkEval + Clone> FrameworkEval for OodsJoinEval<C> {
     }
     fn evaluate<E: EvalAtRow>(&self, eval: E) -> E {
         let ctx = Rc::new(RefCell::new(VerifyBackend::new(eval)));
-        drive(&ctx, &self.chip);
+        let chip = &self.chip;
+        drive(&ctx, self.claimed_sum, self.inner_log_size, |e| {
+            chip.evaluate(e)
+        });
         Rc::try_unwrap(ctx)
             .unwrap_or_else(|_| panic!("a Handle outlived the OODS walk"))
             .into_inner()
             .into_eval()
     }
+}
+
+// ── Shared prove/verify harness for an OODS join AIR ───────────────────────
+
+use stwo::core::air::Component;
+use stwo::core::pcs::PcsConfig;
+use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::verifier::verify;
+use stwo::prover::backend::{Col, Column, CpuBackend};
+use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+use stwo::prover::{CommitmentSchemeProver, prove};
+use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
+
+use super::{P2MerkleChannel, Poseidon2M31Channel};
+
+/// Lay out the recorded column schedule into the join's main trace: each QM31
+/// becomes four M31 columns. Every join constraint is read-at-offset-0 (no
+/// cross-row coupling) but not necessarily homogeneous — the logup
+/// `cumsum_shift` and relation `z` leave constant terms that don't vanish on a
+/// zero row — so the meaningful row is REPLICATED across all rows, making every
+/// row an identical valid witness. With `tamper_col` set, bumps one committed
+/// M31 on row 0 so its constraint fails (rejection check).
+pub fn gen_join_trace(
+    schedule: &[SecureField],
+    trace_log: u32,
+    tamper_col: Option<usize>,
+) -> Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> {
+    let n_cols = schedule.len() * SECURE_EXTENSION_DEGREE;
+    let n = 1usize << trace_log;
+    let mut cols: Vec<Col<CpuBackend, BaseField>> = (0..n_cols)
+        .map(|_| Col::<CpuBackend, BaseField>::zeros(n))
+        .collect();
+    let row: Vec<BaseField> = schedule.iter().flat_map(|q| q.to_m31_array()).collect();
+    for (c, v) in row.into_iter().enumerate() {
+        for r in 0..n {
+            cols[c].set(r, v);
+        }
+    }
+    if let Some(c) = tamper_col {
+        let orig = cols[c].at(0);
+        cols[c].set(0, orig + BaseField::one());
+    }
+    let domain = CanonicCoset::new(trace_log).circle_domain();
+    cols.into_iter()
+        .map(|col| CircleEvaluation::new(domain, col))
+        .collect()
+}
+
+/// Prove + verify an OODS join AIR through the lifted Poseidon2-M31 protocol over
+/// the recorded `schedule` (optionally tampered). `Err` ⇒ rejected.
+pub fn prove_and_verify_join<J: FrameworkEval + Clone + Sync>(
+    join: J,
+    schedule: &[SecureField],
+    trace_log: u32,
+    tamper_col: Option<usize>,
+    config: PcsConfig,
+) -> Result<(), String> {
+    let trace = gen_join_trace(schedule, trace_log, tamper_col);
+    let twiddles = CpuBackend::precompute_twiddles(
+        CanonicCoset::new(trace_log + 1 + config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+    let channel = &mut Poseidon2M31Channel::default();
+    let mut cs = CommitmentSchemeProver::<CpuBackend, P2MerkleChannel>::new(config, &twiddles);
+    let mut tb = cs.tree_builder();
+    tb.extend_evals(Vec::new());
+    tb.commit(channel);
+    let mut tb = cs.tree_builder();
+    tb.extend_evals(trace);
+    tb.commit(channel);
+    let component = FrameworkComponent::<J>::new(
+        &mut TraceLocationAllocator::default(),
+        join,
+        SecureField::zero(),
+    );
+    let proof = prove::<CpuBackend, P2MerkleChannel>(&[&component], channel, cs)
+        .map_err(|e| format!("prove: {e:?}"))?;
+
+    let vch = &mut Poseidon2M31Channel::default();
+    let mut vs = stwo::core::pcs::CommitmentSchemeVerifier::<P2MerkleChannel>::new(config);
+    let sizes = component.trace_log_degree_bounds();
+    vs.commit(proof.commitments[0], &sizes[0], vch);
+    vs.commit(proof.commitments[1], &sizes[1], vch);
+    verify(&[&component as &dyn Component], vch, &mut vs, proof)
+        .map_err(|e| format!("verify: {e:?}"))
 }

@@ -24,6 +24,7 @@
 mod recursion_common;
 
 use num_traits::{One, Zero};
+use recursion_common::oods_auto;
 use recursion_common::oods_auto::{OodsInputs, OodsJoinEval, RecordBackend, drive};
 use recursion_common::{P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel, mobile_config};
 use std::cell::RefCell;
@@ -38,7 +39,7 @@ use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use stwo::core::pcs::utils::try_get_lifting_log_size;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::verifier::{COMPOSITION_LOG_SPLIT, verify};
+use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
 use stwo::prover::backend::{Col, Column, CpuBackend};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
@@ -225,72 +226,21 @@ fn record(inputs: OodsInputs) -> RecordBackend {
         log_n_rows: INNER_LOG,
     };
     let ctx = Rc::new(RefCell::new(RecordBackend::new(inputs)));
-    drive(&ctx, &chip);
+    drive(&ctx, SecureField::zero(), INNER_LOG, |e| chip.evaluate(e));
     Rc::try_unwrap(ctx)
         .unwrap_or_else(|_| panic!("a Handle outlived the recorder walk"))
         .into_inner()
 }
 
-fn gen_trace(
-    schedule: &[SecureField],
-    tamper_col: Option<usize>,
-) -> Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> {
-    let n_cols = schedule.len() * SECURE_EXTENSION_DEGREE;
-    let n = 1usize << TRACE_LOG;
-    let mut cols: Vec<Col<CpuBackend, BaseField>> = (0..n_cols)
-        .map(|_| Col::<CpuBackend, BaseField>::zeros(n))
-        .collect();
-    let row: Vec<BaseField> = schedule.iter().flat_map(|q| q.to_m31_array()).collect();
-    for (c, v) in row.into_iter().enumerate() {
-        cols[c].set(0, v);
-    }
-    if let Some(c) = tamper_col {
-        let orig = cols[c].at(0);
-        cols[c].set(0, orig + BaseField::one());
-    }
-    let domain = CanonicCoset::new(TRACE_LOG).circle_domain();
-    cols.into_iter()
-        .map(|col| CircleEvaluation::new(domain, col))
-        .collect()
-}
-
-fn prove_and_verify(schedule: &[SecureField], tamper_col: Option<usize>) -> Result<(), String> {
-    let config = mobile_config();
-    let trace = gen_trace(schedule, tamper_col);
-    let twiddles = CpuBackend::precompute_twiddles(
-        CanonicCoset::new(TRACE_LOG + 1 + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-    let join = OodsJoinEval {
+fn make_join() -> OodsJoinEval<InnerQm31Eval> {
+    OodsJoinEval {
         chip: InnerQm31Eval {
             log_n_rows: INNER_LOG,
         },
         log_size: TRACE_LOG,
-    };
-    let channel = &mut Poseidon2M31Channel::default();
-    let mut cs = CommitmentSchemeProver::<CpuBackend, P2MerkleChannel>::new(config, &twiddles);
-    let mut tb = cs.tree_builder();
-    tb.extend_evals(Vec::new());
-    tb.commit(channel);
-    let mut tb = cs.tree_builder();
-    tb.extend_evals(trace);
-    tb.commit(channel);
-    let component = FrameworkComponent::<OodsJoinEval<InnerQm31Eval>>::new(
-        &mut TraceLocationAllocator::default(),
-        join,
-        SecureField::zero(),
-    );
-    let proof = prove::<CpuBackend, P2MerkleChannel>(&[&component], channel, cs)
-        .map_err(|e| format!("prove: {e:?}"))?;
-
-    let vch = &mut Poseidon2M31Channel::default();
-    let mut vs = CommitmentSchemeVerifier::<P2MerkleChannel>::new(config);
-    let sizes = component.trace_log_degree_bounds();
-    vs.commit(proof.commitments[0], &sizes[0], vch);
-    vs.commit(proof.commitments[1], &sizes[1], vch);
-    verify(&[&component as &dyn Component], vch, &mut vs, proof)
-        .map_err(|e| format!("verify: {e:?}"))
+        inner_log_size: INNER_LOG,
+        claimed_sum: SecureField::zero(),
+    }
 }
 
 // ── Gates ──────────────────────────────────────────────────────────────────
@@ -325,15 +275,10 @@ fn oods_auto_air_satisfied() {
     );
 
     // Drive the auto-generated join AIR through AssertEvaluator.
-    let trace = gen_trace(&rec.schedule, None);
+    let trace = oods_auto::gen_join_trace(&rec.schedule, TRACE_LOG, None);
     let main: Vec<Vec<M31>> = trace.iter().map(|e| e.values.to_cpu()).collect();
     let tv: TreeVec<Vec<&Vec<M31>>> = TreeVec::new(vec![vec![], main.iter().collect(), vec![]]);
-    let join = OodsJoinEval {
-        chip: InnerQm31Eval {
-            log_n_rows: INNER_LOG,
-        },
-        log_size: TRACE_LOG,
-    };
+    let join = make_join();
     assert_constraints_on_trace(
         &tv,
         TRACE_LOG,
@@ -359,7 +304,8 @@ fn oods_auto_gate() {
     let (inputs, _composition_value) = extract_inputs(&inner, config);
     let rec = record(inputs);
 
-    prove_and_verify(&rec.schedule, None).expect("honest OODS re-eval must prove+verify");
+    oods_auto::prove_and_verify_join(make_join(), &rec.schedule, TRACE_LOG, None, config)
+        .expect("honest OODS re-eval must prove+verify");
 
     // The column schedule (QM31 indices): rc · 16 samples · {ab, a_inv, t} · dinv ·
     // comp · 8 composition-mask · ox · oxr. Perturb the first composition-mask
@@ -368,7 +314,14 @@ fn oods_auto_gate() {
     let first_comp_mask = 1 + INNER_MAIN_COLS + 3 + 1 + 1; // == 22
     let comp0_col = first_comp_mask * SECURE_EXTENSION_DEGREE;
     assert!(
-        prove_and_verify(&rec.schedule, Some(comp0_col)).is_err(),
+        oods_auto::prove_and_verify_join(
+            make_join(),
+            &rec.schedule,
+            TRACE_LOG,
+            Some(comp0_col),
+            config
+        )
+        .is_err(),
         "a perturbed committed column must be rejected"
     );
 
