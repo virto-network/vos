@@ -39,6 +39,37 @@ pub fn draw_all_lookup_elements(
     }
 }
 
+/// Re-evaluate CpuChip's constraints through a caller-supplied [`EvalAtRow`] —
+/// the recursion OODS-embed seam.
+///
+/// `BuiltInComponentEval` and the per-chip lookup-element tuples are
+/// crate-private, so a chip's `add_constraints` can only be driven with an
+/// arbitrary evaluator from inside the crate. The P5.2 verifier-AIR uses this to
+/// walk CpuChip's own generic `evaluate` at the OODS point and re-derive its
+/// composition contribution in-AIR (CpuChip is the heaviest of the 31 canonical
+/// components: 187 `add_constraint` + 45 `add_to_relation`). `lookup` must carry
+/// the same relation elements the proof was produced under (draw them with
+/// [`draw_all_lookup_elements`]).
+pub fn drive_cpu_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
+    log_size: u32,
+    lookup: &AllLookupElements,
+    eval: E,
+) -> E {
+    use crate::chips::CpuChip;
+    use crate::framework::BuiltInComponent;
+    use crate::framework::eval::BuiltInComponentEval;
+    use crate::lookups::ComponentLookupElements;
+    use stwo_constraint_framework::FrameworkEval;
+
+    let cpu = CpuChip;
+    let ce = BuiltInComponentEval::<CpuChip> {
+        component: &cpu,
+        log_size,
+        lookup_elements: <CpuChip as BuiltInComponent>::LookupElements::get(lookup),
+    };
+    ce.evaluate(eval)
+}
+
 /// Functions for creating verifier-side component structures.
 pub mod create_verifier_components {
     use super::*;
