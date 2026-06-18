@@ -5,10 +5,9 @@
 
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
-use stwo::core::{
-    fields::qm31::SecureField, pcs::PcsConfig, proof::StarkProof,
-    vcs_lifted::blake2_merkle::Blake2sMerkleHasher,
-};
+use stwo::core::{fields::qm31::SecureField, pcs::PcsConfig, proof::StarkProof};
+
+use crate::recursion_pcs::ProverMerkleHasher;
 
 /// Current proof format version.  Bumped whenever the AIR shape (number
 /// of components, column counts, lookup-tuple shapes, flag layouts) or
@@ -119,7 +118,14 @@ use stwo::core::{
 ///       relations, a wider CpuChip, and restructured ristretto chips — no new
 ///       CHIPS (`COUNT` unchanged at 31) — so the proof bytes differ and older
 ///       verifiers must reject.
+#[cfg(not(feature = "poseidon2-channel"))]
 pub const PROOF_FORMAT_VERSION: u32 = 8;
+/// Native-recursion Stage-0 (P5.0): the PCS commit hash + Fiat-Shamir
+/// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
+/// become `P2Hash` digests — a different wire format. A Blake2s verifier
+/// (v8) and a Poseidon2-M31 verifier (v9) therefore reject each other's proofs.
+#[cfg(feature = "poseidon2-channel")]
+pub const PROOF_FORMAT_VERSION: u32 = 9;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.
@@ -147,7 +153,7 @@ pub struct Proof {
     /// cryptographic work happens.
     #[serde(default = "proof_format_version_default")]
     pub format_version: u32,
-    pub stark_proof: StarkProof<Blake2sMerkleHasher>,
+    pub stark_proof: StarkProof<ProverMerkleHasher>,
     pub claimed_sums: Vec<SecureField>,
     pub log_sizes: Vec<u32>,
     pub num_components: usize,

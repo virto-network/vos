@@ -121,6 +121,12 @@ pub mod proof;
 pub mod segment;
 pub mod trace;
 
+// Native-recursion Stage-0: the Poseidon2-M31 PCS primitives + the per-build
+// PCS selection. Both are `no_std`-clean (verifier path uses them too); their
+// prover-only pieces are `#[cfg(feature = "prover")]` within.
+pub mod poseidon2;
+pub mod recursion_pcs;
+
 // The page-hash spec constants + tag chaining states are needed by the new
 // memory-Merkle chips' `add_constraints` (verifier-side, `no_std`); the
 // `SideNote` / segment / host-tree-building parts are `#[cfg(prover)]` within.

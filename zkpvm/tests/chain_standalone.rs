@@ -1,4 +1,9 @@
-#![cfg(feature = "prover")]
+// Not under `poseidon2-channel`: this test tampers commitments by byte-XOR
+// (`Blake2sHash` is `[u8; 32]`); under the Poseidon2-M31 PCS a commitment is
+// `P2Hash` (`[M31; 8]`), so the byte-level tamper does not typecheck. The P2
+// chain/tamper coverage lives in `verifier/tests/poseidon2_canonical_segment.rs`
+// (the P2 chain path lands in P5.1).
+#![cfg(all(feature = "prover", not(feature = "poseidon2-channel")))]
 
 //! End-to-end test for the side-note-free `verify_chain_standalone`
 //! (the trustless counterpart to `zkpvm::verify_chain`).

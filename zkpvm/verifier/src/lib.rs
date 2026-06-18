@@ -18,13 +18,16 @@ use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use num_traits::Zero;
 use stwo::core::{
     air::Component,
-    channel::{Blake2sChannel, Channel},
+    channel::Channel,
     fields::qm31::SecureField,
     pcs::{CommitmentSchemeVerifier, TreeVec},
-    vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
     verifier::VerificationError,
 };
 use stwo_constraint_framework::TraceLocationAllocator;
+
+// Per-build PCS selection (Blake2s by default; Poseidon2-M31 under
+// `poseidon2-channel`) — must match the zkpvm prover the proof came from.
+use zkpvm::recursion_pcs::{ProverChannel, ProverMerkleChannel};
 
 // Re-export the Proof type + the format-version constant the verifier
 // was compiled against.  Callers can compare against
@@ -41,8 +44,9 @@ use zkpvm::framework_access::{
     AllLookupElements, create_verifier_components, draw_all_lookup_elements,
 };
 
-/// Verification hash type (Blake2s Merkle root)
-pub use stwo::core::vcs::blake2_hash::Blake2sHash as CommitmentHash;
+/// Verification hash type — the preprocessed-trace Merkle root in the per-build
+/// PCS hash (Blake2s by default; `P2Hash` under `poseidon2-channel`).
+pub use zkpvm::recursion_pcs::ProverMerkleHash as CommitmentHash;
 
 /// Default per-component log_size cap used by `verify_standalone`.
 ///
@@ -217,7 +221,7 @@ pub fn verify_standalone_with_options(
     // so blindly using default here makes Merkle witness sizes mismatch
     // (Merkle::WitnessTooLong).  The proof carries its config; trust it.
     let config = pcs_config;
-    let verifier_channel = &mut Blake2sChannel::default();
+    let verifier_channel = &mut ProverChannel::default();
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
     });
@@ -230,7 +234,7 @@ pub fn verify_standalone_with_options(
         )));
     }
 
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
 
     // Commit preprocessed and original traces
     let (trace_sizes, preprocessed_sizes) =

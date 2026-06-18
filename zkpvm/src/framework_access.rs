@@ -5,12 +5,11 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use stwo::core::{
-    air::Component, channel::Blake2sChannel, fields::qm31::SecureField, pcs::TreeVec,
-};
+use stwo::core::{air::Component, fields::qm31::SecureField, pcs::TreeVec};
 use stwo_constraint_framework::TraceLocationAllocator;
 
 pub use crate::lookups::AllLookupElements;
+use crate::recursion_pcs::ProverChannel;
 
 use crate::BASE_COMPONENTS;
 
@@ -31,7 +30,7 @@ fn active_indices_from_mask(mask: u32) -> alloc::vec::Vec<usize> {
 /// Draw all lookup elements from the channel (same order as prover).
 pub fn draw_all_lookup_elements(
     lookup_elements: &mut AllLookupElements,
-    channel: &mut Blake2sChannel,
+    channel: &mut ProverChannel,
     component_mask: u32,
 ) {
     let indices = active_indices_from_mask(component_mask);

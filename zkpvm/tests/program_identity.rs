@@ -1,4 +1,9 @@
-#![cfg(feature = "prover")]
+// Not under `poseidon2-channel`: builds a "wrong" commitment via
+// `ProgramCommitment::from(&[u8])` — `Blake2sHash` has that conversion but
+// `P2Hash` (the Poseidon2-M31 commitment) does not (the 32-byte ↔ P2Hash ABI
+// lands with the allowlist re-bake in P5.1). Program-identity under P2 is
+// covered by `verifier/tests/poseidon2_canonical_segment.rs`.
+#![cfg(all(feature = "prover", not(feature = "poseidon2-channel")))]
 
 //! Phase 13f: program-identity public API.
 //!

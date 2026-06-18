@@ -2,16 +2,19 @@ use num_traits::Zero;
 use stwo::{
     core::{
         air::Component,
-        channel::{Blake2sChannel, Channel},
+        channel::Channel,
         fields::qm31::SecureField,
         pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
         poly::circle::CanonicCoset,
-        vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher},
         verifier::VerificationError,
     },
-    prover::{CommitmentSchemeProver, backend::simd::SimdBackend, poly::circle::PolyOps},
+    prover::{CommitmentSchemeProver, poly::circle::PolyOps},
 };
 use stwo_constraint_framework::TraceLocationAllocator;
+
+use crate::recursion_pcs::{
+    ProverBackend, ProverChannel, ProverMerkleChannel, ProverMerkleHasher, for_commit,
+};
 
 use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
 
@@ -225,7 +228,7 @@ fn verify_with_options_explicit_components(
             "log sizes len mismatch".to_string(),
         ));
     }
-    let verifier_channel = &mut Blake2sChannel::default();
+    let verifier_channel = &mut ProverChannel::default();
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
     });
@@ -240,7 +243,7 @@ fn verify_with_options_explicit_components(
         prover_components,
     )?;
 
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
     let sizes: Vec<TreeVec<Vec<u32>>> = components
         .iter()
         .zip(&claimed_log_sizes)
@@ -345,9 +348,9 @@ fn verify_with_options_explicit_components(
 }
 
 fn verify_preprocessed_trace(
-    proof: &stwo::core::proof::StarkProof<Blake2sMerkleHasher>,
+    proof: &stwo::core::proof::StarkProof<ProverMerkleHasher>,
     side_note: &SideNote,
-    verifier_channel: &Blake2sChannel,
+    verifier_channel: &ProverChannel,
     log_sizes: &[u32],
     config: &PcsConfig,
     components: &[&dyn crate::framework::MachineProverComponent],
@@ -365,17 +368,19 @@ fn verify_preprocessed_trace(
         .max()
         .unwrap_or(0);
     let verifier_channel = &mut verifier_channel.clone();
-    let twiddles = SimdBackend::precompute_twiddles(
+    let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
     let commitment_scheme =
-        &mut CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(*config, &twiddles);
+        &mut CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(*config, &twiddles);
 
     let mut tree_builder = commitment_scheme.tree_builder();
     for (c, log_size) in components.iter().zip(log_sizes) {
-        tree_builder.extend_evals(c.generate_preprocessed_trace(*log_size, side_note));
+        tree_builder.extend_evals(for_commit(
+            c.generate_preprocessed_trace(*log_size, side_note),
+        ));
     }
     tree_builder.commit(verifier_channel);
 

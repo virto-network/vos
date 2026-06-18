@@ -1,12 +1,11 @@
 use stwo::{
     core::{
         ColumnVec,
-        channel::{Blake2sChannel, Channel},
+        channel::Channel,
         fields::{m31::BaseField, qm31::SecureField},
         fri::FriConfig,
         pcs::PcsConfig,
         poly::circle::CanonicCoset,
-        vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
     },
     prover::{
         CommitmentSchemeProver, ComponentProver, ProvingError,
@@ -18,6 +17,8 @@ use stwo::{
     },
 };
 use stwo_constraint_framework::TraceLocationAllocator;
+
+use crate::recursion_pcs::{ProverBackend, ProverChannel, ProverMerkleChannel, for_commit};
 
 use crate::trace::{
     component::ComponentTrace,
@@ -280,7 +281,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         .collect();
 
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut ProverChannel::default();
     for c in components {
         c.draw_lookup_elements(&mut lookup_elements, channel);
     }
@@ -318,7 +319,7 @@ pub fn debug_assert_constraints_explicit(
         .collect();
 
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut ProverChannel::default();
     for c in components {
         c.draw_lookup_elements(&mut lookup_elements, channel);
     }
@@ -354,7 +355,7 @@ pub fn debug_assert_constraints_streaming(
     components: &[&dyn crate::framework::MachineProverComponent],
 ) {
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut ProverChannel::default();
     for c in components {
         c.draw_lookup_elements(&mut lookup_elements, channel);
     }
@@ -405,7 +406,7 @@ pub fn debug_claimed_sums_streaming(
 ) -> bool {
     use num_traits::Zero;
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut ProverChannel::default();
     for c in components {
         c.draw_lookup_elements(&mut lookup_elements, channel);
     }
@@ -757,16 +758,16 @@ fn prove_impl_with_components_overridden(
         .max()
         .unwrap_or(0);
 
-    let twiddles = SimdBackend::precompute_twiddles(
+    let twiddles = ProverBackend::precompute_twiddles(
         CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
 
-    let prover_channel = &mut Blake2sChannel::default();
+    let prover_channel = &mut ProverChannel::default();
 
     let mut commitment_scheme =
-        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
+        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
     // Stwo v2.x requires polynomial coefficients to be stored — without
     // this, ComponentProver::get_evaluation_on_domain panics with "The
     // polynomial's coefficients are not stored".  The toggle costs some
@@ -780,7 +781,12 @@ fn prove_impl_with_components_overridden(
     let t = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     for component_trace in &traces {
-        tree_builder.extend_evals(component_trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX));
+        // `for_commit` transplants the SimdBackend-generated columns into the
+        // commitment scheme's backend (identity on SimdBackend; `to_cpu` under
+        // `poseidon2-channel`, whose Poseidon2-M31 commit ops are CpuBackend-only).
+        tree_builder.extend_evals(for_commit(
+            component_trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX),
+        ));
     }
     tree_builder.commit(prover_channel);
     let preprocess_commit = t.elapsed();
@@ -790,7 +796,7 @@ fn prove_impl_with_components_overridden(
     let mut tree_builder = commitment_scheme.tree_builder();
     let mut total_main_columns = 0;
     for component_trace in &traces {
-        let evals = component_trace.to_circle_evaluation(ORIGINAL_TRACE_IDX);
+        let evals = for_commit(component_trace.to_circle_evaluation(ORIGINAL_TRACE_IDX));
         total_main_columns += evals.len();
         tree_builder.extend_evals(evals);
     }
@@ -897,7 +903,7 @@ fn prove_impl_with_components_overridden(
     let mut claimed_sums: Vec<SecureField> = Vec::with_capacity(interaction_results.len());
     for (interaction_trace, claimed_sum) in interaction_results {
         total_interaction_columns += interaction_trace.len();
-        tree_builder.extend_evals(interaction_trace);
+        tree_builder.extend_evals(for_commit(interaction_trace));
         claimed_sums.push(claimed_sum);
     }
     let interaction_gen = t.elapsed();
@@ -908,7 +914,7 @@ fn prove_impl_with_components_overridden(
     let interaction_commit = t.elapsed();
 
     let tree_span_provider = &mut TraceLocationAllocator::default();
-    let components: Vec<Box<dyn ComponentProver<SimdBackend>>> = components
+    let components: Vec<Box<dyn ComponentProver<ProverBackend>>> = components
         .iter()
         .zip(&log_sizes)
         .zip(&claimed_sums)
@@ -921,11 +927,11 @@ fn prove_impl_with_components_overridden(
             )
         })
         .collect();
-    let components_ref: Vec<&dyn ComponentProver<SimdBackend>> =
+    let components_ref: Vec<&dyn ComponentProver<ProverBackend>> =
         components.iter().map(|c| &**c).collect();
 
     let t = Instant::now();
-    let proof = stwo::prover::prove::<SimdBackend, Blake2sMerkleChannel>(
+    let proof = stwo::prover::prove::<ProverBackend, ProverMerkleChannel>(
         &components_ref,
         prover_channel,
         commitment_scheme,

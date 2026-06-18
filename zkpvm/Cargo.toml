@@ -16,6 +16,12 @@ prover = ["dep:rayon", "dep:blake3", "dep:curve25519-dalek"]
 # "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
 # modes when adding constraints.
 debug-internals = ["prover"]
+# Native-recursion Stage-0 (P5.0): swap the segment PCS commit + Fiat-Shamir
+# transcript from production Blake2s to the M31-algebraic Poseidon2-M31 stack
+# (`src/poseidon2`), retargeting the commit/prove backend to CpuBackend. Selects
+# the `recursion_pcs` aliases; bumps the proof wire format. Off by default — the
+# production mobile prover stays on Blake2s/SimdBackend.
+poseidon2-channel = []
 
 [dependencies]
 zkpvm-derive = { workspace = true }

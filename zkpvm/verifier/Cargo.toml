@@ -4,6 +4,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Native-recursion Stage-0 (P5.0): verify proofs committed under the
+# Poseidon2-M31 PCS (M31-algebraic commit + Fiat-Shamir). Forwards to zkpvm's
+# `poseidon2-channel`; the `CommitmentHash` / channel types flip to the
+# `recursion_pcs` aliases. Off by default — production verifies Blake2s proofs.
+poseidon2-channel = ["zkpvm/poseidon2-channel"]
+
 [dependencies]
 zkpvm = { path = "..", default-features = false }
 stwo = { workspace = true }
