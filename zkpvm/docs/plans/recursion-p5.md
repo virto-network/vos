@@ -59,6 +59,36 @@ Recommendation: **(A) now, (B) as the parallel P5-perf track.** Get correctness 
 end on CpuBackend; the offline tree (P5.5) tolerates minutes/segment; swap in the SIMD
 commit later if fleet throughput demands it.
 
+**⚠ D1-A IS BIGGER THAN A TYPE SWAP (sharpened 2026-06-18).** `prove::<B, MC>` requires
+BOTH the commitment scheme AND every component to be on `B`, and `B: BackendForChannel<MC>`
+forces `B = CpuBackend` for `MC = P2MerkleChannel`. But the zkpvm framework's prover ABI is
+SimdBackend-HARDWIRED: `MachineProverComponent` returns `Box<dyn ComponentProver<SimdBackend>>`
+(`erased.rs:121,304`), the trace evals are `CircleEvaluation<SimdBackend,…>` (`erased.rs:72,202,287`),
+and the prove call is `prove::<SimdBackend, Blake2sMerkleChannel>` over
+`Vec<Box<dyn ComponentProver<SimdBackend>>>` (`prove.rs:911,928`). Worse, the recursion work
+found `BuiltInComponent`'s interaction-trace generation is itself SimdBackend-specific. So
+D1-A needs ONE of:
+- **(A1) make the framework generic over `B`** — `erased.rs` returns `ComponentProver<B>`, the
+  chip provers support CpuBackend. HEAVY (the SimdBackend interaction-trace-gen must gain a
+  CpuBackend path).
+- **(A2) `to_cpu`-transplant + raw-component rewrap** — keep SimdBackend trace+interaction
+  generation (the framework as-is), `.to_cpu()` every committed eval (the proven
+  `recursion_common:543-551` pattern), then drive the prove via raw stwo
+  `FrameworkComponent`s on CpuBackend (NOT the SimdBackend `BuiltInComponent` provers). The
+  obstruction: `prove` needs each component's `evaluate_constraint_quotients_on_domain` on
+  CpuBackend, so each chip's constraints must be reachable as a CpuBackend `FrameworkEval`.
+  LIGHTER if the chip `evaluate`s are already backend-agnostic (they are — generic over
+  `E: EvalAtRow`), but needs a CpuBackend component wrapper.
+- **(A3 = B) the SIMD Poseidon2-M31 commit op** — collapses D1 and P5-perf: if the commitment
+  rides SimdBackend, NOTHING in the framework changes (stay `prove::<SimdBackend, P2MerkleChannel>`).
+  This may actually be the CLEANEST path despite being "perf" work, because it avoids the
+  framework-backend surgery entirely.
+
+**Implication:** the very first P5.0 step is a backend-mechanism SPIKE (A1 vs A2 vs A3),
+not the alias threading. Budget P5.0 as **1 spike + 1 plumbing session**, or fold the spike
+into a longer P5.0. The A3 option means P5-perf might be a PREREQUISITE, not a parallel track —
+resolve this in the spike before committing to A.
+
 ### D2 — Vetted round constants: land BEFORE re-baking `{C_0,C_1}`
 `recursion_common/mod.rs:61-64` uses **placeholder `1234`** round constants ("vetted
 width-16 M31 constants are a documented P1 follow-up", `mod.rs:26`). The placeholder
@@ -131,12 +161,20 @@ format changes, hence the version bump. `P2Hash` is `Serialize/Deserialize`
 real-31-component segment prove slow — budget minutes, not the sub-second Blake2s mobile
 prove. `cargo clean -p stwo` on inexplicable `ConstraintsNotSatisfied` (stale-rlib gotcha).
 
-**COST.** ~1 session (the plumbing is mechanical but wide: ~9 files + the lib promotion +
-constants). The prove-time regression is expected and acceptable (offline).
+**COST.** **1 backend-mechanism spike (D1: A1/A2/A3) + 1 wide plumbing session.** The
+alias threading is mechanical but wide (~9 files + lib promotion + constants); the spike
+that precedes it (which backend mechanism — see D1's sharpened note) is the real unknown and
+must come first. The prove-time regression (if A1/A2) is expected and acceptable (offline).
 
-**START HERE.** Read `prove.rs:674-928` (`prove_impl_with_components_overridden`) +
-`poseidon2_pcs_spike.rs:370-413` (the working `prove::<CpuBackend, P2MerkleChannel>` round
-trip) side by side — the spike is the exact target shape for the prove path.
+**START HERE.** **The D1 backend spike FIRST** — prove ONE real 31-component segment under
+`P2MerkleChannel`, trying A2 (`to_cpu`-transplant the SimdBackend-generated trace + a
+CpuBackend `FrameworkComponent` rewrap) as the lightest plausible path; if the per-chip
+CpuBackend wrapper is intractable, fall back to A3 (the SIMD commit op) or A1 (framework
+genericization). Read side by side: `prove.rs:674-928`
+(`prove_impl_with_components_overridden`, the SimdBackend prove path), `erased.rs:121,304`
+(the SimdBackend component-prover ABI), `recursion_common:543-551` (the `to_cpu` transplant),
+and `poseidon2_pcs_spike.rs:370-413` (the working `prove::<CpuBackend, P2MerkleChannel>` round
+trip). Only after the backend mechanism is chosen does the alias threading begin.
 
 ---
 
