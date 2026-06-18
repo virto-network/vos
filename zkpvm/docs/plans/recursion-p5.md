@@ -1,6 +1,8 @@
 # P5 build plan: data-scaling the proven recursion to the real 76-segment chain
 
-Status: **P5.0 + P5.1 LANDED 2026-06-18 (LOCAL); P5.2–P5.5 + P5-perf PLANNED.**
+Status: **P5.0 + P5.1 + P5.2a LANDED 2026-06-18 (LOCAL); P5.2b–P5.5 + P5-perf
+PLANNED.** (P5.2a = the auto-witnessing OODS evaluator, de-risked on the small
+AIR + the logup path + the real CpuChip — see the P5.2 section's status block.)
 Branch `voucher-state-transition`. P4 is COMPLETE —
 the recursion *machinery* is proven (`recursion-p4.md`): the single-uniform-component
 join with latched-challenge cross-chip propagation verifies a real child (P4.1) and,
@@ -294,8 +296,47 @@ bumped in P5.0.
 > placeholder `1234`), so the verify-AIR's `eval_permutation` / `record_permutation`
 > match the segment prover's committed transcript. Validated: the constant-sensitive
 > recursion gates (channel_chip transcript-replay, cross_chip_logup, fri_twiddle_chip,
-> qm31_constraints) pass with the real constants. The MAIN harness below is unstarted
-> — it is the biggest block (likely 2 sessions); start it fresh with full context.
+> qm31_constraints) pass with the real constants.
+>
+> **P5.2a DONE 2026-06-18 (commits `e620bd4` / `26d4f8f` / `064e64b`, LOCAL):**
+> the auto-witnessing OODS evaluator is BUILT and de-risked end-to-end. New
+> `tests/recursion_common/oods_auto.rs`: `Handle<B>` (value + degree bound;
+> Mul of two degree-1 handles lowers the product to a fresh witnessed column),
+> `OodsEval<B>` (the chip walks it; `add_constraint` folds into a Horner
+> accumulator with each `acc·rc` witnessed; full logup path replicating stwo's
+> `pub(crate)` `logup_proxy!()` + a `LogupAtRow`), and a two-mode `WitBackend`
+> (`RecordBackend` host V=SecureField → ordered column schedule + composition
+> value; `VerifyBackend<E>` in-AIR V=E::EF → degree-2 bindings + DEEP-ALI
+> equality). One walk serves both passes; layout agrees by construction.
+> Gates (all GREEN):
+> - **small AIR** (`tests/oods_auto_chip.rs`): driving the GATE-4 a·b/a·inv chip
+>   re-derives the IDENTICAL witnessing GATE 4 hand-wrote (5 products, 32 QM31
+>   cols); composition value == stwo's `eval_composition_polynomial_at_point`;
+>   proves+verifies at degree ≤ 2; tamper rejected.
+> - **logup** (`tests/oods_auto_logup.rs`): a chip with `add_to_relation` +
+>   `finalize_logup` re-evaluated against a synthetic mask; 7 witnessed products
+>   (incl. each logup `diff·denominator`); matches stwo; proves+verifies.
+> - **real CpuChip** (`tests/oods_auto_cpu.rs` + crate seam
+>   `framework_access::drive_cpu_chip_oods`): the heaviest chip (187
+>   `add_constraint` + 45 `add_to_relation`) driven through the evaluator with NO
+>   hand-port; in-AIR re-eval == stwo's `evaluate_constraint_quotients_at_point`;
+>   assert_constraints green; proves+verifies (~66s); tamper rejected.
+>
+> **WIDTH MEASUREMENT (the P5.2b risk, previewed):** CpuChip alone embeds as
+> **2329 committed QM31 columns (1529 witnessed products) = 9316 M31 trace
+> columns** at degree ≤ 2 (synthetic-mask, log_size 6). This is the input to the
+> full-31-component width budget and the prove-cost the design flags. The mask is
+> SYNTHETIC (shape from `Component::mask_points`, random samples — the
+> per-component contribution is a pure function of the mask, so this fuzzes the
+> arithmetisation); the REAL-segment transcript replay + per-component mask
+> slicing + claimed-sum balance is **P5.2b**.
+>
+> **P5.2b (next):** scale to all 31 components in `BASE_COMPONENTS` order against
+> a REAL Poseidon2-M31 segment proof (the `drive_cpu_chip_oods` seam generalises
+> to a per-chip-index dispatch over all 31), accumulate in stwo's exact order,
+> add the claimed-sum balance (`verify.rs:296-324`), and MEASURE the total width /
+> log_size. The evaluator + seam pattern are proven; 2b is data-scaling + the
+> transcript-replay plumbing.
 
 **GOAL.** Replace GATE 4's representative 2-constraint OODS consumer with a harness that
 re-evaluates the FULL canonical segment AIR (31 components, **530 `add_constraint` sites**,
