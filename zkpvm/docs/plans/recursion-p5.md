@@ -1,0 +1,438 @@
+# P5 build plan: data-scaling the proven recursion to the real 76-segment chain
+
+Status: **PLAN (2026-06-18).** Branch `voucher-state-transition`. P4 is COMPLETE —
+the recursion *machinery* is proven (`recursion-p4.md`): the single-uniform-component
+join with latched-challenge cross-chip propagation verifies a real child (P4.1) and,
+as the fixed-point NODE, verifies two children of its own shape + seam + allowlist +
+aggregate public inputs (P4.2). **P5 scales the DATA**: take that proven machinery
+and run it on the REAL 76-segment conservation chain — re-prove the segments under
+Poseidon2-M31, scale the join's per-child verify *depth* to the full 31-component
+inner AIR, drive the offline tree, and wire `verify_aggregate`.
+
+This doc is **split into self-contained sessions**. Each session block has: GOAL,
+PREREQS, the concrete BUILD STEPS (with `file:line` anchors from the 2026-06-18
+grounding sweep), the GREEN GATE, GOTCHAS, COST, and a START-HERE pointer. Read
+`recursion-design.md` (architecture) + `recursion-p4.md` (the proven machinery) first.
+
+---
+
+## The three pillars → six sessions
+
+| Pillar | Sessions |
+|---|---|
+| **Stage-0 — re-prove under Poseidon2-M31** | P5.0 (PCS swap), P5.1 (re-pin `{C_0,C_1}` + verify_chain) |
+| **Scale per-child verify DEPTH (31 components)** | P5.2 (OODS-embed harness), P5.3 (real 31-comp child end-to-end), P5.4 (real 2-child join) |
+| **Tree + settlement contract** | P5.5 (tree driver + `verify_aggregate`) |
+| *(parallel perf track, optional)* | P5-perf (SimdBackend Poseidon2-M31 commit op) |
+
+**Dependency graph:** P5.0 → P5.1 (allowlist needs the new hash). P5.0 → P5.2 → P5.3
+→ P5.4 → P5.5 (the depth chain needs Poseidon2-M31 segments). P5-perf is independent
+and can run any time after P5.0 (it only speeds proving, doesn't change correctness).
+
+```
+P5.0 ──┬─► P5.1 ───────────────────────────────────┐
+       └─► P5.2 ─► P5.3 ─► P5.4 ─► P5.5 ◄───────────┘
+P5-perf (independent, after P5.0)
+```
+
+---
+
+## Two decisions to make BEFORE P5.0 (they shape everything)
+
+### D1 — Backend for the re-proved segments: CpuBackend (now) vs SimdBackend (perf)
+**THE gating fact (grounding §stage0.5a):** production segment proving runs on
+**`SimdBackend`** (`prove.rs:13,760,769,928`), but the working Poseidon2-M31 hasher
+implements the per-hasher commitment ops **only on `CpuBackend`**
+(`impl BackendForChannel<P2MerkleChannel> for CpuBackend`, `recursion_common/mod.rs:412`;
+there is NO `SimdBackend` `MerkleOpsLifted` for the custom width-16 M31 permutation).
+So Stage-0 must EITHER:
+- **(A) retarget segment proving to CpuBackend** — touches every `SimdBackend` mention
+  in `prove.rs`/`verify.rs`/`erased.rs`/`framework_access.rs`; the scalar hasher makes
+  proving slow (the recursion stack is ~99.5% perms; canonical-scale ≈ minutes/segment),
+  but it is CORRECT and unblocks everything. **RECOMMENDED for P5 v1.**
+- **(B) write a SimdBackend Poseidon2-M31 commitment op** in the stwo fork (port the
+  scalar `permute`/`hash_children_m31` to packed-M31 lanes + wire `BackendForChannel`) —
+  fork-level backend engineering, the single biggest perf lever, NOT on any tracked
+  path. **This is P5-perf**, deferrable.
+
+Recommendation: **(A) now, (B) as the parallel P5-perf track.** Get correctness end to
+end on CpuBackend; the offline tree (P5.5) tolerates minutes/segment; swap in the SIMD
+commit later if fleet throughput demands it.
+
+### D2 — Vetted round constants: land BEFORE re-baking `{C_0,C_1}`
+`recursion_common/mod.rs:61-64` uses **placeholder `1234`** round constants ("vetted
+width-16 M31 constants are a documented P1 follow-up", `mod.rs:26`). The placeholder
+proves+verifies (plumbing is constant-independent) but is **cryptographically a
+placeholder**. The baked `{C_0,C_1}` commitments are a FUNCTION of the constants, so
+re-baking them (P5.1) must happen AFTER the real constants land — else they get
+re-baked twice. **Therefore: vetted constants are a P5.0 sub-task (or a thin session
+between P5.0 and P5.1), NOT deferred past the re-bake.** Source vetted width-16 M31
+Poseidon2 constants (eprint 2023/323 §5 / a published vector) + a constants-vector test.
+
+---
+
+## Session P5.0 — Stage-0: swap the segment PCS to Poseidon2-M31
+
+**GOAL.** Re-prove a single conservation segment under a Poseidon2-M31 Merkle channel +
+Fiat-Shamir transcript (no Blake2s on commit/transcript), with the program commitment a
+`P2Hash`. This is "Phase C1" from `trustless-chain-verification-roadmap.md:102-116`, now
+UNBLOCKED because we built the M31-Poseidon2 hash (the roadmap's external gate is gone).
+
+**PREREQS.** P4 done. Decisions D1 (backend) + D2 (constants).
+
+**BUILD STEPS.**
+1. **Promote the hasher into a lib module.** `P2MerkleHasher`/`P2MerkleChannel`/
+   `Poseidon2M31Channel`/`permute`/`hash_children_m31`/`record_permutation`/`mobile_config`
+   currently live in the test-only `zkpvm/tests/recursion_common/mod.rs`. Move them into a
+   real module (e.g. `zkpvm/src/poseidon2/` or a small `zkpvm-hash` crate) so `prove.rs`/
+   `verify.rs`/`program_id.rs`/the verifier crate can use them. Swap the placeholder round
+   constants for vetted ones (D2).
+2. **Feature-gate the channel/hasher aliases.** Add (behind `--features poseidon2-channel`):
+   ```
+   type ProverChannel        = Poseidon2M31Channel;   // was Blake2sChannel
+   type ProverMerkleChannel  = P2MerkleChannel;        // was Blake2sMerkleChannel
+   type ProverMerkleHasher   = P2MerkleHasher;         // was Blake2sMerkleHasher
+   type ProverBackend        = CpuBackend;             // was SimdBackend  (D1-A)
+   ```
+   Thread them through the swap surface (grounding §stage0.6 — all hardcoded today):
+   - `prove.rs`: channel `:766`, `CommitmentSchemeProver::<_, _>` `:768-769`,
+     `stwo::prover::prove::<_, _>` `:928`, imports `:4,:9,:13`, backend `:760,883,911`.
+   - `verify.rs`: channel `:228`, scheme `:243`, verify `:344`, `verify_preprocessed_trace`
+     signature `:347-350`, scheme `:374`, imports `:5,:9`.
+   - `proof.rs`: `Proof.stark_proof: StarkProof<ProverMerkleHasher>` `:150`, import `:10`;
+     **bump `PROOF_FORMAT_VERSION` (`:122`, currently 8 → 9).**
+   - `framework/traits/erased.rs`: `draw_lookup_elements(channel: &mut ProverChannel)`
+     `:46-50` + prover mirror `:167`; `SimdBackend` returns `:72,111,121,133,202,287` (if D1-A).
+   - `framework_access.rs`: `draw_all_lookup_elements(…, channel: &mut ProverChannel, …)`
+     `:32-34`, import `:9`.
+   - `program_id.rs`: `ProgramCommitment = P2Hash` `:39`; `program_commitment_of_proof`
+     reads `commitments[0]` `:53-55` (now a `P2Hash`).
+   - `verifier/src/lib.rs`: `CommitmentHash = P2Hash` `:45`, channel `:220`, scheme `:233`,
+     verify `:340`; all `verify_standalone*`/`verify_chain_standalone*` signatures
+     (`:70,92,109,118,382,404,477`).
+   - `examples/extensions/prover/src/lib.rs`: `CommitmentHash`/allowlist types `:65,479`
+     flip with the verifier (the prove/verify *functions* are channel-agnostic).
+   - **THE OBSTRUCTION (grounding §stage0.6):** `draw_lookup_elements`/`draw_all_lookup_elements`
+     are *object-safe trait methods* taking a concrete `&mut Blake2sChannel`. Making them
+     generic over `C: Channel` breaks dyn-dispatch. CHEAPEST fix = a per-build `type
+     ProverChannel = …` alias toggled by the feature (one concrete channel per build), NOT a
+     generic. (Per-channel vtable monomorphization is the heavy alternative.)
+
+**GREEN GATE.** One conservation segment (the `prove_canonical` path, `prove.rs:572`)
+proves+verifies under Poseidon2-M31: `cargo test --features poseidon2-channel` — segment
+round-trips, `program_commitment_of_proof` returns a `P2Hash`, `cargo tree -i blake2`
+shows no Blake2s on the commit/transcript path. A `debug-internals` AssertEvaluator pass
+on the real 31-component trace stays green.
+
+**GOTCHAS.** The `StarkProof<H>`/`ProgramCommitment`/`CommitmentHash` types are in
+SERIALIZED/ABI positions (`proof.rs:150`, `program_id.rs:39`, `verifier:45`) — the wire
+format changes, hence the version bump. `P2Hash` is `Serialize/Deserialize`
+(`recursion_common/mod.rs:172`) so it serializes fine. The scalar hasher (D1-A) makes the
+real-31-component segment prove slow — budget minutes, not the sub-second Blake2s mobile
+prove. `cargo clean -p stwo` on inexplicable `ConstraintsNotSatisfied` (stale-rlib gotcha).
+
+**COST.** ~1 session (the plumbing is mechanical but wide: ~9 files + the lib promotion +
+constants). The prove-time regression is expected and acceptable (offline).
+
+**START HERE.** Read `prove.rs:674-928` (`prove_impl_with_components_overridden`) +
+`poseidon2_pcs_spike.rs:370-413` (the working `prove::<CpuBackend, P2MerkleChannel>` round
+trip) side by side — the spike is the exact target shape for the prove path.
+
+---
+
+## Session P5.1 — re-pin `{C_0,C_1}` + verify_chain under Poseidon2-M31
+
+**GOAL.** Recompute the 2-entry canonical allowlist under the new hash, re-bake the const,
+and get `verify_chain_standalone_allowlist` + the federation chain e2e green under
+Poseidon2-M31.
+
+**PREREQS.** P5.0 (segments prove under Poseidon2-M31). Vetted constants (D2) landed.
+
+**BUILD STEPS.**
+1. **Recompute `{C_0,C_1}`.** The mechanism already exists: `canonical_commitment_allowlist`
+   (`examples/extensions/prover/tests/prove_transition.rs:847-995`) traces the transition,
+   segments at `SEG_STEPS=100_000`, `prove_canonical`s two comb-free segments + the one comb
+   segment, reads `program_commitment_of_proof` (= `commitments[0]`, now `P2Hash`), asserts
+   the two comb-free roots collapse to one `C_0` and the comb segment yields a distinct `C_1`,
+   and PRINTS the new 32-byte arrays (`:991-994`).
+2. **Re-bake.** Paste the new `C_0`/`C_1` into `VOUCHER_CHECK_COMMITMENTS`
+   (`examples/extensions/prover/src/lib.rs:504-519`); `canonical_commitment_drift_guard`
+   (`prove_transition.rs:1008`) re-validates. Re-measure `VOUCHER_CHECK_CANONICAL_PROFILE`
+   (`prover:488-490`) only if the AIR shape changed (it shouldn't — hash swap alone).
+3. **Federation types flip** with the verifier crate (`allowlist_for_commitment`
+   `prover/src/lib.rs:391,449-458`; `verify_chain_segments` `:380-432`).
+
+**GREEN GATE.** `canonical_commitment_drift_guard` passes (re-derived `{C_0,C_1}` == baked,
+under Poseidon2-M31). `verify_chain_standalone_allowlist` (`verifier/src/lib.rs:477-525`)
+green on a real multi-segment chain. The federation capstone (`prove_transition.rs:1128`,
+`prove_chain_segments` → `verify_chain_segments`) round-trips under the new hash. The
+io-binding (final-segment `public_io_hash() == compute_io_hash`, `prover:404-409`) still holds.
+
+**GOTCHAS.** The baked Blake2s commitments go STALE the instant the hash flips — every LIVE
+chain rejects (`allowlist_for_commitment` returns `None`) until re-baked. This is a
+one-time, mandatory re-bake (the const is the single pinned point). Format version already
+bumped in P5.0.
+
+**COST.** ~0.5–1 session (mostly running the re-bake test + pasting + e2e).
+
+**START HERE.** `verifier/src/lib.rs:477-525` (`verify_chain_standalone_allowlist`) +
+`prove_transition.rs:847-995` (`canonical_commitment_allowlist`, the re-bake recipe).
+
+---
+
+## Session P5.2 — the 31-component OODS-embed harness (THE hard one)
+
+**GOAL.** Replace GATE 4's representative 2-constraint OODS consumer with a harness that
+re-evaluates the FULL canonical segment AIR (31 components, **530 `add_constraint` sites**,
+grounding §31comp.2) at the OODS point, in-AIR, degree ≤ 2. This is the verify *depth* the
+join needs; it is the biggest unmeasured cost (`recursion-design.md:197-199`).
+
+**PREREQS.** P5.0 (a real Poseidon2-M31 segment to extract OODS data from). GATE 4's
+`oods_composition_chip.rs` + `join_assembly.rs` as templates.
+
+**THE CENTRAL DESIGN QUESTION — reuse vs hand-port.** The 31 chips implement
+`BuiltInComponent::add_constraints` / `FrameworkEval::evaluate` **generic over `E: EvalAtRow`**
+(`framework/traits/builtin.rs:42-47`, `framework/eval.rs:45-49`). stwo's own OODS check
+(`core/air/components.rs:54-71`) re-runs each component's `evaluate` against the OODS mask via
+a `PointEvaluationAccumulator`. So in principle the join's OODS consumer can REUSE the real
+chips' `evaluate` — feeding them a custom `EvalAtRow` that (a) returns OODS samples from the
+join's committed columns for `next_trace_mask()`, and (b) accumulates each `add_constraint`
+into the composition. The obstruction: the chips' constraints are arbitrary-degree, but the
+join-AIR needs degree ≤ 2 with every QM31 product WITNESSED. Two options:
+- **(P5.2-reuse) An auto-witnessing `EvalAtRow`.** A custom evaluator that, as it walks a
+  chip's `evaluate`, allocates a join-column per intermediate QM31 product (degree-reduction
+  on the fly) and emits the degree-2 witnessing constraints. Drive all 31 chips' real
+  `evaluate` through it. **Highest leverage — no hand-porting of 530 sites — but the
+  auto-witnessing evaluator is real new machinery.** De-risk it on ONE heavy chip first.
+- **(P5.2-port) Hand-port** each chip's constraints into the `oods_composition_chip.rs`
+  witnessed-product idiom. Faithful, mechanical, but 530 sites × the QM31 witnessing — large
+  and error-prone.
+
+**BUILD STEPS.**
+1. **Prototype the auto-witnessing `EvalAtRow`** and drive the **CpuChip** (`chips/cpu/mod.rs`,
+   193 of the 530 sites — the heaviest) through it at the OODS point, cross-checked against
+   stwo's `eval_composition_polynomial_at_point` for that component. GATE: the in-AIR
+   re-eval of CpuChip's constraints matches stwo's accumulator contribution.
+2. **Scale to all 31** components (the full `BASE_COMPONENTS`, `lib.rs:214-246`), accumulating
+   in stwo's exact order (`air/components.rs:61-70`). The OODS mask now carries one QM31 sample
+   per committed column across preprocessed + main + **interaction** trees (grounding §31comp.4
+   — the logup constraints over interaction columns are part of each `evaluate`, so the
+   interaction-mask samples + relation constraints must be embedded too).
+3. **The claimed-sum balance** is SEPARATE from the OODS re-eval (it's the ChannelChip path):
+   `claimed_sums.sum() == 0` (`verify.rs:296-300`) + the boundary-binding claimed sums
+   (`verify.rs:313-324`, `boundary_binding.rs:116-168`, the 4 boundary chips). Wire these as
+   their own constraints driven by the latched challenges (the GATE 4 latch pattern).
+
+**GREEN GATE.** The harness re-evaluates a REAL Poseidon2-M31 conservation segment's full
+31-component OODS composition in-AIR and matches the proof's `composition_oods_eval`
+(extracted via the GATE-4 transcript-replay pattern); `assert_constraints` green; it
+proves+verifies at degree ≤ 2 as ONE uniform component. **MEASURE the added width
+(columns/row) and the resulting log_size** — this is the unmeasured risk.
+
+**GOTCHAS.** `BuiltInComponent`'s `generate_interaction_trace` is SimdBackend-hardwired
+(the recursion work hit this — build on RAW stwo `FrameworkComponent`, not `BuiltInComponent`,
+for the join), but the `add_constraints`/`evaluate` *constraint* path is backend-agnostic and
+reusable. The interaction-trace mask + logup constraints roughly DOUBLE the mask columns.
+Width (not depth) grows — log_size should hold ~14, but per-cell prove cost rises; that's the
+thing to measure.
+
+**COST.** **The biggest session — likely splits into 2** (2a: auto-witnessing evaluator +
+CpuChip de-risk; 2b: scale to 31 + interaction + claimed-sums + measure). Budget generously.
+
+**START HERE.** `oods_composition_chip.rs:177-248` (`extract_oods` — the transcript-replay
+to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` to all trees)
++ `framework/eval.rs:45-49` + `core/air/components.rs:54-71` (the accumulator the harness mirrors).
+
+---
+
+## Session P5.3 — verify ONE real 31-component child end-to-end
+
+**GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
+scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
+scale) + the ChannelChip transcript replay, all against ONE real Poseidon2-M31 conservation
+segment — the full per-child verifier-AIR at canonical scale. This is the make-or-break
+MEASUREMENT the design has front-loaded (`recursion-design.md:170-175,197-199`).
+
+**PREREQS.** P5.0 (real segment) + P5.2 (OODS embed). GATE 2/3/4 machinery.
+
+**BUILD STEPS.**
+1. Scale GATE 2's fold chain to the real FRI: ~19 layers, 38 queries, the real
+   `fri_answers` first-layer evals (the DEEP-quotient chip feeds it).
+2. Scale GATE 3's decommit to the 4 trace trees (preproc/main/interaction/composition) at
+   real heights + the per-FRI-layer trees, leaves from the fold reconstruction.
+3. Wire ChannelChip (full real transcript, ~397 perms) + the latched challenges driving all
+   of the above + P5.2's OODS embed, in ONE uniform component.
+4. Bind the real SegmentState boundary fields (the seam fields come from the real child's
+   `initial_state`/`final_state`, `proof.rs:126-140`).
+
+**GREEN GATE.** The full single-child verifier-AIR proves+verifies a REAL canonical segment
+end-to-end; **MEASURE its natural log_size, width, prove-time, and peak memory.** The design
+predicts log ~14 (`perm_scale.rs`, `recursion-design.md:152-156`); confirm at the REAL
+31-component scale (the prior gates ran a SMALL de-risk child). ACCEPT valid; REJECT a
+tampered query/sample/path.
+
+**GOTCHAS.** This is where the ~16K-perm scale (8,664 FRI-Merkle + 3,192 trace-tree + ~3,040
+leaf + ~397 transcript) becomes real (`recursion-design.md:75-83`). Prove ≈ minutes; peak
+memory tens of GB (scalar hasher, CpuBackend — grounding §perf.4). Validate with
+`assert_constraints` BEFORE every slow prove.
+
+**COST.** ~1–2 sessions (assembly + the slow measurement loop). The prove iterations are the
+slow part — lean hard on `assert_constraints`.
+
+**START HERE.** `recursion-design.md:73-99` (the cost model + the 2 structural facts) +
+`verifier_air_integration.rs` (the integration template) + the GATE 2/3/4 files.
+
+---
+
+## Session P5.4 — the real 2-child fixed-point join
+
+**GOAL.** Combine P4.2's fixed-point STRUCTURE (2 children + seam + allowlist + aggregate
+public inputs) with P5.3's full per-child DEPTH + bind the REAL seam (the page-Merkle
+`memory_root` + pc/ts/registers from real children) + the real `{C_0,C_1}` (P2Hash
+commitments). The genuine recursion node at canonical scale.
+
+**PREREQS.** P5.1 (`{C_0,C_1}` re-pinned) + P5.3 (real per-child depth).
+
+**BUILD STEPS.**
+1. Two real Poseidon2-M31 conservation segments as children (e.g. one comb-free `C_0`
+   segment + the one comb `C_1` segment — exercises both allowlist entries).
+2. Generalize P5.3's single-child verifier to TWO children with P4.2's per-child anchor/break
+   (`is_child_start`/`chain_ok`).
+3. Bind the REAL seam: `child_L.final_state == child_R.initial_state` on the 4 bound fields,
+   where `memory_root` is the real page-Merkle root (`proof.rs:138`, the
+   `Memory{Page,Merkle,RootBoundary}` + `Blake2bBoundary` chips are already IN the 31
+   components P5.2 embeds — so the seam binds to genuinely-verified roots).
+4. Allowlist: each child's `commitments[0]` (P2Hash) bound at its commit-absorb row ∈
+   `{C_0,C_1}` (the real re-pinned const).
+5. Aggregate public inputs: `expected_initial_root` = left child `initial_state.memory_root`,
+   `final_memory_root` = right child `final_state.memory_root`, `io_hash` = right child
+   `registers[9..13]` (`proof.rs:210-216`).
+
+**GREEN GATE.** A real 2-child join (two real segments) proves+verifies through the lifted
+protocol; the real seam + real allowlist + aggregate public inputs bound; **MEASURE log_size
+(~15 predicted) + prove-time + memory.** Tamper: broken seam, out-of-allowlist child,
+tampered child proof — each rejected.
+
+**GOTCHAS.** Two children ≈ 2× the perm count → log ~15, ~5 min/join (extrapolated, scalar
+hasher). Memory ~tens of GB. The fixed point requires the join's OWN proof to re-verify at
+the same canonical shape — confirm (it's the recursion invariant; P4.2 showed it structurally,
+this confirms at real depth).
+
+**COST.** ~1–2 sessions. Slowest proves yet (log ~15 at full 31-comp width).
+
+**START HERE.** `fixed_point_join.rs` (P4.2 structure) + P5.3's single-child verifier.
+
+---
+
+## Session P5.5 — tree driver + fold 76 → aggregate + `verify_aggregate`
+
+**GOAL.** The offline scheduler that folds the 76 real segments up the depth-7 binary tree
+into ONE aggregate proof, and `verify_aggregate` replacing
+`verify_chain_standalone_allowlist` + io-binding.
+
+**PREREQS.** P5.4 (the real join node). P5.1 (allowlist).
+
+**BUILD STEPS.**
+1. **Lift decision:** if a raw segment proof's shape ≠ the join's child shape, build a thin
+   LIFT-AIR normalizing a segment into join shape at the leaves (`recursion-design.md:40-41,
+   206-208`); else the join verifies segments directly (single uniform shape — preferred).
+2. **Offline scheduler:** level-0 = 38 parallel leaf joins (each folds 2 segments), fold up
+   7 levels; the critical path is 7 sequential joins (~35 min–1 hr extrapolated; the 38
+   leaves parallel across boxes, grounding §perf.4). Extend `prove_chain_segments`
+   (`examples/extensions/prover/src/lib.rs:327`) → `aggregate_chain_segments`.
+3. **`verify_aggregate(expected_initial_root, final_memory_root, io_hash, allowlist)`** over
+   the ONE aggregate proof — replaces the N-segment loop while preserving the 4-part public
+   contract (grounding §allowlist.3): anchor `proofs[0].initial.memory_root` ↦
+   `root.left_boundary.memory_root`; final root ↦ `root.right_boundary.memory_root`; io_hash
+   ↦ `root.right_boundary.registers[9..13]`; per-segment allowlist membership folded in-circuit.
+4. **Wire the federation LIVE path:** the bridge's `verify_chain` (`clerk-bridge:736-775`) +
+   `verify_chain_segments` (`prover:380-432`) become `verify_aggregate` over one proof + manifest.
+
+**GREEN GATE.** 76 real segments → one aggregate proof; `verify_aggregate` ≡ today's
+`verify_chain_standalone_allowlist` + io-binding (same accept/reject on the same inputs);
+the federation e2e (`clerk_ledger_two_bank_federation`) green over the aggregate; aggregate
+size ~1–2 MiB (vs 227 MiB chain).
+
+**GOTCHAS.** The aggregate proof must itself be a valid child shape (the fixed point) so a
+future settlement venue verifies ONE canonical STARK. Memory across the 38 parallel leaves
+multiplies the per-join RAM — prover-fleet sizing. `N` never appears in `verify_aggregate`
+(constant-size, N-free — `recursion-design.md:59-71`).
+
+**COST.** ~1–2 sessions (scheduler + the e2e). The full 76-segment aggregate is the heaviest
+run — likely a long offline batch.
+
+**START HERE.** `recursion-design.md:39-71` (tree topology + aggregate public inputs) +
+`prove_chain_segments`/`verify_chain_segments` (`prover/src/lib.rs:327-432`).
+
+---
+
+## P5-perf (parallel, optional) — SimdBackend Poseidon2-M31 commit op
+
+**GOAL.** The single biggest prove-time lever: a `SimdBackend` `MerkleOpsLifted` /
+`BackendForChannel<P2MerkleChannel>` impl, so segments AND joins commit on packed-M31 SIMD
+lanes instead of the scalar hasher (grounding §perf.2 — the scalar hasher is ~99.5% of the
+prove cost and CpuBackend-only today).
+
+**BUILD STEPS.** Port the scalar `permute`/`hash_children_m31` (`recursion_common/mod.rs:132-227`)
+to packed-M31 SIMD lanes in the stwo fork; wire `BackendForChannel<P2MerkleChannel> for
+SimdBackend`. Then D1-A's CpuBackend retarget can be reverted to SimdBackend for both
+segments and joins.
+
+**GREEN GATE.** A segment (and a join) proves+verifies on SimdBackend under Poseidon2-M31,
+measurably faster than the scalar path.
+
+**GOTCHAS.** Fork-level backend engineering; net-new crypto-backend code; not on any tracked
+path. Independent of correctness — defer until fleet throughput demands it.
+
+**COST.** ~1–2 sessions, isolated. Can run any time after P5.0.
+
+---
+
+## Cross-cutting reminders (carry into every session)
+
+- **`assert_constraints_on_trace` (fast, AssertEvaluator) BEFORE every slow prove** — the
+  proves are minutes-to-tens-of-minutes at canonical scale; never burn a prove on a
+  constraint bug a fast assert catches.
+- **ONE uniform component, no producer/consumer split** (the split is a real residual
+  custom-stack bug). Latched challenge columns (the channel's `[0,1]` cross-row mask) are the
+  cross-chip propagation mechanism — proven in P4.
+- **`cargo clean -p stwo` on inexplicable `ConstraintsNotSatisfied`** (stale-rlib gotcha).
+- **fmt + clippy on the pinned `nightly-2025-05-09`** (stwo uses nightly features); vos
+  commits stay LOCAL, `--no-verify`, NEVER Co-Authored-By.
+- **Format version + re-bake ordering:** bump `PROOF_FORMAT_VERSION` once in P5.0; re-bake
+  `{C_0,C_1}` once in P5.1 AFTER vetted constants (D2) — re-baking before the real constants
+  wastes a re-bake.
+- **The unmeasured risk is WIDTH, not depth:** log_size is proven ≤ 19; the 530-site OODS
+  embed + the full 4-tree decommit add columns/row, raising per-cell prove cost. P5.2/P5.3
+  measure it. If a single join's width makes proving intractable, the fallback is a
+  compression layer or a bigger canonical shape (`recursion-design.md:173-175`) — a decision
+  point gated by the P5.3 measurement.
+- **Settlement venue (the recursion-verifier crate) is P6**, not P5 — wasm32 GREEN already;
+  PVM is blocked on stwo-fork dep-gating + `portable_atomic` (`recursion-p4.md:290-318`).
+
+---
+
+## Grounding appendix (the 2026-06-18 sweep — key anchors)
+
+- **Swap surface:** segment prove `prove.rs:674-928` (Blake2s at `:766,769,928`, SimdBackend
+  `:13,760,883,911`); verify `verify.rs:175-374`; proof type `proof.rs:150` + version `:122`;
+  object-safe channel `erased.rs:46-50,167` + `framework_access.rs:32-34`; commitment type
+  `program_id.rs:39`; standalone verifier `verifier/src/lib.rs:45,70-525`. The Poseidon2-M31
+  hasher is CpuBackend-only (`recursion_common/mod.rs:412`); the working round trip is
+  `poseidon2_pcs_spike.rs:370-413`.
+- **Allowlist:** commitment = `commitments[0]` (`program_id.rs:53-55`); baked
+  `VOUCHER_CHECK_COMMITMENTS` (`prover/src/lib.rs:504-519`); `verify_chain_standalone_allowlist`
+  (`verifier/src/lib.rs:477-525`); re-bake recipe `prove_transition.rs:847-995`; LIVE path
+  `clerk-bridge:736-775` → `verify_chain_segments` (`prover:380-432`).
+- **31 components / 530 sites:** `BASE_COMPONENTS` `lib.rs:214-246`; `chip_idx::COUNT=31`
+  `lib.rs:210`; OODS re-eval `verify.rs:344` → stwo `core/air/components.rs:54-71`; logup
+  relations `lookups/relations.rs`; claimed-sum balance `verify.rs:296-324`.
+- **SegmentState:** `proof.rs:126-140`; bound fields pc/ts/registers[13]/memory_root vs
+  vestigial `memory_commitment`; io-hash `proof.rs:210-216`; seam `verify.rs:40-47` /
+  `verifier/src/lib.rs:418-446`; page-Merkle binding `memory_{page,merkle,root_boundary}.rs` +
+  `boundary_binding.rs:116-192`.
+- **Cost:** perm chip log 12 = 145s (`recursion-design.md:155`); per-inner-proof ~15.3K perms
+  → log 14 (`perm_scale.rs`); join log 15 (2-child) / 16 (next level), ≤ 19 with ~4 bits
+  margin (`recursion-p4.md:248-256`). Scalar hasher is the bottleneck; SIMD commit not
+  available (grounding §perf.2). Per-join ~5–10 min extrapolated; 7-deep critical path
+  ~35 min–1 hr; offline-tractable; memory ~tens of GB/join (uncommitted estimate).
