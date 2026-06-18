@@ -1,8 +1,11 @@
 # P5 build plan: data-scaling the proven recursion to the real 76-segment chain
 
-Status: **P5.0 + P5.1 + P5.2a LANDED 2026-06-18 (LOCAL); P5.2b–P5.5 + P5-perf
-PLANNED.** (P5.2a = the auto-witnessing OODS evaluator, de-risked on the small
-AIR + the logup path + the real CpuChip — see the P5.2 section's status block.)
+Status: **P5.0 + P5.1 + P5.2a LANDED 2026-06-18; P5.2b steps 1+2 LANDED
+2026-06-19 (LOCAL); P5.2b-remainder + P5.3–P5.5 + P5-perf PLANNED.** (P5.2a = the
+auto-witnessing OODS evaluator; P5.2b 1+2 = all 31 components driven through it
+[matched vs stwo] + the single-uniform-component continuous Horner + total width
+160720 M31 measured. Remaining 2b = claimed-sum balance + real-segment match.
+See the P5.2 section's status block.)
 Branch `voucher-state-transition`. P4 is COMPLETE —
 the recursion *machinery* is proven (`recursion-p4.md`): the single-uniform-component
 join with latched-challenge cross-chip propagation verifies a real child (P4.1) and,
@@ -331,12 +334,39 @@ bumped in P5.0.
 > arithmetisation); the REAL-segment transcript replay + per-component mask
 > slicing + claimed-sum balance is **P5.2b**.
 >
-> **P5.2b (next):** scale to all 31 components in `BASE_COMPONENTS` order against
-> a REAL Poseidon2-M31 segment proof (the `drive_cpu_chip_oods` seam generalises
-> to a per-chip-index dispatch over all 31), accumulate in stwo's exact order,
-> add the claimed-sum balance (`verify.rs:296-324`), and MEASURE the total width /
-> log_size. The evaluator + seam pattern are proven; 2b is data-scaling + the
-> transcript-replay plumbing.
+> **P5.2b steps 1+2 DONE 2026-06-19 (commits `2c49bc5` / `5bb37e4`, LOCAL):**
+> - **Seam generalised:** `framework_access::drive_chip_oods(chip_idx, ..)`
+>   dispatches over all 31 `BASE_COMPONENTS` (the per-index match; CpuChip seam is
+>   now a wrapper). The evaluator tolerates a constraint-free component (acc=0) and
+>   `RecordBackend::set_preproc_indices` remaps preprocessed reads through a chip's
+>   `preprocessed_column_indices` (stwo's remap — preprocessed reads aren't a
+>   contiguous identity range for every chip; the preprocessed tree is sized to the
+>   full column set).
+> - **Step 1 — all 31 matched + width measured (`tests/oods_auto_all31.rs`):**
+>   every one of the 31 chips' OODS re-eval reproduces stwo's per-component
+>   `evaluate_constraint_quotients_at_point` (each chip's `evaluate` survives the
+>   degree-reducing evaluator, no hand-port). **TOTAL embed ≈ 40180 QM31 = 160720
+>   M31 field values** (23325 witnessed products). Heaviest = Blake2bChip (9549
+>   QM31), then Blake2bBoundary (7858), Ristretto (6252); CpuChip 2318. These are
+>   committable VALUES (width OR distributed across the ~16K perm rows → ~10 M31/row
+>   if spread, so negligible added WIDTH — the design's width worry resolves
+>   favourably modulo the P5.3 layout).
+> - **Step 2 — single-uniform-component continuous Horner
+>   (`tests/oods_auto_join31.rs`):** `drive_multi` walks all 31 chips through ONE
+>   `OodsEval`, the Horner accumulator running continuously across them (logup reset
+>   per component), reproducing the GLOBAL `PointEvaluationAccumulator` (one
+>   composition value, not a sum of per-component contributions) — the exact shape
+>   the join takes; `assert_constraints` green; embed 40150 QM31. Full prove
+>   `#[ignore]` (160K-M31 width × scalar hasher; P5.3 layout).
+>
+> **P5.2b REMAINING:** (a) the **claimed-sum balance** — `claimed_sums.sum()==0`
+> (`verify.rs:299`) + the boundary-binding claimed sums (`verify.rs:316-327`,
+> `boundary_binding.rs`); (b) the **real-segment composition match** — replay the
+> verifier transcript (`verify.rs:178-347`) on a real `prove_canonical` proof to
+> reconstruct the real `lookup_elements`/`oods_point`/`random_coeff`/`claimed_sums`
+> + the per-component mask from `sampled_values`, and match the proof's actual
+> `composition_oods_eval` (vs the synthetic-mask fuzz). Both are plumbing — the
+> evaluator + accumulation are proven.
 
 **GOAL.** Replace GATE 4's representative 2-constraint OODS consumer with a harness that
 re-evaluates the FULL canonical segment AIR (31 components, **530 `add_constraint` sites**,
