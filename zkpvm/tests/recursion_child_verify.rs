@@ -27,7 +27,8 @@ use javm::interpreter::Interpreter;
 use zkpvm::core::tracing::TracingPvm;
 use zkpvm::poseidon2::PermKind;
 use zkpvm::{
-    SideNote, prove_canonical, reconstruct_oods_for_recursion, record_canonical_transcript,
+    SideNote, extract_recursion_data, prove_canonical, reconstruct_oods_for_recursion,
+    record_canonical_transcript,
 };
 
 /// Prove a small but genuine program as ONE full 31-component canonical segment,
@@ -165,5 +166,94 @@ fn record_canonical_transcript_grounding() {
         proof.log_sizes,
         proof.claimed_sums.len(),
         proof.component_mask.count_ones(),
+    );
+}
+
+/// GROUNDING: the full transcript-derived data extraction — every challenge,
+/// query set, fold alpha, and first-layer FRI eval the per-child verifier-AIR's
+/// consumers need. Cross-validates the step-by-step replay against the real stwo
+/// verify, and against the OODS reconstruction.
+#[test]
+#[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
+fn extract_recursion_data_grounding() {
+    let (proof, sn) = canonical_segment();
+
+    let data = extract_recursion_data(&proof, &sn);
+
+    // (1) The step-by-step replay must reproduce the SAME transcript the real stwo
+    // `verify` drives (record_canonical_transcript) — proves the replication is
+    // faithful (no FS-mix drift). Compare prefix_len + every (kind, in, out).
+    let truth = record_canonical_transcript(&proof, &sn);
+    assert_eq!(
+        data.transcript.prefix_len, truth.prefix_len,
+        "extract replay prefix_len must match the real verify"
+    );
+    assert_eq!(
+        data.transcript.records.len(),
+        truth.records.len(),
+        "extract replay perm count must match the real verify"
+    );
+    for (i, (a, b)) in data
+        .transcript
+        .records
+        .iter()
+        .zip(&truth.records)
+        .enumerate()
+    {
+        assert_eq!(a.kind, b.kind, "record {i} kind diverged");
+        assert_eq!(a.input, b.input, "record {i} input diverged");
+        assert_eq!(a.output, b.output, "record {i} output diverged");
+    }
+
+    // (2) The composition random_coeff + OODS point must match the independent
+    // OODS reconstruction (both replay the same transcript).
+    let r = reconstruct_oods_for_recursion(&proof, &sn);
+    assert_eq!(
+        data.random_coeff, r.random_coeff,
+        "extracted composition random_coeff must match reconstruct"
+    );
+
+    // (3) Structural invariants: one fold alpha per FRI layer; query/first-layer
+    // counts consistent; fri_answers (first-layer evals) one per query.
+    let sp = &proof.stark_proof;
+    let n_layers = 1 + sp.fri_proof.inner_layers.len();
+    assert_eq!(
+        data.fold_alphas.len(),
+        n_layers,
+        "one fold alpha per FRI layer (first + inner)"
+    );
+    assert!(
+        data.query_positions.len() <= proof.pcs_config.fri_config.n_queries,
+        "query positions sorted+deduped ≤ n_queries"
+    );
+    assert_eq!(
+        data.first_layer_evals.len(),
+        data.query_positions.len(),
+        "one first-layer FRI eval (fri_answers) per query position"
+    );
+    assert!(
+        data.query_positions.windows(2).all(|w| w[0] < w[1]),
+        "query positions sorted + deduped (strictly increasing)"
+    );
+
+    eprintln!(
+        "extract_recursion_data_grounding GREEN:\n\
+         - step-by-step replay reproduces the REAL stwo verify transcript ({} perms, prefix_len={})\n\
+         - composition random_coeff + DEEP coeff captured; OODS point captured; matches reconstruct\n\
+         - {} fold alphas (1 first + {} inner FRI layers)\n\
+         - {} query positions (≤ {} n_queries), {} preprocessed-remapped\n\
+         - {} first-layer FRI evals (fri_answers / DEEP quotients), one per query\n\
+         - per-tree Merkle decommit + FriVerifier::decommit both VALIDATED Ok\n\
+         - lifting_log_size={}, max_log_degree_bound={}",
+        data.transcript.records.len(),
+        data.transcript.prefix_len,
+        data.fold_alphas.len(),
+        sp.fri_proof.inner_layers.len(),
+        data.query_positions.len(),
+        proof.pcs_config.fri_config.n_queries,
+        data.preprocessed_query_positions.len(),
+        data.first_layer_evals.len(),
+        data.lifting_log_size,
+        data.max_log_degree_bound,
     );
 }

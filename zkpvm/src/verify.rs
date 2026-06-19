@@ -634,6 +634,127 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
     }
 }
 
+/// The verifier-side state the native-recursion data extraction builds by
+/// replaying the zkpvm-specific FS-mix prefix of `verify` (the single source of
+/// truth for that load-bearing mix order — see [`recursion_verify_prefix`]).
+#[cfg(feature = "poseidon2-channel")]
+struct RecursionVerifyContext {
+    /// The relation elements drawn after the boundary-state mix (the `z`/`alpha`
+    /// the boundary-binding + OODS-embed consumers combine over).
+    lookup_elements: AllLookupElements,
+    /// The stwo verifier components, in active order.
+    verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>>,
+}
+
+/// Replay the zkpvm-specific Fiat-Shamir prefix `verify` drives on `channel` and
+/// `commitment_scheme`, up to and including the interaction-tree commit: mix the
+/// per-component log sizes, commit the preprocessed + main trees, mix the boundary
+/// state (gated on `closing_chip_active`), draw the lookup elements, then mix the
+/// claimed sums and commit the interaction tree. This is the single definition of
+/// that mix order (the order is load-bearing for soundness — a divergence silently
+/// corrupts every downstream challenge), shared by [`record_canonical_transcript`]
+/// and [`extract_recursion_data`]. After it returns, the caller drives the stwo
+/// verifier head (random_coeff / composition commit / OODS) on the same channel.
+///
+/// Components are selected by the proof's `component_mask` (canonical forces all
+/// 31), matching [`reconstruct_oods_for_recursion`]'s trace layout. The
+/// preprocessed-root check (`verify_preprocessed_trace`) clones the channel, so it
+/// has no transcript effect and is skipped.
+#[cfg(feature = "poseidon2-channel")]
+fn recursion_verify_prefix(
+    proof: &Proof,
+    side_note: &SideNote,
+    channel: &mut ProverChannel,
+    commitment_scheme: &mut CommitmentSchemeVerifier<ProverMerkleChannel>,
+) -> RecursionVerifyContext {
+    let sp = &proof.stark_proof;
+    let claimed_log_sizes = &proof.log_sizes;
+    let claimed_sums = &proof.claimed_sums;
+
+    let n_active = (proof.component_mask).count_ones() as usize;
+    assert_eq!(
+        n_active,
+        claimed_log_sizes.len(),
+        "component_mask popcount must equal log_sizes length"
+    );
+    assert_eq!(
+        n_active,
+        claimed_sums.len(),
+        "component_mask popcount must equal claimed_sums length"
+    );
+
+    let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = (0
+        ..super::chip_idx::COUNT)
+        .filter(|&i| proof.component_mask & (1 << i) != 0)
+        .map(|i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
+        .collect();
+    let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
+
+    claimed_log_sizes
+        .iter()
+        .for_each(|ls| channel.mix_u64(*ls as u64));
+
+    let sizes: alloc::vec::Vec<TreeVec<alloc::vec::Vec<u32>>> = components
+        .iter()
+        .zip(claimed_log_sizes)
+        .map(|(c, &ls)| c.trace_sizes(ls))
+        .collect();
+    let mut log_sizes = TreeVec::concat_cols(sizes.into_iter());
+    log_sizes[PREPROCESSED_TRACE_IDX] = components
+        .iter()
+        .zip(claimed_log_sizes)
+        .flat_map(|(c, &ls)| c.preprocessed_trace_sizes(ls))
+        .collect();
+
+    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
+        commitment_scheme.commit(sp.commitments[idx], &log_sizes[idx], channel);
+    }
+
+    if side_note.closing_chip_active {
+        for r in &proof.initial_state.registers {
+            channel.mix_u64(*r);
+        }
+        for r in &proof.final_state.registers {
+            channel.mix_u64(*r);
+        }
+        channel.mix_u64(proof.initial_state.pc as u64);
+        channel.mix_u64(proof.initial_state.timestamp);
+        channel.mix_u64(proof.final_state.pc as u64);
+        channel.mix_u64(proof.final_state.timestamp);
+        for chunk in proof.initial_state.memory_root.chunks_exact(8) {
+            channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        for chunk in proof.final_state.memory_root.chunks_exact(8) {
+            channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+    }
+
+    let mut lookup_elements = AllLookupElements::default();
+    components
+        .iter()
+        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, channel));
+
+    let tree_span_provider = &mut TraceLocationAllocator::default();
+    let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
+        .iter()
+        .zip(claimed_sums)
+        .zip(claimed_log_sizes)
+        .map(|((c, cs), &ls)| c.to_component(tree_span_provider, &lookup_elements, ls, *cs))
+        .collect();
+
+    channel.mix_felts(claimed_sums);
+    commitment_scheme.commit(
+        sp.commitments[INTERACTION_TRACE_IDX],
+        &log_sizes[INTERACTION_TRACE_IDX],
+        channel,
+    );
+
+    RecursionVerifyContext {
+        lookup_elements,
+        verifier_components,
+    }
+}
+
 /// The full Fiat-Shamir transcript of a real canonical segment proof's
 /// verification, recorded as an ordered Poseidon2 permutation sequence — the
 /// ground truth the native-recursion verifier-AIR's in-AIR `ChannelChip` replay
@@ -655,134 +776,263 @@ pub struct RecursionTranscript {
 
 /// Record a real canonical segment proof's full verifier transcript by handing a
 /// recording [`Poseidon2M31Channel`](crate::poseidon2::Poseidon2M31Channel)
-/// through the SAME Fiat-Shamir sequence [`verify`] drives — the channel-
-/// affecting prefix of [`verify_with_options_explicit_components`] followed by
-/// stwo's `verify` head + FRI commit + PoW + query sampling + Merkle decommit.
-/// Every absorb/squeeze/pow permutation lands in [`RecursionTranscript::records`]
-/// in caller order.
+/// through the SAME Fiat-Shamir sequence [`verify`] drives — the zkpvm prefix
+/// ([`recursion_verify_prefix`]) followed by stwo's `verify` head + FRI commit +
+/// PoW + query sampling + Merkle decommit. Every absorb/squeeze/pow permutation
+/// lands in [`RecursionTranscript::records`] in caller order. This calls the REAL
+/// stwo `verify`, so its records are the ground truth [`extract_recursion_data`]'s
+/// step-by-step replay is cross-checked against.
 ///
-/// This is the transcript half of the recursion data extraction; pair it with
-/// [`reconstruct_oods_for_recursion`] (which replays the same prefix to the OODS
-/// point and returns the per-component masks + scalars). Both use the same
-/// deterministic transcript, so the challenges they surface agree.
-///
-/// PRECONDITION (same as [`reconstruct_oods_for_recursion`]): `side_note` must be
-/// in the prover-left state (`closing_chip_active` set), so the boundary-state
-/// mix matches the prover's transcript. Panics if the proof fails to verify — a
-/// recursion harness assumes a well-formed, valid proof (its `component_mask`
-/// popcount equals `log_sizes`/`claimed_sums` length).
+/// Pairs with [`reconstruct_oods_for_recursion`] (same prefix, returns the OODS
+/// masks + scalars). PRECONDITION: `side_note` prover-left. Panics if the proof
+/// fails to verify (recursion harness assumes a valid proof).
 #[cfg(feature = "poseidon2-channel")]
 pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> RecursionTranscript {
     use alloc::rc::Rc;
     use core::cell::RefCell;
 
-    let config = proof.pcs_config;
-    let sp = proof.stark_proof.clone();
-    let claimed_log_sizes = &proof.log_sizes;
-    let claimed_sums = &proof.claimed_sums;
-
-    let n_active = (proof.component_mask).count_ones() as usize;
-    assert_eq!(
-        n_active,
-        claimed_log_sizes.len(),
-        "component_mask popcount must equal log_sizes length"
-    );
-    assert_eq!(
-        n_active,
-        claimed_sums.len(),
-        "component_mask popcount must equal claimed_sums length"
-    );
-
-    // Select components by the proof's component_mask (canonical forces all 31),
-    // matching `reconstruct_oods_for_recursion`'s trace layout.
-    let active_indices: alloc::vec::Vec<usize> = (0..super::chip_idx::COUNT)
-        .filter(|&i| proof.component_mask & (1 << i) != 0)
-        .collect();
-    let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = active_indices
-        .iter()
-        .map(|&i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
-        .collect();
-    let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
-
-    // A recording channel; clones share the buffer, so the channel handed to
-    // stwo's `verify` records the whole FRI/query/decommit tail too.
     let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
-    let verifier_channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
-    claimed_log_sizes
-        .iter()
-        .for_each(|ls| verifier_channel.mix_u64(*ls as u64));
-
-    // The preprocessed-root check (`verify_preprocessed_trace`) clones the
-    // channel, so it has no transcript effect and is skipped here.
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
-    let sizes: alloc::vec::Vec<TreeVec<alloc::vec::Vec<u32>>> = components
-        .iter()
-        .zip(claimed_log_sizes)
-        .map(|(c, &ls)| c.trace_sizes(ls))
-        .collect();
-    let mut log_sizes = TreeVec::concat_cols(sizes.into_iter());
-    log_sizes[PREPROCESSED_TRACE_IDX] = components
-        .iter()
-        .zip(claimed_log_sizes)
-        .flat_map(|(c, &ls)| c.preprocessed_trace_sizes(ls))
-        .collect();
-
-    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
-        commitment_scheme.commit(sp.commitments[idx], &log_sizes[idx], verifier_channel);
-    }
-
-    if side_note.closing_chip_active {
-        for r in &proof.initial_state.registers {
-            verifier_channel.mix_u64(*r);
-        }
-        for r in &proof.final_state.registers {
-            verifier_channel.mix_u64(*r);
-        }
-        verifier_channel.mix_u64(proof.initial_state.pc as u64);
-        verifier_channel.mix_u64(proof.initial_state.timestamp);
-        verifier_channel.mix_u64(proof.final_state.pc as u64);
-        verifier_channel.mix_u64(proof.final_state.timestamp);
-        for chunk in proof.initial_state.memory_root.chunks_exact(8) {
-            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        for chunk in proof.final_state.memory_root.chunks_exact(8) {
-            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-    }
-
-    let mut lookup_elements = AllLookupElements::default();
-    components
-        .iter()
-        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, verifier_channel));
-
-    let tree_span_provider = &mut TraceLocationAllocator::default();
-    let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
-        .iter()
-        .zip(claimed_sums)
-        .zip(claimed_log_sizes)
-        .map(|((c, cs), &ls)| c.to_component(tree_span_provider, &lookup_elements, ls, *cs))
-        .collect();
+    let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
+    let commitment_scheme =
+        &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(proof.pcs_config);
+    let ctx = recursion_verify_prefix(proof, side_note, channel, commitment_scheme);
     let components_ref: alloc::vec::Vec<&dyn Component> =
-        verifier_components.iter().map(|c| &**c).collect();
+        ctx.verifier_components.iter().map(|c| &**c).collect();
 
-    verifier_channel.mix_felts(claimed_sums);
-    commitment_scheme.commit(
-        sp.commitments[INTERACTION_TRACE_IDX],
-        &log_sizes[INTERACTION_TRACE_IDX],
-        verifier_channel,
-    );
-
-    // Everything up to here is the zkpvm prefix; stwo's `verify` drives the head
+    // Everything so far is the zkpvm prefix; stwo's `verify` drives the head
     // (random_coeff, composition commit, oods, sampled mix, DEEP coeff), the FRI
     // commit (per-layer roots + fold alphas), PoW, and query sampling next.
     let prefix_len = recorder.borrow().len();
-
-    stwo::core::verifier::verify(&components_ref, verifier_channel, commitment_scheme, sp)
-        .expect("record_canonical_transcript: proof must verify (recursion harness precondition)");
+    stwo::core::verifier::verify(
+        &components_ref,
+        channel,
+        commitment_scheme,
+        proof.stark_proof.clone(),
+    )
+    .expect("record_canonical_transcript: proof must verify (recursion harness precondition)");
 
     let records = recorder.borrow().clone();
     RecursionTranscript {
         records,
         prefix_len,
+    }
+}
+
+/// Every transcript-derived datum the per-child verifier-AIR's FRI / DEEP-quotient
+/// / Merkle-decommit consumers need from a real canonical segment proof, extracted
+/// by replaying stwo's `verify` head + `verify_values` step by step via PUBLIC
+/// stwo calls (so each challenge / query set is captured as it is drawn, rather
+/// than fished out of the raw record stream). The raw per-tree / per-FRI-layer
+/// decommit data (roots, `queried_values`, `hash_witness`, `fri_witness`,
+/// `last_layer_poly`) is read directly from `proof.stark_proof` using these query
+/// positions — it is not duplicated here.
+#[cfg(feature = "poseidon2-channel")]
+pub struct RecursionData {
+    /// The recorded transcript (records + prefix_len), identical to
+    /// [`record_canonical_transcript`]'s — cross-checked equal in the gate test.
+    pub transcript: RecursionTranscript,
+    /// Composition `random_coeff` (the Horner base the OODS embed folds under).
+    pub random_coeff: SecureField,
+    /// DEEP-quotient `random_coeff` (the `fri_answers` / first-layer-eval coeff).
+    pub deep_coeff: SecureField,
+    /// The OODS point.
+    pub oods_point: stwo::core::circle::CirclePoint<SecureField>,
+    /// Per-FRI-layer fold alphas, in fold order (first layer then each inner
+    /// layer) — captured by bracketing `FriVerifier::commit`. `len()` ==
+    /// `1 + fri_proof.inner_layers.len()`.
+    pub fold_alphas: alloc::vec::Vec<SecureField>,
+    /// The drawn FRI query positions on the first-layer domain (sorted + deduped;
+    /// `len() <= n_queries`). Trace trees 1..4 decommit at these.
+    pub query_positions: alloc::vec::Vec<usize>,
+    /// The preprocessed tree's remapped query positions (tree 0 decommits here).
+    pub preprocessed_query_positions: alloc::vec::Vec<usize>,
+    /// The first-layer FRI eval per query position (`fri_answers` — the DEEP
+    /// quotients), the input the in-AIR FRI fold chain folds down to the last layer.
+    pub first_layer_evals: alloc::vec::Vec<SecureField>,
+    /// The relation elements drawn after the boundary-state mix (the `z`/`alpha`
+    /// the boundary-binding + OODS-embed consumers combine over) — the same set
+    /// [`reconstruct_oods_for_recursion`] returns.
+    pub lookup_elements: AllLookupElements,
+    /// The FRI first-layer domain log size (= composition tree height).
+    pub lifting_log_size: u32,
+    /// `lifting_log_size - log_blowup_factor` (the OODS vanishing-domain log size).
+    pub max_log_degree_bound: u32,
+}
+
+/// Extract every transcript-derived datum the per-child verifier-AIR needs from a
+/// real canonical segment proof (see [`RecursionData`]). Replays stwo's `verify`
+/// head + `verify_values` via PUBLIC stwo calls on a recording channel, capturing
+/// the composition/DEEP coeffs, the OODS point, the per-FRI-layer fold alphas (by
+/// bracketing `FriVerifier::commit`), the query positions, and the first-layer FRI
+/// evals (`fri_answers`); it VALIDATES the extraction end-to-end by running the
+/// real per-tree Merkle decommit and `FriVerifier::decommit` (both must succeed).
+///
+/// The replay reproduces the same transcript [`record_canonical_transcript`]
+/// captures from the real stwo `verify` (cross-checked equal in the gate test), so
+/// the captured challenges are exactly what the proof was produced under.
+///
+/// PRECONDITION: `side_note` prover-left. Panics if any validation fails (the
+/// recursion harness assumes a well-formed, valid proof).
+#[cfg(feature = "poseidon2-channel")]
+pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionData {
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+    use core::iter::zip;
+    use stwo::core::air::Components;
+    use stwo::core::circle::CirclePoint;
+    use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+    use stwo::core::fri::{CirclePolyDegreeBound, FriVerifier};
+    use stwo::core::pcs::quotients::{PointSample, fri_answers};
+    use stwo::core::pcs::utils::{prepare_preprocessed_query_positions, try_get_lifting_log_size};
+    use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
+
+    let config = proof.pcs_config;
+    let sp = proof.stark_proof.clone();
+
+    let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
+    let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let ctx = recursion_verify_prefix(proof, side_note, channel, commitment_scheme);
+    let prefix_len = recorder.borrow().len();
+
+    // ── stwo verifier head (verifier.rs `verify_ex`), replicated via pub calls ─
+    let components_ref: alloc::vec::Vec<&dyn Component> =
+        ctx.verifier_components.iter().map(|c| &**c).collect();
+    let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
+        .column_log_sizes
+        .len();
+    let components_struct = Components {
+        components: components_ref.clone(),
+        n_preprocessed_columns,
+    };
+    let split = components_struct.composition_log_degree_bound() - COMPOSITION_LOG_SPLIT;
+    let lifting_log_size =
+        try_get_lifting_log_size(&config, split + config.fri_config.log_blowup_factor).unwrap();
+    let max_log_degree_bound = lifting_log_size - config.fri_config.log_blowup_factor;
+
+    let random_coeff = channel.draw_secure_felt();
+    commitment_scheme.commit(
+        *sp.commitments.last().unwrap(),
+        &alloc::vec![max_log_degree_bound; 2 * SECURE_EXTENSION_DEGREE],
+        channel,
+    );
+    let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
+    let mut sample_points = components_struct.mask_points(oods_point, max_log_degree_bound, false);
+    sample_points.push(alloc::vec![alloc::vec![oods_point]; 2 * SECURE_EXTENSION_DEGREE]);
+    // `lifting_log_size` must equal the committed composition tree height
+    // (what `verify_values` uses); assert it so a head/verify_values mismatch
+    // surfaces loudly rather than as a wrong-challenge silent failure.
+    assert_eq!(
+        lifting_log_size,
+        commitment_scheme.trees.last().unwrap().height,
+        "lifting_log_size must equal the composition tree height"
+    );
+
+    // ── verify_values (pcs/verifier.rs), replicated via pub calls ──────────────
+    channel.mix_felts(&sp.sampled_values.clone().flatten_cols());
+    let deep_coeff = channel.draw_secure_felt();
+    let bound = CirclePolyDegreeBound::new(lifting_log_size - config.fri_config.log_blowup_factor);
+
+    // Capture the per-layer fold alphas by bracketing the FRI commit: the squeezes
+    // it performs (interleaved with the per-layer root absorbs) ARE the alphas.
+    let fri_before = recorder.borrow().len();
+    let mut fri_verifier = FriVerifier::<ProverMerkleChannel>::commit(
+        channel,
+        config.fri_config,
+        sp.fri_proof.clone(),
+        bound,
+    )
+    .expect("FRI commit");
+    let fold_alphas: alloc::vec::Vec<SecureField> = recorder.borrow()[fri_before..]
+        .iter()
+        .filter(|r| r.kind == crate::poseidon2::PermKind::Squeeze)
+        .map(|r| SecureField::from_m31_array([r.output[0], r.output[1], r.output[2], r.output[3]]))
+        .collect();
+
+    assert!(
+        channel.verify_pow_nonce(config.pow_bits, sp.proof_of_work),
+        "FRI proof-of-work"
+    );
+    channel.mix_u64(sp.proof_of_work);
+    let query_positions = fri_verifier.sample_query_positions(channel);
+    let preprocessed_query_positions = prepare_preprocessed_query_positions(
+        &query_positions,
+        lifting_log_size,
+        commitment_scheme.trees[PREPROCESSED_TRACE_IDX].height,
+    );
+
+    // Validate the per-tree Merkle decommits (tree 0 uses the remapped positions).
+    let query_positions_tree = TreeVec::new(
+        commitment_scheme
+            .trees
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                if i == PREPROCESSED_TRACE_IDX {
+                    preprocessed_query_positions.as_slice()
+                } else {
+                    query_positions.as_slice()
+                }
+            })
+            .collect::<alloc::vec::Vec<_>>(),
+    );
+    commitment_scheme
+        .trees
+        .as_ref()
+        .zip_eq(sp.decommitments.clone())
+        .zip_eq(sp.queried_values.clone())
+        .zip_eq(query_positions_tree)
+        .map(|(((tree, decommitment), queried_values), qpos)| {
+            tree.verify(qpos, queried_values, decommitment)
+        })
+        .0
+        .into_iter()
+        .collect::<Result<(), _>>()
+        .expect("trace-tree Merkle decommit");
+
+    // The first-layer FRI evals (DEEP quotients), then validate the FRI decommit.
+    let column_log_sizes: TreeVec<alloc::vec::Vec<u32>> = TreeVec::new(
+        commitment_scheme
+            .trees
+            .iter()
+            .map(|t| t.column_log_sizes.clone())
+            .collect::<alloc::vec::Vec<_>>(),
+    );
+    let samples = sample_points
+        .zip_cols(sp.sampled_values.clone())
+        .map_cols(|(pts, vals)| {
+            zip(pts, vals)
+                .map(|(point, value)| PointSample { point, value })
+                .collect::<alloc::vec::Vec<_>>()
+        });
+    let first_layer_evals = fri_answers(
+        column_log_sizes,
+        samples,
+        deep_coeff,
+        &query_positions,
+        sp.queried_values.clone(),
+        lifting_log_size,
+    )
+    .expect("fri_answers");
+    fri_verifier
+        .decommit(first_layer_evals.clone())
+        .expect("FRI decommit");
+
+    let records = recorder.borrow().clone();
+    RecursionData {
+        transcript: RecursionTranscript {
+            records,
+            prefix_len,
+        },
+        random_coeff,
+        deep_coeff,
+        oods_point,
+        fold_alphas,
+        query_positions,
+        preprocessed_query_positions,
+        first_layer_evals,
+        lookup_elements: ctx.lookup_elements,
+        lifting_log_size,
+        max_log_degree_bound,
     }
 }

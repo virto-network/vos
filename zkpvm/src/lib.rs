@@ -547,7 +547,9 @@ pub use verify::{
     verify_with_options, verify_with_pcs_policy,
 };
 #[cfg(all(feature = "prover", feature = "poseidon2-channel"))]
-pub use verify::{RecursionTranscript, record_canonical_transcript};
+pub use verify::{
+    RecursionData, RecursionTranscript, extract_recursion_data, record_canonical_transcript,
+};
 
 /// Phase I.0 chip-isolated harness surface — re-exports the trait
 /// objects callers need to assemble an explicit component slice for
