@@ -542,8 +542,9 @@ pub use stwo::core::fri::FriConfig;
 pub use stwo::core::pcs::PcsConfig;
 #[cfg(feature = "prover")]
 pub use verify::{
-    DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_explicit_components,
-    verify_with_max_log_size, verify_with_options, verify_with_pcs_policy,
+    ComponentOodsMask, DEFAULT_MAX_LOG_SIZE, OodsReconstruction, reconstruct_oods_for_recursion,
+    verify, verify_chain, verify_with_explicit_components, verify_with_max_log_size,
+    verify_with_options, verify_with_pcs_policy,
 };
 
 /// Phase I.0 chip-isolated harness surface — re-exports the trait

@@ -394,3 +394,216 @@ fn verify_preprocessed_trace(
         Ok(())
     }
 }
+
+/// One active component's OODS mask, sliced from a real proof's `sampled_values`
+/// for the P5.2 recursion verifier-AIR — the chip's columns in read order, ready
+/// to drive the auto-witnessing evaluator. `mask[interaction][column][offset]`;
+/// the preprocessed tree (`mask[0]`) is the FULL column set, indexed through
+/// `preproc_indices` (stwo's preprocessed remap).
+pub struct ComponentOodsMask {
+    pub mask: alloc::vec::Vec<alloc::vec::Vec<alloc::vec::Vec<SecureField>>>,
+    pub preproc_indices: alloc::vec::Vec<usize>,
+}
+
+/// The OODS data reconstructed from a real canonical segment proof by replaying
+/// the verifier's Fiat-Shamir transcript (the channel-affecting steps of
+/// [`verify_with_options_explicit_components`] + the stwo verifier head) — the
+/// inputs the recursion verifier-AIR re-evaluates the inner composition against,
+/// plus the proof's own `composition_oods_eval` (the DEEP-ALI ground truth).
+pub struct OodsReconstruction {
+    /// `(chip_idx, log_size, claimed_sum)` per active component, in
+    /// `BASE_COMPONENTS` order.
+    pub comps: alloc::vec::Vec<(usize, u32, SecureField)>,
+    /// Per-active-component OODS mask, sliced from the proof's `sampled_values`.
+    pub component_masks: alloc::vec::Vec<ComponentOodsMask>,
+    /// The relation elements drawn from the replayed transcript.
+    pub lookup_elements: AllLookupElements,
+    pub random_coeff: SecureField,
+    pub denom_inverse: SecureField,
+    pub oods_x_doubled: SecureField,
+    /// The composition-trace OODS mask (the DEEP-ALI recombination inputs).
+    pub comp_mask: [SecureField; 8],
+    /// The proof's `composition_oods_eval` — what the in-AIR re-eval must match.
+    pub composition_value: SecureField,
+}
+
+/// Replay a real canonical segment proof's verifier transcript to the OODS point
+/// and return everything the P5.2 verifier-AIR needs to re-evaluate the inner
+/// composition in-AIR (the per-component masks sliced from `sampled_values`, the
+/// drawn `lookup_elements`/`random_coeff`/`oods_point`-derived scalars, the
+/// per-component `claimed_sum`/`log_size`) plus the proof's own composition value.
+///
+/// This is the read-only reconstruction the recursion harness drives its
+/// auto-witnessing evaluator against; it mirrors the channel-affecting steps of
+/// [`verify_with_options_explicit_components`] (the preprocessed-root *check*
+/// clones the channel, so it is skipped) followed by the stwo verifier head
+/// (draw `random_coeff`, commit the composition tree, draw `oods_point`).
+pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> OodsReconstruction {
+    use stwo::core::air::Components;
+    use stwo::core::circle::CirclePoint;
+    use stwo::core::constraints::coset_vanishing;
+    use stwo::core::fields::FieldExpOps;
+    use stwo::core::pcs::utils::try_get_lifting_log_size;
+    use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
+
+    let config = proof.pcs_config;
+    let sp = &proof.stark_proof;
+    let claimed_log_sizes = &proof.log_sizes;
+    let claimed_sums = &proof.claimed_sums;
+
+    // Select components by the PROOF's component_mask, not the side note's
+    // natural-active set: a canonical proof forces ALL 31 (padding inactive
+    // chips), so `active_components_verifier(side_note)` (which drops e.g.
+    // Blake2b/Ristretto for a program that never uses them) would not match the
+    // proof's trace layout.
+    let active_indices: alloc::vec::Vec<usize> = (0..super::chip_idx::COUNT)
+        .filter(|&i| proof.component_mask & (1 << i) != 0)
+        .collect();
+    let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = active_indices
+        .iter()
+        .map(|&i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
+        .collect();
+    let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
+
+    // ── Replay the FS transcript (channel-affecting steps only) ─────────────
+    let verifier_channel = &mut ProverChannel::default();
+    claimed_log_sizes
+        .iter()
+        .for_each(|ls| verifier_channel.mix_u64(*ls as u64));
+
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let sizes: alloc::vec::Vec<TreeVec<alloc::vec::Vec<u32>>> = components
+        .iter()
+        .zip(claimed_log_sizes)
+        .map(|(c, &ls)| c.trace_sizes(ls))
+        .collect();
+    let mut log_sizes = TreeVec::concat_cols(sizes.into_iter());
+    log_sizes[PREPROCESSED_TRACE_IDX] = components
+        .iter()
+        .zip(claimed_log_sizes)
+        .flat_map(|(c, &ls)| c.preprocessed_trace_sizes(ls))
+        .collect();
+
+    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
+        commitment_scheme.commit(sp.commitments[idx], &log_sizes[idx], verifier_channel);
+    }
+
+    if side_note.closing_chip_active {
+        for r in &proof.initial_state.registers {
+            verifier_channel.mix_u64(*r);
+        }
+        for r in &proof.final_state.registers {
+            verifier_channel.mix_u64(*r);
+        }
+        verifier_channel.mix_u64(proof.initial_state.pc as u64);
+        verifier_channel.mix_u64(proof.initial_state.timestamp);
+        verifier_channel.mix_u64(proof.final_state.pc as u64);
+        verifier_channel.mix_u64(proof.final_state.timestamp);
+        for chunk in proof.initial_state.memory_root.chunks_exact(8) {
+            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        for chunk in proof.final_state.memory_root.chunks_exact(8) {
+            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+    }
+
+    let mut lookup_elements = AllLookupElements::default();
+    components
+        .iter()
+        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, verifier_channel));
+
+    let tree_span_provider = &mut TraceLocationAllocator::default();
+    let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
+        .iter()
+        .zip(claimed_sums)
+        .zip(claimed_log_sizes)
+        .map(|((c, cs), &ls)| c.to_component(tree_span_provider, &lookup_elements, ls, *cs))
+        .collect();
+
+    verifier_channel.mix_felts(claimed_sums);
+    commitment_scheme.commit(
+        sp.commitments[INTERACTION_TRACE_IDX],
+        &log_sizes[INTERACTION_TRACE_IDX],
+        verifier_channel,
+    );
+
+    // ── stwo verifier head: random_coeff, composition commit, oods_point ────
+    let components_ref: alloc::vec::Vec<&dyn Component> =
+        verifier_components.iter().map(|c| &**c).collect();
+    let n_preprocessed_columns = log_sizes[PREPROCESSED_TRACE_IDX].len();
+    let comps_struct = Components {
+        components: components_ref,
+        n_preprocessed_columns,
+    };
+    let split = comps_struct.composition_log_degree_bound() - COMPOSITION_LOG_SPLIT;
+    let lifting_log_size =
+        try_get_lifting_log_size(&config, split + config.fri_config.log_blowup_factor).unwrap();
+    let mlbd = lifting_log_size - config.fri_config.log_blowup_factor;
+
+    let random_coeff = verifier_channel.draw_secure_felt();
+    let n_comp_cols = sp.sampled_values.last().unwrap().len();
+    commitment_scheme.commit(
+        *sp.commitments.last().unwrap(),
+        &alloc::vec![mlbd; n_comp_cols],
+        verifier_channel,
+    );
+    let oods_point = CirclePoint::<SecureField>::get_random_point(verifier_channel);
+
+    let denom_inverse = coset_vanishing(CanonicCoset::new(mlbd).coset, oods_point).inverse();
+    let oods_x_doubled = oods_point.repeated_double(mlbd - 1).x;
+    let comp_mask: [SecureField; 8] =
+        core::array::from_fn(|i| sp.sampled_values.last().unwrap()[i][0]);
+
+    // The proof's composition_oods_eval = the recombined composition mask
+    // (`left + oods_x_doubled · right`). The verifier checked this equals
+    // `eval_composition_polynomial_at_point`, so it is the DEEP-ALI ground truth
+    // the in-AIR re-eval must reproduce — computed directly here (no second
+    // PointEvaluator pass over the components).
+    let left =
+        SecureField::from_partial_evals([comp_mask[0], comp_mask[1], comp_mask[2], comp_mask[3]]);
+    let right =
+        SecureField::from_partial_evals([comp_mask[4], comp_mask[5], comp_mask[6], comp_mask[7]]);
+    let composition_value = left + oods_x_doubled * right;
+
+    // ── Slice the per-component masks (concat order = BASE_COMPONENTS order) ─
+    let preproc_full = sp.sampled_values[PREPROCESSED_TRACE_IDX].clone();
+    let mut component_masks = alloc::vec::Vec::new();
+    let mut main_off = 0usize;
+    let mut int_off = 0usize;
+    for ((c, &ls), vc) in components
+        .iter()
+        .zip(claimed_log_sizes)
+        .zip(&verifier_components)
+    {
+        let ts = c.trace_sizes(ls);
+        let n_main = ts[ORIGINAL_TRACE_IDX].len();
+        let n_int = ts[INTERACTION_TRACE_IDX].len();
+        let main_slice =
+            sp.sampled_values[ORIGINAL_TRACE_IDX][main_off..main_off + n_main].to_vec();
+        let int_slice = sp.sampled_values[INTERACTION_TRACE_IDX][int_off..int_off + n_int].to_vec();
+        main_off += n_main;
+        int_off += n_int;
+        component_masks.push(ComponentOodsMask {
+            mask: alloc::vec![preproc_full.clone(), main_slice, int_slice],
+            preproc_indices: vc.preprocessed_column_indices(),
+        });
+    }
+
+    let comps = active_indices
+        .iter()
+        .zip(claimed_log_sizes)
+        .zip(claimed_sums)
+        .map(|((&idx, &ls), &cs)| (idx, ls, cs))
+        .collect();
+
+    OodsReconstruction {
+        comps,
+        component_masks,
+        lookup_elements,
+        random_coeff,
+        denom_inverse,
+        oods_x_doubled,
+        comp_mask,
+        composition_value,
+    }
+}
