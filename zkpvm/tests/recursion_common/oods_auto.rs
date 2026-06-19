@@ -1134,6 +1134,278 @@ impl WitBackend for GraphBackend {
     }
 }
 
+// ── Symbolic-capture backend for the streamed emission (P5.3 task #1) ───────
+
+/// Latched protocol inputs held on every row of the streamed layout (read at
+/// offset 0 from anywhere): 0=rc, 1=dinv, 2=ox, 3+i=comp[i]. The streamed
+/// `OodsEval` does not put these in the node stream.
+pub const N_LATCHED: usize = 3 + 2 * SECURE_EXTENSION_DEGREE;
+
+fn latched_slot(kind: AuxKind) -> usize {
+    match kind {
+        AuxKind::Rc => 0,
+        AuxKind::Dinv => 1,
+        AuxKind::Ox => 2,
+        AuxKind::Comp(i) => 3 + i,
+    }
+}
+
+/// A symbolic linear form over stream nodes + latched columns + a constant,
+/// carrying its concrete value: `value = Σ coeff·node_val + Σ d·latched_val +
+/// constant`. The streamed emission reconstructs each operand in-AIR from this —
+/// read every node at its scheduled offset, scale by `coeff` (a preprocessed
+/// value), add the latched reads (offset 0) and the constant. The two impls
+/// before this captured only summary stats / dep sets; this captures the FULL
+/// arithmetic so the binding `w − a·b == 0` can be emitted off-stream.
+#[derive(Clone, Default)]
+pub struct StreamForm {
+    /// `(stream-node id, coefficient)` terms (merged by id).
+    pub nodes: Vec<(u32, SecureField)>,
+    /// `(latched slot, coefficient)` terms (merged by slot).
+    pub latched: Vec<(usize, SecureField)>,
+    pub constant: SecureField,
+    /// The concrete value the form evaluates to.
+    pub value: SecureField,
+}
+
+impl StreamForm {
+    fn konst(x: SecureField) -> Self {
+        Self {
+            nodes: Vec::new(),
+            latched: Vec::new(),
+            constant: x,
+            value: x,
+        }
+    }
+    fn is_scalar(&self) -> bool {
+        self.nodes.is_empty() && self.latched.is_empty()
+    }
+    /// Merge a `(key, coeff)` term into a sorted-by-key Vec (accumulating coeffs).
+    fn merge_term<K: Ord + Copy>(terms: &mut Vec<(K, SecureField)>, key: K, coeff: SecureField) {
+        match terms.binary_search_by(|(k, _)| k.cmp(&key)) {
+            Ok(i) => terms[i].1 += coeff,
+            Err(i) => terms.insert(i, (key, coeff)),
+        }
+    }
+    fn add_scaled(&mut self, other: &Self, scale: SecureField) {
+        for &(id, c) in &other.nodes {
+            Self::merge_term(&mut self.nodes, id, c * scale);
+        }
+        for &(slot, c) in &other.latched {
+            Self::merge_term(&mut self.latched, slot, c * scale);
+        }
+        self.constant += other.constant * scale;
+        self.value += other.value * scale;
+    }
+    fn add(a: &Self, b: &Self) -> Self {
+        let mut out = a.clone();
+        out.add_scaled(b, SecureField::one());
+        out
+    }
+    fn sub(a: &Self, b: &Self) -> Self {
+        let mut out = a.clone();
+        out.add_scaled(b, -SecureField::one());
+        out
+    }
+    fn neg(a: &Self) -> Self {
+        let mut out = Self::konst(SecureField::zero());
+        out.add_scaled(a, -SecureField::one());
+        out
+    }
+    /// `v_mul` is reached only when at least one operand is a scalar (Handle
+    /// routes node·node to `witness_mul`). Scale the non-scalar by the scalar.
+    fn mul(a: &Self, b: &Self) -> Self {
+        if a.is_scalar() {
+            let mut out = Self::konst(SecureField::zero());
+            out.add_scaled(b, a.value);
+            out
+        } else {
+            assert!(b.is_scalar(), "StreamForm::mul of two non-scalars");
+            let mut out = Self::konst(SecureField::zero());
+            out.add_scaled(a, b.value);
+            out
+        }
+    }
+    fn node(id: u32, value: SecureField) -> Self {
+        Self {
+            nodes: vec![(id, SecureField::one())],
+            latched: Vec::new(),
+            constant: SecureField::zero(),
+            value,
+        }
+    }
+    fn latched_ref(slot: usize, value: SecureField) -> Self {
+        Self {
+            nodes: Vec::new(),
+            latched: vec![(slot, SecureField::one())],
+            constant: SecureField::zero(),
+            value,
+        }
+    }
+}
+
+/// A captured node in the streamed schedule.
+#[derive(Clone)]
+pub enum StreamNode {
+    /// A mask sample (a source leaf; its value is committed into the stream).
+    Mask,
+    /// A witnessed product `value = a·b`; the operand forms reconstruct it in-AIR.
+    Product { a: StreamForm, b: StreamForm },
+}
+
+/// The full streamed-emission capture: every node's kind + value, the latched
+/// inputs, and the final DEEP-ALI equality forms (`lhs == rhs`). A schedule pass
+/// turns this into a (row, col) layout + preprocessed routing; the streamed
+/// `FrameworkEval` emits the degree-2 bindings from it.
+pub struct StreamCapture {
+    pub node_kind: Vec<StreamNode>,
+    pub node_value: Vec<SecureField>,
+    pub latched_value: [SecureField; N_LATCHED],
+    pub final_lhs: StreamForm,
+    pub final_rhs: StreamForm,
+}
+
+impl StreamCapture {
+    /// Evaluate a form against the captured node + latched values (the host
+    /// reference the in-AIR reconstruction must reproduce).
+    pub fn eval_form(&self, f: &StreamForm) -> SecureField {
+        let mut acc = f.constant;
+        for &(id, c) in &f.nodes {
+            acc += c * self.node_value[id as usize];
+        }
+        for &(slot, c) in &f.latched {
+            acc += c * self.latched_value[slot];
+        }
+        acc
+    }
+}
+
+/// Walks the chips through [`drive_multi`] with concrete OODS values (like
+/// [`MultiRecordBackend`]) while ALSO capturing each product's symbolic operand
+/// forms — the substrate the streamed `OodsEval` emits from.
+pub struct StreamBackend {
+    components: Vec<ComponentMask>,
+    cur: usize,
+    latched_value: [SecureField; N_LATCHED],
+    col_cursor: Vec<usize>,
+    preproc_cursor: usize,
+    node_kind: Vec<StreamNode>,
+    node_value: Vec<SecureField>,
+    final_lhs: Option<StreamForm>,
+    final_rhs: Option<StreamForm>,
+}
+
+impl StreamBackend {
+    pub fn new(
+        components: Vec<ComponentMask>,
+        random_coeff: SecureField,
+        denom_inverse: SecureField,
+        oods_x_doubled: SecureField,
+        comp: [SecureField; 2 * SECURE_EXTENSION_DEGREE],
+    ) -> Self {
+        let mut latched_value = [SecureField::zero(); N_LATCHED];
+        latched_value[0] = random_coeff;
+        latched_value[1] = denom_inverse;
+        latched_value[2] = oods_x_doubled;
+        latched_value[3..3 + 2 * SECURE_EXTENSION_DEGREE].copy_from_slice(&comp);
+        Self {
+            components,
+            cur: usize::MAX,
+            latched_value,
+            col_cursor: vec![0; 3],
+            preproc_cursor: 0,
+            node_kind: Vec::new(),
+            node_value: Vec::new(),
+            final_lhs: None,
+            final_rhs: None,
+        }
+    }
+
+    fn new_node(&mut self, kind: StreamNode, value: SecureField) -> u32 {
+        let id = self.node_value.len() as u32;
+        self.node_kind.push(kind);
+        self.node_value.push(value);
+        id
+    }
+
+    pub fn finish(self) -> StreamCapture {
+        StreamCapture {
+            node_kind: self.node_kind,
+            node_value: self.node_value,
+            latched_value: self.latched_value,
+            final_lhs: self.final_lhs.expect("final equality discharged"),
+            final_rhs: self.final_rhs.expect("final equality discharged"),
+        }
+    }
+}
+
+impl WitBackend for StreamBackend {
+    type V = StreamForm;
+
+    fn v_const(x: SecureField) -> Self::V {
+        StreamForm::konst(x)
+    }
+    fn v_add(a: Self::V, b: Self::V) -> Self::V {
+        StreamForm::add(&a, &b)
+    }
+    fn v_sub(a: Self::V, b: Self::V) -> Self::V {
+        StreamForm::sub(&a, &b)
+    }
+    fn v_mul(a: Self::V, b: Self::V) -> Self::V {
+        StreamForm::mul(&a, &b)
+    }
+    fn v_neg(a: Self::V) -> Self::V {
+        StreamForm::neg(&a)
+    }
+
+    fn next_mask<const N: usize>(
+        &mut self,
+        interaction: usize,
+        _offsets: [isize; N],
+    ) -> [Self::V; N] {
+        let cur = self.cur;
+        let col = if interaction == PREPROCESSED_TRACE_IDX
+            && !self.components[cur].preproc_indices.is_empty()
+        {
+            let c = self.components[cur].preproc_indices[self.preproc_cursor];
+            self.preproc_cursor += 1;
+            c
+        } else {
+            let c = self.col_cursor[interaction];
+            self.col_cursor[interaction] += 1;
+            c
+        };
+        let samples = self.components[cur].mask[interaction][col].clone();
+        assert_eq!(samples.len(), N, "OODS mask offset count mismatch");
+        std::array::from_fn(|i| {
+            let id = self.new_node(StreamNode::Mask, samples[i]);
+            StreamForm::node(id, samples[i])
+        })
+    }
+
+    fn aux(&mut self, kind: AuxKind) -> Self::V {
+        let slot = latched_slot(kind);
+        StreamForm::latched_ref(slot, self.latched_value[slot])
+    }
+
+    fn witness_mul(&mut self, a: Self::V, b: Self::V) -> Self::V {
+        let value = a.value * b.value;
+        let id = self.new_node(StreamNode::Product { a, b }, value);
+        StreamForm::node(id, value)
+    }
+
+    fn assert_eq(&mut self, lhs: Self::V, rhs: Self::V) {
+        self.final_lhs = Some(lhs);
+        self.final_rhs = Some(rhs);
+    }
+
+    fn start_component(&mut self) {
+        self.cur = self.cur.wrapping_add(1);
+        self.col_cursor = vec![0; 3];
+        self.preproc_cursor = 0;
+    }
+}
+
 // ── In-AIR verify backend (V = E::EF) ──────────────────────────────────────
 
 /// Re-reads the recorded columns via `next_trace_mask` (in the same allocation
