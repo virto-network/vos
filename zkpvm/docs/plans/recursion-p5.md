@@ -1,10 +1,12 @@
 # P5 build plan: data-scaling the proven recursion to the real 76-segment chain
 
-Status: **P5.0 + P5.1 + P5.2a LANDED 2026-06-18; P5.2b steps 1+2 LANDED
-2026-06-19 (LOCAL); P5.2b-remainder + P5.3–P5.5 + P5-perf PLANNED.** (P5.2a = the
-auto-witnessing OODS evaluator; P5.2b 1+2 = all 31 components driven through it
-[matched vs stwo] + the single-uniform-component continuous Horner + total width
-160720 M31 measured. Remaining 2b = claimed-sum balance + real-segment match.
+Status: **P5.0 + P5.1 + P5.2a LANDED 2026-06-18; P5.2 (OODS embed) COMPLETE
+2026-06-19 (LOCAL); P5.3–P5.5 + P5-perf PLANNED.** (P5.2 = the auto-witnessing
+OODS evaluator [P5.2a] driving ALL 31 components, matched vs stwo, single-
+uniform-component continuous Horner proving at degree ≤ 2, total width 160720 M31
+measured, AND matched against a REAL `prove_canonical` segment's
+`composition_oods_eval` [P5.2b 1-3] — the OODS-embed gate is CLOSED. The
+claimed-sum balance is separate and moves to P5.3's latched-challenge assembly.
 See the P5.2 section's status block.)
 Branch `voucher-state-transition`. P4 is COMPLETE —
 the recursion *machinery* is proven (`recursion-p4.md`): the single-uniform-component
@@ -362,14 +364,35 @@ bumped in P5.0.
 >   width (160600 M31 columns, no distribution across perm rows), so the design's
 >   "unmeasured width" make-or-break resolves FAVOURABLY.**
 >
-> **P5.2b REMAINING:** (a) the **claimed-sum balance** — `claimed_sums.sum()==0`
-> (`verify.rs:299`) + the boundary-binding claimed sums (`verify.rs:316-327`,
-> `boundary_binding.rs`); (b) the **real-segment composition match** — replay the
-> verifier transcript (`verify.rs:178-347`) on a real `prove_canonical` proof to
-> reconstruct the real `lookup_elements`/`oods_point`/`random_coeff`/`claimed_sums`
-> + the per-component mask from `sampled_values`, and match the proof's actual
-> `composition_oods_eval` (vs the synthetic-mask fuzz). Both are plumbing — the
-> evaluator + accumulation are proven.
+> - **Step 3 — REAL-segment composition match DONE 2026-06-19 (commit `1c1c6d0`,
+>   `tests/oods_auto_real_segment.rs`):** a real `prove_canonical` 31-component
+>   segment proof's actual OODS composition is re-evaluated in-AIR and matches its
+>   own `composition_oods_eval`. New crate seam
+>   `verify::reconstruct_oods_for_recursion` replays the verifier's FS transcript
+>   (the channel-affecting steps of `verify_with_options_explicit_components` + the
+>   stwo verifier head) and returns the per-component masks sliced from
+>   `sampled_values`, the drawn `lookup_elements`, the oods-derived scalars, the
+>   per-component claimed_sum/log_size, and the proof's composition value
+>   (= the recombined real composition mask). KEY: components are selected by the
+>   PROOF's `component_mask` (canonical forces all 31), NOT
+>   `active_components_verifier` (which drops naturally-inactive chips ⇒ trace-layout
+>   mismatch). All 31 driven through the evaluator (continuous Horner, real mask)
+>   reproduce the proof's `composition_oods_eval` (~24s release, `#[ignore]`).
+>
+> **⇒ THE P5.2 OODS-EMBED GATE IS CLOSED:** the full 31-component composition
+> re-evaluates in-AIR at degree ≤ 2 as ONE uniform component, matches a REAL
+> proof's `composition_oods_eval`, `assert_constraints` green, proves+verifies,
+> width measured (160K M31, tractable).
+>
+> **REMAINING (→ P5.3, the per-child assembly):** the **claimed-sum balance** is
+> SEPARATE from the OODS re-eval (`recursion-p5.md` BUILD STEP 3) and pairs with
+> the latched-challenge assembly: `claimed_sums.sum()==0` (`verify.rs:299`, a
+> degree-1 sum over committed columns) + the boundary-binding claimed sums
+> (`verify.rs:316-327` → `boundary_binding::check_boundary_claimed_sums`, which
+> recomputes the 4 boundary chips' sums as witnessed inverses of relation combines
+> over the public boundary states — `expected_{register_file,program_boundary,
+> memory_root}_sum`). The `reconstruct_oods_for_recursion` seam already returns the
+> real `claimed_sums` + `lookup_elements` these need.
 
 **GOAL.** Replace GATE 4's representative 2-constraint OODS consumer with a harness that
 re-evaluates the FULL canonical segment AIR (31 components, **530 `add_constraint` sites**,
@@ -494,9 +517,20 @@ MEASUREMENT the design has front-loaded (`recursion-design.md:170-175,197-199`).
 2. Scale GATE 3's decommit to the 4 trace trees (preproc/main/interaction/composition) at
    real heights + the per-FRI-layer trees, leaves from the fold reconstruction.
 3. Wire ChannelChip (full real transcript, ~397 perms) + the latched challenges driving all
-   of the above + P5.2's OODS embed, in ONE uniform component.
+   of the above + P5.2's OODS embed, in ONE uniform component. P5.2 ships
+   `verify::reconstruct_oods_for_recursion` (the FS-transcript replay → per-component masks +
+   `lookup_elements` + oods scalars + claimed_sums) and `framework_access::drive_chip_oods` +
+   `oods_auto::drive_multi` (the all-31 continuous-Horner embed) — assemble these here; the
+   latched challenges REPLACE the seam's host-replayed scalars with channel-derived ones.
 4. Bind the real SegmentState boundary fields (the seam fields come from the real child's
    `initial_state`/`final_state`, `proof.rs:126-140`).
+5. **Claimed-sum balance (moved from P5.2 — it's separate from the OODS re-eval):**
+   `claimed_sums.sum()==0` (a degree-1 sum over the committed per-component claimed_sum
+   columns) + the boundary-binding claimed sums (`verify.rs:316-327` →
+   `boundary_binding::check_boundary_claimed_sums` — recompute the 4 boundary chips' sums as
+   witnessed inverses of relation combines over the public boundary states), driven by the
+   latched challenges. The `reconstruct_oods_for_recursion` seam already returns the real
+   `claimed_sums` + `lookup_elements`.
 
 **GREEN GATE.** The full single-child verifier-AIR proves+verifies a REAL canonical segment
 end-to-end; **MEASURE its natural log_size, width, prove-time, and peak memory.** The design
