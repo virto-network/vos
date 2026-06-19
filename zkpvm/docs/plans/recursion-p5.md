@@ -790,6 +790,72 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > non-8-multiple QM31-wide FRI leaves — the partial-rate `finalize` pad); (e)
 > boundary + claimed-sum balance (`boundary_binding::check_boundary_claimed_sums`,
 > scale-free; uses `data.lookup_elements` + the public boundary states).
+>
+> **PER-CHILD ASSEMBLY STEPS 1 + 1b LANDED 2026-06-19 (LOCAL,
+> `tests/recursion_child_assembly.rs`, commits `79fca73` / `461f0a8`).** The
+> channel transcript replay and the streamed OODS embed now co-exist in ONE
+> uniform `FrameworkEval`, driven off ONE real `prove_canonical` segment, with the
+> first cross-chip latch bindings live at canonical scale.
+> - **Step 1 (rc latch):** the merged component reads the channel block (the proven
+>   `join_assembly` AIR) AND the streamed embed block (the proven
+>   `recursion_stream_embed` AIR) on a shared row grid (the embed's 6251 stream rows
+>   ride within the channel's 16384), sharing `not_last` (channel digest chain +
+>   embed latched constancy) and the storage indexing. The embed's `rc` latched
+>   column (`latched[0]`) is BOUND to the channel's composition-`random_coeff`
+>   squeeze via an `is_rc_draw` preprocessed indicator (the first `Squeeze` at/after
+>   `prefix_len`): `is_rc_draw·(lat_rc[j] − squeeze_out[j]) == 0`, degree 2. GATE
+>   GREEN @ **log 14**, ~90s/prove (283s for honest + 2 tampers): proves+verifies;
+>   a tampered transcript value AND a tampered embed value are rejected.
+> - **Step 1b (in-circuit OODS-point derivation):** `dinv` (`latched[1]`) and `ox`
+>   (`latched[2]`) are no longer trusted host inputs — they are DERIVED in-AIR from
+>   a latched `oods_t` (bound to its squeeze, the 2nd `Squeeze` at/after
+>   `prefix_len`, via `is_oods_draw`): the `get_random_point` map (`x=(1−t²)·inv,
+>   y=2t·inv`), then `ox = double_x^{mlbd-1}(oods.x)` (each `double_x(x)=2x²−1`
+>   step's square witnessed) and `dinv = 1/coset_vanishing(coset, oods)` (shift by
+>   the fixed coset point `C = step_size.half().to_point() − coset.initial` of
+>   `CanonicCoset::new(mlbd).coset`, then the same `double_x` chain). `mlbd=14 ⇒
+>   dbl_steps=13`; all constraints degree ≤ 2; `mlbd`/`oods_point`/transcript come
+>   from `extract_recursion_data`. GATE GREEN @ **log 14**, ~87s/prove (347s for
+>   honest + 3 tampers): a tampered `oods_t` is rejected, isolating the new
+>   derivation (only it reads `oods_t`). ⇒ `rc`/`dinv`/`ox` are all now
+>   transcript-derived; `comp` (`latched[3..11]`) + the lookup elements + the embed
+>   LEAVES remain host-supplied (bound via the FRI/DEEP + Merkle path, steps 2–3).
+>
+> **REMAINING — precise architecture (grounded this session):**
+> - **Steps 2 + 3 (FRI fold chain + multi-tree Merkle decommit) are a COUPLED
+>   subsystem that only becomes SOUND TOGETHER**, and they need a **shared perm
+>   block**: ONE `eval_permutation` per row, a row-type selector choosing between a
+>   channel-transcript perm and a Merkle `hash_children` perm. The Merkle decommit
+>   perms (~8.7K FRI-layer + ~6.2K trace-tree) EXTEND the perm-row count to ~23.5K
+>   ⇒ **log 15** (≤ canonical 19). The FRI fold chain's per-layer SIBLINGS come from
+>   the FRI-layer Merkle decommit (`fri_witness`) and its layer-0 input
+>   (`fri_answers` / `data.first_layer_evals`) from the trace-tree decommit's
+>   `queried_values` — so building the FRI fold chain WITHOUT the Merkle decommit
+>   adds columns but no soundness (the mechanism alone is already proven in
+>   `fri_fold_chain.rs`). Latch the 14 `fold_alphas` (the 4th..17th `Squeeze`
+>   at/after `prefix_len`) to the channel; last layer = degree-0 constant. **This
+>   shared-perm-block unification is the architectural crux of the full assembly and
+>   the right thing to de-risk next.**
+> - **Step 4 (claimed-sum balance) is INDEPENDENT** of FRI/Merkle — it rides log 14
+>   (no new perm-rows) and is the federation cash-in (binds the public boundary
+>   states = io-hash in `final.registers[9..13]` + memory roots). Mechanism: bind
+>   the 31 `claimed_sums` to the channel `mix_felts(claimed_sums)` absorb (16 absorb
+>   records, the `fixed_point_join` commit-absorb bind pattern), bind the 3 boundary
+>   relations' lookup elements (`RegisterMemory`/`ProgramExecution`/`MerkleNode`) to
+>   their draw squeezes (each `relation!` draws `z,alpha` from ONE squeeze via
+>   `draw_secure_felts(2)` ⇒ `z=out[0..4]`, `alpha=out[4..8]`; `alpha_powers`
+>   derived in-AIR as witnessed products), then recompute
+>   `check_boundary_claimed_sums` in-AIR (`combine = Σ alpha^i·tuple_i − z`,
+>   witnessed inverses) + `claimed_sums.sum()==0`. Could land before steps 2+3.
+> - **`comp` latch + embed leaves:** the embed's `comp` (`latched[3..11]`) is the
+>   composition-tree OODS sampled values, and the leaves are the per-component OODS
+>   sampled values — both absorbed via `mix_felts(sampled_values)` and verified by
+>   the trace-tree Merkle decommit; they bind in step 3.
+> - **`mlbd` segment-invariance caveat:** the test's tiny segment has `mlbd=14`; the
+>   production 100k-step canonical segments share a (locked) profile ⇒ a fixed
+>   `mlbd` across them, so `dbl_steps`/`C` are fixed AIR parameters there. The
+>   `dbl_steps` loop is already runtime-parametric, so a different `mlbd` just
+>   changes the chain length.
 
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
 scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
