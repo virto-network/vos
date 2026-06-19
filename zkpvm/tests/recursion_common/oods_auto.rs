@@ -793,6 +793,235 @@ impl WitBackend for MultiRecordBackend {
     }
 }
 
+// ── Bandwidth-measurement backend (P5.3 task #0: flat-schedule dataflow) ────
+
+/// The streamable *support* of a value threaded through a chip's `evaluate`: the
+/// sorted set of streamed-schedule node indices it linearly depends on. Latched
+/// columns (the aux `rc`/`dinv`/`ox`/composition mask) and constants contribute
+/// nothing — in the streamed layout they are held on EVERY row, so they are
+/// reachable at offset 0 from anywhere and never count toward cross-row distance.
+/// Only mask samples and witnessed products are nodes.
+#[derive(Clone, Default)]
+pub struct LinForm {
+    support: Vec<u32>,
+}
+
+impl LinForm {
+    fn empty() -> Self {
+        Self {
+            support: Vec::new(),
+        }
+    }
+    fn node(i: u32) -> Self {
+        Self { support: vec![i] }
+    }
+    /// Sorted, deduplicated union of two supports (linear combination).
+    fn union(a: &Self, b: &Self) -> Self {
+        if a.support.is_empty() {
+            return b.clone();
+        }
+        if b.support.is_empty() {
+            return a.clone();
+        }
+        let mut s = Vec::with_capacity(a.support.len() + b.support.len());
+        s.extend_from_slice(&a.support);
+        s.extend_from_slice(&b.support);
+        s.sort_unstable();
+        s.dedup();
+        Self { support: s }
+    }
+}
+
+/// Measures the cross-row operand *bandwidth* of the flat OODS schedule
+/// [`drive_multi`] produces. For every witnessed product it records how far back
+/// in the streamed schedule the product's furthest operand node lives (the offset
+/// a streamed row would have to reach), and it tracks each node's lifetime so the
+/// live-set width `W` (the number of simultaneously-live nodes — the window a
+/// banded layout must hold) can be computed, both for the naive
+/// (`TraceEval::new` reads-all-masks-up-front) order and for a lazy order that
+/// defers each mask read to its first use.
+///
+/// It carries NO field values: the schedule's *shape* — which products witness,
+/// in what order, referencing which nodes — is fixed by the walk alone,
+/// independent of the concrete OODS samples. So the same `drive_multi` walk that
+/// the record/verify backends use yields the identical node sequence here.
+pub struct BandwidthBackend {
+    next_node: u32,
+    /// `death[n]` = the last streamed position at which node `n` is consumed
+    /// (defaults to its own birth index, so an unused node has a unit lifetime).
+    death: Vec<u32>,
+    /// `first_use[n]` = the first position node `n` is consumed (`u32::MAX` until
+    /// used) — the earliest a lazy schedule could place a deferred mask read.
+    first_use: Vec<u32>,
+    /// Whether node `n` is a mask sample (deferrable) vs a witnessed product
+    /// (pinned to its creation, since it depends on earlier nodes).
+    is_mask: Vec<bool>,
+    /// Per witnessed product: the distance to its furthest streamable operand.
+    pub distances: Vec<u32>,
+    /// The component index each recorded distance belongs to (parallel array).
+    pub dist_component: Vec<usize>,
+    cur_component: usize,
+    pub n_mask_nodes: usize,
+    pub n_witness_nodes: usize,
+    /// Witnessed products whose operands are ALL latched (e.g. `ox·right`): these
+    /// stay latched in the streamed layout, so they are not streamed nodes.
+    pub n_latched_products: usize,
+}
+
+impl Default for BandwidthBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BandwidthBackend {
+    pub fn new() -> Self {
+        Self {
+            next_node: 0,
+            death: Vec::new(),
+            first_use: Vec::new(),
+            is_mask: Vec::new(),
+            distances: Vec::new(),
+            dist_component: Vec::new(),
+            cur_component: usize::MAX,
+            n_mask_nodes: 0,
+            n_witness_nodes: 0,
+            n_latched_products: 0,
+        }
+    }
+
+    /// Total streamed nodes (mask samples + witnessed products).
+    pub fn n_nodes(&self) -> usize {
+        self.next_node as usize
+    }
+
+    /// Record that every node in `lf` is consumed at streamed position `at`.
+    fn consume(&mut self, lf: &LinForm, at: u32) {
+        for &n in &lf.support {
+            self.death[n as usize] = at; // monotonic: `at` only ever grows
+            if self.first_use[n as usize] == u32::MAX {
+                self.first_use[n as usize] = at;
+            }
+        }
+    }
+
+    fn new_node(&mut self, is_mask: bool) -> u32 {
+        let n = self.next_node;
+        self.next_node += 1;
+        self.death.push(n);
+        self.first_use.push(u32::MAX);
+        self.is_mask.push(is_mask);
+        n
+    }
+
+    /// Max live-set under the naive (read-all-masks-up-front) order: a node is
+    /// live from its creation index to its last use.
+    pub fn live_set_naive(&self) -> u32 {
+        self.sweep(false)
+    }
+
+    /// Max live-set if every mask read is deferred to its first use (the lazy-read
+    /// restructure): a mask node is live only across `[first_use, last_use]`.
+    pub fn live_set_lazy(&self) -> u32 {
+        self.sweep(true)
+    }
+
+    fn sweep(&self, lazy: bool) -> u32 {
+        let n = self.next_node as usize;
+        if n == 0 {
+            return 0;
+        }
+        // A node may die at position `n` (consumed by the final equality), so
+        // `death + 1` reaches `n + 1`.
+        let mut delta = vec![0i64; n + 2];
+        for node in 0..n {
+            let death = self.death[node];
+            let birth = if lazy && self.is_mask[node] && self.first_use[node] != u32::MAX {
+                self.first_use[node].min(death)
+            } else {
+                node as u32
+            };
+            delta[birth as usize] += 1;
+            delta[death as usize + 1] -= 1;
+        }
+        let mut cur = 0i64;
+        let mut max = 0i64;
+        for d in delta {
+            cur += d;
+            if cur > max {
+                max = cur;
+            }
+        }
+        max as u32
+    }
+}
+
+impl WitBackend for BandwidthBackend {
+    type V = LinForm;
+
+    fn v_const(_x: SecureField) -> Self::V {
+        LinForm::empty()
+    }
+    fn v_add(a: Self::V, b: Self::V) -> Self::V {
+        LinForm::union(&a, &b)
+    }
+    fn v_sub(a: Self::V, b: Self::V) -> Self::V {
+        LinForm::union(&a, &b)
+    }
+    fn v_mul(a: Self::V, b: Self::V) -> Self::V {
+        // Reached only when at least one operand is a constant (degree 0 ⇒ empty
+        // support), so this preserves the support of the non-constant operand.
+        LinForm::union(&a, &b)
+    }
+    fn v_neg(a: Self::V) -> Self::V {
+        a
+    }
+
+    fn next_mask<const N: usize>(
+        &mut self,
+        _interaction: usize,
+        _offsets: [isize; N],
+    ) -> [Self::V; N] {
+        // One streamed node per offset sample (each is a distinct committed OODS
+        // value); values are irrelevant — only the count and order matter.
+        std::array::from_fn(|_| {
+            self.n_mask_nodes += 1;
+            LinForm::node(self.new_node(true))
+        })
+    }
+
+    fn aux(&mut self, _kind: AuxKind) -> Self::V {
+        // Latched: held on every row, never a streamed node.
+        LinForm::empty()
+    }
+
+    fn witness_mul(&mut self, a: Self::V, b: Self::V) -> Self::V {
+        let at = self.next_node; // the product's prospective node index
+        let union = LinForm::union(&a, &b);
+        self.consume(&union, at);
+        if union.support.is_empty() {
+            // latched · latched ⇒ a latched product, not a streamed node.
+            self.n_latched_products += 1;
+            return LinForm::empty();
+        }
+        let dist = at - union.support[0]; // distance to the furthest operand node
+        self.distances.push(dist);
+        self.dist_component.push(self.cur_component);
+        self.n_witness_nodes += 1;
+        LinForm::node(self.new_node(false))
+    }
+
+    fn assert_eq(&mut self, lhs: Self::V, rhs: Self::V) {
+        let at = self.next_node;
+        self.consume(&lhs, at);
+        self.consume(&rhs, at);
+    }
+
+    fn start_component(&mut self) {
+        self.cur_component = self.cur_component.wrapping_add(1);
+    }
+}
+
 // ── In-AIR verify backend (V = E::EF) ──────────────────────────────────────
 
 /// Re-reads the recorded columns via `next_trace_mask` (in the same allocation
