@@ -1022,6 +1022,118 @@ impl WitBackend for BandwidthBackend {
     }
 }
 
+// ── Graph-capture backend (P5.3 task #1: the streamed-layout DAG) ───────────
+
+/// A captured node in the OODS computation graph.
+#[derive(Clone)]
+pub struct GraphNode {
+    /// A mask sample (a source leaf — deferrable / replicable onto consumer rows)
+    /// vs a witnessed product.
+    pub is_mask: bool,
+    /// The streamable operand nodes this node depends on: for a product, the
+    /// `support(a) ∪ support(b)` of its two operands; empty for a mask sample.
+    pub deps: Vec<u32>,
+}
+
+/// Captures the full OODS schedule as a computation DAG — every mask sample and
+/// witnessed product is a node, and a product records the streamable nodes its
+/// two operands reference. This is the substrate the streamed `OodsEval`
+/// schedules into a windowed (row, col) layout, and it lets the two candidate
+/// layouts be costed directly from the real graph:
+///
+/// * **window / lane** layout — hold the live set in `W` register columns, read
+///   at offset `{0, -1}`; cost = the live-set width `W`.
+/// * **co-locate** layout — replicate each mask sample onto the rows that consume
+///   it (offset 0) and read only *product → product* deps cross-row; cost = the
+///   replication (Σ mask uses) plus the product-dep offset reach.
+///
+/// Carries no field values (the graph shape is value-independent), so the same
+/// `drive_multi` walk yields the identical DAG here.
+pub struct GraphBackend {
+    pub nodes: Vec<GraphNode>,
+    /// The streamable deps of the final DEEP-ALI equality.
+    pub final_deps: Vec<u32>,
+}
+
+impl Default for GraphBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphBackend {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            final_deps: Vec::new(),
+        }
+    }
+
+    pub fn n_mask(&self) -> usize {
+        self.nodes.iter().filter(|n| n.is_mask).count()
+    }
+    pub fn n_product(&self) -> usize {
+        self.nodes.iter().filter(|n| !n.is_mask).count()
+    }
+}
+
+impl WitBackend for GraphBackend {
+    type V = LinForm;
+
+    fn v_const(_x: SecureField) -> Self::V {
+        LinForm::empty()
+    }
+    fn v_add(a: Self::V, b: Self::V) -> Self::V {
+        LinForm::union(&a, &b)
+    }
+    fn v_sub(a: Self::V, b: Self::V) -> Self::V {
+        LinForm::union(&a, &b)
+    }
+    fn v_mul(a: Self::V, b: Self::V) -> Self::V {
+        LinForm::union(&a, &b)
+    }
+    fn v_neg(a: Self::V) -> Self::V {
+        a
+    }
+
+    fn next_mask<const N: usize>(
+        &mut self,
+        _interaction: usize,
+        _offsets: [isize; N],
+    ) -> [Self::V; N] {
+        std::array::from_fn(|_| {
+            let id = self.nodes.len() as u32;
+            self.nodes.push(GraphNode {
+                is_mask: true,
+                deps: Vec::new(),
+            });
+            LinForm::node(id)
+        })
+    }
+
+    fn aux(&mut self, _kind: AuxKind) -> Self::V {
+        LinForm::empty()
+    }
+
+    fn witness_mul(&mut self, a: Self::V, b: Self::V) -> Self::V {
+        let union = LinForm::union(&a, &b);
+        if union.support.is_empty() {
+            // latched · latched ⇒ a latched column, not a streamed node.
+            return LinForm::empty();
+        }
+        let id = self.nodes.len() as u32;
+        self.nodes.push(GraphNode {
+            is_mask: false,
+            deps: union.support,
+        });
+        LinForm::node(id)
+    }
+
+    fn assert_eq(&mut self, lhs: Self::V, rhs: Self::V) {
+        self.final_deps = LinForm::union(&lhs, &rhs).support;
+    }
+}
+
 // ── In-AIR verify backend (V = E::EF) ──────────────────────────────────────
 
 /// Re-reads the recorded columns via `next_trace_mask` (in the same allocation
