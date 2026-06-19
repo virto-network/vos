@@ -235,52 +235,55 @@ fn stream_capture_fidelity() {
 /// Ops per streamed row (the embed density knob — the bounded offset window is in
 /// rows = max cell reach / OPS_PER_ROW).
 const OPS_PER_ROW: usize = 8;
-/// Stream/latched terms per `Mac` cell (≥1 + the previous partial). Bounds the
-/// per-cell coefficient width; big operands chain across cells.
-const TERMS_PER_MAC: usize = 4;
 
 /// GATE: the capture compiles to a micro-op SCHEDULE whose host interpreter
 /// reproduces every captured product value and the global composition — and
-/// MEASURE the streamed layout (cells, op mix, rows, window reach). This is the
-/// host reference the streamed AIR must reproduce; no proving yet.
+/// MEASURE the streamed layout vs `terms_per_mac` (cells, op mix, rows, window
+/// reach). The reach (in rows) is the dense-coeff window depth the AIR mask
+/// needs; a higher `terms_per_mac` shortens the Mac chains, packing products
+/// denser and cutting the reach (the constraint stays degree 2 regardless of the
+/// nonzero count). This is the host reference the streamed AIR must reproduce; no
+/// proving yet.
 #[test]
 fn stream_schedule_fidelity() {
     let s = setup();
     let capture = build_capture(&s);
-    let sched = capture.schedule(TERMS_PER_MAC);
-
-    // The interpreter (re-evaluating ops from scratch) matches the stored values.
-    let interp = sched.interpret();
-    assert_eq!(interp.len(), sched.values.len());
-    for (i, (a, b)) in interp.iter().zip(&sched.values).enumerate() {
-        assert_eq!(a, b, "schedule cell {i}: interpreter != stored value");
-    }
-    // The final DEEP-ALI equality holds and equals the global composition.
-    assert_eq!(
-        interp[sched.lhs_cell], interp[sched.rhs_cell],
-        "scheduled final lhs != rhs"
-    );
-    assert_eq!(
-        interp[sched.lhs_cell], s.truth,
-        "scheduled composition != global PointEvaluationAccumulator"
-    );
-
-    let n_cells = sched.ops.len();
-    let rows = n_cells.div_ceil(OPS_PER_ROW);
-    let log = (usize::BITS - rows.next_power_of_two().leading_zeros()).saturating_sub(1);
-    let reach_cells = sched.max_reach();
-    let reach_rows = reach_cells.div_ceil(OPS_PER_ROW);
 
     eprintln!(
-        "stream_schedule_fidelity GREEN (TERMS_PER_MAC={TERMS_PER_MAC}, OPS_PER_ROW={OPS_PER_ROW}): \
-         interpreter reproduces the global composition.\n  \
-         {n_cells} cells = {} leaf + {} mac + {} mul\n  \
-         rows ≈ {rows} → log {log} (channel ~log 14)\n  \
-         window reach: {reach_cells} cells = {reach_rows} rows (the AIR mask offset depth; the \
-         offset spike proved offsets up to ~N/2 read the exact logical row)",
-        sched.n_leaf, sched.n_mac, sched.n_mul,
+        "stream_schedule_fidelity GREEN (OPS_PER_ROW={OPS_PER_ROW}): the interpreter reproduces \
+         the global composition for every terms_per_mac; reach (rows) is the AIR mask window depth.\n  \
+         {:>4}  {:>8}  {:>7} {:>7} {:>7}  {:>6} {:>4}  {:>7} {:>5}",
+        "T/mac", "cells", "leaf", "mac", "mul", "rows", "log", "reach_c", "rows",
     );
 
-    assert!(n_cells > 0);
-    assert!(reach_cells > 0);
+    for &t in &[2usize, 4, 8, 16, 32, 64, 128, 256] {
+        let sched = capture.schedule(t);
+
+        // The interpreter (re-evaluating ops from scratch) matches the stored values.
+        let interp = sched.interpret();
+        assert_eq!(interp.len(), sched.values.len());
+        for (i, (a, b)) in interp.iter().zip(&sched.values).enumerate() {
+            assert_eq!(a, b, "T={t} cell {i}: interpreter != stored value");
+        }
+        assert_eq!(
+            interp[sched.lhs_cell], interp[sched.rhs_cell],
+            "T={t} scheduled final lhs != rhs"
+        );
+        assert_eq!(
+            interp[sched.lhs_cell], s.truth,
+            "T={t} scheduled composition != global PointEvaluationAccumulator"
+        );
+
+        let n_cells = sched.ops.len();
+        let rows = n_cells.div_ceil(OPS_PER_ROW);
+        let log = (usize::BITS - rows.next_power_of_two().leading_zeros()).saturating_sub(1);
+        let reach_cells = sched.max_reach();
+        let reach_rows = reach_cells.div_ceil(OPS_PER_ROW);
+        eprintln!(
+            "  {t:>4}  {n_cells:>8}  {:>7} {:>7} {:>7}  {rows:>6} {log:>4}  {reach_cells:>7} {reach_rows:>5}",
+            sched.n_leaf, sched.n_mac, sched.n_mul,
+        );
+
+        assert!(n_cells > 0 && reach_cells > 0);
+    }
 }
