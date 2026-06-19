@@ -689,6 +689,38 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > (assert) THEN prove+verify (degree), MEASURE rows/width/time; then bind the streamed
 > `rc`/lookup-z/alpha to the channel-latched challenges (the join_assembly latch).
 >
+> **EMISSION CAPTURE + SCHEDULE BUILT + CHARACTERISED 2026-06-19 (commits `ff64c60`/
+> `d86b8ef`+sweep, LOCAL).** The StreamBackend emission's host half is built and
+> validated (no proving yet); the schedule layout is fully characterised.
+> - **`StreamBackend` (symbolic capture, `oods_auto.rs`) + `recursion_stream_capture.rs`:**
+>   a `WitBackend` whose V is a `StreamForm` (`Σ coeff·node + Σ d·latched + const` +
+>   the concrete value), capturing each product's two operand forms (eager EF can't
+>   stream — the read must defer to the consuming row). Host gate: every operand form
+>   reconstructs its value, every product = a·b, the final equality reproduces the
+>   global `PointEvaluationAccumulator`. 40139 nodes (16844 masks + 23295 products).
+>   **FINDING: max operand form = 265 node terms** (a constraint summing ~256 witnessed
+>   products) ⇒ no dense per-operand window-coeff vector; reconstruct big operands as
+>   PARTIAL-SUM CHAINS.
+> - **`StreamCapture::schedule` (chain-VM) + `Schedule::interpret`:** compiles the
+>   capture to a flat micro-op stream (`CellOp` = Leaf | Mac | Mul): products in
+>   capture order, each operand form a Mac chain (≤T terms/cell) over fresh Leaf copies
+>   of mask operands (co-located) + prior Mul cells; the interpreter reproduces the
+>   global composition for every T. **MEASURED (sweep T∈{2..256}, OPS=8):** 156–185k
+>   cells → log 15; window reach 223→**151 rows floor** (1201 cells) — set
+>   structurally by big-operand leaf spans + product-operand rank-spans inflated by
+>   interspersed leaf/mac cells, NOT chain length. **A single flat stream's window is
+>   too deep for a dense per-cell coeff layout (≈151·OPS positions/cell ⇒ ~190M
+>   preproc cells).**
+> - **⇒ NEXT (the schedule's final form): TWO-STREAM / TYPED-LANE layout** — a compact
+>   product-result stream R (one cell/product, read at bounded rank-offset ≤W_p=65) +
+>   the working stream W (leaf/mac, small T ⇒ local reach ~2 rows). Bounds both windows
+>   to ~tens of offsets (R window ≈ 65/OPS_R rows). Dense-coeff cost ≈ cells × window
+>   ≈ tens of millions of preproc cells — tractable (matches the design's "WIDTH is the
+>   cost, minutes/GB"), exact lane/window tuning is an optimisation. THEN: the streamed
+>   `FrameworkEval` (route_spike windowed-coeff mechanism over the two streams), GATE
+>   against the global composition (assert THEN prove — assert does NOT catch the
+>   degree bound), MEASURE; then bind streamed rc/lookup-z/alpha to the channel latches.
+>
 > **NEXT (precise, grounded):** (a) ✅ **DONE** — layout DECIDED (co-locate, W_p=65)
 > + the variable-offset preprocessed-routing mechanism de-risked (above); remaining
 > = the StreamBackend emission (symbolic linear forms + schedule + trace fill +
