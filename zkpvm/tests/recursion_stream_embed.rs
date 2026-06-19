@@ -532,3 +532,152 @@ fn embed_gate() {
         n_preproc,
     );
 }
+
+// ── Real-segment gate: swap the synthetic mask for a real prove_canonical proof ──
+//
+// The synthetic mask fuzzes the arithmetisation (the per-component contribution is
+// a pure function of the mask). This gate drives the SAME streamed embed on a REAL
+// canonical segment's OODS data (via `reconstruct_oods_for_recursion`, the same
+// real-data path `oods_auto_real_segment` uses for the non-streamed embed) and
+// confirms (a) the schedule shape is SEGMENT-INVARIANT — the real layout's row
+// count + window depth match the synthetic — and (b) the embed proves+verifies on
+// real values + rejects a tamper. (a) is the design's core claim that lets the
+// routing "program" be PREPROCESSED (fixed across canonical segments).
+
+#[cfg(feature = "poseidon2-channel")]
+use recursion_common::oods_auto::{ComponentMask, StreamBackend, drive_multi};
+
+#[cfg(feature = "poseidon2-channel")]
+fn canonical_segment() -> (zkpvm::Proof, zkpvm::SideNote) {
+    use javm::PVM_REGISTER_COUNT;
+    use javm::instruction::Opcode;
+    use javm::interpreter::Interpreter;
+    use zkpvm::core::tracing::TracingPvm;
+    use zkpvm::prove_canonical;
+
+    let code = vec![
+        Opcode::Add64 as u8,
+        0x10,
+        2,
+        Opcode::Add64 as u8,
+        0x12,
+        3,
+        Opcode::Add64 as u8,
+        0x13,
+        4,
+        Opcode::Add64 as u8,
+        0x14,
+        5,
+        Opcode::Add64 as u8,
+        0x15,
+        6,
+        Opcode::Add64 as u8,
+        0x16,
+        7,
+        Opcode::Trap as u8,
+    ];
+    let bitmask: Vec<u8> = vec![1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 100;
+    regs[1] = 1;
+    let initial_memory = vec![0u8; 4 * 1024 * 1024];
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        initial_memory.clone(),
+        10_000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run(), javm::ExitReason::Trap);
+    let steps = tracing.into_trace();
+    let mut sn = zkpvm::SideNote::new(steps, code, bitmask).with_memory(initial_memory);
+    let proof = prove_canonical(&mut sn, &[]).expect("prove_canonical under Poseidon2-M31");
+    (proof, sn)
+}
+
+/// Build the co-locate layout from a REAL canonical segment's reconstructed OODS
+/// data (same `StreamBackend` capture, just real masks/scalars).
+#[cfg(feature = "poseidon2-channel")]
+fn real_layout() -> ColocateLayout {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use zkpvm::framework_access::drive_chip_oods;
+    use zkpvm::reconstruct_oods_for_recursion;
+
+    let (proof, sn) = canonical_segment();
+    assert_eq!(
+        proof.num_components,
+        zkpvm::chip_idx::COUNT,
+        "canonical proof must carry all 31 components"
+    );
+    let r = reconstruct_oods_for_recursion(&proof, &sn);
+    let component_masks: Vec<ComponentMask> = r
+        .component_masks
+        .into_iter()
+        .map(|m| ComponentMask {
+            mask: m.mask,
+            preproc_indices: m.preproc_indices,
+        })
+        .collect();
+    let backend = StreamBackend::new(
+        component_masks,
+        r.random_coeff,
+        r.denom_inverse,
+        r.oods_x_doubled,
+        r.comp_mask,
+    );
+    let ctx = Rc::new(RefCell::new(backend));
+    let lookup = &r.lookup_elements;
+    drive_multi(&ctx, &r.comps, |idx, ls, e| {
+        drive_chip_oods(idx, ls, lookup, e)
+    });
+    let capture = Rc::try_unwrap(ctx)
+        .unwrap_or_else(|_| panic!("a Handle outlived the real capture walk"))
+        .into_inner()
+        .finish();
+    capture
+        .schedule_two_stream(T_PER_MAC)
+        .layout_colocate(OPS_S, NLEAF)
+}
+
+/// THE REAL GATE (heavy): the streamed embed reproduces a REAL canonical segment's
+/// composition and proves+verifies; the layout shape matches the synthetic
+/// (schedule is segment-invariant); a tampered cell is rejected.
+#[cfg(feature = "poseidon2-channel")]
+#[test]
+#[ignore = "heavy: prove_canonical + real-segment streamed embed prove+verify (release)"]
+fn embed_gate_real() {
+    let lay = real_layout();
+    let syn = build_layout();
+
+    // (a) schedule invariance: the real segment's layout has the SAME shape as the
+    // synthetic — the design's claim that the routing program is segment-fixed.
+    assert_eq!(
+        (lay.n_rows, lay.dr, lay.max_leaf_in_row),
+        (syn.n_rows, syn.dr, syn.max_leaf_in_row),
+        "real-segment layout shape must match the synthetic (schedule not segment-invariant)"
+    );
+
+    // (b) the embed proves+verifies on REAL OODS values + rejects a tamper.
+    let oa_col = (NLEAF + lay.final_lane * 3) * SECURE_EXTENSION_DEGREE;
+    prove_and_verify(gen_trace(&lay, None))
+        .expect("real-segment streamed OODS embed must prove+verify at degree ≤ 2");
+    assert!(
+        prove_and_verify(gen_trace(&lay, Some(oa_col))).is_err(),
+        "a tampered committed cell must be rejected"
+    );
+
+    eprintln!(
+        "embed_gate_real GREEN: a REAL prove_canonical segment's 31-component OODS composition \
+         re-evaluates in the streamed embed and proves+verifies at degree ≤ 2 — {} stream rows \
+         (log {}), dr={}, identical shape to the synthetic layout (schedule SEGMENT-INVARIANT). \
+         A tampered cell is rejected. The streamed OODS embed now runs on real data, not just the \
+         synthetic fuzz.",
+        lay.n_rows,
+        gen_trace(&lay, None).log_size,
+        lay.dr,
+    );
+}
