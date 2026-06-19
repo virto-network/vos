@@ -721,10 +721,55 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   against the global composition (assert THEN prove — assert does NOT catch the
 >   degree bound), MEASURE; then bind streamed rc/lookup-z/alpha to the channel latches.
 >
+> **TWO-STREAM SCHEDULE + STREAMED AIR — THE STANDALONE OODS-EMBED GATE IS GREEN
+> 2026-06-19 (LOCAL). The session milestone: the full 31-component OODS composition
+> re-evaluates in ONE uniform STREAMED component that proves+verifies at degree <= 2
+> and shares the channel's row count (no longer pure width).**
+> - **Two-stream schedule + co-locate layout (`oods_auto.rs` +
+>   `recursion_stream_two.rs`).** `StreamCapture::schedule_two_stream(T)` routes
+>   PRODUCTS to a compact result stream R (one cell/product) and leaf/mac scratch
+>   to a working stream W; big operands (max 265 mask terms) pre-fold into mac
+>   chains so every consumer recon reads <= T direct terms. `layout_colocate(ops_s,
+>   nleaf)` is the DESIGN's chosen layout: macs + products share ONE dense stream
+>   (`ops_s` slots/row, each slot `r = oa*ob`; a mac is the slot whose `ob`-recon is
+>   the constant 1 so `r = oa`), masks ride OFFSET-0 as WIDTH on their consumer
+>   slot's row (the 86k leaves become columns, not rows). Both interpreters
+>   reproduce the global `PointEvaluationAccumulator`. (The first cut -- a spread
+>   two-stream layout with leaves in their OWN rows -- was WRONG: it scattered R
+>   (dr 75-426) and cost 370M-1.3B preproc; co-locate fixes it. Kept as the spread
+>   `layout` baseline; `layout_colocate` is the AIR target.)
+> - **Measured cost (`colocate_layout_and_cost`; the design's product-rank reach =
+>   64 CONFIRMED from the raw capture -- mean 9, p99 53; avg 1.85 mask terms/operand,
+>   only 2.6% > 8).** Sweet spot **T=16, ops_s=4 -> log 13 (6251 rows), dr=21,
+>   nleaf=74, ~34M preproc M31 cells** -- vs the single-stream 151-row floor / ~190M,
+>   squarely in the design's "tens of millions". Higher T cuts macs but clusters
+>   leaves (nleaf grows); ops_s trades rows for width; preproc total ~ recon-cells *
+>   window is roughly invariant (~ inherent).
+> - **Streamed embed AIR (`recursion_stream_embed.rs`) -- GATE GREEN.** A uniform
+>   windowed-recon `FrameworkEval` generalising the route-spike to the two streams:
+>   per row OPS_S product slots, each `oa`/`ob` RECONSTRUCTED from the window
+>   (offset-0 co-located leaves + the dense stream read at `[0,-DR]` + offset-0
+>   latched OODS scalars) via PREPROCESSED coefficients (the schedule is fixed
+>   across canonical segments -- only OODS VALUES differ), then `r = oa*ob`; the
+>   final slot carries `lhs - rhs` (gated `is_final*r == 0`); latched held constant
+>   by `not_last`. Every constraint <= degree 2 (recon = preproc*main deg-2 sum, term
+>   count free; products = main*main). Locked params T=16 / OPS_S=4 / DR=24 /
+>   NLEAF=80. GATE: `assert_constraints` green on the REAL 31-component layout (412
+>   main + 6149 preproc M31 cols/row), THEN **prove+verify GREEN at degree <= 2
+>   (~72s release, `#[ignore]`) + a tampered cell rejected** -- the 160600-M31
+>   single-row width DISTRIBUTED into a log-13 streamed layout that shares the
+>   channel's rows. TWO gotchas closed: (1) `get_preprocessed_column` is
+>   CURSOR-based (ignores the id) so the AIR MUST read preproc columns in EXACT
+>   registration order (an order mismatch corrupted the coeffs on a band of rows,
+>   invisible to a host read-back); (2) `assert_constraints` does NOT enforce the
+>   degree bound -- only the PROVE confirms degree <= 2.
+> - Shared synthetic setup extracted to `recursion_common::synth`
+>   (`synthetic_setup` / `build_capture`), reused by every streamed gate.
+>
 > **NEXT (precise, grounded):** (a) ✅ **DONE** — layout DECIDED (co-locate, W_p=65)
-> + the variable-offset preprocessed-routing mechanism de-risked (above); remaining
-> = the StreamBackend emission (symbolic linear forms + schedule + trace fill +
-> streamed FrameworkEval; gate against the global composition); (b) bind the streamed
+> + the variable-offset preprocessed-routing mechanism de-risked + the StreamBackend
+> emission (two-stream schedule + co-locate layout + streamed FrameworkEval)
+> PROVES+VERIFIES at degree <= 2 (above); remaining (b) bind the streamed
 > embed's `rc` to
 > the channel-latched composition coeff (the join_assembly latch pattern, scaled);
 > (c) ✅ **DONE (step 1b)** — `extract_recursion_data` gives the full FRI/decommit
