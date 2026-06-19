@@ -595,10 +595,26 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > scheduling pass that keeps live values within a window of W (read masks lazily —
 > right before use — not all up-front as `TraceEval::new` does today). Rows ≈
 > schedule length / ops-per-row (≈40150 → log 16 single-lane, fewer if banded);
-> width ≈ W + latched. **NEXT: implement the row-streaming `OodsEval` (a third
-> `WitBackend` emitting a windowed (row,col) schedule + matching offsets) and
-> MEASURE; then bind the streamed `rc`/lookup-elements to the channel latches.** The
-> offset mechanism it relies on is now de-risked.
+> width ≈ W + latched.
+>
+> **STREAMED-SHAPE TRACTABILITY MEASURED 2026-06-19 (commit `1950ef9`,
+> `tests/recursion_stream_scale.rs`).** A representative streamed AIR — a cross-row
+> Horner whose per-row contributions are `L` WITNESSED QM31 products, accumulator
+> chained across rows, matched to a host composition — at **log 14, L=3 = 49152
+> witnessed products** (≈ the embed's 40150): **GREEN, ~5s/prove, 68 main M31
+> cols/row, tampered column rejected.** ⇒ the streamed embed (a) **FITS in log 14**
+> = the channel's own row count, so it SHARES the channel's rows and adds no depth
+> (with L≈3, 40150 nodes land in ≤16384 rows); (b) is **68 cols/row** (vs 160600
+> width-replicated), ~1.1M cells (vs 2.6B) — no OOM; (c) is **FASTER** than the
+> single-row full-width embed (~5s vs ~23s at log 6). **⇒ the make-or-break is
+> RESOLVED: the integrated per-child verifier (channel + streamed embed + FRI +
+> Merkle) stays ~log 14–15; pick L≈3.** **NEXT (the only remaining big piece):
+> implement the general row-streaming `OodsEval` — a third `WitBackend` that
+> captures each chip's `evaluate` as a computation graph (nodes + product-operand
+> linear forms), schedules it into the windowed (row,col) layout (live-set ≤ W via
+> lazy mask reads), + a matching streamed VerifyBackend; drive all 31; match the
+> global composition; then bind the streamed `rc`/lookup-elements to the channel
+> latches.** Both the offset mechanism AND the shape tractability are now de-risked.
 >
 > **NEXT (precise, grounded):** (a) the row-streaming OODS-embed layout spike
 > (cross-row Horner) — the gating decision; (b) bind the streamed embed's `rc` to
