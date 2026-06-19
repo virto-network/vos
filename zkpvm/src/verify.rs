@@ -438,6 +438,13 @@ pub struct OodsReconstruction {
 /// [`verify_with_options_explicit_components`] (the preprocessed-root *check*
 /// clones the channel, so it is skipped) followed by the stwo verifier head
 /// (draw `random_coeff`, commit the composition tree, draw `oods_point`).
+///
+/// PRECONDITION (same as [`verify`]): `side_note` must be in the prover-left
+/// state (`closing_chip_active` set), so the boundary-state mix matches the
+/// prover's transcript — else the drawn challenges diverge and the returned OODS
+/// data is silently wrong. This is a recursion-harness reconstruction, NOT a
+/// trust boundary: it assumes a well-formed proof (its `component_mask` popcount
+/// equals `log_sizes`/`claimed_sums` length, and an 8-column composition tree).
 pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> OodsReconstruction {
     use stwo::core::air::Components;
     use stwo::core::circle::CirclePoint;
@@ -450,6 +457,22 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
     let sp = &proof.stark_proof;
     let claimed_log_sizes = &proof.log_sizes;
     let claimed_sums = &proof.claimed_sums;
+
+    // The positional zips below (sizes / verifier_components / per-component
+    // slices / comps) assume `component_mask` popcount == log_sizes ==
+    // claimed_sums; the production verifier enforces this (verify.rs:221-230),
+    // so assert it here too rather than silently truncate on a malformed proof.
+    let n_active = (proof.component_mask).count_ones() as usize;
+    assert_eq!(
+        n_active,
+        claimed_log_sizes.len(),
+        "component_mask popcount must equal log_sizes length"
+    );
+    assert_eq!(
+        n_active,
+        claimed_sums.len(),
+        "component_mask popcount must equal claimed_sums length"
+    );
 
     // Select components by the PROOF's component_mask, not the side note's
     // natural-active set: a canonical proof forces ALL 31 (padding inactive
@@ -542,6 +565,9 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
 
     let random_coeff = verifier_channel.draw_secure_felt();
     let n_comp_cols = sp.sampled_values.last().unwrap().len();
+    // COMPOSITION_LOG_SPLIT = 1 ⇒ 2·SECURE_EXTENSION_DEGREE = 8 composition
+    // columns; the `comp_mask`/recombination below depend on exactly that shape.
+    assert_eq!(n_comp_cols, 8, "expected an 8-column composition tree");
     commitment_scheme.commit(
         *sp.commitments.last().unwrap(),
         &alloc::vec![mlbd; n_comp_cols],
