@@ -30,6 +30,13 @@
 //!     shift by the fixed coset point `C`, then a `double_x` chain). All degree ≤ 2.
 //!     This removes two more trusted host inputs. (comp/lookup latches + the embed
 //!     leaves are bound via the FRI/DEEP + Merkle path in steps 2–3.)
+//!   * **claimed-sum balance (step 4a)** — the 31 per-component `claimed_sums` are
+//!     bound to the channel's `mix_felts(claimed_sums)` absorb (16 RATE-8 chunks,
+//!     the last prefix perms before the interaction commit; chunk `c` carries
+//!     `claimed_sum[2c]`/`[2c+1]` in `absorbed[0..4]`/`[4..8]`), then `Σ
+//!     claimed_sums == 0` is enforced in-AIR — the global logup-balance check
+//!     (`verify.rs:299`). (The boundary public-input recompute — `verify.rs:318`,
+//!     binding the io-hash + memory roots — is step 4b.)
 //!
 //! The two AIRs share `not_last` (channel digest chain + embed latched constancy)
 //! and the storage indexing; otherwise the column blocks + constraints are
@@ -124,11 +131,23 @@ fn storage_index(i: usize, log_size: u32) -> usize {
 
 // ── Preprocessed column ids (the fixed routing "program") ────────────────────
 // Registration / read / fill order: not_last, ch_is_first, is_rc_draw,
-// emb_final[OPS_S], then the recon program (per lane, side: const then coeffs).
+// is_oods_draw, is_cs_chunk[N_CS_CHUNKS], emb_final[OPS_S], then the recon program
+// (per lane, side: const then coeffs).
 const NOT_LAST: &str = "ca_not_last";
 const CH_IS_FIRST: &str = "ca_is_first";
 const IS_RC_DRAW: &str = "ca_is_rc_draw";
 const IS_OODS_DRAW: &str = "ca_is_oods_draw";
+
+// Claimed-sum balance: the canonical proof has 31 per-component claimed sums
+// (one QM31 each), absorbed via mix_felts(claimed_sums) = 124 M31 = 16 RATE-8
+// chunks; chunk c carries claimed_sum[2c] (absorbed[0..4]) + claimed_sum[2c+1]
+// (absorbed[4..8]).
+const N_CS: usize = 31;
+const N_CS_CHUNKS: usize = (N_CS * SECURE_EXTENSION_DEGREE).div_ceil(8); // 16
+fn cs_chunk_id(c: usize) -> String {
+    format!("ca_cs_chunk_{c}")
+}
+
 fn final_id(l: usize) -> String {
     format!("ca_final_{l}")
 }
@@ -154,6 +173,9 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
             id: IS_OODS_DRAW.to_string(),
         },
     ];
+    for c in 0..N_CS_CHUNKS {
+        ids.push(PreProcessedColumnId { id: cs_chunk_id(c) });
+    }
     for l in 0..OPS_S {
         ids.push(PreProcessedColumnId { id: final_id(l) });
     }
@@ -228,6 +250,9 @@ impl FrameworkEval for ChildEval {
         });
         let is_oods_draw = eval.get_preprocessed_column(PreProcessedColumnId {
             id: IS_OODS_DRAW.to_string(),
+        });
+        let is_cs_chunk: [E::F; N_CS_CHUNKS] = std::array::from_fn(|c| {
+            eval.get_preprocessed_column(PreProcessedColumnId { id: cs_chunk_id(c) })
         });
         let is_final: [E::F; OPS_S] = std::array::from_fn(|l| {
             eval.get_preprocessed_column(PreProcessedColumnId { id: final_id(l) })
@@ -472,6 +497,41 @@ impl FrameworkEval for ChildEval {
         }
         eval.add_constraint(lat_cur[1].clone() * y - E::EF::one()); // bind dinv, deg 2
 
+        // ── Claimed-sum balance: bind the 31 per-component claimed_sums to the
+        //    transcript's mix_felts(claimed_sums) absorb (chunk c carries
+        //    claimed_sum[2c] in absorbed[0..4], claimed_sum[2c+1] in absorbed[4..8]),
+        //    then enforce Σ claimed_sums == 0 (the global logup-balance check,
+        //    verify.rs:299). The is_cs_chunk indicators are preprocessed (same trust
+        //    model as the draw indicators); the AIR enforces each fires only on a
+        //    genuine Absorb row. ──
+        let cs: [[[E::F; 2]; SECURE_EXTENSION_DEGREE]; N_CS] = std::array::from_fn(|_| {
+            std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]))
+        });
+        // Held constant across rows (one consistent claimed-sum set).
+        for csk in &cs {
+            for coord in csk {
+                eval.add_constraint(not_last.clone() * (coord[1].clone() - coord[0].clone()));
+            }
+        }
+        // Bind absorbed → claimed_sums at each chunk's absorb row.
+        for (c, ind) in is_cs_chunk.iter().enumerate() {
+            eval.add_constraint(ind.clone() * (one.clone() - is_absorb.clone()));
+            for j in 0..SECURE_EXTENSION_DEGREE {
+                eval.add_constraint(ind.clone() * (absorbed[j].clone() - cs[2 * c][j][0].clone()));
+                if 2 * c + 1 < N_CS {
+                    eval.add_constraint(
+                        ind.clone() * (absorbed[4 + j].clone() - cs[2 * c + 1][j][0].clone()),
+                    );
+                }
+            }
+        }
+        // Global balance: Σ claimed_sums == 0 (degree 1, ungated).
+        let mut cs_sum = E::EF::zero();
+        for csk in &cs {
+            cs_sum += E::combine_ef(std::array::from_fn(|i| csk[i][0].clone()));
+        }
+        eval.add_constraint(cs_sum);
+
         eval
     }
 }
@@ -489,9 +549,11 @@ struct ChildTrace {
     cy: BaseField,
 }
 
-/// `channel_tamper`: bump one absorbed value on that record row (breaks the
-/// transcript binding → derived rc diverges). `final_tamper`: bump the embed's
-/// final-slot oa column (breaks the composition).
+/// Tampers (each must be rejected by the gate): `channel_tamper` bumps an absorbed
+/// value (breaks the transcript binding → derived rc/oods_t diverge); `final_tamper`
+/// bumps the embed's final-slot oa (breaks the composition); `oods_t_tamper` corrupts
+/// the latched oods_t (isolates the OODS-point derivation); `indicator_tamper`
+/// mis-places `is_rc_draw` onto a non-squeeze row; `cs_tamper` corrupts a claimed_sum.
 #[allow(clippy::too_many_arguments)]
 fn gen_trace(
     records: &[PermRecord],
@@ -501,13 +563,21 @@ fn gen_trace(
     dbl_steps: usize,
     cx: BaseField,
     cy: BaseField,
+    claimed_sums: &[SecureField],
+    prefix_len: usize,
     lay: &ColocateLayout,
     log_size: u32,
     channel_tamper: Option<usize>,
     final_tamper: bool,
     oods_t_tamper: bool,
     indicator_tamper: bool,
+    cs_tamper: bool,
 ) -> ChildTrace {
+    assert_eq!(
+        claimed_sums.len(),
+        N_CS,
+        "canonical proof has 31 claimed sums"
+    );
     assert!(lay.ops_s == OPS_S && lay.nleaf == NLEAF);
     assert!(lay.dr <= DR, "layout dr={} exceeds DR={DR}", lay.dr);
     assert!(lay.max_leaf_in_row <= NLEAF);
@@ -748,6 +818,36 @@ fn gen_trace(
     );
     let oods_cols: Vec<Vec<SecureField>> = oods_q.into_iter().map(|v| vec![v; n]).collect();
 
+    // ── Claimed-sum columns (31 QM31, held constant) + chunk indicators ──
+    debug_assert_eq!(
+        claimed_sums.iter().copied().sum::<SecureField>(),
+        SecureField::zero(),
+        "a valid proof's claimed_sums must balance to 0"
+    );
+    let cs_cols: Vec<Vec<SecureField>> = (0..N_CS)
+        .map(|k| {
+            let mut v = claimed_sums[k];
+            if cs_tamper && k == 0 {
+                v += SecureField::one();
+            }
+            vec![v; n]
+        })
+        .collect();
+    // The mix_felts(claimed_sums) absorb is the last 16 prefix perms before the
+    // interaction-tree commit (= records[prefix_len-1]); chunk c is at prefix_len-17+c.
+    let cs_chunk_row = |c: usize| prefix_len - (N_CS_CHUNKS + 1) + c;
+    for c in 0..N_CS_CHUNKS {
+        debug_assert_eq!(
+            records[cs_chunk_row(c)].kind,
+            PermKind::Absorb,
+            "claimed_sums chunk {c} must land on an Absorb record"
+        );
+    }
+    let mut is_cs_chunk: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_CS_CHUNKS];
+    for c in 0..N_CS_CHUNKS {
+        is_cs_chunk[c][cs_chunk_row(c)] = BaseField::one();
+    }
+
     // ── Preprocessed logical columns, in registration order ──
     let mut pre_b: Vec<Vec<BaseField>> = Vec::new();
     pre_b.push(
@@ -758,6 +858,9 @@ fn gen_trace(
     pre_b.push(ch_is_first);
     pre_b.push(is_rc_draw);
     pre_b.push(is_oods_draw);
+    for col in is_cs_chunk {
+        pre_b.push(col);
+    }
     for l in 0..OPS_S {
         pre_b.push(
             (0..n)
@@ -817,7 +920,7 @@ fn gen_trace(
     let preprocessed: Vec<_> = pre_b.into_iter().map(wrap).collect();
 
     let mut main_logical: Vec<Vec<BaseField>> = ch;
-    for q in emb_q.iter().chain(oods_cols.iter()) {
+    for q in emb_q.iter().chain(oods_cols.iter()).chain(cs_cols.iter()) {
         for c in 0..SECURE_EXTENSION_DEGREE {
             main_logical.push(q.iter().map(|v| v.to_m31_array()[c]).collect());
         }
@@ -904,6 +1007,8 @@ struct ChildInputs {
     dbl_steps: usize,
     cx: BaseField,
     cy: BaseField,
+    claimed_sums: Vec<SecureField>,
+    prefix_len: usize,
     lay: ColocateLayout,
     log_size: u32,
 }
@@ -923,6 +1028,7 @@ fn build_inputs() -> ChildInputs {
     // Channel transcript + FRI/OODS data (mlbd, oods_point). The transcript's
     // squeezes at/after prefix_len are, in order: rc, oods_t, deep, fold_alphas…
     let data = extract_recursion_data(&proof, &sn);
+    let claimed_sums = proof.claimed_sums.clone();
     let records = data.transcript.records;
     let prefix_len = data.transcript.prefix_len;
     let squeezes: Vec<usize> = records
@@ -998,6 +1104,8 @@ fn build_inputs() -> ChildInputs {
         dbl_steps,
         cx,
         cy,
+        claimed_sums,
+        prefix_len,
         lay,
         log_size,
     }
@@ -1010,6 +1118,7 @@ impl ChildInputs {
         final_tamper: bool,
         oods_t_tamper: bool,
         indicator_tamper: bool,
+        cs_tamper: bool,
     ) -> ChildTrace {
         gen_trace(
             &self.records,
@@ -1019,12 +1128,15 @@ impl ChildInputs {
             self.dbl_steps,
             self.cx,
             self.cy,
+            &self.claimed_sums,
+            self.prefix_len,
             &self.lay,
             self.log_size,
             channel_tamper,
             final_tamper,
             oods_t_tamper,
             indicator_tamper,
+            cs_tamper,
         )
     }
 }
@@ -1075,7 +1187,7 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
 #[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
 fn child_assembly_air_satisfied() {
     let inp = build_inputs();
-    let trace = inp.trace(None, false, false, false);
+    let trace = inp.trace(None, false, false, false, false);
     let log_size = trace.log_size;
     let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
     let pre: Vec<Vec<M31>> = trace
@@ -1121,7 +1233,7 @@ fn child_assembly_air_satisfied() {
 fn child_assembly_gate() {
     let inp = build_inputs();
 
-    prove_and_verify(inp.trace(None, false, false, false))
+    prove_and_verify(inp.trace(None, false, false, false, false))
         .expect("honest per-child assembly must prove+verify at degree ≤ 2");
 
     // Reject: corrupt a channel absorbed value (the transcript binding) — also
@@ -1132,13 +1244,13 @@ fn child_assembly_gate() {
         .position(|r| r.kind == PermKind::Absorb)
         .expect("transcript has an absorb");
     assert!(
-        prove_and_verify(inp.trace(Some(absorb_row), false, false, false)).is_err(),
+        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false)).is_err(),
         "a corrupted transcript value must be rejected"
     );
 
     // Reject: corrupt the embed composition (the final-slot oa value).
     assert!(
-        prove_and_verify(inp.trace(None, true, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, true, false, false, false)).is_err(),
         "a corrupted embed value must be rejected"
     );
 
@@ -1146,7 +1258,7 @@ fn child_assembly_gate() {
     // derivation: only it reads oods_t, so this confirms the dinv/ox binding is
     // non-vacuous independent of the embed).
     assert!(
-        prove_and_verify(inp.trace(None, false, true, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, true, false, false)).is_err(),
         "a corrupted oods_t must be rejected by the OODS-point derivation"
     );
 
@@ -1154,18 +1266,26 @@ fn child_assembly_gate() {
     // (Absorb) row — the is_rc_draw·(1−is_squeeze) hardening must reject binding rc
     // to a non-challenge perm output.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, true)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, true, false)).is_err(),
         "an is_rc_draw indicator on a non-squeeze row must be rejected"
+    );
+
+    // Reject: corrupt a claimed_sum — breaks both its transcript-absorb binding
+    // and the Σ claimed_sums == 0 balance.
+    assert!(
+        prove_and_verify(inp.trace(None, false, false, false, true)).is_err(),
+        "a corrupted claimed_sum must be rejected"
     );
 
     eprintln!(
         "child_assembly_gate GREEN @ log {}: ONE uniform component replays a REAL canonical \
          segment's {}-perm transcript AND re-evaluates its full 31-component OODS composition \
          (streamed embed, {} stream rows), with the embed's rc latched to the channel's \
-         composition-rc squeeze AND dinv/ox derived in-circuit from a transcript-bound oods_t \
-         (mlbd-1={} double_x steps) — proving+verifying through the lifted Poseidon2-M31 protocol \
-         at degree ≤ 2; tampered transcript / embed / oods_t values AND a mis-placed is_rc_draw \
-         indicator (on a non-squeeze row) are each rejected.",
+         composition-rc squeeze, dinv/ox derived in-circuit from a transcript-bound oods_t \
+         (mlbd-1={} double_x steps), AND the 31 claimed_sums bound to the mix_felts(claimed_sums) \
+         absorb + Σ == 0 — proving+verifying through the lifted Poseidon2-M31 protocol at degree \
+         ≤ 2; tampered transcript / embed / oods_t / claimed_sum values AND a mis-placed \
+         is_rc_draw indicator are each rejected.",
         inp.log_size,
         inp.records.len(),
         inp.lay.n_rows,
