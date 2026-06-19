@@ -412,9 +412,22 @@ impl FrameworkEval for ChildEval {
 
         // ── rc latch: bind the embed's rc (latched[0]) to the channel's
         //    composition-random_coeff squeeze output at the is_rc_draw row. ──
+        //
+        // `is_rc_draw`/`is_oods_draw` are PREPROCESSED columns — part of the fixed
+        // verifier-program identity (like `ch_is_first`/`not_last`/the recon-routing
+        // program), pinned in the full recursion by the W0 commitment allowlist
+        // ({C_0,C_1}); a verifier rejects any preprocessed root ∉ the allowlist, so
+        // a prover cannot move the indicator to a wrong row. WHICH squeeze it selects
+        // (the 1st/2nd `Squeeze` at/after `prefix_len` = composition rc / oods_t) is
+        // thus program-pinned, exactly as the rc/oods_t draw order is fixed by the
+        // verify head. The AIR additionally enforces below that the indicator fires
+        // only on a genuine `Squeeze` row (`is_X_draw·(1−is_squeeze)==0`), so even a
+        // mis-generated indicator cannot bind rc/oods_t to a non-challenge perm
+        // output (an Absorb/Pow row's permutation output).
         for j in 0..SECURE_EXTENSION_DEGREE {
             eval.add_constraint(is_rc_draw.clone() * (rc_coords[j].clone() - out[j].clone()));
         }
+        eval.add_constraint(is_rc_draw.clone() * (one.clone() - is_squeeze.clone()));
 
         // ── OODS-point derivation: bind dinv (latched[1]) + ox (latched[2]) to the
         //    transcript by deriving the OODS point in-circuit from a latched oods_t
@@ -439,6 +452,7 @@ impl FrameworkEval for ChildEval {
         for j in 0..SECURE_EXTENSION_DEGREE {
             eval.add_constraint(is_oods_draw.clone() * (oods_t_c[j][0].clone() - out[j].clone()));
         }
+        eval.add_constraint(is_oods_draw.clone() * (one.clone() - is_squeeze.clone()));
         // ox = double_x^{mlbd-1}(oods.x): x_{k+1} = 2·x_k² − 1, each square witnessed.
         let mut x = oodsx.clone();
         for _ in 0..self.dbl_steps {
@@ -492,6 +506,7 @@ fn gen_trace(
     channel_tamper: Option<usize>,
     final_tamper: bool,
     oods_t_tamper: bool,
+    indicator_tamper: bool,
 ) -> ChildTrace {
     assert!(lay.ops_s == OPS_S && lay.nleaf == NLEAF);
     assert!(lay.dr <= DR, "layout dr={} exceeds DR={DR}", lay.dr);
@@ -626,7 +641,18 @@ fn gen_trace(
         if row == 0 {
             ch_is_first[row] = BaseField::one();
         }
-        if row == rc_row {
+        // Honest: is_rc_draw fires at the rc-draw squeeze. `indicator_tamper`
+        // mis-places it onto the first Absorb row (a non-squeeze) — the
+        // is_rc_draw·(1−is_squeeze) hardening must reject this.
+        let rc_indicator_row = if indicator_tamper {
+            records
+                .iter()
+                .position(|r| r.kind == PermKind::Absorb)
+                .expect("transcript has an absorb")
+        } else {
+            rc_row
+        };
+        if row == rc_indicator_row {
             is_rc_draw[row] = BaseField::one();
         }
         if row == oods_row {
@@ -983,6 +1009,7 @@ impl ChildInputs {
         channel_tamper: Option<usize>,
         final_tamper: bool,
         oods_t_tamper: bool,
+        indicator_tamper: bool,
     ) -> ChildTrace {
         gen_trace(
             &self.records,
@@ -997,6 +1024,7 @@ impl ChildInputs {
             channel_tamper,
             final_tamper,
             oods_t_tamper,
+            indicator_tamper,
         )
     }
 }
@@ -1047,7 +1075,7 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
 #[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
 fn child_assembly_air_satisfied() {
     let inp = build_inputs();
-    let trace = inp.trace(None, false, false);
+    let trace = inp.trace(None, false, false, false);
     let log_size = trace.log_size;
     let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
     let pre: Vec<Vec<M31>> = trace
@@ -1093,7 +1121,7 @@ fn child_assembly_air_satisfied() {
 fn child_assembly_gate() {
     let inp = build_inputs();
 
-    prove_and_verify(inp.trace(None, false, false))
+    prove_and_verify(inp.trace(None, false, false, false))
         .expect("honest per-child assembly must prove+verify at degree ≤ 2");
 
     // Reject: corrupt a channel absorbed value (the transcript binding) — also
@@ -1104,13 +1132,13 @@ fn child_assembly_gate() {
         .position(|r| r.kind == PermKind::Absorb)
         .expect("transcript has an absorb");
     assert!(
-        prove_and_verify(inp.trace(Some(absorb_row), false, false)).is_err(),
+        prove_and_verify(inp.trace(Some(absorb_row), false, false, false)).is_err(),
         "a corrupted transcript value must be rejected"
     );
 
     // Reject: corrupt the embed composition (the final-slot oa value).
     assert!(
-        prove_and_verify(inp.trace(None, true, false)).is_err(),
+        prove_and_verify(inp.trace(None, true, false, false)).is_err(),
         "a corrupted embed value must be rejected"
     );
 
@@ -1118,8 +1146,16 @@ fn child_assembly_gate() {
     // derivation: only it reads oods_t, so this confirms the dinv/ox binding is
     // non-vacuous independent of the embed).
     assert!(
-        prove_and_verify(inp.trace(None, false, true)).is_err(),
+        prove_and_verify(inp.trace(None, false, true, false)).is_err(),
         "a corrupted oods_t must be rejected by the OODS-point derivation"
+    );
+
+    // Reject: mis-place the is_rc_draw preprocessed indicator onto a non-squeeze
+    // (Absorb) row — the is_rc_draw·(1−is_squeeze) hardening must reject binding rc
+    // to a non-challenge perm output.
+    assert!(
+        prove_and_verify(inp.trace(None, false, false, true)).is_err(),
+        "an is_rc_draw indicator on a non-squeeze row must be rejected"
     );
 
     eprintln!(
@@ -1128,7 +1164,8 @@ fn child_assembly_gate() {
          (streamed embed, {} stream rows), with the embed's rc latched to the channel's \
          composition-rc squeeze AND dinv/ox derived in-circuit from a transcript-bound oods_t \
          (mlbd-1={} double_x steps) — proving+verifying through the lifted Poseidon2-M31 protocol \
-         at degree ≤ 2; tampered transcript / embed / oods_t values are each rejected.",
+         at degree ≤ 2; tampered transcript / embed / oods_t values AND a mis-placed is_rc_draw \
+         indicator (on a non-squeeze row) are each rejected.",
         inp.log_size,
         inp.records.len(),
         inp.lay.n_rows,
