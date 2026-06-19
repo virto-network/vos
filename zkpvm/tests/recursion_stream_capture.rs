@@ -22,7 +22,9 @@ mod recursion_common;
 
 use num_traits::Zero;
 use recursion_common::Poseidon2M31Channel;
-use recursion_common::oods_auto::{ComponentMask, StreamBackend, StreamNode, drive_multi};
+use recursion_common::oods_auto::{
+    ComponentMask, StreamBackend, StreamCapture, StreamNode, drive_multi,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 use stwo::core::air::Component;
@@ -136,11 +138,9 @@ fn setup() -> Setup {
     }
 }
 
-/// GATE: the captured symbolic forms faithfully reconstruct every value, every
-/// product is a·b, and the final equality reproduces the global composition.
-#[test]
-fn stream_capture_fidelity() {
-    let s = setup();
+/// Drive all 31 chips through the [`StreamBackend`] on `s`'s synthetic masks and
+/// return the symbolic capture.
+fn build_capture(s: &Setup) -> StreamCapture {
     let component_masks: Vec<ComponentMask> = s
         .component_masks
         .iter()
@@ -161,10 +161,18 @@ fn stream_capture_fidelity() {
     drive_multi(&ctx, &s.comps, |idx, ls, e| {
         drive_chip_oods(idx, ls, &lookup, e)
     });
-    let capture = Rc::try_unwrap(ctx)
+    Rc::try_unwrap(ctx)
         .unwrap_or_else(|_| panic!("a Handle outlived the capture walk"))
         .into_inner()
-        .finish();
+        .finish()
+}
+
+/// GATE: the captured symbolic forms faithfully reconstruct every value, every
+/// product is a·b, and the final equality reproduces the global composition.
+#[test]
+fn stream_capture_fidelity() {
+    let s = setup();
+    let capture = build_capture(&s);
 
     let n_nodes = capture.node_kind.len();
     let mut n_mask = 0usize;
@@ -222,4 +230,57 @@ fn stream_capture_fidelity() {
         "expected ~23294 products, got {n_product}"
     );
     assert_eq!(n_mask + n_product, n_nodes);
+}
+
+/// Ops per streamed row (the embed density knob — the bounded offset window is in
+/// rows = max cell reach / OPS_PER_ROW).
+const OPS_PER_ROW: usize = 8;
+/// Stream/latched terms per `Mac` cell (≥1 + the previous partial). Bounds the
+/// per-cell coefficient width; big operands chain across cells.
+const TERMS_PER_MAC: usize = 4;
+
+/// GATE: the capture compiles to a micro-op SCHEDULE whose host interpreter
+/// reproduces every captured product value and the global composition — and
+/// MEASURE the streamed layout (cells, op mix, rows, window reach). This is the
+/// host reference the streamed AIR must reproduce; no proving yet.
+#[test]
+fn stream_schedule_fidelity() {
+    let s = setup();
+    let capture = build_capture(&s);
+    let sched = capture.schedule(TERMS_PER_MAC);
+
+    // The interpreter (re-evaluating ops from scratch) matches the stored values.
+    let interp = sched.interpret();
+    assert_eq!(interp.len(), sched.values.len());
+    for (i, (a, b)) in interp.iter().zip(&sched.values).enumerate() {
+        assert_eq!(a, b, "schedule cell {i}: interpreter != stored value");
+    }
+    // The final DEEP-ALI equality holds and equals the global composition.
+    assert_eq!(
+        interp[sched.lhs_cell], interp[sched.rhs_cell],
+        "scheduled final lhs != rhs"
+    );
+    assert_eq!(
+        interp[sched.lhs_cell], s.truth,
+        "scheduled composition != global PointEvaluationAccumulator"
+    );
+
+    let n_cells = sched.ops.len();
+    let rows = n_cells.div_ceil(OPS_PER_ROW);
+    let log = (usize::BITS - rows.next_power_of_two().leading_zeros()).saturating_sub(1);
+    let reach_cells = sched.max_reach();
+    let reach_rows = reach_cells.div_ceil(OPS_PER_ROW);
+
+    eprintln!(
+        "stream_schedule_fidelity GREEN (TERMS_PER_MAC={TERMS_PER_MAC}, OPS_PER_ROW={OPS_PER_ROW}): \
+         interpreter reproduces the global composition.\n  \
+         {n_cells} cells = {} leaf + {} mac + {} mul\n  \
+         rows ≈ {rows} → log {log} (channel ~log 14)\n  \
+         window reach: {reach_cells} cells = {reach_rows} rows (the AIR mask offset depth; the \
+         offset spike proved offsets up to ~N/2 read the exact logical row)",
+        sched.n_leaf, sched.n_mac, sched.n_mul,
+    );
+
+    assert!(n_cells > 0);
+    assert!(reach_cells > 0);
 }

@@ -1406,6 +1406,255 @@ impl WitBackend for StreamBackend {
     }
 }
 
+// ── Streamed-emission SCHEDULE (P5.3 task #1): capture → micro-op stream ─────
+
+/// One streamed cell's operation. Every cell holds one QM31 value; the streamed
+/// AIR enforces the op as a degree-2 constraint reading earlier cells at fixed
+/// offsets (the proven route-spike window + preprocessed-coefficient mechanism)
+/// plus the latched columns (offset 0).
+#[derive(Clone)]
+pub enum CellOp {
+    /// A committed mask sample (a leaf — no reconstruction constraint). Mask
+    /// samples are replicated onto each consuming chain so their read offset is
+    /// tiny (co-locate); soundness binding to the inner proof is the assembly's job.
+    Leaf,
+    /// A partial-sum step: `value = constant + Σ coeff·cell[i] + Σ coeff·latched[s]`.
+    /// Big operand forms (up to 265 terms) become a CHAIN of these (≤`terms_per_mac`
+    /// stream/latched terms each, plus the previous partial as a stream term), so
+    /// per-cell width stays bounded regardless of operand size. Degree 2
+    /// (preproc-coeff · stream / · latched).
+    Mac {
+        constant: SecureField,
+        stream: Vec<(usize, SecureField)>,
+        latched: Vec<(usize, SecureField)>,
+    },
+    /// The witnessed product `value = cell[a]·cell[b]` (the operands are the two
+    /// reconstructed operand-form partials, placed at fixed prior cells). Degree 2.
+    Mul { a: usize, b: usize },
+}
+
+/// The streamed schedule: a flat micro-op stream realising the captured OODS DAG
+/// in the co-locate layout. The streamed `FrameworkEval` lays these `OPS_PER_ROW`
+/// to a row and emits one degree-2 constraint per cell; the final DEEP-ALI
+/// equality asserts `cell[lhs] == cell[rhs]`.
+pub struct Schedule {
+    pub ops: Vec<CellOp>,
+    pub values: Vec<SecureField>,
+    pub latched_value: [SecureField; N_LATCHED],
+    pub lhs_cell: usize,
+    pub rhs_cell: usize,
+    pub n_leaf: usize,
+    pub n_mac: usize,
+    pub n_mul: usize,
+}
+
+impl Schedule {
+    /// Max cell-distance any op reaches back (the window depth, in CELLS — divide
+    /// by `OPS_PER_ROW` for the row-offset window the AIR mask needs).
+    pub fn max_reach(&self) -> usize {
+        let mut m = 0usize;
+        for (i, op) in self.ops.iter().enumerate() {
+            let mut consider = |j: usize| m = m.max(i - j);
+            match op {
+                CellOp::Leaf => {}
+                CellOp::Mac { stream, .. } => {
+                    for &(c, _) in stream {
+                        consider(c);
+                    }
+                }
+                CellOp::Mul { a, b } => {
+                    consider(*a);
+                    consider(*b);
+                }
+            }
+        }
+        m
+    }
+
+    /// Re-evaluate the ops from scratch (ignoring the stored values) and assert
+    /// each matches — validates the micro-op stream is self-consistent (the host
+    /// reference the streamed AIR must reproduce).
+    pub fn interpret(&self) -> Vec<SecureField> {
+        let mut v = vec![SecureField::zero(); self.ops.len()];
+        for (i, op) in self.ops.iter().enumerate() {
+            v[i] = match op {
+                CellOp::Leaf => self.values[i], // committed input
+                CellOp::Mac {
+                    constant,
+                    stream,
+                    latched,
+                } => {
+                    let mut acc = *constant;
+                    for &(c, coeff) in stream {
+                        acc += coeff * v[c];
+                    }
+                    for &(s, coeff) in latched {
+                        acc += coeff * self.latched_value[s];
+                    }
+                    acc
+                }
+                CellOp::Mul { a, b } => v[*a] * v[*b],
+            };
+        }
+        v
+    }
+}
+
+impl StreamCapture {
+    /// Compile the capture into a [`Schedule`]: lay products in capture (walk)
+    /// order; reconstruct each product's two operand forms as `Mac` chains
+    /// (≤`terms_per_mac` terms/step) over fresh `Leaf` copies of mask operands
+    /// (co-located) and the prior `Mul` cells of product operands; emit the
+    /// `Mul`. The latched columns are referenced directly (offset 0).
+    pub fn schedule(&self, terms_per_mac: usize) -> Schedule {
+        assert!(terms_per_mac >= 1);
+        let mut ops: Vec<CellOp> = Vec::new();
+        let mut values: Vec<SecureField> = Vec::new();
+        // Cell holding each PRODUCT node's value (masks are replicated per use).
+        let mut prod_cell: HashMap<u32, usize> = HashMap::new();
+
+        let emit = |ops: &mut Vec<CellOp>,
+                    values: &mut Vec<SecureField>,
+                    op: CellOp,
+                    value: SecureField|
+         -> usize {
+            let id = ops.len();
+            ops.push(op);
+            values.push(value);
+            id
+        };
+
+        // Reconstruct a form into a Mac chain; return the final cell index.
+        // `term` = (Stream(cell) | Latched(slot), coeff).
+        enum Src {
+            Stream(usize),
+            Latched(usize),
+        }
+        let reconstruct = |ops: &mut Vec<CellOp>,
+                           values: &mut Vec<SecureField>,
+                           prod_cell: &HashMap<u32, usize>,
+                           form: &StreamForm|
+         -> usize {
+            // Gather terms, materialising fresh Leaf copies for mask operands.
+            let mut terms: Vec<(Src, SecureField)> = Vec::new();
+            for &(node, coeff) in &form.nodes {
+                match self.node_kind[node as usize] {
+                    StreamNode::Mask => {
+                        let leaf = emit(ops, values, CellOp::Leaf, self.node_value[node as usize]);
+                        terms.push((Src::Stream(leaf), coeff));
+                    }
+                    StreamNode::Product { .. } => {
+                        terms.push((Src::Stream(prod_cell[&node]), coeff));
+                    }
+                }
+            }
+            for &(slot, coeff) in &form.latched {
+                terms.push((Src::Latched(slot), coeff));
+            }
+
+            // No terms ⇒ a pure constant.
+            if terms.is_empty() {
+                return emit(
+                    ops,
+                    values,
+                    CellOp::Mac {
+                        constant: form.constant,
+                        stream: Vec::new(),
+                        latched: Vec::new(),
+                    },
+                    form.constant,
+                );
+            }
+
+            // Chain Mac cells, `terms_per_mac` terms each; the first carries the
+            // constant, each subsequent reads the previous partial.
+            let mut prev: Option<usize> = None;
+            let mut idx = 0usize;
+            while idx < terms.len() {
+                let end = (idx + terms_per_mac).min(terms.len());
+                let mut constant = SecureField::zero();
+                let mut stream: Vec<(usize, SecureField)> = Vec::new();
+                let mut latched: Vec<(usize, SecureField)> = Vec::new();
+                if let Some(p) = prev {
+                    stream.push((p, SecureField::one()));
+                } else {
+                    constant = form.constant;
+                }
+                for (src, coeff) in &terms[idx..end] {
+                    match src {
+                        Src::Stream(c) => stream.push((*c, *coeff)),
+                        Src::Latched(s) => latched.push((*s, *coeff)),
+                    }
+                }
+                let mut value = constant;
+                for &(c, coeff) in &stream {
+                    value += coeff * values[c];
+                }
+                for &(s, coeff) in &latched {
+                    value += coeff * self.latched_value[s];
+                }
+                let cell = emit(
+                    ops,
+                    values,
+                    CellOp::Mac {
+                        constant,
+                        stream,
+                        latched,
+                    },
+                    value,
+                );
+                prev = Some(cell);
+                idx = end;
+            }
+            prev.unwrap()
+        };
+
+        // Lay every product in capture order; masks emit on demand at each use.
+        for (id, kind) in self.node_kind.iter().enumerate() {
+            if let StreamNode::Product { a, b } = kind {
+                let a_cell = reconstruct(&mut ops, &mut values, &prod_cell, a);
+                let b_cell = reconstruct(&mut ops, &mut values, &prod_cell, b);
+                let value = values[a_cell] * values[b_cell];
+                let mul = emit(
+                    &mut ops,
+                    &mut values,
+                    CellOp::Mul {
+                        a: a_cell,
+                        b: b_cell,
+                    },
+                    value,
+                );
+                prod_cell.insert(id as u32, mul);
+            }
+        }
+
+        // The final DEEP-ALI equality: reconstruct both sides; assert lhs == rhs.
+        let lhs_cell = reconstruct(&mut ops, &mut values, &prod_cell, &self.final_lhs);
+        let rhs_cell = reconstruct(&mut ops, &mut values, &prod_cell, &self.final_rhs);
+
+        let n_leaf = ops.iter().filter(|o| matches!(o, CellOp::Leaf)).count();
+        let n_mac = ops
+            .iter()
+            .filter(|o| matches!(o, CellOp::Mac { .. }))
+            .count();
+        let n_mul = ops
+            .iter()
+            .filter(|o| matches!(o, CellOp::Mul { .. }))
+            .count();
+
+        Schedule {
+            ops,
+            values,
+            latched_value: self.latched_value,
+            lhs_cell,
+            rhs_cell,
+            n_leaf,
+            n_mac,
+            n_mul,
+        }
+    }
+}
+
 // ── In-AIR verify backend (V = E::EF) ──────────────────────────────────────
 
 /// Re-reads the recorded columns via `next_trace_mask` (in the same allocation
