@@ -524,6 +524,29 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   poseidon2-channel, `#[ignore]`, ~27s release): GREEN. Recorded composition
 >   `random_coeff` MATCHES `reconstruct_oods_for_recursion`.
 >
+> **STEP 1b landed (commit `33d19e7`) — the data extraction is now COMPLETE.**
+> `verify::extract_recursion_data(proof, side_note) -> RecursionData` replays
+> stwo's `verify` head + `verify_values` via PUBLIC stwo calls (`Components::
+> mask_points`, `FriVerifier::{commit,sample_query_positions,decommit}`,
+> `fri_answers`, `prepare_preprocessed_query_positions`, `tree.verify`) on a
+> recording channel, capturing EVERY transcript-derived datum the FRI / DEEP /
+> Merkle consumers need: composition + DEEP `random_coeff`, OODS point, the
+> per-FRI-layer **fold alphas** (by BRACKETING `FriVerifier::commit` — the
+> squeezes it performs ARE the alphas), query positions (+ preprocessed remap),
+> the first-layer FRI evals (`fri_answers` = DEEP quotients), and the lookup
+> elements. It VALIDATES end-to-end (real per-tree Merkle decommit + real
+> `FriVerifier::decommit` both succeed). The load-bearing FS-mix prefix is now a
+> single shared helper (`recursion_verify_prefix`). GATE (`extract_recursion_data_
+> grounding`, ~32s): the step-by-step replay reproduces the REAL stwo `verify`
+> transcript EXACTLY (all 8584 perms, every kind/input/output) — no FS-mix drift —
+> AND `random_coeff` matches reconstruct. Measured: **14 fold alphas** (1+13), **38
+> query positions** (= n_queries, no collisions this segment), 38 `fri_answers`,
+> **`lifting_log_size`=16** (FRI first-layer domain), **`max_log_degree_bound`=14**.
+> The raw per-tree/per-FRI-layer decommit data (roots, `queried_values`,
+> `hash_witness`, `fri_witness`, `last_layer_poly`) is read directly from
+> `proof.stark_proof` using these query positions. ⇒ **the AIR-building session has
+> all its inputs; the data half of NEXT items (c) is DONE.**
+>
 > **MEASUREMENT — the design cost model was WRONG about the transcript** (real
 > 31-component canonical segment, small program, log_sizes ≤ 14):
 > - **Transcript = 8584 perms** (8531 absorb / 51 squeeze / 2 pow), NOT the design's
@@ -558,13 +581,16 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > **NEXT (precise, grounded):** (a) the row-streaming OODS-embed layout spike
 > (cross-row Horner) — the gating decision; (b) bind the streamed embed's `rc` to
 > the channel-latched composition coeff (the join_assembly latch pattern, scaled);
-> (c) extend `record_canonical_transcript` → add the FRI fold reconstruction
-> (`compute_decommitment_positions_and_rebuild_evals` + `build_merkle_verification_inputs`)
-> + per-tree/per-layer decommit data extraction (the FRI/Merkle data half of the
-> foundation); (d) scale the FRI fold chain (14 layers, 38 queries) + the 4-trace +
-> 14-FRI-layer Merkle decommit (generalise the leaf sponge for the non-8-multiple
-> QM31-wide FRI leaves — the partial-rate `finalize` pad); (e) boundary +
-> claimed-sum balance (`boundary_binding::check_boundary_claimed_sums`, scale-free).
+> (c) ✅ **DONE (step 1b)** — `extract_recursion_data` gives the full FRI/decommit
+> data via the PUBLIC `fri_answers` + `FriVerifier`/`tree.verify` calls (no need to
+> replicate `compute_decommitment_positions_and_rebuild_evals` —
+> `fri_answers` already produces the first-layer evals; the in-AIR fold chain does
+> the rest of the reconstruction); (d) scale the FRI fold chain (14 layers, 38
+> queries — feed `data.first_layer_evals` + `data.fold_alphas` + `data.query_positions`)
+> + the 4-trace + 14-FRI-layer Merkle decommit (generalise the leaf sponge for the
+> non-8-multiple QM31-wide FRI leaves — the partial-rate `finalize` pad); (e)
+> boundary + claimed-sum balance (`boundary_binding::check_boundary_claimed_sums`,
+> scale-free; uses `data.lookup_elements` + the public boundary states).
 
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
 scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
