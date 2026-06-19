@@ -20,6 +20,7 @@
 //! `tests/poseidon2_round_constants.rs` (the constants-vector test that
 //! re-derives and pins them).
 
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use num_traits::{One, Zero};
@@ -30,6 +31,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::hash::Hash;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 
+use core::cell::RefCell;
 use core::ops::{Add, AddAssign, Mul, Sub};
 
 // ── Poseidon2-over-M31 parameters (width 16; eprint 2023/323 §5) ──────────
@@ -428,21 +430,81 @@ impl<'de> Deserialize<'de> for P2MerkleHasher {
 
 // ── Poseidon2-M31 Fiat-Shamir channel (no Blake2s on commit OR transcript) ─
 
+/// Which channel op produced a recorded permutation — pins the per-row op type
+/// the native-recursion verifier-AIR's in-AIR transcript replay reconstructs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermKind {
+    /// A sponge absorption step (one RATE chunk mixed in, digest advanced).
+    Absorb,
+    /// A squeeze step (digest + `n_draws` + `DRAW_DOMAIN` → fresh challenge).
+    Squeeze,
+    /// One of `verify_pow_nonce`'s two permutations (does NOT advance digest).
+    Pow,
+}
+
+/// One width-16 permutation as the transcript drove it: its full input + output
+/// state and which op invoked it. The ground truth the channel-replay AIR must
+/// reproduce row-for-row.
+///
+/// `first_chunk` is `false` only for the continuation chunks of a multi-chunk
+/// `absorb` (where the rate half carries the previous chunk's permuted state);
+/// it is `true` for a fresh absorb's first chunk, every squeeze, and both pow
+/// permutations.
+#[derive(Clone, Copy, Debug)]
+pub struct PermRecord {
+    pub kind: PermKind,
+    pub input: [BaseField; N_STATE],
+    pub output: [BaseField; N_STATE],
+    pub first_chunk: bool,
+}
+
 /// A sponge transcript over the width-16 Poseidon2-M31 permutation, mirroring
 /// `Poseidon252Channel`: an 8-M31 `digest` + an `n_draws` counter for squeeze
 /// freshness. Deterministic, so prover and verifier agree by construction.
 ///
-/// (The recording variant the `ChannelChip` replay tests use lives in the test
-/// harness; the production transcript needs no recorder.)
+/// When a `recorder` is attached (via [`Poseidon2M31Channel::recording`]) every
+/// permutation the transcript performs is appended to it, in caller order — this
+/// is how the native-recursion verifier-AIR pins the exact op sequence the stwo
+/// verifier drives over a real segment proof. Default (no recorder) is
+/// zero-overhead, so the production transcript is unaffected.
 #[derive(Clone, Debug, Default)]
 pub struct Poseidon2M31Channel {
     digest: [BaseField; 8],
     n_draws: u32,
+    recorder: Option<Rc<RefCell<Vec<PermRecord>>>>,
 }
 
 const DRAW_DOMAIN: u32 = 3;
 
 impl Poseidon2M31Channel {
+    /// A fresh channel that records every permutation it performs into the
+    /// shared buffer. Clones share the buffer, so a channel handed to a stwo
+    /// `verify()` records the whole verifier transcript (the recursion seam
+    /// [`crate::record_canonical_transcript`] uses this).
+    pub fn recording(recorder: Rc<RefCell<Vec<PermRecord>>>) -> Self {
+        Self {
+            digest: [BaseField::zero(); 8],
+            n_draws: 0,
+            recorder: Some(recorder),
+        }
+    }
+
+    /// Permute `state` in place, recording `(kind, input, output, first_chunk)`
+    /// when a recorder is attached. Takes `&self` so `verify_pow_nonce` records
+    /// too. Behaviorally identical to a bare `permute` when no recorder is set.
+    fn rec_permute(&self, kind: PermKind, first_chunk: bool, state: &mut [BaseField; N_STATE]) {
+        let input = *state;
+        permute(state);
+        if let Some(rec) = &self.recorder {
+            rec.borrow_mut().push(PermRecord {
+                kind,
+                input,
+                output: *state,
+                first_chunk,
+            });
+        }
+    }
+
     fn update_digest(&mut self, new_digest: [BaseField; 8]) {
         self.digest = new_digest;
         self.n_draws = 0;
@@ -452,13 +514,13 @@ impl Poseidon2M31Channel {
         let mut state = [BaseField::zero(); N_STATE];
         state[..8].copy_from_slice(&self.digest);
         if values.is_empty() {
-            permute(&mut state);
+            self.rec_permute(PermKind::Absorb, true, &mut state);
         } else {
-            for chunk in values.chunks(RATE) {
+            for (ci, chunk) in values.chunks(RATE).enumerate() {
                 for (i, v) in chunk.iter().enumerate() {
                     state[8 + i] += *v;
                 }
-                permute(&mut state);
+                self.rec_permute(PermKind::Absorb, ci == 0, &mut state);
             }
         }
         let mut d = [BaseField::zero(); 8];
@@ -471,7 +533,7 @@ impl Poseidon2M31Channel {
         state[..8].copy_from_slice(&self.digest);
         state[8] = BaseField::reduce(self.n_draws as u64);
         state[9] = BaseField::reduce(DRAW_DOMAIN as u64);
-        permute(&mut state);
+        self.rec_permute(PermKind::Squeeze, true, &mut state);
         self.n_draws += 1;
         let mut out = [BaseField::zero(); 8];
         out.copy_from_slice(&state[..8]);
@@ -490,12 +552,12 @@ impl Channel for Poseidon2M31Channel {
         let mut s = [BaseField::zero(); N_STATE];
         s[..8].copy_from_slice(&self.digest);
         s[8] = BaseField::reduce(n_bits as u64);
-        permute(&mut s);
+        self.rec_permute(PermKind::Pow, true, &mut s);
         let mut s2 = [BaseField::zero(); N_STATE];
         s2[..8].copy_from_slice(&s[..8]);
         s2[8] = BaseField::reduce(nonce & 0xFFFF_FFFF);
         s2[9] = BaseField::reduce(nonce >> 32);
-        permute(&mut s2);
+        self.rec_permute(PermKind::Pow, true, &mut s2);
         s2[0].0.trailing_zeros() >= n_bits
     }
 

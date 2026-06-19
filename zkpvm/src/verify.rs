@@ -633,3 +633,156 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
         composition_value,
     }
 }
+
+/// The full Fiat-Shamir transcript of a real canonical segment proof's
+/// verification, recorded as an ordered Poseidon2 permutation sequence — the
+/// ground truth the native-recursion verifier-AIR's in-AIR `ChannelChip` replay
+/// reproduces row-for-row, and the source of every channel-derived challenge
+/// (composition `random_coeff`, OODS point, DEEP `random_coeff`, per-FRI-layer
+/// fold alphas, query positions) the downstream consumers latch.
+#[cfg(feature = "poseidon2-channel")]
+pub struct RecursionTranscript {
+    /// Every permutation the verifier transcript performed, in caller order.
+    pub records: alloc::vec::Vec<crate::poseidon2::PermRecord>,
+    /// The number of permutations performed BEFORE stwo's verifier head — i.e.
+    /// through the interaction-tree commit. The composition `random_coeff` is the
+    /// first `Squeeze` record at-or-after this index (the head's first draw); the
+    /// records before it are the zkpvm prefix (log-size mix, preprocessed+main
+    /// commit, boundary-state mix, per-relation lookup-element draws, claimed-sum
+    /// mix, interaction commit).
+    pub prefix_len: usize,
+}
+
+/// Record a real canonical segment proof's full verifier transcript by handing a
+/// recording [`Poseidon2M31Channel`](crate::poseidon2::Poseidon2M31Channel)
+/// through the SAME Fiat-Shamir sequence [`verify`] drives — the channel-
+/// affecting prefix of [`verify_with_options_explicit_components`] followed by
+/// stwo's `verify` head + FRI commit + PoW + query sampling + Merkle decommit.
+/// Every absorb/squeeze/pow permutation lands in [`RecursionTranscript::records`]
+/// in caller order.
+///
+/// This is the transcript half of the recursion data extraction; pair it with
+/// [`reconstruct_oods_for_recursion`] (which replays the same prefix to the OODS
+/// point and returns the per-component masks + scalars). Both use the same
+/// deterministic transcript, so the challenges they surface agree.
+///
+/// PRECONDITION (same as [`reconstruct_oods_for_recursion`]): `side_note` must be
+/// in the prover-left state (`closing_chip_active` set), so the boundary-state
+/// mix matches the prover's transcript. Panics if the proof fails to verify — a
+/// recursion harness assumes a well-formed, valid proof (its `component_mask`
+/// popcount equals `log_sizes`/`claimed_sums` length).
+#[cfg(feature = "poseidon2-channel")]
+pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> RecursionTranscript {
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    let config = proof.pcs_config;
+    let sp = proof.stark_proof.clone();
+    let claimed_log_sizes = &proof.log_sizes;
+    let claimed_sums = &proof.claimed_sums;
+
+    let n_active = (proof.component_mask).count_ones() as usize;
+    assert_eq!(
+        n_active,
+        claimed_log_sizes.len(),
+        "component_mask popcount must equal log_sizes length"
+    );
+    assert_eq!(
+        n_active,
+        claimed_sums.len(),
+        "component_mask popcount must equal claimed_sums length"
+    );
+
+    // Select components by the proof's component_mask (canonical forces all 31),
+    // matching `reconstruct_oods_for_recursion`'s trace layout.
+    let active_indices: alloc::vec::Vec<usize> = (0..super::chip_idx::COUNT)
+        .filter(|&i| proof.component_mask & (1 << i) != 0)
+        .collect();
+    let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = active_indices
+        .iter()
+        .map(|&i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
+        .collect();
+    let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
+
+    // A recording channel; clones share the buffer, so the channel handed to
+    // stwo's `verify` records the whole FRI/query/decommit tail too.
+    let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
+    let verifier_channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
+    claimed_log_sizes
+        .iter()
+        .for_each(|ls| verifier_channel.mix_u64(*ls as u64));
+
+    // The preprocessed-root check (`verify_preprocessed_trace`) clones the
+    // channel, so it has no transcript effect and is skipped here.
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let sizes: alloc::vec::Vec<TreeVec<alloc::vec::Vec<u32>>> = components
+        .iter()
+        .zip(claimed_log_sizes)
+        .map(|(c, &ls)| c.trace_sizes(ls))
+        .collect();
+    let mut log_sizes = TreeVec::concat_cols(sizes.into_iter());
+    log_sizes[PREPROCESSED_TRACE_IDX] = components
+        .iter()
+        .zip(claimed_log_sizes)
+        .flat_map(|(c, &ls)| c.preprocessed_trace_sizes(ls))
+        .collect();
+
+    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
+        commitment_scheme.commit(sp.commitments[idx], &log_sizes[idx], verifier_channel);
+    }
+
+    if side_note.closing_chip_active {
+        for r in &proof.initial_state.registers {
+            verifier_channel.mix_u64(*r);
+        }
+        for r in &proof.final_state.registers {
+            verifier_channel.mix_u64(*r);
+        }
+        verifier_channel.mix_u64(proof.initial_state.pc as u64);
+        verifier_channel.mix_u64(proof.initial_state.timestamp);
+        verifier_channel.mix_u64(proof.final_state.pc as u64);
+        verifier_channel.mix_u64(proof.final_state.timestamp);
+        for chunk in proof.initial_state.memory_root.chunks_exact(8) {
+            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        for chunk in proof.final_state.memory_root.chunks_exact(8) {
+            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+    }
+
+    let mut lookup_elements = AllLookupElements::default();
+    components
+        .iter()
+        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, verifier_channel));
+
+    let tree_span_provider = &mut TraceLocationAllocator::default();
+    let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
+        .iter()
+        .zip(claimed_sums)
+        .zip(claimed_log_sizes)
+        .map(|((c, cs), &ls)| c.to_component(tree_span_provider, &lookup_elements, ls, *cs))
+        .collect();
+    let components_ref: alloc::vec::Vec<&dyn Component> =
+        verifier_components.iter().map(|c| &**c).collect();
+
+    verifier_channel.mix_felts(claimed_sums);
+    commitment_scheme.commit(
+        sp.commitments[INTERACTION_TRACE_IDX],
+        &log_sizes[INTERACTION_TRACE_IDX],
+        verifier_channel,
+    );
+
+    // Everything up to here is the zkpvm prefix; stwo's `verify` drives the head
+    // (random_coeff, composition commit, oods, sampled mix, DEEP coeff), the FRI
+    // commit (per-layer roots + fold alphas), PoW, and query sampling next.
+    let prefix_len = recorder.borrow().len();
+
+    stwo::core::verifier::verify(&components_ref, verifier_channel, commitment_scheme, sp)
+        .expect("record_canonical_transcript: proof must verify (recursion harness precondition)");
+
+    let records = recorder.borrow().clone();
+    RecursionTranscript {
+        records,
+        prefix_len,
+    }
+}
