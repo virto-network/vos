@@ -503,6 +503,69 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 
 ## Session P5.3 — verify ONE real 31-component child end-to-end
 
+> **P5.3 UNDERWAY 2026-06-19 (voucher-state-transition, LOCAL). STEP-1 foundation
+> landed + the cost model GROUNDED + the make-or-break re-scoped to a LAYOUT
+> problem.** Commit `479afdd`.
+>
+> **What landed (the data-extraction foundation every consumer needs):**
+> - A zero-overhead `PermKind`/`PermRecord` recorder on the LIB
+>   `poseidon2::Poseidon2M31Channel` (None by default — production transcript
+>   unaffected, behaviorally identical to bare `permute`). The test-module copy in
+>   `recursion_common` stays (dedup is deferred cleanup); the LIB recorder is what
+>   a REAL canonical (lib-typed) proof needs.
+> - `verify::record_canonical_transcript(proof, side_note) -> RecursionTranscript`
+>   (`#[cfg(all(prover, poseidon2-channel))]`): hands a recording channel through
+>   the SAME transcript `verify` drives — the channel-affecting prefix of
+>   `verify_with_options_explicit_components` then stwo `verify` (head + FRI commit
+>   + PoW + query sampling + decommit) — returning every perm + `prefix_len` (perms
+>   before the verifier head; the composition `random_coeff` is the first `Squeeze`
+>   at-or-after it). Pairs with `reconstruct_oods_for_recursion` (OODS scalars/masks).
+> - `tests/recursion_child_verify.rs` (`record_canonical_transcript_grounding`,
+>   poseidon2-channel, `#[ignore]`, ~27s release): GREEN. Recorded composition
+>   `random_coeff` MATCHES `reconstruct_oods_for_recursion`.
+>
+> **MEASUREMENT — the design cost model was WRONG about the transcript** (real
+> 31-component canonical segment, small program, log_sizes ≤ 14):
+> - **Transcript = 8584 perms** (8531 absorb / 51 squeeze / 2 pow), NOT the design's
+>   estimated **~397**. The `mix_felts(sampled_values.flatten_cols())` absorb
+>   (~17K OODS samples, one QM31 per committed column across the 4 trees) DOMINATES
+>   — ~8500 RATE-8 absorb perms. ⇒ **the channel replay ALONE is ~log 14** (8584 →
+>   16384 rows). (`recursion-design.md:81`'s "transcript ≈ 397 perms" is off ~20×.)
+> - **FRI = 14 layers** (13 inner + 1 first; `inner_layers.len()` read at runtime —
+>   NOT the predicted ~19, because this de-risk segment's max log_size is 14, not
+>   the federation 19), `last_layer_poly` len 1 (degree-0 CONSTANT, as predicted),
+>   38 queries, log_blowup 2, pow_bits 20, 4 trace trees.
+> - **Projected integrated per-child scale:** channel 8584 perms + FRI-Merkle
+>   decommit re-hash (~8.7K FRI-layer + ~6.2K trace-tree, design §75-83) ≈ **~23.5K
+>   perms → log 15** (not the design's ~14). Still ≤ canonical 19 (~4 bits margin) ⇒
+>   the fixed point holds, but the per-child log is **15, not 14**.
+>
+> **THE RE-SCOPED MAKE-OR-BREAK = the LAYOUT problem (the crux the design deferred
+> as "modulo P5.3 layout").** P5.2 proved the 31-comp OODS embed as PURE WIDTH
+> (160600 M31 cols) at log 6 (64 rows, ~23s). But the channel forces ~16384 rows,
+> and replicating 160600 cols × 16384 rows ≈ 2.6 BILLION cells = OOM. So the OODS
+> embed MUST DISTRIBUTE across the ~16K perm rows (~10 M31/row, per
+> `recursion-design.md` and `project_recursion_build`). Distributing the embed turns
+> its **sequential Horner accumulator** (`oods_auto::drive_multi`: `acc·rc + c`,
+> witnessed step by step — currently single-row-replicated by `gen_join_trace`) into
+> a **CROSS-ROW chain** (each row does one `acc·rc + c` step reading the previous
+> row's `acc` via a `[-1,0]` mask, the channel's own latch mechanism). This is a
+> redesign of `OodsEval`/the join-trace layout into a row-streaming form — the real
+> P5.3 engineering, and the gate for integrating OODS with the channel/FRI/Merkle in
+> ONE uniform component. **Decide + spike this layout FIRST next session; it
+> determines the row/column structure every consumer shares.**
+>
+> **NEXT (precise, grounded):** (a) the row-streaming OODS-embed layout spike
+> (cross-row Horner) — the gating decision; (b) bind the streamed embed's `rc` to
+> the channel-latched composition coeff (the join_assembly latch pattern, scaled);
+> (c) extend `record_canonical_transcript` → add the FRI fold reconstruction
+> (`compute_decommitment_positions_and_rebuild_evals` + `build_merkle_verification_inputs`)
+> + per-tree/per-layer decommit data extraction (the FRI/Merkle data half of the
+> foundation); (d) scale the FRI fold chain (14 layers, 38 queries) + the 4-trace +
+> 14-FRI-layer Merkle decommit (generalise the leaf sponge for the non-8-multiple
+> QM31-wide FRI leaves — the partial-rate `finalize` pad); (e) boundary +
+> claimed-sum balance (`boundary_binding::check_boundary_claimed_sums`, scale-free).
+
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
 scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
 scale) + the ChannelChip transcript replay, all against ONE real Poseidon2-M31 conservation
