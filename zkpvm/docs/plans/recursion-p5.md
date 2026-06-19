@@ -765,6 +765,14 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   degree bound -- only the PROVE confirms degree <= 2.
 > - Shared synthetic setup extracted to `recursion_common::synth`
 >   (`synthetic_setup` / `build_capture`), reused by every streamed gate.
+> - **REAL-SEGMENT gate (`embed_gate_real`, `#[ignore]`, ~108s).** Drives the SAME
+>   streamed embed on a REAL `prove_canonical` segment's OODS data (via
+>   `reconstruct_oods_for_recursion`, the `oods_auto_real_segment` real-data path):
+>   it proves+verifies + rejects a tamper, AND its co-locate layout shape is
+>   **identical to the synthetic** (6251 rows, dr=21, max-leaf 74 all match) -- so
+>   the routing "program" (the preprocessed coeff/selector columns) is genuinely
+>   SEGMENT-INVARIANT, the property that lets it be PREPROCESSED across the 76
+>   canonical segments. The streamed embed now runs on real data, not just the fuzz.
 >
 > **NEXT (precise, grounded):** (a) ✅ **DONE** — layout DECIDED (co-locate, W_p=65)
 > + the variable-offset preprocessed-routing mechanism de-risked + the StreamBackend
