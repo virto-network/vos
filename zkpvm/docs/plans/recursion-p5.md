@@ -575,8 +575,30 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > row's `acc` via a `[-1,0]` mask, the channel's own latch mechanism). This is a
 > redesign of `OodsEval`/the join-trace layout into a row-streaming form — the real
 > P5.3 engineering, and the gate for integrating OODS with the channel/FRI/Merkle in
-> ONE uniform component. **Decide + spike this layout FIRST next session; it
-> determines the row/column structure every consumer shares.**
+> ONE uniform component.
+>
+> **LAYOUT VIABILITY PROVEN 2026-06-19 (commit `41d6caa`,
+> `tests/recursion_offset_spike.rs`).** The foundational unknown was whether a
+> circle-STARK mask offset `k` reads exactly logical row `i+k` for `|k|>1` (the
+> proven ChannelChip/FriFoldChip only ever use ±1; the circle domain is a coset,
+> not a line, so clean composition of the group step was not obvious). Spike: fill
+> one column `v[storage(i)]=i`, read it at signed offsets ±{1,2,3,8,16,24} (small
+> AND up to ~N/2) in one mask, constrain `v@±k − v@0 == ±k` gated past the wraps —
+> GREEN + the wrong-expectation control rejected ⇒ **every tested offset reads
+> EXACTLY logical row i+k.** So the streamed evaluator CAN read operands from
+> nearby rows. **DESIGN (grounded):** lay the `OodsEval` `schedule` down the rows as
+> a small set of "register"/lane columns; each row computes one witnessed product
+> or Horner step reading operands at FIXED small relative offsets (`{0,-1,…,-W}`,
+> W = the dataflow cut-width) + LATCHED constants (rc/dinv/ox/comp_mask + the
+> lookup `z`/`alpha`, held constant via the channel's `not_last` eq). To keep the
+> outer OODS mask small the DISTINCT offset set must be bounded (≈W), which needs a
+> scheduling pass that keeps live values within a window of W (read masks lazily —
+> right before use — not all up-front as `TraceEval::new` does today). Rows ≈
+> schedule length / ops-per-row (≈40150 → log 16 single-lane, fewer if banded);
+> width ≈ W + latched. **NEXT: implement the row-streaming `OodsEval` (a third
+> `WitBackend` emitting a windowed (row,col) schedule + matching offsets) and
+> MEASURE; then bind the streamed `rc`/lookup-elements to the channel latches.** The
+> offset mechanism it relies on is now de-risked.
 >
 > **NEXT (precise, grounded):** (a) the row-streaming OODS-embed layout spike
 > (cross-row Horner) — the gating decision; (b) bind the streamed embed's `rc` to
