@@ -791,11 +791,14 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > boundary + claimed-sum balance (`boundary_binding::check_boundary_claimed_sums`,
 > scale-free; uses `data.lookup_elements` + the public boundary states).
 >
-> **PER-CHILD ASSEMBLY STEPS 1 + 1b LANDED 2026-06-19 (LOCAL,
-> `tests/recursion_child_assembly.rs`, commits `79fca73` / `461f0a8`).** The
-> channel transcript replay and the streamed OODS embed now co-exist in ONE
-> uniform `FrameworkEval`, driven off ONE real `prove_canonical` segment, with the
-> first cross-chip latch bindings live at canonical scale.
+> **PER-CHILD ASSEMBLY STEPS 1 + 1b + HARDENING + 4a LANDED 2026-06-19/20 (LOCAL,
+> `tests/recursion_child_assembly.rs`, commits `79fca73` / `461f0a8` / `1de6f70` /
+> `cf157ec`).** The channel transcript replay and the streamed OODS embed now
+> co-exist in ONE uniform `FrameworkEval`, driven off ONE real `prove_canonical`
+> segment, with the first cross-chip latch bindings + the claimed-sum balance live
+> at canonical scale. The honest gate proves+verifies @ **log 14, ~82–94s/prove**;
+> every tamper (transcript / embed / oods_t / mis-placed indicator / claimed_sum)
+> is rejected.
 > - **Step 1 (rc latch):** the merged component reads the channel block (the proven
 >   `join_assembly` AIR) AND the streamed embed block (the proven
 >   `recursion_stream_embed` AIR) on a shared row grid (the embed's 6251 stream rows
@@ -820,6 +823,32 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   derivation (only it reads `oods_t`). ⇒ `rc`/`dinv`/`ox` are all now
 >   transcript-derived; `comp` (`latched[3..11]`) + the lookup elements + the embed
 >   LEAVES remain host-supplied (bound via the FRI/DEEP + Merkle path, steps 2–3).
+> - **Draw-indicator hardening (review follow-up, `1de6f70`):** an adversarial
+>   multi-agent review flagged that the `is_rc_draw`/`is_oods_draw` indicators are
+>   PREPROCESSED columns, so the latch bindings rest on the preprocessed trace being
+>   correct, and nothing in-AIR forced them to fire on a genuine `Squeeze` row.
+>   Resolution: the indicators are part of the fixed verifier-program identity
+>   (pinned in the full recursion by the W0 commitment allowlist — exactly as
+>   `is_first`/`not_last`/the recon-routing program are), so WHICH squeeze they
+>   select is program-pinned; the AIR now additionally enforces `is_X_draw·(1 −
+>   is_squeeze) == 0` so a mis-placed indicator cannot bind rc/oods_t to a
+>   non-challenge Absorb/Pow perm output. New reject test (mis-placed indicator).
+> - **Step 4a (claimed-sum balance):** the 31 per-component `claimed_sums` are bound
+>   to the channel's `mix_felts(claimed_sums)` absorb — the last 16 RATE-8 prefix
+>   perms before the interaction commit (`records[prefix_len-17..prefix_len-1]`),
+>   chunk `c` carrying `claimed_sum[2c]`/`[2c+1]` in `absorbed[0..4]`/`[4..8]` (each
+>   QM31's 4 coords never cross an 8-boundary) — and `Σ claimed_sums == 0` is
+>   enforced in-AIR (the global logup-balance check, `verify.rs:299`). 31 latched cs
+>   columns + 16 `is_cs_chunk` preprocessed indicators (each hardened to fire only on
+>   a genuine Absorb row). The channel already constrains `absorbed` to the mixed
+>   value, so the binding pins cs to the real claimed_sums. GATE GREEN @ **log 14**
+>   (491s / 6 proves, corrupted-claimed_sum rejected). REMAINING for full
+>   claimed-sum soundness: (i) the **boundary recompute** (step 4b, `verify.rs:318`
+>   → `check_boundary_claimed_sums`, binding the public io-hash + memory roots) —
+>   large (the `MerkleNode` relation's 66-element tuple ⇒ 66 α-powers; register
+>   byte-limbs; ~29 inverse-combines; the 3 boundary relations' `z,alpha` each from
+>   ONE squeeze via `draw_secure_felts(2)`); (ii) connecting the embed's BAKED
+>   claimed_sums to the bound cs columns (a follow-on like the lookup-element bind).
 >
 > **REMAINING — precise architecture (grounded this session):**
 > - **Steps 2 + 3 (FRI fold chain + multi-tree Merkle decommit) are a COUPLED
