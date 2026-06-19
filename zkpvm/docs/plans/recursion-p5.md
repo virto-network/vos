@@ -616,8 +616,84 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > global composition; then bind the streamed `rc`/lookup-elements to the channel
 > latches.** Both the offset mechanism AND the shape tractability are now de-risked.
 >
-> **NEXT (precise, grounded):** (a) the row-streaming OODS-embed layout spike
-> (cross-row Horner) — the gating decision; (b) bind the streamed embed's `rc` to
+> **LAYOUT DECIDED + EMISSION MECHANISM DE-RISKED 2026-06-19 (commits `cd4aac6`/
+> `3cf4c9d`/`692b3f3`, `voucher-state-transition`, LOCAL) — the row-streaming
+> OodsEval's two open unknowns (the layout, and the variable-offset read) are both
+> RESOLVED; what remains is the emission engineering, not research.** Three gates,
+> all dataflow-only (no proving for #0/#1, fast prove for the mechanism):
+> - **Task #0 — flat-schedule BANDWIDTH measured (`tests/recursion_stream_bandwidth.rs`,
+>   `BandwidthBackend` in `oods_auto.rs`).** A dataflow-only `WitBackend` walks all
+>   31 chips through `drive_multi` (the schedule shape is value-independent, so no
+>   masks/proof needed) and tracks each node's operand support, EXCLUDING latched
+>   aux (rc/dinv/ox/comp — held on every row, zero distance). Real flat schedule:
+>   **40138 streamed nodes** (16844 mask samples + 23294 witnessed products = 160552
+>   M31, matches the prior 40150/160600 EXACTLY ⇒ the walk is faithful). **Operand
+>   bandwidth is LARGE**: max distance **9785**, mean 2082, 65.8% of products reach
+>   >256 nodes back (worst: Blake2bBoundary 9785, Blake2b 8856, Ristretto 6230) —
+>   the chips read masks up front (`TraceEval::new`) and use them far downstream, so
+>   small fixed offsets do NOT suffice. **Live-set width W**: naive 2903, lazy (defer
+>   each mask read to first use) **1700**. ⇒ a pure register-WINDOW (no replication)
+>   needs ~1700 lanes (≈6800 M31/row) — the acc chain serializes the constraints, so
+>   shared mask samples stay live across them; lazy-W≈1700 is essentially inherent.
+>   This REVISES the `recursion_stream_scale` optimism (68 cols/row modeled fresh
+>   per-row inputs, bandwidth 1 — not the real shared-mask DAG).
+> - **Task #1 — OODS DAG captured + LAYOUT decided: CO-LOCATE
+>   (`tests/recursion_stream_layout.rs`, `GraphBackend` in `oods_auto.rs`).**
+>   `GraphBackend` captures the full DAG (node kinds + per-product operand deps); the
+>   test costs both candidate layouts from the real graph. **Co-locate wins
+>   decisively**: replicate each mask sample onto the rows that CONSUME it (read at
+>   offset 0) and keep only PRODUCT values cross-row. Measured: **product-only
+>   live-set W_p = 65** (the lane count, vs ~1700 for a pure window — products are
+>   short-lived, the Horner collapses each into the next step); **product→product
+>   offset reach: max 64, mean 9, p99 53** (a bounded, small offset set — the offset
+>   spike already proved offsets ≤ N/2 read the exact row); **product fan-in mean
+>   1.0** (each product reads ~1 product operand = the acc lane, + latched rc), max
+>   33; mask replication Σ = 79035 (avg 3.39/product) ⇒ storage ≈ 102329 QM31,
+>   fitting log 14 at OPS_PER_ROW≈7, narrow (a handful of QM31/row + bounded offset
+>   reads + latched). At OPS=8 the product reach ≤64 rank ⇒ ≤ ~8 ROWS.
+> - **Task #1 — variable-offset EMISSION MECHANISM de-risked
+>   (`tests/recursion_stream_route_spike.rs`).** The unsolved piece (neither
+>   offset_spike nor stream_scale covered it): different products read DIFFERENT
+>   past offsets with DIFFERENT coefficients, but a uniform AIR applies ONE fixed
+>   constraint to every row. **Resolution PROVEN: the schedule is FIXED across all
+>   canonical segments** (same 31 chips, same constraint structure, same mask shape —
+>   only the OODS VALUES differ per proof; log_size only moves the cumsum_shift/dinv
+>   *values*, not the shape), so the routing is PREPROCESSED. Each row reads the
+>   stream column at a fixed window `[0,-D]` and reconstructs an operand as
+>   `a = Σ_{k=1}^{D} ca[k]·sample(-k)` with `ca[k]` preprocessed (mostly zero — only
+>   this row's actual operand offsets nonzero). `ca·sample` = preproc(deg1)·main(deg1)
+>   = deg2; the whole sum is ONE deg-2 constraint (TERM COUNT IS FREE — only
+>   multiplicative degree is bounded; verified against stwo's `expr/degree.rs`).
+>   Reconstruction + product constraints stay UNGATED (hold on seed/padding rows
+>   where columns are zero); only the linear chain `active·(s−p)` is gated (deg-1
+>   selector × deg-1 diff = deg2 — gating a deg-2 expr would be deg 3, OVER the
+>   bound). GATE: `route_air_satisfied` (assert, log 6) + `route_gate` (prove+verify
+>   at log 8, ~90s honest, tamper rejected) GREEN. CRITICAL GOTCHA confirmed:
+>   `assert_constraints_on_trace` checks only ZERO-ness, NOT the degree bound (a
+>   degree-3 slip surfaces only as a FRI failure at prove/verify), so the PROVE is
+>   what confirms degree ≤ 2 — every streamed-layout gate MUST prove, not just assert.
+> ⇒ **the row-streaming OodsEval is now an ENGINEERING task, fully de-risked**: the
+> layout (co-locate, W_p=65, masks replicated on-row, products at offsets ≤64 rank /
+> ≤~8 rows at OPS=8) AND the read mechanism (preprocessed-coefficient windowed
+> reconstruction, degree ≤ 2) are both proven. The remaining build = the StreamBackend
+> EMISSION: a `WitBackend` whose V is a SYMBOLIC linear form (`Σ coeff·node + latched
+> + const`, NOT an eager EF expression — the existing `VerifyBackend` binds operands
+> at offset 0 at creation, which cannot stream); capture every product's two operand
+> forms + the final equality; a host SCHEDULE pass laying products in walk order with
+> mask-copies inlined adjacent to consumers + computing each node's (row, offset);
+> a host TRACE fill (the OODS values into the stream + the preprocessed coeff/active
+> columns = the fixed "program"); a streamed `FrameworkEval` reconstructing each
+> product `w == a·b` from the windowed reads via the preprocessed coeffs (the spike's
+> mechanism, scaled to ~8-row windows + the acc lane). GATE: drive all 31 via
+> `drive_multi`/`drive_chip_oods`, match the global `PointEvaluationAccumulator`
+> (assert) THEN prove+verify (degree), MEASURE rows/width/time; then bind the streamed
+> `rc`/lookup-z/alpha to the channel-latched challenges (the join_assembly latch).
+>
+> **NEXT (precise, grounded):** (a) ✅ **DONE** — layout DECIDED (co-locate, W_p=65)
+> + the variable-offset preprocessed-routing mechanism de-risked (above); remaining
+> = the StreamBackend emission (symbolic linear forms + schedule + trace fill +
+> streamed FrameworkEval; gate against the global composition); (b) bind the streamed
+> embed's `rc` to
 > the channel-latched composition coeff (the join_assembly latch pattern, scaled);
 > (c) ✅ **DONE (step 1b)** — `extract_recursion_data` gives the full FRI/decommit
 > data via the PUBLIC `fri_answers` + `FriVerifier`/`tree.verify` calls (no need to
