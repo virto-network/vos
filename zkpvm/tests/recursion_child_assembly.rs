@@ -1,7 +1,7 @@
 #![cfg(feature = "poseidon2-channel")]
 
-//! Recursion build P5.3 — **the per-child assembly (step 1: channel + streamed
-//! OODS embed + rc latch).**
+//! Recursion build P5.3 — **the per-child assembly (steps 1 + 1b: channel +
+//! streamed OODS embed + rc latch + in-circuit OODS-point derivation).**
 //!
 //! P5.2 proved the streamed OODS embed standalone (`recursion_stream_embed`); P4.1
 //! proved the channel transcript replay + latched cross-chip propagation
@@ -21,7 +21,15 @@
 //!     draws `random_coeff` first), and the constraint
 //!     `is_rc_draw · (lat_rc[j] − squeeze_out[j]) == 0` pins the embed's rc to the
 //!     transcript-derived one. So the embed no longer TRUSTS a host rc; it consumes
-//!     the channel's. (dinv/ox/comp/lookup latches are bound in step 1b+.)
+//!     the channel's.
+//!   * **OODS-point derivation (step 1b)** — the embed's `dinv` (`latched[1]`) and
+//!     `ox` (`latched[2]`) are DERIVED in-circuit from a latched `oods_t` (bound to
+//!     its squeeze, the 2nd `Squeeze` at/after `prefix_len`, via `is_oods_draw`):
+//!     the `get_random_point` map gives the OODS point, then `ox =
+//!     double_x^{mlbd-1}(oods.x)` and `dinv = 1/coset_vanishing(coset, oods)` (a
+//!     shift by the fixed coset point `C`, then a `double_x` chain). All degree ≤ 2.
+//!     This removes two more trusted host inputs. (comp/lookup latches + the embed
+//!     leaves are bound via the FRI/DEEP + Merkle path in steps 2–3.)
 //!
 //! The two AIRs share `not_last` (channel digest chain + embed latched constancy)
 //! and the storage indexing; otherwise the column blocks + constraints are
@@ -50,6 +58,7 @@ use recursion_common::{
     permute, record_permutation,
 };
 use stwo::core::air::Component;
+use stwo::core::fields::FieldExpOps;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use stwo::core::pcs::{CommitmentSchemeVerifier, TreeVec};
@@ -119,6 +128,7 @@ fn storage_index(i: usize, log_size: u32) -> usize {
 const NOT_LAST: &str = "ca_not_last";
 const CH_IS_FIRST: &str = "ca_is_first";
 const IS_RC_DRAW: &str = "ca_is_rc_draw";
+const IS_OODS_DRAW: &str = "ca_is_oods_draw";
 fn final_id(l: usize) -> String {
     format!("ca_final_{l}")
 }
@@ -139,6 +149,9 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
         },
         PreProcessedColumnId {
             id: IS_RC_DRAW.to_string(),
+        },
+        PreProcessedColumnId {
+            id: IS_OODS_DRAW.to_string(),
         },
     ];
     for l in 0..OPS_S {
@@ -180,6 +193,13 @@ fn win_index(pos: &WinPos) -> usize {
 #[derive(Clone)]
 struct ChildEval {
     log_n_rows: u32,
+    /// `mlbd - 1` `double_x` steps for the OODS-point `ox`/`dinv` derivation
+    /// (`mlbd` = the segment's composition vanishing-domain log size).
+    dbl_steps: usize,
+    /// The fixed coset-shift point `C = step_size.half().to_point() - coset.initial`
+    /// of `CanonicCoset::new(mlbd).coset`, used to derive `coset_vanishing` in-AIR.
+    cx: BaseField,
+    cy: BaseField,
 }
 
 impl FrameworkEval for ChildEval {
@@ -205,6 +225,9 @@ impl FrameworkEval for ChildEval {
         });
         let is_rc_draw = eval.get_preprocessed_column(PreProcessedColumnId {
             id: IS_RC_DRAW.to_string(),
+        });
+        let is_oods_draw = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: IS_OODS_DRAW.to_string(),
         });
         let is_final: [E::F; OPS_S] = std::array::from_fn(|l| {
             eval.get_preprocessed_column(PreProcessedColumnId { id: final_id(l) })
@@ -393,6 +416,48 @@ impl FrameworkEval for ChildEval {
             eval.add_constraint(is_rc_draw.clone() * (rc_coords[j].clone() - out[j].clone()));
         }
 
+        // ── OODS-point derivation: bind dinv (latched[1]) + ox (latched[2]) to the
+        //    transcript by deriving the OODS point in-circuit from a latched oods_t
+        //    (bound to its squeeze), then `ox = double_x^{mlbd-1}(oods.x)` and
+        //    `dinv = 1/coset_vanishing(coset, oods)` — removing two trusted host
+        //    inputs. (rc done above; comp is bound later via the FRI/DEEP path.) ──
+        let oods_t_c: [[E::F; 2]; SECURE_EXTENSION_DEGREE] =
+            std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
+        let oods_t = E::combine_ef(std::array::from_fn(|i| oods_t_c[i][0].clone()));
+        let oods_t_next = E::combine_ef(std::array::from_fn(|i| oods_t_c[i][1].clone()));
+        let t2 = read4_0(&mut eval);
+        let tinv = read4_0(&mut eval);
+        let oodsx = read4_0(&mut eval);
+        let oodsy = read4_0(&mut eval);
+        // get_random_point map (circle.rs): x=(1−t²)·inv, y=2t·inv, inv=(1+t²)⁻¹.
+        eval.add_constraint(t2.clone() - oods_t.clone() * oods_t.clone());
+        eval.add_constraint(tinv.clone() * (t2.clone() + E::EF::one()) - E::EF::one());
+        eval.add_constraint(oodsx.clone() - (E::EF::one() - t2.clone()) * tinv.clone());
+        eval.add_constraint(oodsy.clone() - (oods_t.clone() + oods_t.clone()) * tinv);
+        // oods_t held constant + bound to its squeeze (the get_random_point draw).
+        eval.add_constraint(lift(not_last.clone()) * (oods_t_next - oods_t));
+        for j in 0..SECURE_EXTENSION_DEGREE {
+            eval.add_constraint(is_oods_draw.clone() * (oods_t_c[j][0].clone() - out[j].clone()));
+        }
+        // ox = double_x^{mlbd-1}(oods.x): x_{k+1} = 2·x_k² − 1, each square witnessed.
+        let mut x = oodsx.clone();
+        for _ in 0..self.dbl_steps {
+            let sq = read4_0(&mut eval);
+            eval.add_constraint(sq.clone() - x.clone() * x.clone()); // deg 2
+            x = sq.clone() + sq - E::EF::one(); // 2·x² − 1, deg 1
+        }
+        eval.add_constraint(lat_cur[2].clone() - x); // bind ox, deg 1
+        // dinv = 1/double_x^{mlbd-1}(p'.x), p' = oods + C (coset_vanishing shift).
+        let cx = lift(E::F::from(self.cx));
+        let cy = lift(E::F::from(self.cy));
+        let mut y = oodsx * cx - oodsy * cy; // p'.x = oods.x·C.x − oods.y·C.y, deg 1
+        for _ in 0..self.dbl_steps {
+            let sq = read4_0(&mut eval);
+            eval.add_constraint(sq.clone() - y.clone() * y.clone()); // deg 2
+            y = sq.clone() + sq - E::EF::one();
+        }
+        eval.add_constraint(lat_cur[1].clone() * y - E::EF::one()); // bind dinv, deg 2
+
         eval
     }
 }
@@ -405,6 +470,9 @@ struct ChildTrace {
     preprocessed: Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>,
     main: Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>,
     log_size: u32,
+    dbl_steps: usize,
+    cx: BaseField,
+    cy: BaseField,
 }
 
 /// `channel_tamper`: bump one absorbed value on that record row (breaks the
@@ -414,10 +482,16 @@ struct ChildTrace {
 fn gen_trace(
     records: &[PermRecord],
     rc_row: usize,
+    oods_row: usize,
+    oods_t: SecureField,
+    dbl_steps: usize,
+    cx: BaseField,
+    cy: BaseField,
     lay: &ColocateLayout,
     log_size: u32,
     channel_tamper: Option<usize>,
     final_tamper: bool,
+    oods_t_tamper: bool,
 ) -> ChildTrace {
     assert!(lay.ops_s == OPS_S && lay.nleaf == NLEAF);
     assert!(lay.dr <= DR, "layout dr={} exceeds DR={DR}", lay.dr);
@@ -436,6 +510,7 @@ fn gen_trace(
     let mut ch: Vec<Vec<BaseField>> = vec![vec![zb; n]; CHANNEL_COLS];
     let mut ch_is_first = vec![zb; n];
     let mut is_rc_draw = vec![zb; n];
+    let mut is_oods_draw = vec![zb; n];
 
     let mut digest = [zb; 8];
     let mut n_draws = 0u32;
@@ -554,6 +629,9 @@ fn gen_trace(
         if row == rc_row {
             is_rc_draw[row] = BaseField::one();
         }
+        if row == oods_row {
+            is_oods_draw[row] = BaseField::one();
+        }
 
         digest = digest_next;
         n_draws = n_draws_next;
@@ -609,6 +687,41 @@ fn gen_trace(
     }
     debug_assert_eq!(emb_q.len(), embed_qm31_cols());
 
+    // ── OODS-derivation QM31 columns (constant across rows; in read order:
+    //    oods_t, t2, tinv, oodsx, oodsy, ox squares×dbl, dinv squares×dbl) ──
+    let one = SecureField::one();
+    let t2 = oods_t.square();
+    let tinv = (t2 + one).inverse();
+    let oodsx = (one - t2) * tinv;
+    let oodsy = (oods_t + oods_t) * tinv;
+    // Corrupt the latched oods_t (only the in-circuit OODS derivation reads it,
+    // so this isolates the new binding from the embed's own constraints).
+    let oods_t_col = if oods_t_tamper {
+        oods_t + SecureField::one()
+    } else {
+        oods_t
+    };
+    let mut oods_q: Vec<SecureField> = vec![oods_t_col, t2, tinv, oodsx, oodsy];
+    let mut x = oodsx;
+    for _ in 0..dbl_steps {
+        let sq = x.square();
+        oods_q.push(sq);
+        x = sq + sq - one;
+    }
+    debug_assert_eq!(x, lay.latched_value[2], "derived ox must match reconstruct");
+    let mut y = oodsx * SecureField::from(cx) - oodsy * SecureField::from(cy);
+    for _ in 0..dbl_steps {
+        let sq = y.square();
+        oods_q.push(sq);
+        y = sq + sq - one;
+    }
+    debug_assert_eq!(
+        lay.latched_value[1] * y,
+        one,
+        "derived dinv·vanishing must equal 1"
+    );
+    let oods_cols: Vec<Vec<SecureField>> = oods_q.into_iter().map(|v| vec![v; n]).collect();
+
     // ── Preprocessed logical columns, in registration order ──
     let mut pre_b: Vec<Vec<BaseField>> = Vec::new();
     pre_b.push(
@@ -618,6 +731,7 @@ fn gen_trace(
     ); // not_last
     pre_b.push(ch_is_first);
     pre_b.push(is_rc_draw);
+    pre_b.push(is_oods_draw);
     for l in 0..OPS_S {
         pre_b.push(
             (0..n)
@@ -677,7 +791,7 @@ fn gen_trace(
     let preprocessed: Vec<_> = pre_b.into_iter().map(wrap).collect();
 
     let mut main_logical: Vec<Vec<BaseField>> = ch;
-    for q in &emb_q {
+    for q in emb_q.iter().chain(oods_cols.iter()) {
         for c in 0..SECURE_EXTENSION_DEGREE {
             main_logical.push(q.iter().map(|v| v.to_m31_array()[c]).collect());
         }
@@ -693,6 +807,9 @@ fn gen_trace(
         preprocessed,
         main,
         log_size,
+        dbl_steps,
+        cx,
+        cy,
     }
 }
 
@@ -756,13 +873,19 @@ fn canonical_segment() -> (Proof, SideNote) {
 struct ChildInputs {
     records: Vec<PermRecord>,
     rc_row: usize,
+    oods_row: usize,
+    oods_t: SecureField,
+    dbl_steps: usize,
+    cx: BaseField,
+    cy: BaseField,
     lay: ColocateLayout,
     log_size: u32,
 }
 
 fn build_inputs() -> ChildInputs {
+    use stwo::core::poly::circle::CanonicCoset;
     use zkpvm::framework_access::drive_chip_oods;
-    use zkpvm::{chip_idx, reconstruct_oods_for_recursion, record_canonical_transcript};
+    use zkpvm::{chip_idx, extract_recursion_data, reconstruct_oods_for_recursion};
 
     let (proof, sn) = canonical_segment();
     assert_eq!(
@@ -771,15 +894,36 @@ fn build_inputs() -> ChildInputs {
         "canonical proof must carry all 31 components"
     );
 
-    // Channel transcript + the composition-rc draw row.
-    let transcript = record_canonical_transcript(&proof, &sn);
-    let records = transcript.records;
-    let prefix_len = transcript.prefix_len;
-    let rc_row = records
+    // Channel transcript + FRI/OODS data (mlbd, oods_point). The transcript's
+    // squeezes at/after prefix_len are, in order: rc, oods_t, deep, fold_alphas…
+    let data = extract_recursion_data(&proof, &sn);
+    let records = data.transcript.records;
+    let prefix_len = data.transcript.prefix_len;
+    let squeezes: Vec<usize> = records
         .iter()
         .enumerate()
-        .position(|(i, r)| i >= prefix_len && r.kind == PermKind::Squeeze)
-        .expect("a squeeze at/after prefix_len (the composition random_coeff)");
+        .filter(|(i, r)| *i >= prefix_len && r.kind == PermKind::Squeeze)
+        .map(|(i, _)| i)
+        .collect();
+    let rc_row = squeezes[0];
+    let oods_row = squeezes[1];
+    let oods_t = {
+        let o = records[oods_row].output;
+        SecureField::from_m31_array([o[0], o[1], o[2], o[3]])
+    };
+
+    // The OODS-point derivation chain length + coset-shift constant C, from mlbd.
+    let mlbd = data.max_log_degree_bound;
+    let dbl_steps = (mlbd - 1) as usize;
+    let coset = CanonicCoset::new(mlbd).coset;
+    let c_point = coset.step_size.half().to_point() - coset.initial;
+    let (cx, cy) = (c_point.x, c_point.y);
+    // Cross-check C against the real OODS point: p'.x = oods.x·C.x − oods.y·C.y.
+    debug_assert_eq!(
+        data.oods_point.x * SecureField::from(cx) - data.oods_point.y * SecureField::from(cy),
+        (data.oods_point - coset.initial.into_ef() + coset.step_size.half().to_point().into_ef()).x,
+        "coset-shift constant C mismatch"
+    );
 
     // Streamed OODS embed layout from the SAME segment's reconstructed OODS data.
     let r = reconstruct_oods_for_recursion(&proof, &sn);
@@ -823,8 +967,37 @@ fn build_inputs() -> ChildInputs {
     ChildInputs {
         records,
         rc_row,
+        oods_row,
+        oods_t,
+        dbl_steps,
+        cx,
+        cy,
         lay,
         log_size,
+    }
+}
+
+impl ChildInputs {
+    fn trace(
+        &self,
+        channel_tamper: Option<usize>,
+        final_tamper: bool,
+        oods_t_tamper: bool,
+    ) -> ChildTrace {
+        gen_trace(
+            &self.records,
+            self.rc_row,
+            self.oods_row,
+            self.oods_t,
+            self.dbl_steps,
+            self.cx,
+            self.cy,
+            &self.lay,
+            self.log_size,
+            channel_tamper,
+            final_tamper,
+            oods_t_tamper,
+        )
     }
 }
 
@@ -850,6 +1023,9 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
         &mut alloc,
         ChildEval {
             log_n_rows: log_size,
+            dbl_steps: trace.dbl_steps,
+            cx: trace.cx,
+            cy: trace.cy,
         },
         SecureField::zero(),
     );
@@ -871,15 +1047,9 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
 #[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
 fn child_assembly_air_satisfied() {
     let inp = build_inputs();
-    let trace = gen_trace(
-        &inp.records,
-        inp.rc_row,
-        &inp.lay,
-        inp.log_size,
-        None,
-        false,
-    );
+    let trace = inp.trace(None, false, false);
     let log_size = trace.log_size;
+    let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
     let pre: Vec<Vec<M31>> = trace
         .preprocessed
         .iter()
@@ -894,6 +1064,9 @@ fn child_assembly_air_satisfied() {
         |e| {
             ChildEval {
                 log_n_rows: log_size,
+                dbl_steps,
+                cx,
+                cy,
             }
             .evaluate(e);
         },
@@ -920,57 +1093,45 @@ fn child_assembly_air_satisfied() {
 fn child_assembly_gate() {
     let inp = build_inputs();
 
-    prove_and_verify(gen_trace(
-        &inp.records,
-        inp.rc_row,
-        &inp.lay,
-        inp.log_size,
-        None,
-        false,
-    ))
-    .expect("honest per-child assembly must prove+verify at degree ≤ 2");
+    prove_and_verify(inp.trace(None, false, false))
+        .expect("honest per-child assembly must prove+verify at degree ≤ 2");
 
-    // Reject: corrupt a channel absorbed value (the transcript binding).
+    // Reject: corrupt a channel absorbed value (the transcript binding) — also
+    // diverges the rc + oods_t squeezes the latches bind to.
     let absorb_row = inp
         .records
         .iter()
         .position(|r| r.kind == PermKind::Absorb)
         .expect("transcript has an absorb");
     assert!(
-        prove_and_verify(gen_trace(
-            &inp.records,
-            inp.rc_row,
-            &inp.lay,
-            inp.log_size,
-            Some(absorb_row),
-            false,
-        ))
-        .is_err(),
+        prove_and_verify(inp.trace(Some(absorb_row), false, false)).is_err(),
         "a corrupted transcript value must be rejected"
     );
 
     // Reject: corrupt the embed composition (the final-slot oa value).
     assert!(
-        prove_and_verify(gen_trace(
-            &inp.records,
-            inp.rc_row,
-            &inp.lay,
-            inp.log_size,
-            None,
-            true,
-        ))
-        .is_err(),
+        prove_and_verify(inp.trace(None, true, false)).is_err(),
         "a corrupted embed value must be rejected"
+    );
+
+    // Reject: corrupt the latched oods_t (isolates the in-circuit OODS-point
+    // derivation: only it reads oods_t, so this confirms the dinv/ox binding is
+    // non-vacuous independent of the embed).
+    assert!(
+        prove_and_verify(inp.trace(None, false, true)).is_err(),
+        "a corrupted oods_t must be rejected by the OODS-point derivation"
     );
 
     eprintln!(
         "child_assembly_gate GREEN @ log {}: ONE uniform component replays a REAL canonical \
          segment's {}-perm transcript AND re-evaluates its full 31-component OODS composition \
          (streamed embed, {} stream rows), with the embed's rc latched to the channel's \
-         composition-rc squeeze — proving+verifying through the lifted Poseidon2-M31 protocol at \
-         degree ≤ 2; a tampered transcript value and a tampered embed value are rejected.",
+         composition-rc squeeze AND dinv/ox derived in-circuit from a transcript-bound oods_t \
+         (mlbd-1={} double_x steps) — proving+verifying through the lifted Poseidon2-M31 protocol \
+         at degree ≤ 2; tampered transcript / embed / oods_t values are each rejected.",
         inp.log_size,
         inp.records.len(),
         inp.lay.n_rows,
+        inp.dbl_steps,
     );
 }
