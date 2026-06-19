@@ -47,6 +47,10 @@ use stwo_constraint_framework::{EvalAtRow, relation};
 /// that drives a chip's own `evaluate` to embed its OODS composition in-AIR.
 pub mod oods_auto;
 
+/// The shared synthetic 31-component setup + symbolic capture used by the streamed
+/// OODS-embed gates (capture fidelity, schedule, two-stream layout, AIR prove).
+pub mod synth;
+
 // ── Poseidon2-over-M31 parameters (width 16; eprint 2023/323 §5) ──────────
 
 pub const N_STATE: usize = 16;

@@ -1655,6 +1655,882 @@ impl StreamCapture {
     }
 }
 
+// ── Two-stream schedule (P5.3 task #1 final form) ───────────────────────────
+//
+// The single flat stream's window floors at ~151 rows because products are read
+// at offsets inflated by the leaf/mac cells interspersed between them. The fix is
+// to give PRODUCT results their own COMPACT stream R (one cell per product, read
+// at product-rank offsets ≤ W_p) while leaf/mac scratch lives in a working stream
+// W (read locally). Every product reconstructs its two operands from the window
+// (recent leaves + product results in R + latched), so both windows are bounded:
+// R by product-rank reach, W by chain locality. This mirrors the route-spike
+// mechanism (operands = windowed preprocessed-coefficient sums, then a witnessed
+// product) but with two typed lanes instead of one.
+
+/// A reconstruction source: a windowed stream cell (`W` = working leaf/mac, `R` =
+/// product result) or a latched column (held on every row, read at offset 0).
+/// [`TwoStreamSchedule::layout`] resolves each into a concrete (lane, row-offset).
+#[derive(Clone, Debug)]
+pub enum Src2 {
+    /// A W-stream cell (leaf or mac) by global W-index.
+    W(usize),
+    /// An R-stream cell (product result) by global R-index.
+    R(usize),
+    /// A latched column slot (offset 0).
+    Latched(usize),
+}
+
+/// A W-stream cell: a co-located mask copy (`Leaf`, free committed value) or a
+/// partial-sum reconstruction (`Mac`), `value = constant + Σ coeff·src`.
+#[derive(Clone)]
+pub enum WOp2 {
+    Leaf,
+    Mac {
+        constant: SecureField,
+        terms: Vec<(Src2, SecureField)>,
+    },
+}
+
+/// An R-stream cell: the witnessed product `r = oa·ob`, where each operand is a
+/// windowed reconstruction `constant + Σ coeff·src`.
+#[derive(Clone)]
+pub struct ROp2 {
+    pub a: (SecureField, Vec<(Src2, SecureField)>),
+    pub b: (SecureField, Vec<(Src2, SecureField)>),
+}
+
+/// A cell in emission order — the order [`TwoStreamSchedule::layout`] walks to
+/// assign rows so every operand lands on a row ≤ its consumer's (causality).
+#[derive(Clone, Copy, Debug)]
+pub enum EmitRef {
+    W(usize),
+    R(usize),
+}
+
+/// The two-stream schedule (see the section header). The final DEEP-ALI equality
+/// is a W mac holding `lhs − rhs`, asserted to be zero.
+pub struct TwoStreamSchedule {
+    pub w_ops: Vec<WOp2>,
+    pub w_value: Vec<SecureField>,
+    pub r_ops: Vec<ROp2>,
+    pub r_oa: Vec<SecureField>,
+    pub r_ob: Vec<SecureField>,
+    pub r_value: Vec<SecureField>,
+    pub latched_value: [SecureField; N_LATCHED],
+    /// Global W-index of the mac holding `lhs − rhs` (evaluates to zero).
+    pub final_w: usize,
+    pub emission: Vec<EmitRef>,
+}
+
+struct TwoStreamBuilder<'a> {
+    cap: &'a StreamCapture,
+    terms_per_mac: usize,
+    w_ops: Vec<WOp2>,
+    w_value: Vec<SecureField>,
+    r_ops: Vec<ROp2>,
+    r_oa: Vec<SecureField>,
+    r_ob: Vec<SecureField>,
+    r_value: Vec<SecureField>,
+    prod_rcell: HashMap<u32, usize>,
+    emission: Vec<EmitRef>,
+}
+
+impl TwoStreamBuilder<'_> {
+    fn eval_src(&self, src: &Src2) -> SecureField {
+        match src {
+            Src2::W(i) => self.w_value[*i],
+            Src2::R(i) => self.r_value[*i],
+            Src2::Latched(s) => self.cap.latched_value[*s],
+        }
+    }
+    fn eval_terms(&self, constant: SecureField, terms: &[(Src2, SecureField)]) -> SecureField {
+        let mut acc = constant;
+        for (src, c) in terms {
+            acc += *c * self.eval_src(src);
+        }
+        acc
+    }
+    fn emit_w(&mut self, op: WOp2, value: SecureField) -> usize {
+        let id = self.w_ops.len();
+        self.w_ops.push(op);
+        self.w_value.push(value);
+        self.emission.push(EmitRef::W(id));
+        id
+    }
+
+    /// Reconstruct a captured form into a residual `(constant, terms)` the consumer
+    /// recon reads directly (≤ `terms_per_mac` terms). Mask operands become fresh
+    /// co-located W leaves; product operands become R refs; latched stay latched. A
+    /// form that exceeds the budget is pre-folded into chained W macs and the
+    /// residual is the single final partial — so the consumer always reads ≤
+    /// `terms_per_mac` terms regardless of operand size (up to 265 nodes).
+    fn reconstruct(&mut self, form: &StreamForm) -> (SecureField, Vec<(Src2, SecureField)>) {
+        let mut terms: Vec<(Src2, SecureField)> = Vec::new();
+        for &(node, coeff) in &form.nodes {
+            match self.cap.node_kind[node as usize] {
+                StreamNode::Mask => {
+                    let v = self.cap.node_value[node as usize];
+                    let leaf = self.emit_w(WOp2::Leaf, v);
+                    terms.push((Src2::W(leaf), coeff));
+                }
+                StreamNode::Product { .. } => {
+                    let rc = self.prod_rcell[&node];
+                    terms.push((Src2::R(rc), coeff));
+                }
+            }
+        }
+        for &(slot, coeff) in &form.latched {
+            terms.push((Src2::Latched(slot), coeff));
+        }
+
+        let tpm = self.terms_per_mac;
+        if terms.len() <= tpm {
+            return (form.constant, terms);
+        }
+
+        // Fold everything into one partial via chained macs (the first carries the
+        // constant; each subsequent reads the previous partial as one of its ≤ tpm
+        // terms). The residual is just that final partial.
+        let mut prev: Option<usize> = None;
+        let mut idx = 0usize;
+        while idx < terms.len() {
+            let cap_fresh = if prev.is_some() { tpm - 1 } else { tpm };
+            let end = (idx + cap_fresh).min(terms.len());
+            let mut constant = SecureField::zero();
+            let mut mterms: Vec<(Src2, SecureField)> = Vec::new();
+            if let Some(p) = prev {
+                mterms.push((Src2::W(p), SecureField::one()));
+            } else {
+                constant = form.constant;
+            }
+            for (src, coeff) in &terms[idx..end] {
+                mterms.push((src.clone(), *coeff));
+            }
+            let value = self.eval_terms(constant, &mterms);
+            let cell = self.emit_w(
+                WOp2::Mac {
+                    constant,
+                    terms: mterms,
+                },
+                value,
+            );
+            prev = Some(cell);
+            idx = end;
+        }
+        (
+            SecureField::zero(),
+            vec![(Src2::W(prev.unwrap()), SecureField::one())],
+        )
+    }
+}
+
+impl StreamCapture {
+    /// Compile the capture into a [`TwoStreamSchedule`]: products in capture order
+    /// (each becomes one R cell), operands reconstructed from the window with
+    /// overflow pre-folded into W macs (`terms_per_mac` terms/step). `terms_per_mac`
+    /// must be ≥ 2 (a chained mac needs the previous partial plus ≥ 1 fresh term).
+    pub fn schedule_two_stream(&self, terms_per_mac: usize) -> TwoStreamSchedule {
+        assert!(
+            terms_per_mac >= 2,
+            "two-stream chaining needs ≥ 2 terms/mac"
+        );
+        let mut b = TwoStreamBuilder {
+            cap: self,
+            terms_per_mac,
+            w_ops: Vec::new(),
+            w_value: Vec::new(),
+            r_ops: Vec::new(),
+            r_oa: Vec::new(),
+            r_ob: Vec::new(),
+            r_value: Vec::new(),
+            prod_rcell: HashMap::new(),
+            emission: Vec::new(),
+        };
+
+        for (id, kind) in self.node_kind.iter().enumerate() {
+            if let StreamNode::Product { a, b: bb } = kind {
+                let (ca, ta) = b.reconstruct(a);
+                let (cb, tb) = b.reconstruct(bb);
+                let oa = b.eval_terms(ca, &ta);
+                let ob = b.eval_terms(cb, &tb);
+                let r = oa * ob;
+                let r_idx = b.r_value.len();
+                b.r_ops.push(ROp2 {
+                    a: (ca, ta),
+                    b: (cb, tb),
+                });
+                b.r_oa.push(oa);
+                b.r_ob.push(ob);
+                b.r_value.push(r);
+                b.emission.push(EmitRef::R(r_idx));
+                b.prod_rcell.insert(id as u32, r_idx);
+            }
+        }
+
+        // The final DEEP-ALI equality: a mac = lhs − rhs, asserted zero downstream.
+        let diff = StreamForm::sub(&self.final_lhs, &self.final_rhs);
+        let (cf, tf) = b.reconstruct(&diff);
+        let vf = b.eval_terms(cf, &tf);
+        let final_w = b.emit_w(
+            WOp2::Mac {
+                constant: cf,
+                terms: tf,
+            },
+            vf,
+        );
+
+        TwoStreamSchedule {
+            w_ops: b.w_ops,
+            w_value: b.w_value,
+            r_ops: b.r_ops,
+            r_oa: b.r_oa,
+            r_ob: b.r_ob,
+            r_value: b.r_value,
+            latched_value: self.latched_value,
+            final_w,
+            emission: b.emission,
+        }
+    }
+}
+
+impl TwoStreamSchedule {
+    /// Re-evaluate every cell from its op (ignoring the stored values), walking
+    /// emission order so refs resolve. Returns `(w, r_oa, r_ob, r)`.
+    pub fn interpret(
+        &self,
+    ) -> (
+        Vec<SecureField>,
+        Vec<SecureField>,
+        Vec<SecureField>,
+        Vec<SecureField>,
+    ) {
+        let mut w = vec![SecureField::zero(); self.w_ops.len()];
+        let mut r = vec![SecureField::zero(); self.r_ops.len()];
+        let mut r_oa = vec![SecureField::zero(); self.r_ops.len()];
+        let mut r_ob = vec![SecureField::zero(); self.r_ops.len()];
+        let eval = |constant: SecureField,
+                    terms: &[(Src2, SecureField)],
+                    w: &[SecureField],
+                    r: &[SecureField]|
+         -> SecureField {
+            let mut acc = constant;
+            for (src, c) in terms {
+                let v = match src {
+                    Src2::W(i) => w[*i],
+                    Src2::R(i) => r[*i],
+                    Src2::Latched(s) => self.latched_value[*s],
+                };
+                acc += *c * v;
+            }
+            acc
+        };
+        for e in &self.emission {
+            match *e {
+                EmitRef::W(i) => {
+                    let val = match &self.w_ops[i] {
+                        WOp2::Leaf => self.w_value[i],
+                        WOp2::Mac { constant, terms } => eval(*constant, terms, &w, &r),
+                    };
+                    w[i] = val;
+                }
+                EmitRef::R(i) => {
+                    let op = &self.r_ops[i];
+                    let oa = eval(op.a.0, &op.a.1, &w, &r);
+                    let ob = eval(op.b.0, &op.b.1, &w, &r);
+                    r_oa[i] = oa;
+                    r_ob[i] = ob;
+                    r[i] = oa * ob;
+                }
+            }
+        }
+        (w, r_oa, r_ob, r)
+    }
+
+    /// Assign cells to a windowed (row, lane) layout: leaves to `ops_leaf` lanes,
+    /// macs to `ops_mac` lanes, products to `ops_r` lanes; the row advances
+    /// whenever the cell's lane fills (emission order keeps every operand on a row
+    /// ≤ its consumer's). Resolves each recon term to a [`WinPos`] and measures the
+    /// per-stream window depths (in rows) the AIR mask must reach.
+    pub fn layout(&self, ops_leaf: usize, ops_mac: usize, ops_r: usize) -> TwoStreamLayout {
+        let nw = self.w_ops.len();
+        let nr = self.r_ops.len();
+        let mut w_loc = vec![CellLoc { row: 0, lane: 0 }; nw];
+        let mut w_is_leaf = vec![false; nw];
+        let mut r_loc = vec![CellLoc { row: 0, lane: 0 }; nr];
+
+        let mut row = 0usize;
+        let (mut leaf_in, mut mac_in, mut r_in) = (0usize, 0usize, 0usize);
+        for e in &self.emission {
+            match *e {
+                EmitRef::W(i) => {
+                    let is_leaf = matches!(self.w_ops[i], WOp2::Leaf);
+                    w_is_leaf[i] = is_leaf;
+                    if is_leaf {
+                        if leaf_in == ops_leaf {
+                            row += 1;
+                            leaf_in = 0;
+                            mac_in = 0;
+                            r_in = 0;
+                        }
+                        w_loc[i] = CellLoc { row, lane: leaf_in };
+                        leaf_in += 1;
+                    } else {
+                        if mac_in == ops_mac {
+                            row += 1;
+                            leaf_in = 0;
+                            mac_in = 0;
+                            r_in = 0;
+                        }
+                        w_loc[i] = CellLoc { row, lane: mac_in };
+                        mac_in += 1;
+                    }
+                }
+                EmitRef::R(i) => {
+                    if r_in == ops_r {
+                        row += 1;
+                        leaf_in = 0;
+                        mac_in = 0;
+                        r_in = 0;
+                    }
+                    r_loc[i] = CellLoc { row, lane: r_in };
+                    r_in += 1;
+                }
+            }
+        }
+        let n_rows = row + 1;
+
+        let mut d = WinDepths::default();
+        let mut mac_resolved: Vec<(usize, ReconResolved)> = Vec::new();
+        for (i, op) in self.w_ops.iter().enumerate() {
+            if let WOp2::Mac { constant, terms } = op {
+                let crow = w_loc[i].row;
+                let rterms = terms
+                    .iter()
+                    .map(|(s, c)| {
+                        (
+                            resolve_term(s, crow, &w_loc, &w_is_leaf, &r_loc, &mut d),
+                            *c,
+                        )
+                    })
+                    .collect();
+                mac_resolved.push((
+                    i,
+                    ReconResolved {
+                        constant: *constant,
+                        terms: rterms,
+                    },
+                ));
+            }
+        }
+        let mut r_resolved: Vec<(ReconResolved, ReconResolved)> = Vec::new();
+        for (i, op) in self.r_ops.iter().enumerate() {
+            let crow = r_loc[i].row;
+            let res =
+                |t: &(SecureField, Vec<(Src2, SecureField)>), d: &mut WinDepths| ReconResolved {
+                    constant: t.0,
+                    terms: t
+                        .1
+                        .iter()
+                        .map(|(s, c)| (resolve_term(s, crow, &w_loc, &w_is_leaf, &r_loc, d), *c))
+                        .collect(),
+                };
+            let oa = res(&op.a, &mut d);
+            let ob = res(&op.b, &mut d);
+            r_resolved.push((oa, ob));
+        }
+
+        TwoStreamLayout {
+            ops_leaf,
+            ops_mac,
+            ops_r,
+            n_rows,
+            dw_leaf: d.leaf,
+            dw_mac: d.mac,
+            dr: d.r,
+            w_loc,
+            w_is_leaf,
+            r_loc,
+            mac_resolved,
+            r_resolved,
+            final_w: self.final_w,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CellLoc {
+    pub row: usize,
+    pub lane: usize,
+}
+
+/// A resolved window position a reconstruction reads (lane + backward row offset),
+/// or a latched column. `Leaf`/`Mac`/`R` are the spread two-stream layout
+/// ([`TwoStreamSchedule::layout`]); `Slot` is the co-locate layout
+/// ([`TwoStreamSchedule::layout_colocate`]), where macs + products share ONE dense
+/// stream and leaves ride offset-0 on their consumer's row.
+#[derive(Clone, Debug)]
+pub enum WinPos {
+    Leaf { lane: usize, off: usize },
+    Mac { lane: usize, off: usize },
+    R { lane: usize, off: usize },
+    Slot { lane: usize, off: usize },
+    Latched(usize),
+}
+
+/// A reconstruction resolved against the layout: `constant + Σ coeff·window[pos]`.
+#[derive(Clone)]
+pub struct ReconResolved {
+    pub constant: SecureField,
+    pub terms: Vec<(WinPos, SecureField)>,
+}
+
+#[derive(Default)]
+struct WinDepths {
+    leaf: usize,
+    mac: usize,
+    r: usize,
+}
+
+fn resolve_term(
+    src: &Src2,
+    crow: usize,
+    w_loc: &[CellLoc],
+    w_is_leaf: &[bool],
+    r_loc: &[CellLoc],
+    d: &mut WinDepths,
+) -> WinPos {
+    match src {
+        Src2::W(i) => {
+            let loc = w_loc[*i];
+            let off = crow - loc.row; // ≥ 0: operand emitted before consumer
+            if w_is_leaf[*i] {
+                d.leaf = d.leaf.max(off);
+                WinPos::Leaf {
+                    lane: loc.lane,
+                    off,
+                }
+            } else {
+                d.mac = d.mac.max(off);
+                WinPos::Mac {
+                    lane: loc.lane,
+                    off,
+                }
+            }
+        }
+        Src2::R(i) => {
+            let loc = r_loc[*i];
+            let off = crow - loc.row;
+            d.r = d.r.max(off);
+            WinPos::R {
+                lane: loc.lane,
+                off,
+            }
+        }
+        Src2::Latched(s) => WinPos::Latched(*s),
+    }
+}
+
+/// The windowed (row, lane) realisation of a [`TwoStreamSchedule`] — the bridge to
+/// the streamed AIR + trace fill. Leaves/macs/products live in `ops_leaf`/
+/// `ops_mac`/`ops_r` lanes per row; each recon term is a [`WinPos`] read at a
+/// bounded backward offset (`dw_leaf`/`dw_mac`/`dr`).
+pub struct TwoStreamLayout {
+    pub ops_leaf: usize,
+    pub ops_mac: usize,
+    pub ops_r: usize,
+    pub n_rows: usize,
+    pub dw_leaf: usize,
+    pub dw_mac: usize,
+    pub dr: usize,
+    pub w_loc: Vec<CellLoc>,
+    pub w_is_leaf: Vec<bool>,
+    pub r_loc: Vec<CellLoc>,
+    /// `(global W-index, recon)` for each mac.
+    pub mac_resolved: Vec<(usize, ReconResolved)>,
+    /// `(oa recon, ob recon)` per global R-index.
+    pub r_resolved: Vec<(ReconResolved, ReconResolved)>,
+    pub final_w: usize,
+}
+
+impl TwoStreamLayout {
+    /// Replay the recons through the resolved window positions (building the value
+    /// grid row by row) and return the recomputed `(w, r_oa, r_ob, r)`. Validates
+    /// that [`resolve_term`] produced correct offsets/lanes — the host reference the
+    /// streamed AIR must reproduce.
+    pub fn interpret(
+        &self,
+        sched: &TwoStreamSchedule,
+    ) -> (
+        Vec<SecureField>,
+        Vec<SecureField>,
+        Vec<SecureField>,
+        Vec<SecureField>,
+    ) {
+        let z = SecureField::zero();
+        let mut leaf = vec![vec![z; self.ops_leaf]; self.n_rows];
+        let mut mac = vec![vec![z; self.ops_mac]; self.n_rows];
+        let mut rg = vec![vec![z; self.ops_r]; self.n_rows];
+
+        // Place leaves (committed inputs).
+        let nw = sched.w_ops.len();
+        for i in 0..nw {
+            if self.w_is_leaf[i] {
+                let loc = self.w_loc[i];
+                leaf[loc.row][loc.lane] = sched.w_value[i];
+            }
+        }
+        let read = |pos: &WinPos,
+                    crow: usize,
+                    leaf: &[Vec<SecureField>],
+                    mac: &[Vec<SecureField>],
+                    rg: &[Vec<SecureField>]|
+         -> SecureField {
+            match *pos {
+                WinPos::Leaf { lane, off } => leaf[crow - off][lane],
+                WinPos::Mac { lane, off } => mac[crow - off][lane],
+                WinPos::R { lane, off } => rg[crow - off][lane],
+                WinPos::Slot { .. } => unreachable!("two-stream layout uses Leaf/Mac/R"),
+                WinPos::Latched(s) => sched.latched_value[s],
+            }
+        };
+        let eval = |rec: &ReconResolved,
+                    crow: usize,
+                    leaf: &[Vec<SecureField>],
+                    mac: &[Vec<SecureField>],
+                    rg: &[Vec<SecureField>]|
+         -> SecureField {
+            let mut acc = rec.constant;
+            for (pos, c) in &rec.terms {
+                acc += *c * read(pos, crow, leaf, mac, rg);
+            }
+            acc
+        };
+
+        // Walk rows; within a row, macs may read other macs at offset 0, so resolve
+        // them in emission order (already lane-ordered) — but a same-row mac→mac
+        // dependency would need ordering. The scheduler never places a mac's mac
+        // operand on the same row (chained partials advance lanes within a row only
+        // forward), so a single forward pass per row over emission order is exact.
+        let mut w_out = vec![z; nw];
+        let mut r_oa = vec![z; sched.r_ops.len()];
+        let mut r_ob = vec![z; sched.r_ops.len()];
+        let mut r_out = vec![z; sched.r_ops.len()];
+        // Index recons by their target for emission-order replay.
+        let mut mac_by_w: HashMap<usize, &ReconResolved> = HashMap::new();
+        for (i, rec) in &self.mac_resolved {
+            mac_by_w.insert(*i, rec);
+        }
+        for e in &sched.emission {
+            match *e {
+                EmitRef::W(i) => {
+                    if self.w_is_leaf[i] {
+                        w_out[i] = sched.w_value[i];
+                    } else {
+                        let loc = self.w_loc[i];
+                        let v = eval(mac_by_w[&i], loc.row, &leaf, &mac, &rg);
+                        mac[loc.row][loc.lane] = v;
+                        w_out[i] = v;
+                    }
+                }
+                EmitRef::R(i) => {
+                    let loc = self.r_loc[i];
+                    let (oa_rec, ob_rec) = &self.r_resolved[i];
+                    let oa = eval(oa_rec, loc.row, &leaf, &mac, &rg);
+                    let ob = eval(ob_rec, loc.row, &leaf, &mac, &rg);
+                    let r = oa * ob;
+                    rg[loc.row][loc.lane] = r;
+                    r_oa[i] = oa;
+                    r_ob[i] = ob;
+                    r_out[i] = r;
+                }
+            }
+        }
+        (w_out, r_oa, r_ob, r_out)
+    }
+
+    /// Total preprocessed QM31 coefficient cells (one per recon × window-position)
+    /// + constants — the dense-routing "program" cost the design flagged.
+    pub fn preproc_qm31_per_row(&self) -> usize {
+        let win = (self.ops_leaf * (self.dw_leaf + 1))
+            + (self.ops_mac * (self.dw_mac + 1))
+            + (self.ops_r * (self.dr + 1))
+            + N_LATCHED;
+        let recons_per_row = self.ops_mac + 2 * self.ops_r;
+        recons_per_row * (win + 1) // +1 for the per-recon constant column
+    }
+}
+
+// ── Co-locate layout (the design's chosen layout — the AIR target) ───────────
+//
+// macs + products share ONE dense stream (`ops_s` slots/row); leaves ride
+// offset-0 on their consumer slot's row (co-located, no rows of their own — the
+// 86k leaves become WIDTH, not depth). Every slot is uniform: `r = oa·ob`, with a
+// mac being a slot whose `ob` reconstruction is the constant 1 (so `r = oa`). The
+// R window depth is then the product-rank reach (≤ 64, lightly inflated by the few
+// interspersed macs) divided by `ops_s` — far below the spread layout's hundreds.
+
+/// A slot's reconstruction resolved against the co-locate layout:
+/// `value = constant + Σ coeff·window[pos]`, `pos` a [`WinPos`] (`Leaf`/`Slot`/
+/// `Latched`).
+pub type Recon = ReconResolved;
+
+/// The co-locate windowed realisation — the bridge to the streamed AIR + trace
+/// fill. Row-major: every `(row, lane)` slot carries an `oa`/`ob` reconstruction
+/// (zeroed for unused slots) and its values; `leaf_val[row][lane]` are the
+/// offset-0 co-located mask copies.
+pub struct ColocateLayout {
+    pub ops_s: usize,
+    pub nleaf: usize,
+    pub n_rows: usize,
+    /// Max backward row offset any recon reads the dense stream (the AIR window).
+    pub dr: usize,
+    /// Max leaves co-located on any single row (the leaf-column budget needed).
+    pub max_leaf_in_row: usize,
+    pub latched_value: [SecureField; N_LATCHED],
+    pub leaf_val: Vec<Vec<SecureField>>,
+    pub slot_oa: Vec<Vec<Recon>>,
+    pub slot_ob: Vec<Vec<Recon>>,
+    pub slot_oa_val: Vec<Vec<SecureField>>,
+    pub slot_ob_val: Vec<Vec<SecureField>>,
+    pub slot_r: Vec<Vec<SecureField>>,
+    pub final_row: usize,
+    pub final_lane: usize,
+}
+
+impl TwoStreamSchedule {
+    /// Lay the schedule into the co-locate layout: macs + products into ONE dense
+    /// stream (`ops_s` slots/row, emission order), leaves onto their consumer
+    /// slot's row (offset 0). `nleaf` is the per-row leaf-column budget (must cover
+    /// the densest row — [`ColocateLayout::max_leaf_in_row`] reports the need).
+    pub fn layout_colocate(&self, ops_s: usize, nleaf: usize) -> ColocateLayout {
+        let one = SecureField::one();
+        let zero = SecureField::zero();
+
+        // 1. Stream slots = macs + products, in emission order.
+        let mut w_to_slot = vec![usize::MAX; self.w_ops.len()];
+        let mut r_to_slot = vec![usize::MAX; self.r_ops.len()];
+        let mut n_slots = 0usize;
+        for e in &self.emission {
+            match *e {
+                EmitRef::W(i) => {
+                    if matches!(self.w_ops[i], WOp2::Mac { .. }) {
+                        w_to_slot[i] = n_slots;
+                        n_slots += 1;
+                    }
+                }
+                EmitRef::R(i) => {
+                    r_to_slot[i] = n_slots;
+                    n_slots += 1;
+                }
+            }
+        }
+        let n_rows = n_slots.div_ceil(ops_s).max(1);
+        let srow = |s: usize| s / ops_s;
+        let slane = |s: usize| s % ops_s;
+
+        // 2. Each leaf's consumer slot (scan all recon terms).
+        let mut leaf_consumer = vec![usize::MAX; self.w_ops.len()];
+        let note = |terms: &[(Src2, SecureField)], slot: usize, lc: &mut Vec<usize>| {
+            for (src, _) in terms {
+                if let Src2::W(i) = src {
+                    if matches!(self.w_ops[*i], WOp2::Leaf) {
+                        lc[*i] = slot;
+                    }
+                }
+            }
+        };
+        for (i, op) in self.w_ops.iter().enumerate() {
+            if let WOp2::Mac { terms, .. } = op {
+                note(terms, w_to_slot[i], &mut leaf_consumer);
+            }
+        }
+        for (i, op) in self.r_ops.iter().enumerate() {
+            note(&op.a.1, r_to_slot[i], &mut leaf_consumer);
+            note(&op.b.1, r_to_slot[i], &mut leaf_consumer);
+        }
+
+        // 3. Place leaves on their consumer's row; assign per-row leaf lanes.
+        let mut leaf_loc = vec![CellLoc { row: 0, lane: 0 }; self.w_ops.len()];
+        let mut leaf_in_row = vec![0usize; n_rows];
+        let mut max_leaf_in_row = 0usize;
+        for (i, op) in self.w_ops.iter().enumerate() {
+            if matches!(op, WOp2::Leaf) {
+                let cs = leaf_consumer[i];
+                assert!(cs != usize::MAX, "leaf {i} has no consumer");
+                let row = srow(cs);
+                let lane = leaf_in_row[row];
+                leaf_in_row[row] += 1;
+                max_leaf_in_row = max_leaf_in_row.max(leaf_in_row[row]);
+                leaf_loc[i] = CellLoc { row, lane };
+            }
+        }
+        assert!(
+            max_leaf_in_row <= nleaf,
+            "nleaf={nleaf} too small for the densest row ({max_leaf_in_row} leaves)"
+        );
+
+        // 4. Resolve a recon's terms to window positions; track the stream depth dr.
+        let mut dr = 0usize;
+        let resolve = |constant: SecureField,
+                       terms: &[(Src2, SecureField)],
+                       crow: usize,
+                       dr: &mut usize|
+         -> Recon {
+            let rt = terms
+                .iter()
+                .map(|(src, c)| {
+                    let pos = match src {
+                        Src2::W(i) => {
+                            if matches!(self.w_ops[*i], WOp2::Leaf) {
+                                let l = leaf_loc[*i];
+                                debug_assert_eq!(
+                                    l.row, crow,
+                                    "leaf not co-located on consumer row"
+                                );
+                                WinPos::Leaf {
+                                    lane: l.lane,
+                                    off: 0,
+                                }
+                            } else {
+                                let s = w_to_slot[*i];
+                                let off = crow - srow(s);
+                                *dr = (*dr).max(off);
+                                WinPos::Slot {
+                                    lane: slane(s),
+                                    off,
+                                }
+                            }
+                        }
+                        Src2::R(i) => {
+                            let s = r_to_slot[*i];
+                            let off = crow - srow(s);
+                            *dr = (*dr).max(off);
+                            WinPos::Slot {
+                                lane: slane(s),
+                                off,
+                            }
+                        }
+                        Src2::Latched(s) => WinPos::Latched(*s),
+                    };
+                    (pos, *c)
+                })
+                .collect();
+            Recon {
+                constant,
+                terms: rt,
+            }
+        };
+
+        // 5. Fill the per-slot recons + values (zeroed slots stay r = 0·0 = 0).
+        let zrec = || Recon {
+            constant: zero,
+            terms: Vec::new(),
+        };
+        let mut slot_oa: Vec<Vec<Recon>> = (0..n_rows)
+            .map(|_| (0..ops_s).map(|_| zrec()).collect())
+            .collect();
+        let mut slot_ob = slot_oa.clone();
+        let mut slot_oa_val = vec![vec![zero; ops_s]; n_rows];
+        let mut slot_ob_val = vec![vec![zero; ops_s]; n_rows];
+        let mut slot_r = vec![vec![zero; ops_s]; n_rows];
+
+        for (i, op) in self.w_ops.iter().enumerate() {
+            if let WOp2::Mac { constant, terms } = op {
+                let s = w_to_slot[i];
+                let (row, lane) = (srow(s), slane(s));
+                slot_oa[row][lane] = resolve(*constant, terms, row, &mut dr);
+                slot_ob[row][lane] = Recon {
+                    constant: one,
+                    terms: Vec::new(),
+                };
+                slot_oa_val[row][lane] = self.w_value[i];
+                slot_ob_val[row][lane] = one;
+                slot_r[row][lane] = self.w_value[i];
+            }
+        }
+        for (i, op) in self.r_ops.iter().enumerate() {
+            let s = r_to_slot[i];
+            let (row, lane) = (srow(s), slane(s));
+            slot_oa[row][lane] = resolve(op.a.0, &op.a.1, row, &mut dr);
+            slot_ob[row][lane] = resolve(op.b.0, &op.b.1, row, &mut dr);
+            slot_oa_val[row][lane] = self.r_oa[i];
+            slot_ob_val[row][lane] = self.r_ob[i];
+            slot_r[row][lane] = self.r_value[i];
+        }
+
+        let mut leaf_val = vec![vec![zero; nleaf]; n_rows];
+        for (i, op) in self.w_ops.iter().enumerate() {
+            if matches!(op, WOp2::Leaf) {
+                let l = leaf_loc[i];
+                leaf_val[l.row][l.lane] = self.w_value[i];
+            }
+        }
+
+        let fs = w_to_slot[self.final_w];
+        ColocateLayout {
+            ops_s,
+            nleaf,
+            n_rows,
+            dr,
+            max_leaf_in_row,
+            latched_value: self.latched_value,
+            leaf_val,
+            slot_oa,
+            slot_ob,
+            slot_oa_val,
+            slot_ob_val,
+            slot_r,
+            final_row: srow(fs),
+            final_lane: slane(fs),
+        }
+    }
+}
+
+impl ColocateLayout {
+    /// Replay the recons through the resolved window positions (row by row, lanes
+    /// in order so same-row earlier-lane reads resolve) and return the slot `r`
+    /// grid — validates [`layout_colocate`] produced correct offsets/lanes.
+    pub fn interpret(&self) -> Vec<Vec<SecureField>> {
+        let z = SecureField::zero();
+        let mut r = vec![vec![z; self.ops_s]; self.n_rows];
+        let read = |pos: &WinPos, crow: usize, r: &[Vec<SecureField>]| -> SecureField {
+            match *pos {
+                WinPos::Leaf { lane, .. } => self.leaf_val[crow][lane],
+                WinPos::Slot { lane, off } => r[crow - off][lane],
+                WinPos::Latched(s) => self.latched_value[s],
+                _ => unreachable!("co-locate layout uses Leaf/Slot/Latched"),
+            }
+        };
+        let eval = |rec: &Recon, crow: usize, r: &[Vec<SecureField>]| -> SecureField {
+            let mut acc = rec.constant;
+            for (p, c) in &rec.terms {
+                acc += *c * read(p, crow, r);
+            }
+            acc
+        };
+        for row in 0..self.n_rows {
+            for lane in 0..self.ops_s {
+                let oa = eval(&self.slot_oa[row][lane], row, &r);
+                let ob = eval(&self.slot_ob[row][lane], row, &r);
+                r[row][lane] = oa * ob;
+            }
+        }
+        r
+    }
+
+    /// Preprocessed QM31 coefficient columns per row (one per recon × window
+    /// position + constant) — the dense-routing "program" width.
+    pub fn preproc_qm31_per_row(&self) -> usize {
+        let win = self.nleaf + self.ops_s * (self.dr + 1) + N_LATCHED;
+        2 * self.ops_s * (win + 1)
+    }
+
+    /// Main QM31 columns per row: `nleaf` leaves + `ops_s` × (oa, ob, r).
+    pub fn main_qm31_per_row(&self) -> usize {
+        self.nleaf + self.ops_s * 3
+    }
+}
+
 // ── In-AIR verify backend (V = E::EF) ──────────────────────────────────────
 
 /// Re-reads the recorded columns via `next_trace_mask` (in the same allocation
