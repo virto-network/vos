@@ -1,4 +1,24 @@
+use stwo::core::fields::qm31::SecureField;
+
 use crate::core::step::WORD_SIZE;
+
+/// `(z, alpha)` of the three boundary-binding relations, in order
+/// `[register_memory, program_execution, merkle_node]`. The native-recursion
+/// verifier-AIR binds each relation's challenges to its Fiat-Shamir draw squeeze
+/// to recompute the boundary chips' claimed sums in-circuit. The wrapped
+/// `LookupElements` field is private to this module, so this accessor lives here.
+pub fn boundary_relation_challenges(
+    elements: &super::AllLookupElements,
+) -> [(SecureField, SecureField); 3] {
+    let reg: &RegisterMemoryLookupElements = elements.as_ref();
+    let prog: &ProgramExecutionLookupElements = elements.as_ref();
+    let merkle: &MerkleNodeLookupElements = elements.as_ref();
+    [
+        (reg.0.z, reg.0.alpha),
+        (prog.0.z, prog.0.alpha),
+        (merkle.0.z, merkle.0.alpha),
+    ]
+}
 
 /// PC is 4 bytes (u32), timestamps are 8 bytes (u64).
 const PC_SIZE: usize = 4;

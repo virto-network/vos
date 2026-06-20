@@ -35,8 +35,19 @@
 //!     the last prefix perms before the interaction commit; chunk `c` carries
 //!     `claimed_sum[2c]`/`[2c+1]` in `absorbed[0..4]`/`[4..8]`), then `Σ
 //!     claimed_sums == 0` is enforced in-AIR — the global logup-balance check
-//!     (`verify.rs:299`). (The boundary public-input recompute — `verify.rs:318`,
-//!     binding the io-hash + memory roots — is step 4b.)
+//!     (`verify.rs:299`).
+//!   * **boundary public-input recompute (step 4b)** — the 4 boundary chips'
+//!     claimed sums are RECOMPUTED in-AIR from the PUBLIC boundary states (initial/
+//!     final registers, pc, ts, memory roots) and each compared to its (step-4a-
+//!     bound) `claimed_sum`, binding the io-hash (`final.registers[9..13]`) + the
+//!     memory roots (`verify.rs:318` → `check_boundary_claimed_sums`). Each chip's
+//!     sum is `Σ 1/⟨z, tuple⟩` where `⟨z, tuple⟩ = Σ alpha^i·tuple_i − z`; the three
+//!     relations' `(z, alpha)` are latched to their draw squeezes (each from ONE
+//!     `draw_secure_felts(2)`), `alpha`-powers derived in-AIR (witnessed chain), and
+//!     each `1/⟨z, tuple⟩` a witnessed inverse — all degree ≤ 2. This is the
+//!     federation cash-in (the public io-hash + roots are now bound in the
+//!     verifier-AIR). (Connecting the embed's BAKED claimed_sums + lookup elements
+//!     to these bound columns is a follow-on; the embed LEAVES bind via Merkle.)
 //!
 //! The two AIRs share `not_last` (channel digest chain + embed latched constancy)
 //! and the storage indexing; otherwise the column blocks + constraints are
@@ -148,6 +159,10 @@ fn cs_chunk_id(c: usize) -> String {
     format!("ca_cs_chunk_{c}")
 }
 
+// Boundary relation-draw indicators (one per relation: register-memory,
+// program-execution, merkle-node), firing on each relation's z/alpha draw squeeze.
+const REL_DRAW_ID: [&str; N_BND_REL] = ["ca_rel_reg", "ca_rel_prog", "ca_rel_merkle"];
+
 fn final_id(l: usize) -> String {
     format!("ca_final_{l}")
 }
@@ -175,6 +190,9 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
     ];
     for c in 0..N_CS_CHUNKS {
         ids.push(PreProcessedColumnId { id: cs_chunk_id(c) });
+    }
+    for id in REL_DRAW_ID {
+        ids.push(PreProcessedColumnId { id: id.to_string() });
     }
     for l in 0..OPS_S {
         ids.push(PreProcessedColumnId { id: final_id(l) });
@@ -208,6 +226,126 @@ fn win_index(pos: &WinPos) -> usize {
     }
 }
 
+// ── Boundary public-input recompute (step 4b) ────────────────────────────────
+// Each boundary chip's claimed sum is a closed form over the public boundary
+// states + a relation's Fiat-Shamir (z, alpha): combine(tuple) = Σ alpha^i·tuple_i
+// − z, and the sum is Σ 1/combine over the chip's tuples. The three relations
+// (register-memory, program-execution, merkle-node) have these tuple lengths:
+const N_REGS: usize = 13;
+const N_REG_TUPLE: usize = 1 + 8 + 8 + 1; // reg, value[8], ts[8], is_write
+const N_PROG_TUPLE: usize = 8 + 4; // ts[8], pc[4]
+const N_MEM_TUPLE: usize = 1 + 1 + 32 + 32; // level, index, init_root[32], final_root[32]
+const N_BND_REL: usize = 3; // register-memory, program-execution, merkle-node
+
+fn le8(v: u64) -> [BaseField; 8] {
+    std::array::from_fn(|i| BaseField::from(((v >> (8 * i)) & 0xff) as u32))
+}
+fn le4(v: u32) -> [BaseField; 4] {
+    std::array::from_fn(|i| BaseField::from((v >> (8 * i)) & 0xff))
+}
+
+/// `combine(tuple) = Σ_i tuple_i·alpha^i − z` (host), then `1/combine`. The exact
+/// closed form `boundary_binding` checks the proof's claimed sums against.
+fn combine_inv_host(tuple: &[BaseField], alpha: SecureField, z: SecureField) -> SecureField {
+    let mut c = -z;
+    let mut p = SecureField::one();
+    for &t in tuple {
+        c += p * SecureField::from(t);
+        p *= alpha;
+    }
+    c.inverse()
+}
+
+/// In-AIR alpha powers `[1, alpha, alpha², …, alpha^{n-1}]`: `pow[0]=1`,
+/// `pow[1]=alpha` (the latched challenge), `pow[i]=pow[i-1]·alpha` each witnessed.
+fn air_powers<E: EvalAtRow>(eval: &mut E, alpha: E::EF, n: usize) -> Vec<E::EF> {
+    let mut pow = Vec::with_capacity(n);
+    pow.push(E::EF::one());
+    if n > 1 {
+        pow.push(alpha.clone());
+    }
+    for i in 2..n {
+        let p = E::combine_ef(std::array::from_fn(|_| eval.next_trace_mask()));
+        eval.add_constraint(p.clone() - pow[i - 1].clone() * alpha.clone()); // deg 2
+        pow.push(p);
+    }
+    pow
+}
+
+/// In-AIR `1/combine(tuple)`: `combine = Σ tuple_i·pow[i] − z` (deg 1, constant
+/// `tuple_i`), `inv` witnessed, `inv·combine == 1` (deg 2). Returns `inv`.
+fn air_inv<E: EvalAtRow>(eval: &mut E, tuple: &[BaseField], pow: &[E::EF], z: &E::EF) -> E::EF {
+    let lift = |f: BaseField| -> E::EF {
+        E::combine_ef([E::F::from(f), E::F::zero(), E::F::zero(), E::F::zero()])
+    };
+    let mut combine = E::EF::zero() - z.clone();
+    for (i, &t) in tuple.iter().enumerate() {
+        combine += pow[i].clone() * lift(t);
+    }
+    let inv = E::combine_ef(std::array::from_fn(|_| eval.next_trace_mask()));
+    eval.add_constraint(inv.clone() * combine - E::EF::one()); // deg 2
+    inv
+}
+
+/// The public boundary states + the boundary chips' positions in the active-
+/// component (claimed-sums) order — the constants the recompute folds.
+#[derive(Clone)]
+struct BoundaryAir {
+    init_regs: [u64; N_REGS],
+    final_regs: [u64; N_REGS],
+    init_pc: u32,
+    final_pc: u32,
+    init_ts: u64,
+    final_ts: u64,
+    init_root: [u8; 32],
+    final_root: [u8; 32],
+    /// Positions of [register_boundary, register_closing, program, memory] in the
+    /// active-component order (the index into the latched claimed_sums).
+    pos: [usize; 4],
+}
+
+impl BoundaryAir {
+    fn reg_tuple(
+        &self,
+        regs: &[u64; N_REGS],
+        r: usize,
+        ts: u64,
+        is_write: u32,
+    ) -> [BaseField; N_REG_TUPLE] {
+        let mut t = [BaseField::zero(); N_REG_TUPLE];
+        t[0] = BaseField::from(r as u32);
+        t[1..9].copy_from_slice(&le8(regs[r]));
+        t[9..17].copy_from_slice(&le8(ts));
+        t[17] = BaseField::from(is_write);
+        t
+    }
+    fn prog_tuple(&self, pc: u32, ts: u64) -> [BaseField; N_PROG_TUPLE] {
+        let mut t = [BaseField::zero(); N_PROG_TUPLE];
+        t[0..8].copy_from_slice(&le8(ts));
+        t[8..12].copy_from_slice(&le4(pc));
+        t
+    }
+    fn mem_tuple(&self) -> [BaseField; N_MEM_TUPLE] {
+        let mut t = [BaseField::zero(); N_MEM_TUPLE];
+        // level, index = 0, 0.
+        for i in 0..32 {
+            t[2 + i] = BaseField::from(self.init_root[i] as u32);
+            t[34 + i] = BaseField::from(self.final_root[i] as u32);
+        }
+        t
+    }
+}
+
+/// Host-side boundary data: the AIR constants + the three relations' drawn
+/// `(z, alpha)` + their draw-squeeze rows (matched against the transcript).
+#[derive(Clone)]
+struct Bnd {
+    air: BoundaryAir,
+    z: [SecureField; N_BND_REL],
+    alpha: [SecureField; N_BND_REL],
+    draw_row: [usize; N_BND_REL],
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The merged per-child AIR: channel replay + streamed embed + rc latch.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -222,6 +360,8 @@ struct ChildEval {
     /// of `CanonicCoset::new(mlbd).coset`, used to derive `coset_vanishing` in-AIR.
     cx: BaseField,
     cy: BaseField,
+    /// Public boundary states + the boundary chips' claimed-sum positions (step 4b).
+    bound: BoundaryAir,
 }
 
 impl FrameworkEval for ChildEval {
@@ -253,6 +393,11 @@ impl FrameworkEval for ChildEval {
         });
         let is_cs_chunk: [E::F; N_CS_CHUNKS] = std::array::from_fn(|c| {
             eval.get_preprocessed_column(PreProcessedColumnId { id: cs_chunk_id(c) })
+        });
+        let is_rel_draw: [E::F; N_BND_REL] = std::array::from_fn(|k| {
+            eval.get_preprocessed_column(PreProcessedColumnId {
+                id: REL_DRAW_ID[k].to_string(),
+            })
         });
         let is_final: [E::F; OPS_S] = std::array::from_fn(|l| {
             eval.get_preprocessed_column(PreProcessedColumnId { id: final_id(l) })
@@ -525,12 +670,79 @@ impl FrameworkEval for ChildEval {
                 }
             }
         }
+        // Per-component claimed sum (cur), reused by the balance + the boundary recompute.
+        let cs_ef: [E::EF; N_CS] =
+            std::array::from_fn(|k| E::combine_ef(std::array::from_fn(|i| cs[k][i][0].clone())));
         // Global balance: Σ claimed_sums == 0 (degree 1, ungated).
         let mut cs_sum = E::EF::zero();
-        for csk in &cs {
-            cs_sum += E::combine_ef(std::array::from_fn(|i| csk[i][0].clone()));
+        for e in &cs_ef {
+            cs_sum += e.clone();
         }
         eval.add_constraint(cs_sum);
+
+        // ── Boundary public-input recompute (step 4b): bind the io-hash + memory
+        //    roots by recomputing the 4 boundary chips' claimed sums from the PUBLIC
+        //    boundary states + each relation's transcript-bound (z, alpha). Each
+        //    chip's recomputed sum must equal its claimed_sum (now bound, step 4a). ──
+        let mut z_lat: [E::EF; N_BND_REL] = std::array::from_fn(|_| E::EF::zero());
+        let mut alpha_lat: [E::EF; N_BND_REL] = std::array::from_fn(|_| E::EF::zero());
+        for k in 0..N_BND_REL {
+            let z: [[E::F; 2]; SECURE_EXTENSION_DEGREE] =
+                std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
+            let a: [[E::F; 2]; SECURE_EXTENSION_DEGREE] =
+                std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
+            // Held constant + bound to the relation's draw squeeze (z = out[0..4],
+            // alpha = out[4..8] of the same `draw_secure_felts(2)` squeeze).
+            for coord in z.iter().chain(a.iter()) {
+                eval.add_constraint(not_last.clone() * (coord[1].clone() - coord[0].clone()));
+            }
+            for j in 0..SECURE_EXTENSION_DEGREE {
+                eval.add_constraint(is_rel_draw[k].clone() * (z[j][0].clone() - out[j].clone()));
+                eval.add_constraint(
+                    is_rel_draw[k].clone() * (a[j][0].clone() - out[4 + j].clone()),
+                );
+            }
+            eval.add_constraint(is_rel_draw[k].clone() * (one.clone() - is_squeeze.clone()));
+            z_lat[k] = E::combine_ef(std::array::from_fn(|i| z[i][0].clone()));
+            alpha_lat[k] = E::combine_ef(std::array::from_fn(|i| a[i][0].clone()));
+        }
+        let reg_pow = air_powers(&mut eval, alpha_lat[0].clone(), N_REG_TUPLE);
+        let prog_pow = air_powers(&mut eval, alpha_lat[1].clone(), N_PROG_TUPLE);
+        let mem_pow = air_powers(&mut eval, alpha_lat[2].clone(), N_MEM_TUPLE);
+
+        // register_boundary: Σ_r 1/⟨z, (reg, init_regs[r], 0, is_write=1)⟩.
+        let mut reg_b = E::EF::zero();
+        for r in 0..N_REGS {
+            let t = self.bound.reg_tuple(&self.bound.init_regs, r, 0, 1);
+            reg_b += air_inv(&mut eval, &t, &reg_pow, &z_lat[0]);
+        }
+        eval.add_constraint(reg_b - cs_ef[self.bound.pos[0]].clone());
+
+        // register_closing: Σ_r 1/⟨z, (reg, final_regs[r], final_ts, is_write=0)⟩.
+        let mut reg_c = E::EF::zero();
+        for r in 0..N_REGS {
+            let t = self
+                .bound
+                .reg_tuple(&self.bound.final_regs, r, self.bound.final_ts, 0);
+            reg_c += air_inv(&mut eval, &t, &reg_pow, &z_lat[0]);
+        }
+        eval.add_constraint(reg_c - cs_ef[self.bound.pos[1]].clone());
+
+        // program_boundary: 1/⟨z, (init_ts, init_pc)⟩ − 1/⟨z, (final_ts, final_pc)⟩.
+        let t_in = self
+            .bound
+            .prog_tuple(self.bound.init_pc, self.bound.init_ts);
+        let prod = air_inv(&mut eval, &t_in, &prog_pow, &z_lat[1]);
+        let t_fin = self
+            .bound
+            .prog_tuple(self.bound.final_pc, self.bound.final_ts);
+        let cons = air_inv(&mut eval, &t_fin, &prog_pow, &z_lat[1]);
+        eval.add_constraint(prod - cons - cs_ef[self.bound.pos[2]].clone());
+
+        // memory_root_boundary: −1/⟨z, (0, 0, init_root[32], final_root[32])⟩.
+        let t_mem = self.bound.mem_tuple();
+        let mem_inv = air_inv(&mut eval, &t_mem, &mem_pow, &z_lat[2]);
+        eval.add_constraint(E::EF::zero() - mem_inv - cs_ef[self.bound.pos[3]].clone());
 
         eval
     }
@@ -547,6 +759,7 @@ struct ChildTrace {
     dbl_steps: usize,
     cx: BaseField,
     cy: BaseField,
+    bound: BoundaryAir,
 }
 
 /// Tampers (each must be rejected by the gate): `channel_tamper` bumps an absorbed
@@ -565,6 +778,7 @@ fn gen_trace(
     cy: BaseField,
     claimed_sums: &[SecureField],
     prefix_len: usize,
+    bnd: &Bnd,
     lay: &ColocateLayout,
     log_size: u32,
     channel_tamper: Option<usize>,
@@ -572,6 +786,7 @@ fn gen_trace(
     oods_t_tamper: bool,
     indicator_tamper: bool,
     cs_tamper: bool,
+    state_tamper: bool,
 ) -> ChildTrace {
     assert_eq!(
         claimed_sums.len(),
@@ -848,6 +1063,103 @@ fn gen_trace(
         is_cs_chunk[c][cs_chunk_row(c)] = BaseField::one();
     }
 
+    // ── Boundary recompute (step 4b): z/alpha latched + alpha powers + inverses ──
+    // `state_tamper` claims a wrong final memory root (the io-hash/root attack): the
+    // recompute (consistent with the claimed state) then ≠ the transcript-bound
+    // claimed_sum, so the boundary comparison rejects.
+    let mut air_eff = bnd.air.clone();
+    if state_tamper {
+        air_eff.final_root[0] ^= 1;
+    }
+    let air = &air_eff;
+    let mut bnd_q: Vec<SecureField> = Vec::new();
+    for k in 0..N_BND_REL {
+        bnd_q.push(bnd.z[k]);
+        bnd_q.push(bnd.alpha[k]);
+    }
+    let powers = |alpha: SecureField, lo: usize, hi: usize| -> Vec<SecureField> {
+        let mut p = SecureField::one();
+        (0..hi)
+            .map(|_| {
+                let v = p;
+                p *= alpha;
+                v
+            })
+            .skip(lo)
+            .collect()
+    };
+    bnd_q.extend(powers(bnd.alpha[0], 2, N_REG_TUPLE)); // reg pow[2..18]
+    bnd_q.extend(powers(bnd.alpha[1], 2, N_PROG_TUPLE)); // prog pow[2..12]
+    bnd_q.extend(powers(bnd.alpha[2], 2, N_MEM_TUPLE)); // mem pow[2..66]
+    // Inverses, in evaluate order: reg_boundary(13), reg_closing(13), prog(2), mem(1).
+    let mut reg_b = SecureField::zero();
+    for r in 0..N_REGS {
+        let inv = combine_inv_host(
+            &air.reg_tuple(&air.init_regs, r, 0, 1),
+            bnd.alpha[0],
+            bnd.z[0],
+        );
+        bnd_q.push(inv);
+        reg_b += inv;
+    }
+    let mut reg_c = SecureField::zero();
+    for r in 0..N_REGS {
+        let inv = combine_inv_host(
+            &air.reg_tuple(&air.final_regs, r, air.final_ts, 0),
+            bnd.alpha[0],
+            bnd.z[0],
+        );
+        bnd_q.push(inv);
+        reg_c += inv;
+    }
+    let prod = combine_inv_host(
+        &air.prog_tuple(air.init_pc, air.init_ts),
+        bnd.alpha[1],
+        bnd.z[1],
+    );
+    let cons = combine_inv_host(
+        &air.prog_tuple(air.final_pc, air.final_ts),
+        bnd.alpha[1],
+        bnd.z[1],
+    );
+    bnd_q.push(prod);
+    bnd_q.push(cons);
+    let mem_inv = combine_inv_host(&air.mem_tuple(), bnd.alpha[2], bnd.z[2]);
+    bnd_q.push(mem_inv);
+    // Cross-check the recompute against the proof's claimed_sums (validates the
+    // tuple encodings + the matched (z, alpha) + the combine formula). Skipped under
+    // `state_tamper`, which deliberately recomputes from a wrong (claimed) state.
+    if !state_tamper {
+        debug_assert_eq!(
+            reg_b, claimed_sums[air.pos[0]],
+            "register_boundary recompute"
+        );
+        debug_assert_eq!(
+            reg_c, claimed_sums[air.pos[1]],
+            "register_closing recompute"
+        );
+        debug_assert_eq!(
+            prod - cons,
+            claimed_sums[air.pos[2]],
+            "program_boundary recompute"
+        );
+        debug_assert_eq!(
+            -mem_inv, claimed_sums[air.pos[3]],
+            "memory_root_boundary recompute"
+        );
+    }
+    let bnd_cols: Vec<Vec<SecureField>> = bnd_q.into_iter().map(|v| vec![v; n]).collect();
+
+    let mut is_rel_draw: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_BND_REL];
+    for k in 0..N_BND_REL {
+        debug_assert_eq!(
+            records[bnd.draw_row[k]].kind,
+            PermKind::Squeeze,
+            "relation {k} draw must land on a Squeeze record"
+        );
+        is_rel_draw[k][bnd.draw_row[k]] = BaseField::one();
+    }
+
     // ── Preprocessed logical columns, in registration order ──
     let mut pre_b: Vec<Vec<BaseField>> = Vec::new();
     pre_b.push(
@@ -859,6 +1171,9 @@ fn gen_trace(
     pre_b.push(is_rc_draw);
     pre_b.push(is_oods_draw);
     for col in is_cs_chunk {
+        pre_b.push(col);
+    }
+    for col in is_rel_draw {
         pre_b.push(col);
     }
     for l in 0..OPS_S {
@@ -920,7 +1235,12 @@ fn gen_trace(
     let preprocessed: Vec<_> = pre_b.into_iter().map(wrap).collect();
 
     let mut main_logical: Vec<Vec<BaseField>> = ch;
-    for q in emb_q.iter().chain(oods_cols.iter()).chain(cs_cols.iter()) {
+    for q in emb_q
+        .iter()
+        .chain(oods_cols.iter())
+        .chain(cs_cols.iter())
+        .chain(bnd_cols.iter())
+    {
         for c in 0..SECURE_EXTENSION_DEGREE {
             main_logical.push(q.iter().map(|v| v.to_m31_array()[c]).collect());
         }
@@ -939,6 +1259,7 @@ fn gen_trace(
         dbl_steps,
         cx,
         cy,
+        bound: air_eff,
     }
 }
 
@@ -1009,13 +1330,15 @@ struct ChildInputs {
     cy: BaseField,
     claimed_sums: Vec<SecureField>,
     prefix_len: usize,
+    bnd: Bnd,
     lay: ColocateLayout,
     log_size: u32,
 }
 
 fn build_inputs() -> ChildInputs {
     use stwo::core::poly::circle::CanonicCoset;
-    use zkpvm::framework_access::drive_chip_oods;
+    use zkpvm::boundary_binding::boundary_positions_in_mask;
+    use zkpvm::framework_access::{boundary_relation_challenges, drive_chip_oods};
     use zkpvm::{chip_idx, extract_recursion_data, reconstruct_oods_for_recursion};
 
     let (proof, sn) = canonical_segment();
@@ -1087,6 +1410,47 @@ fn build_inputs() -> ChildInputs {
         .schedule_two_stream(T_PER_MAC)
         .layout_colocate(OPS_S, NLEAF);
 
+    // Boundary recompute inputs (step 4b): the 3 relations' (z, alpha) + their draw
+    // squeezes (matched by output value) + the boundary chips' claimed-sum positions.
+    let ch = boundary_relation_challenges(&r.lookup_elements);
+    let z: [SecureField; N_BND_REL] = std::array::from_fn(|k| ch[k].0);
+    let alpha: [SecureField; N_BND_REL] = std::array::from_fn(|k| ch[k].1);
+    let draw_row: [usize; N_BND_REL] = std::array::from_fn(|k| {
+        let zc = z[k].to_m31_array();
+        let ac = alpha[k].to_m31_array();
+        records[..prefix_len]
+            .iter()
+            .position(|rec| {
+                rec.kind == PermKind::Squeeze
+                    && (0..4).all(|j| rec.output[j] == zc[j])
+                    && (0..4).all(|j| rec.output[4 + j] == ac[j])
+            })
+            .expect("relation (z, alpha) draw squeeze in the prefix")
+    });
+    let positions =
+        boundary_positions_in_mask(proof.component_mask).expect("boundary chips present");
+    let bnd = Bnd {
+        air: BoundaryAir {
+            init_regs: proof.initial_state.registers,
+            final_regs: proof.final_state.registers,
+            init_pc: proof.initial_state.pc,
+            final_pc: proof.final_state.pc,
+            init_ts: proof.initial_state.timestamp,
+            final_ts: proof.final_state.timestamp,
+            init_root: proof.initial_state.memory_root,
+            final_root: proof.final_state.memory_root,
+            pos: [
+                positions.register_boundary,
+                positions.register_closing,
+                positions.program_boundary,
+                positions.memory_root_boundary,
+            ],
+        },
+        z,
+        alpha,
+        draw_row,
+    };
+
     // The component spans max(transcript rows, embed rows); the transcript
     // dominates (8584 perms vs 6251 stream rows).
     let log_size = records
@@ -1106,6 +1470,7 @@ fn build_inputs() -> ChildInputs {
         cy,
         claimed_sums,
         prefix_len,
+        bnd,
         lay,
         log_size,
     }
@@ -1119,6 +1484,7 @@ impl ChildInputs {
         oods_t_tamper: bool,
         indicator_tamper: bool,
         cs_tamper: bool,
+        state_tamper: bool,
     ) -> ChildTrace {
         gen_trace(
             &self.records,
@@ -1130,6 +1496,7 @@ impl ChildInputs {
             self.cy,
             &self.claimed_sums,
             self.prefix_len,
+            &self.bnd,
             &self.lay,
             self.log_size,
             channel_tamper,
@@ -1137,6 +1504,7 @@ impl ChildInputs {
             oods_t_tamper,
             indicator_tamper,
             cs_tamper,
+            state_tamper,
         )
     }
 }
@@ -1166,6 +1534,7 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
             dbl_steps: trace.dbl_steps,
             cx: trace.cx,
             cy: trace.cy,
+            bound: trace.bound.clone(),
         },
         SecureField::zero(),
     );
@@ -1187,9 +1556,10 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
 #[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
 fn child_assembly_air_satisfied() {
     let inp = build_inputs();
-    let trace = inp.trace(None, false, false, false, false);
+    let trace = inp.trace(None, false, false, false, false, false);
     let log_size = trace.log_size;
     let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
+    let bound = trace.bound.clone();
     let pre: Vec<Vec<M31>> = trace
         .preprocessed
         .iter()
@@ -1207,6 +1577,7 @@ fn child_assembly_air_satisfied() {
                 dbl_steps,
                 cx,
                 cy,
+                bound: bound.clone(),
             }
             .evaluate(e);
         },
@@ -1233,7 +1604,7 @@ fn child_assembly_air_satisfied() {
 fn child_assembly_gate() {
     let inp = build_inputs();
 
-    prove_and_verify(inp.trace(None, false, false, false, false))
+    prove_and_verify(inp.trace(None, false, false, false, false, false))
         .expect("honest per-child assembly must prove+verify at degree ≤ 2");
 
     // Reject: corrupt a channel absorbed value (the transcript binding) — also
@@ -1244,13 +1615,13 @@ fn child_assembly_gate() {
         .position(|r| r.kind == PermKind::Absorb)
         .expect("transcript has an absorb");
     assert!(
-        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false, false)).is_err(),
         "a corrupted transcript value must be rejected"
     );
 
     // Reject: corrupt the embed composition (the final-slot oa value).
     assert!(
-        prove_and_verify(inp.trace(None, true, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, true, false, false, false, false)).is_err(),
         "a corrupted embed value must be rejected"
     );
 
@@ -1258,7 +1629,7 @@ fn child_assembly_gate() {
     // derivation: only it reads oods_t, so this confirms the dinv/ox binding is
     // non-vacuous independent of the embed).
     assert!(
-        prove_and_verify(inp.trace(None, false, true, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, true, false, false, false)).is_err(),
         "a corrupted oods_t must be rejected by the OODS-point derivation"
     );
 
@@ -1266,15 +1637,22 @@ fn child_assembly_gate() {
     // (Absorb) row — the is_rc_draw·(1−is_squeeze) hardening must reject binding rc
     // to a non-challenge perm output.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, true, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, true, false, false)).is_err(),
         "an is_rc_draw indicator on a non-squeeze row must be rejected"
     );
 
     // Reject: corrupt a claimed_sum — breaks both its transcript-absorb binding
     // and the Σ claimed_sums == 0 balance.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, true)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, false, true, false)).is_err(),
         "a corrupted claimed_sum must be rejected"
+    );
+
+    // Reject: claim a wrong final memory root (the io-hash/root attack) — the
+    // boundary recompute then ≠ the transcript-bound claimed_sum.
+    assert!(
+        prove_and_verify(inp.trace(None, false, false, false, false, true)).is_err(),
+        "a wrong claimed boundary state (memory root) must be rejected"
     );
 
     eprintln!(
@@ -1282,10 +1660,12 @@ fn child_assembly_gate() {
          segment's {}-perm transcript AND re-evaluates its full 31-component OODS composition \
          (streamed embed, {} stream rows), with the embed's rc latched to the channel's \
          composition-rc squeeze, dinv/ox derived in-circuit from a transcript-bound oods_t \
-         (mlbd-1={} double_x steps), AND the 31 claimed_sums bound to the mix_felts(claimed_sums) \
-         absorb + Σ == 0 — proving+verifying through the lifted Poseidon2-M31 protocol at degree \
-         ≤ 2; tampered transcript / embed / oods_t / claimed_sum values AND a mis-placed \
-         is_rc_draw indicator are each rejected.",
+         (mlbd-1={} double_x steps), the 31 claimed_sums bound to the mix_felts(claimed_sums) \
+         absorb + Σ == 0, AND the 4 boundary chips' claimed sums recomputed in-AIR from the \
+         PUBLIC boundary states (io-hash + memory roots) via each relation's transcript-bound \
+         (z, alpha) — proving+verifying through the lifted Poseidon2-M31 protocol at degree ≤ 2; \
+         every tamper (transcript / embed / oods_t / claimed_sum / boundary state) AND a \
+         mis-placed is_rc_draw indicator are each rejected.",
         inp.log_size,
         inp.records.len(),
         inp.lay.n_rows,

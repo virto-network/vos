@@ -8,7 +8,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::{air::Component, fields::qm31::SecureField, pcs::TreeVec};
 use stwo_constraint_framework::TraceLocationAllocator;
 
-pub use crate::lookups::AllLookupElements;
+pub use crate::lookups::{AllLookupElements, boundary_relation_challenges};
 use crate::recursion_pcs::ProverChannel;
 
 use crate::BASE_COMPONENTS;
