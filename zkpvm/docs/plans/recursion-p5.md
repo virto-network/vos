@@ -791,14 +791,15 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 > boundary + claimed-sum balance (`boundary_binding::check_boundary_claimed_sums`,
 > scale-free; uses `data.lookup_elements` + the public boundary states).
 >
-> **PER-CHILD ASSEMBLY STEPS 1 + 1b + HARDENING + 4a LANDED 2026-06-19/20 (LOCAL,
-> `tests/recursion_child_assembly.rs`, commits `79fca73` / `461f0a8` / `1de6f70` /
-> `cf157ec`).** The channel transcript replay and the streamed OODS embed now
-> co-exist in ONE uniform `FrameworkEval`, driven off ONE real `prove_canonical`
-> segment, with the first cross-chip latch bindings + the claimed-sum balance live
-> at canonical scale. The honest gate proves+verifies @ **log 14, ~82–94s/prove**;
-> every tamper (transcript / embed / oods_t / mis-placed indicator / claimed_sum)
-> is rejected.
+> **PER-CHILD ASSEMBLY STEPS 1 + 1b + HARDENING + 4a + 4b LANDED 2026-06-19/20
+> (LOCAL, `tests/recursion_child_assembly.rs`, commits `79fca73` / `461f0a8` /
+> `1de6f70` / `cf157ec` / `f8e896b`).** The channel transcript replay and the
+> streamed OODS embed now co-exist in ONE uniform `FrameworkEval`, driven off ONE
+> real `prove_canonical` segment, with the cross-chip latch bindings + the
+> claimed-sum balance + the boundary public-input recompute (the federation cash-in)
+> live at canonical scale. The honest gate proves+verifies @ **log 14,
+> ~82–94s/prove**; every tamper (transcript / embed / oods_t / mis-placed indicator
+> / claimed_sum / wrong boundary state) is rejected.
 > - **Step 1 (rc latch):** the merged component reads the channel block (the proven
 >   `join_assembly` AIR) AND the streamed embed block (the proven
 >   `recursion_stream_embed` AIR) on a shared row grid (the embed's 6251 stream rows
@@ -842,13 +843,22 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   columns + 16 `is_cs_chunk` preprocessed indicators (each hardened to fire only on
 >   a genuine Absorb row). The channel already constrains `absorbed` to the mixed
 >   value, so the binding pins cs to the real claimed_sums. GATE GREEN @ **log 14**
->   (491s / 6 proves, corrupted-claimed_sum rejected). REMAINING for full
->   claimed-sum soundness: (i) the **boundary recompute** (step 4b, `verify.rs:318`
->   → `check_boundary_claimed_sums`, binding the public io-hash + memory roots) —
->   large (the `MerkleNode` relation's 66-element tuple ⇒ 66 α-powers; register
->   byte-limbs; ~29 inverse-combines; the 3 boundary relations' `z,alpha` each from
->   ONE squeeze via `draw_secure_felts(2)`); (ii) connecting the embed's BAKED
->   claimed_sums to the bound cs columns (a follow-on like the lookup-element bind).
+>   (491s / 6 proves, corrupted-claimed_sum rejected).
+> - **Step 4b (boundary public-input recompute — the federation cash-in):** the 4
+>   boundary chips' claimed sums are RECOMPUTED in-AIR from the PUBLIC boundary
+>   states (initial/final registers, pc, ts, memory roots) and each compared to its
+>   (step-4a-bound) `claimed_sum` — binding the io-hash (`final.registers[9..13]`) +
+>   the memory roots (`verify.rs:318` → `check_boundary_claimed_sums`). Each sum is
+>   `Σ 1/⟨z, tuple⟩`, `⟨z, tuple⟩ = Σ alpha^i·tuple_i − z`; the 3 relations
+>   (register-memory 18, program-execution 12, merkle-node 66) have their `(z,
+>   alpha)` latched to their draw squeezes (each from ONE `draw_secure_felts(2)`:
+>   `z=out[0..4]`, `alpha=out[4..8]`, matched to the squeeze by value), `alpha`-powers
+>   derived in-AIR (witnessed chain), each `1/⟨z, tuple⟩` a witnessed inverse; the
+>   boundary states are public AIR constants. New crate accessor
+>   `boundary_relation_challenges`. All degree ≤ 2. GATE GREEN @ **log 14** (622s / 7
+>   proves; a WRONG claimed memory root is rejected). REMAINING follow-on (not a new
+>   gap): connect the embed's BAKED claimed_sums + lookup elements to these bound
+>   columns (the embed leaves bind via Merkle, steps 2–3).
 >
 > **REMAINING — precise architecture (grounded this session):**
 > - **Steps 2 + 3 (FRI fold chain + multi-tree Merkle decommit) are a COUPLED
