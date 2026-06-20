@@ -860,7 +860,90 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   gap): connect the embed's BAKED claimed_sums + lookup elements to these bound
 >   columns (the embed leaves bind via Merkle, steps 2–3).
 >
+> **STEPS 2+3 FOUNDATION + THE MAKE-OR-BREAK MEASUREMENT — 2026-06-21 (LOCAL,
+> commits `4c9c073` / `58d3b66`).** The shared-perm-block crux is PROVEN and the
+> real per-child scale is MEASURED. Net: the architecture works, the per-child is
+> **log 17 (not the predicted 15)** because the trace-tree LEAF SPONGE dominates,
+> and it is **tractable (~20–25 GiB extrapolated) on this 62 GiB box** — the design
+> cost model was ~3.7× low on perms (and 12× low on the trace-tree term).
+> - **Shared-perm-block crux PROVEN (`tests/recursion_shared_perm.rs`,
+>   `shared_perm_gate`, ~4s).** The Merkle decommit STREAMS to ONE perm/row: the
+>   leaf sponge (`update_leaf` absorbs + the padded `finalize`) and every
+>   `hash_children` level are each their OWN row, the 16-wide sponge/hash state
+>   threaded row→row by a `[0,1]` latch on dedicated `st` columns (the channel's
+>   digest-chain mechanism). A preprocessed row-type selector
+>   (`is_tr`/`m_abs`/`m_final`/`m_node`/…) shares the `eval_permutation` slot
+>   between a channel-transcript perm and a Merkle perm. The bit-driven
+>   `hash_children` child ordering (degree 3 = `m_node·bit·sib`) is lowered to
+>   degree 2 by a WITNESSED `mux = bit·(sib − cur)` (`left = cur+mux`,
+>   `right = sib−mux`). A real proof's main trace-tree decommit re-hashes to its
+>   real root in this streamed form, shares the perm slot with a transcript region,
+>   proves+verifies at degree ≤ 2; tampered leaf / sibling / transcript rejected.
+> - **Adversarial review CLEAN (Workflow, 4 lenses + per-finding verify):
+>   `confirmed: []`.** Every finding dismissed as an intended scope caveat or a
+>   documented follow-on. The dismissed set IS the integration-obligation checklist
+>   (carry into the assembly): (a) the streamed transcript is a stand-in — the REAL
+>   channel⊕embed coexistence on one perm is already proven in the landed assembly,
+>   so gating it by `is_transcript` follows the proven pattern; (b) the 4-wide QM31
+>   FRI-layer leaves need the partial-rate `finalize` generalization — **AND** stwo
+>   packs FRI leaves when `log_size ≥ LOG_PACKED_LEAF_SIZE && fold_step>1`
+>   (`prover/fri.rs:296-302`), so the leaf shape must handle BOTH packed and
+>   unpacked partial-rate; (c) the per-tree ROOTS must bind to the channel's
+>   commit-absorb rows (not be host constants); (d) the decommit LEAF VALUES must
+>   bind to the embed's OODS sampled values / the `mix_felts(sampled_values)`
+>   absorb (else a prover decommits arbitrary leaves) — the deepest obligation; (e)
+>   the routing is segment-invariant ONLY for per-path-INDEPENDENT streaming (no
+>   co-queried subpath sharing) — which is what we do (the schedule is fixed by the
+>   canonical profile; only values/bits differ per segment).
+> - **Streamed multi-tree decommit VALIDATED on REAL data
+>   (`tests/recursion_decommit_scale.rs`).** Generalised to the 4 real trace trees:
+>   per-tree widths/heights, MIXED-DEGREE leaves (the lifted Merkle hashes each leaf
+>   row with columns sorted ASCENDING by log size — `extract_recursion_data` now
+>   returns `tree_heights` + `tree_column_log_sizes`), partial-rate finalize for
+>   non-8-multiple widths. `decommit_streamed_assert`: ALL 4 real trees (preproc
+>   452, main 9951, interaction 5364, composition 8 cols; height 16) re-hash to
+>   their real roots. `decommit_streamed_prove`: narrow trees prove+verify at
+>   degree ≤ 2, tampered chunk/sibling rejected. `decommit_streamed_prove_main`:
+>   the WIDE main-tree decommit (log 16, 47880 perms) proves at **1.3 GiB peak
+>   RSS** — a decommit-only component is CHEAP even when tall (its preproc is ~14
+>   narrow cols).
+> - **THE MEASUREMENT (`decommit_scale_measure`, real canonical segment).**
+>   Per-child perm budget: **transcript 8584 + trace-tree 77444 + FRI-layer 1640 =
+>   ~87.7K → log 17.** Breakdown that corrects the design:
+>   - **Trace-tree = 77444 perms, NOT ~6.2K (12× low).** The killer is the LEAF
+>     SPONGE over the WIDE trace: tree 1 (main) 9951 cols → 1244 leaf perms/leaf ×
+>     38 = 47880; tree 2 (interaction) 5364 cols → 26106; tree 0 (preproc) 2774;
+>     tree 3 (composition, 8 cols) 684. Node hashing is only ~2.4K (38×16×4). The
+>     leaf width = the FULL 31-component trace column count and is ~fixed by the AIR
+>     (independent of segment step count — more steps = more ROWS, same columns).
+>   - **FRI-layer = 1640 (hash_witness), CHEAPER than the ~8.7K estimate** (14
+>     layers, last_layer degree-0, 38 queries halving per layer).
+>   - All 38 query positions distinct (no collisions); all trace trees height 16
+>     (= `lifting_log_size`); `max_log_degree_bound`=14.
+> - **TRACTABILITY (revised — the earlier "intractable" fear was based on a wrong
+>   "tens of GB at log 14" assumption; that figure was the multi-million-step
+>   CAPSTONE, not this assembly).** Measured: channel+embed assembly at log 14 =
+>   **2.2 GiB** peak; main-tree decommit at log 16 = **1.3 GiB**. Peak RSS ≈
+>   (preproc+main cols)×2^(log+blowup). Combined log-17 per-child ≈ (6163 preproc +
+>   1997 main) × 2^19 ≈ 4.3B cells → **~20–25 GiB, ~12–15 min** (scalar hasher) —
+>   FEASIBLE on this 62 GiB box (after reclaiming cache). The cost DRIVER to watch
+>   is the EMBED's ~6149-wide preproc replicated across the decommit's ~131K rows
+>   in ONE uniform component (the decommit alone is narrow+cheap; the embed alone is
+>   wide+short; the uniform component pays width×rows). **Implication for the
+>   fold-up:** the 2-child join (P5.4) ~doubles → log 18 / ~40–50 GiB (borderline on
+>   62 GiB); higher fold levels need more RAM or **P5-perf (SIMD Poseidon2-M31
+>   commit) becomes important — promote it from "optional" toward a prerequisite for
+>   P5.4/P5.5.** A trace-width reduction (the 9951+5364 main+interaction leaves) or a
+>   narrower embed-routing preproc would also help and is worth a design pass.
+>
 > **REMAINING — precise architecture (grounded this session):**
+> - **The full single-child verifier (step 5) is the next BUILD** — fold the
+>   validated streamed multi-tree decommit + the FRI fold chain + the FRI-layer
+>   decommit into the assembly's `ChildEval`, gating the channel by `is_transcript`,
+>   discharging integration obligations (a)–(e) above (esp. (c) root↔commit-absorb
+>   and (d) leaf↔OODS-sample binding), and PROVE the combined log-17 component
+>   (~20–25 GiB). The scale + memory are now KNOWN; the mechanisms are PROVEN
+>   standalone; this session de-risked the make-or-break.
 > - **Steps 2 + 3 (FRI fold chain + multi-tree Merkle decommit) are a COUPLED
 >   subsystem that only becomes SOUND TOGETHER**, and they need a **shared perm
 >   block**: ONE `eval_permutation` per row, a row-type selector choosing between a
