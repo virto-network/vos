@@ -857,6 +857,16 @@ pub struct RecursionData {
     pub lifting_log_size: u32,
     /// `lifting_log_size - log_blowup_factor` (the OODS vanishing-domain log size).
     pub max_log_degree_bound: u32,
+    /// The Merkle height of each committed trace tree (preprocessed, main,
+    /// interaction, composition), in tree order — the number of `hash_children`
+    /// levels the streamed per-tree decommit re-hashes. Trees 1.. decommit at
+    /// `query_positions`; tree 0 (preprocessed) at `preprocessed_query_positions`.
+    pub tree_heights: alloc::vec::Vec<u32>,
+    /// Per-tree committed column log sizes, in COMMIT order (the order the columns
+    /// appear in `queried_values`). The lifted Merkle leaf hashes the row of all a
+    /// tree's columns sorted ASCENDING by log size (stable) — so the streamed
+    /// decommit must order its leaf row by these.
+    pub tree_column_log_sizes: alloc::vec::Vec<alloc::vec::Vec<u32>>,
 }
 
 /// Extract every transcript-derived datum the per-child verifier-AIR needs from a
@@ -1034,5 +1044,11 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
         lookup_elements: ctx.lookup_elements,
         lifting_log_size,
         max_log_degree_bound,
+        tree_heights: commitment_scheme.trees.iter().map(|t| t.height).collect(),
+        tree_column_log_sizes: commitment_scheme
+            .trees
+            .iter()
+            .map(|t| t.column_log_sizes.clone())
+            .collect(),
     }
 }
