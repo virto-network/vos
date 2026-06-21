@@ -30,13 +30,24 @@
 
 mod recursion_common;
 
-use num_traits::One;
+use num_traits::{One, Zero};
+use recursion_common::{P2MerkleChannel, Poseidon2M31Channel, mobile_config};
+use stwo::core::air::Component;
 use stwo::core::circle::CirclePoint;
-use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::pcs::CommitmentSchemeVerifier;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::poly::line::LineDomain;
 use stwo::core::utils::bit_reverse_index;
+use stwo::core::verifier::verify;
+use stwo::prover::backend::{Col, Column, CpuBackend};
+use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+use stwo::prover::{CommitmentSchemeProver, prove};
+use stwo_constraint_framework::{
+    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
+};
 use zkpvm::{Proof, SideNote, extract_recursion_data};
 
 fn canonical_segment() -> (Proof, SideNote) {
@@ -342,5 +353,382 @@ fn fri_chain_real_reconstruct() {
         chain.per_query.len(),
         chain.first_log,
         chain.last_layer_domain.log_size(),
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The in-AIR 14-layer fold chain (twiddle derived per layer; constant alphas).
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Clone for CosetConsts {
+    fn clone(&self) -> Self {
+        CosetConsts {
+            initial: self.initial,
+            q_pts: self.q_pts.clone(),
+        }
+    }
+}
+
+/// The bit-sources driving layer `L`'s twiddle point-chain: layer 0 (circle) uses
+/// q-bits `[1, first_log)`; inner layer `L` uses `[forced-0, bits[L+1..first_log)]`
+/// (the subset_start index). `None` = a forced-zero entry.
+fn layer_bit_sources(layer: usize, first_log: u32) -> Vec<Option<usize>> {
+    let fl = first_log as usize;
+    if layer == 0 {
+        (1..fl).map(Some).collect()
+    } else {
+        std::iter::once(None)
+            .chain((layer + 1..fl).map(Some))
+            .collect()
+    }
+}
+
+/// In-AIR conditional-point-add chain (the proven `fri_fold_chain` gadget): reads
+/// `bits.len()` witnessed points, binds each to `pt_k = bits[k] ? pt_{k-1}+q_pts[k]
+/// : pt_{k-1}` (degree 2). Returns the final `(x, y)`.
+fn point_chain<E: EvalAtRow>(eval: &mut E, consts: &CosetConsts, bits: &[E::F]) -> (E::F, E::F) {
+    let mut prev_x = E::F::from(consts.initial.x);
+    let mut prev_y = E::F::from(consts.initial.y);
+    for (k, bit) in bits.iter().enumerate() {
+        let qkx = consts.q_pts[k].x;
+        let qky = consts.q_pts[k].y;
+        let added_x = prev_x.clone() * qkx - prev_y.clone() * qky;
+        let added_y = prev_x.clone() * qky + prev_y.clone() * qkx;
+        let cur_x = eval.next_trace_mask();
+        let cur_y = eval.next_trace_mask();
+        eval.add_constraint(
+            cur_x.clone() - (prev_x.clone() + bit.clone() * (added_x - prev_x.clone())),
+        );
+        eval.add_constraint(
+            cur_y.clone() - (prev_y.clone() + bit.clone() * (added_y - prev_y.clone())),
+        );
+        prev_x = cur_x;
+        prev_y = cur_y;
+    }
+    (prev_x, prev_y)
+}
+
+#[derive(Clone)]
+struct FriChainEval {
+    log_n_rows: u32,
+    first_log: u32,
+    n_layers: usize,
+    line_cosets: Vec<CosetConsts>,
+    alphas: Vec<SecureField>,
+    last_layer_const: SecureField,
+}
+
+impl FrameworkEval for FriChainEval {
+    fn log_size(&self) -> u32 {
+        self.log_n_rows
+    }
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.log_n_rows + 1 // degree ≤ 2
+    }
+    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        let one = E::F::one();
+        let zero = E::F::zero();
+        let read4 = |eval: &mut E| -> [E::F; 4] { std::array::from_fn(|_| eval.next_trace_mask()) };
+
+        // q + its first_log boolean bits (recompose ⇒ binds the bits).
+        let q = eval.next_trace_mask();
+        let bits: Vec<E::F> = (0..self.first_log)
+            .map(|_| eval.next_trace_mask())
+            .collect();
+        let mut recompose = E::F::zero();
+        let mut coeff = BaseField::one();
+        for bit in &bits {
+            eval.add_constraint(bit.clone() * (bit.clone() - one.clone()));
+            recompose += bit.clone() * coeff;
+            coeff += coeff;
+        }
+        eval.add_constraint(recompose - q);
+
+        // One fold step (constant alpha): scaled/prod/folded witnessed, deg ≤ 2.
+        let fold_step_air = |eval: &mut E,
+                             f_a: &[E::F; 4],
+                             f_b: &[E::F; 4],
+                             alpha: SecureField,
+                             twid: E::F|
+         -> [E::F; 4] {
+            let scaled = read4(eval);
+            let prod = read4(eval);
+            let folded = read4(eval);
+            for k in 0..4 {
+                eval.add_constraint(
+                    scaled[k].clone() - (f_a[k].clone() - f_b[k].clone()) * twid.clone(),
+                );
+            }
+            eval.add_constraint(
+                E::combine_ef(prod.clone()) - E::EF::from(alpha) * E::combine_ef(scaled),
+            );
+            eval.add_constraint(
+                E::combine_ef(folded.clone())
+                    - (E::combine_ef(f_a.clone())
+                        + E::combine_ef(f_b.clone())
+                        + E::combine_ef(prod)),
+            );
+            folded
+        };
+        let inv_of = |eval: &mut E, coord: E::F| -> E::F {
+            let t = eval.next_trace_mask();
+            eval.add_constraint(t.clone() * coord - one.clone());
+            t
+        };
+
+        let mut prev_folded: Option<[E::F; 4]> = None;
+        for layer in 0..self.n_layers {
+            let e0 = read4(&mut eval);
+            let e1 = read4(&mut eval);
+            // Chain: the query's eval at this layer = select(bit[layer], e0, e1);
+            // for layer > 0 it must equal the previous layer's folded output.
+            if let Some(pf) = &prev_folded {
+                for k in 0..4 {
+                    let queried =
+                        e0[k].clone() + bits[layer].clone() * (e1[k].clone() - e0[k].clone());
+                    eval.add_constraint(pf[k].clone() - queried);
+                }
+            }
+            // Twiddle: derive the layer's coset point from the (bound) q-bits.
+            let srcs = layer_bit_sources(layer, self.first_log);
+            let layer_bits: Vec<E::F> = srcs
+                .iter()
+                .map(|s| match s {
+                    Some(k) => bits[*k].clone(),
+                    None => zero.clone(),
+                })
+                .collect();
+            let coset = if layer == 0 {
+                &self.line_cosets[0]
+            } else {
+                &self.line_cosets[layer - 1]
+            };
+            let (px, py) = point_chain(&mut eval, coset, &layer_bits);
+            let twid = inv_of(&mut eval, if layer == 0 { py } else { px });
+            let folded = fold_step_air(&mut eval, &e0, &e1, self.alphas[layer], twid);
+            prev_folded = Some(folded);
+        }
+        // Last layer: the surviving folded eval == the degree-0 last-layer constant.
+        let last = prev_folded.expect("at least one layer");
+        eval.add_constraint(E::combine_ef(last) - E::EF::from(self.last_layer_const));
+        eval
+    }
+}
+
+// ── Host trace fill (same order the eval reads) ───────────────────────────────
+
+fn point_chain_host(consts: &CosetConsts, bits: &[u32]) -> Vec<CirclePoint<BaseField>> {
+    let mut pt = consts.initial;
+    let mut out = Vec::with_capacity(bits.len());
+    for (k, &b) in bits.iter().enumerate() {
+        if b == 1 {
+            pt = pt + consts.q_pts[k];
+        }
+        let _ = k;
+        out.push(pt);
+    }
+    out
+}
+
+fn push4(row: &mut Vec<BaseField>, q: SecureField) {
+    row.extend(q.to_m31_array());
+}
+
+/// One query's full fold-chain row (same order `FriChainEval::evaluate` reads).
+fn fri_row(chain: &FriChain, alphas: &[SecureField], recs: &[LayerRec]) -> Vec<BaseField> {
+    let q = recs[0].pos;
+    let mut row = Vec::new();
+    row.push(BaseField::from(q as u32));
+    for k in 0..chain.first_log {
+        row.push(BaseField::from((q >> k) & 1));
+    }
+    for (layer, rec) in recs.iter().enumerate() {
+        push4(&mut row, rec.e0);
+        push4(&mut row, rec.e1);
+        // point chain + twiddle
+        let srcs = layer_bit_sources(layer, chain.first_log);
+        let bit_vals: Vec<u32> = srcs
+            .iter()
+            .map(|s| s.map_or(0, |k| ((q >> k) & 1) as u32))
+            .collect();
+        let coset = if layer == 0 {
+            &chain.line_cosets[0]
+        } else {
+            &chain.line_cosets[layer - 1]
+        };
+        let pts = point_chain_host(coset, &bit_vals);
+        let last_pt = *pts.last().unwrap();
+        for p in &pts {
+            row.push(p.x);
+            row.push(p.y);
+        }
+        let twid = if layer == 0 {
+            last_pt.y.inverse()
+        } else {
+            last_pt.x.inverse()
+        };
+        row.push(twid);
+        let scaled = (rec.e0 - rec.e1) * twid;
+        let prod = alphas[layer] * scaled;
+        let folded = (rec.e0 + rec.e1) + prod;
+        debug_assert_eq!(folded, rec.folded, "host fold must match reconstruction");
+        push4(&mut row, scaled);
+        push4(&mut row, prod);
+        push4(&mut row, folded);
+    }
+    row
+}
+
+fn fri_n_cols(chain: &FriChain) -> usize {
+    let mut n = 1 + chain.first_log as usize; // q + bits
+    for layer in 0..chain.n_layers {
+        let pts = layer_bit_sources(layer, chain.first_log).len();
+        n += 8 + pts * 2 + 1 + 12; // e0,e1 + chain + twid + scaled,prod,folded
+    }
+    n
+}
+
+fn fri_gen_trace(
+    chain: &FriChain,
+    alphas: &[SecureField],
+    log_size: u32,
+    tamper: Option<(usize, usize)>,
+) -> Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> {
+    let n = 1usize << log_size;
+    let n_cols = fri_n_cols(chain);
+    let mut cols: Vec<Col<CpuBackend, BaseField>> = (0..n_cols)
+        .map(|_| Col::<CpuBackend, BaseField>::zeros(n))
+        .collect();
+    for r in 0..n {
+        let recs = &chain.per_query[r % chain.per_query.len()];
+        for (c, v) in fri_row(chain, alphas, recs).into_iter().enumerate() {
+            cols[c].set(r, v);
+        }
+    }
+    if let Some((c, r)) = tamper {
+        let orig = cols[c].at(r);
+        cols[c].set(r, orig + BaseField::one());
+    }
+    let domain = CanonicCoset::new(log_size).circle_domain();
+    cols.into_iter()
+        .map(|col| CircleEvaluation::new(domain, col))
+        .collect()
+}
+
+fn fri_eval(chain: &FriChain, alphas: &[SecureField], log_size: u32) -> FriChainEval {
+    FriChainEval {
+        log_n_rows: log_size,
+        first_log: chain.first_log,
+        n_layers: chain.n_layers,
+        line_cosets: chain.line_cosets.clone(),
+        alphas: alphas.to_vec(),
+        last_layer_const: chain.last_layer_const,
+    }
+}
+
+fn fri_prove_and_verify(
+    chain: &FriChain,
+    alphas: &[SecureField],
+    tamper: Option<(usize, usize)>,
+) -> Result<(), String> {
+    let config = mobile_config();
+    let log_size = (chain.per_query.len() as u32)
+        .next_power_of_two()
+        .trailing_zeros()
+        .max(1);
+    let trace = fri_gen_trace(chain, alphas, log_size, tamper);
+    let twiddles = CpuBackend::precompute_twiddles(
+        CanonicCoset::new(log_size + 1 + config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+    let channel = &mut Poseidon2M31Channel::default();
+    let mut cs = CommitmentSchemeProver::<CpuBackend, P2MerkleChannel>::new(config, &twiddles);
+    let mut tb = cs.tree_builder();
+    tb.extend_evals(Vec::new());
+    tb.commit(channel);
+    let mut tb = cs.tree_builder();
+    tb.extend_evals(trace);
+    tb.commit(channel);
+    let component = FrameworkComponent::<FriChainEval>::new(
+        &mut TraceLocationAllocator::default(),
+        fri_eval(chain, alphas, log_size),
+        SecureField::zero(),
+    );
+    let proof = prove::<CpuBackend, P2MerkleChannel>(&[&component], channel, cs)
+        .map_err(|e| format!("prove: {e:?}"))?;
+    let vch = &mut Poseidon2M31Channel::default();
+    let mut vs = CommitmentSchemeVerifier::<P2MerkleChannel>::new(config);
+    let sizes = component.trace_log_degree_bounds();
+    vs.commit(proof.commitments[0], &sizes[0], vch);
+    vs.commit(proof.commitments[1], &sizes[1], vch);
+    verify(&[&component as &dyn Component], vch, &mut vs, proof)
+        .map_err(|e| format!("verify: {e:?}"))
+}
+
+/// FAST: the real 14-layer fold-chain trace satisfies the AIR.
+#[test]
+#[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
+fn fri_chain_real_air_satisfied() {
+    use stwo::core::pcs::TreeVec;
+    use stwo_constraint_framework::assert_constraints_on_trace;
+    let (proof, sn) = canonical_segment();
+    let data = extract_recursion_data(&proof, &sn);
+    let chain = reconstruct(&proof, &data);
+    let alphas = data.fold_alphas.clone();
+    let log_size = (chain.per_query.len() as u32)
+        .next_power_of_two()
+        .trailing_zeros()
+        .max(1);
+    let trace = fri_gen_trace(&chain, &alphas, log_size, None);
+    let main: Vec<Vec<M31>> = trace.iter().map(|e| e.values.to_cpu()).collect();
+    let tv: TreeVec<Vec<&Vec<M31>>> = TreeVec::new(vec![vec![], main.iter().collect(), vec![]]);
+    let ev = fri_eval(&chain, &alphas, log_size);
+    assert_constraints_on_trace(
+        &tv,
+        log_size,
+        |e| {
+            ev.evaluate(e);
+        },
+        SecureField::zero(),
+    );
+    eprintln!(
+        "fri_chain_real_air_satisfied: the REAL {}-layer fold chain ({} queries, {} cols/row, log \
+         {log_size}) satisfies the AIR (twiddle derived in-AIR per layer from q).",
+        chain.n_layers,
+        chain.per_query.len(),
+        fri_n_cols(&chain),
+    );
+}
+
+/// THE GATE: the real 14-layer FRI fold chain reproduces in-AIR, proves+verifies
+/// through the lifted Poseidon2-M31 protocol; a perturbed fold output is rejected.
+#[test]
+#[ignore = "heavy: real-segment FRI fold chain prove+verify (release)"]
+fn fri_chain_real_gate() {
+    let (proof, sn) = canonical_segment();
+    let data = extract_recursion_data(&proof, &sn);
+    let chain = reconstruct(&proof, &data);
+    let alphas = data.fold_alphas.clone();
+
+    fri_prove_and_verify(&chain, &alphas, None).expect("honest real FRI fold chain");
+
+    // Perturb the layer-0 folded[0] column (q,bits + e0,e1 + chain pts + twid +
+    // scaled,prod, then folded) at row 0 — breaks the chain + last-layer check.
+    let pts0 = layer_bit_sources(0, chain.first_log).len();
+    let folded0_col = (1 + chain.first_log as usize) + 8 + pts0 * 2 + 1 + 8;
+    assert!(
+        fri_prove_and_verify(&chain, &alphas, Some((folded0_col, 0))).is_err(),
+        "a perturbed fold output must be rejected"
+    );
+
+    eprintln!(
+        "fri_chain_real_gate GREEN: the REAL {}-layer FRI fold chain (1 circle + {} line, {} \
+         queries, twiddle derived in-AIR per layer, cross-layer chained, last layer a degree-0 \
+         constant) reproduces in-AIR and proves+verifies through the lifted Poseidon2-M31 protocol \
+         at degree ≤ 2; a perturbed fold is rejected.",
+        chain.n_layers,
+        chain.n_layers - 1,
+        chain.per_query.len(),
     );
 }
