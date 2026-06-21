@@ -936,12 +936,43 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   P5.4/P5.5.** A trace-width reduction (the 9951+5364 main+interaction leaves) or a
 >   narrower embed-routing preproc would also help and is worth a design pass.
 >
+> - **FRI fold chain at REAL scale PROVEN (`tests/recursion_fri_chain_real.rs`,
+>   commits `378042f` host + `182d969` AIR).** Generalises the proven
+>   `fri_fold_chain.rs` to the real segment's **14 layers (1 circle + 13 line), 38
+>   queries**: a HOST reconstruction replays the verifier's per-layer fold from
+>   `extract_recursion_data` (`first_layer_evals` + `fold_alphas` +
+>   `query_positions`) + the raw `fri_witness` siblings — every query folds down to
+>   the degree-0 last-layer constant, matching the real `FriVerifier::decommit`
+>   (de-risks the per-layer indexing). The in-AIR chain (575 cols/row, log 6)
+>   derives each layer's twiddle from the bound q-bits via the proven point-chain
+>   gadget, folds with the constant per-layer `fold_alpha`, chains `folded[L]` into
+>   layer L+1, and checks the last-layer constant — proves+verifies at degree ≤ 2,
+>   perturbed fold rejected (`fri_chain_real_gate`). **fold_step=1 throughout ⇒ the
+>   FRI-layer leaves are 4-wide QM31 (no packing), so the FRI-layer Merkle decommit
+>   needs NO new gadget — the streamed decommit (`recursion_decommit_scale`) applies
+>   directly (`leaf_chunks` already handles the rem=4 partial-rate finalize).**
+>   ⇒ **all per-child verifier MECHANISMS are now proven standalone** (channel,
+>   OODS embed, streamed trace-tree decommit, shared perm block, FRI fold chain,
+>   FRI-layer decommit); the only remaining mechanism is the **DEEP-quotient
+>   reconstruction** (`fri_answers`: leaves + OODS samples → `first_layer_evals` =
+>   obligation (d)).
+>
 > **REMAINING — precise architecture (grounded this session):**
-> - **The full single-child verifier (step 5) is the next BUILD** — fold the
+> - **DEEP-quotient reconstruction (the last mechanism + obligation (d)):** build
+>   the in-AIR `fri_answers` that produces the FRI fold chain's layer-0 input
+>   (`first_layer_evals`) from the trace-decommit leaf values + the OODS
+>   `sampled_values` + `deep_coeff` — the batched DEEP quotient (per query, over all
+>   committed columns: `(queried_val − sample)·deep_coeff^k / (query_point −
+>   oods_point)` across the OODS point + conjugate). This BINDS the decommit leaves
+>   to the OODS samples the embed consumes. A streamed batched computation like the
+>   OODS embed; de-risk host-first (match `extract_recursion_data.first_layer_evals`)
+>   then in-AIR.
+> - **The full single-child verifier (step 5) is the final BUILD** — fold the
 >   validated streamed multi-tree decommit + the FRI fold chain + the FRI-layer
->   decommit into the assembly's `ChildEval`, gating the channel by `is_transcript`,
->   discharging integration obligations (a)–(e) above (esp. (c) root↔commit-absorb
->   and (d) leaf↔OODS-sample binding), and PROVE the combined log-17 component
+>   decommit + the DEEP reconstruction into the assembly's `ChildEval`, gating the
+>   channel by `is_transcript`, discharging integration obligations (a)–(e) above
+>   (esp. (c) root↔commit-absorb and (d) leaf↔OODS-sample binding), and PROVE the
+>   combined log-17 component
 >   (~20–25 GiB). The scale + memory are now KNOWN; the mechanisms are PROVEN
 >   standalone; this session de-risked the make-or-break.
 > - **Steps 2 + 3 (FRI fold chain + multi-tree Merkle decommit) are a COUPLED
