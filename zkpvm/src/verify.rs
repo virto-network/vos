@@ -867,6 +867,24 @@ pub struct RecursionData {
     /// tree's columns sorted ASCENDING by log size (stable) — so the streamed
     /// decommit must order its leaf row by these.
     pub tree_column_log_sizes: alloc::vec::Vec<alloc::vec::Vec<u32>>,
+    /// The DEEP-quotient (`fri_answers`) decomposition in AIR-friendly form: the
+    /// sample batches (grouped by sample point), each carrying per-column the
+    /// FLATTENED column index (into `queried_values.flatten()`) + the
+    /// complex-conjugate line coefficients `(a, b, c)`. The in-AIR FRI layer-0
+    /// input is, per query at domain point `p`,
+    /// `Σ_batch (1/line(z, z̄)(p)) · Σ_col (queried[col]·c − (a·p.y + b))` — this
+    /// binds the trace-decommit leaves to the OODS samples.
+    pub deep_batches: alloc::vec::Vec<DeepBatch>,
+}
+
+/// One DEEP-quotient sample batch: a sample point and the columns sampled there,
+/// each with its flattened column index + line coefficients. See
+/// [`RecursionData::deep_batches`].
+#[cfg(feature = "poseidon2-channel")]
+pub struct DeepBatch {
+    pub point: stwo::core::circle::CirclePoint<SecureField>,
+    /// `(flattened column index, a, b, c)` per column in this batch.
+    pub cols: alloc::vec::Vec<(usize, SecureField, SecureField, SecureField)>,
 }
 
 /// Extract every transcript-derived datum the per-child verifier-AIR needs from a
@@ -1015,6 +1033,43 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
                 .map(|(point, value)| PointSample { point, value })
                 .collect::<alloc::vec::Vec<_>>()
         });
+
+    // DEEP-quotient decomposition (the AIR's `fri_answers` spec): batches grouped
+    // by sample point, each carrying per-column the flattened index + line coeffs.
+    // Computed from clones BEFORE `fri_answers` consumes `samples`/`column_log_sizes`.
+    let deep_batches = {
+        use stwo::core::pcs::quotients::{
+            ColumnSampleBatch, build_samples_with_randomness_and_periodicity, column_line_coeffs,
+        };
+        let cls: alloc::vec::Vec<_> = column_log_sizes
+            .0
+            .iter()
+            .map(|t| t.clone().into_iter())
+            .collect();
+        let swr = build_samples_with_randomness_and_periodicity(
+            &samples,
+            cls,
+            lifting_log_size,
+            deep_coeff,
+        );
+        let flat: alloc::vec::Vec<_> = swr.iter().flatten().collect();
+        let batches = ColumnSampleBatch::new_vec(&flat);
+        let lcs = column_line_coeffs(&batches);
+        batches
+            .iter()
+            .zip(lcs)
+            .map(|(b, lc)| DeepBatch {
+                point: b.point,
+                cols: b
+                    .cols_vals_randpows
+                    .iter()
+                    .zip(lc)
+                    .map(|(nd, (a, bb, c))| (nd.column_index, a, bb, c))
+                    .collect(),
+            })
+            .collect::<alloc::vec::Vec<_>>()
+    };
+
     let first_layer_evals = fri_answers(
         column_log_sizes,
         samples,
@@ -1050,5 +1105,6 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
             .iter()
             .map(|t| t.column_log_sizes.clone())
             .collect(),
+        deep_batches,
     }
 }
