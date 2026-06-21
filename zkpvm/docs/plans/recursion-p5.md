@@ -957,16 +957,29 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   reconstruction** (`fri_answers`: leaves + OODS samples → `first_layer_evals` =
 >   obligation (d)).
 >
-> **REMAINING — precise architecture (grounded this session):**
-> - **DEEP-quotient reconstruction (the last mechanism + obligation (d)):** build
->   the in-AIR `fri_answers` that produces the FRI fold chain's layer-0 input
->   (`first_layer_evals`) from the trace-decommit leaf values + the OODS
->   `sampled_values` + `deep_coeff` — the batched DEEP quotient (per query, over all
->   committed columns: `(queried_val − sample)·deep_coeff^k / (query_point −
->   oods_point)` across the OODS point + conjugate). This BINDS the decommit leaves
->   to the OODS samples the embed consumes. A streamed batched computation like the
->   OODS embed; de-risk host-first (match `extract_recursion_data.first_layer_evals`)
->   then in-AIR.
+> - **DEEP-quotient reconstruction host-first DONE (`tests/recursion_deep_quotient.rs`,
+>   commit `f451bc5`).** `extract_recursion_data` now exposes the `fri_answers`
+>   decomposition in AIR-friendly form (`RecursionData.deep_batches` + `DeepBatch`):
+>   the sample batches grouped by sample point, each carrying per-column the
+>   FLATTENED column index + the complex-conjugate line coefficients `(a, b, c)`
+>   (via stwo's `build_samples_with_randomness_and_periodicity` +
+>   `ColumnSampleBatch` + `column_line_coeffs`). The host re-derives
+>   `accumulate_row_quotients` from that + the real `queried_values` + per-query
+>   domain points and MATCHES stwo's `first_layer_evals` for all 38 queries — the
+>   formula + constants validated in the in-AIR form: per query at `p`, `eval =
+>   Σ_batch (1/line(z,z̄)(p)) · Σ_col (queried[col]·c − (a·p.y + b))`, with the CM31
+>   denominator inverse witnessed (deg 2), the numerator a degree-1 sum over the
+>   leaves (term count FREE), the product degree 2. Real shape: **11 sample batches,
+>   17929 (batch,column) numerator terms**. The numerator reads the SAME leaves the
+>   trace-tree decommit binds ⇒ the in-AIR DEEP rides on the decommit's streamed leaf
+>   rows (an accumulator column + per-row `leaf·c` contributions; ~17929·38 deg-1
+>   adds + 11·38 witnessed CM31 inverses), so it is naturally part of step 5, not a
+>   separate component.
+> - **⇒ ALL per-child verifier mechanisms are now de-risked** (formulas validated,
+>   AIRs proven where standalone-meaningful): channel, OODS embed, streamed
+>   trace-tree decommit, shared perm block, FRI fold chain, FRI-layer decommit, DEEP
+>   quotient. The remaining work is the **step-5 INTEGRATION** (no unknown
+>   mechanisms left).
 > - **The full single-child verifier (step 5) is the final BUILD** — fold the
 >   validated streamed multi-tree decommit + the FRI fold chain + the FRI-layer
 >   decommit + the DEEP reconstruction into the assembly's `ChildEval`, gating the
