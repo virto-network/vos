@@ -1980,11 +1980,14 @@ fn build_inputs() -> ChildInputs {
         draw_row,
     };
 
-    // Step 1b: a small REAL streamed decommit region (the composition trace tree,
-    // 8 cols) rides the freed perm slot after the transcript. The full 4-tree
-    // decommit is step 2; here it validates the channel⊕merkle perm-sharing.
-    let comp_tree = build_tree(&proof, &data, data.tree_heights.len() - 1);
-    let mk_fills = mk_resolve(&[&comp_tree]);
+    // Step 2: the FULL streamed decommit of all 4 real trace trees (preprocessed,
+    // main, interaction, composition) rides the freed perm slot after the
+    // transcript — the make-or-break ~log-17 scale (the wide main/interaction leaf
+    // sponges dominate). The mk_resolve gadget streams them back-to-back (one
+    // perm/row), sorted mixed-degree leaves + partial-rate finalize per tree.
+    let n_trees = proof.stark_proof.commitments.len();
+    let trees: Vec<TreeData> = (0..n_trees).map(|t| build_tree(&proof, &data, t)).collect();
+    let mk_fills = mk_resolve(&trees.iter().collect::<Vec<_>>());
 
     // The component spans max(transcript + merkle rows, embed rows).
     let log_size = (records.len() + mk_fills.len())
@@ -2229,5 +2232,53 @@ fn child_full_gate() {
         inp.lay.n_rows,
         inp.mk_fills.len(),
         inp.dbl_steps,
+    );
+}
+
+/// THE MAKE-OR-BREAK MEASUREMENT (heavy, ~log 17): the FULL per-child verifier —
+/// channel transcript replay + streamed 31-component OODS embed + the streamed
+/// decommit of ALL 4 real trace trees (sharing ONE eval_permutation/row) + the
+/// latched challenges + claimed-sum balance + boundary recompute — proves+verifies
+/// a REAL canonical segment at degree ≤ 2 in ONE uniform component, and a corrupted
+/// merkle sibling (the new decommit soundness at full scale) is rejected. Reports
+/// log_size / column widths / prove-time; poll `/proc/<pid>/status` VmHWM for peak
+/// RSS. The channel/embed/oods_t/claimed_sum/boundary tampers are NOT re-run here
+/// (proven at the log-14 1-tree scale in child_full_gate with identical
+/// constraints; each ~log-17 prove is minutes).
+#[test]
+#[ignore = "make-or-break: full 4-tree per-child verifier prove+verify (~log 17, ~20-25 GiB, minutes)"]
+fn child_full_measure() {
+    let inp = build_inputs();
+    let mk_rows = inp.mk_fills.len();
+    let main_cols = CHANNEL_COLS + MK_COLS + embed_qm31_cols() * SECURE_EXTENSION_DEGREE;
+    let preproc_cols = preproc_ids().len();
+    eprintln!(
+        "child_full_measure: proving the FULL per-child verifier at log {} — transcript {} perms + \
+         embed {} stream rows + 4-tree merkle decommit {} rows in ONE uniform component; main {} \
+         M31 cols, preproc {} M31 cols.",
+        inp.log_size,
+        inp.records.len(),
+        inp.lay.n_rows,
+        mk_rows,
+        main_cols,
+        preproc_cols,
+    );
+
+    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false))
+        .expect("honest full per-child verifier must prove+verify at degree ≤ 2");
+
+    // Reject: corrupt a streamed merkle sibling (the decommit soundness at full
+    // 4-tree scale) — the re-hashed path diverges from the pinned root.
+    assert!(
+        prove_and_verify(inp.trace(None, false, false, false, false, false, false, true)).is_err(),
+        "a corrupted merkle sibling must be rejected at full scale"
+    );
+
+    eprintln!(
+        "child_full_measure GREEN @ log {}: the FULL per-child verifier (channel + streamed OODS \
+         embed + 4-tree streamed merkle decommit + latched challenges + claimed-sum balance + \
+         boundary recompute) proves+verifies a REAL canonical segment in ONE uniform component at \
+         degree ≤ 2; a corrupted merkle sibling is rejected. main {} M31 cols, preproc {} M31 cols.",
+        inp.log_size, main_cols, preproc_cols,
     );
 }
