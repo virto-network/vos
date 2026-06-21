@@ -91,9 +91,11 @@ use recursion_common::oods_auto::{
     ColocateLayout, ComponentMask, N_LATCHED, StreamBackend, WinPos, drive_multi,
 };
 use recursion_common::{
-    N_PERM_COLS, N_STATE, P2MerkleChannel, Poseidon2M31Channel, eval_permutation, mobile_config,
-    permute, record_permutation,
+    N_PERM_COLS, N_STATE, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel, eval_permutation,
+    hash_children_m31, mobile_config, permute, record_permutation,
 };
+use std::collections::HashMap;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::air::Component;
 use stwo::core::fields::FieldExpOps;
 use stwo::core::fields::m31::{BaseField, M31};
@@ -159,6 +161,24 @@ fn storage_index(i: usize, log_size: u32) -> usize {
     bit_reverse_index(coset_index_to_circle_domain_index(i, log_size), log_size)
 }
 
+// ── Merkle decommit layout (the streamed gadget, shared eval_permutation slot) ─
+// Main columns the merkle region adds (after the channel block, before the embed):
+// st[16] (the 16-wide sponge/hash state, read at [0,1]) + chunk[8] + sib[8] + bit
+// + mux[8]. The perm (init/out) is SHARED with the channel via eval_permutation.
+const MK_COLS: usize = N_STATE + 8 + 8 + 1 + 8; // 41
+// Preprocessed row-type selectors (the segment-invariant decommit schedule).
+const M_SPONGE: &str = "ca_m_sponge";
+const M_NODE: &str = "ca_m_node";
+const M_ROOT: &str = "ca_m_root";
+const ZERO_ST: &str = "ca_zero_st";
+const HASH_LINK: &str = "ca_hash_link";
+const CAP_FWD: &str = "ca_cap_fwd";
+/// Per-row pinned tree root (the recomputed root of each path's tree). Step 1b
+/// pins this to the real commitment; step 2 binds it to the channel commit-absorb.
+fn dc_root_id(j: usize) -> String {
+    format!("ca_dc_root_{j}")
+}
+
 // ── Preprocessed column ids (the fixed routing "program") ────────────────────
 // Registration / read / fill order: not_last, ch_is_first, is_rc_draw,
 // is_oods_draw, is_cs_chunk[N_CS_CHUNKS], emb_final[OPS_S], then the recon program
@@ -212,13 +232,21 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
         PreProcessedColumnId {
             id: NOT_LAST_TR.to_string(),
         },
+    ];
+    for id in [M_SPONGE, M_NODE, M_ROOT, ZERO_ST, HASH_LINK, CAP_FWD] {
+        ids.push(PreProcessedColumnId { id: id.to_string() });
+    }
+    for j in 0..8 {
+        ids.push(PreProcessedColumnId { id: dc_root_id(j) });
+    }
+    ids.extend([
         PreProcessedColumnId {
             id: IS_RC_DRAW.to_string(),
         },
         PreProcessedColumnId {
             id: IS_OODS_DRAW.to_string(),
         },
-    ];
+    ]);
     for c in 0..N_CS_CHUNKS {
         ids.push(PreProcessedColumnId { id: cs_chunk_id(c) });
     }
@@ -255,6 +283,273 @@ fn win_index(pos: &WinPos) -> usize {
         WinPos::Latched(s) => NLEAF + OPS_S * N_OFF + s,
         _ => unreachable!("co-locate layout uses Leaf/Slot/Latched"),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Merkle decommit host machinery (adapted from recursion_decommit_scale): replay
+// the lifted Merkle verify into per-path (leaf_row, bits, siblings), then stream
+// each path as one perm/row (leaf sponge + each hash_children level).
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Hash8 = [BaseField; 8];
+
+fn sponge_leaf(row: &[BaseField]) -> Hash8 {
+    let mut h = P2MerkleHasher::default();
+    h.update_leaf(row);
+    h.finalize().0
+}
+
+struct DecommitPath {
+    leaf_row: Vec<BaseField>, // the sorted-by-log-size leaf row
+    bits: Vec<u32>,
+    sibs: Vec<Hash8>,
+}
+
+fn decommit_node_map(
+    height: u32,
+    root: Hash8,
+    query_positions: &[usize],
+    sorted_queried: &[Vec<BaseField>], // [w][n_queries] in SORTED column order
+    hash_witness: &[Hash8],
+) -> Vec<HashMap<usize, Hash8>> {
+    let n_cols = sorted_queried.len();
+    let mut node_map: Vec<HashMap<usize, Hash8>> = vec![HashMap::new(); (height + 1) as usize];
+    let mut layer: Vec<(usize, Hash8)> = Vec::new();
+    for (i, &pos) in query_positions.iter().enumerate() {
+        let row: Vec<BaseField> = (0..n_cols).map(|c| sorted_queried[c][i]).collect();
+        let leaf = sponge_leaf(&row);
+        layer.push((pos, leaf));
+        node_map[0].insert(pos, leaf);
+    }
+    let mut witness = hash_witness.iter();
+    for level in 0..height as usize {
+        let mut next: Vec<(usize, Hash8)> = Vec::new();
+        let mut idx = 0;
+        while idx < layer.len() {
+            let (i0, h0) = layer[idx];
+            let (children, consumed) = if idx + 1 < layer.len() && (i0 ^ 1) == layer[idx + 1].0 {
+                ((h0, layer[idx + 1].1), 2)
+            } else {
+                let w = *witness.next().expect("witness too short");
+                node_map[level].insert(i0 ^ 1, w);
+                (if i0 & 1 == 0 { (h0, w) } else { (w, h0) }, 1)
+            };
+            let parent = hash_children_m31(&children.0, &children.1);
+            next.push((i0 >> 1, parent));
+            node_map[level + 1].insert(i0 >> 1, parent);
+            idx += consumed;
+        }
+        layer = next;
+    }
+    assert!(witness.next().is_none(), "witness not fully consumed");
+    assert_eq!(layer.len(), 1, "fold must reach a single root");
+    assert_eq!(layer[0].1, root, "recomputed root must equal the commitment");
+    node_map
+}
+
+/// All decommit paths for one tree: sort columns by log size (the lifted leaf
+/// order), build per-position sorted leaf rows, replay the node map, extract paths.
+fn tree_paths(
+    queried: &[Vec<BaseField>], // [w][n_queries], commit order
+    column_log_sizes: &[u32],
+    height: u32,
+    root: Hash8,
+    hash_witness: &[Hash8],
+    query_positions: &[usize],
+) -> Vec<DecommitPath> {
+    let w = queried.len();
+    assert_eq!(column_log_sizes.len(), w);
+    let mut order: Vec<usize> = (0..w).collect();
+    order.sort_by_key(|&c| column_log_sizes[c]);
+    let sorted_queried: Vec<Vec<BaseField>> = order.iter().map(|&c| queried[c].clone()).collect();
+
+    let node_map = decommit_node_map(height, root, query_positions, &sorted_queried, hash_witness);
+    query_positions
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| {
+            let leaf_row: Vec<BaseField> = (0..w).map(|c| sorted_queried[c][i]).collect();
+            let mut bits = Vec::with_capacity(height as usize);
+            let mut sibs = Vec::with_capacity(height as usize);
+            for level in 0..height as usize {
+                let node_idx = pos >> level;
+                bits.push((node_idx & 1) as u32);
+                sibs.push(node_map[level][&(node_idx ^ 1)]);
+            }
+            DecommitPath {
+                leaf_row,
+                bits,
+                sibs,
+            }
+        })
+        .collect()
+}
+
+/// One tree's streamed-decommit inputs.
+struct TreeData {
+    width: usize,
+    height: u32,
+    root: Hash8,
+    paths: Vec<DecommitPath>,
+}
+
+fn build_tree(proof: &Proof, data: &zkpvm::RecursionData, t: usize) -> TreeData {
+    let sp = &proof.stark_proof;
+    let queried = &sp.queried_values[t];
+    let width = queried.len();
+    let height = data.tree_heights[t];
+    let root: Hash8 = sp.commitments[t].0;
+    let hash_witness: Vec<Hash8> = sp.decommitments[t]
+        .hash_witness
+        .iter()
+        .map(|h| h.0)
+        .collect();
+    let qpos = if t == 0 {
+        &data.preprocessed_query_positions
+    } else {
+        &data.query_positions
+    };
+    let paths = tree_paths(
+        queried,
+        &data.tree_column_log_sizes[t],
+        height,
+        root,
+        &hash_witness,
+        qpos,
+    );
+    TreeData {
+        width,
+        height,
+        root,
+        paths,
+    }
+}
+
+/// Streamed leaf-sponge perms for a leaf of `w` columns: `floor(w/8)` full absorbs
+/// + 1 partial-rate finalize.
+fn leaf_perms(w: usize) -> usize {
+    w / 8 + 1
+}
+
+/// The 8-value sponge chunks for a leaf row: `floor(w/8)` full chunks + the
+/// partial-rate finalize chunk `[leftover…, 1, 0…]`.
+fn leaf_chunks(leaf_row: &[BaseField]) -> Vec<[BaseField; 8]> {
+    let w = leaf_row.len();
+    let n_full = w / 8;
+    let mut chunks = Vec::with_capacity(n_full + 1);
+    for c in 0..n_full {
+        let mut ch = [BaseField::zero(); 8];
+        ch.copy_from_slice(&leaf_row[c * 8..c * 8 + 8]);
+        chunks.push(ch);
+    }
+    let rem = w % 8;
+    let mut fin = [BaseField::zero(); 8];
+    fin[..rem].copy_from_slice(&leaf_row[n_full * 8..]);
+    fin[rem] = BaseField::one(); // the [1,0,…] pad
+    chunks.push(fin);
+    chunks
+}
+
+/// One streamed merkle row (one perm). `init` is the perm input (shared slot).
+#[derive(Clone)]
+struct MkRow {
+    init: [BaseField; N_STATE],
+    st_cur: [BaseField; N_STATE],
+    chunk: [BaseField; 8],
+    sib: [BaseField; 8],
+    bit: u32,
+    root: [BaseField; 8],
+    m_sponge: bool,
+    m_node: bool,
+    m_root: bool,
+    zero_st: bool,
+    hash_link: bool,
+    cap_fwd: bool,
+}
+
+fn mk_zfill() -> MkRow {
+    let zb = BaseField::zero();
+    MkRow {
+        init: [zb; N_STATE],
+        st_cur: [zb; N_STATE],
+        chunk: [zb; 8],
+        sib: [zb; 8],
+        bit: 0,
+        root: [zb; 8],
+        m_sponge: false,
+        m_node: false,
+        m_root: false,
+        zero_st: false,
+        hash_link: false,
+        cap_fwd: false,
+    }
+}
+
+/// Lay the given trees' decommit paths out as streamed rows (one perm/row).
+fn mk_resolve(trees: &[&TreeData]) -> Vec<MkRow> {
+    let zb = BaseField::zero();
+    let mut rows: Vec<MkRow> = Vec::new();
+    for tree in trees {
+        for path in &tree.paths {
+            let chunks = leaf_chunks(&path.leaf_row);
+            debug_assert_eq!(chunks.len(), leaf_perms(tree.width));
+            // ── Leaf sponge ──
+            let mut state = [zb; N_STATE];
+            for (ci, ch) in chunks.iter().enumerate() {
+                let first = ci == 0;
+                let last_sponge = ci + 1 == chunks.len();
+                let mut f = mk_zfill();
+                f.m_sponge = true;
+                f.zero_st = first;
+                f.chunk = *ch;
+                let st_cur = if first { [zb; N_STATE] } else { state };
+                f.st_cur = st_cur;
+                let mut init = st_cur;
+                for j in 0..8 {
+                    init[j] += ch[j];
+                }
+                f.init = init;
+                let mut o = init;
+                permute(&mut o);
+                state = o;
+                f.hash_link = true; // rate threads into next sponge/node
+                f.cap_fwd = !last_sponge; // capacity threads only sponge→sponge
+                rows.push(f);
+            }
+            debug_assert_eq!(
+                &state[..8],
+                &sponge_leaf(&path.leaf_row)[..],
+                "streamed sponge must reproduce the lifted leaf hash"
+            );
+            // ── hash_children up to the root ──
+            for level in 0..tree.height as usize {
+                let mut f = mk_zfill();
+                f.m_node = true;
+                let bit = path.bits[level];
+                let sib = path.sibs[level];
+                f.bit = bit;
+                f.sib = sib;
+                let mut st_cur = [zb; N_STATE];
+                st_cur[..8].copy_from_slice(&state[..8]);
+                f.st_cur = st_cur;
+                let cur: [BaseField; 8] = std::array::from_fn(|j| st_cur[j]);
+                let (left, right) = if bit == 0 { (cur, sib) } else { (sib, cur) };
+                let mut init = [zb; N_STATE];
+                init[..8].copy_from_slice(&left);
+                init[8..].copy_from_slice(&right);
+                f.init = init;
+                let mut o = init;
+                permute(&mut o);
+                state = o;
+                let is_root = level + 1 == tree.height as usize;
+                f.m_root = is_root;
+                f.root = tree.root;
+                f.hash_link = !is_root; // threads to next node; path ends at root
+                rows.push(f);
+            }
+        }
+    }
+    rows
 }
 
 // ── Boundary public-input recompute (step 4b) ────────────────────────────────
@@ -422,6 +717,27 @@ impl FrameworkEval for ChildFullEval {
         let not_last_tr = eval.get_preprocessed_column(PreProcessedColumnId {
             id: NOT_LAST_TR.to_string(),
         });
+        let m_sponge = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: M_SPONGE.to_string(),
+        });
+        let m_node = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: M_NODE.to_string(),
+        });
+        let m_root = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: M_ROOT.to_string(),
+        });
+        let zero_st = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: ZERO_ST.to_string(),
+        });
+        let hash_link = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: HASH_LINK.to_string(),
+        });
+        let cap_fwd = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: CAP_FWD.to_string(),
+        });
+        let dc_root: [E::F; 8] = std::array::from_fn(|j| {
+            eval.get_preprocessed_column(PreProcessedColumnId { id: dc_root_id(j) })
+        });
         let is_rc_draw = eval.get_preprocessed_column(PreProcessedColumnId {
             id: IS_RC_DRAW.to_string(),
         });
@@ -563,6 +879,55 @@ impl FrameworkEval for ChildFullEval {
             coeff += coeff;
         }
         eval.add_constraint(is_pow2.clone() * (recompose - out[0].clone()));
+
+        // ── Merkle decommit block (streamed, shares the eval_permutation slot). ──
+        //    On merkle rows is_transcript=0 (channel off) and one of m_sponge/m_node
+        //    is 1; the perm INIT is bound by the merkle row type, the perm OUT threads
+        //    the 16-wide state via the [0,1] latch (the recursion_shared_perm gadget).
+        let st: [[E::F; 2]; N_STATE] =
+            std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
+        let st_cur = |j: usize| st[j][0].clone();
+        let st_next = |j: usize| st[j][1].clone();
+        let mk_chunk: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        let mk_sib: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        let mk_bit = eval.next_trace_mask();
+        let mk_mux: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+
+        // Fresh sponge / zeroed state on each path's first row.
+        for j in 0..N_STATE {
+            eval.add_constraint(zero_st.clone() * st_cur(j));
+        }
+        // bit booleanity + the degree-lowering mux = bit·(sib − cur).
+        eval.add_constraint(mk_bit.clone() * (mk_bit.clone() - one.clone()));
+        for j in 0..8 {
+            eval.add_constraint(mk_mux[j].clone() - mk_bit.clone() * (mk_sib[j].clone() - st_cur(j)));
+        }
+        // Leaf sponge: rate += chunk, capacity carried (chunk encodes both a full
+        // absorb and the partial-rate finalize [leftover…, 1, 0…]).
+        for j in 0..8 {
+            eval.add_constraint(
+                m_sponge.clone() * (init[j].clone() - st_cur(j) - mk_chunk[j].clone()),
+            );
+            eval.add_constraint(m_sponge.clone() * (init[8 + j].clone() - st_cur(8 + j)));
+        }
+        // hash_children: bit-ordered (cur, sib) via the witnessed mux.
+        for j in 0..8 {
+            let left = st_cur(j) + mk_mux[j].clone(); // bit=0 → cur, bit=1 → sib
+            let right = mk_sib[j].clone() - mk_mux[j].clone(); // bit=0 → sib, bit=1 → cur
+            eval.add_constraint(m_node.clone() * (init[j].clone() - left));
+            eval.add_constraint(m_node.clone() * (init[8 + j].clone() - right));
+        }
+        // State threading: rate within a path, capacity only across sponge rows.
+        for j in 0..8 {
+            eval.add_constraint(hash_link.clone() * (st_next(j) - out[j].clone()));
+            eval.add_constraint(cap_fwd.clone() * (st_next(8 + j) - out[8 + j].clone()));
+        }
+        // Pin the recomputed root at each path's last (root) node row. Step 1b pins
+        // dc_root to the real commitment (preprocessed); step 2 binds it to the
+        // channel commit-absorb.
+        for j in 0..8 {
+            eval.add_constraint(m_root.clone() * (out[j].clone() - dc_root[j].clone()));
+        }
 
         // ── Embed block (verbatim from the proven recursion_stream_embed AIR) ──
         let read4_0 = |eval: &mut E| -> E::EF {
@@ -822,7 +1187,9 @@ struct ChildTrace {
 /// value (breaks the transcript binding → derived rc/oods_t diverge); `final_tamper`
 /// bumps the embed's final-slot oa (breaks the composition); `oods_t_tamper` corrupts
 /// the latched oods_t (isolates the OODS-point derivation); `indicator_tamper`
-/// mis-places `is_rc_draw` onto a non-squeeze row; `cs_tamper` corrupts a claimed_sum.
+/// mis-places `is_rc_draw` onto a non-squeeze row; `cs_tamper` corrupts a claimed_sum;
+/// `mk_chunk_tamper` bumps a streamed leaf chunk (breaks a leaf hash → root);
+/// `mk_sib_tamper` bumps a streamed sibling on a node row.
 #[allow(clippy::too_many_arguments)]
 fn gen_trace(
     records: &[PermRecord],
@@ -836,6 +1203,7 @@ fn gen_trace(
     prefix_len: usize,
     bnd: &Bnd,
     lay: &ColocateLayout,
+    mk_fills: &[MkRow],
     log_size: u32,
     channel_tamper: Option<usize>,
     final_tamper: bool,
@@ -843,6 +1211,8 @@ fn gen_trace(
     indicator_tamper: bool,
     cs_tamper: bool,
     state_tamper: bool,
+    mk_chunk_tamper: bool,
+    mk_sib_tamper: bool,
 ) -> ChildTrace {
     assert_eq!(
         claimed_sums.len(),
@@ -874,20 +1244,12 @@ fn gen_trace(
     let mut prev_out = [zb; N_STATE];
     let n_real = records.len();
 
-    for row in 0..n {
-        let (kind, input, output, first_chunk) = if row < n_real {
-            let r = records[row];
-            (r.kind, r.input, r.output, r.first_chunk)
-        } else {
-            // Padding: synthetic squeeze threading the running digest.
-            let mut inp = [zb; N_STATE];
-            inp[..8].copy_from_slice(&digest);
-            inp[8] = BaseField::from(n_draws);
-            inp[9] = BaseField::from(3u32);
-            let mut outp = inp;
-            permute(&mut outp);
-            (PermKind::Squeeze, inp, outp, true)
-        };
+    // The transcript region (rows 0..n_real) runs the channel; the merkle/padding
+    // rows (n_real..n) only fill the SHARED perm columns (channel non-perm stays 0,
+    // is_transcript=0 gates the channel off there).
+    for row in 0..n_real {
+        let r = records[row];
+        let (kind, input, output, first_chunk) = (r.kind, r.input, r.output, r.first_chunk);
 
         let (is_absorb, is_squeeze, is_pow1, is_pow2) = match kind {
             PermKind::Absorb => (1u32, 0, 0, 0),
@@ -1003,6 +1365,82 @@ fn gen_trace(
         digest = digest_next;
         n_draws = n_draws_next;
         prev_out = output;
+    }
+
+    // ── Merkle/padding rows: fill ONLY the SHARED perm columns from each row's
+    //    perm input (channel non-perm columns stay 0; is_transcript=0 gates the
+    //    channel off; padding rows permute 0). ──
+    for row in n_real..n {
+        let perm_init = if row - n_real < mk_fills.len() {
+            mk_fills[row - n_real].init
+        } else {
+            [zb; N_STATE]
+        };
+        for (c, v) in record_permutation(perm_init).into_iter().enumerate() {
+            ch[c][row] = v;
+        }
+    }
+
+    // ── Merkle main columns (st[16], chunk[8], sib[8], bit, mux[8]) + the merkle
+    //    preprocessed selectors + the per-path pinned root. ──
+    let mut mk_rows: Vec<MkRow> = mk_fills.to_vec();
+    if mk_chunk_tamper {
+        let r = mk_rows
+            .iter()
+            .position(|f| f.m_sponge)
+            .expect("a merkle sponge row");
+        mk_rows[r].chunk[0] += BaseField::one();
+    }
+    if mk_sib_tamper {
+        let r = mk_rows
+            .iter()
+            .position(|f| f.m_node)
+            .expect("a merkle node row");
+        mk_rows[r].sib[0] += BaseField::one();
+    }
+    let mut mk: Vec<Vec<BaseField>> = vec![vec![zb; n]; MK_COLS];
+    let mut m_sponge = vec![zb; n];
+    let mut m_node = vec![zb; n];
+    let mut m_root = vec![zb; n];
+    let mut zero_st = vec![zb; n];
+    let mut hash_link = vec![zb; n];
+    let mut cap_fwd = vec![zb; n];
+    let mut dc_root: Vec<Vec<BaseField>> = vec![vec![zb; n]; 8];
+    for (i, f) in mk_rows.iter().enumerate() {
+        let row = n_real + i;
+        assert!(row < n, "merkle rows overflow the trace");
+        let mux: [BaseField; 8] =
+            std::array::from_fn(|j| BaseField::from(f.bit) * (f.sib[j] - f.st_cur[j]));
+        let mut col = 0usize;
+        for v in f.st_cur {
+            mk[col][row] = v;
+            col += 1;
+        }
+        for v in f.chunk {
+            mk[col][row] = v;
+            col += 1;
+        }
+        for v in f.sib {
+            mk[col][row] = v;
+            col += 1;
+        }
+        mk[col][row] = BaseField::from(f.bit);
+        col += 1;
+        for v in mux {
+            mk[col][row] = v;
+            col += 1;
+        }
+        debug_assert_eq!(col, MK_COLS);
+        let b = |x: bool| if x { BaseField::one() } else { zb };
+        m_sponge[row] = b(f.m_sponge);
+        m_node[row] = b(f.m_node);
+        m_root[row] = b(f.m_root);
+        zero_st[row] = b(f.zero_st);
+        hash_link[row] = b(f.hash_link);
+        cap_fwd[row] = b(f.cap_fwd);
+        for j in 0..8 {
+            dc_root[j][row] = f.root[j];
+        }
     }
 
     // ── Embed QM31 logical columns ──
@@ -1217,11 +1655,9 @@ fn gen_trace(
     }
 
     // ── Preprocessed logical columns, in registration order ──
-    // Step 1a (empty merkle region): every row is a channel-transcript row, so
-    // is_transcript = 1 everywhere and not_last_tr == not_last (the digest chain
-    // threads across all rows, identical to the un-gated assembly). Step 1b shrinks
-    // n_transcript to the real record count and the trailing rows become merkle.
-    let n_transcript = n;
+    // The transcript region is rows 0..n_real (the real records); the trailing
+    // rows are the streamed merkle decommit + padding (is_transcript=0 there).
+    let n_transcript = n_real;
     let mut pre_b: Vec<Vec<BaseField>> = Vec::new();
     pre_b.push(
         (0..n)
@@ -1245,6 +1681,15 @@ fn gen_trace(
             })
             .collect(),
     ); // not_last_tr
+    pre_b.push(m_sponge);
+    pre_b.push(m_node);
+    pre_b.push(m_root);
+    pre_b.push(zero_st);
+    pre_b.push(hash_link);
+    pre_b.push(cap_fwd);
+    for col in dc_root {
+        pre_b.push(col);
+    }
     pre_b.push(is_rc_draw);
     pre_b.push(is_oods_draw);
     for col in is_cs_chunk {
@@ -1311,7 +1756,12 @@ fn gen_trace(
 
     let preprocessed: Vec<_> = pre_b.into_iter().map(wrap).collect();
 
+    // Main column order = channel (CHANNEL_COLS) + merkle (MK_COLS) + the QM31
+    // blocks (embed, oods, cs, bnd), matching the evaluate read order exactly.
     let mut main_logical: Vec<Vec<BaseField>> = ch;
+    for col in mk {
+        main_logical.push(col);
+    }
     for q in emb_q
         .iter()
         .chain(oods_cols.iter())
@@ -1323,8 +1773,9 @@ fn gen_trace(
         }
     }
     if final_tamper {
-        // Bump the embed's final-slot oa base column on the final row.
-        let oa_col = CHANNEL_COLS + (NLEAF + lay.final_lane * 3) * SECURE_EXTENSION_DEGREE;
+        // Bump the embed's final-slot oa base column on the final row (the embed
+        // QM31 block starts after the channel + merkle columns).
+        let oa_col = CHANNEL_COLS + MK_COLS + (NLEAF + lay.final_lane * 3) * SECURE_EXTENSION_DEGREE;
         main_logical[oa_col][lay.final_row] += BaseField::one();
     }
     let main: Vec<_> = main_logical.into_iter().map(wrap).collect();
@@ -1409,6 +1860,7 @@ struct ChildInputs {
     prefix_len: usize,
     bnd: Bnd,
     lay: ColocateLayout,
+    mk_fills: Vec<MkRow>,
     log_size: u32,
 }
 
@@ -1429,7 +1881,7 @@ fn build_inputs() -> ChildInputs {
     // squeezes at/after prefix_len are, in order: rc, oods_t, deep, fold_alphas…
     let data = extract_recursion_data(&proof, &sn);
     let claimed_sums = proof.claimed_sums.clone();
-    let records = data.transcript.records;
+    let records = data.transcript.records.clone();
     let prefix_len = data.transcript.prefix_len;
     let squeezes: Vec<usize> = records
         .iter()
@@ -1528,10 +1980,14 @@ fn build_inputs() -> ChildInputs {
         draw_row,
     };
 
-    // The component spans max(transcript rows, embed rows); the transcript
-    // dominates (8584 perms vs 6251 stream rows).
-    let log_size = records
-        .len()
+    // Step 1b: a small REAL streamed decommit region (the composition trace tree,
+    // 8 cols) rides the freed perm slot after the transcript. The full 4-tree
+    // decommit is step 2; here it validates the channel⊕merkle perm-sharing.
+    let comp_tree = build_tree(&proof, &data, data.tree_heights.len() - 1);
+    let mk_fills = mk_resolve(&[&comp_tree]);
+
+    // The component spans max(transcript + merkle rows, embed rows).
+    let log_size = (records.len() + mk_fills.len())
         .max(lay.n_rows)
         .next_power_of_two()
         .trailing_zeros()
@@ -1549,11 +2005,13 @@ fn build_inputs() -> ChildInputs {
         prefix_len,
         bnd,
         lay,
+        mk_fills,
         log_size,
     }
 }
 
 impl ChildInputs {
+    #[allow(clippy::too_many_arguments)]
     fn trace(
         &self,
         channel_tamper: Option<usize>,
@@ -1562,6 +2020,8 @@ impl ChildInputs {
         indicator_tamper: bool,
         cs_tamper: bool,
         state_tamper: bool,
+        mk_chunk_tamper: bool,
+        mk_sib_tamper: bool,
     ) -> ChildTrace {
         gen_trace(
             &self.records,
@@ -1575,6 +2035,7 @@ impl ChildInputs {
             self.prefix_len,
             &self.bnd,
             &self.lay,
+            &self.mk_fills,
             self.log_size,
             channel_tamper,
             final_tamper,
@@ -1582,6 +2043,8 @@ impl ChildInputs {
             indicator_tamper,
             cs_tamper,
             state_tamper,
+            mk_chunk_tamper,
+            mk_sib_tamper,
         )
     }
 }
@@ -1633,7 +2096,7 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
 #[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
 fn child_full_air_satisfied() {
     let inp = build_inputs();
-    let trace = inp.trace(None, false, false, false, false, false);
+    let trace = inp.trace(None, false, false, false, false, false, false, false);
     let log_size = trace.log_size;
     let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
     let bound = trace.bound.clone();
@@ -1662,13 +2125,14 @@ fn child_full_air_satisfied() {
     );
     eprintln!(
         "child_full_air_satisfied: REAL segment — channel ({} perms) + streamed OODS embed \
-         ({} stream rows) merged in ONE component at log {log_size}; rc latched to the channel's \
-         composition-rc squeeze (row {}). main {} M31 cols, preproc {} M31 cols. Trace satisfies \
-         the AIR.",
+         ({} stream rows) + streamed merkle decommit ({} rows, sharing the perm slot) merged in \
+         ONE component at log {log_size}; rc latched to the channel's composition-rc squeeze \
+         (row {}). main {} M31 cols, preproc {} M31 cols. Trace satisfies the AIR.",
         inp.records.len(),
         inp.lay.n_rows,
+        inp.mk_fills.len(),
         inp.rc_row,
-        CHANNEL_COLS + embed_qm31_cols() * SECURE_EXTENSION_DEGREE,
+        CHANNEL_COLS + MK_COLS + embed_qm31_cols() * SECURE_EXTENSION_DEGREE,
         preproc_ids().len(),
     );
 }
@@ -1681,7 +2145,7 @@ fn child_full_air_satisfied() {
 fn child_full_gate() {
     let inp = build_inputs();
 
-    prove_and_verify(inp.trace(None, false, false, false, false, false))
+    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false))
         .expect("honest per-child assembly must prove+verify at degree ≤ 2");
 
     // Reject: corrupt a channel absorbed value (the transcript binding) — also
@@ -1692,13 +2156,14 @@ fn child_full_gate() {
         .position(|r| r.kind == PermKind::Absorb)
         .expect("transcript has an absorb");
     assert!(
-        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false, false, false, false))
+            .is_err(),
         "a corrupted transcript value must be rejected"
     );
 
     // Reject: corrupt the embed composition (the final-slot oa value).
     assert!(
-        prove_and_verify(inp.trace(None, true, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, true, false, false, false, false, false, false)).is_err(),
         "a corrupted embed value must be rejected"
     );
 
@@ -1706,7 +2171,7 @@ fn child_full_gate() {
     // derivation: only it reads oods_t, so this confirms the dinv/ox binding is
     // non-vacuous independent of the embed).
     assert!(
-        prove_and_verify(inp.trace(None, false, true, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, true, false, false, false, false, false)).is_err(),
         "a corrupted oods_t must be rejected by the OODS-point derivation"
     );
 
@@ -1714,38 +2179,55 @@ fn child_full_gate() {
     // (Absorb) row — the is_rc_draw·(1−is_squeeze) hardening must reject binding rc
     // to a non-challenge perm output.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, true, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, true, false, false, false, false)).is_err(),
         "an is_rc_draw indicator on a non-squeeze row must be rejected"
     );
 
     // Reject: corrupt a claimed_sum — breaks both its transcript-absorb binding
     // and the Σ claimed_sums == 0 balance.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, true, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, false, true, false, false, false)).is_err(),
         "a corrupted claimed_sum must be rejected"
     );
 
     // Reject: claim a wrong final memory root (the io-hash/root attack) — the
     // boundary recompute then ≠ the transcript-bound claimed_sum.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, true)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, false, false, true, false, false)).is_err(),
         "a wrong claimed boundary state (memory root) must be rejected"
+    );
+
+    // Reject: corrupt a streamed leaf chunk (the merkle decommit) — the leaf hash
+    // diverges from the pinned root.
+    assert!(
+        prove_and_verify(inp.trace(None, false, false, false, false, false, true, false)).is_err(),
+        "a corrupted merkle leaf chunk must be rejected"
+    );
+
+    // Reject: corrupt a streamed sibling on a node row — the re-hashed path diverges
+    // from the pinned root.
+    assert!(
+        prove_and_verify(inp.trace(None, false, false, false, false, false, false, true)).is_err(),
+        "a corrupted merkle sibling must be rejected"
     );
 
     eprintln!(
         "child_full_gate GREEN @ log {}: ONE uniform component replays a REAL canonical \
-         segment's {}-perm transcript AND re-evaluates its full 31-component OODS composition \
-         (streamed embed, {} stream rows), with the embed's rc latched to the channel's \
-         composition-rc squeeze, dinv/ox derived in-circuit from a transcript-bound oods_t \
-         (mlbd-1={} double_x steps), the 31 claimed_sums bound to the mix_felts(claimed_sums) \
-         absorb + Σ == 0, AND the 4 boundary chips' claimed sums recomputed in-AIR from the \
-         PUBLIC boundary states (io-hash + memory roots) via each relation's transcript-bound \
-         (z, alpha) — proving+verifying through the lifted Poseidon2-M31 protocol at degree ≤ 2; \
-         every tamper (transcript / embed / oods_t / claimed_sum / boundary state) AND a \
-         mis-placed is_rc_draw indicator are each rejected.",
+         segment's {}-perm transcript, re-evaluates its full 31-component OODS composition \
+         (streamed embed, {} stream rows), AND streams a real trace-tree Merkle decommit ({} \
+         rows) sharing the SAME eval_permutation slot via is_transcript/m_* row-type selectors — \
+         with the embed's rc latched to the channel's composition-rc squeeze, dinv/ox derived \
+         in-circuit from a transcript-bound oods_t (mlbd-1={} double_x steps), the 31 claimed_sums \
+         bound to the mix_felts(claimed_sums) absorb + Σ == 0, AND the 4 boundary chips' claimed \
+         sums recomputed in-AIR from the PUBLIC boundary states (io-hash + memory roots) via each \
+         relation's transcript-bound (z, alpha) — proving+verifying through the lifted \
+         Poseidon2-M31 protocol at degree ≤ 2; every tamper (transcript / embed / oods_t / \
+         claimed_sum / boundary state / merkle leaf / merkle sibling) AND a mis-placed is_rc_draw \
+         indicator are each rejected.",
         inp.log_size,
         inp.records.len(),
         inp.lay.n_rows,
+        inp.mk_fills.len(),
         inp.dbl_steps,
     );
 }
