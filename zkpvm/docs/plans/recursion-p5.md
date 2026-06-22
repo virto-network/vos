@@ -1022,6 +1022,51 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   `mlbd` across them, so `dbl_steps`/`C` are fixed AIR parameters there. The
 >   `dbl_steps` loop is already runtime-parametric, so a different `mlbd` just
 >   changes the chain length.
+>
+> **STEP 5 INTEGRATION UNDERWAY 2026-06-22 (LOCAL) — THE MAKE-OR-BREAK LOG-17
+> PROVE IS GREEN AT 17.3 GiB.** New `tests/recursion_child_full.rs` folds the
+> proven mechanisms into ONE uniform `ChildFullEval`, built incrementally on top of
+> the proven `recursion_child_assembly` (which stays the log-14 regression gate):
+> - **Step 1a (`12e03d0`) — `is_transcript` gating.** The channel block's
+>   structural constraints fold behind a preprocessed `is_transcript`; the digest
+>   chain uses a preprocessed `not_last_tr = is_transcript[i]·is_transcript[i+1]`
+>   (deg 2); latched constancy keeps the FULL `not_last`. KEY deg-2 trick: terms
+>   already carrying a transcript-only selector (is_absorb/is_squeeze/…) are 0 on
+>   non-tr rows and need NO `is_transcript` factor; only the bare terms get it (else
+>   selector·value·is_transcript = deg 3). Empty merkle ⇒ proves identically to the
+>   assembly (the safe checkpoint freeing the perm slot). Gate GREEN log 14, 622s.
+> - **Step 1b (`4579cfe`) — streamed merkle decommit shares the channel perm slot.**
+>   A real composition-tree decommit (684 rows) rides the freed `eval_permutation`
+>   via the `recursion_shared_perm`/`recursion_decommit_scale` gadget (m_*/zero_st/
+>   hash_link/cap_fwd + st[16] [0,1]-latch + witnessed mux); is_transcript=1 binds
+>   the channel init, m_*=1 binds the merkle init, the perm (init,out) is SHARED.
+>   `gen_trace` restructured: transcript fill on 0..n_real, perm-only fill on the
+>   merkle/padding rows. MK_COLS=41 inserted between the channel & embed blocks.
+>   Gate GREEN log 14, 790s/9 proves (+ merkle leaf/sibling rejects).
+> - **Step 2a (`17020f9`) — THE MAKE-OR-BREAK: full 4-tree decommit at log 17.**
+>   `mk_resolve` streams ALL 4 real trace trees (77444 rows). The full per-child
+>   verifier (channel 8584 + embed 6251 + 4-tree decommit 77444 + latches +
+>   claimed-sum + boundary) proves+verifies a REAL segment in ONE uniform component
+>   at degree ≤ 2. New `child_full_measure` (honest + 1 reject; the 9-tamper
+>   `child_full_gate` is ~135 min at log 17 — kept for documentation; the non-merkle
+>   tampers are proven at log 14 with identical constraints). **MEASURED: log 17
+>   (131072 rows), 975 main / 6187 preproc M31 cols, PEAK RSS = 17.3 GiB (better
+>   than the 20-25 GiB extrapolation), ~17-20 min/prove.** ⇒ tractable on this 62
+>   GiB box; the 2-child join (P5.4) ≈ 2× → ~34 GiB (revised DOWN). **The central
+>   de-risk is ANSWERED: the full per-child verifier fits + proves at log 17.**
+> - **Step 2b — root↔commit-absorb (obligation c).** Each tree root is absorbed via
+>   `mix_root` (root limbs in `absorbed`); latched `root_lat[4][8]` are bound to that
+>   absorb (`is_root_absorb[t]`) and pin the decommit `dc_root` on the tree's root
+>   rows (`is_root_t[t]`), so `out == dc_root == root_lat == the channel commitment`
+>   — the decommit verifies against the TRANSCRIPT-FIXED commitment, not a free host
+>   root. Assert GREEN log 17; the measured prove (honest + root-tamper) confirms it.
+> - **REMAINING (step 3/4/5; all mechanisms PROVEN standalone):** (3) FRI fold chain
+>   + FRI-layer decommit (latch the 14 `fold_alphas` = squeezes[3..17]; couple the
+>   e0/e1 fold inputs to the FRI-layer decommit leaves); (4) the DEEP numerator
+>   (obligation d, leaf↔OODS) over the trace-decommit leaves, bound to the fold
+>   chain's layer-0 `first_layer_evals`; (5) the fully-combined log-17 prove +
+>   adversarial review. Each is the same "add cols / gate / bind / assert / prove"
+>   shape as steps 1-2; the ~17-20 min proves are the cost.
 
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
 scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
