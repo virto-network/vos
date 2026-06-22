@@ -145,3 +145,50 @@ fn deep_quotient_reconstruct() {
          denominator inverse witnessed; numerator a degree-1 sum over the leaves; product degree 2)."
     );
 }
+
+/// Step 4 prereq (host-first): the per-(batch,column) line coeffs `(a,b,c)` are NOT
+/// free host values — they DERIVE from the OODS `sample_value v`, the batch point
+/// `z`, and the DEEP power `α^i` via `complex_conjugate_line_coeffs`. This re-derives
+/// them in the EXACT in-AIR form (complex-conjugate = QM31 coord negation; all QM31
+/// muls) from `data.deep_batches[*].col_samples` (= `(v, α^i)`) + the batch point and
+/// checks they match stwo's `column_line_coeffs` (the `(a,b,c)` already in `cols`).
+/// This validates the soundness-critical derivation the step-4 AIR will arithmetise:
+/// since `v` is the same OODS mask the embed routes, binding `(a,b,c)` to `(v,z,α^i)`
+/// is what makes the leaf↔OODS DEEP binding non-vacuous.
+#[test]
+#[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
+fn deep_line_coeffs_derivation() {
+    use stwo::core::fields::ComplexConjugate;
+    let (proof, sn) = canonical_segment();
+    let data = extract_recursion_data(&proof, &sn);
+
+    let mut n_checked = 0usize;
+    for batch in &data.deep_batches {
+        let z = batch.point;
+        // c' = z̄.y − z.y (z̄ = complex conjugate of z w.r.t. CM31).
+        let cprime = z.complex_conjugate().y - z.y;
+        assert_eq!(
+            batch.cols.len(),
+            batch.col_samples.len(),
+            "cols and col_samples must be parallel"
+        );
+        for (&(_, a, b, c), &(v, alpha)) in batch.cols.iter().zip(&batch.col_samples) {
+            // a' = v̄ − v, b' = v·c' − a'·z.y; (a,b,c) = α^i·(a', b', c').
+            let aprime = v.complex_conjugate() - v;
+            let bprime = v * cprime - aprime * z.y;
+            assert_eq!(a, alpha * aprime, "a = α^i·(v̄−v) mismatch");
+            assert_eq!(b, alpha * bprime, "b = α^i·(v·c′−a′·z.y) mismatch");
+            assert_eq!(c, alpha * cprime, "c = α^i·(z̄.y−z.y) mismatch");
+            n_checked += 1;
+        }
+    }
+
+    eprintln!(
+        "deep_line_coeffs_derivation GREEN: re-derived (a,b,c) from (v, z, α^i) via \
+         complex_conjugate_line_coeffs (complex-conjugate = QM31 coord negation; QM31 muls — the \
+         exact in-AIR form) for all {n_checked} (batch,column) terms across {} batches; matches \
+         stwo's column_line_coeffs. ⇒ the step-4 AIR can DERIVE (a,b,c) from the OODS mask v + the \
+         latched z + the DEEP α^i power chain, making the leaf↔OODS binding non-vacuous.",
+        data.deep_batches.len(),
+    );
+}

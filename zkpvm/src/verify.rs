@@ -885,6 +885,13 @@ pub struct DeepBatch {
     pub point: stwo::core::circle::CirclePoint<SecureField>,
     /// `(flattened column index, a, b, c)` per column in this batch.
     pub cols: alloc::vec::Vec<(usize, SecureField, SecureField, SecureField)>,
+    /// Per column (parallel to `cols`): the OODS `sample_value` `v` and the DEEP
+    /// random-coeff power `α^i`. These DERIVE `(a, b, c)` via
+    /// `complex_conjugate_line_coeffs` (`a=α^i(v̄−v)`, `c=α^i(z̄.y−z.y)`,
+    /// `b=α^i(v·c′−a′·z.y)`), so the in-AIR `(a,b,c)` derivation (step 4) reads these
+    /// rather than trusting `(a,b,c)` as free host values. `v` is the same OODS mask
+    /// the embed routes ⇒ the leaf↔OODS coupling binds through it.
+    pub col_samples: alloc::vec::Vec<(SecureField, SecureField)>,
 }
 
 /// Extract every transcript-derived datum the per-child verifier-AIR needs from a
@@ -1065,6 +1072,11 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
                     .iter()
                     .zip(lc)
                     .map(|(nd, (a, bb, c))| (nd.column_index, a, bb, c))
+                    .collect(),
+                col_samples: b
+                    .cols_vals_randpows
+                    .iter()
+                    .map(|nd| (nd.sample_value, nd.random_coeff))
                     .collect(),
             })
             .collect::<alloc::vec::Vec<_>>()
