@@ -166,10 +166,14 @@ fn storage_index(i: usize, log_size: u32) -> usize {
 // ── Merkle decommit layout (the streamed gadget, shared eval_permutation slot) ─
 // Main columns the merkle region adds (after the channel block, before the embed):
 // st[16] (the 16-wide sponge/hash state, read at [0,1]) + chunk[8] + sib[8] + bit
-// + mux[8]. The perm (init/out) is SHARED with the channel via eval_permutation.
-const MK_COLS: usize = N_STATE + 8 + 8 + 1 + 8; // 41
+// + mux[8] + lh[8] (the leaf hash, read at [-2,-1,0] for the FRI coset merge). The
+// perm (init/out) is SHARED with the channel via eval_permutation.
+const MK_COLS: usize = N_STATE + 8 + 8 + 1 + 8 + 8; // 49
 // Preprocessed row-type selectors (the segment-invariant decommit schedule).
 const M_SPONGE: &str = "ca_m_sponge";
+/// FRI coset merge: hash_children(h0, h1) over the two coset leaf hashes (read from
+/// the two prior sponge rows' `lh` at offsets [-2]/[-1]).
+const M_MERGE: &str = "ca_m_merge";
 const M_NODE: &str = "ca_m_node";
 const M_ROOT: &str = "ca_m_root";
 const ZERO_ST: &str = "ca_zero_st";
@@ -205,6 +209,12 @@ const N_FRI_LAYERS: usize = 14;
 /// at/after prefix_len: rc, oods_t, deep, then the 14 per-layer fold alphas).
 fn fold_draw_id(i: usize) -> String {
     format!("ca_fold_draw_{i}")
+}
+/// is_layer[L]: fires on the e0-sponge (fold) row of every layer-L FRI coset. The
+/// fold step for (query, L) rides this row: e0/e1 ARE the decommitted coset chunks,
+/// and alpha_sel = Σ is_layer[L]·fold_alpha_lat[L].
+fn fri_layer_id(l: usize) -> String {
+    format!("ca_fri_layer_{l}")
 }
 
 // ── Preprocessed column ids (the fixed routing "program") ────────────────────
@@ -261,7 +271,7 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
             id: NOT_LAST_TR.to_string(),
         },
     ];
-    for id in [M_SPONGE, M_NODE, M_ROOT, ZERO_ST, HASH_LINK, CAP_FWD] {
+    for id in [M_SPONGE, M_MERGE, M_NODE, M_ROOT, ZERO_ST, HASH_LINK, CAP_FWD] {
         ids.push(PreProcessedColumnId { id: id.to_string() });
     }
     for j in 0..8 {
@@ -294,6 +304,9 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
     }
     for l in 0..OPS_S {
         ids.push(PreProcessedColumnId { id: final_id(l) });
+    }
+    for l in 0..N_FRI_LAYERS {
+        ids.push(PreProcessedColumnId { id: fri_layer_id(l) });
     }
     for l in 0..OPS_S {
         for r in 0..2 {
@@ -490,6 +503,9 @@ fn leaf_chunks(leaf_row: &[BaseField]) -> Vec<[BaseField; 8]> {
 }
 
 /// One streamed merkle row (one perm). `init` is the perm input (shared slot).
+/// The FRI-layer decommit reuses this row: `m_merge` rows hash the two coset leaf
+/// hashes (carried in `lh`), and the e0-sponge of each coset carries the co-located
+/// fold step (`fri_layer = Some(L)`, `fold_*`).
 #[derive(Clone)]
 struct MkRow {
     init: [BaseField; N_STATE],
@@ -497,32 +513,54 @@ struct MkRow {
     chunk: [BaseField; 8],
     sib: [BaseField; 8],
     bit: u32,
+    lh: [BaseField; 8],
     root: [BaseField; 8],
     tree_idx: usize,
     m_sponge: bool,
+    m_merge: bool,
     m_node: bool,
     m_root: bool,
     zero_st: bool,
     hash_link: bool,
     cap_fwd: bool,
+    /// True on every FRI-layer coset row (so trace m_root rows can be told apart from
+    /// FRI m_root rows for the step-2b transcript root binding).
+    is_fri: bool,
+    /// Some(L) on a layer-L FRI coset's e0-sponge (= fold) row.
+    fri_layer: Option<usize>,
+    fold_e0: SecureField,
+    fold_e1: SecureField,
+    fold_bit: u32,
+    fold_twid: BaseField,
+    fold_folded: SecureField,
 }
 
 fn mk_zfill() -> MkRow {
     let zb = BaseField::zero();
+    let z = SecureField::zero();
     MkRow {
         init: [zb; N_STATE],
         st_cur: [zb; N_STATE],
         chunk: [zb; 8],
         sib: [zb; 8],
         bit: 0,
+        lh: [zb; 8],
         root: [zb; 8],
         tree_idx: 0,
         m_sponge: false,
+        m_merge: false,
         m_node: false,
         m_root: false,
         zero_st: false,
         hash_link: false,
         cap_fwd: false,
+        is_fri: false,
+        fri_layer: None,
+        fold_e0: z,
+        fold_e1: z,
+        fold_bit: 0,
+        fold_twid: zb,
+        fold_folded: z,
     }
 }
 
@@ -554,6 +592,7 @@ fn mk_resolve(trees: &[&TreeData]) -> Vec<MkRow> {
                 let mut o = init;
                 permute(&mut o);
                 state = o;
+                f.lh = std::array::from_fn(|j| o[j]); // leaf hash (bound on every m_sponge row)
                 f.hash_link = true; // rate threads into next sponge/node
                 f.cap_fwd = !last_sponge; // capacity threads only sponge→sponge
                 rows.push(f);
@@ -596,27 +635,21 @@ fn mk_resolve(trees: &[&TreeData]) -> Vec<MkRow> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FRI fold-chain machinery (adapted from recursion_fri_chain_real): the 14-layer
-// fold (1 circle + 13 line), per-layer twiddle derived in-AIR from the bound query
-// bits via a conditional point-add chain, the closed-form fold
-// (f_a+f_b) + α·((f_a−f_b)·twid), chained folded[L] → layer L+1, last layer a
-// degree-0 constant. In the integrated component this rides on ALL rows (each row
-// computes query r%n_queries's full chain — ungated, so the deg-2 fold constraints
-// hold on every row, exactly as the standalone cycles 38 queries to fill its rows).
+// FRI-layer Merkle decommit + co-located fold (step 3b, the de-risked
+// recursion_fri_decommit mechanism). Each queried coset {2k, 2k+1} streams as
+// sponge(e0) + sponge(e1) + a MERGE row hash_children(h0,h1) [reading the two leaf
+// hashes at fixed offsets [-2]/[-1] via lh] + the climb to the layer root. The fold
+// for (query, layer) rides the e0-sponge row: e0/e1 ARE the decommitted leaf chunks
+// (authenticated by construction), the twiddle is HOST (forced by the chain +
+// decommit + last-layer consistency, NO point-chain), and folded[L] is carried to
+// layer L+1's running check via the carry latch. fold_alpha_lat (latched to
+// squeezes[3..17]) supplies alpha_sel.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `domain_point(idx)` over a line coset via the conditional point-add chain.
+/// `domain_point(idx)` over a line coset (used only host-side for the twiddle).
 struct CosetConsts {
     initial: CirclePoint<BaseField>,
     q_pts: Vec<CirclePoint<BaseField>>,
-}
-impl Clone for CosetConsts {
-    fn clone(&self) -> Self {
-        CosetConsts {
-            initial: self.initial,
-            q_pts: self.q_pts.clone(),
-        }
-    }
 }
 
 fn coset_consts(domain: &LineDomain) -> CosetConsts {
@@ -643,28 +676,50 @@ fn fold_step(f_a: SecureField, f_b: SecureField, alpha: SecureField, twid: BaseF
     (f_a + f_b) + alpha * ((f_a - f_b) * twid)
 }
 
-/// Per-query, per-layer fold record: the sibling-pair evals (position order), the
-/// query's parity bit at this layer, and the folded output.
-#[derive(Clone, Copy, Debug)]
-struct LayerRec {
-    pos: usize,
+/// One FRI layer's decommit tree (node map keyed by [level][position]) + height/root.
+struct LayerTree {
+    height: u32,
+    root: Hash8,
+    node_map: Vec<HashMap<usize, Hash8>>,
+}
+
+/// One fold step (query, layer): coset subset `k` (=pos>>1), the two coset evals,
+/// the running parity bit, the host twiddle, the folded output.
+#[derive(Clone, Copy)]
+struct FoldRec {
+    layer: usize,
+    k: usize,
     e0: SecureField,
     e1: SecureField,
+    bit: u32,
+    twid: BaseField,
     folded: SecureField,
 }
 
-struct FriChain {
-    first_log: u32,
-    n_layers: usize,
-    per_query: Vec<Vec<LayerRec>>,
-    line_cosets: Vec<CosetConsts>,
+struct FriData {
+    layers: Vec<LayerTree>,
+    per_query: Vec<Vec<FoldRec>>,
     last_layer_const: SecureField,
 }
 
-/// Replicate the verifier's per-layer fold from the real FRI proof, recording
-/// per-query (e0,e1,bit,folded) at each layer.
-fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriChain {
-    use stwo::core::utils::bit_reverse_index;
+/// Node map for one FRI-layer Merkle tree (4-wide QM31 leaves): reuse the trace
+/// `decommit_node_map` with the 4 QM31 coordinates as the sorted leaf columns.
+fn fri_node_map(
+    height: u32,
+    root: Hash8,
+    positions: &[usize],
+    leaf_vals: &[SecureField],
+    hash_witness: &[Hash8],
+) -> Vec<HashMap<usize, Hash8>> {
+    let sorted_queried: Vec<Vec<BaseField>> = (0..SECURE_EXTENSION_DEGREE)
+        .map(|c| leaf_vals.iter().map(|v| v.to_m31_array()[c]).collect())
+        .collect();
+    decommit_node_map(height, root, positions, &sorted_queried, hash_witness)
+}
+
+/// Reconstruct the per-layer fold (the recursion_fri_chain_real replay) AND build
+/// each FRI layer's decommit node map from the real fri_witness + decommitments.
+fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriData {
     let fp = &proof.stark_proof.fri_proof;
     let first_log = data.lifting_log_size;
     let n_inner = fp.inner_layers.len();
@@ -680,16 +735,13 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriChain {
         line_domain = line_domain.double();
     }
     let last_layer_domain = line_domain;
-    let last_layer_const = {
-        let x = last_layer_domain.at(0);
-        fp.last_layer_poly.eval_at_point(x.into())
-    };
+    let last_layer_const = fp.last_layer_poly.eval_at_point(last_layer_domain.at(0).into());
 
     let mut positions: Vec<usize> = data.query_positions.clone();
     let mut evals: Vec<SecureField> = data.first_layer_evals.clone();
     assert_eq!(positions.len(), evals.len());
-    let mut layer_maps: Vec<HashMap<usize, (SecureField, SecureField, SecureField)>> =
-        Vec::with_capacity(n_layers);
+    let mut layer_maps: Vec<HashMap<usize, (SecureField, SecureField, SecureField)>> = Vec::new();
+    let mut layers: Vec<LayerTree> = Vec::new();
 
     for layer in 0..n_layers {
         let alpha = alphas[layer];
@@ -700,6 +752,8 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriChain {
         };
         let mut wit = fri_witness.iter().copied();
         let mut map = HashMap::new();
+        let mut dec_positions: Vec<usize> = Vec::new();
+        let mut dec_leaf: HashMap<usize, SecureField> = HashMap::new();
         let mut next_pos = Vec::new();
         let mut next_ev = Vec::new();
         let mut i = 0;
@@ -716,6 +770,10 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriChain {
                 }
             }
             let (e0, e1) = (sub[0], sub[1]);
+            dec_positions.push(start);
+            dec_positions.push(start + 1);
+            dec_leaf.insert(start, e0);
+            dec_leaf.insert(start + 1, e1);
             let folded = if layer == 0 {
                 let p = point_at(&line_cosets[0], start >> 1);
                 fold_step(e0, e1, alpha, p.y.inverse())
@@ -728,15 +786,27 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriChain {
             next_ev.push(folded);
         }
         layer_maps.push(map);
+
+        let height = first_log - layer as u32;
+        let root: Hash8 = if layer == 0 {
+            fp.first_layer.commitment.0
+        } else {
+            fp.inner_layers[layer - 1].commitment.0
+        };
+        let hash_witness: Vec<Hash8> = if layer == 0 {
+            fp.first_layer.decommitment.hash_witness.iter().map(|h| h.0).collect()
+        } else {
+            fp.inner_layers[layer - 1].decommitment.hash_witness.iter().map(|h| h.0).collect()
+        };
+        let leaf_vals: Vec<SecureField> = dec_positions.iter().map(|p| dec_leaf[p]).collect();
+        let node_map = fri_node_map(height, root, &dec_positions, &leaf_vals, &hash_witness);
+        layers.push(LayerTree { height, root, node_map });
+
         positions = next_pos;
         evals = next_ev;
     }
-    for (p, e) in positions.iter().zip(&evals) {
-        let x = last_layer_domain.at(bit_reverse_index(*p, last_layer_domain.log_size()));
-        assert_eq!(*e, fp.last_layer_poly.eval_at_point(x.into()), "last-layer eval");
-    }
 
-    let per_query: Vec<Vec<LayerRec>> = data
+    let per_query: Vec<Vec<FoldRec>> = data
         .query_positions
         .iter()
         .map(|&q0| {
@@ -745,12 +815,12 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriChain {
                 .map(|layer| {
                     let sub = pos >> 1;
                     let (e0, e1, folded) = layer_maps[layer][&sub];
-                    let rec = LayerRec {
-                        pos,
-                        e0,
-                        e1,
-                        folded,
+                    let twid = if layer == 0 {
+                        point_at(&line_cosets[0], pos >> 1).y.inverse()
+                    } else {
+                        point_at(&line_cosets[layer - 1], pos & !1).x.inverse()
                     };
+                    let rec = FoldRec { layer, k: sub, e0, e1, bit: (pos & 1) as u32, twid, folded };
                     pos = sub;
                     rec
                 })
@@ -758,117 +828,102 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriChain {
         })
         .collect();
 
-    FriChain {
-        first_log,
-        n_layers,
-        per_query,
-        line_cosets,
-        last_layer_const,
-    }
+    FriData { layers, per_query, last_layer_const }
 }
 
-/// The bit-sources driving layer `L`'s twiddle point-chain: layer 0 (circle) uses
-/// q-bits `[1, first_log)`; inner layer `L` uses `[forced-0, bits[L+1..first_log)]`.
-fn layer_bit_sources(layer: usize, first_log: u32) -> Vec<Option<usize>> {
-    let fl = first_log as usize;
-    if layer == 0 {
-        (1..fl).map(Some).collect()
-    } else {
-        std::iter::once(None)
-            .chain((layer + 1..fl).map(Some))
-            .collect()
-    }
+/// A single-QM31 FRI leaf's sponge chunk: `[v0,v1,v2,v3, 1, 0,0,0]` (the width-4
+/// partial-rate finalize pad).
+fn fri_leaf_chunk(value: SecureField) -> [BaseField; 8] {
+    let mut chunk = [BaseField::zero(); 8];
+    chunk[..4].copy_from_slice(&value.to_m31_array());
+    chunk[4] = BaseField::one();
+    chunk
 }
 
-/// In-AIR conditional point-add chain (the proven gadget): reads `bits.len()`
-/// witnessed points, binds each `pt_k = bits[k] ? pt_{k-1}+q_pts[k] : pt_{k-1}`
-/// (degree 2). Returns the final `(x, y)`.
-fn point_chain<E: EvalAtRow>(eval: &mut E, consts: &CosetConsts, bits: &[E::F]) -> (E::F, E::F) {
-    let mut prev_x = E::F::from(consts.initial.x);
-    let mut prev_y = E::F::from(consts.initial.y);
-    for (k, bit) in bits.iter().enumerate() {
-        let qkx = consts.q_pts[k].x;
-        let qky = consts.q_pts[k].y;
-        let added_x = prev_x.clone() * qkx - prev_y.clone() * qky;
-        let added_y = prev_x.clone() * qky + prev_y.clone() * qkx;
-        let cur_x = eval.next_trace_mask();
-        let cur_y = eval.next_trace_mask();
-        eval.add_constraint(cur_x.clone() - (prev_x.clone() + bit.clone() * (added_x - prev_x.clone())));
-        eval.add_constraint(cur_y.clone() - (prev_y.clone() + bit.clone() * (added_y - prev_y.clone())));
-        prev_x = cur_x;
-        prev_y = cur_y;
-    }
-    (prev_x, prev_y)
-}
-
-fn point_chain_host(consts: &CosetConsts, bits: &[u32]) -> Vec<CirclePoint<BaseField>> {
-    let mut pt = consts.initial;
-    let mut out = Vec::with_capacity(bits.len());
-    for (k, &b) in bits.iter().enumerate() {
-        if b == 1 {
-            pt = pt + consts.q_pts[k];
+/// Lay out the per-(query,layer) FRI coset decommit + co-located fold as MkRows
+/// (appended after the trace-tree decommit rows).
+fn fri_resolve(fri: &FriData) -> Vec<MkRow> {
+    let zb = BaseField::zero();
+    let mut rows: Vec<MkRow> = Vec::new();
+    for recs in &fri.per_query {
+        for rec in recs {
+            let lt = &fri.layers[rec.layer];
+            let k = rec.k;
+            // ── e0 sponge (the fold row) ──
+            let mut r0 = mk_zfill();
+            r0.chunk = fri_leaf_chunk(rec.e0);
+            r0.init[..8].copy_from_slice(&r0.chunk[..8]);
+            let mut o0 = r0.init;
+            permute(&mut o0);
+            r0.lh = std::array::from_fn(|j| o0[j]);
+            r0.m_sponge = true;
+            r0.zero_st = true;
+            r0.root = lt.root;
+            r0.fri_layer = Some(rec.layer);
+            r0.fold_e0 = rec.e0;
+            r0.fold_e1 = rec.e1;
+            r0.fold_bit = rec.bit;
+            r0.fold_twid = rec.twid;
+            r0.fold_folded = rec.folded;
+            let h0 = r0.lh;
+            debug_assert_eq!(h0, lt.node_map[0][&(2 * k)]);
+            rows.push(r0);
+            // ── e1 sponge ──
+            let mut r1 = mk_zfill();
+            r1.chunk = fri_leaf_chunk(rec.e1);
+            r1.init[..8].copy_from_slice(&r1.chunk[..8]);
+            let mut o1 = r1.init;
+            permute(&mut o1);
+            r1.lh = std::array::from_fn(|j| o1[j]);
+            r1.m_sponge = true;
+            r1.zero_st = true;
+            r1.root = lt.root;
+            let h1 = r1.lh;
+            debug_assert_eq!(h1, lt.node_map[0][&(2 * k + 1)]);
+            rows.push(r1);
+            // ── merge: hash_children(h0, h1) → parent@(level 1, k) ──
+            let mut mr = mk_zfill();
+            mr.init[..8].copy_from_slice(&h0);
+            mr.init[8..].copy_from_slice(&h1);
+            let mut om = mr.init;
+            permute(&mut om);
+            let mut state: Hash8 = std::array::from_fn(|j| om[j]);
+            debug_assert_eq!(state, lt.node_map[1][&k]);
+            mr.m_merge = true;
+            mr.hash_link = true;
+            mr.root = lt.root;
+            rows.push(mr);
+            // ── climb from level 1 (position k) to the root ──
+            for lev in 1..lt.height as usize {
+                let node_idx = k >> (lev - 1);
+                let bit = (node_idx & 1) as u32;
+                let sib = lt.node_map[lev][&(node_idx ^ 1)];
+                let cur = state;
+                let (left, right) = if bit == 0 { (cur, sib) } else { (sib, cur) };
+                let mut nr = mk_zfill();
+                nr.st_cur[..8].copy_from_slice(&cur);
+                nr.sib = sib;
+                nr.bit = bit;
+                nr.init[..8].copy_from_slice(&left);
+                nr.init[8..].copy_from_slice(&right);
+                let mut o = nr.init;
+                permute(&mut o);
+                state = std::array::from_fn(|j| o[j]);
+                let is_root = lev + 1 == lt.height as usize;
+                nr.m_node = true;
+                nr.m_root = is_root;
+                nr.root = lt.root;
+                nr.hash_link = !is_root;
+                let _ = zb;
+                rows.push(nr);
+            }
+            debug_assert_eq!(state, lt.root, "FRI coset climb must reach the layer root");
         }
-        let _ = k;
-        out.push(pt);
     }
-    out
-}
-
-fn push4(row: &mut Vec<BaseField>, q: SecureField) {
-    row.extend(q.to_m31_array());
-}
-
-/// One query's full fold-chain row (same order the FRI block of evaluate reads).
-fn fri_row(chain: &FriChain, alphas: &[SecureField], recs: &[LayerRec]) -> Vec<BaseField> {
-    let q = recs[0].pos;
-    let mut row = Vec::new();
-    row.push(BaseField::from(q as u32));
-    for k in 0..chain.first_log {
-        row.push(BaseField::from((q >> k) & 1));
+    for r in &mut rows {
+        r.is_fri = true;
     }
-    for (layer, rec) in recs.iter().enumerate() {
-        push4(&mut row, rec.e0);
-        push4(&mut row, rec.e1);
-        let srcs = layer_bit_sources(layer, chain.first_log);
-        let bit_vals: Vec<u32> = srcs
-            .iter()
-            .map(|s| s.map_or(0, |k| ((q >> k) & 1) as u32))
-            .collect();
-        let coset = if layer == 0 {
-            &chain.line_cosets[0]
-        } else {
-            &chain.line_cosets[layer - 1]
-        };
-        let pts = point_chain_host(coset, &bit_vals);
-        let last_pt = *pts.last().unwrap();
-        for p in &pts {
-            row.push(p.x);
-            row.push(p.y);
-        }
-        let twid = if layer == 0 {
-            last_pt.y.inverse()
-        } else {
-            last_pt.x.inverse()
-        };
-        row.push(twid);
-        let scaled = (rec.e0 - rec.e1) * twid;
-        let prod = alphas[layer] * scaled;
-        let folded = (rec.e0 + rec.e1) + prod;
-        debug_assert_eq!(folded, rec.folded, "host fold must match reconstruction");
-        push4(&mut row, scaled);
-        push4(&mut row, prod);
-        push4(&mut row, folded);
-    }
-    row
-}
-
-fn fri_n_cols(chain: &FriChain) -> usize {
-    let mut n = 1 + chain.first_log as usize; // q + bits
-    for layer in 0..chain.n_layers {
-        let pts = layer_bit_sources(layer, chain.first_log).len();
-        n += 8 + pts * 2 + 1 + 12; // e0,e1 + chain pts + twid + scaled,prod,folded
-    }
-    n
+    rows
 }
 
 // ── Boundary public-input recompute (step 4b) ────────────────────────────────
@@ -1007,12 +1062,9 @@ struct ChildFullEval {
     cy: BaseField,
     /// Public boundary states + the boundary chips' claimed-sum positions (step 4b).
     bound: BoundaryAir,
-    /// FRI fold chain (step 3): the first-layer domain log, the layer count, the
-    /// per-layer line cosets (twiddle geometry), and the degree-0 last-layer
-    /// constant. The 14 fold alphas are latched columns bound to squeezes[3..17].
-    fri_first_log: u32,
-    fri_n_layers: usize,
-    fri_line_cosets: Vec<CosetConsts>,
+    /// FRI fold chain (step 3): the degree-0 last-layer constant (the surviving fold
+    /// must equal it). The 14 fold alphas are latched columns bound to
+    /// squeezes[3..17]; e0/e1 are the FRI-layer decommit leaf chunks (step 3b).
     fri_last_layer_const: SecureField,
 }
 
@@ -1045,6 +1097,9 @@ impl FrameworkEval for ChildFullEval {
         });
         let m_sponge = eval.get_preprocessed_column(PreProcessedColumnId {
             id: M_SPONGE.to_string(),
+        });
+        let m_merge = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: M_MERGE.to_string(),
         });
         let m_node = eval.get_preprocessed_column(PreProcessedColumnId {
             id: M_NODE.to_string(),
@@ -1091,6 +1146,9 @@ impl FrameworkEval for ChildFullEval {
         });
         let is_final: [E::F; OPS_S] = std::array::from_fn(|l| {
             eval.get_preprocessed_column(PreProcessedColumnId { id: final_id(l) })
+        });
+        let is_fri_layer: [E::F; N_FRI_LAYERS] = std::array::from_fn(|l| {
+            eval.get_preprocessed_column(PreProcessedColumnId { id: fri_layer_id(l) })
         });
         let mut prog: Vec<(E::EF, Vec<E::EF>)> = Vec::with_capacity(2 * OPS_S);
         for l in 0..OPS_S {
@@ -1225,10 +1283,17 @@ impl FrameworkEval for ChildFullEval {
             std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
         let st_cur = |j: usize| st[j][0].clone();
         let st_next = |j: usize| st[j][1].clone();
-        let mk_chunk: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        // chunk read at [0,1]: [0] = this row's leaf chunk; [1] (next row) feeds the
+        // co-located FRI fold's e1 (= the e1-sponge of the same coset).
+        let mk_chunk: [[E::F; 2]; 8] =
+            std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
         let mk_sib: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
         let mk_bit = eval.next_trace_mask();
         let mk_mux: [E::F; 8] = std::array::from_fn(|_| eval.next_trace_mask());
+        // lh = the leaf hash (bound to out on every sponge row); the FRI coset MERGE
+        // row reads the two prior sponge rows' lh at [-2] (h0) and [-1] (h1).
+        let mk_lh: [[E::F; 3]; 8] =
+            std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [-2, -1, 0]));
 
         // Fresh sponge / zeroed state on each path's first row.
         for j in 0..N_STATE {
@@ -1240,12 +1305,19 @@ impl FrameworkEval for ChildFullEval {
             eval.add_constraint(mk_mux[j].clone() - mk_bit.clone() * (mk_sib[j].clone() - st_cur(j)));
         }
         // Leaf sponge: rate += chunk, capacity carried (chunk encodes both a full
-        // absorb and the partial-rate finalize [leftover…, 1, 0…]).
+        // absorb and the partial-rate finalize [leftover…, 1, 0…]); bind lh = out.
         for j in 0..8 {
             eval.add_constraint(
-                m_sponge.clone() * (init[j].clone() - st_cur(j) - mk_chunk[j].clone()),
+                m_sponge.clone() * (init[j].clone() - st_cur(j) - mk_chunk[j][0].clone()),
             );
             eval.add_constraint(m_sponge.clone() * (init[8 + j].clone() - st_cur(8 + j)));
+            eval.add_constraint(m_sponge.clone() * (mk_lh[j][2].clone() - out[j].clone()));
+        }
+        // FRI coset merge: hash_children(h0 = lh@[-2], h1 = lh@[-1]); the even leaf
+        // (2k) is the left child, the odd leaf (2k+1) the right.
+        for j in 0..8 {
+            eval.add_constraint(m_merge.clone() * (init[j].clone() - mk_lh[j][0].clone()));
+            eval.add_constraint(m_merge.clone() * (init[8 + j].clone() - mk_lh[j][1].clone()));
         }
         // hash_children: bit-ordered (cur, sib) via the witnessed mux.
         for j in 0..8 {
@@ -1545,73 +1617,56 @@ impl FrameworkEval for ChildFullEval {
             *alat = E::combine_ef(std::array::from_fn(|j| a[j][0].clone()));
         }
 
-        // q + its first_log boolean bits (recompose ⇒ binds the bits).
-        let read4 = |eval: &mut E| -> [E::F; 4] { std::array::from_fn(|_| eval.next_trace_mask()) };
-        let q = eval.next_trace_mask();
-        let bits: Vec<E::F> = (0..self.fri_first_log)
-            .map(|_| eval.next_trace_mask())
-            .collect();
-        let mut recompose = E::F::zero();
-        let mut coeff = BaseField::one();
-        for bit in &bits {
-            eval.add_constraint(bit.clone() * (bit.clone() - one.clone()));
-            recompose += bit.clone() * coeff;
-            coeff += coeff;
-        }
-        eval.add_constraint(recompose - q);
-
-        let inv_of = |eval: &mut E, c: E::F| -> E::F {
-            let t = eval.next_trace_mask();
-            eval.add_constraint(t.clone() * c - one.clone());
-            t
+        // ── Per-step FRI fold, co-located on the FRI coset e0-sponge rows (step 3b,
+        //    the de-risked recursion_fri_decommit mechanism). e0/e1 ARE the
+        //    decommitted leaf chunks (mk_chunk@[0]/@[1]); the twiddle is host (forced
+        //    by the chain + decommit + last-layer); folded[L] is carried to layer
+        //    L+1's running check by the carry latch. The fold FORMULA rides every row
+        //    (UNGATED, dummy-consistent on non-fold rows: folded = e0+e1, prod=0); the
+        //    CONDITIONAL checks are gated by is_fri_layer (degree 2, gating deg-1). ──
+        let read4 = |eval: &mut E| -> E::EF {
+            E::combine_ef(std::array::from_fn(|_| eval.next_trace_mask()))
         };
-        let mut prev_folded: Option<[E::F; 4]> = None;
-        for layer in 0..self.fri_n_layers {
-            let e0 = read4(&mut eval);
-            let e1 = read4(&mut eval);
-            // Chain: the query's eval at layer L = select(bit[L], e0, e1); for L>0 it
-            // must equal the previous layer's folded output.
-            if let Some(pf) = &prev_folded {
-                for k in 0..4 {
-                    let queried = e0[k].clone() + bits[layer].clone() * (e1[k].clone() - e0[k].clone());
-                    eval.add_constraint(pf[k].clone() - queried);
-                }
-            }
-            // Twiddle: derive the layer's coset point from the (bound) q-bits.
-            let srcs = layer_bit_sources(layer, self.fri_first_log);
-            let layer_bits: Vec<E::F> = srcs
-                .iter()
-                .map(|s| match s {
-                    Some(k) => bits[*k].clone(),
-                    None => E::F::zero(),
-                })
-                .collect();
-            let coset = if layer == 0 {
-                &self.fri_line_cosets[0]
-            } else {
-                &self.fri_line_cosets[layer - 1]
-            };
-            let (px, py) = point_chain(&mut eval, coset, &layer_bits);
-            let twid = inv_of(&mut eval, if layer == 0 { py } else { px });
-            // Fold: scaled/prod/folded witnessed (deg ≤ 2 with the latched alpha).
-            let scaled = read4(&mut eval);
-            let prod = read4(&mut eval);
-            let folded = read4(&mut eval);
-            for k in 0..4 {
-                eval.add_constraint(scaled[k].clone() - (e0[k].clone() - e1[k].clone()) * twid.clone());
-            }
-            eval.add_constraint(
-                E::combine_ef(prod.clone()) - fold_alpha_lat[layer].clone() * E::combine_ef(scaled),
-            );
-            eval.add_constraint(
-                E::combine_ef(folded.clone())
-                    - (E::combine_ef(e0) + E::combine_ef(e1) + E::combine_ef(prod)),
-            );
-            prev_folded = Some(folded);
+        let fold_bit = eval.next_trace_mask();
+        let mux_fold = read4(&mut eval);
+        let fri_twid = read4(&mut eval);
+        let alpha_sel = read4(&mut eval);
+        let scaled = read4(&mut eval);
+        let prod = read4(&mut eval);
+        let fri_folded = read4(&mut eval);
+        let carry: [[E::F; 2]; SECURE_EXTENSION_DEGREE] =
+            std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
+        let carry_cur = E::combine_ef(std::array::from_fn(|i| carry[i][0].clone()));
+        let carry_next = E::combine_ef(std::array::from_fn(|i| carry[i][1].clone()));
+        // e0 = this row's leaf chunk; e1 = the next row's (= the coset's e1 sponge).
+        let e0 = E::combine_ef(std::array::from_fn(|i| mk_chunk[i][0].clone()));
+        let e1 = E::combine_ef(std::array::from_fn(|i| mk_chunk[i][1].clone()));
+        let is_fri: E::F = is_fri_layer.iter().fold(E::F::zero(), |a, b| a + b.clone());
+        let is_run: E::F = is_fri_layer[1..].iter().fold(E::F::zero(), |a, b| a + b.clone());
+        // fold_bit boolean + running mux = fold_bit·(e1−e0); running = e0 + mux.
+        eval.add_constraint(fold_bit.clone() * (fold_bit.clone() - one.clone()));
+        eval.add_constraint(mux_fold.clone() - lift(fold_bit.clone()) * (e1.clone() - e0.clone()));
+        let running = e0.clone() + mux_fold.clone();
+        // alpha_sel = Σ is_fri_layer[L]·fold_alpha_lat[L] (deg 2, witnessed).
+        let mut sel = E::EF::zero();
+        for (l, isl) in is_fri_layer.iter().enumerate() {
+            sel += lift(isl.clone()) * fold_alpha_lat[l].clone();
         }
-        // Last layer: the surviving folded eval == the degree-0 last-layer constant.
-        let last = prev_folded.expect("at least one FRI layer");
-        eval.add_constraint(E::combine_ef(last) - E::EF::from(self.fri_last_layer_const));
+        eval.add_constraint(alpha_sel.clone() - sel);
+        eval.add_constraint(scaled.clone() - (e0.clone() - e1.clone()) * fri_twid.clone());
+        eval.add_constraint(prod.clone() - alpha_sel.clone() * scaled.clone());
+        eval.add_constraint(fri_folded.clone() - (e0.clone() + e1.clone() + prod.clone()));
+        // Carry latch: carry[next] = is_fri ? folded : carry[cur] (cycle closed by fill).
+        eval.add_constraint(
+            carry_next - carry_cur.clone() - lift(is_fri) * (fri_folded.clone() - carry_cur.clone()),
+        );
+        // Cross-layer chain: at layer L>0 the running leaf == carry (= folded[L−1]).
+        eval.add_constraint(lift(is_run) * (running - carry_cur));
+        // Last layer (L=13): folded == the degree-0 last-layer constant.
+        eval.add_constraint(
+            lift(is_fri_layer[N_FRI_LAYERS - 1].clone())
+                * (fri_folded - E::EF::from(self.fri_last_layer_const)),
+        );
 
         eval
     }
@@ -1629,9 +1684,6 @@ struct ChildTrace {
     cx: BaseField,
     cy: BaseField,
     bound: BoundaryAir,
-    fri_first_log: u32,
-    fri_n_layers: usize,
-    fri_line_cosets: Vec<CosetConsts>,
     fri_last_layer_const: SecureField,
 }
 
@@ -1658,7 +1710,7 @@ fn gen_trace(
     mk_fills: &[MkRow],
     roots: &[[BaseField; 8]],
     root_absorb_row: &[usize],
-    chain: &FriChain,
+    last_layer_const: SecureField,
     fold_alphas: &[SecureField],
     fold_draw_row: &[usize],
     log_size: u32,
@@ -1859,6 +1911,7 @@ fn gen_trace(
     }
     let mut mk: Vec<Vec<BaseField>> = vec![vec![zb; n]; MK_COLS];
     let mut m_sponge = vec![zb; n];
+    let mut m_merge = vec![zb; n];
     let mut m_node = vec![zb; n];
     let mut m_root = vec![zb; n];
     let mut zero_st = vec![zb; n];
@@ -1866,6 +1919,7 @@ fn gen_trace(
     let mut cap_fwd = vec![zb; n];
     let mut is_root_t: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_TREES];
     let mut dc_root: Vec<Vec<BaseField>> = vec![vec![zb; n]; 8];
+    let mut is_fri_layer: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_FRI_LAYERS];
     for (i, f) in mk_rows.iter().enumerate() {
         let row = n_real + i;
         assert!(row < n, "merkle rows overflow the trace");
@@ -1890,9 +1944,14 @@ fn gen_trace(
             mk[col][row] = v;
             col += 1;
         }
+        for v in f.lh {
+            mk[col][row] = v;
+            col += 1;
+        }
         debug_assert_eq!(col, MK_COLS);
         let b = |x: bool| if x { BaseField::one() } else { zb };
         m_sponge[row] = b(f.m_sponge);
+        m_merge[row] = b(f.m_merge);
         m_node[row] = b(f.m_node);
         m_root[row] = b(f.m_root);
         zero_st[row] = b(f.zero_st);
@@ -1901,8 +1960,14 @@ fn gen_trace(
         for j in 0..8 {
             dc_root[j][row] = f.root[j];
         }
-        if f.m_root {
+        // Trace-tree m_root rows pin to a transcript-bound root (step 2b); FRI m_root
+        // rows pin to the preprocessed dc_root (= the FRI layer root; the
+        // FRI-root↔transcript binding is a follow-on, like last_layer_const).
+        if f.m_root && !f.is_fri {
             is_root_t[f.tree_idx][row] = BaseField::one();
+        }
+        if let Some(l) = f.fri_layer {
+            is_fri_layer[l][row] = BaseField::one();
         }
     }
 
@@ -1932,9 +1997,9 @@ fn gen_trace(
         }
     }
 
-    // ── FRI fold chain (step 3): is_fold_draw[i] fires on the i-th fold-alpha
-    //    squeeze; fold_alpha_lat are the 14 alphas (constant); fold_cols hold each
-    //    row's cycled query fold chain (every row a full chain, ungated). ──
+    // ── FRI fold-alpha latch (step 3a): is_fold_draw[i] fires on the i-th fold-alpha
+    //    squeeze; fold_alpha_lat are the 14 alphas (held constant), reused below as
+    //    the per-step alpha_sel. ──
     assert_eq!(fold_alphas.len(), N_FRI_LAYERS, "14 fold alphas");
     assert_eq!(fold_draw_row.len(), N_FRI_LAYERS);
     let mut is_fold_draw: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_FRI_LAYERS];
@@ -1952,21 +2017,74 @@ fn gen_trace(
             fold_alpha_lat.push(vec![c; n]);
         }
     }
-    let n_queries = chain.per_query.len();
-    let fri_cols = fri_n_cols(chain);
-    let mut fold_cols: Vec<Vec<BaseField>> = vec![vec![zb; n]; fri_cols];
+
+    // ── Per-step FRI fold columns (step 3b): the fold rides every row (ungated
+    //    formula; conditional checks gated by is_fri_layer). e0/e1 = the leaf chunk
+    //    of this row / the next row; on FRI fold rows the MkRow carries the fold rec.
+    //    `fri_tamper` perturbs the first FRI fold's folded output (breaks the chain +
+    //    last-layer check). ──
+    let leaf_val = |row: usize| -> SecureField {
+        if row >= n_real && row < n_real + mk_rows.len() {
+            let c = &mk_rows[row - n_real].chunk;
+            SecureField::from_m31_array([c[0], c[1], c[2], c[3]])
+        } else {
+            z
+        }
+    };
+    let fold_at = |row: usize| -> Option<&MkRow> {
+        if row >= n_real && row < n_real + mk_rows.len() {
+            let f = &mk_rows[row - n_real];
+            if f.fri_layer.is_some() { Some(f) } else { None }
+        } else {
+            None
+        }
+    };
+    let mut fri_fold_bit = vec![zb; n];
+    let mut fri_mux_fold = vec![z; n];
+    let mut fri_twid = vec![z; n];
+    let mut fri_alpha_sel = vec![z; n];
+    let mut fri_scaled = vec![z; n];
+    let mut fri_prod = vec![z; n];
+    let mut fri_folded = vec![z; n];
     for r in 0..n {
-        let recs = &chain.per_query[r % n_queries];
-        for (c, v) in fri_row(chain, fold_alphas, recs).into_iter().enumerate() {
-            fold_cols[c][r] = v;
+        let e0 = leaf_val(r);
+        let e1 = leaf_val((r + 1) % n);
+        if let Some(f) = fold_at(r) {
+            let layer = f.fri_layer.unwrap();
+            fri_fold_bit[r] = BaseField::from(f.fold_bit);
+            fri_mux_fold[r] = SecureField::from(BaseField::from(f.fold_bit)) * (e1 - e0);
+            fri_twid[r] = SecureField::from(f.fold_twid);
+            fri_alpha_sel[r] = fold_alphas[layer];
+            fri_scaled[r] = (e0 - e1) * fri_twid[r];
+            fri_prod[r] = fri_alpha_sel[r] * fri_scaled[r];
+            fri_folded[r] = f.fold_folded;
+            debug_assert_eq!(e0, f.fold_e0, "FRI fold-row e0 must equal the leaf chunk");
+            debug_assert_eq!(e1, f.fold_e1, "FRI fold-row e1 must equal the next-row leaf chunk");
+            debug_assert_eq!(fri_folded[r], e0 + e1 + fri_prod[r], "host FRI fold must be consistent");
+        } else {
+            fri_folded[r] = e0 + e1; // dummy-consistent (prod = 0)
         }
     }
     if fri_tamper {
-        // Bump the layer-0 folded[0] column on row 0 (q,bits + e0,e1 + chain pts +
-        // twid + scaled,prod, then folded) — breaks the chain + last-layer check.
-        let pts0 = layer_bit_sources(0, chain.first_log).len();
-        let folded0_col = (1 + chain.first_log as usize) + 8 + pts0 * 2 + 1 + 8;
-        fold_cols[folded0_col][0] += BaseField::one();
+        let r = (n_real..n_real + mk_rows.len())
+            .find(|&r| fold_at(r).is_some())
+            .expect("a FRI fold row");
+        fri_folded[r] += SecureField::one();
+    }
+    // Carry forward (cycle closed): seed with the last query's folded[13].
+    let last_folded = mk_rows
+        .iter()
+        .rev()
+        .find(|f| f.fri_layer == Some(N_FRI_LAYERS - 1))
+        .map(|f| f.fold_folded)
+        .expect("a layer-13 FRI fold row");
+    let mut fri_carry = vec![z; n];
+    let mut cur = last_folded;
+    for r in 0..n {
+        fri_carry[r] = cur;
+        if fold_at(r).is_some() {
+            cur = fri_folded[r];
+        }
     }
 
     // ── Embed QM31 logical columns ──
@@ -2208,6 +2326,7 @@ fn gen_trace(
             .collect(),
     ); // not_last_tr
     pre_b.push(m_sponge);
+    pre_b.push(m_merge);
     pre_b.push(m_node);
     pre_b.push(m_root);
     pre_b.push(zero_st);
@@ -2245,6 +2364,9 @@ fn gen_trace(
                 })
                 .collect(),
         );
+    }
+    for col in is_fri_layer {
+        pre_b.push(col);
     }
     for l in 0..OPS_S {
         for r in 0..2 {
@@ -2313,7 +2435,8 @@ fn gen_trace(
         let oa_col = CHANNEL_COLS + MK_COLS + (NLEAF + lay.final_lane * 3) * SECURE_EXTENSION_DEGREE;
         main_logical[oa_col][lay.final_row] += BaseField::one();
     }
-    // Root-latch columns, then the FRI fold-alpha latches + fold-chain columns are
+    // Root-latch columns, then the FRI fold-alpha latches, then the per-step FRI fold
+    // columns (fold_bit, mux_fold, twid, alpha_sel, scaled, prod, folded, carry) are
     // LAST in the main trace (read last in evaluate, in this exact order).
     for col in root_lat {
         main_logical.push(col);
@@ -2321,8 +2444,19 @@ fn gen_trace(
     for col in fold_alpha_lat {
         main_logical.push(col);
     }
-    for col in fold_cols {
-        main_logical.push(col);
+    main_logical.push(fri_fold_bit);
+    for q in [
+        &fri_mux_fold,
+        &fri_twid,
+        &fri_alpha_sel,
+        &fri_scaled,
+        &fri_prod,
+        &fri_folded,
+        &fri_carry,
+    ] {
+        for c in 0..SECURE_EXTENSION_DEGREE {
+            main_logical.push(q.iter().map(|v| v.to_m31_array()[c]).collect());
+        }
     }
     let main: Vec<_> = main_logical.into_iter().map(wrap).collect();
 
@@ -2334,10 +2468,7 @@ fn gen_trace(
         cx,
         cy,
         bound: air_eff,
-        fri_first_log: chain.first_log,
-        fri_n_layers: chain.n_layers,
-        fri_line_cosets: chain.line_cosets.clone(),
-        fri_last_layer_const: chain.last_layer_const,
+        fri_last_layer_const: last_layer_const,
     }
 }
 
@@ -2413,7 +2544,7 @@ struct ChildInputs {
     mk_fills: Vec<MkRow>,
     roots: Vec<[BaseField; 8]>,
     root_absorb_row: Vec<usize>,
-    chain: FriChain,
+    last_layer_const: SecureField,
     fold_alphas: Vec<SecureField>,
     fold_draw_row: Vec<usize>,
     log_size: u32,
@@ -2543,7 +2674,7 @@ fn build_inputs() -> ChildInputs {
     let n_trees = proof.stark_proof.commitments.len();
     assert_eq!(n_trees, N_TREES, "canonical proof commits {N_TREES} trace trees");
     let trees: Vec<TreeData> = (0..n_trees).map(|t| build_tree(&proof, &data, t)).collect();
-    let mk_fills = mk_resolve(&trees.iter().collect::<Vec<_>>());
+    let mut mk_fills = mk_resolve(&trees.iter().collect::<Vec<_>>());
 
     // Root ↔ commit-absorb (step 2b): each tree's commitment root is absorbed via
     // mix_root (one Absorb record, root limbs in input[8..16] = the channel's
@@ -2563,10 +2694,14 @@ fn build_inputs() -> ChildInputs {
         })
         .collect();
 
-    // FRI fold chain (step 3): reconstruct the 14-layer fold from the proof, latch
-    // the 14 fold_alphas to squeezes[3..17] (rc, oods_t, deep, then the per-layer
-    // alphas, in order).
-    let chain = fri_reconstruct(&proof, &data);
+    // FRI fold chain + FRI-layer decommit (step 3a+3b): reconstruct the 14-layer
+    // fold + each layer's Merkle node map from the proof, latch the 14 fold_alphas to
+    // squeezes[3..17] (rc, oods_t, deep, then the per-layer alphas), and APPEND the
+    // streamed per-(query,layer) coset decommit + co-located fold to the merkle rows
+    // (so e0/e1 are authenticated leaves, not host values).
+    let fri = fri_reconstruct(&proof, &data);
+    let last_layer_const = fri.last_layer_const;
+    mk_fills.extend(fri_resolve(&fri));
     let fold_alphas = data.fold_alphas.clone();
     assert_eq!(fold_alphas.len(), N_FRI_LAYERS, "14 fold alphas");
     assert!(
@@ -2584,7 +2719,7 @@ fn build_inputs() -> ChildInputs {
         );
     }
 
-    // The component spans max(transcript + merkle rows, embed rows).
+    // The component spans max(transcript + merkle rows [trace + FRI], embed rows).
     let log_size = (records.len() + mk_fills.len())
         .max(lay.n_rows)
         .next_power_of_two()
@@ -2606,7 +2741,7 @@ fn build_inputs() -> ChildInputs {
         mk_fills,
         roots,
         root_absorb_row,
-        chain,
+        last_layer_const,
         fold_alphas,
         fold_draw_row,
         log_size,
@@ -2643,7 +2778,7 @@ impl ChildInputs {
             &self.mk_fills,
             &self.roots,
             &self.root_absorb_row,
-            &self.chain,
+            self.last_layer_const,
             &self.fold_alphas,
             &self.fold_draw_row,
             self.log_size,
@@ -2687,9 +2822,6 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
             cx: trace.cx,
             cy: trace.cy,
             bound: trace.bound.clone(),
-            fri_first_log: trace.fri_first_log,
-            fri_n_layers: trace.fri_n_layers,
-            fri_line_cosets: trace.fri_line_cosets.clone(),
             fri_last_layer_const: trace.fri_last_layer_const,
         },
         SecureField::zero(),
@@ -2716,8 +2848,6 @@ fn child_full_air_satisfied() {
     let log_size = trace.log_size;
     let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
     let bound = trace.bound.clone();
-    let (fri_first_log, fri_n_layers) = (trace.fri_first_log, trace.fri_n_layers);
-    let fri_line_cosets = trace.fri_line_cosets.clone();
     let fri_last_layer_const = trace.fri_last_layer_const;
     let pre: Vec<Vec<M31>> = trace
         .preprocessed
@@ -2737,9 +2867,6 @@ fn child_full_air_satisfied() {
                 cx,
                 cy,
                 bound: bound.clone(),
-                fri_first_log,
-                fri_n_layers,
-                fri_line_cosets: fri_line_cosets.clone(),
                 fri_last_layer_const,
             }
             .evaluate(e);
