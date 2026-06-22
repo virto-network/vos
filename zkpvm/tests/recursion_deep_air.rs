@@ -188,8 +188,7 @@ fn extract() -> DeepSubset {
 
         let mut cols = Vec::with_capacity(m);
         let mut numerator = SecureField::zero();
-        for (&(col, a_real, b_real, c_real), &(v, pow)) in
-            b.cols.iter().zip(&b.col_samples).take(m)
+        for (&(col, a_real, b_real, c_real), &(v, pow)) in b.cols.iter().zip(&b.col_samples).take(m)
         {
             // Cross-check the validated derivation (4a) so the subset uses the
             // exact `(a,b,c)` the host oracle + the in-AIR derivation produce.
@@ -231,7 +230,8 @@ impl FrameworkEval for DeepAirEval {
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let zero = E::F::zero();
         let ef = E::combine_ef;
-        let read_q = |eval: &mut E| -> [E::F; 4] { std::array::from_fn(|_| eval.next_trace_mask()) };
+        let read_q =
+            |eval: &mut E| -> [E::F; 4] { std::array::from_fn(|_| eval.next_trace_mask()) };
         // `conj(v) − v` for QM31 v = [v0,v1,v2,v3] is [0,0,−2v2,−2v3].
         let conj_minus_self = |v: &[E::F; 4]| -> E::EF {
             ef([
@@ -482,6 +482,77 @@ fn prove_and_verify(d: &DeepSubset, tamper_col: Option<usize>) -> Result<(), Str
     vs.commit(proof.commitments[1], &sizes[1], vch);
     stwo::core::verifier::verify(&[&component as &dyn Component], vch, &mut vs, proof)
         .map_err(|e| format!("verify: {e:?}"))
+}
+
+/// DIAGNOSTIC (the 4c layout decision): does the trace-decommit leaf order
+/// (sorted by log size) align with the flattened/commit column order the DEEP
+/// `col` index uses, and is the per-batch flat-index list monotone (the α-power
+/// global order)? Prints per-tree log-size uniformity + the batch column-index
+/// structure so the leaf-row coupling layout can be designed against real shapes.
+#[test]
+#[ignore = "diagnostic: prints real-segment decommit/DEEP column structure"]
+fn deep_layout_diagnostic() {
+    let (proof, sn) = canonical_segment();
+    let data = extract_recursion_data(&proof, &sn);
+
+    eprintln!("── per-tree column log sizes (sorted==commit?) ──");
+    let mut tree_offsets = Vec::new();
+    let mut acc = 0usize;
+    for (t, cls) in data.tree_column_log_sizes.iter().enumerate() {
+        tree_offsets.push(acc);
+        acc += cls.len();
+        let mut distinct: Vec<u32> = cls.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut order: Vec<usize> = (0..cls.len()).collect();
+        order.sort_by_key(|&c| cls[c]);
+        let identity = order.iter().enumerate().all(|(i, &c)| i == c);
+        eprintln!(
+            "  tree {t}: {} cols, height {}, distinct log sizes {:?}, sorted==commit: {identity}",
+            cls.len(),
+            data.tree_heights[t],
+            distinct,
+        );
+    }
+    eprintln!("flat column offsets per tree: {tree_offsets:?} (total {acc})");
+
+    eprintln!("── DEEP batches: flat-index structure ──");
+    let mut all_first: Vec<usize> = Vec::new();
+    for (bi, b) in data.deep_batches.iter().enumerate() {
+        let idxs: Vec<usize> = b.cols.iter().map(|c| c.0).collect();
+        let monotone = idxs.windows(2).all(|w| w[0] < w[1]);
+        let min = *idxs.iter().min().unwrap();
+        let max = *idxs.iter().max().unwrap();
+        let contiguous = max - min + 1 == idxs.len();
+        all_first.push(min);
+        if bi < 6 || bi + 2 >= data.deep_batches.len() {
+            eprintln!(
+                "  batch {bi}: {} cols, flat idx [{min}..={max}], monotone {monotone}, \
+                 contiguous {contiguous}",
+                idxs.len(),
+            );
+        }
+    }
+    eprintln!(
+        "── {} batches total; the per-query first_layer_evals bind to these. \
+         The α-power index is the global flat order; cross-batch monotone-min: {} ──",
+        data.deep_batches.len(),
+        all_first.windows(2).all(|w| w[0] <= w[1]),
+    );
+
+    // Which trees does each batch's columns come from?
+    let which_tree =
+        |flat: usize| -> usize { tree_offsets.iter().rposition(|&o| flat >= o).unwrap_or(0) };
+    for (bi, b) in data.deep_batches.iter().enumerate().take(4) {
+        let mut tcount = [0usize; 8];
+        for c in &b.cols {
+            tcount[which_tree(c.0)] += 1;
+        }
+        eprintln!(
+            "  batch {bi} columns by tree: {:?}",
+            &tcount[..data.tree_heights.len()]
+        );
+    }
 }
 
 /// FAST: the real multi-batch DEEP-numerator trace satisfies the AIR.
