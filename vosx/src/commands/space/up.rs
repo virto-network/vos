@@ -209,7 +209,43 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // AtomicBool that `run_forever`'s poll loop watches.
         crate::shutdown::install(node.shutdown_handle());
         tracing::info!("running until shutdown (Ctrl-C / SIGTERM)");
-        node.run_forever();
+
+        // Spawn-reconcile from the router tick hook: agents
+        // installed after boot — `space install`, `dev new`, an
+        // extension calling `registry.install`, or rows CRDT-synced
+        // from a peer — come up within a few seconds instead of
+        // waiting for the next daemon restart. The subscriptions
+        // filter is captured once here; editing local.toml still
+        // needs a restart to take effect.
+        let local_cfg = crate::commands::space::subscriptions::load(&data_dir).unwrap_or_default();
+        let has_hyperspace = hyperspace.is_some();
+        let mut damped = std::collections::HashSet::new();
+        let mut query_warned = false;
+        let mut last_pass = std::time::Instant::now();
+        node.run_forever_with(|n| {
+            if last_pass.elapsed() < SPAWN_RECONCILE_EVERY {
+                return;
+            }
+            last_pass = std::time::Instant::now();
+            match reconcile_installed_agents(
+                n,
+                &data_dir,
+                local_prefix,
+                has_hyperspace,
+                &local_cfg,
+                &mut damped,
+            ) {
+                Ok(()) => query_warned = false,
+                // Usually a stopped/wedged registry; the condition
+                // persists across passes, so warn once and demote
+                // the 2s-cadence repeats.
+                Err(e) if !query_warned => {
+                    query_warned = true;
+                    tracing::warn!("spawn-reconcile: {e}");
+                }
+                Err(e) => tracing::debug!("spawn-reconcile: {e}"),
+            }
+        });
     }
 
     let results = node.collect();
@@ -441,71 +477,31 @@ fn spawn_installed_agents(
             tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
             continue;
         }
-        let program_hash = BlobHash(a.program_hash);
-        let elf = match blob_store::cache_get(&program_hash)? {
-            Some(b) => b,
-            None => {
-                tracing::warn!(
-                    "skipping agent '{}' — program blob {program_hash} not in local cache",
+        match agent_config_from_row(data_dir, &a)? {
+            RowConfig::Ready(cfg) => {
+                let svc_id = instance_service_id(&a.instance_name, local_prefix);
+                let id = node.register_at_id(*cfg, svc_id);
+                tracing::info!(
+                    "agent '{}' as {id} ({})",
                     a.instance_name,
+                    crate::commands::space::common::consistency_name(a.consistency),
                 );
-                continue;
             }
-        };
-        let blob = grey_transpiler::link_elf(&elf)
-            .map_err(|e| anyhow::anyhow!("transpile {}: {e:?}", a.instance_name))?;
-
-        let Some(consistency) = consistency_from_u8(a.consistency) else {
-            tracing::warn!(
-                "skipping agent '{}' — unknown consistency {}",
-                a.instance_name,
-                a.consistency,
-            );
-            continue;
-        };
-
-        let mut cfg = AgentConfig::new(blob)
-            .with_name(a.instance_name.clone())
-            .with_consistency(consistency);
-        if matches!(
-            consistency,
-            Consistency::Local | Consistency::Crdt | Consistency::Raft
-        ) {
-            cfg = cfg.persist(data_dir);
-        }
-        if matches!(consistency, Consistency::Crdt | Consistency::Raft) {
-            cfg = cfg.with_replication_id(a.replication_id);
-        }
-        if !a.install_args.is_empty() {
-            cfg = cfg.with_storage(vec![(
-                vos::lifecycle::INIT_KEY.to_vec(),
-                a.install_args.clone(),
-            )]);
-        }
-
-        // on_start payloads (from manifest reconciliation) get
-        // dispatched on cold start. Stored as rkyv-encoded
-        // `Vec<Vec<u8>>` on the agent row.
-        match payload_codec::decode(&a.install_payloads) {
-            Ok(payloads) if !payloads.is_empty() => {
-                cfg = cfg.with_init_payloads(payloads);
-            }
-            Ok(_) => {}
-            Err(e) => {
+            RowConfig::MissingBlob => {
                 tracing::warn!(
-                    "agent '{}' has unparseable install_payloads, ignoring: {e}",
+                    "skipping agent '{}' — program blob {} not in local cache",
                     a.instance_name,
+                    BlobHash(a.program_hash),
+                );
+            }
+            RowConfig::BadConsistency => {
+                tracing::warn!(
+                    "skipping agent '{}' — unknown consistency {}",
+                    a.instance_name,
+                    a.consistency,
                 );
             }
         }
-
-        let svc_id = instance_service_id(&a.instance_name, local_prefix);
-        let id = node.register_at_id(cfg, svc_id);
-        tracing::info!(
-            "agent '{}' as {id} ({})",
-            a.instance_name,
-            crate::commands::space::common::consistency_name(a.consistency),
-        );
     }
 
     // Hyperspace mode: advertise every local agent into the
@@ -539,6 +535,238 @@ fn spawn_installed_agents(
     // instead of finding orphans.
     sweep_orphan_redbs(data_dir, &live_svc_ids);
 
+    Ok(())
+}
+
+/// How often the idle hook re-runs the spawn-reconcile pass. The
+/// pass is a single local registry invoke plus a hash-set probe
+/// per row, so a low couple-of-seconds cadence keeps freshly
+/// installed agents snappy without measurable idle cost.
+const SPAWN_RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Outcome of resolving one registry `AgentRow` into a spawnable
+/// [`AgentConfig`].
+enum RowConfig {
+    Ready(Box<AgentConfig>),
+    /// Program blob not in the local cache. On a joiner the row
+    /// can arrive via registry sync before the operator has the
+    /// blob, so this is retryable, not fatal.
+    MissingBlob,
+    /// Unrecognized consistency discriminant.
+    BadConsistency,
+}
+
+/// Build the `AgentConfig` for one registry row — blob lookup,
+/// transpile, persistence/replication wiring, init args, and
+/// on_start payloads. Shared by the boot-time
+/// `spawn_installed_agents` scan and the runtime
+/// `reconcile_installed_agents` pass so both spawn identically.
+fn agent_config_from_row(
+    data_dir: &std::path::Path,
+    a: &space_registry::AgentRow,
+) -> anyhow::Result<RowConfig> {
+    let program_hash = BlobHash(a.program_hash);
+    let elf = match blob_store::cache_get(&program_hash)? {
+        Some(b) => b,
+        None => return Ok(RowConfig::MissingBlob),
+    };
+    let blob = grey_transpiler::link_elf(&elf)
+        .map_err(|e| anyhow::anyhow!("transpile {}: {e:?}", a.instance_name))?;
+
+    let Some(consistency) = consistency_from_u8(a.consistency) else {
+        return Ok(RowConfig::BadConsistency);
+    };
+
+    let mut cfg = AgentConfig::new(blob)
+        .with_name(a.instance_name.clone())
+        .with_consistency(consistency);
+    if matches!(
+        consistency,
+        Consistency::Local | Consistency::Crdt | Consistency::Raft
+    ) {
+        cfg = cfg.persist(data_dir);
+    }
+    if matches!(consistency, Consistency::Crdt | Consistency::Raft) {
+        cfg = cfg.with_replication_id(a.replication_id);
+    }
+    if !a.install_args.is_empty() {
+        cfg = cfg.with_storage(vec![(
+            vos::lifecycle::INIT_KEY.to_vec(),
+            a.install_args.clone(),
+        )]);
+    }
+
+    // on_start payloads (from manifest reconciliation) get
+    // dispatched on cold start. Stored as rkyv-encoded
+    // `Vec<Vec<u8>>` on the agent row.
+    match payload_codec::decode(&a.install_payloads) {
+        Ok(payloads) if !payloads.is_empty() => {
+            cfg = cfg.with_init_payloads(payloads);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                "agent '{}' has unparseable install_payloads, ignoring: {e}",
+                a.instance_name,
+            );
+        }
+    }
+    Ok(RowConfig::Ready(Box::new(cfg)))
+}
+
+/// Cap on agents brought up in a single reconcile pass. The pass
+/// runs on the router thread (routing paused), and each spawn
+/// costs an ELF transpile + redb open + thread spawn — bounding
+/// the batch keeps a burst of synced rows from freezing routing,
+/// and rate-limits how fast a (possibly hostile) flood of
+/// registry rows can amplify into local threads. Remaining rows
+/// spawn on subsequent passes.
+const MAX_SPAWNS_PER_PASS: usize = 4;
+
+/// A row condition already reported (and, for hard failures,
+/// permanently skipped): the damping key is `(instance_name,
+/// program_hash, kind)`, so reinstalling the same name with a new
+/// blob re-attempts and re-reports.
+type RowDamping = std::collections::HashSet<(String, [u8; 32], RowNote)>;
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum RowNote {
+    /// Hard per-row failure (transpile error, cache IO, bad
+    /// consistency, ServiceId collision). Warned once, then the
+    /// row is skipped outright — no point re-running the failing
+    /// work every pass.
+    Failed,
+    /// Program blob not cached yet. Warned once; the (cheap)
+    /// cache probe keeps retrying, so the row spawns if the blob
+    /// appears later.
+    AwaitingBlob,
+}
+
+/// One runtime spawn-reconcile pass: query the registry for
+/// installed agents and bring up any that aren't running yet —
+/// the runtime twin of [`spawn_installed_agents`], called from
+/// `run_forever_with`'s tick hook so agents installed (or
+/// CRDT-synced from a peer) after boot become usable without a
+/// restart.
+///
+/// Idempotent by construction: rows whose deterministic ServiceId
+/// is already registered on the node are skipped, including
+/// agents an operator stopped with `vosx <agent> stop` (their
+/// slot stays taken — a restart revives them, not this pass).
+/// At most [`MAX_SPAWNS_PER_PASS`] rows spawn per pass.
+///
+/// Trust model: registry rows replicate via CRDT sync with no
+/// per-row author check — the Admin gate on `install` fires only
+/// on the originating node. What bounds this pass is the local
+/// blob cache (it never fetches code; only already-cached
+/// programs can spawn), the subscriptions filter, and the
+/// per-pass cap. Until registry ops are author-signed, any space
+/// member can make peers spawn extra instances of programs those
+/// peers already hold.
+///
+/// Uninstall is still restart-bound: this pass only spawns, it
+/// never stops agents whose rows disappeared.
+fn reconcile_installed_agents(
+    node: &mut VosNode,
+    data_dir: &std::path::Path,
+    local_prefix: u16,
+    has_hyperspace: bool,
+    local_cfg: &crate::commands::space::subscriptions::LocalConfig,
+    damped: &mut RowDamping,
+) -> anyhow::Result<()> {
+    use space_registry::{STATUS_OK, SpaceRegistryRef};
+
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let agents =
+        vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+
+    let mut spawned_this_pass = 0usize;
+    for a in agents {
+        if spawned_this_pass >= MAX_SPAWNS_PER_PASS {
+            break;
+        }
+        if !local_cfg.should_spawn(&a.instance_name) {
+            continue;
+        }
+        let key = |note: RowNote| (a.instance_name.clone(), a.program_hash, note);
+        if damped.contains(&key(RowNote::Failed)) {
+            continue;
+        }
+        let svc_id = instance_service_id(&a.instance_name, local_prefix);
+        if node.has_agent(svc_id) {
+            // Usually this row's own agent. A *different* occupying
+            // name means a ~15-bit instance-name hash collision:
+            // name-deterministic, so the row can never spawn on any
+            // node — surface it instead of skipping silently.
+            let occupant = node.agent_name_for(svc_id.0);
+            if occupant
+                .as_deref()
+                .is_some_and(|o| !o.eq_ignore_ascii_case(&a.instance_name))
+                && damped.insert(key(RowNote::Failed))
+            {
+                tracing::warn!(
+                    "agent '{}' can never spawn — its ServiceId collides with installed \
+                     agent '{}' (rename one of them)",
+                    a.instance_name,
+                    occupant.unwrap_or_default(),
+                );
+            }
+            continue;
+        }
+        match agent_config_from_row(data_dir, &a) {
+            Ok(RowConfig::Ready(cfg)) => {
+                let id = node.register_at_id(*cfg, svc_id);
+                spawned_this_pass += 1;
+                tracing::info!(
+                    "agent '{}' spawned at runtime as {id} ({})",
+                    a.instance_name,
+                    crate::commands::space::common::consistency_name(a.consistency),
+                );
+                if has_hyperspace {
+                    let hs_reg = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+                    match vos::block_on(hs_reg.register_remote(
+                        &mut &*node,
+                        a.instance_name.clone(),
+                        local_prefix as u32,
+                    )) {
+                        Ok(STATUS_OK) => {}
+                        Ok(other) => tracing::warn!(
+                            "hyperspace: register_remote('{}') returned status {other}",
+                            a.instance_name,
+                        ),
+                        Err(e) => tracing::warn!(
+                            "hyperspace: register_remote('{}') failed: {e}",
+                            a.instance_name,
+                        ),
+                    }
+                }
+            }
+            Ok(RowConfig::MissingBlob) => {
+                if damped.insert(key(RowNote::AwaitingBlob)) {
+                    tracing::warn!(
+                        "agent '{}' pending — program blob {} not in the local cache \
+                         (no peer fetch exists yet); it spawns when the blob appears",
+                        a.instance_name,
+                        BlobHash(a.program_hash),
+                    );
+                }
+            }
+            Ok(RowConfig::BadConsistency) => {
+                if damped.insert(key(RowNote::Failed)) {
+                    tracing::warn!(
+                        "skipping agent '{}' — unknown consistency {}",
+                        a.instance_name,
+                        a.consistency,
+                    );
+                }
+            }
+            Err(e) => {
+                if damped.insert(key(RowNote::Failed)) {
+                    tracing::warn!("agent '{}' failed to spawn: {e}", a.instance_name);
+                }
+            }
+        }
+    }
     Ok(())
 }
 

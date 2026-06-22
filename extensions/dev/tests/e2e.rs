@@ -144,10 +144,9 @@ impl Daemon {
     }
 
     /// Stop + restart the daemon process against the same
-    /// space + manifest. Used after registry-modifying operations
-    /// (`dev new`, `space install`) so the reconciler's startup
-    /// scan picks up the new agents — the current daemon doesn't
-    /// have a watch loop for runtime registry updates.
+    /// space + manifest. For tests that assert state survives a
+    /// full daemon cycle (CRDT-restored actor state, re-spawned
+    /// agent threads).
     fn restart(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -390,6 +389,27 @@ impl TestClient {
         }
         <Value as Decode>::decode(&reply)
     }
+
+    /// Like [`invoke`](Self::invoke), but tolerates the window
+    /// between a registry install and the daemon's idle-hook
+    /// spawn-reconcile bringing the agent thread up: an unspawned
+    /// target's dispatch returns an empty reply (`Unit`), so poll
+    /// until the agent answers with anything else. Only suitable
+    /// for verbs that never legitimately return `Unit`.
+    fn invoke_until_ready(&self, target: ServiceId, msg: &Msg, what: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let v = self.invoke(target, msg);
+            if !matches!(v, Value::Unit) {
+                return v;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent for {what} didn't spawn within 20s of its install",
+            );
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
 }
 
 impl Drop for TestClient {
@@ -530,18 +550,18 @@ fn member_config(daemon: &Daemon) -> TempDir {
 #[test]
 fn dev_compile_publish_install_invoke() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     // 1. Provision the dev-project instance via the CLI. The
-    //    registry now knows about `myproject`, but the daemon's
-    //    `spawn_installed_agents` only runs at startup — restart
-    //    so the new agent's thread comes up.
+    //    daemon's idle-hook spawn-reconcile brings the new agent's
+    //    thread up within a couple of seconds — no restart. The
+    //    first invoke below polls through that window, which is
+    //    the runtime-spawn property this test gates.
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "myproject"],
         "vosx dev new",
     );
-    daemon.restart();
 
     let client = TestClient::connect(daemon.data_dir());
 
@@ -549,9 +569,10 @@ fn dev_compile_publish_install_invoke() {
     let project_id = client.resolve_instance("myproject");
 
     // 3. Put the counter source into the project's blob store.
-    let put_reply = client.invoke(
+    let put_reply = client.invoke_until_ready(
         project_id,
         &Msg::new("put_blob").with("bytes", COUNTER_SOURCE.as_bytes().to_vec()),
+        "myproject",
     );
     let blob_hash = match put_reply {
         Value::Bytes(b) => {
@@ -630,16 +651,14 @@ fn dev_compile_publish_install_invoke() {
         "vosx space install",
     );
 
-    // Drop the client + restart the daemon: same reason as after
-    // `dev new` — `space install` only writes the registry row,
-    // the agent thread comes up at the next `spawn_installed_agents`
-    // pass, which is currently bound to daemon startup.
-    drop(client);
-    daemon.restart();
-    let client = TestClient::connect(daemon.data_dir());
-
     // 9. Invoke `inc` twice; assert the count advances 1 → 2.
+    //    `space install` only writes the registry row; the idle-hook
+    //    spawn-reconcile brings the counter up moments later. Probe
+    //    with the read-only `get` (0 on a fresh counter — non-Unit
+    //    exactly when the agent answers) so polling can't consume
+    //    an increment.
     let counter_id = client.resolve_instance("counter");
+    client.invoke_until_ready(counter_id, &Msg::new("get"), "counter");
     let first = client.invoke(counter_id, &Msg::new("inc"));
     let second = client.invoke(counter_id, &Msg::new("inc"));
 
@@ -669,15 +688,15 @@ fn dev_compile_publish_install_invoke() {
 #[test]
 fn dev_publish_admin_succeeds_member_refused() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
-    // Admin provisions + compiles a project.
+    // Admin provisions + compiles a project. The spawn-reconcile
+    // brings the agent up mid-run; put_source polls through it.
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "authproj"],
         "vosx dev new authproj",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("authproj");
     let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
@@ -778,9 +797,10 @@ fn decode_hash_result_assert_ok(value: Value, label: &str) -> Vec<u8> {
 #[test]
 fn compile_via_ast_matches_raw_artifact() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
-    // Provision two independent projects.
+    // Provision two independent projects. Both agents spawn from
+    // the idle-hook reconcile; put_source polls through the window.
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "proj-raw"],
@@ -791,7 +811,6 @@ fn compile_via_ast_matches_raw_artifact() {
         &["dev", "new", "--space", &daemon.space_name, "proj-ast"],
         "vosx dev new proj-ast",
     );
-    daemon.restart();
 
     let client = TestClient::connect(daemon.data_dir());
     let raw_id = client.resolve_instance("proj-raw");
@@ -838,7 +857,13 @@ fn compile_via_ast_matches_raw_artifact() {
 }
 
 fn put_source(client: &TestClient, project_id: ServiceId, method: &str, bytes: &[u8]) -> Vec<u8> {
-    let reply = client.invoke(project_id, &Msg::new(method).with("bytes", bytes.to_vec()));
+    // until_ready: the project agent may still be spawning when
+    // this is the first invoke after a `dev new`.
+    let reply = client.invoke_until_ready(
+        project_id,
+        &Msg::new(method).with("bytes", bytes.to_vec()),
+        "dev project",
+    );
     match reply {
         Value::Bytes(b) => {
             assert_eq!(b.len(), 32, "{method} should return a 32-byte hash");
@@ -1012,7 +1037,7 @@ fn build_intent_for(client: &TestClient, project_id: ServiceId) -> dev_project::
 #[test]
 fn cross_project_deps_compile_resolves_lib() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     run_cli(
         &daemon,
@@ -1024,7 +1049,6 @@ fn cross_project_deps_compile_resolves_lib() {
         &["dev", "new", "--space", &daemon.space_name, "proj-a"],
         "vosx dev new proj-a",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
 
     let proj_b_id = client.resolve_instance("proj-b");
@@ -1089,14 +1113,13 @@ fn cross_project_deps_compile_resolves_lib() {
 #[test]
 fn cross_project_deps_self_cycle_errors_loudly() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "proj-cycle"],
         "vosx dev new proj-cycle",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
 
     let proj_id = client.resolve_instance("proj-cycle");
@@ -1192,14 +1215,13 @@ impl Counter {
 #[test]
 fn dev_compile_surfaces_cargo_failure() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "proj-broken"],
         "vosx dev new proj-broken",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
 
     let project_id = client.resolve_instance("proj-broken");
@@ -1251,14 +1273,13 @@ fn dev_compile_surfaces_cargo_failure() {
 #[test]
 fn dev_show_tree_and_file() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "showproj"],
         "vosx dev new showproj",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("showproj");
 
@@ -1314,14 +1335,13 @@ fn dev_show_tree_and_file() {
 #[test]
 fn dev_show_missing_path_errors() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "showproj2"],
         "vosx dev new showproj2",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("showproj2");
     let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
@@ -1353,14 +1373,13 @@ fn dev_show_missing_path_errors() {
 #[test]
 fn dev_merge_ff_advances_main() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "mergeproj"],
         "vosx dev new mergeproj",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("mergeproj");
 
@@ -1423,14 +1442,13 @@ fn dev_merge_ff_advances_main() {
 #[test]
 fn dev_merge_missing_into_errors_clearly() {
     ensure_built();
-    let mut daemon = boot_daemon();
+    let daemon = boot_daemon();
 
     run_cli(
         &daemon,
         &["dev", "new", "--space", &daemon.space_name, "mergeproj2"],
         "vosx dev new mergeproj2",
     );
-    daemon.restart();
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("mergeproj2");
 
@@ -1503,7 +1521,6 @@ fn dev_project_main_branch_survives_daemon_restart() {
         &["dev", "new", "--space", &daemon.space_name, "restartproj"],
         "vosx dev new restartproj",
     );
-    daemon.restart();
 
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("restartproj");

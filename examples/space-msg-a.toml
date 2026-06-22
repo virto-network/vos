@@ -57,6 +57,9 @@ name = "messenger"
 path = "../target/debug/libmessenger_extension.so"
 tick_ms = 500
 # The messenger relays the operator's caller to the channel actors;
-# member is the ceiling the post/commit handlers need. Registry
-# lookups (`resolve`) are read-tier and need no cap.
-intra_caps = ["msg-general-log:member", "msg-general-ctl:member", "msg-directory:member"]
+# member is the ceiling the post/commit handlers need, and the
+# `msg-*` prefix also covers channels created at runtime (their
+# agent names don't exist at manifest time). `space-registry:admin`
+# lets an admin's `messenger create` install a new channel's agent
+# pair; registry lookups (`resolve`) are ungated and need no cap.
+intra_caps = ["msg-*:member", "space-registry:admin"]

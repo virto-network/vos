@@ -20,6 +20,11 @@ const PAGE_LIMIT: u32 = 16;
 
 pub(crate) async fn tick_channels(m: &mut Messenger, ctx: &mut MsgrCtx) {
     for i in 0..m.channels.len() {
+        // A frozen channel makes no progress until repaired; don't
+        // spend ticks re-fetching its chain or parking its log.
+        if m.channels[i].desynced {
+            continue;
+        }
         if let Err(e) = drain_ctl(m, i, ctx).await {
             log::debug!(
                 "messenger: ctl drain for '{}' paused: {e}",
@@ -27,6 +32,7 @@ pub(crate) async fn tick_channels(m: &mut Messenger, ctx: &mut MsgrCtx) {
             );
         }
         if m.channels[i].joined
+            && !m.channels[i].desynced
             && let Err(e) = drain_log(m, i, ctx).await
         {
             log::debug!(
@@ -57,7 +63,21 @@ pub(crate) async fn drain_ctl(
         }
         for row in rows {
             if m.channels[i].joined {
-                process_chain_record(m, i, &row.commit_body, row.epoch)?;
+                if let Err(e) = process_chain_record(m, i, &row.commit_body, row.epoch) {
+                    // A commit we cannot apply (malformed, or we are
+                    // already behind). Freeze the channel pending
+                    // repair instead of re-fetching this record every
+                    // tick and wedging the drain forever. Other
+                    // members who CAN apply it are unaffected.
+                    log::warn!(
+                        "messenger: channel '{}' desynced at chain epoch {}: {e}",
+                        m.channels[i].name,
+                        row.epoch
+                    );
+                    m.channels[i].desynced = true;
+                    m.channels[i].next_epoch = row.epoch + 1;
+                    return Ok(());
+                }
                 m.channels[i].next_epoch = row.epoch + 1;
             } else if !row.welcome.is_empty() && m.holds_key_package(&row.welcome_hint) {
                 join_from_welcome(m, i, &row.welcome, &row.welcome_hint)?;
@@ -136,9 +156,18 @@ fn join_from_welcome(
     };
     let staged = StagedWelcome::new_from_welcome(&provider, &join_config(), welcome, None)
         .map_err(|e| format!("welcome staging failed: {e}"))?;
-    let group = staged
+    let mut group = staged
         .into_group(&provider)
         .map_err(|e| format!("joining from welcome failed: {e}"))?;
+    // Bind the Welcome to THIS channel: a Welcome rides channel X's
+    // ctl chain but its embedded GroupId is attacker/peer-chosen.
+    // Refuse one whose group isn't this channel's, so a misrouted or
+    // malicious Welcome can't graft a foreign group onto the channel.
+    let expected = crate::mls::group_id_for(&m.channels[i].name);
+    if group.group_id().as_slice() != expected {
+        let _ = group.delete(provider.storage());
+        return Err("welcome's group id does not match this channel — ignoring".into());
+    }
     let join_epoch = group.epoch().as_u64();
 
     m.mls_store = snapshot_provider(&provider);
@@ -146,6 +175,7 @@ fn join_from_welcome(
     let entry: &mut ChannelEntry = &mut m.channels[i];
     entry.joined = true;
     entry.removed = false;
+    entry.desynced = false;
     entry.join_epoch = join_epoch;
     entry.next_epoch = join_epoch;
     log::info!(
@@ -206,10 +236,20 @@ async fn drain_log(m: &mut Messenger, i: usize, ctx: &mut MsgrCtx) -> Result<(),
                         text,
                     });
                     advance_cursor(entry, row.lamport, row.id);
+                    // Only an MLS-authenticated message may raise our
+                    // send clock. Undecryptable envelopes (garbage,
+                    // replay, injection) must not — otherwise one
+                    // envelope with lamport u64::MAX would poison every
+                    // member's `send`. See lib.rs send saturating add.
+                    if row.lamport > entry.max_lamport {
+                        entry.max_lamport = row.lamport;
+                    }
                 }
                 Err(e) => {
                     // Garbage, replay, or a non-member's injection:
-                    // skip permanently — MLS already refused it.
+                    // skip permanently — MLS already refused it. The
+                    // cursor advances (so we don't re-fetch it) but the
+                    // send clock does NOT move.
                     log::warn!("messenger: dropping undecryptable envelope in '{name}': {e}");
                     advance_cursor(&mut m.channels[i], row.lamport, row.id);
                 }
@@ -221,12 +261,13 @@ async fn drain_log(m: &mut Messenger, i: usize, ctx: &mut MsgrCtx) -> Result<(),
     }
 }
 
+/// Advance the pagination cursor only. The send clock
+/// (`max_lamport`) is bumped separately, and exclusively from
+/// MLS-authenticated messages, so untrusted envelopes can't drive
+/// it (see the decrypt loop above).
 fn advance_cursor(entry: &mut ChannelEntry, lamport: u64, id: [u8; 32]) {
     entry.cursor_lamport = lamport;
     entry.cursor_id = id.to_vec();
-    if lamport > entry.max_lamport {
-        entry.max_lamport = lamport;
-    }
 }
 
 pub(crate) fn decrypt_app(

@@ -20,6 +20,17 @@
 //! any name. Inviters must validate the claimed KeyPackage
 //! cryptographically (the messenger does), and nickname↔identity
 //! binding arrives with the platform identity layer.
+//!
+//! `claim_kp` is open to any publisher, so a member can drain
+//! another's inventory (griefing): the victim's invite-by-name
+//! then reports "no packages left" and the inviter falls back to
+//! an out-of-band hand-off; the victim republishes (the quota
+//! frees as packages are spent). A claimed package is only a
+//! public KeyPackage — it lets the claimer add the victim to an
+//! MLS group, but the victim's messenger only joins channels it
+//! was locally asked to watch, so an unsolicited Welcome is inert.
+//! Binding claims to real invite authorization is an identity-layer
+//! follow-up.
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_std)]
@@ -39,8 +50,15 @@ pub const KP_HASH_DOMAIN_TAG: &[u8] = b"vos-msg-kp/v1";
 /// bytes for the pinned ciphersuite).
 pub const MAX_KP_BYTES: usize = 4 * 1024;
 
-/// Bound on stored (unclaimed + claimed) packages per member —
-/// keeps a chatty publisher from bloating every replica.
+/// Bound on operator-controlled identity/name strings (nickname,
+/// channel name, creator). Replicated to every node, so cap them so
+/// a member can't bloat shared state with a giant string.
+pub const MAX_NAME_BYTES: usize = 128;
+
+/// Bound on a member's *live* (unclaimed) packages — caps the
+/// inventory waiting to be claimed without ever locking a member
+/// out of replenishing once their packages are spent. Claimed
+/// rows are retained for the single-use marker but don't count.
 pub const MAX_KPS_PER_MEMBER: usize = 16;
 
 /// Byte budget for one `channels` page.
@@ -155,7 +173,7 @@ impl MsgDirectory {
     /// hash; bounded per member.
     #[msg(role = MsgDirectoryRole::Publisher)]
     async fn publish_kp(&mut self, owner: String, kp: Vec<u8>) -> u8 {
-        if owner.is_empty() || kp.is_empty() {
+        if owner.is_empty() || kp.is_empty() || owner.len() > MAX_NAME_BYTES {
             return STATUS_INVALID_INPUT;
         }
         if kp.len() > MAX_KP_BYTES {
@@ -169,12 +187,16 @@ impl MsgDirectory {
             Ok(_) => return STATUS_OK,
             Err(p) => p,
         };
-        let held = self
+        // Bound *live* (unclaimed) inventory, not lifetime
+        // publishes — a member who has used up their packages must
+        // be able to replenish. Claimed rows are spent and don't
+        // count.
+        let unclaimed = self
             .key_packages
             .iter()
-            .filter(|r| r.owner == owner)
+            .filter(|r| r.owner == owner && !r.claimed)
             .count();
-        if held >= MAX_KPS_PER_MEMBER {
+        if unclaimed >= MAX_KPS_PER_MEMBER {
             return STATUS_QUOTA_EXCEEDED;
         }
         self.key_packages.insert(
@@ -218,7 +240,7 @@ impl MsgDirectory {
     /// collisions.
     #[msg(role = MsgDirectoryRole::Publisher)]
     async fn announce_channel(&mut self, name: String, creator: String) -> u8 {
-        if name.is_empty() {
+        if name.is_empty() || name.len() > MAX_NAME_BYTES || creator.len() > MAX_NAME_BYTES {
             return STATUS_INVALID_INPUT;
         }
         let pos = match self.channels.binary_search_by(|r| r.name.cmp(&name)) {
@@ -391,6 +413,38 @@ mod tests {
         );
         // Quota is per member.
         assert_eq!(publish(&mut d, "carol", b"kp"), STATUS_OK);
+        // Oversized owner / channel names are refused.
+        let long = "x".repeat(MAX_NAME_BYTES + 1);
+        assert_eq!(publish(&mut d, &long, b"kp"), STATUS_INVALID_INPUT);
+        assert_eq!(
+            dispatch(
+                &mut d,
+                AnnounceChannel {
+                    name: long,
+                    creator: "alice".into(),
+                },
+            ),
+            STATUS_INVALID_INPUT,
+        );
+    }
+
+    #[test]
+    fn spent_packages_free_quota_for_replenishment() {
+        // The quota bounds live inventory, not lifetime publishes —
+        // a member who claimed all their packages must be able to
+        // publish more. Otherwise a long-lived member locks out
+        // after MAX_KPS_PER_MEMBER total invites.
+        let mut d = MsgDirectory::new();
+        for i in 0..MAX_KPS_PER_MEMBER {
+            assert_eq!(
+                publish(&mut d, "bob", format!("kp-{i}").as_bytes()),
+                STATUS_OK
+            );
+        }
+        assert_eq!(publish(&mut d, "bob", b"blocked"), STATUS_QUOTA_EXCEEDED);
+        // Consume one; a slot frees up.
+        assert!(!claim(&mut d, "bob").is_empty());
+        assert_eq!(publish(&mut d, "bob", b"replenished"), STATUS_OK);
     }
 
     #[test]

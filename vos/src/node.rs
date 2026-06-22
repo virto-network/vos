@@ -2218,11 +2218,41 @@ impl VosNode {
     /// is called from another thread (e.g. a SIGTERM handler) or
     /// every agent has exited on its own.
     pub fn run_forever(&mut self) {
+        self.run_forever_with(|_| {});
+    }
+
+    /// Like [`run_forever`](Self::run_forever), but invokes
+    /// `on_tick` with `&mut self` on every loop pass — after each
+    /// routed envelope and on each ~50 ms idle timeout — so the
+    /// hook keeps firing under sustained envelope traffic. This is
+    /// the only moment the embedder can get mutable access to a
+    /// running node, so it's the hook for maintenance work that
+    /// needs registration rights — e.g. spawning agents that were
+    /// installed (or CRDT-synced into the registry) after boot.
+    ///
+    /// Contract:
+    /// - The callback runs on the router thread with envelope
+    ///   routing paused, and may fire many times per second under
+    ///   traffic: rate-limit internally (a cheap elapsed check) and
+    ///   keep the heavy path short.
+    /// - Synchronous invokes are safe ONLY against targets whose
+    ///   handlers never issue envelope-path effects: PVM actors and
+    ///   `ctx.ask_dispatch` ride `invoke_routes` directly, but an
+    ///   extension handler doing a plain `ctx.ask` parks its
+    ///   envelope on the outbox this loop drains — invoking such a
+    ///   target from here stalls all routing for the invoke
+    ///   timeout and then fails.
+    /// - The loop still exits when every agent thread has finished,
+    ///   checked before the idle-arm callback: on a node with no
+    ///   (live) agents the hook never fires, so it cannot be used
+    ///   to bootstrap the first agent.
+    pub fn run_forever_with(&mut self, mut on_tick: impl FnMut(&mut Self)) {
         loop {
             match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(envelope) => {
                     self.route(envelope);
                     *self.last_activity.lock().unwrap() = Instant::now();
+                    on_tick(self);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if self.shutdown.load(Ordering::Relaxed) {
@@ -2235,6 +2265,7 @@ impl VosNode {
                     if all_done {
                         break;
                     }
+                    on_tick(self);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -2307,6 +2338,19 @@ impl VosNode {
             }
             None => false,
         }
+    }
+
+    /// Whether an agent (actor, service, or transport) is
+    /// registered under `id` on this node. Stays `true` for agents
+    /// that were stopped individually (`stop_agent`) — their slot
+    /// is still taken, so re-registering at the same id would
+    /// clobber routes. The cheap idempotency probe for embedder
+    /// spawn-reconcile loops.
+    pub fn has_agent(&self, id: ServiceId) -> bool {
+        self.agent_info
+            .read()
+            .map(|m| m.contains_key(&id.0))
+            .unwrap_or(false)
     }
 
     /// Describe a SINGLE agent by id: a JSON snapshot of its
@@ -5551,6 +5595,64 @@ mod tests {
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn run_forever_with_idle_hook_gets_mut_node_and_can_invoke() {
+        // A stand-in long-running agent: without one, the
+        // all-agents-exited early-exit breaks the loop before the
+        // idle hook ever fires.
+        let mut node = VosNode::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let agent_stop = stop.clone();
+        node.agents.push(AgentHandle {
+            join: Some(thread::spawn(move || {
+                while !agent_stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                AgentResult {
+                    id: ServiceId(1),
+                    panics: 0,
+                    error: None,
+                }
+            })),
+        });
+
+        // The hook registers a responder on its first tick (the
+        // &mut access registration needs), then synchronously
+        // invokes it on later ticks — the same shape an embedder's
+        // spawn-reconcile uses (register_at_id + registry query).
+        let mut responder: Option<ServiceId> = None;
+        let mut echoed: Option<Vec<u8>> = None;
+        node.run_forever_with(|n| match responder {
+            None => responder = Some(n.install_invoke_responder(|msg| msg)),
+            Some(id) => {
+                if echoed.is_none() {
+                    echoed = n.invoke(id, b"ping".to_vec());
+                }
+                if echoed.is_some() {
+                    n.shutdown();
+                }
+            }
+        });
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(echoed.as_deref(), Some(&b"ping"[..]));
+    }
+
+    #[test]
+    fn has_agent_tracks_registered_ids() {
+        let node = VosNode::new();
+        let id = ServiceId::new(0, 0x0123);
+        assert!(!node.has_agent(id));
+        node.agent_info.write().unwrap().insert(
+            id.0,
+            AgentInfo {
+                name: Some("late".into()),
+                kind: crate::extension::ExtensionKind::Actor as u8,
+                serves_addr: None,
+            },
+        );
+        assert!(node.has_agent(id));
     }
 
     #[test]

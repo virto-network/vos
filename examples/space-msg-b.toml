@@ -31,4 +31,4 @@ consistency = "crdt"
 name = "messenger"
 path = "../target/debug/libmessenger_extension.so"
 tick_ms = 500
-intra_caps = ["msg-general-log:member", "msg-general-ctl:member", "msg-directory:member"]
+intra_caps = ["msg-*:member", "space-registry:admin"]

@@ -32,7 +32,7 @@ mod tick;
 
 use clients::{
     ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp, hex_decode,
-    hex_encode, log_post, resolve,
+    hex_encode, log_post, reg_agents, reg_install, resolve,
 };
 use mls::{kp_hint, new_key_package, open_provider, parse_key_package, snapshot_provider};
 use openmls::prelude::*;
@@ -95,6 +95,11 @@ pub struct ChannelEntry {
     /// (history kept, no decryption possible) until a re-invite's
     /// Welcome arrives.
     pub removed: bool,
+    /// `true` once a commit on the chain couldn't be applied to our
+    /// group: the channel is frozen at its current epoch (no further
+    /// commits processed, no new messages decrypted) pending repair,
+    /// rather than re-fetching the bad record forever.
+    pub desynced: bool,
     /// First epoch we hold keys for; envelopes below it are
     /// undecryptable history by MLS design.
     pub join_epoch: u64,
@@ -202,12 +207,20 @@ impl Messenger {
     }
 
     /// Create a channel: a fresh MLS group with this member as its
-    /// only occupant. The channel's `msg-<name>-log` and
-    /// `msg-<name>-ctl` agents must be installed (manifest).
+    /// only occupant. When the channel's `msg-<name>-log` /
+    /// `msg-<name>-ctl` agents aren't installed yet (no manifest
+    /// entry), they're installed here — program rows cloned from an
+    /// existing channel pair, fresh replication ids — and the
+    /// host's spawn-reconcile brings them up within a few seconds
+    /// on every member's node. Installing is Admin-gated; the
+    /// pre-installed (manifest) path needs no role.
     #[msg(cli)]
     async fn create(&mut self, channel: String, ctx: &mut Context<Self>) -> String {
         if self.channel_index(&channel).is_some() {
             return format!("channel '{channel}' already known");
+        }
+        if let Err(e) = self.ensure_channel_agents(&channel, ctx).await {
+            return e;
         }
         let provider = open_provider(&self.mls_store);
         let (credential, signer) = match self.identity(&provider) {
@@ -225,6 +238,7 @@ impl Messenger {
             name: channel.clone(),
             joined: true,
             removed: false,
+            desynced: false,
             join_epoch: 0,
             next_epoch: 0,
             cursor_lamport: 0,
@@ -295,6 +309,7 @@ impl Messenger {
             name: channel.clone(),
             joined: false,
             removed: false,
+            desynced: false,
             join_epoch: 0,
             next_epoch: 0,
             cursor_lamport: 0,
@@ -428,7 +443,12 @@ impl Messenger {
             return "serializing message failed".into();
         };
         let epoch = group.epoch().as_u64();
-        let lamport = self.channels[i].max_lamport + 1;
+        // Saturating: a poisoned channel whose lamports were driven
+        // to u64::MAX must never panic (debug) or wrap to 0 (which
+        // msg-log rejects) and wedge sending. Worst case under
+        // attack, messages pile at MAX ordered by id — degraded
+        // ordering, never a dead send path.
+        let lamport = self.channels[i].max_lamport.saturating_add(1);
         let ts_ms = now_ms();
         let id = msg_log::envelope_id(
             msg_log::ENVELOPE_KIND_APP,
@@ -443,12 +463,18 @@ impl Messenger {
             Ok(id) => id,
             Err(e) => return e,
         };
+        // Persist the advanced sender ratchet BEFORE publishing the
+        // ciphertext. If we crash after the post lands but before
+        // persisting, the next boot would re-derive this generation
+        // and re-encrypt under the same AES-GCM nonce — a key-stream
+        // reuse break. Snapshotting first means the persisted ratchet
+        // is always at least as advanced as anything posted; a crash
+        // after persist but before post merely skips a generation
+        // (harmless — receivers tolerate gaps).
+        self.mls_store = snapshot_provider(&provider);
         if let Err(e) = log_post(ctx, log_id, epoch, lamport, ts_ms, body).await {
             return e;
         }
-        // The sender ratchet advanced — persist even though the
-        // plaintext never touches the actors.
-        self.mls_store = snapshot_provider(&provider);
         let entry = &mut self.channels[i];
         entry.max_lamport = lamport;
         entry.own_ids.push(id);
@@ -496,7 +522,13 @@ impl Messenger {
         ));
         let provider = open_provider(&self.mls_store);
         for c in &self.channels {
-            if c.joined {
+            if c.desynced {
+                out.push_str(&format!(
+                    "channel {}: desynced — needs repair ({} messages kept)\n",
+                    c.name,
+                    c.messages.len()
+                ));
+            } else if c.joined {
                 let (epoch, members) = match self.load_group(&provider, &c.name) {
                     Ok(g) => (g.epoch().as_u64(), g.members().count()),
                     Err(_) => (0, 0),
@@ -548,6 +580,67 @@ impl Messenger {
         self.channels.iter().position(|c| c.name == name)
     }
 
+    /// Make sure the channel's `msg-<chan>-{log,ctl}` registry rows
+    /// exist, installing whichever half is missing. Program identity
+    /// comes from any already-installed `msg-*-log` / `msg-*-ctl`
+    /// row (the manifest installs the first channel's pair, so a
+    /// template always exists in a working space); each new agent
+    /// gets a fresh random replication id, which peers pick up from
+    /// the CRDT-synced row. Installed rows spawn via the host's
+    /// spawn-reconcile — a send/invite racing that window answers
+    /// "unreachable" and succeeds on retry.
+    async fn ensure_channel_agents(
+        &self,
+        channel: &str,
+        ctx: &mut Context<Self>,
+    ) -> core::result::Result<(), String> {
+        let log_name = log_agent_name(channel);
+        let ctl_name = ctl_agent_name(channel);
+        let log_missing = resolve(ctx, &log_name).await.is_err();
+        let ctl_missing = resolve(ctx, &ctl_name).await.is_err();
+        if !log_missing && !ctl_missing {
+            return Ok(());
+        }
+
+        let rows = reg_agents(ctx).await.map_err(|e| {
+            format!("channel agents not installed and the catalog is unavailable: {e}")
+        })?;
+        let template_for = |suffix: &str| {
+            rows.iter()
+                .find(|r| r.instance_name.starts_with("msg-") && r.instance_name.ends_with(suffix))
+        };
+        // Resolve every needed template BEFORE installing anything:
+        // a missing template after the first install would leave a
+        // half-pair of registry rows behind, replicated space-wide.
+        let mut installs = Vec::new();
+        for (missing, name, suffix) in [
+            (log_missing, &log_name, "-log"),
+            (ctl_missing, &ctl_name, "-ctl"),
+        ] {
+            if !missing {
+                continue;
+            }
+            let Some(template) = template_for(suffix) else {
+                return Err(format!(
+                    "no installed msg-*{suffix} agent to clone program rows from — \
+                     declare one channel in the space manifest first"
+                ));
+            };
+            installs.push((name, template));
+        }
+        let provider = open_provider(&self.mls_store);
+        for (name, template) in installs {
+            let rep_id = mls::fresh_replication_id(&provider)?;
+            match reg_install(ctx, name, template, rep_id).await? {
+                // EXISTS: someone else's create won the race (or a
+                // peer's row synced in) — the post-condition holds.
+                space_registry::STATUS_OK | space_registry::STATUS_INSTANCE_EXISTS => {}
+                code => return Err(format!("installing '{name}' failed (status {code})")),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn holds_key_package(&self, hint: &[u8; 32]) -> bool {
         self.published_kps.iter().any(|k| k.hash == *hint)
     }
@@ -589,6 +682,13 @@ impl Messenger {
         channel: &str,
         op: ChainOp<'_>,
     ) -> core::result::Result<u64, String> {
+        if let Some(i) = self.channel_index(channel)
+            && self.channels[i].desynced
+        {
+            return Err(format!(
+                "channel '{channel}' is desynced — repair it before making membership changes"
+            ));
+        }
         let ctl_id = resolve(ctx, &ctl_agent_name(channel)).await?;
         for attempt in 0..2 {
             let provider = open_provider(&self.mls_store);
@@ -608,11 +708,36 @@ impl Messenger {
                     (c, Some(w), kp_hint(kp_bytes).to_vec())
                 }
                 ChainOp::Remove { nickname } => {
-                    let target = group
+                    // Nicknames are unverified and non-unique, so a
+                    // group can hold two leaves both credentialed the
+                    // same. Refuse an ambiguous target rather than
+                    // evicting an arbitrary first-match (a Remove is
+                    // binding and can't be rewound), and never let a
+                    // nickname match resolve to our own leaf.
+                    let own = group.own_leaf_index();
+                    let matches: Vec<_> = group
                         .members()
-                        .find(|m| m.credential.serialized_content() == nickname.as_bytes())
-                        .ok_or_else(|| format!("'{nickname}' is not a member of '{channel}'"))?
-                        .index;
+                        .filter(|m| m.credential.serialized_content() == nickname.as_bytes())
+                        .map(|m| m.index)
+                        .collect();
+                    let target = match matches.as_slice() {
+                        [] => {
+                            return Err(format!("'{nickname}' is not a member of '{channel}'"));
+                        }
+                        [only] if *only == own => {
+                            return Err("that nickname resolves to your own leaf — \
+                                 have another member remove you"
+                                .into());
+                        }
+                        [only] => *only,
+                        _ => {
+                            return Err(format!(
+                                "'{nickname}' is ambiguous ({} leaves share it) — \
+                                 removal by nickname is unsafe here",
+                                matches.len()
+                            ));
+                        }
+                    };
                     let (c, w, _info) = group
                         .remove_members(&provider, &signer, &[target])
                         .map_err(|e| format!("remove_members failed: {e}"))?;

@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use space_registry::{ProgramRow, STATUS_OK, STATUS_TAG_CONFLICT, SpaceRegistryRef};
+use space_registry::{
+    ProgramRow, STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_TAG_CONFLICT, SpaceRegistryRef,
+};
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
 use vos::node::{ExtensionConfig, VosNode};
@@ -447,13 +449,20 @@ fn render_intra_caps(caps: &[vos::IntraCap]) -> String {
 fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<String> {
     let full = caps.iter().any(|c| c.is_full_wildcard());
     let actor_wild = caps.iter().any(|c| c.is_actor_wildcard());
-    if !actor_wild {
+    // A prefix cap with a `*` role ("msg-*:*") is the same footgun
+    // one namespace down: uncapped (Admin-ceiling) relay across
+    // every actor matching the prefix, present and future.
+    let prefix_uncapped = caps.iter().any(|c| c.is_actor_prefix() && c.role.is_none());
+    if !actor_wild && !prefix_uncapped {
         return None;
     }
     let detail = if full {
         "'*' / '*:*' grants ANY role on ANY actor — the extension becomes a fully-trusted relay"
-    } else {
+    } else if actor_wild {
         "a '*:<role>' cap grants that role on EVERY actor in the space"
+    } else {
+        "a '<prefix>*:*' cap grants ANY role (Admin ceiling) on every actor matching the \
+         prefix — including ones installed later"
     };
     Some(format!(
         "extension '{name}': intra_caps wildcard is a footgun — {detail}. \
@@ -477,7 +486,10 @@ fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<Str
 /// compared case-insensitively to match [`vos::IntraCap`]'s matching).
 /// A named cap outside it is almost certainly a typo: it will silently
 /// relay as `Unauthenticated`, so we flag it at boot. Wildcard-actor
-/// caps (`*:<role>`) match anything and are never flagged.
+/// caps (`*:<role>`) match anything and are never flagged; trailing-`*`
+/// prefix caps (`msg-*:<role>`) are forward-looking grants for agents
+/// installed after boot, so the manifest roster can't falsify them —
+/// also exempt.
 fn unresolvable_cap_warning(
     name: &str,
     caps: &[vos::IntraCap],
@@ -487,7 +499,7 @@ fn unresolvable_cap_warning(
         known_names.iter().map(|n| n.to_ascii_lowercase()).collect();
     let mut unresolved: Vec<&str> = caps
         .iter()
-        .filter(|c| !c.is_actor_wildcard())
+        .filter(|c| !c.is_actor_wildcard() && !c.is_actor_prefix())
         .filter_map(|c| c.actor_name.as_deref())
         .filter(|n| !known_lc.contains(&n.to_ascii_lowercase()))
         .collect();
@@ -751,6 +763,20 @@ fn reconcile_one(
     ))
     .map_err(|e| anyhow::anyhow!("registry.install('{}'): {e}", agent.name))?;
 
+    // A joining node's registry replica may already carry this
+    // agent (the creator installed it and it arrived via CRDT sync
+    // before — or during — this reconcile). `install` is not
+    // idempotent in the registry; it reports STATUS_INSTANCE_EXISTS.
+    // That's the agent already being present, which is exactly the
+    // post-condition we want, so treat it as success and proceed to
+    // spawn. Only an unexpected status is fatal.
+    if status == STATUS_INSTANCE_EXISTS {
+        tracing::info!(
+            "agent {} already installed (synced from a peer) — reusing",
+            agent.name,
+        );
+        return Ok(());
+    }
     if status != STATUS_OK {
         anyhow::bail!("install '{}' returned status {}", agent.name, status);
     }

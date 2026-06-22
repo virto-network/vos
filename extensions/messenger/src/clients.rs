@@ -14,6 +14,9 @@ use vos::value::{Msg, TAG_DYNAMIC, Value};
 
 use crate::MsgrCtx;
 
+/// The space registry's well-known local id.
+const REGISTRY_ID: u32 = 0;
+
 pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -48,7 +51,6 @@ fn value_to_status(v: Value) -> Option<u8> {
 /// the space registry. `Ok(0)` never escapes — an unknown name is
 /// an error here.
 pub(crate) async fn resolve(ctx: &mut MsgrCtx, name: &str) -> Result<u32, String> {
-    const REGISTRY_ID: u32 = 0;
     let local_prefix = (ctx.id().0 >> 16) as u16;
     let msg = Msg::new("resolve")
         .with("name", name.to_string())
@@ -68,6 +70,62 @@ pub(crate) async fn resolve(ctx: &mut MsgrCtx, name: &str) -> Result<u32, String
         return Err(format!("agent '{name}' not installed"));
     }
     Ok(id)
+}
+
+/// `space-registry.agents` — the installed-agent catalog. Used to
+/// clone an existing channel pair's program rows when creating a
+/// channel dynamically. Ungated on the registry side.
+pub(crate) async fn reg_agents(ctx: &mut MsgrCtx) -> Result<Vec<space_registry::AgentRow>, String> {
+    let msg = Msg::new("agents");
+    let raw = ctx
+        .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
+        .await
+        .ok_or_else(|| "registry unreachable".to_string())?;
+    let value = decode_value(&raw).ok_or_else(|| "bad registry reply".to_string())?;
+    let inner = value_to_bytes(value).ok_or_else(|| "bad registry reply".to_string())?;
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    <Vec<space_registry::AgentRow> as vos::Decode>::try_decode(&inner)
+        .ok_or_else(|| "bad registry agents payload".to_string())
+}
+
+/// `space-registry.install` — instantiate a new agent row, cloning
+/// the program identity (name/version/hash) and consistency from
+/// `template` under a fresh instance name + replication id.
+///
+/// The verb is Admin-gated and the host relays the real caller's
+/// role bounded by our manifest `intra_caps`; a refusal surfaces
+/// from `ask_dispatch` as `None`, indistinguishable from an
+/// unreachable registry, so the error names both causes.
+pub(crate) async fn reg_install(
+    ctx: &mut MsgrCtx,
+    instance_name: &str,
+    template: &space_registry::AgentRow,
+    replication_id: [u8; 32],
+) -> Result<u8, String> {
+    let msg = Msg::new("install")
+        .with("instance_name", instance_name.to_string())
+        .with("program_name", template.program_name.clone())
+        .with("program_version", template.program_version.clone())
+        .with("program_hash", template.program_hash.to_vec())
+        .with("replication_id", replication_id.to_vec())
+        .with("consistency", template.consistency as u64)
+        .with("install_args", Vec::<u8>::new())
+        .with("install_payloads", Vec::<u8>::new());
+    let raw = ctx
+        .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
+        .await
+        .ok_or_else(|| {
+            format!(
+                "installing '{instance_name}' was refused or the registry is \
+                 unreachable — creating a channel installs its agents, which \
+                 needs an admin caller and a `space-registry:admin` intra-cap \
+                 on the messenger"
+            )
+        })?;
+    let value = decode_value(&raw).ok_or_else(|| "bad registry reply".to_string())?;
+    value_to_status(value).ok_or_else(|| "bad registry install reply".to_string())
 }
 
 /// `msg-log.post` — append one App envelope.

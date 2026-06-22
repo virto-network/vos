@@ -197,7 +197,7 @@ consistency = "crdt"
 name = "messenger"
 path = "{so}"
 tick_ms = 300
-intra_caps = ["msg-general-log:member", "msg-general-ctl:member", "msg-directory:member"]
+intra_caps = ["msg-*:member", "space-registry:admin"]
 "#,
         log_elf = msg_log_elf().display(),
         ctl_elf = msg_ctl_elf().display(),
@@ -472,12 +472,12 @@ impl RawClient {
         }
     }
 
-    /// Page the whole raw envelope log off the daemon's
-    /// msg-general-log replica.
-    fn raw_envelopes(&self) -> Vec<msg_log::EnvelopeRow> {
+    /// Page the whole raw envelope log off one of the daemon's
+    /// msg-<chan>-log replicas.
+    fn raw_envelopes(&self, log_instance: &str) -> Vec<msg_log::EnvelopeRow> {
         let raw: [u8; 2] = vos::crypto::blake2b_hash(
             b"vos-instance-svc-id/v1",
-            &[&[0u8], "msg-general-log".as_bytes()],
+            &[&[0u8], log_instance.as_bytes()],
         );
         let local = (u16::from_le_bytes(raw) & 0x7FFF).max(0x100);
         let target = ServiceId(((self.daemon_prefix as u32) << 16) | (local as u32));
@@ -533,6 +533,9 @@ const A_TO_B_TEXT: &str = "hello bob, this never crossed the wire in the clear";
 const B_TO_A_TEXT: &str = "hi alice, ciphertext-only replication confirmed";
 const POST_REMOVAL_TEXT: &str = "after-eviction secret: bob's keys stop here";
 const POST_REJOIN_TEXT: &str = "welcome back bob, fresh epoch fresh keys";
+const DEV_WARMUP_TEXT: &str = "dev epoch-0 warm-up: pre-bob, forever alice-only";
+const DEV_A_TEXT: &str = "dev channel says hi over runtime-spawned agents";
+const DEV_B_TEXT: &str = "roger from bob on the runtime channel";
 
 #[test]
 fn two_nodes_exchange_e2ee_messages() {
@@ -679,7 +682,7 @@ fn two_nodes_exchange_e2ee_messages() {
         b"bob",
     ];
     for (who, daemon) in [("A", &a), ("B", &b)] {
-        let envelopes = RawClient::connect(daemon.data_dir()).raw_envelopes();
+        let envelopes = RawClient::connect(daemon.data_dir()).raw_envelopes("msg-general-log");
         assert!(
             envelopes.len() >= 3,
             "node {who} should replicate all 3 envelopes, got {}",
@@ -727,17 +730,27 @@ fn two_nodes_exchange_e2ee_messages() {
     // ciphertext (replication delivered it), then assert his
     // plaintext store never gains it — eviction revoked the keys,
     // not the bytes.
+    //
+    // What this e2e proves: a removed member's messenger replicates
+    // the ciphertext but stops surfacing the channel's new plaintext.
+    // It does NOT by itself prove the *cryptographic* inability to
+    // decrypt — once removed, bob's messenger marks the channel
+    // un-joined and skips its log drain, so it never attempts the
+    // decryption. The hard PCS property (the evicted member's keys
+    // cannot decrypt post-removal traffic even if it tries) is pinned
+    // by the offline `removed_member_cannot_decrypt_post_removal_traffic`
+    // unit test, which drives `decrypt_app` directly and asserts Err.
     {
         let bob_raw = RawClient::connect(b.data_dir());
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if bob_raw.raw_envelopes().len() >= 4 {
+            if bob_raw.raw_envelopes("msg-general-log").len() >= 4 {
                 break;
             }
             thread::sleep(Duration::from_millis(400));
         }
         assert!(
-            bob_raw.raw_envelopes().len() >= 4,
+            bob_raw.raw_envelopes("msg-general-log").len() >= 4,
             "bob's replica should hold the post-removal ciphertext"
         );
     }
@@ -749,7 +762,7 @@ fn two_nodes_exchange_e2ee_messages() {
     );
     assert!(
         !bob_history.contains(POST_REMOVAL_TEXT),
-        "an evicted member must not decrypt post-removal traffic:\n{bob_history}"
+        "an evicted member must not surface post-removal traffic:\n{bob_history}"
     );
     assert!(
         bob_history.contains(A_TO_B_TEXT),
@@ -790,4 +803,104 @@ fn two_nodes_exchange_e2ee_messages() {
         "bob sees post-rejoin message",
         |s| s.contains(POST_REJOIN_TEXT) && !s.contains(POST_REMOVAL_TEXT),
     );
+
+    // ── Dynamic second channel: no manifest entry, no restart.
+    //    `create` clones the general pair's program rows into
+    //    fresh msg-dev-{log,ctl} registry rows; A's idle
+    //    spawn-reconcile brings them up locally, B's spawns them
+    //    from the CRDT-synced rows; the invite/join/exchange flow
+    //    then runs unchanged on the new channel. ─────────────────
+    messenger(&a, &["create", "channel=dev"], "alice creates dev channel");
+    // The first send races the spawn-reconcile window — poll until
+    // the channel's freshly spawned log agent answers. This epoch-0
+    // message predates bob's join, so it must stay alice-only.
+    wait_for(
+        &a,
+        &["send", "channel=dev", &format!("text={DEV_WARMUP_TEXT}")],
+        "alice dev warm-up send",
+        |s| s.contains("sent"),
+    );
+    messenger(&b, &["join", "channel=dev"], "bob joins dev");
+    {
+        // Same KeyPackage-replication race as the general-channel
+        // invite, plus bob's msg-dev-ctl spawn window.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let out = messenger(
+                &a,
+                &["invite", "channel=dev", "member=bob"],
+                "alice dev invite",
+            );
+            if out.contains("invited") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "alice's dev invite never succeeded: {out}"
+            );
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+    wait_for(&b, &["status"], "bob status until dev joined", |s| {
+        s.contains("channel dev: joined")
+    });
+    messenger(
+        &a,
+        &["send", "channel=dev", &format!("text={DEV_A_TEXT}")],
+        "alice dev send",
+    );
+    wait_for(
+        &b,
+        &["history", "channel=dev", "limit=20"],
+        "bob dev history",
+        |s| s.contains(DEV_A_TEXT),
+    );
+    messenger(
+        &b,
+        &["send", "channel=dev", &format!("text={DEV_B_TEXT}")],
+        "bob dev send",
+    );
+    wait_for(
+        &a,
+        &["history", "channel=dev", "limit=20"],
+        "alice dev history",
+        |s| s.contains(DEV_B_TEXT) && s.contains(DEV_A_TEXT),
+    );
+    // Pre-join history stays sealed on the runtime channel too:
+    // bob's replica holds the warm-up ciphertext, his MLS state
+    // has no epoch-0 keys.
+    let bob_dev_history = messenger(
+        &b,
+        &["history", "channel=dev", "limit=50"],
+        "bob full dev history",
+    );
+    assert!(
+        !bob_dev_history.contains("warm-up"),
+        "bob must not decrypt the dev channel's pre-join history:\n{bob_dev_history}"
+    );
+
+    // The runtime-spawned log replicates ciphertext-only on both
+    // nodes — same privacy gate as the manifest channel.
+    for (who, daemon) in [("A", &a), ("B", &b)] {
+        let envelopes = RawClient::connect(daemon.data_dir()).raw_envelopes("msg-dev-log");
+        assert!(
+            envelopes.len() >= 3,
+            "node {who} should replicate the dev channel's envelopes, got {}",
+            envelopes.len()
+        );
+        for env in &envelopes {
+            for needle in [
+                DEV_WARMUP_TEXT.as_bytes(),
+                DEV_A_TEXT.as_bytes(),
+                DEV_B_TEXT.as_bytes(),
+            ] {
+                assert!(
+                    !env.body.windows(needle.len()).any(|w| w == needle),
+                    "node {who}: dev envelope lamport={} leaks plaintext {:?}",
+                    env.lamport,
+                    String::from_utf8_lossy(needle),
+                );
+            }
+        }
+    }
 }

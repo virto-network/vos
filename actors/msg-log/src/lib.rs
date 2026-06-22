@@ -50,9 +50,11 @@ pub const ENVELOPE_ID_DOMAIN_TAG: &[u8] = b"vos-msg-envelope/v1";
 /// the message log.
 pub const MAX_BODY_BYTES: usize = 48 * 1024;
 
-/// Byte budget for one `history` page. Dispatch replies are
-/// capped at 16 KiB; budget the variable part well under that so
-/// the rkyv framing always fits.
+/// Soft byte budget for one `history` page. The host's hard reply
+/// ceiling is much higher (8 MiB producer cap), so this is a
+/// pagination-ergonomics target, not a correctness bound — it keeps
+/// pages small and predictable. A single envelope larger than the
+/// budget is still returned alone (progress is never starved).
 pub const HISTORY_BYTE_BUDGET: usize = 12 * 1024;
 
 /// Hard cap on rows per `history` page, independent of size.

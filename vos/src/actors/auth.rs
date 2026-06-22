@@ -340,6 +340,10 @@ impl core::fmt::Display for Forbidden {
 /// Wildcards:
 /// - `"space-registry:*"` — any role on that actor (uncapped).
 /// - `"*:developer"` — developer ceiling on *any* actor.
+/// - `"msg-*:member"` — member ceiling on any actor whose instance
+///   name starts with `msg-`. The trailing-`*` prefix form is how an
+///   extension reaches agents it installs dynamically (per-channel
+///   actor pairs), whose exact names don't exist at manifest time.
 /// - `"*"` (or `"*:*"`) — any role on any actor. A footgun: the
 ///   extension becomes a fully-trusted relay. Install-time code
 ///   emits a loud warning (see [`Self::is_full_wildcard`]).
@@ -403,6 +407,17 @@ impl IntraCap {
         let actor_name = if actor == "*" {
             None
         } else {
+            // `*` inside a name is only meaningful as a trailing
+            // prefix wildcard (`msg-*`). Reject other placements
+            // loudly — a silently-literal `*` would never match an
+            // installed agent and the cap would be dead.
+            let stars = actor.matches('*').count();
+            if stars > 1 || (stars == 1 && !actor.ends_with('*')) {
+                return Err(err(
+                    "'*' in an actor name only supports the trailing prefix \
+                     form (e.g. \"msg-*\")",
+                ));
+            }
             Some(actor.to_ascii_lowercase())
         };
         let role =
@@ -421,6 +436,14 @@ impl IntraCap {
         self.actor_name.is_none()
     }
 
+    /// `true` when this cap's actor side is a trailing-`*` prefix
+    /// pattern (`msg-*`). Such caps are forward-looking — they match
+    /// agents installed after manifest time — so name-roster
+    /// validation doesn't apply to them.
+    pub fn is_actor_prefix(&self) -> bool {
+        self.actor_name.as_deref().is_some_and(|n| n.ends_with('*'))
+    }
+
     /// `true` when this is the `*:*` footgun (matches every actor at
     /// every role) — install-time code warns on these.
     pub fn is_full_wildcard(&self) -> bool {
@@ -436,11 +459,19 @@ impl IntraCap {
 
     /// Does this cap match `target_name`? Wildcard-actor caps match
     /// every target (including unresolved ones, where `target_name`
-    /// is `None`); named caps match only their (case-folded) name.
+    /// is `None`); a trailing-`*` cap (`msg-*`) matches any resolved
+    /// name with that (case-folded) prefix; named caps match only
+    /// their exact (case-folded) name.
     fn matches(&self, target_name: Option<&str>) -> bool {
         match &self.actor_name {
             None => true,
-            Some(name) => target_name.is_some_and(|t| t.eq_ignore_ascii_case(name)),
+            Some(pat) => match pat.strip_suffix('*') {
+                Some(prefix) => target_name.is_some_and(|t| {
+                    t.get(..prefix.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                }),
+                None => target_name.is_some_and(|t| t.eq_ignore_ascii_case(pat)),
+            },
         }
     }
 }
@@ -734,6 +765,42 @@ mod tests {
             cap_for(&caps, Some("SPACE-REGISTRY")),
             Some(SpaceRole::Developer)
         );
+    }
+
+    #[test]
+    fn cap_for_prefix_wildcard_matches_named_targets_only() {
+        // The dynamic-install shape: one cap covers every
+        // per-channel agent pair without knowing channel names at
+        // manifest time.
+        let caps = [IntraCap::parse("msg-*:member").unwrap()];
+        for t in ["msg-general-log", "msg-dev-ctl", "msg-directory", "MSG-X"] {
+            assert_eq!(cap_for(&caps, Some(t)), Some(SpaceRole::Member), "{t}");
+        }
+        // Not a substring match, and never an unresolved target —
+        // prefix caps require a resolved instance name.
+        assert_eq!(cap_for(&caps, Some("amsg-x")), None);
+        assert_eq!(cap_for(&caps, Some("msg")), None);
+        assert_eq!(cap_for(&caps, None), None);
+
+        // Degenerate `prefix*` with empty prefix matches any *named*
+        // target (still not unresolved ones — that stays `*`-only).
+        let caps = [IntraCap::parse("x*:guest").unwrap()];
+        assert_eq!(cap_for(&caps, Some("x")), Some(SpaceRole::Guest));
+        assert_eq!(cap_for(&caps, Some("y")), None);
+    }
+
+    #[test]
+    fn intra_cap_parse_rejects_non_trailing_star() {
+        for tok in ["m*g:member", "*foo:member", "f**:member", "**:member"] {
+            let e = IntraCap::parse(tok).unwrap_err();
+            assert!(e.reason.contains("trailing prefix"), "{tok} → {}", e.reason);
+        }
+        // Trailing form parses and round-trips through Display.
+        let c = IntraCap::parse("Msg-*:member").unwrap();
+        assert_eq!(c.actor_name.as_deref(), Some("msg-*"));
+        let rendered = alloc::format!("{c}");
+        assert_eq!(rendered, "msg-*:member");
+        assert_eq!(IntraCap::parse(&rendered).unwrap(), c);
     }
 
     #[test]

@@ -462,9 +462,11 @@ fn ai_actor_apply_e2e() {
         .spawn()
         .expect("spawn vosx space up");
 
-    // The reconciler doesn't watch the registry at runtime, so
-    // we need `space new` → daemon restart cycles to pick up
-    // each new agent. Pattern matches the dev extension's e2e.
+    // Restarting after each registry-modifying step gives the
+    // test a deterministic point where the new agent is running.
+    // (The daemon's spawn-reconcile also brings new rows up
+    // within a couple of seconds mid-run; the restart just avoids
+    // polling for that window.)
     let space_data_dir = resolve_space_data_dir(config_home.path(), space_name);
     wait_endpoint(&space_data_dir, &log_path);
 
@@ -483,8 +485,8 @@ fn ai_actor_apply_e2e() {
         String::from_utf8_lossy(&new_proj.stderr),
     );
 
-    // Restart so the project's actor instance comes up. Same
-    // dance the dev extension's e2e does.
+    // Restart so the project's actor instance is deterministically
+    // up before the next step (see the note above).
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(space_data_dir.join(".endpoint"));

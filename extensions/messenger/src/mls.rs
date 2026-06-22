@@ -34,13 +34,30 @@ pub(crate) const GROUP_ID_DOMAIN_TAG: &[u8] = b"vos-msg-group/v1";
 const OUT_OF_ORDER_TOLERANCE: u32 = 64;
 const MAX_FORWARD_DISTANCE: u32 = 2000;
 
-/// Decrypt this many epochs behind the group's current one — the
-/// log and the commit chain replicate independently, so messages
-/// from recently-passed epochs are routine.
-const MAX_PAST_EPOCHS: usize = 8;
+/// Retain decryption keys for this many epochs behind the group's
+/// current one. The log and the commit chain replicate
+/// independently, so application messages from recently-passed
+/// epochs are routine; a message older than this window is dropped
+/// undecryptably. Generous so a burst of membership changes between
+/// a message being sent and a member draining it doesn't silently
+/// lose it — the cost is bounded key-material retention.
+const MAX_PAST_EPOCHS: usize = 64;
 
 pub(crate) fn group_id_for(channel: &str) -> [u8; 32] {
     vos::crypto::blake2b_hash(GROUP_ID_DOMAIN_TAG, &[channel.as_bytes()])
+}
+
+/// 32 random bytes from the crypto provider's RNG — the
+/// replication id for a dynamically installed channel agent.
+/// Random rather than name-derived so the sync group / gossip
+/// topic isn't guessable from the channel name; members learn it
+/// from the registry's replicated `AgentRow` instead.
+pub(crate) fn fresh_replication_id(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
+    use openmls_traits::random::OpenMlsRand;
+    provider
+        .rand()
+        .random_array::<32>()
+        .map_err(|e| format!("rng failure: {e:?}"))
 }
 
 /// The Welcome routing hint is the directory's canonical
@@ -112,13 +129,19 @@ fn decode_store(bytes: &[u8]) -> Option<HashMap<Vec<u8>, Vec<u8>>> {
     let mut at = 0usize;
     let count = read_u64(&mut at)?;
     let mut map = HashMap::new();
+    // `checked_add` + `get` throughout: a corrupt or truncated
+    // snapshot (e.g. a length field claiming more bytes than remain,
+    // or one large enough to overflow `at + len`) must yield None so
+    // `open_provider` falls back to a fresh provider, never panic.
     for _ in 0..count {
         let k_len = read_u64(&mut at)? as usize;
         let v_len = read_u64(&mut at)? as usize;
-        let k = bytes.get(at..at + k_len)?.to_vec();
-        at += k_len;
-        let v = bytes.get(at..at + v_len)?.to_vec();
-        at += v_len;
+        let k_end = at.checked_add(k_len)?;
+        let k = bytes.get(at..k_end)?.to_vec();
+        at = k_end;
+        let v_end = at.checked_add(v_len)?;
+        let v = bytes.get(at..v_end)?.to_vec();
+        at = v_end;
         map.insert(k, v);
     }
     Some(map)
@@ -246,6 +269,43 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A corrupt snapshot — including length fields engineered to
+    /// overflow the running offset — must degrade to a fresh
+    /// provider, never panic. Regression for the unchecked
+    /// `at + len` arithmetic in decode_store.
+    #[test]
+    fn corrupt_snapshots_yield_a_fresh_provider() {
+        let empty = |bytes: &[u8]| {
+            open_provider(bytes)
+                .storage()
+                .values
+                .read()
+                .unwrap()
+                .is_empty()
+        };
+        // count=1 but no following length fields.
+        assert!(empty(&1u64.to_le_bytes()));
+        // count=1, k_len claiming u64::MAX (would overflow at+len),
+        // v_len=0, no body.
+        let mut overflow = Vec::new();
+        overflow.extend_from_slice(&1u64.to_le_bytes());
+        overflow.extend_from_slice(&u64::MAX.to_le_bytes());
+        overflow.extend_from_slice(&0u64.to_le_bytes());
+        assert!(empty(&overflow));
+        // count=1, k_len longer than the remaining bytes.
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(&1u64.to_le_bytes());
+        truncated.extend_from_slice(&64u64.to_le_bytes());
+        truncated.extend_from_slice(&0u64.to_le_bytes());
+        truncated.extend_from_slice(b"short");
+        assert!(empty(&truncated));
+        // A real snapshot still round-trips after these.
+        let provider = OpenMlsRustCrypto::default();
+        make_identity(&provider, "carol");
+        let snap = snapshot_provider(&provider);
+        assert!(!empty(&snap));
     }
 
     /// The whole Phase-1 cryptographic flow offline, crossing the

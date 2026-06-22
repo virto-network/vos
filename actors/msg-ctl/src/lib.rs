@@ -34,16 +34,18 @@ use vos::prelude::*;
 /// Domain tag for commit-record ids.
 pub const COMMIT_ID_DOMAIN_TAG: &[u8] = b"vos-msg-commit/v1";
 
-/// Per-field ciphertext bound. A `CommitRow` must stay fetchable
-/// in a single dispatch reply (16 KiB cap), so commit + welcome
-/// together are also bounded by [`MAX_ROW_BYTES`].
+/// Per-field ciphertext bound. Keeps a `CommitRow` small and a
+/// `commits` page predictable; the host's hard reply ceiling is far
+/// higher (8 MiB), so this is a sizing choice, not a correctness
+/// bound. Commit + welcome together are also held under
+/// [`MAX_ROW_BYTES`].
 pub const MAX_BODY_BYTES: usize = 8 * 1024;
 
-/// Combined bound on `commit_body + welcome` so one row always
-/// fits a `commit_at` reply with framing headroom. Generous for
-/// small groups (an OpenMLS Welcome for a handful of members is
-/// a few KiB); larger groups need welcome-by-blob-reference,
-/// which can land without changing this actor's chain semantics.
+/// Combined bound on `commit_body + welcome` so one row stays small.
+/// Generous for small groups (an OpenMLS Welcome for a handful of
+/// members is a few KiB); larger groups need welcome-by-blob-
+/// reference, which can land without changing this actor's chain
+/// semantics.
 pub const MAX_ROW_BYTES: usize = 12 * 1024;
 
 /// Byte budget for one `commits` page (same dispatch-cap

@@ -30,6 +30,11 @@ vos = { path = "../../vos", default-features = false, features = ["extension"] }
 msg-log = { path = "../../actors/msg-log", default-features = false }
 msg-ctl = { path = "../../actors/msg-ctl", default-features = false }
 msg-directory = { path = "../../actors/msg-directory", default-features = false }
+# Registry wire types (AgentRow, status codes) for dynamic channel
+# creation: `create` clones an existing channel's program rows and
+# installs the new `msg-<chan>-{log,ctl}` pair through the
+# registry's `agents`/`install` verbs.
+space-registry = { path = "../../actors/space-registry", default-features = false }
 # RFC 9420 MLS — the whole content-confidentiality layer. Native
 # extension only; nothing MLS-shaped crosses into PVM actors.
 openmls = "0.8"

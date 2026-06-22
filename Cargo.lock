@@ -4492,6 +4492,7 @@ dependencies = [
  "openmls_rust_crypto",
  "openmls_traits",
  "serde",
+ "space-registry",
  "toml 0.8.23",
  "vos",
 ]
