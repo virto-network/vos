@@ -173,10 +173,28 @@ const M_ROOT: &str = "ca_m_root";
 const ZERO_ST: &str = "ca_zero_st";
 const HASH_LINK: &str = "ca_hash_link";
 const CAP_FWD: &str = "ca_cap_fwd";
-/// Per-row pinned tree root (the recomputed root of each path's tree). Step 1b
-/// pins this to the real commitment; step 2 binds it to the channel commit-absorb.
+/// Per-row pinned tree root (the recomputed root of each path's tree). The
+/// decommit's `out` is pinned to this on each m_root row; step 2b in turn binds
+/// this preprocessed root to the channel commit-absorb (so it is the channel's
+/// absorbed commitment, not a free host value).
 fn dc_root_id(j: usize) -> String {
     format!("ca_dc_root_{j}")
+}
+
+// ── Root ↔ commit-absorb binding (step 2b, obligation c) ─────────────────────
+// The canonical proof commits 4 trace trees; each commitment root is absorbed in
+// the transcript (mix_root → one Absorb record, root limbs in absorbed[0..8]). A
+// latched root_lat[t] is bound to that absorb (is_root_absorb[t]) and pins the
+// decommit's dc_root on tree t's root rows (is_root_t[t]) — so the re-hashed root
+// chains out == dc_root == root_lat == the channel's absorbed commitment.
+const N_TREES: usize = 4;
+/// is_root_absorb[t]: fires on tree t's commit-absorb row (an Absorb).
+fn root_absorb_id(t: usize) -> String {
+    format!("ca_root_absorb_{t}")
+}
+/// is_root_t[t]: fires on tree t's m_root rows (selects the latched root to pin).
+fn root_t_id(t: usize) -> String {
+    format!("ca_root_t_{t}")
 }
 
 // ── Preprocessed column ids (the fixed routing "program") ────────────────────
@@ -238,6 +256,14 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
     }
     for j in 0..8 {
         ids.push(PreProcessedColumnId { id: dc_root_id(j) });
+    }
+    for t in 0..N_TREES {
+        ids.push(PreProcessedColumnId {
+            id: root_absorb_id(t),
+        });
+    }
+    for t in 0..N_TREES {
+        ids.push(PreProcessedColumnId { id: root_t_id(t) });
     }
     ids.extend([
         PreProcessedColumnId {
@@ -459,6 +485,7 @@ struct MkRow {
     sib: [BaseField; 8],
     bit: u32,
     root: [BaseField; 8],
+    tree_idx: usize,
     m_sponge: bool,
     m_node: bool,
     m_root: bool,
@@ -476,6 +503,7 @@ fn mk_zfill() -> MkRow {
         sib: [zb; 8],
         bit: 0,
         root: [zb; 8],
+        tree_idx: 0,
         m_sponge: false,
         m_node: false,
         m_root: false,
@@ -489,7 +517,7 @@ fn mk_zfill() -> MkRow {
 fn mk_resolve(trees: &[&TreeData]) -> Vec<MkRow> {
     let zb = BaseField::zero();
     let mut rows: Vec<MkRow> = Vec::new();
-    for tree in trees {
+    for (ti, tree) in trees.iter().enumerate() {
         for path in &tree.paths {
             let chunks = leaf_chunks(&path.leaf_row);
             debug_assert_eq!(chunks.len(), leaf_perms(tree.width));
@@ -499,6 +527,7 @@ fn mk_resolve(trees: &[&TreeData]) -> Vec<MkRow> {
                 let first = ci == 0;
                 let last_sponge = ci + 1 == chunks.len();
                 let mut f = mk_zfill();
+                f.tree_idx = ti;
                 f.m_sponge = true;
                 f.zero_st = first;
                 f.chunk = *ch;
@@ -524,6 +553,7 @@ fn mk_resolve(trees: &[&TreeData]) -> Vec<MkRow> {
             // ── hash_children up to the root ──
             for level in 0..tree.height as usize {
                 let mut f = mk_zfill();
+                f.tree_idx = ti;
                 f.m_node = true;
                 let bit = path.bits[level];
                 let sib = path.sibs[level];
@@ -737,6 +767,14 @@ impl FrameworkEval for ChildFullEval {
         });
         let dc_root: [E::F; 8] = std::array::from_fn(|j| {
             eval.get_preprocessed_column(PreProcessedColumnId { id: dc_root_id(j) })
+        });
+        let is_root_absorb: [E::F; N_TREES] = std::array::from_fn(|t| {
+            eval.get_preprocessed_column(PreProcessedColumnId {
+                id: root_absorb_id(t),
+            })
+        });
+        let is_root_t: [E::F; N_TREES] = std::array::from_fn(|t| {
+            eval.get_preprocessed_column(PreProcessedColumnId { id: root_t_id(t) })
         });
         let is_rc_draw = eval.get_preprocessed_column(PreProcessedColumnId {
             id: IS_RC_DRAW.to_string(),
@@ -1165,6 +1203,29 @@ impl FrameworkEval for ChildFullEval {
         let mem_inv = air_inv(&mut eval, &t_mem, &mem_pow, &z_lat[2]);
         eval.add_constraint(E::EF::zero() - mem_inv - cs_ef[self.bound.pos[3]].clone());
 
+        // ── Root ↔ commit-absorb binding (step 2b, obligation c): latch each
+        //    tree's commitment root (held constant), bind it to the channel's
+        //    mix_root Absorb (absorbed[j] = root limb j), and pin the decommit's
+        //    per-row dc_root to it on the tree's root rows — so the re-hashed root
+        //    chains out == dc_root == root_lat == the channel's absorbed commitment
+        //    (the decommit verifies against the COMMITMENT the transcript fixed, not
+        //    a free host root). is_root_absorb/is_root_t are preprocessed (the same
+        //    trust model as the draw/cs indicators, W0-allowlist-pinned). ──
+        for t in 0..N_TREES {
+            let rl: [[E::F; 2]; 8] =
+                std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
+            for j in 0..8 {
+                eval.add_constraint(not_last.clone() * (rl[j][1].clone() - rl[j][0].clone()));
+                eval.add_constraint(
+                    is_root_absorb[t].clone() * (absorbed[j].clone() - rl[j][0].clone()),
+                );
+                eval.add_constraint(
+                    is_root_t[t].clone() * (dc_root[j].clone() - rl[j][0].clone()),
+                );
+            }
+            eval.add_constraint(is_root_absorb[t].clone() * (one.clone() - is_absorb.clone()));
+        }
+
         eval
     }
 }
@@ -1204,6 +1265,8 @@ fn gen_trace(
     bnd: &Bnd,
     lay: &ColocateLayout,
     mk_fills: &[MkRow],
+    roots: &[[BaseField; 8]],
+    root_absorb_row: &[usize],
     log_size: u32,
     channel_tamper: Option<usize>,
     final_tamper: bool,
@@ -1213,6 +1276,7 @@ fn gen_trace(
     state_tamper: bool,
     mk_chunk_tamper: bool,
     mk_sib_tamper: bool,
+    root_tamper: bool,
 ) -> ChildTrace {
     assert_eq!(
         claimed_sums.len(),
@@ -1405,6 +1469,7 @@ fn gen_trace(
     let mut zero_st = vec![zb; n];
     let mut hash_link = vec![zb; n];
     let mut cap_fwd = vec![zb; n];
+    let mut is_root_t: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_TREES];
     let mut dc_root: Vec<Vec<BaseField>> = vec![vec![zb; n]; 8];
     for (i, f) in mk_rows.iter().enumerate() {
         let row = n_real + i;
@@ -1440,6 +1505,35 @@ fn gen_trace(
         cap_fwd[row] = b(f.cap_fwd);
         for j in 0..8 {
             dc_root[j][row] = f.root[j];
+        }
+        if f.m_root {
+            is_root_t[f.tree_idx][row] = BaseField::one();
+        }
+    }
+
+    // ── Root ↔ commit-absorb (step 2b): is_root_absorb[t] fires on tree t's
+    //    mix_root Absorb row; root_lat[t] is the latched commitment root (constant,
+    //    = the real root, == the absorbed value there). root_tamper corrupts the
+    //    first tree's latched root so it ≠ the absorbed commitment. ──
+    assert_eq!(roots.len(), N_TREES, "canonical proof commits {N_TREES} trees");
+    assert_eq!(root_absorb_row.len(), N_TREES);
+    let mut is_root_absorb: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_TREES];
+    for t in 0..N_TREES {
+        debug_assert_eq!(
+            records[root_absorb_row[t]].kind,
+            PermKind::Absorb,
+            "tree {t} commit-absorb must land on an Absorb record"
+        );
+        is_root_absorb[t][root_absorb_row[t]] = BaseField::one();
+    }
+    let mut root_lat: Vec<Vec<BaseField>> = Vec::with_capacity(N_TREES * 8);
+    for (t, root) in roots.iter().enumerate() {
+        for (j, &v) in root.iter().enumerate() {
+            let mut val = v;
+            if root_tamper && t == 0 && j == 0 {
+                val += BaseField::one();
+            }
+            root_lat.push(vec![val; n]);
         }
     }
 
@@ -1690,6 +1784,12 @@ fn gen_trace(
     for col in dc_root {
         pre_b.push(col);
     }
+    for col in is_root_absorb {
+        pre_b.push(col);
+    }
+    for col in is_root_t {
+        pre_b.push(col);
+    }
     pre_b.push(is_rc_draw);
     pre_b.push(is_oods_draw);
     for col in is_cs_chunk {
@@ -1778,6 +1878,10 @@ fn gen_trace(
         let oa_col = CHANNEL_COLS + MK_COLS + (NLEAF + lay.final_lane * 3) * SECURE_EXTENSION_DEGREE;
         main_logical[oa_col][lay.final_row] += BaseField::one();
     }
+    // Root-latch columns are LAST in the main trace (read last in evaluate).
+    for col in root_lat {
+        main_logical.push(col);
+    }
     let main: Vec<_> = main_logical.into_iter().map(wrap).collect();
 
     ChildTrace {
@@ -1861,6 +1965,8 @@ struct ChildInputs {
     bnd: Bnd,
     lay: ColocateLayout,
     mk_fills: Vec<MkRow>,
+    roots: Vec<[BaseField; 8]>,
+    root_absorb_row: Vec<usize>,
     log_size: u32,
 }
 
@@ -1986,8 +2092,27 @@ fn build_inputs() -> ChildInputs {
     // sponges dominate). The mk_resolve gadget streams them back-to-back (one
     // perm/row), sorted mixed-degree leaves + partial-rate finalize per tree.
     let n_trees = proof.stark_proof.commitments.len();
+    assert_eq!(n_trees, N_TREES, "canonical proof commits {N_TREES} trace trees");
     let trees: Vec<TreeData> = (0..n_trees).map(|t| build_tree(&proof, &data, t)).collect();
     let mk_fills = mk_resolve(&trees.iter().collect::<Vec<_>>());
+
+    // Root ↔ commit-absorb (step 2b): each tree's commitment root is absorbed via
+    // mix_root (one Absorb record, root limbs in input[8..16] = the channel's
+    // `absorbed`). Match each root to its absorb record (trees 0-2 in the prefix,
+    // the composition tree in the verifier head). Roots are random hashes ⇒ the
+    // 8-limb match is unique.
+    let roots: Vec<[BaseField; 8]> = trees.iter().map(|t| t.root).collect();
+    let root_absorb_row: Vec<usize> = roots
+        .iter()
+        .map(|root| {
+            records
+                .iter()
+                .position(|rec| {
+                    rec.kind == PermKind::Absorb && (0..8).all(|j| rec.input[8 + j] == root[j])
+                })
+                .expect("each commitment root's mix_root absorb in the transcript")
+        })
+        .collect();
 
     // The component spans max(transcript + merkle rows, embed rows).
     let log_size = (records.len() + mk_fills.len())
@@ -2009,6 +2134,8 @@ fn build_inputs() -> ChildInputs {
         bnd,
         lay,
         mk_fills,
+        roots,
+        root_absorb_row,
         log_size,
     }
 }
@@ -2025,6 +2152,7 @@ impl ChildInputs {
         state_tamper: bool,
         mk_chunk_tamper: bool,
         mk_sib_tamper: bool,
+        root_tamper: bool,
     ) -> ChildTrace {
         gen_trace(
             &self.records,
@@ -2039,6 +2167,8 @@ impl ChildInputs {
             &self.bnd,
             &self.lay,
             &self.mk_fills,
+            &self.roots,
+            &self.root_absorb_row,
             self.log_size,
             channel_tamper,
             final_tamper,
@@ -2048,6 +2178,7 @@ impl ChildInputs {
             state_tamper,
             mk_chunk_tamper,
             mk_sib_tamper,
+            root_tamper,
         )
     }
 }
@@ -2099,7 +2230,7 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
 #[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
 fn child_full_air_satisfied() {
     let inp = build_inputs();
-    let trace = inp.trace(None, false, false, false, false, false, false, false);
+    let trace = inp.trace(None, false, false, false, false, false, false, false, false);
     let log_size = trace.log_size;
     let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
     let bound = trace.bound.clone();
@@ -2148,7 +2279,7 @@ fn child_full_air_satisfied() {
 fn child_full_gate() {
     let inp = build_inputs();
 
-    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false))
+    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false, false))
         .expect("honest per-child assembly must prove+verify at degree ≤ 2");
 
     // Reject: corrupt a channel absorbed value (the transcript binding) — also
@@ -2159,14 +2290,14 @@ fn child_full_gate() {
         .position(|r| r.kind == PermKind::Absorb)
         .expect("transcript has an absorb");
     assert!(
-        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false, false, false, false))
+        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false, false, false, false, false))
             .is_err(),
         "a corrupted transcript value must be rejected"
     );
 
     // Reject: corrupt the embed composition (the final-slot oa value).
     assert!(
-        prove_and_verify(inp.trace(None, true, false, false, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, true, false, false, false, false, false, false, false)).is_err(),
         "a corrupted embed value must be rejected"
     );
 
@@ -2174,7 +2305,7 @@ fn child_full_gate() {
     // derivation: only it reads oods_t, so this confirms the dinv/ox binding is
     // non-vacuous independent of the embed).
     assert!(
-        prove_and_verify(inp.trace(None, false, true, false, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, true, false, false, false, false, false, false)).is_err(),
         "a corrupted oods_t must be rejected by the OODS-point derivation"
     );
 
@@ -2182,35 +2313,35 @@ fn child_full_gate() {
     // (Absorb) row — the is_rc_draw·(1−is_squeeze) hardening must reject binding rc
     // to a non-challenge perm output.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, true, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, true, false, false, false, false, false)).is_err(),
         "an is_rc_draw indicator on a non-squeeze row must be rejected"
     );
 
     // Reject: corrupt a claimed_sum — breaks both its transcript-absorb binding
     // and the Σ claimed_sums == 0 balance.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, true, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, false, true, false, false, false, false)).is_err(),
         "a corrupted claimed_sum must be rejected"
     );
 
     // Reject: claim a wrong final memory root (the io-hash/root attack) — the
     // boundary recompute then ≠ the transcript-bound claimed_sum.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, true, false, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, false, false, true, false, false, false)).is_err(),
         "a wrong claimed boundary state (memory root) must be rejected"
     );
 
     // Reject: corrupt a streamed leaf chunk (the merkle decommit) — the leaf hash
     // diverges from the pinned root.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, false, true, false)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, false, false, false, true, false, false)).is_err(),
         "a corrupted merkle leaf chunk must be rejected"
     );
 
     // Reject: corrupt a streamed sibling on a node row — the re-hashed path diverges
     // from the pinned root.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, false, false, true)).is_err(),
+        prove_and_verify(inp.trace(None, false, false, false, false, false, false, true, false)).is_err(),
         "a corrupted merkle sibling must be rejected"
     );
 
@@ -2264,21 +2395,24 @@ fn child_full_measure() {
         preproc_cols,
     );
 
-    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false))
+    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false, false))
         .expect("honest full per-child verifier must prove+verify at degree ≤ 2");
 
-    // Reject: corrupt a streamed merkle sibling (the decommit soundness at full
-    // 4-tree scale) — the re-hashed path diverges from the pinned root.
+    // Reject: corrupt a latched tree root (obligation c) so it ≠ the channel's
+    // mix_root absorb — the is_root_absorb binding bites (the decommit no longer
+    // verifies against the transcript-fixed commitment).
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, false, false, true)).is_err(),
-        "a corrupted merkle sibling must be rejected at full scale"
+        prove_and_verify(inp.trace(None, false, false, false, false, false, false, false, true))
+            .is_err(),
+        "a latched root ≠ the channel commit-absorb must be rejected (obligation c)"
     );
 
     eprintln!(
         "child_full_measure GREEN @ log {}: the FULL per-child verifier (channel + streamed OODS \
-         embed + 4-tree streamed merkle decommit + latched challenges + claimed-sum balance + \
-         boundary recompute) proves+verifies a REAL canonical segment in ONE uniform component at \
-         degree ≤ 2; a corrupted merkle sibling is rejected. main {} M31 cols, preproc {} M31 cols.",
+         embed + 4-tree streamed merkle decommit with roots bound to the channel commit-absorb + \
+         latched challenges + claimed-sum balance + boundary recompute) proves+verifies a REAL \
+         canonical segment in ONE uniform component at degree ≤ 2; a root ≠ its commit-absorb is \
+         rejected (obligation c). main {} M31 cols, preproc {} M31 cols.",
         inp.log_size, main_cols, preproc_cols,
     );
 }
