@@ -1188,8 +1188,20 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >     (3) the cross-region `eval_lat` carrier (above) — PROVE+verify together in ONE uniform
 >     component at deg ≤ 2; tampered consumer-c / leaf / first_layer each rejected. ⇒ the 4c
 >     architecture is fully de-risked; what remains is SCALING + real wiring.
->   * **Add an interaction tree to `child_full`** (it currently commits preproc+main
->     only) via the `cross_chip_logup` `LogupTraceGenerator`→`to_cpu` transplant +
+>   * **INTERACTION TREE LANDED @ log 17 2026-06-22 (`child_full_measure`, commit
+>     `3a2a3ea`):** child_full now draws a `DeepLeafRelation` after the main commit,
+>     gens the leaf↔c logup interaction (the `cross_chip_logup` transplant via
+>     `gen_deep_interaction`), `mix_felts(claimed_sum)`, commits tree 2; a DEEP region
+>     in the free rows after transcript+merkle (producer derives c from real
+>     deep_batches[0] + emits +1, consumer drains −1, self-balanced, N_DEEP=64). The
+>     FULL per-child verifier WITH the interaction tree proves+verifies deg≤2 (~22
+>     min/prove); the pre-existing FRI tamper still rejects ⇒ the addition preserves
+>     soundness. **The foundational structural prereq is DONE.** Remaining increments
+>     (each ~22-min/prove, additive): scale producer to 17929, ride the m_sponge leaf
+>     rows in the consumer (+leaf·c→L), the factored eval + first_layer bind via
+>     eval_lat. Below is the original recipe for those.
+>   * **(original)** Add the interaction tree via the `cross_chip_logup`
+>     `LogupTraceGenerator`→`to_cpu` transplant +
 >     `mix_felts(claimed_sum)` in the channel replay. SCALE: ~17929 producer + ~681k
 >     (≈17929×38) consumer fractions → ~5 fractions/row at log 17; watch memory (the
 >     embed alone is ~17 GiB). REAL WIRING (what `deep_full` stands in for): `z`/`α` from the
