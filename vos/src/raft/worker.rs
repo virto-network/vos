@@ -54,9 +54,12 @@ pub use vos_raft::Role;
 pub struct WorkerConfig {
     /// Local node's `node_prefix`.
     pub me: u16,
-    /// Static cluster membership. Empty / single-element disables
-    /// elections (single-node mode stays in `Follower` forever
-    /// since there's no quorum to win).
+    /// Static cluster membership seed. A single-element `[me]`
+    /// self-elects as leader of a quorum of one (solo bootstrap);
+    /// an empty list never wins an election (no quorum to hold).
+    /// The persisted active configuration — log-recovered or
+    /// stored via `WriteBatch::active_config` — supersedes this
+    /// seed on boot.
     pub members: Vec<u16>,
     /// Replication group id — used for outbound `send_raft_*`
     /// calls and for matching inbound RPCs.

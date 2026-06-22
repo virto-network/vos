@@ -675,6 +675,25 @@ impl Network {
             .unwrap_or_default()
     }
 
+    /// Status of the locally-hosted replica for one replication
+    /// group, or `None` when this node hosts no handler for it.
+    /// Same shape a remote peer would get over a
+    /// [`Frame::RaftStatusReq`] — role, members, leader hint —
+    /// without the wire round-trip. The handler is cloned out of
+    /// the map before the call, so the lock is never held across
+    /// it; the call itself blocks briefly on the worker's inbox
+    /// (one round-trip on the worker thread).
+    pub fn local_raft_status(&self, replication_id: &[u8; 32]) -> Option<RaftStatusReply> {
+        let handler = self
+            .raft_handlers
+            .lock()
+            .ok()?
+            .get(replication_id)
+            .cloned()?;
+        let reply = handler.handle_status(replication_id);
+        reply.present.then_some(reply)
+    }
+
     // Operator-tooling senders (manifest fetch, raft join, raft
     // status) live in the `ops` submodule — they're driven by
     // CLI tools (`vosx space join`, cluster-status reporters),

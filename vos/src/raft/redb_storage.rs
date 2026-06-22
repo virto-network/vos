@@ -19,8 +19,9 @@
 //! [`Storage::commit_batch`] composes every populated field of a
 //! [`WriteBatch<u16>`] into a *single* `redb::WriteTransaction`. A crash
 //! mid-batch leaves either the pre-batch or the post-batch state on
-//! disk — the `truncate → compact → appends → state → meta` ordering
-//! that the worker relies on is enforced inside the txn before commit.
+//! disk — the `truncate → compact → appends → state → meta → config`
+//! ordering that the worker relies on is enforced inside the txn
+//! before commit.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -252,6 +253,10 @@ impl Storage<u16> for RedbStorage {
         Ok(meta_from_raft(&self.meta))
     }
 
+    async fn active_config(&self) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
+        super::log::load_active_config(&self.db)
+    }
+
     async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
         // Empty batch: nothing to do. Avoids opening a write txn
         // for a no-op call.
@@ -260,7 +265,8 @@ impl Storage<u16> for RedbStorage {
             || !batch.appends.is_empty();
         let touches_state = batch.state.is_some();
         let touches_meta = batch.meta.is_some();
-        if !(touches_log || touches_state || touches_meta) {
+        let touches_config = batch.active_config.is_some();
+        if !(touches_log || touches_state || touches_meta || touches_config) {
             return Ok(());
         }
 
@@ -274,6 +280,7 @@ impl Storage<u16> for RedbStorage {
 
         let new_meta = batch.meta.as_ref().cloned();
         let new_state = batch.state.clone();
+        let new_config = batch.active_config.clone();
         let mut do_txn = || -> Result<(), CommitError> {
             let txn = self.db.begin_write()?;
 
@@ -284,6 +291,7 @@ impl Storage<u16> for RedbStorage {
             //   4) replace state row (snapshot install, or
             //      single-node apply)
             //   5) replace meta scalars
+            //   6) persist the adopted active configuration
             if let Some(after) = batch.truncate_after {
                 self.log.truncate_after_in_txn(&txn, after)?;
             }
@@ -322,6 +330,13 @@ impl Storage<u16> for RedbStorage {
                 // META_LAST_APPLIED.
                 let raft_meta = raft_from_meta(&self.meta, m);
                 raft_meta.write_worker_fields_in_txn(&txn)?;
+            }
+            if let Some((current, joint_old)) = &new_config {
+                // Persisting the adopted configuration in the
+                // same txn keeps it atomic with the log mutation
+                // that produced it, and lets boot recovery survive
+                // compaction past the last `ConfigChange` entry.
+                super::log::write_active_config_in_txn(&txn, current, joint_old.as_deref())?;
             }
 
             txn.commit()?;
@@ -798,6 +813,46 @@ mod tests {
             assert_eq!(raw.len(), 3, "got entries: {raw:?}");
             assert_eq!(raw[0].payload(), Some(b"c".as_ref()));
             assert_eq!(raw[2].payload(), Some(b"e".as_ref()));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn active_config_persists_in_batch_and_survives_restart() {
+        // The worker hands the adopted configuration through
+        // `WriteBatch::active_config`; the storage must surface it
+        // again via `Storage::active_config` after a full reopen —
+        // that's what lets boot recovery survive compaction past
+        // the last `ConfigChange` entry.
+        let (path, dir) = temp_db_path();
+        {
+            let db = open_at(&path);
+            let mut s = RedbStorage::open(db).unwrap();
+            assert_eq!(block_on(s.active_config()).unwrap(), None);
+            block_on(s.commit_batch(WriteBatch {
+                appends: alloc::vec![LogEntry::config_change(
+                    1,
+                    1,
+                    Some(alloc::vec![0xAAAA]),
+                    alloc::vec![0xAAAA, 0xBBBB],
+                )],
+                active_config: Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+                ..Default::default()
+            }))
+            .unwrap();
+            assert_eq!(
+                block_on(s.active_config()).unwrap(),
+                Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+            );
+        }
+        {
+            let db = open_at(&path);
+            let s = RedbStorage::open(db).unwrap();
+            assert_eq!(
+                block_on(s.active_config()).unwrap(),
+                Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+                "active config must survive restart",
+            );
         }
         let _ = std::fs::remove_dir_all(dir);
     }

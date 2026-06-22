@@ -476,10 +476,13 @@ pub fn run_refine_service<A: super::Actor>() {
             // serialized state via READ (legal in refine) without any
             // host cooperation. On VOS, this path is skipped because
             // ACTOR_HOLDER is warm from the flat_mem overlay.
-            let mut state_buf = [0u8; BUF_SIZE];
-            let n = lifecycle::read_persisted_state(&mut state_buf);
-            let state = if n > 0 { Some(&state_buf[..n]) } else { None };
-            let boxed = Box::new(lifecycle::load_or_create::<A>(state));
+            //
+            // The read grows onto the heap when the state outgrew the
+            // probe buffer — a fixed-buffer read here would treat a
+            // large state as missing and silently resurrect the actor
+            // as default, persisting the wipe on the next save.
+            let state = lifecycle::read_persisted_state_owned();
+            let boxed = Box::new(lifecycle::load_or_create::<A>(state.as_deref()));
             *holder_ptr = Box::into_raw(boxed) as usize;
         }
         &mut *(*holder_ptr as *mut A)

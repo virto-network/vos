@@ -186,12 +186,12 @@ consistency = "crdt"
 [[agent]]
 name = "msg-general-ctl"
 path = "{ctl_elf}"
-consistency = "crdt"
+consistency = "raft"
 
 [[agent]]
 name = "msg-directory"
 path = "{dir_elf}"
-consistency = "crdt"
+consistency = "raft"
 
 [[extension]]
 name = "messenger"
@@ -595,6 +595,50 @@ fn two_nodes_exchange_e2ee_messages() {
         }
     }
 
+    // ── Raft enrollment: msg-general-ctl + msg-directory run as a
+    //    raft group whose voters come from the registry's members
+    //    table. A is the genesis voter; enroll B's DAEMON node so
+    //    its reconciler joins the groups and spawns followers.
+    //    Forwarded raft writes (a follower's commit re-sent to the
+    //    leader) carry the forwarding NODE's peer — distinct from
+    //    the operators' client peers — so both daemons' node peers
+    //    also get the member tier. ─────────────────────────────────
+    let ep_b = read_endpoint(b.data_dir());
+    run_cli(
+        &a,
+        &["space", "members", SPACE_NAME, "add-node", &ep_b.peer_id],
+        "enroll B's daemon as a raft voter",
+    );
+    run_cli(
+        &a,
+        &["space", "role", SPACE_NAME, "grant", &ep_b.peer_id, "read"],
+        "grant B's daemon the member tier",
+    );
+    run_cli(
+        &a,
+        &["space", "role", SPACE_NAME, "grant", &ep_a.peer_id, "read"],
+        "grant A's daemon the member tier",
+    );
+    // B's reconciler must join the groups and spawn its follower
+    // replicas before bob's register can publish KeyPackages (his
+    // local directory replica is the publish target).
+    {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let log = b.log_tail();
+            if log.contains("agent 'msg-directory' spawned at runtime")
+                && log.contains("agent 'msg-general-ctl' spawned at runtime")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "B never spawned its raft follower replicas\n--- B log ---\n{log}"
+            );
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+
     // ── Bob registers (auto-stocks the directory), watches the
     //    channel. ──────────────────────────────────────────────
     let out = messenger(&b, &["register", "nickname=bob"], "bob register");
@@ -608,8 +652,10 @@ fn two_nodes_exchange_e2ee_messages() {
     //    completes the join. ─────────────────────────────────────
     let out = messenger(&b, &["status"], "bob status pre-invite");
     assert!(out.contains("waiting for welcome"), "status: {out}");
-    // Bob's directory rows replicate to A's replica via CRDT sync;
-    // alice's claim races that, so poll the invite itself.
+    // Bob's KeyPackages reach A's directory replica via the raft
+    // log; alice's claim races that — and the ctl group may still
+    // be mid-join (B's admission as a voter) — so poll the invite
+    // itself and let the deadline be the real assert.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let out = messenger(
@@ -623,10 +669,6 @@ fn two_nodes_exchange_e2ee_messages() {
         assert!(
             Instant::now() < deadline,
             "alice's invite-by-name never succeeded: {out}"
-        );
-        assert!(
-            out.contains("no key packages left"),
-            "unexpected invite failure: {out}"
         );
         thread::sleep(Duration::from_millis(400));
     }
@@ -820,6 +862,27 @@ fn two_nodes_exchange_e2ee_messages() {
         "alice dev warm-up send",
         |s| s.contains("sent"),
     );
+    // msg-dev-ctl is a fresh raft group with voters {A, B}: the
+    // smallest voter prefix bootstraps it (after confirming the
+    // group absent on the other), the other node joins through its
+    // leader. Wait for the replica on BOTH daemons before driving
+    // the join/invite flow over it.
+    {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let spawned = |log: &str| log.contains("agent 'msg-dev-ctl' spawned at runtime");
+            if spawned(&a.log_tail()) && spawned(&b.log_tail()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "msg-dev-ctl never spawned on both daemons\n--- A log ---\n{}\n--- B log ---\n{}",
+                a.log_tail(),
+                b.log_tail(),
+            );
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
     messenger(&b, &["join", "channel=dev"], "bob joins dev");
     {
         // Same KeyPackage-replication race as the general-channel

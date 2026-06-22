@@ -220,6 +220,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let local_cfg = crate::commands::space::subscriptions::load(&data_dir).unwrap_or_default();
         let has_hyperspace = hyperspace.is_some();
         let mut damped = std::collections::HashSet::new();
+        let mut boot_grace = BootGrace::new();
         let mut query_warned = false;
         let mut last_pass = std::time::Instant::now();
         node.run_forever_with(|n| {
@@ -234,6 +235,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 has_hyperspace,
                 &local_cfg,
                 &mut damped,
+                &mut boot_grace,
             ) {
                 Ok(()) => query_warned = false,
                 // Usually a stopped/wedged registry; the condition
@@ -472,15 +474,51 @@ fn spawn_installed_agents(
         live_svc_ids.insert(svc_id.0);
     }
 
+    // Contested raft bootstraps always defer at boot (their grace
+    // spans reconcile passes); the throwaway map just satisfies the
+    // protocol — the runtime reconciler owns the durable counters.
+    let mut boot_grace = BootGrace::new();
     for a in agents {
         if !local_cfg.should_spawn(&a.instance_name) {
             tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
             continue;
         }
+        // Raft rows resolve their member seed first — see the
+        // runtime reconciler for the full rationale.
+        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
+            if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
+                tracing::warn!(
+                    "skipping agent '{}' — program blob {} not in local cache",
+                    a.instance_name,
+                    BlobHash(a.program_hash),
+                );
+                continue;
+            }
+            match raft_members_for_row(node, data_dir, &a, local_prefix, &mut boot_grace) {
+                Ok(RaftSeed::Members(m)) => Some(m),
+                Ok(RaftSeed::Defer(reason)) => {
+                    tracing::info!(
+                        "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
+                        a.instance_name,
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         match agent_config_from_row(data_dir, &a)? {
             RowConfig::Ready(cfg) => {
+                let mut cfg = *cfg;
+                if let Some(members) = raft_members {
+                    cfg.members = members;
+                }
                 let svc_id = instance_service_id(&a.instance_name, local_prefix);
-                let id = node.register_at_id(*cfg, svc_id);
+                let id = node.register_at_id(cfg, svc_id);
                 tracing::info!(
                     "agent '{}' as {id} ({})",
                     a.instance_name,
@@ -614,6 +652,311 @@ fn agent_config_from_row(
     Ok(RowConfig::Ready(Box::new(cfg)))
 }
 
+/// Per-voter wait for a `RaftStatusReq` answer. Probes run on the
+/// router thread (routing paused) against already-connected peers
+/// only, so the worst case per pass is a handful of sub-second
+/// waits on connected-but-slow voters.
+const RAFT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Wait for a `RaftJoinReq` answer — the leader appends a joint
+/// ConfigChange before replying, so give it a little longer than a
+/// status probe.
+const RAFT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Consecutive passes a contested bootstrap decision must hold
+/// before acting on it. "Every other voter is connected and
+/// confirmed absent" can be transiently true while a peer is still
+/// spawning its own replica (boot ordering, spawn-batch cap); the
+/// grace keeps a momentary view from re-genesis-ing a group that is
+/// about to answer.
+const RAFT_BOOTSTRAP_GRACE_PASSES: u32 = 2;
+
+/// Cap on status probes per row per pass, bounding router-thread
+/// stall when a space has many voters.
+const MAX_RAFT_PROBES: usize = 5;
+
+/// Decision for spawning one raft-consistency row, produced by
+/// [`decide_raft_spawn`] from the registry voter set + the peers'
+/// answers. The IO around it (probes, the join handshake, config
+/// seeding, grace counting) lives in [`raft_members_for_row`].
+#[derive(Debug, PartialEq, Eq)]
+enum RaftPlan {
+    /// Spawn now with this member seed (anchored restart, or a
+    /// rejoin the group still counts us in).
+    Spawn(Vec<u16>),
+    /// A live group exists and `leader` can admit us; join first,
+    /// then spawn. `known` is the freshest member view we probed —
+    /// the post-join fallback seed if the leader can't be
+    /// re-probed (never spawn a joiner with just `[local]`: a
+    /// one-element seed self-elects and forks the group).
+    Join { leader: u16, known: Vec<u16> },
+    /// Brand-new group this node should create. `contested` means
+    /// other voters exist (all confirmed absent) — apply the
+    /// bootstrap grace before acting; uncontested (sole voter) is
+    /// immediate.
+    Bootstrap { contested: bool },
+    /// Not spawnable this pass; retried cheaply on later passes.
+    Defer(String),
+}
+
+/// Pure decision table for one raft row. `voters` is the sorted,
+/// deduped `NODE_ROLE_VOTER` prefix set from the registry;
+/// `anchored` means the agent's local db already records a member
+/// configuration (so the persisted config — not our seed — governs
+/// on spawn); `probes` holds the status answers from every OTHER
+/// connected voter, present or absent; `other_voters` is how many
+/// other voters exist in total (probes < other_voters means some
+/// voter was unreachable, which blocks the contested bootstrap).
+fn decide_raft_spawn(
+    local: u16,
+    voters: &[u16],
+    anchored: bool,
+    probes: &[(u16, vos::network::RaftStatusReply)],
+    other_voters: usize,
+) -> RaftPlan {
+    use vos::network::RaftRole;
+
+    if !voters.contains(&local) {
+        return RaftPlan::Defer(
+            "this node is not a voter (enroll it with `vosx space members add-node`)".into(),
+        );
+    }
+    if anchored {
+        // The persisted active config supersedes the seed; the
+        // voter set just has to be non-empty to spawn the worker.
+        return RaftPlan::Spawn(voters.to_vec());
+    }
+    if voters == [local] {
+        return RaftPlan::Bootstrap { contested: false };
+    }
+
+    // A live group somewhere wins over any bootstrap theory.
+    let live: Vec<&(u16, vos::network::RaftStatusReply)> =
+        probes.iter().filter(|(_, r)| r.present).collect();
+    for (_, reply) in &live {
+        if reply.members.contains(&local) {
+            // The group already counts us as a member (a wiped db
+            // rejoining): spawn and let the leader catch us up.
+            return RaftPlan::Spawn(reply.members.clone());
+        }
+    }
+    if let Some((v, reply)) = live.iter().find(|(_, r)| r.role == RaftRole::Leader) {
+        return RaftPlan::Join {
+            leader: *v,
+            known: reply.members.clone(),
+        };
+    }
+    if let Some((_, reply)) = live.iter().find(|(_, r)| r.leader_hint.is_some()) {
+        return RaftPlan::Join {
+            leader: reply.leader_hint.expect("filtered on is_some"),
+            known: reply.members.clone(),
+        };
+    }
+    if !live.is_empty() {
+        return RaftPlan::Defer("group has no leader yet (election in progress)".into());
+    }
+
+    // No live group anywhere we could see. Only the smallest voter
+    // may create one, and only with positive confirmation from
+    // every other voter — an "absent" from a status probe also
+    // covers "host up but replica not spawned yet", hence the
+    // caller-side grace. A wiped smallest-voter racing that window
+    // can still re-genesis a group it can't see; the durable fix is
+    // a bootstrap anchor in the registry row (with signed registry
+    // ops), not reachable from this layer.
+    let smallest = *voters.iter().min().expect("voters contains local");
+    if smallest != local {
+        return RaftPlan::Defer(format!(
+            "waiting for voter {smallest:#06x} to bootstrap the group",
+        ));
+    }
+    if probes.len() < other_voters {
+        return RaftPlan::Defer(format!(
+            "cannot locate the group — {} of {other_voters} other voter(s) unreachable",
+            other_voters - probes.len(),
+        ));
+    }
+    RaftPlan::Bootstrap { contested: true }
+}
+
+/// Outcome of [`raft_members_for_row`]: either the member seed to
+/// spawn with, or the reason the row stays deferred this pass.
+enum RaftSeed {
+    Members(Vec<u16>),
+    Defer(String),
+}
+
+/// Grace counters for contested bootstraps, keyed like the damping
+/// set. Entries are removed when the row spawns or the decision
+/// changes away from bootstrap.
+type BootGrace = std::collections::HashMap<(String, [u8; 32]), u32>;
+
+/// Run the membership protocol for one raft row: read the voter
+/// set, probe connected voters for the group, join a live group
+/// through its leader, or anchor + bootstrap a brand-new one.
+/// Called before the row's (expensive) transpile so a defer costs
+/// little, and so the join handshake only ever fires when the
+/// spawn follows it.
+fn raft_members_for_row(
+    node: &VosNode,
+    data_dir: &std::path::Path,
+    a: &space_registry::AgentRow,
+    local_prefix: u16,
+    boot_grace: &mut BootGrace,
+) -> anyhow::Result<RaftSeed> {
+    use space_registry::{MEMBER_KIND_NODE, NODE_ROLE_VOTER, SpaceRegistryRef};
+
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let rows = vos::block_on(reg.members(&mut &*node))
+        .map_err(|e| anyhow::anyhow!("query members: {e}"))?;
+    let mut voters: Vec<u16> = rows
+        .iter()
+        .filter(|m| m.kind == MEMBER_KIND_NODE && m.role == NODE_ROLE_VOTER)
+        .map(|m| m.prefix)
+        .collect();
+    voters.sort_unstable();
+    voters.dedup();
+
+    let svc_id = instance_service_id(&a.instance_name, local_prefix);
+    let db_path = data_dir
+        .join("agents")
+        .join(format!("{:08x}.redb", svc_id.0));
+    let anchored = db_path.exists()
+        && vos::raft::persisted_membership(&db_path)
+            .unwrap_or_default()
+            .is_some();
+
+    let net = node.network();
+    let other_voters = voters.iter().filter(|&&v| v != local_prefix).count();
+    let mut probes: Vec<(u16, vos::network::RaftStatusReply)> = Vec::new();
+    if let Some(net) = net.as_ref() {
+        for &v in voters
+            .iter()
+            .filter(|&&v| v != local_prefix)
+            .take(MAX_RAFT_PROBES)
+        {
+            let Some(peer) = net.peer_for_prefix(v) else {
+                continue; // not connected — can't confirm anything about it
+            };
+            if let Ok(reply) = net
+                .send_raft_status_req(peer, a.replication_id)
+                .recv_timeout(RAFT_PROBE_TIMEOUT)
+            {
+                probes.push((v, reply));
+            }
+        }
+    }
+
+    let grace_key = (a.instance_name.clone(), a.program_hash);
+    let plan = decide_raft_spawn(local_prefix, &voters, anchored, &probes, other_voters);
+    if !matches!(plan, RaftPlan::Bootstrap { contested: true }) {
+        boot_grace.remove(&grace_key);
+    }
+    match plan {
+        RaftPlan::Spawn(members) => Ok(RaftSeed::Members(members)),
+        RaftPlan::Defer(reason) => Ok(RaftSeed::Defer(reason)),
+        RaftPlan::Bootstrap { contested } => {
+            if contested {
+                let passes = boot_grace.entry(grace_key.clone()).or_insert(0);
+                *passes += 1;
+                if *passes < RAFT_BOOTSTRAP_GRACE_PASSES {
+                    return Ok(RaftSeed::Defer(format!(
+                        "group absent on every other voter — confirming for {} more pass(es) \
+                         before bootstrapping",
+                        RAFT_BOOTSTRAP_GRACE_PASSES - *passes,
+                    )));
+                }
+                boot_grace.remove(&grace_key);
+            }
+            // Anchor the configuration BEFORE the first spawn: a
+            // solo group that never changes membership writes no
+            // ConfigChange entry, and without the seeded row a
+            // restart would re-derive its member set from whatever
+            // the registry says by then — which may have grown,
+            // leaving the group unable to elect (and the pending
+            // joiner with no leader to join).
+            vos::raft::seed_initial_config(&db_path, &[local_prefix])
+                .map_err(|e| anyhow::anyhow!("seed raft config for '{}': {e}", a.instance_name))?;
+            Ok(RaftSeed::Members(vec![local_prefix]))
+        }
+        RaftPlan::Join { leader, known } => {
+            let Some(net) = net else {
+                return Ok(RaftSeed::Defer("no network attached".into()));
+            };
+            join_raft_group(&net, a, local_prefix, leader, known)
+        }
+    }
+}
+
+/// Ask the group's leader to admit this node as a voter, following
+/// at most one leadership redirect. On `Accepted`, re-probe the
+/// leader for the freshest member set (a joiner admitted between
+/// our probe and our join must be in our seed, or we'd reject its
+/// votes until the log catches up) and fall back to the probed
+/// `known` view when the re-probe fails.
+fn join_raft_group(
+    net: &std::sync::Arc<vos::network::Network>,
+    a: &space_registry::AgentRow,
+    local_prefix: u16,
+    mut leader: u16,
+    known: Vec<u16>,
+) -> anyhow::Result<RaftSeed> {
+    use vos::network::RaftJoinResult;
+
+    for _redirect in 0..2 {
+        let Some(peer) = net.peer_for_prefix(leader) else {
+            return Ok(RaftSeed::Defer(format!(
+                "raft leader {leader:#06x} is not connected",
+            )));
+        };
+        let rx = net.send_raft_join_req(peer, a.replication_id, local_prefix);
+        match rx.recv_timeout(RAFT_JOIN_TIMEOUT) {
+            Ok(RaftJoinResult::Accepted { .. }) => {
+                let mut members = match net
+                    .send_raft_status_req(peer, a.replication_id)
+                    .recv_timeout(RAFT_PROBE_TIMEOUT)
+                {
+                    Ok(st) if st.present && !st.members.is_empty() => st.members,
+                    _ => known,
+                };
+                members.push(local_prefix);
+                members.sort_unstable();
+                members.dedup();
+                tracing::info!(
+                    "agent '{}': joined raft group as voter (leader {leader:#06x}, {} member(s))",
+                    a.instance_name,
+                    members.len(),
+                );
+                return Ok(RaftSeed::Members(members));
+            }
+            Ok(RaftJoinResult::NotLeader {
+                leader_hint: Some(h),
+            }) if h != leader => {
+                leader = h; // follow one redirect
+            }
+            Ok(RaftJoinResult::NotLeader { .. }) => {
+                return Ok(RaftSeed::Defer(
+                    "leadership moved during the join handshake".into(),
+                ));
+            }
+            Ok(RaftJoinResult::Busy) => {
+                return Ok(RaftSeed::Defer(
+                    "another membership change is in flight".into(),
+                ));
+            }
+            Ok(RaftJoinResult::UnknownGroup) => {
+                return Ok(RaftSeed::Defer(format!(
+                    "peer {leader:#06x} no longer runs the group",
+                )));
+            }
+            Err(_) => {
+                return Ok(RaftSeed::Defer("join request timed out".into()));
+            }
+        }
+    }
+    Ok(RaftSeed::Defer("leader redirects did not converge".into()))
+}
+
 /// Cap on agents brought up in a single reconcile pass. The pass
 /// runs on the router thread (routing paused), and each spawn
 /// costs an ELF transpile + redb open + thread spawn — bounding
@@ -640,6 +983,12 @@ enum RowNote {
     /// cache probe keeps retrying, so the row spawns if the blob
     /// appears later.
     AwaitingBlob,
+    /// Raft row whose membership protocol deferred the spawn
+    /// (not a voter yet, group not located, join in progress…).
+    /// Warned once with the current reason; later passes log the
+    /// (possibly different) reason at debug. Cleared on spawn so
+    /// a later wedge re-warns.
+    RaftWaiting,
 }
 
 /// One runtime spawn-reconcile pass: query the registry for
@@ -673,6 +1022,7 @@ fn reconcile_installed_agents(
     has_hyperspace: bool,
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
     damped: &mut RowDamping,
+    boot_grace: &mut BootGrace,
 ) -> anyhow::Result<()> {
     use space_registry::{STATUS_OK, SpaceRegistryRef};
 
@@ -713,9 +1063,54 @@ fn reconcile_installed_agents(
             }
             continue;
         }
+        // Raft rows run the membership protocol BEFORE the
+        // (expensive) transpile: a deferred row must not
+        // re-transpile every 2 s, and the join handshake must only
+        // fire when the spawn follows it. The blob probe comes
+        // first for the same reason — joining a group we can't
+        // spawn into would stall its quorum.
+        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
+            if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
+                if damped.insert(key(RowNote::AwaitingBlob)) {
+                    tracing::warn!(
+                        "agent '{}' pending — program blob {} not in the local cache \
+                         (no peer fetch exists yet); it spawns when the blob appears",
+                        a.instance_name,
+                        BlobHash(a.program_hash),
+                    );
+                }
+                continue;
+            }
+            match raft_members_for_row(node, data_dir, &a, local_prefix, boot_grace) {
+                Ok(RaftSeed::Members(m)) => {
+                    damped.remove(&key(RowNote::RaftWaiting));
+                    Some(m)
+                }
+                Ok(RaftSeed::Defer(reason)) => {
+                    if damped.insert(key(RowNote::RaftWaiting)) {
+                        tracing::warn!("agent '{}' (raft) deferred: {reason}", a.instance_name);
+                    } else {
+                        tracing::debug!("agent '{}' (raft) deferred: {reason}", a.instance_name);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    if damped.insert(key(RowNote::RaftWaiting)) {
+                        tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         match agent_config_from_row(data_dir, &a) {
             Ok(RowConfig::Ready(cfg)) => {
-                let id = node.register_at_id(*cfg, svc_id);
+                let mut cfg = *cfg;
+                if let Some(members) = raft_members {
+                    cfg.members = members;
+                }
+                let id = node.register_at_id(cfg, svc_id);
                 spawned_this_pass += 1;
                 tracing::info!(
                     "agent '{}' spawned at runtime as {id} ({})",
@@ -810,5 +1205,126 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
                 entry.path().display(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos::network::{RaftRole, RaftStatusReply};
+
+    fn status(role: RaftRole, members: Vec<u16>, leader_hint: Option<u16>) -> RaftStatusReply {
+        RaftStatusReply {
+            present: true,
+            role,
+            current_term: 1,
+            commit_index: 1,
+            last_log_index: 1,
+            members,
+            leader_hint,
+        }
+    }
+
+    fn absent() -> RaftStatusReply {
+        RaftStatusReply {
+            present: false,
+            role: RaftRole::Follower,
+            current_term: 0,
+            commit_index: 0,
+            last_log_index: 0,
+            members: Vec::new(),
+            leader_hint: None,
+        }
+    }
+
+    #[test]
+    fn non_voter_defers() {
+        let plan = decide_raft_spawn(0x0003, &[0x0001, 0x0002], false, &[], 2);
+        assert!(matches!(plan, RaftPlan::Defer(_)));
+    }
+
+    #[test]
+    fn anchored_db_spawns_with_voter_seed() {
+        // The persisted config governs; the seed just has to be the
+        // current voter set so the worker spawns in multi-mode.
+        let plan = decide_raft_spawn(0x0001, &[0x0001, 0x0002], true, &[], 1);
+        assert_eq!(plan, RaftPlan::Spawn(vec![0x0001, 0x0002]));
+    }
+
+    #[test]
+    fn sole_voter_bootstraps_immediately() {
+        let plan = decide_raft_spawn(0x0001, &[0x0001], false, &[], 0);
+        assert_eq!(plan, RaftPlan::Bootstrap { contested: false });
+    }
+
+    #[test]
+    fn live_group_counting_us_respawns_with_its_members() {
+        // A wiped node the group still counts as a voter rejoins by
+        // spawning with the group's view; the leader catches it up.
+        let probes = vec![(
+            0x0001,
+            status(RaftRole::Leader, vec![0x0001, 0x0002], Some(0x0001)),
+        )];
+        let plan = decide_raft_spawn(0x0002, &[0x0001, 0x0002], false, &probes, 1);
+        assert_eq!(plan, RaftPlan::Spawn(vec![0x0001, 0x0002]));
+    }
+
+    #[test]
+    fn live_group_led_by_probed_voter_joins_there() {
+        let probes = vec![(0x0001, status(RaftRole::Leader, vec![0x0001], Some(0x0001)))];
+        let plan = decide_raft_spawn(0x0002, &[0x0001, 0x0002], false, &probes, 1);
+        assert_eq!(
+            plan,
+            RaftPlan::Join {
+                leader: 0x0001,
+                known: vec![0x0001],
+            },
+        );
+    }
+
+    #[test]
+    fn live_group_follower_redirects_join_to_hint() {
+        // Probed a follower of a three-voter group; its hint names
+        // the leader we didn't probe.
+        let probes = vec![(
+            0x0002,
+            status(RaftRole::Follower, vec![0x0001, 0x0002], Some(0x0001)),
+        )];
+        let plan = decide_raft_spawn(0x0003, &[0x0001, 0x0002, 0x0003], false, &probes, 2);
+        assert_eq!(
+            plan,
+            RaftPlan::Join {
+                leader: 0x0001,
+                known: vec![0x0001, 0x0002],
+            },
+        );
+    }
+
+    #[test]
+    fn live_group_without_leader_defers() {
+        let probes = vec![(0x0001, status(RaftRole::Candidate, vec![0x0001], None))];
+        let plan = decide_raft_spawn(0x0002, &[0x0001, 0x0002], false, &probes, 1);
+        assert!(matches!(plan, RaftPlan::Defer(_)));
+    }
+
+    #[test]
+    fn absent_everywhere_only_smallest_voter_bootstraps_contested() {
+        let probes = vec![(0x0002, absent())];
+        let plan = decide_raft_spawn(0x0001, &[0x0001, 0x0002], false, &probes, 1);
+        assert_eq!(plan, RaftPlan::Bootstrap { contested: true });
+
+        let probes = vec![(0x0001, absent())];
+        let plan = decide_raft_spawn(0x0002, &[0x0001, 0x0002], false, &probes, 1);
+        assert!(matches!(plan, RaftPlan::Defer(_)));
+    }
+
+    #[test]
+    fn unreachable_voter_blocks_contested_bootstrap() {
+        // Two other voters, only one answered: no positive
+        // confirmation, no bootstrap — the group may live on the
+        // silent one.
+        let probes = vec![(0x0002, absent())];
+        let plan = decide_raft_spawn(0x0001, &[0x0001, 0x0002, 0x0003], false, &probes, 2);
+        assert!(matches!(plan, RaftPlan::Defer(_)));
     }
 }

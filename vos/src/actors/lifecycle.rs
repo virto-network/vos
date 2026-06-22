@@ -120,6 +120,37 @@ pub fn read_persisted_state(state_buf: &mut [u8]) -> usize {
     }
 }
 
+/// Read persisted state, growing onto the heap when it exceeds the
+/// stack probe buffer. The READ hostcall copies `min(len, buf)` and
+/// returns the FULL value length, so one retry with an exact-size
+/// buffer always lands it.
+///
+/// This is the cold-start state loader. The fixed-buffer variant
+/// above treats a too-long value as missing — correct for callers
+/// with a hard cap, but fatal as a state loader: an actor whose
+/// serialized state outgrows the buffer would silently resurrect as
+/// `A::create()` and persist that wipe on its next save.
+#[cfg(feature = "service")]
+pub fn read_persisted_state_owned() -> Option<alloc::vec::Vec<u8>> {
+    use crate::abi::error::HOST_NONE;
+    use crate::abi::pvm::hostcalls;
+
+    let mut probe = [0u8; BUF_SIZE];
+    let n = hostcalls::read(STATE_KEY, &mut probe);
+    if n == 0 || n == HOST_NONE {
+        return None;
+    }
+    if n <= BUF_SIZE as u64 {
+        return Some(probe[..n as usize].to_vec());
+    }
+    let mut full = alloc::vec![0u8; n as usize];
+    let m = hostcalls::read(STATE_KEY, &mut full);
+    // A different length on the re-read means the value changed
+    // under us — impossible within one dispatch, so treat it as
+    // corruption and let the caller fall back to a fresh actor.
+    (m == n).then_some(full)
+}
+
 /// Fetch the next raw message from the transfer queue.
 /// Returns the number of bytes, or 0 if no more messages.
 #[cfg(feature = "pvm")]

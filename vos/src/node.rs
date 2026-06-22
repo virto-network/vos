@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::abi::service::ServiceId;
 use crate::runtime::VosRuntime;
@@ -696,6 +696,13 @@ pub struct VosNode {
     /// their writes against each other.
     #[cfg(all(feature = "network", feature = "storage"))]
     pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    /// Map: ServiceId word → replication group, for agents running
+    /// the multi-mode Raft worker. Shared into every extension
+    /// thread (via [`RaftFwd`]) so the ask path can recognize a
+    /// follower-rejected write and re-address it to the group's
+    /// current leader.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    raft_hosts: RaftHosts,
     /// Optional manifest payload exposed to peers via
     /// [`Frame::ManifestReq`](crate::network::Frame::ManifestReq).
     /// Populated by [`set_manifest`](Self::set_manifest) before
@@ -771,6 +778,16 @@ pub(crate) struct ReplicaSlot {
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
 type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
+
+/// Shared map of raft-hosted agents: ServiceId word → replication
+/// group of the multi-mode worker spawned for it. The companion to
+/// `InvokeRoutes` for leader forwarding: where `InvokeRoutes`
+/// answers "which channel reaches this ServiceId?", this answers
+/// "which Raft group does it belong to?" so [`route_invoke`] can
+/// consult the local worker's role/leader-hint when the local
+/// replica drops a write.
+#[cfg(all(feature = "network", feature = "storage"))]
+type RaftHosts = Arc<Mutex<HashMap<u32, [u8; 32]>>>;
 
 /// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
 /// installed instance name. The companion to `InvokeRoutes` for the
@@ -1706,6 +1723,8 @@ impl VosNode {
             shared_network: Arc::new(Mutex::new(None)),
             #[cfg(all(feature = "network", feature = "storage"))]
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "network")]
             manifest: Arc::new(OnceLock::new()),
             #[cfg(all(feature = "network", feature = "storage"))]
@@ -1992,7 +2011,7 @@ impl VosNode {
                     }
                 }
             })
-        } else if config.consistency == Consistency::Raft && config.members.len() > 1 {
+        } else if config.consistency == Consistency::Raft && !config.members.is_empty() {
             // Multi-mode Raft: spawn a worker, install it as the
             // network's RaftRpcHandler, and bridge the worker's
             // apply notifications into both (a) the agent's
@@ -2000,6 +2019,13 @@ impl VosNode {
             // on followers) and (b) the strategy's apply_rx (so
             // the leader's commit_with_log unblocks once its
             // proposed entry commits).
+            //
+            // A single-element member list is the solo-bootstrap
+            // case: the worker self-elects with a quorum of one
+            // and can then admit joiners through `RaftJoinReq` —
+            // unlike the memberless fallback below, which never
+            // answers cluster RPCs. The persisted active config,
+            // when present, supersedes `config.members` on boot.
             let network = self.shared_network.lock().ok().and_then(|g| g.clone());
             let rep_id = config.replication_id.unwrap_or([0u8; 32]);
             match config.db_path(id).map(|p| {
@@ -2044,6 +2070,10 @@ impl VosNode {
                         .expect("spawn raft relay");
                     config.raft_worker = Some(worker);
                     config.raft_apply_rx = Some(commit_rx);
+                    // Record the group membership so the extension
+                    // ask path can forward follower-rejected writes
+                    // to the leader (see `RaftFwd` / `route_invoke`).
+                    self.raft_hosts.lock().unwrap().insert(id.0, rep_id);
                     Some(sync_rx)
                 }
                 Some((path, Err(e))) => {
@@ -2144,6 +2174,12 @@ impl VosNode {
         let proof_blobs_dir = self.proof_blobs_dir.clone();
         #[cfg(feature = "network")]
         let shared_network = self.shared_network.clone();
+        let raft_fwd = RaftFwd {
+            #[cfg(all(feature = "network", feature = "storage"))]
+            network: self.shared_network.clone(),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            hosts: self.raft_hosts.clone(),
+        };
 
         let join = thread::spawn(move || {
             extension_thread(
@@ -2158,6 +2194,7 @@ impl VosNode {
                 activity,
                 proof_blobs,
                 proof_blobs_dir,
+                raft_fwd,
                 #[cfg(feature = "network")]
                 shared_network,
             )
@@ -3663,6 +3700,7 @@ fn extension_thread(
     activity: ActivityClock,
     proof_blobs: ProofBlobStore,
     proof_blobs_dir: Option<std::path::PathBuf>,
+    raft_fwd: RaftFwd,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
 ) -> AgentResult {
     use crate::extension::ExtensionPlugin;
@@ -3714,7 +3752,15 @@ fn extension_thread(
     // `invoke_routes` IS passed: a conn task's `ctx.ask` routes
     // an outbound `InvokeRequest` through it with a per-call async reply channel.
     if plugin.kind() == crate::extension::ExtensionKind::Transport {
-        return run_transport_extension(id, plugin, config, shutdown, activity, invoke_routes);
+        return run_transport_extension(
+            id,
+            plugin,
+            config,
+            shutdown,
+            activity,
+            invoke_routes,
+            raft_fwd,
+        );
     }
 
     let bump = || *activity.lock().unwrap() = Instant::now();
@@ -3807,6 +3853,7 @@ fn extension_thread(
                     &invoke_routes,
                     &config.intra_caps,
                     &agent_names,
+                    &raft_fwd,
                 );
                 if matches!(outcome, DispatchOutcome::Err) {
                     warn!(
@@ -3855,6 +3902,7 @@ fn extension_thread(
                             &invoke_routes,
                             &config.intra_caps,
                             &agent_names,
+                            &raft_fwd,
                         )
                     };
                     // Workers don't yield — pack as DONE with no
@@ -3920,6 +3968,7 @@ fn extension_thread(
             &invoke_routes,
             &config.intra_caps,
             &agent_names,
+            &raft_fwd,
         );
         // Envelope-mode replies don't carry the `[status][state][reply]`
         // wrapper — that's an invoke-channel detail. On the envelope
@@ -4295,6 +4344,33 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// cost of a slow/missing target is one of the host's bounded connection slots.
 const ASK_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Leader-forwarding context for the extension ask path. Bundles the
+/// shared network handle with the host's [`RaftHosts`] map so
+/// [`route_invoke`] can recognize a follower-rejected write (the local
+/// replica drops the reply when its commit fails NotLeader) and
+/// re-address the invoke to the group's current leader over the wire.
+/// `Default` is the inert form (no network, no raft hosts) used by
+/// builds without the network/storage features and by tests.
+#[derive(Clone, Default)]
+struct RaftFwd {
+    #[cfg(all(feature = "network", feature = "storage"))]
+    network: SharedNetwork,
+    #[cfg(all(feature = "network", feature = "storage"))]
+    hosts: RaftHosts,
+}
+
+/// Outcome of awaiting the local invoke reply in [`route_invoke`].
+/// `Canceled` (the target dropped its reply sender) is kept distinct
+/// from `Timeout` and from a real envelope because it is the signature
+/// of a Raft follower refusing a write — the one case worth retrying
+/// against the group's leader. A handler panic also lands here; the
+/// leader-role check in [`forward_to_raft_leader`] filters that out.
+enum AskOutcome {
+    Reply(Vec<u8>),
+    Canceled,
+    Timeout,
+}
+
 /// The async effect router handed to [`run_ext_task`]. Bundles the host-side
 /// channels + blob store + byte-stream reactor a `TASK_PENDING` is fulfilled
 /// against.
@@ -4330,6 +4406,9 @@ struct Fulfiller<'a> {
     /// the ask target's name so `intra_caps` (declared by name) bind, and so
     /// the propagated peer's actor-local grant can be looked up.
     agent_names: &'a AgentNames,
+    /// Leader-forwarding context for asks that target a raft-hosted
+    /// agent whose local replica is a follower.
+    raft_fwd: &'a RaftFwd,
 }
 
 impl Fulfiller<'_> {
@@ -4398,6 +4477,7 @@ impl Fulfiller<'_> {
                 let actor_local_role: Option<u8> = None;
                 match route_invoke(
                     self.invoke_routes,
+                    self.raft_fwd,
                     self.extension_id,
                     caller,
                     space_role,
@@ -4576,6 +4656,9 @@ struct ConnFulfiller {
     /// `ctx.ask(target, msg)` looks the target up here (scoped→unscoped) and
     /// sends an `InvokeRequest` with a per-call async reply.
     invoke_routes: InvokeRoutes,
+    /// Leader-forwarding context for asks that target a raft-hosted
+    /// agent whose local replica is a follower.
+    raft_fwd: RaftFwd,
 }
 
 impl ConnFulfiller {
@@ -4711,6 +4794,7 @@ impl ConnFulfiller {
     async fn invoke_route(&self, rest: &[u8]) -> Option<Vec<u8>> {
         route_invoke(
             &self.invoke_routes,
+            &self.raft_fwd,
             self.extension_id,
             crate::actors::Caller::Unauthenticated,
             None,
@@ -4733,8 +4817,17 @@ impl ConnFulfiller {
 /// for a `()` return) or `None` on any failure (no route / send error / timeout
 /// / non-DONE status). Shared by [`ConnFulfiller`] (transport) + [`Fulfiller`]
 /// (actor-mode `EFFECT_ASK_DISPATCH`).
+///
+/// Raft targets get one extra move: when the target maps to a
+/// raft-hosted agent (via `fwd.hosts`) and the local replica DROPS
+/// the reply — a follower's commit fails NotLeader and
+/// `handle_invoke_request` closes the channel — the invoke is
+/// re-sent to the group's leader over libp2p. Reads never hit this
+/// path (an unchanged-state commit short-circuits before the
+/// propose, so followers answer them locally).
 async fn route_invoke(
     invoke_routes: &InvokeRoutes,
+    fwd: &RaftFwd,
     extension_id: ServiceId,
     caller: crate::actors::Caller,
     space_role: Option<u8>,
@@ -4746,6 +4839,11 @@ async fn route_invoke(
     }
     let target = u32::from_le_bytes(rest[..4].try_into().unwrap());
     let payload = rest[4..].to_vec();
+
+    // Snapshot the forward plan up front (and clone the payload only
+    // when one exists) — the local send consumes `payload`.
+    let forward_plan =
+        raft_forward_plan(fwd, extension_id, target).map(|rep| (rep, payload.clone()));
 
     // Route lookup with two-way prefix fallback against the local table:
     //
@@ -4793,14 +4891,140 @@ async fn route_invoke(
     }
 
     // Await the reply on the executor, raced against a timeout — no thread is
-    // blocked, so sibling tasks keep running while we wait.
-    let envelope = futures_lite::future::or(async { reply_rx.await.ok() }, async {
-        async_io::Timer::after(ASK_TIMEOUT).await;
-        None
-    })
+    // blocked, so sibling tasks keep running while we wait. A dropped
+    // sender (Canceled) is kept distinct from the timeout: it is the
+    // signature of a follower refusing a write.
+    let outcome = futures_lite::future::or(
+        async {
+            match reply_rx.await {
+                Ok(env) => AskOutcome::Reply(env),
+                Err(_) => AskOutcome::Canceled,
+            }
+        },
+        async {
+            async_io::Timer::after(ASK_TIMEOUT).await;
+            AskOutcome::Timeout
+        },
+    )
     .await;
 
-    envelope.and_then(|env| unwrap_invoke_envelope(&env))
+    match outcome {
+        AskOutcome::Reply(env) => unwrap_invoke_envelope(&env),
+        AskOutcome::Timeout => None,
+        AskOutcome::Canceled => match forward_plan {
+            Some((rep_id, payload)) => {
+                forward_to_raft_leader(fwd, extension_id, target, rep_id, payload).await
+            }
+            None => None,
+        },
+    }
+}
+
+/// Look the ask target up in the host's raft map (same three-key
+/// fallback the route lookup uses). `Some(rep_id)` means the target
+/// is served by a local multi-mode Raft worker and a dropped reply
+/// is worth retrying against the group's leader.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn raft_forward_plan(fwd: &RaftFwd, extension_id: ServiceId, target: u32) -> Option<[u8; 32]> {
+    let scoped = (extension_id.0 & 0xFFFF_0000) | (target & 0xFFFF);
+    let map = fwd.hosts.lock().ok()?;
+    map.get(&target)
+        .or_else(|| map.get(&(target & 0xFFFF)))
+        .or_else(|| map.get(&scoped))
+        .copied()
+}
+
+#[cfg(not(all(feature = "network", feature = "storage")))]
+fn raft_forward_plan(_fwd: &RaftFwd, _extension_id: ServiceId, _target: u32) -> Option<[u8; 32]> {
+    None
+}
+
+/// Upper bound on the wire wait for a leader-forwarded invoke. The
+/// leader's quorum wait is bounded by the 5 s propose timeout
+/// (`RaftConfig::propose_timeout_ms`); 3× that covers a retry plus
+/// transit without stacking anywhere near the 300 s `ASK_TIMEOUT` —
+/// a wedged group should surface as a failed ask in seconds, and the
+/// app-level retry owns what happens next.
+#[cfg(all(feature = "network", feature = "storage"))]
+const RAFT_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Re-send a follower-dropped invoke to the Raft group's current
+/// leader. Consults the LOCAL worker first: the forward only fires
+/// when this replica is genuinely not the leader and knows who is —
+/// which also filters out the other reply-drop cause (a handler
+/// panic on a leader replica shows `role == Leader` and stays a
+/// local failure, as before).
+///
+/// The reply comes back as raw bytes the remote side already
+/// unwrapped (`NodeService::dispatch_invoke`), so no second unwrap
+/// here. Empty bytes are indistinguishable from a remote failure and
+/// collapse to `None` — raft write verbs must return a non-empty
+/// reply (statuses/structs do; a bare `()` doesn't). A verbatim
+/// STATUS_FORBIDDEN envelope maps to `None` for parity with the
+/// local path. Caller authority on the leader is the FORWARDING
+/// NODE's peer role — operators must grant member tier to a voter
+/// node's peer for its forwarded writes to pass role gates.
+#[cfg(all(feature = "network", feature = "storage"))]
+async fn forward_to_raft_leader(
+    fwd: &RaftFwd,
+    extension_id: ServiceId,
+    target: u32,
+    rep_id: [u8; 32],
+    payload: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let net = fwd.network.lock().ok()?.clone()?;
+    let st = net.local_raft_status(&rep_id)?;
+    if st.role == crate::network::RaftRole::Leader {
+        return None;
+    }
+    let leader = st.leader_hint?;
+    if leader == net.local_prefix() {
+        // Hint says us but the worker isn't Leader — election in
+        // flight; let the app-level retry pick it up.
+        return None;
+    }
+    let peer = net.peer_for_prefix(leader)?;
+    let to = ((leader as u32) << 16) | (target & 0xFFFF);
+    debug!(
+        %extension_id, target, leader,
+        "ext ask: forwarding follower-dropped raft write to leader"
+    );
+    let rx = net.send_invoke(peer, extension_id.0, to, Vec::new(), payload);
+    // Poll the sync receiver cooperatively — the swarm thread fills
+    // it; this task yields between polls so sibling tasks keep
+    // running.
+    let deadline = Instant::now() + RAFT_FORWARD_TIMEOUT;
+    loop {
+        match rx.try_recv() {
+            Ok(bytes) => {
+                if bytes.is_empty()
+                    || bytes.first().copied() == Some(crate::actors::run::STATUS_FORBIDDEN)
+                {
+                    return None;
+                }
+                return Some(bytes);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    warn!(%extension_id, target, leader, "ext ask: leader forward timed out");
+                    return None;
+                }
+                async_io::Timer::after(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
+#[cfg(not(all(feature = "network", feature = "storage")))]
+async fn forward_to_raft_leader(
+    _fwd: &RaftFwd,
+    _extension_id: ServiceId,
+    _target: u32,
+    _rep_id: [u8; 32],
+    _payload: Vec<u8>,
+) -> Option<Vec<u8>> {
+    None
 }
 
 /// Drive one actor-mode task to completion on the host executor: poll it,
@@ -4877,6 +5101,7 @@ async fn run_ext_task(
 /// NOT freed here (no `drop_task` call) — the instance's `vos_extension_drop`
 /// (run by `drop_state`, after `drop(ex)`) clears the whole slab as the
 /// backstop. The owned `Conn` drops with the `ConnFulfiller`, closing the fd.
+#[allow(clippy::too_many_arguments)]
 async fn run_conn_task(
     shared: crate::extension::SharedInstance<'_>,
     handle: u64,
@@ -4885,6 +5110,7 @@ async fn run_conn_task(
     live: std::rc::Rc<std::cell::Cell<usize>>,
     extension_id: ServiceId,
     invoke_routes: InvokeRoutes,
+    raft_fwd: RaftFwd,
 ) {
     use crate::extension::TaskOutcome;
 
@@ -4901,6 +5127,7 @@ async fn run_conn_task(
         cid,
         extension_id,
         invoke_routes,
+        raft_fwd,
     };
     let mut result: Vec<u8> = Vec::new();
     loop {
@@ -4966,6 +5193,7 @@ fn run_transport_extension(
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
     invoke_routes: InvokeRoutes,
+    raft_fwd: RaftFwd,
 ) -> AgentResult {
     use crate::extension::{ExtensionKind, SharedInstance};
     use std::cell::Cell;
@@ -5147,6 +5375,7 @@ fn run_transport_extension(
                 live.clone(),
                 id,
                 invoke_routes.clone(),
+                raft_fwd.clone(),
             ))
             .detach();
         }
@@ -5207,6 +5436,7 @@ fn dispatch_and_poll(
     invoke_routes: &InvokeRoutes,
     intra_caps: &[crate::actors::IntraCap],
     agent_names: &AgentNames,
+    raft_fwd: &RaftFwd,
 ) -> DispatchOutcome {
     // Actor-mode stays N=1: build exactly one root task and run it to completion
     // before the next message. Running a second root task while this one holds
@@ -5230,6 +5460,7 @@ fn dispatch_and_poll(
         invoke_routes,
         intra_caps,
         agent_names,
+        raft_fwd,
     };
     // block_on(ex.run(..)) drives the root task (and any future spawned tasks)
     // on this thread — the one that owns the instance. Actor-mode spawns none.
@@ -6950,6 +7181,7 @@ mod tests {
                 cid: 0,
                 extension_id: ServiceId(7),
                 invoke_routes: routes.clone(),
+                raft_fwd: RaftFwd::default(),
             };
             f.fulfill(&dispatch_effect(target, b"payload-x")).await
         });
@@ -6970,6 +7202,7 @@ mod tests {
                 cid: 0,
                 extension_id: ServiceId(7),
                 invoke_routes: routes.clone(),
+                raft_fwd: RaftFwd::default(),
             };
             f.fulfill(&dispatch_effect(target, b"x")).await
         });
@@ -6978,6 +7211,74 @@ mod tests {
             alloc::vec![crate::effects::RESP_ERR],
             "a panic envelope must frame as RESP_ERR so the gateway renders 502, not 200 null"
         );
+        drop(routes);
+        stub.join().unwrap();
+    }
+
+    /// A target that DROPS its reply sender (the signature of a raft
+    /// follower refusing a write, or a panicking PVM handler). With no
+    /// raft-forward context the ask must fail FAST — the canceled
+    /// oneshot resolves immediately rather than waiting out the 300 s
+    /// ASK_TIMEOUT.
+    #[test]
+    fn conn_task_dispatch_ask_dropped_reply_is_fast_resp_err() {
+        let target = 53u32;
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(target, tx);
+        let stub = std::thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                drop(req.reply);
+            }
+        });
+        let started = Instant::now();
+        let reply = async_io::block_on(async {
+            let mut f = ConnFulfiller {
+                conn: None,
+                cid: 0,
+                extension_id: ServiceId(7),
+                invoke_routes: routes.clone(),
+                raft_fwd: RaftFwd::default(),
+            };
+            f.fulfill(&dispatch_effect(target, b"x")).await
+        });
+        assert_eq!(reply, alloc::vec![crate::effects::RESP_ERR]);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a canceled reply must resolve immediately, not wait out ASK_TIMEOUT",
+        );
+        drop(routes);
+        stub.join().unwrap();
+    }
+
+    /// Same dropped-reply target, but the hosts map claims it is
+    /// raft-hosted — with no network attached the forward must bail
+    /// gracefully to RESP_ERR instead of panicking or hanging.
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn conn_task_dispatch_ask_dropped_reply_raft_host_without_network_is_resp_err() {
+        let target = 54u32;
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(target, tx);
+        let stub = std::thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                drop(req.reply);
+            }
+        });
+        let fwd = RaftFwd::default();
+        fwd.hosts.lock().unwrap().insert(target, [0xAB; 32]);
+        let reply = async_io::block_on(async {
+            let mut f = ConnFulfiller {
+                conn: None,
+                cid: 0,
+                extension_id: ServiceId(7),
+                invoke_routes: routes.clone(),
+                raft_fwd: fwd,
+            };
+            f.fulfill(&dispatch_effect(target, b"x")).await
+        });
+        assert_eq!(reply, alloc::vec![crate::effects::RESP_ERR]);
         drop(routes);
         stub.join().unwrap();
     }
@@ -6991,6 +7292,7 @@ mod tests {
                 cid: 0,
                 extension_id: ServiceId(7),
                 invoke_routes: routes,
+                raft_fwd: RaftFwd::default(),
             };
             f.fulfill(&dispatch_effect(999, b"x")).await
         });
@@ -7017,6 +7319,7 @@ mod tests {
                 cid: 0,
                 extension_id: ServiceId(7),
                 invoke_routes: routes.clone(),
+                raft_fwd: RaftFwd::default(),
             };
             f.fulfill(&ask_effect(target, &payload)).await
         });
@@ -7046,6 +7349,7 @@ mod tests {
                     cid: 0,
                     extension_id: ServiceId(7),
                     invoke_routes: routes,
+                    raft_fwd: RaftFwd::default(),
                 };
                 f.fulfill(&ask_effect(target, &payload)).await
             }
@@ -7074,6 +7378,7 @@ mod tests {
                 cid: 0,
                 extension_id: ServiceId(7),
                 invoke_routes: routes,
+                raft_fwd: RaftFwd::default(),
             };
             f.fulfill(&ask_effect(12345, b"x")).await
         });

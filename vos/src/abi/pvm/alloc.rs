@@ -1,7 +1,14 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-const HEAP_SIZE: usize = 64 * 1024;
+/// Guest heap arena. Sized for actors whose serialized state runs
+/// to a few tens of KiB: one dispatch holds the decoded actor plus
+/// transient copies (the cold-start state read, rkyv's validating
+/// aligned copy, the reply page, and the save-path encode buffer,
+/// which grows by doubling) — peak live ≈ 4-5× the state size.
+/// The arena is zero-initialised static data (.bss), so growing it
+/// costs address space and zero pages, not image bytes.
+const HEAP_SIZE: usize = 256 * 1024;
 
 /// Minimum block size: must fit a `FreeNode` (2 × usize = 16 bytes on rv64).
 const MIN_BLOCK: usize = core::mem::size_of::<FreeNode>();

@@ -238,6 +238,19 @@ demo-msg-procs: build-msg-actors build-crates
     echo "→ alice: grant bob's operator the member tier..."
     PEER_B=$($VB whoami | sed -n 's/^peer_id = //p' | head -1)
     $VA space role msg-demo grant "$PEER_B" read
+    echo "→ alice: enroll host B as a raft voter (msg-ctl / msg-directory)..."
+    PEER_B_NODE=$(grep peer_id "$B/data/vosx/$SPACE_ID/.endpoint" | cut -d'"' -f2)
+    $VA space members msg-demo add-node "$PEER_B_NODE"
+    # Forwarded raft writes carry the forwarding NODE's peer, so both
+    # daemons' node peers need the member tier.
+    $VA space role msg-demo grant "$PEER_B_NODE" read
+    $VA space role msg-demo grant "$PEER_A" read
+    echo "→ waiting for host B to join the raft groups..."
+    for _ in $(seq 1 60); do
+        grep -q "agent 'msg-directory' spawned at runtime" /tmp/vosx-msg-b.log && \
+        grep -q "agent 'msg-general-ctl' spawned at runtime" /tmp/vosx-msg-b.log && break
+        sleep 0.5
+    done
     echo "→ bob: register (publishes key packages to the directory)..."
     $VB messenger register --space msg-demo nickname=bob
     $VB messenger join --space msg-demo channel=general

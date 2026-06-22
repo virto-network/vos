@@ -225,6 +225,29 @@ impl MsgDirectory {
         Vec::new()
     }
 
+    /// Return a claimed KeyPackage to the unclaimed pool — the
+    /// compensating action for an inviter whose claim definitively
+    /// failed to become a commit (the package was consumed from the
+    /// owner's inventory but admits nobody). Only sound after a
+    /// *decoded refusal*: when the commit submission failed at the
+    /// transport level it may still have landed, and re-arming the
+    /// package would hand a consumed KeyPackage to the next
+    /// claimer. Idempotent — unknown or already-unclaimed rows are
+    /// `STATUS_OK` so retries are safe.
+    #[msg(role = MsgDirectoryRole::Publisher)]
+    async fn release_kp(&mut self, owner: String, hash: Vec<u8>) -> u8 {
+        let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) else {
+            return STATUS_INVALID_INPUT;
+        };
+        if let Ok(pos) = self
+            .key_packages
+            .binary_search_by(|r| kp_key(&r.owner, &r.hash, &owner, &hash))
+        {
+            self.key_packages[pos].claimed = false;
+        }
+        STATUS_OK
+    }
+
     /// Unclaimed packages left for `owner` — the publisher's
     /// replenish signal.
     #[msg]
@@ -445,6 +468,88 @@ mod tests {
         // Consume one; a slot frees up.
         assert!(!claim(&mut d, "bob").is_empty());
         assert_eq!(publish(&mut d, "bob", b"replenished"), STATUS_OK);
+    }
+
+    #[test]
+    fn released_kp_is_claimable_again() {
+        let mut d = MsgDirectory::new();
+        publish(&mut d, "bob", b"the-kp");
+        let claimed = claim(&mut d, "bob");
+        assert_eq!(claimed, b"the-kp");
+        assert!(claim(&mut d, "bob").is_empty(), "single-use after claim");
+
+        let hash = kp_hash(&claimed);
+        assert_eq!(
+            dispatch(
+                &mut d,
+                ReleaseKp {
+                    owner: "bob".into(),
+                    hash: hash.to_vec(),
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(
+            dispatch(
+                &mut d,
+                KpCount {
+                    owner: "bob".into()
+                }
+            ),
+            1,
+            "released package counts as live inventory again"
+        );
+        assert_eq!(claim(&mut d, "bob"), b"the-kp", "released → claimable");
+    }
+
+    #[test]
+    fn release_is_idempotent_and_tolerates_unknown_rows() {
+        let mut d = MsgDirectory::new();
+        publish(&mut d, "bob", b"kp");
+        let hash = kp_hash(b"kp").to_vec();
+        // Releasing an UNCLAIMED row is a no-op success.
+        assert_eq!(
+            dispatch(
+                &mut d,
+                ReleaseKp {
+                    owner: "bob".into(),
+                    hash: hash.clone(),
+                },
+            ),
+            STATUS_OK,
+        );
+        // Unknown owner/hash: still OK (retry-safe).
+        assert_eq!(
+            dispatch(
+                &mut d,
+                ReleaseKp {
+                    owner: "nobody".into(),
+                    hash,
+                },
+            ),
+            STATUS_OK,
+        );
+        // Malformed hash length is the one refused input.
+        assert_eq!(
+            dispatch(
+                &mut d,
+                ReleaseKp {
+                    owner: "bob".into(),
+                    hash: vec![0u8; 7],
+                },
+            ),
+            STATUS_INVALID_INPUT,
+        );
+        // Inventory unchanged throughout.
+        assert_eq!(
+            dispatch(
+                &mut d,
+                KpCount {
+                    owner: "bob".into()
+                }
+            ),
+            1
+        );
     }
 
     #[test]

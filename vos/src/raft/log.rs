@@ -34,6 +34,15 @@ const META_COMMIT_INDEX: &str = "commit_index";
 const META_LAST_APPLIED: &str = "last_applied";
 const META_SNAP_INDEX: &str = "snap_last_index";
 const META_SNAP_TERM: &str = "snap_last_term";
+/// Active cluster configuration row. Value layout:
+/// `[joint_flag: u8]` then, when the flag is 1, the joint-old
+/// list, then the current list — each list is
+/// `[len: u16 LE][prefix: u16 LE × len]`. Written whenever the
+/// worker adopts a new effective configuration (see
+/// `WriteBatch::active_config`) and seeded host-side for solo
+/// bootstraps so a restart never falls back to a stale static
+/// member seed.
+const META_ACTIVE_CONFIG: &str = "active_config";
 
 /// One Raft log entry. Index is 1-based and contiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,6 +562,112 @@ fn u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes(a)
 }
 
+fn encode_prefix_list(buf: &mut Vec<u8>, list: &[u16]) {
+    buf.extend_from_slice(&(list.len() as u16).to_le_bytes());
+    for n in list {
+        buf.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+fn decode_prefix_list(bytes: &[u8], pos: &mut usize) -> Result<Vec<u16>, CommitError> {
+    let len_bytes = bytes
+        .get(*pos..*pos + 2)
+        .ok_or_else(|| CommitError::Config("active_config row: truncated list length".into()))?;
+    *pos += 2;
+    let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        let b = bytes
+            .get(*pos..*pos + 2)
+            .ok_or_else(|| CommitError::Config("active_config row: truncated prefix".into()))?;
+        *pos += 2;
+        out.push(u16::from_le_bytes([b[0], b[1]]));
+    }
+    Ok(out)
+}
+
+/// Write the active cluster configuration row inside the
+/// caller-supplied write txn. `current` is the steady (or
+/// joint-target) member set; `joint_old` is `Some` while a
+/// joint-consensus transition is in flight.
+pub fn write_active_config_in_txn(
+    txn: &redb::WriteTransaction,
+    current: &[u16],
+    joint_old: Option<&[u16]>,
+) -> Result<(), CommitError> {
+    let mut buf = Vec::with_capacity(1 + 2 + 2 * current.len());
+    match joint_old {
+        Some(prev) => {
+            buf.push(1);
+            encode_prefix_list(&mut buf, prev);
+        }
+        None => buf.push(0),
+    }
+    encode_prefix_list(&mut buf, current);
+    let mut t = txn.open_table(RAFT_META)?;
+    t.insert(META_ACTIVE_CONFIG, buf.as_slice())?;
+    Ok(())
+}
+
+/// Read the persisted active cluster configuration. `None` when
+/// the row has never been written (pre-config groups, or dbs
+/// created before the row existed).
+#[allow(clippy::type_complexity)]
+pub fn load_active_config(
+    db: &Database,
+) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, CommitError> {
+    let txn = db.begin_read()?;
+    let table = match txn.open_table(RAFT_META) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(row) = table.get(META_ACTIVE_CONFIG)? else {
+        return Ok(None);
+    };
+    let bytes = row.value();
+    let (flag, _) = bytes
+        .split_first()
+        .ok_or_else(|| CommitError::Config("active_config row: empty".into()))?;
+    let mut pos = 1;
+    let joint_old = match flag {
+        0 => None,
+        1 => Some(decode_prefix_list(bytes, &mut pos)?),
+        other => {
+            return Err(CommitError::Config(alloc::format!(
+                "active_config row: invalid joint flag {other}",
+            )));
+        }
+    };
+    let current = decode_prefix_list(bytes, &mut pos)?;
+    if pos != bytes.len() {
+        return Err(CommitError::Config(alloc::format!(
+            "active_config row: {} trailing bytes",
+            bytes.len() - pos,
+        )));
+    }
+    Ok(Some((current, joint_old)))
+}
+
+/// Persist `members` as the active configuration iff no
+/// configuration row exists yet. Returns `true` when the row was
+/// written. Used by the daemon when it bootstraps a brand-new
+/// group as the sole voter: without the seed, a group that never
+/// went through a membership change has no `ConfigChange` entry
+/// and no persisted row, so a restart would fall back to whatever
+/// static member list the spawner computes *at restart time* —
+/// which may have grown past the configuration the group actually
+/// operates under, leaving it unable to elect.
+pub fn seed_active_config(db: &Database, members: &[u16]) -> Result<bool, CommitError> {
+    if load_active_config(db)?.is_some() {
+        return Ok(false);
+    }
+    let txn = db.begin_write()?;
+    write_active_config_in_txn(&txn, members, None)?;
+    txn.commit()?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +875,37 @@ mod tests {
         assert_eq!(from_disk.snap_last_index, snap.snap_last_index);
         assert_eq!(from_disk.snap_last_term, snap.snap_last_term);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn active_config_round_trips_and_seed_is_write_once() {
+        let (db, dir) = temp_db();
+        // No row yet.
+        assert_eq!(load_active_config(&db).unwrap(), None);
+
+        // Seed writes when absent…
+        assert!(seed_active_config(&db, &[0xAAAA]).unwrap());
+        assert_eq!(
+            load_active_config(&db).unwrap(),
+            Some((alloc::vec![0xAAAA], None)),
+        );
+        // …and refuses to clobber an existing row.
+        assert!(!seed_active_config(&db, &[0xBBBB]).unwrap());
+        assert_eq!(
+            load_active_config(&db).unwrap(),
+            Some((alloc::vec![0xAAAA], None)),
+        );
+
+        // A joint-phase write (the worker's adoption path)
+        // overwrites the seed and round-trips both lists.
+        let txn = db.begin_write().unwrap();
+        write_active_config_in_txn(&txn, &[0xAAAA, 0xBBBB], Some(&[0xAAAA])).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            load_active_config(&db).unwrap(),
+            Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

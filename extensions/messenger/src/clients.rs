@@ -271,6 +271,32 @@ pub(crate) async fn dir_claim_kp(
     Ok((!bytes.is_empty()).then_some(bytes))
 }
 
+/// `msg-directory.release_kp` — return a claimed KeyPackage to the
+/// pool after the invite it was claimed for was definitively
+/// refused. Never call this on a transport-level failure — the
+/// commit may have landed and the package would be re-armed
+/// consumed.
+pub(crate) async fn dir_release_kp(
+    ctx: &mut MsgrCtx,
+    dir_id: u32,
+    owner: &str,
+    hash: [u8; 32],
+) -> Result<(), String> {
+    let msg = Msg::new("release_kp")
+        .with("owner", owner.to_string())
+        .with("hash", hash.to_vec());
+    let raw = ctx
+        .ask_dispatch(ServiceId(dir_id), &dyn_payload(&msg))
+        .await
+        .ok_or_else(|| "msg-directory unreachable".to_string())?;
+    let value = decode_value(&raw).ok_or_else(|| "bad msg-directory reply".to_string())?;
+    match value_to_status(value) {
+        Some(msg_directory::STATUS_OK) => Ok(()),
+        Some(code) => Err(format!("msg-directory refused the release (status {code})")),
+        None => Err("bad msg-directory reply".into()),
+    }
+}
+
 /// `msg-directory.announce_channel`.
 pub(crate) async fn dir_announce_channel(
     ctx: &mut MsgrCtx,

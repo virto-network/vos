@@ -31,8 +31,8 @@ mod mls;
 mod tick;
 
 use clients::{
-    ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp, hex_decode,
-    hex_encode, log_post, reg_agents, reg_install, resolve,
+    ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp, dir_release_kp,
+    hex_decode, hex_encode, log_post, reg_agents, reg_install, resolve,
 };
 use mls::{kp_hint, new_key_package, open_provider, parse_key_package, snapshot_provider};
 use openmls::prelude::*;
@@ -334,6 +334,10 @@ impl Messenger {
         }
         // A serialized KeyPackage is hundreds of bytes; anything
         // long and hex-shaped is one, anything else is a nickname.
+        // A directory claim is remembered so a definitively-refused
+        // commit can return the package to the pool instead of
+        // leaking it from the member's inventory.
+        let mut claimed_from: Option<u32> = None;
         let kp_bytes = match hex_decode(&member).filter(|b| b.len() > 64) {
             Some(bytes) => bytes,
             None => {
@@ -342,7 +346,10 @@ impl Messenger {
                     Err(e) => return format!("can't look up '{member}': {e}"),
                 };
                 match dir_claim_kp(ctx, dir_id, &member).await {
-                    Ok(Some(bytes)) => bytes,
+                    Ok(Some(bytes)) => {
+                        claimed_from = Some(dir_id);
+                        bytes
+                    }
                     Ok(None) => {
                         return format!(
                             "'{member}' has no key packages left in the directory — \
@@ -364,7 +371,21 @@ impl Messenger {
             .await
         {
             Ok(epoch) => format!("invited — '{channel}' now at epoch {epoch}"),
-            Err(e) => e,
+            Err(e) => {
+                // Compensate ONLY definite refusals: after an
+                // indeterminate (transport) failure the commit may
+                // have landed, and re-arming the package would hand
+                // out a consumed KeyPackage.
+                if let (Some(dir_id), ChainErr::Refused(_)) = (claimed_from, &e) {
+                    let hash = msg_directory::kp_hash(&kp_bytes);
+                    if let Err(release_err) = dir_release_kp(ctx, dir_id, &member, hash).await {
+                        log::warn!(
+                            "couldn't return '{member}'s claimed key package: {release_err}"
+                        );
+                    }
+                }
+                e.into_message()
+            }
         }
     }
 
@@ -395,7 +416,7 @@ impl Messenger {
             .await
         {
             Ok(epoch) => format!("removed '{nickname}' — '{channel}' now at epoch {epoch}"),
-            Err(e) => e,
+            Err(e) => e.into_message(),
         }
     }
 
@@ -412,7 +433,7 @@ impl Messenger {
             .await
         {
             Ok(epoch) => format!("rotated keys — '{channel}' now at epoch {epoch}"),
-            Err(e) => e,
+            Err(e) => e.into_message(),
         }
     }
 
@@ -575,6 +596,35 @@ enum ChainOp<'a> {
     SelfUpdate,
 }
 
+/// How a failed chain op relates to the channel's chain. `Refused`
+/// is a definitive no — local validation or the sequencer rejected
+/// the operation and nothing landed, so compensating actions (like
+/// releasing a claimed KeyPackage) are safe. `Indeterminate` means
+/// the submission itself failed in transit: the commit MAY have
+/// been accepted, so compensation must not fire.
+enum ChainErr {
+    Refused(String),
+    Indeterminate(String),
+}
+
+impl ChainErr {
+    fn into_message(self) -> String {
+        match self {
+            Self::Refused(m) | Self::Indeterminate(m) => m,
+        }
+    }
+}
+
+/// Every error produced *before* the commit reaches the sequencer
+/// (resolution, MLS build, serialization, decoded refusals) is a
+/// definitive `Refused`; only the `ctl_commit` transport failure is
+/// marked `Indeterminate`, explicitly, at its call site.
+impl From<String> for ChainErr {
+    fn from(m: String) -> Self {
+        Self::Refused(m)
+    }
+}
+
 impl Messenger {
     fn channel_index(&self, name: &str) -> Option<usize> {
         self.channels.iter().position(|c| c.name == name)
@@ -681,13 +731,14 @@ impl Messenger {
         ctx: &mut Context<Self>,
         channel: &str,
         op: ChainOp<'_>,
-    ) -> core::result::Result<u64, String> {
+    ) -> core::result::Result<u64, ChainErr> {
         if let Some(i) = self.channel_index(channel)
             && self.channels[i].desynced
         {
             return Err(format!(
                 "channel '{channel}' is desynced — repair it before making membership changes"
-            ));
+            )
+            .into());
         }
         let ctl_id = resolve(ctx, &ctl_agent_name(channel)).await?;
         for attempt in 0..2 {
@@ -695,7 +746,7 @@ impl Messenger {
             let (_, signer) = self.identity(&provider)?;
             let mut group = self.load_group(&provider, channel)?;
             if !group.is_active() {
-                return Err(format!("no longer a member of '{channel}'"));
+                return Err(format!("no longer a member of '{channel}'").into());
             }
             let epoch = group.epoch().as_u64();
 
@@ -722,12 +773,16 @@ impl Messenger {
                         .collect();
                     let target = match matches.as_slice() {
                         [] => {
-                            return Err(format!("'{nickname}' is not a member of '{channel}'"));
+                            return Err(
+                                format!("'{nickname}' is not a member of '{channel}'").into()
+                            );
                         }
                         [only] if *only == own => {
-                            return Err("that nickname resolves to your own leaf — \
+                            return Err(ChainErr::Refused(
+                                "that nickname resolves to your own leaf — \
                                  have another member remove you"
-                                .into());
+                                    .into(),
+                            ));
                         }
                         [only] => *only,
                         _ => {
@@ -735,7 +790,8 @@ impl Messenger {
                                 "'{nickname}' is ambiguous ({} leaves share it) — \
                                  removal by nickname is unsafe here",
                                 matches.len()
-                            ));
+                            )
+                            .into());
                         }
                     };
                     let (c, w, _info) = group
@@ -743,9 +799,11 @@ impl Messenger {
                         .map_err(|e| format!("remove_members failed: {e}"))?;
                     if w.is_some() {
                         let _ = group.clear_pending_commit(provider.storage());
-                        return Err("commit unexpectedly produced a welcome — \
+                        return Err(ChainErr::Refused(
+                            "commit unexpectedly produced a welcome — \
                                     pending add proposals in the way"
-                            .into());
+                                .into(),
+                        ));
                     }
                     (c, None, Vec::new())
                 }
@@ -756,9 +814,11 @@ impl Messenger {
                         .into_contents();
                     if w.is_some() {
                         let _ = group.clear_pending_commit(provider.storage());
-                        return Err("commit unexpectedly produced a welcome — \
+                        return Err(ChainErr::Refused(
+                            "commit unexpectedly produced a welcome — \
                                     pending add proposals in the way"
-                            .into());
+                                .into(),
+                        ));
                     }
                     (c, None, Vec::new())
                 }
@@ -773,8 +833,14 @@ impl Messenger {
                 None => Vec::new(),
             };
 
+            // The one indeterminate failure: the submission itself
+            // failed in transit (local follower drop, forward
+            // timeout…) — the leader may still have accepted it.
             let outcome =
-                ctl_commit(ctx, ctl_id, epoch, now_ms(), commit_body, welcome, hint).await?;
+                match ctl_commit(ctx, ctl_id, epoch, now_ms(), commit_body, welcome, hint).await {
+                    Ok(o) => o,
+                    Err(e) => return Err(ChainErr::Indeterminate(e)),
+                };
             match outcome.status {
                 msg_ctl::STATUS_OK => {
                     group
@@ -799,7 +865,7 @@ impl Messenger {
                 other => {
                     let _ = group.clear_pending_commit(provider.storage());
                     self.mls_store = snapshot_provider(&provider);
-                    return Err(match other {
+                    return Err(ChainErr::Refused(match other {
                         msg_ctl::STATUS_EPOCH_TAKEN => format!(
                             "another commit won epoch {epoch} again — channel is contended, retry"
                         ),
@@ -808,11 +874,13 @@ impl Messenger {
                             outcome.next_epoch
                         ),
                         code => format!("msg-ctl refused the commit (status {code})"),
-                    });
+                    }));
                 }
             }
         }
-        Err("commit lost the race twice — channel is contended, try again".into())
+        Err(ChainErr::Refused(
+            "commit lost the race twice — channel is contended, try again".into(),
+        ))
     }
 }
 

@@ -4,13 +4,22 @@
 # messenger extension holding this node's MLS state:
 #
 #   msg-general-log  crdt   ciphertext envelope log (leaderless)
-#   msg-general-ctl  crdt¹  sequenced MLS commit chain
+#   msg-general-ctl  raft¹  sequenced MLS commit chain
 #   messenger        .so    encrypt/decrypt at the edge, poll tick
 #
-# ¹ crdt-mode sequencing is only safe while a single member issues
-#   MLS commits (here: host A creates the channel and does all the
-#   inviting). Multi-committer channels flip this line to
-#   consistency = "raft" once follower→leader write routing lands.
+# ¹ raft linearizes the MLS commit chain (and msg-directory's
+#   single-use KeyPackage claims) across nodes, so any member can
+#   commit — a follower's write is forwarded to the group's
+#   leader. Voters come from the registry's members table: the
+#   creator is enrolled at `space new`; enroll each joining node
+#   (and grant its NODE peer the member tier — a forwarded write
+#   carries the forwarding node's authority):
+#
+#     vosx space members msg-demo add-node <node-peer-id>
+#     vosx space role msg-demo grant <node-peer-id> read
+#
+#   The node peer id is in the joiner's `.endpoint` file (NOT
+#   `vosx whoami`, which is the operator's client identity).
 #
 # Pair with `space-msg-b.toml` in another vosx process. Easiest
 # end-to-end recipe:
@@ -45,12 +54,12 @@ consistency = "crdt"
 [[agent]]
 name = "msg-general-ctl"
 path = "../actors/msg-ctl/target/riscv64em-javm/release/msg_ctl.elf"
-consistency = "crdt"
+consistency = "raft"
 
 [[agent]]
 name = "msg-directory"
 path = "../actors/msg-directory/target/riscv64em-javm/release/msg_directory.elf"
-consistency = "crdt"
+consistency = "raft"
 
 [[extension]]
 name = "messenger"
