@@ -1,62 +1,42 @@
-# Chronos bias resistance — ECVRF + committee commit-reveal (Phase D)
+# Chronos bias resistance — ECVRF + committee commit-reveal
 
-**Status:** **v1 LANDED 2026-06-16, branch `messaging`** (D0–D4 + two fixes;
-commits `37876d6`→`76c3aec`). The design below is the original groundwork; read
-the **As-built** section next for where the implementation diverged.
 **Extends:** [`actor-clock-and-randomness.md`](./actor-clock-and-randomness.md)
-(the "Crypto evolution" + "Security invariants" sections). Phases A/B/C of that
-doc are landed; this is its Phase D ("bias resistance").
+(the "Crypto evolution" + "Security invariants" sections). This is the v1 bias-resistance
+step of that design.
 
-## As-built (Phase D v1 landed)
+## Design notes (where the implementation diverges from the protocol sketch)
 
-The committee protocol matches the design — per-voter ECVRF over `α`, XOR
-combine, multi-epoch open→reveal→fold, the lagged read, the unchanged pull API —
-with three deltas worth recording, plus two bugs found and fixed during
-verification:
+The committee protocol is per-voter ECVRF over `α`, XOR combine, multi-epoch
+open→reveal→fold, the lagged read, behind the unchanged pull API — with three deltas worth
+recording:
 
-- **Auth is cryptographic, not caller-based (delta from §Seam evolution).** The
-  design assumed a follower's reveal/enrol arrives as `Caller::Peer`. It does at
-  the libp2p edge, but a chronos handler runs on the **raft apply path, where the
-  originating caller is NOT preserved** — a cross-node reveal reaches the handler
-  as `Caller::Unauthenticated`. So `reveal(voter_id, round, proof)` authenticates
-  by the VRF proof itself (verified against the round's snapshot key — only the
-  key holder could produce it), and `enrol_voter(voter_id, pubkey)` by the
-  leader-pushed authorized set + **first-wins** binding (rebinding a different key
-  → `STATUS_KEY_LOCKED`). General lesson: *authenticate a raft actor's writes by
-  what's in the committed entry (a signature/proof), never by the caller.*
-- **Enrol residual (documented).** Because enrol is caller-free, a party that
-  front-runs an authorized voter's *first* enrol can bind its own key to that
-  slot (committee griefing/Sybil within the authorized set). No β is ever
-  forgeable, so bias resistance is intact. The proper close is binding the VRF
-  pubkey in the **registry at admit time** (the rejected "option B" — now the
-  recommended hardening; see the roadmap).
-- **Runtime prerequisite found + fixed (`654b2da`).** A raft agent soft-restarted
-  (reload + replay the whole DAG) on *every* committed index — including the echo
-  of its own proposals — so a continuously-committing actor (the chronos clock,
-  the first such consumer) thrashed O(n²) and transiently reset to genesis. This
-  was a **pre-existing** runtime bug (reproduced on v0 chronos), not Phase D's.
-  Fix: `CommitStrategy::needs_sync_reload()` gates the restart on whether the
-  store actually moved ahead of what the agent applied (`commit_index >
-  last_applied` for raft) — reload only for genuine remote merges, never for the
-  agent's own commits.
-- **Verified live:** 38 chronos unit tests; vos lib 267; messenger e2e + retry;
-  a 2-node committee folding both voters' VRF reveals every round on the PVM; and
-  the full `just demo-msg-procs` (messenger + chronos) green.
-- **Done:** D0 (`vrf`), D1 (enrol substrate), D2 (round protocol), D3
-  (`verify_combine`), D4 (vosx feeder). **Deferred:** D5 (ristretto precompiles —
-  perf, gated on profiling) and D6 (Bandersnatch RingVRF, JAM interop).
-- **Open follow-ups (persisted in the roadmap):** a committed multi-node
-  committee integration test (the live path is only script/demo-verified today);
-  registry pubkey-binding to close the enrol residual; and incremental
-  follower-apply (a raft follower still full-replays per applied entry — perf,
-  not correctness).
+- **Auth is cryptographic, not caller-based.** A follower's reveal/enrol arrives as
+  `Caller::Peer` at the libp2p edge, but a chronos handler runs on the **raft apply path,
+  where the originating caller is NOT preserved** — a cross-node reveal reaches the handler
+  as `Caller::Unauthenticated`. So `reveal(voter_id, round, proof)` authenticates by the VRF
+  proof itself (verified against the round's snapshot key — only the key holder could produce
+  it), and `enrol_voter(voter_id, pubkey)` by the leader-pushed authorized set + **first-wins**
+  binding (rebinding a different key → `STATUS_KEY_LOCKED`). General lesson: *authenticate a
+  raft actor's writes by what's in the committed entry (a signature/proof), never by the
+  caller.*
+- **Enrol residual.** Because enrol is caller-free, a party that front-runs an authorized
+  voter's *first* enrol can bind its own key to that slot (committee griefing/Sybil within
+  the authorized set). No β is ever forgeable, so bias resistance is intact. The proper close
+  is binding the VRF pubkey in the **registry at admit time** (see Open items).
+- **Raft soft-restart prerequisite.** A raft agent soft-restarting (reload + replay the whole
+  DAG) on *every* committed index — including the echo of its own proposals — makes a
+  continuously-committing actor (the chronos clock, the first such consumer) thrash O(n²) and
+  transiently reset to genesis. The fix gates the restart on whether the store actually moved
+  ahead of what the agent applied: `CommitStrategy::needs_sync_reload()` (`commit_index >
+  last_applied` for raft) reloads only for genuine remote merges, never for the agent's own
+  commits.
 
 ## Why
 
 v0 chronos is a blake2b hash-chain of leader-contributed entropy: the round
 driver supplies the 32 bytes folded each epoch and could **grind** it (try
 values, pick a favourable beacon) before committing. v0 documents this as the
-trusted-leader boundary. Phase D removes the grind by making each round's
+trusted-leader boundary. v1 removes the grind by making each round's
 entropy a **verifiable random function (VRF) output** that no one can choose,
 contributed by a committee (the raft voters) under commit-reveal so a single
 honest voter randomises the round. This is the v1 step toward JAM's entropy
@@ -66,33 +46,25 @@ The whole upgrade lives **behind the stable pull API** (`now`/`epoch`/
 `current`/`latest_final`/`randomness_at`/`range`/`verify_chain`): no consumer
 changes — the messenger hedge and every other reader keep working unmodified.
 
-## Feasibility verdict: the precompile is NOT a correctness gate
+## Feasibility: the precompile is NOT a correctness gate
 
-The v0 module doc said the ECVRF upgrade was "gated on the edwards/ristretto
-precompiles being wired into `vos::crypto`." **Groundwork finding: it is not** —
-exactly as the P2 spike found for the messenger ciphersuite.
-
-A feasibility fixture, `actors/_chronos_crypto_spike` (mirroring
-`actors/_crypto_spike`), implements a minimal **ECVRF-RISTRETTO255-SHA512**
-(keygen / prove / verify) plus the committee XOR-combine in pure no_std
-software over `curve25519-dalek` (serial backend) + SHA-512, and:
+ECVRF-RISTRETTO255-SHA512 (keygen / prove / verify) plus the committee XOR-combine in pure
+no_std software over `curve25519-dalek` (serial backend) + SHA-512:
 
 - **compiles + transpiles** (`grey_transpiler::link_elf`) to a riscv64em-javm
-  PVM ELF (202 KB), using only the blake2b precompile; and
-- **runs correctly on the PVM** — `vosx run` instantiates the actor, `new()`
-  round-trips a valid proof (verify ⇒ true) and rejects a tampered proof, a
-  wrong key, and a wrong input (verify ⇒ false), asserts the 80-byte wire
-  encoding, and asserts the XOR-combine is order-independent. A flip test (one
-  assertion inverted) panics on the PVM at the exact line, proving the checks
-  execute rather than merely link.
+  PVM ELF, using only the blake2b precompile; and
+- **runs correctly on the PVM** — the actor instantiates, round-trips a valid proof
+  (verify ⇒ true), rejects a tampered proof, a wrong key, and a wrong input
+  (verify ⇒ false), asserts the 80-byte wire encoding, and asserts the XOR-combine
+  is order-independent. (`chronos_transpile.rs` gates this over the real `chronos.elf`.)
 
 `curve25519-dalek` 4.1.3 (the version `ed25519-dalek` v2 already pulls and the
-P2 spike already transpiled) ships the `ristretto` module **unconditionally** —
+messenger ciphersuite already transpiles) ships the `ristretto` module **unconditionally** —
 `RistrettoPoint`, `CompressedRistretto`, `from_uniform_bytes` (Elligator
 hash-to-curve), `Scalar * RistrettoPoint`, scalar arithmetic — with
 `default-features = false`. No `rand_core` ⇒ no `::random` ⇒ determinism is
 structurally enforced (every scalar is loaded from bytes). The `+e`
-16→13-register squeeze is a non-issue (same as P2).
+16→13-register squeeze is a non-issue.
 
 So ECVRF verify decomposes into operations that **all run in software today**:
 hash-to-curve (Elligator), two scalar-mults (`s·B`, `c·pk` / `c·Γ`), and a
@@ -140,9 +112,9 @@ property), and anyone can verify it afterward with `pk_i` and the 80-byte proof.
 **Proof shape (RFC 9381, ECVRF-RISTRETTO255-SHA512):** `Γ ‖ c ‖ s` = 32 + 16 +
 32 = **80 bytes**. `Γ = sk·H`, `c = challenge(pk,H,Γ,k·B,k·H)` (128-bit), `s =
 k + c·sk`; verify recomputes `U = s·B − c·pk`, `V = s·H − c·Γ`, accepts iff the
-re-derived challenge equals `c`; the VRF output is `β = H(Γ)`. The spike
-implements exactly this. (SHA-512 keeps drand/Sui interop; a blake2b
-substitution is sound but non-standard — decide at build time.)
+re-derived challenge equals `c`; the VRF output is `β = H(Γ)`. (SHA-512 keeps
+drand/Sui interop; a blake2b substitution is sound but non-standard — decide at
+build time.)
 
 ### Committee combine (one honest voter randomises the round)
 
@@ -206,29 +178,34 @@ the lagged value; time stays bounded; and clock/entropy still originate only in
 the runtime feeder — the VRF *keys* are the voters', the VRF *inputs* are public
 chain state, and chronos itself still samples no entropy.
 
-## Seam evolution (v0 → v1, API unchanged)
+## Seam (v0 → v1)
 
-Anchors are against the landed `actors/chronos/src/lib.rs`.
+Anchors are against `actors/chronos/src/lib.rs`. The seam is described here; the deltas where
+the implementation diverges from the protocol sketch (cryptographic auth, first-wins enrol)
+are in the design-notes section above.
 
-- **State (`Chronos` struct):** add `voter_pubkeys: BTreeMap<[u8;32],[u8;32]>`
-  (voter id → VRF pk, refreshed from the registry on membership change),
-  `pending: BTreeMap<u64, RoundDraft>` (round → collected reveals/commitments).
-  `BeaconRound` gains `combined: [u8;32]` provenance and an optional
-  per-round proof set for `verify_chain`. The rkyv whole-struct state has no
-  version tag, so this field-add is a **deliberate re-init** (as the v0→chronos
-  field-add already was) or carries an explicit version byte — documented in the
-  module, same caveat the slot-add already follows.
-- **Handlers:** keep `advance(slot, entropy)` as the leader feed (it now opens a
-  round + records `α`); add `reveal(round, beta, proof)` (Advancer/voter-gated,
-  a raft write). `init`/reads unchanged. `AdvanceOutcome` shape unchanged.
+- **State (`Chronos` struct):** `voter_pubkeys: BTreeMap<[u8;32],[u8;32]>`
+  (voter id → VRF pk, refreshed from the leader-pushed authorized set on
+  membership change) and `pending: BTreeMap<u64, RoundDraft>` (round → collected
+  reveals/commitments). `BeaconRound` carries `combined: [u8;32]` provenance plus
+  the per-round proof set `verify_chain` checks. The rkyv whole-struct state has
+  no version tag, so this field-add is a **deliberate re-init** (as the
+  v0→chronos field-add already was), documented in the module — the same caveat
+  the slot-add already follows.
+- **Handlers:** `advance(slot, entropy)` is the leader feed (it opens a round +
+  records `α`); `reveal(voter_id, round, proof)` is a raft write authenticated by
+  the VRF proof rather than the caller (see the design notes), alongside the
+  caller-free `enrol_voter(voter_id, pubkey)`. `init`/reads and the
+  `AdvanceOutcome` shape are unchanged.
 - **Voter keys:** the voter set is the registry's `MemberRow`s with
   `kind == MEMBER_KIND_NODE && role == NODE_ROLE_VOTER`
-  (`actors/space-registry`); each voter's VRF pk is enrolled alongside (a new
-  registry field or a chronos-local enrol handler). chronos caches it like the
-  feeder caches the chronos replication id.
-- **`verify_chain`:** extends from "re-hash + linkage" to additionally verify
-  each round's VRF proof set against the round's voter pubkeys. Routes through
-  the ristretto precompile when wired, software otherwise — identical result.
+  (`actors/space-registry`); each voter's VRF pk is enrolled via the
+  **chronos-local `enrol_voter` handler** (first-wins binding — see Open items for
+  the registry-binding hardening that closes its front-running residual). chronos
+  caches it like the feeder caches the chronos replication id.
+- **`verify_chain`:** beyond "re-hash + linkage", verifies each round's VRF proof
+  set against the round's voter pubkeys. Runs the software ristretto path; routes
+  through the precompile if/when it is wired — identical result.
 - **Consumers:** **no change.** `latest_final`/`randomness_at` return the same
   `BeaconRound`; readers never parse proofs or voter keys.
 
@@ -243,37 +220,54 @@ a precompile lift comparable in scope to the ristretto chip. Deferred until JAM
 interop is a concrete requirement; the v1 ECVRF endpoint serves bias resistance
 in the meantime, and the stable API means v2 is again a behind-the-seam swap.
 
-## Phased plan for the v1 build (when scheduled)
+## Components
 
-- **D0 — VRF library — DONE** (`vrf` crate): the spike's ECVRF lifted into a
-  standalone no_std library — `prove`/`verify`/`output` + an 80-byte `Proof`
-  codec + `keypair_from_seed`, ECVRF-RISTRETTO255-SHA512, 9 property tests,
-  compiles for the PVM target (so the chronos actor can depend on it). Kept out
+- **VRF library (`vrf` crate):** a standalone no_std library —
+  `prove`/`verify`/`output` + an 80-byte `Proof` codec + `keypair_from_seed`,
+  ECVRF-RISTRETTO255-SHA512, property tests, compiles for the PVM target. Kept out
   of core `vos` (curve25519 only reaches chronos/vosx via this crate). Internal
-  ciphersuite — no RFC-registered ristretto suite exists, so correctness rests
-  on the algebraic identity + property tests, not cross-impl vectors; SHA-512
-  chosen over blake2b (interop-friendlier; revisit only on a profiled win).
-- **D1 — voter key enrolment:** registry/chronos plumbing for per-voter VRF
-  pubkeys keyed off the existing voter membership.
-- **D2 — chronos v1 round protocol:** `advance` opens a round; `reveal` collects
-  + verifies; fold on quorum/timeout; the field-add re-init.
-- **D3 — `verify_chain` proof verification** + unit tests (valid/forged/missing
-  reveals; the 1-bit-leak bound made explicit in a test's comments).
-- **D4 — feeder/voter wiring** in vosx: voters post reveals on the chronos feed
-  cadence; leader opens rounds (extends the landed `feed_chronos`).
-- **D5 (perf, optional):** wire the ristretto precompile handlers (the existing
-  ECALLs 110-114) + a hash-to-ristretto ECALL **iff** profiling the round shows
-  the software path is the bottleneck — pure performance, gated on measurement.
-- **D6 (later):** v2 Bandersnatch precompile + RingVRF for JAM interop.
+  ciphersuite — no RFC-registered ristretto suite exists, so correctness rests on
+  the algebraic identity + property tests, not cross-impl vectors.
+- **Voter key enrolment:** the caller-free `enrol_voter` substrate, keyed off the
+  existing voter membership (first-wins binding — see the design notes).
+- **Round protocol:** `advance` opens a round; `reveal` collects + verifies; fold
+  on quorum/timeout; the field-add re-init.
+- **`verify_chain` proof verification** (valid/forged/missing reveals; the
+  1-bit-leak bound made explicit in a test's comments).
+- **Feeder/voter wiring** in vosx: voters post reveals on the chronos feed cadence;
+  the leader opens rounds (extends `feed_chronos`).
 
-## Open questions / decisions
+## Settled decisions
 
-- **SHA-512 vs blake2b** in the ciphersuite: SHA-512 keeps drand/Sui interop and
-  is proven in the spike; blake2b reuses the existing precompile but is
-  non-standard. Lean SHA-512 unless a profiled win says otherwise.
-- **Reveal window length / timeout** and the withholding penalty — sets how
+- **Ciphersuite hash = SHA-512.** **ECVRF-RISTRETTO255-SHA512** keeps drand/Sui
+  interop; blake2b would reuse the existing precompile but is non-standard —
+  revisit only on a profiled win.
+- **Voter-key enrolment venue = a chronos-local, caller-free `enrol_voter`
+  handler with first-wins binding.** (The registry-field alternative is the
+  recommended hardening, see Open items.)
+
+## Open items
+
+- **Committed multi-node committee integration test.** The live committee path is
+  only script/demo-verified today (`just demo-msg-procs`, 2-node folding); a
+  committed automated multi-node test is owed.
+- **Registry pubkey-binding to close the enrol front-running residual.** Because
+  `enrol_voter` is caller-free + first-wins, a party can front-run an authorized
+  voter's *first* enrol and bind its own key to that slot (committee
+  griefing/Sybil within the authorized set; no β is ever forgeable, so bias
+  resistance is intact). The proper close is binding the VRF pubkey in the
+  **registry at admit time**.
+- **Incremental follower-apply (perf).** A raft follower still full-replays per
+  applied entry — performance, not correctness.
+- **Ristretto precompiles.** Wire the existing ECALLs 110–114 + a
+  hash-to-ristretto ECALL (reserve e.g. 115), **iff** profiling the actual
+  chronos round shows the software path is the bottleneck. Pure performance,
+  gated on measurement.
+- **v2 Bandersnatch RingVRF** for JAM interop (behind the unchanged pull API).
+  Deferred until JAM interop is a concrete requirement.
+- **Reveal window length / timeout + withholding penalty policy.** Sets how
   exposed the 1-bit last-revealer bit is in practice.
-- **Voter VRF key lifecycle**: per-node static key vs rotating; enrolment venue
-  (registry field vs chronos handler); revocation on membership change.
-- **Quorum policy**: fold on all-reveals vs a threshold-of-voters vs
-  first-k — affects liveness vs the honest-voter assumption.
+- **Voter VRF key lifecycle:** per-node static key vs rotation, and revocation on
+  membership change.
+- **Quorum policy:** fold on all-reveals vs a threshold-of-voters vs first-k —
+  affects liveness vs the honest-voter assumption.

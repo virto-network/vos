@@ -1,9 +1,10 @@
 # Deterministic clock & verifiable randomness for VOS actors
 
-**Status:** design agreed 2026-06-15 (branch `messaging`); not yet implemented.
-**Supersedes:** the "host round-driver / messenger-tick driver" sketch in the P3
-section of [`messaging-pvm-native.md`](./messaging-pvm-native.md). That doc's
-`beacon` actor is the seed of the **chronos** service described here.
+The **chronos** service gives deterministic VOS actors a clock and verifiable randomness:
+a v0 clock + blake2b entropy chain and v1 Ristretto ECVRF committee bias resistance, with
+the messenger hedge that consumes it. See also the verifiable-randomness section of
+[`messaging-pvm-native.md`](./messaging-pvm-native.md); chronos is the generalization of
+that doc's `beacon` actor.
 
 ## Why
 
@@ -23,7 +24,7 @@ But the messaging / collaboration protocols need both:
 - **verifiable randomness** — fair ordering/sampling, domain separation, and an
   optional HKDF-`info` hedge for the MLS CSPRNG.
 
-This document defines how both reach a deterministic actor **without breaking
+This document records how both reach a deterministic actor **without breaking
 determinism** and **without putting time/randomness origination into application
 code or a native extension**, while staying close to JAM so a future JAM
 integration plays nice.
@@ -91,7 +92,7 @@ pull API. Consumers never originate time/randomness; they ask chronos.
    reply pinned in the consumer's effect log → deterministic replay
 ```
 
-### State & API (evolution of `actors/beacon/src/lib.rs`)
+### State & API (`actors/chronos/src/lib.rs`, generalized from the old `beacon`)
 
 - **Clock:** `current_slot: u64` (+ derived `epoch`). Monotone.
 - **Entropy:** the existing blake2b hash-chain of contributed entropy
@@ -113,25 +114,29 @@ pull API. Consumers never originate time/randomness; they ask chronos.
 The API is the stable seam. Everything behind it — hash-chain → VRF → committee —
 evolves without touching a single consumer.
 
-### The feed (F1 — agreed)
+### The feed
 
 The **raft leader feeds chronos at the sequencing boundary** via
 `node.invoke(chronos_id, advance(slot, entropy))` with **`Caller::System`**
-(`vos/src/node.rs` `invoke_with_timeout` ~2707; System bypasses the role gate via
-`Caller::is_trusted`, `vos/src/actors/auth.rs` ~235 / `context.rs` `has_role`
-~170). No leadership detection: raft serializes, and on a follower the local
-replica's write fails NotLeader so `node.invoke` returns `None` benignly — only
-the leader's advance lands. This is the **one** minimal, generic, runtime-layer
-touch; it is not messaging/app code and not the messenger extension. (The rejected
-alternative — a faucet *extension* on a `tick` — relays Unauthenticated and so
-cannot drive a gated `advance` without making it dangerously open.)
+(`vos/src/node.rs` `invoke_with_timeout`; System bypasses the role gate via
+`Caller::is_trusted`, `vos/src/actors/auth.rs` / `context.rs` `has_role`). No
+leadership detection: raft serializes, and on a follower the local replica's write
+fails NotLeader so `node.invoke` returns `None` benignly — only the leader's
+advance lands. This is the **one** minimal, generic, runtime-layer touch; it is
+not messaging/app code and not in the messenger. (The rejected alternative — a
+faucet *extension* on a `tick` — relays Unauthenticated and so cannot drive a
+gated `advance` without making it dangerously open.)
 
-The driver reuses the existing vosx daemon periodic hook
-(`run_forever_with` → `reconcile_installed_agents`, `vosx/src/commands/space/up.rs`
-~226) as a sibling pass: resolve `instance_service_id("chronos", prefix)`, skip if
-`!node.has_agent(id)`, `init` once (idempotent), then each pass compute
-`slot = floor(wall_ms / SLOT_MS)` and `entropy = getrandom(32)` and invoke
-`advance`. `getrandom` failure → skip the pass (never feed zero entropy).
+The driver (`ChronosFeeder`, `vosx/src/commands/space/up.rs`) is a sibling pass on
+the existing vosx daemon periodic hook (`run_forever_with`): it resolves the local
+chronos via `instance_service_id`/`has_agent`, `init`s once (idempotent), then on
+its own keepalive cadence (`CHRONOS_FEED_EVERY`, 1 s — deliberately *not* the slot
+rate) computes `slot = (wall_ms - VOS_COMMON_ERA_MS) / CHRONOS_SLOT_MS` and
+`entropy = getrandom(32)` and invokes `advance`. `getrandom` failure → skip the
+pass (never feed zero entropy). On a voter the same pass also mirrors the
+registry's `NODE_ROLE_VOTER` set into chronos (`set_committee`) and drives the v1
+committee commit-reveal locally over `Caller::System` — no extra network, no extra
+block beyond the keepalive advance.
 
 ### Determinism for consumers
 
@@ -151,33 +156,41 @@ chronos through the same pinned-`ctx.ask` path.
 
 This is the "real-time-ish" decision and VOS's deliberate divergence from JAM.
 
-- **Slot = 250 ms** (default, configurable) — 4 Hz, fine enough for ordering /
-  presence / expiries. Integer slots from a fixed **VOS Common Era** anchor, so
-  the JAM structure (slot, epoch) is preserved, just faster. (Tune 100 ms–1 s.)
-- **Entropy round = coarse** (default ~1 s, i.e. one finalized round per epoch of
-  N slots, or per real commit). Randomness does **not** need 4 Hz, and the future
-  VRF/committee work is the expensive part — keep its rate low.
+- **Slot = 250 ms** (`CHRONOS_SLOT_MS`) — 4 Hz, fine enough for ordering /
+  presence / expiries. Integer slots from a fixed **VOS Common Era** anchor
+  (`VOS_COMMON_ERA_MS`), so the JAM structure (slot, epoch) is preserved, just
+  faster.
+- **Entropy round = coarse** (`SLOTS_PER_EPOCH = 4` slots ≈ 1 s per folded round,
+  folded at most once per epoch boundary). Randomness does **not** need 4 Hz, and
+  the VRF/committee work is the expensive part — its rate stays low.
 
-**Cost note (tune + benchmark):** every `advance` that changes state is a raft
-commit. Feeding the *clock* at 4 Hz = 4 commits/s/space, which is heavy for a chat
-app. Mitigations, in order: (a) **piggyback** the slot stamp on raft traffic that
-is already happening (msg-ctl commits carry the current slot for free), so a
-dedicated clock advance fires only as an **idle keepalive**; (b) fold entropy only
-on epoch boundaries (cheap blake2b, bounded history); (c) keep chronos state small.
-The clock's freshness is bounded by the advance cadence — pick the keepalive
-interval to match the protocol's real-time needs.
+**Cost note:** every `advance` that changes state is a raft commit. Feeding the
+*clock* at the full 4 Hz slot rate would be 4 commits/s/space, heavy for a chat
+app. The mitigations: (a) the feeder advances on an **idle keepalive** cadence
+(`CHRONOS_FEED_EVERY = 1 s`), *not* the 250 ms slot rate; (b) entropy folds only
+on epoch boundaries (cheap blake2b, bounded history); (c) chronos state is kept
+small (bounded round history). The clock's freshness is bounded by the keepalive
+cadence. **Open follow-on:** benchmark the raft-commit cost and add the
+**piggyback** optimisation — stamp the current slot onto raft traffic that is
+already happening (e.g. msg-ctl commits carry the slot for free), so a dedicated
+clock advance fires only when the space is otherwise idle.
 
 ## Crypto evolution (behind the stable API)
 
-- **v0 (now): blake2b hash-chain, trusted leader.** `beaconₙ = H(domain ‖ prevₙ₋₁
-  ‖ n ‖ entropyₙ)`. Already built. The leader could grind; documented v0 trust
-  boundary. Add `latest_final()` (lagged read) — the single highest-value upgrade.
-- **v1: Ristretto ECVRF + commit-reveal across raft voters.** Each round folds a
-  VRF output over `(prev, epoch)` so the value is unpredictable-yet-verifiable and
-  one honest voter randomizes it; commit-reveal kills the leader's 1-bit
-  withholding bias. Reuses the Ristretto/Ed25519 primitives present in zkpvm.
-- **v2 (JAM interop): Bandersnatch RingVRF** — the true "play nice with JAM"
-  endpoint (`η₀' = blake(η₀ ‖ VRF_out)`), a precompile lift.
+- **v0: blake2b hash-chain, trusted leader.** `beaconₙ = H(domain ‖ prevₙ₋₁ ‖ n ‖
+  entropyₙ)`. The leader can grind; this is the documented v0 trust boundary.
+  `latest_final()` (lagged read) is the single highest-value hardening. A
+  committee-less round folds immediately on the leader entropy (so absent a
+  committee, behaviour is exactly v0).
+- **v1: Ristretto ECVRF + commit-reveal across raft voters.** Each round folds VRF
+  outputs over a public `α` so the value is unpredictable-yet-verifiable and one
+  honest voter randomizes it; the reveal window (`REVEAL_WINDOW_EPOCHS`) kills the
+  leader's 1-bit withholding bias. Reuses the Ristretto/Ed25519 primitives present
+  in zkpvm; the ECVRF ciphersuite hash is **SHA-512** (ECVRF-RISTRETTO255-SHA512),
+  not blake2b. See the `vrf` crate + the committee combine (`combine_betas`,
+  `verify_round`) and `chronos-bias-resistance.md`.
+- **v2 (future, JAM interop): Bandersnatch RingVRF** — the true "play nice with
+  JAM" endpoint (`η₀' = blake(η₀ ‖ VRF_out)`), a precompile lift.
 
 We adopt **drand's architecture** (a known committee = the raft voters produces;
 everyone else pulls; verifiable) but **not its crypto** — threshold-BLS needs a
@@ -187,10 +200,11 @@ pairing precompile VOS does not have (decision carried from
 ## Security invariants (must hold at every version)
 
 1. **The beacon is never key material.** It enters a key derivation only as HKDF
-   `info` on the output branch, bound to `(space_id, epoch, domain)`; confidentiality
-   rests on the secret seed alone (RFC 9180 §9.7.5). The messenger consume seam is
-   already shaped for this: `host_rand.rs` `set_beacon`/`PublicBeacon` (~78, ~173)
-   feed only the output-branch `info` — drop the `#[allow(dead_code)]` when wiring.
+   `info` on the output branch, bound to its round via blake2b; confidentiality
+   rests on the secret seed alone (RFC 9180 §9.7.5). The messenger's
+   `host_rand.rs` `set_beacon`/`PublicBeacon` feed only the output-branch `info`,
+   never seed/salt/ratchet; `mls::build_client_hedged` folds the beacon there and
+   nowhere else.
 2. **Grinding-sensitive consumers read the lagged value**, never the live head.
 3. **Time is bounded, not trusted:** strict monotonicity + a future-drift cap on
    the stamped slot.
@@ -199,60 +213,67 @@ pairing precompile VOS does not have (decision carried from
 
 ## Reused primitives (the "reuse if it fits" audit)
 
-- `actors/beacon` → generalized in place into `chronos` (chain, history,
+- `actors/beacon` → generalized into `actors/chronos` (chain, history,
   `verify_chain`, role gate).
 - **raft** consistency + leader-forward (chronos is raft; the leader is the feeder).
 - **effect log** (`vos/src/effect_log.rs`) — deterministic consumer replay, no new
   machinery.
-- **`VosNode::invoke`** `Caller::System` path (`node.rs` ~2707) — the feed call.
-- vosx **`run_forever_with`** periodic hook (`up.rs` ~226) + `instance_service_id`
-  / `has_agent` — the feed driver, no new host loop.
+- **`VosNode::invoke`** `Caller::System` path (`node.rs`) — the feed call.
+- vosx **`run_forever_with`** periodic hook (`up.rs`) + `instance_service_id`
+  / `has_agent` — the feed driver (`ChronosFeeder`), no new host loop.
 - **blake2b** precompile (v0); **Ristretto/Ed25519** zkpvm precompiles (v1).
 - messenger **`set_beacon`/`PublicBeacon`** seam (`host_rand.rs`) — the hedge
-  consume site, already built and dead-code-gated.
+  consume site, wired via `mls::build_client_hedged` ← `clients::chronos_beacon`.
 - `examples/agents/scheduler` self-tick / `lifecycle::invoke` pattern — reference
   for any future actor-driven cadence.
 
-## Phased implementation plan
+## Implementation
 
-- **Phase A — generalize `beacon` → `chronos` (self-contained, no host changes).**
-  Add `current_slot`/`now()`, `advance(slot, entropy)` (was `advance(entropy)`),
-  `latest_final()`/`randomness_at(epoch)` (lagged read), epoch derivation, the
-  finalized-vs-live split. Keep `verify_chain`, history bound, role gate. Unit-test
-  in its own `[workspace]` with the noop-waker `run()` (no `vos::block_on`).
-  `just build-beacon` (rename target/crate as desired).
-- **Phase B — the leader `Caller::System` feed.** Sibling pass in the vosx daemon
-  periodic hook: resolve local chronos, init once, stamp `slot` + fold `entropy`
-  via `node.invoke`. Separate (fast) cadence gate from the ~2 s reconcile gate;
-  piggyback/idle-keepalive per the cost note. Followers' `None` is benign.
-- **Phase C — consumer wiring = the original P3 hedge.** Messenger reads
-  `chronos.latest_final()` → `set_beacon` (lagged, domain-bound); drop the
-  `#[allow(dead_code)]` on `set_beacon`/`PublicBeacon`; unit test (beacon set ⇒
-  output differs, ratchet state identical); confirm the determinism gate +
-  `two_nodes_exchange_e2ee_messages` + `retry` stay green (absent chronos ⇒ `None`
-  ⇒ no hedge ⇒ no behavior change). Install `chronos` (raft) in
-  `examples/space-msg-{a,b}.toml`. Optionally replace caller-supplied `ts_ms` with
-  `chronos.now()`.
-- **Phase D (later) — bias resistance.** v1 Ristretto ECVRF + commit-reveal; then
-  v2 Bandersnatch for JAM interop. **Scoped:**
-  [`chronos-bias-resistance.md`](./chronos-bias-resistance.md) — the
-  `actors/_chronos_crypto_spike` fixture proves pure-software
-  ECVRF-RISTRETTO255 (prove/verify + committee XOR-combine) compiles,
-  transpiles, and runs correctly on the PVM, so the precompile is a *performance*
-  follow-on, not a correctness gate (the ristretto ECALLs 110-114 already exist
-  on the proving side). The doc covers the committee commit-reveal protocol, the
-  v0→v1 seam (behind the unchanged API), and the honest residual 1-bit
-  last-revealer bound.
+- **`actors/chronos`** (the generalization of the `beacon` actor): `current_slot`/
+  `now()`, `advance(slot, entropy)`, `latest_final()`/`randomness_at(epoch)`
+  (lagged), epoch derivation, finalized-vs-live split; `verify_chain`, history
+  bound, role gate.
+- **The leader `Caller::System` feed.** `ChronosFeeder` is a sibling pass in the
+  vosx daemon periodic hook: it resolves the local chronos, `init`s once, and
+  stamps `slot` + folds `entropy` via `node.invoke` on its own keepalive cadence
+  (separate from the reconcile gate). Followers' `None` is benign.
+- **Consumer wiring (the messenger hedge).** The messenger reads
+  `chronos.latest_final()` (`clients::chronos_beacon`) → folds it (domain-bound by
+  blake2b to its round) into the MLS CSPRNG HKDF output branch only via
+  `mls::build_client_hedged` → `set_beacon`. The five key-minting handlers
+  (key_package/create/send/stock_directory/commit_chain_op) fetch the beacon;
+  absent chronos ⇒ `None` ⇒ byte-identical to before.
+- **Bias resistance.** v1 Ristretto ECVRF + committee commit-reveal (committee
+  XOR-combine over a reveal window; ECVRF-RISTRETTO255-SHA512), scoped in
+  [`chronos-bias-resistance.md`](./chronos-bias-resistance.md) — the committee
+  commit-reveal protocol, the v0→v1 seam (behind the unchanged API), and the honest
+  residual 1-bit last-revealer bound. Pure-software ECVRF compiles, transpiles, and
+  runs on the PVM (`chronos_transpile.rs` over the real `chronos.elf`), so the
+  precompile lift is a *performance* follow-on, not a correctness gate. **v2
+  Bandersnatch RingVRF** for true JAM interop is the open future endpoint
+  (precompile-gated).
 
-## Open questions / tunables
+## Settled decisions
 
-- **Slot length & epoch size** — default 250 ms slot, ~1 s entropy epoch; benchmark
-  the raft-commit cost and the piggyback/keepalive split.
-- **Global VOS Common Era vs per-space genesis** — global is more JAM-faithful and
-  gives cross-space-comparable slots; per-space is simpler/isolated. Default:
-  global era, per-space domain tag on the entropy.
-- **Name** — `chronos` vs `oracle` vs keep `beacon`; whether clock + entropy are
-  one actor or two (one is simpler — shared feed/boundary).
-- **rkyv state versioning** — chronos adds fields to the beacon's whole-struct
-  rkyv state (no version tag today): treat the add as a deliberate re-init or add
-  a version byte, per the beacon module's existing caveat.
+- **Slot length & epoch size** — shipped as constants: `CHRONOS_SLOT_MS = 250`
+  (slot, `vosx/.../up.rs`), `SLOTS_PER_EPOCH = 4` (≈ 1 s entropy epoch,
+  `actors/chronos/src/lib.rs`), `FINALIZED_LAG = 2` (the η₂ lag),
+  `REVEAL_WINDOW_EPOCHS = 2` (v1 committee window).
+- **Global VOS Common Era vs per-space genesis** — chose the **global era**
+  (`VOS_COMMON_ERA_MS`, more JAM-faithful, cross-space-comparable slots) with a
+  per-space domain tag on the entropy.
+- **Name & shape** — chose `chronos`, with clock + entropy as **one actor**
+  (simpler — shared feed/boundary).
+- **rkyv state versioning** — chronos adds fields over the beacon's whole-struct
+  rkyv state as a **deliberate re-init** (the layout caveat in the module doc
+  applies to any future field add too, e.g. the v2 RingVRF fields).
+
+## Open items / follow-ons
+
+- **v2 Bandersnatch RingVRF** (future) — the true JAM-interop endpoint
+  (`η₀' = blake(η₀ ‖ VRF_out)`); precompile-gated (see the bias-resistance section
+  and `chronos-bias-resistance.md`).
+- **Slot/epoch benchmark + piggyback optimisation** — benchmark the raft-commit
+  cost of the keepalive cadence and add the piggyback path (stamp the slot onto
+  raft traffic already happening; dedicated advance only when idle), per the cost
+  note above.
