@@ -185,6 +185,24 @@ pub struct AgentConfig {
     /// All cluster members must list the same set in the same
     /// order.
     pub members: Vec<u16>,
+    /// Periodic `tick()` interval in milliseconds. When `Some(>0)`, the
+    /// agent thread dispatches a synthetic `tick` message to the actor's
+    /// `tick` handler about every interval, *between* inbound work — the
+    /// same heartbeat the `.so` extension gets via its `tick_ms`. `None`
+    /// (default) → no ticking. Only set this on agents that define a
+    /// `tick` handler. Best-effort cadence: a long invoke delays the next
+    /// tick (the thread never preempts a handler).
+    pub tick_ms: Option<u64>,
+    /// Declared intra-system capabilities — the ceiling [`SpaceRole`] this
+    /// agent may relay to each named target on its OUTBOUND invokes. Empty
+    /// (the default) keeps the legacy behaviour: an agent's outbound calls
+    /// arrive as the trusted [`Caller::Actor`], which bypasses role gates —
+    /// every existing agent→agent call relies on this. A NON-empty list
+    /// opts this agent into bounded relay instead: it relays the real
+    /// caller's role capped by these caps (the same model as an extension's
+    /// `intra_caps`), so a privileged downstream call needs a
+    /// correspondingly-privileged original caller. See [`IntraCap`].
+    pub intra_caps: Vec<crate::actors::IntraCap>,
     /// Pre-spawned Raft worker for `Consistency::Raft` multi-mode
     /// replication. `register` spawns this when the right
     /// conditions hold (multi-member + network attached + storage
@@ -218,6 +236,8 @@ impl AgentConfig {
             #[cfg(feature = "storage")]
             pre_opened_lock: None,
             members: Vec::new(),
+            tick_ms: None,
+            intra_caps: Vec::new(),
             #[cfg(all(feature = "storage", feature = "network"))]
             raft_worker: None,
             #[cfg(all(feature = "storage", feature = "network"))]
@@ -229,6 +249,23 @@ impl AgentConfig {
     /// — list of `node_prefix`es. Same list on every replica.
     pub fn with_members(mut self, members: Vec<u16>) -> Self {
         self.members = members;
+        self
+    }
+
+    /// Dispatch a synthetic `tick` to this agent's `tick` handler about
+    /// every `ms` milliseconds (0 disables). Only meaningful for agents
+    /// that define a `tick` handler.
+    pub fn with_tick_ms(mut self, ms: u64) -> Self {
+        self.tick_ms = (ms > 0).then_some(ms);
+        self
+    }
+
+    /// Opt this agent into bounded caller-relay on its outbound invokes —
+    /// the ceiling [`SpaceRole`] it may relay to each named target. Empty
+    /// (the default) keeps the legacy trusted [`Caller::Actor`] relay. See
+    /// [`IntraCap`].
+    pub fn with_intra_caps(mut self, caps: Vec<crate::actors::IntraCap>) -> Self {
+        self.intra_caps = caps;
         self
     }
 
@@ -2237,8 +2274,22 @@ impl VosNode {
         // shutdown fans out to it), so the daemon can stop it individually.
         let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
+        // Reverse svc-id → instance-name map, so an agent that opts into
+        // bounded outbound relay (declared `intra_caps`) can resolve each
+        // invoke target's name to pick its cap ceiling.
+        let agent_names = self.agent_names.clone();
         #[cfg(feature = "network")]
         let shared_network = self.shared_network.clone();
+        // Leader-forward plan for an agent that opted into bounded relay and
+        // writes to a raft target: a follower that refuses the write (drops the
+        // reply) is recognized + the write re-sent to the leader (mirrors the
+        // extension ask path's `route_invoke`).
+        let raft_fwd = RaftFwd {
+            #[cfg(all(feature = "network", feature = "storage"))]
+            network: self.shared_network.clone(),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            hosts: self.raft_hosts.clone(),
+        };
 
         let join = thread::spawn(move || {
             agent_thread(
@@ -2248,6 +2299,8 @@ impl VosNode {
                 invoke_rx,
                 outbox,
                 invoke_routes,
+                agent_names,
+                raft_fwd,
                 shutdown,
                 activity,
                 #[cfg(feature = "network")]
@@ -2902,6 +2955,8 @@ fn agent_thread(
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     invoke_routes: InvokeRoutes,
+    agent_names: AgentNames,
+    raft_fwd: RaftFwd,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
@@ -2932,6 +2987,12 @@ fn agent_thread(
     //   - Depth: cap at MAX_CROSS_AGENT_DEPTH hops. Same abort.
     let invoke_routes_for_ext = invoke_routes.clone();
     let chain_for_ext = current_chain.clone();
+    // For an agent that opted into bounded outbound relay (declared
+    // `intra_caps`), the closure resolves each target's name + relays the real
+    // caller capped per cap. Empty caps (the default) keep the legacy trusted
+    // `Caller::Actor` relay that every existing agent→agent call relies on.
+    let agent_names_for_ext = agent_names.clone();
+    let intra_caps_for_ext = config.intra_caps.clone();
     #[cfg(feature = "network")]
     let shared_network_for_ext = shared_network.clone();
     // Only the cross-node routing branch (network) reads this.
@@ -2966,16 +3027,55 @@ fn agent_thread(
             map.get(&target.0).cloned()
         };
         if let Some(tx) = local_tx {
+            // Caller for the relayed invoke. Default (no declared
+            // `intra_caps`): the trusted `Caller::Actor` — `id` is the
+            // calling agent's ServiceId, and being past the libp2p gate it
+            // bypasses role checks (the legacy behaviour every existing
+            // agent→agent call relies on). With `intra_caps` declared: bounded
+            // relay of the real inbound caller (read from this thread's
+            // `RELAY_CALLER`, stamped around the invoke dispatch), capped by the
+            // cap for this target — exactly the extension relay model, so a
+            // privileged downstream call needs a privileged original caller.
+            let (caller, space_role, actor_local_role) = if intra_caps_for_ext.is_empty() {
+                (crate::actors::Caller::Actor(id), None, None)
+            } else {
+                let target_name = agent_names_for_ext
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(&local_id_of(target.0)).cloned());
+                let propagated = current_relay_caller();
+                #[allow(unused_mut)]
+                let (mut caller, space_role) = resolve_relay_caller(
+                    propagated.as_ref(),
+                    &intra_caps_for_ext,
+                    target_name.as_deref(),
+                );
+                // Faithfully relay the caller's actor-local grant on the final
+                // target (uncapped — the cap only gates whether the relay may
+                // reach it). Overrides space_role, so the carrier must stay the
+                // Peer. Peer-only (libp2p gate), so `network`-gated.
+                #[cfg(feature = "network")]
+                let actor_local_role = match relay_actor_local_role(
+                    &invoke_routes_for_ext,
+                    propagated.as_ref(),
+                    &intra_caps_for_ext,
+                    target_name.as_deref(),
+                ) {
+                    Some((peer_bytes, role)) => {
+                        caller = crate::actors::Caller::Peer(peer_bytes);
+                        Some(role)
+                    }
+                    None => None,
+                };
+                #[cfg(not(feature = "network"))]
+                let actor_local_role: Option<u8> = None;
+                (caller, space_role, actor_local_role)
+            };
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(InvokeRequest {
-                // Intra-system call from this agent. `id` is the
-                // calling agent's ServiceId — perfect for the
-                // `Caller::Actor` variant. Past-the-libp2p-gate
-                // calls bypass role checks by virtue of being
-                // inside the trust boundary.
-                caller: crate::actors::Caller::Actor(id),
-                space_role: None,
-                actor_local_role: None,
+                caller,
+                space_role,
+                actor_local_role,
                 msg: msg.to_vec(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: chain_snapshot,
@@ -2987,10 +3087,28 @@ fn agent_thread(
             // — preserving STATUS_YIELDED across the thread
             // boundary so the calling actor can keep driving a
             // yielded child.
-            let envelope = reply_rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .ok()?;
-            return decode_invoke_envelope(&envelope);
+            match reply_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(envelope) => return decode_invoke_envelope(&envelope),
+                // The local target dropped its reply sender — the signature of
+                // a raft follower refusing a write. If it is a raft agent,
+                // forward the write to the leader (the agent analogue of the
+                // extension ask path's `route_invoke` leader-forward).
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    #[cfg(all(feature = "network", feature = "storage"))]
+                    if let Some(rep_id) = raft_forward_plan(&raft_fwd, id, target.0) {
+                        return agent_forward_to_raft_leader(
+                            &raft_fwd,
+                            id,
+                            target.0,
+                            rep_id,
+                            msg.to_vec(),
+                        )
+                        .map(crate::runtime::ExternalInvokeReply::Done);
+                    }
+                    return None;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+            }
         }
 
         // 2. Cross-node invoke — target on a different node and we
@@ -3154,6 +3272,13 @@ fn agent_thread(
 
     let mut fatal_error: Option<String> = None;
 
+    // Periodic `tick()` (when the agent declared `tick_ms`). The thread
+    // synthesizes a `tick` message about every interval, between inbound
+    // work — the same heartbeat the `.so` extension gets. Re-armed from
+    // *now* after each fire so a slow tick doesn't build up a burst.
+    let tick_interval = config.tick_ms.map(Duration::from_millis);
+    let mut tick_deadline = tick_interval.map(|iv| Instant::now() + iv);
+
     // Loop until the node tells us to stop (or our channels
     // disconnect, which happens during collect()). No per-agent
     // idle heuristic — the node is the source of truth for "are
@@ -3181,6 +3306,19 @@ fn agent_thread(
                         chain.extend_from_slice(&req.chain);
                         chain.push(id.0);
                     }
+                    // Stamp this thread's relay caller for the duration of the
+                    // dispatch, so an outbound ask during it can relay the real
+                    // caller bounded by `intra_caps` (read in `external_invoke`).
+                    // Only when this agent opted into bounded relay — otherwise
+                    // the relay carrier is unread and the legacy `Caller::Actor`
+                    // path is byte-for-byte unchanged. Cleared on scope exit
+                    // (even on panic), so a refused call can't poison the next.
+                    let _relay = (!config.intra_caps.is_empty()).then(|| {
+                        RelayCallerGuard::stamp(PropagatedCaller {
+                            caller: req.caller.clone(),
+                            space_role: req.space_role,
+                        })
+                    });
                     let outcome = handle_invoke_request(
                         &mut runtime,
                         svc_id,
@@ -3278,16 +3416,37 @@ fn agent_thread(
             publish_heads_if_replicated(&shared_network, agent_rep_id, strategy.as_ref());
             continue;
         } else {
-            // Short blocking wait on inbox so we re-check the
-            // shutdown flag and the invoke channel promptly.
-            match inbox.recv_timeout(Duration::from_millis(50)) {
-                Ok(env) => {
-                    bump();
-                    *current_chain.lock().unwrap() = vec![id.0];
-                    env.payload
+            // A due periodic tick takes priority over blocking — synthesize
+            // a `tick` message and dispatch it through the normal path. No
+            // inbound caller, so RELAY_CALLER stays unset (a tick's outbound
+            // asks relay as Unauthenticated, matching the extension tick).
+            let now = Instant::now();
+            if let Some(deadline) = tick_deadline
+                && now >= deadline
+            {
+                bump();
+                *current_chain.lock().unwrap() = vec![id.0];
+                tick_deadline = tick_interval.map(|iv| Instant::now() + iv);
+                encode_tick_payload()
+            } else {
+                // Short blocking wait on inbox so we re-check the shutdown
+                // flag and the invoke channel promptly, waking by the tick
+                // deadline so ticks stay roughly on cadence.
+                let wait = match tick_deadline {
+                    Some(deadline) => deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(50)),
+                    None => Duration::from_millis(50),
+                };
+                match inbox.recv_timeout(wait) {
+                    Ok(env) => {
+                        bump();
+                        *current_chain.lock().unwrap() = vec![id.0];
+                        env.payload
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
         if let Err(e) = dispatch_once(
@@ -5146,6 +5305,44 @@ const RAFT_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
 /// NODE's peer role — operators must grant member tier to a voter
 /// node's peer for its forwarded writes to pass role gates.
 #[cfg(all(feature = "network", feature = "storage"))]
+/// Synchronous leader-forward for the agent thread's (blocking) outbound-invoke
+/// path: the agent analogue of the async [`forward_to_raft_leader`] the
+/// extension ask path uses. Re-sends a follower-dropped raft write to the
+/// current leader and blocks on the reply.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn agent_forward_to_raft_leader(
+    fwd: &RaftFwd,
+    from_id: ServiceId,
+    target: u32,
+    rep_id: [u8; 32],
+    payload: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let net = fwd.network.lock().ok()?.clone()?;
+    let st = net.local_raft_status(&rep_id)?;
+    if st.role == crate::network::RaftRole::Leader {
+        return None;
+    }
+    let leader = st.leader_hint?;
+    if leader == net.local_prefix() {
+        // Hint says us but we aren't Leader — election in flight; let the
+        // app-level retry pick it up.
+        return None;
+    }
+    let peer = net.peer_for_prefix(leader)?;
+    let to = ((leader as u32) << 16) | (target & 0xFFFF);
+    debug!(%from_id, target, leader, "agent ask: forwarding follower-dropped raft write to leader");
+    let rx = net.send_invoke(peer, from_id.0, to, Vec::new(), payload);
+    match rx.recv_timeout(RAFT_FORWARD_TIMEOUT) {
+        Ok(bytes)
+            if !bytes.is_empty()
+                && bytes.first().copied() != Some(crate::actors::run::STATUS_FORBIDDEN) =>
+        {
+            Some(bytes)
+        }
+        _ => None,
+    }
+}
+
 async fn forward_to_raft_leader(
     fwd: &RaftFwd,
     extension_id: ServiceId,

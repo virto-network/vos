@@ -13,7 +13,7 @@ readme.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -52,8 +52,8 @@ log = { version = "0.4", default-features = false }
 # Both crates are pinned by git rev during local development; the
 # `version` is what crates.io uses when the published vos package
 # resolves them (the git URL is stripped at publish time).
-javm = { git = "https://github.com/olanod/jar.git", rev = "e8861917c03d8f277a03ad8c079acf95c531b3d6", version = "0.4", optional = true }
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "6075cec9989b5fe221051fb87be6664459a6148e", version = "0.1", optional = true }
+javm = { git = "https://github.com/olanod/jar.git", rev = "c91e83c1c10219117ed7bb679a80fb424b34228a", version = "0.4", optional = true }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "c91e83c1c10219117ed7bb679a80fb424b34228a", version = "0.1", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }
@@ -61,6 +61,10 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
+# Host-side OS entropy for the BOOT_CONTEXT seam: mints a fresh per-boot
+# `boot_token` + the host-local `device_id`. `std`-gated — the no_std riscv
+# guest reaches the host via the BOOT_CONTEXT ecall and never links this.
+getrandom = { version = "0.2", optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 redb = { version = "2", optional = true }
@@ -157,3 +161,12 @@ blake2 = "0.10"
 # byte-stream guard (the test acts as the rustls client; the host
 # terminates TLS and the extension echoes plaintext).
 rcgen = "0.13"
+# Ciphersuite-1 reference impls for the in-PVM crypto execution gate
+# (`vos/tests/crypto_spike_pvm.rs`): the test drives the `crypto_spike` actor's
+# `tv_*` handlers and asserts the PVM-computed bytes are bit-exact against these
+# host RustCrypto crates. Versions track `actors/_crypto_spike/Cargo.toml`.
+sha2 = "0.10"
+hkdf = "0.12"
+aes-gcm = { version = "0.10", features = ["aes", "alloc"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = "2"

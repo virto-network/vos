@@ -33,14 +33,9 @@ exclude = [
     # the actor target too); excluded so a host member path-dep'ing it (vosx)
     # doesn't pull it in as a second workspace root.
     "vrf",
-    "actors/space-registry",
-    "actors/dev-project",
-    "actors/space-bridge",
-    "actors/clerk-ledger",
-    "actors/clerk-bridge",
-    "actors/msg-log",
-    "actors/msg-ctl",
-    "actors/msg-directory",
+    # Every actor crate, incl. those path-dep'd by host members as dev-deps
+    # (Cargo would otherwise promote a member's path dep to a member).
+    "actors/*",
     # zkpvm-fuzz uses libfuzzer-sys + panic=abort + nightly-only
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.

@@ -8,12 +8,17 @@
 //! it (cursor untouched) and retries next tick once the chain
 //! catches up.
 
-use openmls::prelude::tls_codec::Deserialize as TlsDeserialize;
-use openmls::prelude::*;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+
+use mls_rs::client_builder::MlsConfig;
+use mls_rs::group::{CommitEffect, Group, ReceivedMessage};
+use mls_rs::{MlsMessage, WireFormat};
 use vos::prelude::*;
 
 use crate::clients::{ctl_commits, log_history, resolve};
-use crate::mls::{join_config, snapshot_provider};
+use crate::store;
 use crate::{ChannelEntry, Messenger, MsgrCtx, PlainMessage, ctl_agent_name, log_agent_name};
 
 const PAGE_LIMIT: u32 = 16;
@@ -25,20 +30,24 @@ pub(crate) async fn tick_channels(m: &mut Messenger, ctx: &mut MsgrCtx) {
         if m.channels[i].desynced {
             continue;
         }
-        if let Err(e) = drain_ctl(m, i, ctx).await {
+        // Box the drain futures onto the heap: each embeds the full ctl/log
+        // RPC + MLS decrypt path, so inlining both into `tick_channels`'s own
+        // future would blow the small PVM stack when the future is constructed
+        // (a 0xfffffff8 page fault) — even on an idle tick. Boxing keeps this
+        // future pointer-small.
+        if let Err(e) = Box::pin(drain_ctl(m, i, ctx)).await {
             log::debug!(
                 "messenger: ctl drain for '{}' paused: {e}",
                 m.channels[i].name
             );
         }
-        if m.channels[i].joined
-            && !m.channels[i].desynced
-            && let Err(e) = drain_log(m, i, ctx).await
-        {
-            log::debug!(
-                "messenger: log drain for '{}' paused: {e}",
-                m.channels[i].name
-            );
+        if m.channels[i].joined && !m.channels[i].desynced {
+            if let Err(e) = Box::pin(drain_log(m, i, ctx)).await {
+                log::debug!(
+                    "messenger: log drain for '{}' paused: {e}",
+                    m.channels[i].name
+                );
+            }
         }
     }
 }
@@ -81,7 +90,7 @@ pub(crate) async fn drain_ctl(
                 m.channels[i].next_epoch = row.epoch + 1;
             } else if !row.welcome.is_empty() {
                 // We don't yet hold this channel's group. Try to join
-                // from this Welcome: MLS staging succeeds only if it was
+                // from this Welcome: MLS join succeeds only if it was
                 // sealed to a KeyPackage we published, so trial-decryption
                 // is how we recognise our own Welcome — there is no public
                 // routing tag to match (the row's token is random).
@@ -113,40 +122,43 @@ pub(crate) async fn drain_ctl(
 
 /// Process one commit record against the local group. Records the
 /// group already incorporated (our own merged commits included —
-/// merging advanced the epoch past them) are skipped.
+/// applying advanced the epoch past them) are skipped. mls-rs
+/// auto-applies a processed commit (no separate merge step) and
+/// short-circuits re-processing our own committed epoch, so chain
+/// replay is idempotent.
 fn process_chain_record(
     m: &mut Messenger,
     i: usize,
     commit_body: &[u8],
     record_epoch: u64,
 ) -> Result<(), String> {
-    let provider = m.open_mls();
-    let mut group = m.load_group(&provider, &m.channels[i].name)?;
-    if group.epoch().as_u64() > record_epoch {
+    let stores = crate::mls::open_stores(&m.mls_store);
+    let client = crate::mls::build_client(&m.nickname, &m.csprng_seed, &stores)?;
+    let mut group = crate::mls::load_group(&client, &m.channels[i].name)?;
+    if group.current_epoch() > record_epoch {
         return Ok(());
     }
-    let mls_msg = MlsMessageIn::tls_deserialize(&mut &commit_body[..])
-        .map_err(|e| format!("commit deserialize failed: {e}"))?;
-    let protocol = mls_msg
-        .try_into_protocol_message()
-        .map_err(|e| format!("commit is not a protocol message: {e}"))?;
-    let processed = group
-        .process_message(&provider, protocol)
-        .map_err(|e| format!("commit processing failed: {e}"))?;
-    match processed.into_content() {
-        ProcessedMessageContent::StagedCommitMessage(staged) => {
-            group
-                .merge_staged_commit(&provider, *staged)
-                .map_err(|e| format!("commit merge failed: {e}"))?;
-        }
+    let msg = MlsMessage::from_bytes(commit_body)
+        .map_err(|e| format!("commit deserialize failed: {e:?}"))?;
+    let received = group
+        .process_incoming_message(msg)
+        .map_err(|e| format!("commit processing failed: {e:?}"))?;
+    let evicted = match received {
+        // A processed commit is applied in place; inspect its effect to
+        // learn whether it evicted us (mls-rs has no `is_active`).
+        ReceivedMessage::Commit(desc) => matches!(desc.effect, CommitEffect::Removed { .. }),
         _ => return Err("control record did not contain a commit".into()),
-    }
-    if !group.is_active() {
-        // This commit evicted us. PCS means our keys stop working
-        // at this epoch; drop the dead group state so a re-invite's
-        // Welcome can rebuild under the same group id, and park the
-        // channel (history kept, decryption stops).
-        let _ = group.delete(provider.storage());
+    };
+    if evicted {
+        // This commit evicted us. PCS means our keys stop working at this
+        // epoch; drop the dead group state so a re-invite's Welcome can
+        // rebuild under the same group id, and park the channel (history
+        // kept, decryption stops). Our key schedule was NOT advanced for
+        // this commit, so nothing to persist beyond the deletion.
+        stores
+            .group_state
+            .delete_group(&crate::mls::group_id_for(&m.channels[i].name));
+        m.mls_store = store::snapshot(&stores);
         let entry = &mut m.channels[i];
         entry.joined = false;
         entry.removed = true;
@@ -154,8 +166,12 @@ fn process_chain_record(
             "messenger: removed from channel '{}' at chain epoch {record_epoch}",
             entry.name
         );
+    } else {
+        group
+            .write_to_storage()
+            .map_err(|e| format!("persisting applied commit failed: {e:?}"))?;
+        m.mls_store = store::snapshot(&stores);
     }
-    m.mls_store = snapshot_provider(&provider);
     Ok(())
 }
 
@@ -164,29 +180,34 @@ fn process_chain_record(
 /// caller trial-decrypts every Welcome to find ours), is malformed,
 /// or carries a foreign group id.
 fn join_from_welcome(m: &mut Messenger, i: usize, welcome_bytes: &[u8]) -> Result<(), String> {
-    let provider = m.open_mls();
-    let mls_msg = MlsMessageIn::tls_deserialize(&mut &welcome_bytes[..])
-        .map_err(|e| format!("welcome deserialize failed: {e}"))?;
-    let MlsMessageBodyIn::Welcome(welcome) = mls_msg.extract() else {
+    let stores = crate::mls::open_stores(&m.mls_store);
+    let client = crate::mls::build_client(&m.nickname, &m.csprng_seed, &stores)?;
+    let msg = MlsMessage::from_bytes(welcome_bytes)
+        .map_err(|e| format!("welcome deserialize failed: {e:?}"))?;
+    if msg.wire_format() != WireFormat::Welcome {
         return Err("control record's welcome is not a Welcome message".into());
-    };
-    let staged = StagedWelcome::new_from_welcome(&provider, &join_config(), welcome, None)
-        .map_err(|e| format!("welcome staging failed: {e}"))?;
-    let mut group = staged
-        .into_group(&provider)
-        .map_err(|e| format!("joining from welcome failed: {e}"))?;
-    // Bind the Welcome to THIS channel: a Welcome rides channel X's
-    // ctl chain but its embedded GroupId is attacker/peer-chosen.
-    // Refuse one whose group isn't this channel's, so a misrouted or
-    // malicious Welcome can't graft a foreign group onto the channel.
+    }
+    // Trial-decryption: join succeeds only if the Welcome was sealed to a
+    // KeyPackage we hold. The ratchet tree rides in-band, so tree_data = None.
+    let (group, _info) = client
+        .join_group(None, &msg, None)
+        .map_err(|e| format!("joining from welcome failed: {e:?}"))?;
+    // Bind the Welcome to THIS channel: a Welcome rides channel X's ctl
+    // chain but its embedded GroupId is attacker/peer-chosen. Refuse one
+    // whose group isn't this channel's, so a misrouted or malicious Welcome
+    // can't graft a foreign group onto the channel. We have NOT persisted the
+    // group yet (no write_to_storage), so on mismatch we simply drop it.
     let expected = crate::mls::group_id_for(&m.channels[i].name);
-    if group.group_id().as_slice() != expected {
-        let _ = group.delete(provider.storage());
+    if group.group_id() != expected {
         return Err("welcome's group id does not match this channel — ignoring".into());
     }
-    let join_epoch = group.epoch().as_u64();
+    let join_epoch = group.current_epoch();
+    let mut group = group;
+    group
+        .write_to_storage()
+        .map_err(|e| format!("persisting joined group failed: {e:?}"))?;
 
-    m.mls_store = snapshot_provider(&provider);
+    m.mls_store = store::snapshot(&stores);
     // This join consumed exactly one of our published KeyPackages.
     m.published_kp_count = m.published_kp_count.saturating_sub(1);
     let entry: &mut ChannelEntry = &mut m.channels[i];
@@ -217,8 +238,9 @@ async fn drain_log(m: &mut Messenger, i: usize, ctx: &mut MsgrCtx) -> Result<(),
             return Ok(());
         }
 
-        let provider = m.open_mls();
-        let mut group = m.load_group(&provider, &name)?;
+        let stores = crate::mls::open_stores(&m.mls_store);
+        let client = crate::mls::build_client(&m.nickname, &m.csprng_seed, &stores)?;
+        let mut group = crate::mls::load_group(&client, &name)?;
         let mut dirty = false;
         for row in &rows {
             let entry = &mut m.channels[i];
@@ -236,13 +258,16 @@ async fn drain_log(m: &mut Messenger, i: usize, ctx: &mut MsgrCtx) -> Result<(),
             }
             // From an epoch ahead of us: park until the commit
             // chain catches up. Cursor stays put.
-            if row.epoch > group.epoch().as_u64() {
+            if row.epoch > group.current_epoch() {
                 if dirty {
-                    m.mls_store = snapshot_provider(&provider);
+                    group
+                        .write_to_storage()
+                        .map_err(|e| format!("persisting decrypt ratchet failed: {e:?}"))?;
+                    m.mls_store = store::snapshot(&stores);
                 }
                 return Ok(());
             }
-            match decrypt_app(&provider, &mut group, &row.body) {
+            match decrypt_app(&mut group, &row.body) {
                 Ok((sender, text)) => {
                     dirty = true;
                     let entry = &mut m.channels[i];
@@ -273,7 +298,10 @@ async fn drain_log(m: &mut Messenger, i: usize, ctx: &mut MsgrCtx) -> Result<(),
             }
         }
         if dirty {
-            m.mls_store = snapshot_provider(&provider);
+            group
+                .write_to_storage()
+                .map_err(|e| format!("persisting decrypt ratchet failed: {e:?}"))?;
+            m.mls_store = store::snapshot(&stores);
         }
     }
 }
@@ -287,23 +315,29 @@ fn advance_cursor(entry: &mut ChannelEntry, lamport: u64, id: [u8; 32]) {
     entry.cursor_id = id.to_vec();
 }
 
-pub(crate) fn decrypt_app(
-    provider: &crate::host_rand::VosProvider,
-    group: &mut MlsGroup,
+/// Decrypt one ciphertext envelope to `(sender_nickname, text)`. The group's
+/// sender ratchet advances in place (the caller persists it); a commit or any
+/// non-application message is rejected.
+pub(crate) fn decrypt_app<C: MlsConfig>(
+    group: &mut Group<C>,
     body: &[u8],
 ) -> Result<(String, String), String> {
-    let mls_msg =
-        MlsMessageIn::tls_deserialize(&mut &body[..]).map_err(|e| format!("deserialize: {e}"))?;
-    let protocol = mls_msg
-        .try_into_protocol_message()
-        .map_err(|e| format!("not a protocol message: {e}"))?;
-    let processed = group
-        .process_message(provider, protocol)
-        .map_err(|e| format!("process: {e}"))?;
-    let sender = String::from_utf8_lossy(processed.credential().serialized_content()).into_owned();
-    match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app) => {
-            let text = String::from_utf8_lossy(&app.into_bytes()).into_owned();
+    let msg = MlsMessage::from_bytes(body).map_err(|e| format!("deserialize: {e:?}"))?;
+    let received = group
+        .process_incoming_message(msg)
+        .map_err(|e| format!("process: {e:?}"))?;
+    match received {
+        ReceivedMessage::ApplicationMessage(app) => {
+            let sender = group
+                .member_at_index(app.sender_index)
+                .and_then(|m| {
+                    m.signing_identity
+                        .credential
+                        .as_basic()
+                        .map(|b| String::from_utf8_lossy(b.identifier()).into_owned())
+                })
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(app.data()).into_owned();
             Ok((sender, text))
         }
         _ => Err("envelope decrypted to a non-application message".into()),

@@ -15,6 +15,15 @@ pub fn gas() -> u64 {
     ecall0(hostcall::GAS)
 }
 
+/// Host wall-clock in Unix-epoch milliseconds (see [`hostcall::NOW_MS`]). The
+/// deterministic PVM has no clock; a `Local` actor that needs real wall time
+/// (the messenger, for MLS `Lifetime` validity) reads it here. Non-deterministic
+/// — sound only for non-replicated actors; replicated state must use `chronos`.
+#[inline]
+pub fn now_ms() -> u64 {
+    ecall0(hostcall::NOW_MS)
+}
+
 /// Request additional heap pages.
 #[inline]
 pub fn grow_heap(pages: u32) -> u64 {
@@ -75,6 +84,24 @@ pub fn invoke(code_hash: &[u8; 32], input: &[u8], gas_limit: u64, output: &mut [
 #[inline]
 pub fn fetch_item(buf: &mut [u8]) -> u64 {
     ecall2(hostcall::FETCH, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+/// Boot-context seam. Writes `boot_token(32) ‖ device_id(32) ‖
+/// boot_epoch(u64 LE)` (72 bytes) into `buf` and returns the full length the
+/// host produced (so `n > buf.len()` flags truncation, like [`peek`]/[`fetch`]).
+/// `buf` MUST live on the stack (the default object cap, [`VOS_OBJECT_CAP`]).
+///
+/// The host mints a FRESH `boot_token` on every (re)instantiation — cold AND
+/// warm restart — and advances `boot_epoch`, so a CSPRNG re-booted from this at
+/// the top of each refine entry never re-emits used randomness after a warm
+/// restart. Legal in refine.
+#[inline]
+pub fn boot_context(buf: &mut [u8]) -> u64 {
+    ecall2(
+        hostcall::BOOT_CONTEXT,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
 }
 
 /// Fetch a preimage by hash. Returns bytes read into `buf`.

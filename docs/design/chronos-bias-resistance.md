@@ -1,10 +1,55 @@
-# Chronos bias resistance — ECVRF + committee commit-reveal (Phase D groundwork)
+# Chronos bias resistance — ECVRF + committee commit-reveal (Phase D)
 
-**Status:** groundwork (scoping + feasibility spike + design), 2026-06-15, branch
-`messaging`. Implementation NOT started.
+**Status:** **v1 LANDED 2026-06-16, branch `messaging`** (D0–D4 + two fixes;
+commits `37876d6`→`76c3aec`). The design below is the original groundwork; read
+the **As-built** section next for where the implementation diverged.
 **Extends:** [`actor-clock-and-randomness.md`](./actor-clock-and-randomness.md)
 (the "Crypto evolution" + "Security invariants" sections). Phases A/B/C of that
-doc are landed; this scopes its Phase D ("bias resistance").
+doc are landed; this is its Phase D ("bias resistance").
+
+## As-built (Phase D v1 landed)
+
+The committee protocol matches the design — per-voter ECVRF over `α`, XOR
+combine, multi-epoch open→reveal→fold, the lagged read, the unchanged pull API —
+with three deltas worth recording, plus two bugs found and fixed during
+verification:
+
+- **Auth is cryptographic, not caller-based (delta from §Seam evolution).** The
+  design assumed a follower's reveal/enrol arrives as `Caller::Peer`. It does at
+  the libp2p edge, but a chronos handler runs on the **raft apply path, where the
+  originating caller is NOT preserved** — a cross-node reveal reaches the handler
+  as `Caller::Unauthenticated`. So `reveal(voter_id, round, proof)` authenticates
+  by the VRF proof itself (verified against the round's snapshot key — only the
+  key holder could produce it), and `enrol_voter(voter_id, pubkey)` by the
+  leader-pushed authorized set + **first-wins** binding (rebinding a different key
+  → `STATUS_KEY_LOCKED`). General lesson: *authenticate a raft actor's writes by
+  what's in the committed entry (a signature/proof), never by the caller.*
+- **Enrol residual (documented).** Because enrol is caller-free, a party that
+  front-runs an authorized voter's *first* enrol can bind its own key to that
+  slot (committee griefing/Sybil within the authorized set). No β is ever
+  forgeable, so bias resistance is intact. The proper close is binding the VRF
+  pubkey in the **registry at admit time** (the rejected "option B" — now the
+  recommended hardening; see the roadmap).
+- **Runtime prerequisite found + fixed (`654b2da`).** A raft agent soft-restarted
+  (reload + replay the whole DAG) on *every* committed index — including the echo
+  of its own proposals — so a continuously-committing actor (the chronos clock,
+  the first such consumer) thrashed O(n²) and transiently reset to genesis. This
+  was a **pre-existing** runtime bug (reproduced on v0 chronos), not Phase D's.
+  Fix: `CommitStrategy::needs_sync_reload()` gates the restart on whether the
+  store actually moved ahead of what the agent applied (`commit_index >
+  last_applied` for raft) — reload only for genuine remote merges, never for the
+  agent's own commits.
+- **Verified live:** 38 chronos unit tests; vos lib 267; messenger e2e + retry;
+  a 2-node committee folding both voters' VRF reveals every round on the PVM; and
+  the full `just demo-msg-procs` (messenger + chronos) green.
+- **Done:** D0 (`vrf`), D1 (enrol substrate), D2 (round protocol), D3
+  (`verify_combine`), D4 (vosx feeder). **Deferred:** D5 (ristretto precompiles —
+  perf, gated on profiling) and D6 (Bandersnatch RingVRF, JAM interop).
+- **Open follow-ups (persisted in the roadmap):** a committed multi-node
+  committee integration test (the live path is only script/demo-verified today);
+  registry pubkey-binding to close the enrol residual; and incremental
+  follower-apply (a raft follower still full-replays per applied entry — perf,
+  not correctness).
 
 ## Why
 

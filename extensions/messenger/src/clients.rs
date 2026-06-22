@@ -6,6 +6,10 @@
 //! types shared from the actor crates. No MLS, no policy — those
 //! live in `mls`/`tick`; this module only moves bytes.
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use msg_ctl::{CommitOutcome, CommitRow};
 use msg_log::EnvelopeRow;
 use vos::actors::context::ServiceId;
@@ -17,7 +21,10 @@ use crate::MsgrCtx;
 /// The space registry's well-known local id.
 const REGISTRY_ID: u32 = 0;
 
-/// The per-space clock + verifiable-randomness service's instance name.
+/// The per-space clock + verifiable-randomness service's instance name. Read
+/// by [`chronos_beacon`] — both await the determinism wiring that folds the
+/// public beacon into the MLS CSPRNG (a custom `CipherSuiteProvider`).
+#[allow(dead_code)]
 pub(crate) const CHRONOS_AGENT: &str = "chronos";
 
 pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
@@ -28,6 +35,28 @@ pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
     payload
 }
 
+/// Send a dynamic [`Msg`] to `target` and return the decoded reply [`Value`],
+/// or `None` if the target is unreachable / refused / replied undecodably.
+///
+/// The outbound-ask effect differs by build flavor: the host extension uses the
+/// native `ask_dispatch` effect (returns the raw reply bytes, decoded here);
+/// the PVM service actor has no `ask_dispatch` (it is `extension`-gated) and
+/// uses `ask_raw`/`invoke_raw`, which returns the reply already decoded to a
+/// `Value`. Both wrap the same `[TAG_DYNAMIC ‖ Msg]` payload, so every caller
+/// below is flavor-agnostic.
+async fn ask_value(ctx: &mut MsgrCtx, target: ServiceId, msg: &Msg) -> Option<Value> {
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let raw = ctx.ask_dispatch(target, &dyn_payload(msg)).await?;
+        decode_value(&raw)
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        ctx.ask_raw(target, &dyn_payload(msg)).await.ok()
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
 fn decode_value(bytes: &[u8]) -> Option<Value> {
     <Value as vos::Decode>::try_decode(bytes)
 }
@@ -58,11 +87,9 @@ pub(crate) async fn resolve(ctx: &mut MsgrCtx, name: &str) -> Result<u32, String
     let msg = Msg::new("resolve")
         .with("name", name.to_string())
         .with("caller_prefix", local_prefix as u64);
-    let raw = ctx
-        .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(REGISTRY_ID), &msg)
         .await
         .ok_or_else(|| "registry unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad registry reply".to_string())?;
     let id = match value {
         Value::U32(id) => id,
         Value::U64(id) => id as u32,
@@ -80,11 +107,9 @@ pub(crate) async fn resolve(ctx: &mut MsgrCtx, name: &str) -> Result<u32, String
 /// channel dynamically. Ungated on the registry side.
 pub(crate) async fn reg_agents(ctx: &mut MsgrCtx) -> Result<Vec<space_registry::AgentRow>, String> {
     let msg = Msg::new("agents");
-    let raw = ctx
-        .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(REGISTRY_ID), &msg)
         .await
         .ok_or_else(|| "registry unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad registry reply".to_string())?;
     let inner = value_to_bytes(value).ok_or_else(|| "bad registry reply".to_string())?;
     if inner.is_empty() {
         return Ok(Vec::new());
@@ -116,8 +141,7 @@ pub(crate) async fn reg_install(
         .with("consistency", template.consistency as u64)
         .with("install_args", Vec::<u8>::new())
         .with("install_payloads", Vec::<u8>::new());
-    let raw = ctx
-        .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(REGISTRY_ID), &msg)
         .await
         .ok_or_else(|| {
             format!(
@@ -127,7 +151,6 @@ pub(crate) async fn reg_install(
                  on the messenger"
             )
         })?;
-    let value = decode_value(&raw).ok_or_else(|| "bad registry reply".to_string())?;
     value_to_status(value).ok_or_else(|| "bad registry install reply".to_string())
 }
 
@@ -147,11 +170,9 @@ pub(crate) async fn log_post(
         .with("ts_ms", ts_ms)
         .with("to_hint", Vec::<u8>::new())
         .with("body", body);
-    let raw = ctx
-        .ask_dispatch(ServiceId(log_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(log_id), &msg)
         .await
         .ok_or_else(|| "msg-log unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-log reply".to_string())?;
     match value_to_status(value) {
         Some(msg_log::STATUS_OK) => Ok(()),
         Some(code) => Err(format!("msg-log refused the envelope (status {code})")),
@@ -171,11 +192,9 @@ pub(crate) async fn log_history(
         .with("after_lamport", after_lamport)
         .with("after_id", after_id)
         .with("limit", limit as u64);
-    let raw = ctx
-        .ask_dispatch(ServiceId(log_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(log_id), &msg)
         .await
         .ok_or_else(|| "msg-log unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-log reply".to_string())?;
     let inner = value_to_bytes(value).ok_or_else(|| "bad msg-log reply".to_string())?;
     if inner.is_empty() {
         return Ok(Vec::new());
@@ -200,11 +219,9 @@ pub(crate) async fn ctl_commit(
         .with("commit_body", commit_body)
         .with("welcome", welcome)
         .with("welcome_hint", welcome_hint);
-    let raw = ctx
-        .ask_dispatch(ServiceId(ctl_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(ctl_id), &msg)
         .await
         .ok_or_else(|| "msg-ctl unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-ctl reply".to_string())?;
     let inner = value_to_bytes(value).ok_or_else(|| "bad msg-ctl reply".to_string())?;
     <CommitOutcome as vos::Decode>::try_decode(&inner)
         .ok_or_else(|| "bad msg-ctl commit payload".to_string())
@@ -220,11 +237,9 @@ pub(crate) async fn ctl_commits(
     let msg = Msg::new("commits")
         .with("from_epoch", from_epoch)
         .with("limit", limit as u64);
-    let raw = ctx
-        .ask_dispatch(ServiceId(ctl_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(ctl_id), &msg)
         .await
         .ok_or_else(|| "msg-ctl unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-ctl reply".to_string())?;
     let inner = value_to_bytes(value).ok_or_else(|| "bad msg-ctl reply".to_string())?;
     if inner.is_empty() {
         return Ok(Vec::new());
@@ -243,11 +258,9 @@ pub(crate) async fn dir_publish_kp(
     let msg = Msg::new("publish_kp")
         .with("owner", owner.to_string())
         .with("kp", kp);
-    let raw = ctx
-        .ask_dispatch(ServiceId(dir_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-directory reply".to_string())?;
     match value_to_status(value) {
         Some(msg_directory::STATUS_OK) => Ok(()),
         Some(code) => Err(format!(
@@ -265,11 +278,9 @@ pub(crate) async fn dir_claim_kp(
     owner: &str,
 ) -> Result<Option<Vec<u8>>, String> {
     let msg = Msg::new("claim_kp").with("owner", owner.to_string());
-    let raw = ctx
-        .ask_dispatch(ServiceId(dir_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-directory reply".to_string())?;
     let bytes = value_to_bytes(value).ok_or_else(|| "bad msg-directory reply".to_string())?;
     Ok((!bytes.is_empty()).then_some(bytes))
 }
@@ -282,16 +293,18 @@ pub(crate) async fn dir_claim_kp(
 /// with no hedge, which is a no-op on the stream (so absent chronos ⇒ no
 /// behaviour change). Reads the *finalized* round, never the live head, so a
 /// last-revealer cannot grind the value the messenger consumes.
+///
+/// Retained for the determinism wiring (P2.3): once the messenger drives mls-rs
+/// through a host-seeded `CipherSuiteProvider`, this beacon is folded into the
+/// CSPRNG output branch. The stock crypto provider used today ignores it.
+#[allow(dead_code)]
 pub(crate) async fn chronos_beacon(ctx: &mut MsgrCtx) -> Option<[u8; 32]> {
     let chronos_id = resolve(ctx, CHRONOS_AGENT).await.ok()?;
     let msg = Msg::new("latest_final");
-    let raw = ctx
-        .ask_dispatch(ServiceId(chronos_id), &dyn_payload(&msg))
-        .await?;
     // `Option<BeaconRound>` over the wire: empty bytes = None (no finalized
     // round), populated = rkyv-encoded BeaconRound (see the macro's reply
     // encoding). Mirror the `dir_claim_kp` shape.
-    let inner = value_to_bytes(decode_value(&raw)?)?;
+    let inner = value_to_bytes(ask_value(ctx, ServiceId(chronos_id), &msg).await?)?;
     if inner.is_empty() {
         return None;
     }
@@ -313,11 +326,9 @@ pub(crate) async fn dir_release_kp(
     let msg = Msg::new("release_kp")
         .with("owner", owner.to_string())
         .with("hash", hash.to_vec());
-    let raw = ctx
-        .ask_dispatch(ServiceId(dir_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-directory reply".to_string())?;
     match value_to_status(value) {
         Some(msg_directory::STATUS_OK) => Ok(()),
         Some(code) => Err(format!("msg-directory refused the release (status {code})")),
@@ -335,11 +346,9 @@ pub(crate) async fn dir_announce_channel(
     let msg = Msg::new("announce_channel")
         .with("name", name.to_string())
         .with("creator", creator.to_string());
-    let raw = ctx
-        .ask_dispatch(ServiceId(dir_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-directory reply".to_string())?;
     value_to_status(value).ok_or_else(|| "bad msg-directory reply".to_string())
 }
 
@@ -353,11 +362,9 @@ pub(crate) async fn dir_channels(
     let msg = Msg::new("channels")
         .with("from", from)
         .with("limit", limit as u64);
-    let raw = ctx
-        .ask_dispatch(ServiceId(dir_id), &dyn_payload(&msg))
+    let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    let value = decode_value(&raw).ok_or_else(|| "bad msg-directory reply".to_string())?;
     let inner = value_to_bytes(value).ok_or_else(|| "bad msg-directory reply".to_string())?;
     if inner.is_empty() {
         return Ok(Vec::new());

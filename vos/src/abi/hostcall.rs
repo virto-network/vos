@@ -56,3 +56,32 @@ pub const PREIMAGE_FORGET: u32 = 25;
 pub const OUTPUT: u32 = 26;
 pub const PREIMAGE_PROVIDE: u32 = 27;
 pub const QUOTA: u32 = 28;
+
+// --- VOS-specific high-range hostcalls (slots 29..=127, cap-installed by the
+// host via `install_vos_precompile_caps`, NOT spec protocol caps) ---
+//
+// These share the program-cap range the blake2b/ristretto precompiles squat
+// (`vos::crypto` IDs 100/110..=114). The host installs a cap for each slot so a
+// guest `ecalli N` resolves to a `ProtocolCall { slot: N }` the runtime handles
+// rather than `RESULT_WHAT`. All fit javm's `imm <= 127` budget.
+
+/// Boot-context seam. Mints a
+/// **fresh** 32-byte `boot_token` on every (re)instantiation (cold AND warm
+/// restart), a host-local `device_id`, and a monotonic `boot_epoch`, written as
+/// `boot_token(32) ‖ device_id(32) ‖ boot_epoch(u64 LE)` into the guest buffer.
+/// The deterministic PVM has no OS entropy, so a forward-ratcheting CSPRNG (the
+/// messenger's `HostRand`) re-boots from this each refine entry to keep used MLS
+/// randomness from being re-emitted on a warm restart / snapshot fork. Sound
+/// only for non-replicated (`Local`) actors — the token is intentionally
+/// non-deterministic, so it must never feed a replicated state transition.
+pub const BOOT_CONTEXT: u32 = 120;
+
+/// Host wall-clock in Unix-epoch milliseconds. The deterministic PVM has no
+/// clock and there is no time precompile; a `Local` actor that needs real time
+/// (e.g. the messenger, for MLS KeyPackage/commit `Lifetime` validity that
+/// remote peers check against their own clock) reads it here. Like
+/// [`BOOT_CONTEXT`] the value is intentionally non-deterministic, so it is sound
+/// ONLY for non-replicated (`Local`) actors and must never feed a replicated
+/// state transition — replicated actors take time from the `chronos` beacon
+/// (sampled once at the raft leader and committed), never from this hostcall.
+pub const NOW_MS: u32 = 121;

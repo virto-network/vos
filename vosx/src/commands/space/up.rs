@@ -120,6 +120,26 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .as_ref()
         .and_then(|(m, _)| m.hyperspace.clone());
 
+    // Agents that declared `device_secret = true` — they get a node-local
+    // secret seed provisioned post-spawn (see `provision_device_seeds`).
+    // Captured here before the manifest is consumed by the reconcile block.
+    // Node-local by design: the flag never rides the replicated AgentRow.
+    let device_secret_agents: Vec<String> = parsed_manifest
+        .as_ref()
+        .map(|(m, _)| {
+            m.agents
+                .iter()
+                .filter(|a| a.device_secret)
+                .map(|a| a.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Node-local per-agent policy from the manifest (`tick_ms` + `intra_caps`)
+    // — never replicated. Applied at spawn in `agent_config_from_row`. Malformed
+    // intra_caps fail the boot eagerly (like the extension path).
+    let agent_policies = collect_agent_policies(parsed_manifest.as_ref().map(|(m, _)| m))?;
+
     // Always attach a libp2p network — even local-only spaces
     // bind a loopback port so client commands (`space publish`,
     // `space install`, etc.) have an endpoint to dial.
@@ -183,7 +203,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
     // path is stable across restarts.
-    spawn_installed_agents(&mut node, &data_dir, local_prefix, hyperspace.is_some())?;
+    spawn_installed_agents(
+        &mut node,
+        &data_dir,
+        local_prefix,
+        hyperspace.is_some(),
+        &agent_policies,
+    )?;
+
+    // Provision device-local secret seeds for agents that declared
+    // `device_secret = true` (the messenger's MLS CSPRNG root). Runs after
+    // spawn so the targets are live; the seed never touches the replicated
+    // registry — it lives only in a node-local sidecar. Idempotent.
+    provision_device_seeds(&node, &device_secret_agents, &data_dir, local_prefix);
 
     // Sprint 2 — first-boot admin bootstrap. `space new` records
     // the creator's client PeerId in `admin_bootstrap.txt`. We
@@ -255,6 +287,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &local_cfg,
                 &mut damped,
                 &mut boot_grace,
+                &agent_policies,
             ) {
                 Ok(()) => query_warned = false,
                 // Usually a stopped/wedged registry; the condition
@@ -409,6 +442,117 @@ fn consume_admin_bootstrap(
     Ok(())
 }
 
+/// Node-local per-agent policy from the manifest (never replicated): the
+/// periodic `tick_ms` and the parsed `intra_caps` relay bound.
+#[derive(Default, Clone)]
+struct AgentLocalPolicy {
+    tick_ms: Option<u64>,
+    intra_caps: Vec<vos::IntraCap>,
+}
+
+type AgentPolicies = std::collections::BTreeMap<String, AgentLocalPolicy>;
+
+/// Collect the `tick_ms` / `intra_caps` policy for each manifest agent. Parses
+/// the `intra_caps` strings eagerly so a malformed cap fails the boot.
+fn collect_agent_policies(
+    manifest: Option<&crate::commands::space::reconcile::Manifest>,
+) -> anyhow::Result<AgentPolicies> {
+    let mut map = AgentPolicies::new();
+    let Some(m) = manifest else {
+        return Ok(map);
+    };
+    for a in &m.agents {
+        let mut intra_caps = Vec::with_capacity(a.intra_caps.len());
+        for tok in &a.intra_caps {
+            intra_caps.push(
+                vos::IntraCap::parse(tok)
+                    .map_err(|e| anyhow::anyhow!("agent '{}': intra_cap '{tok}': {e}", a.name))?,
+            );
+        }
+        let tick_ms = a.tick_ms.filter(|ms| *ms > 0);
+        if tick_ms.is_some() || !intra_caps.is_empty() {
+            map.insert(
+                a.name.clone(),
+                AgentLocalPolicy {
+                    tick_ms,
+                    intra_caps,
+                },
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// Provision each `device_secret = true` agent with a node-local CSPRNG seed
+/// (the messenger's MLS confidentiality root). The seed is 32 bytes of OS
+/// entropy held in a `{data_dir}/agents/{svc_id:08x}.seed` sidecar — node-local
+/// like the P0 `.seal`, never replicated — and delivered by a `seed` message
+/// over a local `Caller::System` invoke (the same bypass-the-auth-gate path
+/// `consume_admin_bootstrap` uses). Idempotent: the agent persists the seed in
+/// its Local redb, so a re-send on a later boot is a no-op. Best-effort — a
+/// failure to seed is logged, not fatal.
+fn provision_device_seeds(node: &VosNode, agents: &[String], data_dir: &std::path::Path, daemon_prefix: u16) {
+    for name in agents {
+        let svc_id = crate::commands::space::common::instance_service_id(name, daemon_prefix);
+        let seed = match load_or_mint_device_seed(data_dir, svc_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(agent = %name, "device seed: {e}");
+                continue;
+            }
+        };
+        let msg = vos::value::Msg::new("seed").with("seed_bytes", seed);
+        let encoded = vos::Encode::encode(&msg);
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(vos::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        match node.invoke_with_timeout(svc_id, payload, std::time::Duration::from_secs(5)) {
+            Some(_) => tracing::info!(agent = %name, "device seed provisioned"),
+            None => tracing::warn!(
+                agent = %name,
+                "device seed: provisioning invoke returned no reply (agent not spawned?)"
+            ),
+        }
+    }
+}
+
+/// Load an agent's 32-byte device seed from its node-local sidecar, minting
+/// fresh OS entropy (persisted `0600`) on first boot.
+fn load_or_mint_device_seed(data_dir: &std::path::Path, svc_id: ServiceId) -> anyhow::Result<Vec<u8>> {
+    let dir = data_dir.join("agents");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{:08x}.seed", svc_id.0));
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            return Ok(bytes);
+        }
+        tracing::warn!(?path, "device seed sidecar has wrong length; re-minting");
+    }
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("OS entropy for device seed: {e}"))?;
+    write_secret_file(&path, &seed)?;
+    Ok(seed.to_vec())
+}
+
+/// Write a secret file, `0600` on Unix.
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
 fn publish_endpoint(
     node: &VosNode,
     data_dir: &std::path::Path,
@@ -459,6 +603,7 @@ fn spawn_installed_agents(
     data_dir: &std::path::Path,
     local_prefix: u16,
     has_hyperspace: bool,
+    policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
     use space_registry::{STATUS_OK, SpaceRegistryRef};
     use std::collections::HashSet;
@@ -530,7 +675,7 @@ fn spawn_installed_agents(
         } else {
             None
         };
-        match agent_config_from_row(data_dir, &a)? {
+        match agent_config_from_row(data_dir, &a, policies)? {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
                 if let Some(members) = raft_members {
@@ -1069,6 +1214,7 @@ enum RowConfig {
 fn agent_config_from_row(
     data_dir: &std::path::Path,
     a: &space_registry::AgentRow,
+    policies: &AgentPolicies,
 ) -> anyhow::Result<RowConfig> {
     let program_hash = BlobHash(a.program_hash);
     let elf = match blob_store::cache_get(&program_hash)? {
@@ -1114,6 +1260,17 @@ fn agent_config_from_row(
                 "agent '{}' has unparseable install_payloads, ignoring: {e}",
                 a.instance_name,
             );
+        }
+    }
+
+    // Node-local manifest policy (never replicated): periodic `tick` cadence
+    // and the bounded outbound-relay caps.
+    if let Some(policy) = policies.get(&a.instance_name) {
+        if let Some(ms) = policy.tick_ms {
+            cfg = cfg.with_tick_ms(ms);
+        }
+        if !policy.intra_caps.is_empty() {
+            cfg = cfg.with_intra_caps(policy.intra_caps.clone());
         }
     }
     Ok(RowConfig::Ready(Box::new(cfg)))
@@ -1490,6 +1647,7 @@ fn reconcile_installed_agents(
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
     damped: &mut RowDamping,
     boot_grace: &mut BootGrace,
+    policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
     use space_registry::{STATUS_OK, SpaceRegistryRef};
 
@@ -1571,7 +1729,7 @@ fn reconcile_installed_agents(
         } else {
             None
         };
-        match agent_config_from_row(data_dir, &a) {
+        match agent_config_from_row(data_dir, &a, policies) {
             Ok(RowConfig::Ready(cfg)) => {
                 let mut cfg = *cfg;
                 if let Some(members) = raft_members {

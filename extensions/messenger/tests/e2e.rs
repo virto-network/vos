@@ -55,11 +55,8 @@ fn vosx_bin() -> PathBuf {
     workspace().join("target").join("debug").join("vosx")
 }
 
-fn messenger_so() -> PathBuf {
-    workspace()
-        .join("target")
-        .join("debug")
-        .join("libmessenger_extension.so")
+fn messenger_elf() -> PathBuf {
+    workspace().join("target/riscv64em-javm/release/messenger_extension.elf")
 }
 
 fn msg_log_elf() -> PathBuf {
@@ -77,7 +74,7 @@ fn msg_directory_elf() -> PathBuf {
 fn ensure_built() {
     for (path, hint) in [
         (vosx_bin(), "cargo build -p vosx"),
-        (messenger_so(), "cargo build -p messenger-extension"),
+        (messenger_elf(), "cd extensions/messenger && cargo +nightly actor"),
         (msg_log_elf(), "just build-msg-actors"),
         (msg_ctl_elf(), "just build-msg-actors"),
         (msg_directory_elf(), "just build-msg-actors"),
@@ -193,16 +190,18 @@ name = "msg-directory"
 path = "{dir_elf}"
 consistency = "raft"
 
-[[extension]]
+[[agent]]
 name = "messenger"
-path = "{so}"
+path = "{elf}"
+consistency = "local"
+device_secret = true
 tick_ms = 300
 intra_caps = ["msg-*:member", "space-registry:admin"]
 "#,
         log_elf = msg_log_elf().display(),
         ctl_elf = msg_ctl_elf().display(),
         dir_elf = msg_directory_elf().display(),
-        so = messenger_so().display(),
+        elf = messenger_elf().display(),
     );
     fs::write(&manifest_path, body).expect("write manifest");
     manifest_path

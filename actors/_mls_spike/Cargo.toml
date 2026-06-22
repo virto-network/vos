@@ -1,0 +1,60 @@
+[workspace]
+
+[package]
+name = "mls-spike"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# mls-rs core protocol: drop default = [std, rayon, ...]; keep only the
+# alloc-only framing/codec/TreeKEM path. `private_message` pulls the RFC-9420
+# PrivateMessage framing the messenger pins (PURE PrivateMessage); the by_ref /
+# custom-proposal / out_of_order / psk features round out an RFC-compliant
+# commit/proposal path so create_group + add-member-commit are reachable.
+mls-rs = { version = "0.55", default-features = false, features = [
+    "private_message",
+    "by_ref_proposal",
+    "custom_proposal",
+    "out_of_order",
+    "prior_epoch",
+    "psk",
+    "tree_index",
+] }
+# RustCrypto ciphersuite-1 provider, std dropped. `getrandom` feature pulls the
+# optional getrandom dep so we can register a custom (no_std) backend below.
+mls-rs-crypto-rustcrypto = { version = "0.22", default-features = false, features = [
+    "getrandom",
+] }
+
+# getrandom 0.2 with a custom backend: os = "none" has no OS entropy source, so
+# we register a deterministic stub (spike-only) via `register_custom_getrandom!`.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+
+# mls-rs (no_std) pulls `portable-atomic` to emulate atomics on a target with no
+# native CAS (max-atomic-width 0), and `spin` for the in-memory-storage Mutex.
+# portable-atomic needs a `critical-section` backend on such a target; on a
+# singlethread PVM (no interrupts/preemption) acquire/release is a no-op, which
+# we provide via `critical-section::set_impl!` below.
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+critical-section = { version = "1", default-features = false }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "service"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "wasm-bootstrap"] }
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "extension"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

@@ -146,6 +146,31 @@ pub struct AgentDef {
     /// where extra keys become `Msg::with` arguments.
     #[serde(default)]
     pub on_start: Vec<OnStartMsg>,
+    /// Provision a device-local secret seed into this agent (the
+    /// messenger's MLS CSPRNG root). The daemon mints 32 bytes of OS
+    /// entropy into a node-local `{svc_id}.seed` sidecar on first spawn and
+    /// sends it via a `seed` message (`Caller::System`), re-sent idempotently
+    /// on every restart. Node-LOCAL by design: unlike `on_start`/`init` (which
+    /// ride the replicated `AgentRow`), this never touches the registry, so the
+    /// secret never leaves the node. Only meaningful for `consistency = "local"`
+    /// agents that expose a `seed(Vec<u8>)` handler.
+    #[serde(default)]
+    pub device_secret: bool,
+    /// Periodic `tick` interval in milliseconds — the host dispatches a
+    /// synthetic `tick` to this agent's `tick` handler about this often,
+    /// between inbound work (the agent analogue of an extension's
+    /// `tick_ms`). Node-local policy; only set it on agents with a `tick`
+    /// handler. Omitted / 0 → no ticking.
+    pub tick_ms: Option<u64>,
+    /// Declared intra-system capabilities — `"actor:role"` strings bounding
+    /// what this agent may relay to other actors on its OUTBOUND invokes.
+    /// Node-local policy (never the replicated `AgentRow`). Empty (the
+    /// default) keeps the legacy trusted relay (outbound calls are
+    /// `Caller::Actor`, bypassing role gates); a non-empty list opts the
+    /// agent into bounded relay (the real caller's role capped per cap),
+    /// mirroring an extension's `intra_caps`.
+    #[serde(default)]
+    pub intra_caps: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]

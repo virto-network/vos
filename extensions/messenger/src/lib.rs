@@ -5,7 +5,7 @@
 //! (the sequenced MLS commit chain). Neither ever sees plaintext
 //! or key material. This native extension is where the
 //! cryptography lives: it holds the member's MLS credential and
-//! group state (RFC 9420 via OpenMLS), encrypts on `send`,
+//! group state (RFC 9420 via mls-rs), encrypts on `send`,
 //! decrypts on its poll `tick`, and keeps the decrypted
 //! conversation in node-local extension state.
 //!
@@ -27,18 +27,48 @@
 use vos::prelude::*;
 
 mod clients;
+mod crypto_provider;
 mod host_rand;
 mod mls;
+mod store;
 mod tick;
 
 use clients::{
-    chronos_beacon, ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp,
-    dir_release_kp, hex_decode, hex_encode, log_post, reg_agents, reg_install, resolve,
+    ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp, dir_release_kp,
+    hex_decode, hex_encode, log_post, reg_agents, reg_install, resolve,
 };
-use host_rand::PublicBeacon;
-use mls::{new_key_package, open_provider, parse_key_package, snapshot_provider, welcome_nonce};
-use openmls::prelude::*;
-use openmls_traits::OpenMlsProvider;
+use mls::{new_key_package, parse_key_package, welcome_nonce};
+use mls_rs::ExtensionList;
+
+// ── PVM-actor no_std runtime shims ────────────────────────────────
+//
+// The riscv64em-javm target has no native atomics and no OS entropy.
+//
+// `critical-section`: mls-rs's no_std build and the messenger's own
+// `spin::Mutex` storage emulate atomics through `portable-atomic`, which needs a
+// registered `critical_section::Impl`. The target is single-threaded with no
+// interrupts/preemption, so acquire/release are no-ops.
+#[cfg(target_arch = "riscv64")]
+struct SingleThreadCriticalSection;
+#[cfg(target_arch = "riscv64")]
+critical_section::set_impl!(SingleThreadCriticalSection);
+#[cfg(target_arch = "riscv64")]
+unsafe impl critical_section::Impl for SingleThreadCriticalSection {
+    unsafe fn acquire() -> critical_section::RawRestoreState {}
+    unsafe fn release(_: critical_section::RawRestoreState) {}
+}
+
+// `getrandom`: every entropy draw the messenger makes flows through the
+// host-seeded `HostRand` (see `crypto_provider`), so any `getrandom`/`OsRng`
+// reachable inside the PVM — only mls-rs's off-path `signature_key_generate`,
+// which the messenger never calls because it hands the Client a seed-derived
+// signer — is a misuse. Fail loudly rather than hand back predictable bytes.
+#[cfg(target_arch = "riscv64")]
+fn pvm_no_os_entropy(_buf: &mut [u8]) -> core::result::Result<(), getrandom::Error> {
+    Err(getrandom::Error::UNSUPPORTED)
+}
+#[cfg(target_arch = "riscv64")]
+getrandom::register_custom_getrandom!(pvm_no_os_entropy);
 
 /// Per-channel agent naming convention. The manifest installs the
 /// pair under these names; `create`/`join` address them by channel
@@ -118,11 +148,13 @@ pub struct Messenger {
     /// Operator-chosen display identity (the MLS BasicCredential).
     /// Empty until `register`.
     nickname: String,
-    /// Ed25519 public key locating our signer in MLS storage.
+    /// This member's Ed25519 public key — a stable identity reference,
+    /// reproducible from the seed (the signer is derived, not stored).
     signature_key: Vec<u8>,
-    /// Snapshot of the OpenMLS storage map — every MLS secret
-    /// (signer, KeyPackage private parts, group ratchets) lives
-    /// in here. See `mls::open_provider`/`snapshot_provider`.
+    /// Snapshot of the mls-rs storage providers — the group ratchet state
+    /// (`GroupStateStorage`) and KeyPackage private parts
+    /// (`KeyPackageStorage`). See `mls::open_stores` / `store::snapshot`.
+    /// The signer is NOT here: it is derived from `csprng_seed`.
     mls_store: Vec<u8>,
     /// The 32-byte secret root of the host-seeded MLS CSPRNG (the only
     /// confidentiality source for freshly-drawn key material). Provisioned
@@ -154,27 +186,12 @@ impl Messenger {
         }
     }
 
-    /// Open the MLS provider over this node's persisted store and the
-    /// host-seeded CSPRNG. Centralises the `csprng_seed` threading so every
-    /// MLS operation draws from the same secret root. Used by read/decrypt
-    /// paths that draw no fresh key material; key-generating handlers use
-    /// [`Self::open_mls_with`] to hedge with the public beacon.
-    pub(crate) fn open_mls(&self) -> host_rand::VosProvider {
-        self.open_mls_with(None)
-    }
-
-    /// Open the MLS provider and, when a public `beacon` is supplied, hedge it
-    /// into the CSPRNG's output branch (HKDF `info` only — never key material;
-    /// see [`crate::host_rand`]). Callers fetch the beacon once per operation
-    /// via [`chronos_beacon`] and thread it to every draw in that operation;
-    /// `None` (no chronos, or no finalized round yet) leaves the stream
-    /// unchanged, so the beacon is a pure additive hedge.
-    pub(crate) fn open_mls_with(&self, beacon: Option<[u8; 32]>) -> host_rand::VosProvider {
-        let provider = open_provider(&self.mls_store, &self.csprng_seed);
-        if let Some(b) = beacon {
-            provider.set_beacon(PublicBeacon(b));
-        }
-        provider
+    /// Restore the mls-rs storage providers (group state + key packages) from
+    /// this node's persisted snapshot. The messenger keeps the returned stores
+    /// alongside the Client built over them (via [`mls::build_client`]) so it
+    /// can [`store::snapshot`] them back after a mutating MLS op.
+    pub(crate) fn open_stores(&self) -> store::VosStores {
+        mls::open_stores(&self.mls_store)
     }
 
     /// Provision the CSPRNG secret seed (the MLS confidentiality root) into
@@ -214,7 +231,10 @@ impl Messenger {
             return "usage: register <nickname>".into();
         }
         // Provision the CSPRNG root before the first draw if a host didn't
-        // already do so via `seed` — on native this is fresh OS entropy.
+        // already do so via `seed` — on the host extension this is fresh OS
+        // entropy. The PVM actor has no OS entropy, so the seed is mandatory:
+        // `seed` must be called first (the deterministic-port requirement).
+        #[cfg(not(target_arch = "riscv64"))]
         if self.csprng_seed.is_empty() {
             let mut s = [0u8; 32];
             if getrandom::getrandom(&mut s).is_err() {
@@ -222,25 +242,22 @@ impl Messenger {
             }
             self.csprng_seed = s.to_vec();
         }
-        // Fetch the public-randomness hedge once for this whole registration
-        // (signer + stocked KeyPackages all draw under it).
-        let beacon = chronos_beacon(ctx).await;
-        let provider = self.open_mls_with(beacon);
-        // Derive the Ed25519 signer from the seeded CSPRNG (not OsRng), so
-        // the signing identity is under the same secret root as every other
-        // key — see `mls::derive_signer`.
-        let keys = match mls::derive_signer(&provider) {
-            Ok(k) => k,
+        #[cfg(target_arch = "riscv64")]
+        if self.csprng_seed.is_empty() {
+            return "seed not provisioned — call `seed` with 32 bytes before \
+                    `register` (a PVM actor has no OS entropy)"
+                .into();
+        }
+        // The Ed25519 signing identity is derived deterministically from the
+        // seed (not OsRng), so it is reproducible and under the same secret
+        // root as the rest of the key material — see `mls::derive_signer`.
+        self.signature_key = match mls::signer_public(&self.csprng_seed) {
+            Ok(p) => p,
             Err(e) => return format!("key generation failed: {e}"),
         };
-        if let Err(e) = keys.store(provider.storage()) {
-            return format!("storing signer failed: {e}");
-        }
-        self.signature_key = keys.public().to_vec();
         self.nickname = nickname;
-        self.mls_store = snapshot_provider(&provider);
 
-        match self.stock_directory(ctx, REGISTER_KP_COUNT, beacon).await {
+        match self.stock_directory(ctx, REGISTER_KP_COUNT).await {
             Ok(n) => format!(
                 "registered as '{}' ({n} key packages published to the directory)",
                 self.nickname
@@ -256,18 +273,18 @@ impl Messenger {
     /// Mint a KeyPackage and print it hex-encoded for out-of-band
     /// delivery to an inviter. One KeyPackage admits one join.
     #[msg(cli)]
-    async fn key_package(&mut self, ctx: &mut Context<Self>) -> String {
-        let provider = self.open_mls_with(chronos_beacon(ctx).await);
-        let (credential, signer) = match self.identity(&provider) {
-            Ok(v) => v,
+    async fn key_package(&mut self, _ctx: &mut Context<Self>) -> String {
+        let stores = self.open_stores();
+        let client = match mls::build_client(&self.nickname, &self.csprng_seed, &stores) {
+            Ok(c) => c,
             Err(e) => return e,
         };
-        let kp_bytes = match new_key_package(&provider, credential, &signer) {
+        let kp_bytes = match new_key_package(&client, now_ms()) {
             Ok(b) => b,
             Err(e) => return e,
         };
         self.published_kp_count += 1;
-        self.mls_store = snapshot_provider(&provider);
+        self.mls_store = store::snapshot(&stores);
         hex_encode(&kp_bytes)
     }
 
@@ -284,22 +301,27 @@ impl Messenger {
         if self.channel_index(&channel).is_some() {
             return format!("channel '{channel}' already known");
         }
-        let beacon = chronos_beacon(ctx).await;
-        if let Err(e) = self.ensure_channel_agents(&channel, ctx, beacon).await {
+        if let Err(e) = self.ensure_channel_agents(&channel, ctx).await {
             return e;
         }
-        let provider = self.open_mls_with(beacon);
-        let (credential, signer) = match self.identity(&provider) {
-            Ok(v) => v,
+        let stores = self.open_stores();
+        let client = match mls::build_client(&self.nickname, &self.csprng_seed, &stores) {
+            Ok(c) => c,
             Err(e) => return e,
         };
-        let gid = GroupId::from_slice(&mls::group_id_for(&channel));
-        if let Err(e) =
-            MlsGroup::new_with_group_id(&provider, &signer, &mls::create_config(), gid, credential)
-        {
-            return format!("group creation failed: {e}");
+        let mut group = match client.create_group_with_id(
+            mls::group_id_for(&channel).to_vec(),
+            ExtensionList::default(),
+            ExtensionList::default(),
+            Some(mls::mls_time(now_ms())),
+        ) {
+            Ok(g) => g,
+            Err(e) => return format!("group creation failed: {e:?}"),
+        };
+        if let Err(e) = group.write_to_storage() {
+            return format!("persisting group failed: {e:?}");
         }
-        self.mls_store = snapshot_provider(&provider);
+        self.mls_store = store::snapshot(&stores);
         self.channels.push(ChannelEntry {
             name: channel.clone(),
             joined: true,
@@ -513,23 +535,23 @@ impl Messenger {
         if !self.channels[i].joined {
             return format!("not joined to '{channel}' yet");
         }
-        let provider = self.open_mls_with(chronos_beacon(ctx).await);
-        let (_, signer) = match self.identity(&provider) {
-            Ok(v) => v,
+        let stores = self.open_stores();
+        let client = match mls::build_client(&self.nickname, &self.csprng_seed, &stores) {
+            Ok(c) => c,
             Err(e) => return e,
         };
-        let mut group = match self.load_group(&provider, &channel) {
+        let mut group = match mls::load_group(&client, &channel) {
             Ok(g) => g,
             Err(e) => return e,
         };
-        let msg_out = match group.create_message(&provider, &signer, text.as_bytes()) {
+        let msg_out = match group.encrypt_application_message(text.as_bytes(), Vec::new()) {
             Ok(m) => m,
-            Err(e) => return format!("encryption failed: {e}"),
+            Err(e) => return format!("encryption failed: {e:?}"),
         };
         let Ok(body) = msg_out.to_bytes() else {
             return "serializing message failed".into();
         };
-        let epoch = group.epoch().as_u64();
+        let epoch = group.current_epoch();
         // Saturating: a poisoned channel whose lamports were driven
         // to u64::MAX must never panic (debug) or wrap to 0 (which
         // msg-log rejects) and wedge sending. Worst case under
@@ -558,7 +580,10 @@ impl Messenger {
         // is always at least as advanced as anything posted; a crash
         // after persist but before post merely skips a generation
         // (harmless — receivers tolerate gaps).
-        self.mls_store = snapshot_provider(&provider);
+        if let Err(e) = group.write_to_storage() {
+            return format!("persisting send ratchet failed: {e:?}");
+        }
+        self.mls_store = store::snapshot(&stores);
         if let Err(e) = log_post(ctx, log_id, epoch, lamport, ts_ms, body).await {
             return e;
         }
@@ -607,7 +632,8 @@ impl Messenger {
             "key packages published: {}\n",
             self.published_kp_count
         ));
-        let provider = self.open_mls();
+        let stores = self.open_stores();
+        let client = mls::build_client(&self.nickname, &self.csprng_seed, &stores).ok();
         for c in &self.channels {
             if c.desynced {
                 out.push_str(&format!(
@@ -616,10 +642,11 @@ impl Messenger {
                     c.messages.len()
                 ));
             } else if c.joined {
-                let (epoch, members) = match self.load_group(&provider, &c.name) {
-                    Ok(g) => (g.epoch().as_u64(), g.members().count()),
-                    Err(_) => (0, 0),
-                };
+                let (epoch, members) = client
+                    .as_ref()
+                    .and_then(|cl| mls::load_group(cl, &c.name).ok())
+                    .map(|g| (g.current_epoch(), g.roster().members_iter().count()))
+                    .unwrap_or((0, 0));
                 out.push_str(&format!(
                     "channel {}: joined, epoch {epoch}, {members} members, {} messages\n",
                     c.name,
@@ -719,7 +746,6 @@ impl Messenger {
         &self,
         channel: &str,
         ctx: &mut Context<Self>,
-        beacon: Option<[u8; 32]>,
     ) -> core::result::Result<(), String> {
         let log_name = log_agent_name(channel);
         let ctl_name = ctl_agent_name(channel);
@@ -755,9 +781,8 @@ impl Messenger {
             };
             installs.push((name, template));
         }
-        let provider = self.open_mls_with(beacon);
         for (name, template) in installs {
-            let rep_id = mls::fresh_replication_id(&provider)?;
+            let rep_id = mls::fresh_replication_id()?;
             match reg_install(ctx, name, template, rep_id).await? {
                 // EXISTS: someone else's create won the race (or a
                 // peer's row synced in) — the post-condition holds.
@@ -776,15 +801,14 @@ impl Messenger {
         &mut self,
         ctx: &mut Context<Self>,
         n: usize,
-        beacon: Option<[u8; 32]>,
     ) -> core::result::Result<usize, String> {
         let dir_id = resolve(ctx, DIRECTORY_AGENT).await?;
         let mut published = 0usize;
         for _ in 0..n {
-            let provider = self.open_mls_with(beacon);
-            let (credential, signer) = self.identity(&provider)?;
-            let kp_bytes = new_key_package(&provider, credential, &signer)?;
-            self.mls_store = snapshot_provider(&provider);
+            let stores = self.open_stores();
+            let client = mls::build_client(&self.nickname, &self.csprng_seed, &stores)?;
+            let kp_bytes = new_key_package(&client, now_ms())?;
+            self.mls_store = store::snapshot(&stores);
             dir_publish_kp(ctx, dir_id, &self.nickname.clone(), kp_bytes).await?;
             self.published_kp_count += 1;
             published += 1;
@@ -813,39 +837,56 @@ impl Messenger {
             .into());
         }
         let ctl_id = resolve(ctx, &ctl_agent_name(channel)).await?;
-        // Hedge every attempt's draws (commit secrets, Welcome, routing token)
-        // with one beacon read for the whole operation.
-        let beacon = chronos_beacon(ctx).await;
         for attempt in 0..2 {
-            let provider = self.open_mls_with(beacon);
-            let (_, signer) = self.identity(&provider)?;
-            let mut group = self.load_group(&provider, channel)?;
-            if !group.is_active() {
+            let stores = self.open_stores();
+            let client = mls::build_client(&self.nickname, &self.csprng_seed, &stores)?;
+            let mut group = mls::load_group(&client, channel)?;
+            // mls-rs has no `is_active`; our own leaf missing from the roster
+            // means a prior commit evicted us.
+            if group.member_at_index(group.current_member_index()).is_none() {
                 return Err(format!("no longer a member of '{channel}'").into());
             }
-            let epoch = group.epoch().as_u64();
+            let epoch = group.current_epoch();
+            // One timestamp for this attempt: it stamps both the MLS commit
+            // Lifetime (so the commit/Welcome bytes are deterministic given the
+            // time, not the wall clock) and the ctl chain row.
+            let ts_ms = now_ms();
+            let commit_time = mls::mls_time(ts_ms);
 
-            let (commit_out, welcome_out, welcome_token) = match &op {
+            // Build the commit (leaves a pending commit on the group; applied
+            // only once the sequencer accepts it).
+            let (commit_msg, welcome_msg, welcome_token) = match &op {
                 ChainOp::Add { kp_bytes } => {
-                    let kp = parse_key_package(&provider, kp_bytes)?;
-                    let (c, w, _info) = group
-                        .add_members(&provider, &signer, core::slice::from_ref(&kp))
-                        .map_err(|e| format!("add_members failed: {e}"))?;
-                    // Random routing token, NOT a hash of the joiner's
-                    // public KeyPackage — see `mls::welcome_nonce`.
-                    (c, Some(w), welcome_nonce(&provider)?.to_vec())
+                    let kp_msg = parse_key_package(kp_bytes)?;
+                    let out = group
+                        .commit_builder()
+                        .commit_time(commit_time)
+                        .add_member(kp_msg)
+                        .map_err(|e| format!("add proposal failed: {e:?}"))?
+                        .build()
+                        .map_err(|e| format!("add commit failed: {e:?}"))?;
+                    let welcome = out.welcome_messages.into_iter().next();
+                    // Random routing token, NOT a hash of the joiner's public
+                    // KeyPackage — see `mls::welcome_nonce`.
+                    (out.commit_message, welcome, welcome_nonce()?.to_vec())
                 }
                 ChainOp::Remove { nickname } => {
-                    // Nicknames are unverified and non-unique, so a
-                    // group can hold two leaves both credentialed the
-                    // same. Refuse an ambiguous target rather than
-                    // evicting an arbitrary first-match (a Remove is
-                    // binding and can't be rewound), and never let a
-                    // nickname match resolve to our own leaf.
-                    let own = group.own_leaf_index();
-                    let matches: Vec<_> = group
-                        .members()
-                        .filter(|m| m.credential.serialized_content() == nickname.as_bytes())
+                    // Nicknames are unverified and non-unique, so a group can
+                    // hold two leaves both credentialed the same. Refuse an
+                    // ambiguous target rather than evicting an arbitrary
+                    // first-match (a Remove is binding and can't be rewound),
+                    // and never let a nickname match resolve to our own leaf.
+                    let own = group.current_member_index();
+                    let matches: Vec<u32> = group
+                        .roster()
+                        .members_iter()
+                        .filter(|m| {
+                            m.signing_identity
+                                .credential
+                                .as_basic()
+                                .map(|b| b.identifier() == nickname.as_bytes())
+                                .unwrap_or(false)
+                        })
                         .map(|m| m.index)
                         .collect();
                     let target = match matches.as_slice() {
@@ -871,42 +912,49 @@ impl Messenger {
                             .into());
                         }
                     };
-                    let (c, w, _info) = group
-                        .remove_members(&provider, &signer, &[target])
-                        .map_err(|e| format!("remove_members failed: {e}"))?;
-                    if w.is_some() {
-                        let _ = group.clear_pending_commit(provider.storage());
+                    let out = group
+                        .commit_builder()
+                        .commit_time(commit_time)
+                        .remove_member(target)
+                        .map_err(|e| format!("remove proposal failed: {e:?}"))?
+                        .build()
+                        .map_err(|e| format!("remove commit failed: {e:?}"))?;
+                    if !out.welcome_messages.is_empty() {
+                        group.clear_pending_commit();
                         return Err(ChainErr::Refused(
                             "commit unexpectedly produced a welcome — \
                                     pending add proposals in the way"
                                 .into(),
                         ));
                     }
-                    (c, None, Vec::new())
+                    (out.commit_message, None, Vec::new())
                 }
                 ChainOp::SelfUpdate => {
-                    let (c, w, _info) = group
-                        .self_update(&provider, &signer, LeafNodeParameters::default())
-                        .map_err(|e| format!("self_update failed: {e}"))?
-                        .into_contents();
-                    if w.is_some() {
-                        let _ = group.clear_pending_commit(provider.storage());
+                    // An empty commit auto-includes an update path (the
+                    // self-update / PCS-heal operation).
+                    let out = group
+                        .commit_builder()
+                        .commit_time(commit_time)
+                        .build()
+                        .map_err(|e| format!("self-update commit failed: {e:?}"))?;
+                    if !out.welcome_messages.is_empty() {
+                        group.clear_pending_commit();
                         return Err(ChainErr::Refused(
                             "commit unexpectedly produced a welcome — \
                                     pending add proposals in the way"
                                 .into(),
                         ));
                     }
-                    (c, None, Vec::new())
+                    (out.commit_message, None, Vec::new())
                 }
             };
-            let commit_body = commit_out
+            let commit_body = commit_msg
                 .to_bytes()
-                .map_err(|e| format!("serializing commit failed: {e}"))?;
-            let welcome = match welcome_out {
+                .map_err(|e| format!("serializing commit failed: {e:?}"))?;
+            let welcome = match welcome_msg {
                 Some(w) => w
                     .to_bytes()
-                    .map_err(|e| format!("serializing welcome failed: {e}"))?,
+                    .map_err(|e| format!("serializing welcome failed: {e:?}"))?,
                 None => Vec::new(),
             };
 
@@ -917,7 +965,7 @@ impl Messenger {
                 ctx,
                 ctl_id,
                 epoch,
-                now_ms(),
+                ts_ms,
                 commit_body,
                 welcome,
                 welcome_token,
@@ -930,17 +978,22 @@ impl Messenger {
             match outcome.status {
                 msg_ctl::STATUS_OK => {
                     group
-                        .merge_pending_commit(&provider)
-                        .map_err(|e| format!("merging own commit failed: {e}"))?;
-                    self.mls_store = snapshot_provider(&provider);
+                        .apply_pending_commit()
+                        .map_err(|e| format!("applying own commit failed: {e:?}"))?;
+                    group
+                        .write_to_storage()
+                        .map_err(|e| format!("persisting own commit failed: {e:?}"))?;
+                    self.mls_store = store::snapshot(&stores);
                     if let Some(i) = self.channel_index(channel) {
                         self.channels[i].next_epoch = epoch + 1;
                     }
                     return Ok(epoch + 1);
                 }
                 msg_ctl::STATUS_EPOCH_TAKEN | msg_ctl::STATUS_EPOCH_GAP if attempt == 0 => {
-                    let _ = group.clear_pending_commit(provider.storage());
-                    self.mls_store = snapshot_provider(&provider);
+                    // Drop our rejected pending commit; the unapplied build
+                    // wrote nothing to storage, so there is nothing to persist
+                    // — drain_ctl re-syncs and re-snapshots from the chain.
+                    group.clear_pending_commit();
                     let i = self
                         .channel_index(channel)
                         .ok_or_else(|| format!("unknown channel '{channel}'"))?;
@@ -949,8 +1002,7 @@ impl Messenger {
                         .map_err(|e| format!("catching up on the chain failed: {e}"))?;
                 }
                 other => {
-                    let _ = group.clear_pending_commit(provider.storage());
-                    self.mls_store = snapshot_provider(&provider);
+                    group.clear_pending_commit();
                     return Err(ChainErr::Refused(match other {
                         msg_ctl::STATUS_EPOCH_TAKEN => format!(
                             "another commit won epoch {epoch} again — channel is contended, retry"
@@ -970,9 +1022,25 @@ impl Messenger {
     }
 }
 
-fn now_ms() -> u64 {
+/// The node's current wall-clock time in Unix-epoch milliseconds — the single
+/// time seam the messenger feeds to MLS (KeyPackage/commit Lifetimes) and to the
+/// wire (envelope/commit row `ts_ms`). On the host extension build this reads
+/// `SystemTime`; the deterministic PVM actor has no clock, so it reads the host
+/// wall-clock through the `NOW_MS` hostcall. The messenger is a `Local`
+/// (non-replicated) actor, so a per-dispatch wall-clock is sound — its only use
+/// is the MLS `Lifetime` a remote peer validates against its own clock, and the
+/// stamped wire-row `ts_ms`; neither feeds a replicated state transition. The
+/// deterministic crypto provider pins the entropy, so KeyPackage/commit bytes
+/// remain a pure function of `(seed, boot token, ts_ms)`.
+#[cfg(not(target_arch = "riscv64"))]
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn now_ms() -> u64 {
+    vos::hostcalls::now_ms()
 }

@@ -132,6 +132,77 @@ fn kread_hash(k: &InvocationKernel, addr: u32) -> [u8; 32] {
     h
 }
 
+// --- BOOT_CONTEXT host provider ---
+//
+// Host-local, non-replicated source for the BOOT_CONTEXT hostcall. The
+// deterministic PVM has no OS entropy, so the host mints a fresh per-boot
+// `boot_token` (real OS entropy) on every refine (re)entry — cold AND warm
+// restart — plus a host-local `device_id` and a monotonic per-service
+// `boot_epoch`. A `Local`-consistency actor's forward-ratcheting CSPRNG
+// (`HostRand`) re-boots from `(seed, token, device_id, epoch, persisted_ctr)`
+// each entry, so a warm restart / snapshot fork cannot re-emit used MLS
+// randomness (the Ristenpart–Yilek reuse catastrophe).
+//
+// This state is deliberately process-global, NOT per-`VosRuntime`: `device_id`
+// is a property of the physical host, and `boot_epoch` must be host-local and
+// outlive any single runtime instance. The token is intentionally
+// non-deterministic — BOOT_CONTEXT is sound ONLY for non-replicated actors, and
+// its output must never feed a replicated state transition.
+//
+// **Seam limits (follow-ons):** `boot_epoch`
+// lives in memory, so it is monotonic only within a process — durable
+// cross-process persistence (the live-RAM-snapshot defense) and a real
+// per-device `device_id` (e.g. derived from the node's libp2p identity) are
+// wired when the messenger runs as a PVM actor. The fresh OS-entropy
+// token already defends cold clone + warm restart today.
+struct BootContextHost {
+    device_id: [u8; 32],
+    boot_epochs: HashMap<u32, u64>,
+}
+
+impl BootContextHost {
+    fn new() -> Self {
+        let mut device_id = [0u8; 32];
+        getrandom::getrandom(&mut device_id)
+            .expect("OS entropy for the BOOT_CONTEXT device_id");
+        Self {
+            device_id,
+            boot_epochs: HashMap::new(),
+        }
+    }
+
+    /// Mint a fresh boot context for `svc_id`: fresh OS-entropy `boot_token`,
+    /// the stable host `device_id`, and the next monotonic `boot_epoch`.
+    fn mint(&mut self, svc_id: u32) -> ([u8; 32], [u8; 32], u64) {
+        let mut token = [0u8; 32];
+        getrandom::getrandom(&mut token).expect("OS entropy for the BOOT_CONTEXT token");
+        let slot = self.boot_epochs.entry(svc_id).or_insert(0);
+        let epoch = *slot;
+        *slot += 1;
+        (token, self.device_id, epoch)
+    }
+}
+
+static BOOT_CONTEXT_HOST: std::sync::LazyLock<std::sync::Mutex<BootContextHost>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BootContextHost::new()));
+
+/// Wire layout of one BOOT_CONTEXT reply: `boot_token(32) ‖ device_id(32) ‖
+/// boot_epoch(u64 LE)`.
+const BOOT_CONTEXT_LEN: usize = 32 + 32 + 8;
+
+/// Serialize a freshly-minted boot context for `svc_id` into the wire layout.
+fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
+    let (token, device_id, epoch) = BOOT_CONTEXT_HOST
+        .lock()
+        .expect("BOOT_CONTEXT host mutex poisoned")
+        .mint(svc_id);
+    let mut out = [0u8; BOOT_CONTEXT_LEN];
+    out[..32].copy_from_slice(&token);
+    out[32..64].copy_from_slice(&device_id);
+    out[64..72].copy_from_slice(&epoch.to_le_bytes());
+    out
+}
+
 /// Install the VOS-specific zkpvm-precompile slots as Protocol caps in
 /// the active VM's cap table. javm auto-installs slots 1..=28 (the
 /// spec-canonical protocol range) but leaves higher slots empty, so
@@ -164,13 +235,15 @@ fn install_vos_precompile_caps(kernel: &mut InvocationKernel) {
     // handler today); ristretto IDs are hardcoded here until vos
     // grows its own handler — the install is a no-op for slots
     // whose ECALL never fires.
-    let slots: [u8; 6] = [
+    let slots: [u8; 8] = [
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8, // 100
         110,                                         // ristretto_scalar_mult
         111,                                         // ristretto_point_add
         112,                                         // scalar_from_bytes_mod_order_wide
         113,                                         // scalar_mul_mod_l
         114,                                         // scalar_add_mod_l
+        hostcall::BOOT_CONTEXT as u8,                // 120 (boot-context seam)
+        hostcall::NOW_MS as u8,                      // 121 (host wall-clock seam)
     ];
     let vm = kernel.vm_arena.vm_mut(kernel.active_vm);
     for &slot in &slots {
@@ -1071,6 +1144,32 @@ fn handle_refine_hostcall(
             }
         }
         hostcall::OUTPUT | hostcall::CHECKPOINT => (error::HOST_OK, 0),
+        hostcall::BOOT_CONTEXT => {
+            // Boot-context seam: mint a FRESH boot context for this (re)entry —
+            // a0 = guest out-buffer ptr, a1 = its length. Writes
+            // `boot_token(32) ‖ device_id(32) ‖ boot_epoch(u64 LE)` and
+            // returns the full length (so the guest can detect truncation,
+            // like STORAGE_R / FETCH). A fresh OS-entropy token + advanced
+            // epoch every call is what keeps a warm restart from re-emitting
+            // used MLS randomness.
+            let buf_ptr = a0 as u32;
+            let buf_len = a1 as usize;
+            let ctx = mint_boot_context(svc_id);
+            let n = ctx.len().min(buf_len);
+            kwrite(kernel, buf_ptr, &ctx[..n]);
+            (ctx.len() as u64, 0)
+        }
+        hostcall::NOW_MS => {
+            // Host wall-clock in Unix-epoch milliseconds. No args; the value is
+            // returned directly. Intentionally non-deterministic — sound only
+            // for non-replicated (`Local`) actors (the messenger reads it for
+            // MLS Lifetime validity); replicated state takes time from chronos.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            (now, 0)
+        }
         crate::crypto::ECALL_BLAKE2B_COMPRESS => {
             // Wire ABI matches `zkpvm-precompiles`: a0=h_ptr (64B
             // in/out), a1=m_ptr (128B in), a2=t_low (counter low

@@ -1,5 +1,8 @@
 # Root justfile for vos — build and test orchestration.
 
+# Run recipe bodies with nushell instead of sh.
+set shell := ["nu", "-c"]
+
 # Default: list available recipes
 default:
     @just --list
@@ -19,12 +22,12 @@ build-extensions:
 
 # Build WASM actors (wasm32-unknown-unknown target)
 build-wasm:
-    cd examples/wasm/echo && cargo build --target wasm32-unknown-unknown --release
-    cd examples/wasm/fetcher && cargo build --target wasm32-unknown-unknown --release
+    cd examples/wasm/echo; cargo build --target wasm32-unknown-unknown --release
+    cd examples/wasm/fetcher; cargo build --target wasm32-unknown-unknown --release
 
 # Build all PVM actors and agents (riscv64 targets, requires custom toolchain)
 build-pvm:
-    cd examples && just build
+    cd examples; just build
 
 # ── Test ────────────────────────────────────────────────────────────
 
@@ -52,7 +55,7 @@ test-one name: build-extensions
 
 # Build just the crdt-counter actor (cycle-5 example)
 build-crdt-counter:
-    cd examples/actors/crdt-counter && cargo actor
+    cd examples/actors/crdt-counter; cargo actor
 
 # Build the space-registry actor — built-in PVM actor that
 # lives under actors/ alongside the workspace crates. `cargo actor`
@@ -62,7 +65,7 @@ build-crdt-counter:
 # host bundles. Plain `cargo build --release` silently builds only
 # the rlib + dropped cdylib, leaving the ELF stale.
 build-registry:
-    cd actors/space-registry && cargo +nightly actor
+    cd actors/space-registry; cargo +nightly actor
 
 # Refresh the shipped registry blob at `vosx/blobs/space_registry.elf`.
 # `cargo install vosx` from crates.io reads this file (the dev path
@@ -78,13 +81,13 @@ refresh-bundled-registry: build-registry
 # every member space of a hyperspace runs as the cross-space
 # gateway. Same toolchain as the registry.
 build-bridge:
-    cd actors/space-bridge && cargo +nightly actor
+    cd actors/space-bridge; cargo +nightly actor
 
 
 # Build the clerk-ledger actor — per-bank stateful agent
 # wrapping cipher-clerk's confidential double-entry kernel.
 build-clerk-ledger:
-    cd actors/clerk-ledger && cargo +nightly actor
+    cd actors/clerk-ledger; cargo +nightly actor
 
 
 # Build the clerk-bridge actor — per-bank cross-clerk voucher
@@ -93,7 +96,7 @@ build-clerk-ledger:
 # the host operator (which then credits the local recipient via
 # clerk-ledger).
 build-clerk-bridge:
-    cd actors/clerk-bridge && cargo +nightly actor
+    cd actors/clerk-bridge; cargo +nightly actor
 
 
 # Build the voucher-check PVM guest — the binary whose traced
@@ -104,7 +107,7 @@ build-clerk-bridge:
 # it's a guest workload, not a service actor — no Local/Crdt
 # replication, no Ref API consumers.
 build-voucher-check:
-    cd examples/actors/voucher-check && cargo +nightly build --release
+    cd examples/actors/voucher-check; cargo +nightly build --release
 
 
 # Build the per-channel messaging actors — msg-log (crdt-mode
@@ -112,15 +115,26 @@ build-voucher-check:
 # Same toolchain as the registry. The messenger extension is a
 # normal workspace member (`cargo build -p messenger-extension`).
 build-msg-actors:
-    cd actors/msg-log && cargo +nightly actor
-    cd actors/msg-ctl && cargo +nightly actor
-    cd actors/msg-directory && cargo +nightly actor
+    cd actors/msg-log; cargo +nightly actor
+    cd actors/msg-ctl; cargo +nightly actor
+    cd actors/msg-directory; cargo +nightly actor
+
+# Build the messenger as a PVM actor (the no_std riscv64 flavor, P2.4).
+# The messenger is also a host extension (`cargo build -p
+# messenger-extension`); this is the deterministic mls-rs PVM-native
+# build whose ELF the `link_elf` transpile gate
+# (cargo test -p vos --test messenger_transpile) checks. The ELF lands
+# in the shared workspace target dir, since the messenger stays a
+# workspace member. The gate test needs the clerk dev-deps severed (the
+# pre-existing cipher-clerk drift) — see docs/design/messaging-pvm-native.md.
+build-messenger-actor:
+    cd extensions/messenger; cargo +nightly actor
 
 # Build the chronos actor — the public clock + verifiable-randomness
 # service plane (the generalized beacon). Standalone (not
 # messaging-private); installed per space via manifest.
 build-chronos:
-    cd actors/chronos && cargo +nightly actor
+    cd actors/chronos; cargo +nightly actor
 
 
 # Live cross-node CRDT convergence demo. Spins up two networked
@@ -132,152 +146,129 @@ demo-crdt-sync: build-crdt-counter
     cargo test -p vos --features network --test elf_integration \
         crdt_counter_converges_across_nodes_live -- --nocapture
 
-# Two-process CRDT demo using real `vosx space up` daemons.
-# Each process gets its own isolated XDG state tree (so
-# `~/.config/vosx/spaces.toml` doesn't collide between them)
-# and reconciles the same crdt-counter agent from
-# `examples/space-crdt-{a,b}.toml`. Both manifests' `on_start`
-# fires one inc per replica; the EffectLogs hash to distinct
-# DAG nodes (different `(origin, seq)` per replica), gossipsub
-# carries them to the other side, soft-restart replays both
-# logs, and `count=2` shows up on each side once convergence
-# completes (~6s end-to-end).
+# Two-process CRDT demo: two real `vosx space up` daemons (isolated XDG trees)
+# reconcile the same crdt-counter agent; one inc per replica gossips across and
+# both converge to count=2 (~6s). Daemons run as nu jobs, torn down via try/catch.
 demo-crdt-procs: build-crdt-counter build-crates
-    #!/usr/bin/env bash
-    set -euo pipefail
-    A=/tmp/vosx-a; B=/tmp/vosx-b
+    #!/usr/bin/env nu
+    def vx [e, a: list] { with-env $e { ^./target/debug/vosx ...$a } }
+    def peerid [f] { open --raw $f | lines | where ($it | str contains "peer_id") | first | str replace -r "^.*peer_id = .([^\"]*).*$" "$1" }
+    def xdg [d] { { XDG_DATA_HOME: $"($d)/data", XDG_CONFIG_HOME: $"($d)/config", XDG_CACHE_HOME: $"($d)/cache" } }
+    def wait-bind [f] { for _ in 1..50 { if ($f | path exists) { break }; sleep 100ms } }
+
+    let A = "/tmp/vosx-a"
+    let B = "/tmp/vosx-b"
+    let ea = (xdg $A)
+    let eb = (xdg $B)
     rm -rf $A $B
-    mkdir -p $A/{data,config,cache} $B/{data,config,cache}
+    mkdir $"($A)/data" $"($A)/config" $"($A)/cache" $"($B)/data" $"($B)/config" $"($B)/cache"
 
-    echo "→ host A: create space..."
-    XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
-      ./target/debug/vosx space new --name demo > /dev/null
-    SPACE_ID=$(grep -E '^id = ' $A/config/vosx/spaces.toml | head -1 | cut -d'"' -f2)
-    echo "  space_id=$SPACE_ID"
+    print "→ host A: create space..."
+    vx $ea [space new --name demo] | ignore
+    let space_id = (open --raw $"($A)/config/vosx/spaces.toml" | lines | where ($it | str starts-with "id = ") | first | str replace -r "^id = .(.*).$" "$1")
+    print $"  space_id=($space_id)"
 
-    echo "→ host A: starting daemon on :4811, reconciling space-crdt-a.toml..."
-    XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache \
-    RUST_LOG=info ./target/debug/vosx space up demo \
-        --manifest examples/space-crdt-a.toml \
-        --listen /ip4/127.0.0.1/tcp/4811 \
-        > /tmp/vosx-a.log 2>&1 &
-    PID_A=$!
+    print "→ host A: starting daemon on :4811..."
+    let job_a = (job spawn { with-env ($ea | merge { RUST_LOG: "info" }) {
+        ^./target/debug/vosx space up demo --manifest examples/space-crdt-a.toml --listen /ip4/127.0.0.1/tcp/4811 out+err> /tmp/vosx-a.log
+    } })
 
-    # Wait for A's swarm to bind and write its endpoint, then
-    # extract the peer-id so B can dial it.
-    for _ in $(seq 1 50); do
-        [ -f "$A/data/vosx/$SPACE_ID/.endpoint" ] && break
-        sleep 0.1
-    done
-    PEER_A=$(grep peer_id "$A/data/vosx/$SPACE_ID/.endpoint" | cut -d'"' -f2)
-    BOOTNODE="/ip4/127.0.0.1/tcp/4811/p2p/$PEER_A"
-    echo "  bootnode=$BOOTNODE"
+    let ep_a = $"($A)/data/vosx/($space_id)/.endpoint"
+    wait-bind $ep_a
+    let bootnode = $"/ip4/127.0.0.1/tcp/4811/p2p/(peerid $ep_a)"
+    print $"  bootnode=($bootnode)"
 
-    echo "→ host B: join + start (dials A)..."
-    XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache \
-      ./target/debug/vosx space join "$SPACE_ID@$BOOTNODE" --name demo > /dev/null
-    XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache \
-    RUST_LOG=info ./target/debug/vosx space up demo \
-        --manifest examples/space-crdt-b.toml \
-        --connect "$BOOTNODE" \
-        > /tmp/vosx-b.log 2>&1 &
-    PID_B=$!
+    print "→ host B: join + start (dials A)..."
+    vx $eb [space join $"($space_id)@($bootnode)" --name demo] | ignore
+    let job_b = (job spawn { with-env ($eb | merge { RUST_LOG: "info" }) {
+        ^./target/debug/vosx space up demo --manifest examples/space-crdt-b.toml --connect $bootnode out+err> /tmp/vosx-b.log
+    } })
 
-    sleep 6
-    echo ""
-    echo "── host A counter log ─────────────────────────────────────"
-    grep "crdt-counter:" /tmp/vosx-a.log || echo "(no actor output)"
-    echo ""
-    echo "── host B counter log ─────────────────────────────────────"
-    grep "crdt-counter:" /tmp/vosx-b.log || echo "(no actor output)"
-    echo ""
-    echo "→ shutting down..."
-    kill $PID_A $PID_B 2>/dev/null || true
-    wait $PID_A 2>/dev/null || true
-    wait $PID_B 2>/dev/null || true
-    echo "done. Full logs in /tmp/vosx-{a,b}.log"
+    sleep 6sec
+    print "\n── host A counter log ─────────────────────────────────────"
+    try { ^grep "crdt-counter:" /tmp/vosx-a.log } catch { print "(no actor output)" }
+    print "\n── host B counter log ─────────────────────────────────────"
+    try { ^grep "crdt-counter:" /tmp/vosx-b.log } catch { print "(no actor output)" }
+    print "\n→ shutting down..."
+    try { job kill $job_a }
+    try { job kill $job_b }
+    print "done. Full logs in /tmp/vosx-{a,b}.log"
 
-# Two-process E2EE messaging demo: alice (host A) creates the
-# "general" channel and invites bob (host B) via an out-of-band
-# KeyPackage; both exchange messages through the replicated
-# ciphertext log while every byte the actors see stays MLS-
-# encrypted. ~20s end-to-end.
+# Two-process E2EE messaging demo: alice (host A) creates the "general" channel,
+# invites bob (host B), and they exchange messages through the replicated
+# ciphertext log while every actor-visible byte stays MLS-encrypted (~20s).
+# Daemons run as nu jobs, torn down via try/catch.
 demo-msg-procs: build-msg-actors build-chronos build-crates
-    #!/usr/bin/env bash
-    set -euo pipefail
+    #!/usr/bin/env nu
+    def vx [e, a: list] { with-env $e { ^./target/debug/vosx ...$a } }
+    def peerid [f] { open --raw $f | lines | where ($it | str contains "peer_id") | first | str replace -r "^.*peer_id = .([^\"]*).*$" "$1" }
+    def xdg [d] { { XDG_DATA_HOME: $"($d)/data", XDG_CONFIG_HOME: $"($d)/config", XDG_CACHE_HOME: $"($d)/cache" } }
+    def wait-bind [f] { for _ in 1..50 { if ($f | path exists) { break }; sleep 100ms } }
+
     cargo build -p messenger-extension
-    A=/tmp/vosx-msg-a; B=/tmp/vosx-msg-b
+    let A = "/tmp/vosx-msg-a"
+    let B = "/tmp/vosx-msg-b"
+    let ea = (xdg $A)
+    let eb = (xdg $B)
     rm -rf $A $B
-    mkdir -p $A/{data,config,cache} $B/{data,config,cache}
-    VA="env XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache ./target/debug/vosx"
-    VB="env XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache ./target/debug/vosx"
+    mkdir $"($A)/data" $"($A)/config" $"($A)/cache" $"($B)/data" $"($B)/config" $"($B)/cache"
 
-    echo "→ host A: create space..."
-    $VA space new --name msg-demo > /dev/null
-    SPACE_ID=$(grep -E '^id = ' $A/config/vosx/spaces.toml | head -1 | cut -d'"' -f2)
+    print "→ host A: create space..."
+    vx $ea [space new --name msg-demo] | ignore
+    let space_id = (open --raw $"($A)/config/vosx/spaces.toml" | lines | where ($it | str starts-with "id = ") | first | str replace -r "^id = .(.*).$" "$1")
 
-    echo "→ host A: starting daemon on :4821..."
-    RUST_LOG=info $VA space up msg-demo \
-        --manifest examples/space-msg-a.toml \
-        --listen /ip4/127.0.0.1/tcp/4821 \
-        > /tmp/vosx-msg-a.log 2>&1 &
-    PID_A=$!
-    for _ in $(seq 1 50); do
-        [ -f "$A/data/vosx/$SPACE_ID/.endpoint" ] && break
-        sleep 0.1
-    done
-    PEER_A=$(grep peer_id "$A/data/vosx/$SPACE_ID/.endpoint" | cut -d'"' -f2)
-    BOOTNODE="/ip4/127.0.0.1/tcp/4821/p2p/$PEER_A"
+    print "→ host A: starting daemon on :4821..."
+    let job_a = (job spawn { with-env ($ea | merge { RUST_LOG: "info" }) {
+        ^./target/debug/vosx space up msg-demo --manifest examples/space-msg-a.toml --listen /ip4/127.0.0.1/tcp/4821 out+err> /tmp/vosx-msg-a.log
+    } })
+    let ep_a = $"($A)/data/vosx/($space_id)/.endpoint"
+    wait-bind $ep_a
+    let bootnode = $"/ip4/127.0.0.1/tcp/4821/p2p/(peerid $ep_a)"
 
-    echo "→ host B: join + start (dials A)..."
-    $VB space join "$SPACE_ID@$BOOTNODE" --name msg-demo > /dev/null
-    RUST_LOG=info $VB space up msg-demo \
-        --manifest examples/space-msg-b.toml \
-        --connect "$BOOTNODE" \
-        > /tmp/vosx-msg-b.log 2>&1 &
-    PID_B=$!
-    sleep 3
+    print "→ host B: join + start (dials A)..."
+    vx $eb [space join $"($space_id)@($bootnode)" --name msg-demo] | ignore
+    let job_b = (job spawn { with-env ($eb | merge { RUST_LOG: "info" }) {
+        ^./target/debug/vosx space up msg-demo --manifest examples/space-msg-b.toml --connect $bootnode out+err> /tmp/vosx-msg-b.log
+    } })
+    sleep 3sec
 
-    echo "→ alice: register + create channel..."
-    $VA messenger register --space msg-demo nickname=alice
-    $VA messenger create --space msg-demo channel=general
-    echo "→ alice: grant bob's operator the member tier..."
-    PEER_B=$($VB whoami | sed -n 's/^peer_id = //p' | head -1)
-    $VA space role msg-demo grant "$PEER_B" read
-    echo "→ alice: enroll host B as a raft voter (msg-ctl / msg-directory)..."
-    PEER_B_NODE=$(grep peer_id "$B/data/vosx/$SPACE_ID/.endpoint" | cut -d'"' -f2)
-    $VA space members msg-demo add-node "$PEER_B_NODE"
+    print "→ alice: register + create channel..."
+    vx $ea [messenger register --space msg-demo nickname=alice]
+    vx $ea [messenger create --space msg-demo channel=general]
+    print "→ alice: grant peers the member tier + enroll host B as a raft voter..."
+    let peer_b = (vx $eb [whoami] | lines | where ($it | str starts-with "peer_id = ") | first | str replace -r "^peer_id = " "")
+    vx $ea [space role msg-demo grant $peer_b read]
+    let peer_b_node = (peerid $"($B)/data/vosx/($space_id)/.endpoint")
+    vx $ea [space members msg-demo add-node $peer_b_node]
     # Forwarded raft writes carry the forwarding NODE's peer, so both
     # daemons' node peers need the member tier.
-    $VA space role msg-demo grant "$PEER_B_NODE" read
-    $VA space role msg-demo grant "$PEER_A" read
-    echo "→ waiting for host B to join the raft groups..."
-    for _ in $(seq 1 60); do
-        grep -q "agent 'msg-directory' spawned at runtime" /tmp/vosx-msg-b.log && \
-        grep -q "agent 'msg-general-ctl' spawned at runtime" /tmp/vosx-msg-b.log && break
-        sleep 0.5
-    done
-    echo "→ bob: register (publishes key packages to the directory)..."
-    $VB messenger register --space msg-demo nickname=bob
-    $VB messenger join --space msg-demo channel=general
-    echo "→ alice: invite bob by name + send..."
-    $VA messenger invite --space msg-demo channel=general member=bob
-    $VA messenger send --space msg-demo channel=general "text=hello bob, this never leaves our devices in the clear"
-    sleep 5
-    echo "→ bob: reply..."
-    $VB messenger send --space msg-demo channel=general "text=hi alice, received over ciphertext-only replication"
-    sleep 5
+    vx $ea [space role msg-demo grant $peer_b_node read]
+    vx $ea [space role msg-demo grant (peerid $ep_a) read]
+    print "→ waiting for host B to join the raft groups..."
+    for _ in 1..60 {
+        let log = (try { open --raw /tmp/vosx-msg-b.log } catch { "" })
+        if (($log | str contains "agent 'msg-directory' spawned at runtime") and ($log | str contains "agent 'msg-general-ctl' spawned at runtime")) { break }
+        sleep 500ms
+    }
+    print "→ bob: register + join..."
+    vx $eb [messenger register --space msg-demo nickname=bob]
+    vx $eb [messenger join --space msg-demo channel=general]
+    print "→ alice: invite bob + send..."
+    vx $ea [messenger invite --space msg-demo channel=general member=bob]
+    vx $ea [messenger send --space msg-demo channel=general "text=hello bob, this never leaves our devices in the clear"]
+    sleep 5sec
+    print "→ bob: reply..."
+    vx $eb [messenger send --space msg-demo channel=general "text=hi alice, received over ciphertext-only replication"]
+    sleep 5sec
 
-    echo ""
-    echo "── alice's view ───────────────────────────────────────────"
-    $VA messenger history --space msg-demo channel=general limit=10 || true
-    echo "── bob's view ─────────────────────────────────────────────"
-    $VB messenger history --space msg-demo channel=general limit=10 || true
-    echo "→ shutting down..."
-    kill $PID_A $PID_B 2>/dev/null || true
-    wait $PID_A 2>/dev/null || true
-    wait $PID_B 2>/dev/null || true
-    echo "done. Full logs in /tmp/vosx-msg-{a,b}.log"
+    print "\n── alice's view ───────────────────────────────────────────"
+    try { vx $ea [messenger history --space msg-demo channel=general limit=10] }
+    print "── bob's view ─────────────────────────────────────────────"
+    try { vx $eb [messenger history --space msg-demo channel=general limit=10] }
+    print "→ shutting down..."
+    try { job kill $job_a }
+    try { job kill $job_b }
+    print "done. Full logs in /tmp/vosx-msg-{a,b}.log"
 
 # ── Run ─────────────────────────────────────────────────────────────
 
@@ -315,7 +306,7 @@ test-zkpvm-fast:
 # Remove build artifacts
 clean:
     cargo clean
-    cd examples && cargo clean 2>/dev/null || true
+    try { cd examples; cargo clean } catch { }
 
 # Format all code
 fmt:

@@ -1,12 +1,21 @@
 # PVM-native messaging: deterministic MLS, verifiable randomness, immutable locality, device-sync
 
 Status (branch `messaging`): **P0 done** (monotone-locality seal + registry widen-guard),
-**P1 done** (host-seeded forward-ratcheting MLS CSPRNG, cdylib spike), **P3 v0 done** (the
-`beacon` actor — public randomness hash-chain), **P2 scoped** (this pass; not started). This
-is the roadmap for evolving the messenger off its native `.so` extension toward a portable
-PVM actor, plus the supporting primitives. Validated against the relevant RFCs and crate
-sources (adversarial verification; corrections folded in below), and the P2 crypto
-feasibility was confirmed by an empirical PVM spike.
+**P1 done** (host-seeded forward-ratcheting MLS CSPRNG, cdylib spike), **P3 done** (the
+`beacon`→`chronos` clock+randomness actor, hardened with the Phase D bias-resistant
+committee ECVRF — see [`chronos-bias-resistance.md`](./chronos-bias-resistance.md); a
+pre-existing raft soft-restart bug was found + fixed there too, `654b2da`). **P2.0–P2.4
+done** — the messenger runs on mls-rs with a deterministic host-seeded
+`CipherSuiteProvider` (bit-identical KeyPackages/commits/Welcomes), and **the whole crate
+now also builds as a no_std riscv64 `#[actor]` whose ELF transpiles clean through
+`link_elf`** (the make-or-break). **P2.5 (live PVM e2e + RFC-interop + per-channel cutover)
+is what remains.** Cross-space messaging follows P2. P4 (device-sync) stays blocked on
+device-enrollment infra. This is the roadmap for evolving the messenger off its native
+`.so` extension toward a portable PVM actor, plus the supporting primitives. Validated
+against the relevant RFCs and crate sources (adversarial verification; corrections folded
+in below), and the P2 crypto feasibility was confirmed by an empirical PVM spike (P2 is a
+bounded port, NOT a precompile blocker). The full cross-track status + backlog lives in
+[`messaging-roadmap.md`](./messaging-roadmap.md).
 
 ## Why
 
@@ -171,55 +180,192 @@ RFC-9420 suite-1 framing — the channel actors and their rkyv rows need **no ch
 **Phases** (each gated; ~4–6 focused sessions total — the two XL poles are the mls-rs API
 migration and the make-or-break transpile of mls-rs's *own* code):
 
-- **P2.0 — in-JAVM crypto execution gate (M).** Extend `_crypto_spike` with `#[msg]` test-vector
-  handlers; assert PVM-computed X25519/Ed25519/AES-GCM/SHA-256/HKDF == host RustCrypto, clean
-  across a warm restart. Closes the one gap the compile spike left (correct *execution*, not just
-  linkage) given the recorded JAVM warm-restart/Vec/branch bugs. **Fold in the open question: does
-  mls-rs's own framing/codec/tree code transpile?** (a minimal mls-rs create-group+commit ELF
-  through `link_elf`) — so the lib decision is still cheap to revisit if it chokes.
-- **P2.1 — host boot-context seam (L).** A `BOOT_CONTEXT` hostcall minting a **fresh 32-byte
-  boot_token on every (re)instantiation — cold AND warm restart** (the warm restart *is* the fork
-  case that re-emits), + host-local `device_id` + monotonic `boot_epoch`. The actor re-boots
-  `HostRand` from `(seed, fresh token, device_id, boot_epoch+1, persisted_ctr)` at the **top of
-  every refine entry** (NOT cached — `on_start` doesn't run on warm restart). Persist the advanced
-  counter+epoch before any drawn bytes hit the wire (crash-consistency). Defeats the dominant
-  reuse hazard; independent of the lib, so it can land first.
-- **P2.2 — mls-rs port of `mls.rs` behind the existing API, host build (XL).** Map every OpenMLS
-  type (MlsGroup/KeyPackage/StagedWelcome/configs/commit ops); reimplement the snapshot store as
-  an mls-rs `GroupStateStorage`/`KeyPackageStorage` over `alloc BTreeMap` (deterministic; replaces
-  the flat HashMap). Pin suite 1, PURE PrivateMessage, ratchet-tree ext, `(64,2000)`,
-  max_past_epochs 64, GroupId = blake2b(channel). Gate: the existing group-flow/commit-race/
-  eviction tests pass against mls-rs on the host. **Verify early: mls-rs's async-shaped provider
-  API composes with the single-poll handler model** (sync facade or in-PVM synchronous INVOKE).
-- **P2.3 — custom deterministic `CipherSuiteProvider` (L).** Route EVERY entropy draw through
-  `HostRand`: `random_bytes`, `signature_key_generate`, `kem_generate` (X25519 static secret), AND
-  the HPKE-seal ephemeral. Zero `OsRng`/`from_entropy` reachable in-PVM (it traps). Gate: two
-  providers from the same (seed, boot context) emit **bit-identical KeyPackages, commits, AND
-  Welcomes** on the host build (the seam OpenMLS couldn't reach).
-- **P2.4 — cut the messenger crate to the PVM actor flavor (XL).** no_std the ~5 files (drop
-  `SystemTime`/`now_ms` → thread `ts_ms` from the wire; `core::error::Error`; HashMap→BTreeMap;
-  make `seed()` mandatory, cfg-out the getrandom fallback), standalone-actor scaffolding (model
-  `actors/beacon`). **Gate: the messenger ELF transpiles clean through `link_elf`** — the real
-  make-or-break (mls-rs's own code over the proven primitives is the unmeasured transpile surface).
-- **P2.5 — e2e PVM messenger + RFC-interop + clean cutover (L).** Full flow in a live space over
-  Local rkyv state with the boot seam live; **RFC-interop** (not bit-exactness) between an mls-rs
-  PVM member and an OpenMLS cdylib member — converge on the same exported group secret + mutual
-  decrypt. **Clean cutover per channel** (new instance_name + replication_id + fresh group, riding
-  P0's reinstall discipline) — do NOT bet on mixed cdylib+PVM inside one live group (non-normative
-  encoding divergence risks `tick.rs` `desynced` freeze). Measure per-dispatch gas.
+- **P2.0 — in-JAVM crypto execution gate (M). DONE (crypto-exec gate).** `_crypto_spike` grew
+  parametric `tv_{sha256,hkdf,x25519,ed25519,aes}` `#[msg]` handlers (each takes an input, returns
+  the raw primitive output) plus a self-scheduling `warm_rounds` handler that re-runs the whole
+  stack across `new_warm` re-entries and folds each round's digest. `vos/tests/crypto_spike_pvm.rs`
+  loads the ELF, drives every handler over several inputs, and asserts the PVM-computed bytes are
+  **bit-exact against host RustCrypto** for all five primitives — and that the crypto path is clean
+  across a warm restart (every round reproduces round 0, monotone fold matches a host reproduction,
+  zero guest panics). 6/6 green; closes the execution gap the compile spike left. **Wire-name note:**
+  the `#[msg]` macro mints a PascalCase struct per handler, so handlers carry a `tv_` prefix (an
+  un-prefixed `sha256` would mint `Sha256` and collide with `sha2::Sha256`). **Fold-in RESOLVED ✅
+  — mls-rs's own code transpiles.** `actors/_mls_spike` (mls-rs 0.55 `--no-default-features` +
+  `mls-rs-crypto-rustcrypto`, a real two-client create-group + add-member-commit + `MlsMessage`
+  codec round-trip) builds to a 1.46 MiB riscv64em-javm ELF and transpiles to a 1.31 MiB PVM blob
+  through the same `grey_transpiler::link_elf` the repo uses (`vos/tests/mls_spike_transpile.rs`
+  guards it). `rayon` is confirmed absent from the riscv dep tree; the sync API (no
+  `mls_build_async`) composes with the single-poll model (de-risks P2.2). Two no_std build-outs
+  surfaced, both spike-only and already anticipated downstream: a `getrandom` custom backend (real
+  port routes entropy through the P2.3 deterministic `CipherSuiteProvider`) and a
+  `critical-section`/`portable-atomic` shim for the in-memory storage `spin::Mutex` (real port
+  swaps the in-memory store for the P2.2 alloc-`BTreeMap` `GroupStateStorage`, dropping the Mutex).
+  **The library decision (OpenMLS → mls-rs) is empirically confirmed; P2's dominant residual
+  unknown is closed.**
+- **P2.1 — host boot-context seam (L). DONE (the seam; messenger wiring is P2.4).** New
+  `BOOT_CONTEXT` hostcall (id 120, cap-installed via `install_vos_precompile_caps`, handled in
+  `handle_refine_hostcall`): writes `boot_token(32) ‖ device_id(32) ‖ boot_epoch(u64 LE)` into a
+  guest buffer. The host mints a **fresh OS-entropy `boot_token` on every refine (re)entry — cold
+  AND warm restart** (`BootContextHost` in `runtime.rs`, a process-global behind `getrandom`), a
+  host-local `device_id`, and a per-service **monotonic `boot_epoch`**. Guest stub
+  `vos::hostcalls::boot_context`. Verified by `pvm_boot_context_fresh_across_warm_restart`: across
+  `new_warm` re-entries the tokens are all distinct, `boot_epoch` increments by one, and `device_id`
+  is stable. **Deferred to when the messenger is a PVM actor (P2.4):** re-booting `HostRand` from
+  `(seed, token, device_id, boot_epoch, persisted_ctr)` at the top of every refine entry; durable
+  **cross-process** `boot_epoch` persistence (today in-memory → monotonic within a process only, the
+  fresh token already defends cold-clone + warm-restart); real per-device `device_id` provenance
+  (e.g. the node's libp2p identity). The seam was independent of the lib, so it landed first.
+- **P2.2 — mls-rs port of `mls.rs` behind the existing API, host build (XL). DONE.** The whole
+  messenger crate (`mls.rs`, `host_rand.rs`, `lib.rs`, `tick.rs` + new `store.rs`) now runs on
+  mls-rs 0.55 and compiles + passes its tests. Structural shift absorbed: **Client-centric** (a
+  `Client<impl MlsConfig + use<>>` built per-dispatch via `mls::build_client`, no per-call provider;
+  `use<>` so it doesn't borrow `self`), custom **`GroupStateStorage` + `KeyPackageStorage` over
+  `BTreeMap`** (`store.rs`, shared across Client clones via `Arc<Mutex>`, snapshot/restore both maps,
+  `max_past_epochs=64` enforced as the store's trim-on-write since mls-rs has no config knob), the
+  **signer derived deterministically from the seed** (HKDF→Ed25519 64-byte keypair, no OsRng), MLS
+  rules = PURE ciphertext (`encrypt_control_messages=true`) + in-band ratchet tree, **commit
+  processing auto-applies** (no staged-commit/merge — `process_incoming_message`), eviction detected
+  via `CommitEffect::Removed` (mls-rs has no `is_active`), and **explicit `Group::write_to_storage()`
+  after every mutation** (mls-rs doesn't auto-persist). **Gate MET:** group-flow / commit-race /
+  eviction tests pass against mls-rs on the host (`cargo test -p messenger-extension --lib` → 11/11;
+  the commit-race converges to a byte-identical `export_secret`). **Async-API question RESOLVED:**
+  mls-rs's default (no `mls_build_async`) build is fully synchronous — the storage traits are plain
+  sync `fn`s and compose directly with the single-poll handler model. **Known deltas (documented):**
+  (1) the sender-ratchet window is the fixed `MAX_RATCHET_BACK_HISTORY=1024`, not the OpenMLS
+  `(64,2000)` — more back-tolerance, stricter forward cap, harmless for the per-sender causal log;
+  (2) KeyPackages are now `MlsMessage`-wrapped (not byte-compatible with the old OpenMLS bare-KP
+  directory format — a fresh format, no deployed OpenMLS members to interop with); (3) determinism
+  is signer-only for now (KEM/HPKE entropy still OsRng) — full bit-exactness is **P2.3**. The two
+  heavy e2e/RFC-interop tests are deferred to P2.5; `tests/e2e.rs` compiles unchanged (it drives the
+  actor via the CLI/`Msg` interface). The Cargo dep swapped OpenMLS → `mls-rs`/`mls-rs-core`/
+  `mls-rs-codec`/`mls-rs-crypto-rustcrypto` (host default features; the no_std cut is **P2.4**).
+- **P2.3 — custom deterministic `CipherSuiteProvider` (L). DONE (host build).** New
+  `extensions/messenger/src/crypto_provider.rs`. The injection seam turned out to be
+  `DhType::generate()`: in mls-rs both `kem_generate` AND the HPKE ephemeral
+  (`hpke_seal`/`hpke_setup_s`) route through `DhKem::encap → self.dh.generate()`, so a
+  `DeterministicEcdh` wrapping RustCrypto's `Ecdh` (override `generate` to draw the X25519 keypair
+  from `HostRand`, delegate the rest) determinizes **the ephemeral the stock provider drew from
+  `OsRng` — the seam OpenMLS structurally could not reach**. `VosCipherSuiteProvider` delegates all
+  24 `CipherSuiteProvider` methods to an inner `RustCryptoCipherSuite` over that KEM, overriding only
+  `random_bytes`; `VosCryptoProvider` yields it over an `Arc<Mutex<HostRand>>` so the Client's
+  provider clones advance one ratchet in order. `build_client` boots `HostRand` from the seed + a
+  fresh per-open OS token. **`signature_key_generate` stays `OsRng` but is off-path** (the signer is
+  the seed-derived identity handed to the Client; mls-rs never generates a signature key in
+  create/commit/keypackage/welcome). **Gate MET:** `host_seeded_provider_is_deterministic` asserts
+  bit-identical KEM keypair + HPKE `kem_output`/`ciphertext` + `random_bytes` from the same (seed,
+  boot token), forked by a different token. **Byte-determinism CLOSED** (a P2.4 down-payment landed
+  with P2.3): `ts_ms` is now threaded into the KeyPackage + commit Lifetimes (`new_key_package(_,
+  ts_ms)` → `Some(MlsTime)`; `create_group_with_id`/`CommitBuilder::commit_time`), so a fixed
+  `(seed, boot token, ts_ms)` yields **bit-identical KeyPackages, commits, AND Welcomes** —
+  `same_seed_boot_and_ts_yields_identical_{key_package,commit_and_welcome}` (14/14 lib tests). The
+  remaining `OsRng` reachable in-PVM (it traps) is closed by P2.4's no_std cut + the deterministic
+  provider being the only one wired; `now_ms()` is now the single time seam that becomes host-fed
+  when the messenger runs as a PVM actor.
+- **P2.4 — cut the messenger crate to the PVM actor flavor (XL). DONE.** The whole
+  messenger crate now builds in two flavors off one source, splitting on
+  `cfg(target_arch = "riscv64")` (the same discriminator the `#[actor]`/`#[messages]` macros
+  use): the host `.so` (vos `extension`, std, mls-rs default features — behaviourally
+  unchanged) and a **no_std riscv64 `#[actor]`** (vos `macros,service`, mls-rs +
+  `default-features = false`). The cut: `now_ms()` reads `SystemTime` on the host and a
+  wire-threaded seam (`set_wire_now_ms`, default 0 until P2.5) in the actor (a PVM guest has
+  no clock and there is no time hostcall — the deterministic provider already pins the
+  bytes); `build_client`'s boot token is OS entropy on the host and the **BOOT_CONTEXT
+  hostcall** (the P2.1 seam, fresh per refine entry) in the actor; `mls::random_32`
+  (non-key-material) draws OS entropy / boot-token+counter; `register` makes the seed
+  mandatory in the actor; `store.rs`/`crypto_provider.rs` share state via `spin::Mutex` over
+  an `Arc` that is `alloc::sync` on the host / `portable_atomic_util` on the no-atomics
+  target (mirroring mls-rs's own in-memory providers); `core::error::Error`; per-module
+  `alloc` imports; a no-op `critical_section::Impl` + a fail-loud getrandom backend
+  (cfg riscv64); mls-rs errors formatted via `Debug` (no `Display` without std). The build
+  scaffolding (per-target `Cargo.toml` deps, crate-local `.cargo/config.toml`,
+  `riscv64em-javm.json`) models `actors/chronos` / `_crypto_spike`; the messenger **stays a
+  host-workspace member** (so `cargo test -p messenger-extension --lib` keeps driving the
+  .so), so its ELF lands in the shared workspace target dir. **Gate MET: the messenger ELF
+  transpiles clean through `link_elf`** (`vos/tests/messenger_transpile.rs`, the permanent
+  regression) — the real make-or-break, beyond `_mls_spike`'s minimal flow now exercising the
+  whole crate. Host gate green throughout (`cargo test -p messenger-extension --lib` →
+  14/14). `cd extensions/messenger && cargo +nightly actor` → a 2.7 MiB ELF.
+- **P2.5 — e2e PVM messenger + RFC-interop + clean cutover (L). Execution down-payment
+  landed.** Beyond the `link_elf` transpile gate, `vos/tests/messenger_pvm.rs` proves the
+  messenger actually **runs** as a PVM actor: it drives `seed` → `register` → `key_package`
+  through `VosRuntime` and mints a clean KeyPackage, exercising the whole no_std MLS path at
+  runtime (seed-derived Ed25519 signer, the deterministic X25519 KEM via the custom
+  `DhType::generate`/`HostRand`, mls-rs framing, the `spin`+`portable-atomic` storage, rkyv
+  state persistence across dispatches, the `BOOT_CONTEXT` hostcall). **Fork resolved:** the
+  operator chose to **replace the `.so`** — the PVM messenger becomes the messenger (an
+  `[[agent]]` with `consistency = "local"`). A 5-agent recon found that the CLI, install,
+  spawn, and invoke machinery is **uniform across `.so` extensions and PVM-actor agents** (no
+  extension-vs-agent branch — proven by `vosx … math add a=2 b=3` and
+  `gateway_pvm_e2e.rs`), so the messenger's 13 `#[msg(cli)]` verbs survive the move untouched;
+  the move is a manifest change (`[[extension]]` → `[[agent]]`, point `path` at the ELF) plus
+  the two seams below. **Increment 1 done** — the `NOW_MS` hostcall (id 121, mirroring
+  `BOOT_CONTEXT`): the messenger is the `ts_ms` ORIGIN (it stamps MLS Lifetimes + the
+  msg-log/msg-ctl wire rows), and as a `Local` (non-replicated) actor it now reads real host
+  wall-clock through the hostcall, so a freshly-minted KeyPackage carries a valid Lifetime a
+  remote peer accepts (replaced the placeholder `set_wire_now_ms` static).
+  **Increment 2 done — device-local seed provisioning:** the seed is the only confidentiality
+  root and must never replicate, but `install_args`/`on_start` live in the *replicated*
+  `AgentRow` — so it follows clerk-bridge's `bootstrap(secret)`: a new node-local
+  `device_secret = true` manifest flag, and after spawn the daemon mints OS entropy into a
+  node-local `{data_dir}/agents/{svc_id}.seed` sidecar (0600, like the P0 `.seal`) and sends a
+  `seed` message via `node.invoke_with_timeout` (`Caller::System`), idempotent. **Validated
+  live single-node:** a `consistency = "local"` messenger agent installs, gets "device seed
+  provisioned", and `vosx messenger register / key_package / status` run end-to-end through the
+  PVM agent (outbound resolve ask, a real-Lifetime KeyPackage, state persisted across
+  dispatches). **Increment 3 — PVM-agent runtime support: DONE + validated live.** Three (it
+  turned out four) opt-in/narrow runtime pieces, all landed: **(3a) agent ticking** —
+  `AgentConfig::tick_ms` + a tick loop in `agent_thread` mirroring the extension heartbeat;
+  **(3b) opt-in agent caller-relay** — `AgentConfig::intra_caps`; an agent's outbound invoke
+  defaults to the trusted `Caller::Actor` (the bypass every existing agent→agent call relies
+  on), and only an agent that declares `intra_caps` relays the real caller bounded per cap
+  (the existing `RelayCallerGuard`/`resolve_relay_caller` machinery) — so a privileged
+  downstream call needs a privileged original caller, preserving the `.so`'s ACL model without
+  regressing existing agents; **(4th) raft leader-forward** — an agent's write to a local raft
+  follower (a dropped reply) is re-sent to the leader (`agent_forward_to_raft_leader`, the sync
+  analogue of `route_invoke`'s forward). The manifest gained node-local `tick_ms`/`intra_caps`
+  on `[[agent]]`. **Validated live:** the 2-node e2e drives the PVM-agent messenger through
+  register → create → send → join → grant → cross-node bob-register (bounded relay carries the
+  admin caller through `create`→`registry.install`; raft-forward lets the follower-node
+  messenger publish + commit). **LANDED — e2e GREEN under the recompiler.** The "guest-stack
+  overflow" was a misdiagnosis: the channel-active `tick` failures were four codegen bugs, not a
+  stack limit. Three were in grey-transpiler (a `CALL_PLT` `pending_load_imm` leak that desynced
+  branch targets into mid-instruction traps; a `load_imm`+ALU mis-fusion on self-aliased operands
+  and non-commutative shifts; a `load_imm`+load fusion that fired for `rd != rs1` and skipped the
+  `address_map` update) and one in the javm JIT recompiler (a variable shift whose destination is
+  `φ[12]`=RCX clobbered the shift count — mls-rs TreeKEM `imm << level` index math then produced
+  wrong node indices → `InvalidLeafConsumption` on a joiner's encrypt and `InvalidNodeIndex` on
+  member removal; the interpreter was correct, the JIT was not). All four are fixed in jar
+  (`fix/pvm-transpiler-codegen`, merged to master); the heap-boxed drains stay. With them the
+  2-node e2e (`two_nodes_exchange_e2ee_messages`) runs the full flow — register → create → invite →
+  commit → Welcome → join → bidirectional E2EE → member removal — GREEN with the messenger as a
+  `consistency="local"` PVM agent under the default JIT, and the manifest cutover has landed.
+  **RFC-interop is moot** (the messenger is fully off OpenMLS; no live counterpart).
+  **Clean cutover per channel** (new instance_name + replication_id + fresh group, riding
+  P0's reinstall discipline) — do NOT bet on mixed cdylib+PVM inside one live group
+  (non-normative encoding divergence risks `tick.rs` `desynced` freeze). Measure per-dispatch
+  gas.
 
 **Determinism gate (split by the lib swap):** *in-PVM* (mls-rs↔mls-rs, same seed → same bytes) is
-ACHIEVABLE and IS the gate — but only because P2.3 closes the HPKE-seal seam (P1 couldn't).
+ACHIEVABLE and IS the gate — and **P2.3 closed the HPKE-seal seam** (via the `DhType::generate`
+wrap) that P1 couldn't, so the provider's entropy draws (KEM keypair, HPKE ephemeral, `random_bytes`)
+are now bit-identical from a fixed (seed, boot) — and the KeyPackage/commit timestamp gap is
+**closed** (P2.3's `ts_ms` threading), so full KeyPackage/commit/Welcome bytes are deterministic.
 *Cross-library* (OpenMLS↔mls-rs) bit-exactness is IMPOSSIBLE (different ephemerals + non-normative
 encoding) and is **not** the gate — relaxed to RFC-interop, proven by a cross-library test.
 
-**Key risks:** (1) P2.4 transpile of mls-rs's own code is the dominant residual unknown — gate on
-`link_elf`, not `cargo build`. (2) warm-restart nonce reuse is empirically live — re-boot HostRand
-per refine entry with a host-minted fresh token (load-bearing, not optional). (3) mls-rs's async
-provider API vs the single-poll model — verify before building on it. (4) cross-library desync —
+**Key risks:** (1) ~~P2.4 transpile of mls-rs's own code is the dominant residual unknown~~ —
+**RETIRED by P2.0b**: the `_mls_spike` create-group+commit ELF transpiles through `link_elf`
+(`mls_spike_transpile.rs`); the P2.4 gate remains `link_elf` not `cargo build`, but the make-or-break
+is now known-good. (2) warm-restart nonce reuse is empirically live — re-boot HostRand per refine
+entry with a host-minted fresh token (load-bearing, not optional) — **the BOOT_CONTEXT seam for this
+landed in P2.1**. (3) ~~mls-rs's async provider API vs the single-poll model~~ — **RESOLVED in P2.2**:
+the default (no `mls_build_async`) build is fully synchronous; the custom `GroupStateStorage`/
+`KeyPackageStorage` are plain sync `fn`s and compose directly with the single-poll handler model. (4) cross-library desync —
 clean cutover mitigates. (5) crash-consistency of the persisted counter+epoch before ciphertext
-posts. **Open questions** carried in the memory memo (mls-rs sync facade; mls-rs transpile;
-device_id provenance; BOOT_CONTEXT ABI; warm-restart host hook; in-PVM `ts_ms` source).
+posts — **partially addressed**: the BOOT_CONTEXT seam exists; durable cross-process `boot_epoch`
+persistence is the P2.4 follow-on. **Open questions** carried in the memory memo (~~mls-rs sync
+facade; mls-rs transpile~~ both resolved by P2.0b; device_id provenance; BOOT_CONTEXT ABI;
+warm-restart host hook; in-PVM `ts_ms` source).
 
 ### P3 — Verifiable randomness actor (public beacon)
 
