@@ -13,7 +13,7 @@ use openmls::prelude::*;
 use vos::prelude::*;
 
 use crate::clients::{ctl_commits, log_history, resolve};
-use crate::mls::{join_config, open_provider, snapshot_provider};
+use crate::mls::{join_config, snapshot_provider};
 use crate::{ChannelEntry, Messenger, MsgrCtx, PlainMessage, ctl_agent_name, log_agent_name};
 
 const PAGE_LIMIT: u32 = 16;
@@ -120,7 +120,7 @@ fn process_chain_record(
     commit_body: &[u8],
     record_epoch: u64,
 ) -> Result<(), String> {
-    let provider = open_provider(&m.mls_store);
+    let provider = m.open_mls();
     let mut group = m.load_group(&provider, &m.channels[i].name)?;
     if group.epoch().as_u64() > record_epoch {
         return Ok(());
@@ -164,7 +164,7 @@ fn process_chain_record(
 /// caller trial-decrypts every Welcome to find ours), is malformed,
 /// or carries a foreign group id.
 fn join_from_welcome(m: &mut Messenger, i: usize, welcome_bytes: &[u8]) -> Result<(), String> {
-    let provider = open_provider(&m.mls_store);
+    let provider = m.open_mls();
     let mls_msg = MlsMessageIn::tls_deserialize(&mut &welcome_bytes[..])
         .map_err(|e| format!("welcome deserialize failed: {e}"))?;
     let MlsMessageBodyIn::Welcome(welcome) = mls_msg.extract() else {
@@ -217,7 +217,7 @@ async fn drain_log(m: &mut Messenger, i: usize, ctx: &mut MsgrCtx) -> Result<(),
             return Ok(());
         }
 
-        let provider = open_provider(&m.mls_store);
+        let provider = m.open_mls();
         let mut group = m.load_group(&provider, &name)?;
         let mut dirty = false;
         for row in &rows {
@@ -288,7 +288,7 @@ fn advance_cursor(entry: &mut ChannelEntry, lamport: u64, id: [u8; 32]) {
 }
 
 pub(crate) fn decrypt_app(
-    provider: &openmls_rust_crypto::OpenMlsRustCrypto,
+    provider: &crate::host_rand::VosProvider,
     group: &mut MlsGroup,
     body: &[u8],
 ) -> Result<(String, String), String> {

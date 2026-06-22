@@ -32,6 +32,15 @@ grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "6075cec998
 # Per-space catalog of programs / agents / members. Source of
 # truth that the new `space *` subcommands operate on.
 space-registry = { path = "../actors/space-registry", version = "0.1.0", default-features = false }
+# The per-space clock + verifiable-randomness service. The daemon
+# feeds it from the raft leader (init/advance via Caller::System) and
+# the typed `ChronosRef` / `AdvanceOutcome` / `MAX_SLOT_JUMP` ride along.
+# `default-features = false` strips the PVM bin entry-point.
+chronos = { path = "../actors/chronos", version = "0.1.0", default-features = false }
+# ECVRF primitive (Phase D v1): each node derives a static VRF keypair from
+# node.key and the leader's feeder enrols pubkeys + posts per-round reveals to
+# the committee. no_std, pure software (host build).
+vrf = { path = "../vrf" }
 # The sandboxed nushell console engine backing `vosx space console`.
 vos-shell = { path = "../vos-shell" }
 # Wire types for the `vosx dev *` subcommands. The dev extension
@@ -56,6 +65,10 @@ redb = "2"
 # `kill -0` to detect stale endpoint files left by a crashed
 # `space up` daemon.
 libc = "0.2"
+# OS entropy for the chronos beacon feed (the leader samples 32
+# fresh bytes per advance; a draw failure skips the pass rather
+# than ever feeding zero entropy).
+getrandom = "0.2"
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }

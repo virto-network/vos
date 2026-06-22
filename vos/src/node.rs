@@ -3218,7 +3218,13 @@ fn agent_thread(
             while let Ok(()) = rx.try_recv() {
                 got_signal = true;
             }
-            if got_signal {
+            // The notifier fires for every committed index, including the echo
+            // of this agent's own proposals. Only reload when the backing store
+            // actually gained nodes we haven't folded in (`needs_sync_reload`) —
+            // soft-restarting on our own commits replays the whole DAG every
+            // commit (O(n²), stalling a continuously-committing actor) and
+            // transiently wipes state to genesis mid-replay.
+            if got_signal && strategy.needs_sync_reload() {
                 bump();
                 info!(%id, "agent: CRDT sync merged new nodes; soft-restarting");
                 if let Err(err) = soft_restart_crdt(&mut runtime, svc_id, strategy.as_mut()) {

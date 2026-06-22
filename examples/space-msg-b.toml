@@ -1,21 +1,5 @@
-# E2EE messaging demo, host B. See space-msg-a.toml for context.
-#
-# Run (after starting host A):
-#   vosx space join <space-id>@/ip4/127.0.0.1/tcp/4821/p2p/<peer-a> --name msg-demo
-#   vosx space up msg-demo --manifest examples/space-msg-b.toml \
-#     --connect <bootnode> &
-#
-# On host A, enroll this node as a raft voter so its msg-ctl /
-# msg-directory replicas spawn (node peer id from B's `.endpoint`,
-# NOT `vosx whoami` — that's the operator's client identity):
-#   vosx space members msg-demo add-node <peer-b-node-id>
-#   vosx space role msg-demo grant <peer-b-node-id> read
-#
-# Then:
-#   vosx messenger register bob
-#   vosx messenger key_package            # hand the hex to host A
-#   vosx messenger join general           # tick picks up the welcome
-#   vosx messenger history general
+# E2EE messaging demo, host B — joins host A. See space-msg-a.toml and
+# docs/messaging.md; `just demo-msg-procs` runs both sides end to end.
 
 space = "msg-demo"
 version = "0.1.0"
@@ -33,6 +17,11 @@ consistency = "raft"
 [[agent]]
 name = "msg-directory"
 path = "../actors/msg-directory/target/riscv64em-javm/release/msg_directory.elf"
+consistency = "raft"
+
+[[agent]]
+name = "chronos"
+path = "../actors/chronos/target/riscv64em-javm/release/chronos.elf"
 consistency = "raft"
 
 [[extension]]

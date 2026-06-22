@@ -1,0 +1,46 @@
+[workspace]
+
+[package]
+name = "chronos"
+description = "Built-in VOS service actor: per-space deterministic clock + verifiable randomness. Holds a monotone slot clock and a blake2b hash-chain entropy beacon (the public, replicated randomness plane — fair ordering, sampling, freshness), fed once at the sequencing boundary by the raft leader and served over a stable pull API. Kept strictly apart from any secret key material."
+keywords = ["vos", "actor", "clock", "randomness", "p2p"]
+categories = ["data-structures", "cryptography"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/virto-network/vos"
+homepage = "https://github.com/virto-network/vos"
+authors = ["Daniel Olano <daniel@olanod.com>"]
+
+[features]
+# `bin` enables PVM entry-point emission. Default-on so a plain
+# `cargo build` (or `cargo actor`) produces an actor ELF; consumers
+# depending on this crate as a Ref source turn it off via
+# `default-features = false` so no entries land in their link.
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# The ECVRF primitive (Phase D v1): per-voter verifiable randomness over
+# Ristretto255. no_std, pure software (the ristretto precompiles are a
+# performance follow-on, not a correctness gate). Compiles for the actor
+# target — see `actors/_chronos_crypto_spike`. `chronos` only ever holds
+# PUBLIC VRF keys + proofs; no secret key material lives here.
+vrf = { path = "../../vrf" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "service"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "wasm-bootstrap"] }
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "extension"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

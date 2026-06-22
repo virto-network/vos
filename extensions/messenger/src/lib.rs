@@ -27,16 +27,17 @@
 use vos::prelude::*;
 
 mod clients;
+mod host_rand;
 mod mls;
 mod tick;
 
 use clients::{
-    ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp, dir_release_kp,
-    hex_decode, hex_encode, log_post, reg_agents, reg_install, resolve,
+    chronos_beacon, ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp,
+    dir_release_kp, hex_decode, hex_encode, log_post, reg_agents, reg_install, resolve,
 };
+use host_rand::PublicBeacon;
 use mls::{new_key_package, open_provider, parse_key_package, snapshot_provider, welcome_nonce};
 use openmls::prelude::*;
-use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 
 /// Per-channel agent naming convention. The manifest installs the
@@ -123,6 +124,14 @@ pub struct Messenger {
     /// (signer, KeyPackage private parts, group ratchets) lives
     /// in here. See `mls::open_provider`/`snapshot_provider`.
     mls_store: Vec<u8>,
+    /// The 32-byte secret root of the host-seeded MLS CSPRNG (the only
+    /// confidentiality source for freshly-drawn key material). Provisioned
+    /// once — by an explicit `seed` message, or lazily from OS entropy on
+    /// `register` — and held in this node-local, non-replicated state, never
+    /// in the replicated DAG. Empty until provisioned. See
+    /// `crate::host_rand` for the construction and why a replayer who lacks
+    /// this seed cannot predict the stream despite PVM determinism.
+    csprng_seed: Vec<u8>,
     /// Count of KeyPackages we've published and not yet seen consumed.
     /// Just a tally: a join consumes exactly one published KP, and the
     /// joiner can't influence *which* one an inviter claims, so the
@@ -139,9 +148,57 @@ impl Messenger {
             nickname: String::new(),
             signature_key: Vec::new(),
             mls_store: Vec::new(),
+            csprng_seed: Vec::new(),
             published_kp_count: 0,
             channels: Vec::new(),
         }
+    }
+
+    /// Open the MLS provider over this node's persisted store and the
+    /// host-seeded CSPRNG. Centralises the `csprng_seed` threading so every
+    /// MLS operation draws from the same secret root. Used by read/decrypt
+    /// paths that draw no fresh key material; key-generating handlers use
+    /// [`Self::open_mls_with`] to hedge with the public beacon.
+    pub(crate) fn open_mls(&self) -> host_rand::VosProvider {
+        self.open_mls_with(None)
+    }
+
+    /// Open the MLS provider and, when a public `beacon` is supplied, hedge it
+    /// into the CSPRNG's output branch (HKDF `info` only — never key material;
+    /// see [`crate::host_rand`]). Callers fetch the beacon once per operation
+    /// via [`chronos_beacon`] and thread it to every draw in that operation;
+    /// `None` (no chronos, or no finalized round yet) leaves the stream
+    /// unchanged, so the beacon is a pure additive hedge.
+    pub(crate) fn open_mls_with(&self, beacon: Option<[u8; 32]>) -> host_rand::VosProvider {
+        let provider = open_provider(&self.mls_store, &self.csprng_seed);
+        if let Some(b) = beacon {
+            provider.set_beacon(PublicBeacon(b));
+        }
+        provider
+    }
+
+    /// Provision the CSPRNG secret seed (the MLS confidentiality root) into
+    /// node-local state, mirroring the clerk-bridge `bootstrap(ivk_secret)`
+    /// precedent: a runtime secret injected by message, never carried in the
+    /// public `AgentConfig.storage` install args. One-shot — a second call
+    /// is refused so the stream can never be re-forked against already-drawn
+    /// material. `register` provisions one from OS entropy if none was set,
+    /// so this is for hosts that want to control the root explicitly (and is
+    /// mandatory for the deterministic PVM port, where OS entropy is absent).
+    ///
+    /// One-shot and 32-byte-validated; the caller-role gate (Admin/System)
+    /// is an open hardening decision, deferred with the rest of the seed
+    /// provisioning model.
+    #[msg]
+    async fn seed(&mut self, seed_bytes: Vec<u8>) -> String {
+        if !self.csprng_seed.is_empty() {
+            return "seed already provisioned".into();
+        }
+        if seed_bytes.len() != 32 {
+            return format!("seed must be exactly 32 bytes, got {}", seed_bytes.len());
+        }
+        self.csprng_seed = seed_bytes;
+        "seed provisioned".into()
     }
 
     /// Create this node's messaging identity: an MLS credential
@@ -156,8 +213,23 @@ impl Messenger {
         if nickname.is_empty() {
             return "usage: register <nickname>".into();
         }
-        let provider = open_provider(&self.mls_store);
-        let keys = match SignatureKeyPair::new(mls::CIPHERSUITE.signature_algorithm()) {
+        // Provision the CSPRNG root before the first draw if a host didn't
+        // already do so via `seed` — on native this is fresh OS entropy.
+        if self.csprng_seed.is_empty() {
+            let mut s = [0u8; 32];
+            if getrandom::getrandom(&mut s).is_err() {
+                return "seed generation failed: OS entropy unavailable".into();
+            }
+            self.csprng_seed = s.to_vec();
+        }
+        // Fetch the public-randomness hedge once for this whole registration
+        // (signer + stocked KeyPackages all draw under it).
+        let beacon = chronos_beacon(ctx).await;
+        let provider = self.open_mls_with(beacon);
+        // Derive the Ed25519 signer from the seeded CSPRNG (not OsRng), so
+        // the signing identity is under the same secret root as every other
+        // key — see `mls::derive_signer`.
+        let keys = match mls::derive_signer(&provider) {
             Ok(k) => k,
             Err(e) => return format!("key generation failed: {e}"),
         };
@@ -168,7 +240,7 @@ impl Messenger {
         self.nickname = nickname;
         self.mls_store = snapshot_provider(&provider);
 
-        match self.stock_directory(ctx, REGISTER_KP_COUNT).await {
+        match self.stock_directory(ctx, REGISTER_KP_COUNT, beacon).await {
             Ok(n) => format!(
                 "registered as '{}' ({n} key packages published to the directory)",
                 self.nickname
@@ -184,8 +256,8 @@ impl Messenger {
     /// Mint a KeyPackage and print it hex-encoded for out-of-band
     /// delivery to an inviter. One KeyPackage admits one join.
     #[msg(cli)]
-    async fn key_package(&mut self) -> String {
-        let provider = open_provider(&self.mls_store);
+    async fn key_package(&mut self, ctx: &mut Context<Self>) -> String {
+        let provider = self.open_mls_with(chronos_beacon(ctx).await);
         let (credential, signer) = match self.identity(&provider) {
             Ok(v) => v,
             Err(e) => return e,
@@ -212,10 +284,11 @@ impl Messenger {
         if self.channel_index(&channel).is_some() {
             return format!("channel '{channel}' already known");
         }
-        if let Err(e) = self.ensure_channel_agents(&channel, ctx).await {
+        let beacon = chronos_beacon(ctx).await;
+        if let Err(e) = self.ensure_channel_agents(&channel, ctx, beacon).await {
             return e;
         }
-        let provider = open_provider(&self.mls_store);
+        let provider = self.open_mls_with(beacon);
         let (credential, signer) = match self.identity(&provider) {
             Ok(v) => v,
             Err(e) => return e,
@@ -440,7 +513,7 @@ impl Messenger {
         if !self.channels[i].joined {
             return format!("not joined to '{channel}' yet");
         }
-        let provider = open_provider(&self.mls_store);
+        let provider = self.open_mls_with(chronos_beacon(ctx).await);
         let (_, signer) = match self.identity(&provider) {
             Ok(v) => v,
             Err(e) => return e,
@@ -534,7 +607,7 @@ impl Messenger {
             "key packages published: {}\n",
             self.published_kp_count
         ));
-        let provider = open_provider(&self.mls_store);
+        let provider = self.open_mls();
         for c in &self.channels {
             if c.desynced {
                 out.push_str(&format!(
@@ -646,6 +719,7 @@ impl Messenger {
         &self,
         channel: &str,
         ctx: &mut Context<Self>,
+        beacon: Option<[u8; 32]>,
     ) -> core::result::Result<(), String> {
         let log_name = log_agent_name(channel);
         let ctl_name = ctl_agent_name(channel);
@@ -681,7 +755,7 @@ impl Messenger {
             };
             installs.push((name, template));
         }
-        let provider = open_provider(&self.mls_store);
+        let provider = self.open_mls_with(beacon);
         for (name, template) in installs {
             let rep_id = mls::fresh_replication_id(&provider)?;
             match reg_install(ctx, name, template, rep_id).await? {
@@ -702,11 +776,12 @@ impl Messenger {
         &mut self,
         ctx: &mut Context<Self>,
         n: usize,
+        beacon: Option<[u8; 32]>,
     ) -> core::result::Result<usize, String> {
         let dir_id = resolve(ctx, DIRECTORY_AGENT).await?;
         let mut published = 0usize;
         for _ in 0..n {
-            let provider = open_provider(&self.mls_store);
+            let provider = self.open_mls_with(beacon);
             let (credential, signer) = self.identity(&provider)?;
             let kp_bytes = new_key_package(&provider, credential, &signer)?;
             self.mls_store = snapshot_provider(&provider);
@@ -738,8 +813,11 @@ impl Messenger {
             .into());
         }
         let ctl_id = resolve(ctx, &ctl_agent_name(channel)).await?;
+        // Hedge every attempt's draws (commit secrets, Welcome, routing token)
+        // with one beacon read for the whole operation.
+        let beacon = chronos_beacon(ctx).await;
         for attempt in 0..2 {
-            let provider = open_provider(&self.mls_store);
+            let provider = self.open_mls_with(beacon);
             let (_, signer) = self.identity(&provider)?;
             let mut group = self.load_group(&provider, channel)?;
             if !group.is_active() {

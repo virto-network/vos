@@ -29,6 +29,10 @@ exclude = [
     # Listing the directory itself keeps it from being picked
     # up as a workspace member.
     "actors",
+    # The ECVRF primitive crate is its own `[workspace]` (no_std, builds for
+    # the actor target too); excluded so a host member path-dep'ing it (vosx)
+    # doesn't pull it in as a second workspace root.
+    "vrf",
     "actors/space-registry",
     "actors/dev-project",
     "actors/space-bridge",

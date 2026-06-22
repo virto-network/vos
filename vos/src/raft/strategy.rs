@@ -434,6 +434,25 @@ impl CommitStrategy for RaftCommit {
         Vec::new()
     }
 
+    fn needs_sync_reload(&self) -> bool {
+        // The worker advances `commit_index` on disk out-of-band — its own
+        // quorum matches AND a follower receiving a higher `leader_commit` from
+        // a heartbeat — while the host owns `last_applied`, bumped only when WE
+        // apply an entry (`commit_with_log` on our own proposal, or `commit()`
+        // after the follower replay). So there is something to fold in iff the
+        // committed frontier sits ahead of what we've applied. After our own
+        // commit `last_applied == commit_index`, so this is false and the agent
+        // skips the soft-restart — which would otherwise replay the whole log on
+        // every single commit (O(n) per commit ⇒ O(n²)) and stall a
+        // continuously-committing actor, the chronos clock being the first to
+        // hit it. A follower receiving the leader's entries advances
+        // commit_index past last_applied, so it still reloads and converges.
+        let commit_index = RaftMeta::load(&self.db)
+            .map(|m| m.commit_index)
+            .unwrap_or(self.meta.commit_index);
+        commit_index > self.meta.last_applied
+    }
+
     fn is_writable(&self) -> bool {
         match &self.role {
             // Single-node mode is always writable — the agent

@@ -158,6 +158,24 @@ pub trait CommitStrategy: Send {
     fn is_writable(&self) -> bool {
         true
     }
+
+    /// Whether the agent must run a sync reload (soft-restart) to fold in DAG
+    /// nodes the backing store gained out-of-band — the soft-restart's whole
+    /// reason to exist (a peer merge by the sync ticker, or a follower applying
+    /// the leader's replicated entries).
+    ///
+    /// The sync notifier fires for *every* committed index, including the echo
+    /// of the agent's OWN proposal — the raft relay can't tell the two apart.
+    /// Default `true` preserves the historical always-reload behaviour; a
+    /// strategy that can recognise a self-commit echo (its committed state
+    /// already matches what's on disk) overrides this to return `false` for it,
+    /// skipping a soft-restart that would otherwise replay the entire DAG on
+    /// every commit (O(n) per commit ⇒ O(n²), which stalls a continuously-
+    /// committing actor) and briefly expose genesis while STATE_KEY is deleted
+    /// mid-replay.
+    fn needs_sync_reload(&self) -> bool {
+        true
+    }
 }
 
 /// No-op strategy — state lives only in memory and is lost on exit.
@@ -648,6 +666,20 @@ mod crdt {
 
         fn roots(&self) -> Vec<[u8; 32]> {
             self.root_bytes()
+        }
+
+        fn needs_sync_reload(&self) -> bool {
+            // After our own `write_atomic`, the in-memory clock is set to the
+            // freshly-committed roots, which is exactly what we persisted — so
+            // an equal root set means the sync signal is the echo of our own
+            // commit and there is nothing to fold in. A genuine remote merge
+            // (the sync ticker's `insert_node` + `compact_roots`, or a follower
+            // applying the leader's entries) advances the persisted roots past
+            // our clock, so the sets differ and we reload to converge. This is
+            // conservative: it never skips a real merge (any divergence reloads),
+            // it only drops the redundant self-commit restart.
+            let persisted = load_clock(&self.db).unwrap_or_else(MerkleClock::new);
+            self.clock.roots() != persisted.roots()
         }
 
         fn replay_logs(&self) -> Result<Vec<EffectLog>, CommitError> {

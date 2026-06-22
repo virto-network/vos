@@ -1100,6 +1100,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronos"
+version = "0.1.0"
+dependencies = [
+ "vos",
+ "vrf",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4483,6 +4491,10 @@ dependencies = [
 name = "messenger-extension"
 version = "0.1.0"
 dependencies = [
+ "chronos",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hkdf",
  "libp2p",
  "msg-ctl",
  "msg-directory",
@@ -4492,9 +4504,11 @@ dependencies = [
  "openmls_rust_crypto",
  "openmls_traits",
  "serde",
+ "sha2",
  "space-registry",
  "toml 0.8.23",
  "vos",
+ "zeroize",
 ]
 
 [[package]]
@@ -8327,8 +8341,10 @@ name = "vosx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chronos",
  "clap",
  "dev-project",
+ "getrandom 0.2.17",
  "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=6075cec9989b5fe221051fb87be6664459a6148e)",
  "hex",
  "libc",
@@ -8344,6 +8360,16 @@ dependencies = [
  "tracing-subscriber",
  "vos",
  "vos-shell",
+ "vrf",
+]
+
+[[package]]
+name = "vrf"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]

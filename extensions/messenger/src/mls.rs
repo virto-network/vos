@@ -12,11 +12,12 @@
 use openmls::prelude::tls_codec::Serialize as TlsSerialize;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 use std::collections::HashMap;
+use zeroize::Zeroize;
 
 use crate::Messenger;
+use crate::host_rand::{HostRand, VosProvider};
 
 /// The one ciphersuite VOS messaging speaks (per docs/encryption.md).
 pub(crate) const CIPHERSUITE: Ciphersuite =
@@ -47,7 +48,7 @@ pub(crate) fn group_id_for(channel: &str) -> [u8; 32] {
     vos::crypto::blake2b_hash(GROUP_ID_DOMAIN_TAG, &[channel.as_bytes()])
 }
 
-fn random_32(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
+fn random_32(provider: &VosProvider) -> Result<[u8; 32], String> {
     use openmls_traits::random::OpenMlsRand;
     provider
         .rand()
@@ -60,7 +61,7 @@ fn random_32(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
 /// Random rather than name-derived so the sync group / gossip
 /// topic isn't guessable from the channel name; members learn it
 /// from the registry's replicated `AgentRow` instead.
-pub(crate) fn fresh_replication_id(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
+pub(crate) fn fresh_replication_id(provider: &VosProvider) -> Result<[u8; 32], String> {
     random_32(provider)
 }
 
@@ -73,7 +74,7 @@ pub(crate) fn fresh_replication_id(provider: &OpenMlsRustCrypto) -> Result<[u8; 
 /// token leaks nothing; the joiner recognises its own Welcome by
 /// trial-decryption (only a Welcome sealed to a KeyPackage it holds
 /// stages successfully), so no public routing tag is needed.
-pub(crate) fn welcome_nonce(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
+pub(crate) fn welcome_nonce(provider: &VosProvider) -> Result<[u8; 32], String> {
     random_32(provider)
 }
 
@@ -101,11 +102,39 @@ pub(crate) fn join_config() -> MlsGroupJoinConfig {
 
 // ── Provider persistence ──────────────────────────────────────────
 
-/// Restore the MLS provider from the persisted snapshot. An empty
-/// (or corrupt — possible only by operator tampering) snapshot
-/// yields a fresh provider.
-pub(crate) fn open_provider(snapshot: &[u8]) -> OpenMlsRustCrypto {
-    let provider = OpenMlsRustCrypto::default();
+/// Restore the MLS provider from the persisted snapshot, booting the
+/// host-seeded CSPRNG over `seed` — the 32-byte confidentiality root held
+/// in the messenger's node-local state. A per-boot uniqueness token is
+/// drawn fresh from OS entropy on every call (see [`crate::host_rand`]), so
+/// a clone or rollback can never re-emit used randomness. An unseeded or
+/// malformed `seed` falls back to a fully OS-entropy ephemeral root: paths
+/// that run before `register` provisions the durable seed draw nothing that
+/// is persisted. An empty (or corrupt — only by operator tampering)
+/// snapshot yields a fresh storage map.
+pub(crate) fn open_provider(snapshot: &[u8], seed: &[u8]) -> VosProvider {
+    let mut seed32 = [0u8; 32];
+    if seed.len() == 32 {
+        seed32.copy_from_slice(seed);
+    } else {
+        // Pre-`register` fallback root; nothing drawn here is persisted.
+        getrandom::getrandom(&mut seed32)
+            .expect("OS entropy unavailable for the MLS CSPRNG seed fallback");
+    }
+    // The per-boot uniqueness token is currently the ONLY live cross-boot
+    // reuse defense: `device_id`/`boot_epoch`/`persisted_ctr` below are
+    // host-fed by the deterministic PVM runtime (not yet wired) and left at
+    // their freshness defaults here, and the ratchet state is reborn per
+    // dispatch (never persisted). So a fresh token per open is load-bearing —
+    // an entropy failure MUST abort, never silently boot a zero (and thus
+    // replayable) stream. OS entropy here; a host-fed VM-generation value
+    // takes its place once the messenger runs as a deterministic PVM actor.
+    let mut boot_token = [0u8; 32];
+    getrandom::getrandom(&mut boot_token)
+        .expect("OS entropy unavailable for the MLS CSPRNG boot token");
+    let rand = HostRand::boot(&seed32, &boot_token, &[], 0, 0);
+    seed32.zeroize();
+    boot_token.zeroize();
+    let provider = VosProvider::new(rand);
     if let Some(map) = decode_store(snapshot) {
         *provider.storage().values.write().unwrap() = map;
     }
@@ -113,7 +142,7 @@ pub(crate) fn open_provider(snapshot: &[u8]) -> OpenMlsRustCrypto {
 }
 
 /// Snapshot the provider's storage back into persistable bytes.
-pub(crate) fn snapshot_provider(provider: &OpenMlsRustCrypto) -> Vec<u8> {
+pub(crate) fn snapshot_provider(provider: &VosProvider) -> Vec<u8> {
     let values = provider.storage().values.read().unwrap();
     let mut out = Vec::new();
     out.extend_from_slice(&(values.len() as u64).to_le_bytes());
@@ -164,7 +193,7 @@ impl Messenger {
     /// storage. Errors when `register` hasn't run.
     pub(crate) fn identity(
         &self,
-        provider: &OpenMlsRustCrypto,
+        provider: &VosProvider,
     ) -> Result<(CredentialWithKey, SignatureKeyPair), String> {
         if self.nickname.is_empty() {
             return Err("not registered — run `messenger register <nickname>` first".into());
@@ -187,7 +216,7 @@ impl Messenger {
 
     pub(crate) fn load_group(
         &self,
-        provider: &OpenMlsRustCrypto,
+        provider: &VosProvider,
         channel: &str,
     ) -> Result<MlsGroup, String> {
         let gid = GroupId::from_slice(&group_id_for(channel));
@@ -200,7 +229,7 @@ impl Messenger {
 /// Serialize a fresh KeyPackage for out-of-band transport (the
 /// private parts stay in the provider's storage).
 pub(crate) fn new_key_package(
-    provider: &OpenMlsRustCrypto,
+    provider: &VosProvider,
     credential: CredentialWithKey,
     signer: &SignatureKeyPair,
 ) -> Result<Vec<u8>, String> {
@@ -215,7 +244,7 @@ pub(crate) fn new_key_package(
 
 /// Validate a received serialized KeyPackage.
 pub(crate) fn parse_key_package(
-    provider: &OpenMlsRustCrypto,
+    provider: &VosProvider,
     bytes: &[u8],
 ) -> Result<KeyPackage, String> {
     use openmls::prelude::tls_codec::Deserialize as TlsDeserialize;
@@ -226,10 +255,49 @@ pub(crate) fn parse_key_package(
         .map_err(|e| format!("KeyPackage invalid: {e}"))
 }
 
+/// Build this member's Ed25519 signer from a host-seeded CSPRNG draw rather
+/// than `SignatureKeyPair::new()`. The stock constructor draws from `OsRng`,
+/// which would leave the signing identity as the one key not reproducible
+/// from the seed (breaking the determinism the PVM port needs) and is
+/// unavailable in a deterministic PVM at all. Any 32 bytes are a valid
+/// Ed25519 secret, so the single draw fully determines the keypair.
+pub(crate) fn derive_signer(provider: &VosProvider) -> Result<SignatureKeyPair, String> {
+    use openmls_traits::random::OpenMlsRand;
+    let mut sk = provider
+        .rand()
+        .random_array::<32>()
+        .map_err(|e| format!("signer rng failure: {e}"))?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&sk);
+    let public = signing.verifying_key().to_bytes().to_vec();
+    let pair = SignatureKeyPair::from_raw(CIPHERSUITE.signature_algorithm(), sk.to_vec(), public);
+    sk.zeroize();
+    Ok(pair)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use openmls::prelude::tls_codec::Deserialize as TlsDeserialize;
+
+    // Distinct per-party seeds so each test identity draws a distinct
+    // signature key and key stream — a shared seed would collide.
+    const ALICE: u8 = 0xA1;
+    const BOB: u8 = 0xB2;
+    const CHARLIE: u8 = 0xC3;
+
+    /// A fresh provider over an empty store, seeded deterministically so a
+    /// test's draws are reproducible. Production opens reseed per boot from
+    /// OS entropy (see `open_provider`); the determinism property itself is
+    /// asserted in `crate::host_rand`'s unit tests.
+    fn provider(seed_byte: u8) -> VosProvider {
+        open_provider(&[], &[seed_byte; 32])
+    }
+
+    /// Reopen a party's provider from its persisted snapshot under the same
+    /// seed — exercising the per-dispatch open/snapshot cycle.
+    fn reopen(snapshot: &[u8], seed_byte: u8) -> VosProvider {
+        open_provider(snapshot, &[seed_byte; 32])
+    }
 
     /// #7: the Welcome routing token must be fresh per invite and must
     /// never equal the directory's public `kp_hash` — otherwise a holder
@@ -237,9 +305,9 @@ mod tests {
     /// nickname (and link the same KeyPackage across channels).
     #[test]
     fn welcome_nonce_is_fresh_and_unlinkable() {
-        let provider = OpenMlsRustCrypto::default();
-        let n1 = welcome_nonce(&provider).unwrap();
-        let n2 = welcome_nonce(&provider).unwrap();
+        let p = provider(ALICE);
+        let n1 = welcome_nonce(&p).unwrap();
+        let n2 = welcome_nonce(&p).unwrap();
         assert_ne!(n1, n2, "tokens must be fresh per invite");
         // A token derived from the public KeyPackage would equal this.
         assert_ne!(
@@ -249,11 +317,8 @@ mod tests {
         );
     }
 
-    fn make_identity(
-        provider: &OpenMlsRustCrypto,
-        name: &str,
-    ) -> (CredentialWithKey, SignatureKeyPair) {
-        let keys = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+    fn make_identity(provider: &VosProvider, name: &str) -> (CredentialWithKey, SignatureKeyPair) {
+        let keys = derive_signer(provider).unwrap();
         keys.store(provider.storage()).unwrap();
         let credential = BasicCredential::new(name.as_bytes().to_vec());
         (
@@ -269,20 +334,20 @@ mod tests {
     /// a stored signer must come back readable.
     #[test]
     fn provider_snapshot_round_trips() {
-        let provider = OpenMlsRustCrypto::default();
-        let (_, keys) = make_identity(&provider, "alice");
-        let snapshot = snapshot_provider(&provider);
+        let p = provider(ALICE);
+        let (_, keys) = make_identity(&p, "alice");
+        let snapshot = snapshot_provider(&p);
 
-        let restored = open_provider(&snapshot);
+        let restored = reopen(&snapshot, ALICE);
         let read = SignatureKeyPair::read(
             restored.storage(),
             keys.public(),
             CIPHERSUITE.signature_algorithm(),
         );
         assert!(read.is_some(), "signer must survive snapshot/restore");
-        // Corrupt/empty snapshots fall back to a fresh provider.
+        // Corrupt/empty snapshots fall back to a fresh storage map.
         assert!(
-            open_provider(&[])
+            reopen(&[], ALICE)
                 .storage()
                 .values
                 .read()
@@ -290,7 +355,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            open_provider(&[1, 2, 3])
+            reopen(&[1, 2, 3], ALICE)
                 .storage()
                 .values
                 .read()
@@ -306,7 +371,7 @@ mod tests {
     #[test]
     fn corrupt_snapshots_yield_a_fresh_provider() {
         let empty = |bytes: &[u8]| {
-            open_provider(bytes)
+            reopen(bytes, CHARLIE)
                 .storage()
                 .values
                 .read()
@@ -330,9 +395,9 @@ mod tests {
         truncated.extend_from_slice(b"short");
         assert!(empty(&truncated));
         // A real snapshot still round-trips after these.
-        let provider = OpenMlsRustCrypto::default();
-        make_identity(&provider, "carol");
-        let snap = snapshot_provider(&provider);
+        let p = provider(CHARLIE);
+        make_identity(&p, "carol");
+        let snap = snapshot_provider(&p);
         assert!(!empty(&snap));
     }
 
@@ -345,7 +410,7 @@ mod tests {
     #[test]
     fn group_flow_survives_snapshot_boundaries() {
         // Alice: identity + group, then persist.
-        let alice = OpenMlsRustCrypto::default();
+        let alice = provider(ALICE);
         let (alice_cred, alice_keys) = make_identity(&alice, "alice");
         let gid = GroupId::from_slice(&group_id_for("general"));
         MlsGroup::new_with_group_id(
@@ -359,13 +424,13 @@ mod tests {
         let alice_snap = snapshot_provider(&alice);
 
         // Bob: identity + KeyPackage, then persist.
-        let bob = OpenMlsRustCrypto::default();
+        let bob = provider(BOB);
         let (bob_cred, bob_keys) = make_identity(&bob, "bob");
         let kp_bytes = new_key_package(&bob, bob_cred, &bob_keys).unwrap();
         let bob_snap = snapshot_provider(&bob);
 
         // Alice (fresh restore): validate Bob's KP, add, commit.
-        let alice = open_provider(&alice_snap);
+        let alice = reopen(&alice_snap, ALICE);
         let kp = parse_key_package(&alice, &kp_bytes).unwrap();
         let mut group = MlsGroup::load(alice.storage(), &gid).unwrap().unwrap();
         let (_commit, welcome_out, _gi) = group
@@ -376,7 +441,7 @@ mod tests {
         let alice_snap = snapshot_provider(&alice);
 
         // Bob (fresh restore): join from the Welcome wire bytes.
-        let bob = open_provider(&bob_snap);
+        let bob = reopen(&bob_snap, BOB);
         let mls_msg = MlsMessageIn::tls_deserialize(&mut &welcome_bytes[..]).unwrap();
         let MlsMessageBodyIn::Welcome(welcome) = mls_msg.extract() else {
             panic!("expected a welcome");
@@ -389,7 +454,7 @@ mod tests {
         let bob_snap = snapshot_provider(&bob);
 
         // Alice → Bob across the wire.
-        let alice = open_provider(&alice_snap);
+        let alice = reopen(&alice_snap, ALICE);
         let mut alice_group = MlsGroup::load(alice.storage(), &gid).unwrap().unwrap();
         let wire = alice_group
             .create_message(&alice, &alice_keys, b"hello bob")
@@ -397,7 +462,7 @@ mod tests {
             .to_bytes()
             .unwrap();
 
-        let bob = open_provider(&bob_snap);
+        let bob = reopen(&bob_snap, BOB);
         let (sender, text) = crate::tick::decrypt_app(&bob, &mut bob_group, &wire).unwrap();
         assert_eq!((sender.as_str(), text.as_str()), ("alice", "hello bob"));
 
@@ -417,6 +482,39 @@ mod tests {
         assert!(
             !wire.windows(needle.len()).any(|w| w == needle),
             "MLS wire bytes must not leak plaintext"
+        );
+    }
+
+    /// The determinism acceptance gate: two providers booted from the SAME
+    /// seed and boot context produce a byte-identical signing key and
+    /// KeyPackage — the determinism the eventual PVM port relies on, and proof
+    /// the seam (rand-swap + seed-derived signer) is complete for key material.
+    ///
+    /// Commit/Welcome *wire* bytes are deliberately NOT asserted: HPKE Seal
+    /// draws its ephemeral KEM key from hpke-rs's own per-call RNG, not the
+    /// provider, so those bytes stay non-deterministic until a custom
+    /// `OpenMlsCrypto` seam lands. The group *secret* state still converges
+    /// (see `losing_commit_…`'s `export_secret` assertion).
+    #[test]
+    fn same_seed_yields_identical_key_package() {
+        let mint = |seed: [u8; 32]| {
+            // Fixed boot token so the stream is reproducible here; production
+            // opens reseed per boot from OS entropy.
+            let p = VosProvider::new(HostRand::boot(&seed, &[0u8; 32], b"dev", 0, 0));
+            let (cred, signer) = make_identity(&p, "zoe");
+            let kp = new_key_package(&p, cred, &signer).unwrap();
+            (signer.public().to_vec(), kp)
+        };
+        let (pk1, kp1) = mint([0x5A; 32]);
+        let (pk2, kp2) = mint([0x5A; 32]);
+        assert_eq!(pk1, pk2, "same seed must yield the same signing key");
+        assert_eq!(kp1, kp2, "same seed must yield byte-identical KeyPackages");
+
+        let (pk3, kp3) = mint([0x6B; 32]);
+        assert_ne!(pk1, pk3, "a different seed must yield a different signer");
+        assert_ne!(
+            kp1, kp3,
+            "a different seed must yield a different KeyPackage"
         );
     }
 
@@ -481,7 +579,7 @@ mod tests {
         )
     }
 
-    fn process_and_merge(provider: &OpenMlsRustCrypto, group: &mut MlsGroup, wire: &[u8]) {
+    fn process_and_merge(provider: &VosProvider, group: &mut MlsGroup, wire: &[u8]) {
         let msg = MlsMessageIn::tls_deserialize(&mut &wire[..]).unwrap();
         let processed = group
             .process_message(provider, msg.try_into_protocol_message().unwrap())
@@ -504,14 +602,14 @@ mod tests {
 
         // Group bootstrap, all commits through the sequencer:
         // alice creates at epoch 0, adds bob (epoch 0 → 1).
-        let alice = OpenMlsRustCrypto::default();
+        let alice = provider(ALICE);
         let (alice_cred, alice_keys) = make_identity(&alice, "alice");
         let gid = GroupId::from_slice(&group_id_for("contended"));
         let mut alice_group =
             MlsGroup::new_with_group_id(&alice, &alice_keys, &create_config(), gid, alice_cred)
                 .unwrap();
 
-        let bob = OpenMlsRustCrypto::default();
+        let bob = provider(BOB);
         let (bob_cred, bob_keys) = make_identity(&bob, "bob");
         let bob_kp = new_key_package(&bob, bob_cred, &bob_keys).unwrap();
         let kp = parse_key_package(&alice, &bob_kp).unwrap();
@@ -542,7 +640,7 @@ mod tests {
         // The race: both commit at epoch 1. Alice adds charlie;
         // bob rotates his keys. Alice's reaches the sequencer
         // first.
-        let charlie = OpenMlsRustCrypto::default();
+        let charlie = provider(CHARLIE);
         let (charlie_cred, charlie_keys) = make_identity(&charlie, "charlie");
         let charlie_kp = new_key_package(&charlie, charlie_cred, &charlie_keys).unwrap();
         let ckp = parse_key_package(&alice, &charlie_kp).unwrap();
@@ -609,14 +707,14 @@ mod tests {
     /// later traffic is undecryptable to them.
     #[test]
     fn removed_member_cannot_decrypt_post_removal_traffic() {
-        let alice = OpenMlsRustCrypto::default();
+        let alice = provider(ALICE);
         let (alice_cred, alice_keys) = make_identity(&alice, "alice");
         let gid = GroupId::from_slice(&group_id_for("evict"));
         let mut alice_group =
             MlsGroup::new_with_group_id(&alice, &alice_keys, &create_config(), gid, alice_cred)
                 .unwrap();
 
-        let bob = OpenMlsRustCrypto::default();
+        let bob = provider(BOB);
         let (bob_cred, bob_keys) = make_identity(&bob, "bob");
         let bob_kp = new_key_package(&bob, bob_cred, &bob_keys).unwrap();
         let kp = parse_key_package(&alice, &bob_kp).unwrap();

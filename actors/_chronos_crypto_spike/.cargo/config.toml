@@ -1,0 +1,29 @@
+# Per-target rustflags so the same source compiles for all three
+# build flavors. `-Zcrate-attr` injects crate-level attributes the
+# user shouldn't have to write.
+
+[target.riscv64em-javm]
+rustflags = [
+    "-Zunstable-options",
+    "-Zcrate-attr=no_std",
+    "-Zcrate-attr=no_main",
+    "-Aduplicate-macro-attributes",
+    "-Aunused-attributes",
+]
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-Zunstable-options",
+    "-Zcrate-attr=no_std",
+    "-Aunused-attributes",
+]
+
+# Aliases drive target + feature selection per flavor. `cargo
+# actor` produces the riscv64 ELF.
+[alias]
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-javm.json"
+worker = "build --release --no-default-features"
+wasm = "build --release --no-default-features --target wasm32-unknown-unknown"
+
+[unstable]
+json-target-spec = true

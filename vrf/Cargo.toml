@@ -1,0 +1,29 @@
+[workspace]
+
+[package]
+name = "vrf"
+description = "ECVRF over Ristretto255 (SHA-512) — a no_std verifiable random function for VOS chronos bias resistance (Phase D). prove/verify/output + an 80-byte proof codec. Pure software (curve25519-dalek serial backend); the ristretto precompiles are a performance follow-on, not required for correctness."
+keywords = ["vos", "vrf", "ecvrf", "ristretto255", "randomness"]
+categories = ["cryptography", "no-std"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/virto-network/vos"
+homepage = "https://github.com/virto-network/vos"
+authors = ["Daniel Olano <daniel@olanod.com>"]
+
+[dependencies]
+# Ristretto255 group + scalar field, pure no_std serial backend. No
+# `rand_core` ⇒ no ::random; every scalar is loaded from bytes, so the VRF is
+# deterministic by construction (the chronos determinism invariant).
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
+# SHA-512 for the ECVRF challenge, nonce, hash-to-curve expansion, and output
+# (the standard ECVRF-RISTRETTO255-SHA512 hash).
+sha2 = { version = "0.10", default-features = false }
+# Wipe secret-key scalars on drop.
+zeroize = { version = "1", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

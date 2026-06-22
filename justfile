@@ -116,6 +116,12 @@ build-msg-actors:
     cd actors/msg-ctl && cargo +nightly actor
     cd actors/msg-directory && cargo +nightly actor
 
+# Build the chronos actor — the public clock + verifiable-randomness
+# service plane (the generalized beacon). Standalone (not
+# messaging-private); installed per space via manifest.
+build-chronos:
+    cd actors/chronos && cargo +nightly actor
+
 
 # Live cross-node CRDT convergence demo. Spins up two networked
 # VosNodes in-process, registers the crdt-counter actor on both
@@ -196,7 +202,7 @@ demo-crdt-procs: build-crdt-counter build-crates
 # KeyPackage; both exchange messages through the replicated
 # ciphertext log while every byte the actors see stays MLS-
 # encrypted. ~20s end-to-end.
-demo-msg-procs: build-msg-actors build-crates
+demo-msg-procs: build-msg-actors build-chronos build-crates
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build -p messenger-extension

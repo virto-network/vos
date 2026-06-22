@@ -17,6 +17,9 @@ use crate::MsgrCtx;
 /// The space registry's well-known local id.
 const REGISTRY_ID: u32 = 0;
 
+/// The per-space clock + verifiable-randomness service's instance name.
+pub(crate) const CHRONOS_AGENT: &str = "chronos";
+
 pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
@@ -269,6 +272,31 @@ pub(crate) async fn dir_claim_kp(
     let value = decode_value(&raw).ok_or_else(|| "bad msg-directory reply".to_string())?;
     let bytes = value_to_bytes(value).ok_or_else(|| "bad msg-directory reply".to_string())?;
     Ok((!bytes.is_empty()).then_some(bytes))
+}
+
+/// `chronos.latest_final` — the 32-byte value of the latest *finalized*
+/// (lagged) beacon round, for hedging into the MLS CSPRNG output branch
+/// (HKDF `info`, never key material; see [`crate::host_rand`]). Deliberately
+/// best-effort and infallible-ish: `None` when chronos is not installed in the
+/// space, has no finalized round yet, or is unreachable — the caller then draws
+/// with no hedge, which is a no-op on the stream (so absent chronos ⇒ no
+/// behaviour change). Reads the *finalized* round, never the live head, so a
+/// last-revealer cannot grind the value the messenger consumes.
+pub(crate) async fn chronos_beacon(ctx: &mut MsgrCtx) -> Option<[u8; 32]> {
+    let chronos_id = resolve(ctx, CHRONOS_AGENT).await.ok()?;
+    let msg = Msg::new("latest_final");
+    let raw = ctx
+        .ask_dispatch(ServiceId(chronos_id), &dyn_payload(&msg))
+        .await?;
+    // `Option<BeaconRound>` over the wire: empty bytes = None (no finalized
+    // round), populated = rkyv-encoded BeaconRound (see the macro's reply
+    // encoding). Mirror the `dir_claim_kp` shape.
+    let inner = value_to_bytes(decode_value(&raw)?)?;
+    if inner.is_empty() {
+        return None;
+    }
+    let round = <chronos::BeaconRound as vos::Decode>::try_decode(&inner)?;
+    Some(round.beacon)
 }
 
 /// `msg-directory.release_kp` — return a claimed KeyPackage to the
