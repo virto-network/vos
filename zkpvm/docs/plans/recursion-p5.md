@@ -1148,9 +1148,38 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >     add `leaf·c` to `L[b]`. A column in 2 batches ⇒ 2 producer entries + 2
 >     consumptions (the multiplicity/multi-batch-per-leaf bookkeeping is the remaining
 >     design point — most columns are in batch 0 only).
->   * **Bind** `eval[qi]` to the FRI fold chain's layer-0 running `first_layer_evals[qi]`;
->     `p[qi].y` is derivable from the FRI layer-0 twiddle (`twid_0 = p.y.inverse()`),
->     `z` from the latched OODS (oods, oods±step, conj), `α` from `squeeze[2]`.
+>   * **Bind** `eval[qi]` to the FRI fold chain's layer-0 input `first_layer_evals[qi]`,
+>     `z` from the latched OODS (oods, oods±step, conj), `α` from `squeeze[2]`. **TWO
+>     CORRECTIONS from the 2026-06-22 adversarial review (both confirmed REAL — heed
+>     before building):**
+>     - **`p[qi].y` is NOT `1/twid_0` (parity-unsound).** The DEEP `p` is the CIRCLE
+>       point `lifting_domain.at(brev(position))` — per-query, with the query's OWN
+>       parity. The FRI layer-0 (circle) fold twiddle is the EVEN-representative's `y`
+>       (`src_domain.at(brev((pos>>1)<<1)).y`, parity-INDEPENDENT — `fold_circle_into_line`
+>       drops the parity bit, fri.rs:809-813). For ODD queries `p.y = −even.y` (the
+>       conjugate half-coset; NUMERICALLY verified: odd `p.y == −even.y` for all 32
+>       subsets, fold twiddle `== even.y` for all, `== odd.y` for none). Since `a≠0`
+>       generically (`a=α^i(v̄−v)`), feeding `+y` where `−y` is needed corrupts `a·p.y+b`
+>       for ~half the queries. FIX: carry a per-query parity-correct `p.y` bound to the
+>       query position — the FRI chain ALREADY builds per-query circle points
+>       (`recursion_fri_chain_real.rs` pushes `p.x,p.y` rows) — OR apply the parity-bit
+>       sign-flip to the even twiddle. Do NOT reuse the bare fold twiddle.
+>     - **`eval[qi]↔first_layer_evals[qi]` is a THIRD un-de-risked COUPLING (not routine
+>       engineering).** The DEEP `eval[qi]` finalizes on the trace-decommit leaf rows
+>       (after the LAST leaf row of the LAST tree for `qi`; batch 0 spans all ~15775
+>       cols), while `first_layer_evals[qi]` is consumed by the FRI fold chain on the
+>       FRI-fold rows (parity-bit-selected from `{e0,e1}`); the integration code today
+>       marks the FRI layer-0 input "host-supplied (trusted)" (`recursion_child_full.rs`
+>       ~1602). The 4c logup is keyed by `col_index` (per-column), 3b's carry-latch
+>       threads `folded[L]` WITHIN one query's contiguous FRI rows — NEITHER provides
+>       this per-query CROSS-REGION equality. It needs its OWN mechanism — but the
+>       cleanest (a logup keyed by query position: the DEEP region produces `(qi, eval[qi])`,
+>       the FRI region consumes `(qi, layer0_input[qi])`, balance forces equality) REUSES
+>       the EXACT 4c-crux logup-permutation pattern (`recursion_deep_couple`), just keyed
+>       by `qi` not `col_index` ⇒ de-risked-by-analogy, needs only wiring. (A latched
+>       per-query carrier works only if the two regions are per-query adjacent, which they
+>       are not — batch 0 spans all trees.) Still: confirm the per-query logup composes
+>       with the per-col_index leaf↔c logup in ONE component (two relations, both balanced).
 >   * **Add an interaction tree to `child_full`** (it currently commits preproc+main
 >     only) via the `cross_chip_logup` `LogupTraceGenerator`→`to_cpu` transplant +
 >     `mix_felts(claimed_sum)` in the channel replay. SCALE: ~17929 producer + ~681k
