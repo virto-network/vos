@@ -33,7 +33,7 @@ use mls_rs::{CipherSuite, Client, ExtensionList, MlsMessage};
 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
 
 use crate::crypto_provider::VosCryptoProvider;
-use crate::host_rand::HostRand;
+use crate::host_rand::{HostRand, PublicBeacon};
 use crate::store::{self, VosStores};
 
 /// The one ciphersuite VOS messaging speaks (per docs/encryption.md):
@@ -165,15 +165,34 @@ pub(crate) fn open_stores(snapshot: &[u8]) -> VosStores {
 
 /// Build the per-member MLS Client over the restored stores, the deterministic
 /// host-seeded crypto provider, and the seed-derived signing identity under
-/// `nickname`. Boots [`HostRand`] from the seed plus a fresh per-open OS-entropy
-/// token, so every MLS entropy draw in this dispatch flows from one ratchet
-/// (deterministic within the boot) while the token forks the stream across
-/// boots (forward secrecy). A host-minted token replaces the OS draw when the
-/// messenger runs as a deterministic PVM actor (the BOOT_CONTEXT seam).
+/// `nickname`. Seed-only stream — see [`build_client_hedged`] for the
+/// verifiable-randomness variant.
 pub(crate) fn build_client(
     nickname: &str,
     seed: &[u8],
     stores: &VosStores,
+) -> Result<Client<impl MlsConfig + use<>>, String> {
+    build_client_hedged(nickname, seed, stores, None)
+}
+
+/// [`build_client`], additionally folding a public verifiable-randomness
+/// `beacon` (already domain-bound by [`crate::clients::chronos_beacon`]) into
+/// the MLS CSPRNG. Boots [`HostRand`] from the seed plus a fresh per-open
+/// OS-entropy token, so every MLS entropy draw in this dispatch flows from one
+/// ratchet (deterministic within the boot) while the token forks the stream
+/// across boots (forward secrecy). A host-minted token replaces the OS draw
+/// when the messenger runs as a deterministic PVM actor (the BOOT_CONTEXT seam).
+///
+/// The beacon enters only the HKDF *output* branch (never the seed, salt, or
+/// ratchet — see [`HostRand`]), so confidentiality still rests on the secret
+/// seed alone (RFC 9180 §9.7.5). Folding the SAME beacon keeps draws
+/// bit-identical (the determinism gate holds); `None` is byte-identical to
+/// [`build_client`], so a space without a chronos feed is unaffected.
+pub(crate) fn build_client_hedged(
+    nickname: &str,
+    seed: &[u8],
+    stores: &VosStores,
+    beacon: Option<[u8; 32]>,
 ) -> Result<Client<impl MlsConfig + use<>>, String> {
     let seed32 = seed_array(seed)?;
     let mut boot_token = [0u8; 32];
@@ -181,7 +200,7 @@ pub(crate) fn build_client(
     getrandom::getrandom(&mut boot_token)
         .map_err(|e| format!("OS entropy unavailable for the MLS CSPRNG boot token: {e}"))?;
     // PVM actor: the host mints a FRESH boot token on every refine (re)entry —
-    // cold AND warm restart — via the BOOT_CONTEXT seam (P2.1). Re-booting the
+    // cold AND warm restart — via the BOOT_CONTEXT seam. Re-booting the
     // CSPRNG from it per dispatch is what defeats warm-restart nonce reuse: a
     // resurrected snapshot draws under a different token, so it never re-emits
     // used randomness.
@@ -192,6 +211,9 @@ pub(crate) fn build_client(
         boot_token.copy_from_slice(&ctx_buf[..32]);
     }
     let rand = HostRand::boot(&seed32, &boot_token, &[], 0, 0);
+    if let Some(b) = beacon {
+        rand.set_beacon(PublicBeacon(b));
+    }
     build_client_with_rand(nickname, seed, rand, stores)
 }
 
@@ -712,7 +734,7 @@ mod tests {
         );
     }
 
-    /// The P2.3 determinism gate: every mls-rs entropy draw flows through the
+    /// The determinism gate: every mls-rs entropy draw flows through the
     /// host-seeded CSPRNG, so two providers from the same (seed, boot context)
     /// produce bit-identical KEM keypairs, HPKE ciphertexts (the ephemeral the
     /// stock provider drew from OsRng — the seam OpenMLS couldn't reach), and
@@ -771,6 +793,48 @@ mod tests {
             csp(ALICE, [0x99u8; 32]).kem_generate().unwrap().1,
             csp(ALICE, token).kem_generate().unwrap().1,
             "a different boot token must fork the KEM key"
+        );
+    }
+
+    /// The chronos beacon hedge: folding the SAME beacon stays bit-identical
+    /// (so the determinism gate + cross-member consistency hold), a DIFFERENT
+    /// beacon forks the draw (the hedge actually mixes in), and folding any
+    /// beacon differs from the seed-only stream (so absent chronos is a distinct
+    /// no-op path). Mirrors `host_rand::beacon_is_output_info_only` at the
+    /// provider level.
+    #[test]
+    fn beacon_hedge_keeps_determinism_and_forks_on_change() {
+        use crate::crypto_provider::VosCryptoProvider;
+        use crate::host_rand::PublicBeacon;
+        use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
+
+        let token = [0x5Au8; 32];
+        let csp = |beacon: Option<[u8; 32]>| {
+            let rand = HostRand::boot(&ALICE, &token, &[], 0, 0);
+            if let Some(b) = beacon {
+                rand.set_beacon(PublicBeacon(b));
+            }
+            VosCryptoProvider::new(rand)
+                .cipher_suite_provider(CIPHERSUITE)
+                .unwrap()
+        };
+        let b1 = [0x11u8; 32];
+        let b2 = [0x22u8; 32];
+
+        assert_eq!(
+            csp(Some(b1)).kem_generate().unwrap().1,
+            csp(Some(b1)).kem_generate().unwrap().1,
+            "same seed+boot+beacon must yield an identical KEM key"
+        );
+        assert_ne!(
+            csp(Some(b1)).kem_generate().unwrap().1,
+            csp(Some(b2)).kem_generate().unwrap().1,
+            "a different beacon must fork the KEM key"
+        );
+        assert_ne!(
+            csp(Some(b1)).kem_generate().unwrap().1,
+            csp(None).kem_generate().unwrap().1,
+            "folding a beacon must differ from the seed-only stream"
         );
     }
 

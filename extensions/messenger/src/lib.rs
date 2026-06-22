@@ -16,13 +16,30 @@
 //! node can read this node's plaintext: the standard end-to-end
 //! assumption that your own device is yours.
 //!
-//! Phase 1 invite flow is out-of-band, SimpleX-style: the invitee
+//! The invite flow is out-of-band, SimpleX-style: the invitee
 //! prints a KeyPackage (`key_package`), hands it to the inviter
 //! (link, QR, …), and the inviter's `invite` commits the
 //! membership change; the Welcome rides the commit chain and the
 //! invitee's `tick` picks it up by KeyPackage hash. A directory
 //! actor with sequenced single-use claims replaces the hand-off
 //! in a later phase.
+//!
+//! Why mls-rs (AWS) and not OpenMLS: this crate must also build as a
+//! deterministic no_std riscv64 PVM actor (see the riscv64 dep flavor in
+//! `Cargo.toml` and `vos/tests/messenger_transpile.rs`). OpenMLS is
+//! irreducibly `std` — a non-optional `rayon` dependency (TreeKEM `par_iter`,
+//! gated only against wasm32, so the PVM target would still pull it),
+//! `SystemTime` in KeyPackage lifetimes, `std::collections` throughout — and,
+//! decisively, its HPKE-Seal ephemeral KEM key is drawn by hpke-rs's own
+//! per-call `from_entropy` RNG, a seam *structurally unreachable* through the
+//! provider, so the deterministic CSPRNG could never cover it. mls-rs makes
+//! std/rayon optional and routes both `kem_generate` and the HPKE ephemeral
+//! through `DhType::generate`, so a custom `CipherSuiteProvider` closes every
+//! entropy seam. (There was never an OpenMLS deployment to migrate from; this
+//! is an initial-library choice.) A process-global `getrandom` custom backend
+//! was rejected for the entropy seam: it is too broad (it would capture
+//! libp2p/TLS/everything) yet too narrow (it intercepts only the one seed draw,
+//! not the per-message provider draws the deterministic provider must cover).
 
 use vos::prelude::*;
 
@@ -273,9 +290,11 @@ impl Messenger {
     /// Mint a KeyPackage and print it hex-encoded for out-of-band
     /// delivery to an inviter. One KeyPackage admits one join.
     #[msg(cli)]
-    async fn key_package(&mut self, _ctx: &mut Context<Self>) -> String {
+    async fn key_package(&mut self, ctx: &mut Context<Self>) -> String {
+        let beacon = crate::clients::chronos_beacon(ctx).await;
         let stores = self.open_stores();
-        let client = match mls::build_client(&self.nickname, &self.csprng_seed, &stores) {
+        let client = match mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)
+        {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -304,8 +323,10 @@ impl Messenger {
         if let Err(e) = self.ensure_channel_agents(&channel, ctx).await {
             return e;
         }
+        let beacon = crate::clients::chronos_beacon(ctx).await;
         let stores = self.open_stores();
-        let client = match mls::build_client(&self.nickname, &self.csprng_seed, &stores) {
+        let client = match mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)
+        {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -535,8 +556,10 @@ impl Messenger {
         if !self.channels[i].joined {
             return format!("not joined to '{channel}' yet");
         }
+        let beacon = crate::clients::chronos_beacon(ctx).await;
         let stores = self.open_stores();
-        let client = match mls::build_client(&self.nickname, &self.csprng_seed, &stores) {
+        let client = match mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)
+        {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -803,10 +826,14 @@ impl Messenger {
         n: usize,
     ) -> core::result::Result<usize, String> {
         let dir_id = resolve(ctx, DIRECTORY_AGENT).await?;
+        // One beacon for the whole batch — every KeyPackage in this dispatch
+        // hedges under the same finalized round.
+        let beacon = crate::clients::chronos_beacon(ctx).await;
         let mut published = 0usize;
         for _ in 0..n {
             let stores = self.open_stores();
-            let client = mls::build_client(&self.nickname, &self.csprng_seed, &stores)?;
+            let client =
+                mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)?;
             let kp_bytes = new_key_package(&client, now_ms())?;
             self.mls_store = store::snapshot(&stores);
             dir_publish_kp(ctx, dir_id, &self.nickname.clone(), kp_bytes).await?;
@@ -837,9 +864,13 @@ impl Messenger {
             .into());
         }
         let ctl_id = resolve(ctx, &ctl_agent_name(channel)).await?;
+        // One beacon for both commit attempts — a retry re-derives the commit
+        // under the same finalized round.
+        let beacon = crate::clients::chronos_beacon(ctx).await;
         for attempt in 0..2 {
             let stores = self.open_stores();
-            let client = mls::build_client(&self.nickname, &self.csprng_seed, &stores)?;
+            let client =
+                mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)?;
             let mut group = mls::load_group(&client, channel)?;
             // mls-rs has no `is_active`; our own leaf missing from the roster
             // means a prior commit evicted us.

@@ -21,10 +21,8 @@ use crate::MsgrCtx;
 /// The space registry's well-known local id.
 const REGISTRY_ID: u32 = 0;
 
-/// The per-space clock + verifiable-randomness service's instance name. Read
-/// by [`chronos_beacon`] — both await the determinism wiring that folds the
-/// public beacon into the MLS CSPRNG (a custom `CipherSuiteProvider`).
-#[allow(dead_code)]
+/// The per-space clock + verifiable-randomness service's instance name. Read by
+/// [`chronos_beacon`] to fold the public beacon into the MLS CSPRNG hedge.
 pub(crate) const CHRONOS_AGENT: &str = "chronos";
 
 pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
@@ -294,10 +292,10 @@ pub(crate) async fn dir_claim_kp(
 /// behaviour change). Reads the *finalized* round, never the live head, so a
 /// last-revealer cannot grind the value the messenger consumes.
 ///
-/// Retained for the determinism wiring (P2.3): once the messenger drives mls-rs
-/// through a host-seeded `CipherSuiteProvider`, this beacon is folded into the
-/// CSPRNG output branch. The stock crypto provider used today ignores it.
-#[allow(dead_code)]
+/// The value is domain-bound to its round (`blake2b`) before it leaves here, so
+/// the hedge can't be replayed across rounds and the raw beacon never enters
+/// the CSPRNG directly. [`crate::mls::build_client_hedged`] folds the result
+/// into the output branch.
 pub(crate) async fn chronos_beacon(ctx: &mut MsgrCtx) -> Option<[u8; 32]> {
     let chronos_id = resolve(ctx, CHRONOS_AGENT).await.ok()?;
     let msg = Msg::new("latest_final");
@@ -309,7 +307,10 @@ pub(crate) async fn chronos_beacon(ctx: &mut MsgrCtx) -> Option<[u8; 32]> {
         return None;
     }
     let round = <chronos::BeaconRound as vos::Decode>::try_decode(&inner)?;
-    Some(round.beacon)
+    Some(vos::crypto::blake2b_hash::<32>(
+        b"vos-msg/beacon-hedge/v1",
+        &[&round.round.to_le_bytes(), &round.beacon],
+    ))
 }
 
 /// `msg-directory.release_kp` — return a claimed KeyPackage to the

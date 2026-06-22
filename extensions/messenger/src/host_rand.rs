@@ -11,21 +11,19 @@
 //!
 //! mls-rs takes randomness through its `CipherSuiteProvider` rather than a
 //! standalone RNG trait, and the RustCrypto provider draws OS entropy *inside*
-//! `signature_key_generate`/`kem_generate`/`hpke_seal`. Routing every one of
-//! those through this stream is the determinism work; it is staged separately
-//! (a custom `CipherSuiteProvider`) from the functional mls-rs port, so on the
-//! host build this CSPRNG is not yet wired into mls-rs — it is retained here
-//! for that wiring, and to derive the signer secret deterministically.
+//! `kem_generate`/`hpke_seal`. The messenger's [`crate::crypto_provider`] routes
+//! every one of those draws through this stream, so all of a dispatch's MLS
+//! entropy flows from one ratchet; the seed-derived signer is the only key
+//! material drawn outside it.
 //!
 //! Two randomness planes are kept strictly apart. The **secret seed** is the
 //! only confidentiality root; it is the HKDF IKM and nothing else ever is. A
-//! **public beacon** (operational fairness) may only ever enter as HKDF `info`
-//! on the output branch — never as IKM, salt, or the ratchet input — so
+//! **public beacon** (operational fairness — the chronos verifiable-randomness
+//! hedge, folded in via [`HostRand::set_beacon`]) may only ever enter as HKDF
+//! `info` on the output branch — never as IKM, salt, or the ratchet input — so
 //! confidentiality holds on the seed alone even if the beacon is known (RFC
 //! 9180 §9.7.5). That separation is enforced structurally here: there is no
 //! method that folds external bytes into the ratchet state.
-
-#![allow(dead_code)]
 
 use core::cell::{Cell, RefCell};
 use core::fmt;
@@ -141,7 +139,9 @@ impl HostRand {
     }
 
     /// The current draw counter — for persisting alongside the MLS store so a
-    /// later boot can fast-forward past it.
+    /// later boot can fast-forward past it. Staged for the durable-counter
+    /// persistence follow-on; not yet read on the actor build.
+    #[allow(dead_code)]
     pub(crate) fn counter(&self) -> u64 {
         self.ctr.get()
     }
@@ -176,7 +176,9 @@ impl HostRand {
         Ok(())
     }
 
-    /// Draw a fixed-size array.
+    /// Draw a fixed-size array. (Convenience over `draw_into`; used on the host
+    /// build, retained for parity on the actor build.)
+    #[allow(dead_code)]
     pub(crate) fn random_array<const N: usize>(&self) -> Result<[u8; N], HostRandError> {
         let mut out = [0u8; N];
         self.draw_into(&mut out)?;
