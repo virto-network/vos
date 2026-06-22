@@ -1184,23 +1184,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "clerk-bridge"
-version = "0.1.0"
-dependencies = [
- "cipher-clerk",
- "clerk-ledger",
- "vos",
-]
-
-[[package]]
-name = "clerk-ledger"
-version = "0.1.0"
-dependencies = [
- "cipher-clerk",
- "vos",
-]
-
-[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7981,39 +7964,31 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vos"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "async-executor",
  "async-io",
  "async-trait",
  "blake2",
  "blake2b_simd",
- "cipher-clerk",
  "clap",
- "clerk-bridge",
- "clerk-ledger",
  "crdt-counter",
  "dlmalloc",
- "ed25519-dalek",
  "futures-channel",
  "futures-executor",
  "futures-lite",
  "futures-rustls",
  "getrandom 0.2.17",
  "grey-transpiler 0.1.0 (git+https://github.com/olanod/jar.git?rev=c91e83c1c10219117ed7bb679a80fb424b34228a)",
- "hkdf",
  "javm 0.4.0 (git+https://github.com/olanod/jar.git?rev=c91e83c1c10219117ed7bb679a80fb424b34228a)",
  "libloading",
  "libp2p",
  "log",
  "merkle-crdt",
  "pollster",
- "prover-extension",
  "rcgen",
  "redb",
  "rkyv",
  "rustls-pemfile",
  "serde",
- "sha2",
  "space-bridge",
  "space-registry",
  "tokio",
@@ -8023,7 +7998,6 @@ dependencies = [
  "ureq",
  "vos-macros",
  "vos-raft",
- "x25519-dalek",
 ]
 
 [[package]]

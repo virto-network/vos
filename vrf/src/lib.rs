@@ -8,17 +8,16 @@
 //! exactly what chronos needs to kill the v0 leader's entropy grind: each raft
 //! voter contributes a VRF output over the public round input
 //! `α = blake2b(prev_beacon ‖ epoch)`, the committee combines them, and the
-//! result is unbiasable as long as one voter is honest. See
-//! `docs/design/chronos-bias-resistance.md`.
+//! result is unbiasable as long as one voter is honest.
 //!
 //! ## Scope
 //!
 //! This is the reusable primitive ("D0"); the chronos round protocol,
 //! voter-key enrolment, and committee combine layer on top of it (D1+). It is
-//! pure software over `curve25519-dalek`'s serial backend — proven to compile,
-//! transpile, and run on the PVM by `actors/_chronos_crypto_spike` — so it needs
-//! no precompile for correctness; the ristretto precompiles (zkpvm ECALLs
-//! 110-114) are a measured performance follow-on.
+//! pure software over `curve25519-dalek`'s serial backend — its PVM transpile
+//! is gated through the real `chronos` actor ELF (`vos/tests/chronos_transpile.rs`)
+//! — so it needs no precompile for correctness; the ristretto precompiles (zkpvm
+//! ECALLs 110-114) are a measured performance follow-on.
 //!
 //! ## Ciphersuite (internal, not RFC-registered)
 //!

@@ -23,38 +23,25 @@ crate-type = ["rlib", "cdylib"]
 
 # ── Flavor-agnostic deps (build for both the host .so and the PVM actor) ──
 [dependencies]
-# Wire types shared with the per-channel PVM actors + registry/chronos
-# (EnvelopeRow, CommitRow, AgentRow, BeaconRound, kp_hash, status codes, id
-# derivations). `default-features = false` strips their `bin` feature so no PVM
-# entry-point glue lands in the messenger's link. These are portable actor
-# crates, so they build for both flavors unchanged. msg-log/msg-ctl: the
-# channel log + commit sequencer. space-registry: dynamic channel install
-# (`create` clones a channel pair's program rows). chronos: the BeaconRound
-# wire type for the optional public-randomness hedge (HKDF `info`, never key
-# material; absent chronos => no hedge, no behaviour change).
+# Wire types shared with the channel actors + registry/chronos.
+# `default-features = false` strips their PVM `bin` glue; portable, so one dep
+# serves both flavors. chronos carries the BeaconRound type for the optional
+# randomness hedge (absent chronos => no hedge, no behaviour change).
 msg-log = { path = "../../actors/msg-log", default-features = false }
 msg-ctl = { path = "../../actors/msg-ctl", default-features = false }
 msg-directory = { path = "../../actors/msg-directory", default-features = false }
 space-registry = { path = "../../actors/space-registry", default-features = false }
 chronos = { path = "../../actors/chronos", default-features = false }
-# zeroize for ratchet/key material; its default features are alloc-only (no
-# std), so one dep serves both flavors. `spin::Mutex` shares the mls-rs storage
-# providers + the host-seeded CSPRNG across the Client's clones (store.rs /
-# crypto_provider.rs), mirroring mls-rs's own in-memory providers — a real
-# spinlock, never contended in the single-threaded dispatch model, correct on
-# the host too. The PVM actor adds spin's `portable_atomic` feature + a
-# critical-section backend below.
+# zeroize for key material; `spin::Mutex` shares the mls-rs storage + CSPRNG
+# providers across the Client's clones (uncontended in single-threaded dispatch).
 zeroize = "1.8"
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
 
 # ── Host extension flavor (the loadable .so) ──────────────────────
-# vos extension ABI + RFC 9420 MLS (mls-rs, AWS) and the crypto stack with
-# default (std) features. ciphersuite 1 =
-# MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 = CURVE25519_AES128. The
-# deterministic CipherSuiteProvider (crypto_provider.rs) wraps RustCrypto's
-# DhType so the X25519 KEM keypair + HPKE ephemeral draw from the host-seeded
-# CSPRNG; hkdf/sha2 match the KDF, ed25519-dalek builds the seed-derived signer,
-# getrandom mints the per-boot token + the register-time seed.
+# vos extension ABI + mls-rs (RFC 9420) with std. Ciphersuite 1
+# (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519). The deterministic
+# CipherSuiteProvider (crypto_provider.rs) draws the X25519 KEM + HPKE ephemeral
+# from the host-seeded CSPRNG; getrandom mints the per-boot token + reg seed.
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
 vos = { path = "../../vos", default-features = false, features = ["extension"] }
 mls-rs = "0.55"
@@ -70,11 +57,8 @@ ed25519-dalek = "2"
 getrandom = "0.2"
 
 # ── PVM actor flavor (the riscv64em-javm ELF; `cargo +nightly actor`) ──
-# vos service ABI + the SAME mls-rs/crypto stack with std dropped
-# (`default-features = false`) — the no_std cut whose own-code transpile
-# `actors/_mls_spike` proved and the `link_elf` gate (vos/tests/
-# messenger_transpile.rs) enforces — plus the no-native-atomics support crates.
-# The mls-rs feature set mirrors `_mls_spike` (the proven-transpiling minimum).
+# The SAME stack with std dropped — the no_std cut whose transpile
+# vos/tests/messenger_transpile.rs gates. Feature set = proven-transpiling minimum.
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
 mls-rs = { version = "0.55", default-features = false, features = [
@@ -96,20 +80,17 @@ hkdf = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 ed25519-dalek = { version = "2", default-features = false }
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
-# The riscv64em-javm target has max-atomic-width 0: spin needs portable-atomic
-# (its `portable_atomic` feature), portable-atomic emulates the atomics through
-# critical-section (impl in lib.rs), and portable-atomic-util provides the `Arc`
-# that `alloc::sync::Arc` can't (gated on native atomics). Mirrors mls-rs's own
-# no_std atomics wiring.
+# riscv64em-javm has max-atomic-width 0: spin's atomics go through
+# portable-atomic over critical-section (impl in lib.rs), and
+# portable-atomic-util supplies the `Arc` alloc::sync can't without native atomics.
 spin = { version = "0.10", default-features = false, features = ["portable_atomic"] }
 portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
 portable-atomic-util = { version = "0.2", default-features = false, features = ["alloc"] }
 critical-section = { version = "1", default-features = false }
 
 [dev-dependencies]
-# The e2e test drives two real `vosx space up` daemons (creator +
-# joiner) and dials one as a libp2p client to read the raw
-# ciphertext log. Same harness shape as extensions/dev/tests/e2e.rs.
+# The e2e test drives two real `vosx space up` daemons and dials one as a
+# libp2p client to read the raw ciphertext log.
 vos = { path = "../../vos", default-features = false, features = ["extension", "std", "network", "storage"] }
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "macros", "ping", "identify", "request-response", "gossipsub"] }
 serde = { version = "1", features = ["derive"] }

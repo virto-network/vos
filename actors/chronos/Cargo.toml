@@ -26,9 +26,10 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 # The ECVRF primitive (Phase D v1): per-voter verifiable randomness over
 # Ristretto255. no_std, pure software (the ristretto precompiles are a
-# performance follow-on, not a correctness gate). Compiles for the actor
-# target — see `actors/_chronos_crypto_spike`. `chronos` only ever holds
-# PUBLIC VRF keys + proofs; no secret key material lives here.
+# performance follow-on, not a correctness gate). Its transpile for the actor
+# target is gated via this actor's ELF (vos/tests/chronos_transpile.rs).
+# `chronos` only ever holds PUBLIC VRF keys + proofs; no secret key material
+# lives here.
 vrf = { path = "../../vrf" }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
