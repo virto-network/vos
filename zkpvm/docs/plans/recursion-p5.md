@@ -1068,17 +1068,29 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   `is_fold_draw[i]` (was AIR constants). GREEN log 17, peak 19.0 GiB (the +631 fold
 >   cols), 2569s/2 proves; a perturbed FRI fold rejected. The layer-0 input + e0/e1
 >   subset evals are HOST-SUPPLIED (trusted) — bound in 3b/4.
-> - **REMAINING (step 3b/4/5):** **(3b)** FRI-layer Merkle decommit + couple the
->   e0/e1 fold inputs to the FRI-layer decommit leaves (needs mapping stwo's FRI
->   decommit structure — `FriLayerProof`/`FriVerifier::decommit`, the fold_step=1
->   coset {pos,pos^1}, 4-wide QM31 leaves; query positions halve per layer; bind each
->   layer root to its `mix_root` absorb; the challenge is coupling the all-rows cycled
->   fold chain to the merkle-row decommit leaves). **(4)** the DEEP numerator
->   (obligation d, leaf↔OODS) over the trace-decommit leaves, bound to the fold
->   chain's layer-0 `first_layer_evals`. **(5)** the fully-combined log-17 prove + the
->   adversarial-review Workflow. Each is the same "add cols / bind / assert / prove"
->   shape as steps 1-2; the ~40-min proves are the cost. TIP: map the stwo FRI
->   decommit BEFORE building 3b (as the 6 mechanisms were mapped at step-5 start).
+> - **Step 3b (`ec54a58` standalone + `6bf7951` integration) — FRI-layer decommit +
+>   co-located fold, DONE + PROVEN @ log 17.** Replaced 3a's host-e0/e1 full-chain
+>   fold: the fold inputs are now DECOMMITTED leaves of the transcript-pinned FRI
+>   Merkle trees. The open layout question is RESOLVED by a **per-(query,layer) coset
+>   stream** (sponge(e0)+sponge(e1)+a MERGE row reading the two leaf hashes via a new
+>   `lh` column at fixed offsets [-2]/[-1]+climb) co-located with the fold on the
+>   e0-sponge row (e0=chunk[0], e1=chunk[+1] ARE the decommit leaves), a **carry
+>   latch** for cross-layer chaining, and the KEY insight that the **twiddle is host,
+>   FORCED by consistency** (chain+decommit+last-layer ⇒ no in-AIR point-chain). FRI
+>   roots preproc-pinned (FRI-root↔transcript a follow-on, like last_layer_const).
+>   Standalone `recursion_fri_decommit.rs` fri_decommit_gate GREEN @ log 13 (tampers
+>   rejected = the degree-proof); integrated child_full_measure GREEN @ log 17, PEAK
+>   RSS 17.3 GiB (better than 3a's 19.0 — the per-step fold dropped ~540 cols), a
+>   perturbed FRI fold rejected. main 983 / preproc 6224 M31 cols.
+> - **REMAINING (step 4/5):** **(4)** the DEEP numerator (obligation d, leaf↔OODS)
+>   over the trace-decommit leaves (`data.deep_batches`, 11 batches/17929 terms; CM31
+>   denom-inverse witnessed; numerator deg-1 over leaves; product deg2), bound to the
+>   fold chain's layer-0 `first_layer_evals` (= the layer-0 running leaf). Rides the
+>   trace-decommit leaf rows; host-first proven in `recursion_deep_quotient.rs`.
+>   **(5)** the fully-combined log-17 prove + the adversarial-review Workflow. **Plus
+>   the deferred transcript bindings** (FRI-root↔mix_root, last_layer_const↔mix_felts,
+>   query-position↔sampling). Each is the same "add cols / bind / assert / prove"
+>   shape; the ~25-min log-17 proves are the cost.
 
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
 scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
