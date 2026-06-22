@@ -1,0 +1,34 @@
+# E2EE messaging demo, host B. See space-msg-a.toml for context.
+#
+# Run (after starting host A):
+#   vosx space join <space-id>@/ip4/127.0.0.1/tcp/4821/p2p/<peer-a> --name msg-demo
+#   vosx space up msg-demo --manifest examples/space-msg-b.toml \
+#     --connect <bootnode> &
+#   vosx messenger register bob
+#   vosx messenger key_package            # hand the hex to host A
+#   vosx messenger join general           # tick picks up the welcome
+#   vosx messenger history general
+
+space = "msg-demo"
+version = "0.1.0"
+
+[[agent]]
+name = "msg-general-log"
+path = "../actors/msg-log/target/riscv64em-javm/release/msg_log.elf"
+consistency = "crdt"
+
+[[agent]]
+name = "msg-general-ctl"
+path = "../actors/msg-ctl/target/riscv64em-javm/release/msg_ctl.elf"
+consistency = "crdt"
+
+[[agent]]
+name = "msg-directory"
+path = "../actors/msg-directory/target/riscv64em-javm/release/msg_directory.elf"
+consistency = "crdt"
+
+[[extension]]
+name = "messenger"
+path = "../target/debug/libmessenger_extension.so"
+tick_ms = 500
+intra_caps = ["msg-general-log:member", "msg-general-ctl:member", "msg-directory:member"]

@@ -107,6 +107,16 @@ build-voucher-check:
     cd examples/actors/voucher-check && cargo +nightly build --release
 
 
+# Build the per-channel messaging actors — msg-log (crdt-mode
+# ciphertext envelope log) + msg-ctl (sequenced MLS commit chain).
+# Same toolchain as the registry. The messenger extension is a
+# normal workspace member (`cargo build -p messenger-extension`).
+build-msg-actors:
+    cd actors/msg-log && cargo +nightly actor
+    cd actors/msg-ctl && cargo +nightly actor
+    cd actors/msg-directory && cargo +nightly actor
+
+
 # Live cross-node CRDT convergence demo. Spins up two networked
 # VosNodes in-process, registers the crdt-counter actor on both
 # under the same replication_id, drives one inc on each side,
@@ -180,6 +190,75 @@ demo-crdt-procs: build-crdt-counter build-crates
     wait $PID_A 2>/dev/null || true
     wait $PID_B 2>/dev/null || true
     echo "done. Full logs in /tmp/vosx-{a,b}.log"
+
+# Two-process E2EE messaging demo: alice (host A) creates the
+# "general" channel and invites bob (host B) via an out-of-band
+# KeyPackage; both exchange messages through the replicated
+# ciphertext log while every byte the actors see stays MLS-
+# encrypted. ~20s end-to-end.
+demo-msg-procs: build-msg-actors build-crates
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p messenger-extension
+    A=/tmp/vosx-msg-a; B=/tmp/vosx-msg-b
+    rm -rf $A $B
+    mkdir -p $A/{data,config,cache} $B/{data,config,cache}
+    VA="env XDG_DATA_HOME=$A/data XDG_CONFIG_HOME=$A/config XDG_CACHE_HOME=$A/cache ./target/debug/vosx"
+    VB="env XDG_DATA_HOME=$B/data XDG_CONFIG_HOME=$B/config XDG_CACHE_HOME=$B/cache ./target/debug/vosx"
+
+    echo "→ host A: create space..."
+    $VA space new --name msg-demo > /dev/null
+    SPACE_ID=$(grep -E '^id = ' $A/config/vosx/spaces.toml | head -1 | cut -d'"' -f2)
+
+    echo "→ host A: starting daemon on :4821..."
+    RUST_LOG=info $VA space up msg-demo \
+        --manifest examples/space-msg-a.toml \
+        --listen /ip4/127.0.0.1/tcp/4821 \
+        > /tmp/vosx-msg-a.log 2>&1 &
+    PID_A=$!
+    for _ in $(seq 1 50); do
+        [ -f "$A/data/vosx/$SPACE_ID/.endpoint" ] && break
+        sleep 0.1
+    done
+    PEER_A=$(grep peer_id "$A/data/vosx/$SPACE_ID/.endpoint" | cut -d'"' -f2)
+    BOOTNODE="/ip4/127.0.0.1/tcp/4821/p2p/$PEER_A"
+
+    echo "→ host B: join + start (dials A)..."
+    $VB space join "$SPACE_ID@$BOOTNODE" --name msg-demo > /dev/null
+    RUST_LOG=info $VB space up msg-demo \
+        --manifest examples/space-msg-b.toml \
+        --connect "$BOOTNODE" \
+        > /tmp/vosx-msg-b.log 2>&1 &
+    PID_B=$!
+    sleep 3
+
+    echo "→ alice: register + create channel..."
+    $VA messenger register --space msg-demo nickname=alice
+    $VA messenger create --space msg-demo channel=general
+    echo "→ alice: grant bob's operator the member tier..."
+    PEER_B=$($VB whoami | sed -n 's/^peer_id = //p' | head -1)
+    $VA space role msg-demo grant "$PEER_B" read
+    echo "→ bob: register (publishes key packages to the directory)..."
+    $VB messenger register --space msg-demo nickname=bob
+    $VB messenger join --space msg-demo channel=general
+    echo "→ alice: invite bob by name + send..."
+    $VA messenger invite --space msg-demo channel=general member=bob
+    $VA messenger send --space msg-demo channel=general "text=hello bob, this never leaves our devices in the clear"
+    sleep 5
+    echo "→ bob: reply..."
+    $VB messenger send --space msg-demo channel=general "text=hi alice, received over ciphertext-only replication"
+    sleep 5
+
+    echo ""
+    echo "── alice's view ───────────────────────────────────────────"
+    $VA messenger history --space msg-demo channel=general limit=10 || true
+    echo "── bob's view ─────────────────────────────────────────────"
+    $VB messenger history --space msg-demo channel=general limit=10 || true
+    echo "→ shutting down..."
+    kill $PID_A $PID_B 2>/dev/null || true
+    wait $PID_A 2>/dev/null || true
+    wait $PID_B 2>/dev/null || true
+    echo "done. Full logs in /tmp/vosx-msg-{a,b}.log"
 
 # ── Run ─────────────────────────────────────────────────────────────
 

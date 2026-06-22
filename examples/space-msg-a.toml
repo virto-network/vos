@@ -1,0 +1,62 @@
+# E2EE messaging demo, host A — see docs/messaging.md.
+#
+# One channel ("general") = two replicated PVM agents + the native
+# messenger extension holding this node's MLS state:
+#
+#   msg-general-log  crdt   ciphertext envelope log (leaderless)
+#   msg-general-ctl  crdt¹  sequenced MLS commit chain
+#   messenger        .so    encrypt/decrypt at the edge, poll tick
+#
+# ¹ crdt-mode sequencing is only safe while a single member issues
+#   MLS commits (here: host A creates the channel and does all the
+#   inviting). Multi-committer channels flip this line to
+#   consistency = "raft" once follower→leader write routing lands.
+#
+# Pair with `space-msg-b.toml` in another vosx process. Easiest
+# end-to-end recipe:
+#
+#   just demo-msg-procs
+#
+# Step-by-step (host A):
+#
+#   cargo build -p vosx -p messenger-extension
+#   just build-msg-actors
+#   vosx space new --name msg-demo
+#   vosx space up msg-demo --manifest examples/space-msg-a.toml \
+#     --listen /ip4/127.0.0.1/tcp/4821 &
+#   vosx messenger register alice
+#   vosx messenger create general
+#   vosx messenger invite general <key_package hex from host B>
+#   vosx messenger send general "hello"
+#   vosx messenger history general
+#
+# `replication_id` defaults to "auto" = blake2b(name || 0 || blob);
+# both manifests reference the same actors by the same names, so
+# each agent pair auto-shares a replication group.
+
+space = "msg-demo"
+version = "0.1.0"
+
+[[agent]]
+name = "msg-general-log"
+path = "../actors/msg-log/target/riscv64em-javm/release/msg_log.elf"
+consistency = "crdt"
+
+[[agent]]
+name = "msg-general-ctl"
+path = "../actors/msg-ctl/target/riscv64em-javm/release/msg_ctl.elf"
+consistency = "crdt"
+
+[[agent]]
+name = "msg-directory"
+path = "../actors/msg-directory/target/riscv64em-javm/release/msg_directory.elf"
+consistency = "crdt"
+
+[[extension]]
+name = "messenger"
+path = "../target/debug/libmessenger_extension.so"
+tick_ms = 500
+# The messenger relays the operator's caller to the channel actors;
+# member is the ceiling the post/commit handlers need. Registry
+# lookups (`resolve`) are read-tier and need no cap.
+intra_caps = ["msg-general-log:member", "msg-general-ctl:member", "msg-directory:member"]

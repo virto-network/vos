@@ -77,11 +77,10 @@ pub enum Consistency {
     /// is attached to each DAG node for deterministic replay.
     Crdt,
     /// Raft consensus — every state-changing dispatch appends a
-    /// committed log entry. Phase 1 runs as a single-node
-    /// "self-quorum" mode (durable persistence + replay equivalent
-    /// to `Local` + a log); the cluster machinery (election,
-    /// AppendEntries, leader-forwarding `commit_with_log`) lands
-    /// in later phases.
+    /// committed log entry. Single-node mode runs as a "self-quorum"
+    /// (durable persistence + replay equivalent to `Local` + a log);
+    /// cluster machinery (election, AppendEntries,
+    /// leader-forwarding `commit_with_log`) activates when peers join.
     Raft,
 }
 
@@ -1227,8 +1226,8 @@ impl crate::network::NetworkService for NodeService {
             return reply;
         }
 
-        // M7 — Sprint-2's dispatch-layer auth gate retires here.
-        // The actor's own macro-emitted #[msg(role = X)] check
+        // The dispatch-layer role gate has moved to the actor's own
+        // macro-emitted #[msg(role = X)] check
         // runs at the dispatch boundary inside the agent and
         // surfaces STATUS_FORBIDDEN through the wire envelope
         // (see vos/src/actors/lifecycle.rs::exit_status + the
@@ -3126,9 +3125,8 @@ fn handle_invoke_request(
     if recording_enabled {
         runtime.begin_recording(req.msg.clone());
     }
-    // M7 — wrap the dispatch payload with a caller-info header
-    // so the PVM agent can populate Context::caller / role
-    // bytes before running the M6 macro-emitted role check.
+    // Wrap the dispatch payload with a caller-info header so the PVM
+    // agent can populate Context::caller and role bytes from the caller info.
     // Format: see lifecycle::TAG_CALLER_PREFIX.
     let payload = encode_caller_prefix(&req);
     runtime.send_to(svc_id, payload);
@@ -3198,7 +3196,7 @@ fn handle_invoke_request(
             return Ok(());
         }
     };
-    // M6 — when the macro-emitted role check refused the call,
+    // When the role check refused the call,
     // the runtime stashes STATUS_FORBIDDEN in last_status. That
     // wins over the default DONE/YIELDED inference so the wire
     // envelope carries the actor-level refusal end-to-end.
@@ -3251,7 +3249,7 @@ fn forbidden_envelope() -> Vec<u8> {
 }
 
 /// Replay-side wrapper for already-logged messages. Always
-/// emits a trusted-System prefix so the M6 macro-emitted role
+/// emits a trusted-System prefix so the role
 /// check passes during replay — original authorisation is
 /// implicit in the fact the log was committed.
 fn encode_replay_payload(msg: &[u8]) -> Vec<u8> {
@@ -3285,9 +3283,8 @@ fn wrap_with_unauthenticated_prefix(msg: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Wrap the request's message bytes with the M7 caller-info
-/// header so the PVM agent can populate `Context::caller` and
-/// the role bytes before the M6 macro-emitted role check runs.
+/// Wrap the request's message bytes with a caller-info header so the
+/// PVM agent can populate `Context::caller` and the role bytes from caller info.
 ///
 /// Layout (6 bytes header + original message):
 ///

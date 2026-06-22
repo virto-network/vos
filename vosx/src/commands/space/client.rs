@@ -438,7 +438,7 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
     }
 
-    // ── Sprint 2 auth grants ────────────────────────────────────
+    // ── Auth grants ────────────────────────────────────
 
     pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
         vos::block_on(self.registry().grant_role(&mut &self.node, peer_id, role))

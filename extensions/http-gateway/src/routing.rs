@@ -600,6 +600,9 @@ async fn resolve(ctx: &mut Context<HttpGateway>, name: &str) -> Option<ServiceId
     (id != 0).then_some(ServiceId(id))
 }
 
+// The Err variant is the terminal 400 response, built once on the
+// cold rejection path — not worth boxing every call site for.
+#[allow(clippy::result_large_err)]
 fn build_msg(
     method: String,
     method_meta: Option<&vos::metadata::ParsedMessage>,

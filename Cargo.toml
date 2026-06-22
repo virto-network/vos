@@ -16,6 +16,7 @@ members = [
     "extensions/ai",
     "extensions/dev",
     "extensions/http-gateway",
+    "extensions/messenger",
     "examples/extensions/*",
 ]
 exclude = [
@@ -33,6 +34,9 @@ exclude = [
     "actors/space-bridge",
     "actors/clerk-ledger",
     "actors/clerk-bridge",
+    "actors/msg-log",
+    "actors/msg-ctl",
+    "actors/msg-directory",
     # zkpvm-fuzz uses libfuzzer-sys + panic=abort + nightly-only
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.

@@ -239,10 +239,8 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
     // host-side warn() in node.rs::dispatch_invoke fires when
     // an actor returns STATUS_FORBIDDEN — confirms both that
     // the wire status round-tripped and that the offending peer
-    // is named. Pre-M7 the warn came from the dispatch gate
-    // (`handler=grant_role` etc.); post-M7 it comes from the
-    // actor's own M6 macro-emitted role check via
-    // STATUS_FORBIDDEN.
+    // is named. The warn comes from the actor's macro-emitted
+    // role check when it returns STATUS_FORBIDDEN.
     let gate_deadline = Instant::now() + Duration::from_secs(2);
     let mut log_snapshot = String::new();
     let mut saw_refusal = false;

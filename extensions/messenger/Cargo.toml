@@ -1,0 +1,47 @@
+[package]
+name = "messenger-extension"
+description = "Messenger extension — the E2EE edge of VOS messaging. Holds each member's MLS state, encrypts/decrypts at the node boundary, and drives the per-channel msg-log/msg-ctl actors."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# `bin` enables the cdylib's `vos_extension_*` extern-fn exports.
+# `extension` is matched by the actor macros to emit the host ABI
+# glue. Both default-on so a plain `cargo build` produces a
+# loadable extension .so.
+default = ["bin", "extension"]
+bin = []
+extension = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../vos", default-features = false, features = ["extension"] }
+# Wire types shared with the per-channel PVM actors (EnvelopeRow,
+# CommitRow, status codes, id derivations). `default-features =
+# false` strips their `bin` feature so the host-target rlib build
+# doesn't drag in PVM entry-point glue.
+msg-log = { path = "../../actors/msg-log", default-features = false }
+msg-ctl = { path = "../../actors/msg-ctl", default-features = false }
+msg-directory = { path = "../../actors/msg-directory", default-features = false }
+# RFC 9420 MLS — the whole content-confidentiality layer. Native
+# extension only; nothing MLS-shaped crosses into PVM actors.
+openmls = "0.8"
+openmls_rust_crypto = "0.5"
+openmls_basic_credential = "0.5"
+openmls_traits = "0.5"
+
+[dev-dependencies]
+# The e2e test drives two real `vosx space up` daemons (creator +
+# joiner) and dials one as a libp2p client to read the raw
+# ciphertext log. Same harness shape as extensions/dev/tests/e2e.rs.
+vos = { path = "../../vos", default-features = false, features = ["extension", "std", "network", "storage"] }
+libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "macros", "ping", "identify", "request-response", "gossipsub"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
