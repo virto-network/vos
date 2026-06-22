@@ -1059,14 +1059,26 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   absorb (`is_root_absorb[t]`) and pin the decommit `dc_root` on the tree's root
 >   rows (`is_root_t[t]`), so `out == dc_root == root_lat == the channel commitment`
 >   — the decommit verifies against the TRANSCRIPT-FIXED commitment, not a free host
->   root. Assert GREEN log 17; the measured prove (honest + root-tamper) confirms it.
-> - **REMAINING (step 3/4/5; all mechanisms PROVEN standalone):** (3) FRI fold chain
->   + FRI-layer decommit (latch the 14 `fold_alphas` = squeezes[3..17]; couple the
->   e0/e1 fold inputs to the FRI-layer decommit leaves); (4) the DEEP numerator
+>   root. GREEN log 17, peak 17.4 GiB; a root ≠ its commit-absorb rejected.
+> - **Step 3a (`f983438`) — 14-layer FRI fold chain, fold_alphas latched.** The
+>   proven `FriChainEval` mechanism folds in. The deg-2 fold constraints CANNOT be
+>   multiplicatively gated (deg2·selector = deg3), so the chain rides on EVERY row
+>   (row r = query r%n_queries's full chain, UNGATED) — as the standalone cycles 38
+>   queries. The 14 `fold_alphas` are LATCHED columns bound to squeezes[3..17] via
+>   `is_fold_draw[i]` (was AIR constants). GREEN log 17, peak 19.0 GiB (the +631 fold
+>   cols), 2569s/2 proves; a perturbed FRI fold rejected. The layer-0 input + e0/e1
+>   subset evals are HOST-SUPPLIED (trusted) — bound in 3b/4.
+> - **REMAINING (step 3b/4/5):** **(3b)** FRI-layer Merkle decommit + couple the
+>   e0/e1 fold inputs to the FRI-layer decommit leaves (needs mapping stwo's FRI
+>   decommit structure — `FriLayerProof`/`FriVerifier::decommit`, the fold_step=1
+>   coset {pos,pos^1}, 4-wide QM31 leaves; query positions halve per layer; bind each
+>   layer root to its `mix_root` absorb; the challenge is coupling the all-rows cycled
+>   fold chain to the merkle-row decommit leaves). **(4)** the DEEP numerator
 >   (obligation d, leaf↔OODS) over the trace-decommit leaves, bound to the fold
->   chain's layer-0 `first_layer_evals`; (5) the fully-combined log-17 prove +
->   adversarial review. Each is the same "add cols / gate / bind / assert / prove"
->   shape as steps 1-2; the ~17-20 min proves are the cost.
+>   chain's layer-0 `first_layer_evals`. **(5)** the fully-combined log-17 prove + the
+>   adversarial-review Workflow. Each is the same "add cols / bind / assert / prove"
+>   shape as steps 1-2; the ~40-min proves are the cost. TIP: map the stwo FRI
+>   decommit BEFORE building 3b (as the 6 mechanisms were mapped at step-5 start).
 
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
 scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
