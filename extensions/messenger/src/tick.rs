@@ -79,11 +79,29 @@ pub(crate) async fn drain_ctl(
                     return Ok(());
                 }
                 m.channels[i].next_epoch = row.epoch + 1;
-            } else if !row.welcome.is_empty() && m.holds_key_package(&row.welcome_hint) {
-                join_from_welcome(m, i, &row.welcome, &row.welcome_hint)?;
-                // The join repositioned `next_epoch`; restart paging
-                // from the group's own epoch on the next loop turn.
-                break;
+            } else if !row.welcome.is_empty() {
+                // We don't yet hold this channel's group. Try to join
+                // from this Welcome: MLS staging succeeds only if it was
+                // sealed to a KeyPackage we published, so trial-decryption
+                // is how we recognise our own Welcome — there is no public
+                // routing tag to match (the row's token is random).
+                match join_from_welcome(m, i, &row.welcome) {
+                    Ok(()) => {
+                        // Joined; the join repositioned `next_epoch`.
+                        // Restart paging from the group's own epoch on
+                        // the next loop turn.
+                        break;
+                    }
+                    Err(e) => {
+                        // Not sealed to us (or malformed) — someone
+                        // else's join. Skip it and keep scanning.
+                        log::debug!(
+                            "messenger: welcome at chain epoch {} not for us: {e}",
+                            row.epoch
+                        );
+                        m.channels[i].next_epoch = row.epoch + 1;
+                    }
+                }
             } else {
                 // Someone else's membership change from before our
                 // join — history we'll never hold keys for.
@@ -141,13 +159,11 @@ fn process_chain_record(
     Ok(())
 }
 
-/// Join the channel's group from a Welcome addressed to us.
-fn join_from_welcome(
-    m: &mut Messenger,
-    i: usize,
-    welcome_bytes: &[u8],
-    hint: &[u8; 32],
-) -> Result<(), String> {
+/// Join the channel's group from a Welcome addressed to us. Returns
+/// `Err` when the Welcome isn't sealed to a KeyPackage we hold (the
+/// caller trial-decrypts every Welcome to find ours), is malformed,
+/// or carries a foreign group id.
+fn join_from_welcome(m: &mut Messenger, i: usize, welcome_bytes: &[u8]) -> Result<(), String> {
     let provider = open_provider(&m.mls_store);
     let mls_msg = MlsMessageIn::tls_deserialize(&mut &welcome_bytes[..])
         .map_err(|e| format!("welcome deserialize failed: {e}"))?;
@@ -171,7 +187,8 @@ fn join_from_welcome(
     let join_epoch = group.epoch().as_u64();
 
     m.mls_store = snapshot_provider(&provider);
-    m.published_kps.retain(|k| k.hash != *hint);
+    // This join consumed exactly one of our published KeyPackages.
+    m.published_kp_count = m.published_kp_count.saturating_sub(1);
     let entry: &mut ChannelEntry = &mut m.channels[i];
     entry.joined = true;
     entry.removed = false;

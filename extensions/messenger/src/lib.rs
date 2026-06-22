@@ -34,7 +34,7 @@ use clients::{
     ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp, dir_release_kp,
     hex_decode, hex_encode, log_post, reg_agents, reg_install, resolve,
 };
-use mls::{kp_hint, new_key_package, open_provider, parse_key_package, snapshot_provider};
+use mls::{new_key_package, open_provider, parse_key_package, snapshot_provider, welcome_nonce};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
@@ -70,16 +70,6 @@ pub struct PlainMessage {
     pub ts_ms: u64,
     pub sender: String,
     pub text: String,
-}
-
-/// A KeyPackage we've published and not yet seen consumed — the
-/// hash doubles as the Welcome routing hint.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct KpRecord {
-    pub hash: [u8; 32],
 }
 
 /// Local view of one channel.
@@ -133,7 +123,12 @@ pub struct Messenger {
     /// (signer, KeyPackage private parts, group ratchets) lives
     /// in here. See `mls::open_provider`/`snapshot_provider`.
     mls_store: Vec<u8>,
-    published_kps: Vec<KpRecord>,
+    /// Count of KeyPackages we've published and not yet seen consumed.
+    /// Just a tally: a join consumes exactly one published KP, and the
+    /// joiner can't influence *which* one an inviter claims, so the
+    /// records are fungible — there's nothing to identify, only to
+    /// count (a Welcome is matched by trial-decryption, not by a tag).
+    published_kp_count: u32,
     channels: Vec<ChannelEntry>,
 }
 
@@ -144,7 +139,7 @@ impl Messenger {
             nickname: String::new(),
             signature_key: Vec::new(),
             mls_store: Vec::new(),
-            published_kps: Vec::new(),
+            published_kp_count: 0,
             channels: Vec::new(),
         }
     }
@@ -199,9 +194,7 @@ impl Messenger {
             Ok(b) => b,
             Err(e) => return e,
         };
-        self.published_kps.push(KpRecord {
-            hash: kp_hint(&kp_bytes),
-        });
+        self.published_kp_count += 1;
         self.mls_store = snapshot_provider(&provider);
         hex_encode(&kp_bytes)
     }
@@ -302,7 +295,7 @@ impl Messenger {
         if self.channel_index(&channel).is_some() {
             return format!("channel '{channel}' already known");
         }
-        if self.published_kps.is_empty() {
+        if self.published_kp_count == 0 {
             return "no published KeyPackage — run `messenger key_package` and hand it to the inviter".into();
         }
         self.channels.push(ChannelEntry {
@@ -539,7 +532,7 @@ impl Messenger {
         }
         out.push_str(&format!(
             "key packages published: {}\n",
-            self.published_kps.len()
+            self.published_kp_count
         ));
         let provider = open_provider(&self.mls_store);
         for c in &self.channels {
@@ -580,6 +573,16 @@ impl Messenger {
     #[msg]
     async fn tick(&mut self, ctx: &mut Context<Self>) {
         tick::tick_channels(self, ctx).await;
+    }
+
+    /// On-demand drain: one full tick pass, now. Lets an operator
+    /// (or a test) pull in pending welcomes/commits/messages
+    /// without waiting out — or even configuring — the periodic
+    /// `tick_ms`.
+    #[msg(cli)]
+    async fn sync(&mut self, ctx: &mut Context<Self>) -> String {
+        tick::tick_channels(self, ctx).await;
+        "synced".into()
     }
 }
 
@@ -691,15 +694,10 @@ impl Messenger {
         Ok(())
     }
 
-    pub(crate) fn holds_key_package(&self, hint: &[u8; 32]) -> bool {
-        self.published_kps.iter().any(|k| k.hash == *hint)
-    }
-
     /// Mint `n` KeyPackages and publish them to the space
-    /// directory, recording their hashes locally so the tick
-    /// recognises Welcomes that consume them. Mints nothing when
-    /// the directory is unreachable — out-of-band `key_package`
-    /// remains the fallback.
+    /// directory, tallying them locally. Mints nothing when the
+    /// directory is unreachable — out-of-band `key_package` remains
+    /// the fallback.
     async fn stock_directory(
         &mut self,
         ctx: &mut Context<Self>,
@@ -711,10 +709,9 @@ impl Messenger {
             let provider = open_provider(&self.mls_store);
             let (credential, signer) = self.identity(&provider)?;
             let kp_bytes = new_key_package(&provider, credential, &signer)?;
-            let hash = kp_hint(&kp_bytes);
             self.mls_store = snapshot_provider(&provider);
             dir_publish_kp(ctx, dir_id, &self.nickname.clone(), kp_bytes).await?;
-            self.published_kps.push(KpRecord { hash });
+            self.published_kp_count += 1;
             published += 1;
         }
         Ok(published)
@@ -750,13 +747,15 @@ impl Messenger {
             }
             let epoch = group.epoch().as_u64();
 
-            let (commit_out, welcome_out, hint) = match &op {
+            let (commit_out, welcome_out, welcome_token) = match &op {
                 ChainOp::Add { kp_bytes } => {
                     let kp = parse_key_package(&provider, kp_bytes)?;
                     let (c, w, _info) = group
                         .add_members(&provider, &signer, core::slice::from_ref(&kp))
                         .map_err(|e| format!("add_members failed: {e}"))?;
-                    (c, Some(w), kp_hint(kp_bytes).to_vec())
+                    // Random routing token, NOT a hash of the joiner's
+                    // public KeyPackage — see `mls::welcome_nonce`.
+                    (c, Some(w), welcome_nonce(&provider)?.to_vec())
                 }
                 ChainOp::Remove { nickname } => {
                     // Nicknames are unverified and non-unique, so a
@@ -836,11 +835,20 @@ impl Messenger {
             // The one indeterminate failure: the submission itself
             // failed in transit (local follower drop, forward
             // timeout…) — the leader may still have accepted it.
-            let outcome =
-                match ctl_commit(ctx, ctl_id, epoch, now_ms(), commit_body, welcome, hint).await {
-                    Ok(o) => o,
-                    Err(e) => return Err(ChainErr::Indeterminate(e)),
-                };
+            let outcome = match ctl_commit(
+                ctx,
+                ctl_id,
+                epoch,
+                now_ms(),
+                commit_body,
+                welcome,
+                welcome_token,
+            )
+            .await
+            {
+                Ok(o) => o,
+                Err(e) => return Err(ChainErr::Indeterminate(e)),
+            };
             match outcome.status {
                 msg_ctl::STATUS_OK => {
                     group

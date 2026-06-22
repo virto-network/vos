@@ -91,9 +91,13 @@ pub struct CommitRow {
     /// Opaque MLS Welcome for members this commit added; empty
     /// when the commit added nobody.
     pub welcome: Vec<u8>,
-    /// blake2b-256 of the joiner's KeyPackage so the joiner can
-    /// spot its Welcome without trial-decrypting every record;
-    /// zeroed when `welcome` is empty.
+    /// Opaque routing token accompanying a Welcome. The inviter
+    /// supplies fresh random bytes — deliberately NOT derived from
+    /// the joiner's public KeyPackage, since a public-derivable
+    /// token would let anyone holding the directory and this chain
+    /// map joins back to nicknames. Joiners recognise their Welcome
+    /// by trial-decryption; this actor only enforces presence.
+    /// Zeroed when `welcome` is empty.
     pub welcome_hint: [u8; 32],
 }
 

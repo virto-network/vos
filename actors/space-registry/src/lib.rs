@@ -149,6 +149,25 @@ pub struct AgentRow {
     pub install_payloads: Vec<u8>,
 }
 
+/// Monotone-locality floor: the narrowest consistency tier (by
+/// shareability) an `instance_name` was ever installed at. Retained
+/// across `uninstall` — unlike the `AgentRow`, which is removed — so
+/// that reusing a name to *widen* it (e.g. re-installing a
+/// formerly-`Local` channel as `Crdt`) is refused. The load-bearing
+/// enforcement lives host-side in `vos::node` (the registry is
+/// replicated and not trusted); this catalog-level row keeps honest
+/// replicas from ever *recording* a widening.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ConsistencyFloorRow {
+    pub instance_name: String,
+    /// `vos::node::Consistency` discriminant, same encoding as
+    /// `AgentRow.consistency`.
+    pub consistency: u8,
+}
+
 // ── Members ──────────────────────────────────────────────────────
 
 /// Member kind discriminant.
@@ -313,7 +332,6 @@ pub struct HostMapping {
     pub host_prefix: u16,
 }
 
-
 // ── Result codes ─────────────────────────────────────────────────
 //
 // Mutation messages return a single u8 status. 0 always = ok.
@@ -334,6 +352,14 @@ pub const STATUS_FORBIDDEN: u8 = 7;
 /// `STATUS_NOT_FOUND` so callers can distinguish "instance
 /// not found" from "host node not enrolled".
 pub const STATUS_BAD_PREFIX: u8 = 8;
+/// Monotone-locality guard: `install` refused to (re)create an
+/// instance at a *wider* consistency tier than the narrowest one
+/// the same `instance_name` was ever installed at. Confined tiers
+/// (`Ephemeral`/`Local`) may never be widened into replication by
+/// reusing a name — widening requires a fresh name. This is the
+/// defense-in-depth half of the immutable-local seal; the
+/// load-bearing enforcement is host-side in `vos::node`.
+pub const STATUS_CONSISTENCY_WIDEN_DENIED: u8 = 9;
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -354,13 +380,12 @@ use vos::prelude::*;
 ///                                         grants)
 ///   space Member    → registry Reader    (read-only handlers)
 ///   space Guest     → None               (deny mutations)
-pub const SPACE_REGISTRY_SPACE_ROLE_MAP: vos::SpaceRoleMap<SpaceRegistryRole> =
-    vos::SpaceRoleMap {
-        admin: Some(SpaceRegistryRole::Admin),
-        developer: Some(SpaceRegistryRole::Developer),
-        member: Some(SpaceRegistryRole::Reader),
-        guest: None,
-    };
+pub const SPACE_REGISTRY_SPACE_ROLE_MAP: vos::SpaceRoleMap<SpaceRegistryRole> = vos::SpaceRoleMap {
+    admin: Some(SpaceRegistryRole::Admin),
+    developer: Some(SpaceRegistryRole::Developer),
+    member: Some(SpaceRegistryRole::Reader),
+    guest: None,
+};
 
 #[actor(
     role = SpaceRegistryRole,
@@ -412,6 +437,14 @@ pub struct SpaceRegistry {
     /// this empty so its `resolve` keeps the in-space behaviour
     /// (caller_prefix == host).
     host_mappings: Vec<HostMapping>,
+    /// Monotone-locality floors, sorted by `instance_name`. The
+    /// narrowest consistency tier each name was ever installed at;
+    /// retained across `uninstall` so `install` can refuse to widen
+    /// a reused name (see [`ConsistencyFloorRow`]). Pre-existing
+    /// state archives don't have this field; the actor's
+    /// fall-back-to-fresh behaviour on archive decode failure lets
+    /// upgrades resync from the DAG.
+    consistency_floors: Vec<ConsistencyFloorRow>,
 }
 
 #[messages]
@@ -427,6 +460,7 @@ impl SpaceRegistry {
             auth_grants: Vec::new(),
             actor_acls: Vec::new(),
             host_mappings: Vec::new(),
+            consistency_floors: Vec::new(),
         }
     }
 
@@ -533,10 +567,7 @@ impl SpaceRegistry {
             }
             idx += 1;
         }
-        self.metas.push(MetaRow {
-            program_hash,
-            blob,
-        });
+        self.metas.push(MetaRow { program_hash, blob });
         STATUS_OK
     }
 
@@ -687,6 +718,25 @@ impl SpaceRegistry {
             }
             idx += 1;
         }
+
+        // Monotone-locality guard (defense-in-depth): if this name was
+        // ever installed before, its shareability may only narrow. A
+        // reused name can't be *widened* into replication — that needs a
+        // fresh name (and a fresh `replication_id`), so private-era state
+        // is never folded into a now-shared DAG. The floor outlives the
+        // row, so this fires on the uninstall→reinstall-wider path; a live
+        // row already returned `STATUS_INSTANCE_EXISTS` above.
+        if let Some(floor) = consistency_floor(&self.consistency_floors, &instance_name) {
+            if !may_transition_to(floor, consistency) {
+                return STATUS_CONSISTENCY_WIDEN_DENIED;
+            }
+        }
+        record_consistency_floor(
+            &mut self.consistency_floors,
+            instance_name.clone(),
+            consistency,
+        );
+
         self.agents.insert(
             idx,
             AgentRow {
@@ -829,11 +879,7 @@ impl SpaceRegistry {
             return instance_service_id(&name, caller_prefix as u16);
         }
         // 2. Hyperspace host mapping (agent hosted on a peer node).
-        if let Some(h) = self
-            .host_mappings
-            .iter()
-            .find(|h| h.instance_name == name)
-        {
+        if let Some(h) = self.host_mappings.iter().find(|h| h.instance_name == name) {
             return instance_service_id(&name, h.host_prefix);
         }
         0
@@ -1206,6 +1252,74 @@ fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Position of an `AgentRow.consistency` byte on the monotone
+/// *shareability* lattice — mirrors `vos::node::Consistency::shareability`.
+/// Confined tiers keep state node-local (`Ephemeral`=0 → 0, `Local`=1 → 1);
+/// `Crdt`(2) and `Raft`(3) both replicate off-node and are rank-equal (2).
+/// Any unrecognised byte is treated as fully shared (2) so an unknown wider
+/// tier can never slip *under* the guard as if it were confined.
+fn shareability(consistency: u8) -> u8 {
+    match consistency {
+        0 => 0,
+        1 => 1,
+        _ => 2,
+    }
+}
+
+/// Defense-in-depth monotone-locality predicate: an instance may only ever
+/// move to an equal-or-narrower shareability tier. Raising shareability
+/// (widening into broader replication) is refused. Rank-equal moves — a
+/// `Crdt`↔`Raft` lateral, or any narrowing — are allowed.
+fn may_transition_to(floor: u8, requested: u8) -> bool {
+    shareability(requested) <= shareability(floor)
+}
+
+/// Current monotone-locality floor for `instance_name`, if one was ever
+/// recorded. `None` means the name has never been installed (any tier is
+/// allowed).
+fn consistency_floor(floors: &[ConsistencyFloorRow], instance_name: &str) -> Option<u8> {
+    let mut i = 0usize;
+    while i < floors.len() {
+        if floors[i].instance_name == instance_name {
+            return Some(floors[i].consistency);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Record — or *narrow* — the floor for an instance name, keeping the
+/// table sorted by `instance_name`. The floor only ever moves to a lower
+/// shareability; a genuine widening never reaches here (it's rejected in
+/// `install`). Re-installing at the same shareability (including a
+/// `Crdt`↔`Raft` lateral) leaves the recorded tier unchanged.
+fn record_consistency_floor(
+    floors: &mut Vec<ConsistencyFloorRow>,
+    instance_name: String,
+    consistency: u8,
+) {
+    let mut idx = 0usize;
+    while idx < floors.len() {
+        if floors[idx].instance_name == instance_name {
+            if shareability(consistency) < shareability(floors[idx].consistency) {
+                floors[idx].consistency = consistency;
+            }
+            return;
+        }
+        if floors[idx].instance_name.as_str() > instance_name.as_str() {
+            break;
+        }
+        idx += 1;
+    }
+    floors.insert(
+        idx,
+        ConsistencyFloorRow {
+            instance_name,
+            consistency,
+        },
+    );
+}
+
 fn compare_program(a_name: &str, a_version: &str, b_name: &str, b_version: &str) -> i8 {
     if a_name < b_name {
         return -1;
@@ -1227,12 +1341,7 @@ fn compare_program(a_name: &str, a_version: &str, b_name: &str, b_version: &str)
 /// (lexicographic); secondary key is `agent_name`. Returns
 /// `Ordering` directly so it can be plugged into
 /// `binary_search_by`.
-fn actor_acl_key(
-    a_peer: &[u8],
-    a_name: &str,
-    b_peer: &[u8],
-    b_name: &str,
-) -> core::cmp::Ordering {
+fn actor_acl_key(a_peer: &[u8], a_name: &str, b_peer: &[u8], b_name: &str) -> core::cmp::Ordering {
     match compare_bytes(a_peer, b_peer).cmp(&0) {
         core::cmp::Ordering::Equal => a_name.cmp(b_name),
         other => other,
@@ -1598,8 +1707,12 @@ mod tests {
         let rows = dispatch(&mut r, ActorAcls);
         for w in rows.windows(2) {
             assert!(
-                actor_acl_key(&w[0].peer_id, &w[0].agent_name, &w[1].peer_id, &w[1].agent_name)
-                    == core::cmp::Ordering::Less,
+                actor_acl_key(
+                    &w[0].peer_id,
+                    &w[0].agent_name,
+                    &w[1].peer_id,
+                    &w[1].agent_name
+                ) == core::cmp::Ordering::Less,
                 "actor_acls rows must be in sorted order",
             );
         }
@@ -1645,6 +1758,132 @@ mod tests {
                 },
             ),
             3,
+        );
+    }
+
+    // ── Monotone-locality widen guard ───────────────────────────
+
+    /// Publish a throwaway program (idempotent for the same hash)
+    /// and install `name` at `consistency`, returning the status.
+    fn install_at(r: &mut SpaceRegistry, name: &str, consistency: u8) -> u8 {
+        let hash = alloc::vec![7u8; 32];
+        let pub_status = dispatch(
+            r,
+            Publish {
+                name: String::from("p"),
+                version: String::from("1"),
+                hash: hash.clone(),
+            },
+        );
+        assert!(pub_status == STATUS_OK, "program publish must succeed");
+        dispatch(
+            r,
+            Install {
+                instance_name: String::from(name),
+                program_name: String::from("p"),
+                program_version: String::from("1"),
+                program_hash: hash,
+                replication_id: alloc::vec![9u8; 32],
+                consistency,
+                install_args: Vec::new(),
+                install_payloads: Vec::new(),
+            },
+        )
+    }
+
+    fn uninstall(r: &mut SpaceRegistry, name: &str) -> u8 {
+        dispatch(
+            r,
+            Uninstall {
+                instance_name: String::from(name),
+            },
+        )
+    }
+
+    #[test]
+    fn shareability_orders_confined_below_replicated() {
+        assert!(shareability(0) < shareability(1)); // Ephemeral < Local
+        assert!(shareability(1) < shareability(2)); // Local < Crdt
+        assert_eq!(shareability(2), shareability(3)); // Crdt == Raft (rank-equal)
+        // Unknown bytes are treated as fully shared, never confined.
+        assert_eq!(shareability(4), 2);
+        assert_eq!(shareability(255), 2);
+    }
+
+    #[test]
+    fn may_transition_to_allows_narrow_and_lateral_only() {
+        assert!(may_transition_to(1, 1)); // Local -> Local
+        assert!(may_transition_to(1, 0)); // Local -> Ephemeral (narrow)
+        assert!(!may_transition_to(1, 2)); // Local -> Crdt (widen) denied
+        assert!(!may_transition_to(1, 3)); // Local -> Raft (widen) denied
+        assert!(may_transition_to(2, 3)); // Crdt -> Raft (rank-equal lateral)
+        assert!(may_transition_to(3, 2)); // Raft -> Crdt (rank-equal lateral)
+        assert!(may_transition_to(2, 1)); // Crdt -> Local (narrow)
+        assert!(!may_transition_to(0, 1)); // Ephemeral -> Local (widen) denied
+    }
+
+    #[test]
+    fn reinstall_widening_after_uninstall_is_denied() {
+        let mut r = registry();
+        assert_eq!(install_at(&mut r, "msg-foo", 1 /* Local */), STATUS_OK);
+        assert_eq!(uninstall(&mut r, "msg-foo"), STATUS_OK);
+        // The floor survives uninstall: reusing the name at a wider tier
+        // is refused — widening needs a fresh name.
+        assert_eq!(
+            install_at(&mut r, "msg-foo", 2 /* Crdt */),
+            STATUS_CONSISTENCY_WIDEN_DENIED
+        );
+        assert_eq!(
+            install_at(&mut r, "msg-foo", 3 /* Raft */),
+            STATUS_CONSISTENCY_WIDEN_DENIED
+        );
+        // Re-installing at the same or a narrower tier is fine.
+        assert_eq!(install_at(&mut r, "msg-foo", 1 /* Local */), STATUS_OK);
+        assert_eq!(uninstall(&mut r, "msg-foo"), STATUS_OK);
+        assert_eq!(install_at(&mut r, "msg-foo", 0 /* Ephemeral */), STATUS_OK);
+    }
+
+    #[test]
+    fn lateral_crdt_raft_reinstall_is_allowed() {
+        let mut r = registry();
+        assert_eq!(install_at(&mut r, "shared", 2 /* Crdt */), STATUS_OK);
+        assert_eq!(uninstall(&mut r, "shared"), STATUS_OK);
+        // Crdt <-> Raft is a rank-equal lateral move, allowed in v0.
+        assert_eq!(install_at(&mut r, "shared", 3 /* Raft */), STATUS_OK);
+    }
+
+    #[test]
+    fn fresh_instance_name_installs_at_any_tier() {
+        let mut r = registry();
+        assert_eq!(install_at(&mut r, "a", 0 /* Ephemeral */), STATUS_OK);
+        assert_eq!(install_at(&mut r, "b", 3 /* Raft */), STATUS_OK);
+        assert_eq!(install_at(&mut r, "c", 2 /* Crdt */), STATUS_OK);
+    }
+
+    #[test]
+    fn floor_tracks_narrowest_ever_so_widening_back_is_denied() {
+        // Crdt, then narrow to Local on reinstall — the floor pins at
+        // Local, so a later attempt to widen back to Crdt is refused.
+        let mut r = registry();
+        assert_eq!(install_at(&mut r, "drift", 2 /* Crdt */), STATUS_OK);
+        assert_eq!(uninstall(&mut r, "drift"), STATUS_OK);
+        assert_eq!(install_at(&mut r, "drift", 1 /* Local */), STATUS_OK);
+        assert_eq!(uninstall(&mut r, "drift"), STATUS_OK);
+        assert_eq!(
+            install_at(&mut r, "drift", 2 /* Crdt */),
+            STATUS_CONSISTENCY_WIDEN_DENIED
+        );
+    }
+
+    #[test]
+    fn live_instance_reinstall_reports_exists_not_widen() {
+        let mut r = registry();
+        assert_eq!(install_at(&mut r, "live", 1 /* Local */), STATUS_OK);
+        // A live row takes precedence: even a widen attempt is the
+        // pre-existing "already installed" error, not the widen guard.
+        assert_eq!(
+            install_at(&mut r, "live", 2 /* Crdt */),
+            STATUS_INSTANCE_EXISTS
         );
     }
 }

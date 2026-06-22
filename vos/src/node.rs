@@ -84,6 +84,56 @@ pub enum Consistency {
     Raft,
 }
 
+impl Consistency {
+    /// Byte encoding, matching the registry `AgentRow.consistency`
+    /// wire order (`Ephemeral`=0, `Local`=1, `Crdt`=2, `Raft`=3).
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`Self::as_u8`]; `None` for an unknown byte.
+    pub(crate) fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Ephemeral),
+            1 => Some(Self::Local),
+            2 => Some(Self::Crdt),
+            3 => Some(Self::Raft),
+            _ => None,
+        }
+    }
+
+    /// Position on the monotone *shareability* lattice — higher means
+    /// more widely shared. Confined tiers (`Ephemeral`, `Local`) keep
+    /// state on this node; `Crdt`/`Raft` both replicate it off-node and
+    /// are rank-equal (distinguished only by algorithm). An installed
+    /// agent's shareability may only ever *decrease*: a `Local` keystore
+    /// can never be widened into replication. See [`VosNode::seal_consistency`].
+    pub(crate) fn shareability(self) -> u8 {
+        match self {
+            Self::Ephemeral => 0,
+            Self::Local => 1,
+            Self::Crdt | Self::Raft => 2,
+        }
+    }
+}
+
+/// The effective consistency once the monotone locality seal is applied:
+/// a persisted `sealed` floor forbids *widening* (raising shareability),
+/// so a forged or merged registry row claiming a wider tier than the one
+/// this instance was first spawned at is pinned back down. Equal-or-lower
+/// shareability (including a `Crdt`↔`Raft` lateral, or a deliberate
+/// narrowing) is honoured.
+#[cfg(feature = "storage")]
+pub(crate) fn effective_after_seal(
+    sealed: Option<Consistency>,
+    requested: Consistency,
+) -> Consistency {
+    match sealed {
+        Some(s) if requested.shareability() > s.shareability() => s,
+        _ => requested,
+    }
+}
+
 /// Configuration for registering an agent in the node.
 pub struct AgentConfig {
     /// PVM blob (already transpiled).
@@ -247,6 +297,51 @@ impl AgentConfig {
         let dir = data_dir.join("agents");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir.join(format!("{:08x}.redb", id.0)))
+    }
+
+    /// Node-local sidecar recording the narrowest consistency tier this
+    /// instance was ever spawned at — the monotone locality seal. Sits
+    /// next to the agent's redb so it shares the agent's lifetime.
+    #[cfg(feature = "storage")]
+    fn seal_path(&self, id: ServiceId) -> Option<std::path::PathBuf> {
+        let dir = self.data_dir.as_ref()?.join("agents");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(format!("{:08x}.seal", id.0)))
+    }
+
+    /// Enforce the monotone locality seal on this config's requested
+    /// consistency. Best-effort and node-local: with no `data_dir` or no
+    /// `name` there is nothing durable to seal, so the request passes
+    /// through. Otherwise the (possibly narrowed) tier is persisted, so a
+    /// later spawn — even one driven by a forged or CRDT-merged registry
+    /// row — can never *widen* a sealed agent's shareability. This is the
+    /// load-bearing half of immutable-local: the registry is replicated
+    /// and not trusted, so the seal lives here on the host, ahead of the
+    /// sync-attach branches that key on `config.consistency`.
+    #[cfg(feature = "storage")]
+    fn apply_consistency_seal(&mut self, id: ServiceId) {
+        if self.name.is_none() {
+            return;
+        }
+        let Some(path) = self.seal_path(id) else {
+            return;
+        };
+        let sealed = std::fs::read(&path)
+            .ok()
+            .and_then(|b| b.first().copied())
+            .and_then(Consistency::from_u8);
+        let effective = effective_after_seal(sealed, self.consistency);
+        if effective != self.consistency {
+            warn!(
+                %id,
+                requested = ?self.consistency,
+                sealed = ?sealed,
+                effective = ?effective,
+                "consistency: refusing to widen a sealed agent; pinning to the sealed tier",
+            );
+        }
+        let _ = std::fs::write(&path, [effective.as_u8()]);
+        self.consistency = effective;
     }
 }
 
@@ -774,6 +869,10 @@ fn proof_blob_filename(hash: &[u8; 32]) -> String {
 pub(crate) struct ReplicaSlot {
     pub db: Arc<redb::Database>,
     pub commit_lock: Arc<Mutex<()>>,
+    /// Installed instance name of the replica, used by the sync-serve
+    /// path to membership-gate private (`msg-*`) groups. Empty for
+    /// anonymous/test replicas — those serve openly (ungated).
+    pub name: String,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
@@ -1022,6 +1121,29 @@ impl NodeService {
         payload.extend_from_slice(&msg.encode());
         self.probe_registry_for_u8(payload)
             .unwrap_or(AUTH_ROLE_NONE)
+    }
+
+    /// Membership gate for serving a replica's sync data (heads /
+    /// nodes). A replica whose instance name begins with [`MSG_PREFIX`]
+    /// is *private*: it ships E2EE ciphertext, so we serve it only to a
+    /// peer holding at least a read grant on the channel agent (its
+    /// actor-local `actor_acls` row) or on the space (`auth_grants`).
+    /// Every other replica (the space-registry a joiner needs *before*
+    /// it has any grant, app CRDTs) serves openly — gating those would
+    /// wedge bootstrap. `caller == None` (no libp2p identity) denies a
+    /// private group.
+    #[cfg(feature = "storage")]
+    fn sync_serve_allowed(&self, caller_peer_id: Option<&libp2p::PeerId>, name: &str) -> bool {
+        if !name.starts_with(MSG_PREFIX) {
+            return true;
+        }
+        let Some(peer) = caller_peer_id else {
+            return false;
+        };
+        if self.lookup_caller_role(Some(peer)) >= AUTH_ROLE_READONLY {
+            return true;
+        }
+        self.lookup_caller_actor_role(Some(peer), name) >= AUTH_ROLE_READONLY
     }
 
     /// Shared probe helper for both auth lookups — sends an
@@ -1350,14 +1472,29 @@ impl crate::network::NetworkService for NodeService {
     }
 
     #[cfg(feature = "storage")]
-    fn sync_roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+    fn sync_roots(
+        &self,
+        caller_peer_id: Option<libp2p::PeerId>,
+        replication_id: &[u8; 32],
+    ) -> Option<Vec<[u8; 32]>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        if !self.sync_serve_allowed(caller_peer_id.as_ref(), &slot.name) {
+            return None;
+        }
         crate::commit::read_roots(&slot.db).ok()
     }
 
     #[cfg(feature = "storage")]
-    fn sync_get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
+    fn sync_get_node(
+        &self,
+        caller_peer_id: Option<libp2p::PeerId>,
+        replication_id: &[u8; 32],
+        cid: &[u8; 32],
+    ) -> Option<Vec<u8>> {
         let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        if !self.sync_serve_allowed(caller_peer_id.as_ref(), &slot.name) {
+            return None;
+        }
         crate::commit::read_dag_node(&slot.db, cid).ok().flatten()
     }
 
@@ -1963,6 +2100,13 @@ impl VosNode {
         self.routes.insert(id.0, tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
         self.record_agent_name(id, config.name.clone());
+        // Monotone locality seal (immutable-local): a named agent's
+        // shareability may only ever narrow, never widen — enforced
+        // host-side, ahead of the sync-attach branches below, because the
+        // registry row that carries `consistency` is replicated and not
+        // trusted.
+        #[cfg(feature = "storage")]
+        config.apply_consistency_seal(id);
         // Actor-mode agent: kind 0, no serve endpoint. Backs `__describe`.
         self.agent_info.write().unwrap().insert(
             id.0,
@@ -1993,6 +2137,7 @@ impl VosNode {
                         let slot = ReplicaSlot {
                             db: Arc::new(db),
                             commit_lock: Arc::new(Mutex::new(())),
+                            name: config.name.clone().unwrap_or_default(),
                         };
                         self.crdt_replicas
                             .lock()
@@ -2476,9 +2621,24 @@ impl VosNode {
         rep_id: [u8; 32],
         db_path: &std::path::Path,
     ) -> ReplicaSlot {
+        self.install_test_replica_named(rep_id, db_path, "")
+    }
+
+    /// Like [`Self::install_test_replica`] but tags the replica with an
+    /// instance `name` so the sync-serve membership gate can be
+    /// exercised (a `msg-*` name is private; anything else serves
+    /// openly).
+    #[cfg(all(test, feature = "network", feature = "storage"))]
+    pub(crate) fn install_test_replica_named(
+        &mut self,
+        rep_id: [u8; 32],
+        db_path: &std::path::Path,
+        name: &str,
+    ) -> ReplicaSlot {
         let slot = ReplicaSlot {
             db: Arc::new(redb::Database::create(db_path).expect("create db")),
             commit_lock: Arc::new(Mutex::new(())),
+            name: name.to_string(),
         };
         self.crdt_replicas
             .lock()
@@ -3307,6 +3467,21 @@ pub(crate) const AUTH_ROLE_NONE: u8 = 0;
 /// — only an admin may stop an agent host-side.
 #[cfg(feature = "network")]
 pub(crate) const AUTH_ROLE_ADMIN: u8 = 3;
+
+/// Wire-byte for the lowest grant tier (read / Member). Mirrors
+/// `space_registry::AUTH_ROLE_READONLY`; the floor that authorizes a
+/// peer to be served a private replica's sync data.
+#[cfg(all(feature = "network", feature = "storage"))]
+pub(crate) const AUTH_ROLE_READONLY: u8 = 1;
+
+/// Instance-name prefix marking a replica as *private* (a messaging
+/// channel agent — `msg-<chan>-log`, `msg-<chan>-ctl`, `msg-directory`).
+/// The sync-serve path membership-gates these; every other replica
+/// (space-registry, app CRDTs) serves openly. Matches the `msg-*`
+/// intra-cap convention so dynamically-installed channels are gated
+/// without any registry-schema flag.
+#[cfg(all(feature = "network", feature = "storage"))]
+pub(crate) const MSG_PREFIX: &str = "msg-";
 
 /// Build a failure envelope the libp2p layer relays back to
 /// the caller when the dispatch-layer auth gate refuses a call.
@@ -5826,6 +6001,53 @@ mod tests {
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn consistency_byte_roundtrips() {
+        for c in [
+            Consistency::Ephemeral,
+            Consistency::Local,
+            Consistency::Crdt,
+            Consistency::Raft,
+        ] {
+            assert_eq!(Consistency::from_u8(c.as_u8()), Some(c));
+        }
+        assert_eq!(Consistency::from_u8(4), None);
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn shareability_orders_confined_below_replicated() {
+        assert!(Consistency::Ephemeral.shareability() < Consistency::Local.shareability());
+        assert!(Consistency::Local.shareability() < Consistency::Crdt.shareability());
+        // Crdt and Raft are both fully shared — rank-equal.
+        assert_eq!(
+            Consistency::Crdt.shareability(),
+            Consistency::Raft.shareability()
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn seal_forbids_widening_only() {
+        use Consistency::*;
+        // No prior seal: the request passes through unchanged.
+        assert_eq!(effective_after_seal(None, Crdt), Crdt);
+        assert_eq!(effective_after_seal(None, Local), Local);
+        // Sealed Local: a forged/merged row claiming Crdt or Raft is
+        // pinned back to Local — the immutable-local guarantee.
+        assert_eq!(effective_after_seal(Some(Local), Crdt), Local);
+        assert_eq!(effective_after_seal(Some(Local), Raft), Local);
+        // Sealed Local stays Local; narrowing to Ephemeral is allowed.
+        assert_eq!(effective_after_seal(Some(Local), Local), Local);
+        assert_eq!(effective_after_seal(Some(Local), Ephemeral), Ephemeral);
+        // Deliberate narrowing of a shared agent is honoured.
+        assert_eq!(effective_after_seal(Some(Crdt), Local), Local);
+        // Crdt <-> Raft is a rank-equal lateral move, allowed in v0.
+        assert_eq!(effective_after_seal(Some(Crdt), Raft), Raft);
+        assert_eq!(effective_after_seal(Some(Raft), Crdt), Crdt);
     }
 
     #[test]

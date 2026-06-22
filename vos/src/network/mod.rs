@@ -251,13 +251,28 @@ pub trait NetworkService: Send + Sync {
     /// Inbound `Frame::FetchHeads` for a replication group.
     /// Default returns `None` (no replica of that group locally),
     /// which surfaces to the peer as an empty roots list.
-    fn sync_roots(&self, _replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+    ///
+    /// `caller_peer_id` is the noise-verified PeerId of the
+    /// requesting peer, threaded so the concrete impl can
+    /// membership-gate private (messaging) replicas before serving
+    /// their ciphertext DAG. `None` denies a gated group.
+    fn sync_roots(
+        &self,
+        _caller_peer_id: Option<libp2p::PeerId>,
+        _replication_id: &[u8; 32],
+    ) -> Option<Vec<[u8; 32]>> {
         None
     }
 
     /// Inbound `Frame::FetchNode` for one DAG node within a
-    /// replication group. Default returns `None`.
-    fn sync_get_node(&self, _replication_id: &[u8; 32], _cid: &[u8; 32]) -> Option<Vec<u8>> {
+    /// replication group. Default returns `None`. `caller_peer_id`
+    /// gates private replicas — see [`Self::sync_roots`].
+    fn sync_get_node(
+        &self,
+        _caller_peer_id: Option<libp2p::PeerId>,
+        _replication_id: &[u8; 32],
+        _cid: &[u8; 32],
+    ) -> Option<Vec<u8>> {
         None
     }
 
@@ -1078,6 +1093,11 @@ async fn network_main(
     // per peer, then suppress until the peer reconnects (which clears it).
     let mut warned_dial_failures: HashSet<PeerId> = HashSet::new();
 
+    // Per-peer sync flood cap: counts FetchHeads/FetchNode requests in a
+    // sliding window and drops a peer that exceeds the budget (see
+    // [`SyncRateLimiter`]).
+    let mut sync_rate = SyncRateLimiter::default();
+
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -1086,6 +1106,7 @@ async fn network_main(
                     &prefix_map, &listen_addrs, &inbox_tx,
                     &mut outbound_replies,
                     &mut warned_dial_failures,
+                    &mut sync_rate,
                     &service,
                     &raft_handlers,
                     &response_tx,
@@ -1405,6 +1426,7 @@ fn handle_swarm_event(
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     warned_dial_failures: &mut HashSet<PeerId>,
+    sync_rate: &mut SyncRateLimiter,
     service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
     raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
@@ -1486,6 +1508,7 @@ fn handle_swarm_event(
                 inbox,
                 outbound_replies,
                 warned_dial_failures,
+                sync_rate,
                 service,
                 raft_handlers,
                 response_tx,
@@ -1507,6 +1530,7 @@ fn handle_req_resp(
     inbox: &std_mpsc::Sender<InboundTell>,
     outbound_replies: &mut HashMap<request_response::OutboundRequestId, OutboundReply>,
     warned_dial_failures: &mut HashSet<PeerId>,
+    sync_rate: &mut SyncRateLimiter,
     service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
     raft_handlers: &RaftHandlerMap,
     response_tx: &async_mpsc::UnboundedSender<(request_response::ResponseChannel<Frame>, Frame)>,
@@ -1574,11 +1598,19 @@ fn handle_req_resp(
                         });
                     }
                     Frame::FetchHeads { replication_id } => {
+                        // Per-peer flood cap: a peer hammering FetchHeads/
+                        // FetchNode is dropped (no response → caller's recv
+                        // yields None and retries next tick) rather than
+                        // amplifying redb reads.
+                        if !sync_rate.allow(peer) {
+                            return;
+                        }
                         // Sync reads are quick redb txns; serve them
                         // inline rather than spawning a blocking task.
+                        // `peer` membership-gates private (msg-*) replicas.
                         let roots = service
                             .get()
-                            .and_then(|s| s.sync_roots(&replication_id))
+                            .and_then(|s| s.sync_roots(Some(peer), &replication_id))
                             .unwrap_or_default();
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
@@ -1592,9 +1624,12 @@ fn handle_req_resp(
                         replication_id,
                         cid,
                     } => {
+                        if !sync_rate.allow(peer) {
+                            return;
+                        }
                         let node = service
                             .get()
-                            .and_then(|s| s.sync_get_node(&replication_id, &cid));
+                            .and_then(|s| s.sync_get_node(Some(peer), &replication_id, &cid));
                         let _ = swarm
                             .behaviour_mut()
                             .req_resp
@@ -1953,6 +1988,49 @@ fn handle_req_resp(
             warn!(%peer, error = %error, "network: inbound request failed");
         }
         Event::ResponseSent { .. } => {}
+    }
+}
+
+/// Fixed-window per-peer cap on sync fetches (`FetchHeads` +
+/// `FetchNode`). A peer that exceeds [`MAX_SYNC_FETCHES_PER_WINDOW`]
+/// within [`SYNC_RATE_WINDOW`] is dropped (its request goes
+/// unanswered, surfacing to the caller as `None` → retried next
+/// tick) so it can't amplify redb reads into a head/node flood. The
+/// budget is sized well above a legitimate cold-joiner DAG walk
+/// (one `FetchNode` per CID), which arrives in a burst then quiesces.
+#[derive(Default)]
+struct SyncRateLimiter {
+    peers: HashMap<PeerId, (std::time::Instant, u32)>,
+}
+
+/// Window length for the per-peer sync fetch budget.
+const SYNC_RATE_WINDOW: Duration = Duration::from_secs(2);
+/// Max `FetchHeads`/`FetchNode` requests served per peer per window.
+const MAX_SYNC_FETCHES_PER_WINDOW: u32 = 1024;
+/// Map-size threshold that triggers a sweep of expired windows, so a
+/// churn of one-shot PeerIds can't grow the table without bound.
+const SYNC_RATE_PRUNE_LEN: usize = 1024;
+
+impl SyncRateLimiter {
+    /// Record a fetch from `peer` and report whether it stays within
+    /// budget. Resets the peer's counter when its window elapses.
+    fn allow(&mut self, peer: PeerId) -> bool {
+        let now = std::time::Instant::now();
+        if self.peers.len() >= SYNC_RATE_PRUNE_LEN {
+            self.peers
+                .retain(|_, (start, _)| now.duration_since(*start) < SYNC_RATE_WINDOW);
+        }
+        let entry = self.peers.entry(peer).or_insert((now, 0));
+        if now.duration_since(entry.0) >= SYNC_RATE_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        if entry.1 > MAX_SYNC_FETCHES_PER_WINDOW {
+            debug!(%peer, "network: peer over sync-fetch budget; dropping request");
+            false
+        } else {
+            true
+        }
     }
 }
 
@@ -2409,6 +2487,116 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
+    /// A replica whose instance name is `msg-*` is private: the host
+    /// must refuse to serve its heads/nodes to a peer that holds no
+    /// read grant. Node B has no space-registry installed, so every
+    /// grant probe resolves to `AUTH_ROLE_NONE` → deny. (The same
+    /// two-node sync over a non-`msg-` replica is proven served by
+    /// `cross_node_sync_via_vosnode_replicas`.)
+    #[test]
+    fn private_replica_sync_denied_without_grant() {
+        use crate::commit::{CommitStrategy, CrdtCommit};
+        use crate::effect_log::EffectLog;
+        use crate::node::VosNode;
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+            auto_dial_mdns: true,
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial: Multiaddr = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
+        });
+
+        let mut node_b = VosNode::with_prefix(prefix_b);
+        let rep_id = [0x77u8; 32];
+        let dir_b = std::env::temp_dir().join(format!(
+            "vos_gate_b_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let db_path_b = dir_b.join("replica.redb");
+        // `msg-*` name → membership-gated serving.
+        let _slot_b = node_b.install_test_replica_named(rep_id, &db_path_b, "msg-general-log");
+
+        let slot_for_writes = node_b
+            .crdt_replicas
+            .lock()
+            .unwrap()
+            .get(&rep_id)
+            .cloned()
+            .unwrap();
+        let mut cc =
+            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id);
+        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"secret".to_vec()))
+            .unwrap();
+        let root = cc.root_bytes()[0];
+        drop(cc);
+
+        node_b.attach_network(net_b);
+        let mut node_a = VosNode::with_prefix(prefix_a);
+        node_a.attach_network(net_a);
+        let net_a_arc = node_a
+            .shared_network
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("net_a attached");
+
+        wait_for(
+            || net_a_arc.peer_for_prefix(prefix_b),
+            Duration::from_secs(10),
+        )
+        .expect("Hello completes");
+        let peer_b = net_a_arc.peer_for_prefix(prefix_b).unwrap();
+
+        // Ungranted caller: the private replica's heads come back empty…
+        let heads = net_a_arc
+            .send_fetch_heads(peer_b, rep_id)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchHeads reply");
+        assert!(
+            heads.is_empty(),
+            "private replica served heads to an ungranted peer: {heads:?}"
+        );
+        // …and a point-node fetch is refused.
+        let node = net_a_arc
+            .send_fetch_node(peer_b, rep_id, root)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FetchNode reply");
+        assert!(
+            node.is_none(),
+            "private replica served a node to an ungranted peer"
+        );
+
+        let _ = node_a.collect();
+        let _ = node_b.collect();
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
     /// Network-level test: gossipsub head announcements route a
     /// `Frame::Heads` published by A to a hint sender registered
     /// by B, with the publisher's PeerId surfaced as the hint
@@ -2482,14 +2670,23 @@ mod tests {
         }
 
         impl NetworkService for StaticProvider {
-            fn sync_roots(&self, replication_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+            fn sync_roots(
+                &self,
+                _caller_peer_id: Option<libp2p::PeerId>,
+                replication_id: &[u8; 32],
+            ) -> Option<Vec<[u8; 32]>> {
                 if replication_id == &self.rep_id {
                     Some(self.roots.clone())
                 } else {
                     None
                 }
             }
-            fn sync_get_node(&self, replication_id: &[u8; 32], cid: &[u8; 32]) -> Option<Vec<u8>> {
+            fn sync_get_node(
+                &self,
+                _caller_peer_id: Option<libp2p::PeerId>,
+                replication_id: &[u8; 32],
+                cid: &[u8; 32],
+            ) -> Option<Vec<u8>> {
                 if replication_id != &self.rep_id {
                     return None;
                 }

@@ -50,6 +50,16 @@ pub const ENVELOPE_ID_DOMAIN_TAG: &[u8] = b"vos-msg-envelope/v1";
 /// the message log.
 pub const MAX_BODY_BYTES: usize = 48 * 1024;
 
+/// Leading bytes of a TLS-serialized MLS `MLSMessage` carrying an
+/// application message: `ProtocolVersion::Mls10` (u16 = 1) followed
+/// by `WireFormat::PrivateMessage` (u16 = 2). The data plane carries
+/// only these. The actor can't decrypt (all crypto is at the edge),
+/// but rejecting bodies that aren't even MLS PrivateMessage framing
+/// keeps junk out of the grow-only replicated log — a malformed body
+/// can never deduplicate against a real one or waste every replica's
+/// storage. Real MLS validation still happens in the messenger.
+pub const MLS_PRIVATE_MESSAGE_PREFIX: [u8; 4] = [0x00, 0x01, 0x00, 0x02];
+
 /// Soft byte budget for one `history` page. The host's hard reply
 /// ceiling is much higher (8 MiB producer cap), so this is a
 /// pagination-ergonomics target, not a correctness bound — it keeps
@@ -69,9 +79,10 @@ pub const STATUS_BODY_TOO_LARGE: u8 = 2;
 // ── Wire types ────────────────────────────────────────────────────
 
 /// One envelope in the log. `body` is an opaque MLS message —
-/// this actor validates only shape (length bounds), never
-/// content; a body that fails MLS processing is discarded by the
-/// messenger extension at the edge.
+/// this actor validates only shape (length bounds + the MLS
+/// PrivateMessage framing prefix, see [`MLS_PRIVATE_MESSAGE_PREFIX`]),
+/// never content; a body that fails MLS processing is discarded by
+/// the messenger extension at the edge.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -232,6 +243,11 @@ impl MsgLog {
         if body.len() > MAX_BODY_BYTES {
             return STATUS_BODY_TOO_LARGE;
         }
+        // Reject anything that isn't MLS PrivateMessage framing before
+        // it lands in the replicated log (see the prefix const).
+        if !body.starts_with(&MLS_PRIVATE_MESSAGE_PREFIX) {
+            return STATUS_INVALID_INPUT;
+        }
         let to_hint = match hint_to_32(&to_hint) {
             Some(h) => h,
             None => return STATUS_INVALID_INPUT,
@@ -382,6 +398,14 @@ mod tests {
         run(<MsgLog as Message<M>>::handle(l, msg, &mut ctx))
     }
 
+    /// Wrap a test payload in the minimal MLS PrivateMessage framing
+    /// the `post` validator requires (version + wire-format prefix).
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut b = MLS_PRIVATE_MESSAGE_PREFIX.to_vec();
+        b.extend_from_slice(payload);
+        b
+    }
+
     fn post(l: &mut MsgLog, lamport: u64, body: &[u8]) -> u8 {
         dispatch(
             l,
@@ -391,7 +415,7 @@ mod tests {
                 lamport,
                 ts_ms: 1000 + lamport,
                 to_hint: Vec::new(),
-                body: body.to_vec(),
+                body: framed(body),
             },
         )
     }
@@ -410,8 +434,42 @@ mod tests {
             },
         );
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].body, b"ciphertext-a");
-        assert_eq!(rows[1].body, b"ciphertext-b");
+        assert_eq!(rows[0].body, framed(b"ciphertext-a"));
+        assert_eq!(rows[1].body, framed(b"ciphertext-b"));
+    }
+
+    #[test]
+    fn post_rejects_non_mls_framed_body() {
+        let mut l = log();
+        // A rejected post returns before insertion, so probing several
+        // bad bodies against the same log leaves it empty.
+        let mut bad = |body: Vec<u8>| {
+            dispatch(
+                &mut l,
+                Post {
+                    kind: ENVELOPE_KIND_APP,
+                    epoch: 1,
+                    lamport: 1,
+                    ts_ms: 1,
+                    to_hint: Vec::new(),
+                    body,
+                },
+            )
+        };
+        // Arbitrary bytes with no MLS framing are refused.
+        assert_eq!(bad(b"not-mls-at-all".to_vec()), STATUS_INVALID_INPUT);
+        // Right version but the wrong wire format (Welcome = 3, not the
+        // PrivateMessage = 2 the data plane carries) is refused.
+        assert_eq!(
+            bad(vec![0x00, 0x01, 0x00, 0x03, 0xAB]),
+            STATUS_INVALID_INPUT
+        );
+        // A body shorter than the prefix is refused.
+        assert_eq!(bad(vec![0x00, 0x01]), STATUS_INVALID_INPUT);
+        assert_eq!(dispatch(&mut l, Stats).count, 0);
+        // The same payload under valid framing is accepted and stored.
+        assert_eq!(post(&mut l, 1, b"real"), STATUS_OK);
+        assert_eq!(dispatch(&mut l, Stats).count, 1);
     }
 
     #[test]
@@ -494,7 +552,7 @@ mod tests {
             },
         );
         assert_eq!(rest.len(), 3);
-        assert_eq!(rest[0].body, b"m3");
+        assert_eq!(rest[0].body, framed(b"m3"));
     }
 
     #[test]
@@ -519,8 +577,22 @@ mod tests {
     #[test]
     fn post_validates_shape() {
         let mut l = log();
-        // Empty body.
-        assert_eq!(post(&mut l, 1, b""), STATUS_INVALID_INPUT);
+        // Empty body (dispatched raw — the `post` helper would frame it
+        // into a non-empty body).
+        assert_eq!(
+            dispatch(
+                &mut l,
+                Post {
+                    kind: ENVELOPE_KIND_APP,
+                    epoch: 1,
+                    lamport: 1,
+                    ts_ms: 0,
+                    to_hint: Vec::new(),
+                    body: Vec::new(),
+                },
+            ),
+            STATUS_INVALID_INPUT
+        );
         // Zero lamport.
         assert_eq!(post(&mut l, 0, b"x"), STATUS_INVALID_INPUT);
         // Oversized body.

@@ -2,7 +2,9 @@
 //! installed agent.
 
 use serde::Serialize;
-use space_registry::{STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_PROGRAM_NOT_FOUND};
+use space_registry::{
+    STATUS_CONSISTENCY_WIDEN_DENIED, STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_PROGRAM_NOT_FOUND,
+};
 use vos::init::{InitArgs, InitValue};
 
 use crate::commands::space::client::DaemonClient;
@@ -107,6 +109,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             STATUS_PROGRAM_NOT_FOUND => {
                 anyhow::bail!("program {program_name}:{program_version} not in catalog (race?)",)
             }
+            STATUS_CONSISTENCY_WIDEN_DENIED => anyhow::bail!(
+                "'{instance_name}' was previously installed at a more confined consistency tier; \
+                 a name's locality may only narrow, never widen. Use a fresh --name to install at \
+                 '{}'.",
+                args.consistency,
+            ),
             other => anyhow::bail!("install returned status {other}"),
         }
     })

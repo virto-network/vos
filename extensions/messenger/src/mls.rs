@@ -47,12 +47,7 @@ pub(crate) fn group_id_for(channel: &str) -> [u8; 32] {
     vos::crypto::blake2b_hash(GROUP_ID_DOMAIN_TAG, &[channel.as_bytes()])
 }
 
-/// 32 random bytes from the crypto provider's RNG — the
-/// replication id for a dynamically installed channel agent.
-/// Random rather than name-derived so the sync group / gossip
-/// topic isn't guessable from the channel name; members learn it
-/// from the registry's replicated `AgentRow` instead.
-pub(crate) fn fresh_replication_id(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
+fn random_32(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
     use openmls_traits::random::OpenMlsRand;
     provider
         .rand()
@@ -60,11 +55,26 @@ pub(crate) fn fresh_replication_id(provider: &OpenMlsRustCrypto) -> Result<[u8; 
         .map_err(|e| format!("rng failure: {e:?}"))
 }
 
-/// The Welcome routing hint is the directory's canonical
-/// KeyPackage hash: publisher, directory, and joiner all compute
-/// the same value from the serialized bytes.
-pub(crate) fn kp_hint(serialized_kp: &[u8]) -> [u8; 32] {
-    msg_directory::kp_hash(serialized_kp)
+/// 32 random bytes from the crypto provider's RNG — the
+/// replication id for a dynamically installed channel agent.
+/// Random rather than name-derived so the sync group / gossip
+/// topic isn't guessable from the channel name; members learn it
+/// from the registry's replicated `AgentRow` instead.
+pub(crate) fn fresh_replication_id(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
+    random_32(provider)
+}
+
+/// 32 random bytes for a Commit row's Welcome routing token.
+/// The token must NOT be derivable from the joiner's public
+/// KeyPackage: a deterministic hash of the public KP equals the
+/// directory's `kp_hash`, which would let anyone holding both the
+/// replicated directory and the ctl chain map the token back to a
+/// nickname (and link the same KP across channels). A fresh random
+/// token leaks nothing; the joiner recognises its own Welcome by
+/// trial-decryption (only a Welcome sealed to a KeyPackage it holds
+/// stages successfully), so no public routing tag is needed.
+pub(crate) fn welcome_nonce(provider: &OpenMlsRustCrypto) -> Result<[u8; 32], String> {
+    random_32(provider)
 }
 
 fn ratchet_config() -> SenderRatchetConfiguration {
@@ -220,6 +230,24 @@ pub(crate) fn parse_key_package(
 mod tests {
     use super::*;
     use openmls::prelude::tls_codec::Deserialize as TlsDeserialize;
+
+    /// #7: the Welcome routing token must be fresh per invite and must
+    /// never equal the directory's public `kp_hash` — otherwise a holder
+    /// of both the directory and the ctl chain could map a join back to a
+    /// nickname (and link the same KeyPackage across channels).
+    #[test]
+    fn welcome_nonce_is_fresh_and_unlinkable() {
+        let provider = OpenMlsRustCrypto::default();
+        let n1 = welcome_nonce(&provider).unwrap();
+        let n2 = welcome_nonce(&provider).unwrap();
+        assert_ne!(n1, n2, "tokens must be fresh per invite");
+        // A token derived from the public KeyPackage would equal this.
+        assert_ne!(
+            n1,
+            msg_directory::kp_hash(b"any serialized key package"),
+            "token must not equal the directory's public kp_hash",
+        );
+    }
 
     fn make_identity(
         provider: &OpenMlsRustCrypto,
@@ -490,7 +518,12 @@ mod tests {
         let (add_commit, welcome, _) = alice_group
             .add_members(&alice, &alice_keys, core::slice::from_ref(&kp))
             .unwrap();
-        let outcome = submit(&mut ctl, 0, &add_commit, Some((&welcome, kp_hint(&bob_kp))));
+        let outcome = submit(
+            &mut ctl,
+            0,
+            &add_commit,
+            Some((&welcome, msg_directory::kp_hash(&bob_kp))),
+        );
         assert_eq!(outcome.status, msg_ctl::STATUS_OK);
         alice_group.merge_pending_commit(&alice).unwrap();
 
@@ -526,7 +559,7 @@ mod tests {
             &mut ctl,
             1,
             &alice_commit,
-            Some((&charlie_welcome, kp_hint(&charlie_kp))),
+            Some((&charlie_welcome, msg_directory::kp_hash(&charlie_kp))),
         );
         assert_eq!(outcome.status, msg_ctl::STATUS_OK);
         alice_group.merge_pending_commit(&alice).unwrap();
