@@ -90,32 +90,67 @@ use num_traits::{One, Zero};
 use recursion_common::oods_auto::{
     ColocateLayout, ComponentMask, N_LATCHED, StreamBackend, WinPos, drive_multi,
 };
+use recursion_common::to_cpu;
 use recursion_common::{
     N_PERM_COLS, N_STATE, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel, eval_permutation,
     hash_children_m31, mobile_config, permute, record_permutation,
 };
 use std::collections::HashMap;
-use stwo::core::circle::CirclePoint;
-use stwo::core::poly::line::LineDomain;
-use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::air::Component;
+use stwo::core::channel::Channel;
+use stwo::core::circle::CirclePoint;
+use stwo::core::fields::ComplexConjugate;
 use stwo::core::fields::FieldExpOps;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use stwo::core::pcs::{CommitmentSchemeVerifier, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::poly::line::LineDomain;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::verifier::verify;
+use stwo::prover::backend::simd::m31::{LOG_N_LANES, PackedM31};
+use stwo::prover::backend::simd::qm31::PackedQM31;
 use stwo::prover::backend::{Col, Column, CpuBackend};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::{CommitmentSchemeProver, prove};
 use stwo_constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, ORIGINAL_TRACE_IDX, TraceLocationAllocator,
-    assert_constraints_on_trace, preprocessed_columns::PreProcessedColumnId,
+    EvalAtRow, FrameworkComponent, FrameworkEval, LogupTraceGenerator, ORIGINAL_TRACE_IDX,
+    Relation, RelationEntry, TraceLocationAllocator, assert_constraints_on_trace,
+    preprocessed_columns::PreProcessedColumnId, relation,
 };
 use zkpvm::poseidon2::{PermKind, PermRecord};
 use zkpvm::{Proof, SideNote};
+
+// ── DEEP numerator (step 4): the leaf↔c logup. Tuple = (batch_id, col_index, c[4]).
+//    The interaction tree this adds is the step-4 integration's foundational piece;
+//    this first increment wires the leaf↔c logup (producer derives c, consumer
+//    drains, self-balanced) over a subset of the real `deep_batches`, validating
+//    the interaction tree at the real log-17 scale. The full producer/consumer over
+//    the trace-decommit leaf rows + the factored eval + first_layer binding follow.
+const DEEP_TUPLE_LEN: usize = 2 + SECURE_EXTENSION_DEGREE;
+relation!(DeepLeafRelation, DEEP_TUPLE_LEN);
+/// How many real `deep_batches[0]` columns this increment's logup covers.
+const N_DEEP: usize = 64;
+const DEEP_IS_PROD: &str = "ca_deep_is_prod";
+const DEEP_IS_CONS: &str = "ca_deep_is_cons";
+const DEEP_BATCH: &str = "ca_deep_batch";
+const DEEP_COL: &str = "ca_deep_col";
+
+/// One row's leaf↔c logup input: the multiplicity + the (batch, col, c[4]) tuple.
+#[derive(Clone, Copy)]
+struct DeepLogupRow {
+    num: SecureField,
+    tuple: [BaseField; DEEP_TUPLE_LEN],
+}
+
+/// The DEEP region's data (a subset of `deep_batches[0]`): the batch point's `z.y`
+/// + per column `(col_index, α^i)`. The line coeff `c = α^i·(z̄.y − z.y)`.
+struct DeepRegion {
+    zy: SecureField,
+    cols: Vec<(u32, SecureField)>,
+}
 
 // ── Locked embed layout parameters (recursion_stream_embed sweet spot) ───────
 const T_PER_MAC: usize = 16;
@@ -271,7 +306,9 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
             id: NOT_LAST_TR.to_string(),
         },
     ];
-    for id in [M_SPONGE, M_MERGE, M_NODE, M_ROOT, ZERO_ST, HASH_LINK, CAP_FWD] {
+    for id in [
+        M_SPONGE, M_MERGE, M_NODE, M_ROOT, ZERO_ST, HASH_LINK, CAP_FWD,
+    ] {
         ids.push(PreProcessedColumnId { id: id.to_string() });
     }
     for j in 0..8 {
@@ -286,7 +323,9 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
         ids.push(PreProcessedColumnId { id: root_t_id(t) });
     }
     for i in 0..N_FRI_LAYERS {
-        ids.push(PreProcessedColumnId { id: fold_draw_id(i) });
+        ids.push(PreProcessedColumnId {
+            id: fold_draw_id(i),
+        });
     }
     ids.extend([
         PreProcessedColumnId {
@@ -306,7 +345,9 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
         ids.push(PreProcessedColumnId { id: final_id(l) });
     }
     for l in 0..N_FRI_LAYERS {
-        ids.push(PreProcessedColumnId { id: fri_layer_id(l) });
+        ids.push(PreProcessedColumnId {
+            id: fri_layer_id(l),
+        });
     }
     for l in 0..OPS_S {
         for r in 0..2 {
@@ -323,6 +364,10 @@ fn preproc_ids() -> Vec<PreProcessedColumnId> {
                 }
             }
         }
+    }
+    // DEEP leaf↔c logup selectors (appended LAST; read last in evaluate).
+    for id in [DEEP_IS_PROD, DEEP_IS_CONS, DEEP_BATCH, DEEP_COL] {
+        ids.push(PreProcessedColumnId { id: id.to_string() });
     }
     ids
 }
@@ -395,7 +440,10 @@ fn decommit_node_map(
     }
     assert!(witness.next().is_none(), "witness not fully consumed");
     assert_eq!(layer.len(), 1, "fold must reach a single root");
-    assert_eq!(layer[0].1, root, "recomputed root must equal the commitment");
+    assert_eq!(
+        layer[0].1, root,
+        "recomputed root must equal the commitment"
+    );
     node_map
 }
 
@@ -672,7 +720,12 @@ fn point_at(c: &CosetConsts, idx: usize) -> CirclePoint<BaseField> {
     pt
 }
 
-fn fold_step(f_a: SecureField, f_b: SecureField, alpha: SecureField, twid: BaseField) -> SecureField {
+fn fold_step(
+    f_a: SecureField,
+    f_b: SecureField,
+    alpha: SecureField,
+    twid: BaseField,
+) -> SecureField {
     (f_a + f_b) + alpha * ((f_a - f_b) * twid)
 }
 
@@ -735,7 +788,9 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriData {
         line_domain = line_domain.double();
     }
     let last_layer_domain = line_domain;
-    let last_layer_const = fp.last_layer_poly.eval_at_point(last_layer_domain.at(0).into());
+    let last_layer_const = fp
+        .last_layer_poly
+        .eval_at_point(last_layer_domain.at(0).into());
 
     let mut positions: Vec<usize> = data.query_positions.clone();
     let mut evals: Vec<SecureField> = data.first_layer_evals.clone();
@@ -794,13 +849,27 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriData {
             fp.inner_layers[layer - 1].commitment.0
         };
         let hash_witness: Vec<Hash8> = if layer == 0 {
-            fp.first_layer.decommitment.hash_witness.iter().map(|h| h.0).collect()
+            fp.first_layer
+                .decommitment
+                .hash_witness
+                .iter()
+                .map(|h| h.0)
+                .collect()
         } else {
-            fp.inner_layers[layer - 1].decommitment.hash_witness.iter().map(|h| h.0).collect()
+            fp.inner_layers[layer - 1]
+                .decommitment
+                .hash_witness
+                .iter()
+                .map(|h| h.0)
+                .collect()
         };
         let leaf_vals: Vec<SecureField> = dec_positions.iter().map(|p| dec_leaf[p]).collect();
         let node_map = fri_node_map(height, root, &dec_positions, &leaf_vals, &hash_witness);
-        layers.push(LayerTree { height, root, node_map });
+        layers.push(LayerTree {
+            height,
+            root,
+            node_map,
+        });
 
         positions = next_pos;
         evals = next_ev;
@@ -820,7 +889,15 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriData {
                     } else {
                         point_at(&line_cosets[layer - 1], pos & !1).x.inverse()
                     };
-                    let rec = FoldRec { layer, k: sub, e0, e1, bit: (pos & 1) as u32, twid, folded };
+                    let rec = FoldRec {
+                        layer,
+                        k: sub,
+                        e0,
+                        e1,
+                        bit: (pos & 1) as u32,
+                        twid,
+                        folded,
+                    };
                     pos = sub;
                     rec
                 })
@@ -828,7 +905,11 @@ fn fri_reconstruct(proof: &Proof, data: &zkpvm::RecursionData) -> FriData {
         })
         .collect();
 
-    FriData { layers, per_query, last_layer_const }
+    FriData {
+        layers,
+        per_query,
+        last_layer_const,
+    }
 }
 
 /// A single-QM31 FRI leaf's sponge chunk: `[v0,v1,v2,v3, 1, 0,0,0]` (the width-4
@@ -1066,6 +1147,8 @@ struct ChildFullEval {
     /// must equal it). The 14 fold alphas are latched columns bound to
     /// squeezes[3..17]; e0/e1 are the FRI-layer decommit leaf chunks (step 3b).
     fri_last_layer_const: SecureField,
+    /// The DEEP leaf↔c logup relation (step 4, drawn after the main commit).
+    deep_rel: DeepLeafRelation,
 }
 
 impl FrameworkEval for ChildFullEval {
@@ -1128,7 +1211,9 @@ impl FrameworkEval for ChildFullEval {
             eval.get_preprocessed_column(PreProcessedColumnId { id: root_t_id(t) })
         });
         let is_fold_draw: [E::F; N_FRI_LAYERS] = std::array::from_fn(|i| {
-            eval.get_preprocessed_column(PreProcessedColumnId { id: fold_draw_id(i) })
+            eval.get_preprocessed_column(PreProcessedColumnId {
+                id: fold_draw_id(i),
+            })
         });
         let is_rc_draw = eval.get_preprocessed_column(PreProcessedColumnId {
             id: IS_RC_DRAW.to_string(),
@@ -1148,7 +1233,9 @@ impl FrameworkEval for ChildFullEval {
             eval.get_preprocessed_column(PreProcessedColumnId { id: final_id(l) })
         });
         let is_fri_layer: [E::F; N_FRI_LAYERS] = std::array::from_fn(|l| {
-            eval.get_preprocessed_column(PreProcessedColumnId { id: fri_layer_id(l) })
+            eval.get_preprocessed_column(PreProcessedColumnId {
+                id: fri_layer_id(l),
+            })
         });
         let mut prog: Vec<(E::EF, Vec<E::EF>)> = Vec::with_capacity(2 * OPS_S);
         for l in 0..OPS_S {
@@ -1302,7 +1389,9 @@ impl FrameworkEval for ChildFullEval {
         // bit booleanity + the degree-lowering mux = bit·(sib − cur).
         eval.add_constraint(mk_bit.clone() * (mk_bit.clone() - one.clone()));
         for j in 0..8 {
-            eval.add_constraint(mk_mux[j].clone() - mk_bit.clone() * (mk_sib[j].clone() - st_cur(j)));
+            eval.add_constraint(
+                mk_mux[j].clone() - mk_bit.clone() * (mk_sib[j].clone() - st_cur(j)),
+            );
         }
         // Leaf sponge: rate += chunk, capacity carried (chunk encodes both a full
         // absorb and the partial-rate finalize [leftover…, 1, 0…]); bind lh = out.
@@ -1590,9 +1679,7 @@ impl FrameworkEval for ChildFullEval {
                 eval.add_constraint(
                     is_root_absorb[t].clone() * (absorbed[j].clone() - rl[j][0].clone()),
                 );
-                eval.add_constraint(
-                    is_root_t[t].clone() * (dc_root[j].clone() - rl[j][0].clone()),
-                );
+                eval.add_constraint(is_root_t[t].clone() * (dc_root[j].clone() - rl[j][0].clone()));
             }
             eval.add_constraint(is_root_absorb[t].clone() * (one.clone() - is_absorb.clone()));
         }
@@ -1602,8 +1689,7 @@ impl FrameworkEval for ChildFullEval {
         //    are UNGATED (hold on all rows). The layer-0 input + e0/e1 subset evals
         //    are host-supplied here; step 3b couples e0/e1 to the FRI-layer decommit
         //    leaves, and step 4 binds the layer-0 input to the DEEP numerator. ──
-        let mut fold_alpha_lat: [E::EF; N_FRI_LAYERS] =
-            std::array::from_fn(|_| E::EF::zero());
+        let mut fold_alpha_lat: [E::EF; N_FRI_LAYERS] = std::array::from_fn(|_| E::EF::zero());
         for (i, alat) in fold_alpha_lat.iter_mut().enumerate() {
             let a: [[E::F; 2]; SECURE_EXTENSION_DEGREE] =
                 std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
@@ -1642,7 +1728,9 @@ impl FrameworkEval for ChildFullEval {
         let e0 = E::combine_ef(std::array::from_fn(|i| mk_chunk[i][0].clone()));
         let e1 = E::combine_ef(std::array::from_fn(|i| mk_chunk[i][1].clone()));
         let is_fri: E::F = is_fri_layer.iter().fold(E::F::zero(), |a, b| a + b.clone());
-        let is_run: E::F = is_fri_layer[1..].iter().fold(E::F::zero(), |a, b| a + b.clone());
+        let is_run: E::F = is_fri_layer[1..]
+            .iter()
+            .fold(E::F::zero(), |a, b| a + b.clone());
         // fold_bit boolean + running mux = fold_bit·(e1−e0); running = e0 + mux.
         eval.add_constraint(fold_bit.clone() * (fold_bit.clone() - one.clone()));
         eval.add_constraint(mux_fold.clone() - lift(fold_bit.clone()) * (e1.clone() - e0.clone()));
@@ -1658,7 +1746,9 @@ impl FrameworkEval for ChildFullEval {
         eval.add_constraint(fri_folded.clone() - (e0.clone() + e1.clone() + prod.clone()));
         // Carry latch: carry[next] = is_fri ? folded : carry[cur] (cycle closed by fill).
         eval.add_constraint(
-            carry_next - carry_cur.clone() - lift(is_fri) * (fri_folded.clone() - carry_cur.clone()),
+            carry_next
+                - carry_cur.clone()
+                - lift(is_fri) * (fri_folded.clone() - carry_cur.clone()),
         );
         // Cross-layer chain: at layer L>0 the running leaf == carry (= folded[L−1]).
         eval.add_constraint(lift(is_run) * (running - carry_cur));
@@ -1667,6 +1757,61 @@ impl FrameworkEval for ChildFullEval {
             lift(is_fri_layer[N_FRI_LAYERS - 1].clone())
                 * (fri_folded - E::EF::from(self.fri_last_layer_const)),
         );
+
+        // ── DEEP leaf↔c logup (step 4, first increment): the interaction tree +
+        //    the leaf↔c matching over a subset of deep_batches[0]. The producer
+        //    DERIVES c = α^i·(z̄.y − z.y) and emits (batch, col, c) +1; the consumer
+        //    drains it −1 (c free, forced by the balance to match). Self-balanced
+        //    (claimed_sum == 0). The trace-decommit-leaf consumer + leaf·c
+        //    accumulation + factored eval + first_layer binding are later increments.
+        let deep_is_prod = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: DEEP_IS_PROD.to_string(),
+        });
+        let deep_is_cons = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: DEEP_IS_CONS.to_string(),
+        });
+        let deep_batch = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: DEEP_BATCH.to_string(),
+        });
+        let deep_col = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: DEEP_COL.to_string(),
+        });
+        let deep_c: [E::F; 4] = std::array::from_fn(|_| eval.next_trace_mask());
+        let deep_pow: [E::F; 4] = std::array::from_fn(|_| eval.next_trace_mask());
+        let deep_cw: [E::F; 4] = std::array::from_fn(|_| eval.next_trace_mask());
+        let deep_zy: [[E::F; 2]; 4] =
+            std::array::from_fn(|_| eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, 1]));
+        let dz = E::F::zero();
+        // raw_c = conj(z.y) − z.y = [0,0,−2·zy2,−2·zy3] (cur values).
+        let deep_raw_c = E::combine_ef([
+            dz.clone(),
+            dz.clone(),
+            dz.clone() - deep_zy[2][0].clone() - deep_zy[2][0].clone(),
+            dz.clone() - deep_zy[3][0].clone() - deep_zy[3][0].clone(),
+        ]);
+        // cw = pow · raw_c (witnessed deg-2); on producer rows c == cw.
+        eval.add_constraint(E::combine_ef(deep_cw.clone()) - E::combine_ef(deep_pow) * deep_raw_c);
+        eval.add_constraint(
+            (E::combine_ef(deep_c.clone()) - E::combine_ef(deep_cw)) * deep_is_prod.clone(),
+        );
+        // z.y held constant across rows.
+        for k in 0..4 {
+            eval.add_constraint(not_last.clone() * (deep_zy[k][1].clone() - deep_zy[k][0].clone()));
+        }
+        // Logup: +1 producer, −1 consumer (self-balanced).
+        let deep_lift =
+            |f: E::F| -> E::EF { E::combine_ef([f, dz.clone(), dz.clone(), dz.clone()]) };
+        let deep_mult = deep_lift(deep_is_prod) - deep_lift(deep_is_cons);
+        let deep_tuple = [
+            deep_batch,
+            deep_col,
+            deep_c[0].clone(),
+            deep_c[1].clone(),
+            deep_c[2].clone(),
+            deep_c[3].clone(),
+        ];
+        eval.add_to_relation(RelationEntry::new(&self.deep_rel, deep_mult, &deep_tuple));
+        eval.finalize_logup_in_pairs();
 
         eval
     }
@@ -1685,6 +1830,9 @@ struct ChildTrace {
     cy: BaseField,
     bound: BoundaryAir,
     fri_last_layer_const: SecureField,
+    /// The DEEP leaf↔c logup inputs per STORAGE row (for the interaction-tree gen
+    /// after the relation is drawn).
+    deep_logup: Vec<DeepLogupRow>,
 }
 
 /// Tampers (each must be rejected by the gate): `channel_tamper` bumps an absorbed
@@ -1713,6 +1861,7 @@ fn gen_trace(
     last_layer_const: SecureField,
     fold_alphas: &[SecureField],
     fold_draw_row: &[usize],
+    deep: &DeepRegion,
     log_size: u32,
     channel_tamper: Option<usize>,
     final_tamper: bool,
@@ -1975,7 +2124,11 @@ fn gen_trace(
     //    mix_root Absorb row; root_lat[t] is the latched commitment root (constant,
     //    = the real root, == the absorbed value there). root_tamper corrupts the
     //    first tree's latched root so it ≠ the absorbed commitment. ──
-    assert_eq!(roots.len(), N_TREES, "canonical proof commits {N_TREES} trees");
+    assert_eq!(
+        roots.len(),
+        N_TREES,
+        "canonical proof commits {N_TREES} trees"
+    );
     assert_eq!(root_absorb_row.len(), N_TREES);
     let mut is_root_absorb: Vec<Vec<BaseField>> = vec![vec![zb; n]; N_TREES];
     for t in 0..N_TREES {
@@ -2059,8 +2212,15 @@ fn gen_trace(
             fri_prod[r] = fri_alpha_sel[r] * fri_scaled[r];
             fri_folded[r] = f.fold_folded;
             debug_assert_eq!(e0, f.fold_e0, "FRI fold-row e0 must equal the leaf chunk");
-            debug_assert_eq!(e1, f.fold_e1, "FRI fold-row e1 must equal the next-row leaf chunk");
-            debug_assert_eq!(fri_folded[r], e0 + e1 + fri_prod[r], "host FRI fold must be consistent");
+            debug_assert_eq!(
+                e1, f.fold_e1,
+                "FRI fold-row e1 must equal the next-row leaf chunk"
+            );
+            debug_assert_eq!(
+                fri_folded[r],
+                e0 + e1 + fri_prod[r],
+                "host FRI fold must be consistent"
+            );
         } else {
             fri_folded[r] = e0 + e1; // dummy-consistent (prod = 0)
         }
@@ -2311,7 +2471,13 @@ fn gen_trace(
     pre_b.push(ch_is_first);
     pre_b.push(
         (0..n)
-            .map(|i| if i < n_transcript { BaseField::one() } else { zb })
+            .map(|i| {
+                if i < n_transcript {
+                    BaseField::one()
+                } else {
+                    zb
+                }
+            })
             .collect(),
     ); // is_transcript
     pre_b.push(
@@ -2401,6 +2567,67 @@ fn gen_trace(
         }
     }
 
+    // ── DEEP leaf↔c logup region (step 4, first increment): producer rows derive
+    //    c and emit +1; consumer rows drain −1. Placed in the free rows after the
+    //    transcript + merkle region. z.y latched on ALL rows. ──
+    let deep_start = records.len() + mk_fills.len();
+    assert!(
+        deep_start + 2 * N_DEEP <= n,
+        "DEEP region {} + {} > rows {n}",
+        deep_start,
+        2 * N_DEEP
+    );
+    let raw_c = deep.zy.complex_conjugate() - deep.zy;
+    let mut deep_c_vec = vec![z; n];
+    let mut deep_pow_vec = vec![z; n];
+    let mut deep_cw_vec = vec![z; n];
+    let deep_zy_vec = vec![deep.zy; n]; // latched constant
+    let mut deep_is_prod = vec![zb; n];
+    let mut deep_is_cons = vec![zb; n];
+    let deep_batch_col = vec![zb; n]; // batch fixed at 0 for this increment
+    let mut deep_col_col = vec![zb; n];
+    let mut deep_logup = vec![
+        DeepLogupRow {
+            num: z,
+            tuple: [zb; DEEP_TUPLE_LEN],
+        };
+        n
+    ];
+    let deep_tuple = |batch: u32, col: u32, c: SecureField| -> [BaseField; DEEP_TUPLE_LEN] {
+        let cm = c.to_m31_array();
+        [
+            BaseField::from(batch),
+            BaseField::from(col),
+            cm[0],
+            cm[1],
+            cm[2],
+            cm[3],
+        ]
+    };
+    for (i, &(col_idx, pow)) in deep.cols.iter().take(N_DEEP).enumerate() {
+        let c = pow * raw_c; // = α^i·(z̄.y − z.y) = the line coeff c
+        // Producer row.
+        let pr = deep_start + i;
+        deep_c_vec[pr] = c;
+        deep_pow_vec[pr] = pow;
+        deep_cw_vec[pr] = c; // pow·raw_c
+        deep_is_prod[pr] = BaseField::one();
+        deep_col_col[pr] = BaseField::from(col_idx);
+        deep_logup[storage_index(pr, log_size)] = DeepLogupRow {
+            num: SecureField::one(),
+            tuple: deep_tuple(0, col_idx, c),
+        };
+        // Consumer row (c free; honest = c, forced by the balance).
+        let cr = deep_start + N_DEEP + i;
+        deep_c_vec[cr] = c;
+        deep_is_cons[cr] = BaseField::one();
+        deep_col_col[cr] = BaseField::from(col_idx);
+        deep_logup[storage_index(cr, log_size)] = DeepLogupRow {
+            num: -SecureField::one(),
+            tuple: deep_tuple(0, col_idx, c),
+        };
+    }
+
     // ── Flatten + storage-index both trees ──
     let domain = CanonicCoset::new(log_size).circle_domain();
     let wrap = |logical: Vec<BaseField>| {
@@ -2410,6 +2637,12 @@ fn gen_trace(
         }
         CircleEvaluation::<CpuBackend, _, BitReversedOrder>::new(domain, c)
     };
+
+    // DEEP preprocessed selectors (appended LAST, matching preproc_ids order).
+    pre_b.push(deep_is_prod);
+    pre_b.push(deep_is_cons);
+    pre_b.push(deep_batch_col);
+    pre_b.push(deep_col_col);
 
     let preprocessed: Vec<_> = pre_b.into_iter().map(wrap).collect();
 
@@ -2432,7 +2665,8 @@ fn gen_trace(
     if final_tamper {
         // Bump the embed's final-slot oa base column on the final row (the embed
         // QM31 block starts after the channel + merkle columns).
-        let oa_col = CHANNEL_COLS + MK_COLS + (NLEAF + lay.final_lane * 3) * SECURE_EXTENSION_DEGREE;
+        let oa_col =
+            CHANNEL_COLS + MK_COLS + (NLEAF + lay.final_lane * 3) * SECURE_EXTENSION_DEGREE;
         main_logical[oa_col][lay.final_row] += BaseField::one();
     }
     // Root-latch columns, then the FRI fold-alpha latches, then the per-step FRI fold
@@ -2458,6 +2692,12 @@ fn gen_trace(
             main_logical.push(q.iter().map(|v| v.to_m31_array()[c]).collect());
         }
     }
+    // DEEP main columns LAST (read last in evaluate): deep_c, deep_pow, deep_cw, deep_zy.
+    for q in [&deep_c_vec, &deep_pow_vec, &deep_cw_vec, &deep_zy_vec] {
+        for c in 0..SECURE_EXTENSION_DEGREE {
+            main_logical.push(q.iter().map(|v| v.to_m31_array()[c]).collect());
+        }
+    }
     let main: Vec<_> = main_logical.into_iter().map(wrap).collect();
 
     ChildTrace {
@@ -2469,6 +2709,7 @@ fn gen_trace(
         cy,
         bound: air_eff,
         fri_last_layer_const: last_layer_const,
+        deep_logup,
     }
 }
 
@@ -2547,6 +2788,7 @@ struct ChildInputs {
     last_layer_const: SecureField,
     fold_alphas: Vec<SecureField>,
     fold_draw_row: Vec<usize>,
+    deep: DeepRegion,
     log_size: u32,
 }
 
@@ -2672,7 +2914,10 @@ fn build_inputs() -> ChildInputs {
     // sponges dominate). The mk_resolve gadget streams them back-to-back (one
     // perm/row), sorted mixed-degree leaves + partial-rate finalize per tree.
     let n_trees = proof.stark_proof.commitments.len();
-    assert_eq!(n_trees, N_TREES, "canonical proof commits {N_TREES} trace trees");
+    assert_eq!(
+        n_trees, N_TREES,
+        "canonical proof commits {N_TREES} trace trees"
+    );
     let trees: Vec<TreeData> = (0..n_trees).map(|t| build_tree(&proof, &data, t)).collect();
     let mut mk_fills = mk_resolve(&trees.iter().collect::<Vec<_>>());
 
@@ -2719,8 +2964,31 @@ fn build_inputs() -> ChildInputs {
         );
     }
 
-    // The component spans max(transcript + merkle rows [trace + FRI], embed rows).
-    let log_size = (records.len() + mk_fills.len())
+    // DEEP region (step 4, first increment): a subset of deep_batches[0]'s columns,
+    // placed in the free rows after the transcript + merkle region.
+    let b0 = &data.deep_batches[0];
+    let raw_c = b0.point.y.complex_conjugate() - b0.point.y;
+    let deep_cols: Vec<(u32, SecureField)> = b0
+        .cols
+        .iter()
+        .zip(&b0.col_samples)
+        .take(N_DEEP)
+        .map(|(&(_, _, _, c), &(_, pow))| {
+            debug_assert_eq!(c, pow * raw_c, "line coeff c must equal α^i·(z̄.y − z.y)");
+            // col_index is the flat queried-column index; kept small + distinct here.
+            (0, pow)
+        })
+        .enumerate()
+        .map(|(i, (_, pow))| (i as u32, pow))
+        .collect();
+    let deep = DeepRegion {
+        zy: b0.point.y,
+        cols: deep_cols,
+    };
+
+    // The component spans max(transcript + merkle rows [trace + FRI] + DEEP region,
+    // embed rows).
+    let log_size = (records.len() + mk_fills.len() + 2 * N_DEEP)
         .max(lay.n_rows)
         .next_power_of_two()
         .trailing_zeros()
@@ -2744,6 +3012,7 @@ fn build_inputs() -> ChildInputs {
         last_layer_const,
         fold_alphas,
         fold_draw_row,
+        deep,
         log_size,
     }
 }
@@ -2781,6 +3050,7 @@ impl ChildInputs {
             self.last_layer_const,
             &self.fold_alphas,
             &self.fold_draw_row,
+            &self.deep,
             self.log_size,
             channel_tamper,
             final_tamper,
@@ -2794,6 +3064,35 @@ impl ChildInputs {
             fri_tamper,
         )
     }
+}
+
+/// Generate the DEEP leaf↔c logup interaction column + its claimed sum from the
+/// per-storage-row logup inputs (the `cross_chip_logup` SIMD→Cpu transplant).
+fn gen_deep_interaction(
+    deep_logup: &[DeepLogupRow],
+    log_size: u32,
+    rel: &DeepLeafRelation,
+) -> (
+    Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>,
+    SecureField,
+) {
+    let mut logup = LogupTraceGenerator::new(log_size);
+    let mut col = logup.new_col();
+    for vec_row in 0..(1usize << (log_size - LOG_N_LANES)) {
+        let nums: [SecureField; 1 << LOG_N_LANES] =
+            std::array::from_fn(|lane| deep_logup[vec_row * (1 << LOG_N_LANES) + lane].num);
+        let num = PackedQM31::from_array(nums);
+        let tuple: [PackedM31; DEEP_TUPLE_LEN] = std::array::from_fn(|t| {
+            PackedM31::from_array(std::array::from_fn(|lane| {
+                deep_logup[vec_row * (1 << LOG_N_LANES) + lane].tuple[t]
+            }))
+        });
+        let denom = rel.combine(&tuple);
+        col.write_frac(vec_row, num, denom);
+    }
+    col.finalize_col();
+    let (simd, claimed_sum) = logup.finalize_last();
+    (to_cpu(&simd), claimed_sum)
 }
 
 fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
@@ -2813,6 +3112,15 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
     tb.extend_evals(trace.main);
     tb.commit(channel);
 
+    // Draw the DEEP relation AFTER the main commit, generate the leaf↔c logup
+    // interaction, mix its claimed sum, and commit the interaction tree.
+    let deep_rel = DeepLeafRelation::draw(channel);
+    let (inter, deep_claimed) = gen_deep_interaction(&trace.deep_logup, log_size, &deep_rel);
+    channel.mix_felts(&[deep_claimed]);
+    let mut tb = cs.tree_builder();
+    tb.extend_evals(inter);
+    tb.commit(channel);
+
     let mut alloc = TraceLocationAllocator::new_with_preprocessed_columns(&preproc_ids());
     let component = FrameworkComponent::<ChildFullEval>::new(
         &mut alloc,
@@ -2823,8 +3131,9 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
             cy: trace.cy,
             bound: trace.bound.clone(),
             fri_last_layer_const: trace.fri_last_layer_const,
+            deep_rel: deep_rel.clone(),
         },
-        SecureField::zero(),
+        deep_claimed,
     );
     let proof = prove::<CpuBackend, P2MerkleChannel>(&[&component], channel, cs)
         .map_err(|e| format!("prove: {e:?}"))?;
@@ -2834,6 +3143,9 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
     let sizes = component.trace_log_degree_bounds();
     vs.commit(proof.commitments[0], &sizes[0], vch);
     vs.commit(proof.commitments[1], &sizes[1], vch);
+    let _deep_rel_v = DeepLeafRelation::draw(vch);
+    vch.mix_felts(&[deep_claimed]);
+    vs.commit(proof.commitments[2], &sizes[2], vch);
     verify(&[&component as &dyn Component], vch, &mut vs, proof)
         .map_err(|e| format!("verify: {e:?}"))
 }
@@ -2844,7 +3156,9 @@ fn prove_and_verify(trace: ChildTrace) -> Result<(), String> {
 #[ignore = "heavy: prove_canonical builds a real 31-component segment (~30s release)"]
 fn child_full_air_satisfied() {
     let inp = build_inputs();
-    let trace = inp.trace(None, false, false, false, false, false, false, false, false, false);
+    let trace = inp.trace(
+        None, false, false, false, false, false, false, false, false, false,
+    );
     let log_size = trace.log_size;
     let (dbl_steps, cx, cy) = (trace.dbl_steps, trace.cx, trace.cy);
     let bound = trace.bound.clone();
@@ -2855,8 +3169,16 @@ fn child_full_air_satisfied() {
         .map(|e| e.values.to_cpu())
         .collect();
     let main: Vec<Vec<M31>> = trace.main.iter().map(|e| e.values.to_cpu()).collect();
-    let tv: TreeVec<Vec<&Vec<M31>>> =
-        TreeVec::new(vec![pre.iter().collect(), main.iter().collect(), vec![]]);
+    // Draw the DEEP relation + generate the leaf↔c logup interaction so the assert
+    // exercises the logup constraint against a consistent interaction tree.
+    let deep_rel = DeepLeafRelation::draw(&mut Poseidon2M31Channel::default());
+    let (inter, deep_claimed) = gen_deep_interaction(&trace.deep_logup, log_size, &deep_rel);
+    let intr: Vec<Vec<M31>> = inter.iter().map(|e| e.values.to_cpu()).collect();
+    let tv: TreeVec<Vec<&Vec<M31>>> = TreeVec::new(vec![
+        pre.iter().collect(),
+        main.iter().collect(),
+        intr.iter().collect(),
+    ]);
     assert_constraints_on_trace(
         &tv,
         log_size,
@@ -2868,10 +3190,11 @@ fn child_full_air_satisfied() {
                 cy,
                 bound: bound.clone(),
                 fri_last_layer_const,
+                deep_rel: deep_rel.clone(),
             }
             .evaluate(e);
         },
-        SecureField::zero(),
+        deep_claimed,
     );
     eprintln!(
         "child_full_air_satisfied: REAL segment — channel ({} perms) + streamed OODS embed \
@@ -2895,8 +3218,10 @@ fn child_full_air_satisfied() {
 fn child_full_gate() {
     let inp = build_inputs();
 
-    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false, false, false))
-        .expect("honest per-child assembly must prove+verify at degree ≤ 2");
+    prove_and_verify(inp.trace(
+        None, false, false, false, false, false, false, false, false, false,
+    ))
+    .expect("honest per-child assembly must prove+verify at degree ≤ 2");
 
     // Reject: corrupt a channel absorbed value (the transcript binding) — also
     // diverges the rc + oods_t squeezes the latches bind to.
@@ -2906,14 +3231,28 @@ fn child_full_gate() {
         .position(|r| r.kind == PermKind::Absorb)
         .expect("transcript has an absorb");
     assert!(
-        prove_and_verify(inp.trace(Some(absorb_row), false, false, false, false, false, false, false, false, false))
-            .is_err(),
+        prove_and_verify(inp.trace(
+            Some(absorb_row),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+        ))
+        .is_err(),
         "a corrupted transcript value must be rejected"
     );
 
     // Reject: corrupt the embed composition (the final-slot oa value).
     assert!(
-        prove_and_verify(inp.trace(None, true, false, false, false, false, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(
+            None, true, false, false, false, false, false, false, false, false
+        ))
+        .is_err(),
         "a corrupted embed value must be rejected"
     );
 
@@ -2921,7 +3260,10 @@ fn child_full_gate() {
     // derivation: only it reads oods_t, so this confirms the dinv/ox binding is
     // non-vacuous independent of the embed).
     assert!(
-        prove_and_verify(inp.trace(None, false, true, false, false, false, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(
+            None, false, true, false, false, false, false, false, false, false
+        ))
+        .is_err(),
         "a corrupted oods_t must be rejected by the OODS-point derivation"
     );
 
@@ -2929,35 +3271,50 @@ fn child_full_gate() {
     // (Absorb) row — the is_rc_draw·(1−is_squeeze) hardening must reject binding rc
     // to a non-challenge perm output.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, true, false, false, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(
+            None, false, false, true, false, false, false, false, false, false
+        ))
+        .is_err(),
         "an is_rc_draw indicator on a non-squeeze row must be rejected"
     );
 
     // Reject: corrupt a claimed_sum — breaks both its transcript-absorb binding
     // and the Σ claimed_sums == 0 balance.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, true, false, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(
+            None, false, false, false, true, false, false, false, false, false
+        ))
+        .is_err(),
         "a corrupted claimed_sum must be rejected"
     );
 
     // Reject: claim a wrong final memory root (the io-hash/root attack) — the
     // boundary recompute then ≠ the transcript-bound claimed_sum.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, true, false, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(
+            None, false, false, false, false, true, false, false, false, false
+        ))
+        .is_err(),
         "a wrong claimed boundary state (memory root) must be rejected"
     );
 
     // Reject: corrupt a streamed leaf chunk (the merkle decommit) — the leaf hash
     // diverges from the pinned root.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, false, true, false, false, false)).is_err(),
+        prove_and_verify(inp.trace(
+            None, false, false, false, false, false, true, false, false, false
+        ))
+        .is_err(),
         "a corrupted merkle leaf chunk must be rejected"
     );
 
     // Reject: corrupt a streamed sibling on a node row — the re-hashed path diverges
     // from the pinned root.
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, false, false, true, false, false)).is_err(),
+        prove_and_verify(inp.trace(
+            None, false, false, false, false, false, false, true, false, false
+        ))
+        .is_err(),
         "a corrupted merkle sibling must be rejected"
     );
 
@@ -3011,15 +3368,19 @@ fn child_full_measure() {
         preproc_cols,
     );
 
-    prove_and_verify(inp.trace(None, false, false, false, false, false, false, false, false, false))
-        .expect("honest full per-child verifier must prove+verify at degree ≤ 2");
+    prove_and_verify(inp.trace(
+        None, false, false, false, false, false, false, false, false, false,
+    ))
+    .expect("honest full per-child verifier must prove+verify at degree ≤ 2");
 
     // Reject: perturb a FRI fold output (step 3's new soundness) — the cross-layer
     // chain + the last-layer constant check bite. (The root-binding tamper is proven
     // in step 2b; the channel/embed/boundary tampers at the log-14 1-tree scale.)
     assert!(
-        prove_and_verify(inp.trace(None, false, false, false, false, false, false, false, false, true))
-            .is_err(),
+        prove_and_verify(inp.trace(
+            None, false, false, false, false, false, false, false, false, true
+        ))
+        .is_err(),
         "a perturbed FRI fold output must be rejected"
     );
 
