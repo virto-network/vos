@@ -1172,20 +1172,34 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >       marks the FRI layer-0 input "host-supplied (trusted)" (`recursion_child_full.rs`
 >       ~1602). The 4c logup is keyed by `col_index` (per-column), 3b's carry-latch
 >       threads `folded[L]` WITHIN one query's contiguous FRI rows — NEITHER provides
->       this per-query CROSS-REGION equality. It needs its OWN mechanism — but the
->       cleanest (a logup keyed by query position: the DEEP region produces `(qi, eval[qi])`,
->       the FRI region consumes `(qi, layer0_input[qi])`, balance forces equality) REUSES
->       the EXACT 4c-crux logup-permutation pattern (`recursion_deep_couple`), just keyed
->       by `qi` not `col_index` ⇒ de-risked-by-analogy, needs only wiring. (A latched
->       per-query carrier works only if the two regions are per-query adjacent, which they
->       are not — batch 0 spans all trees.) Still: confirm the per-query logup composes
->       with the per-col_index leaf↔c logup in ONE component (two relations, both balanced).
+>       this per-query CROSS-REGION equality. **RESOLVED 2026-06-22 (`recursion_deep_full`,
+>       commit `f7f8bcb`): a GLOBALLY-LATCHED per-query `eval_lat[qi]` carrier — held
+>       constant on ALL rows by `not_last`, bound to the computed DEEP eval at the evalfin
+>       row and to `first_layer[qi]` at the distant flayer row (each via a one-hot query
+>       selector) — bridges the two regions with NO second logup.** (The earlier "a latched
+>       carrier works only if adjacent" was WRONG: a column held constant everywhere carries
+>       its value across ANY distance — the standard child_full latch.) Cheaper than a second
+>       relation; PROVEN at log 6.
+>   * **FULL ARCHITECTURE DE-RISKED 2026-06-22 (`recursion_deep_full`, `deep_full_gate`,
+>     log 6):** the three remaining compositions — (1) derive-c-in-producer (the logup `c`
+>     CONSTRAINED == the in-AIR `c = α^i·(z̄.y−z.y)`, selected raw_c witnessed to stay deg 2),
+>     (2) the per-query logup MULTIPLICITY (producer emits each `(batch_id, col_index, c)`
+>     `+N_QUERIES`, one entry serving all queries; each query's consumer leaf drains `−1`),
+>     (3) the cross-region `eval_lat` carrier (above) — PROVE+verify together in ONE uniform
+>     component at deg ≤ 2; tampered consumer-c / leaf / first_layer each rejected. ⇒ the 4c
+>     architecture is fully de-risked; what remains is SCALING + real wiring.
 >   * **Add an interaction tree to `child_full`** (it currently commits preproc+main
 >     only) via the `cross_chip_logup` `LogupTraceGenerator`→`to_cpu` transplant +
 >     `mix_felts(claimed_sum)` in the channel replay. SCALE: ~17929 producer + ~681k
 >     (≈17929×38) consumer fractions → ~5 fractions/row at log 17; watch memory (the
->     embed alone is ~17 GiB). v's transcript binding (`mix_felts(sampled_values)`)
->     stays a deferred follow-on (the embed leaves), so the DEEP reads the SAME `v`
+>     embed alone is ~17 GiB). REAL WIRING (what `deep_full` stands in for): `z`/`α` from the
+>     latched OODS/`squeeze[2]`; the producer `v` from the embed mask; the consumer leaves
+>     from the trace-decommit chunks (`col_index` preproc sorted→flat); `first_layer[qi]`
+>     from the FRI layer-0 running; the full factored eval (denom + A/B + parity-correct
+>     `p.y`) replacing `L0+L1`; the variable-batch `L→eval` via latched-by-selector (as
+>     `eval_lat`) since batch sizes vary (batch 0 = all cols). v's transcript binding
+>     (`mix_felts(sampled_values)`) stays a deferred follow-on (the embed leaves), so the
+>     DEEP reads the SAME `v`
 >     the embed routes — full non-vacuousness lands with that binding.
 
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
