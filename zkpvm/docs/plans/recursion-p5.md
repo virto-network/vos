@@ -1091,6 +1091,73 @@ to get real OODS data; the 31-comp version extends `sampled_values[tree][col]` t
 >   the deferred transcript bindings** (FRI-root↔mix_root, last_layer_const↔mix_felts,
 >   query-position↔sampling). Each is the same "add cols / bind / assert / prove"
 >   shape; the ~25-min log-17 proves are the cost.
+>
+> **STEP 4 NEW-MECHANISMS DE-RISKED 2026-06-22 (LOCAL, commits `7343d42` 4b +
+> `b9c2879` 4c-crux). Both genuinely-new step-4 mechanisms now PROVE standalone;
+> the full DEEP layout is RE-SCOPED around a LOGUP PERMUTATION (not a cross-row
+> accumulator) on a hard empirical finding.**
+> - **Step 4b (`tests/recursion_deep_air.rs`, `deep_air_gate`): the multi-batch
+>   DEEP numerator + the in-AIR CM31 denominator.** `deep_quotient_chip.rs` (P4.1)
+>   already proved the per-batch arithmetic but took the denominator as a HOST
+>   `[d0,d1,0,0]`. This proves the MULTI-BATCH numerator (real `deep_batches`
+>   subset) with the denominator `line(z,z̄)(p) = (Re(zₓ)−pₓ)·Im(zᵧ)−(Re(zᵧ)−pᵧ)·Im(zₓ)`
+>   DERIVED in-AIR (CM31 from `z`'s four CM31 coords + `p`'s two M31 coords, each
+>   CM31 product witnessed, inverse witnessed `di·d==1`), `(a,b,c)` derived from
+>   `(v, z.y, α^i)`, `numerator·denom_inv` accumulated across batches, bound to a
+>   host oracle. Proves+verifies deg ≤ 2; perturbed leaf rejected. ⇒ the step-4
+>   ARITHMETIC (incl. the only-host-before denom) is fully validated.
+> - **THE HARD FINDING (`deep_air::deep_layout_diagnostic`): the leaf↔c coupling
+>   needs a PERMUTATION, not a cross-row read.** Real-segment trees 0-2 have MIXED
+>   column log sizes (`[6,7,8,10,12,16]`) ⇒ the lifted-Merkle leaf order
+>   (sorted-by-log-size) ≠ the commit/flat order the DEEP `col` index + the `α^i`
+>   power chain run in. So the per-leaf `c` (flat order) cannot be read at a fixed
+>   cross-row offset from the trace-decommit leaves (sorted order). Batch 0 spans
+>   ALL ~15775 columns (the OODS point); the α-power index IS the global flat order;
+>   11 batches. (This REVISES the earlier "cross-row accumulator riding the leaf
+>   rows" sketch — that only works if sorted==commit, which it isn't.)
+> - **Step 4c CRUX (`tests/recursion_deep_couple.rs`, `deep_couple_gate`): the
+>   flat↔sorted leaf↔c LOGUP PERMUTATION in ONE uniform component.** A PRODUCER
+>   presents `(col_index, c)` in flat order (+1), a CONSUMER drains it in sorted
+>   (permuted) order (−1) while accumulating `leaf·c` into a carry-latched `S`; the
+>   claimed-sum balance forces the consumer's `c` per `col_index` to equal the
+>   producer's (Schwartz-Zippel). ONE `FrameworkEval` emits BOTH fractions (sign = a
+>   preproc row-type selector — the single-component self-balancing logup, NO
+>   producer/consumer split), built on the `cross_chip_logup` SIMD→Cpu transplant;
+>   `col_index` pinned to a preproc routing (flat | sorted→flat). Proves+verifies
+>   deg ≤ 2; an unmatched `(col_index,c)` (logup imbalance, caught in VERIFY) AND a
+>   tampered consumer leaf (`S ≠ host total`, caught at PROVE) each rejected. ⇒ the
+>   leaf↔c coupling layout (the analog of 3b's co-location decision) is PROVEN.
+> - **GOTCHA (cost me an hour, recorded): a leaf tamper bound by `is_last·(S−host)`
+>   is caught at PROVE (`ConstraintsNotSatisfied`), not verify — the honest-prover
+>   invariant: an invalid trace is unprovable.** The de-risk's "honest prove always
+>   succeeded, tamper panics at `.expect`" looked like an AIR bug but was the test
+>   harness; the gate must treat a prove-OR-verify failure as a tamper rejection.
+> - **THE 4C INTEGRATION RECIPE (both mechanisms proven; remaining = engineering):**
+>   * **Factored form** (the key simplification): `eval[qi] = Σ_batch denom_inv[b][qi]·
+>     (L[b][qi] − p[qi].y·A[b] − B[b])` where `A[b]=Σ_{col∈b} a[col]`, `B[b]=Σ b[col]`
+>     are QUERY-INDEPENDENT (derived once from `v,z,α`), and `L[b][qi]=Σ_{col∈b}
+>     leaf[col][qi]·c[col]` is the ONLY leaf-dependent part. So the `a·p.y+b` terms
+>     collapse to 11 latched `A[b]/B[b]` pairs; only `L[b]` rides the leaves.
+>   * **Phase 1 (logup producer, flat order):** derive `(a,b,c)` per (batch,col) term
+>     (17929) from the embed mask `v` + latched `z` (the OODS point, step 1b) +
+>     latched `α` (DEEP coeff = `squeeze[2]`) via the proven 4b arithmetic; emit logup
+>     `+1` keyed by `(batch_id, col_index, c)`; accumulate `A[b]`, `B[b]` (latched).
+>   * **Phase 2 (logup consumer, on the trace-decommit leaf-sponge rows):** at each
+>     8-wide chunk slot, consume `(batch_id, col_index, c)` (`col_index` preproc-routed
+>     = the sorted→flat map per tree; `batch_id` from the col's batch membership) and
+>     add `leaf·c` to `L[b]`. A column in 2 batches ⇒ 2 producer entries + 2
+>     consumptions (the multiplicity/multi-batch-per-leaf bookkeeping is the remaining
+>     design point — most columns are in batch 0 only).
+>   * **Bind** `eval[qi]` to the FRI fold chain's layer-0 running `first_layer_evals[qi]`;
+>     `p[qi].y` is derivable from the FRI layer-0 twiddle (`twid_0 = p.y.inverse()`),
+>     `z` from the latched OODS (oods, oods±step, conj), `α` from `squeeze[2]`.
+>   * **Add an interaction tree to `child_full`** (it currently commits preproc+main
+>     only) via the `cross_chip_logup` `LogupTraceGenerator`→`to_cpu` transplant +
+>     `mix_felts(claimed_sum)` in the channel replay. SCALE: ~17929 producer + ~681k
+>     (≈17929×38) consumer fractions → ~5 fractions/row at log 17; watch memory (the
+>     embed alone is ~17 GiB). v's transcript binding (`mix_felts(sampled_values)`)
+>     stays a deferred follow-on (the embed leaves), so the DEEP reads the SAME `v`
+>     the embed routes — full non-vacuousness lands with that binding.
 
 **GOAL.** Assemble P5.2's OODS embed + the real FRI fold chain (GATE 2 at the real 19-layer
 scale) + the real multi-tree Merkle decommit (GATE 3 at the real 4-tree + FRI-layer-tree
