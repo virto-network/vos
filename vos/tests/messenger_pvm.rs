@@ -18,7 +18,7 @@
 //! identity (nickname + seed-derived signer) is still established, which is all
 //! `key_package` needs.
 //!
-//! Build the ELF with `cd extensions/messenger && cargo +nightly actor`. If the
+//! Build the ELF with `cd actors/messenger && cargo +nightly actor`. If the
 //! ELF is absent the test SKIPs loudly rather than failing the suite.
 
 use vos::abi::service::ServiceId;
@@ -27,18 +27,18 @@ use vos::value::{Msg, TAG_DYNAMIC, Value};
 use vos::{Decode, Encode};
 
 /// Read the pre-built messenger actor ELF, or `None` (with a loud SKIP). The
-/// messenger stays a host-workspace member, so its ELF lands in the shared
-/// workspace target dir (not a crate-local one).
+/// messenger is its own workspace under `actors/`, so its ELF lands in the
+/// crate-local target dir.
 fn messenger_elf() -> Option<Vec<u8>> {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path =
-        format!("{workspace}/../target/riscv64em-javm/release/messenger_extension.elf");
+        format!("{workspace}/../actors/messenger/target/riscv64em-javm/release/messenger.elf");
     match std::fs::read(&path) {
         Ok(d) => Some(d),
         Err(_) => {
             eprintln!(
                 "SKIP: messenger ELF not built at {path}\n      \
-                 run: cd extensions/messenger && cargo +nightly actor"
+                 run: cd actors/messenger && cargo +nightly actor"
             );
             None
         }

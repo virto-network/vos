@@ -22,7 +22,7 @@
 //!
 //! Build prerequisites (the harness panics with hints otherwise):
 //!
-//!   cargo build -p vosx -p messenger-extension
+//!   cargo build -p vosx; cd actors/messenger && cargo +nightly actor
 //!   just build-msg-actors
 
 use std::fs;
@@ -44,7 +44,7 @@ use vos::{Decode, Encode};
 fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("extensions/")
+        .expect("actors/")
         .parent()
         .expect("workspace root")
         .to_path_buf()
@@ -54,11 +54,8 @@ fn vosx_bin() -> PathBuf {
     workspace().join("target").join("debug").join("vosx")
 }
 
-fn messenger_so() -> PathBuf {
-    workspace()
-        .join("target")
-        .join("debug")
-        .join("libmessenger_extension.so")
+fn messenger_elf() -> PathBuf {
+    workspace().join("actors/messenger/target/riscv64em-javm/release/messenger.elf")
 }
 
 fn msg_log_elf() -> PathBuf {
@@ -76,7 +73,7 @@ fn msg_directory_elf() -> PathBuf {
 fn ensure_built() {
     for (path, hint) in [
         (vosx_bin(), "cargo build -p vosx"),
-        (messenger_so(), "cargo build -p messenger-extension"),
+        (messenger_elf(), "cd actors/messenger && cargo +nightly actor"),
         (msg_log_elf(), "just build-msg-actors"),
         (msg_ctl_elf(), "just build-msg-actors"),
         (msg_directory_elf(), "just build-msg-actors"),
@@ -159,7 +156,7 @@ impl Drop for Daemon {
     }
 }
 
-/// Four instances of the same `.so` under distinct names; NO
+/// Four device-local messenger agents (same ELF, distinct names); NO
 /// `tick_ms`, so the only drains are explicit `sync` calls.
 fn write_manifest(dir: &Path) -> PathBuf {
     let manifest_path = dir.join("msg-retry-manifest.toml");
@@ -187,15 +184,21 @@ consistency = "raft"
         ctl_elf = msg_ctl_elf().display(),
         dir_elf = msg_directory_elf().display(),
     );
+    // Four device-local messenger agents (distinct names → distinct seeds +
+    // identities) sharing the one channel stack. No `tick_ms`: every drain is
+    // the explicit `sync` verb so each instance's epoch view is under test
+    // control.
     for name in [ALICE, BOB, CAROL, DAVE] {
         body.push_str(&format!(
             r#"
-[[extension]]
+[[agent]]
 name = "{name}"
-path = "{so}"
+path = "{elf}"
+consistency = "local"
+device_secret = true
 intra_caps = ["msg-*:member", "space-registry:admin"]
 "#,
-            so = messenger_so().display(),
+            elf = messenger_elf().display(),
         ));
     }
     fs::write(&manifest_path, body).expect("write manifest");

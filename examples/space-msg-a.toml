@@ -26,10 +26,14 @@ name = "chronos"
 path = "../actors/chronos/target/riscv64em-javm/release/chronos.elf"
 consistency = "raft"
 
-[[extension]]
+# The messenger is a device-local PVM agent: it holds this node's private MLS
+# state + CSPRNG seed (never replicated), encrypts/decrypts at the edge, and
+# relays the operator's role to the channel actors (member) and the registry
+# (admin — `messenger create` installs a channel's agent pair).
+[[agent]]
 name = "messenger"
-path = "../target/debug/libmessenger_extension.so"
+path = "../actors/messenger/target/riscv64em-javm/release/messenger.elf"
+consistency = "local"
+device_secret = true
 tick_ms = 500
-# member: ceiling for post/commit (and `msg-*` covers runtime-created
-# channels); admin: lets `messenger create` install a channel's agents.
 intra_caps = ["msg-*:member", "space-registry:admin"]

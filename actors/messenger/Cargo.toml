@@ -1,49 +1,53 @@
+[workspace]
+
 [package]
-name = "messenger-extension"
-description = "Messenger extension — the E2EE edge of VOS messaging. Holds each member's MLS state, encrypts/decrypts at the node boundary, and drives the per-channel msg-log/msg-ctl actors."
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+name = "messenger"
+description = "Built-in VOS actor: the E2EE edge of messaging. Holds each member's device-local MLS state, encrypts/decrypts at the node boundary, and drives the per-channel msg-log/msg-ctl actors."
+keywords = ["vos", "actor", "messaging", "mls", "p2p"]
+categories = ["network-programming", "cryptography"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/virto-network/vos"
+homepage = "https://github.com/virto-network/vos"
+authors = ["Daniel Olano <daniel@olanod.com>"]
 
 [features]
-# `bin` enables the cdylib's `vos_extension_*` extern-fn exports.
-# `extension` is matched by the actor macros to emit the host ABI
-# glue. Both default-on so a plain `cargo build` produces a
-# loadable extension .so.
-default = ["bin", "extension"]
+# `bin` enables PVM entry-point emission. Default-on so `cargo actor`
+# produces an actor ELF; Ref consumers set `default-features = false`.
+default = ["bin"]
 bin = []
-extension = []
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
-check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+check-cfg = ['cfg(feature, values("pvm", "service", "wasm"))']
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
-# ── Flavor-agnostic deps (build for both the host .so and the PVM actor) ──
+# ── Flavor-agnostic deps (host + PVM) ──
 [dependencies]
 # Wire types shared with the channel actors + registry/chronos.
 # `default-features = false` strips their PVM `bin` glue; portable, so one dep
 # serves both flavors. chronos carries the BeaconRound type for the optional
 # randomness hedge (absent chronos => no hedge, no behaviour change).
-msg-log = { path = "../../actors/msg-log", default-features = false }
-msg-ctl = { path = "../../actors/msg-ctl", default-features = false }
-msg-directory = { path = "../../actors/msg-directory", default-features = false }
-space-registry = { path = "../../actors/space-registry", default-features = false }
-chronos = { path = "../../actors/chronos", default-features = false }
+msg-log = { path = "../msg-log", default-features = false }
+msg-ctl = { path = "../msg-ctl", default-features = false }
+msg-directory = { path = "../msg-directory", default-features = false }
+space-registry = { path = "../space-registry", default-features = false }
+chronos = { path = "../chronos", default-features = false }
 # zeroize for key material; `spin::Mutex` shares the mls-rs storage + CSPRNG
 # providers across the Client's clones (uncontended in single-threaded dispatch).
 zeroize = "1.8"
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
 
-# ── Host extension flavor (the loadable .so) ──────────────────────
-# vos extension ABI + mls-rs (RFC 9420) with std. Ciphersuite 1
+# ── Host flavor (unit tests + the typed Ref) ──
+# vos host actor ABI + mls-rs (RFC 9420) with std. Ciphersuite 1
 # (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519). The deterministic
 # CipherSuiteProvider (crypto_provider.rs) draws the X25519 KEM + HPKE ephemeral
 # from the host-seeded CSPRNG; getrandom mints the per-boot token + reg seed.
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
-vos = { path = "../../vos", default-features = false, features = ["extension"] }
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension"] }
 mls-rs = "0.55"
 mls-rs-core = "0.27"
 mls-rs-codec = "0.7"
@@ -58,7 +62,7 @@ getrandom = "0.2"
 
 # ── PVM actor flavor (the riscv64em-javm ELF; `cargo +nightly actor`) ──
 # The SAME stack with std dropped — the no_std cut whose transpile
-# vos/tests/messenger_transpile.rs gates. Feature set = proven-transpiling minimum.
+# tests/messenger_transpile.rs gates. Feature set = proven-transpiling minimum.
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
 mls-rs = { version = "0.55", default-features = false, features = [
@@ -91,7 +95,11 @@ critical-section = { version = "1", default-features = false }
 [dev-dependencies]
 # The e2e test drives two real `vosx space up` daemons and dials one as a
 # libp2p client to read the raw ciphertext log.
-vos = { path = "../../vos", default-features = false, features = ["extension", "std", "network", "storage"] }
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension", "std", "network", "storage"] }
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "macros", "ping", "identify", "request-response", "gossipsub"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

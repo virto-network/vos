@@ -23,7 +23,7 @@
 //!
 //! Build prerequisites (the harness panics with hints otherwise):
 //!
-//!   cargo build -p vosx -p messenger-extension
+//!   cargo build -p vosx; cd actors/messenger && cargo +nightly actor
 //!   just build-msg-actors
 
 use std::fs;
@@ -45,7 +45,7 @@ use vos::{Decode, Encode};
 fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("extensions/")
+        .expect("actors/")
         .parent()
         .expect("workspace root")
         .to_path_buf()
@@ -56,7 +56,7 @@ fn vosx_bin() -> PathBuf {
 }
 
 fn messenger_elf() -> PathBuf {
-    workspace().join("target/riscv64em-javm/release/messenger_extension.elf")
+    workspace().join("actors/messenger/target/riscv64em-javm/release/messenger.elf")
 }
 
 fn msg_log_elf() -> PathBuf {
@@ -74,7 +74,7 @@ fn msg_directory_elf() -> PathBuf {
 fn ensure_built() {
     for (path, hint) in [
         (vosx_bin(), "cargo build -p vosx"),
-        (messenger_elf(), "cd extensions/messenger && cargo +nightly actor"),
+        (messenger_elf(), "cd actors/messenger && cargo +nightly actor"),
         (msg_log_elf(), "just build-msg-actors"),
         (msg_ctl_elf(), "just build-msg-actors"),
         (msg_directory_elf(), "just build-msg-actors"),

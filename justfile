@@ -112,23 +112,17 @@ build-voucher-check:
 
 # Build the per-channel messaging actors — msg-log (crdt-mode
 # ciphertext envelope log) + msg-ctl (sequenced MLS commit chain).
-# Same toolchain as the registry. The messenger extension is a
-# normal workspace member (`cargo build -p messenger-extension`).
+# Same toolchain as the registry.
 build-msg-actors:
     cd actors/msg-log; cargo +nightly actor
     cd actors/msg-ctl; cargo +nightly actor
     cd actors/msg-directory; cargo +nightly actor
 
-# Build the messenger as a PVM actor (the no_std riscv64 flavor, P2.4).
-# The messenger is also a host extension (`cargo build -p
-# messenger-extension`); this is the deterministic mls-rs PVM-native
-# build whose ELF the `link_elf` transpile gate
-# (cargo test -p vos --test messenger_transpile) checks. The ELF lands
-# in the shared workspace target dir, since the messenger stays a
-# workspace member. The gate test needs the clerk dev-deps severed (the
-# pre-existing cipher-clerk drift) — see docs/design/messaging-pvm-native.md.
+# Build the messenger PVM actor (the device-local E2EE edge): the
+# deterministic no_std mls-rs riscv64 build whose ELF the `link_elf`
+# transpile gate (cargo test -p vos --test messenger_transpile) checks.
 build-messenger-actor:
-    cd extensions/messenger; cargo +nightly actor
+    cd actors/messenger; cargo +nightly actor
 
 # Build the chronos actor — the public clock + verifiable-randomness
 # service plane (the generalized beacon). Standalone (not
@@ -198,14 +192,13 @@ demo-crdt-procs: build-crdt-counter build-crates
 # invites bob (host B), and they exchange messages through the replicated
 # ciphertext log while every actor-visible byte stays MLS-encrypted (~20s).
 # Daemons run as nu jobs, torn down via try/catch.
-demo-msg-procs: build-msg-actors build-chronos build-crates
+demo-msg-procs: build-msg-actors build-chronos build-messenger-actor build-crates
     #!/usr/bin/env nu
     def vx [e, a: list] { with-env $e { ^./target/debug/vosx ...$a } }
     def peerid [f] { open --raw $f | lines | where ($it | str contains "peer_id") | first | str replace -r "^.*peer_id = .([^\"]*).*$" "$1" }
     def xdg [d] { { XDG_DATA_HOME: $"($d)/data", XDG_CONFIG_HOME: $"($d)/config", XDG_CACHE_HOME: $"($d)/cache" } }
     def wait-bind [f] { for _ in 1..50 { if ($f | path exists) { break }; sleep 100ms } }
 
-    cargo build -p messenger-extension
     let A = "/tmp/vosx-msg-a"
     let B = "/tmp/vosx-msg-b"
     let ea = (xdg $A)

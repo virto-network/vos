@@ -325,7 +325,7 @@ mod tests {
         open_stores(snap)
     }
 
-    /// #7: the Welcome routing token must be fresh per invite and must never
+    /// The Welcome routing token must be fresh per invite and must never
     /// equal the directory's public `kp_hash`.
     #[test]
     fn welcome_nonce_is_fresh_and_unlinkable() {

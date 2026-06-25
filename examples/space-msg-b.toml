@@ -24,8 +24,11 @@ name = "chronos"
 path = "../actors/chronos/target/riscv64em-javm/release/chronos.elf"
 consistency = "raft"
 
-[[extension]]
+# Device-local PVM messenger agent — see space-msg-a.toml.
+[[agent]]
 name = "messenger"
-path = "../target/debug/libmessenger_extension.so"
+path = "../actors/messenger/target/riscv64em-javm/release/messenger.elf"
+consistency = "local"
+device_secret = true
 tick_ms = 500
 intra_caps = ["msg-*:member", "space-registry:admin"]
