@@ -1,15 +1,17 @@
-//! Messenger extension — the E2EE edge of VOS messaging.
+//! Messenger actor — the E2EE edge of VOS messaging.
 //!
 //! Channels replicate as two PVM agents: `msg-<chan>-log`
 //! (crdt-mode, the ciphertext envelope log) and `msg-<chan>-ctl`
 //! (the sequenced MLS commit chain). Neither ever sees plaintext
-//! or key material. This native extension is where the
+//! or key material. This actor is where the
 //! cryptography lives: it holds the member's MLS credential and
 //! group state (RFC 9420 via mls-rs), encrypts on `send`,
 //! decrypts on its poll `tick`, and keeps the decrypted
-//! conversation in node-local extension state.
+//! conversation in node-local actor state. It runs device-local
+//! (`consistency = "local"`, never replicated), seeded once via the
+//! host `device_secret` provisioning.
 //!
-//! Trust boundary: everything in this extension's state —
+//! Trust boundary: everything in this actor's state —
 //! signature keys, ratchet secrets, plaintext history — is
 //! device-local and never replicated. Peers, relays, and the
 //! channel actors handle ciphertext only. The operator of *this*
@@ -207,6 +209,13 @@ impl Messenger {
     /// this node's persisted snapshot. The messenger keeps the returned stores
     /// alongside the Client built over them (via [`mls::build_client`]) so it
     /// can [`store::snapshot`] them back after a mutating MLS op.
+    ///
+    /// Cost: each mutating op restores the full store, rebuilds the Client over
+    /// it (re-derives the signer, reconstructs both providers + the CSPRNG), and
+    /// re-serializes the whole store back — O(total MLS state) per dispatch.
+    /// Sound at current group sizes; a scalability ceiling for a node in many or
+    /// large groups. The Client can't be cached across dispatches because actor
+    /// state must round-trip to bytes between messages.
     pub(crate) fn open_stores(&self) -> store::VosStores {
         mls::open_stores(&self.mls_store)
     }
@@ -248,7 +257,7 @@ impl Messenger {
             return "usage: register <nickname>".into();
         }
         // Provision the CSPRNG root before the first draw if a host didn't
-        // already do so via `seed` — on the host extension this is fresh OS
+        // already do so via `seed` — on the host build this is fresh OS
         // entropy. The PVM actor has no OS entropy, so the seed is mandatory:
         // `seed` must be called first (the deterministic-port requirement).
         #[cfg(not(target_arch = "riscv64"))]
@@ -1055,7 +1064,7 @@ impl Messenger {
 
 /// The node's current wall-clock time in Unix-epoch milliseconds — the single
 /// time seam the messenger feeds to MLS (KeyPackage/commit Lifetimes) and to the
-/// wire (envelope/commit row `ts_ms`). On the host extension build this reads
+/// wire (envelope/commit row `ts_ms`). On the host build this reads
 /// `SystemTime`; the deterministic PVM actor has no clock, so it reads the host
 /// wall-clock through the `NOW_MS` hostcall. The messenger is a `Local`
 /// (non-replicated) actor, so a per-dispatch wall-clock is sound — its only use

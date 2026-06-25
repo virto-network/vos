@@ -279,9 +279,23 @@ impl CipherSuiteProvider for VosCipherSuiteProvider {
     fn signature_key_generate(
         &self,
     ) -> Result<(SignatureSecretKey, SignaturePublicKey), Self::Error> {
-        // Off the messenger's path (the signer is provided to the Client); the
-        // stock OsRng path is acceptable here.
-        self.inner.signature_key_generate()
+        // Off the messenger's path: the signing identity is the seed-derived
+        // signer handed to the Client (`mls::derive_signer`), so mls-rs never
+        // reaches this during create / commit / keypackage / welcome. The stock
+        // path draws `OsRng`, which on the PVM target hits the no-entropy shim
+        // and traps — an obscure failure for a call that "can't happen." Route
+        // it through `HostRand` instead: a well-formed, deterministic Ed25519
+        // keypair in the same 64-byte (seed‖public) `SignatureSecretKey`
+        // encoding `derive_signer` produces — never a trap, even if some future
+        // mls-rs path does reach it.
+        let seed = draw::<32>(&self.rand);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public = signing.verifying_key().to_bytes().to_vec();
+        let keypair = signing.to_keypair_bytes().to_vec();
+        Ok((
+            SignatureSecretKey::from(keypair),
+            SignaturePublicKey::from(public),
+        ))
     }
 
     fn signature_key_derive_public(

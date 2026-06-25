@@ -36,9 +36,10 @@ pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
 /// Send a dynamic [`Msg`] to `target` and return the decoded reply [`Value`],
 /// or `None` if the target is unreachable / refused / replied undecodably.
 ///
-/// The outbound-ask effect differs by build flavor: the host extension uses the
+/// The outbound-ask effect differs by build flavor: the host build uses the
 /// native `ask_dispatch` effect (returns the raw reply bytes, decoded here);
-/// the PVM service actor has no `ask_dispatch` (it is `extension`-gated) and
+/// the PVM service actor has no `ask_dispatch` (it is `extension`-feature-gated)
+/// and
 /// uses `ask_raw`/`invoke_raw`, which returns the reply already decoded to a
 /// `Value`. Both wrap the same `[TAG_DYNAMIC ‖ Msg]` payload, so every caller
 /// below is flavor-agnostic.
