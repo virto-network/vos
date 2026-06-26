@@ -115,6 +115,17 @@ impl Consistency {
             Self::Crdt | Self::Raft => 2,
         }
     }
+
+    /// `true` for the node-confined tiers (`Ephemeral`, `Local`) whose
+    /// state never leaves this device. Such an agent — the messenger's
+    /// MLS keys, CSPRNG seed and decrypted plaintext are the load-bearing
+    /// example — must be reachable only from in-process host calls, never
+    /// from a remote peer's `InvokeRequest`. The replicated tiers
+    /// (`Crdt`/`Raft`) are the only ones that legitimately answer the
+    /// network. See [`NodeService::dispatch_invoke`].
+    pub(crate) fn is_node_confined(self) -> bool {
+        self.shareability() < Self::Crdt.shareability()
+    }
 }
 
 /// The effective consistency once the monotone locality seal is applied:
@@ -820,6 +831,21 @@ pub struct VosNode {
     /// [`attach_network`](Self::attach_network) runs.
     #[cfg(feature = "network")]
     pub(crate) shared_network: SharedNetwork,
+    /// This daemon's operator: the PeerId bytes of the CLI identity that
+    /// ran `vosx space up` (loaded in-process from the operator's
+    /// `vosx/identity.key`). A node-confined agent — the messenger holds
+    /// device-private MLS keys, the CSPRNG seed and decrypted plaintext —
+    /// is reachable over the network ONLY by this exact caller (see
+    /// [`NodeService::dispatch_invoke`]): the operator drives their own
+    /// messenger with `vosx messenger …`, which dials the daemon as a
+    /// libp2p call from THIS identity, while every other peer — including a
+    /// remote admin of the same space — is refused. `None` (the default:
+    /// a raw `vosx run`, a transient peer, or a test node) fails closed, so
+    /// no peer reaches a confined agent. Set by
+    /// [`set_operator_peer`](Self::set_operator_peer) before
+    /// [`attach_network`](Self::attach_network).
+    #[cfg(feature = "network")]
+    operator_peer: Option<Vec<u8>>,
     /// Map: replication group → local replica handle.
     /// Populated by `register` whenever a CRDT actor with a
     /// `replication_id` is added. Read by [`NodeService`] (db
@@ -957,6 +983,11 @@ struct AgentInfo {
     name: Option<String>,
     kind: u8,
     serves_addr: Option<String>,
+    /// Effective (post-seal) consistency tier for an actor agent, or
+    /// `None` for a native extension (which has no tier). Read by
+    /// [`NodeService::dispatch_invoke`] to refuse inbound *remote* calls
+    /// to a node-confined agent — see [`Consistency::is_node_confined`].
+    consistency: Option<Consistency>,
 }
 
 /// Shared per-agent shutdown flags (`id.0 → flag`). `Arc<Mutex>` so the
@@ -1095,6 +1126,11 @@ struct NodeService {
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     proof_blobs: ProofBlobStore,
     proof_blobs_dir: Option<std::path::PathBuf>,
+    /// This daemon's operator PeerId bytes (a clone of
+    /// [`VosNode::operator_peer`], set at [`VosNode::attach_network`]). The
+    /// sole caller [`Self::dispatch_invoke`] admits to a node-confined
+    /// target. `None` denies every caller (fail closed).
+    operator_peer: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "network")]
@@ -1158,6 +1194,22 @@ impl NodeService {
         payload.extend_from_slice(&msg.encode());
         self.probe_registry_for_u8(payload)
             .unwrap_or(AUTH_ROLE_NONE)
+    }
+
+    /// Probe the local space-registry's `node_role` handler for the
+    /// NODE member enrolled at `prefix`. Reply byte: `0` = not enrolled,
+    /// `1` = VOTER, `2` = OBSERVER (the registry encodes `role + 1`; see
+    /// `space_registry::node_role`). `0` on an unreachable/undecodable
+    /// reply — the caller treats that as "deny".
+    #[cfg(feature = "network")]
+    fn lookup_node_role(&self, prefix: u16) -> u8 {
+        use crate::actors::codec::Encode;
+        use crate::value::{Msg, TAG_DYNAMIC};
+        let msg = Msg::new("node_role").with("prefix", prefix as u64);
+        let mut payload = Vec::with_capacity(1 + 16);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+        self.probe_registry_for_u8(payload).unwrap_or(0)
     }
 
     /// Membership gate for serving a replica's sync data (heads /
@@ -1286,6 +1338,41 @@ impl NodeService {
         }
     }
 
+    /// `true` when `to` resolves to a node-confined agent this node
+    /// registered (consistency `Local`/`Ephemeral`). Mirrors the
+    /// `dispatch_invoke` route lookup's scoped/unscoped fallback. A missing
+    /// entry (anonymous, cross-node, or never-registered target) is treated
+    /// as *not* confined — the route lookup then handles it normally — so
+    /// the gate only ever restricts agents this node knows to be device-
+    /// private. See [`Self::dispatch_invoke`].
+    fn target_is_node_confined(&self, to: u32, to_unscoped: u32) -> bool {
+        let Ok(info) = self.agent_info.read() else {
+            return false;
+        };
+        let entry = info
+            .get(&to)
+            .or_else(|| (to != to_unscoped).then(|| info.get(&to_unscoped)).flatten());
+        entry
+            .and_then(|i| i.consistency)
+            .is_some_and(Consistency::is_node_confined)
+    }
+
+    /// `true` when `caller` is this daemon's own operator — the CLI identity
+    /// that ran `vosx space up` ([`VosNode::set_operator_peer`]). The one
+    /// caller admitted to a node-confined agent over the network: the
+    /// operator drives their device-local messenger with `vosx messenger …`,
+    /// which dials the daemon as a libp2p call from this identity. Fails
+    /// closed — an unset operator (`None`), an anonymous caller (`None`), or
+    /// any other PeerId (a remote peer, or even a remote admin of the same
+    /// space) all return `false` — so confined plaintext never leaves the
+    /// device. See [`Self::dispatch_invoke`].
+    fn caller_is_operator(&self, caller: Option<&libp2p::PeerId>) -> bool {
+        match (self.operator_peer.as_deref(), caller) {
+            (Some(op), Some(p)) => op == p.to_bytes().as_slice(),
+            _ => false,
+        }
+    }
+
     /// Render an agent's describe JSON by id (the `__describe` primitive's
     /// core). `None` when no agent is registered under `id`.
     fn describe_agent_id(&self, id: u32) -> Option<String> {
@@ -1386,6 +1473,35 @@ impl crate::network::NetworkService for NodeService {
         // path makes via `is_on_node || is_local`.
         let to_unscoped = to & 0xFFFF;
 
+        // Locality boundary: a node-confined agent (`Local`/`Ephemeral`)
+        // holds device-private state — for the messenger, the MLS keys, the
+        // CSPRNG seed and the decrypted plaintext history. The ONLY network
+        // caller allowed to reach it is this daemon's own operator: the
+        // device's human drives their messenger with `vosx messenger …`,
+        // which dials the daemon as a libp2p call carrying the operator's CLI
+        // identity (`Caller::Peer(<operator>)`). Every other peer is refused
+        // — without this gate one could compute the name-derived ServiceId
+        // and call `history` (read another node's plaintext), `seed` (inject
+        // a known CSPRNG root) or `send`/`invite` (impersonate the member),
+        // and a remote ADMIN of the same space is refused just the same: the
+        // boundary is the device, not the space role. Refuse as if the agent
+        // did not exist (empty reply — no existence oracle, matching the
+        // unknown-target path below). Runs ahead of the lifecycle interceptor
+        // so `__stop`/`__describe` of a confined agent are refused too. In-
+        // process host calls (`VosNode::invoke` / `InvokeHandle`) never reach
+        // this method, so local provisioning is unaffected.
+        if self.target_is_node_confined(to, to_unscoped)
+            && !self.caller_is_operator(caller_peer_id.as_ref())
+        {
+            warn!(
+                target = to,
+                peer = ?caller_peer_id,
+                "invoke refused: node-confined agent is reachable only by this \
+                 device's operator",
+            );
+            return Vec::new();
+        }
+
         // Reserved generic lifecycle methods are answered
         // host-side, so `vosx <agent> stop|describe` works for ANY agent —
         // including transport extensions (the gateway) that have no inbound
@@ -1459,6 +1575,40 @@ impl crate::network::NetworkService for NodeService {
             // short-circuit.
             _ => (None, None),
         };
+
+        // Private-replica read gate. The `msg-*` channel actors
+        // (`msg-log` / `msg-ctl` / `msg-directory`) hold the E2EE channel's
+        // ciphertext + metadata, and their READ handlers are bare `#[msg]`
+        // (no role gate). The local messenger reads its OWN replica through
+        // the same-node invoke route and never reaches `dispatch_invoke`, so a
+        // read arriving HERE is always a remote peer. Gate it by the same
+        // membership floor the sync path uses ([`sync_serve_allowed`]): a space
+        // member (or an actor-local read grant) may read; a non-member is
+        // refused as if the method did not exist (empty reply — no existence
+        // oracle, matching the unknown-target path). A member learns nothing
+        // new — its own membership-gated sync replica already holds this
+        // ciphertext — so this only closes the invoke backdoor that bypassed
+        // the sync gate. WRITE handlers (raft leader-forward of `post` /
+        // `commit` / `publish_kp` / …) are NOT gated here: they carry the
+        // actor's own `#[msg(role = …)]` check and legitimately arrive over the
+        // network. Reuses the role bytes already probed above.
+        if self
+            .agent_name_for(to_unscoped)
+            .is_some_and(|name| name.starts_with(MSG_PREFIX))
+            && intercepted_method_name(&msg).is_some_and(|m| is_private_read_method(&m))
+        {
+            let is_member = space_role.is_some_and(|r| r >= AUTH_ROLE_READONLY)
+                || actor_local_role.is_some_and(|r| r >= AUTH_ROLE_READONLY);
+            if !is_member {
+                warn!(
+                    target = to,
+                    peer = ?caller_peer_id,
+                    "invoke refused: private msg- replica read requires space membership",
+                );
+                return Vec::new();
+            }
+        }
+
         if tx
             .send(InvokeRequest {
                 caller,
@@ -1552,6 +1702,15 @@ impl crate::network::NetworkService for NodeService {
             store.insert(*hash, bytes.clone());
         }
         Some(bytes)
+    }
+
+    /// Admit a Raft joiner only if it is enrolled as a `NODE_ROLE_VOTER`
+    /// in the local space-registry. Fails **closed** — an unreachable or
+    /// empty registry reply (`lookup_node_role` → `0` = "not enrolled")
+    /// denies the join — so a peer an admin never enrolled cannot make
+    /// itself a voter.
+    fn raft_join_authorized(&self, prefix: u16) -> bool {
+        self.lookup_node_role(prefix) == NODE_ROLE_REPLY_VOTER
     }
 }
 
@@ -1895,6 +2054,8 @@ impl VosNode {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             #[cfg(feature = "network")]
             shared_network: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "network")]
+            operator_peer: None,
             #[cfg(all(feature = "network", feature = "storage"))]
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
@@ -1985,6 +2146,18 @@ impl VosNode {
         let _ = self.manifest.set(reply);
     }
 
+    /// Record this daemon's operator — the PeerId bytes of the CLI identity
+    /// that started it (`vosx space up` loads the operator's
+    /// `vosx/identity.key`). The value is threaded into the [`NodeService`]
+    /// at [`attach_network`](Self::attach_network), where the locality gate
+    /// admits this caller — and only this caller — to a node-confined agent.
+    /// Call before `attach_network`; afterwards the service holds its own
+    /// copy.
+    #[cfg(feature = "network")]
+    pub fn set_operator_peer(&mut self, peer_bytes: Vec<u8>) {
+        self.operator_peer = Some(peer_bytes);
+    }
+
     /// Attach a libp2p [`Network`](crate::network::Network) so the
     /// node can route to and from peers.
     ///
@@ -2017,6 +2190,7 @@ impl VosNode {
             manifest: self.manifest.clone(),
             proof_blobs: self.proof_blobs.clone(),
             proof_blobs_dir: self.proof_blobs_dir.clone(),
+            operator_peer: self.operator_peer.clone(),
         });
         network.set_service(service);
 
@@ -2145,12 +2319,16 @@ impl VosNode {
         #[cfg(feature = "storage")]
         config.apply_consistency_seal(id);
         // Actor-mode agent: kind 0, no serve endpoint. Backs `__describe`.
+        // `consistency` is recorded *after* the seal so the locality gate
+        // sees the effective (possibly narrowed) tier, never a forged
+        // registry row's requested one.
         self.agent_info.write().unwrap().insert(
             id.0,
             AgentInfo {
                 name: config.name.clone(),
                 kind: crate::extension::ExtensionKind::Actor as u8,
                 serves_addr: None,
+                consistency: Some(config.consistency),
             },
         );
 
@@ -2358,6 +2536,9 @@ impl VosNode {
                     crate::extension::ExtensionKind::Actor as u8
                 },
                 serves_addr: config.serves_addr.clone(),
+                // Native extensions have no consistency tier; they relay
+                // through their own caps model and stay network-reachable.
+                consistency: None,
             },
         );
 
@@ -3639,14 +3820,38 @@ pub(crate) const AUTH_ROLE_ADMIN: u8 = 3;
 #[cfg(all(feature = "network", feature = "storage"))]
 pub(crate) const AUTH_ROLE_READONLY: u8 = 1;
 
+/// `node_role` reply byte for an enrolled Raft VOTER: the registry's
+/// `NODE_ROLE_VOTER` (0) encoded as `role + 1`. Kept as a local literal
+/// — `space-registry` is only a dev-dependency of `vos`, so the const
+/// can't be imported into host code; it must track
+/// `space_registry::{node_role encoding, NODE_ROLE_VOTER}`.
+#[cfg(feature = "network")]
+pub(crate) const NODE_ROLE_REPLY_VOTER: u8 = 1;
+
 /// Instance-name prefix marking a replica as *private* (a messaging
 /// channel agent — `msg-<chan>-log`, `msg-<chan>-ctl`, `msg-directory`).
 /// The sync-serve path membership-gates these; every other replica
 /// (space-registry, app CRDTs) serves openly. Matches the `msg-*`
 /// intra-cap convention so dynamically-installed channels are gated
 /// without any registry-schema flag.
-#[cfg(all(feature = "network", feature = "storage"))]
+#[cfg(feature = "network")]
 pub(crate) const MSG_PREFIX: &str = "msg-";
+
+/// The bare (un-role-gated) READ handlers on the private `msg-*` channel
+/// replicas — `msg-log` (`history` / `stats`), `msg-ctl` (`commits` /
+/// `commit_at` / `head`), `msg-directory` (`kp_count` / `channels`).
+/// dispatch gate ([`NodeService::dispatch_invoke`]) membership-checks REMOTE
+/// invokes of these: they expose ciphertext / channel metadata the sync path
+/// already gates. The actors' WRITE handlers carry `#[msg(role = …)]` and are
+/// intentionally ABSENT here — they're left to the actor's own gate so raft
+/// leader-forward works. Must track the read surface of those three crates.
+#[cfg(feature = "network")]
+fn is_private_read_method(method: &str) -> bool {
+    matches!(
+        method,
+        "history" | "stats" | "commits" | "commit_at" | "head" | "kp_count" | "channels"
+    )
+}
 
 /// Build a failure envelope the libp2p layer relays back to
 /// the caller when the dispatch-layer auth gate refuses a call.
@@ -6306,6 +6511,7 @@ mod tests {
                 name: Some("late".into()),
                 kind: crate::extension::ExtensionKind::Actor as u8,
                 serves_addr: None,
+                consistency: None,
             },
         );
         assert!(node.has_agent(id));
@@ -8169,6 +8375,7 @@ mod tests {
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
+            operator_peer: None,
         };
 
         let peer = libp2p::PeerId::random();
@@ -8193,6 +8400,225 @@ mod tests {
         drop(service); // close the senders so the mock threads exit.
         reg.join().unwrap();
         sink.join().unwrap();
+    }
+
+    /// The locality boundary: a node-confined agent (the messenger runs
+    /// `consistency = "local"`, holding MLS keys + CSPRNG seed + decrypted
+    /// plaintext) is reachable through the network dispatch path ONLY by this
+    /// daemon's own operator — even though its route is registered and its
+    /// name-derived ServiceId is computable by any peer. A non-operator peer
+    /// (including a remote admin) is refused; a replicated agent (`Crdt`/
+    /// `Raft`) stays reachable by anyone.
+    #[test]
+    #[cfg(feature = "network")]
+    fn dispatch_invoke_gates_node_confined_agent_to_operator() {
+        use crate::actors::codec::Encode;
+        use crate::actors::run::STATUS_DONE;
+        use crate::network::NetworkService;
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        let target = ServiceId::new(0x00ab, 0x0123);
+
+        // Drive one `dispatch_invoke` from `caller` against a target whose
+        // AgentInfo carries `consistency`, with the daemon's `operator_peer`
+        // set to `operator`. Report whether the agent actually received the
+        // request and what the caller got back.
+        let run = |consistency: Option<Consistency>,
+                   operator: Option<libp2p::PeerId>,
+                   caller: libp2p::PeerId|
+         -> (bool, Vec<u8>) {
+            let (tgt_tx, tgt_rx) = mpsc::channel::<InvokeRequest>();
+            let received = Arc::new(AtomicBool::new(false));
+            let received_w = received.clone();
+            let sink = thread::spawn(move || {
+                if let Ok(req) = tgt_rx.recv() {
+                    received_w.store(true, Ordering::Relaxed);
+                    let _ = req
+                        .reply
+                        .send(encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(7).encode()));
+                }
+            });
+            let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::from([(target.0, tgt_tx)])));
+            let info: AgentInfos = Arc::new(std::sync::RwLock::new(HashMap::from([(
+                target.0,
+                AgentInfo {
+                    name: Some("messenger".into()),
+                    kind: crate::extension::ExtensionKind::Actor as u8,
+                    serves_addr: None,
+                    consistency,
+                },
+            )])));
+            let mut service =
+                lifecycle_service(routes, Arc::new(Mutex::new(HashMap::new())), info);
+            service.operator_peer = operator.map(|p| p.to_bytes());
+            let mut payload = vec![TAG_DYNAMIC];
+            payload.extend_from_slice(&Msg::new("history").encode());
+            let reply = service.dispatch_invoke(Some(caller), 0, target.0, vec![], payload);
+            // Drop the service (and thus the route's sender) so a sink the
+            // gate skipped unblocks from `recv` and the thread can join.
+            drop(service);
+            let got = received.load(Ordering::Relaxed);
+            sink.join().unwrap();
+            (got, reply)
+        };
+
+        let operator = libp2p::PeerId::random();
+        let other = libp2p::PeerId::random();
+
+        // Confined (`Local`) called by the operator: admitted — the agent
+        // receives the call and its reply rides back. This is the operator
+        // driving their own device-local messenger via `vosx messenger …`.
+        let (op_received, op_reply) = run(Some(Consistency::Local), Some(operator), operator);
+        assert!(
+            op_received,
+            "the device operator must reach its own node-confined agent"
+        );
+        assert!(
+            !op_reply.is_empty(),
+            "the confined agent's reply must ride back to the operator"
+        );
+
+        // Confined called by a NON-operator peer (e.g. a remote admin): the
+        // gate fires before routing — the agent never sees the call and the
+        // peer gets an empty, no-such-agent reply (no existence oracle).
+        let (other_received, other_reply) = run(Some(Consistency::Local), Some(operator), other);
+        assert!(
+            !other_received,
+            "a non-operator peer must not reach a node-confined agent"
+        );
+        assert!(
+            other_reply.is_empty(),
+            "a refused confined invoke must reply empty"
+        );
+
+        // Confined with NO operator recorded (`operator_peer = None`): fail
+        // closed — even though `caller` would otherwise look like the only
+        // identity around, an unset operator admits nobody.
+        let (unset_received, _) = run(Some(Consistency::Local), None, operator);
+        assert!(
+            !unset_received,
+            "an unset operator must admit no one to a confined agent"
+        );
+
+        // Ephemeral is confined too — a non-operator is refused.
+        let (ephemeral_received, _) = run(Some(Consistency::Ephemeral), Some(operator), other);
+        assert!(
+            !ephemeral_received,
+            "a non-operator must not reach an ephemeral agent"
+        );
+
+        // Replicated (`Crdt`): no gate — the request reaches the agent and
+        // its reply is forwarded back even for a non-operator peer.
+        let (crdt_received, crdt_reply) = run(Some(Consistency::Crdt), Some(operator), other);
+        assert!(
+            crdt_received,
+            "a replicated agent must stay reachable over the network"
+        );
+        assert!(
+            !crdt_reply.is_empty(),
+            "the replicated agent's reply must be forwarded back"
+        );
+    }
+
+    /// Private-replica read gate. A bare-`#[msg]` READ on a `msg-*`
+    /// replica is served over the network only to a space member; a WRITE,
+    /// and any method on a non-private agent, is left to the normal path.
+    #[test]
+    #[cfg(feature = "network")]
+    fn dispatch_invoke_gates_private_replica_reads_to_members() {
+        use crate::actors::codec::Encode;
+        use crate::actors::run::STATUS_DONE;
+        use crate::network::NetworkService;
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        let target = ServiceId::new(0x00ab, 0x0150);
+
+        // Drive one dispatch_invoke of `method` against a target the host knows
+        // as `agent_name`, with the stub registry granting the caller `role`.
+        // Report whether the target agent actually received the request.
+        let run = |agent_name: &str, method: &str, role: u8| -> bool {
+            let (routes, _reg) = spawn_stub_peer_role_registry(role);
+            let (tgt_tx, tgt_rx) = mpsc::channel::<InvokeRequest>();
+            routes.lock().unwrap().insert(target.0, tgt_tx);
+            let received = Arc::new(AtomicBool::new(false));
+            let received_w = received.clone();
+            let sink = thread::spawn(move || {
+                if let Ok(req) = tgt_rx.recv() {
+                    received_w.store(true, Ordering::Relaxed);
+                    let _ = req
+                        .reply
+                        .send(encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(1).encode()));
+                }
+            });
+            let names = Arc::new(std::sync::RwLock::new(HashMap::from([(
+                local_id_of(target.0),
+                agent_name.to_string(),
+            )])));
+            let mut svc = lifecycle_service(
+                routes,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+            );
+            svc.agent_names = names;
+            let peer = libp2p::PeerId::random();
+            let mut payload = vec![TAG_DYNAMIC];
+            payload.extend_from_slice(&Msg::new(method).encode());
+            let _ = svc.dispatch_invoke(Some(peer), 0, target.0, vec![], payload);
+            drop(svc);
+            let got = received.load(Ordering::Relaxed);
+            sink.join().unwrap();
+            got
+        };
+
+        // Private (`msg-`) READ from a NON-member: refused before routing.
+        assert!(
+            !run("msg-general-log", "history", AUTH_ROLE_NONE),
+            "a non-member must not read a private msg- replica"
+        );
+        // Private READ from a space member (READONLY): reaches the agent.
+        assert!(
+            run("msg-general-log", "history", AUTH_ROLE_READONLY),
+            "a space member may read a private msg- replica"
+        );
+        // Private WRITE (`post`) is NOT gated here — it reaches the agent even
+        // from a non-member; the actor's own `#[msg(role)]` check decides.
+        assert!(
+            run("msg-general-log", "post", AUTH_ROLE_NONE),
+            "writes are not gated here — they carry the actor's own role check"
+        );
+        // A non-private agent's read is never gated.
+        assert!(
+            run("app-counter", "history", AUTH_ROLE_NONE),
+            "only msg- replicas are gated"
+        );
+    }
+
+    /// Raft-join admission probe: `raft_join_authorized` consults the
+    /// registry's `node_role` and admits ONLY the VOTER sentinel. An
+    /// unenrolled prefix (0), an observer (2), or an unreachable registry
+    /// all deny — so a peer an admin never enrolled cannot become a voter.
+    #[test]
+    #[cfg(feature = "network")]
+    fn raft_join_authorized_only_for_enrolled_voter() {
+        use crate::network::NetworkService;
+        // `reply = Some(b)` stands in for the registry's node_role byte;
+        // `None` models no registry route at all (fail closed).
+        let check = |reply: Option<u8>| -> bool {
+            let routes: InvokeRoutes = match reply {
+                Some(b) => spawn_stub_peer_role_registry(b).0,
+                None => Arc::new(Mutex::new(HashMap::new())),
+            };
+            let svc = lifecycle_service(
+                routes,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+            );
+            svc.raft_join_authorized(0x00ab)
+        };
+        assert!(check(Some(NODE_ROLE_REPLY_VOTER)), "enrolled VOTER is admitted");
+        assert!(!check(Some(0)), "an unenrolled prefix is refused");
+        assert!(!check(Some(2)), "an OBSERVER is refused");
+        assert!(!check(None), "an unreachable registry fails closed");
     }
 
     /// A stub registry on route 0 that answers the `peer_role` probe with a
@@ -8234,6 +8660,7 @@ mod tests {
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
+            operator_peer: None,
         }
     }
 
@@ -8260,6 +8687,7 @@ mod tests {
                 name: Some("gateway".into()),
                 kind: crate::extension::ExtensionKind::Transport as u8,
                 serves_addr: Some("127.0.0.1:8080".into()),
+                consistency: None,
             },
         )])));
 
@@ -8324,6 +8752,7 @@ mod tests {
                 name: Some("gateway".into()),
                 kind: 2,
                 serves_addr: Some("127.0.0.1:8080".into()),
+                consistency: None,
             },
         )])));
 

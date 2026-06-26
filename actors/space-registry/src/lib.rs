@@ -1058,6 +1058,24 @@ impl SpaceRegistry {
         self.members.clone()
     }
 
+    /// Raft-join admission probe: the role of the NODE member enrolled at
+    /// `prefix`, encoded `role + 1` so the byte is self-describing —
+    /// `0` = not enrolled, `1` = VOTER ([`NODE_ROLE_VOTER`]), `2` =
+    /// OBSERVER ([`NODE_ROLE_OBSERVER`]). The Raft leader's host calls this
+    /// (as `Caller::System`) before admitting a `RaftJoinReq`, so a peer
+    /// that an admin never enrolled cannot make itself a voter. An ungated
+    /// read — the answer is non-secret membership metadata, and enrollment
+    /// itself stays Admin-gated at [`add_node`](Self::add_node).
+    #[msg]
+    async fn node_role(&self, prefix: u64) -> u8 {
+        let prefix = prefix as u16;
+        self.members
+            .iter()
+            .find(|m| m.kind == MEMBER_KIND_NODE && m.prefix == prefix)
+            .map(|m| m.role.saturating_add(1))
+            .unwrap_or(0)
+    }
+
     // ── Auth grants (Sprint 2) ─────────────────────────────────
 
     /// Grant `role` to `peer_id`. Idempotent — re-granting the

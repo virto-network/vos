@@ -293,6 +293,15 @@ pub trait NetworkService: Send + Sync {
     fn get_proof_blob(&self, _hash: &[u8; 32]) -> Option<Vec<u8>> {
         None
     }
+
+    /// Raft-join admission: may the node at `prefix` — already bound to
+    /// its noise-verified PeerId by the dispatch layer — be enrolled as a
+    /// voter? The concrete `vos::node` impl checks the registry's
+    /// `NODE_ROLE_VOTER` set. Default **DENIES** (fail closed): a service
+    /// that can't vouch for enrollment must not admit voters.
+    fn raft_join_authorized(&self, _prefix: u16) -> bool {
+        false
+    }
 }
 
 /// Local handler for inbound Raft RPCs. Mirrors [`SyncHandler`]'s
@@ -1818,18 +1827,61 @@ fn handle_req_resp(
                         replication_id,
                         joiner_prefix,
                     } => {
+                        // A join makes the requester a Raft VOTER (it then
+                        // replicates and votes on the channel/registry/
+                        // chronos state), so the prefix being enrolled MUST
+                        // be cryptographically bound to the caller. Derive
+                        // it from the noise-verified PeerId rather than
+                        // trusting the self-declared `joiner_prefix`:
+                        // otherwise any connected peer could enrol an
+                        // arbitrary prefix — add a victim node, or bloat
+                        // membership with fabricated voters. A peer may only
+                        // ever add ITSELF. (Admission — that the bound peer
+                        // is an enrolled voter — is a further gate; see the
+                        // handler.)
+                        let bound_prefix = derive_node_prefix(&peer);
+                        if bound_prefix != joiner_prefix {
+                            warn!(
+                                %peer,
+                                claimed = joiner_prefix,
+                                bound = bound_prefix,
+                                "network: RaftJoinReq prefix does not match the caller's \
+                                 peer id; enrolling the bound prefix",
+                            );
+                        }
                         // Join requests can call `change_membership`,
-                        // which writes the joint-config redb row. Off
-                        // the swarm thread.
+                        // which writes the joint-config redb row, AND the
+                        // admission check below probes the local registry
+                        // (a blocking local round-trip) — both off the swarm
+                        // thread.
                         let handler = raft_handlers
                             .lock()
                             .ok()
                             .and_then(|g| g.get(&replication_id).cloned());
+                        let svc = service.get().cloned();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
                             let result = match handler {
-                                Some(h) => h.handle_join(&replication_id, joiner_prefix),
                                 None => RaftJoinResult::UnknownGroup,
+                                // Admission: a peer may add itself only if an
+                                // admin enrolled it as a NODE_ROLE_VOTER in the
+                                // registry. Fail closed when the NodeService /
+                                // registry is unavailable.
+                                Some(h)
+                                    if svc
+                                        .as_ref()
+                                        .is_some_and(|s| s.raft_join_authorized(bound_prefix)) =>
+                                {
+                                    h.handle_join(&replication_id, bound_prefix)
+                                }
+                                Some(_) => {
+                                    warn!(
+                                        prefix = bound_prefix,
+                                        "network: RaftJoinReq refused — prefix is not an \
+                                         enrolled voter",
+                                    );
+                                    RaftJoinResult::NotAuthorized
+                                }
                             };
                             let _ = response_tx.send((channel, Frame::RaftJoinResp { result }));
                         });

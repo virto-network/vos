@@ -357,7 +357,8 @@ struct Endpoint {
     pid: u32,
 }
 
-fn read_chain(data_dir: &Path) -> Vec<msg_ctl::CommitRow> {
+fn read_chain(daemon: &Daemon) -> Vec<msg_ctl::CommitRow> {
+    let data_dir = daemon.data_dir();
     let raw = fs::read_to_string(data_dir.join(".endpoint")).expect("read endpoint");
     let ep: Endpoint = toml::from_str(&raw).expect("parse endpoint");
     let bootstrap_str = format!(
@@ -368,6 +369,23 @@ fn read_chain(data_dir: &Path) -> Vec<msg_ctl::CommitRow> {
     let bootstrap = Multiaddr::from_str(&bootstrap_str).expect("parse daemon multiaddr");
     let keypair = libp2p::identity::Keypair::generate_ed25519();
     let peer_id = libp2p::PeerId::from(keypair.public());
+
+    // `commits` is a private `msg-*` read: the dispatch layer refuses it
+    // for a non-member peer (the membership gate). Grant this raw
+    // chain-reader the read tier first, the way a real operator would.
+    run_cli(
+        daemon,
+        &[
+            "space",
+            "role",
+            SPACE_NAME,
+            "grant",
+            &peer_id.to_string(),
+            "read",
+        ],
+        "grant raw chain-reader the read tier",
+    );
+
     let local_prefix = vos::network::derive_node_prefix(&peer_id);
     let net = Network::start(NetworkConfig {
         keypair,
@@ -527,7 +545,7 @@ fn stale_committer_retries_through_production_catch_up() {
 
     // The chain holds exactly the three winning commits, in order,
     // each carrying a welcome (all three were Adds).
-    let chain = read_chain(d.data_dir());
+    let chain = read_chain(&d);
     assert_eq!(
         chain.len(),
         3,

@@ -172,6 +172,28 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
+    // Record this daemon's operator — the CLI identity that ran `vosx space
+    // up` (the same `vosx/identity.key` the operator later presents when
+    // driving agents with `vosx <agent> …`). The node's locality gate admits
+    // this caller, and only this caller, to a device-local (`consistency =
+    // local`) agent such as the messenger, so the operator can drive their
+    // own E2EE messenger while every remote peer is refused. A best-effort
+    // load: if the operator identity can't be resolved the daemon still boots,
+    // but no caller will reach a confined agent (fail closed).
+    match crate::identity::load_or_create() {
+        Ok(kp) => {
+            let operator = libp2p::PeerId::from(kp.public());
+            node.set_operator_peer(operator.to_bytes());
+            tracing::info!(%operator, "auth: recorded operator for device-local agents");
+        }
+        Err(e) => {
+            tracing::warn!(
+                "auth: could not load operator identity ({e}); device-local agents \
+                 will be unreachable until restarted with a readable identity",
+            );
+        }
+    }
+
     node.attach_network(network);
 
     tracing::info!(
@@ -1571,6 +1593,16 @@ fn join_raft_group(
             Ok(RaftJoinResult::UnknownGroup) => {
                 return Ok(RaftSeed::Defer(format!(
                     "peer {leader:#06x} no longer runs the group",
+                )));
+            }
+            Ok(RaftJoinResult::NotAuthorized) => {
+                // Permanent refusal — this node isn't an enrolled voter.
+                // Don't retry; an admin must enrol it first.
+                return Ok(RaftSeed::Defer(format!(
+                    "this node ({local_prefix:#06x}) is not enrolled as a voter for \
+                     agent '{}'; an admin must run `vosx space members add <peer> \
+                     --role voter`",
+                    a.instance_name,
                 )));
             }
             Err(_) => {

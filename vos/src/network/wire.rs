@@ -337,6 +337,13 @@ pub enum RaftJoinResult {
     /// because another joint-consensus change is in flight.
     /// Joiner backs off and retries.
     Busy,
+    /// The joiner is not an enrolled voter for this space — no
+    /// `NODE_ROLE_VOTER` member row exists for its (peer-bound) prefix.
+    /// A permanent refusal: the joiner must be enrolled by an admin
+    /// (`vosx space members add … --role voter`) before it can join,
+    /// so it must NOT retry. Distinct from `UnknownGroup` (which means
+    /// "try another bootnode").
+    NotAuthorized,
 }
 
 /// One log entry carried inside an [`Frame::RaftAppendReq`].
@@ -585,6 +592,7 @@ impl Frame {
                     }
                     RaftJoinResult::UnknownGroup => out.push(2),
                     RaftJoinResult::Busy => out.push(3),
+                    RaftJoinResult::NotAuthorized => out.push(4),
                 }
             }
             Frame::ManifestReq => {
@@ -852,6 +860,7 @@ impl Frame {
                     }
                     2 => RaftJoinResult::UnknownGroup,
                     3 => RaftJoinResult::Busy,
+                    4 => RaftJoinResult::NotAuthorized,
                     other => return Err(FrameError::BadOption(other)),
                 };
                 Frame::RaftJoinResp { result }
