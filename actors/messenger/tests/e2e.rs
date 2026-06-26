@@ -406,6 +406,25 @@ fn messenger(daemon: &Daemon, verb_and_args: &[&str], what: &str) -> String {
     run_cli(daemon, &args, what)
 }
 
+/// Lower-case hex (no dep) — for passing a PeerId's bytes as an invite target.
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Decode a hex string to bytes (the inverse of [`to_hex`]).
+fn from_hex(s: &str) -> Vec<u8> {
+    let s = s.trim();
+    assert!(s.len() % 2 == 0, "odd-length hex");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
+        .collect()
+}
+
 /// Poll a CLI read until `pred` accepts its stdout.
 fn wait_for(daemon: &Daemon, verb_and_args: &[&str], what: &str, pred: impl Fn(&str) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(45);
@@ -479,6 +498,30 @@ impl RawClient {
     /// This client's libp2p PeerId (string), for granting it a space role.
     fn peer_id(&self) -> &str {
         &self.peer_id
+    }
+
+    /// Raw `msg-directory.publish_kp(owner, kp)` — stages a substitution by
+    /// listing a KeyPackage under an `owner` the publisher doesn't actually own
+    /// (the directory stores `owner` opaquely; binding is enforced inviter-side).
+    fn publish_kp_raw(&self, owner: &str, kp: Vec<u8>) -> u8 {
+        let raw: [u8; 2] =
+            vos::crypto::blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"msg-directory"]);
+        let local = (u16::from_le_bytes(raw) & 0x7FFF).max(0x100);
+        let target = ServiceId(((self.daemon_prefix as u32) << 16) | (local as u32));
+        let msg = Msg::new("publish_kp")
+            .with("owner", owner.to_string())
+            .with("kp", kp);
+        let mut payload = Vec::with_capacity(1 + 256);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+        let reply = self
+            .node
+            .invoke_with_timeout(target, payload, Duration::from_secs(30))
+            .expect("daemon didn't reply to raw publish_kp");
+        match <Value as Decode>::decode(&reply) {
+            Value::Bytes(b) if b.len() == 1 => b[0],
+            v => v.as_u8().expect("publish_kp status"),
+        }
     }
 
     /// Page the whole raw envelope log off one of the daemon's
@@ -593,7 +636,10 @@ fn two_nodes_exchange_e2ee_messages() {
     let id = space_id(a.config_home.path());
 
     let out = messenger(&a, &["register", "nickname=alice"], "alice register");
-    assert!(out.contains("registered"), "register reply: {out}");
+    assert!(
+        out.contains("key packages published"),
+        "register should bind identity + stock the directory: {out}"
+    );
     messenger(&a, &["create", "channel=general"], "alice create channel");
     messenger(
         &a,
@@ -613,6 +659,13 @@ fn two_nodes_exchange_e2ee_messages() {
         .find_map(|l| l.strip_prefix("peer_id = "))
         .map(str::trim)
         .expect("whoami output should contain peer_id");
+    // Invites use verified PeerId: the 38-byte ed25519 multihash, hex.
+    let peer_b_hex = to_hex(
+        &peer_b
+            .parse::<libp2p::PeerId>()
+            .expect("parse bob's peer id")
+            .to_bytes(),
+    );
     run_cli(
         &a,
         &["space", "role", SPACE_NAME, "grant", peer_b, "read"],
@@ -689,8 +742,8 @@ fn two_nodes_exchange_e2ee_messages() {
     );
     messenger(&b, &["join", "channel=general"], "bob join");
 
-    // ── Alice invites bob BY NAME (directory claim); bob's tick
-    //    completes the join. ─────────────────────────────────────
+    // ── Alice invites bob BY PEER ID (directory claim by verified
+    //    identity); bob's tick completes the join. ────────────────
     let out = messenger(&b, &["status"], "bob status pre-invite");
     assert!(out.contains("waiting for welcome"), "status: {out}");
     // Bob's KeyPackages reach A's directory replica via the raft
@@ -701,7 +754,7 @@ fn two_nodes_exchange_e2ee_messages() {
     loop {
         let out = messenger(
             &a,
-            &["invite", "channel=general", "member=bob"],
+            &["invite", "channel=general", &format!("member={peer_b_hex}")],
             "alice invite",
         );
         if out.contains("invited") {
@@ -709,7 +762,7 @@ fn two_nodes_exchange_e2ee_messages() {
         }
         assert!(
             Instant::now() < deadline,
-            "alice's invite-by-name never succeeded: {out}"
+            "alice's invite-by-peer-id never succeeded: {out}"
         );
         thread::sleep(Duration::from_millis(400));
     }
@@ -753,6 +806,41 @@ fn two_nodes_exchange_e2ee_messages() {
         !bob_history.contains("pre-bob"),
         "bob must not decrypt pre-join history:\n{bob_history}"
     );
+
+    // ── Identity binding prevents impersonation. A member (a raw
+    //    client granted the member tier) lists bob's real bound KeyPackage
+    //    under a VICTIM's PeerId in the directory. When alice invites that
+    //    victim by identity, the claim returns a package whose credential
+    //    binds to bob — not the victim — so the inviter refuses it. ────────
+    {
+        let bob_kp_hex = messenger(&b, &["key_package"], "bob kp for substitution")
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .max_by_key(|run| run.len())
+            .filter(|run| run.len() > 64)
+            .map(str::to_string)
+            .expect("key_package should print hex");
+        // A would-be victim identity that never published its own KeyPackage.
+        let victim = libp2p::identity::Keypair::generate_ed25519();
+        let victim_hex = to_hex(&libp2p::PeerId::from(victim.public()).to_bytes());
+        // The attacker lists bob's KeyPackage under the victim's identity.
+        let attacker = connect_reader(&a, &a);
+        assert_eq!(
+            attacker.publish_kp_raw(&victim_hex, from_hex(&bob_kp_hex)),
+            0,
+            "the directory stores the (opaque) substituted row",
+        );
+        // Alice invites the victim by identity; the claim returns bob's
+        // package, whose credential binds to bob — refused.
+        let out = messenger(
+            &a,
+            &["invite", "channel=general", &format!("member={victim_hex}")],
+            "alice invites the impersonated victim",
+        );
+        assert!(
+            out.contains("different identity") || out.contains("substitution"),
+            "a KeyPackage bound to a different identity must be refused: {out}"
+        );
+    }
 
     // ── Privacy gate 2: the replicated `msg-*` log is membership-gated AND
     //    ciphertext-only. (a) Private read handlers require membership; a
@@ -947,7 +1035,7 @@ fn two_nodes_exchange_e2ee_messages() {
         loop {
             let out = messenger(
                 &a,
-                &["invite", "channel=dev", "member=bob"],
+                &["invite", "channel=dev", &format!("member={peer_b_hex}")],
                 "alice dev invite",
             );
             if out.contains("invited") {

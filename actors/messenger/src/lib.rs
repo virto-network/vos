@@ -48,6 +48,7 @@ use vos::prelude::*;
 mod clients;
 mod crypto_provider;
 mod host_rand;
+mod identity;
 mod mls;
 mod store;
 mod tick;
@@ -97,6 +98,13 @@ pub fn log_agent_name(channel: &str) -> String {
 }
 pub fn ctl_agent_name(channel: &str) -> String {
     format!("msg-{channel}-ctl")
+}
+
+/// Whether `b` is a libp2p ed25519 PeerId (the fixed 38-byte
+/// identity-multihash `00 24 08 01 12 20 ‖ key[32]`) — how an invite target is
+/// distinguished from a (much larger) raw KeyPackage.
+fn is_peer_id(b: &[u8]) -> bool {
+    b.len() == 38 && b[..6] == [0x00, 0x24, 0x08, 0x01, 0x12, 0x20]
 }
 
 /// The per-space directory agent's instance name.
@@ -164,12 +172,24 @@ pub struct ChannelEntry {
 
 #[actor]
 pub struct Messenger {
-    /// Operator-chosen display identity (the MLS BasicCredential).
-    /// Empty until `register`.
+    /// Operator-chosen display name, carried (non-authoritatively) in the
+    /// MLS credential. Empty until `register`.
     nickname: String,
     /// This member's Ed25519 public key — a stable identity reference,
     /// reproducible from the seed (the signer is derived, not stored).
     signature_key: Vec<u8>,
+    /// The operator's verified space PeerId (libp2p multihash bytes),
+    /// the authoritative identity this member's MLS key is bound to. Empty
+    /// until `bind_identity`.
+    peer_id: Vec<u8>,
+    /// The operator's binding cert: their identity key signing over
+    /// `(mls_pubkey ‖ peer_id ‖ space_id)`. Travels in the MLS credential so
+    /// any peer validating a leaf can confirm the key↔PeerId binding. Empty
+    /// until `bind_identity`.
+    binding_cert: Vec<u8>,
+    /// The space id the binding cert is scoped to (32 bytes). Empty
+    /// until `bind_identity`.
+    space_id: Vec<u8>,
     /// Snapshot of the mls-rs storage providers — the group ratchet state
     /// (`GroupStateStorage`) and KeyPackage private parts
     /// (`KeyPackageStorage`). See `mls::open_stores` / `store::snapshot`.
@@ -198,11 +218,42 @@ impl Messenger {
         Messenger {
             nickname: String::new(),
             signature_key: Vec::new(),
+            peer_id: Vec::new(),
+            binding_cert: Vec::new(),
+            space_id: Vec::new(),
             mls_store: Vec::new(),
             csprng_seed: Vec::new(),
             published_kp_count: 0,
             channels: Vec::new(),
         }
+    }
+
+    /// The identity binding for this member, or an error if `bind_identity`
+    /// hasn't run yet. Every MLS client built for an operation carries it.
+    fn binding(&self) -> core::result::Result<crate::identity::Binding, String> {
+        if self.peer_id.is_empty() || self.binding_cert.is_empty() {
+            return Err("not bound — run `messenger register` (binds your space \
+                        identity) before this operation"
+                .into());
+        }
+        Ok(crate::identity::Binding {
+            peer_id: self.peer_id.clone(),
+            display_name: self.nickname.clone(),
+            cert: self.binding_cert.clone(),
+        })
+    }
+
+    /// The bound space id as a fixed array.
+    fn space_id_array(&self) -> core::result::Result<[u8; 32], String> {
+        self.space_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| String::from("binding space id is malformed"))
+    }
+
+    /// The `(binding, space_id)` pair every MLS client build needs.
+    fn bound_inputs(&self) -> core::result::Result<(crate::identity::Binding, [u8; 32]), String> {
+        Ok((self.binding()?, self.space_id_array()?))
     }
 
     /// Restore the mls-rs storage providers (group state + key packages) from
@@ -244,12 +295,13 @@ impl Messenger {
         "seed provisioned".into()
     }
 
-    /// Create this node's messaging identity: an MLS credential
-    /// under `nickname` with a fresh Ed25519 signer. Also stocks
-    /// the space directory with a few KeyPackages so others can
-    /// invite this member by name right away.
+    /// Create this node's messaging identity: a fresh seed-derived Ed25519
+    /// MLS signer under display name `nickname`. Returns `mls_pubkey=<hex>`
+    /// so the caller can have the operator sign a binding cert over it and
+    /// call [`bind_identity`](Self::bind_identity) — KeyPackages aren't
+    /// published until then (they carry the identity-bound credential).
     #[msg(cli)]
-    async fn register(&mut self, nickname: String, ctx: &mut Context<Self>) -> String {
+    async fn register(&mut self, nickname: String, _ctx: &mut Context<Self>) -> String {
         if !self.nickname.is_empty() {
             return format!("already registered as '{}'", self.nickname);
         }
@@ -282,16 +334,54 @@ impl Messenger {
             Err(e) => return format!("key generation failed: {e}"),
         };
         self.nickname = nickname;
+        // The caller signs a binding cert over this key and calls
+        // `bind_identity`; publishing waits for the bound credential.
+        format!("mls_pubkey={}", hex_encode(&self.signature_key))
+    }
 
+    /// Bind this member's MLS key to the operator's verified space PeerId.
+    /// The operator's CLI identity key signs a cert over
+    /// `(mls_pubkey ‖ peer_id ‖ space_id)`; we verify it against our own
+    /// derived MLS key, store the binding, and publish the now
+    /// identity-bound KeyPackages so peers can invite us by PeerId. A
+    /// member can't be impersonated: a KeyPackage's credential carries this
+    /// cert, and an inviter (and every group member, via the MLS leaf
+    /// validator) refuses any MLS key the claimed PeerId never signed for.
+    #[msg(cli)]
+    async fn bind_identity(
+        &mut self,
+        peer_id: Vec<u8>,
+        space_id: Vec<u8>,
+        cert: Vec<u8>,
+        ctx: &mut Context<Self>,
+    ) -> String {
+        if self.nickname.is_empty() {
+            return "not registered — run `register` first".into();
+        }
+        if !self.peer_id.is_empty() {
+            return format!("already bound to peer {}", hex_encode(&self.peer_id));
+        }
+        let space_arr: [u8; 32] = match space_id.as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => return "space_id must be 32 bytes".into(),
+        };
+        if !crate::identity::verify_binding(&self.signature_key, &peer_id, &cert, &space_arr) {
+            return "binding cert does not verify against this member's MLS key \
+                    — wrong operator key, peer id, or space id"
+                .into();
+        }
+        self.peer_id = peer_id;
+        self.binding_cert = cert;
+        self.space_id = space_id;
         match self.stock_directory(ctx, REGISTER_KP_COUNT).await {
             Ok(n) => format!(
-                "registered as '{}' ({n} key packages published to the directory)",
-                self.nickname
+                "bound to peer {} ({n} key packages published)",
+                hex_encode(&self.peer_id),
             ),
             Err(e) => format!(
-                "registered as '{}' — directory unavailable ({e}); \
+                "bound to peer {} — directory unavailable ({e}); \
                  use `key_package` for out-of-band invites",
-                self.nickname
+                hex_encode(&self.peer_id),
             ),
         }
     }
@@ -300,10 +390,19 @@ impl Messenger {
     /// delivery to an inviter. One KeyPackage admits one join.
     #[msg(cli)]
     async fn key_package(&mut self, ctx: &mut Context<Self>) -> String {
+        let (binding, space_id) = match self.bound_inputs() {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
         let beacon = crate::clients::chronos_beacon(ctx).await;
         let stores = self.open_stores();
-        let client = match mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)
-        {
+        let client = match mls::build_bound_client_hedged(
+            &binding,
+            space_id,
+            &self.csprng_seed,
+            &stores,
+            beacon,
+        ) {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -332,10 +431,19 @@ impl Messenger {
         if let Err(e) = self.ensure_channel_agents(&channel, ctx).await {
             return e;
         }
+        let (binding, space_id) = match self.bound_inputs() {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
         let beacon = crate::clients::chronos_beacon(ctx).await;
         let stores = self.open_stores();
-        let client = match mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)
-        {
+        let client = match mls::build_bound_client_hedged(
+            &binding,
+            space_id,
+            &self.csprng_seed,
+            &stores,
+            beacon,
+        ) {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -450,34 +558,52 @@ impl Messenger {
         if self.channel_index(&channel).is_none() {
             return format!("unknown channel '{channel}'");
         }
-        // A serialized KeyPackage is hundreds of bytes; anything
-        // long and hex-shaped is one, anything else is a nickname.
-        // A directory claim is remembered so a definitively-refused
-        // commit can return the package to the pool instead of
-        // leaking it from the member's inventory.
-        let mut claimed_from: Option<u32> = None;
-        let kp_bytes = match hex_decode(&member).filter(|b| b.len() > 64) {
-            Some(bytes) => bytes,
-            None => {
+        // Identity-first: the target is either the member's verified
+        // PeerId — claim their attested KeyPackage from the directory BY
+        // identity — or a raw out-of-band KeyPackage (hundreds of bytes). A
+        // PeerId is the fixed 38-byte ed25519 multihash; a KeyPackage is much
+        // larger. A directory claim is remembered (with its owner key) so a
+        // definitively-refused commit can return the package to the pool.
+        let mut claimed_from: Option<(u32, String)> = None;
+        let (kp_bytes, expected_peer) = match hex_decode(&member) {
+            Some(b) if is_peer_id(&b) => {
                 let dir_id = match resolve(ctx, DIRECTORY_AGENT).await {
                     Ok(id) => id,
-                    Err(e) => return format!("can't look up '{member}': {e}"),
+                    Err(e) => return format!("can't reach the directory: {e}"),
                 };
-                match dir_claim_kp(ctx, dir_id, &member).await {
+                let owner = hex_encode(&b);
+                match dir_claim_kp(ctx, dir_id, &owner).await {
                     Ok(Some(bytes)) => {
-                        claimed_from = Some(dir_id);
-                        bytes
+                        claimed_from = Some((dir_id, owner));
+                        (bytes, Some(b))
                     }
                     Ok(None) => {
-                        return format!(
-                            "'{member}' has no key packages left in the directory — \
-                             ask them to run `messenger key_package` and pass you the hex"
-                        );
+                        return "no key packages published for that identity — ask them \
+                                to run `messenger register`, or pass a key-package hex \
+                                for an out-of-band invite"
+                            .into();
                     }
                     Err(e) => return e,
                 }
             }
+            Some(b) if b.len() > 64 => (b, None),
+            _ => return "invite target must be a peer id or a key-package hex".into(),
         };
+
+        // Refuse a KeyPackage whose credential isn't a real enrolled member's,
+        // and — on a directory claim — one that doesn't match the identity we
+        // asked for (a substituted KeyPackage under a victim's name).
+        if let Err(e) = self
+            .verify_invite_target(ctx, &kp_bytes, expected_peer.as_deref())
+            .await
+        {
+            if let Some((dir_id, owner)) = &claimed_from {
+                let hash = msg_directory::kp_hash(&kp_bytes);
+                let _ = dir_release_kp(ctx, *dir_id, owner, hash).await;
+            }
+            return e;
+        }
+
         match self
             .commit_chain_op(
                 ctx,
@@ -494,17 +620,50 @@ impl Messenger {
                 // indeterminate (transport) failure the commit may
                 // have landed, and re-arming the package would hand
                 // out a consumed KeyPackage.
-                if let (Some(dir_id), ChainErr::Refused(_)) = (claimed_from, &e) {
+                if let (Some((dir_id, owner)), ChainErr::Refused(_)) = (&claimed_from, &e) {
                     let hash = msg_directory::kp_hash(&kp_bytes);
-                    if let Err(release_err) = dir_release_kp(ctx, dir_id, &member, hash).await {
-                        log::warn!(
-                            "couldn't return '{member}'s claimed key package: {release_err}"
-                        );
+                    if let Err(release_err) = dir_release_kp(ctx, *dir_id, owner, hash).await {
+                        log::warn!("couldn't return the claimed key package: {release_err}");
                     }
                 }
                 e.into_message()
             }
         }
+    }
+
+    /// Verify a claimed/supplied KeyPackage is a real identity-bound, enrolled
+    /// member's — and, when `expected_peer` is set (a directory claim by
+    /// PeerId), that its credential actually binds to that identity. This is
+    /// the inviter-side identity binding check: the substitution attack (publish a KP under
+    /// a victim's directory name) is caught here, before the member is added.
+    async fn verify_invite_target(
+        &self,
+        ctx: &mut Context<Self>,
+        kp_bytes: &[u8],
+        expected_peer: Option<&[u8]>,
+    ) -> core::result::Result<(), String> {
+        let kp = mls::parse_key_package(kp_bytes)?
+            .into_key_package()
+            .ok_or_else(|| String::from("not a key package"))?;
+        let si = kp.signing_identity();
+        let mls_pubkey = si.signature_key.as_bytes().to_vec();
+        let dec = crate::identity::member_binding(si)
+            .ok_or_else(|| String::from("key package carries no VOS identity credential"))?;
+        let space_id = self.space_id_array()?;
+        if !crate::identity::verify_binding(&mls_pubkey, &dec.peer_id, &dec.cert, &space_id) {
+            return Err("key package's identity binding does not verify — refusing".into());
+        }
+        if let Some(expected) = expected_peer
+            && dec.peer_id != expected
+        {
+            return Err("the directory returned a key package for a different identity \
+                        than requested — refusing (possible substitution)"
+                .into());
+        }
+        if !crate::clients::reg_is_member(ctx, &dec.peer_id).await? {
+            return Err("that identity is not an enrolled member of this space".into());
+        }
+        Ok(())
     }
 
     /// Evict a member. MLS post-compromise security does the real
@@ -579,10 +738,19 @@ impl Messenger {
                  before sending"
             );
         }
+        let (binding, space_id) = match self.bound_inputs() {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
         let beacon = crate::clients::chronos_beacon(ctx).await;
         let stores = self.open_stores();
-        let client = match mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)
-        {
+        let client = match mls::build_bound_client_hedged(
+            &binding,
+            space_id,
+            &self.csprng_seed,
+            &stores,
+            beacon,
+        ) {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -679,7 +847,9 @@ impl Messenger {
             self.published_kp_count
         ));
         let stores = self.open_stores();
-        let client = mls::build_client(&self.nickname, &self.csprng_seed, &stores).ok();
+        let client = self.bound_inputs().ok().and_then(|(binding, space_id)| {
+            mls::build_bound_client(&binding, space_id, &self.csprng_seed, &stores).ok()
+        });
         for c in &self.channels {
             if c.desynced {
                 out.push_str(&format!(
@@ -850,17 +1020,26 @@ impl Messenger {
         n: usize,
     ) -> core::result::Result<usize, String> {
         let dir_id = resolve(ctx, DIRECTORY_AGENT).await?;
+        let (binding, space_id) = self.bound_inputs()?;
+        // Published under the verified PeerId (hex), so an inviter claims by
+        // identity — not a free-form nickname.
+        let owner = hex_encode(&self.peer_id);
         // One beacon for the whole batch — every KeyPackage in this dispatch
         // hedges under the same finalized round.
         let beacon = crate::clients::chronos_beacon(ctx).await;
         let mut published = 0usize;
         for _ in 0..n {
             let stores = self.open_stores();
-            let client =
-                mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)?;
+            let client = mls::build_bound_client_hedged(
+                &binding,
+                space_id,
+                &self.csprng_seed,
+                &stores,
+                beacon,
+            )?;
             let kp_bytes = new_key_package(&client, now_ms())?;
             self.mls_store = store::snapshot(&stores);
-            dir_publish_kp(ctx, dir_id, &self.nickname.clone(), kp_bytes).await?;
+            dir_publish_kp(ctx, dir_id, &owner, kp_bytes).await?;
             self.published_kp_count += 1;
             published += 1;
         }
@@ -890,13 +1069,19 @@ impl Messenger {
             .into());
         }
         let ctl_id = resolve(ctx, &ctl_agent_name(channel)).await?;
+        let (binding, space_id) = self.bound_inputs()?;
         // One beacon for both commit attempts — a retry re-derives the commit
         // under the same finalized round.
         let beacon = crate::clients::chronos_beacon(ctx).await;
         for attempt in 0..2 {
             let stores = self.open_stores();
-            let client =
-                mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)?;
+            let client = mls::build_bound_client_hedged(
+                &binding,
+                space_id,
+                &self.csprng_seed,
+                &stores,
+                beacon,
+            )?;
             let mut group = mls::load_group(&client, channel)?;
             // mls-rs has no `is_active`; our own leaf missing from the roster
             // means a prior commit evicted us.
@@ -938,10 +1123,8 @@ impl Messenger {
                         .roster()
                         .members_iter()
                         .filter(|m| {
-                            m.signing_identity
-                                .credential
-                                .as_basic()
-                                .map(|b| b.identifier() == nickname.as_bytes())
+                            crate::identity::member_binding(&m.signing_identity)
+                                .map(|d| d.display_name.as_str() == *nickname)
                                 .unwrap_or(false)
                         })
                         .map(|m| m.index)

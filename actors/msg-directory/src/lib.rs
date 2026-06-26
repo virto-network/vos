@@ -15,11 +15,15 @@
 //! (the second Welcome simply fails to stage on the joiner, who
 //! has already consumed the private part).
 //!
-//! Identity caveat: rows bind to a *nickname*, not a verified
-//! space identity — anyone the role gate lets in can publish under
-//! any name. Inviters must validate the claimed KeyPackage
-//! cryptographically (the messenger does), and nickname↔identity
-//! binding arrives with the platform identity layer.
+//! Identity binding: the directory stores `(owner, kp)` rows
+//! *opaquely* — it links no MLS library, so it can't inspect a
+//! KeyPackage's credential. The binding to a verified identity is
+//! enforced messenger-side: a member publishes under its own verified
+//! PeerId (the `owner` is the PeerId, not a free nickname), and an
+//! inviter that claims by PeerId refuses any returned package whose
+//! embedded credential binds to a different identity (or an
+//! unenrolled member). So a member listing a package under a victim's
+//! PeerId here is harmless — the inviter catches the substitution.
 //!
 //! `claim_kp` is open to any publisher, so a member can drain
 //! another's inventory (griefing): the victim's invite-by-name

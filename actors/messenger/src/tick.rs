@@ -157,8 +157,9 @@ fn process_chain_record(
     commit_body: &[u8],
     record_epoch: u64,
 ) -> Result<(), String> {
+    let (binding, space_id) = (m.binding()?, m.space_id_array()?);
     let stores = crate::mls::open_stores(&m.mls_store);
-    let client = crate::mls::build_client(&m.nickname, &m.csprng_seed, &stores)?;
+    let client = crate::mls::build_bound_client(&binding, space_id, &m.csprng_seed, &stores)?;
     let mut group = crate::mls::load_group(&client, &m.channels[i].name)?;
     if group.current_epoch() > record_epoch {
         return Ok(());
@@ -205,8 +206,9 @@ fn process_chain_record(
 /// caller trial-decrypts every Welcome to find ours), is malformed,
 /// or carries a foreign group id.
 fn join_from_welcome(m: &mut Messenger, i: usize, welcome_bytes: &[u8]) -> Result<(), String> {
+    let (binding, space_id) = (m.binding()?, m.space_id_array()?);
     let stores = crate::mls::open_stores(&m.mls_store);
-    let client = crate::mls::build_client(&m.nickname, &m.csprng_seed, &stores)?;
+    let client = crate::mls::build_bound_client(&binding, space_id, &m.csprng_seed, &stores)?;
     let msg = MlsMessage::from_bytes(welcome_bytes)
         .map_err(|e| format!("welcome deserialize failed: {e:?}"))?;
     if msg.wire_format() != WireFormat::Welcome {
@@ -289,8 +291,9 @@ async fn drain_log(m: &mut Messenger, i: usize, ctx: &mut MsgrCtx) -> Result<(),
             return Ok(());
         }
 
+        let (binding, space_id) = (m.binding()?, m.space_id_array()?);
         let stores = crate::mls::open_stores(&m.mls_store);
-        let client = crate::mls::build_client(&m.nickname, &m.csprng_seed, &stores)?;
+        let client = crate::mls::build_bound_client(&binding, space_id, &m.csprng_seed, &stores)?;
         let mut group = crate::mls::load_group(&client, &name)?;
         let mut dirty = false;
         // Set when we stop the drain mid-page — an envelope from an epoch
@@ -462,13 +465,21 @@ pub(crate) fn decrypt_app<C: MlsConfig>(
         .map_err(|e| format!("process: {e:?}"))?;
     match received {
         ReceivedMessage::ApplicationMessage(app) => {
+            // Display name only (non-authoritative — the cryptographic identity
+            // is the credential's PeerId, validated by the identity provider).
+            // Read it from the VOS credential, falling back to a bare
+            // BasicCredential identifier for any non-bound leaf.
             let sender = group
                 .member_at_index(app.sender_index)
                 .and_then(|m| {
-                    m.signing_identity
-                        .credential
-                        .as_basic()
-                        .map(|b| String::from_utf8_lossy(b.identifier()).into_owned())
+                    crate::identity::member_binding(&m.signing_identity)
+                        .map(|d| d.display_name)
+                        .or_else(|| {
+                            m.signing_identity
+                                .credential
+                                .as_basic()
+                                .map(|b| String::from_utf8_lossy(b.identifier()).into_owned())
+                        })
                 })
                 .unwrap_or_default();
             let text = String::from_utf8_lossy(app.data()).into_owned();

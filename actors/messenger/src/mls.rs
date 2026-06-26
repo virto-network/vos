@@ -167,6 +167,10 @@ pub(crate) fn open_stores(snapshot: &[u8]) -> VosStores {
 /// host-seeded crypto provider, and the seed-derived signing identity under
 /// `nickname`. Seed-only stream — see [`build_client_hedged`] for the
 /// verifiable-randomness variant.
+// Basic (un-bound) credential builders. Since M4 every production path builds
+// identity-bound clients (`build_bound_client*`); these remain to exercise MLS
+// group mechanics independent of the binding in unit tests.
+#[allow(dead_code)]
 pub(crate) fn build_client(
     nickname: &str,
     seed: &[u8],
@@ -188,12 +192,20 @@ pub(crate) fn build_client(
 /// seed alone (RFC 9180 §9.7.5). Folding the SAME beacon keeps draws
 /// bit-identical (the determinism gate holds); `None` is byte-identical to
 /// [`build_client`], so a space without a chronos feed is unaffected.
+#[allow(dead_code)]
 pub(crate) fn build_client_hedged(
     nickname: &str,
     seed: &[u8],
     stores: &VosStores,
     beacon: Option<[u8; 32]>,
 ) -> Result<Client<impl MlsConfig + use<>>, String> {
+    build_client_with_rand(nickname, seed, boot_host_rand(seed, beacon)?, stores)
+}
+
+/// Boot the per-dispatch MLS CSPRNG from the seed plus a fresh per-open token,
+/// folding an optional verifiable-randomness beacon into the output branch.
+/// Shared by the basic and identity-bound client builders.
+fn boot_host_rand(seed: &[u8], beacon: Option<[u8; 32]>) -> Result<HostRand, String> {
     let seed32 = seed_array(seed)?;
     let mut boot_token = [0u8; 32];
     #[cfg(not(target_arch = "riscv64"))]
@@ -214,7 +226,30 @@ pub(crate) fn build_client_hedged(
     if let Some(b) = beacon {
         rand.set_beacon(PublicBeacon(b));
     }
-    build_client_with_rand(nickname, seed, rand, stores)
+    Ok(rand)
+}
+
+/// Identity-bound counterpart of [`build_client`] (M4): builds the Client over
+/// the custom credential + [`crate::identity::VosIdentityProvider`]. Seed-only
+/// stream (no beacon).
+pub(crate) fn build_bound_client(
+    binding: &crate::identity::Binding,
+    space_id: [u8; 32],
+    seed: &[u8],
+    stores: &VosStores,
+) -> Result<Client<impl MlsConfig + use<>>, String> {
+    build_bound_client_hedged(binding, space_id, seed, stores, None)
+}
+
+/// Identity-bound counterpart of [`build_client_hedged`] (M4).
+pub(crate) fn build_bound_client_hedged(
+    binding: &crate::identity::Binding,
+    space_id: [u8; 32],
+    seed: &[u8],
+    stores: &VosStores,
+    beacon: Option<[u8; 32]>,
+) -> Result<Client<impl MlsConfig + use<>>, String> {
+    build_bound_client_with_rand(binding, space_id, seed, boot_host_rand(seed, beacon)?, stores)
 }
 
 /// Build the Client over an explicit [`HostRand`]. Two clients built from the
@@ -225,6 +260,7 @@ pub(crate) fn build_client_hedged(
 /// `use<>`: the returned Client captures none of the input lifetimes — it copies
 /// the nickname into a credential, derives owned signer keys, and clones the
 /// stores — so callers may keep mutating `self` while it lives.
+#[allow(dead_code)]
 pub(crate) fn build_client_with_rand(
     nickname: &str,
     seed: &[u8],
@@ -242,6 +278,35 @@ pub(crate) fn build_client_with_rand(
     Ok(Client::builder()
         .crypto_provider(VosCryptoProvider::new(rand))
         .identity_provider(BasicIdentityProvider)
+        .group_state_storage(stores.group_state.clone())
+        .key_package_repo(stores.key_packages.clone())
+        .mls_rules(vos_mls_rules())
+        .signing_identity(signing_identity, secret, CIPHERSUITE)
+        .build())
+}
+
+/// Like [`build_client_with_rand`] but with the M4 identity-bound custom
+/// credential + [`crate::identity::VosIdentityProvider`]: the leaf carries
+/// `(peer_id, display_name, binding_cert)` and every leaf mls-rs validates
+/// (added members, joined-tree members) has its cert checked against
+/// `space_id`. The MLS signer is still the seed-derived Ed25519 key and the
+/// cert is a provisioned input (not drawn from entropy), so KeyPackage /
+/// commit / Welcome bytes stay bit-identical given the same (seed, boot, ts)
+/// — the determinism gate holds (proven by
+/// `same_seed_boot_and_ts_yields_identical_bound_key_package`).
+pub(crate) fn build_bound_client_with_rand(
+    binding: &crate::identity::Binding,
+    space_id: [u8; 32],
+    seed: &[u8],
+    rand: HostRand,
+    stores: &VosStores,
+) -> Result<Client<impl MlsConfig + use<>>, String> {
+    let (secret, public) = derive_signer(seed)?;
+    let signing_identity =
+        SigningIdentity::new(crate::identity::vos_credential(binding), public);
+    Ok(Client::builder()
+        .crypto_provider(VosCryptoProvider::new(rand))
+        .identity_provider(crate::identity::VosIdentityProvider::new(space_id))
         .group_state_storage(stores.group_state.clone())
         .key_package_repo(stores.key_packages.clone())
         .mls_rules(vos_mls_rules())
@@ -862,6 +927,83 @@ mod tests {
             mint(TS_MS + 100_000_000),
             "a different timestamp must change the KeyPackage lifetime"
         );
+    }
+
+    /// The identity-bound KeyPackage (custom credential
+    /// carrying peer_id + binding cert) is bit-identical given the same
+    /// (seed, boot token, ts, binding). The binding is a deterministic
+    /// credential input, not an entropy source, so the host-vs-PVM gate holds.
+    #[test]
+    fn same_seed_boot_and_ts_yields_identical_bound_key_package() {
+        use crate::identity::Binding;
+        let token = [0x5Au8; 32];
+        let space_id = [0x11u8; 32];
+        // The cert bytes only need to be stable here — KeyPackage generation
+        // never validates them (validation is a verifier-side hook).
+        let binding = Binding {
+            peer_id: alloc::vec![0x22u8; 38],
+            display_name: String::from("zoe"),
+            cert: alloc::vec![0x33u8; 64],
+        };
+        let mint = |ts: u64| {
+            let s = stores(&[]);
+            let client = build_bound_client_with_rand(
+                &binding,
+                space_id,
+                &ALICE,
+                HostRand::boot(&ALICE, &token, &[], 0, 0),
+                &s,
+            )
+            .unwrap();
+            new_key_package(&client, ts).unwrap()
+        };
+        assert_eq!(
+            mint(TS_MS),
+            mint(TS_MS),
+            "same seed+boot+ts+binding ⇒ byte-identical bound KeyPackage",
+        );
+        assert_ne!(
+            mint(TS_MS),
+            mint(TS_MS + 100_000_000),
+            "a different timestamp must change the bound KeyPackage lifetime",
+        );
+    }
+
+    /// The bound credential actually changes the signed KeyPackage (so the
+    /// determinism gate above is meaningful) and two distinct bindings fork it.
+    #[test]
+    fn bound_key_package_differs_by_binding() {
+        use crate::identity::Binding;
+        let token = [0x5Au8; 32];
+        let space_id = [0x11u8; 32];
+        let kp = |b: &Binding| {
+            let s = stores(&[]);
+            let client = build_bound_client_with_rand(
+                b,
+                space_id,
+                &ALICE,
+                HostRand::boot(&ALICE, &token, &[], 0, 0),
+                &s,
+            )
+            .unwrap();
+            new_key_package(&client, TS_MS).unwrap()
+        };
+        let basic = {
+            let s = stores(&[]);
+            let client =
+                build_client_with_rand("zoe", &ALICE, HostRand::boot(&ALICE, &token, &[], 0, 0), &s)
+                    .unwrap();
+            new_key_package(&client, TS_MS).unwrap()
+        };
+        let b1 = Binding {
+            peer_id: alloc::vec![0x22u8; 38],
+            display_name: String::from("zoe"),
+            cert: alloc::vec![0x33u8; 64],
+        };
+        let mut b2 = b1.clone();
+        b2.peer_id = alloc::vec![0x44u8; 38];
+        assert_ne!(kp(&b1), basic, "bound credential changes the KeyPackage");
+        assert_ne!(kp(&b1), kp(&b2), "distinct bindings fork the KeyPackage");
     }
 
     /// Byte-determinism gate for commits + Welcomes: an add-member commit and

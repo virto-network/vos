@@ -117,6 +117,18 @@ pub(crate) async fn reg_agents(ctx: &mut MsgrCtx) -> Result<Vec<space_registry::
         .ok_or_else(|| "bad registry agents payload".to_string())
 }
 
+/// `space-registry.peer_role` — is `peer_id` an enrolled space member (any
+/// granted auth role above NONE)? Ungated read. Used at invite time to refuse
+/// adding a KeyPackage for an identity that isn't a member of this space.
+pub(crate) async fn reg_is_member(ctx: &mut MsgrCtx, peer_id: &[u8]) -> Result<bool, String> {
+    let msg = Msg::new("peer_role").with("peer_id", peer_id.to_vec());
+    let value = ask_value(ctx, ServiceId(REGISTRY_ID), &msg)
+        .await
+        .ok_or_else(|| "registry unreachable for the membership check".to_string())?;
+    let role = value_to_status(value).ok_or_else(|| "bad registry peer_role reply".to_string())?;
+    Ok(role != space_registry::AUTH_ROLE_NONE)
+}
+
 /// `space-registry.install` — instantiate a new agent row, cloning
 /// the program identity (name/version/hash) and consistency from
 /// `template` under a fresh instance name + replication id.
