@@ -128,20 +128,26 @@ impl Consistency {
     }
 }
 
-/// The effective consistency once the monotone locality seal is applied:
-/// a persisted `sealed` floor forbids *widening* (raising shareability),
-/// so a forged or merged registry row claiming a wider tier than the one
-/// this instance was first spawned at is pinned back down. Equal-or-lower
-/// shareability (including a `Crdt`↔`Raft` lateral, or a deliberate
-/// narrowing) is honoured.
+/// The effective consistency once the monotone locality seal is applied: a
+/// persisted `sealed` floor pins the tier this instance was first spawned at,
+/// so a forged or merged registry row can't change it. Honoured: an exact
+/// re-spawn, or a deliberate *narrowing* (lower shareability — more confined).
+/// Pinned back to `sealed`: a shareability *widening* (e.g. `Local`→`Crdt`),
+/// AND a `Crdt`↔`Raft` *lateral* — same shareability, but it swaps the
+/// replication trust model (consensus-sequenced Raft ↔ merge-anyone CRDT), so
+/// a forged catalog byte must not be able to downgrade a Raft replica to CRDT
+/// The earlier seal collapsed `Crdt`/`Raft` to one shareability rank and
+/// let the lateral through; this pins the exact tier instead.
 #[cfg(feature = "storage")]
 pub(crate) fn effective_after_seal(
     sealed: Option<Consistency>,
     requested: Consistency,
 ) -> Consistency {
     match sealed {
-        Some(s) if requested.shareability() > s.shareability() => s,
-        _ => requested,
+        Some(s) if requested == s => requested,
+        Some(s) if requested.shareability() < s.shareability() => requested,
+        Some(s) => s,
+        None => requested,
     }
 }
 
@@ -6439,7 +6445,7 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
-    fn seal_forbids_widening_only() {
+    fn seal_pins_exact_tier_forbidding_widen_and_lateral() {
         use Consistency::*;
         // No prior seal: the request passes through unchanged.
         assert_eq!(effective_after_seal(None, Crdt), Crdt);
@@ -6453,9 +6459,14 @@ mod tests {
         assert_eq!(effective_after_seal(Some(Local), Ephemeral), Ephemeral);
         // Deliberate narrowing of a shared agent is honoured.
         assert_eq!(effective_after_seal(Some(Crdt), Local), Local);
-        // Crdt <-> Raft is a rank-equal lateral move, allowed in v0.
-        assert_eq!(effective_after_seal(Some(Crdt), Raft), Raft);
-        assert_eq!(effective_after_seal(Some(Raft), Crdt), Crdt);
+        assert_eq!(effective_after_seal(Some(Raft), Ephemeral), Ephemeral);
+        // The `Crdt`<->`Raft` lateral is now PINNED to the sealed tier:
+        // a forged catalog byte can't downgrade a Raft replica to merge-anyone
+        // CRDT (or upgrade the reverse). Exact re-spawn still passes.
+        assert_eq!(effective_after_seal(Some(Crdt), Raft), Crdt);
+        assert_eq!(effective_after_seal(Some(Raft), Crdt), Raft);
+        assert_eq!(effective_after_seal(Some(Raft), Raft), Raft);
+        assert_eq!(effective_after_seal(Some(Crdt), Crdt), Crdt);
     }
 
     #[test]
