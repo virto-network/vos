@@ -1601,24 +1601,35 @@ fn handle_req_resp(
                         // Per-peer flood cap: a peer hammering FetchHeads/
                         // FetchNode is dropped (no response → caller's recv
                         // yields None and retries next tick) rather than
-                        // amplifying redb reads.
+                        // amplifying redb reads. The cap is a cheap in-memory
+                        // check; keep it on the loop, ahead of the handoff.
                         if !sync_rate.allow(peer) {
                             return;
                         }
-                        // Sync reads are quick redb txns; serve them
-                        // inline rather than spawning a blocking task.
-                        // `peer` membership-gates private (msg-*) replicas.
-                        let roots = service
-                            .get()
-                            .and_then(|s| s.sync_roots(Some(peer), &replication_id))
-                            .unwrap_or_default();
-                        let _ = swarm.behaviour_mut().req_resp.send_response(
-                            channel,
-                            Frame::Heads {
-                                replication_id,
-                                roots,
-                            },
-                        );
+                        // Off the swarm thread. The redb read itself is quick,
+                        // but serving a private (`msg-`) replica runs the
+                        // membership gate (`sync_serve_allowed`), whose
+                        // registry probe blocks on a local invoke round-trip
+                        // (up to ~5s, ~10s if both the space and actor-local
+                        // probes miss). Inline, that would stall ALL network
+                        // I/O for every peer. Mirror the Raft / InvokeRequest
+                        // handoff: clone the service + reply sender, serve in a
+                        // blocking task, and post the response back through
+                        // `response_tx` (the swarm `select!` arm forwards it).
+                        let svc = service.get().cloned();
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let roots = svc
+                                .and_then(|s| s.sync_roots(Some(peer), &replication_id))
+                                .unwrap_or_default();
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::Heads {
+                                    replication_id,
+                                    roots,
+                                },
+                            ));
+                        });
                     }
                     Frame::FetchNode {
                         replication_id,
@@ -1627,13 +1638,16 @@ fn handle_req_resp(
                         if !sync_rate.allow(peer) {
                             return;
                         }
-                        let node = service
-                            .get()
-                            .and_then(|s| s.sync_get_node(Some(peer), &replication_id, &cid));
-                        let _ = swarm
-                            .behaviour_mut()
-                            .req_resp
-                            .send_response(channel, Frame::NodeReply { node });
+                        // Off-loop for the same reason as FetchHeads: serving a
+                        // private replica runs the membership gate's blocking
+                        // registry probe.
+                        let svc = service.get().cloned();
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let node = svc
+                                .and_then(|s| s.sync_get_node(Some(peer), &replication_id, &cid));
+                            let _ = response_tx.send((channel, Frame::NodeReply { node }));
+                        });
                     }
                     Frame::FetchProofBlob { hash } => {
                         // Proof-blob lookup is a HashMap read behind an
