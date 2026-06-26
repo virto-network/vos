@@ -22,6 +22,7 @@ use vos::node::VosNode;
 
 use crate::commands::space::common::instance_service_id;
 use crate::commands::space::endpoint;
+use crate::commands::space::op_sign::op_auth;
 use crate::spaces_index::{self, SpaceEntry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,6 +44,11 @@ fn invoke_timeout() -> Duration {
 
 pub struct DaemonClient {
     node: VosNode,
+    /// The operator's libp2p identity key — signs the `auth`
+    /// blob on every gated registry mutation. The same key drives the
+    /// libp2p dial below, so the daemon sees a `Caller::Peer` whose
+    /// role it can check AND a signature its registry actor verifies.
+    signer: libp2p::identity::Keypair,
     /// Cached so command handlers can access the entry the
     /// query resolved to (e.g. for printing the space name).
     pub entry: SpaceEntry,
@@ -104,6 +110,9 @@ impl DaemonClient {
         let keypair = crate::identity::load_or_create()?;
         let peer_id = libp2p::PeerId::from(keypair.public());
         let local_prefix = vos::network::derive_node_prefix(&peer_id);
+        // Retain the key for signing registry mutations; the clone
+        // below is consumed by the libp2p stack.
+        let signer = keypair.clone();
 
         let net = vos::network::Network::start(vos::network::NetworkConfig {
             keypair,
@@ -142,6 +151,7 @@ impl DaemonClient {
 
         Ok(Self {
             node,
+            signer,
             entry,
             daemon_prefix: ep.prefix,
             endpoint: ep,
@@ -406,15 +416,21 @@ impl DaemonClient {
     }
 
     pub fn add_node(&self, prefix: u32, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
+        let auth = op_auth(
+            &self.signer,
+            "add_node",
+            &[&prefix.to_le_bytes(), &peer_id, &[role]],
+        )?;
         vos::block_on(
             self.registry()
-                .add_node(&mut &self.node, prefix, peer_id, role),
+                .add_node(&mut &self.node, prefix, peer_id, role, auth),
         )
         .map_err(|e| anyhow::anyhow!("registry.add_node(): {e}"))
     }
 
     pub fn remove_node(&self, prefix: u32) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().remove_node(&mut &self.node, prefix))
+        let auth = op_auth(&self.signer, "remove_node", &[&prefix.to_le_bytes()])?;
+        vos::block_on(self.registry().remove_node(&mut &self.node, prefix, auth))
             .map_err(|e| anyhow::anyhow!("registry.remove_node(): {e}"))
     }
 
@@ -424,29 +440,38 @@ impl DaemonClient {
         proof_kind: u8,
         proof_data: Vec<u8>,
     ) -> anyhow::Result<u8> {
+        let auth = op_auth(
+            &self.signer,
+            "add_identity",
+            &[&public_key, &[proof_kind], &proof_data],
+        )?;
         vos::block_on(self.registry().add_identity(
             &mut &self.node,
             public_key,
             proof_kind,
             proof_data,
+            auth,
         ))
         .map_err(|e| anyhow::anyhow!("registry.add_identity(): {e}"))
     }
 
     pub fn remove_identity(&self, public_key: Vec<u8>) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().remove_identity(&mut &self.node, public_key))
+        let auth = op_auth(&self.signer, "remove_identity", &[&public_key])?;
+        vos::block_on(self.registry().remove_identity(&mut &self.node, public_key, auth))
             .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
     }
 
     // ── Auth grants ────────────────────────────────────
 
     pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().grant_role(&mut &self.node, peer_id, role))
+        let auth = op_auth(&self.signer, "grant_role", &[&peer_id, &[role]])?;
+        vos::block_on(self.registry().grant_role(&mut &self.node, peer_id, role, auth))
             .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))
     }
 
     pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().revoke_role(&mut &self.node, peer_id))
+        let auth = op_auth(&self.signer, "revoke_role", &[&peer_id])?;
+        vos::block_on(self.registry().revoke_role(&mut &self.node, peer_id, auth))
             .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))
     }
 
@@ -469,17 +494,27 @@ impl DaemonClient {
         agent_name: String,
         role: u8,
     ) -> anyhow::Result<u8> {
+        let auth = op_auth(
+            &self.signer,
+            "grant_actor_role",
+            &[&peer_id, agent_name.as_bytes(), &[role]],
+        )?;
         vos::block_on(
             self.registry()
-                .grant_actor_role(&mut &self.node, peer_id, agent_name, role),
+                .grant_actor_role(&mut &self.node, peer_id, agent_name, role, auth),
         )
         .map_err(|e| anyhow::anyhow!("registry.grant_actor_role(): {e}"))
     }
 
     pub fn revoke_actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<u8> {
+        let auth = op_auth(
+            &self.signer,
+            "revoke_actor_role",
+            &[&peer_id, agent_name.as_bytes()],
+        )?;
         vos::block_on(
             self.registry()
-                .revoke_actor_role(&mut &self.node, peer_id, agent_name),
+                .revoke_actor_role(&mut &self.node, peer_id, agent_name, auth),
         )
         .map_err(|e| anyhow::anyhow!("registry.revoke_actor_role(): {e}"))
     }

@@ -13,11 +13,12 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use space_registry::{NODE_ROLE_VOTER, STATUS_OK, SpaceRegistryRef};
+use space_registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, STATUS_OK, SpaceRegistryRef};
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 
 use crate::blob_store::{self, BlobSource};
+use crate::commands::space::op_sign::op_auth;
 use crate::output;
 use crate::paths;
 use crate::spaces_index::{self, SpacesIndex};
@@ -86,16 +87,56 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .persist(&temp_dir);
     let _id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
-    // 5. Send the genesis-defining message: register the creator
-    //    as the first Node member with Voter role. This produces
-    //    a non-trivial first commit so the genesis DAG root is
-    //    distinct per-creator.
+    // 5. Genesis commits: anchor the operator's CLI identity as
+    //    the signing root, grant it ADMIN, and enrol the node as the
+    //    first voter. All three ride the genesis DAG, so they're pinned
+    //    into `space_id` — a joiner verifies the root the same way it
+    //    verifies the space id, and from then on every gated registry
+    //    mutation must be signed by the root or an admin it delegated
+    //    to. The operator key signs the two gated ops; `set_root` is
+    //    the unsigned anchor (first-write-wins, refused thereafter).
+    let operator_kp = crate::identity::load_or_create()?;
+    let operator_peer_id = libp2p::PeerId::from(operator_kp.public()).to_bytes();
     let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+
+    let status = vos::block_on(reg.set_root(&mut &node, operator_peer_id.clone()))
+        .map_err(|e| anyhow::anyhow!("genesis set_root failed: {e}"))?;
+    if status != STATUS_OK {
+        anyhow::bail!("genesis set_root returned status {status}");
+    }
+
+    let grant_auth = op_auth(
+        &operator_kp,
+        "grant_role",
+        &[&operator_peer_id, &[AUTH_ROLE_ADMIN]],
+    )?;
+    let status = vos::block_on(reg.grant_role(
+        &mut &node,
+        operator_peer_id.clone(),
+        AUTH_ROLE_ADMIN,
+        grant_auth,
+    ))
+    .map_err(|e| anyhow::anyhow!("genesis grant_role failed: {e}"))?;
+    if status != STATUS_OK {
+        anyhow::bail!("genesis grant_role returned status {status}");
+    }
+
+    let node_peer_id = peer_id.to_bytes();
+    let node_auth = op_auth(
+        &operator_kp,
+        "add_node",
+        &[
+            &(local_prefix as u32).to_le_bytes(),
+            &node_peer_id,
+            &[NODE_ROLE_VOTER],
+        ],
+    )?;
     let status = vos::block_on(reg.add_node(
         &mut &node,
         local_prefix as u32,
-        peer_id.to_bytes(),
+        node_peer_id,
         NODE_ROLE_VOTER,
+        node_auth,
     ))
     .map_err(|e| anyhow::anyhow!("genesis add_node failed: {e}"))?;
     if status != STATUS_OK {
@@ -143,23 +184,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .to_protobuf_encoding()
         .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
     std::fs::write(&key_path, key_bytes)?;
-
-    // 9.5. Sprint 2 — record the creator's client PeerId so the
-    // first `space up` of this space auto-enrols it as
-    // AUTH_ROLE_ADMIN in the registry's auth_grants. Without this
-    // file the space comes up with no admin and the gated
-    // registry handlers (`publish`, `install`, …) reject every
-    // client invoke.
-    let creator_kp = crate::identity::load_or_create()?;
-    let creator_peer_id = libp2p::PeerId::from(creator_kp.public());
-    let bootstrap_path = final_dir.join("admin_bootstrap.txt");
-    std::fs::write(&bootstrap_path, creator_peer_id.to_string()).map_err(|e| {
-        anyhow::anyhow!(
-            "write {}: {e} — admin_bootstrap file ensures first \
-             `space up` enrols you as ADMIN",
-            bootstrap_path.display(),
-        )
-    })?;
 
     // 10. Append to the spaces index.
     let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
@@ -251,16 +275,51 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// Open the registry's redb and return the first DAG root.
-/// After a single state-changing commit there's exactly one
-/// root; the registry's first commit IS the genesis.
+/// Open the registry's redb and return the CID of the `seq == 0`
+/// commit — the genesis anchor `space_id` derives from.
+///
+/// Genesis is now several commits (`set_root`, the operator's ADMIN
+/// grant, the first `add_node`); the `seq == 0` event is `set_root`,
+/// so `space_id` binds to the root identity. This MUST key on
+/// `seq == 0` (not the DAG tip): `space up` and joiners verify the
+/// space via the same `seq == 0` scan in `verify.rs`, and the tip
+/// moves with every post-genesis commit.
 fn read_genesis_root(db_path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    use redb::ReadableTable;
+    const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
+
     let db = redb::Database::open(db_path)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", db_path.display()))?;
-    let roots = vos::commit::read_roots(&db).map_err(|e| anyhow::anyhow!("read roots: {e}"))?;
-    drop(db);
-    roots
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("registry has no roots after genesis commit"))
+    let txn = db
+        .begin_read()
+        .map_err(|e| anyhow::anyhow!("begin read: {e}"))?;
+    let table = txn
+        .open_table(DAG_TABLE)
+        .map_err(|e| anyhow::anyhow!("open dag table: {e}"))?;
+
+    for row in table.iter().map_err(|e| anyhow::anyhow!("iter dag: {e}"))? {
+        let (key, value) = row.map_err(|e| anyhow::anyhow!("read dag row: {e}"))?;
+        let bytes: &[u8] = value.value();
+        // DagNode wire: [payload_len:u64 LE][payload][n_children:u64 LE][children…]
+        if bytes.len() < 8 {
+            continue;
+        }
+        let payload_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        if bytes.len() < 8 + payload_len {
+            continue;
+        }
+        let Some(event) = vos::effect_log::CrdtEvent::from_bytes(&bytes[8..8 + payload_len]) else {
+            continue;
+        };
+        if event.seq != 0 {
+            continue;
+        }
+        let key_bytes: &[u8] = key.value();
+        if key_bytes.len() == 32 {
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(key_bytes);
+            return Ok(cid);
+        }
+    }
+    anyhow::bail!("registry has no seq==0 commit after genesis")
 }

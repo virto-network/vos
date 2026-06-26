@@ -445,6 +445,14 @@ pub struct SpaceRegistry {
     /// fall-back-to-fresh behaviour on archive decode failure lets
     /// upgrades resync from the DAG.
     consistency_floors: Vec<ConsistencyFloorRow>,
+    /// Genesis root authority: the operator PeerId baked at
+    /// `space new` via the first [`set_root`](SpaceRegistry::set_root)
+    /// op. Empty until set. [`authorize_op`](SpaceRegistry::authorize_op)
+    /// treats the root as the supreme signer of any mutation; every
+    /// other admin's authority delegates from it through `auth_grants`.
+    /// Pinned into `space_id` (it rides the genesis DAG), so a joiner
+    /// verifies it via the same `space new`/`space verify` root recompute.
+    root: Vec<u8>,
 }
 
 #[messages]
@@ -461,7 +469,38 @@ impl SpaceRegistry {
             actor_acls: Vec::new(),
             host_mappings: Vec::new(),
             consistency_floors: Vec::new(),
+            root: Vec::new(),
         }
+    }
+
+    // ── Genesis root authority ──────────────────────────────────
+
+    /// Establish the genesis root — the operator PeerId whose
+    /// signature anchors every signed registry mutation. First-write-
+    /// wins: valid only while no root is set, so the genesis `set_root`
+    /// `space new` emits (and pins into `space_id`) is the one true
+    /// root, and a later forged `set_root` merged via CRDT is refused.
+    /// This op carries no `auth` of its own — it *is* the anchor;
+    /// its integrity comes from being part of the immutable genesis
+    /// commit that `space verify` recomputes against the advertised
+    /// `space_id`.
+    #[msg]
+    async fn set_root(&mut self, root: Vec<u8>) -> u8 {
+        if root.is_empty() {
+            return STATUS_BAD_HASH;
+        }
+        if !self.root.is_empty() {
+            return STATUS_FORBIDDEN;
+        }
+        self.root = root;
+        STATUS_OK
+    }
+
+    /// The genesis root PeerId, or empty if none is set. Read surface
+    /// for diagnostics and joiner verification.
+    #[msg]
+    async fn root(&self) -> Vec<u8> {
+        self.root.clone()
     }
 
     // ── Programs catalog ────────────────────────────────────────
@@ -950,7 +989,13 @@ impl SpaceRegistry {
     /// updates `peer_id` and `role`. `role` is
     /// `NODE_ROLE_VOTER` or `NODE_ROLE_OBSERVER`.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn add_node(&mut self, prefix: u32, peer_id: Vec<u8>, role: u8) -> u8 {
+    async fn add_node(&mut self, prefix: u32, peer_id: Vec<u8>, role: u8, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("add_node", &[&prefix.to_le_bytes(), &peer_id, &[role]]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let prefix = prefix as u16;
         let mut idx = 0usize;
         while idx < self.members.len() {
@@ -984,7 +1029,13 @@ impl SpaceRegistry {
     }
 
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn remove_node(&mut self, prefix: u32) -> u8 {
+    async fn remove_node(&mut self, prefix: u32, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("remove_node", &[&prefix.to_le_bytes()]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let prefix = prefix as u16;
         let mut idx = 0usize;
         while idx < self.members.len() {
@@ -1009,7 +1060,17 @@ impl SpaceRegistry {
         public_key: Vec<u8>,
         proof_kind: u8,
         proof_data: Vec<u8>,
+        auth: Vec<u8>,
     ) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes(
+                "add_identity",
+                &[&public_key, &[proof_kind], &proof_data],
+            ),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let mut idx = 0usize;
         while idx < self.members.len() {
             let cur = &self.members[idx];
@@ -1040,7 +1101,13 @@ impl SpaceRegistry {
     }
 
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn remove_identity(&mut self, public_key: Vec<u8>) -> u8 {
+    async fn remove_identity(&mut self, public_key: Vec<u8>, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("remove_identity", &[&public_key]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let mut idx = 0usize;
         while idx < self.members.len() {
             let cur = &self.members[idx];
@@ -1083,7 +1150,10 @@ impl SpaceRegistry {
     /// `peer_id` is libp2p multihash bytes (same encoding as
     /// `add_node`'s `peer_id` arg).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8) -> u8 {
+    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(&canonical_op_bytes("grant_role", &[&peer_id, &[role]]), &auth) {
+            return STATUS_FORBIDDEN;
+        }
         if peer_id.is_empty() {
             return STATUS_BAD_HASH;
         }
@@ -1106,7 +1176,10 @@ impl SpaceRegistry {
     /// Remove the grant for `peer_id`. Returns
     /// `STATUS_NOT_FOUND` if the peer wasn't granted.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn revoke_role(&mut self, peer_id: Vec<u8>) -> u8 {
+    async fn revoke_role(&mut self, peer_id: Vec<u8>, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(&canonical_op_bytes("revoke_role", &[&peer_id]), &auth) {
+            return STATUS_FORBIDDEN;
+        }
         match self
             .auth_grants
             .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
@@ -1124,13 +1197,7 @@ impl SpaceRegistry {
     /// dispatch-layer gate treats this as "deny".
     #[msg]
     async fn peer_role(&self, peer_id: Vec<u8>) -> u8 {
-        match self
-            .auth_grants
-            .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
-        {
-            Ok(idx) => self.auth_grants[idx].role,
-            Err(_) => AUTH_ROLE_NONE,
-        }
+        lookup_grant(&self.auth_grants, &peer_id)
     }
 
     /// Full grants list — for `vosx space role list`.
@@ -1153,7 +1220,22 @@ impl SpaceRegistry {
     /// changing the role updates in place. `role` is interpreted
     /// in the target actor's `Role` enum (not `SpaceRole`).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_actor_role(&mut self, peer_id: Vec<u8>, agent_name: String, role: u8) -> u8 {
+    async fn grant_actor_role(
+        &mut self,
+        peer_id: Vec<u8>,
+        agent_name: String,
+        role: u8,
+        auth: Vec<u8>,
+    ) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes(
+                "grant_actor_role",
+                &[&peer_id, agent_name.as_bytes(), &[role]],
+            ),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         if peer_id.is_empty() || agent_name.is_empty() {
             return STATUS_BAD_HASH;
         }
@@ -1183,7 +1265,18 @@ impl SpaceRegistry {
     /// `STATUS_NOT_FOUND` if no such row exists. Does not affect
     /// the space-level grant in `auth_grants`.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn revoke_actor_role(&mut self, peer_id: Vec<u8>, agent_name: String) -> u8 {
+    async fn revoke_actor_role(
+        &mut self,
+        peer_id: Vec<u8>,
+        agent_name: String,
+        auth: Vec<u8>,
+    ) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("revoke_actor_role", &[&peer_id, agent_name.as_bytes()]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         match self
             .actor_acls
             .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
@@ -1259,7 +1352,56 @@ impl SpaceRegistry {
     }
 }
 
+// ── Signed-op authorization ────────────────────────────────────────
+//
+// Kept out of the `#[messages]` impl so it stays a plain helper, not
+// a dispatchable handler.
+impl SpaceRegistry {
+    /// Authorize a mutation: the `auth` blob's signature must be valid
+    /// for `canonical` (the op's [`canonical_op_bytes`]), AND the
+    /// signer must be authorized — the genesis root, or a peer the
+    /// already-verified `auth_grants` table marks ADMIN.
+    ///
+    /// This runs at handler time on BOTH the live dispatch and every
+    /// peer's causal replay (where the op arrives as `Caller::System`
+    /// and the `#[msg(role)]` gate is a no-op). So a forged op merged
+    /// via CRDT — a fabricated AuthGrantRow{ADMIN} or MemberRow{VOTER}
+    /// — is refused on each honest node unless it carries a signature
+    /// an admin (or the root) actually produced.
+    ///
+    /// Delegation is transitive without explicit cert chains: a peer
+    /// is ADMIN in `auth_grants` only because a prior verified op put
+    /// it there, and that op was signed by the root or an earlier
+    /// admin — so authority bottoms out at the genesis root, applied
+    /// in causal order during replay.
+    fn authorize_op(&self, canonical: &[u8], auth: &[u8]) -> bool {
+        let Some((signer, sig)) = unpack_auth(auth) else {
+            return false;
+        };
+        if !verify_op_sig(signer, canonical, &sig) {
+            return false;
+        }
+        // The genesis root is the supreme signer. (Before genesis sets
+        // a root, `self.root` is empty and only the unsigned `set_root`
+        // anchor op is accepted — every signed mutator fails closed.)
+        if !self.root.is_empty() && self.root.as_slice() == signer {
+            return true;
+        }
+        lookup_grant(&self.auth_grants, signer) == AUTH_ROLE_ADMIN
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Auth role byte granted to `peer_id` in a sorted `auth_grants`
+/// table, or [`AUTH_ROLE_NONE`] if no row exists. Shared by the
+/// `peer_role` read handler and `authorize_op`.
+fn lookup_grant(grants: &[AuthGrantRow], peer_id: &[u8]) -> u8 {
+    match grants.binary_search_by(|g| compare_bytes(&g.peer_id, peer_id).cmp(&0)) {
+        Ok(idx) => grants[idx].role,
+        Err(_) => AUTH_ROLE_NONE,
+    }
+}
 
 fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     if b.len() != 32 {
@@ -1413,6 +1555,121 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
     ((prefix as u32) << 16) | (local as u32)
 }
 
+// ── Signed registry ops ──────────────────────────────────
+//
+// The authority-critical mutations — the auth-grant table
+// (`grant_role`/`revoke_role`/`grant_actor_role`/`revoke_actor_role`)
+// and the member table (`add_node`/`remove_node`/`add_identity`/
+// `remove_identity`) — carry an `auth` blob: the signer's PeerId
+// bytes followed by an ed25519 signature over the op's canonical
+// bytes. The actor verifies the signature and the signer's authority
+// at handler time — and crucially, because the op (with its `auth`
+// arg) is recorded into the replicated DAG, the same verification
+// re-runs on every peer's causal replay. That closes the forge gap:
+// a replayed op that arrives as `Caller::System` still has to carry
+// a signature an admin (or the genesis root) actually produced, so a
+// peer can't merge a fabricated AuthGrantRow{ADMIN} or
+// MemberRow{VOTER} to self-escalate or seize consensus.
+//
+// The signing seam is the operator's libp2p identity key (held by
+// the CLI, and by the daemon at boot). Authority is anchored at the
+// genesis `set_root` and delegates through the already-verified
+// `auth_grants` table — see [`SpaceRegistry::authorize_op`].
+//
+// The program/agent CATALOG mutators (`publish`/`install`/`upgrade`/
+// …) are NOT signed here: they're reachable from a PVM agent that
+// has no operator key (the messenger installs a channel's actor pair
+// via `create`), so they can't carry a CLI signature. Closing the
+// catalog-forgery vector (the M5 remote agent-row vector) needs a
+// host-level "sign on relay" seam — deferred. The auth/member tables,
+// which the headline vuln (admin self-escalation, voter seizure)
+// targets, are only ever mutated by the operator CLI or the daemon
+// at boot, so the CLI/daemon signing seam covers them completely.
+
+/// Domain tag mixed into the canonical bytes an op is signed over.
+/// Prevents a signature from one protocol/version being replayed as
+/// a registry op. Bump if [`canonical_op_bytes`] changes.
+pub const REGISTRY_OP_DOMAIN: &[u8] = b"vos-registry-op/v1";
+
+/// ed25519 signature length.
+pub const OP_SIG_LEN: usize = 64;
+
+/// Canonical byte string a mutation's author signs. Layout:
+/// `domain || u16(op.len) || op || (u32(field.len) || field)*`.
+/// The signer (CLI/daemon) and the verifier (actor) build these
+/// from the same logical args, so the bytes match exactly without
+/// re-encoding the wire `Msg`.
+pub fn canonical_op_bytes(op: &str, fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(REGISTRY_OP_DOMAIN);
+    out.extend_from_slice(&(op.len() as u16).to_le_bytes());
+    out.extend_from_slice(op.as_bytes());
+    for f in fields {
+        out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+/// Pack an authorization blob: `signer_peer_id || signature(64)`.
+/// `signer_peer_id` is libp2p multihash bytes (same encoding as
+/// [`AuthGrantRow::peer_id`]); the verifier splits at `len - 64`.
+pub fn pack_auth(signer_peer_id: &[u8], sig: &[u8; OP_SIG_LEN]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(signer_peer_id.len() + OP_SIG_LEN);
+    out.extend_from_slice(signer_peer_id);
+    out.extend_from_slice(sig);
+    out
+}
+
+/// Split an auth blob into `(signer_peer_id, signature)`. `None` if
+/// it's too short to hold a signature.
+fn unpack_auth(auth: &[u8]) -> Option<(&[u8], [u8; OP_SIG_LEN])> {
+    if auth.len() <= OP_SIG_LEN {
+        return None;
+    }
+    let (signer, sig) = auth.split_at(auth.len() - OP_SIG_LEN);
+    let mut s = [0u8; OP_SIG_LEN];
+    s.copy_from_slice(sig);
+    Some((signer, s))
+}
+
+/// Extract the raw 32-byte ed25519 public key embedded in a libp2p
+/// PeerId. For ed25519, a PeerId is the identity-multihash of the
+/// protobuf-encoded public key, a fixed 38-byte shape:
+///
+/// ```text
+/// 00 24 08 01 12 20 <32-byte ed25519 key>
+/// │  │  └──────────┴ protobuf PublicKey { KeyType::Ed25519=1, key[32] }
+/// │  └ multihash length 0x24 = 36
+/// └ multihash code 0x00 = identity
+/// ```
+///
+/// Returns `None` for any other shape — a non-ed25519 identity can't
+/// be a registry signer in v1.
+pub fn ed25519_pubkey_from_peer_id(peer_id: &[u8]) -> Option<[u8; 32]> {
+    const PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+    if peer_id.len() != 38 || peer_id[..6] != PREFIX {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&peer_id[6..]);
+    Some(key)
+}
+
+/// Verify ed25519 `sig` over `msg` under the key embedded in
+/// `signer_peer_id`. Pure (no RNG) and deterministic across host and
+/// PVM. `false` on any malformed input or bad signature.
+pub fn verify_op_sig(signer_peer_id: &[u8], msg: &[u8], sig: &[u8; OP_SIG_LEN]) -> bool {
+    let Some(pk) = ed25519_pubkey_from_peer_id(signer_peer_id) else {
+        return false;
+    };
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk) else {
+        return false;
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(sig);
+    vk.verify_strict(msg, &signature).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1420,7 +1677,17 @@ mod tests {
     use vos::actors::context::ServiceId;
 
     fn registry() -> SpaceRegistry {
-        SpaceRegistry::new()
+        let mut r = SpaceRegistry::new();
+        // Establish the genesis root so signed mutators authorize
+        // against it (tests sign every op as the root via `root_auth`).
+        let status = dispatch(
+            &mut r,
+            SetRoot {
+                root: root_peer_id(),
+            },
+        );
+        assert_eq!(status, STATUS_OK, "set_root on a fresh registry");
+        r
     }
 
     fn run<F: core::future::Future>(fut: F) -> F::Output {
@@ -1463,14 +1730,7 @@ mod tests {
         let mut r = registry();
         let peer = alloc::vec![1, 2, 3];
         let agent = String::from("dev-project");
-        let status = dispatch(
-            &mut r,
-            GrantActorRole {
-                peer_id: peer.clone(),
-                agent_name: agent.clone(),
-                role: 2,
-            },
-        );
+        let status = grant_actor(&mut r, &peer, &agent, 2);
         assert_eq!(status, STATUS_OK);
 
         let role = dispatch(
@@ -1507,28 +1767,8 @@ mod tests {
         let mut r = registry();
         let peer = alloc::vec![1, 2, 3];
         let agent = String::from("dev-project");
-        assert_eq!(
-            dispatch(
-                &mut r,
-                GrantActorRole {
-                    peer_id: peer.clone(),
-                    agent_name: agent.clone(),
-                    role: 2,
-                },
-            ),
-            STATUS_OK,
-        );
-        assert_eq!(
-            dispatch(
-                &mut r,
-                GrantActorRole {
-                    peer_id: peer.clone(),
-                    agent_name: agent.clone(),
-                    role: 2,
-                },
-            ),
-            STATUS_OK,
-        );
+        assert_eq!(grant_actor(&mut r, &peer, &agent, 2), STATUS_OK);
+        assert_eq!(grant_actor(&mut r, &peer, &agent, 2), STATUS_OK);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -1551,22 +1791,8 @@ mod tests {
         let mut r = registry();
         let peer = alloc::vec![1, 2, 3];
         let agent = String::from("dev-project");
-        dispatch(
-            &mut r,
-            GrantActorRole {
-                peer_id: peer.clone(),
-                agent_name: agent.clone(),
-                role: 1,
-            },
-        );
-        dispatch(
-            &mut r,
-            GrantActorRole {
-                peer_id: peer.clone(),
-                agent_name: agent.clone(),
-                role: 3,
-            },
-        );
+        grant_actor(&mut r, &peer, &agent, 1);
+        grant_actor(&mut r, &peer, &agent, 3);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -1586,28 +1812,10 @@ mod tests {
         // collide with future identity bytes. STATUS_BAD_HASH
         // matches the existing convention from grant_role.
         let mut r = registry();
-        assert_eq!(
-            dispatch(
-                &mut r,
-                GrantActorRole {
-                    peer_id: Vec::new(),
-                    agent_name: String::from("x"),
-                    role: 1,
-                },
-            ),
-            STATUS_BAD_HASH,
-        );
-        assert_eq!(
-            dispatch(
-                &mut r,
-                GrantActorRole {
-                    peer_id: alloc::vec![1],
-                    agent_name: String::new(),
-                    role: 1,
-                },
-            ),
-            STATUS_BAD_HASH,
-        );
+        // The op is root-signed (authorize_op passes); the empty-arg
+        // guard inside the handler is what rejects.
+        assert_eq!(grant_actor(&mut r, &[], "x", 1), STATUS_BAD_HASH);
+        assert_eq!(grant_actor(&mut r, &[1], "", 1), STATUS_BAD_HASH);
     }
 
     // ── revoke_actor_role ───────────────────────────────────────
@@ -1617,21 +1825,8 @@ mod tests {
         let mut r = registry();
         let peer = alloc::vec![1, 2, 3];
         let agent = String::from("dev-project");
-        dispatch(
-            &mut r,
-            GrantActorRole {
-                peer_id: peer.clone(),
-                agent_name: agent.clone(),
-                role: 2,
-            },
-        );
-        let status = dispatch(
-            &mut r,
-            RevokeActorRole {
-                peer_id: peer.clone(),
-                agent_name: agent.clone(),
-            },
-        );
+        grant_actor(&mut r, &peer, &agent, 2);
+        let status = revoke_actor(&mut r, &peer, &agent);
         assert_eq!(status, STATUS_OK);
         assert_eq!(
             dispatch(
@@ -1649,13 +1844,7 @@ mod tests {
     #[test]
     fn revoke_actor_role_missing_returns_not_found() {
         let mut r = registry();
-        let status = dispatch(
-            &mut r,
-            RevokeActorRole {
-                peer_id: alloc::vec![1],
-                agent_name: String::from("x"),
-            },
-        );
+        let status = revoke_actor(&mut r, &[1], "x");
         assert_eq!(status, STATUS_NOT_FOUND);
     }
 
@@ -1668,22 +1857,8 @@ mod tests {
         // without one role bleeding into the other.
         let mut r = registry();
         let peer = alloc::vec![1, 2, 3];
-        dispatch(
-            &mut r,
-            GrantActorRole {
-                peer_id: peer.clone(),
-                agent_name: String::from("a"),
-                role: 1,
-            },
-        );
-        dispatch(
-            &mut r,
-            GrantActorRole {
-                peer_id: peer.clone(),
-                agent_name: String::from("b"),
-                role: 3,
-            },
-        );
+        grant_actor(&mut r, &peer, "a", 1);
+        grant_actor(&mut r, &peer, "b", 3);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -1713,14 +1888,7 @@ mod tests {
         // reverse and confirm actor_acls() returns sorted order.
         let mut r = registry();
         for peer_byte in (1u8..=4).rev() {
-            dispatch(
-                &mut r,
-                GrantActorRole {
-                    peer_id: alloc::vec![peer_byte],
-                    agent_name: String::from("z"),
-                    role: 1,
-                },
-            );
+            grant_actor(&mut r, &[peer_byte], "z", 1);
         }
         let rows = dispatch(&mut r, ActorAcls);
         for w in rows.windows(2) {
@@ -1743,21 +1911,8 @@ mod tests {
         // and vice versa.
         let mut r = registry();
         let peer = alloc::vec![1, 2, 3];
-        dispatch(
-            &mut r,
-            GrantRole {
-                peer_id: peer.clone(),
-                role: AUTH_ROLE_DEVELOPER,
-            },
-        );
-        dispatch(
-            &mut r,
-            GrantActorRole {
-                peer_id: peer.clone(),
-                agent_name: String::from("x"),
-                role: 3,
-            },
-        );
+        grant_space(&mut r, &peer, AUTH_ROLE_DEVELOPER);
+        grant_actor(&mut r, &peer, "x", 3);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -1903,5 +2058,372 @@ mod tests {
             install_at(&mut r, "live", 2 /* Crdt */),
             STATUS_INSTANCE_EXISTS
         );
+    }
+
+    // ── Signed registry ops ────────────────────────────────
+
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Deterministic test signing key standing in for the operator /
+    /// genesis root. Fixed bytes → reproducible across runs.
+    fn root_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Build the 38-byte libp2p ed25519 PeerId for a raw pubkey — the
+    /// inverse of [`ed25519_pubkey_from_peer_id`], so tests can mint a
+    /// PeerId for a dalek key without depending on libp2p.
+    fn peer_id_for(pk: &[u8; 32]) -> Vec<u8> {
+        let mut id = alloc::vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(pk);
+        id
+    }
+
+    fn root_peer_id() -> Vec<u8> {
+        peer_id_for(&root_key().verifying_key().to_bytes())
+    }
+
+    /// Sign an op's canonical bytes as the root, packing the auth blob
+    /// the way the CLI/daemon would.
+    fn root_auth(op: &str, fields: &[&[u8]]) -> Vec<u8> {
+        let sig = root_key().sign(&canonical_op_bytes(op, fields));
+        pack_auth(&root_peer_id(), &sig.to_bytes())
+    }
+
+    /// Root-signed `grant_role` dispatch (the common case in tests).
+    fn grant_space(r: &mut SpaceRegistry, peer: &[u8], role: u8) -> u8 {
+        dispatch(
+            r,
+            GrantRole {
+                peer_id: peer.to_vec(),
+                role,
+                auth: root_auth("grant_role", &[peer, &[role]]),
+            },
+        )
+    }
+
+    /// Root-signed `grant_actor_role` dispatch.
+    fn grant_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str, role: u8) -> u8 {
+        dispatch(
+            r,
+            GrantActorRole {
+                peer_id: peer.to_vec(),
+                agent_name: String::from(agent),
+                role,
+                auth: root_auth("grant_actor_role", &[peer, agent.as_bytes(), &[role]]),
+            },
+        )
+    }
+
+    /// Root-signed `revoke_actor_role` dispatch.
+    fn revoke_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str) -> u8 {
+        dispatch(
+            r,
+            RevokeActorRole {
+                peer_id: peer.to_vec(),
+                agent_name: String::from(agent),
+                auth: root_auth("revoke_actor_role", &[peer, agent.as_bytes()]),
+            },
+        )
+    }
+
+    #[test]
+    fn peer_id_pubkey_extraction_round_trips() {
+        let pk = root_key().verifying_key().to_bytes();
+        let pid = peer_id_for(&pk);
+        assert_eq!(pid.len(), 38);
+        assert_eq!(ed25519_pubkey_from_peer_id(&pid), Some(pk));
+        // Wrong length / wrong prefix → not an ed25519 signer.
+        assert_eq!(ed25519_pubkey_from_peer_id(&pid[..37]), None);
+        let mut bad = pid.clone();
+        bad[0] = 0x12; // not the identity-multihash code
+        assert_eq!(ed25519_pubkey_from_peer_id(&bad), None);
+    }
+
+    #[test]
+    fn verify_op_sig_accepts_valid_and_rejects_tampered() {
+        let key = root_key();
+        let pid = peer_id_for(&key.verifying_key().to_bytes());
+        let canonical = canonical_op_bytes("grant_role", &[&[1, 2, 3], &[AUTH_ROLE_ADMIN]]);
+        let sig = key.sign(&canonical).to_bytes();
+
+        assert!(verify_op_sig(&pid, &canonical, &sig), "valid sig accepted");
+
+        // Tampered message (different role) → rejected.
+        let other = canonical_op_bytes("grant_role", &[&[1, 2, 3], &[AUTH_ROLE_READONLY]]);
+        assert!(!verify_op_sig(&pid, &other, &sig), "wrong message rejected");
+
+        // Tampered signature → rejected.
+        let mut bad_sig = sig;
+        bad_sig[0] ^= 0xFF;
+        assert!(!verify_op_sig(&pid, &canonical, &bad_sig), "bad sig rejected");
+
+        // Different signer identity → rejected (sig doesn't match key).
+        let other_key = SigningKey::from_bytes(&[9u8; 32]);
+        let other_pid = peer_id_for(&other_key.verifying_key().to_bytes());
+        assert!(
+            !verify_op_sig(&other_pid, &canonical, &sig),
+            "sig under a different key rejected",
+        );
+    }
+
+    #[test]
+    fn unpack_auth_round_trips_and_rejects_short() {
+        let pid = root_peer_id();
+        let sig = [3u8; OP_SIG_LEN];
+        let blob = pack_auth(&pid, &sig);
+        let (signer, got) = unpack_auth(&blob).expect("well-formed auth unpacks");
+        assert_eq!(signer, pid.as_slice());
+        assert_eq!(got, sig);
+        // Too short to hold a signature.
+        assert!(unpack_auth(&[0u8; OP_SIG_LEN]).is_none());
+        assert!(unpack_auth(&[]).is_none());
+    }
+
+    #[test]
+    fn canonical_op_bytes_is_unambiguous() {
+        // Field boundaries are length-prefixed, so concatenation
+        // ambiguity ("ab"+"c" vs "a"+"bc") can't collide.
+        let a = canonical_op_bytes("op", &[b"ab", b"c"]);
+        let b = canonical_op_bytes("op", &[b"a", b"bc"]);
+        assert_ne!(a, b);
+        // Op name is bound too: same fields, different op → different bytes.
+        let c = canonical_op_bytes("op2", &[b"ab", b"c"]);
+        assert_ne!(a, c);
+    }
+
+    // ── Authorization: the forge gap is closed ────────────────────
+
+    /// Sign an op as an arbitrary key (a would-be attacker or a
+    /// delegated admin), packing the auth blob.
+    fn auth_as(key: &SigningKey, op: &str, fields: &[&[u8]]) -> Vec<u8> {
+        let sig = key.sign(&canonical_op_bytes(op, fields));
+        pack_auth(&peer_id_for(&key.verifying_key().to_bytes()), &sig.to_bytes())
+    }
+
+    /// Dispatch as `Caller::System` — the trusted caller CRDT replay
+    /// uses, which clears the `#[msg(role)]` gate. Models the exact
+    /// path a forged op merged via sync takes on an honest node.
+    fn dispatch_as_system<M>(
+        r: &mut SpaceRegistry,
+        msg: M,
+    ) -> <SpaceRegistry as Message<M>>::Output
+    where
+        SpaceRegistry: Message<M>,
+    {
+        let mut ctx: vos::Context<SpaceRegistry> = vos::Context::new(ServiceId(0));
+        ctx.set_caller(vos::actors::auth::Caller::System);
+        run(<SpaceRegistry as Message<M>>::handle(r, msg, &mut ctx))
+    }
+
+    #[test]
+    fn forged_admin_grant_rejected_on_system_replay_path() {
+        // The key mechanism: on replay the op arrives as Caller::System,
+        // so the #[msg(role=Admin)] gate is a no-op — yet authorize_op
+        // still rejects a forgery, so a CRDT-merged AuthGrantRow{ADMIN}
+        // never applies on an honest node.
+        let mut r = registry();
+        let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
+        let attacker = peer_id_for(&attacker_key.verifying_key().to_bytes());
+        let auth = auth_as(&attacker_key, "grant_role", &[&attacker, &[AUTH_ROLE_ADMIN]]);
+        let status = dispatch_as_system(
+            &mut r,
+            GrantRole {
+                peer_id: attacker.clone(),
+                role: AUTH_ROLE_ADMIN,
+                auth,
+            },
+        );
+        assert_eq!(status, STATUS_FORBIDDEN, "System caller can't bypass authorize_op");
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: attacker }),
+            AUTH_ROLE_NONE,
+        );
+    }
+
+    #[test]
+    fn set_root_is_first_write_wins() {
+        let mut r = SpaceRegistry::new();
+        assert!(dispatch(&mut r, Root).is_empty(), "no root before genesis");
+        assert_eq!(
+            dispatch(&mut r, SetRoot { root: root_peer_id() }),
+            STATUS_OK,
+        );
+        assert_eq!(dispatch(&mut r, Root), root_peer_id());
+        // A second set_root — e.g. a forged genesis merged via CRDT —
+        // is refused; the genesis root is immutable.
+        assert_eq!(
+            dispatch(
+                &mut r,
+                SetRoot {
+                    root: alloc::vec![0xFFu8; 38],
+                },
+            ),
+            STATUS_FORBIDDEN,
+        );
+        assert_eq!(dispatch(&mut r, Root), root_peer_id());
+    }
+
+    #[test]
+    fn unsigned_grant_is_rejected() {
+        // The exact forge vector: a peer authors a grant_role op with
+        // no valid signature. authorize_op fails closed.
+        let mut r = registry();
+        let victim = alloc::vec![1, 2, 3];
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: victim.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    auth: Vec::new(),
+                },
+            ),
+            STATUS_FORBIDDEN,
+        );
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim }), AUTH_ROLE_NONE);
+    }
+
+    #[test]
+    fn forged_admin_grant_by_non_admin_is_rejected() {
+        // A space member (valid signature, but NOT root and NOT an
+        // admin) tries to self-escalate to ADMIN. Refused.
+        let mut r = registry();
+        let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
+        let attacker = peer_id_for(&attacker_key.verifying_key().to_bytes());
+        let auth = auth_as(&attacker_key, "grant_role", &[&attacker, &[AUTH_ROLE_ADMIN]]);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: attacker.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    auth,
+                },
+            ),
+            STATUS_FORBIDDEN,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: attacker }),
+            AUTH_ROLE_NONE,
+        );
+    }
+
+    #[test]
+    fn forged_voter_row_by_non_admin_is_rejected() {
+        // The other headline: a peer forges a Node VOTER member row to
+        // seize raft/chronos consensus. Refused unless an admin signs.
+        let mut r = registry();
+        // [99;32] is neither the root key ([7;32]) nor a granted admin.
+        let attacker_key = SigningKey::from_bytes(&[99u8; 32]);
+        let node = peer_id_for(&attacker_key.verifying_key().to_bytes());
+        let forged = auth_as(
+            &attacker_key,
+            "add_node",
+            &[&5u32.to_le_bytes(), &node, &[NODE_ROLE_VOTER]],
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                AddNode {
+                    prefix: 5,
+                    peer_id: node.clone(),
+                    role: NODE_ROLE_VOTER,
+                    auth: forged,
+                },
+            ),
+            STATUS_FORBIDDEN,
+        );
+        assert_eq!(dispatch(&mut r, NodeRole { prefix: 5 }), 0, "not enrolled");
+
+        // Root-signed enrollment of the same node succeeds.
+        let ok = root_auth("add_node", &[&5u32.to_le_bytes(), &node, &[NODE_ROLE_VOTER]]);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                AddNode {
+                    prefix: 5,
+                    peer_id: node,
+                    role: NODE_ROLE_VOTER,
+                    auth: ok,
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(dispatch(&mut r, NodeRole { prefix: 5 }), NODE_ROLE_VOTER + 1);
+    }
+
+    #[test]
+    fn root_delegates_admin_and_delegate_can_sign() {
+        // State-anchored delegation: root grants ADMIN to Bob; Bob's
+        // own signature then authorizes a further grant. Authority
+        // chains back to the genesis root through auth_grants.
+        let mut r = registry();
+        let bob_key = SigningKey::from_bytes(&[11u8; 32]);
+        let bob = peer_id_for(&bob_key.verifying_key().to_bytes());
+        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), STATUS_OK);
+
+        // Bob (now admin) grants Carol READONLY, signing with his key.
+        let carol = alloc::vec![3, 3, 3];
+        let auth = auth_as(&bob_key, "grant_role", &[&carol, &[AUTH_ROLE_READONLY]]);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: carol.clone(),
+                    role: AUTH_ROLE_READONLY,
+                    auth,
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: carol }),
+            AUTH_ROLE_READONLY,
+        );
+
+        // But a peer Bob granted only READONLY can't sign mutations.
+        let dave_key = SigningKey::from_bytes(&[12u8; 32]);
+        let dave = peer_id_for(&dave_key.verifying_key().to_bytes());
+        assert_eq!(grant_space(&mut r, &dave, AUTH_ROLE_READONLY), STATUS_OK);
+        let evil = auth_as(&dave_key, "grant_role", &[&dave, &[AUTH_ROLE_ADMIN]]);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: dave.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    auth: evil,
+                },
+            ),
+            STATUS_FORBIDDEN,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: dave }),
+            AUTH_ROLE_READONLY,
+            "READONLY peer can't self-escalate",
+        );
+    }
+
+    #[test]
+    fn signature_does_not_authorize_a_different_op() {
+        // A valid root signature over revoke_role's canonical bytes
+        // must not pass grant_role — the op name is bound into the
+        // signed bytes, defeating cross-op replay.
+        let mut r = registry();
+        let victim = alloc::vec![4, 5, 6];
+        let wrong_op_auth = root_auth("revoke_role", &[&victim]);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: victim.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    auth: wrong_op_auth,
+                },
+            ),
+            STATUS_FORBIDDEN,
+        );
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim }), AUTH_ROLE_NONE);
     }
 }
