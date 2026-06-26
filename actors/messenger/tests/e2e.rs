@@ -428,6 +428,10 @@ fn wait_for(daemon: &Daemon, verb_and_args: &[&str], what: &str, pred: impl Fn(&
 struct RawClient {
     node: VosNode,
     daemon_prefix: u16,
+    /// This client's own libp2p PeerId (string form) — the identity the
+    /// daemon sees as `Caller::Peer`. Exposed so a test can grant it a space
+    /// role to access private `msg-*` logs.
+    peer_id: String,
 }
 
 impl RawClient {
@@ -468,7 +472,13 @@ impl RawClient {
         RawClient {
             node,
             daemon_prefix: ep.prefix,
+            peer_id: peer_id.to_string(),
         }
+    }
+
+    /// This client's libp2p PeerId (string), for granting it a space role.
+    fn peer_id(&self) -> &str {
+        &self.peer_id
     }
 
     /// Page the whole raw envelope log off one of the daemon's
@@ -498,6 +508,11 @@ impl RawClient {
                 .node
                 .invoke_with_timeout(target, payload, Duration::from_secs(30))
                 .expect("daemon didn't reply to raw history");
+            // An empty reply means the daemon refused the read (non-members
+            // are denied access) — no rows to page.
+            if reply.is_empty() {
+                break;
+            }
             let value = <Value as Decode>::decode(&reply);
             let inner = match value {
                 Value::Bytes(b) => b,
@@ -523,6 +538,33 @@ impl Drop for RawClient {
         self.node.shutdown();
         let _ = std::mem::replace(&mut self.node, VosNode::with_prefix(0)).collect();
     }
+}
+
+/// Connect a raw client to `daemon` and grant its peer the space READ tier
+/// (via `admin`), waiting until `daemon`'s registry replica sees the grant —
+/// so read access allows its raw `msg-*` ciphertext reads. The reader is
+/// a space member but NOT a channel (MLS-group) member, so it can page the
+/// replicated log yet only ever sees ciphertext.
+fn connect_reader(daemon: &Daemon, admin: &Daemon) -> RawClient {
+    let rc = RawClient::connect(daemon.data_dir());
+    run_cli(
+        admin,
+        &["space", "role", SPACE_NAME, "grant", rc.peer_id(), "read"],
+        "grant raw reader the space read tier",
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, stdout, _) = cli(daemon, &["space", "role", SPACE_NAME, "list"]);
+        if ok && stdout.contains(rc.peer_id()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "raw reader grant never replicated:\n{stdout}"
+        );
+        thread::sleep(Duration::from_millis(400));
+    }
+    rc
 }
 
 // ── The test ─────────────────────────────────────────────────────────
@@ -712,9 +754,12 @@ fn two_nodes_exchange_e2ee_messages() {
         "bob must not decrypt pre-join history:\n{bob_history}"
     );
 
-    // ── Privacy gate 2: the replicated log is ciphertext-only on
-    //    BOTH nodes. Every plaintext we exchanged must be absent
-    //    from every stored envelope body.
+    // ── Privacy gate 2: the replicated `msg-*` log is membership-gated AND
+    //    ciphertext-only. (a) Private read handlers require membership; a
+    //    NON-member can't read the log at all. (b) A
+    //    space member who is NOT in the channel CAN read the replicated log
+    //    on both nodes, but every envelope body is ciphertext (it never held
+    //    the MLS keys). ────────────────────────────────────────────────────
     let plaintexts: [&[u8]; 5] = [
         PRE_JOIN_TEXT.as_bytes(),
         A_TO_B_TEXT.as_bytes(),
@@ -722,8 +767,20 @@ fn two_nodes_exchange_e2ee_messages() {
         b"alice",
         b"bob",
     ];
+
+    // (a) An ungranted outsider is denied access (empty → no rows).
+    let outsider = RawClient::connect(a.data_dir());
+    assert!(
+        outsider.raw_envelopes("msg-general-log").is_empty(),
+        "M1: an ungranted peer must not read the private msg- log"
+    );
+
+    // (b) Grant a snooper the space READ tier and confirm it reads only
+    //     ciphertext from BOTH nodes. The snooper is a space member but not a
+    //     channel (MLS-group) member — the realistic metadata-snooping threat.
     for (who, daemon) in [("A", &a), ("B", &b)] {
-        let envelopes = RawClient::connect(daemon.data_dir()).raw_envelopes("msg-general-log");
+        let snoop = connect_reader(daemon, &a);
+        let envelopes = snoop.raw_envelopes("msg-general-log");
         assert!(
             envelopes.len() >= 3,
             "node {who} should replicate all 3 envelopes, got {}",
@@ -782,7 +839,7 @@ fn two_nodes_exchange_e2ee_messages() {
     // by the offline `removed_member_cannot_decrypt_post_removal_traffic`
     // unit test, which drives `decrypt_app` directly and asserts Err.
     {
-        let bob_raw = RawClient::connect(b.data_dir());
+        let bob_raw = connect_reader(&b, &a);
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if bob_raw.raw_envelopes("msg-general-log").len() >= 4 {
@@ -944,7 +1001,7 @@ fn two_nodes_exchange_e2ee_messages() {
     // The runtime-spawned log replicates ciphertext-only on both
     // nodes — same privacy gate as the manifest channel.
     for (who, daemon) in [("A", &a), ("B", &b)] {
-        let envelopes = RawClient::connect(daemon.data_dir()).raw_envelopes("msg-dev-log");
+        let envelopes = connect_reader(daemon, &a).raw_envelopes("msg-dev-log");
         assert!(
             envelopes.len() >= 3,
             "node {who} should replicate the dev channel's envelopes, got {}",

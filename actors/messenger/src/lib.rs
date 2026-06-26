@@ -565,6 +565,20 @@ impl Messenger {
         if !self.channels[i].joined {
             return format!("not joined to '{channel}' yet");
         }
+        if self.channels[i].desynced {
+            // A degraded channel is read-only at its last good epoch (the
+            // commit chain is bricked; see `tick::channel_drain_plan`). The
+            // local group can still technically encrypt at that stale epoch,
+            // but its membership can no longer be rotated — an eviction whose
+            // commit was lost would never take effect — so emitting fresh
+            // ciphertext could leak to a member who should have been removed.
+            // Refuse, matching the membership-op gate in `commit_chain_op`.
+            return format!(
+                "channel '{channel}' is degraded (commit chain bricked) — it is \
+                 read-only at the last good epoch; re-create or re-join to repair \
+                 before sending"
+            );
+        }
         let beacon = crate::clients::chronos_beacon(ctx).await;
         let stores = self.open_stores();
         let client = match mls::build_client_hedged(&self.nickname, &self.csprng_seed, &stores, beacon)
@@ -669,7 +683,8 @@ impl Messenger {
         for c in &self.channels {
             if c.desynced {
                 out.push_str(&format!(
-                    "channel {}: desynced — needs repair ({} messages kept)\n",
+                    "channel {}: degraded — read-only at last good epoch, \
+                     the commit chain is bricked ({} messages readable)\n",
                     c.name,
                     c.messages.len()
                 ));
@@ -868,7 +883,9 @@ impl Messenger {
             && self.channels[i].desynced
         {
             return Err(format!(
-                "channel '{channel}' is desynced — repair it before making membership changes"
+                "channel '{channel}' is degraded (commit chain bricked) — it is \
+                 read-only at the last good epoch; re-create or re-join to repair \
+                 before making membership changes"
             )
             .into());
         }

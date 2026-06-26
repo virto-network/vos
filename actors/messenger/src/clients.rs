@@ -11,7 +11,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use msg_ctl::{CommitOutcome, CommitRow};
-use msg_log::EnvelopeRow;
+use msg_log::{EnvelopeRow, LogStats};
 use vos::actors::context::ServiceId;
 use vos::prelude::*;
 use vos::value::{Msg, TAG_DYNAMIC, Value};
@@ -200,6 +200,19 @@ pub(crate) async fn log_history(
     }
     <Vec<EnvelopeRow> as vos::Decode>::try_decode(&inner)
         .ok_or_else(|| "bad msg-log history payload".to_string())
+}
+
+/// `msg-log.stats` — the log's row count and highest lamport stamp.
+/// Read once at join to seat the authenticated frontier on the join
+/// watermark (see [`tick::seat_join_frontier`](crate::tick)).
+pub(crate) async fn log_stats(ctx: &mut MsgrCtx, log_id: u32) -> Result<LogStats, String> {
+    let msg = Msg::new("stats");
+    let value = ask_value(ctx, ServiceId(log_id), &msg)
+        .await
+        .ok_or_else(|| "msg-log unreachable".to_string())?;
+    let inner = value_to_bytes(value).ok_or_else(|| "bad msg-log reply".to_string())?;
+    <LogStats as vos::Decode>::try_decode(&inner)
+        .ok_or_else(|| "bad msg-log stats payload".to_string())
 }
 
 /// `msg-ctl.commit` — submit an MLS Commit for sequencing.
