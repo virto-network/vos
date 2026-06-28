@@ -180,6 +180,11 @@ pub mod runtime;
 #[cfg(feature = "std")]
 pub mod node;
 
+// Host-side reconstruction of the registry's signed-op canonical bytes
+// so the daemon can author-sign catalog mutations on relay.
+#[cfg(feature = "std")]
+pub(crate) mod registry_canon;
+
 /// Drive a future to completion on the current thread.
 ///
 /// Single-poll loop with a no-op waker — sufficient because the

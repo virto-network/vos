@@ -320,7 +320,7 @@ pub(crate) async fn dir_claim_kp(
 ///
 /// The value is domain-bound to its round (`blake2b`) before it leaves here, so
 /// the hedge can't be replayed across rounds and the raw beacon never enters
-/// the CSPRNG directly. [`crate::mls::build_client_hedged`] folds the result
+/// the CSPRNG directly. [`crate::mls::build_bound_client_hedged`] folds the result
 /// into the output branch.
 pub(crate) async fn chronos_beacon(ctx: &mut MsgrCtx) -> Option<[u8; 32]> {
     let chronos_id = resolve(ctx, CHRONOS_AGENT).await.ok()?;

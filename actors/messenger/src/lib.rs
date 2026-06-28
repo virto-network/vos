@@ -258,7 +258,7 @@ impl Messenger {
 
     /// Restore the mls-rs storage providers (group state + key packages) from
     /// this node's persisted snapshot. The messenger keeps the returned stores
-    /// alongside the Client built over them (via [`mls::build_client`]) so it
+    /// alongside the Client built over them (via [`mls::build_bound_client`]) so it
     /// can [`store::snapshot`] them back after a mutating MLS op.
     ///
     /// Cost: each mutating op restores the full store, rebuilds the Client over

@@ -510,7 +510,13 @@ impl SpaceRegistry {
     /// `STATUS_TAG_CONFLICT` unless the existing hash matches
     /// (idempotent re-publish).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn publish(&mut self, name: String, version: String, hash: Vec<u8>) -> u8 {
+    async fn publish(&mut self, name: String, version: String, hash: Vec<u8>, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("publish", &[name.as_bytes(), version.as_bytes(), &hash]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let Some(hash) = bytes_to_32(&hash) else {
             return STATUS_BAD_HASH;
         };
@@ -543,7 +549,13 @@ impl SpaceRegistry {
     /// Remove a program from the catalog. Errors with
     /// `STATUS_IN_USE` if any agent still references the version.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn unpublish(&mut self, name: String, version: String) -> u8 {
+    async fn unpublish(&mut self, name: String, version: String, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("unpublish", &[name.as_bytes(), version.as_bytes()]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let mut idx = 0usize;
         while idx < self.programs.len() {
             let cur = &self.programs[idx];
@@ -723,7 +735,26 @@ impl SpaceRegistry {
         consistency: u8,
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
+        auth: Vec<u8>,
     ) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes(
+                "install",
+                &[
+                    instance_name.as_bytes(),
+                    program_name.as_bytes(),
+                    program_version.as_bytes(),
+                    &program_hash,
+                    &replication_id,
+                    &[consistency],
+                    &install_args,
+                    &install_payloads,
+                ],
+            ),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return STATUS_BAD_HASH;
         };
@@ -795,7 +826,13 @@ impl SpaceRegistry {
     /// Tombstone an agent. Local data on each replica moves to
     /// trash on the host side; the registry just removes the row.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn uninstall(&mut self, instance_name: String) -> u8 {
+    async fn uninstall(&mut self, instance_name: String, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("uninstall", &[instance_name.as_bytes()]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let mut idx = 0usize;
         while idx < self.agents.len() {
             if self.agents[idx].instance_name == instance_name {
@@ -817,7 +854,22 @@ impl SpaceRegistry {
         new_program_name: String,
         new_program_version: String,
         new_program_hash: Vec<u8>,
+        auth: Vec<u8>,
     ) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes(
+                "upgrade",
+                &[
+                    instance_name.as_bytes(),
+                    new_program_name.as_bytes(),
+                    new_program_version.as_bytes(),
+                    &new_program_hash,
+                ],
+            ),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let Some(new_program_hash) = bytes_to_32(&new_program_hash) else {
             return STATUS_BAD_HASH;
         };
@@ -1576,15 +1628,23 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
 // genesis `set_root` and delegates through the already-verified
 // `auth_grants` table — see [`SpaceRegistry::authorize_op`].
 //
-// The program/agent CATALOG mutators (`publish`/`install`/`upgrade`/
-// …) are NOT signed here: they're reachable from a PVM agent that
-// has no operator key (the messenger installs a channel's actor pair
-// via `create`), so they can't carry a CLI signature. Closing the
-// catalog-forgery vector (the M5 remote agent-row vector) needs a
-// host-level "sign on relay" seam — deferred. The auth/member tables,
-// which the headline vuln (admin self-escalation, voter seizure)
-// targets, are only ever mutated by the operator CLI or the daemon
-// at boot, so the CLI/daemon signing seam covers them completely.
+// The program/agent CATALOG mutators (`publish`/`unpublish`/`install`/
+// `uninstall`/`upgrade`) carry the same `auth` blob, closing the
+// catalog-forgery vector (a forged AgentRow/ProgramRow merged via CRDT
+// that drives every peer's reconcile to spawn an agent). They are
+// reachable from a PVM agent that holds no operator key (the messenger
+// clones a channel's actor pair via `create` → `install`) and from the
+// daemon's own in-process manifest reconcile, so the signature can't
+// always originate at the CLI. The daemon signs them on relay: when a
+// catalog mutation reaches the registry it rebuilds these canonical
+// bytes from the dispatch `Msg` and signs with the operator key it
+// loaded at boot, before the op is recorded into the DAG. Because the
+// signature is the operator's, `authorize_op` passes on the operator's
+// (admin) node and fails on a joined non-admin node — which is correct:
+// a non-admin never authors a catalog row, it consumes the admin's
+// already-signed rows via sync, and the reconcile path tolerates the
+// resulting STATUS_FORBIDDEN. `register_remote` stays unsigned: it is
+// the hyperspace/federation surface and has a separate trust model.
 
 /// Domain tag mixed into the canonical bytes an op is signed over.
 /// Prevents a signature from one protocol/version being replayed as
@@ -1668,6 +1728,30 @@ pub fn verify_op_sig(signer_peer_id: &[u8], msg: &[u8], sig: &[u8; OP_SIG_LEN]) 
     };
     let signature = ed25519_dalek::Signature::from_bytes(sig);
     vk.verify_strict(msg, &signature).is_ok()
+}
+
+/// Domain tag for the MLS identity-binding signature (the messenger's
+/// `vos-msg/identity-binding/v1`). Separate from [`REGISTRY_OP_DOMAIN`]
+/// so a registry-op signature can never be replayed as a binding cert.
+pub const BINDING_DOMAIN: &[u8] = b"vos-msg/identity-binding/v1";
+
+/// Canonical bytes the operator's identity key signs to bind an MLS
+/// signature key to a space PeerId: `domain || u16(mls_pubkey.len) ||
+/// mls_pubkey || u16(peer_id.len) || peer_id || space_id`. Shared so the
+/// messenger actor (which verifies the cert on every leaf) and the CLI
+/// (`vosx`, which produces it) build identical bytes from one source —
+/// it lives here next to [`canonical_op_bytes`] because both are
+/// signing-byte builders the PVM actor flavor and the host must agree on.
+pub fn binding_signed_bytes(mls_pubkey: &[u8], peer_id: &[u8], space_id: &[u8; 32]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(BINDING_DOMAIN.len() + 4 + mls_pubkey.len() + peer_id.len() + 32);
+    out.extend_from_slice(BINDING_DOMAIN);
+    out.extend_from_slice(&(mls_pubkey.len() as u16).to_le_bytes());
+    out.extend_from_slice(mls_pubkey);
+    out.extend_from_slice(&(peer_id.len() as u16).to_le_bytes());
+    out.extend_from_slice(peer_id);
+    out.extend_from_slice(space_id);
+    out
 }
 
 #[cfg(test)]
@@ -1946,20 +2030,35 @@ mod tests {
                 name: String::from("p"),
                 version: String::from("1"),
                 hash: hash.clone(),
+                auth: root_auth("publish", &[b"p", b"1", &hash]),
             },
         );
         assert!(pub_status == STATUS_OK, "program publish must succeed");
+        let rep = alloc::vec![9u8; 32];
         dispatch(
             r,
             Install {
                 instance_name: String::from(name),
                 program_name: String::from("p"),
                 program_version: String::from("1"),
-                program_hash: hash,
-                replication_id: alloc::vec![9u8; 32],
+                program_hash: hash.clone(),
+                replication_id: rep.clone(),
                 consistency,
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
+                auth: root_auth(
+                    "install",
+                    &[
+                        name.as_bytes(),
+                        b"p",
+                        b"1",
+                        &hash,
+                        &rep,
+                        &[consistency],
+                        &[],
+                        &[],
+                    ],
+                ),
             },
         )
     }
@@ -1969,6 +2068,7 @@ mod tests {
             r,
             Uninstall {
                 instance_name: String::from(name),
+                auth: root_auth("uninstall", &[name.as_bytes()]),
             },
         )
     }
@@ -2351,6 +2451,123 @@ mod tests {
             STATUS_OK,
         );
         assert_eq!(dispatch(&mut r, NodeRole { prefix: 5 }), NODE_ROLE_VOTER + 1);
+    }
+
+    #[test]
+    fn forged_install_rejected_on_system_replay_path() {
+        // The catalog-forgery guard: a non-admin peer forges an `install` op (a
+        // fabricated AgentRow) and merges it via CRDT. On replay it
+        // arrives as Caller::System, so the #[msg(role)] gate is a
+        // no-op — yet authorize_op rejects it, so reconcile never sees
+        // the row and the forged agent never spawns on an honest node.
+        let mut r = registry();
+        let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
+        let hash = alloc::vec![7u8; 32];
+        let rep = alloc::vec![9u8; 32];
+        let forged = auth_as(
+            &attacker_key,
+            "install",
+            &[b"evil", b"p", b"1", &hash, &rep, &[2u8], &[], &[]],
+        );
+        let status = dispatch_as_system(
+            &mut r,
+            Install {
+                instance_name: String::from("evil"),
+                program_name: String::from("p"),
+                program_version: String::from("1"),
+                program_hash: hash,
+                replication_id: rep,
+                consistency: 2,
+                install_args: Vec::new(),
+                install_payloads: Vec::new(),
+                auth: forged,
+            },
+        );
+        assert_eq!(
+            status, STATUS_FORBIDDEN,
+            "System caller can't bypass authorize_op for install",
+        );
+        assert!(
+            dispatch(
+                &mut r,
+                Agent {
+                    instance_name: String::from("evil"),
+                },
+            )
+            .is_none(),
+            "forged AgentRow must never land",
+        );
+    }
+
+    #[test]
+    fn forged_publish_rejected_on_system_replay_path() {
+        // The program-catalog half of the same vector: a forged
+        // ProgramRow merged via CRDT is refused on replay.
+        let mut r = registry();
+        let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
+        let hash = alloc::vec![7u8; 32];
+        let forged = auth_as(&attacker_key, "publish", &[b"evil", b"1", &hash]);
+        let status = dispatch_as_system(
+            &mut r,
+            Publish {
+                name: String::from("evil"),
+                version: String::from("1"),
+                hash,
+                auth: forged,
+            },
+        );
+        assert_eq!(status, STATUS_FORBIDDEN);
+        assert!(
+            dispatch(
+                &mut r,
+                Program {
+                    name: String::from("evil"),
+                    version: String::from("1"),
+                },
+            )
+            .is_none(),
+            "forged ProgramRow must never land",
+        );
+    }
+
+    #[test]
+    fn unsigned_install_is_rejected() {
+        // An `install` with no auth blob fails closed, just like the
+        // auth/member mutators.
+        let mut r = registry();
+        let status = dispatch(
+            &mut r,
+            Install {
+                instance_name: String::from("x"),
+                program_name: String::from("p"),
+                program_version: String::from("1"),
+                program_hash: alloc::vec![7u8; 32],
+                replication_id: alloc::vec![9u8; 32],
+                consistency: 2,
+                install_args: Vec::new(),
+                install_payloads: Vec::new(),
+                auth: Vec::new(),
+            },
+        );
+        assert_eq!(status, STATUS_FORBIDDEN);
+    }
+
+    #[test]
+    fn root_signed_install_lands_the_agent_row() {
+        // Positive control: the operator (root) signs publish+install
+        // (as the host sign-on-relay seam does on the admin node), so
+        // authorize_op passes and the AgentRow materializes — proving
+        // the signed path doesn't reject legitimate catalog ops.
+        let mut r = registry();
+        assert_eq!(install_at(&mut r, "good", 2), STATUS_OK);
+        let row = dispatch(
+            &mut r,
+            Agent {
+                instance_name: String::from("good"),
+            },
+        )
+        .expect("root-signed install lands the row");
+        assert_eq!(row.instance_name, "good");
     }
 
     #[test]

@@ -852,6 +852,15 @@ pub struct VosNode {
     /// [`attach_network`](Self::attach_network).
     #[cfg(feature = "network")]
     operator_peer: Option<Vec<u8>>,
+    /// Signs the space-registry's catalog mutators on relay with the
+    /// operator key the daemon loaded at boot (the "sign on relay"
+    /// seam). Handed to the registry agent thread, which injects the
+    /// `auth` blob before recording so a keyless PVM agent's (or the
+    /// in-process reconcile's) `install`/`publish`/… authorizes on the
+    /// operator's node. `None` (a raw `vosx run` or a test node) leaves
+    /// catalog ops unsigned, so the registry refuses them — fail closed.
+    /// Set by [`set_operator_signer`](Self::set_operator_signer).
+    operator_signer: Option<crate::registry_canon::CatalogOpSigner>,
     /// Map: replication group → local replica handle.
     /// Populated by `register` whenever a CRDT actor with a
     /// `replication_id` is added. Read by [`NodeService`] (db
@@ -2062,6 +2071,7 @@ impl VosNode {
             shared_network: Arc::new(Mutex::new(None)),
             #[cfg(feature = "network")]
             operator_peer: None,
+            operator_signer: None,
             #[cfg(all(feature = "network", feature = "storage"))]
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
@@ -2162,6 +2172,22 @@ impl VosNode {
     #[cfg(feature = "network")]
     pub fn set_operator_peer(&mut self, peer_bytes: Vec<u8>) {
         self.operator_peer = Some(peer_bytes);
+    }
+
+    /// Install the operator's catalog-op signer (the "sign on relay"
+    /// seam). `signer` produces the packed `auth` blob for a registry
+    /// op's canonical bytes; the space-registry agent thread calls it to
+    /// author-sign `install`/`publish`/`upgrade`/`uninstall`/`unpublish`
+    /// before recording, so a keyless PVM agent's or the in-process
+    /// reconcile's catalog mutation authorizes on the operator's node.
+    /// Must be set before the registry agent is registered so its thread
+    /// captures the signer. Unset (the default) leaves catalog ops
+    /// unsigned — the registry then refuses them (fail closed).
+    pub fn set_operator_signer<F>(&mut self, signer: F)
+    where
+        F: Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
+    {
+        self.operator_signer = Some(Arc::new(signer));
     }
 
     /// Attach a libp2p [`Network`](crate::network::Network) so the
@@ -2474,6 +2500,15 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage"))]
             hosts: self.raft_hosts.clone(),
         };
+        // Only the space-registry (local id 0) author-signs catalog
+        // mutations on relay; no other agent holds the operator key.
+        // Excludes the hyperspace registry (local id 1), whose
+        // register_remote has a separate trust model.
+        let operator_signer = if id.local_id() == ServiceId::REGISTRY.local_id() {
+            self.operator_signer.clone()
+        } else {
+            None
+        };
 
         let join = thread::spawn(move || {
             agent_thread(
@@ -2487,6 +2522,7 @@ impl VosNode {
                 raft_fwd,
                 shutdown,
                 activity,
+                operator_signer,
                 #[cfg(feature = "network")]
                 shared_network,
                 #[cfg(all(feature = "network", feature = "storage"))]
@@ -3146,6 +3182,7 @@ fn agent_thread(
     raft_fwd: RaftFwd,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
+    operator_signer: Option<crate::registry_canon::CatalogOpSigner>,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
     #[cfg(all(feature = "network", feature = "storage"))] sync_rx: Option<mpsc::Receiver<()>>,
 ) -> AgentResult {
@@ -3514,6 +3551,7 @@ fn agent_thread(
                         req,
                         strategy.as_mut(),
                         recording_enabled,
+                        operator_signer.as_ref(),
                     );
                     if let Err(e) = outcome {
                         fatal_error = Some(format!("commit failed during invoke: {e}"));
@@ -3711,10 +3749,26 @@ fn handle_invoke_request(
     svc_id: ServiceId,
     outbox: &mpsc::Sender<Envelope>,
     from_id: ServiceId,
-    req: InvokeRequest,
+    mut req: InvokeRequest,
     strategy: &mut dyn crate::commit::CommitStrategy,
     recording_enabled: bool,
+    operator_signer: Option<&crate::registry_canon::CatalogOpSigner>,
 ) -> Result<(), crate::commit::CommitError> {
+    // Only the space-registry thread holds the operator signer for catalog ops.
+    // If this dispatch is a signed catalog mutator, author-sign it with
+    // the operator key here — at the funnel every invoke to the registry
+    // converges on — and inject the `auth` blob BEFORE `begin_recording`
+    // so the recorded (and thus replicated) op carries the signature.
+    // The role gate + authorize_op still run inside the handler; an
+    // unauthorized op mutates no state, so `write_atomic` records no DAG
+    // node and nothing escapes the node. On a joined non-admin daemon
+    // the signature is its own (non-admin) operator's, so authorize_op
+    // refuses it and the row is consumed from sync instead.
+    if let Some(signer) = operator_signer {
+        if let Some(signed) = crate::registry_canon::sign_catalog_op_on_relay(&req.msg, signer) {
+            req.msg = signed;
+        }
+    }
     if recording_enabled {
         runtime.begin_recording(req.msg.clone());
     }
@@ -6467,6 +6521,226 @@ mod tests {
         assert_eq!(effective_after_seal(Some(Raft), Crdt), Raft);
         assert_eq!(effective_after_seal(Some(Raft), Raft), Raft);
         assert_eq!(effective_after_seal(Some(Crdt), Crdt), Crdt);
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn forged_registry_rows_are_rejected_at_replay() {
+        // The cross-node consistency boundary, deterministically. A peer can
+        // author a byte-consistent registry `CrdtEvent`, and an honest
+        // node WILL merge it — `insert_node` only checks the CID, not
+        // the author. The defense is at replay: `replay_dag_into_runtime`
+        // feeds each merged op back through the actor as `Caller::System`
+        // (the `#[msg(role)]` gate a no-op), where `authorize_op`
+        // re-verifies the embedded signature.
+        //
+        // We hand-build a registry DAG exactly as a peer's sync would
+        // deliver it — genesis `set_root`, then root-signed ops (the
+        // positive controls) interleaved with forged ops signed by a
+        // non-admin — inject it via the same `insert_node` path, then
+        // cold-start the registry so the real replay runs. The
+        // root-signed grant + install must land; the forged grant +
+        // install (the forged AgentRow vector) must not. This is the
+        // end-to-end counterpart to the registry's
+        // `forged_*_rejected_on_system_replay_path` unit tests, which
+        // exercise only the actor struct.
+        use crate::actors::codec::Encode;
+        use crate::commit::{Blake2b, CrdtCommit};
+        use crate::effect_log::{CrdtEvent, EffectLog};
+        use crate::value::{Msg, TAG_DYNAMIC};
+        use ed25519_dalek::{Signer, SigningKey};
+        use merkle_crdt::DagNode;
+        use std::collections::BTreeSet;
+
+        let workspace = env!("CARGO_MANIFEST_DIR");
+        let elf_path = format!(
+            "{workspace}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf"
+        );
+        let Ok(elf) = std::fs::read(&elf_path) else {
+            eprintln!("SKIP: space-registry ELF not built — run: just build-registry");
+            return;
+        };
+        let blob = grey_transpiler::link_elf(&elf).expect("registry transpiles");
+
+        // ── Identities ──────────────────────────────────────────────
+        const ADMIN: u8 = 3; // space_registry::AUTH_ROLE_ADMIN
+        let root_key = SigningKey::from_bytes(&[7u8; 32]);
+        let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
+        let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+            let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+            id.extend_from_slice(&pk);
+            id
+        };
+        let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+        let attacker_peer = peer_id_for(attacker_key.verifying_key().to_bytes());
+        let victim = vec![0xBBu8; 38];
+
+        // auth blob = signer_peer_id || ed25519_sig(canonical_op_bytes).
+        let auth_as = |key: &SigningKey, signer_peer: &[u8], op: &str, fields: &[&[u8]]| -> Vec<u8> {
+            let canonical = space_registry::canonical_op_bytes(op, fields);
+            let sig = key.sign(&canonical).to_bytes();
+            space_registry::pack_auth(signer_peer, &sig)
+        };
+
+        // A shared program the installs pin to.
+        let prog = "p";
+        let ver = "1";
+        let hash = vec![7u8; 32];
+        let rep = vec![9u8; 32];
+        let consistency = Consistency::Crdt.as_u8();
+
+        // ── Registry op messages (bare `[TAG_DYNAMIC][Msg]`, the shape
+        //    `EffectLog.msg` records — replay re-adds the caller prefix) ─
+        let dyn_payload = |m: Msg| -> Vec<u8> {
+            let mut p = vec![TAG_DYNAMIC];
+            p.extend_from_slice(&m.encode());
+            p
+        };
+        let grant_msg = |key: &SigningKey, signer: &[u8], who: &[u8]| {
+            dyn_payload(
+                Msg::new("grant_role")
+                    .with("peer_id", who.to_vec())
+                    .with("role", ADMIN as u64)
+                    .with("auth", auth_as(key, signer, "grant_role", &[who, &[ADMIN]])),
+            )
+        };
+        let install_msg = |key: &SigningKey, signer: &[u8], inst: &str| {
+            dyn_payload(
+                Msg::new("install")
+                    .with("instance_name", inst.to_string())
+                    .with("program_name", prog.to_string())
+                    .with("program_version", ver.to_string())
+                    .with("program_hash", hash.clone())
+                    .with("replication_id", rep.clone())
+                    .with("consistency", consistency as u64)
+                    .with("install_args", Vec::<u8>::new())
+                    .with("install_payloads", Vec::<u8>::new())
+                    .with(
+                        "auth",
+                        auth_as(
+                            key,
+                            signer,
+                            "install",
+                            &[
+                                inst.as_bytes(),
+                                prog.as_bytes(),
+                                ver.as_bytes(),
+                                &hash,
+                                &rep,
+                                &[consistency],
+                                &[],
+                                &[],
+                            ],
+                        ),
+                    ),
+            )
+        };
+
+        let set_root = dyn_payload(Msg::new("set_root").with("root", root_peer.clone()));
+        let publish = dyn_payload(
+            Msg::new("publish")
+                .with("name", prog.to_string())
+                .with("version", ver.to_string())
+                .with("hash", hash.clone())
+                .with(
+                    "auth",
+                    auth_as(&root_key, &root_peer, "publish", &[prog.as_bytes(), ver.as_bytes(), &hash]),
+                ),
+        );
+        let ops = [
+            set_root,
+            grant_msg(&root_key, &root_peer, &victim), // valid grant
+            grant_msg(&attacker_key, &attacker_peer, &attacker_peer), // forged grant
+            publish,
+            install_msg(&root_key, &root_peer, "good"), // valid install
+            install_msg(&attacker_key, &attacker_peer, "evil"), // forged install
+        ];
+
+        // ── Pre-seed the registry's redb with the DAG, exactly as a
+        //    peer's sync would: `insert_node` + `compact_roots`, no
+        //    committed state — so cold start replays the whole chain. ──
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir =
+            std::env::temp_dir().join(format!("vos_forged_row_{}_{}", std::process::id(), stamp));
+        let agents_dir = data_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        // db_path(ServiceId::REGISTRY) = {data_dir}/agents/{id.0:08x}.redb.
+        let redb_path = agents_dir.join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
+
+        {
+            let origin = [0x11u8; 32]; // a remote replica's origin
+            let mut db = CrdtCommit::open(&redb_path, origin).unwrap();
+            let mut prev: Option<merkle_crdt::Cid<Blake2b>> = None;
+            for (seq, msg) in ops.into_iter().enumerate() {
+                let event = CrdtEvent::new(origin, seq as u64, EffectLog::for_msg(msg));
+                let children: BTreeSet<merkle_crdt::Cid<Blake2b>> = prev.into_iter().collect();
+                let dag_node: DagNode<Blake2b, CrdtEvent> = DagNode::new(event, children);
+                let cid = dag_node.cid();
+                assert!(
+                    db.insert_node(&cid.0, &dag_node.to_bytes()).unwrap(),
+                    "node {seq} is new",
+                );
+                prev = Some(cid);
+            }
+            db.compact_roots().unwrap();
+        } // drop releases the redb lock before the agent reopens it
+
+        // ── Cold-start the registry over the seeded DAG ─────────────
+        let mut node = VosNode::new();
+        node.register_at_id(
+            AgentConfig::new(blob)
+                .with_consistency(Consistency::Crdt)
+                .with_replication_id([0x11u8; 32])
+                .persist(&data_dir),
+            ServiceId::REGISTRY,
+        );
+
+        // Query via raw invoke (the typed `SpaceRegistryRef` can't be
+        // used here — the dev-dep registry links a different vos build
+        // than the crate under test, so `&node` doesn't satisfy its
+        // `Invoker` bound). `peer_role` returns a `u8` (decodes as a
+        // `Value`); for `agent` we compare the reply against a
+        // known-`None` baseline rather than decoding `Option<AgentRow>`.
+        let invoke = |m: Msg| -> Vec<u8> {
+            let mut p = vec![TAG_DYNAMIC];
+            p.extend_from_slice(&m.encode());
+            node.invoke(ServiceId::REGISTRY, p).expect("registry reply")
+        };
+        let role_of = |peer: &[u8]| -> u64 {
+            let bytes = invoke(Msg::new("peer_role").with("peer_id", peer.to_vec()));
+            let v: crate::value::Value = crate::Decode::decode(&bytes);
+            v.as_u64().expect("peer_role returns an integer")
+        };
+        let agent_reply = |inst: &str| invoke(Msg::new("agent").with("instance_name", inst.to_string()));
+        let none_reply = agent_reply("does-not-exist"); // canonical `None` for this type
+
+        // Positive controls: the root-signed ops survived replay —
+        // proves the inject + replay pipeline is genuinely live.
+        assert_eq!(role_of(&victim), ADMIN as u64, "root-signed grant must apply on replay");
+        assert_ne!(
+            agent_reply("good"),
+            none_reply,
+            "root-signed install must materialize an AgentRow on replay",
+        );
+
+        // The headline: forged ops were refused by authorize_op on the
+        // System replay path, so neither row ever materializes.
+        assert_eq!(
+            role_of(&attacker_peer),
+            0,
+            "forged admin grant must be rejected at replay (AUTH_ROLE_NONE)",
+        );
+        assert_eq!(
+            agent_reply("evil"),
+            none_reply,
+            "forged install (M5 AgentRow vector) must be rejected at replay",
+        );
+
+        node.shutdown();
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

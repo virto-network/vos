@@ -27,15 +27,13 @@ use mls_rs_core::error::IntoAnyError;
 use mls_rs_core::identity::{
     Credential, CredentialType, CustomCredential, IdentityProvider, MemberValidationContext,
 };
+// Shared with the CLI signer (`vosx`) so the operator's binding cert
+// round-trips byte-for-byte — one source of truth in `space-registry`.
+use space_registry::binding_signed_bytes;
 
 /// Private-use MLS credential type id for VOS identity-bound credentials
 /// (≠ `CredentialType::BASIC`=1 / `X509`=2).
 pub(crate) const VOS_CREDENTIAL_TYPE: u16 = 0xF001;
-
-/// Domain tag separating the operator's binding signature from any other
-/// use of the identity key. The CLI signer ([`vosx`]) must build the same
-/// bytes via [`binding_signed_bytes`].
-const BINDING_DOMAIN: &[u8] = b"vos-msg/identity-binding/v1";
 
 /// Ed25519 signature length — the binding cert is exactly this.
 const SIG_LEN: usize = 64;
@@ -48,22 +46,9 @@ pub(crate) struct Binding {
     pub peer_id: Vec<u8>,
     /// Cosmetic display name. Not authoritative.
     pub display_name: String,
-    /// `Sign_{operatorKey}(BINDING_DOMAIN ‖ mls_pubkey ‖ peer_id ‖ space_id)`.
+    /// `Sign_{operatorKey}(domain ‖ mls_pubkey ‖ peer_id ‖ space_id)` —
+    /// see [`space_registry::binding_signed_bytes`].
     pub cert: Vec<u8>,
-}
-
-/// Canonical bytes the operator's identity key signs to bind an MLS key to
-/// a PeerId within a space. The CLI and the verifier build these
-/// identically, so the cert round-trips without re-encoding.
-pub(crate) fn binding_signed_bytes(mls_pubkey: &[u8], peer_id: &[u8], space_id: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(BINDING_DOMAIN.len() + 4 + mls_pubkey.len() + peer_id.len() + 32);
-    out.extend_from_slice(BINDING_DOMAIN);
-    out.extend_from_slice(&(mls_pubkey.len() as u16).to_le_bytes());
-    out.extend_from_slice(mls_pubkey);
-    out.extend_from_slice(&(peer_id.len() as u16).to_le_bytes());
-    out.extend_from_slice(peer_id);
-    out.extend_from_slice(space_id);
-    out
 }
 
 /// Canonical credential payload: `[peer_id][display_name][cert]`, each

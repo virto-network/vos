@@ -26,7 +26,6 @@ use zeroize::Zeroizing;
 use mls_rs::client_builder::{MlsConfig, PaddingMode};
 use mls_rs::group::Group;
 use mls_rs::identity::SigningIdentity;
-use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
 use mls_rs::mls_rules::{CommitOptions, DefaultMlsRules, EncryptionOptions};
 use mls_rs::time::MlsTime;
 use mls_rs::{CipherSuite, Client, ExtensionList, MlsMessage};
@@ -163,48 +162,9 @@ pub(crate) fn open_stores(snapshot: &[u8]) -> VosStores {
     store::restore(snapshot, MAX_PAST_EPOCHS)
 }
 
-/// Build the per-member MLS Client over the restored stores, the deterministic
-/// host-seeded crypto provider, and the seed-derived signing identity under
-/// `nickname`. Seed-only stream — see [`build_client_hedged`] for the
-/// verifiable-randomness variant.
-// Basic (un-bound) credential builders. Since M4 every production path builds
-// identity-bound clients (`build_bound_client*`); these remain to exercise MLS
-// group mechanics independent of the binding in unit tests.
-#[allow(dead_code)]
-pub(crate) fn build_client(
-    nickname: &str,
-    seed: &[u8],
-    stores: &VosStores,
-) -> Result<Client<impl MlsConfig + use<>>, String> {
-    build_client_hedged(nickname, seed, stores, None)
-}
-
-/// [`build_client`], additionally folding a public verifiable-randomness
-/// `beacon` (already domain-bound by [`crate::clients::chronos_beacon`]) into
-/// the MLS CSPRNG. Boots [`HostRand`] from the seed plus a fresh per-open
-/// OS-entropy token, so every MLS entropy draw in this dispatch flows from one
-/// ratchet (deterministic within the boot) while the token forks the stream
-/// across boots (forward secrecy). A host-minted token replaces the OS draw
-/// when the messenger runs as a deterministic PVM actor (the BOOT_CONTEXT seam).
-///
-/// The beacon enters only the HKDF *output* branch (never the seed, salt, or
-/// ratchet — see [`HostRand`]), so confidentiality still rests on the secret
-/// seed alone (RFC 9180 §9.7.5). Folding the SAME beacon keeps draws
-/// bit-identical (the determinism gate holds); `None` is byte-identical to
-/// [`build_client`], so a space without a chronos feed is unaffected.
-#[allow(dead_code)]
-pub(crate) fn build_client_hedged(
-    nickname: &str,
-    seed: &[u8],
-    stores: &VosStores,
-    beacon: Option<[u8; 32]>,
-) -> Result<Client<impl MlsConfig + use<>>, String> {
-    build_client_with_rand(nickname, seed, boot_host_rand(seed, beacon)?, stores)
-}
-
 /// Boot the per-dispatch MLS CSPRNG from the seed plus a fresh per-open token,
 /// folding an optional verifiable-randomness beacon into the output branch.
-/// Shared by the basic and identity-bound client builders.
+/// Shared by the identity-bound client builders.
 fn boot_host_rand(seed: &[u8], beacon: Option<[u8; 32]>) -> Result<HostRand, String> {
     let seed32 = seed_array(seed)?;
     let mut boot_token = [0u8; 32];
@@ -229,9 +189,10 @@ fn boot_host_rand(seed: &[u8], beacon: Option<[u8; 32]>) -> Result<HostRand, Str
     Ok(rand)
 }
 
-/// Identity-bound counterpart of [`build_client`] (M4): builds the Client over
-/// the custom credential + [`crate::identity::VosIdentityProvider`]. Seed-only
-/// stream (no beacon).
+/// Build the per-member identity-bound MLS Client over the restored stores, the
+/// custom credential + [`crate::identity::VosIdentityProvider`], and the
+/// seed-derived signing identity. Seed-only stream — see
+/// [`build_bound_client_hedged`] for the verifiable-randomness variant.
 pub(crate) fn build_bound_client(
     binding: &crate::identity::Binding,
     space_id: [u8; 32],
@@ -241,7 +202,10 @@ pub(crate) fn build_bound_client(
     build_bound_client_hedged(binding, space_id, seed, stores, None)
 }
 
-/// Identity-bound counterpart of [`build_client_hedged`] (M4).
+/// [`build_bound_client`], additionally folding a public verifiable-randomness
+/// `beacon` into the MLS CSPRNG: boots [`HostRand`] from the seed plus a fresh
+/// per-open token, with the beacon entering only the HKDF output branch, so
+/// confidentiality still rests on the secret seed alone.
 pub(crate) fn build_bound_client_hedged(
     binding: &crate::identity::Binding,
     space_id: [u8; 32],
@@ -252,44 +216,18 @@ pub(crate) fn build_bound_client_hedged(
     build_bound_client_with_rand(binding, space_id, seed, boot_host_rand(seed, beacon)?, stores)
 }
 
-/// Build the Client over an explicit [`HostRand`]. Two clients built from the
-/// same seed + the same `HostRand` boot context emit bit-identical KeyPackages,
-/// commits, and Welcomes — the determinism gate. `build_client` is the
-/// fresh-per-open wrapper; tests drive this directly with a fixed boot context.
+/// Build the identity-bound Client over an explicit [`HostRand`]: the leaf
+/// carries the custom credential `(peer_id, display_name, binding_cert)` and
+/// [`crate::identity::VosIdentityProvider`] checks every leaf mls-rs validates
+/// (added members, joined-tree members) against `space_id`. Two clients built
+/// from the same seed + the same `HostRand` boot context emit bit-identical
+/// KeyPackages, commits, and Welcomes — the determinism gate.
 ///
 /// `use<>`: the returned Client captures none of the input lifetimes — it copies
-/// the nickname into a credential, derives owned signer keys, and clones the
+/// the binding into a credential, derives owned signer keys, and clones the
 /// stores — so callers may keep mutating `self` while it lives.
-#[allow(dead_code)]
-pub(crate) fn build_client_with_rand(
-    nickname: &str,
-    seed: &[u8],
-    rand: HostRand,
-    stores: &VosStores,
-) -> Result<Client<impl MlsConfig + use<>>, String> {
-    if nickname.is_empty() {
-        return Err("not registered — run `messenger register <nickname>` first".into());
-    }
-    let (secret, public) = derive_signer(seed)?;
-    let signing_identity = SigningIdentity::new(
-        BasicCredential::new(nickname.as_bytes().to_vec()).into_credential(),
-        public,
-    );
-    Ok(Client::builder()
-        .crypto_provider(VosCryptoProvider::new(rand))
-        .identity_provider(BasicIdentityProvider)
-        .group_state_storage(stores.group_state.clone())
-        .key_package_repo(stores.key_packages.clone())
-        .mls_rules(vos_mls_rules())
-        .signing_identity(signing_identity, secret, CIPHERSUITE)
-        .build())
-}
-
-/// Like [`build_client_with_rand`] but with the M4 identity-bound custom
-/// credential + [`crate::identity::VosIdentityProvider`]: the leaf carries
-/// `(peer_id, display_name, binding_cert)` and every leaf mls-rs validates
-/// (added members, joined-tree members) has its cert checked against
-/// `space_id`. The MLS signer is still the seed-derived Ed25519 key and the
+///
+/// The MLS signer is still the seed-derived Ed25519 key and the
 /// cert is a provisioned input (not drawn from entropy), so KeyPackage /
 /// commit / Welcome bytes stay bit-identical given the same (seed, boot, ts)
 /// — the determinism gate holds (proven by
@@ -381,6 +319,9 @@ mod tests {
     const CHARLIE: [u8; 32] = [0xC3; 32];
     // A fixed timestamp so KeyPackage/commit Lifetimes are reproducible.
     const TS_MS: u64 = 1_700_000_000_000;
+    // One space id shared by every member of a group: the identity provider
+    // rejects leaves bound to a different space, so co-members must agree on it.
+    const SPACE: [u8; 32] = [0x11; 32];
 
     /// Open the stores from a party's persisted snapshot. The caller builds a
     /// client over them, runs an op, persists with `Group::write_to_storage`,
@@ -388,6 +329,28 @@ mod tests {
     /// messenger runs.
     fn stores(snap: &[u8]) -> VosStores {
         open_stores(snap)
+    }
+
+    /// A valid identity binding for a member: a distinct operator key (derived
+    /// from `seed`, giving a distinct PeerId) signs the binding cert over the
+    /// member's seed-derived MLS public key, that PeerId, and `space_id` — the
+    /// exact triple [`crate::identity::verify_binding`] checks. Leaves built from
+    /// it pass `validate_member` at create/add/join.
+    fn test_binding(seed: &[u8], display_name: &str, space_id: &[u8; 32]) -> crate::identity::Binding {
+        use ed25519_dalek::{Signer, SigningKey};
+        let op = SigningKey::from_bytes(&seed_array(seed).unwrap());
+        let mut peer_id = alloc::vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        peer_id.extend_from_slice(&op.verifying_key().to_bytes());
+        let mls_pubkey = signer_public(seed).unwrap();
+        let cert = op
+            .sign(&space_registry::binding_signed_bytes(&mls_pubkey, &peer_id, space_id))
+            .to_bytes()
+            .to_vec();
+        crate::identity::Binding {
+            peer_id,
+            display_name: String::from(display_name),
+            cert,
+        }
     }
 
     /// The Welcome routing token must be fresh per invite and must never
@@ -423,8 +386,9 @@ mod tests {
     /// stores and the group loads at the same epoch.
     #[test]
     fn group_survives_snapshot_boundary() {
+        let alice_b = test_binding(&ALICE, "alice", &SPACE);
         let s = stores(&[]);
-        let client = build_client("alice", &ALICE, &s).unwrap();
+        let client = build_bound_client(&alice_b, SPACE, &ALICE, &s).unwrap();
         let mut group = client
             .create_group_with_id(
                 group_id_for("general").to_vec(),
@@ -439,13 +403,13 @@ mod tests {
 
         // Reopen from the snapshot and reload.
         let s2 = stores(&snap);
-        let client2 = build_client("alice", &ALICE, &s2).unwrap();
+        let client2 = build_bound_client(&alice_b, SPACE, &ALICE, &s2).unwrap();
         let group2 = load_group(&client2, "general").unwrap();
         assert_eq!(group2.current_epoch(), 0);
         assert_eq!(group2.roster().members_iter().count(), 1);
 
         // Corrupt/empty snapshots degrade to a fresh (empty) store.
-        assert!(build_client("alice", &ALICE, &stores(&[1, 2, 3]))
+        assert!(build_bound_client(&alice_b, SPACE, &ALICE, &stores(&[1, 2, 3]))
             .unwrap()
             .load_group(&group_id_for("general"))
             .is_err());
@@ -458,9 +422,11 @@ mod tests {
     /// application messages as serialized wire bytes.
     #[test]
     fn group_flow_survives_snapshot_boundaries() {
+        let alice_b = test_binding(&ALICE, "alice", &SPACE);
+        let bob_b = test_binding(&BOB, "bob", &SPACE);
         // Alice: create the group, persist.
         let s = stores(&[]);
-        let alice = build_client("alice", &ALICE, &s).unwrap();
+        let alice = build_bound_client(&alice_b, SPACE, &ALICE, &s).unwrap();
         let mut alice_group = alice
             .create_group_with_id(
                 group_id_for("general").to_vec(),
@@ -474,13 +440,13 @@ mod tests {
 
         // Bob: publish a KeyPackage, persist.
         let s = stores(&[]);
-        let bob = build_client("bob", &BOB, &s).unwrap();
+        let bob = build_bound_client(&bob_b, SPACE, &BOB, &s).unwrap();
         let kp_bytes = new_key_package(&bob, crate::now_ms()).unwrap();
         let bob_snap = store::snapshot(&s);
 
         // Alice (fresh restore): add Bob, commit, persist.
         let s = stores(&alice_snap);
-        let alice = build_client("alice", &ALICE, &s).unwrap();
+        let alice = build_bound_client(&alice_b, SPACE, &ALICE, &s).unwrap();
         let mut alice_group = load_group(&alice, "general").unwrap();
         let out = alice_group
             .commit_builder()
@@ -495,7 +461,7 @@ mod tests {
 
         // Bob (fresh restore): join from the Welcome wire bytes, persist.
         let s = stores(&bob_snap);
-        let bob = build_client("bob", &BOB, &s).unwrap();
+        let bob = build_bound_client(&bob_b, SPACE, &BOB, &s).unwrap();
         let welcome = MlsMessage::from_bytes(&welcome_bytes).unwrap();
         let (mut bob_group, _info) = bob.join_group(None, &welcome, None).unwrap();
         assert_eq!(bob_group.roster().members_iter().count(), 2);
@@ -504,7 +470,7 @@ mod tests {
 
         // Alice → Bob across the wire.
         let s = stores(&alice_snap);
-        let alice = build_client("alice", &ALICE, &s).unwrap();
+        let alice = build_bound_client(&alice_b, SPACE, &ALICE, &s).unwrap();
         let mut alice_group = load_group(&alice, "general").unwrap();
         let wire = alice_group
             .encrypt_application_message(b"hello bob", Vec::new())
@@ -515,7 +481,7 @@ mod tests {
         let alice_snap = store::snapshot(&s);
 
         let s = stores(&bob_snap);
-        let bob = build_client("bob", &BOB, &s).unwrap();
+        let bob = build_bound_client(&bob_b, SPACE, &BOB, &s).unwrap();
         let mut bob_group = load_group(&bob, "general").unwrap();
         let (sender, text) = crate::tick::decrypt_app(&mut bob_group, &wire).unwrap();
         assert_eq!((sender.as_str(), text.as_str()), ("alice", "hello bob"));
@@ -524,7 +490,7 @@ mod tests {
 
         // Bob → Alice, each side restored from its latest snapshot.
         let s = stores(&bob_snap);
-        let bob = build_client("bob", &BOB, &s).unwrap();
+        let bob = build_bound_client(&bob_b, SPACE, &BOB, &s).unwrap();
         let mut bob_group = load_group(&bob, "general").unwrap();
         let wire_back = bob_group
             .encrypt_application_message(b"hi alice", Vec::new())
@@ -534,7 +500,7 @@ mod tests {
         bob_group.write_to_storage().unwrap();
 
         let s = stores(&alice_snap);
-        let alice = build_client("alice", &ALICE, &s).unwrap();
+        let alice = build_bound_client(&alice_b, SPACE, &ALICE, &s).unwrap();
         let mut alice_group = load_group(&alice, "general").unwrap();
         let (sender, text) = crate::tick::decrypt_app(&mut alice_group, &wire_back).unwrap();
         assert_eq!((sender.as_str(), text.as_str()), ("bob", "hi alice"));
@@ -615,8 +581,11 @@ mod tests {
         let mut ctl = msg_ctl::MsgCtl::new();
 
         // Bootstrap: alice creates, adds bob (epoch 0 → 1) through the sequencer.
+        let alice_b = test_binding(&ALICE, "alice", &SPACE);
+        let bob_b = test_binding(&BOB, "bob", &SPACE);
+        let charlie_b = test_binding(&CHARLIE, "charlie", &SPACE);
         let sa = stores(&[]);
-        let alice = build_client("alice", &ALICE, &sa).unwrap();
+        let alice = build_bound_client(&alice_b, SPACE, &ALICE, &sa).unwrap();
         let mut alice_group = alice
             .create_group_with_id(
                 group_id_for("contended").to_vec(),
@@ -627,7 +596,7 @@ mod tests {
             .unwrap();
 
         let sb = stores(&[]);
-        let bob = build_client("bob", &BOB, &sb).unwrap();
+        let bob = build_bound_client(&bob_b, SPACE, &BOB, &sb).unwrap();
         let bob_kp = new_key_package(&bob, crate::now_ms()).unwrap();
 
         let out = alice_group
@@ -656,7 +625,7 @@ mod tests {
         // The race: both commit at epoch 1. Alice adds charlie; bob rotates his
         // keys (self-update). Alice's reaches the sequencer first.
         let sc = stores(&[]);
-        let charlie = build_client("charlie", &CHARLIE, &sc).unwrap();
+        let charlie = build_bound_client(&charlie_b, SPACE, &CHARLIE, &sc).unwrap();
         let charlie_kp = new_key_package(&charlie, crate::now_ms()).unwrap();
         let alice_out = alice_group
             .commit_builder()
@@ -726,8 +695,10 @@ mod tests {
     /// is undecryptable to them.
     #[test]
     fn removed_member_cannot_decrypt_post_removal_traffic() {
+        let alice_b = test_binding(&ALICE, "alice", &SPACE);
+        let bob_b = test_binding(&BOB, "bob", &SPACE);
         let sa = stores(&[]);
-        let alice = build_client("alice", &ALICE, &sa).unwrap();
+        let alice = build_bound_client(&alice_b, SPACE, &ALICE, &sa).unwrap();
         let mut alice_group = alice
             .create_group_with_id(
                 group_id_for("evict").to_vec(),
@@ -738,7 +709,7 @@ mod tests {
             .unwrap();
 
         let sb = stores(&[]);
-        let bob = build_client("bob", &BOB, &sb).unwrap();
+        let bob = build_bound_client(&bob_b, SPACE, &BOB, &sb).unwrap();
         let bob_kp = new_key_package(&bob, crate::now_ms()).unwrap();
         let out = alice_group
             .commit_builder()
@@ -751,15 +722,13 @@ mod tests {
         let welcome = MlsMessage::from_bytes(&welcome).unwrap();
         let (mut bob_group, _info) = bob.join_group(None, &welcome, None).unwrap();
 
-        // Alice evicts bob.
+        // Alice evicts bob, located by his verified binding's display name.
         let bob_index = alice_group
             .roster()
             .members_iter()
             .find(|m| {
-                m.signing_identity
-                    .credential
-                    .as_basic()
-                    .map(|b| b.identifier() == b"bob")
+                crate::identity::member_binding(&m.signing_identity)
+                    .map(|d| d.display_name == "bob")
                     .unwrap_or(false)
             })
             .unwrap()
@@ -910,11 +879,17 @@ mod tests {
     #[test]
     fn same_seed_boot_and_ts_yields_identical_key_package() {
         let token = [0x5Au8; 32];
+        let binding = test_binding(&ALICE, "zoe", &SPACE);
         let mint = |ts: u64| {
             let s = stores(&[]);
-            let client =
-                build_client_with_rand("zoe", &ALICE, HostRand::boot(&ALICE, &token, &[], 0, 0), &s)
-                    .unwrap();
+            let client = build_bound_client_with_rand(
+                &binding,
+                SPACE,
+                &ALICE,
+                HostRand::boot(&ALICE, &token, &[], 0, 0),
+                &s,
+            )
+            .unwrap();
             new_key_package(&client, ts).unwrap()
         };
         assert_eq!(
@@ -969,8 +944,8 @@ mod tests {
         );
     }
 
-    /// The bound credential actually changes the signed KeyPackage (so the
-    /// determinism gate above is meaningful) and two distinct bindings fork it.
+    /// The binding actually enters the signed KeyPackage: two distinct bindings
+    /// (different PeerId) fork it, so the determinism gate above is meaningful.
     #[test]
     fn bound_key_package_differs_by_binding() {
         use crate::identity::Binding;
@@ -988,13 +963,6 @@ mod tests {
             .unwrap();
             new_key_package(&client, TS_MS).unwrap()
         };
-        let basic = {
-            let s = stores(&[]);
-            let client =
-                build_client_with_rand("zoe", &ALICE, HostRand::boot(&ALICE, &token, &[], 0, 0), &s)
-                    .unwrap();
-            new_key_package(&client, TS_MS).unwrap()
-        };
         let b1 = Binding {
             peer_id: alloc::vec![0x22u8; 38],
             display_name: String::from("zoe"),
@@ -1002,7 +970,6 @@ mod tests {
         };
         let mut b2 = b1.clone();
         b2.peer_id = alloc::vec![0x44u8; 38];
-        assert_ne!(kp(&b1), basic, "bound credential changes the KeyPackage");
         assert_ne!(kp(&b1), kp(&b2), "distinct bindings fork the KeyPackage");
     }
 
@@ -1014,16 +981,24 @@ mod tests {
     #[test]
     fn same_seed_boot_and_ts_yields_identical_commit_and_welcome() {
         let token = [0x5Au8; 32];
+        let alice_b = test_binding(&ALICE, "alice", &SPACE);
+        let bob_b = test_binding(&BOB, "bob", &SPACE);
         let run = || {
             let bs = stores(&[]);
-            let bob =
-                build_client_with_rand("bob", &BOB, HostRand::boot(&BOB, &token, &[], 0, 0), &bs)
-                    .unwrap();
+            let bob = build_bound_client_with_rand(
+                &bob_b,
+                SPACE,
+                &BOB,
+                HostRand::boot(&BOB, &token, &[], 0, 0),
+                &bs,
+            )
+            .unwrap();
             let kp = new_key_package(&bob, TS_MS).unwrap();
 
             let as_ = stores(&[]);
-            let alice = build_client_with_rand(
-                "alice",
+            let alice = build_bound_client_with_rand(
+                &alice_b,
+                SPACE,
                 &ALICE,
                 HostRand::boot(&ALICE, &token, &[], 0, 0),
                 &as_,

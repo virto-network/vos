@@ -191,9 +191,14 @@ fn messenger_register(client: &DaemonClient, args: &[&str]) -> anyhow::Result<()
         .try_into()
         .map_err(|_| anyhow!("space id is not 32 bytes"))?;
 
-    // 3. sign the binding cert
+    // 3. sign the binding cert (shared canonical so it byte-matches the
+    //    messenger verifier — see `space_registry::binding_signed_bytes`)
     let cert = keypair
-        .sign(&binding_signed_bytes(&mls_pubkey, &operator_peer, &space_id))
+        .sign(&space_registry::binding_signed_bytes(
+            &mls_pubkey,
+            &operator_peer,
+            &space_id,
+        ))
         .map_err(|e| anyhow!("sign binding cert: {e}"))?;
 
     // 4. bind_identity
@@ -205,21 +210,6 @@ fn messenger_register(client: &DaemonClient, args: &[&str]) -> anyhow::Result<()
             .with("cert", cert),
     )?;
     render_reply(reply2)
-}
-
-/// Canonical bytes the operator's identity key signs to bind an MLS key to a
-/// PeerId within a space. MUST byte-match the messenger's
-/// `identity::binding_signed_bytes` (domain `vos-msg/identity-binding/v1`).
-fn binding_signed_bytes(mls_pubkey: &[u8], peer_id: &[u8], space_id: &[u8; 32]) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"vos-msg/identity-binding/v1";
-    let mut out = Vec::with_capacity(DOMAIN.len() + 4 + mls_pubkey.len() + peer_id.len() + 32);
-    out.extend_from_slice(DOMAIN);
-    out.extend_from_slice(&(mls_pubkey.len() as u16).to_le_bytes());
-    out.extend_from_slice(mls_pubkey);
-    out.extend_from_slice(&(peer_id.len() as u16).to_le_bytes());
-    out.extend_from_slice(peer_id);
-    out.extend_from_slice(space_id);
-    out
 }
 
 /// Render an invoke reply to stdout, JSON or text per the global format.

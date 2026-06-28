@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use space_registry::{
-    ProgramRow, STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_TAG_CONFLICT, SpaceRegistryRef,
+    ProgramRow, STATUS_FORBIDDEN, STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_TAG_CONFLICT,
+    SpaceRegistryRef,
 };
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
@@ -693,16 +694,33 @@ fn reconcile_one(
             );
         }
         None => {
+            // Empty `auth`: the daemon signs catalog mutations on relay
+            // with its operator key. On the admin (operator) node that
+            // signature authorizes the op; on a joined non-admin node it
+            // doesn't, yielding STATUS_FORBIDDEN — which is expected, the
+            // row arrives via registry sync instead (handled below).
             let status = vos::block_on(reg.publish(
                 &mut &*node,
                 program_name.clone(),
                 program_version.clone(),
                 hash.0.to_vec(),
+                Vec::new(),
             ))
             .map_err(|e| anyhow::anyhow!("registry.publish('{program_name}'): {e}"))?;
             match status {
                 STATUS_OK => {
                     tracing::info!("published {program_name}:{program_version}");
+                }
+                STATUS_FORBIDDEN => {
+                    // Not the admin node — the program row is authored
+                    // and signed on the operator's node and replicates
+                    // here via CRDT sync. Proceed to install (which is
+                    // likewise tolerant) so the agent spawns once the
+                    // synced rows land.
+                    tracing::debug!(
+                        "publish {program_name}:{program_version} not authored here \
+                         (non-admin node); awaiting sync",
+                    );
                 }
                 STATUS_TAG_CONFLICT => {
                     anyhow::bail!("publish conflict on {program_name}:{program_version}");
@@ -775,6 +793,10 @@ fn reconcile_one(
     let install_args = encode_init_args(&agent.name, &elf_bytes, &agent.init, name_ids)?;
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
+    // Empty `auth`: the daemon signs on relay (see the publish call
+    // above). STATUS_FORBIDDEN here means this isn't the admin node, so
+    // the agent row is authored on the operator's node and arrives via
+    // sync — tolerated the same way as STATUS_INSTANCE_EXISTS below.
     let status = vos::block_on(reg.install(
         &mut &*node,
         agent.name.clone(),
@@ -785,6 +807,7 @@ fn reconcile_one(
         consistency,
         install_args,
         install_payloads,
+        Vec::new(),
     ))
     .map_err(|e| anyhow::anyhow!("registry.install('{}'): {e}", agent.name))?;
 
@@ -798,6 +821,18 @@ fn reconcile_one(
     if status == STATUS_INSTANCE_EXISTS {
         tracing::info!(
             "agent {} already installed (synced from a peer) — reusing",
+            agent.name,
+        );
+        return Ok(());
+    }
+    // A non-admin node can't author the catalog row (the daemon's
+    // operator key isn't the space root/admin). That's expected: the
+    // row is installed + signed on the operator's node and replicates
+    // here. The runtime reconcile pass then spawns the agent once the
+    // synced row + program blob are present.
+    if status == STATUS_FORBIDDEN {
+        tracing::info!(
+            "agent {} not installed here (non-admin node) — awaiting registry sync",
             agent.name,
         );
         return Ok(());

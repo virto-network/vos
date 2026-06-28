@@ -147,6 +147,43 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let local_prefix = network.local_prefix();
 
     let mut node = VosNode::with_prefix(local_prefix);
+
+    // Record this daemon's operator — the CLI identity that ran `vosx space
+    // up` (the same `vosx/identity.key` the operator later presents when
+    // driving agents with `vosx <agent> …`). Two roles: (1) the locality
+    // gate admits this caller, and only this caller, to a device-local
+    // (`consistency = local`) agent such as the messenger, so the operator
+    // can drive their own E2EE messenger while every remote peer is refused;
+    // (2) the registry agent author-signs catalog mutators on relay with
+    // this key — a keyless PVM agent (the messenger cloning a channel's
+    // actor pair) or the in-process reconcile can't carry a CLI signature,
+    // so the daemon signs `install`/`publish`/… before recording. Set BEFORE
+    // registering the registry so its thread captures the signer. A
+    // best-effort load: if the operator identity can't be resolved the
+    // daemon still boots, but no caller reaches a confined agent and no
+    // catalog op is signed (fail closed).
+    match crate::identity::load_or_create() {
+        Ok(kp) => {
+            let operator = libp2p::PeerId::from(kp.public());
+            let operator_bytes = operator.to_bytes();
+            node.set_operator_peer(operator_bytes.clone());
+            node.set_operator_signer(move |canonical: &[u8]| {
+                // libp2p ed25519 sign interops with the registry's
+                // ed25519-dalek verify_strict; pack as signer_peer_id || sig(64).
+                let sig = kp.sign(canonical).ok()?;
+                let sig: [u8; 64] = sig.as_slice().try_into().ok()?;
+                Some(space_registry::pack_auth(&operator_bytes, &sig))
+            });
+            tracing::info!(%operator, "auth: recorded operator for device-local agents");
+        }
+        Err(e) => {
+            tracing::warn!(
+                "auth: could not load operator identity ({e}); device-local agents \
+                 will be unreachable until restarted with a readable identity",
+            );
+        }
+    }
+
     let cfg = AgentConfig::new(blob.clone())
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
@@ -170,28 +207,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             "hyperspace '{name}' registry as {hs_id} (rep={}…)",
             &hex::encode(hs_rep)[..12],
         );
-    }
-
-    // Record this daemon's operator — the CLI identity that ran `vosx space
-    // up` (the same `vosx/identity.key` the operator later presents when
-    // driving agents with `vosx <agent> …`). The node's locality gate admits
-    // this caller, and only this caller, to a device-local (`consistency =
-    // local`) agent such as the messenger, so the operator can drive their
-    // own E2EE messenger while every remote peer is refused. A best-effort
-    // load: if the operator identity can't be resolved the daemon still boots,
-    // but no caller will reach a confined agent (fail closed).
-    match crate::identity::load_or_create() {
-        Ok(kp) => {
-            let operator = libp2p::PeerId::from(kp.public());
-            node.set_operator_peer(operator.to_bytes());
-            tracing::info!(%operator, "auth: recorded operator for device-local agents");
-        }
-        Err(e) => {
-            tracing::warn!(
-                "auth: could not load operator identity ({e}); device-local agents \
-                 will be unreachable until restarted with a readable identity",
-            );
-        }
     }
 
     node.attach_network(network);

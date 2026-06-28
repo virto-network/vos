@@ -354,17 +354,25 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.members(): {e}"))
     }
 
+    // The catalog mutators (publish/unpublish/install/uninstall/upgrade)
+    // pass an empty `auth`: the daemon signs them on relay with the
+    // operator key it loaded at boot, so the signature is the operator's
+    // regardless of whether the CLI or a keyless PVM agent drove the op.
+    // See `space_registry`'s signed-registry-ops note.
     pub fn publish(&self, name: String, version: String, hash: Vec<u8>) -> anyhow::Result<u8> {
         vos::block_on(
             self.registry()
-                .publish(&mut &self.node, name, version, hash),
+                .publish(&mut &self.node, name, version, hash, Vec::new()),
         )
         .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
     }
 
     pub fn unpublish(&self, name: String, version: String) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().unpublish(&mut &self.node, name, version))
-            .map_err(|e| anyhow::anyhow!("registry.unpublish(): {e}"))
+        vos::block_on(
+            self.registry()
+                .unpublish(&mut &self.node, name, version, Vec::new()),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.unpublish(): {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -389,6 +397,7 @@ impl DaemonClient {
             consistency,
             install_args,
             install_payloads,
+            Vec::new(),
         ))
         .map_err(|e| anyhow::anyhow!("registry.install(): {e}"))
     }
@@ -406,13 +415,17 @@ impl DaemonClient {
             program_name,
             program_version,
             program_hash,
+            Vec::new(),
         ))
         .map_err(|e| anyhow::anyhow!("registry.upgrade(): {e}"))
     }
 
     pub fn uninstall(&self, instance_name: String) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().uninstall(&mut &self.node, instance_name))
-            .map_err(|e| anyhow::anyhow!("registry.uninstall(): {e}"))
+        vos::block_on(
+            self.registry()
+                .uninstall(&mut &self.node, instance_name, Vec::new()),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.uninstall(): {e}"))
     }
 
     pub fn add_node(&self, prefix: u32, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
