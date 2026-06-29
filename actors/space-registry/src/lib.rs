@@ -284,6 +284,45 @@ impl vos::RoleByte for SpaceRegistryRole {
 pub struct AuthGrantRow {
     pub peer_id: Vec<u8>,
     pub role: u8,
+    /// Monotonic grant epoch. A grant only takes effect while its
+    /// epoch is strictly above the peer's `revoke_epochs` high-water,
+    /// so a replayed (stale-epoch) grant can never resurrect a revoked
+    /// role and a fresh re-grant must carry a higher epoch (the CLI
+    /// reads [`SpaceRegistry::peer_epoch`] and signs `epoch + 1`).
+    pub epoch: u64,
+    /// PeerId of the op's signer — the delegator. Authority is
+    /// resolved on demand by [`SpaceRegistry::effective_role`]: this
+    /// grant counts only if `grantor` is itself the genesis root or a
+    /// transitively-effective admin, so revoking a delegator voids its
+    /// whole subtree regardless of replay order.
+    pub grantor: Vec<u8>,
+}
+
+/// Grow-only revoke high-water for a space-level grant. `revoke_role`
+/// raises (never lowers) the epoch for `peer_id`; a grant whose epoch
+/// is at or below this is dominated. Order-independent: the high-water
+/// is a max, so a revoke that merges in after the grants it dominates
+/// still voids them once [`SpaceRegistry::effective_role`] recomputes.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct RevokeEpochRow {
+    pub peer_id: Vec<u8>,
+    pub epoch: u64,
+}
+
+/// Grow-only revoke high-water for an actor-local `(peer_id,
+/// agent_name)` grant. Sibling of [`RevokeEpochRow`] for the
+/// `actor_acls` table.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ActorRevokeEpochRow {
+    pub peer_id: Vec<u8>,
+    pub agent_name: String,
+    pub epoch: u64,
 }
 
 /// Per-(PeerId, agent_name) ACL row — the M4 actor-local override
@@ -305,6 +344,13 @@ pub struct ActorAclRow {
     pub peer_id: Vec<u8>,
     pub agent_name: String,
     pub role: u8,
+    /// Monotonic grant epoch — see [`AuthGrantRow::epoch`]. Compared
+    /// against the matching [`ActorRevokeEpochRow`] high-water.
+    pub epoch: u64,
+    /// PeerId of the delegator. The actor-local grant counts only if
+    /// the grantor is a transitively-effective *space* admin (resolved
+    /// via [`SpaceRegistry::effective_role`]).
+    pub grantor: Vec<u8>,
 }
 
 // ── Host mappings (hyperspace addressing) ───────────────────────
@@ -360,6 +406,18 @@ pub const STATUS_BAD_PREFIX: u8 = 8;
 /// defense-in-depth half of the immutable-local seal; the
 /// load-bearing enforcement is host-side in `vos::node`.
 pub const STATUS_CONSISTENCY_WIDEN_DENIED: u8 = 9;
+/// Anti-replay guard: `install` refused because its `replication_id`
+/// was already consumed by a prior install (the id is a grow-only
+/// tombstone that outlives `uninstall`). A captured `install` op
+/// replayed to resurrect an uninstalled agent hits this; a legitimate
+/// reinstall must mint a fresh `replication_id`.
+pub const STATUS_REPLICATION_ID_REUSED: u8 = 10;
+/// Compare-and-swap guard: `upgrade` refused because the instance's
+/// live program hash no longer matches the `from_hash` the op was
+/// authored against — a replayed or superseded upgrade (e.g. a
+/// version rollback re-injected via CRDT). Re-issue against the
+/// current hash to proceed.
+pub const STATUS_STALE_UPGRADE: u8 = 11;
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -432,6 +490,15 @@ pub struct SpaceRegistry {
     /// `auth_grants` (space-level) when no actor-local grant
     /// exists for `(peer, target_agent)`.
     actor_acls: Vec<ActorAclRow>,
+    /// Grow-only revoke high-waters for space-level grants, sorted by
+    /// `peer_id`. A grant is dominated while its epoch is at or below
+    /// the peer's entry here (see [`AuthGrantRow::epoch`]). Retained
+    /// across re-grants so revocation can't be undone by replaying a
+    /// stale-epoch grant.
+    revoke_epochs: Vec<RevokeEpochRow>,
+    /// Grow-only revoke high-waters for actor-local grants, sorted by
+    /// `(peer_id, agent_name)`. Sibling of `revoke_epochs`.
+    actor_revoke_epochs: Vec<ActorRevokeEpochRow>,
     /// Sorted by `instance_name`. Populated on the hyperspace
     /// registry replica only — the local space-registry leaves
     /// this empty so its `resolve` keeps the in-space behaviour
@@ -453,6 +520,15 @@ pub struct SpaceRegistry {
     /// Pinned into `space_id` (it rides the genesis DAG), so a joiner
     /// verifies it via the same `space new`/`space verify` root recompute.
     root: Vec<u8>,
+    /// Grow-only set of `replication_id`s any `install` has ever
+    /// consumed, sorted ascending. An install whose `replication_id`
+    /// is already here is refused, so a captured `install` op can't be
+    /// replayed to resurrect an uninstalled agent (the tombstone
+    /// outlives the `AgentRow`). A legitimate reinstall uses a fresh
+    /// `replication_id`. Order-independent: presence is a grow-only
+    /// set, so the original install's id blocks the replay regardless
+    /// of merge order.
+    used_replication_ids: Vec<[u8; 32]>,
 }
 
 #[messages]
@@ -467,9 +543,12 @@ impl SpaceRegistry {
             blobs: Vec::new(),
             auth_grants: Vec::new(),
             actor_acls: Vec::new(),
+            revoke_epochs: Vec::new(),
+            actor_revoke_epochs: Vec::new(),
             host_mappings: Vec::new(),
             consistency_floors: Vec::new(),
             root: Vec::new(),
+            used_replication_ids: Vec::new(),
         }
     }
 
@@ -806,6 +885,20 @@ impl SpaceRegistry {
             idx += 1;
         }
 
+        // Anti-replay guard: the `replication_id` is a grow-only
+        // tombstone. A captured `install` op replayed after the agent
+        // was uninstalled reuses its id, so refuse any id already
+        // consumed. Order-independent — the original install seeds the
+        // id, so the replay is blocked regardless of merge order, and
+        // the tombstone outlives the `AgentRow` that `uninstall` removes.
+        if self
+            .used_replication_ids
+            .binary_search(&replication_id)
+            .is_ok()
+        {
+            return STATUS_REPLICATION_ID_REUSED;
+        }
+
         // Monotone-locality guard (defense-in-depth): if this name was
         // ever installed before, its shareability may only narrow. A
         // reused name can't be *widened* into replication — that needs a
@@ -837,6 +930,10 @@ impl SpaceRegistry {
                 install_payloads,
             },
         );
+        // Burn the replication_id so it can never seed a second install.
+        if let Err(at) = self.used_replication_ids.binary_search(&replication_id) {
+            self.used_replication_ids.insert(at, replication_id);
+        }
         STATUS_OK
     }
 
@@ -864,6 +961,14 @@ impl SpaceRegistry {
     /// Repoint an agent at a different program version. State
     /// is preserved (same `replication_id`, same redb); replicas
     /// restart their agent thread on the next sync.
+    ///
+    /// `from_hash` is the program hash the caller observed the instance
+    /// currently running — a compare-and-swap precondition. The upgrade
+    /// applies only if the live `AgentRow.program_hash` still equals
+    /// `from_hash`, so a captured `upgrade` op replayed (e.g. to roll an
+    /// instance back to a superseded version) finds a stale base and is
+    /// refused. This is the version-monotonicity guard: each upgrade is
+    /// pinned to the exact state it was authored against.
     #[msg(role = SpaceRegistryRole::Admin)]
     async fn upgrade(
         &mut self,
@@ -871,6 +976,7 @@ impl SpaceRegistry {
         new_program_name: String,
         new_program_version: String,
         new_program_hash: Vec<u8>,
+        from_hash: Vec<u8>,
         auth: Vec<u8>,
     ) -> u8 {
         if !self.authorize_op(
@@ -881,6 +987,7 @@ impl SpaceRegistry {
                     new_program_name.as_bytes(),
                     new_program_version.as_bytes(),
                     &new_program_hash,
+                    &from_hash,
                 ],
             ),
             &auth,
@@ -888,6 +995,9 @@ impl SpaceRegistry {
             return STATUS_FORBIDDEN;
         }
         let Some(new_program_hash) = bytes_to_32(&new_program_hash) else {
+            return STATUS_BAD_HASH;
+        };
+        let Some(from_hash) = bytes_to_32(&from_hash) else {
             return STATUS_BAD_HASH;
         };
 
@@ -912,6 +1022,13 @@ impl SpaceRegistry {
         let mut idx = 0usize;
         while idx < self.agents.len() {
             if self.agents[idx].instance_name == instance_name {
+                // Compare-and-swap on the live program hash: a replayed
+                // or stale upgrade whose `from_hash` no longer matches is
+                // refused, so an instance can't be rolled back by
+                // re-injecting a superseded `upgrade` op.
+                if self.agents[idx].program_hash != from_hash {
+                    return STATUS_STALE_UPGRADE;
+                }
                 self.agents[idx].program_name = new_program_name;
                 self.agents[idx].program_version = new_program_version;
                 self.agents[idx].program_hash = new_program_hash;
@@ -1214,65 +1331,118 @@ impl SpaceRegistry {
 
     // ── Auth grants (Sprint 2) ─────────────────────────────────
 
-    /// Grant `role` to `peer_id`. Idempotent — re-granting the
-    /// same role is a no-op; changing the role updates in place.
-    /// `peer_id` is libp2p multihash bytes (same encoding as
-    /// `add_node`'s `peer_id` arg).
+    /// Grant `role` to `peer_id` at `epoch`. `epoch` must be above the
+    /// peer's current [`peer_epoch`](Self::peer_epoch) (the CLI reads it
+    /// and signs `epoch + 1`); a grant at or below the peer's revoke
+    /// high-water is recorded but stays dominated, so a replayed
+    /// stale-epoch grant can never resurrect a revoked role. `peer_id`
+    /// is libp2p multihash bytes. The grant is attributed to its signer
+    /// (`grantor`) so [`effective_role`](Self::effective_role) can void
+    /// the subtree if the delegator is later revoked.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8, auth: Vec<u8>) -> u8 {
-        if !self.authorize_op(&canonical_op_bytes("grant_role", &[&peer_id, &[role]]), &auth) {
+    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8, epoch: u64, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("grant_role", &[&peer_id, &[role], &epoch.to_le_bytes()]),
+            &auth,
+        ) {
             return STATUS_FORBIDDEN;
         }
         if peer_id.is_empty() {
             return STATUS_BAD_HASH;
         }
+        let Some((grantor, _)) = unpack_auth(&auth) else {
+            return STATUS_FORBIDDEN;
+        };
+        let grantor = grantor.to_vec();
         match self
             .auth_grants
             .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
         {
             Ok(idx) => {
-                self.auth_grants[idx].role = role;
+                // One row per peer: keep the dominant grant under
+                // `grant_supersedes` (root-signed grants are immutable to
+                // non-root displacement; otherwise highest epoch wins).
+                let cur = &self.auth_grants[idx];
+                if grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root) {
+                    self.auth_grants[idx].role = role;
+                    self.auth_grants[idx].epoch = epoch;
+                    self.auth_grants[idx].grantor = grantor;
+                }
                 STATUS_OK
             }
             Err(insert_at) => {
-                self.auth_grants
-                    .insert(insert_at, AuthGrantRow { peer_id, role });
+                self.auth_grants.insert(
+                    insert_at,
+                    AuthGrantRow {
+                        peer_id,
+                        role,
+                        epoch,
+                        grantor,
+                    },
+                );
                 STATUS_OK
             }
         }
     }
 
-    /// Remove the grant for `peer_id`. Returns
-    /// `STATUS_NOT_FOUND` if the peer wasn't granted.
+    /// Revoke `peer_id` at `epoch`. Raises the peer's grow-only revoke
+    /// high-water, dominating every grant at or below `epoch` — so the
+    /// revoke is replay-position independent (a forged grant ground to
+    /// sort before this op is still voided once `effective_role`
+    /// recomputes). Re-granting later requires a fresh, higher epoch.
+    /// Always `STATUS_OK`: revoking sets a floor even with no live grant
+    /// (it blocks a future replayed grant).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn revoke_role(&mut self, peer_id: Vec<u8>, auth: Vec<u8>) -> u8 {
-        if !self.authorize_op(&canonical_op_bytes("revoke_role", &[&peer_id]), &auth) {
+    async fn revoke_role(&mut self, peer_id: Vec<u8>, epoch: u64, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("revoke_role", &[&peer_id, &epoch.to_le_bytes()]),
+            &auth,
+        ) {
             return STATUS_FORBIDDEN;
         }
-        match self
-            .auth_grants
-            .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
-        {
-            Ok(idx) => {
-                self.auth_grants.remove(idx);
-                STATUS_OK
-            }
-            Err(_) => STATUS_NOT_FOUND,
-        }
+        bump_revoke_high_water(&mut self.revoke_epochs, peer_id, epoch);
+        STATUS_OK
     }
 
-    /// Look up the role granted to `peer_id`. Returns
-    /// `AUTH_ROLE_NONE` if no grant exists — the
-    /// dispatch-layer gate treats this as "deny".
+    /// Look up the *effective* role of `peer_id` — the value the
+    /// dispatch-layer gate enforces. Resolves revoke-dominance and
+    /// delegation order-independently (see
+    /// [`effective_role`](Self::effective_role)); `AUTH_ROLE_NONE` means
+    /// "deny".
     #[msg]
     async fn peer_role(&self, peer_id: Vec<u8>) -> u8 {
-        lookup_grant(&self.auth_grants, &peer_id)
+        self.effective_role(&peer_id)
     }
 
-    /// Full grants list — for `vosx space role list`.
+    /// Current freshness epoch for `peer_id`: the higher of its stored
+    /// grant epoch and its revoke high-water. The CLI reads this before
+    /// authoring a `grant_role`/`revoke_role` and signs `epoch + 1`, so
+    /// each authority change for a peer carries a strictly higher epoch
+    /// than any it could be replaying. An ungated read (membership
+    /// metadata is non-secret).
+    #[msg]
+    async fn peer_epoch(&self, peer_id: Vec<u8>) -> u64 {
+        grant_high_water(&self.auth_grants, &peer_id)
+            .max(revoke_high_water(&self.revoke_epochs, &peer_id))
+    }
+
+    /// Full grants list, resolved to *effective* roles — for
+    /// `vosx space role list`. A grant dominated by a revoke or a
+    /// revoked delegator is omitted.
     #[msg]
     async fn auth_grants(&self) -> Vec<AuthGrantRow> {
-        self.auth_grants.clone()
+        self.auth_grants
+            .iter()
+            .filter_map(|g| {
+                let role = self.effective_role(&g.peer_id);
+                (role != AUTH_ROLE_NONE).then(|| AuthGrantRow {
+                    peer_id: g.peer_id.clone(),
+                    role,
+                    epoch: g.epoch,
+                    grantor: g.grantor.clone(),
+                })
+            })
+            .collect()
     }
 
     // ── Actor-local ACLs (M4) ──────────────────────────────────
@@ -1294,12 +1464,13 @@ impl SpaceRegistry {
         peer_id: Vec<u8>,
         agent_name: String,
         role: u8,
+        epoch: u64,
         auth: Vec<u8>,
     ) -> u8 {
         if !self.authorize_op(
             &canonical_op_bytes(
                 "grant_actor_role",
-                &[&peer_id, agent_name.as_bytes(), &[role]],
+                &[&peer_id, agent_name.as_bytes(), &[role], &epoch.to_le_bytes()],
             ),
             &auth,
         ) {
@@ -1308,12 +1479,23 @@ impl SpaceRegistry {
         if peer_id.is_empty() || agent_name.is_empty() {
             return STATUS_BAD_HASH;
         }
+        let Some((grantor, _)) = unpack_auth(&auth) else {
+            return STATUS_FORBIDDEN;
+        };
+        let grantor = grantor.to_vec();
         match self
             .actor_acls
             .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
         {
             Ok(idx) => {
-                self.actor_acls[idx].role = role;
+                // One row per (peer, agent): same root-dominates ordering
+                // as the space-level grants (see `grant_supersedes`).
+                let cur = &self.actor_acls[idx];
+                if grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root) {
+                    self.actor_acls[idx].role = role;
+                    self.actor_acls[idx].epoch = epoch;
+                    self.actor_acls[idx].grantor = grantor;
+                }
                 STATUS_OK
             }
             Err(insert_at) => {
@@ -1323,6 +1505,8 @@ impl SpaceRegistry {
                         peer_id,
                         agent_name,
                         role,
+                        epoch,
+                        grantor,
                     },
                 );
                 STATUS_OK
@@ -1330,32 +1514,47 @@ impl SpaceRegistry {
         }
     }
 
-    /// Remove the actor-local grant for `(peer_id, agent_name)`.
-    /// `STATUS_NOT_FOUND` if no such row exists. Does not affect
-    /// the space-level grant in `auth_grants`.
+    /// Revoke the actor-local grant for `(peer_id, agent_name)` at
+    /// `epoch`, raising its grow-only revoke high-water (replay-position
+    /// independent — see [`revoke_role`](Self::revoke_role)). Always
+    /// `STATUS_OK`. Does not affect the space-level grant.
     #[msg(role = SpaceRegistryRole::Admin)]
     async fn revoke_actor_role(
         &mut self,
         peer_id: Vec<u8>,
         agent_name: String,
+        epoch: u64,
         auth: Vec<u8>,
     ) -> u8 {
         if !self.authorize_op(
-            &canonical_op_bytes("revoke_actor_role", &[&peer_id, agent_name.as_bytes()]),
+            &canonical_op_bytes(
+                "revoke_actor_role",
+                &[&peer_id, agent_name.as_bytes(), &epoch.to_le_bytes()],
+            ),
             &auth,
         ) {
             return STATUS_FORBIDDEN;
         }
-        match self
+        bump_actor_revoke_high_water(&mut self.actor_revoke_epochs, peer_id, agent_name, epoch);
+        STATUS_OK
+    }
+
+    /// Current freshness epoch for an actor-local `(peer_id,
+    /// agent_name)` grant — the higher of its stored grant epoch and
+    /// its revoke high-water. The CLI reads this before authoring a
+    /// `grant_actor_role`/`revoke_actor_role` and signs `epoch + 1`.
+    #[msg]
+    async fn actor_epoch(&self, peer_id: Vec<u8>, agent_name: String) -> u64 {
+        let grant = self
             .actor_acls
             .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
-        {
-            Ok(idx) => {
-                self.actor_acls.remove(idx);
-                STATUS_OK
-            }
-            Err(_) => STATUS_NOT_FOUND,
-        }
+            .map(|idx| self.actor_acls[idx].epoch)
+            .unwrap_or(0);
+        grant.max(actor_revoke_high_water(
+            &self.actor_revoke_epochs,
+            &peer_id,
+            &agent_name,
+        ))
     }
 
     /// Look up the actor-local role byte granted to `peer_id`
@@ -1369,20 +1568,31 @@ impl SpaceRegistry {
     /// distinguish "no row" from "row with role 0".)
     #[msg]
     async fn actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> u8 {
-        match self
-            .actor_acls
-            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
-        {
-            Ok(idx) => self.actor_acls[idx].role,
-            Err(_) => AUTH_ROLE_NONE,
-        }
+        // Effective role: revoke-dominated or ineffective-grantor grants
+        // resolve to AUTH_ROLE_NONE, which the host dispatch path treats
+        // as "no grant" (falling through to the space-level role).
+        self.effective_actor_role(&peer_id, &agent_name)
+            .unwrap_or(AUTH_ROLE_NONE)
     }
 
-    /// Full actor-local ACL list — for `vosx space role list --in
-    /// <actor>` and operator audit. Returned in sorted order.
+    /// Full actor-local ACL list, resolved to *effective* roles — for
+    /// `vosx space role list --in <actor>` and operator audit. A grant
+    /// dominated by a revoke or a revoked delegator is omitted.
     #[msg]
     async fn actor_acls(&self) -> Vec<ActorAclRow> {
-        self.actor_acls.clone()
+        self.actor_acls
+            .iter()
+            .filter_map(|a| {
+                self.effective_actor_role(&a.peer_id, &a.agent_name)
+                    .map(|role| ActorAclRow {
+                        peer_id: a.peer_id.clone(),
+                        agent_name: a.agent_name.clone(),
+                        role,
+                        epoch: a.epoch,
+                        grantor: a.grantor.clone(),
+                    })
+            })
+            .collect()
     }
 
     // ── Blob bytes ─────────────────────────────────────────────
@@ -1428,8 +1638,9 @@ impl SpaceRegistry {
 impl SpaceRegistry {
     /// Authorize a mutation: the `auth` blob's signature must be valid
     /// for `canonical` (the op's [`canonical_op_bytes`]), AND the
-    /// signer must be authorized — the genesis root, or a peer the
-    /// already-verified `auth_grants` table marks ADMIN.
+    /// signer must be an *effective* admin — the genesis root, or a
+    /// peer whose grant chain bottoms out at the root and is not
+    /// dominated by a revoke (see [`effective_role`](Self::effective_role)).
     ///
     /// This runs at handler time on BOTH the live dispatch and every
     /// peer's causal replay (where the op arrives as `Caller::System`
@@ -1438,11 +1649,13 @@ impl SpaceRegistry {
     /// — is refused on each honest node unless it carries a signature
     /// an admin (or the root) actually produced.
     ///
-    /// Delegation is transitive without explicit cert chains: a peer
-    /// is ADMIN in `auth_grants` only because a prior verified op put
-    /// it there, and that op was signed by the root or an earlier
-    /// admin — so authority bottoms out at the genesis root, applied
-    /// in causal order during replay.
+    /// Because `effective_role` is computed on demand from the stored
+    /// grant graph and the grow-only revoke high-waters — never from a
+    /// cached "is admin" flag — authority is *replay-position
+    /// independent*: a signer who was revoked anywhere in the merged
+    /// DAG is not an effective admin here, even when a forged node is
+    /// ground to sort causally *before* its own revoke. That closes the
+    /// re-grant-revoked-admin and revoked-delegator escalation vectors.
     fn authorize_op(&self, canonical: &[u8], auth: &[u8]) -> bool {
         let Some((signer, sig)) = unpack_auth(auth) else {
             return false;
@@ -1450,25 +1663,175 @@ impl SpaceRegistry {
         if !verify_op_sig(signer, canonical, &sig) {
             return false;
         }
-        // The genesis root is the supreme signer. (Before genesis sets
-        // a root, `self.root` is empty and only the unsigned `set_root`
-        // anchor op is accepted — every signed mutator fails closed.)
+        self.is_effective_admin(signer)
+    }
+
+    /// True when `signer` is the genesis root or a transitively
+    /// effective ADMIN. The root is the supreme signer — before genesis
+    /// sets one, `self.root` is empty and every signed mutator fails
+    /// closed (only the unsigned `set_root` anchor is accepted).
+    fn is_effective_admin(&self, signer: &[u8]) -> bool {
         if !self.root.is_empty() && self.root.as_slice() == signer {
             return true;
         }
-        lookup_grant(&self.auth_grants, signer) == AUTH_ROLE_ADMIN
+        self.effective_role(signer) == AUTH_ROLE_ADMIN
+    }
+
+    /// Effective space-level role of `peer_id`, resolving revoke-
+    /// dominance and delegation *order-independently*. A stored grant
+    /// counts only if its epoch is strictly above the peer's grow-only
+    /// revoke high-water AND its `grantor` is itself effective (the
+    /// genesis root, or a transitively-effective admin). Computed on
+    /// demand — never cached — so a revoke that merges in after the
+    /// grants it dominates (including a forged node ground to sort
+    /// before its own revoke during replay) retroactively voids the
+    /// whole delegation subtree.
+    fn effective_role(&self, peer_id: &[u8]) -> u8 {
+        self.effective_role_depth(peer_id, 0)
+    }
+
+    fn effective_role_depth(&self, peer_id: &[u8], depth: usize) -> u8 {
+        // A grant chain longer than the number of grants must contain a
+        // cycle, which can never bottom out at the root — refuse it.
+        if depth > self.auth_grants.len() {
+            return AUTH_ROLE_NONE;
+        }
+        let Ok(idx) = self
+            .auth_grants
+            .binary_search_by(|g| compare_bytes(&g.peer_id, peer_id).cmp(&0))
+        else {
+            return AUTH_ROLE_NONE;
+        };
+        let row = &self.auth_grants[idx];
+        if row.epoch <= revoke_high_water(&self.revoke_epochs, peer_id) {
+            return AUTH_ROLE_NONE;
+        }
+        // The grantor must itself be effective. The genesis root is the
+        // base case (always admin, never revocable).
+        if !self.root.is_empty() && self.root.as_slice() == row.grantor.as_slice() {
+            return row.role;
+        }
+        if self.effective_role_depth(&row.grantor, depth + 1) == AUTH_ROLE_ADMIN {
+            return row.role;
+        }
+        AUTH_ROLE_NONE
+    }
+
+    /// Effective actor-local role of `(peer_id, agent_name)`. Like
+    /// [`effective_role`](Self::effective_role): the grant counts only
+    /// while its epoch is above the matching actor revoke high-water
+    /// AND its `grantor` is an effective *space* admin. Returns `None`
+    /// when there is no row at all so the dispatch path can tell "no
+    /// grant" from "role 0".
+    fn effective_actor_role(&self, peer_id: &[u8], agent_name: &str) -> Option<u8> {
+        let idx = self
+            .actor_acls
+            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, peer_id, agent_name))
+            .ok()?;
+        let row = &self.actor_acls[idx];
+        if row.epoch <= actor_revoke_high_water(&self.actor_revoke_epochs, peer_id, agent_name) {
+            return None;
+        }
+        if self.is_effective_admin(&row.grantor) {
+            Some(row.role)
+        } else {
+            None
+        }
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Auth role byte granted to `peer_id` in a sorted `auth_grants`
-/// table, or [`AUTH_ROLE_NONE`] if no row exists. Shared by the
-/// `peer_role` read handler and `authorize_op`.
-fn lookup_grant(grants: &[AuthGrantRow], peer_id: &[u8]) -> u8 {
+/// Grow-only revoke high-water for `peer_id`, or 0 if never revoked.
+fn revoke_high_water(table: &[RevokeEpochRow], peer_id: &[u8]) -> u64 {
+    match table.binary_search_by(|r| compare_bytes(&r.peer_id, peer_id).cmp(&0)) {
+        Ok(idx) => table[idx].epoch,
+        Err(_) => 0,
+    }
+}
+
+/// Raise (never lower) the revoke high-water for `peer_id` to `epoch`.
+fn bump_revoke_high_water(table: &mut Vec<RevokeEpochRow>, peer_id: Vec<u8>, epoch: u64) {
+    match table.binary_search_by(|r| compare_bytes(&r.peer_id, &peer_id).cmp(&0)) {
+        Ok(idx) => {
+            if epoch > table[idx].epoch {
+                table[idx].epoch = epoch;
+            }
+        }
+        Err(at) => table.insert(at, RevokeEpochRow { peer_id, epoch }),
+    }
+}
+
+/// Grow-only revoke high-water for an actor-local `(peer_id,
+/// agent_name)` grant, or 0 if never revoked.
+fn actor_revoke_high_water(table: &[ActorRevokeEpochRow], peer_id: &[u8], agent_name: &str) -> u64 {
+    match table.binary_search_by(|r| actor_acl_key(&r.peer_id, &r.agent_name, peer_id, agent_name)) {
+        Ok(idx) => table[idx].epoch,
+        Err(_) => 0,
+    }
+}
+
+/// Raise (never lower) the actor revoke high-water for `(peer_id,
+/// agent_name)` to `epoch`.
+fn bump_actor_revoke_high_water(
+    table: &mut Vec<ActorRevokeEpochRow>,
+    peer_id: Vec<u8>,
+    agent_name: String,
+    epoch: u64,
+) {
+    match table.binary_search_by(|r| actor_acl_key(&r.peer_id, &r.agent_name, &peer_id, &agent_name))
+    {
+        Ok(idx) => {
+            if epoch > table[idx].epoch {
+                table[idx].epoch = epoch;
+            }
+        }
+        Err(at) => table.insert(
+            at,
+            ActorRevokeEpochRow {
+                peer_id,
+                agent_name,
+                epoch,
+            },
+        ),
+    }
+}
+
+/// Decide whether an incoming grant should replace the stored grant for
+/// the same target (one row per target). The ordering is a max over a
+/// total, content-derived order — independent of replay/merge order:
+///
+///   1. A **root-signed** grant dominates any non-root grant *regardless
+///      of epoch*. Root authority is immutable, so a delegated admin can
+///      never capture a root-granted target's trust path by re-granting
+///      it (which would let revoking that admin void a root delegation).
+///   2. Otherwise the higher epoch wins (a stale grant is dominated).
+///   3. At equal epoch and equal root-ness, the lexicographically smaller
+///      grantor wins — a deterministic tiebreak so two concurrent grants
+///      at the same epoch resolve identically on every replica.
+fn grant_supersedes(
+    new_epoch: u64,
+    new_grantor: &[u8],
+    cur_epoch: u64,
+    cur_grantor: &[u8],
+    root: &[u8],
+) -> bool {
+    let new_root = !root.is_empty() && new_grantor == root;
+    let cur_root = !root.is_empty() && cur_grantor == root;
+    if new_root != cur_root {
+        return new_root;
+    }
+    if new_epoch != cur_epoch {
+        return new_epoch > cur_epoch;
+    }
+    compare_bytes(new_grantor, cur_grantor) < 0
+}
+
+/// Highest grant epoch recorded for `peer_id`, or 0 if no grant row.
+fn grant_high_water(grants: &[AuthGrantRow], peer_id: &[u8]) -> u64 {
     match grants.binary_search_by(|g| compare_bytes(&g.peer_id, peer_id).cmp(&0)) {
-        Ok(idx) => grants[idx].role,
-        Err(_) => AUTH_ROLE_NONE,
+        Ok(idx) => grants[idx].epoch,
+        Err(_) => 0,
     }
 }
 
@@ -1943,10 +2306,15 @@ mod tests {
     }
 
     #[test]
-    fn revoke_actor_role_missing_returns_not_found() {
+    fn revoke_actor_role_missing_sets_floor_ok() {
+        // Revoke is grow-only and replay-position independent: revoking
+        // a peer with no live grant still raises the revoke high-water,
+        // so a later replayed grant at or below this epoch can't take
+        // effect. It returns OK rather than NOT_FOUND for that reason.
         let mut r = registry();
         let status = revoke_actor(&mut r, &[1], "x");
-        assert_eq!(status, STATUS_NOT_FOUND);
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(dispatch(&mut r, ActorEpoch { peer_id: alloc::vec![1], agent_name: String::from("x") }), 1);
     }
 
     // ── multi-peer / multi-agent ─────────────────────────────────
@@ -2037,8 +2405,22 @@ mod tests {
 
     // ── Monotone-locality widen guard ───────────────────────────
 
+    /// Monotonically-unique 32-byte `replication_id` for tests — each
+    /// install mints a fresh one, as the real CLI / messenger do (the
+    /// id is a grow-only anti-replay tombstone, so a reinstall must not
+    /// reuse a prior id).
+    fn fresh_rep_id() -> Vec<u8> {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut rep = alloc::vec![0u8; 32];
+        rep[..8].copy_from_slice(&n.to_le_bytes());
+        rep
+    }
+
     /// Publish a throwaway program (idempotent for the same hash)
-    /// and install `name` at `consistency`, returning the status.
+    /// and install `name` at `consistency` with a fresh
+    /// `replication_id`, returning the status.
     fn install_at(r: &mut SpaceRegistry, name: &str, consistency: u8) -> u8 {
         let hash = alloc::vec![7u8; 32];
         let pub_status = dispatch(
@@ -2051,7 +2433,7 @@ mod tests {
             },
         );
         assert!(pub_status == STATUS_OK, "program publish must succeed");
-        let rep = alloc::vec![9u8; 32];
+        let rep = fresh_rep_id();
         dispatch(
             r,
             Install {
@@ -2208,38 +2590,78 @@ mod tests {
     }
 
     /// Root-signed `grant_role` dispatch (the common case in tests).
+    /// Reads the peer's current epoch and signs `epoch + 1`, exactly as
+    /// the CLI does, so each grant/revoke for a peer is monotonically
+    /// fresh.
     fn grant_space(r: &mut SpaceRegistry, peer: &[u8], role: u8) -> u8 {
+        let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
         dispatch(
             r,
             GrantRole {
                 peer_id: peer.to_vec(),
                 role,
-                auth: root_auth("grant_role", &[peer, &[role]]),
+                epoch,
+                auth: root_auth("grant_role", &[peer, &[role], &epoch.to_le_bytes()]),
+            },
+        )
+    }
+
+    /// Root-signed `revoke_role` dispatch — reads + bumps the epoch.
+    fn revoke_space(r: &mut SpaceRegistry, peer: &[u8]) -> u8 {
+        let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
+        dispatch(
+            r,
+            RevokeRole {
+                peer_id: peer.to_vec(),
+                epoch,
+                auth: root_auth("revoke_role", &[peer, &epoch.to_le_bytes()]),
             },
         )
     }
 
     /// Root-signed `grant_actor_role` dispatch.
     fn grant_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str, role: u8) -> u8 {
+        let epoch = dispatch(
+            r,
+            ActorEpoch {
+                peer_id: peer.to_vec(),
+                agent_name: String::from(agent),
+            },
+        ) + 1;
         dispatch(
             r,
             GrantActorRole {
                 peer_id: peer.to_vec(),
                 agent_name: String::from(agent),
                 role,
-                auth: root_auth("grant_actor_role", &[peer, agent.as_bytes(), &[role]]),
+                epoch,
+                auth: root_auth(
+                    "grant_actor_role",
+                    &[peer, agent.as_bytes(), &[role], &epoch.to_le_bytes()],
+                ),
             },
         )
     }
 
     /// Root-signed `revoke_actor_role` dispatch.
     fn revoke_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str) -> u8 {
+        let epoch = dispatch(
+            r,
+            ActorEpoch {
+                peer_id: peer.to_vec(),
+                agent_name: String::from(agent),
+            },
+        ) + 1;
         dispatch(
             r,
             RevokeActorRole {
                 peer_id: peer.to_vec(),
                 agent_name: String::from(agent),
-                auth: root_auth("revoke_actor_role", &[peer, agent.as_bytes()]),
+                epoch,
+                auth: root_auth(
+                    "revoke_actor_role",
+                    &[peer, agent.as_bytes(), &epoch.to_le_bytes()],
+                ),
             },
         )
     }
@@ -2342,12 +2764,17 @@ mod tests {
         let mut r = registry();
         let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
         let attacker = peer_id_for(&attacker_key.verifying_key().to_bytes());
-        let auth = auth_as(&attacker_key, "grant_role", &[&attacker, &[AUTH_ROLE_ADMIN]]);
+        let auth = auth_as(
+            &attacker_key,
+            "grant_role",
+            &[&attacker, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()],
+        );
         let status = dispatch_as_system(
             &mut r,
             GrantRole {
                 peer_id: attacker.clone(),
                 role: AUTH_ROLE_ADMIN,
+                epoch: 1,
                 auth,
             },
         );
@@ -2393,6 +2820,7 @@ mod tests {
                 GrantRole {
                     peer_id: victim.clone(),
                     role: AUTH_ROLE_ADMIN,
+                    epoch: 1,
                     auth: Vec::new(),
                 },
             ),
@@ -2408,13 +2836,18 @@ mod tests {
         let mut r = registry();
         let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
         let attacker = peer_id_for(&attacker_key.verifying_key().to_bytes());
-        let auth = auth_as(&attacker_key, "grant_role", &[&attacker, &[AUTH_ROLE_ADMIN]]);
+        let auth = auth_as(
+            &attacker_key,
+            "grant_role",
+            &[&attacker, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()],
+        );
         assert_eq!(
             dispatch(
                 &mut r,
                 GrantRole {
                     peer_id: attacker.clone(),
                     role: AUTH_ROLE_ADMIN,
+                    epoch: 1,
                     auth,
                 },
             ),
@@ -2599,13 +3032,18 @@ mod tests {
 
         // Bob (now admin) grants Carol READONLY, signing with his key.
         let carol = alloc::vec![3, 3, 3];
-        let auth = auth_as(&bob_key, "grant_role", &[&carol, &[AUTH_ROLE_READONLY]]);
+        let auth = auth_as(
+            &bob_key,
+            "grant_role",
+            &[&carol, &[AUTH_ROLE_READONLY], &1u64.to_le_bytes()],
+        );
         assert_eq!(
             dispatch(
                 &mut r,
                 GrantRole {
                     peer_id: carol.clone(),
                     role: AUTH_ROLE_READONLY,
+                    epoch: 1,
                     auth,
                 },
             ),
@@ -2620,13 +3058,18 @@ mod tests {
         let dave_key = SigningKey::from_bytes(&[12u8; 32]);
         let dave = peer_id_for(&dave_key.verifying_key().to_bytes());
         assert_eq!(grant_space(&mut r, &dave, AUTH_ROLE_READONLY), STATUS_OK);
-        let evil = auth_as(&dave_key, "grant_role", &[&dave, &[AUTH_ROLE_ADMIN]]);
+        let evil = auth_as(
+            &dave_key,
+            "grant_role",
+            &[&dave, &[AUTH_ROLE_ADMIN], &2u64.to_le_bytes()],
+        );
         assert_eq!(
             dispatch(
                 &mut r,
                 GrantRole {
                     peer_id: dave.clone(),
                     role: AUTH_ROLE_ADMIN,
+                    epoch: 2,
                     auth: evil,
                 },
             ),
@@ -2646,18 +3089,355 @@ mod tests {
         // signed bytes, defeating cross-op replay.
         let mut r = registry();
         let victim = alloc::vec![4, 5, 6];
-        let wrong_op_auth = root_auth("revoke_role", &[&victim]);
+        let wrong_op_auth = root_auth("revoke_role", &[&victim, &1u64.to_le_bytes()]);
         assert_eq!(
             dispatch(
                 &mut r,
                 GrantRole {
                     peer_id: victim.clone(),
                     role: AUTH_ROLE_ADMIN,
+                    epoch: 1,
                     auth: wrong_op_auth,
                 },
             ),
             STATUS_FORBIDDEN,
         );
         assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim }), AUTH_ROLE_NONE);
+    }
+
+    // ── Replay-position-independent authority ──────────────────────
+
+    #[test]
+    fn revoking_a_delegator_voids_the_subtree_regardless_of_order() {
+        // Scenario: root grants Bob ADMIN; Bob (while admin) grants Carol
+        // ADMIN; only AFTER that does root revoke Bob — the exact
+        // "author before the revoke" order an attacker would grind.
+        // Because authority is resolved on demand from the grant graph
+        // plus the grow-only revoke high-water, revoking Bob
+        // retroactively voids Carol's delegated grant.
+        let mut r = registry();
+        let bob_key = SigningKey::from_bytes(&[11u8; 32]);
+        let bob = peer_id_for(&bob_key.verifying_key().to_bytes());
+        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), STATUS_OK);
+
+        let carol = alloc::vec![3, 3, 3];
+        let e = dispatch(&mut r, PeerEpoch { peer_id: carol.clone() }) + 1;
+        let bob_grants_carol = auth_as(
+            &bob_key,
+            "grant_role",
+            &[&carol, &[AUTH_ROLE_ADMIN], &e.to_le_bytes()],
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: carol.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    epoch: e,
+                    auth: bob_grants_carol,
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: carol.clone() }),
+            AUTH_ROLE_ADMIN,
+            "Carol is admin while her delegator Bob is",
+        );
+
+        // root revokes Bob — applied AFTER Carol's grant.
+        assert_eq!(revoke_space(&mut r, &bob), STATUS_OK);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: bob }),
+            AUTH_ROLE_NONE,
+            "Bob is revoked",
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: carol }),
+            AUTH_ROLE_NONE,
+            "revoking the delegator retroactively voids the subtree",
+        );
+    }
+
+    #[test]
+    fn root_granted_peer_survives_a_capturing_admins_revocation() {
+        // Grantor-swap vector: root grants Carol ADMIN; a delegated admin
+        // (Mallory) re-grants Carol at a HIGHER epoch to capture her trust
+        // path, then Mallory is revoked. A root-signed grant is immutable
+        // to non-root displacement (grant_supersedes), so Carol's grantor
+        // stays root and she keeps ADMIN — revoking Mallory can't void a
+        // root delegation.
+        let mut r = registry();
+        let mallory_key = SigningKey::from_bytes(&[21u8; 32]);
+        let mallory = peer_id_for(&mallory_key.verifying_key().to_bytes());
+        assert_eq!(grant_space(&mut r, &mallory, AUTH_ROLE_ADMIN), STATUS_OK);
+
+        let carol = alloc::vec![3, 3, 3];
+        assert_eq!(grant_space(&mut r, &carol, AUTH_ROLE_ADMIN), STATUS_OK);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: carol.clone() }),
+            AUTH_ROLE_ADMIN,
+        );
+
+        // Mallory re-grants Carol at a higher epoch (read + 1).
+        let e = dispatch(&mut r, PeerEpoch { peer_id: carol.clone() }) + 1;
+        let capture = auth_as(
+            &mallory_key,
+            "grant_role",
+            &[&carol, &[AUTH_ROLE_ADMIN], &e.to_le_bytes()],
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: carol.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    epoch: e,
+                    auth: capture,
+                },
+            ),
+            STATUS_OK,
+        );
+
+        assert_eq!(revoke_space(&mut r, &mallory), STATUS_OK);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: mallory }),
+            AUTH_ROLE_NONE,
+            "Mallory is revoked",
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: carol }),
+            AUTH_ROLE_ADMIN,
+            "a root-granted peer can't be captured and voided by a delegated admin",
+        );
+    }
+
+    #[test]
+    fn replayed_stale_grant_cannot_resurrect_a_revoked_role() {
+        // Scenario: capture the root-signed grant that first made Bob admin,
+        // revoke Bob, then replay the captured grant. Its stale epoch is
+        // dominated by the revoke high-water, so Bob stays revoked — but
+        // a fresh, higher-epoch re-grant still works (revocation is not
+        // a permanent footgun).
+        let mut r = registry();
+        let bob = alloc::vec![1, 2, 3];
+        let captured = root_auth(
+            "grant_role",
+            &[&bob, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()],
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                GrantRole {
+                    peer_id: bob.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    epoch: 1,
+                    auth: captured.clone(),
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
+            AUTH_ROLE_ADMIN,
+        );
+
+        // root revokes Bob (reads epoch 1, bumps the high-water to 2).
+        assert_eq!(revoke_space(&mut r, &bob), STATUS_OK);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
+            AUTH_ROLE_NONE,
+        );
+
+        // Replay the captured epoch-1 grant via the System replay path.
+        assert_eq!(
+            dispatch_as_system(
+                &mut r,
+                GrantRole {
+                    peer_id: bob.clone(),
+                    role: AUTH_ROLE_ADMIN,
+                    epoch: 1,
+                    auth: captured,
+                },
+            ),
+            STATUS_OK,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
+            AUTH_ROLE_NONE,
+            "a replayed stale-epoch grant can't resurrect the revoked role",
+        );
+
+        // A fresh root re-grant at a higher epoch restores Bob.
+        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), STATUS_OK);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: bob }),
+            AUTH_ROLE_ADMIN,
+            "a fresh higher-epoch grant re-authorizes",
+        );
+    }
+
+    #[test]
+    fn replayed_install_cannot_resurrect_an_uninstalled_agent() {
+        // The replay guard: the replication_id is a grow-only tombstone. Capturing a
+        // root-signed install and replaying it after uninstall reuses
+        // the id and is refused; a fresh id reinstalls cleanly.
+        let mut r = registry();
+        let hash = alloc::vec![7u8; 32];
+        dispatch(
+            &mut r,
+            Publish {
+                name: String::from("p"),
+                version: String::from("1"),
+                hash: hash.clone(),
+                auth: root_auth("publish", &[b"p", b"1", &hash]),
+            },
+        );
+        let rep = alloc::vec![5u8; 32];
+        let install_auth = root_auth(
+            "install",
+            &[b"res", b"p", b"1", &hash, &rep, &[2u8], &[], &[]],
+        );
+        let install = |r: &mut SpaceRegistry| {
+            dispatch(
+                r,
+                Install {
+                    instance_name: String::from("res"),
+                    program_name: String::from("p"),
+                    program_version: String::from("1"),
+                    program_hash: hash.clone(),
+                    replication_id: rep.clone(),
+                    consistency: 2,
+                    install_args: Vec::new(),
+                    install_payloads: Vec::new(),
+                    auth: install_auth.clone(),
+                },
+            )
+        };
+        assert_eq!(install(&mut r), STATUS_OK);
+        assert_eq!(uninstall(&mut r, "res"), STATUS_OK);
+        // Replay the captured install (same replication_id).
+        assert_eq!(install(&mut r), STATUS_REPLICATION_ID_REUSED);
+        assert!(
+            dispatch(
+                &mut r,
+                Agent {
+                    instance_name: String::from("res"),
+                },
+            )
+            .is_none(),
+            "resurrect blocked — the AgentRow stays gone",
+        );
+
+        // A legitimate reinstall mints a fresh replication_id.
+        let rep2 = alloc::vec![6u8; 32];
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Install {
+                    instance_name: String::from("res"),
+                    program_name: String::from("p"),
+                    program_version: String::from("1"),
+                    program_hash: hash.clone(),
+                    replication_id: rep2.clone(),
+                    consistency: 2,
+                    install_args: Vec::new(),
+                    install_payloads: Vec::new(),
+                    auth: root_auth(
+                        "install",
+                        &[b"res", b"p", b"1", &hash, &rep2, &[2u8], &[], &[]],
+                    ),
+                },
+            ),
+            STATUS_OK,
+        );
+    }
+
+    #[test]
+    fn replayed_upgrade_cannot_roll_back_a_version() {
+        // Version-monotonicity guard: upgrade is pinned to the program
+        // hash it was authored against (`from_hash`). After upgrading
+        // p/1 → p/2, replaying a superseded upgrade whose `from_hash` is
+        // the old hash finds a stale base and is refused.
+        let mut r = registry();
+        let h1 = alloc::vec![1u8; 32];
+        let h2 = alloc::vec![2u8; 32];
+        for (v, h) in [("1", &h1), ("2", &h2)] {
+            dispatch(
+                &mut r,
+                Publish {
+                    name: String::from("p"),
+                    version: String::from(v),
+                    hash: h.clone(),
+                    auth: root_auth("publish", &[b"p", v.as_bytes(), h]),
+                },
+            );
+        }
+        let rep = alloc::vec![8u8; 32];
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Install {
+                    instance_name: String::from("app"),
+                    program_name: String::from("p"),
+                    program_version: String::from("1"),
+                    program_hash: h1.clone(),
+                    replication_id: rep.clone(),
+                    consistency: 2,
+                    install_args: Vec::new(),
+                    install_payloads: Vec::new(),
+                    auth: root_auth(
+                        "install",
+                        &[b"app", b"p", b"1", &h1, &rep, &[2u8], &[], &[]],
+                    ),
+                },
+            ),
+            STATUS_OK,
+        );
+
+        // Upgrade app p/1 → p/2, asserting the live base is h1.
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Upgrade {
+                    instance_name: String::from("app"),
+                    new_program_name: String::from("p"),
+                    new_program_version: String::from("2"),
+                    new_program_hash: h2.clone(),
+                    from_hash: h1.clone(),
+                    auth: root_auth("upgrade", &[b"app", b"p", b"2", &h2, &h1]),
+                },
+            ),
+            STATUS_OK,
+        );
+
+        // Replay an upgrade back to p/1 (from_hash = h1) — the live hash
+        // is now h2, so the compare-and-swap fails.
+        assert_eq!(
+            dispatch_as_system(
+                &mut r,
+                Upgrade {
+                    instance_name: String::from("app"),
+                    new_program_name: String::from("p"),
+                    new_program_version: String::from("1"),
+                    new_program_hash: h1.clone(),
+                    from_hash: h1.clone(),
+                    auth: root_auth("upgrade", &[b"app", b"p", b"1", &h1, &h1]),
+                },
+            ),
+            STATUS_STALE_UPGRADE,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Agent {
+                    instance_name: String::from("app"),
+                },
+            )
+            .unwrap()
+            .program_version,
+            "2",
+            "the instance stays on the newer version",
+        );
     }
 }

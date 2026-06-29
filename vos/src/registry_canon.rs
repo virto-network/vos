@@ -105,6 +105,7 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
             let new_program_name = a.get_str("new_program_name")?;
             let new_program_version = a.get_str("new_program_version")?;
             let new_program_hash = a.get_bytes("new_program_hash")?;
+            let from_hash = a.get_bytes("from_hash")?;
             canonical_op_bytes(
                 "upgrade",
                 &[
@@ -112,6 +113,7 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
                     new_program_name.as_bytes(),
                     new_program_version.as_bytes(),
                     &new_program_hash,
+                    &from_hash,
                 ],
             )
         }
@@ -236,10 +238,11 @@ mod tests {
             .with("instance_name", "msg-x-log")
             .with("new_program_name", "p")
             .with("new_program_version", "2")
-            .with("new_program_hash", alloc::vec![5u8; 32]);
+            .with("new_program_hash", alloc::vec![5u8; 32])
+            .with("from_hash", alloc::vec![7u8; 32]);
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
-            reg("upgrade", &[b"msg-x-log", b"p", b"2", &[5u8; 32]]),
+            reg("upgrade", &[b"msg-x-log", b"p", b"2", &[5u8; 32], &[7u8; 32]]),
         );
     }
 

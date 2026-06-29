@@ -409,12 +409,20 @@ impl DaemonClient {
         program_version: String,
         program_hash: Vec<u8>,
     ) -> anyhow::Result<u8> {
+        // Compare-and-swap base: read the instance's live program hash so
+        // the registry rejects this upgrade if the instance has moved on
+        // (a replayed/superseded upgrade can't roll the version back).
+        let from_hash = vos::block_on(self.registry().agent(&mut &self.node, instance_name.clone()))
+            .map_err(|e| anyhow::anyhow!("registry.agent(): {e}"))?
+            .map(|row| row.program_hash.to_vec())
+            .ok_or_else(|| anyhow::anyhow!("upgrade: instance '{instance_name}' is not installed"))?;
         vos::block_on(self.registry().upgrade(
             &mut &self.node,
             instance_name,
             program_name,
             program_version,
             program_hash,
+            from_hash,
             Vec::new(),
         ))
         .map_err(|e| anyhow::anyhow!("registry.upgrade(): {e}"))
@@ -477,15 +485,51 @@ impl DaemonClient {
     // ── Auth grants ────────────────────────────────────
 
     pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
-        let auth = op_auth(&self.signer, "grant_role", &[&peer_id, &[role]])?;
-        vos::block_on(self.registry().grant_role(&mut &self.node, peer_id, role, auth))
-            .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))
+        // Read the peer's current freshness epoch and sign `epoch + 1`
+        // so the grant strictly post-dates any prior revoke — a replayed
+        // stale-epoch grant can never resurrect a revoked role.
+        let epoch = self.peer_epoch(peer_id.clone())? + 1;
+        let auth = op_auth(
+            &self.signer,
+            "grant_role",
+            &[&peer_id, &[role], &epoch.to_le_bytes()],
+        )?;
+        vos::block_on(
+            self.registry()
+                .grant_role(&mut &self.node, peer_id, role, epoch, auth),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))
     }
 
     pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<u8> {
-        let auth = op_auth(&self.signer, "revoke_role", &[&peer_id])?;
-        vos::block_on(self.registry().revoke_role(&mut &self.node, peer_id, auth))
-            .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))
+        let epoch = self.peer_epoch(peer_id.clone())? + 1;
+        let auth = op_auth(
+            &self.signer,
+            "revoke_role",
+            &[&peer_id, &epoch.to_le_bytes()],
+        )?;
+        vos::block_on(
+            self.registry()
+                .revoke_role(&mut &self.node, peer_id, epoch, auth),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))
+    }
+
+    /// Current freshness epoch for `peer_id` — read before signing a
+    /// `grant_role`/`revoke_role`.
+    fn peer_epoch(&self, peer_id: Vec<u8>) -> anyhow::Result<u64> {
+        vos::block_on(self.registry().peer_epoch(&mut &self.node, peer_id))
+            .map_err(|e| anyhow::anyhow!("registry.peer_epoch(): {e}"))
+    }
+
+    /// Current freshness epoch for an actor-local `(peer_id, agent_name)`
+    /// grant.
+    fn actor_epoch(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<u64> {
+        vos::block_on(
+            self.registry()
+                .actor_epoch(&mut &self.node, peer_id, agent_name),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.actor_epoch(): {e}"))
     }
 
     #[allow(dead_code)] // exposed for tooling; CLI consumers use `space role list`.
@@ -507,27 +551,29 @@ impl DaemonClient {
         agent_name: String,
         role: u8,
     ) -> anyhow::Result<u8> {
+        let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,
             "grant_actor_role",
-            &[&peer_id, agent_name.as_bytes(), &[role]],
+            &[&peer_id, agent_name.as_bytes(), &[role], &epoch.to_le_bytes()],
         )?;
         vos::block_on(
             self.registry()
-                .grant_actor_role(&mut &self.node, peer_id, agent_name, role, auth),
+                .grant_actor_role(&mut &self.node, peer_id, agent_name, role, epoch, auth),
         )
         .map_err(|e| anyhow::anyhow!("registry.grant_actor_role(): {e}"))
     }
 
     pub fn revoke_actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<u8> {
+        let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,
             "revoke_actor_role",
-            &[&peer_id, agent_name.as_bytes()],
+            &[&peer_id, agent_name.as_bytes(), &epoch.to_le_bytes()],
         )?;
         vos::block_on(
             self.registry()
-                .revoke_actor_role(&mut &self.node, peer_id, agent_name, auth),
+                .revoke_actor_role(&mut &self.node, peer_id, agent_name, epoch, auth),
         )
         .map_err(|e| anyhow::anyhow!("registry.revoke_actor_role(): {e}"))
     }

@@ -6637,11 +6637,23 @@ mod tests {
             p
         };
         let grant_msg = |key: &SigningKey, signer: &[u8], who: &[u8]| {
+            // First grant for each peer → epoch 1 (the canonical now binds
+            // a per-peer freshness epoch; see space_registry::grant_role).
+            let epoch: u64 = 1;
             dyn_payload(
                 Msg::new("grant_role")
                     .with("peer_id", who.to_vec())
                     .with("role", ADMIN as u64)
-                    .with("auth", auth_as(key, signer, "grant_role", &[who, &[ADMIN]])),
+                    .with("epoch", epoch)
+                    .with(
+                        "auth",
+                        auth_as(
+                            key,
+                            signer,
+                            "grant_role",
+                            &[who, &[ADMIN], &epoch.to_le_bytes()],
+                        ),
+                    ),
             )
         };
         let install_msg = |key: &SigningKey, signer: &[u8], inst: &str| {

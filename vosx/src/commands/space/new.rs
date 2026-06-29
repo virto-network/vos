@@ -105,15 +105,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         anyhow::bail!("genesis set_root returned status {status}");
     }
 
+    // Fresh registry, so the operator's grant epoch starts at 1 (the
+    // read returns 0). Sign the epoch into the canonical the same way
+    // the CLI does on every later grant.
+    let grant_epoch = vos::block_on(reg.peer_epoch(&mut &node, operator_peer_id.clone()))
+        .map_err(|e| anyhow::anyhow!("genesis peer_epoch failed: {e}"))?
+        + 1;
     let grant_auth = op_auth(
         &operator_kp,
         "grant_role",
-        &[&operator_peer_id, &[AUTH_ROLE_ADMIN]],
+        &[&operator_peer_id, &[AUTH_ROLE_ADMIN], &grant_epoch.to_le_bytes()],
     )?;
     let status = vos::block_on(reg.grant_role(
         &mut &node,
         operator_peer_id.clone(),
         AUTH_ROLE_ADMIN,
+        grant_epoch,
         grant_auth,
     ))
     .map_err(|e| anyhow::anyhow!("genesis grant_role failed: {e}"))?;

@@ -888,6 +888,21 @@ fn reconcile_one(
         );
         return Ok(());
     }
+    if status == space_registry::STATUS_REPLICATION_ID_REUSED {
+        // The `replication_id` is a retired anti-replay tombstone — this
+        // agent (or one with the same auto-derived id) was installed and
+        // uninstalled before, and an `auto`/fixed id can't be reused.
+        // Don't resurrect it from a stale slot; surface it so the
+        // operator either removes it from the manifest or assigns a
+        // fresh `replication_id` (which is a fresh, empty state).
+        tracing::warn!(
+            "agent {} not (re)installed: its replication_id is a retired tombstone (was \
+             uninstalled). Assign a fresh `replication_id` in the manifest to re-create it with \
+             clean state, or remove it from the manifest.",
+            agent.name,
+        );
+        return Ok(());
+    }
     if status != STATUS_OK {
         anyhow::bail!("install '{}' returned status {}", agent.name, status);
     }
