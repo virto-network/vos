@@ -235,6 +235,12 @@ pub struct AgentConfig {
     #[cfg(all(feature = "storage", feature = "network"))]
     #[doc(hidden)]
     pub raft_apply_rx: Option<std::sync::mpsc::Receiver<u64>>,
+    /// Per-replica gate on peer-merged CRDT nodes (see
+    /// [`NodeValidator`](crate::commit::NodeValidator)). Installed on the
+    /// space-registry replica to bind the genesis `set_root` to the
+    /// advertised space_id; `None` (default) accepts all peer nodes.
+    #[cfg(feature = "storage")]
+    pub node_validator: Option<crate::commit::NodeValidator>,
 }
 
 impl AgentConfig {
@@ -259,6 +265,8 @@ impl AgentConfig {
             raft_worker: None,
             #[cfg(all(feature = "storage", feature = "network"))]
             raft_apply_rx: None,
+            #[cfg(feature = "storage")]
+            node_validator: None,
         }
     }
 
@@ -325,6 +333,16 @@ impl AgentConfig {
     /// merkle-DAGs.
     pub fn with_replication_id(mut self, id: [u8; 32]) -> Self {
         self.replication_id = Some(id);
+        self
+    }
+
+    /// Gate peer-merged CRDT nodes through `validator` (see
+    /// [`NodeValidator`](crate::commit::NodeValidator)). The daemon sets
+    /// this on the space-registry replica to reject a forged genesis
+    /// whose CID doesn't derive the advertised space_id.
+    #[cfg(feature = "storage")]
+    pub fn with_node_validator(mut self, validator: crate::commit::NodeValidator) -> Self {
+        self.node_validator = Some(validator);
         self
     }
 
@@ -951,6 +969,12 @@ pub(crate) struct ReplicaSlot {
     /// path to membership-gate private (`msg-*`) groups. Empty for
     /// anonymous/test replicas — those serve openly (ungated).
     pub name: String,
+    /// Per-replica gate applied to peer-merged nodes on the SYNC INGEST
+    /// path (`sync_with_peer` → `insert_node`) — this is where peer
+    /// nodes actually enter the DAG, so the registry's genesis validator
+    /// must live here, not just on the agent thread's strategy. `None`
+    /// accepts all peer nodes.
+    pub node_validator: Option<crate::commit::NodeValidator>,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
@@ -2000,6 +2024,9 @@ fn sync_with_peer(
     let replica_origin = derive_replica_origin(rep_id, net.local_prefix());
     let mut cc =
         CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone(), replica_origin);
+    // Gate peer nodes through the replica's validator (the registry binds
+    // the genesis set_root to its space_id) — this is the ingest point.
+    cc.set_node_validator(slot.node_validator.clone());
     let mut frontier: Vec<[u8; 32]> = heads.clone();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut inserted_any = false;
@@ -2396,6 +2423,7 @@ impl VosNode {
                             db: Arc::new(db),
                             commit_lock: Arc::new(Mutex::new(())),
                             name: config.name.clone().unwrap_or_default(),
+                            node_validator: config.node_validator.clone(),
                         };
                         self.crdt_replicas
                             .lock()
@@ -2926,6 +2954,7 @@ impl VosNode {
             db: Arc::new(redb::Database::create(db_path).expect("create db")),
             commit_lock: Arc::new(Mutex::new(())),
             name: name.to_string(),
+            node_validator: None,
         };
         self.crdt_replicas
             .lock()
@@ -4246,7 +4275,7 @@ fn build_agent_strategy(
                 })?;
                 let replica_origin = derive_replica_origin(&replication_id, self_node_prefix);
                 if let Some(arc) = &config.pre_opened_db {
-                    let cc = match &config.pre_opened_lock {
+                    let mut cc = match &config.pre_opened_lock {
                         Some(lock) => crate::commit::CrdtCommit::from_db_arc_locked(
                             arc.clone(),
                             lock.clone(),
@@ -4254,6 +4283,7 @@ fn build_agent_strategy(
                         ),
                         None => crate::commit::CrdtCommit::from_db_arc(arc.clone(), replica_origin),
                     };
+                    cc.set_node_validator(config.node_validator.clone());
                     return Ok(Box::new(cc));
                 }
                 let path = config.db_path(id).ok_or_else(|| {
@@ -4261,10 +4291,9 @@ fn build_agent_strategy(
                         "Crdt consistency requires data_dir on AgentConfig".into(),
                     )
                 })?;
-                Ok(Box::new(crate::commit::CrdtCommit::open(
-                    &path,
-                    replica_origin,
-                )?))
+                let mut cc = crate::commit::CrdtCommit::open(&path, replica_origin)?;
+                cc.set_node_validator(config.node_validator.clone());
+                Ok(Box::new(cc))
             }
             Consistency::Raft => {
                 // Single-node-only path: agent_thread handles the

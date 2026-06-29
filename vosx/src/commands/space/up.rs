@@ -186,9 +186,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    // Bind the registry's genesis to this space so a member can't grind a
+    // low-CID forged `set_root` and hijack the registry root on replay
+    // (the hyperspace registry is the separate-trust federation surface
+    // and is left ungated). See `genesis_node_validator`.
     let cfg = AgentConfig::new(blob.clone())
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
+        .with_node_validator(crate::commands::space::common::genesis_node_validator(space_id))
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
 

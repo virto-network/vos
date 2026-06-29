@@ -87,6 +87,49 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
     )
 }
 
+/// A [`NodeValidator`](vos::commit::NodeValidator) that binds the
+/// registry's genesis to `space_id`: it rejects any peer-merged
+/// `set_root` DAG node whose CID doesn't derive `space_id`, and passes
+/// every other node through.
+///
+/// `insert_node` only checks `CID == hash(bytes)`, and replay orders
+/// concurrent origin nodes by ascending CID — so without this gate a
+/// space member could author a second `set_root{attacker}`, grind its
+/// `origin` until the node's CID sorts below the genuine genesis, serve
+/// it as a head, and on the next sync→replay see the forged root applied
+/// first (`set_root` is first-write-wins) → registry authority takeover.
+/// Grinding a CID to sort low is cheap; grinding one to derive a
+/// *specific* `space_id` is a second-preimage attack on blake2b, so the
+/// genuine genesis (whose CID derives `space_id` by construction) is the
+/// only `set_root` this accepts.
+pub fn genesis_node_validator(space_id: [u8; 32]) -> vos::commit::NodeValidator {
+    std::sync::Arc::new(move |cid: &[u8; 32], node_bytes: &[u8]| -> bool {
+        // DagNode wire: [payload_len:u64 LE][payload(CrdtEvent)][children…].
+        if node_bytes.len() < 8 {
+            return true;
+        }
+        let payload_len = u64::from_le_bytes(node_bytes[..8].try_into().unwrap()) as usize;
+        let Some(payload) = node_bytes.get(8..8 + payload_len) else {
+            return true;
+        };
+        let Some(event) = vos::effect_log::CrdtEvent::from_bytes(payload) else {
+            return true;
+        };
+        let msg = &event.log.msg; // [TAG_DYNAMIC][rkyv Msg]
+        if msg.first() != Some(&vos::value::TAG_DYNAMIC) {
+            return true;
+        }
+        let Some(decoded) = <vos::value::Msg as vos::Decode>::try_decode(&msg[1..]) else {
+            return true;
+        };
+        // Only `set_root` is genesis-bound; every other op flows through.
+        if decoded.name != "set_root" {
+            return true;
+        }
+        derive_space_id(cid) == space_id
+    })
+}
+
 /// Auto-derive a `replication_id` for an installed agent.
 /// `blake2b("vos-replication-id/v1" || instance_name || 0 || program_hash)`.
 /// Two replicas that install the same program with the same
@@ -179,6 +222,43 @@ mod tests {
             let local = (id.0 & 0xFFFF) as u16;
             assert!(local >= 0x100 && local < 0x8000, "got 0x{local:04x}");
         }
+    }
+
+    #[test]
+    fn genesis_validator_binds_set_root_to_space_id() {
+        use vos::Encode;
+        // A DagNode wire ([payload_len:u64][CrdtEvent][n_children:u64])
+        // wrapping a registry op named `name`.
+        fn node_for(name: &str) -> Vec<u8> {
+            let m = vos::value::Msg::new(name).with("root", vec![0xAAu8; 38]);
+            let mut msg = vec![vos::value::TAG_DYNAMIC];
+            msg.extend_from_slice(&m.encode());
+            let event =
+                vos::effect_log::CrdtEvent::new([0u8; 32], 0, vos::effect_log::EffectLog::for_msg(msg));
+            let payload = event.to_bytes();
+            let mut node = (payload.len() as u64).to_le_bytes().to_vec();
+            node.extend_from_slice(&payload);
+            node.extend_from_slice(&0u64.to_le_bytes()); // no children
+            node
+        }
+
+        let genuine_cid = [7u8; 32];
+        let space_id = derive_space_id(&genuine_cid);
+        let v = genesis_node_validator(space_id);
+
+        let set_root = node_for("set_root");
+        // The genuine genesis: its CID derives the advertised space_id.
+        assert!(v(&genuine_cid, &set_root), "genuine genesis accepted");
+        // A forged set_root: any other CID derives a different space_id.
+        assert!(
+            !v(&[9u8; 32], &set_root),
+            "forged set_root (wrong derived space_id) rejected",
+        );
+        // Non-genesis ops flow through regardless of CID.
+        assert!(
+            v(&[9u8; 32], &node_for("grant_role")),
+            "non-set_root op is not genesis-gated",
+        );
     }
 
     #[test]

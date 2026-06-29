@@ -85,6 +85,21 @@ mod from_redb {
 /// they only see and store them. CRDT-shaped strategies layer
 /// additional tables (DAG nodes, roots) on the same backend and
 /// override the log-aware methods.
+/// Per-replica gate run on every peer-merged DAG node before it is
+/// stored ([`CrdtCommit::insert_node`]). Returns `true` to accept, `false`
+/// to drop the node. `insert_node` only checks `CID == hash(bytes)`, which
+/// stops byte-tampering but not a peer authoring a *valid* node the
+/// replica must not trust — e.g. a forged genesis. The space-registry
+/// installs one that binds the genesis `set_root` to the advertised
+/// space_id, so a member can't grind a low-CID `set_root` node to hijack
+/// the registry root on replay (grinding a CID to sort low is cheap;
+/// grinding one to derive a *specific* space_id is a preimage attack).
+/// `None` (the default for every other replica) accepts all nodes.
+///
+/// Args: `(cid, node_bytes)` — the node's content-id and its full
+/// `DagNode` wire bytes.
+pub type NodeValidator = alloc::sync::Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>;
+
 pub trait CommitStrategy: Send {
     /// Return previously-persisted state, if any.
     ///
@@ -369,6 +384,9 @@ mod crdt {
         /// in the same write-txn as the new DAG node so a crash
         /// can't reuse a `seq` value.
         next_seq: u64,
+        /// Optional gate on peer-merged nodes (see
+        /// [`NodeValidator`](super::NodeValidator)). `None` accepts all.
+        node_validator: Option<super::NodeValidator>,
     }
 
     impl CrdtCommit {
@@ -436,7 +454,14 @@ mod crdt {
                 commit_lock,
                 replica_origin,
                 next_seq,
+                node_validator: None,
             }
+        }
+
+        /// Install a [`NodeValidator`](super::NodeValidator) that gates
+        /// every peer-merged node in [`insert_node`](Self::insert_node).
+        pub fn set_node_validator(&mut self, validator: Option<super::NodeValidator>) {
+            self.node_validator = validator;
         }
 
         /// Borrow the underlying redb database.
@@ -489,6 +514,18 @@ mod crdt {
                 return Err(CommitError::Config(alloc::format!(
                     "insert_node: CID mismatch (claimed {cid:02x?}, recomputed {recomputed:02x?})"
                 )));
+            }
+            // Per-replica gate: drop a peer node the replica must not
+            // trust (e.g. a forged genesis whose CID doesn't derive the
+            // space_id). Dropped, not errored — one bad node mustn't
+            // abort the whole sync. The honest node's own commits go
+            // through `write_atomic`, not here, so this only filters
+            // peer-merged ingress.
+            if let Some(validator) = &self.node_validator
+                && !validator(cid, node_bytes)
+            {
+                log::warn!("insert_node: rejected peer node {cid:02x?} (failed replica validator)");
+                return Ok(false);
             }
             // Quick existence check — avoids a write txn for
             // duplicates (which is the common case during gossip).
@@ -1072,6 +1109,50 @@ mod tests {
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].msg, b"local");
         assert_eq!(logs[1].msg, b"remote");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn insert_node_honors_validator() {
+        // A per-replica NodeValidator gates peer-merged nodes: a rejected
+        // node is dropped (Ok(false), not stored), an accepted one lands.
+        // This is the ingest gate the registry uses to bind its genesis.
+        use crate::effect_log::{CrdtEvent, EffectLog};
+        use merkle_crdt::DagNode;
+        use std::collections::BTreeSet;
+
+        let path = temp_db_path("validator_gate");
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+
+        let mk = |msg: &[u8], seq: u64| -> ([u8; 32], Vec<u8>) {
+            let ev = CrdtEvent::new([1u8; 32], seq, EffectLog::for_msg(msg.to_vec()));
+            let node: DagNode<Blake2b, CrdtEvent> = DagNode::new(ev, BTreeSet::new());
+            (node.cid().0, node.to_bytes())
+        };
+        let (good_cid, good_bytes) = mk(b"good", 0);
+        let (bad_cid, bad_bytes) = mk(b"bad", 1);
+
+        // Accept only `good_cid`.
+        let accept = good_cid;
+        cc.set_node_validator(Some(alloc::sync::Arc::new(
+            move |cid: &[u8; 32], _b: &[u8]| *cid == accept,
+        )));
+
+        assert!(
+            !cc.insert_node(&bad_cid, &bad_bytes).unwrap(),
+            "rejected node reports not-inserted",
+        );
+        assert!(
+            cc.get_node_bytes(&bad_cid).unwrap().is_none(),
+            "rejected node must not be stored",
+        );
+        assert!(
+            cc.insert_node(&good_cid, &good_bytes).unwrap(),
+            "accepted node is inserted",
+        );
+        assert!(cc.get_node_bytes(&good_cid).unwrap().is_some());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
