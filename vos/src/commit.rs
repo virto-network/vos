@@ -741,18 +741,38 @@ mod crdt {
                 if nodes.contains_key(&cid) {
                     continue;
                 }
-                let val = table.get(cid.as_ref())?.ok_or_else(|| {
-                    CommitError::Config(alloc::format!(
-                        "DAG node {cid:?} reachable from roots is missing from the dag table",
-                    ))
-                })?;
+                // A child CID that doesn't resolve to a stored node is a
+                // dangling causal reference. This happens two legitimate
+                // ways and one hostile way, and replay must survive all
+                // three rather than abort:
+                //   * sync fetches heads→parents, so a node can land
+                //     before its parents have synced in;
+                //   * a forged peer node can cite a parent that was never
+                //     produced (children = {random CID}) — `insert_node`
+                //     only checks CID==hash(bytes), and `compact_roots`
+                //     already tolerates the missing child, so the bogus
+                //     node reaches replay.
+                // Hard-erroring here would set the agent's `fatal_error`
+                // and brick *every* cold restart (the forged node persists
+                // in redb) — a member-triggerable DoS. Instead skip the
+                // unresolved node, exactly as `compact_roots` does. Its
+                // children are simply absent from `nodes`, so
+                // `topological_order` quarantines any node that depends on
+                // them (their indegree never reaches 0) without applying
+                // it. Once the real parents sync in, the next replay walks
+                // the now-complete chain.
+                let Some(val) = table.get(cid.as_ref())? else {
+                    continue;
+                };
                 let bytes = val.value();
-                let node: DagNode<Blake2b, CrdtEvent> =
-                    DagNode::from_bytes(bytes).ok_or_else(|| {
-                        CommitError::Config(alloc::format!(
-                            "DAG node {cid:?} could not be decoded — db corruption",
-                        ))
-                    })?;
+                let Some(node) = DagNode::<Blake2b, CrdtEvent>::from_bytes(bytes) else {
+                    // Present but undecodable — local corruption, or a peer
+                    // node whose bytes hash to their CID yet aren't a valid
+                    // `DagNode` encoding. Same DoS class, same fail-safe:
+                    // skip rather than abort the whole replay.
+                    log::warn!("replay_logs: skipping undecodable DAG node {cid:02x?}");
+                    continue;
+                };
                 for child in &node.children {
                     if !nodes.contains_key(child) {
                         stack.push(child.clone());
@@ -1153,6 +1173,69 @@ mod tests {
             "accepted node is inserted",
         );
         assert!(cc.get_node_bytes(&good_cid).unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn replay_logs_quarantines_dangling_parent() {
+        // A peer (or a forging member) can inject a DAG node that cites a
+        // parent which was never produced: `insert_node` accepts it on the
+        // CID-only check, and `compact_roots` already tolerates the missing
+        // child. Replay must NOT hard-error on the unresolved parent — doing
+        // so sets the agent's fatal_error and bricks every cold restart,
+        // which is a member-triggerable DoS. Instead the orphaned node is
+        // quarantined (skipped) and the rest of the DAG replays.
+        use crate::effect_log::{CrdtEvent, EffectLog};
+        use merkle_crdt::{Cid, DagNode, Hasher};
+        use std::collections::BTreeSet;
+
+        let path = temp_db_path("dangling_parent");
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+
+        // A real two-event chain (one head).
+        let log1 = EffectLog::for_msg(b"real-1".to_vec());
+        let log2 = EffectLog::for_msg(b"real-2".to_vec());
+        cc.commit_with_log(b"state-1", &log1).unwrap();
+        cc.commit_with_log(b"state-2", &log2).unwrap();
+        assert_eq!(cc.root_bytes().len(), 1, "linear chain → one head");
+
+        // Forge a node whose only parent is a CID that was never inserted.
+        let dangling = Cid::<Blake2b>(Blake2b::hash(b"this-parent-never-existed"));
+        let mut children = BTreeSet::new();
+        children.insert(dangling);
+        let forged_event = CrdtEvent::new([0xAA; 32], 0, EffectLog::for_msg(b"forged".to_vec()));
+        let forged_node: DagNode<Blake2b, CrdtEvent> = DagNode::new(forged_event, children);
+        let forged_cid = forged_node.cid();
+        let forged_bytes = forged_node.to_bytes();
+
+        // Ingest accepts it (CID == hash(bytes); no validator installed) and
+        // compaction leaves it as a second, dangling head.
+        assert!(
+            cc.insert_node(&forged_cid.0, &forged_bytes).unwrap(),
+            "forged node passes the CID-only ingest check",
+        );
+        cc.compact_roots().unwrap();
+        assert!(
+            cc.get_node_bytes(&forged_cid.0).unwrap().is_some(),
+            "forged node is stored in the DAG (accepted at ingest)",
+        );
+        assert_eq!(cc.root_bytes().len(), 2, "real head + dangling forged head");
+
+        // Replay survives: it returns the real chain and silently drops the
+        // node whose parent can't be resolved.
+        let logs = cc
+            .replay_logs()
+            .expect("a dangling parent must not abort replay");
+        let msgs: Vec<&[u8]> = logs.iter().map(|l| l.msg.as_slice()).collect();
+        assert!(msgs.contains(&&b"real-1"[..]), "real chain still replays");
+        assert!(msgs.contains(&&b"real-2"[..]), "real chain still replays");
+        assert!(
+            !msgs.contains(&&b"forged"[..]),
+            "a node citing an unresolvable parent is quarantined, not applied",
+        );
+        assert_eq!(logs.len(), 2, "only the real chain replays");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
