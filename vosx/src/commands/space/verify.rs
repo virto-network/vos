@@ -44,7 +44,7 @@ pub fn verify_with_timeout(
     let mut last_seen: Option<([u8; 32], [u8; 32])> = None;
 
     loop {
-        if let Some((genesis_cid, derived)) = scan_for_genesis(registry_db_path)? {
+        if let Some((genesis_cid, derived)) = scan_for_genesis(registry_db_path, advertised)? {
             if &derived == advertised {
                 return Ok(VerifyOutcome::Verified { genesis_cid });
             }
@@ -66,10 +66,17 @@ pub fn verify_with_timeout(
     })
 }
 
-/// Scan the DAG table for a CrdtEvent with seq=1, return its
-/// CID + the space_id it derives to. None if no such event
-/// (yet).
-fn scan_for_genesis(registry_db_path: &Path) -> anyhow::Result<Option<([u8; 32], [u8; 32])>> {
+/// Scan the DAG table for the genesis CrdtEvent (`seq == 0`) and return
+/// its CID + the space_id it derives to. Prefers the candidate whose
+/// derived id equals `advertised` — there must be exactly one genuine
+/// genesis, but a peer can merge a forged `seq == 0` node whose CID
+/// sorts lower (redb iterates by CID), so we cannot just take the first.
+/// Returns the genuine genesis if present; otherwise the first `seq == 0`
+/// node (so the caller can report the mismatch); `None` if none exist.
+fn scan_for_genesis(
+    registry_db_path: &Path,
+    advertised: &[u8; 32],
+) -> anyhow::Result<Option<([u8; 32], [u8; 32])>> {
     let db = redb::Database::open(registry_db_path)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", registry_db_path.display()))?;
     let txn = db
@@ -81,6 +88,9 @@ fn scan_for_genesis(registry_db_path: &Path) -> anyhow::Result<Option<([u8; 32],
         Err(e) => anyhow::bail!("open dag table: {e}"),
     };
 
+    // The first `seq == 0` node seen (lowest CID), kept only to report a
+    // genuine mismatch if no candidate matches `advertised`.
+    let mut first_seq0: Option<([u8; 32], [u8; 32])> = None;
     for row in table.iter().map_err(|e| anyhow::anyhow!("iter dag: {e}"))? {
         let (key, value) = row.map_err(|e| anyhow::anyhow!("read dag row: {e}"))?;
         let bytes: &[u8] = value.value();
@@ -109,7 +119,15 @@ fn scan_for_genesis(registry_db_path: &Path) -> anyhow::Result<Option<([u8; 32],
         let mut cid = [0u8; 32];
         cid.copy_from_slice(key_bytes);
         let derived = crate::commands::space::common::derive_space_id(&cid);
-        return Ok(Some((cid, derived)));
+        // The genuine genesis is the one whose CID derives the advertised
+        // space_id — return it regardless of CID sort order, so a forged
+        // lower-CID `seq == 0` sibling can't shadow it.
+        if &derived == advertised {
+            return Ok(Some((cid, derived)));
+        }
+        if first_seq0.is_none() {
+            first_seq0 = Some((cid, derived));
+        }
     }
-    Ok(None)
+    Ok(first_seq0)
 }

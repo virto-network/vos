@@ -2174,6 +2174,17 @@ impl VosNode {
         self.operator_peer = Some(peer_bytes);
     }
 
+    /// This daemon's operator PeerId bytes (the identity that ran `vosx
+    /// space up`), if one was recorded. Lets boot-time reconcile tell
+    /// "I am the space admin" (operator == registry root / has an ADMIN
+    /// grant) from "I am a non-admin joiner", so a catalog op refused
+    /// because the signer can't author isn't misread as the benign
+    /// awaiting-sync case.
+    #[cfg(feature = "network")]
+    pub fn operator_peer(&self) -> Option<&[u8]> {
+        self.operator_peer.as_deref()
+    }
+
     /// Install the operator's catalog-op signer (the "sign on relay"
     /// seam). `signer` produces the packed `auth` blob for a registry
     /// op's canonical bytes; the space-registry agent thread calls it to

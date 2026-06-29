@@ -115,6 +115,16 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
                 ],
             )
         }
+        "register_meta" => {
+            let program_hash = a.get_bytes("program_hash")?;
+            let blob = a.get_bytes("blob")?;
+            canonical_op_bytes("register_meta", &[&program_hash, &blob])
+        }
+        "register_extension_meta" => {
+            let instance_name = a.get_str("instance_name")?;
+            let blob = a.get_bytes("blob")?;
+            canonical_op_bytes("register_extension_meta", &[instance_name.as_bytes(), &blob])
+        }
         _ => return None,
     };
     Some(canon)
@@ -204,6 +214,22 @@ mod tests {
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
             reg("uninstall", &[b"msg-x-log"]),
+        );
+
+        let m = Msg::new("register_meta")
+            .with("program_hash", alloc::vec![7u8; 32])
+            .with("blob", alloc::vec![1u8, 2, 3]);
+        assert_eq!(
+            catalog_op_canonical(&m).unwrap(),
+            reg("register_meta", &[&[7u8; 32], &[1u8, 2, 3]]),
+        );
+
+        let m = Msg::new("register_extension_meta")
+            .with("instance_name", "gateway")
+            .with("blob", alloc::vec![9u8, 8]);
+        assert_eq!(
+            catalog_op_canonical(&m).unwrap(),
+            reg("register_extension_meta", &[b"gateway", &[9u8, 8]]),
         );
 
         let m = Msg::new("upgrade")

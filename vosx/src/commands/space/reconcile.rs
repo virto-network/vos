@@ -376,11 +376,16 @@ fn register_extension(
     );
 
     if !meta_blob.is_empty() {
-        let status =
-            vos::block_on(reg.register_extension_meta(&mut &*node, ext.name.clone(), meta_blob))
-                .map_err(|e| {
-                    anyhow::anyhow!("registry.register_extension_meta('{}'): {e}", ext.name)
-                })?;
+        // Empty `auth`: the daemon signs on relay with the operator key
+        // (see the catalog mutators). A non-admin node's metadata write
+        // is refused and arrives via sync instead — non-fatal below.
+        let status = vos::block_on(reg.register_extension_meta(
+            &mut &*node,
+            ext.name.clone(),
+            meta_blob,
+            Vec::new(),
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.register_extension_meta('{}'): {e}", ext.name))?;
         if status != STATUS_OK {
             tracing::warn!(
                 "register_extension_meta('{}') returned status {status}; \
@@ -642,8 +647,28 @@ pub fn reconcile(
         );
     }
 
+    // Is this daemon the space's admin authoring node? True when its
+    // operator is the genesis root or holds an ADMIN grant. The daemon
+    // signs catalog ops on relay with the operator key; on an admin node
+    // a STATUS_FORBIDDEN therefore means the signer can't author (key
+    // absent/unreadable/wrong) — a misconfiguration to surface loudly,
+    // NOT the benign "non-admin joiner awaiting sync" case. (A node that
+    // is the admin machine but loaded the wrong key reads as non-admin
+    // here — unavoidable from the registry's view — so the tolerated-path
+    // log points at that possibility rather than asserting non-admin.)
+    let node_is_admin = match node.operator_peer().map(<[u8]>::to_vec) {
+        Some(op) => {
+            let root = vos::block_on(reg.root(&mut &*node)).unwrap_or_default();
+            let is_root = !root.is_empty() && root == op;
+            is_root
+                || vos::block_on(reg.peer_role(&mut &*node, op)).unwrap_or(0)
+                    == space_registry::AUTH_ROLE_ADMIN
+        }
+        None => false,
+    };
+
     for agent in flatten(&manifest.agents) {
-        reconcile_one(node, &reg, agent, manifest_dir, daemon_prefix, &name_ids)?;
+        reconcile_one(node, &reg, agent, manifest_dir, daemon_prefix, &name_ids, node_is_admin)?;
     }
 
     Ok(ext_caps)
@@ -656,6 +681,7 @@ fn reconcile_one(
     manifest_dir: &Path,
     _daemon_prefix: u16,
     name_ids: &BTreeMap<String, u32>,
+    node_is_admin: bool,
 ) -> anyhow::Result<()> {
     // 1. Resolve and cache the agent's blob.
     let elf_path = manifest_dir.join(&agent.path);
@@ -711,15 +737,27 @@ fn reconcile_one(
                 STATUS_OK => {
                     tracing::info!("published {program_name}:{program_version}");
                 }
+                STATUS_FORBIDDEN if node_is_admin => {
+                    // This node IS the space admin, yet the daemon's
+                    // on-relay signature was refused — the operator key
+                    // can't author catalog ops. Fail loud rather than
+                    // silently install nothing (no peer will supply the
+                    // rows for the authoring node).
+                    anyhow::bail!(
+                        "publish '{program_name}:{program_version}' refused (STATUS_FORBIDDEN) on \
+                         the space-admin node — the operator key cannot author registry ops. \
+                         Check that the correct identity.key is loaded and matches the space root."
+                    );
+                }
                 STATUS_FORBIDDEN => {
-                    // Not the admin node — the program row is authored
-                    // and signed on the operator's node and replicates
-                    // here via CRDT sync. Proceed to install (which is
-                    // likewise tolerant) so the agent spawns once the
-                    // synced rows land.
+                    // Not authored locally: this node isn't the space
+                    // admin, so the program row is signed on the admin's
+                    // node and replicates here via CRDT sync. Proceed to
+                    // install (likewise tolerant) so the agent spawns
+                    // once the synced rows land.
                     tracing::debug!(
-                        "publish {program_name}:{program_version} not authored here \
-                         (non-admin node); awaiting sync",
+                        "publish {program_name}:{program_version} not authored locally; awaiting \
+                         registry sync (if this should be the admin node, check identity.key)",
                     );
                 }
                 STATUS_TAG_CONFLICT => {
@@ -741,12 +779,14 @@ fn reconcile_one(
     //     have today.
     if let Some(meta_blob) = vos::metadata::raw_section_from_elf(&elf_bytes) {
         let status =
-            vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob))
+            // Empty `auth`: signed on relay by the daemon (operator key).
+            vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob, Vec::new()))
                 .map_err(|e| anyhow::anyhow!("registry.register_meta('{program_name}'): {e}"))?;
         if status != STATUS_OK {
             // Don't fail the install — meta registration is a
-            // nice-to-have. Log so a future operator can spot
-            // schema drift.
+            // nice-to-have (and FORBIDDEN on a non-admin node is
+            // expected; the row arrives via sync). Log so a future
+            // operator can spot schema drift.
             tracing::warn!(
                 "register_meta('{program_name}') returned status {status}; \
                  schema-aware coercion disabled for this agent",
@@ -825,14 +865,25 @@ fn reconcile_one(
         );
         return Ok(());
     }
-    // A non-admin node can't author the catalog row (the daemon's
-    // operator key isn't the space root/admin). That's expected: the
-    // row is installed + signed on the operator's node and replicates
-    // here. The runtime reconcile pass then spawns the agent once the
-    // synced row + program blob are present.
     if status == STATUS_FORBIDDEN {
+        if node_is_admin {
+            // The admin node's own signature was refused → the operator
+            // key can't author. Surface it instead of silently failing
+            // to install (this node authors the rows; no peer supplies
+            // them).
+            anyhow::bail!(
+                "install '{}' refused (STATUS_FORBIDDEN) on the space-admin node — the operator \
+                 key cannot author registry ops. Check that the correct identity.key is loaded \
+                 and matches the space root.",
+                agent.name,
+            );
+        }
+        // Not the admin node: the agent row is installed + signed on the
+        // admin's node and replicates here. The runtime reconcile pass
+        // spawns the agent once the synced row + program blob land.
         tracing::info!(
-            "agent {} not installed here (non-admin node) — awaiting registry sync",
+            "agent {} not authored locally — awaiting registry sync (if this should be the admin \
+             node, check identity.key matches the space root)",
             agent.name,
         );
         return Ok(());

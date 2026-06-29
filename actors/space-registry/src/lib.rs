@@ -606,7 +606,13 @@ impl SpaceRegistry {
     /// the program is published if the orchestrator prefers
     /// that order.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn register_meta(&mut self, program_hash: Vec<u8>, blob: Vec<u8>) -> u8 {
+    async fn register_meta(&mut self, program_hash: Vec<u8>, blob: Vec<u8>, auth: Vec<u8>) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("register_meta", &[&program_hash, &blob]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return STATUS_BAD_HASH;
         };
@@ -694,7 +700,18 @@ impl SpaceRegistry {
     /// back a previously-published surface rather than leaving
     /// behind a stale row.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn register_extension_meta(&mut self, instance_name: String, blob: Vec<u8>) -> u8 {
+    async fn register_extension_meta(
+        &mut self,
+        instance_name: String,
+        blob: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> u8 {
+        if !self.authorize_op(
+            &canonical_op_bytes("register_extension_meta", &[instance_name.as_bytes(), &blob]),
+            &auth,
+        ) {
+            return STATUS_FORBIDDEN;
+        }
         let mut idx = 0usize;
         while idx < self.extension_metas.len() {
             if self.extension_metas[idx].instance_name == instance_name {

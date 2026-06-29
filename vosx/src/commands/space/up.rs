@@ -178,8 +178,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
         Err(e) => {
             tracing::warn!(
-                "auth: could not load operator identity ({e}); device-local agents \
-                 will be unreachable until restarted with a readable identity",
+                "auth: could not load operator identity ({e}); device-local agents will be \
+                 unreachable AND this node cannot author registry catalog ops \
+                 (install/publish/upgrade/…) — if this is the space-admin node its manifest \
+                 agents will not install. Restart with a readable identity matching the space root.",
             );
         }
     }
