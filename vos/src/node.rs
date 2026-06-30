@@ -1390,7 +1390,7 @@ impl NodeService {
         };
         let entry = info
             .get(&to)
-            .or_else(|| (to != to_unscoped).then(|| info.get(&to_unscoped)).flatten());
+            .or_else(|| if to != to_unscoped { info.get(&to_unscoped) } else { None });
         entry
             .and_then(|i| i.consistency)
             .is_some_and(Consistency::is_node_confined)
@@ -1406,10 +1406,10 @@ impl NodeService {
     /// space) all return `false` — so confined plaintext never leaves the
     /// device. See [`Self::dispatch_invoke`].
     fn caller_is_operator(&self, caller: Option<&libp2p::PeerId>) -> bool {
-        match (self.operator_peer.as_deref(), caller) {
-            (Some(op), Some(p)) => op == p.to_bytes().as_slice(),
-            _ => false,
-        }
+        self.operator_peer
+            .as_deref()
+            .zip(caller)
+            .is_some_and(|(op, p)| op == p.to_bytes().as_slice())
     }
 
     /// Render an agent's describe JSON by id (the `__describe` primitive's

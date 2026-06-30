@@ -247,11 +247,7 @@ pub fn verify(pk: &PublicKey, alpha: &[u8], proof: &Proof) -> Option<[u8; OUTPUT
     let u = &proof.s * &RISTRETTO_BASEPOINT_POINT + &neg_c * &pk.point; // s·B − c·pk
     let v = &proof.s * &h + &neg_c * &proof.gamma; // s·H − c·Γ
     let c2 = challenge(pk, &h, &proof.gamma, &u, &v);
-    if c2 == proof.c {
-        Some(gamma_output(&proof.gamma))
-    } else {
-        None
-    }
+    (c2 == proof.c).then(|| gamma_output(&proof.gamma))
 }
 
 /// The VRF output `β` of a proof, independent of verification — callers that
@@ -376,12 +372,8 @@ mod tests {
         let (sk_b, pk_b) = keypair_from_seed(&SEED_B);
         let a = verify(&pk_a, ALPHA, &prove(&sk_a, &pk_a, ALPHA)).unwrap();
         let b = verify(&pk_b, ALPHA, &prove(&sk_b, &pk_b, ALPHA)).unwrap();
-        let mut ab = [0u8; OUTPUT_LEN];
-        let mut ba = [0u8; OUTPUT_LEN];
-        for i in 0..OUTPUT_LEN {
-            ab[i] = a[i] ^ b[i];
-            ba[i] = b[i] ^ a[i];
-        }
+        let ab: [u8; OUTPUT_LEN] = core::array::from_fn(|i| a[i] ^ b[i]);
+        let ba: [u8; OUTPUT_LEN] = core::array::from_fn(|i| b[i] ^ a[i]);
         assert_eq!(ab, ba);
         assert_ne!(ab, a, "the combine must depend on every contribution");
     }

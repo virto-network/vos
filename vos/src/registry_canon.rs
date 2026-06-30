@@ -140,7 +140,7 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
 /// catalog mutator, the payload isn't a dynamic `Msg`, or signing
 /// failed (the registry then rejects the unsigned op).
 pub(crate) fn sign_catalog_op_on_relay(payload: &[u8], signer: &CatalogOpSigner) -> Option<Vec<u8>> {
-    if payload.first() != Some(&TAG_DYNAMIC) {
+    if !payload.starts_with(&[TAG_DYNAMIC]) {
         return None;
     }
     let mut msg = <Msg as crate::Decode>::try_decode(&payload[1..])?;

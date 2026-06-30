@@ -85,14 +85,14 @@ impl Status {
     /// Decode a status byte (the over-the-wire discriminant) back into a
     /// `Status`. `None` for an unknown byte.
     pub fn from_u8(b: u8) -> Option<Self> {
-        Some(match b {
-            0 => Status::Ok,
-            1 => Status::InvalidInput,
-            2 => Status::TooLarge,
-            3 => Status::EpochTaken,
-            4 => Status::EpochGap,
-            _ => return None,
-        })
+        match b {
+            0 => Some(Self::Ok),
+            1 => Some(Self::InvalidInput),
+            2 => Some(Self::TooLarge),
+            3 => Some(Self::EpochTaken),
+            4 => Some(Self::EpochGap),
+            _ => None,
+        }
     }
 }
 
@@ -353,12 +353,7 @@ fn hint_to_32(b: &[u8]) -> Option<[u8; 32]> {
     if b.is_empty() {
         return Some([0u8; 32]);
     }
-    if b.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(b);
-    Some(out)
+    b.try_into().ok()
 }
 
 #[cfg(test)]

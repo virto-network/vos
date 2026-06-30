@@ -539,12 +539,7 @@ pub fn verify_combine(domain: &[u8], round: &BeaconRound, proofs: &RoundProofSet
 }
 
 fn to_entropy(bytes: &[u8]) -> Option<[u8; ENTROPY_LEN]> {
-    if bytes.len() != ENTROPY_LEN {
-        return None;
-    }
-    let mut out = [0u8; ENTROPY_LEN];
-    out.copy_from_slice(bytes);
-    Some(out)
+    bytes.try_into().ok()
 }
 
 /// Validate and canonicalize a 32-byte VRF public key: it must be exactly 32

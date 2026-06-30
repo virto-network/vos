@@ -100,12 +100,12 @@ impl Status {
     /// Decode a status byte (the over-the-wire discriminant) back into a
     /// `Status`. `None` for an unknown byte.
     pub fn from_u8(b: u8) -> Option<Self> {
-        Some(match b {
-            0 => Status::Ok,
-            1 => Status::InvalidInput,
-            2 => Status::BodyTooLarge,
-            _ => return None,
-        })
+        match b {
+            0 => Some(Self::Ok),
+            1 => Some(Self::InvalidInput),
+            2 => Some(Self::BodyTooLarge),
+            _ => None,
+        }
     }
 }
 
@@ -363,10 +363,7 @@ impl MsgLog {
     async fn stats(&self) -> LogStats {
         LogStats {
             count: self.envelopes.len() as u64,
-            max_lamport: match self.envelopes.last() {
-                Some(e) => e.lamport,
-                None => 0,
-            },
+            max_lamport: self.envelopes.last().map_or(0, |e| e.lamport),
         }
     }
 }
@@ -394,10 +391,7 @@ fn sort_key(
     b_lamport: u64,
     b_id: &[u8; 32],
 ) -> core::cmp::Ordering {
-    match a_lamport.cmp(&b_lamport) {
-        core::cmp::Ordering::Equal => a_id.cmp(b_id),
-        other => other,
-    }
+    a_lamport.cmp(&b_lamport).then_with(|| a_id.cmp(b_id))
 }
 
 #[cfg(test)]

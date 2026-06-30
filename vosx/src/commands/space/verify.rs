@@ -125,9 +125,7 @@ fn scan_for_genesis(
         if &derived == advertised {
             return Ok(Some((cid, derived)));
         }
-        if first_seq0.is_none() {
-            first_seq0 = Some((cid, derived));
-        }
+        first_seq0.get_or_insert((cid, derived));
     }
     Ok(first_seq0)
 }

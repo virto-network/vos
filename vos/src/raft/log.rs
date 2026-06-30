@@ -595,13 +595,11 @@ pub fn write_active_config_in_txn(
     current: &[u16],
     joint_old: Option<&[u16]>,
 ) -> Result<(), CommitError> {
-    let mut buf = Vec::with_capacity(1 + 2 + 2 * current.len());
-    match joint_old {
-        Some(prev) => {
-            buf.push(1);
-            encode_prefix_list(&mut buf, prev);
-        }
-        None => buf.push(0),
+    let mut buf =
+        Vec::with_capacity(1 + joint_old.map_or(0, |j| 2 + 2 * j.len()) + 2 + 2 * current.len());
+    buf.push(joint_old.is_some() as u8);
+    if let Some(prev) = joint_old {
+        encode_prefix_list(&mut buf, prev);
     }
     encode_prefix_list(&mut buf, current);
     let mut t = txn.open_table(RAFT_META)?;
@@ -626,8 +624,8 @@ pub fn load_active_config(
         return Ok(None);
     };
     let bytes = row.value();
-    let (flag, _) = bytes
-        .split_first()
+    let flag = *bytes
+        .first()
         .ok_or_else(|| CommitError::Config("active_config row: empty".into()))?;
     let mut pos = 1;
     let joint_old = match flag {

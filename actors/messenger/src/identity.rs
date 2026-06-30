@@ -278,10 +278,10 @@ mod tests {
     /// A correctly-signed binding: the operator key signs over the MLS key,
     /// its own PeerId, and the space id.
     fn valid_binding(op: &SigningKey, mls_pubkey: &[u8], name: &str) -> Binding {
-        let pid = op_peer_id(op);
-        let sig = op.sign(&binding_signed_bytes(mls_pubkey, &pid, &SPACE));
+        let peer_id = op_peer_id(op);
+        let sig = op.sign(&binding_signed_bytes(mls_pubkey, &peer_id, &SPACE));
         Binding {
-            peer_id: pid,
+            peer_id,
             display_name: String::from(name),
             cert: sig.to_bytes().to_vec(),
         }

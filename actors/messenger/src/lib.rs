@@ -476,10 +476,11 @@ impl Messenger {
 
         // Announce for discovery — best effort, the channel works
         // without a directory.
-        let announced = match resolve(ctx, DIRECTORY_AGENT).await {
-            Ok(dir_id) => dir_announce_channel(ctx, dir_id, &channel, &self.nickname.clone()).await,
-            Err(e) => Err(e),
-        };
+        let announced = async {
+            let dir_id = resolve(ctx, DIRECTORY_AGENT).await?;
+            dir_announce_channel(ctx, dir_id, &channel, &self.nickname).await
+        }
+        .await;
         match announced {
             Ok(msg_directory::Status::Ok) => format!("channel '{channel}' created and announced"),
             Ok(msg_directory::Status::Exists) => format!(
@@ -1027,7 +1028,8 @@ impl Messenger {
         // One beacon for the whole batch — every KeyPackage in this dispatch
         // hedges under the same finalized round.
         let beacon = crate::clients::chronos_beacon(ctx).await;
-        let mut published = 0usize;
+        // Every iteration propagates its errors with `?`, so reaching the
+        // end means all `n` packages published.
         for _ in 0..n {
             let stores = self.open_stores();
             let client = mls::build_bound_client_hedged(
@@ -1041,9 +1043,8 @@ impl Messenger {
             self.mls_store = store::snapshot(&stores);
             dir_publish_kp(ctx, dir_id, &owner, kp_bytes).await?;
             self.published_kp_count += 1;
-            published += 1;
         }
-        Ok(published)
+        Ok(n)
     }
 
     /// Build `op` as an MLS Commit at the group's current epoch and

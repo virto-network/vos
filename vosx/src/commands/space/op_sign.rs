@@ -22,12 +22,14 @@ use space_registry::{OP_SIG_LEN, canonical_op_bytes, pack_auth};
 /// corresponding registry handler passes to `canonical_op_bytes`.
 pub fn op_auth(keypair: &Keypair, op: &str, fields: &[&[u8]]) -> anyhow::Result<Vec<u8>> {
     let canonical = canonical_op_bytes(op, fields);
-    let sig = keypair
+    let sig: [u8; OP_SIG_LEN] = keypair
         .sign(&canonical)
-        .map_err(|e| anyhow::anyhow!("sign registry op '{op}': {e}"))?;
-    let sig: [u8; OP_SIG_LEN] = sig.as_slice().try_into().map_err(|_| {
-        anyhow::anyhow!("registry op '{op}': expected a {OP_SIG_LEN}-byte ed25519 signature")
-    })?;
+        .map_err(|e| anyhow::anyhow!("sign registry op '{op}': {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            anyhow::anyhow!("registry op '{op}': expected a {OP_SIG_LEN}-byte ed25519 signature")
+        })?;
     let signer = libp2p::PeerId::from(keypair.public()).to_bytes();
     Ok(pack_auth(&signer, &sig))
 }

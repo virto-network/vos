@@ -1221,16 +1221,18 @@ fn agent_config_from_row(
         return Ok(RowConfig::BadConsistency);
     };
 
+    let needs_persistence = matches!(
+        consistency,
+        Consistency::Local | Consistency::Crdt | Consistency::Raft
+    );
+    let needs_replication = matches!(consistency, Consistency::Crdt | Consistency::Raft);
     let mut cfg = AgentConfig::new(blob)
         .with_name(a.instance_name.clone())
         .with_consistency(consistency);
-    if matches!(
-        consistency,
-        Consistency::Local | Consistency::Crdt | Consistency::Raft
-    ) {
+    if needs_persistence {
         cfg = cfg.persist(data_dir);
     }
-    if matches!(consistency, Consistency::Crdt | Consistency::Raft) {
+    if needs_replication {
         cfg = cfg.with_replication_id(a.replication_id);
     }
     if !a.install_args.is_empty() {

@@ -103,7 +103,7 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         // operator's identity key sign a binding cert over it, then
         // `bind_identity`. The plain `register`/`bind_identity` handlers stay
         // reachable for advanced/manual use.
-        if target.as_str() == "messenger" && method.as_str() == "register" {
+        if target == "messenger" && method == "register" {
             return messenger_register(client, &method_args);
         }
 

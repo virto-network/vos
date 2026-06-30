@@ -656,8 +656,7 @@ pub fn reconcile(
     let node_is_admin = match node.operator_peer().map(<[u8]>::to_vec) {
         Some(op) => {
             let root = vos::block_on(reg.root(&mut &*node)).unwrap_or_default();
-            let is_root = !root.is_empty() && root == op;
-            is_root
+            (!root.is_empty() && root == op)
                 || vos::block_on(reg.peer_role(&mut &*node, op)).unwrap_or(0)
                     == space_registry::AUTH_ROLE_ADMIN
         }

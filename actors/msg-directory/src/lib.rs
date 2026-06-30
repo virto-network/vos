@@ -93,14 +93,14 @@ impl Status {
     /// Decode a status byte (the over-the-wire discriminant) back into a
     /// `Status`. `None` for an unknown byte.
     pub fn from_u8(b: u8) -> Option<Self> {
-        Some(match b {
-            0 => Status::Ok,
-            1 => Status::InvalidInput,
-            2 => Status::TooLarge,
-            3 => Status::QuotaExceeded,
-            4 => Status::Exists,
-            _ => return None,
-        })
+        match b {
+            0 => Some(Self::Ok),
+            1 => Some(Self::InvalidInput),
+            2 => Some(Self::TooLarge),
+            3 => Some(Self::QuotaExceeded),
+            4 => Some(Self::Exists),
+            _ => None,
+        }
     }
 }
 
@@ -348,10 +348,7 @@ fn kp_key(
     b_owner: &str,
     b_hash: &[u8; 32],
 ) -> core::cmp::Ordering {
-    match a_owner.cmp(b_owner) {
-        core::cmp::Ordering::Equal => a_hash.cmp(b_hash),
-        other => other,
-    }
+    a_owner.cmp(b_owner).then_with(|| a_hash.cmp(b_hash))
 }
 
 #[cfg(test)]

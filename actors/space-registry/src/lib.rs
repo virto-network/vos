@@ -443,21 +443,21 @@ impl Status {
     /// `Status`. `None` for an unknown byte. Used by raw callers that
     /// pull the reply byte directly rather than through a typed `Ref`.
     pub fn from_u8(b: u8) -> Option<Self> {
-        Some(match b {
-            0 => Status::Ok,
-            1 => Status::TagConflict,
-            2 => Status::NotFound,
-            3 => Status::InUse,
-            4 => Status::ProgramNotFound,
-            5 => Status::InstanceExists,
-            6 => Status::BadHash,
-            7 => Status::Forbidden,
-            8 => Status::BadPrefix,
-            9 => Status::ConsistencyWidenDenied,
-            10 => Status::ReplicationIdReused,
-            11 => Status::StaleUpgrade,
-            _ => return None,
-        })
+        match b {
+            0 => Some(Self::Ok),
+            1 => Some(Self::TagConflict),
+            2 => Some(Self::NotFound),
+            3 => Some(Self::InUse),
+            4 => Some(Self::ProgramNotFound),
+            5 => Some(Self::InstanceExists),
+            6 => Some(Self::BadHash),
+            7 => Some(Self::Forbidden),
+            8 => Some(Self::BadPrefix),
+            9 => Some(Self::ConsistencyWidenDenied),
+            10 => Some(Self::ReplicationIdReused),
+            11 => Some(Self::StaleUpgrade),
+            _ => None,
+        }
     }
 }
 
@@ -719,14 +719,10 @@ impl SpaceRegistry {
     /// Look up a single program by `(name, version)`.
     #[msg]
     async fn program(&self, name: String, version: String) -> Option<ProgramRow> {
-        let mut idx = 0usize;
-        while idx < self.programs.len() {
-            if self.programs[idx].name == name && self.programs[idx].version == version {
-                return Some(self.programs[idx].clone());
-            }
-            idx += 1;
-        }
-        None
+        self.programs
+            .iter()
+            .find(|p| p.name == name && p.version == version)
+            .cloned()
     }
 
     /// Snapshot the full catalog. Pagination can come later.
@@ -777,14 +773,11 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Vec::new();
         };
-        let mut idx = 0usize;
-        while idx < self.metas.len() {
-            if self.metas[idx].program_hash == program_hash {
-                return self.metas[idx].blob.clone();
-            }
-            idx += 1;
-        }
-        Vec::new()
+        self.metas
+            .iter()
+            .find(|m| m.program_hash == program_hash)
+            .map(|m| m.blob.clone())
+            .unwrap_or_default()
     }
 
     /// Convenience join: find an installed agent by name, then
@@ -1102,14 +1095,10 @@ impl SpaceRegistry {
 
     #[msg]
     async fn agent(&self, instance_name: String) -> Option<AgentRow> {
-        let mut idx = 0usize;
-        while idx < self.agents.len() {
-            if self.agents[idx].instance_name == instance_name {
-                return Some(self.agents[idx].clone());
-            }
-            idx += 1;
-        }
-        None
+        self.agents
+            .iter()
+            .find(|a| a.instance_name == instance_name)
+            .cloned()
     }
 
     #[msg]
@@ -1124,13 +1113,10 @@ impl SpaceRegistry {
     /// Same ordering as `agents()` — sorted by `instance_name`.
     #[msg]
     async fn agent_names(&self) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.agents.len());
-        let mut idx = 0usize;
-        while idx < self.agents.len() {
-            out.push(self.agents[idx].instance_name.clone());
-            idx += 1;
-        }
-        out
+        self.agents
+            .iter()
+            .map(|a| a.instance_name.clone())
+            .collect()
     }
 
     /// Resolve an installed agent's name to the `ServiceId` it

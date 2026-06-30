@@ -556,10 +556,9 @@ mod tests {
         commit_body: Vec<u8>,
         welcome: Option<(Vec<u8>, [u8; 32])>,
     ) -> msg_ctl::CommitOutcome {
-        let (welcome_bytes, hint) = match welcome {
-            Some((w, h)) => (w, h.to_vec()),
-            None => (Vec::new(), Vec::new()),
-        };
+        let (welcome_bytes, hint) = welcome
+            .map(|(w, h)| (w, h.to_vec()))
+            .unwrap_or_default();
         ctl_dispatch(
             ctl,
             msg_ctl::Commit {
@@ -717,9 +716,9 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        let welcome = out.welcome_messages[0].to_bytes().unwrap();
+        let welcome_bytes = out.welcome_messages[0].to_bytes().unwrap();
         alice_group.apply_pending_commit().unwrap();
-        let welcome = MlsMessage::from_bytes(&welcome).unwrap();
+        let welcome = MlsMessage::from_bytes(&welcome_bytes).unwrap();
         let (mut bob_group, _info) = bob.join_group(None, &welcome, None).unwrap();
 
         // Alice evicts bob, located by his verified binding's display name.
@@ -728,8 +727,7 @@ mod tests {
             .members_iter()
             .find(|m| {
                 crate::identity::member_binding(&m.signing_identity)
-                    .map(|d| d.display_name == "bob")
-                    .unwrap_or(false)
+                    .is_some_and(|d| d.display_name == "bob")
             })
             .unwrap()
             .index;
