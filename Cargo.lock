@@ -4151,6 +4151,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "msg-ctl"
+version = "0.1.0"
+dependencies = [
+ "vos",
+]
+
+[[package]]
 name = "multiaddr"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7580,6 +7587,7 @@ dependencies = [
  "libp2p",
  "log",
  "merkle-crdt",
+ "msg-ctl",
  "pollster",
  "prover-extension",
  "rcgen",

@@ -126,6 +126,11 @@ crdt-counter = { path = "../examples/actors/crdt-counter", default-features = fa
 # tests load the pre-built actor ELF separately and only need the
 # Ref surface from the rlib.
 space-registry = { path = "../actors/space-registry", default-features = false }
+# The channel sequencer's reply types (`CommitOutcome` / `Status`), so the
+# in-PVM commit-retry gate can mint byte-identical msg-ctl replies through the
+# external-invoke seam and drive `commit_chain_op`'s catch-up loop without a
+# live sequencer. `default-features = false` keeps the PVM bin glue out.
+msg-ctl = { path = "../actors/msg-ctl", default-features = false }
 # Same shape — host tests use the typed SpaceBridgeRef to invoke
 # the bridge actor's where_am_i / forward handlers over libp2p.
 space-bridge = { path = "../actors/space-bridge", default-features = false }
