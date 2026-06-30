@@ -98,13 +98,14 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
             return print_target_surface(target, meta.as_ref());
         };
 
-        // Identity-bound registration is a two-step process the CLI orchestrates:
-        // call `register` to get the messenger's MLS public key, have the
-        // operator's identity key sign a binding cert over it, then
-        // `bind_identity`. The plain `register`/`bind_identity` handlers stay
-        // reachable for advanced/manual use.
-        if target == "messenger" && method == "register" {
-            return messenger_register(client, &method_args);
+        // Identity-bound registration is a two-step process the CLI orchestrates
+        // for any messenger instance: call `register` to get the messenger's MLS
+        // public key, have the operator's identity key sign a binding cert over
+        // it, then `bind_identity`. `register` is messenger-unique, so the verb
+        // alone identifies the flow. `bind_identity` stays directly reachable for
+        // manual re-binding.
+        if method == "register" {
+            return messenger_register(client, target, &method_args);
         }
 
         if parsed.wants_help {
@@ -161,15 +162,15 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
 /// sign a binding cert over `(mls_pubkey ‖ peer_id ‖ space_id)`, then
 /// `bind_identity`. This is the two-step process the messenger can't do itself — it
 /// holds no operator key.
-fn messenger_register(client: &DaemonClient, args: &[&str]) -> anyhow::Result<()> {
+fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> anyhow::Result<()> {
     let nickname = args
         .iter()
         .find_map(|a| a.strip_prefix("nickname="))
         .or_else(|| args.iter().copied().find(|a| !a.contains('=')))
-        .ok_or_else(|| anyhow!("usage: vosx messenger register nickname=<name>"))?
+        .ok_or_else(|| anyhow!("usage: vosx {target} register nickname=<name>"))?
         .to_string();
 
-    let target_id = client.resolve_target("messenger")?;
+    let target_id = client.resolve_target(target)?;
 
     // 1. register → `mls_pubkey=<hex>`
     let reply = client.invoke_dyn(target_id, &Msg::new("register").with("nickname", nickname))?;
