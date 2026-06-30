@@ -235,13 +235,12 @@ pub enum SpaceCommand {
         #[command(subcommand)]
         command: Option<members::MembersCommand>,
     },
-    /// Manage auth-role grants (Sprint 2). Subcommands: list,
-    /// grant, revoke. Bare `space role <space>` lists. Sprint
-    /// 2 gates registry-mutation handlers behind
-    /// `AUTH_ROLE_ADMIN`; this is the table the dispatch-layer
-    /// gate consults. The space creator is auto-enrolled by
-    /// `space new` (first `space up` reads
-    /// `admin_bootstrap.txt`).
+    /// Manage auth-role grants. Subcommands: list, grant, revoke.
+    /// Bare `space role <space>` lists. Registry-mutation handlers
+    /// are gated behind `AUTH_ROLE_ADMIN`; this is the table the
+    /// dispatch-layer gate consults. The space creator is
+    /// auto-enrolled as admin by `space new` via a signed
+    /// `grant_role` baked into the genesis DAG.
     Role {
         space: String,
         #[command(subcommand)]

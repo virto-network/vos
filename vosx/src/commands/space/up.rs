@@ -480,8 +480,8 @@ fn collect_agent_policies(
 /// (the messenger's MLS confidentiality root). The seed is 32 bytes of OS
 /// entropy held in a `{data_dir}/agents/{svc_id:08x}.seed` sidecar — node-local
 /// like the P0 `.seal`, never replicated — and delivered by a `seed` message
-/// over a local `Caller::System` invoke (the same bypass-the-auth-gate path
-/// `consume_admin_bootstrap` uses). Idempotent: the agent persists the seed in
+/// over a local `Caller::System` invoke (a node-local, host-initiated path
+/// that bypasses the auth gate). Idempotent: the agent persists the seed in
 /// its Local redb, so a re-send on a later boot is a no-op. Best-effort — a
 /// failure to seed is logged, not fatal.
 fn provision_device_seeds(node: &VosNode, agents: &[String], data_dir: &std::path::Path, daemon_prefix: u16) {

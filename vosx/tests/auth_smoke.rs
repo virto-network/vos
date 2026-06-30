@@ -1,17 +1,17 @@
-//! Sprint 2 daemon-auth gate end-to-end.
+//! Daemon-auth gate end-to-end.
 //!
-//! Three properties verified:
+//! Properties verified:
 //!
-//! 1. `space new` records the creator's PeerId in
-//!    `admin_bootstrap.txt`; on first `space up` the daemon
-//!    grants `AUTH_ROLE_ADMIN` to that peer and removes the file.
-//! 2. The admin operator (XDG_CONFIG_HOME A) can `vosx space
-//!    publish` against the running daemon.
+//! 1. `space new` grants the creator `AUTH_ROLE_ADMIN` via a signed
+//!    `grant_role` op baked into the genesis DAG (no on-disk
+//!    bootstrap file), so `space role list` shows the operator as admin.
+//! 2. The admin operator (XDG_CONFIG_HOME A) can grant roles against the
+//!    running daemon.
 //! 3. A second client with a different identity (XDG_CONFIG_HOME
-//!    B) is *refused* by the dispatch-layer auth gate when it
-//!    tries to publish.
+//!    B) is *refused* by the dispatch-layer auth gate.
 //! 4. After the admin grants role to B via `vosx space role
-//!    grant`, B can publish.
+//!    grant`, B can grant in turn — and the actor-local (`--in <actor>`)
+//!    grant path is independent of the space-level one.
 //!
 //! The test reuses the same `vosx` binary across A and B —
 //! identity comes from `$XDG_CONFIG_HOME`, so a second
@@ -75,22 +75,6 @@ fn find_endpoint(root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn space_data_dir(data_home: &Path) -> PathBuf {
-    // Walk one level into the per-space subdirectory under
-    // `<DATA_HOME>/vosx/<space_id>/`.
-    let vosx = data_home.join("vosx");
-    let mut found = None;
-    if let Ok(rd) = fs::read_dir(&vosx) {
-        for entry in rd.flatten() {
-            if entry.path().is_dir() {
-                found = Some(entry.path());
-                break;
-            }
-        }
-    }
-    found.unwrap_or(vosx)
-}
-
 #[test]
 fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
     let data_home = TempDir::new("data");
@@ -112,15 +96,7 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
         String::from_utf8_lossy(&new.stderr)
     );
 
-    let data_dir = space_data_dir(data_home.path());
-    let bootstrap = data_dir.join("admin_bootstrap.txt");
-    assert!(
-        bootstrap.exists(),
-        "space new must record admin bootstrap PeerId at {}",
-        bootstrap.display(),
-    );
-
-    // ── space up (admin bootstrap consumed; file deleted) ───
+    // ── space up (the genesis admin grant is already in the DAG) ───
     let log_path = data_home.path().join("daemon.stderr");
     let log_file = fs::File::create(&log_path).expect("create log");
     let mut child: Child = Command::new(vosx_bin())
@@ -150,22 +126,8 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
         fs::read_to_string(&log_path).unwrap_or_default(),
     );
 
-    // The bootstrap file must be gone after the daemon's
-    // startup grant.
-    let after_boot_deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < after_boot_deadline {
-        if !bootstrap.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        !bootstrap.exists(),
-        "admin_bootstrap.txt should be deleted after space up consumes it — log:\n{}",
-        fs::read_to_string(&log_path).unwrap_or_default(),
-    );
-
-    // ── A: role list — expect A's own peer_id with role=admin ──
+    // ── A: role list — expect A's own peer_id with role=admin
+    // (the genesis grant_role from `space new`, replayed from the DAG) ──
     let list = Command::new(vosx_bin())
         .args(["space", "role", space_name, "list"])
         .env("XDG_DATA_HOME", data_home.path())
