@@ -57,18 +57,56 @@ pub const PAGE_MAX_ROWS: u32 = 16;
 
 // ── Status codes ──────────────────────────────────────────────────
 
-pub const STATUS_OK: u8 = 0;
-pub const STATUS_INVALID_INPUT: u8 = 1;
-pub const STATUS_TOO_LARGE: u8 = 2;
-/// The epoch already has a winning commit. The caller lost the
-/// race: fetch the winner via `commit_at(epoch)`, process it,
-/// and re-issue at the next epoch.
-pub const STATUS_EPOCH_TAKEN: u8 = 3;
-/// The epoch is ahead of the chain — the caller built a commit
-/// on epochs this sequencer hasn't seen, which can't happen if
-/// it processed the chain first. Refused so a gap never enters
-/// the record.
-pub const STATUS_EPOCH_GAP: u8 = 4;
+/// Outcome of a commit submission. `Ok` means this commit won its epoch.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum Status {
+    /// This commit is the epoch's winner.
+    Ok = 0,
+    /// An argument was empty or otherwise malformed.
+    InvalidInput = 1,
+    /// A byte field exceeded its size budget.
+    TooLarge = 2,
+    /// The epoch already has a winning commit. The caller lost the
+    /// race: fetch the winner via `commit_at(epoch)`, process it,
+    /// and re-issue at the next epoch.
+    EpochTaken = 3,
+    /// The epoch is ahead of the chain — the caller built a commit
+    /// on epochs this sequencer hasn't seen, which can't happen if
+    /// it processed the chain first. Refused so a gap never enters
+    /// the record.
+    EpochGap = 4,
+}
+
+impl Status {
+    /// Decode a status byte (the over-the-wire discriminant) back into a
+    /// `Status`. `None` for an unknown byte.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Status::Ok,
+            1 => Status::InvalidInput,
+            2 => Status::TooLarge,
+            3 => Status::EpochTaken,
+            4 => Status::EpochGap,
+            _ => return None,
+        })
+    }
+}
+
+impl core::fmt::Display for Status {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Status::Ok => "ok",
+            Status::InvalidInput => "invalid input",
+            Status::TooLarge => "too large",
+            Status::EpochTaken => "epoch taken",
+            Status::EpochGap => "epoch gap",
+        })
+    }
+}
 
 // ── Wire types ────────────────────────────────────────────────────
 
@@ -107,11 +145,10 @@ pub struct CommitRow {
 )]
 #[rkyv(crate = vos::rkyv)]
 pub struct CommitOutcome {
-    /// `STATUS_*` — `STATUS_OK` means this commit is the epoch's
-    /// winner.
-    pub status: u8,
+    /// `Status::Ok` means this commit is the epoch's winner.
+    pub status: Status,
     /// The epoch the chain expects next (= its current length).
-    /// On `STATUS_EPOCH_TAKEN`/`GAP` this tells the caller how
+    /// On `EpochTaken`/`EpochGap` this tells the caller how
     /// far behind/ahead it is.
     pub next_epoch: u64,
 }
@@ -217,9 +254,9 @@ impl MsgCtl {
 
     /// Submit the MLS Commit created at `epoch`. First writer for
     /// the chain's next epoch wins; everyone else gets
-    /// [`STATUS_EPOCH_TAKEN`] and re-issues after processing the
+    /// [`Status::EpochTaken`] and re-issues after processing the
     /// winner. Re-submitting the winning record itself is
-    /// idempotent (`STATUS_OK`).
+    /// idempotent (`Status::Ok`).
     #[msg(role = MsgCtlRole::Committer)]
     async fn commit(
         &mut self,
@@ -230,31 +267,31 @@ impl MsgCtl {
         welcome_hint: Vec<u8>,
     ) -> CommitOutcome {
         let next_epoch = self.commits.len() as u64;
-        let reply = |status: u8| CommitOutcome { status, next_epoch };
+        let reply = |status: Status| CommitOutcome { status, next_epoch };
 
         if commit_body.is_empty() || (welcome.is_empty() != welcome_hint.is_empty()) {
-            return reply(STATUS_INVALID_INPUT);
+            return reply(Status::InvalidInput);
         }
         if commit_body.len() > MAX_BODY_BYTES
             || welcome.len() > MAX_BODY_BYTES
             || commit_body.len() + welcome.len() > MAX_ROW_BYTES
         {
-            return reply(STATUS_TOO_LARGE);
+            return reply(Status::TooLarge);
         }
         let welcome_hint = match hint_to_32(&welcome_hint) {
             Some(h) => h,
-            None => return reply(STATUS_INVALID_INPUT),
+            None => return reply(Status::InvalidInput),
         };
         let id = commit_record_id(epoch, ts_ms, &commit_body, &welcome, &welcome_hint);
         if epoch < next_epoch {
             let winner = &self.commits[epoch as usize];
             if winner.id == id {
-                return reply(STATUS_OK);
+                return reply(Status::Ok);
             }
-            return reply(STATUS_EPOCH_TAKEN);
+            return reply(Status::EpochTaken);
         }
         if epoch > next_epoch {
-            return reply(STATUS_EPOCH_GAP);
+            return reply(Status::EpochGap);
         }
         self.commits.push(CommitRow {
             id,
@@ -265,7 +302,7 @@ impl MsgCtl {
             welcome_hint,
         });
         CommitOutcome {
-            status: STATUS_OK,
+            status: Status::Ok,
             next_epoch: next_epoch + 1,
         }
     }
@@ -385,14 +422,14 @@ mod tests {
         assert_eq!(
             submit(&mut c, 0, b"add-bob"),
             CommitOutcome {
-                status: STATUS_OK,
+                status: Status::Ok,
                 next_epoch: 1
             }
         );
         assert_eq!(
             submit(&mut c, 1, b"add-carol"),
             CommitOutcome {
-                status: STATUS_OK,
+                status: Status::Ok,
                 next_epoch: 2
             }
         );
@@ -406,7 +443,7 @@ mod tests {
         let mut c = ctl();
         submit(&mut c, 0, b"alice-wins");
         let outcome = submit(&mut c, 0, b"bob-loses");
-        assert_eq!(outcome.status, STATUS_EPOCH_TAKEN);
+        assert_eq!(outcome.status, Status::EpochTaken);
         assert_eq!(outcome.next_epoch, 1);
         let winner = dispatch(&mut c, CommitAt { epoch: 0 }).unwrap();
         assert_eq!(winner.commit_body, b"alice-wins");
@@ -417,7 +454,7 @@ mod tests {
         let mut c = ctl();
         submit(&mut c, 0, b"same");
         let again = submit(&mut c, 0, b"same");
-        assert_eq!(again.status, STATUS_OK);
+        assert_eq!(again.status, Status::Ok);
         assert_eq!(dispatch(&mut c, Head), CtlHead { next_epoch: 1 });
     }
 
@@ -427,7 +464,7 @@ mod tests {
         // processing the chain — never let a hole into the record.
         let mut c = ctl();
         let outcome = submit(&mut c, 3, b"from-the-future");
-        assert_eq!(outcome.status, STATUS_EPOCH_GAP);
+        assert_eq!(outcome.status, Status::EpochGap);
         assert_eq!(outcome.next_epoch, 0);
         assert_eq!(dispatch(&mut c, Head), CtlHead { next_epoch: 0 });
     }
@@ -445,7 +482,7 @@ mod tests {
                 welcome_hint: Vec::new(),
             },
         );
-        assert_eq!(outcome.status, STATUS_INVALID_INPUT);
+        assert_eq!(outcome.status, Status::InvalidInput);
         let outcome = dispatch(
             &mut c,
             Commit {
@@ -456,7 +493,7 @@ mod tests {
                 welcome_hint: vec![7u8; 32],
             },
         );
-        assert_eq!(outcome.status, STATUS_OK);
+        assert_eq!(outcome.status, Status::Ok);
         let row = dispatch(&mut c, CommitAt { epoch: 0 }).unwrap();
         assert_eq!(row.welcome, b"welcome-bytes");
         assert_eq!(row.welcome_hint, [7u8; 32]);
@@ -466,7 +503,7 @@ mod tests {
     fn size_bounds_are_enforced() {
         let mut c = ctl();
         let over = vec![0u8; MAX_BODY_BYTES + 1];
-        assert_eq!(submit(&mut c, 0, &over).status, STATUS_TOO_LARGE);
+        assert_eq!(submit(&mut c, 0, &over).status, Status::TooLarge);
         // Each field within bounds but the row over the combined cap.
         let body = vec![0u8; 7 * 1024];
         let welcome = vec![1u8; 7 * 1024];
@@ -480,7 +517,7 @@ mod tests {
                 welcome_hint: vec![7u8; 32],
             },
         );
-        assert_eq!(outcome.status, STATUS_TOO_LARGE);
+        assert_eq!(outcome.status, Status::TooLarge);
         assert_eq!(dispatch(&mut c, Head), CtlHead { next_epoch: 0 });
     }
 

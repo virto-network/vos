@@ -33,11 +33,20 @@ use vos::prelude::*;
 
 /// Envelope kinds. The data plane carries `App` envelopes;
 /// control-plane kinds live in `msg-ctl` and are listed here so
-/// the discriminant space is allocated in one place.
-pub const ENVELOPE_KIND_APP: u8 = 0;
-pub const ENVELOPE_KIND_PROPOSAL: u8 = 1;
-pub const ENVELOPE_KIND_COMMIT: u8 = 2;
-pub const ENVELOPE_KIND_WELCOME: u8 = 3;
+/// the discriminant space is allocated in one place. The
+/// discriminant is the over-the-wire byte (and the byte hashed into
+/// [`envelope_id`]).
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum EnvelopeKind {
+    App = 0,
+    Proposal = 1,
+    Commit = 2,
+    Welcome = 3,
+}
 
 /// Domain tag for envelope ids: `blake2b("vos-msg-envelope/v1" ‖
 /// fields)`. Content-derived, so equal envelopes deduplicate and
@@ -72,9 +81,43 @@ pub const HISTORY_MAX_ROWS: u32 = 64;
 
 // ── Status codes ──────────────────────────────────────────────────
 
-pub const STATUS_OK: u8 = 0;
-pub const STATUS_INVALID_INPUT: u8 = 1;
-pub const STATUS_BODY_TOO_LARGE: u8 = 2;
+/// Status returned by a log mutation handler. `Ok` is `0`.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum Status {
+    /// Handler succeeded.
+    Ok = 0,
+    /// An argument was empty, malformed, or not an App envelope.
+    InvalidInput = 1,
+    /// The body exceeded [`MAX_BODY_BYTES`].
+    BodyTooLarge = 2,
+}
+
+impl Status {
+    /// Decode a status byte (the over-the-wire discriminant) back into a
+    /// `Status`. `None` for an unknown byte.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Status::Ok,
+            1 => Status::InvalidInput,
+            2 => Status::BodyTooLarge,
+            _ => return None,
+        })
+    }
+}
+
+impl core::fmt::Display for Status {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Status::Ok => "ok",
+            Status::InvalidInput => "invalid input",
+            Status::BodyTooLarge => "body too large",
+        })
+    }
+}
 
 // ── Wire types ────────────────────────────────────────────────────
 
@@ -90,8 +133,8 @@ pub const STATUS_BODY_TOO_LARGE: u8 = 2;
 pub struct EnvelopeRow {
     /// Content-derived id — see [`envelope_id`].
     pub id: [u8; 32],
-    /// `ENVELOPE_KIND_*` discriminant.
-    pub kind: u8,
+    /// Envelope discriminant.
+    pub kind: EnvelopeKind,
     /// MLS epoch hint, in plaintext so receivers pick a
     /// decryption key without trial-decrypting every cached
     /// epoch. Leaks membership-change cadence to anyone holding
@@ -231,40 +274,41 @@ impl MsgLog {
         ts_ms: u64,
         to_hint: Vec<u8>,
         body: Vec<u8>,
-    ) -> u8 {
-        if kind != ENVELOPE_KIND_APP {
+    ) -> Status {
+        if kind != EnvelopeKind::App as u8 {
             // Control-plane envelopes belong in msg-ctl; rejecting
             // them here keeps the two planes from drifting together.
-            return STATUS_INVALID_INPUT;
+            return Status::InvalidInput;
         }
         if body.is_empty() || lamport == 0 {
-            return STATUS_INVALID_INPUT;
+            return Status::InvalidInput;
         }
         if body.len() > MAX_BODY_BYTES {
-            return STATUS_BODY_TOO_LARGE;
+            return Status::BodyTooLarge;
         }
         // Reject anything that isn't MLS PrivateMessage framing before
         // it lands in the replicated log (see the prefix const).
         if !body.starts_with(&MLS_PRIVATE_MESSAGE_PREFIX) {
-            return STATUS_INVALID_INPUT;
+            return Status::InvalidInput;
         }
         let to_hint = match hint_to_32(&to_hint) {
             Some(h) => h,
-            None => return STATUS_INVALID_INPUT,
+            None => return Status::InvalidInput,
         };
         let id = envelope_id(kind, epoch, lamport, ts_ms, &to_hint, &body);
         let pos = match self
             .envelopes
             .binary_search_by(|e| sort_key(e.lamport, &e.id, lamport, &id))
         {
-            Ok(_) => return STATUS_OK,
+            Ok(_) => return Status::Ok,
             Err(p) => p,
         };
         self.envelopes.insert(
             pos,
             EnvelopeRow {
                 id,
-                kind,
+                // `post` accepts only App envelopes (checked above).
+                kind: EnvelopeKind::App,
                 epoch,
                 lamport,
                 ts_ms,
@@ -272,7 +316,7 @@ impl MsgLog {
                 body,
             },
         );
-        STATUS_OK
+        Status::Ok
     }
 
     /// Page envelopes strictly after the `(after_lamport,
@@ -406,11 +450,11 @@ mod tests {
         b
     }
 
-    fn post(l: &mut MsgLog, lamport: u64, body: &[u8]) -> u8 {
+    fn post(l: &mut MsgLog, lamport: u64, body: &[u8]) -> Status {
         dispatch(
             l,
             Post {
-                kind: ENVELOPE_KIND_APP,
+                kind: EnvelopeKind::App as u8,
                 epoch: 1,
                 lamport,
                 ts_ms: 1000 + lamport,
@@ -423,8 +467,8 @@ mod tests {
     #[test]
     fn post_then_history_round_trips() {
         let mut l = log();
-        assert_eq!(post(&mut l, 1, b"ciphertext-a"), STATUS_OK);
-        assert_eq!(post(&mut l, 2, b"ciphertext-b"), STATUS_OK);
+        assert_eq!(post(&mut l, 1, b"ciphertext-a"), Status::Ok);
+        assert_eq!(post(&mut l, 2, b"ciphertext-b"), Status::Ok);
         let rows = dispatch(
             &mut l,
             History {
@@ -447,7 +491,7 @@ mod tests {
             dispatch(
                 &mut l,
                 Post {
-                    kind: ENVELOPE_KIND_APP,
+                    kind: EnvelopeKind::App as u8,
                     epoch: 1,
                     lamport: 1,
                     ts_ms: 1,
@@ -457,18 +501,18 @@ mod tests {
             )
         };
         // Arbitrary bytes with no MLS framing are refused.
-        assert_eq!(bad(b"not-mls-at-all".to_vec()), STATUS_INVALID_INPUT);
+        assert_eq!(bad(b"not-mls-at-all".to_vec()), Status::InvalidInput);
         // Right version but the wrong wire format (Welcome = 3, not the
         // PrivateMessage = 2 the data plane carries) is refused.
         assert_eq!(
             bad(vec![0x00, 0x01, 0x00, 0x03, 0xAB]),
-            STATUS_INVALID_INPUT
+            Status::InvalidInput
         );
         // A body shorter than the prefix is refused.
-        assert_eq!(bad(vec![0x00, 0x01]), STATUS_INVALID_INPUT);
+        assert_eq!(bad(vec![0x00, 0x01]), Status::InvalidInput);
         assert_eq!(dispatch(&mut l, Stats).count, 0);
         // The same payload under valid framing is accepted and stored.
-        assert_eq!(post(&mut l, 1, b"real"), STATUS_OK);
+        assert_eq!(post(&mut l, 1, b"real"), Status::Ok);
         assert_eq!(dispatch(&mut l, Stats).count, 1);
     }
 
@@ -477,8 +521,8 @@ mod tests {
         // A CRDT merge can replay the same event on a replica
         // that already holds it — the log must not duplicate.
         let mut l = log();
-        assert_eq!(post(&mut l, 1, b"same"), STATUS_OK);
-        assert_eq!(post(&mut l, 1, b"same"), STATUS_OK);
+        assert_eq!(post(&mut l, 1, b"same"), Status::Ok);
+        assert_eq!(post(&mut l, 1, b"same"), Status::Ok);
         assert_eq!(dispatch(&mut l, Stats).count, 1);
     }
 
@@ -583,7 +627,7 @@ mod tests {
             dispatch(
                 &mut l,
                 Post {
-                    kind: ENVELOPE_KIND_APP,
+                    kind: EnvelopeKind::App as u8,
                     epoch: 1,
                     lamport: 1,
                     ts_ms: 0,
@@ -591,19 +635,19 @@ mod tests {
                     body: Vec::new(),
                 },
             ),
-            STATUS_INVALID_INPUT
+            Status::InvalidInput
         );
         // Zero lamport.
-        assert_eq!(post(&mut l, 0, b"x"), STATUS_INVALID_INPUT);
+        assert_eq!(post(&mut l, 0, b"x"), Status::InvalidInput);
         // Oversized body.
         let huge = vec![0u8; MAX_BODY_BYTES + 1];
-        assert_eq!(post(&mut l, 1, &huge), STATUS_BODY_TOO_LARGE);
+        assert_eq!(post(&mut l, 1, &huge), Status::BodyTooLarge);
         // Control-plane kind on the data plane.
         assert_eq!(
             dispatch(
                 &mut l,
                 Post {
-                    kind: ENVELOPE_KIND_COMMIT,
+                    kind: EnvelopeKind::Commit as u8,
                     epoch: 1,
                     lamport: 1,
                     ts_ms: 0,
@@ -611,14 +655,14 @@ mod tests {
                     body: b"c".to_vec(),
                 },
             ),
-            STATUS_INVALID_INPUT,
+            Status::InvalidInput,
         );
         // Malformed hint length.
         assert_eq!(
             dispatch(
                 &mut l,
                 Post {
-                    kind: ENVELOPE_KIND_APP,
+                    kind: EnvelopeKind::App as u8,
                     epoch: 1,
                     lamport: 1,
                     ts_ms: 0,
@@ -626,7 +670,7 @@ mod tests {
                     body: b"c".to_vec(),
                 },
             ),
-            STATUS_INVALID_INPUT,
+            Status::InvalidInput,
         );
         assert_eq!(dispatch(&mut l, Stats).count, 0);
     }

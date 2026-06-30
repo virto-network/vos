@@ -70,11 +70,51 @@ pub const PAGE_BYTE_BUDGET: usize = 12 * 1024;
 
 // ── Status codes ──────────────────────────────────────────────────
 
-pub const STATUS_OK: u8 = 0;
-pub const STATUS_INVALID_INPUT: u8 = 1;
-pub const STATUS_TOO_LARGE: u8 = 2;
-pub const STATUS_QUOTA_EXCEEDED: u8 = 3;
-pub const STATUS_EXISTS: u8 = 4;
+/// Status returned by a directory mutation handler. `Ok` is `0`.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum Status {
+    /// Handler succeeded.
+    Ok = 0,
+    /// An argument was empty or otherwise malformed.
+    InvalidInput = 1,
+    /// A byte field exceeded its size budget.
+    TooLarge = 2,
+    /// The owner is at its KeyPackage quota.
+    QuotaExceeded = 3,
+    /// A channel with this name is already announced.
+    Exists = 4,
+}
+
+impl Status {
+    /// Decode a status byte (the over-the-wire discriminant) back into a
+    /// `Status`. `None` for an unknown byte.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Status::Ok,
+            1 => Status::InvalidInput,
+            2 => Status::TooLarge,
+            3 => Status::QuotaExceeded,
+            4 => Status::Exists,
+            _ => return None,
+        })
+    }
+}
+
+impl core::fmt::Display for Status {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Status::Ok => "ok",
+            Status::InvalidInput => "invalid input",
+            Status::TooLarge => "too large",
+            Status::QuotaExceeded => "quota exceeded",
+            Status::Exists => "exists",
+        })
+    }
+}
 
 // ── Wire types ────────────────────────────────────────────────────
 
@@ -176,19 +216,19 @@ impl MsgDirectory {
     /// Publish one KeyPackage under `owner`. Idempotent by content
     /// hash; bounded per member.
     #[msg(role = MsgDirectoryRole::Publisher)]
-    async fn publish_kp(&mut self, owner: String, kp: Vec<u8>) -> u8 {
+    async fn publish_kp(&mut self, owner: String, kp: Vec<u8>) -> Status {
         if owner.is_empty() || kp.is_empty() || owner.len() > MAX_NAME_BYTES {
-            return STATUS_INVALID_INPUT;
+            return Status::InvalidInput;
         }
         if kp.len() > MAX_KP_BYTES {
-            return STATUS_TOO_LARGE;
+            return Status::TooLarge;
         }
         let hash = kp_hash(&kp);
         let pos = match self
             .key_packages
             .binary_search_by(|r| kp_key(&r.owner, &r.hash, &owner, &hash))
         {
-            Ok(_) => return STATUS_OK,
+            Ok(_) => return Status::Ok,
             Err(p) => p,
         };
         // Bound *live* (unclaimed) inventory, not lifetime
@@ -201,7 +241,7 @@ impl MsgDirectory {
             .filter(|r| r.owner == owner && !r.claimed)
             .count();
         if unclaimed >= MAX_KPS_PER_MEMBER {
-            return STATUS_QUOTA_EXCEEDED;
+            return Status::QuotaExceeded;
         }
         self.key_packages.insert(
             pos,
@@ -212,7 +252,7 @@ impl MsgDirectory {
                 claimed: false,
             },
         );
-        STATUS_OK
+        Status::Ok
     }
 
     /// Claim one unclaimed KeyPackage for `owner`: marks it
@@ -237,11 +277,11 @@ impl MsgDirectory {
     /// transport level it may still have landed, and re-arming the
     /// package would hand a consumed KeyPackage to the next
     /// claimer. Idempotent — unknown or already-unclaimed rows are
-    /// `STATUS_OK` so retries are safe.
+    /// `Status::Ok` so retries are safe.
     #[msg(role = MsgDirectoryRole::Publisher)]
-    async fn release_kp(&mut self, owner: String, hash: Vec<u8>) -> u8 {
+    async fn release_kp(&mut self, owner: String, hash: Vec<u8>) -> Status {
         let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) else {
-            return STATUS_INVALID_INPUT;
+            return Status::InvalidInput;
         };
         if let Ok(pos) = self
             .key_packages
@@ -249,7 +289,7 @@ impl MsgDirectory {
         {
             self.key_packages[pos].claimed = false;
         }
-        STATUS_OK
+        Status::Ok
     }
 
     /// Unclaimed packages left for `owner` — the publisher's
@@ -263,19 +303,19 @@ impl MsgDirectory {
     }
 
     /// Announce a channel. First announcement wins; re-announcing
-    /// the same name is `STATUS_EXISTS` so creators notice
+    /// the same name is `Status::Exists` so creators notice
     /// collisions.
     #[msg(role = MsgDirectoryRole::Publisher)]
-    async fn announce_channel(&mut self, name: String, creator: String) -> u8 {
+    async fn announce_channel(&mut self, name: String, creator: String) -> Status {
         if name.is_empty() || name.len() > MAX_NAME_BYTES || creator.len() > MAX_NAME_BYTES {
-            return STATUS_INVALID_INPUT;
+            return Status::InvalidInput;
         }
         let pos = match self.channels.binary_search_by(|r| r.name.cmp(&name)) {
-            Ok(_) => return STATUS_EXISTS,
+            Ok(_) => return Status::Exists,
             Err(p) => p,
         };
         self.channels.insert(pos, ChannelRow { name, creator });
-        STATUS_OK
+        Status::Ok
     }
 
     /// Announced channels, name-sorted, byte-budgeted page from
@@ -352,7 +392,7 @@ mod tests {
         run(<MsgDirectory as Message<M>>::handle(d, msg, &mut ctx))
     }
 
-    fn publish(d: &mut MsgDirectory, owner: &str, kp: &[u8]) -> u8 {
+    fn publish(d: &mut MsgDirectory, owner: &str, kp: &[u8]) -> Status {
         dispatch(
             d,
             PublishKp {
@@ -374,8 +414,8 @@ mod tests {
     #[test]
     fn each_published_kp_is_claimable_exactly_once() {
         let mut d = MsgDirectory::new();
-        assert_eq!(publish(&mut d, "bob", b"kp-one"), STATUS_OK);
-        assert_eq!(publish(&mut d, "bob", b"kp-two"), STATUS_OK);
+        assert_eq!(publish(&mut d, "bob", b"kp-one"), Status::Ok);
+        assert_eq!(publish(&mut d, "bob", b"kp-two"), Status::Ok);
         assert_eq!(
             dispatch(
                 &mut d,
@@ -408,8 +448,8 @@ mod tests {
     #[test]
     fn publish_is_idempotent_by_content() {
         let mut d = MsgDirectory::new();
-        assert_eq!(publish(&mut d, "bob", b"same"), STATUS_OK);
-        assert_eq!(publish(&mut d, "bob", b"same"), STATUS_OK);
+        assert_eq!(publish(&mut d, "bob", b"same"), Status::Ok);
+        assert_eq!(publish(&mut d, "bob", b"same"), Status::Ok);
         assert_eq!(
             dispatch(
                 &mut d,
@@ -424,25 +464,25 @@ mod tests {
     #[test]
     fn publish_validates_shape_and_quota() {
         let mut d = MsgDirectory::new();
-        assert_eq!(publish(&mut d, "", b"kp"), STATUS_INVALID_INPUT);
-        assert_eq!(publish(&mut d, "bob", b""), STATUS_INVALID_INPUT);
+        assert_eq!(publish(&mut d, "", b"kp"), Status::InvalidInput);
+        assert_eq!(publish(&mut d, "bob", b""), Status::InvalidInput);
         let huge = vec![0u8; MAX_KP_BYTES + 1];
-        assert_eq!(publish(&mut d, "bob", &huge), STATUS_TOO_LARGE);
+        assert_eq!(publish(&mut d, "bob", &huge), Status::TooLarge);
         for i in 0..MAX_KPS_PER_MEMBER {
             assert_eq!(
                 publish(&mut d, "bob", format!("kp-{i}").as_bytes()),
-                STATUS_OK
+                Status::Ok
             );
         }
         assert_eq!(
             publish(&mut d, "bob", b"one-too-many"),
-            STATUS_QUOTA_EXCEEDED
+            Status::QuotaExceeded
         );
         // Quota is per member.
-        assert_eq!(publish(&mut d, "carol", b"kp"), STATUS_OK);
+        assert_eq!(publish(&mut d, "carol", b"kp"), Status::Ok);
         // Oversized owner / channel names are refused.
         let long = "x".repeat(MAX_NAME_BYTES + 1);
-        assert_eq!(publish(&mut d, &long, b"kp"), STATUS_INVALID_INPUT);
+        assert_eq!(publish(&mut d, &long, b"kp"), Status::InvalidInput);
         assert_eq!(
             dispatch(
                 &mut d,
@@ -451,7 +491,7 @@ mod tests {
                     creator: "alice".into(),
                 },
             ),
-            STATUS_INVALID_INPUT,
+            Status::InvalidInput,
         );
     }
 
@@ -465,13 +505,13 @@ mod tests {
         for i in 0..MAX_KPS_PER_MEMBER {
             assert_eq!(
                 publish(&mut d, "bob", format!("kp-{i}").as_bytes()),
-                STATUS_OK
+                Status::Ok
             );
         }
-        assert_eq!(publish(&mut d, "bob", b"blocked"), STATUS_QUOTA_EXCEEDED);
+        assert_eq!(publish(&mut d, "bob", b"blocked"), Status::QuotaExceeded);
         // Consume one; a slot frees up.
         assert!(!claim(&mut d, "bob").is_empty());
-        assert_eq!(publish(&mut d, "bob", b"replenished"), STATUS_OK);
+        assert_eq!(publish(&mut d, "bob", b"replenished"), Status::Ok);
     }
 
     #[test]
@@ -491,7 +531,7 @@ mod tests {
                     hash: hash.to_vec(),
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(
             dispatch(
@@ -520,7 +560,7 @@ mod tests {
                     hash: hash.clone(),
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         // Unknown owner/hash: still OK (retry-safe).
         assert_eq!(
@@ -531,7 +571,7 @@ mod tests {
                     hash,
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         // Malformed hash length is the one refused input.
         assert_eq!(
@@ -542,7 +582,7 @@ mod tests {
                     hash: vec![0u8; 7],
                 },
             ),
-            STATUS_INVALID_INPUT,
+            Status::InvalidInput,
         );
         // Inventory unchanged throughout.
         assert_eq!(
@@ -575,7 +615,7 @@ mod tests {
                     creator: "alice".into(),
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(
             dispatch(
@@ -585,7 +625,7 @@ mod tests {
                     creator: "mallory".into(),
                 },
             ),
-            STATUS_EXISTS,
+            Status::Exists,
         );
         let rows = dispatch(&mut d, Channels { from: 0, limit: 10 });
         assert_eq!(rows.len(), 1);

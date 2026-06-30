@@ -177,7 +177,7 @@ pub(crate) async fn log_post(
     body: Vec<u8>,
 ) -> Result<(), String> {
     let msg = Msg::new("post")
-        .with("kind", msg_log::ENVELOPE_KIND_APP as u64)
+        .with("kind", msg_log::EnvelopeKind::App as u64)
         .with("epoch", epoch)
         .with("lamport", lamport)
         .with("ts_ms", ts_ms)
@@ -186,9 +186,9 @@ pub(crate) async fn log_post(
     let value = ask_value(ctx, ServiceId(log_id), &msg)
         .await
         .ok_or_else(|| "msg-log unreachable".to_string())?;
-    match value_to_status(value) {
-        Some(msg_log::STATUS_OK) => Ok(()),
-        Some(code) => Err(format!("msg-log refused the envelope (status {code})")),
+    match value_to_status(value).and_then(msg_log::Status::from_u8) {
+        Some(msg_log::Status::Ok) => Ok(()),
+        Some(other) => Err(format!("msg-log refused the envelope ({other})")),
         None => Err("bad msg-log reply".into()),
     }
 }
@@ -287,11 +287,9 @@ pub(crate) async fn dir_publish_kp(
     let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    match value_to_status(value) {
-        Some(msg_directory::STATUS_OK) => Ok(()),
-        Some(code) => Err(format!(
-            "msg-directory refused the key package (status {code})"
-        )),
+    match value_to_status(value).and_then(msg_directory::Status::from_u8) {
+        Some(msg_directory::Status::Ok) => Ok(()),
+        Some(other) => Err(format!("msg-directory refused the key package ({other})")),
         None => Err("bad msg-directory reply".into()),
     }
 }
@@ -358,9 +356,9 @@ pub(crate) async fn dir_release_kp(
     let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    match value_to_status(value) {
-        Some(msg_directory::STATUS_OK) => Ok(()),
-        Some(code) => Err(format!("msg-directory refused the release (status {code})")),
+    match value_to_status(value).and_then(msg_directory::Status::from_u8) {
+        Some(msg_directory::Status::Ok) => Ok(()),
+        Some(other) => Err(format!("msg-directory refused the release ({other})")),
         None => Err("bad msg-directory reply".into()),
     }
 }
@@ -371,14 +369,16 @@ pub(crate) async fn dir_announce_channel(
     dir_id: u32,
     name: &str,
     creator: &str,
-) -> Result<u8, String> {
+) -> Result<msg_directory::Status, String> {
     let msg = Msg::new("announce_channel")
         .with("name", name.to_string())
         .with("creator", creator.to_string());
     let value = ask_value(ctx, ServiceId(dir_id), &msg)
         .await
         .ok_or_else(|| "msg-directory unreachable".to_string())?;
-    value_to_status(value).ok_or_else(|| "bad msg-directory reply".to_string())
+    value_to_status(value)
+        .and_then(msg_directory::Status::from_u8)
+        .ok_or_else(|| "bad msg-directory reply".to_string())
 }
 
 /// `msg-directory.channels` — one page of announcements.

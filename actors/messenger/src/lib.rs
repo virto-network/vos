@@ -481,11 +481,11 @@ impl Messenger {
             Err(e) => Err(e),
         };
         match announced {
-            Ok(msg_directory::STATUS_OK) => format!("channel '{channel}' created and announced"),
-            Ok(msg_directory::STATUS_EXISTS) => format!(
+            Ok(msg_directory::Status::Ok) => format!("channel '{channel}' created and announced"),
+            Ok(msg_directory::Status::Exists) => format!(
                 "channel '{channel}' created — a channel of that name was already announced"
             ),
-            Ok(code) => format!("channel '{channel}' created (announce failed, status {code})"),
+            Ok(other) => format!("channel '{channel}' created (announce failed: {other})"),
             Err(e) => format!("channel '{channel}' created (no directory: {e})"),
         }
     }
@@ -774,7 +774,7 @@ impl Messenger {
         let lamport = self.channels[i].max_lamport.saturating_add(1);
         let ts_ms = now_ms();
         let id = msg_log::envelope_id(
-            msg_log::ENVELOPE_KIND_APP,
+            msg_log::EnvelopeKind::App as u8,
             epoch,
             lamport,
             ts_ms,
@@ -1216,7 +1216,7 @@ impl Messenger {
                 Err(e) => return Err(ChainErr::Indeterminate(e)),
             };
             match outcome.status {
-                msg_ctl::STATUS_OK => {
+                msg_ctl::Status::Ok => {
                     group
                         .apply_pending_commit()
                         .map_err(|e| format!("applying own commit failed: {e:?}"))?;
@@ -1229,7 +1229,7 @@ impl Messenger {
                     }
                     return Ok(epoch + 1);
                 }
-                msg_ctl::STATUS_EPOCH_TAKEN | msg_ctl::STATUS_EPOCH_GAP if attempt == 0 => {
+                msg_ctl::Status::EpochTaken | msg_ctl::Status::EpochGap if attempt == 0 => {
                     // Drop our rejected pending commit; the unapplied build
                     // wrote nothing to storage, so there is nothing to persist
                     // — drain_ctl re-syncs and re-snapshots from the chain.
@@ -1244,10 +1244,10 @@ impl Messenger {
                 other => {
                     group.clear_pending_commit();
                     return Err(ChainErr::Refused(match other {
-                        msg_ctl::STATUS_EPOCH_TAKEN => format!(
+                        msg_ctl::Status::EpochTaken => format!(
                             "another commit won epoch {epoch} again — channel is contended, retry"
                         ),
-                        msg_ctl::STATUS_EPOCH_GAP => format!(
+                        msg_ctl::Status::EpochGap => format!(
                             "local group still behind the chain (next is {}) — wait for sync",
                             outcome.next_epoch
                         ),

@@ -613,7 +613,7 @@ mod tests {
             add_commit,
             Some((welcome, msg_directory::kp_hash(&bob_kp))),
         );
-        assert_eq!(outcome.status, msg_ctl::STATUS_OK);
+        assert_eq!(outcome.status, msg_ctl::Status::Ok);
         alice_group.apply_pending_commit().unwrap();
 
         let row = ctl_dispatch(&mut ctl, msg_ctl::CommitAt { epoch: 0 }).unwrap();
@@ -646,13 +646,13 @@ mod tests {
             alice_commit,
             Some((charlie_welcome, msg_directory::kp_hash(&charlie_kp))),
         );
-        assert_eq!(outcome.status, msg_ctl::STATUS_OK);
+        assert_eq!(outcome.status, msg_ctl::Status::Ok);
         alice_group.apply_pending_commit().unwrap();
 
         let outcome = submit(&mut ctl, 1, bob_commit, None);
         assert_eq!(
             outcome.status,
-            msg_ctl::STATUS_EPOCH_TAKEN,
+            msg_ctl::Status::EpochTaken,
             "the second commit for epoch 1 must lose"
         );
 
@@ -672,7 +672,7 @@ mod tests {
         let bob_retry = bob_group.commit(Vec::new()).unwrap();
         assert!(bob_retry.welcome_messages.is_empty());
         let outcome = submit(&mut ctl, 2, bob_retry.commit_message.to_bytes().unwrap(), None);
-        assert_eq!(outcome.status, msg_ctl::STATUS_OK);
+        assert_eq!(outcome.status, msg_ctl::Status::Ok);
         bob_group.apply_pending_commit().unwrap();
 
         // Alice processes bob's re-issued commit off the chain.
