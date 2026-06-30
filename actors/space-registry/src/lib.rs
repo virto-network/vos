@@ -379,45 +379,106 @@ pub struct HostMapping {
 }
 
 // ── Result codes ─────────────────────────────────────────────────
-//
-// Mutation messages return a single u8 status. 0 always = ok.
 
-pub const STATUS_OK: u8 = 0;
-pub const STATUS_TAG_CONFLICT: u8 = 1;
-pub const STATUS_NOT_FOUND: u8 = 2;
-pub const STATUS_IN_USE: u8 = 3;
-pub const STATUS_PROGRAM_NOT_FOUND: u8 = 4;
-pub const STATUS_INSTANCE_EXISTS: u8 = 5;
-pub const STATUS_BAD_HASH: u8 = 6;
-/// Sprint 2: the caller's PeerId doesn't carry the auth role
-/// required for this handler. Distinct from `STATUS_NOT_FOUND`
-/// so clients can surface "permission denied" specifically.
-pub const STATUS_FORBIDDEN: u8 = 7;
-/// Hyperspace `register_remote`: the supplied `host_prefix`
-/// doesn't match any registered node prefix. Distinct from
-/// `STATUS_NOT_FOUND` so callers can distinguish "instance
-/// not found" from "host node not enrolled".
-pub const STATUS_BAD_PREFIX: u8 = 8;
-/// Monotone-locality guard: `install` refused to (re)create an
-/// instance at a *wider* consistency tier than the narrowest one
-/// the same `instance_name` was ever installed at. Confined tiers
-/// (`Ephemeral`/`Local`) may never be widened into replication by
-/// reusing a name — widening requires a fresh name. This is the
-/// defense-in-depth half of the immutable-local seal; the
-/// load-bearing enforcement is host-side in `vos::node`.
-pub const STATUS_CONSISTENCY_WIDEN_DENIED: u8 = 9;
-/// Anti-replay guard: `install` refused because its `replication_id`
-/// was already consumed by a prior install (the id is a grow-only
-/// tombstone that outlives `uninstall`). A captured `install` op
-/// replayed to resurrect an uninstalled agent hits this; a legitimate
-/// reinstall must mint a fresh `replication_id`.
-pub const STATUS_REPLICATION_ID_REUSED: u8 = 10;
-/// Compare-and-swap guard: `upgrade` refused because the instance's
-/// live program hash no longer matches the `from_hash` the op was
-/// authored against — a replayed or superseded upgrade (e.g. a
-/// version rollback re-injected via CRDT). Re-issue against the
-/// current hash to proceed.
-pub const STATUS_STALE_UPGRADE: u8 = 11;
+/// Status returned by a mutation handler. `Ok` is always `0`.
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[repr(u8)]
+pub enum Status {
+    /// Handler succeeded.
+    Ok = 0,
+    /// A `(name, version)` tag already exists bound to a different hash.
+    TagConflict = 1,
+    /// The referenced row doesn't exist.
+    NotFound = 2,
+    /// A program can't be unpublished while an agent still references it.
+    InUse = 3,
+    /// The referenced program isn't in the catalog.
+    ProgramNotFound = 4,
+    /// An agent with this `instance_name` is already installed.
+    InstanceExists = 5,
+    /// A byte field wasn't the expected fixed length.
+    BadHash = 6,
+    /// The caller's PeerId doesn't carry the auth role required for this
+    /// handler. Distinct from `NotFound` so clients can surface
+    /// "permission denied" specifically.
+    Forbidden = 7,
+    /// Hyperspace `register_remote`: the supplied `host_prefix` doesn't
+    /// match any registered node prefix. Distinct from `NotFound` so
+    /// callers can tell "instance not found" from "host node not enrolled".
+    BadPrefix = 8,
+    /// Monotone-locality guard: `install` refused to (re)create an
+    /// instance at a *wider* consistency tier than the narrowest one the
+    /// same `instance_name` was ever installed at. Confined tiers
+    /// (`Ephemeral`/`Local`) may never be widened into replication by
+    /// reusing a name — widening requires a fresh name. This is the
+    /// defense-in-depth half of the immutable-local seal; the
+    /// load-bearing enforcement is host-side in `vos::node`.
+    ConsistencyWidenDenied = 9,
+    /// Anti-replay guard: `install` refused because its `replication_id`
+    /// was already consumed by a prior install (the id is a grow-only
+    /// tombstone that outlives `uninstall`). A captured `install` op
+    /// replayed to resurrect an uninstalled agent hits this; a legitimate
+    /// reinstall must mint a fresh `replication_id`.
+    ReplicationIdReused = 10,
+    /// Compare-and-swap guard: `upgrade` refused because the instance's
+    /// live program hash no longer matches the `from_hash` the op was
+    /// authored against — a replayed or superseded upgrade (e.g. a
+    /// version rollback re-injected via CRDT). Re-issue against the
+    /// current hash to proceed.
+    StaleUpgrade = 11,
+}
+
+impl Status {
+    /// Decode a status byte (the over-the-wire discriminant) back into a
+    /// `Status`. `None` for an unknown byte. Used by raw callers that
+    /// pull the reply byte directly rather than through a typed `Ref`.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Status::Ok,
+            1 => Status::TagConflict,
+            2 => Status::NotFound,
+            3 => Status::InUse,
+            4 => Status::ProgramNotFound,
+            5 => Status::InstanceExists,
+            6 => Status::BadHash,
+            7 => Status::Forbidden,
+            8 => Status::BadPrefix,
+            9 => Status::ConsistencyWidenDenied,
+            10 => Status::ReplicationIdReused,
+            11 => Status::StaleUpgrade,
+            _ => return None,
+        })
+    }
+}
+
+impl core::fmt::Display for Status {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Status::Ok => "ok",
+            Status::TagConflict => "tag conflict",
+            Status::NotFound => "not found",
+            Status::InUse => "in use",
+            Status::ProgramNotFound => "program not found",
+            Status::InstanceExists => "instance exists",
+            Status::BadHash => "bad hash",
+            Status::Forbidden => "forbidden",
+            Status::BadPrefix => "bad prefix",
+            Status::ConsistencyWidenDenied => "consistency widen denied",
+            Status::ReplicationIdReused => "replication id reused",
+            Status::StaleUpgrade => "stale upgrade",
+        })
+    }
+}
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -564,15 +625,15 @@ impl SpaceRegistry {
     /// commit that `space verify` recomputes against the advertised
     /// `space_id`.
     #[msg]
-    async fn set_root(&mut self, root: Vec<u8>) -> u8 {
+    async fn set_root(&mut self, root: Vec<u8>) -> Status {
         if root.is_empty() {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         }
         if !self.root.is_empty() {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         self.root = root;
-        STATUS_OK
+        Status::Ok
     }
 
     /// The genesis root PeerId, or empty if none is set. Read surface
@@ -586,18 +647,18 @@ impl SpaceRegistry {
 
     /// Add a program to the catalog. Tags are immutable — if
     /// `(name, version)` already exists, returns
-    /// `STATUS_TAG_CONFLICT` unless the existing hash matches
+    /// `Status::TagConflict` unless the existing hash matches
     /// (idempotent re-publish).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn publish(&mut self, name: String, version: String, hash: Vec<u8>, auth: Vec<u8>) -> u8 {
+    async fn publish(&mut self, name: String, version: String, hash: Vec<u8>, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("publish", &[name.as_bytes(), version.as_bytes(), &hash]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let Some(hash) = bytes_to_32(&hash) else {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         };
         let mut idx = 0usize;
         while idx < self.programs.len() {
@@ -605,9 +666,9 @@ impl SpaceRegistry {
             let cmp = compare_program(&cur.name, &cur.version, &name, &version);
             if cmp == 0 {
                 if cur.hash == hash {
-                    return STATUS_OK;
+                    return Status::Ok;
                 }
-                return STATUS_TAG_CONFLICT;
+                return Status::TagConflict;
             }
             if cmp > 0 {
                 break;
@@ -622,18 +683,18 @@ impl SpaceRegistry {
                 hash,
             },
         );
-        STATUS_OK
+        Status::Ok
     }
 
     /// Remove a program from the catalog. Errors with
-    /// `STATUS_IN_USE` if any agent still references the version.
+    /// `Status::InUse` if any agent still references the version.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn unpublish(&mut self, name: String, version: String, auth: Vec<u8>) -> u8 {
+    async fn unpublish(&mut self, name: String, version: String, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("unpublish", &[name.as_bytes(), version.as_bytes()]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let mut idx = 0usize;
         while idx < self.programs.len() {
@@ -643,16 +704,16 @@ impl SpaceRegistry {
                 let mut ai = 0usize;
                 while ai < self.agents.len() {
                     if self.agents[ai].program_hash == hash {
-                        return STATUS_IN_USE;
+                        return Status::InUse;
                     }
                     ai += 1;
                 }
                 self.programs.remove(idx);
-                return STATUS_OK;
+                return Status::Ok;
             }
             idx += 1;
         }
-        STATUS_NOT_FOUND
+        Status::NotFound
     }
 
     /// Look up a single program by `(name, version)`.
@@ -679,32 +740,32 @@ impl SpaceRegistry {
     /// Record (or replace) the metadata blob for a program hash.
     /// Idempotent: re-registering the same hash overwrites the
     /// existing blob (lets a manifest re-deploy refresh schema).
-    /// Returns `STATUS_BAD_HASH` if the hash isn't 32 bytes;
-    /// otherwise `STATUS_OK`. The hash doesn't need to match an
+    /// Returns `Status::BadHash` if the hash isn't 32 bytes;
+    /// otherwise `Status::Ok`. The hash doesn't need to match an
     /// existing `ProgramRow` — schema can be registered before
     /// the program is published if the orchestrator prefers
     /// that order.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn register_meta(&mut self, program_hash: Vec<u8>, blob: Vec<u8>, auth: Vec<u8>) -> u8 {
+    async fn register_meta(&mut self, program_hash: Vec<u8>, blob: Vec<u8>, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("register_meta", &[&program_hash, &blob]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         };
         let mut idx = 0usize;
         while idx < self.metas.len() {
             if self.metas[idx].program_hash == program_hash {
                 self.metas[idx].blob = blob;
-                return STATUS_OK;
+                return Status::Ok;
             }
             idx += 1;
         }
         self.metas.push(MetaRow { program_hash, blob });
-        STATUS_OK
+        Status::Ok
     }
 
     /// Look up the metadata blob for a program hash. Returns an
@@ -784,12 +845,12 @@ impl SpaceRegistry {
         instance_name: String,
         blob: Vec<u8>,
         auth: Vec<u8>,
-    ) -> u8 {
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("register_extension_meta", &[instance_name.as_bytes(), &blob]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let mut idx = 0usize;
         while idx < self.extension_metas.len() {
@@ -799,7 +860,7 @@ impl SpaceRegistry {
                 } else {
                     self.extension_metas[idx].blob = blob;
                 }
-                return STATUS_OK;
+                return Status::Ok;
             }
             idx += 1;
         }
@@ -809,7 +870,7 @@ impl SpaceRegistry {
                 blob,
             });
         }
-        STATUS_OK
+        Status::Ok
     }
 
     // ── Agents (instances) ──────────────────────────────────────
@@ -832,7 +893,7 @@ impl SpaceRegistry {
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
         auth: Vec<u8>,
-    ) -> u8 {
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes(
                 "install",
@@ -849,13 +910,13 @@ impl SpaceRegistry {
             ),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         };
         let Some(replication_id) = bytes_to_32(&replication_id) else {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         };
 
         // Verify program exists with the claimed hash.
@@ -870,14 +931,14 @@ impl SpaceRegistry {
             pi += 1;
         }
         if !found {
-            return STATUS_PROGRAM_NOT_FOUND;
+            return Status::ProgramNotFound;
         }
 
         let mut idx = 0usize;
         while idx < self.agents.len() {
             let cur = &self.agents[idx];
             if cur.instance_name == instance_name {
-                return STATUS_INSTANCE_EXISTS;
+                return Status::InstanceExists;
             }
             if cur.instance_name.as_str() > instance_name.as_str() {
                 break;
@@ -896,7 +957,7 @@ impl SpaceRegistry {
             .binary_search(&replication_id)
             .is_ok()
         {
-            return STATUS_REPLICATION_ID_REUSED;
+            return Status::ReplicationIdReused;
         }
 
         // Monotone-locality guard (defense-in-depth): if this name was
@@ -905,10 +966,10 @@ impl SpaceRegistry {
         // fresh name (and a fresh `replication_id`), so private-era state
         // is never folded into a now-shared DAG. The floor outlives the
         // row, so this fires on the uninstall→reinstall-wider path; a live
-        // row already returned `STATUS_INSTANCE_EXISTS` above.
+        // row already returned `Status::InstanceExists` above.
         if let Some(floor) = consistency_floor(&self.consistency_floors, &instance_name) {
             if !may_transition_to(floor, consistency) {
-                return STATUS_CONSISTENCY_WIDEN_DENIED;
+                return Status::ConsistencyWidenDenied;
             }
         }
         record_consistency_floor(
@@ -934,28 +995,28 @@ impl SpaceRegistry {
         if let Err(at) = self.used_replication_ids.binary_search(&replication_id) {
             self.used_replication_ids.insert(at, replication_id);
         }
-        STATUS_OK
+        Status::Ok
     }
 
     /// Tombstone an agent. Local data on each replica moves to
     /// trash on the host side; the registry just removes the row.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn uninstall(&mut self, instance_name: String, auth: Vec<u8>) -> u8 {
+    async fn uninstall(&mut self, instance_name: String, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("uninstall", &[instance_name.as_bytes()]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let mut idx = 0usize;
         while idx < self.agents.len() {
             if self.agents[idx].instance_name == instance_name {
                 self.agents.remove(idx);
-                return STATUS_OK;
+                return Status::Ok;
             }
             idx += 1;
         }
-        STATUS_NOT_FOUND
+        Status::NotFound
     }
 
     /// Repoint an agent at a different program version. State
@@ -978,7 +1039,7 @@ impl SpaceRegistry {
         new_program_hash: Vec<u8>,
         from_hash: Vec<u8>,
         auth: Vec<u8>,
-    ) -> u8 {
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes(
                 "upgrade",
@@ -992,13 +1053,13 @@ impl SpaceRegistry {
             ),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let Some(new_program_hash) = bytes_to_32(&new_program_hash) else {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         };
         let Some(from_hash) = bytes_to_32(&from_hash) else {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         };
 
         // Verify the target program exists.
@@ -1016,7 +1077,7 @@ impl SpaceRegistry {
             pi += 1;
         }
         if !found {
-            return STATUS_PROGRAM_NOT_FOUND;
+            return Status::ProgramNotFound;
         }
 
         let mut idx = 0usize;
@@ -1027,16 +1088,16 @@ impl SpaceRegistry {
                 // refused, so an instance can't be rolled back by
                 // re-injecting a superseded `upgrade` op.
                 if self.agents[idx].program_hash != from_hash {
-                    return STATUS_STALE_UPGRADE;
+                    return Status::StaleUpgrade;
                 }
                 self.agents[idx].program_name = new_program_name;
                 self.agents[idx].program_version = new_program_version;
                 self.agents[idx].program_hash = new_program_hash;
-                return STATUS_OK;
+                return Status::Ok;
             }
             idx += 1;
         }
-        STATUS_NOT_FOUND
+        Status::NotFound
     }
 
     #[msg]
@@ -1132,12 +1193,12 @@ impl SpaceRegistry {
     /// register_remote calls to a known clerk pubkey signature; until
     /// that lands, do not deploy this surface to untrusted peers.
     ///
-    /// Returns `STATUS_BAD_PREFIX` when `host_prefix` doesn't fit in
-    /// a u16. Otherwise `STATUS_OK`.
+    /// Returns `Status::BadPrefix` when `host_prefix` doesn't fit in
+    /// a u16. Otherwise `Status::Ok`.
     #[msg]
-    async fn register_remote(&mut self, instance_name: String, host_prefix: u32) -> u8 {
+    async fn register_remote(&mut self, instance_name: String, host_prefix: u32) -> Status {
         if host_prefix > u16::MAX as u32 {
-            return STATUS_BAD_PREFIX;
+            return Status::BadPrefix;
         }
         let host_prefix = host_prefix as u16;
         let mut idx = 0usize;
@@ -1145,7 +1206,7 @@ impl SpaceRegistry {
             let cur = &self.host_mappings[idx];
             if cur.instance_name == instance_name {
                 self.host_mappings[idx].host_prefix = host_prefix;
-                return STATUS_OK;
+                return Status::Ok;
             }
             if cur.instance_name.as_str() > instance_name.as_str() {
                 break;
@@ -1159,7 +1220,7 @@ impl SpaceRegistry {
                 host_prefix,
             },
         );
-        STATUS_OK
+        Status::Ok
     }
 
     /// Snapshot the host-mapping table. Diagnostic/test surface;
@@ -1175,12 +1236,12 @@ impl SpaceRegistry {
     /// updates `peer_id` and `role`. `role` is
     /// `NODE_ROLE_VOTER` or `NODE_ROLE_OBSERVER`.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn add_node(&mut self, prefix: u32, peer_id: Vec<u8>, role: u8, auth: Vec<u8>) -> u8 {
+    async fn add_node(&mut self, prefix: u32, peer_id: Vec<u8>, role: u8, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("add_node", &[&prefix.to_le_bytes(), &peer_id, &[role]]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let prefix = prefix as u16;
         let mut idx = 0usize;
@@ -1189,7 +1250,7 @@ impl SpaceRegistry {
             if cur.kind == MEMBER_KIND_NODE && cur.prefix == prefix {
                 self.members[idx].key = peer_id;
                 self.members[idx].role = role;
-                return STATUS_OK;
+                return Status::Ok;
             }
             // Nodes sort before Identities; within Nodes by prefix.
             if cur.kind == MEMBER_KIND_NODE && cur.prefix > prefix {
@@ -1211,16 +1272,16 @@ impl SpaceRegistry {
                 proof_data: Vec::new(),
             },
         );
-        STATUS_OK
+        Status::Ok
     }
 
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn remove_node(&mut self, prefix: u32, auth: Vec<u8>) -> u8 {
+    async fn remove_node(&mut self, prefix: u32, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("remove_node", &[&prefix.to_le_bytes()]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let prefix = prefix as u16;
         let mut idx = 0usize;
@@ -1228,11 +1289,11 @@ impl SpaceRegistry {
             let cur = &self.members[idx];
             if cur.kind == MEMBER_KIND_NODE && cur.prefix == prefix {
                 self.members.remove(idx);
-                return STATUS_OK;
+                return Status::Ok;
             }
             idx += 1;
         }
-        STATUS_NOT_FOUND
+        Status::NotFound
     }
 
     /// Add an Identity member. The registry stores the `proof`
@@ -1247,7 +1308,7 @@ impl SpaceRegistry {
         proof_kind: u8,
         proof_data: Vec<u8>,
         auth: Vec<u8>,
-    ) -> u8 {
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes(
                 "add_identity",
@@ -1255,7 +1316,7 @@ impl SpaceRegistry {
             ),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let mut idx = 0usize;
         while idx < self.members.len() {
@@ -1264,7 +1325,7 @@ impl SpaceRegistry {
                 if cur.key == public_key {
                     self.members[idx].proof_kind = proof_kind;
                     self.members[idx].proof_data = proof_data;
-                    return STATUS_OK;
+                    return Status::Ok;
                 }
                 if compare_bytes(&cur.key, &public_key) > 0 {
                     break;
@@ -1283,27 +1344,27 @@ impl SpaceRegistry {
                 proof_data,
             },
         );
-        STATUS_OK
+        Status::Ok
     }
 
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn remove_identity(&mut self, public_key: Vec<u8>, auth: Vec<u8>) -> u8 {
+    async fn remove_identity(&mut self, public_key: Vec<u8>, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("remove_identity", &[&public_key]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         let mut idx = 0usize;
         while idx < self.members.len() {
             let cur = &self.members[idx];
             if cur.kind == MEMBER_KIND_IDENTITY && cur.key == public_key {
                 self.members.remove(idx);
-                return STATUS_OK;
+                return Status::Ok;
             }
             idx += 1;
         }
-        STATUS_NOT_FOUND
+        Status::NotFound
     }
 
     #[msg]
@@ -1340,18 +1401,18 @@ impl SpaceRegistry {
     /// (`grantor`) so [`effective_role`](Self::effective_role) can void
     /// the subtree if the delegator is later revoked.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8, epoch: u64, auth: Vec<u8>) -> u8 {
+    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8, epoch: u64, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("grant_role", &[&peer_id, &[role], &epoch.to_le_bytes()]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         if peer_id.is_empty() {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         }
         let Some((grantor, _)) = unpack_auth(&auth) else {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         };
         let grantor = grantor.to_vec();
         match self
@@ -1368,7 +1429,7 @@ impl SpaceRegistry {
                     self.auth_grants[idx].epoch = epoch;
                     self.auth_grants[idx].grantor = grantor;
                 }
-                STATUS_OK
+                Status::Ok
             }
             Err(insert_at) => {
                 self.auth_grants.insert(
@@ -1380,7 +1441,7 @@ impl SpaceRegistry {
                         grantor,
                     },
                 );
-                STATUS_OK
+                Status::Ok
             }
         }
     }
@@ -1390,18 +1451,18 @@ impl SpaceRegistry {
     /// revoke is replay-position independent (a forged grant ground to
     /// sort before this op is still voided once `effective_role`
     /// recomputes). Re-granting later requires a fresh, higher epoch.
-    /// Always `STATUS_OK`: revoking sets a floor even with no live grant
+    /// Always `Status::Ok`: revoking sets a floor even with no live grant
     /// (it blocks a future replayed grant).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn revoke_role(&mut self, peer_id: Vec<u8>, epoch: u64, auth: Vec<u8>) -> u8 {
+    async fn revoke_role(&mut self, peer_id: Vec<u8>, epoch: u64, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("revoke_role", &[&peer_id, &epoch.to_le_bytes()]),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         bump_revoke_high_water(&mut self.revoke_epochs, peer_id, epoch);
-        STATUS_OK
+        Status::Ok
     }
 
     /// Look up the *effective* role of `peer_id` — the value the
@@ -1466,7 +1527,7 @@ impl SpaceRegistry {
         role: u8,
         epoch: u64,
         auth: Vec<u8>,
-    ) -> u8 {
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes(
                 "grant_actor_role",
@@ -1474,13 +1535,13 @@ impl SpaceRegistry {
             ),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         if peer_id.is_empty() || agent_name.is_empty() {
-            return STATUS_BAD_HASH;
+            return Status::BadHash;
         }
         let Some((grantor, _)) = unpack_auth(&auth) else {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         };
         let grantor = grantor.to_vec();
         match self
@@ -1496,7 +1557,7 @@ impl SpaceRegistry {
                     self.actor_acls[idx].epoch = epoch;
                     self.actor_acls[idx].grantor = grantor;
                 }
-                STATUS_OK
+                Status::Ok
             }
             Err(insert_at) => {
                 self.actor_acls.insert(
@@ -1509,7 +1570,7 @@ impl SpaceRegistry {
                         grantor,
                     },
                 );
-                STATUS_OK
+                Status::Ok
             }
         }
     }
@@ -1517,7 +1578,7 @@ impl SpaceRegistry {
     /// Revoke the actor-local grant for `(peer_id, agent_name)` at
     /// `epoch`, raising its grow-only revoke high-water (replay-position
     /// independent — see [`revoke_role`](Self::revoke_role)). Always
-    /// `STATUS_OK`. Does not affect the space-level grant.
+    /// `Status::Ok`. Does not affect the space-level grant.
     #[msg(role = SpaceRegistryRole::Admin)]
     async fn revoke_actor_role(
         &mut self,
@@ -1525,7 +1586,7 @@ impl SpaceRegistry {
         agent_name: String,
         epoch: u64,
         auth: Vec<u8>,
-    ) -> u8 {
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes(
                 "revoke_actor_role",
@@ -1533,10 +1594,10 @@ impl SpaceRegistry {
             ),
             &auth,
         ) {
-            return STATUS_FORBIDDEN;
+            return Status::Forbidden;
         }
         bump_actor_revoke_high_water(&mut self.actor_revoke_epochs, peer_id, agent_name, epoch);
-        STATUS_OK
+        Status::Ok
     }
 
     /// Current freshness epoch for an actor-local `(peer_id,
@@ -2023,7 +2084,7 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
 // (admin) node and fails on a joined non-admin node — which is correct:
 // a non-admin never authors a catalog row, it consumes the admin's
 // already-signed rows via sync, and the reconcile path tolerates the
-// resulting STATUS_FORBIDDEN. `register_remote` stays unsigned: it is
+// resulting Status::Forbidden. `register_remote` stays unsigned: it is
 // the hyperspace/federation surface and has a separate trust model.
 
 /// Domain tag mixed into the canonical bytes an op is signed over.
@@ -2150,7 +2211,7 @@ mod tests {
                 root: root_peer_id(),
             },
         );
-        assert_eq!(status, STATUS_OK, "set_root on a fresh registry");
+        assert_eq!(status, Status::Ok, "set_root on a fresh registry");
         r
     }
 
@@ -2195,7 +2256,7 @@ mod tests {
         let peer = alloc::vec![1, 2, 3];
         let agent = String::from("dev-project");
         let status = grant_actor(&mut r, &peer, &agent, 2);
-        assert_eq!(status, STATUS_OK);
+        assert_eq!(status, Status::Ok);
 
         let role = dispatch(
             &mut r,
@@ -2231,8 +2292,8 @@ mod tests {
         let mut r = registry();
         let peer = alloc::vec![1, 2, 3];
         let agent = String::from("dev-project");
-        assert_eq!(grant_actor(&mut r, &peer, &agent, 2), STATUS_OK);
-        assert_eq!(grant_actor(&mut r, &peer, &agent, 2), STATUS_OK);
+        assert_eq!(grant_actor(&mut r, &peer, &agent, 2), Status::Ok);
+        assert_eq!(grant_actor(&mut r, &peer, &agent, 2), Status::Ok);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -2273,13 +2334,13 @@ mod tests {
     #[test]
     fn grant_actor_role_rejects_empty_peer_or_name() {
         // Empty peer/name would alias to an unintended row and
-        // collide with future identity bytes. STATUS_BAD_HASH
+        // collide with future identity bytes. Status::BadHash
         // matches the existing convention from grant_role.
         let mut r = registry();
         // The op is root-signed (authorize_op passes); the empty-arg
         // guard inside the handler is what rejects.
-        assert_eq!(grant_actor(&mut r, &[], "x", 1), STATUS_BAD_HASH);
-        assert_eq!(grant_actor(&mut r, &[1], "", 1), STATUS_BAD_HASH);
+        assert_eq!(grant_actor(&mut r, &[], "x", 1), Status::BadHash);
+        assert_eq!(grant_actor(&mut r, &[1], "", 1), Status::BadHash);
     }
 
     // ── revoke_actor_role ───────────────────────────────────────
@@ -2291,7 +2352,7 @@ mod tests {
         let agent = String::from("dev-project");
         grant_actor(&mut r, &peer, &agent, 2);
         let status = revoke_actor(&mut r, &peer, &agent);
-        assert_eq!(status, STATUS_OK);
+        assert_eq!(status, Status::Ok);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -2313,7 +2374,7 @@ mod tests {
         // effect. It returns OK rather than NOT_FOUND for that reason.
         let mut r = registry();
         let status = revoke_actor(&mut r, &[1], "x");
-        assert_eq!(status, STATUS_OK);
+        assert_eq!(status, Status::Ok);
         assert_eq!(dispatch(&mut r, ActorEpoch { peer_id: alloc::vec![1], agent_name: String::from("x") }), 1);
     }
 
@@ -2421,7 +2482,7 @@ mod tests {
     /// Publish a throwaway program (idempotent for the same hash)
     /// and install `name` at `consistency` with a fresh
     /// `replication_id`, returning the status.
-    fn install_at(r: &mut SpaceRegistry, name: &str, consistency: u8) -> u8 {
+    fn install_at(r: &mut SpaceRegistry, name: &str, consistency: u8) -> Status {
         let hash = alloc::vec![7u8; 32];
         let pub_status = dispatch(
             r,
@@ -2432,7 +2493,7 @@ mod tests {
                 auth: root_auth("publish", &[b"p", b"1", &hash]),
             },
         );
-        assert!(pub_status == STATUS_OK, "program publish must succeed");
+        assert!(pub_status == Status::Ok, "program publish must succeed");
         let rep = fresh_rep_id();
         dispatch(
             r,
@@ -2462,7 +2523,7 @@ mod tests {
         )
     }
 
-    fn uninstall(r: &mut SpaceRegistry, name: &str) -> u8 {
+    fn uninstall(r: &mut SpaceRegistry, name: &str) -> Status {
         dispatch(
             r,
             Uninstall {
@@ -2497,39 +2558,39 @@ mod tests {
     #[test]
     fn reinstall_widening_after_uninstall_is_denied() {
         let mut r = registry();
-        assert_eq!(install_at(&mut r, "msg-foo", 1 /* Local */), STATUS_OK);
-        assert_eq!(uninstall(&mut r, "msg-foo"), STATUS_OK);
+        assert_eq!(install_at(&mut r, "msg-foo", 1 /* Local */), Status::Ok);
+        assert_eq!(uninstall(&mut r, "msg-foo"), Status::Ok);
         // The floor survives uninstall: reusing the name at a wider tier
         // is refused — widening needs a fresh name.
         assert_eq!(
             install_at(&mut r, "msg-foo", 2 /* Crdt */),
-            STATUS_CONSISTENCY_WIDEN_DENIED
+            Status::ConsistencyWidenDenied
         );
         assert_eq!(
             install_at(&mut r, "msg-foo", 3 /* Raft */),
-            STATUS_CONSISTENCY_WIDEN_DENIED
+            Status::ConsistencyWidenDenied
         );
         // Re-installing at the same or a narrower tier is fine.
-        assert_eq!(install_at(&mut r, "msg-foo", 1 /* Local */), STATUS_OK);
-        assert_eq!(uninstall(&mut r, "msg-foo"), STATUS_OK);
-        assert_eq!(install_at(&mut r, "msg-foo", 0 /* Ephemeral */), STATUS_OK);
+        assert_eq!(install_at(&mut r, "msg-foo", 1 /* Local */), Status::Ok);
+        assert_eq!(uninstall(&mut r, "msg-foo"), Status::Ok);
+        assert_eq!(install_at(&mut r, "msg-foo", 0 /* Ephemeral */), Status::Ok);
     }
 
     #[test]
     fn lateral_crdt_raft_reinstall_is_allowed() {
         let mut r = registry();
-        assert_eq!(install_at(&mut r, "shared", 2 /* Crdt */), STATUS_OK);
-        assert_eq!(uninstall(&mut r, "shared"), STATUS_OK);
+        assert_eq!(install_at(&mut r, "shared", 2 /* Crdt */), Status::Ok);
+        assert_eq!(uninstall(&mut r, "shared"), Status::Ok);
         // Crdt <-> Raft is a rank-equal lateral move, allowed in v0.
-        assert_eq!(install_at(&mut r, "shared", 3 /* Raft */), STATUS_OK);
+        assert_eq!(install_at(&mut r, "shared", 3 /* Raft */), Status::Ok);
     }
 
     #[test]
     fn fresh_instance_name_installs_at_any_tier() {
         let mut r = registry();
-        assert_eq!(install_at(&mut r, "a", 0 /* Ephemeral */), STATUS_OK);
-        assert_eq!(install_at(&mut r, "b", 3 /* Raft */), STATUS_OK);
-        assert_eq!(install_at(&mut r, "c", 2 /* Crdt */), STATUS_OK);
+        assert_eq!(install_at(&mut r, "a", 0 /* Ephemeral */), Status::Ok);
+        assert_eq!(install_at(&mut r, "b", 3 /* Raft */), Status::Ok);
+        assert_eq!(install_at(&mut r, "c", 2 /* Crdt */), Status::Ok);
     }
 
     #[test]
@@ -2537,25 +2598,25 @@ mod tests {
         // Crdt, then narrow to Local on reinstall — the floor pins at
         // Local, so a later attempt to widen back to Crdt is refused.
         let mut r = registry();
-        assert_eq!(install_at(&mut r, "drift", 2 /* Crdt */), STATUS_OK);
-        assert_eq!(uninstall(&mut r, "drift"), STATUS_OK);
-        assert_eq!(install_at(&mut r, "drift", 1 /* Local */), STATUS_OK);
-        assert_eq!(uninstall(&mut r, "drift"), STATUS_OK);
+        assert_eq!(install_at(&mut r, "drift", 2 /* Crdt */), Status::Ok);
+        assert_eq!(uninstall(&mut r, "drift"), Status::Ok);
+        assert_eq!(install_at(&mut r, "drift", 1 /* Local */), Status::Ok);
+        assert_eq!(uninstall(&mut r, "drift"), Status::Ok);
         assert_eq!(
             install_at(&mut r, "drift", 2 /* Crdt */),
-            STATUS_CONSISTENCY_WIDEN_DENIED
+            Status::ConsistencyWidenDenied
         );
     }
 
     #[test]
     fn live_instance_reinstall_reports_exists_not_widen() {
         let mut r = registry();
-        assert_eq!(install_at(&mut r, "live", 1 /* Local */), STATUS_OK);
+        assert_eq!(install_at(&mut r, "live", 1 /* Local */), Status::Ok);
         // A live row takes precedence: even a widen attempt is the
         // pre-existing "already installed" error, not the widen guard.
         assert_eq!(
             install_at(&mut r, "live", 2 /* Crdt */),
-            STATUS_INSTANCE_EXISTS
+            Status::InstanceExists
         );
     }
 
@@ -2593,7 +2654,7 @@ mod tests {
     /// Reads the peer's current epoch and signs `epoch + 1`, exactly as
     /// the CLI does, so each grant/revoke for a peer is monotonically
     /// fresh.
-    fn grant_space(r: &mut SpaceRegistry, peer: &[u8], role: u8) -> u8 {
+    fn grant_space(r: &mut SpaceRegistry, peer: &[u8], role: u8) -> Status {
         let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
         dispatch(
             r,
@@ -2607,7 +2668,7 @@ mod tests {
     }
 
     /// Root-signed `revoke_role` dispatch — reads + bumps the epoch.
-    fn revoke_space(r: &mut SpaceRegistry, peer: &[u8]) -> u8 {
+    fn revoke_space(r: &mut SpaceRegistry, peer: &[u8]) -> Status {
         let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
         dispatch(
             r,
@@ -2620,7 +2681,7 @@ mod tests {
     }
 
     /// Root-signed `grant_actor_role` dispatch.
-    fn grant_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str, role: u8) -> u8 {
+    fn grant_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str, role: u8) -> Status {
         let epoch = dispatch(
             r,
             ActorEpoch {
@@ -2644,7 +2705,7 @@ mod tests {
     }
 
     /// Root-signed `revoke_actor_role` dispatch.
-    fn revoke_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str) -> u8 {
+    fn revoke_actor(r: &mut SpaceRegistry, peer: &[u8], agent: &str) -> Status {
         let epoch = dispatch(
             r,
             ActorEpoch {
@@ -2778,7 +2839,7 @@ mod tests {
                 auth,
             },
         );
-        assert_eq!(status, STATUS_FORBIDDEN, "System caller can't bypass authorize_op");
+        assert_eq!(status, Status::Forbidden, "System caller can't bypass authorize_op");
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: attacker }),
             AUTH_ROLE_NONE,
@@ -2791,7 +2852,7 @@ mod tests {
         assert!(dispatch(&mut r, Root).is_empty(), "no root before genesis");
         assert_eq!(
             dispatch(&mut r, SetRoot { root: root_peer_id() }),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(dispatch(&mut r, Root), root_peer_id());
         // A second set_root — e.g. a forged genesis merged via CRDT —
@@ -2803,7 +2864,7 @@ mod tests {
                     root: alloc::vec![0xFFu8; 38],
                 },
             ),
-            STATUS_FORBIDDEN,
+            Status::Forbidden,
         );
         assert_eq!(dispatch(&mut r, Root), root_peer_id());
     }
@@ -2824,7 +2885,7 @@ mod tests {
                     auth: Vec::new(),
                 },
             ),
-            STATUS_FORBIDDEN,
+            Status::Forbidden,
         );
         assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim }), AUTH_ROLE_NONE);
     }
@@ -2851,7 +2912,7 @@ mod tests {
                     auth,
                 },
             ),
-            STATUS_FORBIDDEN,
+            Status::Forbidden,
         );
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: attacker }),
@@ -2882,7 +2943,7 @@ mod tests {
                     auth: forged,
                 },
             ),
-            STATUS_FORBIDDEN,
+            Status::Forbidden,
         );
         assert_eq!(dispatch(&mut r, NodeRole { prefix: 5 }), 0, "not enrolled");
 
@@ -2898,7 +2959,7 @@ mod tests {
                     auth: ok,
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(dispatch(&mut r, NodeRole { prefix: 5 }), NODE_ROLE_VOTER + 1);
     }
@@ -2934,7 +2995,7 @@ mod tests {
             },
         );
         assert_eq!(
-            status, STATUS_FORBIDDEN,
+            status, Status::Forbidden,
             "System caller can't bypass authorize_op for install",
         );
         assert!(
@@ -2966,7 +3027,7 @@ mod tests {
                 auth: forged,
             },
         );
-        assert_eq!(status, STATUS_FORBIDDEN);
+        assert_eq!(status, Status::Forbidden);
         assert!(
             dispatch(
                 &mut r,
@@ -2999,7 +3060,7 @@ mod tests {
                 auth: Vec::new(),
             },
         );
-        assert_eq!(status, STATUS_FORBIDDEN);
+        assert_eq!(status, Status::Forbidden);
     }
 
     #[test]
@@ -3009,7 +3070,7 @@ mod tests {
         // authorize_op passes and the AgentRow materializes — proving
         // the signed path doesn't reject legitimate catalog ops.
         let mut r = registry();
-        assert_eq!(install_at(&mut r, "good", 2), STATUS_OK);
+        assert_eq!(install_at(&mut r, "good", 2), Status::Ok);
         let row = dispatch(
             &mut r,
             Agent {
@@ -3028,7 +3089,7 @@ mod tests {
         let mut r = registry();
         let bob_key = SigningKey::from_bytes(&[11u8; 32]);
         let bob = peer_id_for(&bob_key.verifying_key().to_bytes());
-        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), STATUS_OK);
+        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), Status::Ok);
 
         // Bob (now admin) grants Carol READONLY, signing with his key.
         let carol = alloc::vec![3, 3, 3];
@@ -3047,7 +3108,7 @@ mod tests {
                     auth,
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: carol }),
@@ -3057,7 +3118,7 @@ mod tests {
         // But a peer Bob granted only READONLY can't sign mutations.
         let dave_key = SigningKey::from_bytes(&[12u8; 32]);
         let dave = peer_id_for(&dave_key.verifying_key().to_bytes());
-        assert_eq!(grant_space(&mut r, &dave, AUTH_ROLE_READONLY), STATUS_OK);
+        assert_eq!(grant_space(&mut r, &dave, AUTH_ROLE_READONLY), Status::Ok);
         let evil = auth_as(
             &dave_key,
             "grant_role",
@@ -3073,7 +3134,7 @@ mod tests {
                     auth: evil,
                 },
             ),
-            STATUS_FORBIDDEN,
+            Status::Forbidden,
         );
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: dave }),
@@ -3100,7 +3161,7 @@ mod tests {
                     auth: wrong_op_auth,
                 },
             ),
-            STATUS_FORBIDDEN,
+            Status::Forbidden,
         );
         assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim }), AUTH_ROLE_NONE);
     }
@@ -3118,7 +3179,7 @@ mod tests {
         let mut r = registry();
         let bob_key = SigningKey::from_bytes(&[11u8; 32]);
         let bob = peer_id_for(&bob_key.verifying_key().to_bytes());
-        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), STATUS_OK);
+        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), Status::Ok);
 
         let carol = alloc::vec![3, 3, 3];
         let e = dispatch(&mut r, PeerEpoch { peer_id: carol.clone() }) + 1;
@@ -3137,7 +3198,7 @@ mod tests {
                     auth: bob_grants_carol,
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: carol.clone() }),
@@ -3146,7 +3207,7 @@ mod tests {
         );
 
         // root revokes Bob — applied AFTER Carol's grant.
-        assert_eq!(revoke_space(&mut r, &bob), STATUS_OK);
+        assert_eq!(revoke_space(&mut r, &bob), Status::Ok);
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: bob }),
             AUTH_ROLE_NONE,
@@ -3170,10 +3231,10 @@ mod tests {
         let mut r = registry();
         let mallory_key = SigningKey::from_bytes(&[21u8; 32]);
         let mallory = peer_id_for(&mallory_key.verifying_key().to_bytes());
-        assert_eq!(grant_space(&mut r, &mallory, AUTH_ROLE_ADMIN), STATUS_OK);
+        assert_eq!(grant_space(&mut r, &mallory, AUTH_ROLE_ADMIN), Status::Ok);
 
         let carol = alloc::vec![3, 3, 3];
-        assert_eq!(grant_space(&mut r, &carol, AUTH_ROLE_ADMIN), STATUS_OK);
+        assert_eq!(grant_space(&mut r, &carol, AUTH_ROLE_ADMIN), Status::Ok);
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: carol.clone() }),
             AUTH_ROLE_ADMIN,
@@ -3196,10 +3257,10 @@ mod tests {
                     auth: capture,
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
 
-        assert_eq!(revoke_space(&mut r, &mallory), STATUS_OK);
+        assert_eq!(revoke_space(&mut r, &mallory), Status::Ok);
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: mallory }),
             AUTH_ROLE_NONE,
@@ -3235,7 +3296,7 @@ mod tests {
                     auth: captured.clone(),
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
@@ -3243,7 +3304,7 @@ mod tests {
         );
 
         // root revokes Bob (reads epoch 1, bumps the high-water to 2).
-        assert_eq!(revoke_space(&mut r, &bob), STATUS_OK);
+        assert_eq!(revoke_space(&mut r, &bob), Status::Ok);
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
             AUTH_ROLE_NONE,
@@ -3260,7 +3321,7 @@ mod tests {
                     auth: captured,
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
@@ -3269,7 +3330,7 @@ mod tests {
         );
 
         // A fresh root re-grant at a higher epoch restores Bob.
-        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), STATUS_OK);
+        assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), Status::Ok);
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: bob }),
             AUTH_ROLE_ADMIN,
@@ -3314,10 +3375,10 @@ mod tests {
                 },
             )
         };
-        assert_eq!(install(&mut r), STATUS_OK);
-        assert_eq!(uninstall(&mut r, "res"), STATUS_OK);
+        assert_eq!(install(&mut r), Status::Ok);
+        assert_eq!(uninstall(&mut r, "res"), Status::Ok);
         // Replay the captured install (same replication_id).
-        assert_eq!(install(&mut r), STATUS_REPLICATION_ID_REUSED);
+        assert_eq!(install(&mut r), Status::ReplicationIdReused);
         assert!(
             dispatch(
                 &mut r,
@@ -3349,7 +3410,7 @@ mod tests {
                     ),
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
     }
 
@@ -3392,7 +3453,7 @@ mod tests {
                     ),
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
 
         // Upgrade app p/1 → p/2, asserting the live base is h1.
@@ -3408,7 +3469,7 @@ mod tests {
                     auth: root_auth("upgrade", &[b"app", b"p", b"2", &h2, &h1]),
                 },
             ),
-            STATUS_OK,
+            Status::Ok,
         );
 
         // Replay an upgrade back to p/1 (from_hash = h1) — the live hash
@@ -3425,7 +3486,7 @@ mod tests {
                     auth: root_auth("upgrade", &[b"app", b"p", b"1", &h1, &h1]),
                 },
             ),
-            STATUS_STALE_UPGRADE,
+            Status::StaleUpgrade,
         );
         assert_eq!(
             dispatch(

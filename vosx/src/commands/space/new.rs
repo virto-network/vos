@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use space_registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, STATUS_OK, SpaceRegistryRef};
+use space_registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, SpaceRegistryRef, Status};
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 
@@ -101,7 +101,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let status = vos::block_on(reg.set_root(&mut &node, operator_peer_id.clone()))
         .map_err(|e| anyhow::anyhow!("genesis set_root failed: {e}"))?;
-    if status != STATUS_OK {
+    if status != Status::Ok {
         anyhow::bail!("genesis set_root returned status {status}");
     }
 
@@ -124,7 +124,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         grant_auth,
     ))
     .map_err(|e| anyhow::anyhow!("genesis grant_role failed: {e}"))?;
-    if status != STATUS_OK {
+    if status != Status::Ok {
         anyhow::bail!("genesis grant_role returned status {status}");
     }
 
@@ -146,7 +146,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         node_auth,
     ))
     .map_err(|e| anyhow::anyhow!("genesis add_node failed: {e}"))?;
-    if status != STATUS_OK {
+    if status != Status::Ok {
         anyhow::bail!("genesis add_node returned status {status}");
     }
 

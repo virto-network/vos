@@ -1003,7 +1003,7 @@ impl Messenger {
             match reg_install(ctx, name, template, rep_id).await? {
                 // EXISTS: someone else's create won the race (or a
                 // peer's row synced in) — the post-condition holds.
-                space_registry::STATUS_OK | space_registry::STATUS_INSTANCE_EXISTS => {}
+                space_registry::Status::Ok | space_registry::Status::InstanceExists => {}
                 code => return Err(format!("installing '{name}' failed (status {code})")),
             }
         }

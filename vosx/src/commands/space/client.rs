@@ -16,7 +16,7 @@
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use space_registry::{AgentRow, MemberRow, ProgramRow, SpaceRegistryRef};
+use space_registry::{AgentRow, MemberRow, ProgramRow, SpaceRegistryRef, Status};
 use vos::abi::service::ServiceId;
 use vos::node::VosNode;
 
@@ -271,7 +271,7 @@ impl DaemonClient {
 
     /// Like [`Self::invoke_dyn`] but returns the RAW reply bytes (empty when
     /// the reply is empty). Callers that need to distinguish the daemon's
-    /// 5-byte `STATUS_FORBIDDEN` refusal envelope from a normal reply use
+    /// 5-byte forbidden-refusal envelope from a normal reply use
     /// this — `invoke_dyn` decodes blindly and would mis-handle a refusal.
     pub fn invoke_dyn_bytes(
         &self,
@@ -359,7 +359,7 @@ impl DaemonClient {
     // operator key it loaded at boot, so the signature is the operator's
     // regardless of whether the CLI or a keyless PVM agent drove the op.
     // See `space_registry`'s signed-registry-ops note.
-    pub fn publish(&self, name: String, version: String, hash: Vec<u8>) -> anyhow::Result<u8> {
+    pub fn publish(&self, name: String, version: String, hash: Vec<u8>) -> anyhow::Result<Status> {
         vos::block_on(
             self.registry()
                 .publish(&mut &self.node, name, version, hash, Vec::new()),
@@ -367,7 +367,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
     }
 
-    pub fn unpublish(&self, name: String, version: String) -> anyhow::Result<u8> {
+    pub fn unpublish(&self, name: String, version: String) -> anyhow::Result<Status> {
         vos::block_on(
             self.registry()
                 .unpublish(&mut &self.node, name, version, Vec::new()),
@@ -386,7 +386,7 @@ impl DaemonClient {
         consistency: u8,
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
-    ) -> anyhow::Result<u8> {
+    ) -> anyhow::Result<Status> {
         vos::block_on(self.registry().install(
             &mut &self.node,
             instance_name,
@@ -408,7 +408,7 @@ impl DaemonClient {
         program_name: String,
         program_version: String,
         program_hash: Vec<u8>,
-    ) -> anyhow::Result<u8> {
+    ) -> anyhow::Result<Status> {
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
         // (a replayed/superseded upgrade can't roll the version back).
@@ -428,7 +428,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.upgrade(): {e}"))
     }
 
-    pub fn uninstall(&self, instance_name: String) -> anyhow::Result<u8> {
+    pub fn uninstall(&self, instance_name: String) -> anyhow::Result<Status> {
         vos::block_on(
             self.registry()
                 .uninstall(&mut &self.node, instance_name, Vec::new()),
@@ -436,7 +436,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.uninstall(): {e}"))
     }
 
-    pub fn add_node(&self, prefix: u32, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
+    pub fn add_node(&self, prefix: u32, peer_id: Vec<u8>, role: u8) -> anyhow::Result<Status> {
         let auth = op_auth(
             &self.signer,
             "add_node",
@@ -449,7 +449,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.add_node(): {e}"))
     }
 
-    pub fn remove_node(&self, prefix: u32) -> anyhow::Result<u8> {
+    pub fn remove_node(&self, prefix: u32) -> anyhow::Result<Status> {
         let auth = op_auth(&self.signer, "remove_node", &[&prefix.to_le_bytes()])?;
         vos::block_on(self.registry().remove_node(&mut &self.node, prefix, auth))
             .map_err(|e| anyhow::anyhow!("registry.remove_node(): {e}"))
@@ -460,7 +460,7 @@ impl DaemonClient {
         public_key: Vec<u8>,
         proof_kind: u8,
         proof_data: Vec<u8>,
-    ) -> anyhow::Result<u8> {
+    ) -> anyhow::Result<Status> {
         let auth = op_auth(
             &self.signer,
             "add_identity",
@@ -476,7 +476,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.add_identity(): {e}"))
     }
 
-    pub fn remove_identity(&self, public_key: Vec<u8>) -> anyhow::Result<u8> {
+    pub fn remove_identity(&self, public_key: Vec<u8>) -> anyhow::Result<Status> {
         let auth = op_auth(&self.signer, "remove_identity", &[&public_key])?;
         vos::block_on(self.registry().remove_identity(&mut &self.node, public_key, auth))
             .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
@@ -484,7 +484,7 @@ impl DaemonClient {
 
     // ── Auth grants ────────────────────────────────────
 
-    pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<u8> {
+    pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<Status> {
         // Read the peer's current freshness epoch and sign `epoch + 1`
         // so the grant strictly post-dates any prior revoke — a replayed
         // stale-epoch grant can never resurrect a revoked role.
@@ -501,7 +501,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))
     }
 
-    pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<u8> {
+    pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<Status> {
         let epoch = self.peer_epoch(peer_id.clone())? + 1;
         let auth = op_auth(
             &self.signer,
@@ -550,7 +550,7 @@ impl DaemonClient {
         peer_id: Vec<u8>,
         agent_name: String,
         role: u8,
-    ) -> anyhow::Result<u8> {
+    ) -> anyhow::Result<Status> {
         let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,
@@ -564,7 +564,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.grant_actor_role(): {e}"))
     }
 
-    pub fn revoke_actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<u8> {
+    pub fn revoke_actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<Status> {
         let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,

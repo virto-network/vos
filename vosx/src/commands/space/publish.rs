@@ -1,7 +1,7 @@
 //! `space publish` — add a program to the catalog.
 
 use serde::Serialize;
-use space_registry::{STATUS_OK, STATUS_TAG_CONFLICT};
+use space_registry::{Status};
 
 use crate::blob_store::{self, BlobSource};
 use crate::commands::space::client::DaemonClient;
@@ -31,7 +31,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     DaemonClient::with_connect(&args.space, |client| {
         let status = client.publish(name.clone(), version.clone(), hash.0.to_vec())?;
         match status {
-            STATUS_OK => {
+            Status::Ok => {
                 if output::is_json() {
                     output::print_json(&PublishedView {
                         name: name.clone(),
@@ -44,7 +44,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            STATUS_TAG_CONFLICT => anyhow::bail!(
+            Status::TagConflict => anyhow::bail!(
                 "{name}:{version} already exists in the catalog with a different hash; \
                  tags are immutable",
             ),

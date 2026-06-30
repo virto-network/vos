@@ -15,7 +15,7 @@
 //!    `new(name)` constructor just records the display name.
 
 use serde::Serialize;
-use space_registry::{STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_TAG_CONFLICT};
+use space_registry::{Status};
 use vos::init::{InitArgs, InitValue};
 
 use crate::blob_store::{self, BlobHash};
@@ -86,8 +86,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     cached_hash.0.to_vec(),
                 )?;
                 match status {
-                    STATUS_OK => cached_hash,
-                    STATUS_TAG_CONFLICT => anyhow::bail!(
+                    Status::Ok => cached_hash,
+                    Status::TagConflict => anyhow::bail!(
                         "{DEV_PROJECT_NAME}:{DEV_PROJECT_VERSION} TAG_CONFLICT mid-publish — \
                          race with another vosx? Retry.",
                     ),
@@ -128,7 +128,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         )?;
 
         match status {
-            STATUS_OK => {
+            Status::Ok => {
                 if output::is_json() {
                     output::print_json(&CreatedView {
                         name: &args.name,
@@ -151,7 +151,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            STATUS_INSTANCE_EXISTS => anyhow::bail!(
+            Status::InstanceExists => anyhow::bail!(
                 "a project named '{}' is already installed in space '{}'; \
                  pick a different name or `vosx space uninstall {} {}` first",
                 args.name,

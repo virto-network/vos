@@ -33,10 +33,7 @@
 
 use clap::Subcommand;
 use serde::Serialize;
-use space_registry::{
-    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, STATUS_NOT_FOUND,
-    STATUS_OK,
-};
+use space_registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, Status};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
@@ -175,7 +172,7 @@ fn grant(space: &str, peer_arg: &str, role_str: &str, agent: Option<&str>) -> an
                 .parse()
                 .map_err(|_| anyhow::anyhow!("actor-local role must be a 0..255 byte"))?;
             let status = client.grant_actor_role(peer_id.to_bytes(), name.to_string(), role)?;
-            if status != STATUS_OK {
+            if status != Status::Ok {
                 anyhow::bail!("grant_actor_role returned status {status}");
             }
             if output::is_json() {
@@ -198,7 +195,7 @@ fn grant(space: &str, peer_arg: &str, role_str: &str, agent: Option<&str>) -> an
         None => {
             let role = parse_role(role_str)?;
             let status = client.grant_role(peer_id.to_bytes(), role)?;
-            if status != STATUS_OK {
+            if status != Status::Ok {
                 anyhow::bail!("grant_role returned status {status}");
             }
             if output::is_json() {
@@ -222,7 +219,7 @@ fn revoke(space: &str, peer_arg: &str, agent: Option<&str>) -> anyhow::Result<()
             None => client.revoke_role(peer_id.to_bytes())?,
         };
         match status {
-            STATUS_OK => {
+            Status::Ok => {
                 if output::is_json() {
                     #[derive(Serialize)]
                     struct V {
@@ -240,7 +237,7 @@ fn revoke(space: &str, peer_arg: &str, agent: Option<&str>) -> anyhow::Result<()
                 }
                 Ok(())
             }
-            STATUS_NOT_FOUND => match agent {
+            Status::NotFound => match agent {
                 Some(name) => anyhow::bail!("no actor-local grant for {peer_id} in {name}"),
                 None => anyhow::bail!("no grant for {peer_id}"),
             },

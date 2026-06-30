@@ -8,10 +8,7 @@
 
 use clap::Subcommand;
 
-use space_registry::{
-    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER,
-    PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, STATUS_NOT_FOUND, STATUS_OK,
-};
+use space_registry::{MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, Status};
 
 use serde::Serialize;
 
@@ -208,7 +205,7 @@ fn add_node(
 
     DaemonClient::with_connect(space, |client| {
         let status = client.add_node(prefix, peer_id.to_bytes(), role)?;
-        if status != STATUS_OK {
+        if status != Status::Ok {
             anyhow::bail!("add_node returned status {status}");
         }
         if output::is_json() {
@@ -230,7 +227,7 @@ fn add_node(
 
 fn remove_node(space: &str, prefix: u32) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| match client.remove_node(prefix)? {
-        STATUS_OK => {
+        Status::Ok => {
             if output::is_json() {
                 #[derive(Serialize)]
                 struct V {
@@ -244,7 +241,7 @@ fn remove_node(space: &str, prefix: u32) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        STATUS_NOT_FOUND => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
+        Status::NotFound => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
         other => anyhow::bail!("remove_node returned status {other}"),
     })
 }
@@ -270,7 +267,7 @@ fn add_identity(
 
     DaemonClient::with_connect(space, |client| {
         let status = client.add_identity(pubkey.clone(), proof_kind, proof_data)?;
-        if status != STATUS_OK {
+        if status != Status::Ok {
             anyhow::bail!("add_identity returned status {status}");
         }
         if output::is_json() {
@@ -298,7 +295,7 @@ fn remove_identity(space: &str, pubkey_hex: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("public_key must be hex"))?;
     DaemonClient::with_connect(space, |client| {
         match client.remove_identity(pubkey.clone())? {
-            STATUS_OK => {
+            Status::Ok => {
                 if output::is_json() {
                     #[derive(Serialize)]
                     struct V {
@@ -312,7 +309,7 @@ fn remove_identity(space: &str, pubkey_hex: &str) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            STATUS_NOT_FOUND => anyhow::bail!("no identity with that public key"),
+            Status::NotFound => anyhow::bail!("no identity with that public key"),
             other => anyhow::bail!("remove_identity returned status {other}"),
         }
     })

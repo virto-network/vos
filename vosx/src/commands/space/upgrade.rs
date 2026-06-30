@@ -1,7 +1,7 @@
 //! `space upgrade` — repoint an agent at a different program version.
 
 use serde::Serialize;
-use space_registry::{STATUS_NOT_FOUND, STATUS_OK, STATUS_PROGRAM_NOT_FOUND};
+use space_registry::{Status};
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::parse_program_ref;
@@ -39,7 +39,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         )?;
 
         match status {
-            STATUS_OK => {
+            Status::Ok => {
                 if output::is_json() {
                     output::print_json(&UpgradedView {
                         instance_name: &args.instance,
@@ -55,8 +55,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            STATUS_NOT_FOUND => anyhow::bail!("no agent named '{}' installed", args.instance),
-            STATUS_PROGRAM_NOT_FOUND => {
+            Status::NotFound => anyhow::bail!("no agent named '{}' installed", args.instance),
+            Status::ProgramNotFound => {
                 anyhow::bail!("program {program_name}:{program_version} not in catalog")
             }
             other => anyhow::bail!("upgrade returned status {other}"),

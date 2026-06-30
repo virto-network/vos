@@ -23,10 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use space_registry::{
-    ProgramRow, STATUS_FORBIDDEN, STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_TAG_CONFLICT,
-    SpaceRegistryRef,
-};
+use space_registry::{ProgramRow, SpaceRegistryRef, Status};
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
 use vos::node::{ExtensionConfig, VosNode};
@@ -386,7 +383,7 @@ fn register_extension(
             Vec::new(),
         ))
         .map_err(|e| anyhow::anyhow!("registry.register_extension_meta('{}'): {e}", ext.name))?;
-        if status != STATUS_OK {
+        if status != Status::Ok {
             tracing::warn!(
                 "register_extension_meta('{}') returned status {status}; \
                  CLI dispatch surface unavailable for this extension",
@@ -650,7 +647,7 @@ pub fn reconcile(
     // Is this daemon the space's admin authoring node? True when its
     // operator is the genesis root or holds an ADMIN grant. The daemon
     // signs catalog ops on relay with the operator key; on an admin node
-    // a STATUS_FORBIDDEN therefore means the signer can't author (key
+    // a Status::Forbidden therefore means the signer can't author (key
     // absent/unreadable/wrong) — a misconfiguration to surface loudly,
     // NOT the benign "non-admin joiner awaiting sync" case. (A node that
     // is the admin machine but loaded the wrong key reads as non-admin
@@ -723,7 +720,7 @@ fn reconcile_one(
             // Empty `auth`: the daemon signs catalog mutations on relay
             // with its operator key. On the admin (operator) node that
             // signature authorizes the op; on a joined non-admin node it
-            // doesn't, yielding STATUS_FORBIDDEN — which is expected, the
+            // doesn't, yielding Status::Forbidden — which is expected, the
             // row arrives via registry sync instead (handled below).
             let status = vos::block_on(reg.publish(
                 &mut &*node,
@@ -734,22 +731,22 @@ fn reconcile_one(
             ))
             .map_err(|e| anyhow::anyhow!("registry.publish('{program_name}'): {e}"))?;
             match status {
-                STATUS_OK => {
+                Status::Ok => {
                     tracing::info!("published {program_name}:{program_version}");
                 }
-                STATUS_FORBIDDEN if node_is_admin => {
+                Status::Forbidden if node_is_admin => {
                     // This node IS the space admin, yet the daemon's
                     // on-relay signature was refused — the operator key
                     // can't author catalog ops. Fail loud rather than
                     // silently install nothing (no peer will supply the
                     // rows for the authoring node).
                     anyhow::bail!(
-                        "publish '{program_name}:{program_version}' refused (STATUS_FORBIDDEN) on \
+                        "publish '{program_name}:{program_version}' refused (Status::Forbidden) on \
                          the space-admin node — the operator key cannot author registry ops. \
                          Check that the correct identity.key is loaded and matches the space root."
                     );
                 }
-                STATUS_FORBIDDEN => {
+                Status::Forbidden => {
                     // Not authored locally: this node isn't the space
                     // admin, so the program row is signed on the admin's
                     // node and replicates here via CRDT sync. Proceed to
@@ -760,7 +757,7 @@ fn reconcile_one(
                          registry sync (if this should be the admin node, check identity.key)",
                     );
                 }
-                STATUS_TAG_CONFLICT => {
+                Status::TagConflict => {
                     anyhow::bail!("publish conflict on {program_name}:{program_version}");
                 }
                 other => anyhow::bail!("publish status {other}"),
@@ -782,7 +779,7 @@ fn reconcile_one(
             // Empty `auth`: signed on relay by the daemon (operator key).
             vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob, Vec::new()))
                 .map_err(|e| anyhow::anyhow!("registry.register_meta('{program_name}'): {e}"))?;
-        if status != STATUS_OK {
+        if status != Status::Ok {
             // Don't fail the install — meta registration is a
             // nice-to-have (and FORBIDDEN on a non-admin node is
             // expected; the row arrives via sync). Log so a future
@@ -834,9 +831,9 @@ fn reconcile_one(
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
     // Empty `auth`: the daemon signs on relay (see the publish call
-    // above). STATUS_FORBIDDEN here means this isn't the admin node, so
+    // above). Status::Forbidden here means this isn't the admin node, so
     // the agent row is authored on the operator's node and arrives via
-    // sync — tolerated the same way as STATUS_INSTANCE_EXISTS below.
+    // sync — tolerated the same way as Status::InstanceExists below.
     let status = vos::block_on(reg.install(
         &mut &*node,
         agent.name.clone(),
@@ -854,25 +851,25 @@ fn reconcile_one(
     // A joining node's registry replica may already carry this
     // agent (the creator installed it and it arrived via CRDT sync
     // before — or during — this reconcile). `install` is not
-    // idempotent in the registry; it reports STATUS_INSTANCE_EXISTS.
+    // idempotent in the registry; it reports Status::InstanceExists.
     // That's the agent already being present, which is exactly the
     // post-condition we want, so treat it as success and proceed to
     // spawn. Only an unexpected status is fatal.
-    if status == STATUS_INSTANCE_EXISTS {
+    if status == Status::InstanceExists {
         tracing::info!(
             "agent {} already installed (synced from a peer) — reusing",
             agent.name,
         );
         return Ok(());
     }
-    if status == STATUS_FORBIDDEN {
+    if status == Status::Forbidden {
         if node_is_admin {
             // The admin node's own signature was refused → the operator
             // key can't author. Surface it instead of silently failing
             // to install (this node authors the rows; no peer supplies
             // them).
             anyhow::bail!(
-                "install '{}' refused (STATUS_FORBIDDEN) on the space-admin node — the operator \
+                "install '{}' refused (Status::Forbidden) on the space-admin node — the operator \
                  key cannot author registry ops. Check that the correct identity.key is loaded \
                  and matches the space root.",
                 agent.name,
@@ -888,7 +885,7 @@ fn reconcile_one(
         );
         return Ok(());
     }
-    if status == space_registry::STATUS_REPLICATION_ID_REUSED {
+    if status == space_registry::Status::ReplicationIdReused {
         // The `replication_id` is a retired anti-replay tombstone — this
         // agent (or one with the same auto-derived id) was installed and
         // uninstalled before, and an `auto`/fixed id can't be reused.
@@ -903,7 +900,7 @@ fn reconcile_one(
         );
         return Ok(());
     }
-    if status != STATUS_OK {
+    if status != Status::Ok {
         anyhow::bail!("install '{}' returned status {}", agent.name, status);
     }
     tracing::info!(
@@ -1109,7 +1106,7 @@ fn flat_count(agents: &[AgentDef]) -> usize {
 /// first's invoke channel, leaving the first's worker thread
 /// orphaned and its inbound traffic redirected to the wrong
 /// handler. The registry's `install` catches duplicate agent
-/// names (`STATUS_INSTANCE_EXISTS`) but it knows nothing about
+/// names (`Status::InstanceExists`) but it knows nothing about
 /// extensions and nothing about within-extension duplicates;
 /// catching the full set manifest-side gives the operator a
 /// single clear error before any side-effects land.
@@ -1399,7 +1396,7 @@ mod tests {
     #[test]
     fn validate_names_rejects_duplicate_agents() {
         // The registry's `install` handler returns
-        // STATUS_INSTANCE_EXISTS for this case at runtime, but
+        // Status::InstanceExists for this case at runtime, but
         // the manifest-side check fails earlier — before any
         // .elf gets blob-cached or any partial registration
         // lands.

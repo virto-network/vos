@@ -1,7 +1,7 @@
 //! `space uninstall` — tombstone an agent.
 
 use serde::Serialize;
-use space_registry::{STATUS_NOT_FOUND, STATUS_OK};
+use space_registry::{Status};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
@@ -14,7 +14,7 @@ struct UninstalledView<'a> {
 pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
         match client.uninstall(instance.to_string())? {
-            STATUS_OK => {
+            Status::Ok => {
                 // The redb file under `<data_dir>/agents/<svc_id>.redb`
                 // is held open by the running daemon and can't be
                 // moved here. The next `space up` sweeps orphan
@@ -29,7 +29,7 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            STATUS_NOT_FOUND => anyhow::bail!("no agent named '{instance}' installed"),
+            Status::NotFound => anyhow::bail!("no agent named '{instance}' installed"),
             other => anyhow::bail!("uninstall returned status {other}"),
         }
     })

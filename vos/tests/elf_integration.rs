@@ -5205,7 +5205,7 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
     let status =
         vos::block_on(hs_reg_a.register_remote(&mut &node_a, "alice".to_string(), prefix_a as u32))
             .expect("register_remote on A");
-    assert_eq!(status, space_registry::STATUS_OK);
+    assert_eq!(status, space_registry::Status::Ok);
 
     // ── Wait for convergence + assert ──────────────────────────
     let hs_reg_b = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
@@ -5465,7 +5465,7 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
         let status =
             vos::block_on(hs_reg.register_remote(&mut &node_a, name.to_string(), prefix as u32))
                 .expect("register_remote");
-        assert_eq!(status, space_registry::STATUS_OK, "register_remote {name}");
+        assert_eq!(status, space_registry::Status::Ok, "register_remote {name}");
     }
 
     // Sanity: A's hyperspace registry resolves bridge-b to the
@@ -6389,12 +6389,12 @@ fn clerk_ledger_two_bank_federation() {
     for (name, prefix) in [("bridge-a", prefix_a), ("clerk-a", prefix_a)] {
         let s = vos::block_on(hs_a.register_remote(&mut &node_a, name.into(), prefix as u32))
             .expect("register_remote on A");
-        assert_eq!(s, space_registry::STATUS_OK, "A.register_remote {name}");
+        assert_eq!(s, space_registry::Status::Ok, "A.register_remote {name}");
     }
     for (name, prefix) in [("bridge-b", prefix_b), ("clerk-b", prefix_b)] {
         let s = vos::block_on(hs_b.register_remote(&mut &node_b, name.into(), prefix as u32))
             .expect("register_remote on B");
-        assert_eq!(s, space_registry::STATUS_OK, "B.register_remote {name}");
+        assert_eq!(s, space_registry::Status::Ok, "B.register_remote {name}");
     }
 
     // CRDT converges via gossipsub. Wait until each side can resolve

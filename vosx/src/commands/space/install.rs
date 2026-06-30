@@ -2,9 +2,7 @@
 //! installed agent.
 
 use serde::Serialize;
-use space_registry::{
-    STATUS_CONSISTENCY_WIDEN_DENIED, STATUS_INSTANCE_EXISTS, STATUS_OK, STATUS_PROGRAM_NOT_FOUND,
-};
+use space_registry::{Status};
 use vos::init::{InitArgs, InitValue};
 
 use crate::commands::space::client::DaemonClient;
@@ -84,7 +82,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         )?;
 
         match status {
-            STATUS_OK => {
+            Status::Ok => {
                 if output::is_json() {
                     output::print_json(&InstalledView {
                         instance_name: &instance_name,
@@ -103,13 +101,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            STATUS_INSTANCE_EXISTS => anyhow::bail!(
+            Status::InstanceExists => anyhow::bail!(
                 "an agent named '{instance_name}' is already installed; pass --name to disambiguate",
             ),
-            STATUS_PROGRAM_NOT_FOUND => {
+            Status::ProgramNotFound => {
                 anyhow::bail!("program {program_name}:{program_version} not in catalog (race?)",)
             }
-            STATUS_CONSISTENCY_WIDEN_DENIED => anyhow::bail!(
+            Status::ConsistencyWidenDenied => anyhow::bail!(
                 "'{instance_name}' was previously installed at a more confined consistency tier; \
                  a name's locality may only narrow, never widen. Use a fresh --name to install at \
                  '{}'.",

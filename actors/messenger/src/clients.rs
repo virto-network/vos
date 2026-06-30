@@ -142,7 +142,7 @@ pub(crate) async fn reg_install(
     instance_name: &str,
     template: &space_registry::AgentRow,
     replication_id: [u8; 32],
-) -> Result<u8, String> {
+) -> Result<space_registry::Status, String> {
     let msg = Msg::new("install")
         .with("instance_name", instance_name.to_string())
         .with("program_name", template.program_name.clone())
@@ -162,7 +162,9 @@ pub(crate) async fn reg_install(
                  on the messenger"
             )
         })?;
-    value_to_status(value).ok_or_else(|| "bad registry install reply".to_string())
+    value_to_status(value)
+        .and_then(space_registry::Status::from_u8)
+        .ok_or_else(|| "bad registry install reply".to_string())
 }
 
 /// `msg-log.post` — append one App envelope.

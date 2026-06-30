@@ -1,7 +1,7 @@
 //! `space unpublish` — remove a program from the catalog.
 
 use serde::Serialize;
-use space_registry::{STATUS_IN_USE, STATUS_NOT_FOUND, STATUS_OK};
+use space_registry::{Status};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
@@ -33,7 +33,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     DaemonClient::with_connect(&args.space, |client| {
         match client.unpublish(n.clone(), v.clone())? {
-            STATUS_OK => {
+            Status::Ok => {
                 if output::is_json() {
                     output::print_json(&UnpublishedView {
                         name: &n,
@@ -44,8 +44,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            STATUS_NOT_FOUND => anyhow::bail!("{n}:{v} not in catalog"),
-            STATUS_IN_USE => {
+            Status::NotFound => anyhow::bail!("{n}:{v} not in catalog"),
+            Status::InUse => {
                 anyhow::bail!("{n}:{v} is referenced by an installed agent — uninstall first",)
             }
             other => anyhow::bail!("unpublish returned status {other}"),

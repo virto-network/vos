@@ -598,7 +598,7 @@ fn spawn_installed_agents(
     has_hyperspace: bool,
     policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
-    use space_registry::{STATUS_OK, SpaceRegistryRef};
+    use space_registry::{SpaceRegistryRef, Status};
     use std::collections::HashSet;
 
     let local_cfg = crate::commands::space::subscriptions::load(data_dir).unwrap_or_default();
@@ -712,7 +712,7 @@ fn spawn_installed_agents(
                 name.clone(),
                 local_prefix as u32,
             )) {
-                Ok(STATUS_OK) => {
+                Ok(Status::Ok) => {
                     tracing::info!("hyperspace: registered '{name}' @ prefix {local_prefix:#06x}",)
                 }
                 Ok(other) => {
@@ -1652,7 +1652,7 @@ fn reconcile_installed_agents(
     boot_grace: &mut BootGrace,
     policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
-    use space_registry::{STATUS_OK, SpaceRegistryRef};
+    use space_registry::{SpaceRegistryRef, Status};
 
     let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
     let agents =
@@ -1752,7 +1752,7 @@ fn reconcile_installed_agents(
                         a.instance_name.clone(),
                         local_prefix as u32,
                     )) {
-                        Ok(STATUS_OK) => {}
+                        Ok(Status::Ok) => {}
                         Ok(other) => tracing::warn!(
                             "hyperspace: register_remote('{}') returned status {other}",
                             a.instance_name,
