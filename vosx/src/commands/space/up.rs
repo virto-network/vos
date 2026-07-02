@@ -1012,7 +1012,7 @@ impl ChronosFeeder {
         let n = sorted.len();
         let encoded = chronos::encode_committee(&sorted);
         let chronos = ChronosRef::at(chronos_id);
-        if let Ok(chronos::STATUS_OK) = vos::block_on(chronos.set_committee(&mut &*node, encoded)) {
+        if let Ok(chronos::Status::Ok) = vos::block_on(chronos.set_committee(&mut &*node, encoded)) {
             self.last_committee = Some(sorted);
             tracing::info!(voters = n, "chronos: committee updated from registry");
         }
@@ -1038,7 +1038,7 @@ impl ChronosFeeder {
         if is_leader {
             let chronos = ChronosRef::at(chronos_id);
             // One local write; mark done so it doesn't re-fire every pass.
-            if let Ok(chronos::STATUS_OK) = vos::block_on(chronos.enrol_voter(
+            if let Ok(chronos::Status::Ok) = vos::block_on(chronos.enrol_voter(
                 &mut &*node,
                 self.local_peer.clone(),
                 self.vrf_pk_bytes.clone(),
