@@ -176,6 +176,66 @@ fn prove_store_and_load_u64() {
 }
 
 #[test]
+fn prove_store_load_u64_crossing_page_boundaries() {
+    // Regression: a MISALIGNED 8-byte access whose bytes cross a 256-byte
+    // (and here also a 65536-byte) boundary. Base 0x2fffb: bytes land at
+    // 0x2fffb..0x30002, crossing 0x30000 — so the byte addresses need carry
+    // propagation across address bytes 0 AND 1 (c1 and c2). Emitting each
+    // byte's memory-lookup address as `addr[0] + i` on the low byte alone
+    // would give bytes past the boundary a low byte of 256/257/… with the
+    // higher bytes un-incremented — mismatching the MemoryChip ledger's
+    // canonical address and leaving the memory logup unbalanced. Aligned
+    // accesses (addr[0] ∈ {0,8,…,248}) never overflow, so such a flaw stays
+    // latent until a misaligned cross-boundary store appears in real code
+    // (the cipher-clerk SMT-root recompute). This proves+verifies only with
+    // the per-byte address carry chain.
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0xDEAD_BEEF_CAFE_BABE;
+    regs[1] = 0x2fffb; // base[0]=0xfb, base[1]=0xff → +i crosses 0x30000
+
+    let memory = vec![0u8; 4 * 1024 * 1024];
+
+    let code = vec![
+        Opcode::StoreIndU64 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndU64 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, javm::ExitReason::Trap);
+
+    let steps = tracing.into_trace();
+    // The store really crossed the boundary, and the load read it back.
+    let w = steps[0].mem_write.as_ref().expect("store");
+    assert_eq!(w.address, 0x2fffb);
+    assert_eq!(w.size, 8);
+    assert_eq!(steps[1].regs_after[2], 0xDEAD_BEEF_CAFE_BABE);
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
 fn prove_multiple_stores_same_addr() {
     // Write twice to the same address, then read
     let mut regs = [0u64; PVM_REGISTER_COUNT];
@@ -238,12 +298,12 @@ fn prove_multiple_stores_same_addr() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// ── Phase 27: StoreImm direct + StoreImmInd value/address binding ────────
+// ── StoreImm direct + StoreImmInd value/address binding ──────────────────
 
 #[test]
 fn prove_store_imm_u8_then_load() {
     // StoreImmU8 (TwoImm direct): mem[imm_x=0x1000] = imm_y=0x42.
-    // Then read back via LoadIndU8.  Phase 27 binds:
+    // Then read back via LoadIndU8.  The AIR binds:
     //   - MemAddr = ImmBytes[0..4] (= imm_x), via the widened
     //     `IsLoadDirect+IsStoreDirect+IsStoreImmDirect` gate.
     //   - MemValue = ImmYBytes (= imm_y) on active bytes.

@@ -1,7 +1,7 @@
 #![cfg(feature = "prover")]
 
-//! Phase 12b: BitManip TwoReg ops — positive + negative tests for the
-//! constraints added in CpuChip.  Helpers live in `tests/common/mod.rs`.
+//! BitManip TwoReg ops — positive + negative tests for the CpuChip
+//! constraints.  Helpers live in `tests/common/mod.rs`.
 
 mod common;
 use common::*;
@@ -153,9 +153,9 @@ fn sign_extend_16_forged_byte_1_rejected() {
     );
 }
 
-// ── Phase 13b: program-identity authentication ─────────────────────────────
+// ── Program-identity authentication ────────────────────────────────────────
 // CpuChip's per-step instruction tuple (pc, opcode, skip_len, reg_a, reg_b,
-// reg_d, imm) now flows through ProgramMemoryChip.  Forging any field —
+// reg_d, imm) flows through ProgramMemoryChip.  Forging any field —
 // the prover lying about which instruction ran — breaks the lookup.
 
 use javm::PVM_REGISTER_COUNT;
@@ -203,27 +203,29 @@ fn forged_step_skip_len_rejected() {
     });
 }
 
-// ── Phase 13c: flag binding ────────────────────────────────────────────────
+// ── Flag binding ────────────────────────────────────────────────────────────
 // These tests cross-check that the prover can't alter the OPCODE → FLAGS
-// relation by lying about the opcode in a way the 13b tuple (which includes
-// flags) wouldn't catch on its own.  Concretely: forging the opcode to
-// another instruction whose decoded fields (regs, imm, skip_len) and flags
-// happen to all match would slip past 13b alone; 13c's flag binding closes
-// that residual.  Most of these tests reduce to the same "opcode mismatch"
-// path 13b already catches, but we keep them to document the surface.
+// relation by lying about the opcode in a way the instruction tuple (which
+// includes flags) wouldn't catch on its own.  Concretely: forging the opcode
+// to another instruction whose decoded fields (regs, imm, skip_len) and flags
+// happen to all match would slip past the tuple lookup alone; the flag
+// binding closes that residual.  Most of these tests reduce to the same
+// "opcode mismatch" path the tuple lookup already catches, but they document
+// the surface.
 
 #[test]
 #[should_panic(expected = "failed")]
 fn forged_opcode_to_different_category_rejected() {
     // Trace: ReverseBytes (BitManip TwoReg).  Forge: claim Move (also
     // TwoReg, also no immediate) — different category flags → rejected
-    // either via opcode mismatch (13b) or flag mismatch (13c).
+    // either via opcode mismatch (tuple lookup) or flag mismatch (flag
+    // binding).
     forge_step_field(Opcode::ReverseBytes, 2, 3, 0x12_34, |s: &mut PvmStep| {
         s.opcode = Opcode::MoveReg;
     });
 }
 
-// ── Phase 33: CountSetBits forge tests ─────────────────────────────────────
+// ── CountSetBits forge tests ───────────────────────────────────────────────
 
 #[test]
 fn prove_count_set_bits_64() {
@@ -279,7 +281,7 @@ fn count_set_bits_32_forged_count_rejected() {
     );
 }
 
-// ── Phase 34: LeadingZeroBits / TrailingZeroBits forge tests ──────────────
+// ── LeadingZeroBits / TrailingZeroBits forge tests ────────────────────────
 
 #[test]
 fn prove_leading_zero_bits_64() {

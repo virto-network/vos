@@ -376,7 +376,7 @@ fn bench_prove_log14() {
     bench_at_log_size(14);
 }
 
-// ── Track B: PCS config exploration for mobile (Phase 58 / Track B) ──
+// ── PCS config exploration for mobile ──
 //
 // Probes alternative FRI parameters at log14 to evaluate the blowup
 // trade-off.  Verification uses a matching PcsPolicy so the proof is

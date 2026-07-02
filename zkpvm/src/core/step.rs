@@ -29,7 +29,7 @@ pub struct PvmStep {
     pub reg_d: usize,
     /// Decoded immediate value (sign-extended, for imm-category ops).
     pub imm: u64,
-    /// Phase 13d-loadimmjumpind: second immediate for `LoadImmJumpInd`
+    /// Second immediate for `LoadImmJumpInd`
     /// (TwoRegTwoImm category) — the jump-offset side.  `imm` holds the
     /// load-value `imm_x`; this holds the jump-offset `imm_y`.  Default 0
     /// for opcodes without a second immediate.

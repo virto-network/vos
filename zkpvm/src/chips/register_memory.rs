@@ -1,6 +1,6 @@
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use num_traits::One;
+use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
@@ -32,17 +32,19 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 /// RegisterMemoryChip: PVM register-file ledger, analogous to MemoryChip but
 /// indexed by register number (0..NUM_REGS-1) and valued as full u64s.
 ///
-/// At Phase 9b only the initial-state writes (ts=0, from SideNote.initial_regs)
-/// populate the ledger — CpuChip register-access emissions are added in
-/// subsequent phases.  The ledger entries are sorted by (reg_addr, timestamp)
-/// and the read-consistency constraint fires when a read is preceded by a
-/// same-register entry (forcing read value = previous value).
+/// The initial-state writes (ts=0, from SideNote.initial_regs) and the CpuChip
+/// register-access emissions populate the ledger.  The ledger entries are
+/// sorted by (reg_addr, timestamp) and the read-consistency constraint fires
+/// when a read is preceded by a same-register entry (forcing read value =
+/// previous value).
 pub struct RegisterMemoryChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Register index.
+    /// Register index.  `#[mask_next_row]` so the read-consistency /
+    /// sortedness gadget can read the next ledger row's register.
     #[size = 1]
+    #[mask_next_row]
     RegAddr,
     /// u64 value as 8 LE bytes.
     #[size = 8]
@@ -50,8 +52,10 @@ pub enum Column {
     /// Slot 0 timestamp (u64, 8 LE bytes).  Sort anchor — the row's
     /// position in the ledger is determined by `(RegAddr, Ts0)`.  Slot 0
     /// is gated on `is_real = 1 - IsPadding`; on real rows, this slot
-    /// always emits one consumer fraction.
+    /// always emits one consumer fraction.  `#[mask_next_row]` so the
+    /// sortedness gadget can read the next row's timestamp.
     #[size = 8]
+    #[mask_next_row]
     Ts0,
     /// Slot 1 timestamp.  Emits a consumer fraction iff `SlotReal1 = 1`.
     /// On unmerged rows (or writes), zero-fill.
@@ -77,18 +81,48 @@ pub enum Column {
     #[size = 1]
     IsWrite,
     /// Previous value at same register (u64, 8 bytes).  0 on the first entry
-    /// per register.
+    /// per register.  `#[mask_next_row]` so a row can bind the *next* row's
+    /// `prev_value` to this row's `value` (cross-row read-consistency).
     #[size = 8]
+    #[mask_next_row]
     PrevValue,
-    /// 1 if the next ledger row accesses the same register.
+    /// BOUND boolean: 1 iff the next ledger row is real AND accesses the same
+    /// register.  No longer a free witness — pinned by the sortedness gadget
+    /// (`IsSameRegNext · key_diff = 0` and the range-checked `OrderDelta`), and
+    /// it gates the cross-row `prev_value` value binding.
     #[size = 1]
     IsSameRegNext,
-    /// 1 if padding row (beyond real ledger entries).
+    /// 1 if padding row (beyond real ledger entries).  `#[mask_next_row]` so a
+    /// row can tell whether its successor is real (the sortedness/value gadget
+    /// only fires between two real rows).
     #[size = 1]
+    #[mask_next_row]
     IsPadding,
-    // (B3 audit dropped RealReadH — read-consistency uses an
-    // unconditional `(1 - is_write) · (value[i] - prev_value[i]) = 0`
-    // per byte.  Padding rows have value=prev_value=0 so 1·0=0 holds.)
+    /// 24-bit little-endian decomposition of the per-transition ordering delta
+    /// `OrderDelta = both_real · (IsSameRegNext·ts_diff + (1−IsSameRegNext)·
+    /// (reg_diff−1))`.  Each bit is constrained boolean and recomposed; this is
+    /// a SELF-CONTAINED non-negativity range-check (no Range256 lookup — the
+    /// consumer pass runs with an immutable `&SideNote` and cannot bump
+    /// multiplicities).  24 bits covers `ts_diff < 2^24` and `reg_diff − 1 <
+    /// NUM_REGS`, and `2^24 ≪ p` so a field-wrapped negative (≈ p − small ≈
+    /// 2^31, needing 31 bits) cannot alias a valid small positive.
+    #[size = 24]
+    OrderBits,
+    /// Helper (degree flattening, so all constraints stay ≤ degree 2):
+    /// `BothRealH = (1−IsPadding)·(1−IsPadding_next)` — 1 iff this row and its
+    /// successor are both real.  Gates the ordering range-check off padding
+    /// boundaries and the cyclic last→row-0 wraparound.
+    #[size = 1]
+    BothRealH,
+    /// Helper (degree flattening): `OrderValH = IsSameRegNext·ts_diff +
+    /// (1−IsSameRegNext)·(reg_diff−1)`, the un-gated ordering value.  The
+    /// range-checked OrderDelta is `BothRealH · OrderValH`.
+    #[size = 1]
+    OrderValH,
+    // Read-consistency uses an unconditional
+    // `(1 - is_write) · (value[i] - prev_value[i]) = 0` per byte (no
+    // gating helper column).  Padding rows have value=prev_value=0 so
+    // 1·0=0 holds.
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -130,7 +164,7 @@ impl BuiltInComponent for RegisterMemoryChip {
         let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
         let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
 
-        // ── B5 slot-real flag invariants ────────────────────────────────
+        // ── Slot-real flag invariants ────────────────────────────────
         // Each SlotReal_i ∈ {0, 1}: bool · (bool − 1) = 0.
         eval.add_constraint(slot1[0].clone() * (slot1[0].clone() - E::F::one()));
         eval.add_constraint(slot2[0].clone() * (slot2[0].clone() - E::F::one()));
@@ -148,15 +182,91 @@ impl BuiltInComponent for RegisterMemoryChip {
         eval.add_constraint(is_write[0].clone() * slot3[0].clone());
 
         // Read consistency: for a read (is_write=0) that follows a same-reg
-        // entry, the byte-wise value must equal prev_value.  Unchanged from
-        // pre-B5 — the merge collapses only same-VALUE read runs, so a
-        // merged read row's value matches the run's first slot's value
-        // and the prev-value lookup against the previous ledger row works
-        // unchanged.
-        // B3 audit: read consistency unconditional per byte.
+        // entry, the byte-wise value must equal prev_value.  The merge
+        // collapses only same-VALUE read runs, so a merged read row's value
+        // matches the run's first slot's value and the prev-value lookup
+        // against the previous ledger row works unchanged.  Enforced
+        // unconditionally per byte.
         let is_read = E::F::one() - is_write[0].clone();
         for i in 0..8 {
             eval.add_constraint(is_read.clone() * (value[i].clone() - prev_value[i].clone()));
+        }
+
+        // ── Cross-row read-consistency + (reg, ts) sortedness gadget ─────
+        // The ledger is sorted by (RegAddr, Ts0).  These constraints pin that
+        // ordering and bind each read to the immediately-preceding same-reg
+        // row, closing the read-consistency soundness gap (see
+        // docs/plans/ledger-read-consistency.md).  All
+        // constraints stay ≤ degree 2 (this chip can't raise
+        // LOG_CONSTRAINT_DEGREE_BOUND), via the BothRealH / OrderValH helpers.
+        let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
+        let reg_addr_next = crate::trace::trace_eval_next_row!(trace_eval, Column::RegAddr);
+        let ts0_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Ts0);
+        let prev_value_next = crate::trace::trace_eval_next_row!(trace_eval, Column::PrevValue);
+        let order_bits = crate::trace::trace_eval!(trace_eval, Column::OrderBits);
+        let is_same_reg = crate::trace::trace_eval!(trace_eval, Column::IsSameRegNext);
+        let both_real_h = crate::trace::trace_eval!(trace_eval, Column::BothRealH);
+        let order_val_h = crate::trace::trace_eval!(trace_eval, Column::OrderValH);
+
+        // `key_same` (= IsSameRegNext) is now a BOUND boolean: it can be 1 only
+        // when this row and its successor are both real and same-register.
+        eval.add_constraint(is_same_reg[0].clone() * (is_same_reg[0].clone() - E::F::one()));
+        eval.add_constraint(is_same_reg[0].clone() * is_pad[0].clone());
+        eval.add_constraint(is_same_reg[0].clone() * is_pad_next[0].clone());
+        let reg_diff = reg_addr_next[0].clone() - reg_addr[0].clone();
+        eval.add_constraint(is_same_reg[0].clone() * reg_diff.clone());
+
+        // BothRealH = (1−IsPadding)·(1−IsPadding_next): 1 iff both rows real.
+        eval.add_constraint(
+            both_real_h[0].clone()
+                - (E::F::one() - is_pad[0].clone()) * (E::F::one() - is_pad_next[0].clone()),
+        );
+
+        // OrderValH = key_same·ts_diff + (1−key_same)·(reg_diff−1).
+        let combine_ts = |bytes: &[E::F; 8]| -> E::F {
+            let b256 = E::F::from(BaseField::from(256u32));
+            let mut acc = E::F::zero();
+            let mut pow = E::F::one();
+            for b in bytes {
+                acc += b.clone() * pow.clone();
+                pow *= b256.clone();
+            }
+            acc
+        };
+        let ts_diff = combine_ts(&ts0_next) - combine_ts(&ts0);
+        eval.add_constraint(
+            order_val_h[0].clone()
+                - (is_same_reg[0].clone() * ts_diff
+                    + (E::F::one() - is_same_reg[0].clone()) * (reg_diff - E::F::one())),
+        );
+
+        // OrderDelta = BothRealH · OrderValH, range-checked ≥ 0 via a 24-bit
+        // decomposition (self-contained — no Range256 lookup, the consumer pass
+        // runs with an immutable `&SideNote`; 24 bits ≪ p so a field-wrapped
+        // negative cannot alias a valid small positive).  Then:
+        //   key_same=1 ⇒ ts non-decreasing (ts_diff ≥ 0).
+        //   key_same=0, both real ⇒ reg strictly increases (reg_diff ≥ 1) ⇒
+        //     registers are contiguous (no value-chain bleed) AND key_same is
+        //     forced truthful (claiming 0 on equal regs yields −1, which has no
+        //     24-bit decomposition).
+        let two = E::F::from(BaseField::from(2u32));
+        let mut recomposed = E::F::zero();
+        let mut pow2 = E::F::one();
+        for bit in &order_bits {
+            eval.add_constraint(bit.clone() * (bit.clone() - E::F::one()));
+            recomposed += bit.clone() * pow2.clone();
+            pow2 *= two.clone();
+        }
+        eval.add_constraint(recomposed - both_real_h[0].clone() * order_val_h[0].clone());
+
+        // Cross-row value binding: when the next row is the same register, its
+        // prev_value must equal THIS row's value.  Combined with the per-byte
+        // read-consistency above, this forces every read to return the
+        // most-recent same-reg value (a real write or the initial state).
+        for k in 0..8 {
+            eval.add_constraint(
+                is_same_reg[0].clone() * (prev_value_next[k].clone() - value[k].clone()),
+            );
         }
 
         // ── Per-slot consumer emissions ─────────────────────────────────
@@ -172,6 +282,9 @@ impl BuiltInComponent for RegisterMemoryChip {
             for col in ts {
                 dst.push(col.clone());
             }
+            // is_write is part of the tuple (binds read/write so a read can't
+            // masquerade as a write to skip read-consistency).
+            dst.push(is_write[0].clone());
         };
         // Slot 0.
         let mut tuple0: Vec<E::F> = Vec::with_capacity(17);
@@ -229,51 +342,90 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             return trace.finalize_bit_reversed();
         }
 
-        // B5 fold: collapse runs of consecutive same-(reg, value) reads
-        // into merged rows of up to `B5_MERGE_CAP` slots.  Writes never
-        // merge.  Soundness invariant verified by `merge_entries`'s
-        // property tests — `unmerge(merge(e)) == e`.
-        let merged = merge_entries(&entries);
-
-        let num_rows_real = merged.len();
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real);
+        // The read-run merge is DISABLED: the ledger carries one entry per
+        // row, sorted by (reg, ts).  This keeps the sortedness argument that
+        // pins read-consistency (below) auditable — a merged row spanning
+        // multiple timestamps would need per-slot monotonicity + an
+        // overlap-forbidding constraint.  `merge_entries` and its property
+        // tests stay (uncalled) as documentation of the merge optimisation.
+        // See docs/plans/ledger-read-consistency.md.
+        let num_rows_real = entries.len();
+        let mut log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real);
+        // Guarantee ≥ 1 padding row so the cyclic last→row-0 wraparound is always
+        // a padding row (is_pad = 1 ⇒ both_real = 0): the sortedness gadget must
+        // NOT fire across the wraparound (the last real reg → reg 0 would look
+        // like a backwards key step).
+        if (1usize << log_size) == num_rows_real {
+            log_size += 1;
+        }
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
-        for (row, m) in merged.iter().enumerate() {
-            trace.fill_columns(row, m.reg_addr, Column::RegAddr);
-            trace.fill_columns(row, m.value, Column::Value);
-            trace.fill_columns(row, m.timestamps[0], Column::Ts0);
-            trace.fill_columns(row, m.timestamps[1], Column::Ts1);
-            trace.fill_columns(row, m.timestamps[2], Column::Ts2);
-            trace.fill_columns(row, m.timestamps[3], Column::Ts3);
-            trace.fill_columns(row, m.mult >= 2, Column::SlotReal1);
-            trace.fill_columns(row, m.mult >= 3, Column::SlotReal2);
-            trace.fill_columns(row, m.mult >= 4, Column::SlotReal3);
-            trace.fill_columns(row, m.is_write, Column::IsWrite);
+        // Pass 1: base columns.  Track per-row (reg, ts, key_same) so the
+        // ordering helpers (pass 2) can read the cyclic next row.
+        let mut regs = vec![0u8; num_rows];
+        let mut tss = vec![0u64; num_rows];
+        let mut key_same = vec![false; num_rows];
+        for (row, e) in entries.iter().enumerate() {
+            trace.fill_columns(row, e.reg_addr, Column::RegAddr);
+            trace.fill_columns(row, e.value, Column::Value);
+            trace.fill_columns(row, e.timestamp, Column::Ts0);
+            // Ts1..3 / SlotReal1..3 stay zero (merge disabled — one entry/row).
+            trace.fill_columns(row, e.is_write, Column::IsWrite);
 
-            // Prev-value: previous merged row's value if same register.
-            // The merge groups same-(reg, value) reads — within a group,
-            // value == prev_value trivially (they're the same value).
-            // Across groups: the previous merged row at the same register
-            // is either a write that set this value, OR a read with this
-            // same value (but a value-change would have been the boundary
-            // that ended the prior run, so prev value here is the read
-            // value of the prior run at the same register).
-            let prev_value: u64 = if row > 0 && merged[row - 1].reg_addr == m.reg_addr {
-                merged[row - 1].value
+            // prev_value = previous ledger row's value when same register; the
+            // sortedness gadget binds the NEXT row's prev_value to this row's
+            // value, so the honest filler must agree with that ordering.
+            let prev_value: u64 = if row > 0 && entries[row - 1].reg_addr == e.reg_addr {
+                entries[row - 1].value
             } else {
                 0
             };
             trace.fill_columns(row, prev_value, Column::PrevValue);
 
-            let same_reg_next = row + 1 < num_rows_real && merged[row + 1].reg_addr == m.reg_addr;
+            // key_same = next row real AND same register (a bound boolean).
+            let same_reg_next = row + 1 < num_rows_real && entries[row + 1].reg_addr == e.reg_addr;
             trace.fill_columns(row, same_reg_next, Column::IsSameRegNext);
             trace.fill_columns(row, false, Column::IsPadding);
-        }
 
+            regs[row] = e.reg_addr;
+            tss[row] = e.timestamp;
+            key_same[row] = same_reg_next;
+        }
         for row in num_rows_real..num_rows {
             trace.fill_columns(row, true, Column::IsPadding);
+            // regs/tss/key_same stay 0/false for padding rows.
+        }
+
+        // Pass 2: ordering helpers, reading the cyclic next = (row+1) % num_rows.
+        //   BothRealH = both rows real.
+        //   OrderValH = key_same·ts_diff + (1−key_same)·(reg_diff−1)  [in field;
+        //               may be negative on padding/wraparound rows, where
+        //               BothRealH = 0 gates OrderDelta to 0].
+        //   OrderDelta = BothRealH·OrderValH, 24-bit range-checked ≥ 0.
+        let one = BaseField::from(1u32);
+        for row in 0..num_rows {
+            let next = (row + 1) % num_rows;
+            let both_real = row < num_rows_real && next < num_rows_real;
+            trace.fill_columns(row, both_real, Column::BothRealH);
+
+            let order_val_h: BaseField = if key_same[row] {
+                BaseField::from((tss[next] - tss[row]) as u32)
+            } else {
+                BaseField::from(regs[next] as u32) - BaseField::from(regs[row] as u32) - one
+            };
+            trace.fill_columns_base_field(row, &[order_val_h], Column::OrderValH);
+
+            let order_delta: u64 = if !both_real {
+                0
+            } else if key_same[row] {
+                tss[next] - tss[row]
+            } else {
+                (regs[next] as u64) - (regs[row] as u64) - 1
+            };
+            let bits: [BaseField; 24] =
+                core::array::from_fn(|b| BaseField::from(((order_delta >> b) & 1) as u32));
+            trace.fill_columns_base_field(row, &bits, Column::OrderBits);
         }
 
         trace.finalize_bit_reversed()
@@ -303,17 +455,19 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         let slot1 = crate::trace::original_base_column!(component_trace, Column::SlotReal1);
         let slot2 = crate::trace::original_base_column!(component_trace, Column::SlotReal2);
         let slot3 = crate::trace::original_base_column!(component_trace, Column::SlotReal3);
+        let is_write = crate::trace::original_base_column!(component_trace, Column::IsWrite);
 
         // 4 emissions per row (one per slot), paired by `add_constraints`'s
         // `finalize_logup_in_pairs`.  Tuple shape:
-        //   (reg_addr[1], value[8], ts[8]) = 17 limbs.
+        //   (reg_addr[1], value[8], ts[8], is_write[1]) = 18 limbs.
         // Slot 0 gate = is_real = 1 - is_pad.
         // Slot i (i=1,2,3) gate = SlotReal_i.
         // EMISSION ORDER MUST MATCH the AIR side exactly.
-        let mut tuple0: Vec<_> = Vec::with_capacity(17);
+        let mut tuple0: Vec<_> = Vec::with_capacity(18);
         tuple0.push(reg_addr[0].clone());
         tuple0.extend_from_slice(&value);
         tuple0.extend_from_slice(&ts0);
+        tuple0.push(is_write[0].clone());
         logup.add_to_relation_with(
             reg_lookup,
             [is_pad[0].clone()],
@@ -321,22 +475,25 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             &tuple0,
         );
 
-        let mut tuple1: Vec<_> = Vec::with_capacity(17);
+        let mut tuple1: Vec<_> = Vec::with_capacity(18);
         tuple1.push(reg_addr[0].clone());
         tuple1.extend_from_slice(&value);
         tuple1.extend_from_slice(&ts1);
+        tuple1.push(is_write[0].clone());
         logup.add_to_relation_with(reg_lookup, [slot1[0].clone()], |[s]| (-s).into(), &tuple1);
 
-        let mut tuple2: Vec<_> = Vec::with_capacity(17);
+        let mut tuple2: Vec<_> = Vec::with_capacity(18);
         tuple2.push(reg_addr[0].clone());
         tuple2.extend_from_slice(&value);
         tuple2.extend_from_slice(&ts2);
+        tuple2.push(is_write[0].clone());
         logup.add_to_relation_with(reg_lookup, [slot2[0].clone()], |[s]| (-s).into(), &tuple2);
 
-        let mut tuple3: Vec<_> = Vec::with_capacity(17);
+        let mut tuple3: Vec<_> = Vec::with_capacity(18);
         tuple3.push(reg_addr[0].clone());
         tuple3.extend_from_slice(&value);
         tuple3.extend_from_slice(&ts3);
+        tuple3.push(is_write[0].clone());
         logup.add_to_relation_with(reg_lookup, [slot3[0].clone()], |[s]| (-s).into(), &tuple3);
 
         logup.finalize()
@@ -346,12 +503,11 @@ impl BuiltInProverComponent for RegisterMemoryChip {
 /// Compile-time check that NUM_REGS fits in a single byte for RegAddr.
 const _: [(); (NUM_REGS <= u8::MAX as usize) as usize - 1] = [];
 
-/// B5 dedup-feasibility report — counts how many entries in the (reg, ts)-sorted
+/// Dedup-feasibility report — counts how many entries in the (reg, ts)-sorted
 /// register-memory ledger fall into runs of consecutive same-(reg, value) reads,
 /// and what the resulting `log_size` would be if every such run were merged into
-/// a single multiplicity-bearing row.  Used to decide whether the B5 chip-shrink
-/// pencils out before committing to the audit-sensitive constraint redesign.
-/// See `crates/zkpvm/PERF_ROADMAP.md` §3.1.
+/// a single multiplicity-bearing row.  Used to decide whether a merged-row
+/// chip-shrink pencils out before committing to the constraint redesign it needs.
 #[derive(Debug, Default, Clone)]
 pub struct RegisterDedupReport {
     /// Total ledger entries today (initial-state writes + every CpuChip read/write).
@@ -363,7 +519,7 @@ pub struct RegisterDedupReport {
     pub saved: usize,
     /// `ceil_log2_at_least_lanes(total_entries)` — what the chip uses today.
     pub current_log_size: u32,
-    /// `ceil_log2_at_least_lanes(after_dedup)` — what B5 would deliver.
+    /// `ceil_log2_at_least_lanes(after_dedup)` — what the merge would deliver.
     pub after_dedup_log_size: u32,
     /// Number of runs collapsed (= number of merged rows in the dedup'd ledger).
     /// A "run" of length 1 is also counted: it folds into itself with multiplicity 1.
@@ -452,7 +608,7 @@ pub fn build_entries_from_side_note(side_note: &crate::side_note::SideNote) -> V
         }
     }
 
-    // Phase Z0: synthetic closing-read entries — one per register at
+    // Synthetic closing-read entries — one per register at
     // ts=closing_ts. Pair with `RegisterMemoryClosingChip`'s producer
     // emissions to consume them; read-consistency in this chip then
     // forces each row's value to equal the previous ledger row's
@@ -556,10 +712,10 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> RegisterDedupRep
     }
 }
 
-// ── B5 merge helper (PERF_ROADMAP §3.1) ────────────────────────────────
+// ── Merge helper ───────────────────────────────────────────────────────
 //
-// Audit-sensitive: this is the soundness backbone of the future merged
-// chip.  The merge function takes the (reg, ts)-sorted single-entry
+// Soundness-sensitive: this is the backbone of the merged-row chip.  The
+// merge function takes the (reg, ts)-sorted single-entry
 // ledger and folds runs of consecutive same-(reg, value) reads into
 // merged rows of up to `B5_MERGE_CAP` slots.  Writes are never merged
 // (writes change the value, ending a run).  Runs of length > MERGE_CAP
@@ -570,8 +726,8 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> RegisterDedupRep
 // `unmerge(merge(e)) == e` for any (reg, ts)-sorted `e`.  This invariant
 // pins the merge rule before AIR constraint changes layer in.
 //
-// AIR constraint design notes (next-session work, NOT yet wired into
-// the chip): each merged row carries `Mult ∈ 0..=B5_MERGE_CAP`,
+// AIR constraint design notes (NOT yet wired into the chip): each merged
+// row carries `Mult ∈ 0..=B5_MERGE_CAP`,
 // `SlotReal_i = (Mult > i)`, and per-slot timestamp columns
 // `TS_i[8]`.  Per-slot consumer emits `−SlotReal_i · (RegAddr, Value,
 // TS_i)` to `RegisterMemoryLookupElements`.  Sort key remains
@@ -617,7 +773,7 @@ impl MergedRegEntry {
     }
 }
 
-/// Apply the B5 merge rule to a (reg, ts)-sorted list of single-entry
+/// Apply the merge rule to a (reg, ts)-sorted list of single-entry
 /// register-memory ledger rows.  Consecutive same-(reg, value) reads are
 /// folded up to `B5_MERGE_CAP` slots; runs of length > `B5_MERGE_CAP`
 /// split into multiple adjacent merged rows.
@@ -870,10 +1026,9 @@ mod tests {
         assert_eq!(restored, entries);
     }
 
-    /// Pseudo-random sweep — same shape as the suggested
-    /// `tests/quickcheck_register_memory.rs` from PERF_ROADMAP §3.1, but
-    /// hand-rolled (no quickcheck dep needed).  Generates 200 random step
-    /// sequences and asserts the roundtrip invariant on each.
+    /// Pseudo-random sweep — hand-rolled (no quickcheck dep needed).
+    /// Generates 200 random step sequences and asserts the roundtrip
+    /// invariant on each.
     #[test]
     fn roundtrip_random_sweep() {
         // Linear congruential generator for reproducibility without

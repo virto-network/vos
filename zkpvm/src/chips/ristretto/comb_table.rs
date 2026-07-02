@@ -1,5 +1,5 @@
-//! Session 2.1 of the perf roadmap — comb-method scaffolding for
-//! Ristretto fixed-base scalar multiplication.
+//! Comb-method scaffolding for Ristretto fixed-base scalar
+//! multiplication.
 //!
 //! This module is host-side only.  It precomputes the per-base
 //! lookup table `T[64][16]` and exposes a reference
@@ -13,10 +13,8 @@
 //! `i`-th nibble: `k_i = (scalar[i/2] >> (4·(i%2))) & 0xF`.
 //!
 //! The chip-side integration (preprocessed columns + lookup
-//! constraint + new fixed-base row class) is the next-larger
-//! deliverable for Session 2.1; this module's role is to pin down
-//! the precompute math first so the chip side has a host-side
-//! reference that's already cross-checked against the existing
+//! constraint + fixed-base row class) consumes this table; this
+//! module pins down the precompute math, cross-checked against the
 //! double-and-add path.
 
 #![cfg(feature = "prover")]

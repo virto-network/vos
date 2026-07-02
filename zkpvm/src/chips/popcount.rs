@@ -1,4 +1,4 @@
-//! Phase 33: PopcountChip — 256-row lookup table proving
+//! PopcountChip — 256-row lookup table proving
 //! `popcount = byte.count_ones()`.
 //!
 //! Each row holds `(byte, popcount(byte))` for `byte ∈ [0, 256)`.

@@ -1,13 +1,12 @@
 #![cfg(feature = "prover")]
 
-//! Phase 20: signed-load inactive-byte sign-extension tests.
+//! Signed-load inactive-byte sign-extension tests.
 //!
 //! Each test stores a byte/halfword/word with the high bit set, then
 //! loads it as signed (LoadIndI8/LoadIndI16/LoadIndI32) and asserts
-//! the destination register contains the sign-extended value.  Phase
-//! 20 added the AIR constraint that pins inactive bytes of the load
-//! result to `0xFF · LoadSignBit`; pre-Phase-20 those bytes were
-//! prover-witnessed and unconstrained.
+//! the destination register contains the sign-extended value.  The AIR
+//! constraint pins inactive bytes of the load result to
+//! `0xFF · LoadSignBit`.
 
 mod common;
 use common::*;
@@ -192,7 +191,7 @@ fn load_i8_positive_zero_extends() {
 fn load_i8_negative_forged_high_byte_rejected() {
     // Store 0x80 (negative i8 → -128); honest load yields
     // 0xFFFFFFFFFFFFFF80.  Forge to drop the high 0xFF byte → mismatch
-    // detected by the new inactive-byte sign-extension constraint.
+    // detected by the inactive-byte sign-extension constraint.
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[0] = 0x80;
     regs[1] = 0x1000;

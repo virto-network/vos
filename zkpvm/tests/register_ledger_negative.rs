@@ -1,7 +1,7 @@
 #![cfg(feature = "prover")]
 
 //! Negative-test corpus for the register-memory ledger
-//! (RegisterMemoryChip + CpuChip producers — Phase 9 architecture).
+//! (RegisterMemoryChip + CpuChip producers).
 //!
 //! These tests target a *different* soundness layer than tests/alu_negative.rs.
 //! The ALU-negative corpus forges `regs_after[rd]` on a one-step program;

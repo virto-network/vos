@@ -1,4 +1,4 @@
-//! Session 2.1 of the perf roadmap — RistrettoCombTableChip.
+//! RistrettoCombTableChip.
 //!
 //! Producer-side chip for the Ristretto/Ed25519 fixed-base scalar-mult
 //! comb method.  Holds the precomputed lookup table
@@ -7,17 +7,16 @@
 //! counts how many fixed-base scalar-mult lookups hit each entry, and
 //! the chip emits a `-Multiplicity` contribution to the
 //! `RistrettoCombLookupElements` relation per row, drained by the
-//! consumer chip (deferred — Session 2.1 step 5+).
+//! consumer chip.
 //!
 //! Mirrors the PopcountChip / BitwiseLookupChip pattern: fixed
 //! preprocessed table plus a single Multiplicity column counted from
 //! consumer-side per-row charges.
 //!
-//! Today this chip is dormant — `BASE_COMPONENTS` doesn't include it
-//! yet (gated by `activity.ristretto_comb`, false until the consumer
-//! lands).  Adding it here without the consumer keeps lookups balanced
-//! at 0 (multiplicity = 0 ⇒ no contribution); when the consumer lands
-//! the chip activates and the relation closes.
+//! The chip is gated by `activity.ristretto_comb`.  With
+//! multiplicity = 0 (no consumer lookups) it contributes nothing and
+//! the relation stays balanced; when consumers reference the table the
+//! relation closes.
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};

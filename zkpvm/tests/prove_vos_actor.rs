@@ -10,22 +10,32 @@ use zkpvm::{
     production_pcs_config_mobile, prove, prove_profiled, prove_profiled_with_config, verify,
 };
 
-/// Load fibonacci PVM blob (transpiled from ELF).
-fn load_fibonacci_blob() -> Vec<u8> {
+/// Load fibonacci PVM blob (transpiled from ELF), or `None` when the
+/// fixture is absent so callers SKIP (print + return) rather than panic.
+/// Matches the skip-if-absent hygiene of `settle_run.rs`.
+fn load_fibonacci_blob() -> Option<Vec<u8>> {
     let blob_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.pvm"
+        "/../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.pvm"
     );
     if let Ok(data) = std::fs::read(blob_path) {
-        return data;
+        return Some(data);
     }
     let elf_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.elf"
+        "/../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.elf"
     );
-    let elf_data = std::fs::read(elf_path)
-        .expect("fibonacci ELF not found — build with: cd examples/actors/fibonacci && cargo build --release");
-    grey_transpiler::link_elf(&elf_data).expect("failed to transpile fibonacci ELF")
+    let elf_data = match std::fs::read(elf_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!(
+                "SKIP: fibonacci actor fixture absent; build with \
+                 `cd examples/actors/fibonacci && cargo actor` (or `just build-pvm`)"
+            );
+            return None;
+        }
+    };
+    Some(grey_transpiler::link_elf(&elf_data).expect("failed to transpile fibonacci ELF"))
 }
 
 /// Test-side panicking wrapper over `zkpvm::actor::interpreter_from_blob`
@@ -38,7 +48,9 @@ fn interpreter_from_blob(blob: &[u8], gas: u64) -> (Interpreter, Vec<u8>) {
 
 #[test]
 fn trace_fibonacci_actor() {
-    let blob = load_fibonacci_blob();
+    let Some(blob) = load_fibonacci_blob() else {
+        return;
+    };
     eprintln!("PVM blob: {} bytes", blob.len());
 
     let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
@@ -76,7 +88,9 @@ fn trace_fibonacci_actor() {
 
 #[test]
 fn prove_fibonacci_actor() {
-    let blob = load_fibonacci_blob();
+    let Some(blob) = load_fibonacci_blob() else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("failed to parse JAR blob");
 
     // Extract code and bitmask
@@ -108,7 +122,9 @@ fn prove_fibonacci_actor() {
 
 #[test]
 fn profile_fibonacci_actor() {
-    let blob = load_fibonacci_blob();
+    let Some(blob) = load_fibonacci_blob() else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("failed to parse JAR blob");
 
     let mut code_data = None;
@@ -176,20 +192,32 @@ fn profile_fibonacci_actor() {
 
 // ── Generic actor profile helper ──
 
-fn load_actor_blob(name: &str) -> Vec<u8> {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/actors/");
+/// Load actor `name`'s PVM blob (preferring a pre-transpiled `.pvm`,
+/// else transpiling its `.elf`), or `None` when the fixture is absent
+/// so callers SKIP (print + return) rather than panic.  The SKIP
+/// message is emitted here, so callers just `let Some(blob) = ... else
+/// { return; };`.
+fn load_actor_blob(name: &str) -> Option<Vec<u8>> {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/actors/");
     let pvm_path = format!("{base}{name}/target/riscv64em-javm/release/{name}.pvm");
     if let Ok(data) = std::fs::read(&pvm_path) {
-        return data;
+        return Some(data);
     }
     let elf_path = format!("{base}{name}/target/riscv64em-javm/release/{name}.elf");
-    let elf_data =
-        std::fs::read(&elf_path).unwrap_or_else(|_| panic!("{name} ELF not found — build first"));
-    grey_transpiler::link_elf(&elf_data).expect("failed to transpile ELF")
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: {name} actor fixture absent; run `just build-pvm` first");
+            return None;
+        }
+    };
+    Some(grey_transpiler::link_elf(&elf_data).expect("failed to transpile ELF"))
 }
 
 fn profile_actor(name: &str, gas: u64) {
-    let blob = load_actor_blob(name);
+    let Some(blob) = load_actor_blob(name) else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -208,7 +236,7 @@ fn profile_actor(name: &str, gas: u64) {
     // their on_start handler under the bare interpreter.  Pure-compute
     // actors with no hostcalls behave the same as `run()`.
     let exit = tracing.run_with_vos_stubs();
-    // Step 9-18 ECALL records — capture before consuming `tracing`.
+    // Precompile ECALL records — capture before consuming `tracing`.
     let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
     let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
     let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
@@ -261,7 +289,7 @@ fn profile_actor(name: &str, gas: u64) {
             .with_memory(flat_mem)
             .with_jump_table(code_blob.jump_table.to_vec());
 
-    // Steps 9-18: install precompile ECALL records on side_note.
+    // Install precompile ECALL records on side_note.
     for c in &blake2b_calls {
         side_note
             .blake2b_calls
@@ -295,7 +323,9 @@ fn profile_actor(name: &str, gas: u64) {
 }
 
 fn profile_actor_with_config(name: &str, gas: u64, config: zkpvm::PcsConfig) {
-    let blob = load_actor_blob(name);
+    let Some(blob) = load_actor_blob(name) else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -385,7 +415,9 @@ fn profile_clerk_refine_bench() {
 /// also runs the full prove path.
 #[test]
 fn trace_clerk_refine_bench() {
-    let blob = load_actor_blob("clerk-refine-bench");
+    let Some(blob) = load_actor_blob("clerk-refine-bench") else {
+        return;
+    };
     let (interp, _flat_mem) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run_with_vos_stubs();
@@ -414,11 +446,13 @@ fn profile_clerk_private_pay_bench_mobile() {
     );
 }
 
-/// B5 feasibility check: build the side_note exactly as the prover would for
-/// `name`'s canonical workload, then run `register_memory::analyze_dedup` and
-/// print the report.  No prove step — fast.  See PERF_ROADMAP §3.1.
+/// Build the side_note exactly as the prover would for `name`'s canonical
+/// workload, then run `register_memory::analyze_dedup` and print the report.
+/// No prove step — fast.
 fn analyze_register_dedup(name: &str, gas: u64) {
-    let blob = load_actor_blob(name);
+    let Some(blob) = load_actor_blob(name) else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -517,11 +551,13 @@ fn analyze_register_dedup_clerk_private_pay_bench() {
     analyze_register_dedup("clerk-private-pay-bench", 100_000_000);
 }
 
-/// B6 feasibility check: build the side_note for `name` and run
-/// `memory::analyze_dedup`, which counts byte-flood groups (runs of
-/// consecutive same-(ts, is_write) entries with monotone-by-1 addresses).
+/// Build the side_note for `name` and run `memory::analyze_dedup`, which
+/// counts byte-flood groups (runs of consecutive same-(ts, is_write)
+/// entries with monotone-by-1 addresses).
 fn analyze_memory_dedup(name: &str, gas: u64) {
-    let blob = load_actor_blob(name);
+    let Some(blob) = load_actor_blob(name) else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -615,7 +651,9 @@ fn analyze_memory_dedup_clerk_private_pay_bench() {
 
 #[test]
 fn trace_clerk_private_pay_bench() {
-    let blob = load_actor_blob("clerk-private-pay-bench");
+    let Some(blob) = load_actor_blob("clerk-private-pay-bench") else {
+        return;
+    };
     let (interp, _flat_mem) = interpreter_from_blob(&blob, 500_000_000);
     let mut tracing = TracingPvm::new(interp);
     let exit = tracing.run_with_vos_stubs();
@@ -628,7 +666,9 @@ fn trace_clerk_private_pay_bench() {
 
 #[test]
 fn profile_hash_bench() {
-    let blob = load_actor_blob("hash-bench");
+    let Some(blob) = load_actor_blob("hash-bench") else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -694,17 +734,20 @@ fn profile_hash_bench() {
 fn profile_hash_variant(name: &str) {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/actors/hash-bench/"
+        "/../examples/actors/hash-bench/"
     );
     let pvm_path = format!("{base}hash-{name}.pvm");
     let elf_path = format!("{base}hash-{name}.elf");
-    let blob = std::fs::read(&pvm_path)
-        .or_else(|_| {
-            let elf =
-                std::fs::read(&elf_path).unwrap_or_else(|_| panic!("hash-{name} ELF not found"));
-            Ok::<_, std::io::Error>(grey_transpiler::link_elf(&elf).expect("transpile"))
-        })
-        .unwrap();
+    let blob = match std::fs::read(&pvm_path) {
+        Ok(data) => data,
+        Err(_) => match std::fs::read(&elf_path) {
+            Ok(elf) => grey_transpiler::link_elf(&elf).expect("transpile"),
+            Err(_) => {
+                eprintln!("SKIP: hash-{name} fixture absent; build hash-bench variants first");
+                return;
+            }
+        },
+    };
 
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
@@ -772,9 +815,15 @@ fn compare_hash_algorithms() {
 fn debug_blake2s_prefix() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/actors/hash-bench/"
+        "/../examples/actors/hash-bench/"
     );
-    let blob = std::fs::read(format!("{base}hash-blake2s.pvm")).expect("blake2s PVM");
+    let blob = match std::fs::read(format!("{base}hash-blake2s.pvm")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: hash-blake2s.pvm fixture absent");
+            return;
+        }
+    };
     let parsed = program::parse_blob(&blob).expect("parse");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -841,9 +890,15 @@ fn debug_blake2s_prefix() {
 fn prove_diverse() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/actors/hash-bench/"
+        "/../examples/actors/hash-bench/"
     );
-    let blob = std::fs::read(format!("{base}hash-diverse.pvm")).expect("diverse PVM");
+    let blob = match std::fs::read(format!("{base}hash-diverse.pvm")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: hash-diverse.pvm fixture absent");
+            return;
+        }
+    };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -877,9 +932,15 @@ fn prove_diverse() {
 fn trace_diverse_steps() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/actors/hash-bench/"
+        "/../examples/actors/hash-bench/"
     );
-    let blob = std::fs::read(format!("{base}hash-diverse.pvm")).expect("diverse PVM");
+    let blob = match std::fs::read(format!("{base}hash-diverse.pvm")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: hash-diverse.pvm fixture absent");
+            return;
+        }
+    };
     let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run();
@@ -900,9 +961,15 @@ fn trace_diverse_steps() {
 fn trace_keccak_steps() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/actors/hash-bench/"
+        "/../examples/actors/hash-bench/"
     );
-    let blob = std::fs::read(format!("{base}hash-keccak.pvm")).expect("keccak PVM");
+    let blob = match std::fs::read(format!("{base}hash-keccak.pvm")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: hash-keccak.pvm fixture absent");
+            return;
+        }
+    };
     let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run();
@@ -922,7 +989,9 @@ fn trace_keccak_steps() {
 #[test]
 fn prove_segmented_hash_bench() {
     // Split hash-bench (635 steps) into 2 segments and verify the chain
-    let blob = load_actor_blob("hash-bench");
+    let Some(blob) = load_actor_blob("hash-bench") else {
+        return;
+    };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -1020,8 +1089,8 @@ fn prove_blake2b_precompile() {
 
     // Runs a minimal PVM program that just ECALLs blake2b.  Needs to go
     // through TracingPvm.run_with_precompiles so the CpuChip gets an ECALL
-    // step (Phase 8c producer) and the tracer captures the matching
-    // blake2b_mem_op (Phase 8a/8b consumer pre-image).
+    // step (the producer) and the tracer captures the matching
+    // blake2b_mem_op (the consumer pre-image).
     let h = [
         0x6A09E667F3BCC908u64,
         0xBB67AE8584CAA73B,
@@ -1055,7 +1124,7 @@ fn prove_blake2b_precompile() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2/A3 = φ[7/8/9/10] post off-by-three fix.
+    // PVM A0/A1/A2/A3 map to φ[7/8/9/10].
     regs[7] = h_addr;
     regs[8] = m_addr;
     regs[9] = 0;
@@ -1104,21 +1173,20 @@ fn prove_blake2b_precompile() {
     eprintln!("Blake2b precompile: PROVED!");
 }
 
-/// R1e-quat: end-to-end chip-on test.  Pre-populates
+/// End-to-end chip-on test.  Pre-populates
 /// `side_note.ristretto_field_rows` with a single field-add row
 /// (1 + 2 = 3 mod p), turns the chip on via the
 /// `ristretto_field_rows.is_empty()` activity hook, and proves +
 /// verifies.  Validates that the AIR's per-row constraints
 /// (R1c-3..R1c-5-b) hold against real witness data — separate from
-/// the ECALL boundary path (R1f).
+/// the ECALL boundary path.
 ///
-/// **Ignored after R1e-pent** lands: the chip's register-file
-/// lookup now requires every consumer (a, b) byte to have a
-/// matching producer (some prior row's `out`).  This test pushes
-/// a single row with default a_source = b_source = 0 — no producer
-/// exists for the consumed values, so logup fails.  Re-enable once
-/// the chip gains an INPUT-PRODUCER row class or ECALL-boundary
-/// producer mechanism (R1e-bdry).
+/// Ignored: the chip's register-file lookup requires every consumer
+/// (a, b) byte to have a matching producer (some prior row's `out`).
+/// This test pushes a single row with default a_source = b_source = 0
+/// — no producer exists for the consumed values, so logup fails.
+/// Re-enable once the chip gains an INPUT-PRODUCER row class or
+/// ECALL-boundary producer mechanism.
 #[test]
 #[ignore]
 fn prove_ristretto_chip_field_add() {
@@ -1158,12 +1226,12 @@ fn prove_ristretto_chip_field_add() {
     eprintln!("RistrettoChip field-add: PROVED + VERIFIED");
 }
 
-/// R1e-quat: chip-on test for field-mul.  Exercises the full
-/// is_mul row constraint chain (schoolbook R1c-4-b → 2-pass
-/// reduction R1c-5-b → final < p check R1c-3-bis).
+/// Chip-on test for field-mul.  Exercises the full is_mul row
+/// constraint chain (schoolbook R1c-4-b → 2-pass reduction R1c-5-b
+/// → final < p check R1c-3-bis).
 ///
-/// **Ignored after R1e-pent** — see prove_ristretto_chip_field_add
-/// for the same reason.
+/// Ignored: single bare rows can't prove — see
+/// prove_ristretto_chip_field_add for the same reason.
 #[test]
 #[ignore]
 fn prove_ristretto_chip_field_mul() {
@@ -1171,8 +1239,8 @@ fn prove_ristretto_chip_field_mul() {
 
     let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
-    // Smallest non-zero case: 1 · 1 = 1.  Currently fails (see
-    // doc above); the all-zero case 0·0=0 passes via
+    // Smallest non-zero case: 1 · 1 = 1.  This bare single row can't
+    // prove (see doc above); the all-zero case 0·0=0 is covered by
     // prove_ristretto_chip_field_mul_zero below.
     let mut a = [0u8; 32];
     a[0] = 1;
@@ -1232,16 +1300,15 @@ fn debug_fill_mul_one_times_one() {
     );
 }
 
-/// R1f-soundness: negative tests confirming the chip's per-row
-/// constraints reject malformed witnesses.  Runs prove with invalid
-/// witnesses; each MUST fail.  This is the audit evidence that
-/// within-row soundness is intact.
+/// Negative tests confirming the chip's per-row constraints reject
+/// malformed witnesses.  Runs prove with invalid witnesses; each
+/// MUST fail.  This is the audit evidence that within-row soundness
+/// is intact.
 ///
-/// **Ignored after R1e-pent** — single bare rows can no longer
-/// prove (consumer side unbalanced without INPUT-PRODUCER
-/// mechanism).  Re-enable with a 2-row chained setup, or rely on
-/// the unrelated-rows-rejected attestation.  The per-row
-/// constraints themselves are unchanged and still in the chip.
+/// Ignored: single bare rows can't prove (consumer side unbalanced
+/// without INPUT-PRODUCER mechanism).  Re-enable with a 2-row
+/// chained setup, or rely on the unrelated-rows-rejected
+/// attestation.  The per-row constraints themselves live in the chip.
 #[test]
 #[ignore]
 fn ristretto_chip_negative_per_row_soundness_audit() {
@@ -1403,11 +1470,11 @@ fn ristretto_chip_negative_per_row_soundness_audit() {
     eprintln!("final-form, partition, and closure constraints.");
 }
 
-/// R1f-soundness: validate the cipher-clerk per-payment row sequence
-/// COMPOSES correctly via the host-side compose validator.  Catches
-/// any bug in the point-op generators (point_double_rows /
-/// point_add_rows / scalar_mult_rows) that would produce
-/// inconsistent intermediate values.
+/// Validate the cipher-clerk per-payment row sequence COMPOSES
+/// correctly via the host-side compose validator.  Catches any bug
+/// in the point-op generators (point_double_rows / point_add_rows /
+/// scalar_mult_rows) that would produce inconsistent intermediate
+/// values.
 #[test]
 fn ristretto_chip_per_payment_row_sequence_composes() {
     use zkpvm::chips::ristretto::point::{
@@ -1492,11 +1559,10 @@ fn ristretto_chip_per_payment_row_sequence_composes() {
     };
 }
 
-/// R1e-pent: confirms the inter-row binding gap is now CLOSED.
-/// Push 100 unrelated is_add rows whose inputs don't compose with
-/// any prior row's output.  Before R1e-pent: this proved (the gap).
-/// After R1e-pent: the chip's register-file lookup detects the
-/// unbalanced consumer side and the prove FAILS.
+/// Confirms the inter-row binding is enforced.  Push 100 unrelated
+/// is_add rows whose inputs don't compose with any prior row's
+/// output.  The chip's register-file lookup detects the unbalanced
+/// consumer side and the prove FAILS.
 #[test]
 fn ristretto_chip_unrelated_rows_now_rejected() {
     use zkpvm::chips::ristretto::witness::fill_add;
@@ -1534,11 +1600,11 @@ fn ristretto_chip_unrelated_rows_now_rejected() {
     eprintln!("R1e-pent inter-row binding: CLOSED.");
 }
 
-/// R1e-bdry: chip-on test using INPUT-PRODUCER rows for boundary
-/// inputs.  Demonstrates the full soundness chain: boundary inputs
-/// emit producer tuples → op rows consume them → op rows produce
-/// outputs that downstream rows could consume.  This is the right
-/// pattern for R1f's cipher-clerk integration.
+/// Chip-on test using INPUT-PRODUCER rows for boundary inputs.
+/// Demonstrates the full soundness chain: boundary inputs emit
+/// producer tuples → op rows consume them → op rows produce outputs
+/// that downstream rows could consume.  This is the right pattern
+/// for the cipher-clerk integration.
 #[test]
 fn prove_ristretto_chip_with_input_producers() {
     use zkpvm::chips::ristretto::witness::{fill_add, fill_input};
@@ -1565,8 +1631,8 @@ fn prove_ristretto_chip_with_input_producers() {
     // this CONSUMES row 2's output, balancing the lookup.
     // Wait — input rows are PRODUCERS, not consumers.  The lookup
     // imbalance from row 2's unmatched producer is the "output is
-    // consumed externally" pattern that R1f's ECALL OUTPUT
-    // boundary will provide.  For chip-on tests without R1f,
+    // consumed externally" pattern that the ECALL OUTPUT boundary
+    // provides.  For chip-on tests without an ECALL boundary,
     // simulate by adding a final consumer row that uses row 2's
     // output as its `a`.
     let mut consumer_row = fill_add(row.out, [0u8; 32]);
@@ -1586,10 +1652,10 @@ fn prove_ristretto_chip_with_input_producers() {
     side_note.add_ristretto_field_row(drain); // row 5
 
     // Row 5 is also unmatched...  this chain doesn't close in
-    // chip-only mode.  In R1f the FINAL row's output is consumed
-    // by the ECALL OUTPUT boundary lookup against MemoryChip.
-    // For this chip-on test, we accept the unbalance — the
-    // VERIFIER will reject.  This test asserts the chain is
+    // chip-only mode.  With an ECALL boundary the FINAL row's output
+    // is consumed by the ECALL OUTPUT boundary lookup against
+    // MemoryChip.  For this chip-on test, we accept the unbalance —
+    // the VERIFIER will reject.  This test asserts the chain is
     // structurally correct (even if the trailing consumer is
     // missing) by checking the prove path.
     let config = zkpvm::PcsConfig {
@@ -1619,10 +1685,10 @@ fn prove_ristretto_chip_with_input_producers() {
     eprintln!("Inter-row binding + boundary-input mechanism: COMPOSABLE.");
 }
 
-/// R1e-bdry: CLOSED chip-on chain with INPUT-PRODUCER + OUTPUT-CONSUMER
-/// rows.  Demonstrates a fully-balanced lookup: every produced byte
-/// is consumed exactly once.  This is the soundness-complete
-/// pattern for chip-on tests independent of R1f's ECALL boundary.
+/// CLOSED chip-on chain with INPUT-PRODUCER + OUTPUT-CONSUMER rows.
+/// Demonstrates a fully-balanced lookup: every produced byte is
+/// consumed exactly once.  This is the soundness-complete pattern
+/// for chip-on tests independent of the ECALL boundary.
 #[test]
 fn prove_ristretto_chip_closed_chain_input_output() {
     use zkpvm::chips::ristretto::witness::{fill_add, fill_input, fill_output};
@@ -1653,26 +1719,45 @@ fn prove_ristretto_chip_closed_chain_input_output() {
         fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
-    let proof =
-        zkpvm::prove_with_config(&mut side_note, config).expect("closed chain should prove");
+    // Chip-isolated prove/verify: this exercises the RistrettoChip's per-row +
+    // inter-row + boundary lookup closure against its Range256 table producer
+    // only.  The full-machine path (`prove_with_config`) additionally activates
+    // the always-on memory + register boundary chips, whose Phase Z0 closing
+    // binding rejects step-less traces by design (a step-less proof asserts
+    // nothing about a program), so a chip-only chain must prove in isolation.
+    let components: &[&'static dyn zkpvm::harness::MachineProverComponent] =
+        &[&zkpvm::chips::RangeMultiplicity256, &zkpvm::chips::RistrettoChip];
+    let proof = zkpvm::prove_with_explicit_components(&mut side_note, config, components)
+        .expect("closed chain should prove");
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
         min_fri_log_blowup: 0,
     };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("closed chain should verify");
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    zkpvm::verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .expect("closed chain should verify");
     eprintln!("Closed chain (1 input + 1 input + 1 op + 1 output): PROVED + VERIFIED.");
     eprintln!("Soundness chain: per-row + inter-row + boundary all CLOSED.");
 }
 
-/// R1f: end-to-end SOUNDNESS-COMPLETE prove-time benchmark.
-/// Builds a 1000-deep linear add chain (each step adds a fresh
-/// constant to the running accumulator) using INPUT/OUTPUT
-/// boundary rows.  Every produced byte is consumed exactly once;
-/// the chip's lookup is fully balanced.
+/// End-to-end SOUNDNESS-COMPLETE prove-time benchmark.  Builds a
+/// 1000-deep linear add chain (each step adds a fresh constant to
+/// the running accumulator) using INPUT/OUTPUT boundary rows.
+/// Every produced byte is consumed exactly once; the chip's lookup
+/// is fully balanced.
 ///
-/// This is the "what does soundness-complete prove time look like
-/// per N row chip operations" measurement that R1f answers.
+/// Measures what soundness-complete prove time looks like per N row
+/// chip operations.
 #[test]
 fn bench_ristretto_chip_soundness_complete_chain() {
     use std::time::Instant;
@@ -1717,8 +1802,14 @@ fn bench_ristretto_chip_soundness_complete_chain() {
         fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
+    // Chip-isolated prove/verify (see `prove_ristretto_chip_closed_chain_input_output`):
+    // measure the RistrettoChip + Range256 table cost only, without the
+    // always-on memory / register boundary machinery (whose Phase Z0 closing
+    // binding rejects step-less traces).
+    let components: &[&'static dyn zkpvm::harness::MachineProverComponent] =
+        &[&zkpvm::chips::RangeMultiplicity256, &zkpvm::chips::RistrettoChip];
     let t = Instant::now();
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
+    let proof = zkpvm::prove_with_explicit_components(&mut side_note, config, components)
         .expect("soundness-complete chain prove failed");
     let prove_time = t.elapsed();
 
@@ -1727,9 +1818,19 @@ fn bench_ristretto_chip_soundness_complete_chain() {
         min_fri_queries: 3,
         min_fri_log_blowup: 0,
     };
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
     let t = Instant::now();
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("soundness-complete chain verify failed");
+    zkpvm::verify_with_explicit_components(
+        proof,
+        &side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .expect("soundness-complete chain verify failed");
     let verify_time = t.elapsed();
 
     eprintln!();
@@ -1748,9 +1849,8 @@ fn bench_ristretto_chip_soundness_complete_chain() {
     );
 }
 
-/// R1f-bug-bisect: scalar_mult_rows([N, 0, ...], id) bug — bisect by
-/// the position of the first set bit (MSB-first iteration) where
-/// the add fires.
+/// Bisects scalar_mult_rows([N, 0, ...], id) by the position of the
+/// first set bit (MSB-first iteration) where the add fires.
 #[test]
 #[ignore]
 fn debug_scalar_mult_bisect_first_set_bit_position() {
@@ -1782,9 +1882,9 @@ fn debug_scalar_mult_bisect_first_set_bit_position() {
     }
 }
 
-/// R1f-bug-bisect: identify which specific row in the
-/// scalar_mult_rows([32], id) sequence fails by truncating the
-/// row sequence and seeing where it starts to fail.
+/// Identify which specific row in the scalar_mult_rows([32], id)
+/// sequence fails by truncating the row sequence and seeing where
+/// it starts to fail.
 #[test]
 #[ignore]
 fn debug_scalar_mult_truncate_to_find_failing_row() {
@@ -1841,13 +1941,13 @@ fn debug_scalar_mult_truncate_to_find_failing_row() {
     }
 }
 
-/// R1f-combined: realistic prove-time measurement combining the
-/// RistrettoChip's per-payment row sequence (~21K rows) with a
-/// non-trivial CpuChip baseline (loaded from fibonacci_actor's
-/// PVM trace).  This is the "chip on top of an existing actor
-/// trace" cost — the configuration users would actually pay for.
+/// Realistic prove-time measurement combining the RistrettoChip's
+/// per-payment row sequence (~21K rows) with a non-trivial CpuChip
+/// baseline (loaded from fibonacci_actor's PVM trace).  This is the
+/// "chip on top of an existing actor trace" cost — the
+/// configuration users would actually pay for.
 ///
-/// **Ignored after R1e-pent** — needs INPUT-PRODUCER mechanism.
+/// Ignored: needs the INPUT-PRODUCER mechanism.
 #[test]
 #[ignore]
 fn bench_ristretto_chip_combined_with_cpu_baseline() {
@@ -1857,7 +1957,9 @@ fn bench_ristretto_chip_combined_with_cpu_baseline() {
 
     // CpuChip baseline: clerk-private-pay-bench actor (~37K PVM
     // steps, log17 trace) — the realistic per-payment baseline.
-    let blob = load_actor_blob("clerk-private-pay-bench");
+    let Some(blob) = load_actor_blob("clerk-private-pay-bench") else {
+        return;
+    };
     let (interp, flat_mem) = interpreter_from_blob(&blob, 100_000_000);
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
@@ -1928,14 +2030,14 @@ fn bench_ristretto_chip_combined_with_cpu_baseline() {
     eprintln!("Prove: {:>6.2} s", prove_time.as_secs_f64());
 }
 
-/// R1f: actual end-to-end prove-time measurement for one private
+/// Actual end-to-end prove-time measurement for one private
 /// payment's crypto core (1 Pedersen v·G + b·H + add, 1 Schnorr
 /// k·G + sk·G).  Pushes the full ~21K-row sequence through the
-/// (now-working) RistrettoChip and reports prove + verify time.
+/// RistrettoChip and reports prove + verify time.
 ///
-/// **Ignored after R1e-pent** — chip rejects rows whose inputs
-/// don't have producers.  Re-enable once point-op generators
-/// thread row IDs and INPUT-PRODUCER mechanism lands.
+/// Ignored: the chip rejects rows whose inputs don't have producers.
+/// Re-enable once point-op generators thread row IDs and the
+/// INPUT-PRODUCER mechanism lands.
 #[test]
 #[ignore]
 fn bench_ristretto_chip_one_private_payment() {
@@ -1961,8 +2063,8 @@ fn bench_ristretto_chip_one_private_payment() {
     let t0 = Instant::now();
     let mut rows = Vec::new();
     // Full per-payment crypto core: 1 Pedersen v·G + b·H + add,
-    // 1 Schnorr k·G + sk·G.  After the R1f sub-chain fix, all
-    // scalars work; this exercises the full ~21K-row sequence.
+    // 1 Schnorr k·G + sk·G.  Exercises the full ~21K-row sequence
+    // across all scalars.
     let (vg_rows, vg_pt) = scalar_mult_rows(&scalar_v, &id);
     rows.extend(vg_rows);
     let (bh_rows, bh_pt) = scalar_mult_rows(&scalar_b, &id);
@@ -2010,11 +2112,11 @@ fn bench_ristretto_chip_one_private_payment() {
     eprintln!("Prove:  {:>8.2} s", prove_time.as_secs_f64());
 }
 
-/// R1e projection: count the host-side row sequence for one full
-/// cipher-clerk "tap-and-pay" cryptographic core (one Pedersen
-/// amount commit + one Schnorr-on-Ristretto sign), and report the
-/// expected RistrettoChip log_size.  This estimates the chip's
-/// prove-time cost IF the constraint-debug bug were resolved.
+/// Count the host-side row sequence for one full cipher-clerk
+/// "tap-and-pay" cryptographic core (one Pedersen amount commit +
+/// one Schnorr-on-Ristretto sign), and report the expected
+/// RistrettoChip log_size.  Estimates the chip's prove-time cost
+/// from the row count.
 #[test]
 fn project_ristretto_chip_size_for_one_payment() {
     use zkpvm::chips::ristretto::point::{
@@ -2088,10 +2190,10 @@ fn project_ristretto_chip_size_for_one_payment() {
     );
 }
 
-/// R1e-quat diagnostic: bisect over the COLUMN that triggers the
-/// fail.  Each scenario hand-builds a row with all-zero witness
-/// EXCEPT one specific column has its index-0 cell = 1.  Reports
-/// which columns are "tainted" by a non-zero cell.
+/// Bisect over the COLUMN that triggers the fail.  Each scenario
+/// hand-builds a row with all-zero witness EXCEPT one specific
+/// column has its index-0 cell = 1.  Reports which columns are
+/// "tainted" by a non-zero cell.
 #[test]
 #[ignore]
 fn debug_mul_column_bisect() {
@@ -2255,9 +2357,9 @@ fn debug_mul_column_bisect() {
     }
 }
 
-/// R1e-quat diagnostic: 17 rows of 0·0=0 (forces log_size > LOG_N_LANES).
-/// If this passes, multiple is_mul rows compose; the failure on
-/// 1·1=1 is row-content-specific, not a row-count issue.
+/// 17 rows of 0·0=0 (forces log_size > LOG_N_LANES).  If this
+/// passes, multiple is_mul rows compose; a failure on 1·1=1 is
+/// row-content-specific, not a row-count issue.
 #[test]
 #[ignore]
 fn debug_seventeen_mul_zero_rows() {
@@ -2283,8 +2385,8 @@ fn debug_seventeen_mul_zero_rows() {
     eprintln!("17 mul-zero rows: PROVED + VERIFIED");
 }
 
-/// R1e-quat bisect over which witness CELL triggers the failure.
-/// Each scenario hand-crafts a single field-op row with one specific
+/// Bisect over which witness CELL triggers the failure.  Each
+/// scenario hand-crafts a single field-op row with one specific
 /// non-zero cell and reports prove pass/fail.
 #[test]
 #[ignore]
@@ -2386,7 +2488,7 @@ fn debug_mul_cell_bisect() {
     }
 }
 
-/// **Ignored after R1e-pent** — needs INPUT-PRODUCER mechanism.
+/// Ignored: needs the INPUT-PRODUCER mechanism.
 #[test]
 #[ignore]
 fn prove_ristretto_chip_field_mul_zero() {
@@ -2415,11 +2517,11 @@ fn prove_ristretto_chip_field_mul_zero() {
     eprintln!("RistrettoChip field-mul (0·0=0): PROVED + VERIFIED");
 }
 
-/// R1e-quat: chip-on test for field-mul with operands that overflow
-/// 2²⁵⁶, exercising the full reduction chain (pass-1 fold + pass-2
-/// fold + top-bit fold + final < p).
+/// Chip-on test for field-mul with operands that overflow 2²⁵⁶,
+/// exercising the full reduction chain (pass-1 fold + pass-2 fold +
+/// top-bit fold + final < p).
 ///
-/// **Ignored after R1e-pent** — needs INPUT-PRODUCER mechanism.
+/// Ignored: needs the INPUT-PRODUCER mechanism.
 #[test]
 #[ignore]
 fn prove_ristretto_chip_field_mul_with_reduction() {
@@ -2455,12 +2557,11 @@ fn prove_ristretto_chip_field_mul_with_reduction() {
     eprintln!("RistrettoChip field-mul (full reduction): PROVED + VERIFIED");
 }
 
-/// R1a smoke test: hand-craft an `ecalli 200` program, set up
-/// φ[10]/φ[11]/φ[12] to point at scalar/input-point/output-point
-/// buffers in flat_mem, run TracingPvm with precompile dispatch, and
-/// confirm the captured `RistrettoRecord` + the bytes written to
-/// `output_ptr` match a host-side dalek computation.  No chip /
-/// proving yet — that's R1b onwards.
+/// Hand-craft an `ecalli 200` program, set up φ[10]/φ[11]/φ[12] to
+/// point at scalar/input-point/output-point buffers in flat_mem, run
+/// TracingPvm with precompile dispatch, and confirm the captured
+/// `RistrettoRecord` + the bytes written to `output_ptr` match a
+/// host-side dalek computation.  Traces only — no chip / proving.
 #[test]
 fn ristretto_scalar_mult_via_ecall_tracing() {
     use zkpvm::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
@@ -2596,10 +2697,10 @@ fn prove_blake2b_via_ecall() {
     let bitmask = vec![1, 0, 0, 0, 0, 1];
 
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2/A3 = φ[7/8/9/10] post off-by-three fix.  The
-    // zkpvm-precompiles shim's `in("a0") h_ptr, in("a1") m_ptr,
-    // in("a2") t_low, in("a3") f_flag` lands the actor's blake2b
-    // arguments in φ[7/8/9/10], where the host handler now reads them.
+    // PVM A0/A1/A2/A3 map to φ[7/8/9/10].  The zkpvm-precompiles
+    // shim's `in("a0") h_ptr, in("a1") m_ptr, in("a2") t_low,
+    // in("a3") f_flag` lands the actor's blake2b arguments in
+    // φ[7/8/9/10], where the host handler reads them.
     regs[7] = h_addr; // a0 = h pointer
     regs[8] = m_addr; // a1 = m pointer
     regs[9] = 0; // a2 = t (counter)
@@ -2656,8 +2757,7 @@ fn prove_blake2b_via_ecall() {
     let proof = zkpvm::prove_with_config(&mut side_note, config).expect("proving failed");
     // Test config uses pow_bits=5 / fri_log_blowup=0, well below the
     // STANDARD policy floor.  Use a permissive policy so the verify
-    // step exercises the algebraic check, not the policy gate.  This
-    // was a pre-existing failure mode; pure-test fix.
+    // step exercises the algebraic check, not the policy gate.
     let policy = zkpvm::PcsPolicy {
         min_pow_bits: 5,
         min_fri_queries: 3,
@@ -2672,16 +2772,13 @@ fn prove_blake2b_via_ecall() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Step 9-19 ECALL-chip / ristretto-chip / scalar-arithmetic safety net.
-// Re-authored after the failed Stwo-bump revert clobbered the originals
-// (`git checkout --` discards uncommitted work).  See
-// crates/zkpvm/STWO_2.2.0_MIGRATION.md for the migration block context.
+// ECALL-chip / ristretto-chip / scalar-arithmetic safety net.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Step 7 / Step 13: hand-built `ecalli 200` (scalar_mult).  Chip
-/// activates via the byte-attestation boundary — RistrettoEcallChip
-/// emits memory producers, MemoryChip ledger ingests the matching
-/// consumer entries.
+/// Hand-built `ecalli 200` (scalar_mult).  Chip activates via the
+/// byte-attestation boundary — RistrettoEcallChip emits memory
+/// producers, MemoryChip ledger ingests the matching consumer
+/// entries.
 #[test]
 fn prove_ristretto_via_ecall_boundary() {
     use zkpvm::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
@@ -2749,7 +2846,100 @@ fn prove_ristretto_via_ecall_boundary() {
         .expect("ristretto via ECALL boundary verification failed");
 }
 
-/// Step 13: hand-built `ecalli 201` (point_add) isolation.
+/// End-to-end: the IDENTITY (`0·G`) routed through the REAL ECALL →
+/// tracing → `ingest_ristretto_boundary` comb path, proved with the
+/// full active-component set.  This is the exact shape cipher-clerk
+/// produces: every balanced double-entry layer's zero-sum reveal
+/// (`reveal_and_check` → `verify_reveal`) recomputes
+/// `Amount::commit(0, net_blinding)`, whose `0·G` is a FixedBasepoint
+/// ECALL with scalar = 0.  `detect_scalar_mult_kind` routes it onto the
+/// comb path; `compress(0·G)` is the all-zero identity encoding.
+///
+/// The `IsIdentity` gate is what makes the compress chain's unity row
+/// hold for `0·G`; without it the proof fails `ConstraintsNotSatisfied`.
+/// A tiny single-ECALL trace, so it runs in seconds (the full kernel
+/// transition that contains this op is memory-bound for a separate,
+/// non-constraint reason — proof aggregation / fewer software SMT ops).
+#[test]
+fn prove_ristretto_identity_via_ecall_comb() {
+    use zkpvm::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
+
+    let scalar_addr: u64 = 0x1000;
+    let point_addr: u64 = 0x1020;
+    let output_addr: u64 = 0x1040;
+    // scalar = 0, point = basepoint ⇒ FixedBasepoint comb call for 0·G.
+    let scalar_bytes = [0u8; 32];
+    let point_bytes = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
+    let mut flat_mem = vec![0u8; 0x2000];
+    flat_mem[scalar_addr as usize..scalar_addr as usize + 32].copy_from_slice(&scalar_bytes);
+    flat_mem[point_addr as usize..point_addr as usize + 32].copy_from_slice(&point_bytes);
+
+    let imm = ECALL_RISTRETTO_SCALAR_MULT;
+    let code = vec![
+        javm::instruction::Opcode::Ecalli as u8,
+        (imm & 0xff) as u8,
+        ((imm >> 8) & 0xff) as u8,
+        ((imm >> 16) & 0xff) as u8,
+        ((imm >> 24) & 0xff) as u8,
+        javm::instruction::Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 1];
+    let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
+    regs[7] = scalar_addr;
+    regs[8] = point_addr;
+    regs[9] = output_addr;
+
+    let pvm = javm::interpreter::Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        flat_mem.clone(),
+        10_000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run_with_precompiles();
+    assert_eq!(tracing.ristretto_records.len(), 1);
+    // The traced output is the canonical identity encoding.
+    assert_eq!(
+        tracing.ristretto_mem_ops[0].out_bytes, [0u8; 32],
+        "0·G must trace to the all-zero Ristretto identity encoding"
+    );
+
+    let steps = tracing.steps.clone();
+    let r_records = tracing.ristretto_records.clone();
+    let r_mem_ops = tracing.ristretto_mem_ops.clone();
+    let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
+        .with_memory(flat_mem)
+        .with_initial_regs(regs);
+    side_note.ristretto_calls = r_records;
+    side_note.ristretto_mem_ops = r_mem_ops;
+    // Route the FixedBasepoint call onto the comb→compress→output path.
+    side_note.ingest_ristretto_boundary();
+    assert_eq!(
+        side_note.ristretto_comb_calls.len(),
+        1,
+        "0·G must be routed onto the comb path (FixedBasepoint)"
+    );
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("identity 0·G via ECALL comb path: prove failed (task #7 regressed)");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("identity 0·G via ECALL comb path: verify failed");
+}
+
+/// Hand-built `ecalli 201` (point_add) isolation.
 #[test]
 fn prove_ristretto_point_add_via_ecall_boundary() {
     use zkpvm::core::tracing::ECALL_RISTRETTO_POINT_ADD;
@@ -2774,7 +2964,7 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
+    // PVM A0/A1/A2 map to φ[7/8/9].
     regs[7] = p_addr;
     regs[8] = q_addr;
     regs[9] = output_addr;
@@ -2815,7 +3005,7 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 13: hand-built `ecalli 202` (scalar_reduce_wide) isolation.
+/// Hand-built `ecalli 202` (scalar_reduce_wide) isolation.
 #[test]
 fn prove_scalar_reduce_wide_via_ecall_boundary() {
     use zkpvm::core::tracing::ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE;
@@ -2839,7 +3029,6 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
     // PVM A0/A1 = φ[7/8] per grey-transpiler's RISC-V → PVM mapping.
-    // Aligns with the post-fix handler reads.
     regs[7] = wide_addr;
     regs[8] = output_addr;
 
@@ -2880,7 +3069,7 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 18: hand-built `ecalli 203` (scalar_mul_mod_l) isolation.
+/// Hand-built `ecalli 203` (scalar_mul_mod_l) isolation.
 #[test]
 fn prove_scalar_mul_mod_l_via_ecall() {
     use zkpvm::core::tracing::ECALL_SCALAR_MUL_MOD_L;
@@ -2907,7 +3096,7 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
+    // PVM A0/A1/A2 map to φ[7/8/9].
     regs[7] = a_addr;
     regs[8] = b_addr;
     regs[9] = output_addr;
@@ -2949,7 +3138,7 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 18: scalar mul + add (back-to-back, both binops fire).
+/// Scalar mul + add (back-to-back, both binops fire).
 #[test]
 fn prove_scalar_mul_then_add_mod_l() {
     use zkpvm::core::tracing::{ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_MUL_MOD_L};
@@ -2982,7 +3171,7 @@ fn prove_scalar_mul_then_add_mod_l() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
+    // PVM A0/A1/A2 map to φ[7/8/9].
     regs[7] = a_addr;
     regs[8] = b_addr;
     regs[9] = out_addr;
@@ -3024,8 +3213,8 @@ fn prove_scalar_mul_then_add_mod_l() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 14 bisect: cross-type ECALLs (scalar_mult + point_add) — verifies
-/// the new chip handles multiple ECALL types in one trace.
+/// Cross-type ECALLs (scalar_mult + point_add) — verifies the chip
+/// handles multiple ECALL types in one trace.
 #[test]
 fn prove_scalar_mult_then_point_add() {
     use zkpvm::core::tracing::{ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT};
@@ -3057,9 +3246,7 @@ fn prove_scalar_mult_then_point_add() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2 = φ[7/8/9] for both scalar_mult and point_add
-    // (off-by-three fixed for both — scalar_mult in 02922c4, point_add
-    // in this commit).
+    // PVM A0/A1/A2 = φ[7/8/9] for both scalar_mult and point_add.
     regs[7] = scalar_addr;
     regs[8] = point_addr;
     regs[9] = a_addr;
@@ -3102,7 +3289,7 @@ fn prove_scalar_mult_then_point_add() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 13: two back-to-back scalar_mult ECALLs to same output.
+/// Two back-to-back scalar_mult ECALLs to same output.
 #[test]
 fn prove_two_ristretto_scalar_mult_ecalls() {
     use zkpvm::core::tracing::ECALL_RISTRETTO_SCALAR_MULT;
@@ -3171,7 +3358,7 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 18 chained: mul output consumed by add (Schnorr-shaped pattern).
+/// Mul output consumed by add (Schnorr-shaped pattern).
 #[test]
 fn prove_scalar_mul_chained_add() {
     use zkpvm::core::tracing::{ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_MUL_MOD_L};
@@ -3203,7 +3390,7 @@ fn prove_scalar_mul_chained_add() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
     let mut regs = [0u64; javm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2 = φ[7/8/9] post off-by-three fix.
+    // PVM A0/A1/A2 map to φ[7/8/9].
     regs[7] = a_addr;
     regs[8] = b_addr;
     regs[9] = out_addr;
@@ -3243,13 +3430,12 @@ fn prove_scalar_mul_chained_add() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 4 chained: source-threaded `point_double` end-to-end.
-/// Re-authored after Stwo-bump revert; minor multiplicity-balance issue
-/// vs the lost original — verify rejects with "claimed logup sum is not
-/// zero".  The chip itself is intact (closed_chain_input_output passes).
-/// Marked ignored pending side-by-side comparison with the original
-/// (which is gone).  Not blocking — the bench-level safety net covers
-/// the same chip code paths.
+/// Source-threaded `point_double` end-to-end.
+///
+/// Ignored: a multiplicity-balance issue makes verify reject with
+/// "claimed logup sum is not zero".  The chip itself is intact
+/// (closed_chain_input_output passes); the bench-level safety net
+/// covers the same chip code paths.
 #[test]
 #[ignore]
 fn prove_ristretto_chip_double_chained() {
@@ -3307,8 +3493,9 @@ fn prove_ristretto_chip_double_chained() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 4 chained: source-threaded `point_add` end-to-end.  See
-/// `prove_ristretto_chip_double_chained` — same re-author drift issue.
+/// Source-threaded `point_add` end-to-end.  See
+/// `prove_ristretto_chip_double_chained` — same multiplicity-balance
+/// issue.
 #[test]
 #[ignore]
 fn prove_ristretto_chip_add_chained() {
@@ -3379,9 +3566,10 @@ fn prove_ristretto_chip_add_chained() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 5: small-scalar ladder (k=5, 3 bits) — exercises full chained
-/// `scalar_mult_rows_chained` driver with multi-iteration source threading.
-/// Same re-author drift as the other two chained tests above.
+/// Small-scalar ladder (k=5, 3 bits) — exercises the full chained
+/// `scalar_mult_rows_chained` driver with multi-iteration source
+/// threading.  Same multiplicity-balance issue as the other two
+/// chained tests above.
 #[test]
 #[ignore]
 fn prove_ristretto_chip_scalar_mult_chained_small() {
@@ -3461,11 +3649,13 @@ fn prove_ristretto_chip_scalar_mult_chained_small() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Step 11: hot-PC profile of clerk-private-pay-bench.  Diagnostic
-/// (no prove); used to identify which functions dominate trace size.
+/// Hot-PC profile of clerk-private-pay-bench.  Diagnostic (no
+/// prove); used to identify which functions dominate trace size.
 #[test]
 fn profile_hot_pcs_clerk_private_pay_bench() {
-    let blob = load_actor_blob("clerk-private-pay-bench");
+    let Some(blob) = load_actor_blob("clerk-private-pay-bench") else {
+        return;
+    };
     let (interp, _flat_mem) = interpreter_from_blob(&blob, 500_000_000);
     let mut tracing = TracingPvm::new(interp);
     let _ = tracing.run_with_vos_stubs();

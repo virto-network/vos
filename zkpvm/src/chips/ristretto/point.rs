@@ -1,4 +1,4 @@
-//! R1d: Edwards point doubling and addition over twisted Edwards
+//! Edwards point doubling and addition over the twisted Edwards
 //! curve `−x² + y² = 1 + d·x²·y²` where `d = -121665/121666` and
 //! `a = −1`.  This is the underlying curve of Curve25519/Ristretto.
 //!
@@ -7,11 +7,11 @@
 //! need 9M).
 //!
 //! Each operation is composed as a sequence of is_mul / is_add /
-//! is_sub `FieldOpRow`s.  The chip's existing per-row constraints
-//! (R1c-3..R1c-5-b) cover each emitted row; R1d here is pure host-
-//! side composition, just like R1c-6's inversion driver.  The chip
-//! scheduler (R1e) binds each row's FieldA/FieldB inputs to the
-//! correct intermediate output via boundary lookups.
+//! is_sub `FieldOpRow`s.  The chip's per-row constraints cover each
+//! emitted row; this module is pure host-side composition, like the
+//! inversion driver.  The chip scheduler binds each row's
+//! FieldA/FieldB inputs to the correct intermediate output via
+//! boundary lookups.
 //!
 //! Cross-checked against `curve25519-dalek`'s
 //! `EdwardsPoint::double` and `+` operators inside the test module.
@@ -34,7 +34,7 @@ pub struct ExtendedPoint {
     pub t: Bytes,
 }
 
-/// R1e: source-row indices for an extended-coords point.  Names the
+/// Source-row indices for an extended-coords point.  Names the
 /// chip rows whose `out` produced X, Y, Z, T respectively, so a
 /// downstream chained op can fill its `a_source_row` /
 /// `b_source_row` accurately.  Returned by every chained point op
@@ -53,7 +53,7 @@ pub struct ExtendedPointSources {
 /// host-side; needed for the addition formula.
 ///
 /// Formula: K = 2·d (mod p).  Value taken from RFC 8032 / dalek.
-/// The chip scheduler (R1e) embeds this as a boundary-injected
+/// The chip scheduler embeds this as a boundary-injected
 /// constant or a preprocessed column.
 pub const ED25519_TWO_D: Bytes = [
     0x59, 0xf1, 0xb2, 0x26, 0x94, 0x9b, 0xd6, 0xeb, 0x56, 0xb1, 0x83, 0x82, 0x9a, 0x14, 0xe0, 0x00,
@@ -71,7 +71,7 @@ fn zero_field() -> Bytes {
     [0u8; 32]
 }
 
-/// R1d: emit field-op rows for `2·P` on extended Edwards coordinates.
+/// Emit field-op rows for `2·P` on extended Edwards coordinates.
 ///
 /// Twisted-Edwards doubling formula (a = -1, RFC 8032):
 ///
@@ -165,7 +165,7 @@ pub fn point_double_rows(p: &ExtendedPoint) -> (Vec<FieldOpRow>, ExtendedPoint) 
     )
 }
 
-/// R1d: emit field-op rows for `P + Q` on extended Edwards
+/// Emit field-op rows for `P + Q` on extended Edwards
 /// coordinates.
 ///
 /// Twisted-Edwards addition formula (Hisil et al.):
@@ -265,7 +265,7 @@ pub fn point_add_rows(p: &ExtendedPoint, q: &ExtendedPoint) -> (Vec<FieldOpRow>,
     )
 }
 
-/// R1e (Step 4): source-threaded `2·P` doubling.  Same formula as
+/// Source-threaded `2·P` doubling.  Same formula as
 /// `point_double_rows`, but every emitted row carries the
 /// `a_source_row` / `b_source_row` of the row that produced its
 /// inputs.  `sources` names the rows whose `out` is currently
@@ -374,7 +374,7 @@ pub fn point_double_rows_chained(
     )
 }
 
-/// R1e (Step 4): source-threaded `P + Q` addition.  `p_sources` /
+/// Source-threaded `P + Q` addition.  `p_sources` /
 /// `q_sources` name the rows currently producing each operand's
 /// X/Y/Z/T.  `two_d_source` names the row whose `out` is the
 /// canonical `ED25519_TWO_D` constant (caller must pre-emit that
@@ -495,7 +495,7 @@ pub fn point_add_rows_chained(
     )
 }
 
-/// Step 5: source-threaded scalar-mult `k · P` via the double-and-add
+/// Source-threaded scalar-mult `k · P` via the double-and-add
 /// ladder.  Drives `point_double_rows_chained` and (conditionally)
 /// `point_add_rows_chained`, threading source rows through the entire
 /// ladder so every intermediate value's `a` / `b` source is a real
@@ -568,7 +568,7 @@ pub fn scalar_mult_rows_chained(
     (rows, acc, acc_sources)
 }
 
-// ── R1e-ter: Ristretto compress/decompress witness chain ──────────
+// ── Ristretto compress/decompress witness chain ──────────
 //
 // The byte boundary at the ECALL — 32 compressed-point bytes in,
 // 32 compressed-point bytes out — must be bound to the chip's
@@ -597,24 +597,24 @@ pub fn scalar_mult_rows_chained(
 //   5. Conditional negation by parity of `Zinv·T`         (~3 rows)
 //   6. `s = D · (Z − …)` plus final byte-encoding         (~3 rows)
 //
-// Both paths reuse the chip's existing per-row constraints (R1c-3..
-// R1c-5-b cover the field arithmetic) — the work is composing the
-// rows in the right order with proper source threading and adding
-// any auxiliary columns the canonicality / sign / sqrt witnesses
-// need (the sqrt witness is the substantive piece — it can lean on
-// `pow_rows` already in `witness.rs` for the Fermat exponent).
+// Both paths reuse the chip's per-row constraints (which cover the
+// field arithmetic) — the work is composing the rows in the right
+// order with proper source threading and adding any auxiliary columns
+// the canonicality / sign / sqrt witnesses need (the sqrt witness is
+// the substantive piece — it can lean on `pow_rows` in `witness.rs`
+// for the Fermat exponent).
 //
-// The implementations are deferred — production cipher-clerk
-// integration goes through the Step 3 byte-attestation boundary
+// These implementations are not present in this variable-base path —
+// production integration goes through the byte-attestation boundary
 // (chip attests "these bytes were observed at the ECALL boundary"
-// without binding them to the scalar-mult chain) until R1e-ter
-// lands.  Soundness gap to bridge: a malicious prover can today
+// without binding them to the scalar-mult chain).  Soundness gap to
+// bridge: without the compress/decompress chain a malicious prover can
 // supply any `output` bytes for any `(scalar, point)` input — the
 // chip's ECALL boundary doesn't enforce `output = scalar · point`.
 //
-// Rows-per-payment with R1e-ter: ~6500 (ladder) + ~30 (decompress
-// input point) + ~25 (compress output point) ≈ 6555 rows per
-// scalar mult.  Adds roughly 1% to chip work.
+// Rows-per-payment for the full chain: ~6500 (ladder) + ~30
+// (decompress input point) + ~25 (compress output point) ≈ 6555 rows
+// per scalar mult.  Adds roughly 1% to chip work.
 
 /// Identity point in extended coords: (0, 1, 1, 0).
 pub fn point_identity() -> ExtendedPoint {
@@ -626,7 +626,7 @@ pub fn point_identity() -> ExtendedPoint {
     }
 }
 
-/// R1e: scalar multiplication `k · P → Q` via double-and-add over
+/// Scalar multiplication `k · P → Q` via double-and-add over
 /// extended Edwards coordinates.
 ///
 /// Scans the scalar bits MSB-first.  For each bit:
@@ -638,14 +638,14 @@ pub fn point_identity() -> ExtendedPoint {
 ///
 /// Cost: ~256 doublings + ~128 (avg) additions = ~384 point ops.
 /// Each doubling = 16 field-op rows, each addition = 18.  Total per
-/// scalar mult: ~6500 field-op rows.  R1e-bis (NAF-w4
-/// optimization) cuts adds to ~64 + 8 table-setup, knocking ~30%.
+/// scalar mult: ~6500 field-op rows.  A NAF-w4 optimization cuts adds
+/// to ~64 + 8 table-setup, knocking ~30%.
 ///
 /// **Caveat**: this is the EXTENDED-COORDS scalar mult.  Going from
 /// ECALL byte buffers (compressed Ristretto in/out) to/from
 /// ExtendedPoint requires decompression / compression — a separate
-/// piece (R1e-bis) that adds ~50 field-op rows of curve-equation
-/// witness at the boundary.
+/// piece that adds ~50 field-op rows of curve-equation witness at the
+/// boundary.
 pub fn scalar_mult_rows(scalar: &Bytes, p: &ExtendedPoint) -> (Vec<FieldOpRow>, ExtendedPoint) {
     let mut rows = Vec::new();
     let mut acc = point_identity();
@@ -816,7 +816,7 @@ mod tests {
         // We can't easily produce a non-identity point without
         // dalek's private (X, Y, Z, T) accessors, so this test
         // confirms only that 1·O = O.  Real basepoint coverage
-        // lands in R1f via the ECALL path against dalek directly.
+        // comes via the ECALL path against dalek directly.
         let id = point_identity();
         let mut k = [0u8; 32];
         k[0] = 1;

@@ -1,11 +1,12 @@
-//! Session 2.1 column-shrink — RistrettoCombAnchorChip.
+//! RistrettoCombAnchorChip.
 //!
-//! Sibling chip carrying the lookup-anchor metadata that previously
-//! lived on the consumer chip's per-window anchor row.  Splitting it
-//! out trims ~137 cells from the consumer chip's per-row width
-//! (X/Y/Z/T = 128 bytes + IsLookupAnchor + WindowIdx + ScalarWindow
-//! + Y/Z/T source-row Lo/Hi pairs).  At consumer-chip log_size=13
-//! (8192 rows) that's ~1.1M cells dropped from the prover.
+//! Sibling chip carrying the lookup-anchor metadata, kept off the
+//! consumer chip's per-window rows to keep that chip's per-row width
+//! small.  Holding it here rather than on the consumer chip saves
+//! ~137 cells per consumer row (X/Y/Z/T = 128 bytes + IsLookupAnchor
+//! + WindowIdx + ScalarWindow + Y/Z/T source-row Lo/Hi pairs), which
+//! at consumer-chip log_size=13 (8192 rows) is ~1.1M cells off the
+//! prover.
 //!
 //! Per fixed-basepoint scalar mult call: 64 rows (one per window)
 //! holding `(CallIdx, WindowIdx, ScalarWindow, X[32], Y[32], Z[32],
@@ -199,7 +200,7 @@ impl BuiltInComponent for RistrettoCombAnchorChip {
             ));
         }
 
-        // ── Scalar boundary relation (step 8): bind ScalarWindow per
+        // ── Scalar boundary relation: bind ScalarWindow per
         // (call, window) to the actor's scalar's nibble.  Emits 1
         // tuple per row.
         eval.add_to_relation(RelationEntry::new(
@@ -220,8 +221,9 @@ impl BuiltInComponent for RistrettoCombAnchorChip {
 impl BuiltInProverComponent for RistrettoCombAnchorChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = anchor_log_size(side_note);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        // Canonical-shape: use the (possibly forced) main-trace `log_size`.
+        // ByteIdx is pure-positional ⇒ witness-independent preprocessed trace.
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         for row in 0..num_rows {
@@ -232,10 +234,18 @@ impl BuiltInProverComponent for RistrettoCombAnchorChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         use crate::chips::ristretto::comb_table::{
             CombTable, NUM_WINDOWS, ed25519_basepoint_extended,
         };
-        let log_size = anchor_log_size(side_note);
+        let log_size = anchor_log_size(side_note).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         let table = CombTable::from_base(&ed25519_basepoint_extended());

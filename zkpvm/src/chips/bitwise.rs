@@ -1,10 +1,11 @@
-//! Phase 54e — `BitwiseChip`: per-bitwise-row chip.
+//! `BitwiseChip`: per-bitwise-row chip.
 //!
 //! CpuChip emits one BitwiseLookup producer per `is_bitwise=1` row;
 //! BitwiseChip consumes once per real row.  BitwiseChip witnesses the
 //! AND result + nibble decompositions, runs the per-op result-binding
 //! identities, and emits the 16 nibble-AND lookups against
-//! BitwiseLookupChip's table — all moved off CpuChip's wide trace.
+//! BitwiseLookupChip's table — all on BitwiseChip's narrower trace
+//! rather than CpuChip's wide one.
 //!
 //! Lookup tuple (30 limbs): val_b[8] + val_d[8] + result[8] +
 //! is_and + is_or + is_xor + is_and_inv + is_or_inv + is_xnor.
@@ -87,7 +88,7 @@ pub enum PreprocessedColumn {}
 impl BuiltInComponent for BitwiseChip {
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    /// Phase 54e — depends on both BitwiseLookup (for the row-level
+    /// Depends on both BitwiseLookup (for the row-level
     /// consumer) and BitwiseAndLookup (for the 16 nibble emissions).
     type LookupElements = (BitwiseLookupElements, BitwiseAndLookupElements);
 
@@ -135,8 +136,8 @@ impl BuiltInComponent for BitwiseChip {
         eval.add_constraint(is_real.clone() * (variant_sum.clone() - E::F::one()));
         eval.add_constraint(is_padding[0].clone() * variant_sum);
 
-        // ── Per-op result-binding identities (mirroring CpuChip's old
-        //    Phase 3 block) ──
+        // ── Per-op result-binding identities (mirroring the block
+        //    CpuChip would otherwise carry) ──
         let f255 = E::F::from(BaseField::from(255));
         let f2 = E::F::from(BaseField::from(2u32));
         for i in 0..WORD_SIZE {

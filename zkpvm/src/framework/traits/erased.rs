@@ -1,8 +1,8 @@
 use alloc::{boxed::Box, vec, vec::Vec};
-use stwo::core::{
-    air::Component, channel::Blake2sChannel, fields::qm31::SecureField, pcs::TreeVec,
-};
+use stwo::core::{air::Component, fields::qm31::SecureField, pcs::TreeVec};
 use stwo_constraint_framework::{FrameworkEval, InfoEvaluator, TraceLocationAllocator};
+
+use crate::recursion_pcs::ProverChannel;
 
 use crate::air_column::AirColumn;
 
@@ -14,6 +14,8 @@ use crate::{
 
 #[cfg(feature = "prover")]
 use super::builtin::BuiltInProverComponent;
+#[cfg(feature = "prover")]
+use crate::recursion_pcs::ProverBackend;
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 #[cfg(feature = "prover")]
@@ -46,7 +48,7 @@ pub trait MachineComponent: Sync {
     fn draw_lookup_elements(
         &self,
         lookup_elements: &mut AllLookupElements,
-        channel: &mut Blake2sChannel,
+        channel: &mut ProverChannel,
     );
 
     fn to_component<'a>(
@@ -83,6 +85,25 @@ pub trait MachineProverComponent: MachineComponent {
     /// parallel consumer pass in `prove_impl_with_components`.
     fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace;
 
+    /// Canonical-shape variant of `generate_component_trace` threading a
+    /// per-chip `min_log_size` floor (federation wire-through W0; see
+    /// `BuiltInProverComponent::generate_main_trace_min`).  The
+    /// preprocessed trace is built at the (possibly forced) main `log_size`,
+    /// so a forcing-set chip's preprocessed columns track the canonical
+    /// height.
+    fn generate_component_trace_min(
+        &self,
+        side_note: &mut SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace;
+
+    /// Canonical-shape variant of `generate_component_trace_immut`.
+    fn generate_component_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace;
+
     fn generate_interaction_trace(
         &self,
         component_trace: ComponentTrace,
@@ -99,9 +120,9 @@ pub trait MachineProverComponent: MachineComponent {
         lookup_elements: &AllLookupElements,
         log_size: u32,
         claimed_sum: SecureField,
-    ) -> Box<dyn ComponentProver<SimdBackend> + 'a>;
+    ) -> Box<dyn ComponentProver<ProverBackend> + 'a>;
 
-    /// Phase I.0 debug: pinpoint failing constraint by row + constraint #.
+    /// Debug: pinpoint failing constraint by row + constraint #.
     /// Drives Stwo's `AssertEvaluator` over this chip's main + interaction
     /// trace.  When prove fails with `ConstraintsNotSatisfied` and the
     /// `CPU_DUMP` diagnostic isn't enough to localise the bug, this helper
@@ -145,7 +166,7 @@ where
     fn draw_lookup_elements(
         &self,
         lookup_elements: &mut AllLookupElements,
-        channel: &mut Blake2sChannel,
+        channel: &mut ProverChannel,
     ) {
         C::LookupElements::draw(lookup_elements, channel);
     }
@@ -222,6 +243,43 @@ where
         }
     }
 
+    fn generate_component_trace_min(
+        &self,
+        side_note: &mut SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace {
+        let original_trace =
+            <C as BuiltInProverComponent>::generate_main_trace_min(self, side_note, min_log_size);
+        let log_size = original_trace.log_size;
+        let preprocessed_trace =
+            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
+        ComponentTrace {
+            log_size,
+            preprocessed_trace: preprocessed_trace.cols,
+            original_trace: original_trace.cols,
+        }
+    }
+
+    fn generate_component_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> ComponentTrace {
+        let original_trace = <C as BuiltInProverComponent>::generate_main_trace_immut_min(
+            self,
+            side_note,
+            min_log_size,
+        );
+        let log_size = original_trace.log_size;
+        let preprocessed_trace =
+            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
+        ComponentTrace {
+            log_size,
+            preprocessed_trace: preprocessed_trace.cols,
+            original_trace: original_trace.cols,
+        }
+    }
+
     fn generate_interaction_trace(
         &self,
         component_trace: ComponentTrace,
@@ -245,7 +303,7 @@ where
         lookup_elements: &AllLookupElements,
         log_size: u32,
         claimed_sum: SecureField,
-    ) -> Box<dyn ComponentProver<SimdBackend> + 'a> {
+    ) -> Box<dyn ComponentProver<ProverBackend> + 'a> {
         let lookup_elements = C::LookupElements::get(lookup_elements);
         Box::new(FrameworkComponent::new(
             tree_span_provider,

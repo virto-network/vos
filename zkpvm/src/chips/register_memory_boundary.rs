@@ -68,7 +68,7 @@ impl BuiltInComponent for RegisterMemoryBoundaryChip {
         let reg_val = crate::trace::trace_eval!(trace_eval, Column::RegVal);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
 
-        let mut tuple: Vec<E::F> = Vec::with_capacity(17);
+        let mut tuple: Vec<E::F> = Vec::with_capacity(18);
         tuple.push(reg_addr[0].clone());
         for col in &reg_val {
             tuple.push(col.clone());
@@ -76,6 +76,8 @@ impl BuiltInComponent for RegisterMemoryBoundaryChip {
         for _ in 0..8 {
             tuple.push(E::F::zero());
         }
+        // is_write = 1 (the boundary seeds are the registers' initial writes).
+        tuple.push(E::F::from(BaseField::from(1u32)));
 
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -124,14 +126,14 @@ impl BuiltInProverComponent for RegisterMemoryBoundaryChip {
 
         use stwo::prover::backend::simd::m31::PackedBaseField;
 
-        // Tuple: (reg_addr[1], reg_val[8], timestamp[8]=0) — 17 limbs.
+        // Tuple: (reg_addr[1], reg_val[8], timestamp[8]=0, is_write=1) — 18 limbs.
         logup.add_to_relation_computed(
             reg_lookup,
             [is_real[0].clone()],
             |[real]| real.into(),
-            17,
+            18,
             |vec_idx| {
-                let mut tuple = Vec::with_capacity(17);
+                let mut tuple = Vec::with_capacity(18);
                 tuple.push(reg_addr[0].at(vec_idx));
                 for col in &reg_val {
                     tuple.push(col.at(vec_idx));
@@ -139,6 +141,7 @@ impl BuiltInProverComponent for RegisterMemoryBoundaryChip {
                 for _ in 0..8 {
                     tuple.push(PackedBaseField::zero());
                 }
+                tuple.push(PackedBaseField::broadcast(BaseField::from(1u32)));
                 tuple
             },
         );

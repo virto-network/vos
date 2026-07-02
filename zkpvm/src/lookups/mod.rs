@@ -11,19 +11,22 @@ mod relations;
 
 #[cfg(feature = "prover")]
 pub use self::logup_trace_builder::LogupTraceBuilder;
+pub use self::relations::boundary_relation_challenges;
 pub use self::{
     range_check::Range256LookupElements,
     relations::{
         BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
-        Blake2bCallLookupElements, Blake2bStateLookupElements, ByteToBitsLookupElements,
-        CompareLookupElements, DivRemLookupElements, JumpTableLookupElements,
-        MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements,
-        PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
-        RegisterMemoryLookupElements, RistrettoCombCompressOutputLookupElements,
+        Blake2bCallLookupElements, Blake2bCompressionLookupElements, Blake2bStateLookupElements,
+        ByteToBitsLookupElements, CompareLookupElements, DivRemLookupElements,
+        JumpTableLookupElements, MemoryAccessLookupElements, MerkleNodeLookupElements,
+        MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
+        ProgramExecutionLookupElements, ProgramMemoryLookupElements, RegisterMemoryLookupElements,
+        RistrettoCallLookupElements, RistrettoCombCompressOutputLookupElements,
         RistrettoCombCompressRegFileLookupElements,
         RistrettoCombConsumerRegisterFileLookupElements, RistrettoCombCoordBoundaryLookupElements,
         RistrettoCombFinalAccLookupElements, RistrettoCombLookupElements,
-        RistrettoCombScalarBoundaryLookupElements, RistrettoRegisterFileLookupElements,
+        RistrettoCombScalarBoundaryLookupElements, RistrettoFixedOutTsLookupElements,
+        RistrettoFixedScalarTsLookupElements, RistrettoRegisterFileLookupElements,
     },
 };
 
@@ -41,6 +44,8 @@ macros::register_relation! {
         BitcountLookupElements,
         Blake2bStateLookupElements,
         Blake2bCallLookupElements,
+        Blake2bCompressionLookupElements,
+        MerkleNodeLookupElements,
         MultiplicationLookupElements,
         BitwiseLookupElements,
         CompareLookupElements,
@@ -54,6 +59,9 @@ macros::register_relation! {
         RistrettoCombCompressRegFileLookupElements,
         RistrettoCombCompressOutputLookupElements,
         RistrettoCombFinalAccLookupElements,
+        RistrettoCallLookupElements,
+        RistrettoFixedScalarTsLookupElements,
+        RistrettoFixedOutTsLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

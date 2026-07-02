@@ -2,14 +2,13 @@
 //! PC of `code` to its decoded instruction tuple `(opcode, skip_len, reg_a,
 //! reg_b, reg_d, imm, flag_bytes[6], imm_y_canon, branch_target_canon)`.
 //!
-//! Phase 13a wired the chip in producer-only form; 13b/c added the
-//! consumer + flag bag; subsequent phases extended the bag with extra
-//! per-opcode flags.  Phase 55b packs the 48 individual flag bits into
-//! 6 bytes on BOTH the prog_mem preprocessed table and CpuChip's main
-//! trace.  CpuChip emits 6 byte-to-bits lookups per row to bind each
-//! individual flag column (or its sum-of-sub-flags expression for the
-//! 5 folded category slots) back to its packed byte.  The prog_mem
-//! tuple shrinks from 73 → 31 limbs.
+//! The tuple's flag bag carries per-opcode category/sub-category flags
+//! so a prover can't clear flags to skip per-op constraints.  The 48
+//! individual flag bits are packed into 6 bytes on BOTH the prog_mem
+//! preprocessed table and CpuChip's main trace.  CpuChip emits 6
+//! byte-to-bits lookups per row to bind each individual flag column
+//! (or its sum-of-sub-flags expression for the 5 folded category
+//! slots) back to its packed byte.  The prog_mem tuple is 31 limbs.
 //!
 //! Soundness chain:
 //!   - The preprocessed columns commit, via the Merkle root the verifier
@@ -23,7 +22,7 @@
 //!     CpuChip steps never have a fully-zero `(pc, opcode, …)` tuple at a
 //!     non-zero pc, so consumer demand at those rows yields zero matches.
 //!     Padding rows past `code.len()` similarly hold zero.
-//!   - Phase 55b: each FlagByte_i on CpuChip is bound to the canonical
+//!   - Each FlagByte_i on CpuChip is bound to the canonical
 //!     packed byte via the prog_mem lookup balance; the byte-to-bits
 //!     lookup binds each individual flag column to its bit slot in
 //!     FlagByte_i.  Composed, every individual flag column is pinned
@@ -95,7 +94,7 @@ pub enum PreprocessedColumn {
     /// padding).
     #[size = 8]
     Imm,
-    /// Phase 55b: 6 packed flag bytes.  Each byte holds 8 of the 48
+    /// 6 packed flag bytes.  Each byte holds 8 of the 48
     /// canonical category/sub-category flags as bits 0..7.  Layout per
     /// byte is documented in `lookups/relations.rs` next to
     /// `PROG_MEMORY_N_FLAG_BYTES`.  CpuChip's matching FlagByte0..5
@@ -113,13 +112,13 @@ pub enum PreprocessedColumn {
     FlagByte4,
     #[size = 1]
     FlagByte5,
-    /// Phase 13d-loadimmjumpind: low 4 bytes of canonical `imm_y` for
+    /// Low 4 bytes of canonical `imm_y` for
     /// LoadImmJumpInd (the jump offset).  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
     /// tuple lookup.
     #[size = 4]
     ImmYCanon,
-    /// Phase 15-branch-target-fix: canonical absolute target for static
+    /// Canonical absolute target for static
     /// jumps/branches at this PC, as 4 little-endian bytes.  Computed
     /// from bytecode as `pc + sign_extend(signed_offset)`.  For ops
     /// whose target isn't determined by bytecode (JumpInd / LoadImmJumpInd
@@ -229,7 +228,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                     &d.imm_y_canon.to_le_bytes(),
                     PreprocessedColumn::ImmYCanon,
                 );
-                // Phase 55b: pack the 48 canonical flags into 6 bytes
+                // Pack the 48 canonical flags into 6 bytes
                 // (bit i of byte k = flag[8*k + i]) and fill the 6
                 // FlagByte preprocessed columns.
                 let flag_bytes = pack_flags(&d.flags);
@@ -340,7 +339,7 @@ fn chip_log_size(code_len: usize) -> u32 {
     crate::trace::utils::ceil_log2_at_least_lanes(code_len.max(1))
 }
 
-/// Decoded instruction tuple at one PC.  Phase 55b keeps the 48-flag
+/// Decoded instruction tuple at one PC.  Keeps the 48-flag
 /// array as the source-of-truth (matches `classify_opcode_for_program_memory`)
 /// and `pack_flags` derives the 6 packed bytes that land in the
 /// preprocessed FlagByte0..5 columns.

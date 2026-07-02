@@ -51,6 +51,12 @@ pub struct SideNote {
     /// writes for output).  MemoryChip ingests these into the ledger so the
     /// Blake2bChip memory-consumer lookups balance.
     pub blake2b_mem_ops: Vec<crate::core::tracing::Blake2bMemOp>,
+    /// Synthetic blake2b compressions for the in-AIR memory-page Merkle
+    /// boundary multiproof, proven by `Blake2bBoundaryChip`.  Unlike
+    /// `blake2b_calls` these hash page images (leaves) and node pairs, with
+    /// no memory-ledger binding.  Built on the prove path from
+    /// `page_merkle::boundary_blake2b_calls`.
+    pub merkle_blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     /// R1f: Ristretto255 scalar-mult ECALL records (scalar / input
     /// point / output point as 32 LE bytes each).  Populated by the
     /// trace driver after `TracingPvm::run_with_precompiles`; consumed
@@ -142,6 +148,40 @@ pub struct SideNote {
     /// chip's lookup balance stays at 0 = 0.
     #[cfg(feature = "prover")]
     pub ristretto_field_rows: Vec<crate::chips::ristretto::witness::FieldOpRow>,
+    /// Phase A memory-page Merkle boundary payload, built on the prove path by
+    /// [`SideNote::ingest_memory_pages`].  Holds the listed pages' entering /
+    /// exit images, the boundary multiproof (leaves + merge schedule + roots),
+    /// and seeds `merkle_blake2b_calls`.  `MemoryChip` reads it to inject the
+    /// per-page ts=0 boundary writes + closing reads, `MemoryPageChip` produces
+    /// the leaf hashes, `MemoryMerkleChip` the merge rows, and
+    /// `MemoryRootBoundaryChip` consumes the root.  `None` until ingested (and
+    /// on the verify path, which never needs it — the new chips are
+    /// unconditionally active and their preprocessed traces are row-index pure).
+    #[cfg(feature = "prover")]
+    pub memory_pages: Option<MemoryPagePayload>,
+}
+
+/// One listed page's entering and exit byte images (each [`PAGE_SIZE`] bytes).
+#[cfg(feature = "prover")]
+#[derive(Clone, Debug)]
+pub struct MemoryPageImage {
+    pub page_idx: u32,
+    /// Entering image bytes (root-before leaf input).
+    pub before: Vec<u8>,
+    /// Exit image bytes (root-after leaf input).
+    pub after: Vec<u8>,
+}
+
+/// Per-segment memory-page Merkle boundary payload (design §1–§3).
+#[cfg(feature = "prover")]
+#[derive(Clone, Debug)]
+pub struct MemoryPagePayload {
+    /// Listed pages with entering/exit images, sorted ascending by page index;
+    /// parallel to `multiproof.leaves`.  Always contains page 0.
+    pub pages: Vec<MemoryPageImage>,
+    /// The boundary multiproof: leaf before/after hashes, the bottom-up merge
+    /// schedule, and the two recomputed roots.
+    pub multiproof: crate::page_merkle::MerkleMultiproof,
 }
 
 /// Phase 54g/54i/54k — Single divrem-row witness for the DivRemLookup
@@ -313,6 +353,7 @@ impl SideNote {
             ristretto_comb_calls: Vec::new(),
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
+            merkle_blake2b_calls: Vec::new(),
             ristretto_calls: Vec::new(),
             ristretto_mem_ops: Vec::new(),
             ristretto_add_calls: Vec::new(),
@@ -333,7 +374,41 @@ impl SideNote {
             divrem_entries: Vec::new(),
             #[cfg(feature = "prover")]
             ristretto_field_rows: Vec::new(),
+            #[cfg(feature = "prover")]
+            memory_pages: None,
         }
+    }
+
+    /// Phase A: build the memory-page Merkle boundary payload for this segment
+    /// (design §0–§3).  Enumerates the touched pages (always adding page 0, so
+    /// the listed set is never empty and the new chips stay unconditionally
+    /// active), takes the entering image (`initial_memory`) and the exit image
+    /// (`replay_writes(.., None)`), recomputes both roots via a boundary
+    /// multiproof, and seeds `merkle_blake2b_calls` with the exact compressions
+    /// the `Blake2bBoundaryChip` must prove (one per in-circuit consumption,
+    /// duplicates kept).  Prove-path only; idempotent (rebuilds from scratch).
+    #[cfg(feature = "prover")]
+    pub fn ingest_memory_pages(&mut self) {
+        use crate::page_merkle;
+        let mut touched = page_merkle::touched_pages(self);
+        touched.insert(0); // never-empty page set (design §0)
+        let exiting = crate::segment::replay_writes(self, None);
+        let mp = page_merkle::build_multiproof(&self.initial_memory, &exiting, &touched);
+        // One call per consumption, duplicates included (design §4).
+        self.merkle_blake2b_calls =
+            page_merkle::boundary_blake2b_calls(&mp, &self.initial_memory, &exiting);
+        let pages = touched
+            .iter()
+            .map(|&p| MemoryPageImage {
+                page_idx: p,
+                before: page_merkle::page_bytes(&self.initial_memory, p).to_vec(),
+                after: page_merkle::page_bytes(&exiting, p).to_vec(),
+            })
+            .collect();
+        self.memory_pages = Some(MemoryPagePayload {
+            pages,
+            multiproof: mp,
+        });
     }
 
     /// Builder-style setter: attach a program's jump_table to this side note.
