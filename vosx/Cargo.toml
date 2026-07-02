@@ -28,7 +28,7 @@ vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage"
 # Direct dep for ELF → PVM blob conversion. vos uses it
 # transitively but doesn't re-export, so vosx pulls its own.
 # `version` is what crates.io resolves at publish time.
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "c91e83c1c10219117ed7bb679a80fb424b34228a", version = "0.1" }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.1" }
 # Per-space catalog of programs / agents / members. Source of
 # truth that the new `space *` subcommands operate on.
 space-registry = { path = "../actors/space-registry", version = "0.1.0", default-features = false }

@@ -52,8 +52,8 @@ log = { version = "0.4", default-features = false }
 # Both crates are pinned by git rev during local development; the
 # `version` is what crates.io uses when the published vos package
 # resolves them (the git URL is stripped at publish time).
-javm = { git = "https://github.com/olanod/jar.git", rev = "c91e83c1c10219117ed7bb679a80fb424b34228a", version = "0.4", optional = true }
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "c91e83c1c10219117ed7bb679a80fb424b34228a", version = "0.1", optional = true }
+javm = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.4", optional = true }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.1", optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }

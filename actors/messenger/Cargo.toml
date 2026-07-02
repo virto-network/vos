@@ -96,10 +96,11 @@ libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
-# Unlike the sibling data actors, messenger stays at the default opt-level (3),
-# NOT `opt-level = "s"`: its mls-rs HKDF→Ed25519 signer path mis-executes when
-# transpiled from the size-optimized codegen (the PVM gate's `register` fails
-# with "signer derivation failed"). `vos/tests/messenger_pvm` is the guard.
+# `opt-level = "s"` requires a grey-transpiler that doesn't fuse a left immediate
+# into SLT/SLTU (see the jar pin in ../../vos/Cargo.toml); an older one
+# miscompiles the mls-rs HKDF→Ed25519 path — `vos/tests/messenger_pvm` guards it.
 [profile.release]
-lto = "fat"
+opt-level = "s"
+lto = true
 codegen-units = 1
+panic = "abort"
