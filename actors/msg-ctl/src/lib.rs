@@ -23,37 +23,32 @@
 //! extension. Commits are encrypted to the group where the
 //! ciphersuite allows; the Welcome is encrypted to the joiner's
 //! KeyPackage. Nothing here needs plaintext.
+//!
+//! ## Module layout
+//!
+//! - [`consts`] — the commit-id domain tag and sizing/paging bounds.
+//! - [`rows`] — wire types (`CommitRow`, `CommitOutcome`, `CtlHead`).
+//! - [`roles`] — the [`MsgCtlRole`] gate + [`MSG_CTL_SPACE_ROLE_MAP`].
+//!
+//! `Status` — the handler return type — lives here rather than in its own
+//! module: every `#[msg]` handler below returns it, so it reads best kept
+//! next to the actor it gates.
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+pub mod consts;
+pub mod roles;
+pub mod rows;
+
+#[cfg(test)]
+mod tests;
+
+pub use consts::*;
+pub use roles::{MSG_CTL_SPACE_ROLE_MAP, MsgCtlRole};
+pub use rows::{CommitOutcome, CommitRow, CtlHead, commit_record_id};
+
 use vos::prelude::*;
-
-// ── Constants ─────────────────────────────────────────────────────
-
-/// Domain tag for commit-record ids.
-pub const COMMIT_ID_DOMAIN_TAG: &[u8] = b"vos-msg-commit/v1";
-
-/// Per-field ciphertext bound. Keeps a `CommitRow` small and a
-/// `commits` page predictable; the host's hard reply ceiling is far
-/// higher (8 MiB), so this is a sizing choice, not a correctness
-/// bound. Commit + welcome together are also held under
-/// [`MAX_ROW_BYTES`].
-pub const MAX_BODY_BYTES: usize = 8 * 1024;
-
-/// Combined bound on `commit_body + welcome` so one row stays small.
-/// Generous for small groups (an OpenMLS Welcome for a handful of
-/// members is a few KiB); larger groups need welcome-by-blob-
-/// reference, which can land without changing this actor's chain
-/// semantics.
-pub const MAX_ROW_BYTES: usize = 12 * 1024;
-
-/// Byte budget for one `commits` page (same dispatch-cap
-/// reasoning as msg-log's history paging).
-pub const PAGE_BYTE_BUDGET: usize = 12 * 1024;
-
-/// Hard cap on rows per `commits` page.
-pub const PAGE_MAX_ROWS: u32 = 16;
 
 // ── Status codes ──────────────────────────────────────────────────
 
@@ -107,129 +102,6 @@ impl core::fmt::Display for Status {
         })
     }
 }
-
-// ── Wire types ────────────────────────────────────────────────────
-
-/// One accepted commit. `epoch` is the epoch the commit was
-/// *created at*; processing it advances the group to `epoch + 1`.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct CommitRow {
-    /// Content-derived id — see [`commit_record_id`]. What a
-    /// losing committer compares against to confirm its own
-    /// commit lost.
-    pub id: [u8; 32],
-    pub epoch: u64,
-    /// Sender wall clock, display only.
-    pub ts_ms: u64,
-    /// Opaque MLS Commit message.
-    pub commit_body: Vec<u8>,
-    /// Opaque MLS Welcome for members this commit added; empty
-    /// when the commit added nobody.
-    pub welcome: Vec<u8>,
-    /// Opaque routing token accompanying a Welcome. The inviter
-    /// supplies fresh random bytes — deliberately NOT derived from
-    /// the joiner's public KeyPackage, since a public-derivable
-    /// token would let anyone holding the directory and this chain
-    /// map joins back to nicknames. Joiners recognise their Welcome
-    /// by trial-decryption; this actor only enforces presence.
-    /// Zeroed when `welcome` is empty.
-    pub welcome_hint: [u8; 32],
-}
-
-/// Reply shape for `commit`.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct CommitOutcome {
-    /// `Status::Ok` means this commit is the epoch's winner.
-    pub status: Status,
-    /// The epoch the chain expects next (= its current length).
-    /// On `EpochTaken`/`EpochGap` this tells the caller how
-    /// far behind/ahead it is.
-    pub next_epoch: u64,
-}
-
-/// Reply shape for `head` — enough for a poller to decide
-/// whether new commits exist.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct CtlHead {
-    pub next_epoch: u64,
-}
-
-/// Content-derived id over every field of the record.
-pub fn commit_record_id(
-    epoch: u64,
-    ts_ms: u64,
-    commit_body: &[u8],
-    welcome: &[u8],
-    welcome_hint: &[u8; 32],
-) -> [u8; 32] {
-    vos::crypto::blake2b_hash(
-        COMMIT_ID_DOMAIN_TAG,
-        &[
-            &epoch.to_le_bytes(),
-            &ts_ms.to_le_bytes(),
-            commit_body,
-            welcome,
-            welcome_hint,
-        ],
-    )
-}
-
-// ── Roles ─────────────────────────────────────────────────────────
-
-/// Local role hierarchy. Any space member may submit commits —
-/// whether a commit is *cryptographically* valid is MLS's job
-/// (a non-member can't produce one the group accepts); the role
-/// gate just keeps strangers from growing the chain.
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-)]
-#[rkyv(crate = vos::rkyv)]
-#[repr(u8)]
-pub enum MsgCtlRole {
-    None = 0,
-    Reader = 1,
-    Committer = 2,
-}
-
-impl vos::RoleByte for MsgCtlRole {
-    fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(Self::None),
-            1 => Some(Self::Reader),
-            2 => Some(Self::Committer),
-            _ => None,
-        }
-    }
-    fn as_byte(self) -> u8 {
-        self as u8
-    }
-}
-
-pub const MSG_CTL_SPACE_ROLE_MAP: vos::SpaceRoleMap<MsgCtlRole> = vos::SpaceRoleMap {
-    admin: Some(MsgCtlRole::Committer),
-    developer: Some(MsgCtlRole::Committer),
-    member: Some(MsgCtlRole::Committer),
-    guest: None,
-};
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -354,207 +226,4 @@ fn hint_to_32(b: &[u8]) -> Option<[u8; 32]> {
         return Some([0u8; 32]);
     }
     b.try_into().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vos::Message;
-    use vos::actors::context::ServiceId;
-
-    fn ctl() -> MsgCtl {
-        MsgCtl::new()
-    }
-
-    /// Handler futures never await anything external, so a single
-    /// poll with a no-op waker resolves them — no executor (or
-    /// vos `std` feature) needed in this crate's unit tests.
-    fn run<F: core::future::Future>(fut: F) -> F::Output {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn raw() -> RawWaker {
-            fn clone(_: *const ()) -> RawWaker {
-                raw()
-            }
-            fn noop(_: *const ()) {}
-            RawWaker::new(
-                core::ptr::null(),
-                &RawWakerVTable::new(clone, noop, noop, noop),
-            )
-        }
-        let waker = unsafe { Waker::from_raw(raw()) };
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = core::pin::pin!(fut);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(out) => out,
-            Poll::Pending => panic!("actor handler future was not immediately ready"),
-        }
-    }
-
-    fn dispatch<M>(c: &mut MsgCtl, msg: M) -> <MsgCtl as Message<M>>::Output
-    where
-        MsgCtl: Message<M>,
-    {
-        let mut ctx: vos::Context<MsgCtl> = vos::Context::new(ServiceId(0));
-        run(<MsgCtl as Message<M>>::handle(c, msg, &mut ctx))
-    }
-
-    fn submit(c: &mut MsgCtl, epoch: u64, body: &[u8]) -> CommitOutcome {
-        dispatch(
-            c,
-            Commit {
-                epoch,
-                ts_ms: 1000 + epoch,
-                commit_body: body.to_vec(),
-                welcome: Vec::new(),
-                welcome_hint: Vec::new(),
-            },
-        )
-    }
-
-    #[test]
-    fn chain_advances_one_epoch_at_a_time() {
-        let mut c = ctl();
-        assert_eq!(
-            submit(&mut c, 0, b"add-bob"),
-            CommitOutcome {
-                status: Status::Ok,
-                next_epoch: 1
-            }
-        );
-        assert_eq!(
-            submit(&mut c, 1, b"add-carol"),
-            CommitOutcome {
-                status: Status::Ok,
-                next_epoch: 2
-            }
-        );
-        assert_eq!(dispatch(&mut c, Head), CtlHead { next_epoch: 2 });
-    }
-
-    #[test]
-    fn second_commit_for_an_epoch_is_rejected_with_the_winner_intact() {
-        // The MLS fork-prevention property: exactly one commit
-        // wins each epoch; the loser is told to reprocess.
-        let mut c = ctl();
-        submit(&mut c, 0, b"alice-wins");
-        let outcome = submit(&mut c, 0, b"bob-loses");
-        assert_eq!(outcome.status, Status::EpochTaken);
-        assert_eq!(outcome.next_epoch, 1);
-        let winner = dispatch(&mut c, CommitAt { epoch: 0 }).unwrap();
-        assert_eq!(winner.commit_body, b"alice-wins");
-    }
-
-    #[test]
-    fn resubmitting_the_winner_is_idempotent() {
-        let mut c = ctl();
-        submit(&mut c, 0, b"same");
-        let again = submit(&mut c, 0, b"same");
-        assert_eq!(again.status, Status::Ok);
-        assert_eq!(dispatch(&mut c, Head), CtlHead { next_epoch: 1 });
-    }
-
-    #[test]
-    fn epoch_gap_is_refused() {
-        // A commit built on unseen epochs means the caller skipped
-        // processing the chain — never let a hole into the record.
-        let mut c = ctl();
-        let outcome = submit(&mut c, 3, b"from-the-future");
-        assert_eq!(outcome.status, Status::EpochGap);
-        assert_eq!(outcome.next_epoch, 0);
-        assert_eq!(dispatch(&mut c, Head), CtlHead { next_epoch: 0 });
-    }
-
-    #[test]
-    fn welcome_and_hint_must_travel_together() {
-        let mut c = ctl();
-        let outcome = dispatch(
-            &mut c,
-            Commit {
-                epoch: 0,
-                ts_ms: 0,
-                commit_body: b"add".to_vec(),
-                welcome: b"welcome-bytes".to_vec(),
-                welcome_hint: Vec::new(),
-            },
-        );
-        assert_eq!(outcome.status, Status::InvalidInput);
-        let outcome = dispatch(
-            &mut c,
-            Commit {
-                epoch: 0,
-                ts_ms: 0,
-                commit_body: b"add".to_vec(),
-                welcome: b"welcome-bytes".to_vec(),
-                welcome_hint: vec![7u8; 32],
-            },
-        );
-        assert_eq!(outcome.status, Status::Ok);
-        let row = dispatch(&mut c, CommitAt { epoch: 0 }).unwrap();
-        assert_eq!(row.welcome, b"welcome-bytes");
-        assert_eq!(row.welcome_hint, [7u8; 32]);
-    }
-
-    #[test]
-    fn size_bounds_are_enforced() {
-        let mut c = ctl();
-        let over = vec![0u8; MAX_BODY_BYTES + 1];
-        assert_eq!(submit(&mut c, 0, &over).status, Status::TooLarge);
-        // Each field within bounds but the row over the combined cap.
-        let body = vec![0u8; 7 * 1024];
-        let welcome = vec![1u8; 7 * 1024];
-        let outcome = dispatch(
-            &mut c,
-            Commit {
-                epoch: 0,
-                ts_ms: 0,
-                commit_body: body,
-                welcome,
-                welcome_hint: vec![7u8; 32],
-            },
-        );
-        assert_eq!(outcome.status, Status::TooLarge);
-        assert_eq!(dispatch(&mut c, Head), CtlHead { next_epoch: 0 });
-    }
-
-    #[test]
-    fn commits_pages_in_epoch_order() {
-        let mut c = ctl();
-        for e in 0..5u64 {
-            submit(&mut c, e, format!("c{e}").as_bytes());
-        }
-        let first = dispatch(
-            &mut c,
-            Commits {
-                from_epoch: 0,
-                limit: 2,
-            },
-        );
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[1].epoch, 1);
-        let rest = dispatch(
-            &mut c,
-            Commits {
-                from_epoch: first.last().unwrap().epoch + 1,
-                limit: 10,
-            },
-        );
-        assert_eq!(rest.len(), 3);
-        assert_eq!(rest[0].commit_body, b"c2");
-    }
-
-    #[test]
-    fn commits_paging_respects_byte_budget_but_returns_progress() {
-        let mut c = ctl();
-        let big = vec![0xAAu8; 7 * 1024];
-        submit(&mut c, 0, &big);
-        submit(&mut c, 1, &big);
-        let rows = dispatch(
-            &mut c,
-            Commits {
-                from_epoch: 0,
-                limit: 10,
-            },
-        );
-        assert_eq!(rows.len(), 1, "two 7 KiB commits exceed the 12 KiB budget");
-    }
 }

@@ -35,38 +35,33 @@
 //! was locally asked to watch, so an unsolicited Welcome is inert.
 //! Binding claims to real invite authorization is an identity-layer
 //! follow-up.
+//!
+//! ## Module layout
+//!
+//! - [`consts`] — the KeyPackage-hash domain tag and sizing/quota bounds.
+//! - [`rows`] — wire types (`KpRow`, `ChannelRow`) + the canonical
+//!   KeyPackage hash.
+//! - [`roles`] — the [`MsgDirectoryRole`] gate + [`MSG_DIRECTORY_SPACE_ROLE_MAP`].
+//!
+//! `Status` — the handler return type — lives here rather than in its own
+//! module: every `#[msg]` handler below returns it, so it reads best kept
+//! next to the actor it gates.
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+pub mod consts;
+pub mod roles;
+pub mod rows;
+
+#[cfg(test)]
+mod tests;
+
+pub use consts::*;
+pub use roles::{MSG_DIRECTORY_SPACE_ROLE_MAP, MsgDirectoryRole};
+pub use rows::{ChannelRow, KpRow, kp_hash};
+
 use vos::prelude::*;
-
-// ── Constants ─────────────────────────────────────────────────────
-
-/// Domain tag for KeyPackage hashes. The canonical computation for
-/// the whole messaging stack: the publisher hashes the serialized
-/// KeyPackage it minted, the directory dedupes by it, and the
-/// Welcome routing hint on the msg-ctl chain carries the same
-/// value so a joiner recognises which record admits it.
-pub const KP_HASH_DOMAIN_TAG: &[u8] = b"vos-msg-kp/v1";
-
-/// Bound on one serialized KeyPackage (typically a few hundred
-/// bytes for the pinned ciphersuite).
-pub const MAX_KP_BYTES: usize = 4 * 1024;
-
-/// Bound on operator-controlled identity/name strings (nickname,
-/// channel name, creator). Replicated to every node, so cap them so
-/// a member can't bloat shared state with a giant string.
-pub const MAX_NAME_BYTES: usize = 128;
-
-/// Bound on a member's *live* (unclaimed) packages — caps the
-/// inventory waiting to be claimed without ever locking a member
-/// out of replenishing once their packages are spent. Claimed
-/// rows are retained for the single-use marker but don't count.
-pub const MAX_KPS_PER_MEMBER: usize = 16;
-
-/// Byte budget for one `channels` page.
-pub const PAGE_BYTE_BUDGET: usize = 12 * 1024;
 
 // ── Status codes ──────────────────────────────────────────────────
 
@@ -115,80 +110,6 @@ impl core::fmt::Display for Status {
         })
     }
 }
-
-// ── Wire types ────────────────────────────────────────────────────
-
-/// One published KeyPackage. `kp` is opaque to the directory —
-/// validation happens MLS-side on the inviter.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct KpRow {
-    pub owner: String,
-    pub hash: [u8; 32],
-    pub kp: Vec<u8>,
-    pub claimed: bool,
-}
-
-/// One announced channel.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct ChannelRow {
-    pub name: String,
-    pub creator: String,
-}
-
-/// Canonical KeyPackage hash — see [`KP_HASH_DOMAIN_TAG`].
-pub fn kp_hash(serialized_kp: &[u8]) -> [u8; 32] {
-    vos::crypto::blake2b_hash(KP_HASH_DOMAIN_TAG, &[serialized_kp])
-}
-
-// ── Roles ─────────────────────────────────────────────────────────
-
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-)]
-#[rkyv(crate = vos::rkyv)]
-#[repr(u8)]
-pub enum MsgDirectoryRole {
-    None = 0,
-    Reader = 1,
-    Publisher = 2,
-}
-
-impl vos::RoleByte for MsgDirectoryRole {
-    fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(Self::None),
-            1 => Some(Self::Reader),
-            2 => Some(Self::Publisher),
-            _ => None,
-        }
-    }
-    fn as_byte(self) -> u8 {
-        self as u8
-    }
-}
-
-pub const MSG_DIRECTORY_SPACE_ROLE_MAP: vos::SpaceRoleMap<MsgDirectoryRole> = vos::SpaceRoleMap {
-    admin: Some(MsgDirectoryRole::Publisher),
-    developer: Some(MsgDirectoryRole::Publisher),
-    member: Some(MsgDirectoryRole::Publisher),
-    guest: None,
-};
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -349,283 +270,4 @@ fn kp_key(
     b_hash: &[u8; 32],
 ) -> core::cmp::Ordering {
     a_owner.cmp(b_owner).then_with(|| a_hash.cmp(b_hash))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vos::Message;
-    use vos::actors::context::ServiceId;
-
-    /// Handler futures never await anything external, so a single
-    /// poll with a no-op waker resolves them — no executor (or
-    /// vos `std` feature) needed in this crate's unit tests.
-    fn run<F: core::future::Future>(fut: F) -> F::Output {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn raw() -> RawWaker {
-            fn clone(_: *const ()) -> RawWaker {
-                raw()
-            }
-            fn noop(_: *const ()) {}
-            RawWaker::new(
-                core::ptr::null(),
-                &RawWakerVTable::new(clone, noop, noop, noop),
-            )
-        }
-        let waker = unsafe { Waker::from_raw(raw()) };
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = core::pin::pin!(fut);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(out) => out,
-            Poll::Pending => panic!("actor handler future was not immediately ready"),
-        }
-    }
-
-    fn dispatch<M>(d: &mut MsgDirectory, msg: M) -> <MsgDirectory as Message<M>>::Output
-    where
-        MsgDirectory: Message<M>,
-    {
-        let mut ctx: vos::Context<MsgDirectory> = vos::Context::new(ServiceId(0));
-        run(<MsgDirectory as Message<M>>::handle(d, msg, &mut ctx))
-    }
-
-    fn publish(d: &mut MsgDirectory, owner: &str, kp: &[u8]) -> Status {
-        dispatch(
-            d,
-            PublishKp {
-                owner: owner.into(),
-                kp: kp.to_vec(),
-            },
-        )
-    }
-
-    fn claim(d: &mut MsgDirectory, owner: &str) -> Vec<u8> {
-        dispatch(
-            d,
-            ClaimKp {
-                owner: owner.into(),
-            },
-        )
-    }
-
-    #[test]
-    fn each_published_kp_is_claimable_exactly_once() {
-        let mut d = MsgDirectory::new();
-        assert_eq!(publish(&mut d, "bob", b"kp-one"), Status::Ok);
-        assert_eq!(publish(&mut d, "bob", b"kp-two"), Status::Ok);
-        assert_eq!(
-            dispatch(
-                &mut d,
-                KpCount {
-                    owner: "bob".into()
-                }
-            ),
-            2
-        );
-
-        let first = claim(&mut d, "bob");
-        let second = claim(&mut d, "bob");
-        assert!(!first.is_empty() && !second.is_empty());
-        assert_ne!(first, second, "each claim must consume a distinct package");
-        assert!(
-            claim(&mut d, "bob").is_empty(),
-            "an exhausted member yields no package"
-        );
-        assert_eq!(
-            dispatch(
-                &mut d,
-                KpCount {
-                    owner: "bob".into()
-                }
-            ),
-            0
-        );
-    }
-
-    #[test]
-    fn publish_is_idempotent_by_content() {
-        let mut d = MsgDirectory::new();
-        assert_eq!(publish(&mut d, "bob", b"same"), Status::Ok);
-        assert_eq!(publish(&mut d, "bob", b"same"), Status::Ok);
-        assert_eq!(
-            dispatch(
-                &mut d,
-                KpCount {
-                    owner: "bob".into()
-                }
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn publish_validates_shape_and_quota() {
-        let mut d = MsgDirectory::new();
-        assert_eq!(publish(&mut d, "", b"kp"), Status::InvalidInput);
-        assert_eq!(publish(&mut d, "bob", b""), Status::InvalidInput);
-        let huge = vec![0u8; MAX_KP_BYTES + 1];
-        assert_eq!(publish(&mut d, "bob", &huge), Status::TooLarge);
-        for i in 0..MAX_KPS_PER_MEMBER {
-            assert_eq!(
-                publish(&mut d, "bob", format!("kp-{i}").as_bytes()),
-                Status::Ok
-            );
-        }
-        assert_eq!(
-            publish(&mut d, "bob", b"one-too-many"),
-            Status::QuotaExceeded
-        );
-        // Quota is per member.
-        assert_eq!(publish(&mut d, "carol", b"kp"), Status::Ok);
-        // Oversized owner / channel names are refused.
-        let long = "x".repeat(MAX_NAME_BYTES + 1);
-        assert_eq!(publish(&mut d, &long, b"kp"), Status::InvalidInput);
-        assert_eq!(
-            dispatch(
-                &mut d,
-                AnnounceChannel {
-                    name: long,
-                    creator: "alice".into(),
-                },
-            ),
-            Status::InvalidInput,
-        );
-    }
-
-    #[test]
-    fn spent_packages_free_quota_for_replenishment() {
-        // The quota bounds live inventory, not lifetime publishes —
-        // a member who claimed all their packages must be able to
-        // publish more. Otherwise a long-lived member locks out
-        // after MAX_KPS_PER_MEMBER total invites.
-        let mut d = MsgDirectory::new();
-        for i in 0..MAX_KPS_PER_MEMBER {
-            assert_eq!(
-                publish(&mut d, "bob", format!("kp-{i}").as_bytes()),
-                Status::Ok
-            );
-        }
-        assert_eq!(publish(&mut d, "bob", b"blocked"), Status::QuotaExceeded);
-        // Consume one; a slot frees up.
-        assert!(!claim(&mut d, "bob").is_empty());
-        assert_eq!(publish(&mut d, "bob", b"replenished"), Status::Ok);
-    }
-
-    #[test]
-    fn released_kp_is_claimable_again() {
-        let mut d = MsgDirectory::new();
-        publish(&mut d, "bob", b"the-kp");
-        let claimed = claim(&mut d, "bob");
-        assert_eq!(claimed, b"the-kp");
-        assert!(claim(&mut d, "bob").is_empty(), "single-use after claim");
-
-        let hash = kp_hash(&claimed);
-        assert_eq!(
-            dispatch(
-                &mut d,
-                ReleaseKp {
-                    owner: "bob".into(),
-                    hash: hash.to_vec(),
-                },
-            ),
-            Status::Ok,
-        );
-        assert_eq!(
-            dispatch(
-                &mut d,
-                KpCount {
-                    owner: "bob".into()
-                }
-            ),
-            1,
-            "released package counts as live inventory again"
-        );
-        assert_eq!(claim(&mut d, "bob"), b"the-kp", "released → claimable");
-    }
-
-    #[test]
-    fn release_is_idempotent_and_tolerates_unknown_rows() {
-        let mut d = MsgDirectory::new();
-        publish(&mut d, "bob", b"kp");
-        let hash = kp_hash(b"kp").to_vec();
-        // Releasing an UNCLAIMED row is a no-op success.
-        assert_eq!(
-            dispatch(
-                &mut d,
-                ReleaseKp {
-                    owner: "bob".into(),
-                    hash: hash.clone(),
-                },
-            ),
-            Status::Ok,
-        );
-        // Unknown owner/hash: still OK (retry-safe).
-        assert_eq!(
-            dispatch(
-                &mut d,
-                ReleaseKp {
-                    owner: "nobody".into(),
-                    hash,
-                },
-            ),
-            Status::Ok,
-        );
-        // Malformed hash length is the one refused input.
-        assert_eq!(
-            dispatch(
-                &mut d,
-                ReleaseKp {
-                    owner: "bob".into(),
-                    hash: vec![0u8; 7],
-                },
-            ),
-            Status::InvalidInput,
-        );
-        // Inventory unchanged throughout.
-        assert_eq!(
-            dispatch(
-                &mut d,
-                KpCount {
-                    owner: "bob".into()
-                }
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn claims_are_scoped_to_the_owner() {
-        let mut d = MsgDirectory::new();
-        publish(&mut d, "bob", b"bobs-kp");
-        assert!(claim(&mut d, "carol").is_empty());
-        assert_eq!(claim(&mut d, "bob"), b"bobs-kp");
-    }
-
-    #[test]
-    fn channel_announcements_are_first_wins() {
-        let mut d = MsgDirectory::new();
-        assert_eq!(
-            dispatch(
-                &mut d,
-                AnnounceChannel {
-                    name: "general".into(),
-                    creator: "alice".into(),
-                },
-            ),
-            Status::Ok,
-        );
-        assert_eq!(
-            dispatch(
-                &mut d,
-                AnnounceChannel {
-                    name: "general".into(),
-                    creator: "mallory".into(),
-                },
-            ),
-            Status::Exists,
-        );
-        let rows = dispatch(&mut d, Channels { from: 0, limit: 10 });
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].creator, "alice");
-    }
 }
