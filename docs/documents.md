@@ -250,7 +250,7 @@ content).
 
 Editing is the normal CRDT flow: the application produces a CRDT
 operation, which is recorded as a DAG node, encrypted, and synced. See
-[Sync Layer](./sync.md) and [Encryption](./encryption.md).
+[Sync Layer](./sync.md) and [Encryption](./messaging.md#group-encryption-mls).
 
 ### Archive
 

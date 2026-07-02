@@ -55,7 +55,7 @@ portability. This is the primary working copy: always available,
 lowest latency, and the only tier that is fully trusted.
 
 Local data is encrypted at rest. The encryption key is derived from
-the peer's root secret (see [encryption](encryption.md) for key
+the peer's root secret (see [encryption](messaging.md#group-encryption-mls) for key
 derivation details). Even if the device's disk is imaged, an attacker
 without the root secret sees only ciphertext.
 

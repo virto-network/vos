@@ -6,9 +6,55 @@ decrypted conversation in node-local state. It is the *only* component in the
 messaging stack that ever sees plaintext or key material — every other actor
 handles ciphertext and public data only.
 
-For the user-facing protocol overview see [`docs/messaging.md`](../../docs/messaging.md);
-this README is the actor's architecture + how it interacts with the rest of the
-stack.
+This README covers the protocol's **properties** (what it gives you, next) and
+the actor's **architecture** (below). [`docs/messaging.md`](../../docs/messaging.md)
+sketches the longer-term roadmap — anonymous, moderatable membership and a
+metadata-protecting transport — beyond what ships today.
+
+## What it gives you (and what it doesn't)
+
+A **decentralized, identity-first end-to-end-encrypted group messenger**: MLS
+(RFC 9420) crypto over a per-space actor substrate, with no messaging server and
+no account. The questions that decide whether it fits your use case:
+
+- **Is content end-to-end encrypted, with what?** Yes — RFC 9420 **MLS** (via
+  mls-rs), ciphersuite 1 (X25519 · AES-128-GCM · SHA-256 · Ed25519). Encrypt and
+  decrypt happen only on-device (this actor); peers, relays, and every other
+  actor handle ciphertext and public data only.
+- **Forward secrecy & post-compromise security?** Both, from the MLS key
+  schedule. A key leak doesn't expose past messages (forward secrecy); removing a
+  member rekeys the group so they can't read future messages (post-compromise
+  security). A joiner never decrypts traffic from before its join epoch.
+- **Can someone impersonate me?** No — identity-first. Each member's MLS
+  credential is bound to a **verified space PeerId** by an operator-signed
+  certificate carried in the credential; an inviter refuses any KeyPackage whose
+  credential doesn't match the expected PeerId. So a member can't publish a key
+  under someone else's identity or MITM an invite. (It is *not* anonymous — your
+  PeerId is known to the group.)
+- **Who do I trust? Is there a server?** No messaging server. A *space* is a set
+  of actors replicated across members' own nodes over libp2p — a leaderless CRDT
+  for the ciphertext log, raft quorums for the sequenced planes (membership
+  commits, directory, registry). Secret key material is device-local and never
+  replicated, and registry mutations that grant roles or install agents are
+  **author-signed**, so a member can't forge admin/voter rows.
+- **Metadata — who sees who talks to whom?** Content and keys are hidden from
+  *all* infrastructure, but the ciphertext log and commit chain replicate across
+  the space's nodes, so anyone in the space sees channel **activity** — that a
+  channel exists, its membership changes, envelope timing and sizes — while only
+  channel members decrypt content and authorship. There is **no metadata-hiding
+  transport yet** (no mixnet / cover traffic), so a network observer sees libp2p
+  traffic patterns. Metadata-privacy work (epoch-scoped topics, …) is roadmap.
+- **Multi-device?** Each device is its own MLS leaf with its own device-local
+  seed that never leaves it. Cross-device history sync is not yet built.
+- **Availability / offline?** The ciphertext log is a leaderless CRDT: it
+  converges with any one honest peer reachable and merges offline sends on
+  reconnect. Membership changes need their channel's raft quorum.
+- **What it does *not* protect against:** a compromised device (your own device
+  reads your plaintext — the standard end-to-end assumption); deanonymization by
+  a fellow space member (identity-first, not anonymous); traffic analysis by a
+  network observer (no mix transport yet); pre-quantum cryptanalysis (today's
+  primitives are classical); and total relay DoS (local reads continue, sync
+  stalls).
 
 ## Trust boundary
 
@@ -27,7 +73,7 @@ stack.
         ▼                ▼               ▼                  ▼                  ▼
   msg-<chan>-log   msg-<chan>-ctl    msg-directory     space-registry        chronos
   (crdt / gossip)  (raft)            (raft)            (raft)                (raft)
-  ciphertext log   MLS commit chain  nickname→KeyPkg   agent catalog +       randomness
+  ciphertext log   MLS commit chain  PeerId → KeyPkg   agent catalog +       randomness
   (leaderless)     (sequenced)       + channel list    auth grants           beacon
 ```
 
@@ -71,7 +117,7 @@ channels at runtime (the admin-gated `reg_install`).
   KeyPackage by verified PeerId (`dir_claim_kp`, single-use) or take a handed
   one, build an MLS **Add** commit,
   and submit it to the chain (`ctl_commit`). The **Welcome rides the commit
-  chain**; the invitee picks it up by KeyPackage hash on its next `tick`.
+  chain**; the invitee recognizes it by trial-decryption on its next `tick`.
 - **`join <channel>`** — start watching a channel for a Welcome addressed to one
   of this member's published KeyPackages.
 - **`send <channel> <text>`** — encrypt the message as an MLS application message
@@ -102,11 +148,11 @@ RFC 9420 MLS via **mls-rs** (AWS), ciphersuite 1
   provider overrides `DhType::generate` (the X25519 KEM + HPKE ephemeral) and
   `random_bytes` to route every draw through `HostRand`. Result: two providers
   from the same `(seed, boot context)` emit **bit-identical** KeyPackages,
-  commits, and Welcomes — the determinism the PVM port needs.
+  commits, and Welcomes — the reproducibility the actor relies on across restarts.
 
 The signing identity is **seed-derived**, not drawn from `OsRng`
-(`mls::derive_signer`), so it is stable across restarts and reproducible for the
-PVM port.
+(`mls::derive_signer`), so it is stable across restarts and reproducible from the
+seed alone.
 
 Why mls-rs and not OpenMLS: OpenMLS is irreducibly `std` (a non-optional `rayon`
 the PVM target would pull, `SystemTime`, `std::collections`) and, decisively, its

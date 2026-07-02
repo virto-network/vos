@@ -288,7 +288,7 @@ wasteful and leaks information. Batching addresses both problems.
   typing cadence, which is a biometric fingerprint. Batching collapses
   a window of operations into a single node, obscuring timing.
 - **Amortize encryption cost.** Each DAG node is independently encrypted
-  (see [Encryption](./encryption.md)). Batching reduces the number of
+  (see [Encryption](./messaging.md#group-encryption-mls)). Batching reduces the number of
   encryption operations.
 - **Reduce sync overhead.** Fewer nodes means fewer CIDs to exchange,
   fewer `contains` checks, and faster DAG walks.
@@ -627,5 +627,5 @@ Each document in a space has its own `MerkleCrdt` instance:
 The sync layer operates on plaintext locally — CRDT operations are
 applied to the in-memory document state in the clear. Encryption
 happens at the storage boundary: nodes are encrypted before leaving
-the peer and decrypted upon arrival. See [Encryption](./encryption.md)
+the peer and decrypted upon arrival. See [Encryption](./messaging.md#group-encryption-mls)
 for the full key management lifecycle.

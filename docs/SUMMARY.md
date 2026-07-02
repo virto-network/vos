@@ -22,7 +22,6 @@
 - [Overview](applications.md)
 - [Messaging — Private Group Messaging](messaging.md)
     - [Sync Layer: Merkle-CRDTs](sync.md)
-    - [Encryption Layer: Group Key Management](encryption.md)
     - [Anonymous Moderation: zk-promises](zk-promises.md)
 - [Private Economy: Payments, Voting, Governance](private-economy.md)
 - [Kunekt — Real-Time Collaboration (reserved)](kunekt.md)

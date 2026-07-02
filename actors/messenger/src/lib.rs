@@ -22,7 +22,7 @@
 //! prints a KeyPackage (`key_package`), hands it to the inviter
 //! (link, QR, …), and the inviter's `invite` commits the
 //! membership change; the Welcome rides the commit chain and the
-//! invitee's `tick` picks it up by KeyPackage hash. The `msg-directory`
+//! invitee's `tick` recognizes it by trial-decryption. The `msg-directory`
 //! actor — sequenced single-use claims keyed by verified PeerId — is the
 //! default invite path; the out-of-band hand-off coexists as a fallback.
 //!

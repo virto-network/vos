@@ -522,7 +522,7 @@ careful security analysis. The key question is whether it weakens
 MLS's post-compromise security guarantees. The current assessment is
 that it does not, because the group secret is rotated on every
 membership change regardless of which leaf was the sender. See
-[Encryption](./encryption.md) for the full MLS integration.
+[Encryption](./messaging.md#group-encryption-mls) for the full MLS integration.
 
 ### Joining anonymously
 

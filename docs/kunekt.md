@@ -24,7 +24,7 @@ collaboration layer that goes beyond messaging.
 ## How it will relate to Messaging
 
 Messaging and Kunekt share almost everything below the application logic —
-the [Merkle-CRDT sync](sync.md) layer, [group encryption](encryption.md),
+the [Merkle-CRDT sync](sync.md) layer, [group encryption](messaging.md#group-encryption-mls),
 and [anonymous moderation](zk-promises.md). Kunekt adds what real-time
 co-editing specifically needs:
 
