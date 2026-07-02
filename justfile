@@ -29,6 +29,17 @@ build-wasm:
 build-pvm:
     cd examples; just build
 
+# Build the on-chain settlement-verifier ELF for the JAM PVM (riscv64em-javm).
+# Gates zkpvm's settle_run / settle_transpile tests (they skip if absent).
+# Needs the pinned nightly + rust-src (build-std). Regenerate the embedded proof
+# fixture first ONLY if the proof format changed:
+#   cargo test -p zkpvm --test settle_fixture
+build-settle:
+    cd zkpvm/recursion-verifier && cargo build --release --target riscv64em-javm.json \
+      -Zbuild-std=core,alloc,compiler_builtins \
+      -Zbuild-std-features=compiler-builtins-mem \
+      --features pvm-settle --bin settle
+
 # ── Test ────────────────────────────────────────────────────────────
 
 # Run all tests (workspace + integration)

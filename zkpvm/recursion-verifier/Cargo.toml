@@ -1,0 +1,48 @@
+# A SEPARATE, self-contained workspace for the verify-only Poseidon2-M31 stwo
+# settlement verifier that compiles for wasm32 AND the PVM (riscv64em-javm)
+# target with NO blst and NO rayon.
+#
+# It is its OWN `[workspace]` (and is in the vos root `exclude` list) so its
+# Cargo feature resolution never co-resolves with `javm`/prover-stwo: feature
+# unification is per-workspace-per-target, and the vos workspace pins stwo with
+# `std,prover,parallel` (which drag rayon, and javm drags blst).  Here stwo is
+# pinned `default-features = false` — no std, no prover, no parallel.
+[package]
+name = "recursion-verifier"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Verify-only Poseidon2-M31 stwo settlement verifier for native recursion (wasm32 + JAM PVM)"
+
+[features]
+# Build the `settle` PVM ELF (no_main + bump allocator + _start). Gated so host
+# / wasm32 `cargo build` skips the bare-metal bin.
+pvm-settle = []
+
+[[bin]]
+name = "settle"
+required-features = ["pvm-settle"]
+
+[workspace]
+
+[dependencies]
+# stwo at the same code as the vos workspace's pinned rev, from a fork that makes
+# `dashmap` (std-only, prover-only) optional + prover-gated, so this
+# `default-features = false` build (no std, no prover, no parallel) does not drag
+# crossbeam-utils + lock_api on the no_std/no-atomics PVM / wasm32 targets. Only
+# that one build-config change differs from the pinned rev — no verifier logic.
+stwo = { git = "https://github.com/olanod/stwo", rev = "6df2fb305182bf9d0f77890215a5692affb8748e", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "6df2fb305182bf9d0f77890215a5692affb8748e", default-features = false }
+num-traits = { version = "0.2", default-features = false }
+# no_std + alloc wire format for the embedded settlement proof fixture (the same
+# format zkpvm's `settle_fixture` test serializes).
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+# stwo's `vcs::hash::Hash` supertrait requires Serialize + Deserialize (proofs
+# serialize); serde+derive is no_std-friendly, so it is not a wasm/PVM blocker.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

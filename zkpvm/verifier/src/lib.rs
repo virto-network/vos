@@ -18,13 +18,16 @@ use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use num_traits::Zero;
 use stwo::core::{
     air::Component,
-    channel::{Blake2sChannel, Channel},
+    channel::Channel,
     fields::qm31::SecureField,
     pcs::{CommitmentSchemeVerifier, TreeVec},
-    vcs_lifted::blake2_merkle::Blake2sMerkleChannel,
     verifier::VerificationError,
 };
 use stwo_constraint_framework::TraceLocationAllocator;
+
+// Per-build PCS selection (Blake2s by default; Poseidon2-M31 under
+// `poseidon2-channel`) — must match the zkpvm prover the proof came from.
+use zkpvm::recursion_pcs::{ProverChannel, ProverMerkleChannel};
 
 // Re-export the Proof type + the format-version constant the verifier
 // was compiled against.  Callers can compare against
@@ -41,8 +44,9 @@ use zkpvm::framework_access::{
     AllLookupElements, create_verifier_components, draw_all_lookup_elements,
 };
 
-/// Verification hash type (Blake2s Merkle root)
-pub use stwo::core::vcs::blake2_hash::Blake2sHash as CommitmentHash;
+/// Verification hash type — the preprocessed-trace Merkle root in the per-build
+/// PCS hash (Blake2s by default; `P2Hash` under `poseidon2-channel`).
+pub use zkpvm::recursion_pcs::ProverMerkleHash as CommitmentHash;
 
 /// Default per-component log_size cap used by `verify_standalone`.
 ///
@@ -193,13 +197,31 @@ pub fn verify_standalone_with_options(
             "log sizes len mismatch".to_string(),
         ));
     }
+    // The active-component reconstruction zips mask-selected chips with
+    // the claimed sums/log sizes; require the counts to agree so a
+    // mask/num_components mismatch can't silently truncate either side.
+    if component_mask.count_ones() as usize != num_components {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask popcount does not match num_components".to_string(),
+        ));
+    }
+    // Phase A (v7): reject `initial_state.timestamp < 1` per segment (the
+    // production consumer verifies single proofs here, not only the chain
+    // wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
+    // ts=0 per-page boundary writes from being forged as real steps, and (with
+    // the CpuChip ts-chain) lands every step ts in [initial_ts, final_ts).
+    if initial_state.timestamp < 1 {
+        return Err(VerificationError::InvalidStructure(
+            "initial_state.timestamp must be >= 1 (Phase A memory-boundary anchoring)".to_string(),
+        ));
+    }
 
     // Use the proof's own PCS config — `prove()` uses production_pcs_config
     // by default (blowup=16, 19 queries, 20-bit PoW), not PcsConfig::default(),
     // so blindly using default here makes Merkle witness sizes mismatch
     // (Merkle::WitnessTooLong).  The proof carries its config; trust it.
     let config = pcs_config;
-    let verifier_channel = &mut Blake2sChannel::default();
+    let verifier_channel = &mut ProverChannel::default();
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
     });
@@ -212,7 +234,7 @@ pub fn verify_standalone_with_options(
         )));
     }
 
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
 
     // Commit preprocessed and original traces
     let (trace_sizes, preprocessed_sizes) =
@@ -232,21 +254,32 @@ pub fn verify_standalone_with_options(
         );
     }
 
-    // Phase Z0: bind `proof.initial_state.registers` and
-    // `proof.final_state.registers` into the FS transcript. The
-    // `component_mask = 0` reject at the top of this function
-    // guarantees we only reach here for production proofs that
-    // included the boundary + closing chip pair, so the mix is
-    // unconditional. Any post-prove tamper of either field shifts
-    // the lookup-element challenges drawn next; the committed
-    // interaction trace then no longer satisfies the constraint
-    // system and verify rejects. Order MUST match the prover (see
-    // `prove.rs`): initial first, then final.
+    // Phase Z0: mix `proof.{initial,final}_state` (registers, pc,
+    // timestamp) into the FS transcript. The `component_mask = 0`
+    // reject at the top of this function guarantees we only reach here
+    // for production proofs that included the boundary + closing chip
+    // pair, so the mix is unconditional. The lookup elements drawn next
+    // therefore depend on the claimed boundary states. Order MUST match
+    // the prover (see `prove.rs`): initial first, then final.
+    // `memory_commitment` stays unmixed (computed outside the circuit).
     for r in &initial_state.registers {
         verifier_channel.mix_u64(*r);
     }
     for r in &final_state.registers {
         verifier_channel.mix_u64(*r);
+    }
+    verifier_channel.mix_u64(initial_state.pc as u64);
+    verifier_channel.mix_u64(initial_state.timestamp);
+    verifier_channel.mix_u64(final_state.pc as u64);
+    verifier_channel.mix_u64(final_state.timestamp);
+    // Phase A (v7): entering then exit RAM Merkle root, 4 LE u64 each.
+    // Unconditional — the component_mask=0 reject above guarantees a
+    // production proof with the Phase-A chips.
+    for chunk in initial_state.memory_root.chunks_exact(8) {
+        verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    for chunk in final_state.memory_root.chunks_exact(8) {
+        verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
     }
 
     let mut lookup_elements = AllLookupElements::default();
@@ -258,6 +291,38 @@ pub fn verify_standalone_with_options(
             "claimed logup sum is not zero".to_string(),
         ));
     }
+
+    // Boundary public-input binding (format v5): each boundary chip's
+    // claimed sum must equal the value recomputed from the proof's
+    // public boundary states with the just-drawn lookup elements. This
+    // BINDS `proof.{initial,final}_state` to the committed boundary
+    // COLUMNS; the mix above alone is only tamper-evidence against
+    // post-prove edits, not against a from-scratch prover. pc/timestamp
+    // columns are pinned to the trace, so those become genuine bound
+    // public inputs; the register columns (and the voucher io-hash read
+    // from `final_state.registers[9..13]`) are pinned to the trace only
+    // by the register-ledger read-consistency, which is vacuous against
+    // a from-scratch prover today — see `zkpvm::boundary_binding` and
+    // `chips/register_memory_closing.rs`. A mask missing any binding
+    // chip cannot bind its boundary states and is rejected outright (all
+    // three are unconditionally active in the production prove path).
+    let Some(boundary_positions) =
+        zkpvm::boundary_binding::boundary_positions_in_mask(component_mask)
+    else {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask lacks a boundary-binding chip \
+             (RegisterMemoryBoundary / RegisterMemoryClosing / ProgramBoundary)"
+                .to_string(),
+        ));
+    };
+    zkpvm::boundary_binding::check_boundary_claimed_sums(
+        &initial_state,
+        &final_state,
+        &lookup_elements,
+        &claimed_sums,
+        &boundary_positions,
+    )
+    .map_err(|msg| VerificationError::InvalidStructure(msg.to_string()))?;
 
     let tree_span_provider = &mut TraceLocationAllocator::default();
     let verifier_components: Vec<Box<dyn Component>> = create_verifier_components::components(
@@ -282,4 +347,183 @@ pub fn verify_standalone_with_options(
         commitment_scheme,
         stark_proof,
     )
+}
+
+/// Verify a CHAIN of segment proofs WITHOUT any side note — the trustless
+/// counterpart to `zkpvm::verify_chain` (which needs prover-supplied
+/// `SideNote`s and never pins program identity).
+///
+/// Each segment is verified via [`verify_standalone`] against the SAME
+/// `preprocessed_commitment`, so the chain (a) needs no prover-supplied
+/// trace data and (b) pins every segment to ONE program identity (a
+/// from-scratch prover cannot splice in a segment of a different program).
+/// Consecutive segments must chain: `proofs[i].final_state ==
+/// proofs[i+1].initial_state`.
+///
+/// SOUNDNESS SCOPE — the boundary-continuity equality is BOUND in-circuit
+/// for every continued field, so an accepted chain proves genuine state
+/// continuity (not mere tamper-evidence): registers via the register-ledger
+/// read-consistency binding, pc/timestamp via CpuChip program-execution
+/// chaining, and `SegmentState.memory_root` via the in-AIR page-Merkle trie
+/// (`Memory{Page,Merkle,RootBoundary}Chip` force `memory_root` to be the
+/// genuine blake2b Merkle root of the listed RAM pages, and
+/// `check_boundary_claimed_sums` pins it to the public boundary state). The
+/// entering image is anchored by `expected_initial_root`; the returned final
+/// root pins the post-state. (`SegmentState.memory_commitment`, a
+/// `blake3(flat_mem)` field, is unbound but vestigial — `memory_root`
+/// supersedes it for continuity.) So a chain accepted here proves: one
+/// program, per-segment validity, and full register / pc / timestamp /
+/// memory continuity from `expected_initial_root` to the returned final
+/// root.
+///
+/// PRECONDITION — every segment must share `preprocessed_commitment`, i.e.
+/// have the SAME per-component `log_sizes` (the program commitment is the
+/// preprocessed-trace Merkle root, which is size-dependent). Deployments
+/// that segment a long trace should pad all segments to one uniform size
+/// so a single published commitment pins them all; a chain whose last
+/// segment is smaller would currently need its own commitment (a
+/// per-segment-commitment variant is future work).
+pub fn verify_chain_standalone(
+    proofs: &[Proof],
+    preprocessed_commitment: CommitmentHash,
+    expected_initial_root: [u8; 32],
+) -> Result<[u8; 32], VerificationError> {
+    verify_chain_standalone_with_options(
+        proofs,
+        preprocessed_commitment,
+        expected_initial_root,
+        DEFAULT_MAX_LOG_SIZE,
+        &PcsPolicy::STANDARD,
+    )
+}
+
+/// [`verify_chain_standalone`] with explicit `max_log_size` cap + `PcsPolicy`.
+///
+/// `expected_initial_root` is the page-Merkle root of the program's starting
+/// RAM image — the memory analogue of the program commitment — checked against
+/// `proofs[0].initial_state.memory_root`.  On success returns the chain's final
+/// root (`proofs.last().final_state.memory_root`) so the caller can pin the
+/// post-state.  Callers compute `expected_initial_root` host-side via
+/// `zkpvm::page_merkle::image_root` over the input image.
+pub fn verify_chain_standalone_with_options(
+    proofs: &[Proof],
+    preprocessed_commitment: CommitmentHash,
+    expected_initial_root: [u8; 32],
+    max_log_size: u32,
+    policy: &PcsPolicy,
+) -> Result<[u8; 32], VerificationError> {
+    if proofs.is_empty() {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone: empty proof chain".to_string(),
+        ));
+    }
+    // Phase A: anchor the chain's entering image — proofs[0] must start from the
+    // verifier-supplied expected root (the memory analogue of program identity).
+    if proofs[0].initial_state.memory_root != expected_initial_root {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone: proofs[0].initial_state.memory_root \
+             does not match expected_initial_root"
+                .to_string(),
+        ));
+    }
+    // Boundary continuity: each segment's final state must equal the next
+    // segment's initial state.  Bound for registers/pc/timestamp (and, Phase A,
+    // the memory root) by each segment's in-circuit boundary binding.
+    for window in proofs.windows(2) {
+        if window[0].final_state != window[1].initial_state {
+            return Err(VerificationError::InvalidStructure(format!(
+                "segment chain broken: final state at ts={} does not match next initial at ts={}",
+                window[0].final_state.timestamp, window[1].initial_state.timestamp,
+            )));
+        }
+    }
+    // Each segment verifies standalone against the SAME program commitment:
+    // no side note, and program identity is pinned across the whole chain.
+    for proof in proofs {
+        verify_standalone_with_options(
+            proof.clone(),
+            preprocessed_commitment,
+            max_log_size,
+            policy,
+        )?;
+    }
+    Ok(proofs[proofs.len() - 1].final_state.memory_root)
+}
+
+/// Like [`verify_chain_standalone`], but pins program identity to a small
+/// published SET of allowed commitments instead of a single one.
+///
+/// WHY a set: canonical-shape proving (forcing each preprocessed-bearing chip
+/// to a fixed `log_size`) makes most chips' preprocessed columns identical
+/// across segments, but two chips — `RistrettoFixedBaseConsumerChip` and
+/// `RistrettoCombCompressChip` — have preprocessed selectors gated on the
+/// per-segment fixed-base-scalar-mult ("comb") count, so a segment with `k`
+/// comb calls gets a distinct commitment `C_k` even at the forced `log_size`.
+/// The number of distinct `C_k` is small and bounded (a `SEG_STEPS`-sized
+/// segment can hold only a few comb calls), so a deployment publishes the
+/// allowlist `{C_0, C_1, …, C_max}` — one canonical commitment per comb-call
+/// count.  Each `C_k` is WITNESS-INDEPENDENT (a function of `k` + the forced
+/// profile, not of the scalars/account contents), so the allowlist is a fixed
+/// per-program constant.
+///
+/// SOUNDNESS: every segment's commitment must be IN the allowlist (a
+/// from-scratch prover splicing a foreign program produces a commitment in no
+/// `C_k`), and each segment then verifies standalone against its own
+/// commitment.  Combined with the same boundary-continuity + anchoring as
+/// [`verify_chain_standalone`], an accepted chain proves: the program is one
+/// of the published canonical voucher-check shapes, per-segment validity, and
+/// full register / pc / timestamp / memory continuity.
+///
+/// PRECONDITION: the prover used canonical-shape proving (`zkpvm::prove_canonical`
+/// with the deployment's per-chip `min_log_size` profile) so the forced
+/// `log_size`s are constant across the chain; otherwise log_size variation
+/// would produce commitments outside the allowlist.
+pub fn verify_chain_standalone_allowlist(
+    proofs: &[Proof],
+    allowed_commitments: &[CommitmentHash],
+    expected_initial_root: [u8; 32],
+    max_log_size: u32,
+    policy: &PcsPolicy,
+) -> Result<[u8; 32], VerificationError> {
+    if proofs.is_empty() {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone_allowlist: empty proof chain".to_string(),
+        ));
+    }
+    if allowed_commitments.is_empty() {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone_allowlist: empty commitment allowlist".to_string(),
+        ));
+    }
+    // Anchor the entering image (memory analogue of program identity).
+    if proofs[0].initial_state.memory_root != expected_initial_root {
+        return Err(VerificationError::InvalidStructure(
+            "verify_chain_standalone_allowlist: proofs[0].initial_state.memory_root \
+             does not match expected_initial_root"
+                .to_string(),
+        ));
+    }
+    // Boundary continuity across the chain.
+    for window in proofs.windows(2) {
+        if window[0].final_state != window[1].initial_state {
+            return Err(VerificationError::InvalidStructure(format!(
+                "segment chain broken: final state at ts={} does not match next initial at ts={}",
+                window[0].final_state.timestamp, window[1].initial_state.timestamp,
+            )));
+        }
+    }
+    // Each segment's program commitment must be in the published allowlist,
+    // then it verifies standalone against that (its own) commitment.
+    for proof in proofs {
+        let actual = proof.stark_proof.commitments[0];
+        if !allowed_commitments.contains(&actual) {
+            return Err(VerificationError::InvalidStructure(
+                "verify_chain_standalone_allowlist: a segment's program commitment \
+                 is not in the published allowlist"
+                    .to_string(),
+            ));
+        }
+        verify_standalone_with_options(proof.clone(), actual, max_log_size, policy)?;
+    }
+    Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }
