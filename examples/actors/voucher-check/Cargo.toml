@@ -46,22 +46,16 @@ cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features 
     "voucher",
     "pvm-precompile",
 ] }
-# cipher-clerk's voucher feature pulls chacha20poly1305 → aead;
-# none of them need getrandom directly. But `signing` (which we DON'T
-# enable here) would — keep it off so the actor's PVM build doesn't
-# drag OsRng/getrandom plumbing.
+# `pvm-precompile` routes cipher-clerk's Ristretto / scalar ops through
+# zkpvm's precompile ECALLs (RistrettoEcall + comb chips) instead of dalek
+# software arithmetic — a much smaller prove trace. cipher-clerk owns its
+# own path-dep on zkpvm-precompiles via this feature; it is not pulled here
+# directly.
 #
-# pvm-precompile DELIBERATELY OFF: cipher-clerk's Ristretto path
-# routes through zkpvm's RistrettoCombCompressChip when the
-# precompile is on, which currently emits a `ConstraintsNotSatisfied`
-# failure during prove on this branch (tracked as task #7). Falling
-# back to dalek native lets `Amount::commit` resolve in PVM software
-# arithmetic — slower but proves cleanly against the ALU + Memory
-# chips we know work (fizzbuzz pins this).
-#
-# When task #7 lands, re-enable `pvm-precompile` for a much smaller
-# trace. zkpvm-precompiles is no longer pulled directly — cipher-
-# clerk owns its own path-dep on it via the `pvm-precompile` feature.
+# `signing` is intentionally NOT enabled: the guest only DECODES and verifies
+# a witness, it never builds transitions, and `signing` would drag in
+# OsRng/getrandom plumbing the actor's PVM build can't satisfy. The voucher
+# feature pulls chacha20poly1305 → aead, none of which need getrandom.
 
 [profile.release]
 opt-level = "s"

@@ -704,12 +704,16 @@ fn reply(status: Status) -> SubmitVoucherReply {
 ///     unreachable" from "proof rejected" — same state-hiding
 ///     posture as `VoucherInvalid`.
 ///
-/// The prover's `verify` composes two checks: STARK validity against
-/// `program_commitment` (which program) AND the tagless io-binding
-/// `proof.public_io_hash() == compute_io_hash(public_bytes,
-/// return_bytes)` (which I/O). So the bridge must hand it:
+/// The prover's `verify_chain` composes three checks: every segment's
+/// program commitment is in the canonical ALLOWLIST resolved from
+/// `program_commitment` (which program), chain continuity + entering-image
+/// anchoring across the segments, AND the tagless io-binding on the FINAL
+/// segment `public_io_hash() == compute_io_hash(public_bytes, return_bytes)`
+/// (which I/O). So the bridge must hand it:
 ///   - `program_commitment`: the trusted commitment configured via
-///     `set_prover` (the verifier's program-identity anchor).
+///     `set_prover` — one of the program's canonical-shape commitments; the
+///     extension reverse-resolves the full allowlist from it (the verifier's
+///     program-identity anchor).
 ///   - `public_bytes`: cipher-clerk's explicit, domain-separated
 ///     `voucher::proof::public_bytes(&public)` — THE canonical
 ///     proof-input encoding, byte-identical to what voucher-check's
@@ -722,10 +726,13 @@ fn reply(status: Status) -> SubmitVoucherReply {
 ///   - `return_bytes`: voucher-check's `1` success return as a raw byte
 ///     (`vec![1u8]`).
 ///
-/// `voucher.proof.bytes` is the 32-byte content address of the actual
-/// STARK in the producer node's proof-blob store; the extension fetches
-/// the bytes via `ctx.blob_get` (with `peer_prefix` as a fan-out hint)
-/// rather than the bridge shipping multi-MB through PVM dispatch.
+/// `voucher.proof.bytes` is the 32-byte content address of the chain MANIFEST
+/// (the list of per-segment proof CAS hashes) in the producer node's proof-blob
+/// store (unchanged wire shape — one hash); the extension fetches the manifest
+/// via `ctx.blob_get` (with `peer_prefix` as a fan-out hint) and then each
+/// per-segment proof the same way, rather than the bridge shipping multi-MB
+/// through PVM dispatch. Per-segment delivery keeps every cross-node blob under
+/// the 8 MiB frame cap, which the single concatenated chain blob exceeds.
 async fn dispatch_external_proof(
     ctx: &mut vos::Context<ClerkBridge>,
     prover_id: u32,
@@ -756,7 +763,11 @@ async fn dispatch_external_proof(
     // federation e2e is the guest↔bridge agreement gate.
     let public_bytes = cipher_clerk::voucher::proof::public_bytes(&public);
     let return_bytes = vec![1u8];
-    let msg = vos::value::Msg::new("verify")
+    // The proof is a canonical-shape SEGMENT CHAIN: `proof.bytes` addresses a
+    // `bincode(Vec<Proof>)` blob and the extension verifies it against the
+    // program's canonical commitment allowlist (reverse-resolved from
+    // `program_commitment`). Wire shape is unchanged — still one 32-byte hash.
+    let msg = vos::value::Msg::new("verify_chain")
         .with("program_commitment", program_commitment.to_vec())
         .with("proof_hash", voucher.proof.bytes.clone())
         .with("public_bytes", public_bytes)

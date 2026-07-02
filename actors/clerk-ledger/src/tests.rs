@@ -224,8 +224,8 @@ fn smt_root_is_deterministic_and_order_invariant() {
             view.put_transfer(mk_transfer(byte), &mut NoopOracle);
         }
     }
-    let root1 = compute_state_root(&a1, &t1, Some(&journal));
-    let root2 = compute_state_root(&a2, &t2, Some(&journal));
+    let root1 = compute_state_root(&a1, &t1, Some(&journal), &e1, &v1, &[]);
+    let root2 = compute_state_root(&a2, &t2, Some(&journal), &e2, &v2, &[]);
     assert_eq!(root1, root2, "SMT root must be order-invariant");
     assert_ne!(
         root1, [0u8; 32],
@@ -243,11 +243,19 @@ fn smt_root_changes_when_state_changes() {
     let journal = CcJournal::new(CcJournalId([0xCA; 16]), AuthKey([0xAA; 32]), 1);
     let mut a = Vec::new();
     let mut t = Vec::new();
-    let r0 = compute_state_root(&a, &t, Some(&journal));
+    let r0 = compute_state_root(&a, &t, Some(&journal), &[], &[], &[]);
     a.push(mk_account(0x01));
-    let r1 = compute_state_root(&a, &t, Some(&journal));
+    let r1 = compute_state_root(&a, &t, Some(&journal), &[], &[], &[]);
     assert_ne!(r0, r1, "adding an account must change the root");
     t.push(mk_transfer(0x10));
-    let r2 = compute_state_root(&a, &t, Some(&journal));
+    let r2 = compute_state_root(&a, &t, Some(&journal), &[], &[], &[]);
     assert_ne!(r1, r2, "adding a transfer must change the root");
+    // The bookkeeping sets are committed too (Phase 0 of the
+    // conservation-of-value proof leans on this).
+    let r3 = compute_state_root(&a, &t, Some(&journal), &[[0xE0; 32]], &[], &[]);
+    assert_ne!(r2, r3, "marking an external id must change the root");
+    let r4 = compute_state_root(&a, &t, Some(&journal), &[], &[[0x55; 16]], &[]);
+    assert_ne!(r2, r4, "voiding a transfer must change the root");
+    let r5 = compute_state_root(&a, &t, Some(&journal), &[], &[], &[([0x55; 16], 0)]);
+    assert_ne!(r2, r5, "a pending entry must change the root");
 }
