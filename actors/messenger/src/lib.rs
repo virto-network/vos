@@ -42,6 +42,12 @@
 //! was rejected for the entropy seam: it is too broad (it would capture
 //! libp2p/TLS/everything) yet too narrow (it intercepts only the one seed draw,
 //! not the per-message provider draws the deterministic provider must cover).
+//!
+//! Besides the crypto/protocol submodules (`clients`, `crypto_provider`,
+//! `host_rand`, `identity`, `mls`, `store`, `tick`), [`rows`] holds the
+//! persisted state shapes (`ChannelEntry`, `PlainMessage`) and [`runtime`]
+//! the PVM no_std environment shims (critical-section, getrandom). The actor
+//! struct + its `#[messages]` handlers stay here.
 
 use vos::prelude::*;
 
@@ -50,6 +56,8 @@ mod crypto_provider;
 mod host_rand;
 mod identity;
 mod mls;
+mod rows;
+mod runtime;
 mod store;
 mod tick;
 
@@ -59,36 +67,7 @@ use clients::{
 };
 use mls::{new_key_package, parse_key_package, welcome_nonce};
 use mls_rs::ExtensionList;
-
-// ── PVM-actor no_std runtime shims ────────────────────────────────
-//
-// The riscv64em-javm target has no native atomics and no OS entropy.
-//
-// `critical-section`: mls-rs's no_std build and the messenger's own
-// `spin::Mutex` storage emulate atomics through `portable-atomic`, which needs a
-// registered `critical_section::Impl`. The target is single-threaded with no
-// interrupts/preemption, so acquire/release are no-ops.
-#[cfg(target_arch = "riscv64")]
-struct SingleThreadCriticalSection;
-#[cfg(target_arch = "riscv64")]
-critical_section::set_impl!(SingleThreadCriticalSection);
-#[cfg(target_arch = "riscv64")]
-unsafe impl critical_section::Impl for SingleThreadCriticalSection {
-    unsafe fn acquire() -> critical_section::RawRestoreState {}
-    unsafe fn release(_: critical_section::RawRestoreState) {}
-}
-
-// `getrandom`: every entropy draw the messenger makes flows through the
-// host-seeded `HostRand` (see `crypto_provider`), so any `getrandom`/`OsRng`
-// reachable inside the PVM — only mls-rs's off-path `signature_key_generate`,
-// which the messenger never calls because it hands the Client a seed-derived
-// signer — is a misuse. Fail loudly rather than hand back predictable bytes.
-#[cfg(target_arch = "riscv64")]
-fn pvm_no_os_entropy(_buf: &mut [u8]) -> core::result::Result<(), getrandom::Error> {
-    Err(getrandom::Error::UNSUPPORTED)
-}
-#[cfg(target_arch = "riscv64")]
-getrandom::register_custom_getrandom!(pvm_no_os_entropy);
+pub use rows::{ChannelEntry, PlainMessage};
 
 /// Per-channel agent naming convention. The manifest installs the
 /// pair under these names; `create`/`join` address them by channel
@@ -113,60 +92,6 @@ pub const DIRECTORY_AGENT: &str = "msg-directory";
 /// KeyPackages auto-published on `register` — enough invites
 /// before the member needs a replenish.
 const REGISTER_KP_COUNT: usize = 3;
-
-// ── Persisted state shapes ────────────────────────────────────────
-
-/// One decrypted message in the node-local store. Ordering is by
-/// `(lamport, ts_ms, sender)` — same convergent key the log uses,
-/// with display ties broken arbitrarily-but-stably.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct PlainMessage {
-    pub lamport: u64,
-    pub ts_ms: u64,
-    pub sender: String,
-    pub text: String,
-}
-
-/// Local view of one channel.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct ChannelEntry {
-    pub name: String,
-    /// `false` while waiting for a Welcome.
-    pub joined: bool,
-    /// `true` after the chain evicted us — the channel sits idle
-    /// (history kept, no decryption possible) until a re-invite's
-    /// Welcome arrives.
-    pub removed: bool,
-    /// `true` once a commit on the chain couldn't be applied to our
-    /// group: the channel is frozen at its current epoch (no further
-    /// commits processed, no new messages decrypted) pending repair,
-    /// rather than re-fetching the bad record forever.
-    pub desynced: bool,
-    /// First epoch we hold keys for; envelopes below it are
-    /// undecryptable history by MLS design.
-    pub join_epoch: u64,
-    /// Unjoined: ctl-chain scan position. Joined: next chain
-    /// record to process.
-    pub next_epoch: u64,
-    /// Log read cursor (last consumed envelope).
-    pub cursor_lamport: u64,
-    pub cursor_id: Vec<u8>,
-    /// Highest lamport seen anywhere in the channel — `send`
-    /// stamps `max + 1`.
-    pub max_lamport: u64,
-    /// Envelope ids of our own posts not yet echoed back by the
-    /// log drain (displayed at send time; MLS can't decrypt own
-    /// traffic).
-    pub own_ids: Vec<[u8; 32]>,
-    /// The decrypted conversation.
-    pub messages: Vec<PlainMessage>,
-}
 
 // ── Actor ─────────────────────────────────────────────────────────
 
