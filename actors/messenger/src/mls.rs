@@ -10,10 +10,11 @@
 //!
 //! The signer is derived deterministically from the node-local CSPRNG seed
 //! (HKDF → Ed25519), so it is reproducible from the seed alone and never drawn
-//! from OS entropy — the property the eventual PVM port needs. Routing the rest
-//! of mls-rs's entropy (KEM/HPKE/key-package secrets) through the host-seeded
-//! CSPRNG is staged separately (a custom `CipherSuiteProvider`); the host build
-//! here uses the stock `RustCryptoProvider`.
+//! from OS entropy. Every other entropy draw mls-rs makes (KEM/HPKE/key-package
+//! secrets) is routed through that same host-seeded CSPRNG by the custom
+//! [`crate::crypto_provider::VosCryptoProvider`] installed on every `Client`, so
+//! the whole client is deterministic in its `(seed, boot context)` — the
+//! reproducibility the device-local actor relies on across restarts.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -129,7 +130,7 @@ fn vos_mls_rules() -> DefaultMlsRules {
 /// `SignatureSecretKey` is Ed25519's 64-byte keypair encoding (seed‖public) and
 /// the public is the verifying key. Reproducible from the seed alone, never
 /// from OS entropy — so the signing identity is stable across restarts and
-/// reproducible for the PVM port.
+/// reproducible from the seed alone.
 pub(crate) fn derive_signer(seed: &[u8]) -> Result<(SignatureSecretKey, SignaturePublicKey), String> {
     let signing = ed25519_signer(seed)?;
     let public = signing.verifying_key().to_bytes().to_vec();
@@ -368,10 +369,10 @@ mod tests {
     }
 
     /// The signer is derived deterministically from the seed (reproducible, no
-    /// OsRng) and forks per seed — the determinism the PVM port relies on for
-    /// the signing identity. (Full KeyPackage determinism awaits the custom
-    /// CipherSuiteProvider; mls-rs's stock provider draws OS entropy for KEM
-    /// keys, so KeyPackage *bytes* are not yet reproducible.)
+    /// OsRng) and forks per seed. Full KeyPackage/commit/Welcome byte
+    /// reproducibility comes from the custom `VosCryptoProvider` routing every
+    /// KEM/HPKE draw through the same seed — asserted by
+    /// `same_seed_boot_and_ts_yields_identical_key_package` and friends below.
     #[test]
     fn signer_is_deterministic_from_seed() {
         let (_, p1) = derive_signer(&ALICE).unwrap();

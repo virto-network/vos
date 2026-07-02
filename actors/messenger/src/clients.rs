@@ -1,7 +1,7 @@
 //! Thin RPC clients for the per-channel PVM actors.
 //!
 //! Everything here is the dynamic-`Msg` wire dance: build a named
-//! message, `ask_dispatch` it over the host invoke path, decode
+//! message, ask it over the host invoke path, decode
 //! the `Value` reply, and rkyv-decode typed payloads with the row
 //! types shared from the actor crates. No MLS, no policy — those
 //! live in `mls`/`tick`; this module only moves bytes.
@@ -36,11 +36,10 @@ pub(crate) fn dyn_payload(msg: &Msg) -> Vec<u8> {
 /// Send a dynamic [`Msg`] to `target` and return the decoded reply [`Value`],
 /// or `None` if the target is unreachable / refused / replied undecodably.
 ///
-/// The outbound-ask effect differs by build flavor: the host build uses the
-/// native `ask_dispatch` effect (returns the raw reply bytes, decoded here);
+/// The outbound-ask effect differs by build flavor: the host test build uses
+/// the native `ask_dispatch` effect (returns the raw reply bytes, decoded here);
 /// the PVM service actor has no `ask_dispatch` (it is `extension`-feature-gated)
-/// and
-/// uses `ask_raw`/`invoke_raw`, which returns the reply already decoded to a
+/// and uses `ask_raw`/`invoke_raw`, which returns the reply already decoded to a
 /// `Value`. Both wrap the same `[TAG_DYNAMIC ‖ Msg]` payload, so every caller
 /// below is flavor-agnostic.
 async fn ask_value(ctx: &mut MsgrCtx, target: ServiceId, msg: &Msg) -> Option<Value> {
@@ -415,7 +414,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 
 pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);

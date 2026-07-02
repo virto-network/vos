@@ -1,7 +1,6 @@
 //! mls-rs storage providers + snapshot/restore.
 //!
-//! OpenMLS kept every secret in one opaque key-value `StorageProvider` map the
-//! messenger snapshotted wholesale. mls-rs instead splits persistence across
+//! mls-rs splits persistence across
 //! `GroupStateStorage` (group ratchet state, keyed by group id, with an
 //! N-epoch sliding window) and `KeyPackageStorage` (KeyPackage private parts,
 //! keyed by key-package ref). We implement both over `BTreeMap`s — deterministic
@@ -177,8 +176,7 @@ impl VosStores {
 //             [epoch_count u32] repeat: [epoch_id u64][data_len u32][data]
 //   [kp_count u32]
 //     repeat: [id_len u32][kpd_len u32][id][kpd (KeyPackageData::mls_encode)]
-// A corrupt/truncated snapshot degrades to fresh empty stores (never panics),
-// matching the OpenMLS provider's tolerance.
+// A corrupt/truncated snapshot degrades to fresh empty stores (never panics).
 
 fn put_u32(out: &mut Vec<u8>, v: usize) {
     out.extend_from_slice(&(v as u32).to_le_bytes());

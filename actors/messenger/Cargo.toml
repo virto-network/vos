@@ -18,10 +18,6 @@ authors = ["Daniel Olano <daniel@olanod.com>"]
 default = ["bin"]
 bin = []
 
-[lints.rust.unexpected_cfgs]
-level = "allow"
-check-cfg = ['cfg(feature, values("pvm", "service", "wasm"))']
-
 [lib]
 crate-type = ["rlib"]
 
@@ -100,6 +96,10 @@ libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# Unlike the sibling data actors, messenger stays at the default opt-level (3),
+# NOT `opt-level = "s"`: its mls-rs HKDF→Ed25519 signer path mis-executes when
+# transpiled from the size-optimized codegen (the PVM gate's `register` fails
+# with "signer derivation failed"). `vos/tests/messenger_pvm` is the guard.
 [profile.release]
 lto = "fat"
 codegen-units = 1

@@ -47,7 +47,7 @@ through the registry, then asks it.
 |---|---|---|---|
 | `msg-<chan>-log` | crdt (gossip) | Leaderless ciphertext **envelope log** — the conversation as opaque bytes. | `log_post` (append an encrypted envelope), `log_history` (read) |
 | `msg-<chan>-ctl` | raft | Sequenced **MLS commit chain** — linearizes membership changes so exactly one Commit wins each epoch. | `ctl_commit` (submit a Commit), `ctl_commits` (drain the chain) |
-| `msg-directory` | raft (per-space) | **nickname → KeyPackage** map + channel catalog + single-use KeyPackage claims. | `dir_publish_kp`, `dir_claim_kp`, `dir_release_kp`, `dir_announce_channel`, `dir_channels` |
+| `msg-directory` | raft (per-space) | **verified PeerId → KeyPackage** map + channel catalog + single-use KeyPackage claims. | `dir_publish_kp`, `dir_claim_kp`, `dir_release_kp`, `dir_announce_channel`, `dir_channels` |
 | `space-registry` | raft | The space's **agent catalog** + auth grants. | `resolve` (name → ServiceId), `reg_agents` (list channels), `reg_install` (install a channel's agent pair) |
 | `chronos` | raft | Verifiable-randomness **beacon** (optional). | `chronos_beacon` (latest finalized round → CSPRNG hedge) |
 
@@ -62,13 +62,14 @@ channels at runtime (the admin-gated `reg_install`).
 - **`register <nickname>`** — establish this node's identity: derive the Ed25519
   signer from the CSPRNG seed (deterministic, reproducible), set the MLS
   credential, and stock the directory with a few KeyPackages so others can invite
-  this member by name (`dir_publish_kp`).
+  this member by their verified PeerId (`dir_publish_kp`).
 - **`create <channel>`** — install the channel's `log`/`ctl` agent pair if absent
   (`reg_install`, admin) and announce it (`dir_announce_channel`).
 - **`key_package`** — mint a KeyPackage for out-of-band handoff (link/QR), the
   SimpleX-style invite path.
-- **`invite <channel> <member|kp>`** — claim the invitee's KeyPackage
-  (`dir_claim_kp`, single-use) or take a handed one, build an MLS **Add** commit,
+- **`invite <channel> <peer-id|kp-hex>`** — claim the invitee's directory
+  KeyPackage by verified PeerId (`dir_claim_kp`, single-use) or take a handed
+  one, build an MLS **Add** commit,
   and submit it to the chain (`ctl_commit`). The **Welcome rides the commit
   chain**; the invitee picks it up by KeyPackage hash on its next `tick`.
 - **`join <channel>`** — start watching a channel for a Welcome addressed to one
@@ -118,9 +119,11 @@ and the HPKE ephemeral through `DhType::generate`. (Full rationale in
 ## State & persistence
 
 The `#[actor]` state ([`src/lib.rs`](src/lib.rs)) is flat and device-local:
-`nickname`, `signature_key` (public), `mls_store` (the mls-rs storage providers,
-snapshotted to bytes — see [`src/store.rs`](src/store.rs)), `csprng_seed` (the
-secret root), `published_kp_count`, and `channels` (decrypted history). It
+`nickname`, `signature_key` (public), `peer_id`/`binding_cert`/`space_id` (the
+verified space identity bound by `bind_identity`), `mls_store` (the mls-rs
+storage providers, snapshotted to bytes — see [`src/store.rs`](src/store.rs)),
+`csprng_seed` (the secret root), `published_kp_count`, and `channels` (decrypted
+history). It
 persists in the node-local `consistency = "local"` redb and survives daemon
 restarts; nothing here is ever replicated.
 
@@ -148,8 +151,11 @@ own.
 ## Build & test
 
 ```sh
-# host (unit tests + the two-node e2e / commit-race retry harnesses)
+# host (unit tests + the two-node e2e harness)
 cargo test --manifest-path actors/messenger/Cargo.toml
+
+# the commit-race retry + transpile/link gates live in vos
+cargo test -p vos --test messenger_pvm --test messenger_transpile
 
 # the PVM actor ELF (deterministic no_std riscv64 build)
 just build-messenger-actor          # = cd actors/messenger && cargo +nightly actor

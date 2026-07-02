@@ -32,21 +32,17 @@ pub(crate) async fn tick_channels(m: &mut Messenger, ctx: &mut MsgrCtx) {
         // future would blow the small PVM stack when the future is constructed
         // (a 0xfffffff8 page fault) — even on an idle tick. Boxing keeps this
         // future pointer-small.
-        if run_ctl {
-            if let Err(e) = Box::pin(drain_ctl(m, i, ctx)).await {
-                log::debug!(
-                    "messenger: ctl drain for '{}' paused: {e}",
-                    m.channels[i].name
-                );
-            }
+        if run_ctl && let Err(e) = Box::pin(drain_ctl(m, i, ctx)).await {
+            log::debug!(
+                "messenger: ctl drain for '{}' paused: {e}",
+                m.channels[i].name
+            );
         }
-        if run_log {
-            if let Err(e) = Box::pin(drain_log(m, i, ctx)).await {
-                log::debug!(
-                    "messenger: log drain for '{}' paused: {e}",
-                    m.channels[i].name
-                );
-            }
+        if run_log && let Err(e) = Box::pin(drain_log(m, i, ctx)).await {
+            log::debug!(
+                "messenger: log drain for '{}' paused: {e}",
+                m.channels[i].name
+            );
         }
     }
 }

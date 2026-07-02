@@ -19,7 +19,8 @@
 //! signature key during create/commit/keypackage/welcome.
 //!
 //! Result: two providers from the same `(seed, boot context)` emit bit-identical
-//! KeyPackages, commits, and Welcomes — the determinism the PVM port needs.
+//! KeyPackages, commits, and Welcomes across restarts and re-dispatches — no
+//! OS-entropy divergence, the reproducibility the messenger relies on.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -351,7 +352,7 @@ impl CryptoProvider for VosCryptoProvider {
             rand: self.rand.clone(),
         };
         let kem_id = KemId::new(cipher_suite)?;
-        let kem = DhKem::new(det, kdf.clone(), kem_id as u16, kem_id.n_secret());
+        let kem = DhKem::new(det, kdf, kem_id as u16, kem_id.n_secret());
         let aead = Aead::new(cipher_suite)?;
         let inner = RustCryptoCipherSuite::new(cipher_suite, kem, kdf, aead)?;
         Some(VosCipherSuiteProvider {

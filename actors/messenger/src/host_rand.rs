@@ -176,8 +176,8 @@ impl HostRand {
         Ok(())
     }
 
-    /// Draw a fixed-size array. (Convenience over `draw_into`; used on the host
-    /// build, retained for parity on the actor build.)
+    /// Draw a fixed-size array. (Convenience over `draw_into`; used by the host
+    /// test build, retained for parity on the actor build.)
     #[allow(dead_code)]
     pub(crate) fn random_array<const N: usize>(&self) -> Result<[u8; N], HostRandError> {
         let mut out = [0u8; N];

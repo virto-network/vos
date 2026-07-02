@@ -22,9 +22,9 @@
 //! prints a KeyPackage (`key_package`), hands it to the inviter
 //! (link, QR, …), and the inviter's `invite` commits the
 //! membership change; the Welcome rides the commit chain and the
-//! invitee's `tick` picks it up by KeyPackage hash. A directory
-//! actor with sequenced single-use claims replaces the hand-off
-//! in a later phase.
+//! invitee's `tick` picks it up by KeyPackage hash. The `msg-directory`
+//! actor — sequenced single-use claims keyed by verified PeerId — is the
+//! default invite path; the out-of-band hand-off coexists as a fallback.
 //!
 //! Why mls-rs (AWS) and not OpenMLS: this crate must also build as a
 //! deterministic no_std riscv64 PVM actor (see the riscv64 dep flavor in
@@ -203,7 +203,7 @@ impl Messenger {
     /// is refused so the stream can never be re-forked against already-drawn
     /// material. `register` provisions one from OS entropy if none was set,
     /// so this is for hosts that want to control the root explicitly (and is
-    /// mandatory for the deterministic PVM port, where OS entropy is absent).
+    /// mandatory on the PVM actor build, where OS entropy is absent).
     ///
     /// One-shot and 32-byte-validated; the caller-role gate (Admin/System)
     /// is an open hardening decision, deferred with the rest of the seed
@@ -473,12 +473,12 @@ impl Messenger {
         format!("watching '{channel}' for a welcome")
     }
 
-    /// Add a member. `member` is either a nickname — resolved by
-    /// claiming one of their directory-published KeyPackages — or
-    /// a raw hex KeyPackage from `key_package` on their node
-    /// (out-of-band invite). Either way it becomes an MLS Add +
-    /// Commit on the channel's sequenced chain, with the Welcome
-    /// riding the same record.
+    /// Add a member. `member` is either the invitee's verified PeerId
+    /// (the 38-byte ed25519 multihash, hex) — resolved by claiming one of
+    /// their directory-published KeyPackages by identity — or a raw hex
+    /// KeyPackage from `key_package` on their node (out-of-band invite).
+    /// Either way it becomes an MLS Add + Commit on the channel's sequenced
+    /// chain, with the Welcome riding the same record.
     #[msg(cli)]
     async fn invite(&mut self, channel: String, member: String, ctx: &mut Context<Self>) -> String {
         if self.channel_index(&channel).is_none() {
@@ -830,7 +830,8 @@ impl Messenger {
 }
 
 /// The messenger's actor [`vos::Context`] — threaded through every
-/// helper that reaches the channel actors via `ask_dispatch`.
+/// helper that reaches the channel actors over the host invoke path
+/// (`ask_raw` on the PVM actor, `ask_dispatch` on the host test build).
 pub(crate) type MsgrCtx = vos::Context<Messenger>;
 
 /// A membership change to commit onto the channel's sequenced
