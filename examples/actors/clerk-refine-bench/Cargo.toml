@@ -5,6 +5,15 @@ name = "clerk-refine-bench"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# `bin` gates the PVM entry-point block (`_start`/`accumulate`) the
+# `#[actor]` macro emits under `cfg(all(target_arch = "riscv64",
+# feature = "bin"))` — replaces the removed `vos::pvm_main!` macro.
+# Default-on so `cargo build --release` for the riscv64em-javm target
+# produces a non-empty bin ELF (mirrors examples/actors/voucher-check).
+default = ["bin"]
+bin = []
+
 [dependencies]
 vos = { path = "../../../vos", default-features = false, features = ["macros", "service"] }
 cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false }
