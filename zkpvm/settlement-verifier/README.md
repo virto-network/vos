@@ -1,25 +1,26 @@
-# recursion-verifier
+# settlement-verifier
 
-The verify-only Poseidon2-over-M31 stwo **settlement verifier** for native
-recursion: stwo's `verify()` driven by a custom Poseidon2-M31 Merkle channel,
-plus the in-AIR constraint re-evaluation at the OODS point. It carries only the
-VERIFY side of the recursion stack (no `CpuBackend`/SIMD commitment ops, no
-`std`/`rayon`/`blst`), so it builds for both `wasm32-unknown-unknown` and the
-JAM PVM (`riscv64em-javm`), and it executes and **ACCEPTS real proofs on the
-PVM**.
+The verify-only Poseidon2-over-M31 stwo **settlement verifier**: stwo's
+`verify()` driven by a custom Poseidon2-M31 Merkle channel, plus the in-AIR
+constraint re-evaluation at the OODS point. It carries only the VERIFY side (no
+`CpuBackend`/SIMD commitment ops, no `std`/`rayon`/`blst`), so it builds for both
+`wasm32-unknown-unknown` and the JAM PVM (`riscv64em-javm`), and it executes and
+**ACCEPTS real proofs on the PVM**. This is the on-chain verify for a single
+light segment proof — the Track-A path in
+`zkpvm/docs/plans/recursion-decision.md`.
 
 ## Why a separate workspace
 
 This crate is its OWN `[workspace]` (and is in the vos root `exclude` list) so
 its Cargo feature resolution never co-resolves with `javm`/prover-stwo. The vos
 workspace pins stwo with `std,prover,parallel` (which drag rayon, and javm drags
-blst); here stwo is pinned at the same git rev but `default-features = false`.
+blst); here stwo is pinned at the same code but `default-features = false`.
 
-`vendor/stwo/` is a copy of that rev (trimmed to `stwo` + `constraint-framework`)
-with ONE build-config change — `dashmap` made optional + prover-gated — wired via
-the `[patch]` in `Cargo.toml`, so a no_std / no-atomics verifier build does not
-drag crossbeam-utils. No verifier logic is modified; keep it byte-identical to
-upstream except that one change when bumping the stwo rev.
+The stwo dependency points at the `olanod/stwo` fork (see `Cargo.toml`), whose
+only change from the upstream rev is making `dashmap` (std-only, prover-only)
+optional + prover-gated, so this no_std / no-atomics verifier build does not drag
+`crossbeam-utils` + `lock_api`. No verifier logic is modified; when bumping the
+stwo rev, carry only that one build-config change forward.
 
 ## Building the PVM settlement ELF
 

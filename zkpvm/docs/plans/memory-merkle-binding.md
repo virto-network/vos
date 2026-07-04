@@ -1,9 +1,10 @@
 # Phase A design: in-circuit Merkle binding of the RAM boundary (`initial_root`/`final_root`)
 
-Implements Phase A of `trustless-chain-verification-roadmap.md`: replace the
-unbound `memory_commitment = blake3(flat image)` metadata with Merkle roots of
-the RAM that are **bound in-circuit**, so chain verification becomes sound for
-memory. Decisions inherited from the roadmap (not re-litigated here): approach
+Replaces the unbound `memory_commitment = blake3(flat image)` metadata with
+Merkle roots of the RAM that are **bound in-circuit**, so chain verification
+becomes sound for memory. This is the per-segment memory binding that the
+recursion decision record (`recursion-decision.md`) identifies as required
+regardless of aggregation. Design decisions (not re-litigated here): approach
 A (Merkle memory), tree keyed by **page address** (not hashed keys),
 **4096-byte pages**, **blake2b** (the existing compression AIR), no PCS change.
 

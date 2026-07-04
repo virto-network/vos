@@ -1,6 +1,4 @@
-//! Session 1 (recursion-completion plan) — MEASURE THE FINISH LINE.
-//!
-//! Pure measurement of the two unmeasured goal-metrics for a *single light
+//! Measure the two goal-metrics for a *single light
 //! segment* (Track A's unit of work, and one inner proof of Track B):
 //!   1. VERIFY COST — serialized proof size (bincode, the on-wire format) +
 //!      native `verify_standalone` wall-time.

@@ -1,6 +1,7 @@
 # A SEPARATE, self-contained workspace for the verify-only Poseidon2-M31 stwo
 # settlement verifier that compiles for wasm32 AND the PVM (riscv64em-javm)
-# target with NO blst and NO rayon.
+# target with NO blst and NO rayon. It verifies a single light segment proof
+# on-chain (the Track-A path; see zkpvm/docs/plans/recursion-decision.md).
 #
 # It is its OWN `[workspace]` (and is in the vos root `exclude` list) so its
 # Cargo feature resolution never co-resolves with `javm`/prover-stwo: feature
@@ -8,11 +9,11 @@
 # `std,prover,parallel` (which drag rayon, and javm drags blst).  Here stwo is
 # pinned `default-features = false` — no std, no prover, no parallel.
 [package]
-name = "recursion-verifier"
+name = "settlement-verifier"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Verify-only Poseidon2-M31 stwo settlement verifier for native recursion (wasm32 + JAM PVM)"
+description = "Verify-only Poseidon2-M31 stwo settlement verifier (wasm32 + JAM PVM)"
 
 [features]
 # Build the `settle` PVM ELF (no_main + bump allocator + _start). Gated so host

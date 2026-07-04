@@ -290,8 +290,8 @@ cap, and ~7-8× larger than the "tens of MiB" the earlier comments assumed. Each
 ### Recursion — re-scoped to a LATER succinctness/settlement layer (NOT delivery)
 
 A 6-branch code-grounded feasibility investigation (2026-06-16) re-verified
-`recursion-spike.md` against the current stwo pin (`e1286720`) and concluded the
-spike's verdict **HOLDS and is strengthened**: native AIR recursion for this
+`recursion-decision.md` against the current stwo pin (`e1286720`) and concluded the
+verdict **HOLDS and is strengthened**: native AIR recursion for this
 M31/Blake2s zkpvm is a multi-person-month build, with no shortcut —
 - **stwo** (the pinned source): no `EvalAtRow`-based verifier-AIR in core, no
   usable Poseidon2-over-M31 Merkle hasher/channel (only Blake2s / Blake2s-M31
@@ -330,7 +330,7 @@ ops are blanket; only a one-line orphan-legal `BackendForChannel` marker is
 needed; a tampered commitment is rejected). So the foundation is sound — the
 multi-person-month work is what sits ON it: the verifier-as-AIR
 (FRI+Merkle+OODS+composition as constraints), an M31-algebraic Fiat-Shamir
-transcript, and vetted Poseidon2-M31 constants. See `recursion-spike.md`.
+transcript, and vetted Poseidon2-M31 constants. See `recursion-decision.md`.
 
 ## Non-goals
 

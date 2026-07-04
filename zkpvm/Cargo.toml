@@ -47,7 +47,7 @@ curve25519-dalek = { version = "4.1", optional = true, default-features = false,
 grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ec9debbec0bd06c686af8a24fabe222491558481" }
 bincode = "1"
 # no_std + serde wire format shared with the PVM settlement verifier
-# (recursion-verifier): the fixture this crate serializes is deserialized there.
+# (settlement-verifier): the fixture this crate serializes is deserialized there.
 postcard = { version = "1", features = ["alloc"] }
 zkpvm-verifier = { workspace = true }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
@@ -68,6 +68,16 @@ required-features = ["prover"]
 
 [[example]]
 name = "prove_and_verify"
+required-features = ["prover"]
+
+# Proving benchmarks (measurement, not correctness — see benches/prove.rs).
+# `harness = false` + a custom `main` keeps them out of `cargo test` and runs
+# them serially (one prove at a time, so large traces never contend for RAM).
+#   cargo bench --bench prove                 # default safe set
+#   cargo bench --bench prove -- log16        # a specific heavy one
+[[bench]]
+name = "prove"
+harness = false
 required-features = ["prover"]
 
 [lints.clippy]

@@ -1,6 +1,6 @@
 //! THE FINISH LINE: run the settlement verifier on the JAM PVM and measure it.
 //!
-//! Transpiles `recursion-verifier`'s `settle.elf` (which `include_bytes!`es the
+//! Transpiles `settlement-verifier`'s `settle.elf` (which `include_bytes!`es the
 //! `bool_proof.postcard` fixture and runs the full Poseidon2-M31 verify) to JAVM
 //! bytecode, executes it under the tracing interpreter, and asserts the verify
 //! ACCEPTS the honest proof (`halt(0xACCE)` ⇒ a0 = φ[7] = 0xACCE), reporting the

@@ -35,7 +35,7 @@ build-pvm:
 # fixture first ONLY if the proof format changed:
 #   cargo test -p zkpvm --test settle_fixture
 build-settle:
-    cd zkpvm/recursion-verifier && cargo build --release --target riscv64em-javm.json \
+    cd zkpvm/settlement-verifier && cargo build --release --target riscv64em-javm.json \
       -Zbuild-std=core,alloc,compiler_builtins \
       -Zbuild-std-features=compiler-builtins-mem \
       --features pvm-settle --bin settle
@@ -304,6 +304,12 @@ test-zkpvm:
 # Run only the fast zkpvm tests.
 test-zkpvm-fast:
     cargo test -p zkpvm --lib --test add64_e2e --test memory --test control_flow
+
+# Run the proving benchmarks (measurement harness, NOT part of `cargo test`).
+# Runs serially, so a large trace never contends for RAM with another. Pass a
+# name substring to select specific benches (e.g. `just bench log16`).
+bench filter="":
+    cargo bench -p zkpvm --bench prove -- {{filter}}
 
 # ── Maintenance ─────────────────────────────────────────────────────
 

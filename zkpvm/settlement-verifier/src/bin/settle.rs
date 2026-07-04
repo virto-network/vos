@@ -2,7 +2,7 @@
 //!
 //! A `#![no_main]` binary whose `_start` deserializes an embedded Poseidon2-M31
 //! `StarkProof` fixture and runs the full verify path
-//! ([`recursion_verifier::verify_settlement_proof`] and its transitive graph —
+//! ([`settlement_verifier::verify_settlement_proof`] and its transitive graph —
 //! FRI verify, Merkle decommit, OODS composition re-eval), halting with the
 //! result. This is the end-to-end proof that the M31-algebraic settlement verify
 //! is PVM-runnable AND value-correct: it ACCEPTS the honest fixture on the JAM
@@ -79,7 +79,7 @@ fn panic(_info: &PanicInfo) -> ! {
 pub extern "C" fn _start() -> ! {
     // Deserialize the embedded proof and run the full Poseidon2-M31 verify
     // (FRI + Merkle decommit + OODS) on the PVM.
-    match recursion_verifier::verify_settlement_proof(FIXTURE) {
+    match settlement_verifier::verify_settlement_proof(FIXTURE) {
         Ok(()) => halt(0xACCE),  // accepted
         Err(()) => halt(0x5E5),  // rejected
     }

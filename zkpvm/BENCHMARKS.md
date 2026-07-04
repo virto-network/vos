@@ -177,7 +177,7 @@ program in user-space.
 
 ## Synthetic Add64 sweep
 
-`tests/bench_prove.rs` generates a program of N sequential
+`benches/prove.rs` generates a program of N sequential
 `Add64` instructions (N = 2^log_size) followed by `Trap`, traces
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
@@ -381,7 +381,8 @@ pre-Phase-54, 2 000–2 300 at Phase 54g).  Below log_size 10 per-
 chip fixed overhead dominates (the lookup-table chips have
 minimum sizes regardless of step count).  Above log_size 14 we
 run out of memory on a 16 GB machine — `bench_prove_log16` is
-`#[ignore]`d for that reason.
+left out of the default `cargo bench --bench prove` set for that
+reason (run it explicitly by name on a box with the headroom).
 
 ### Per-stage breakdown at log_size = 14 (Phase 54k)
 
@@ -579,9 +580,10 @@ inside `compute_final_memory_commitment`.  At log_size = 14:
 | FRI committed evals  | (× blowup factor 16) ≈ 9.5 GB peak  |
 | Initial memory clone | 4 MB / call                         |
 
-`bench_prove_log16` (32 768 cycles) is `#[ignore]`d because
-the FRI committed evals at that scale exceed 16 GB on a typical
-desktop.  Plan accordingly when sizing actor proving boxes:
+`bench_prove_log16` (32 768 cycles) is left out of the default
+`cargo bench` set because the FRI committed evals at that scale
+exceed 16 GB on a typical desktop.  Plan accordingly when sizing
+actor proving boxes:
 `log_size + 4 + log2(main_cols × 16) ≈ 30+` of working memory
 under SimdBackend.
 
@@ -589,13 +591,11 @@ under SimdBackend.
 
 ```sh
 # Synthetic Add sweep (log10/12/14)
-cargo test -p zkpvm --features prover --release --test bench_prove \
-    -- bench_prove_log10 bench_prove_log12 bench_prove_log14 \
-    --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench prove \
+    -- bench_prove_log10 bench_prove_log12 bench_prove_log14
 
 # Per-stage profile at log14
-cargo test -p zkpvm --features prover --release --test bench_prove \
-    -- profile_log14 --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench prove -- profile_log14
 
 # hash_bench actor profile
 cargo test -p zkpvm --features prover --release --test prove_vos_actor \
@@ -629,9 +629,10 @@ the upstream Stwo announcement numbers.
   `production_pcs_config()` (96-bit security).  A `pow_bits = 0,
   n_queries = 1` test config proves ~3× faster but rejects
   under `PcsPolicy::STANDARD`.  See SECURITY.md.
-- **`bench_prove_log16` is `#[ignore]`d.**  Run explicitly with
-  `--ignored` on a ≥16 GB box; expect ~80 s prove time, ~5 s
-  verify, ~610 KB proof.
+- **`bench_prove_log16` is left out of the default bench set.**
+  Run it explicitly by name (`cargo bench --bench prove -- log16`)
+  on a ≥16 GB box; expect ~80 s prove time, ~5 s verify, ~610 KB
+  proof.
 
 ---
 

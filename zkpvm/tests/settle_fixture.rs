@@ -3,9 +3,9 @@
 //!
 //! Produces a `StarkProof<P2MerkleHasher>` of a TRIVIAL boolean AIR
 //! (`x·(x−1)=0`) committed under the recursion Poseidon2-M31 stack, postcard-
-//! serializes it to `recursion-verifier/fixtures/bool_proof.postcard`, and
+//! serializes it to `settlement-verifier/fixtures/bool_proof.postcard`, and
 //! round-trips it (deserialize → verify) on host. The settlement bin
-//! (`recursion-verifier/src/bin/settle.rs`) `include_bytes!`es the same fixture
+//! (`settlement-verifier/src/bin/settle.rs`) `include_bytes!`es the same fixture
 //! and runs the SAME verify on JAM PVM, so this test pins both the wire format
 //! and the verify-driver shape the PVM side must reproduce.
 //!
@@ -31,10 +31,10 @@ use stwo_constraint_framework::{
 };
 // The production Poseidon2-M31 stack (these carry serde, unlike the
 // test-support `recursion_common` mirror). The settlement bin uses the
-// structurally-identical promoted copies in `recursion-verifier`.
+// structurally-identical promoted copies in `settlement-verifier`.
 use zkpvm::poseidon2::{P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
 
-/// MOBILE PCS config — MUST match `recursion-verifier`'s `mobile_config()`
+/// MOBILE PCS config — MUST match `settlement-verifier`'s `mobile_config()`
 /// (blowup 2, 38 queries, 20-bit PoW), or the verifier replays a different
 /// transcript and rejects the proof.
 fn mobile_config() -> PcsConfig {
@@ -139,7 +139,7 @@ fn generate_and_roundtrip_fixture() {
     assert!(tamper_rejected, "a tampered proof must NOT verify");
 
     // Emit the fixture the settlement bin embeds.
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/recursion-verifier/fixtures");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/settlement-verifier/fixtures");
     std::fs::create_dir_all(dir).expect("create fixtures dir");
     let path = format!("{dir}/bool_proof.postcard");
     std::fs::write(&path, &bytes).expect("write fixture");

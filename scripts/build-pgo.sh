@@ -45,10 +45,12 @@ RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PROFDIR" \
   cargo build -p zkpvm --features prover --release --tests
 
 echo "=== Step 2a/3: Training run — synthetic Add bench (ALU-heavy) ==="
+# The Add benchmarks live in the `prove` bench harness (harness=false, runs
+# serially), so training drives them via `cargo bench`. The name filters after
+# `--` select the training workloads; libtest-style flags are ignored.
 RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PROFDIR" \
-  cargo test -p zkpvm --features prover --release --test bench_prove \
+  cargo bench -p zkpvm --features prover --bench prove \
   -- profile_log14_mobile bench_prove_log10 bench_prove_log12 bench_prove_log14 \
-  --nocapture --test-threads 1 \
   > /dev/null
 
 echo "=== Step 2b/3: Training run — clerk-private-pay (ECALL + ledger) ==="
@@ -78,5 +80,4 @@ echo "Profile data: $PROFDIR/merged.profdata"
 echo
 echo "To bench the PGO build:"
 echo "  RUSTFLAGS=\"-C target-cpu=native -Cprofile-use=$PROFDIR/merged.profdata\" \\"
-echo "    cargo test -p zkpvm --features prover --release --test bench_prove \\"
-echo "    -- profile_log14_mobile --nocapture --test-threads 1"
+echo "    cargo bench -p zkpvm --features prover --bench prove -- profile_log14_mobile"

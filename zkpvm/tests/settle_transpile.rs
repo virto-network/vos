@@ -1,7 +1,7 @@
 //! Does the settlement verifier ELF survive grey-transpilation to JAM PVM
 //! bytecode? The transpiler rejects RISC-V instructions JAVM cannot execute
 //! (e.g. atomic instructions, compressed insts, out-of-range registers), so a
-//! clean `link_elf` is the bytecode-level proof that `recursion-verifier`'s
+//! clean `link_elf` is the bytecode-level proof that `settlement-verifier`'s
 //! `settle.elf` is genuinely PVM-runnable — not just ELF-linkable.
 //!
 //! The ELF is built out-of-band (separate workspace + custom target) via
