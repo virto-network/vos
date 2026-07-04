@@ -97,7 +97,7 @@ fewer rows) recovers the regression.
 
 ## Older — Session 1 + Session 2.1 producer side (parallel trace-gen + PGO with STANDARD training)
 
-`tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
+`benches/actors.rs::profile_clerk_private_pay_bench{,_mobile}`
 is the canonical tap-to-pay bench: clerk-private-pay-bench actor
 (Pedersen + Schnorr + commitment + signing payload, ~24 K PVM
 steps).  Median of 5 trials, post B3 audit + parallel
@@ -136,8 +136,8 @@ Reproducing the PGO build:
 ```
 bash scripts/build-pgo.sh   # ~10 min on the reference desktop
 RUSTFLAGS="-C target-cpu=native -Cprofile-use=/tmp/zkpvm-pgo-data/merged.profdata" \
-  cargo test -p zkpvm --release --test prove_vos_actor \
-  profile_clerk_private_pay_bench_mobile -- --exact --nocapture
+  cargo bench -p zkpvm --features prover --bench actors \
+  -- profile_clerk_private_pay_bench_mobile
 ```
 
 Verifier-side, MOBILE proofs require
@@ -410,9 +410,10 @@ Trace shape at log_size = 14, post-Phase-54k:
 
 ## Real-world workloads
 
-`tests/prove_vos_actor.rs` proves real RISC-V actors compiled to
-PVM via the `grey-transpiler` toolchain.  Numbers below are at
-branch tip with the same prover config.
+`benches/actors.rs` proves real RISC-V actors compiled to
+PVM via the `grey-transpiler` toolchain (the functional
+counterparts live in `tests/prove_vos_actor.rs`).  Numbers below
+are at branch tip with the same prover config.
 
 ### `hash_bench` (bare-metal hash benchmark)
 
@@ -598,12 +599,12 @@ cargo bench -p zkpvm --features prover --bench prove \
 cargo bench -p zkpvm --features prover --bench prove -- profile_log14
 
 # hash_bench actor profile
-cargo test -p zkpvm --features prover --release --test prove_vos_actor \
-    -- profile_hash_bench --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench actors \
+    -- profile_hash_bench
 
 # fibonacci actor profile
-cargo test -p zkpvm --features prover --release --test prove_vos_actor \
-    -- profile_fibonacci_actor --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench actors \
+    -- profile_fibonacci_actor
 ```
 
 Numbers will vary across hardware; the per-stage shape (main
@@ -687,8 +688,8 @@ log_sizes:               [15, 11, 16, 10, 16, 4, 4, 15, 9, 8, 8, 6, 8, 10, 11, 1
 
 Reproducer:
 ```sh
-cargo test --features prover --release --test prove_vos_actor \
-    profile_clerk_private_pay_bench -p zkpvm -- --nocapture
+cargo bench -p zkpvm --features prover --bench actors \
+    -- profile_clerk_private_pay_bench
 ```
 
 ### Sub-second roadmap
@@ -703,7 +704,8 @@ The 3.85 s baseline is therefore a *real* shipped milestone, not a stepping ston
 
 ### Test coverage (re-authored after Stwo-bump revert)
 
-Step-9–19 chip code is exercised by 13 tests in `tests/prove_vos_actor.rs`:
+Step-9–19 chip code is exercised by tests in `tests/prove_vos_actor.rs`
+plus actor/chip benchmarks in `benches/actors.rs`:
 
 - `prove_ristretto_via_ecall_boundary` — single `ecalli 200` (scalar_mult) end-to-end
 - `prove_ristretto_point_add_via_ecall_boundary` — single `ecalli 201` (point_add)
@@ -713,10 +715,10 @@ Step-9–19 chip code is exercised by 13 tests in `tests/prove_vos_actor.rs`:
 - `prove_scalar_mult_then_point_add` — cross-type (scalar_mult + point_add)
 - `prove_two_ristretto_scalar_mult_ecalls` — two same-type, same output
 - `prove_scalar_mul_chained_add` — Schnorr-shaped `mul + add` chain
-- `profile_hot_pcs_clerk_private_pay_bench` — diagnostic, no prove
-- `profile_clerk_private_pay_bench` — full Phase-2 end-to-end (the headline test)
+- `profile_hot_pcs_clerk_private_pay_bench` — diagnostic, no prove (bench, `benches/actors.rs`)
+- `profile_clerk_private_pay_bench` — full Phase-2 end-to-end, the headline workload (bench, `benches/actors.rs`)
 - `prove_ristretto_chip_with_input_producers` — RistrettoChip dangling chain (negative)
 - `prove_ristretto_chip_closed_chain_input_output` — RistrettoChip balanced chain (positive)
-- `bench_ristretto_chip_soundness_complete_chain` — 10K-op chain bench (`#[ignore]`'d)
+- `bench_ristretto_chip_soundness_complete_chain` — 10K-op chain bench (`benches/actors.rs`, explicit-name-only)
 
 Three Step-4 chained tests (`prove_ristretto_chip_double_chained`, `add_chained`, `scalar_mult_chained_small`) are `#[ignore]`'d pending re-investigation: re-author drift from the lost originals trips a logup-balance issue. The chip code paths they cover are exercised by `closed_chain_input_output` and the bench, so coverage isn't lost.

@@ -80,6 +80,17 @@ name = "prove"
 harness = false
 required-features = ["prover"]
 
+# Actor-workload proving benchmarks (measurement, not correctness — see
+# benches/actors.rs).  Same `harness = false` + custom `main` pattern as the
+# `prove` bench: kept out of `cargo test`, run serially so a large actor trace
+# never contends for RAM with another.
+#   cargo bench --bench actors                              # default safe set
+#   cargo bench --bench actors -- profile_clerk_refine_bench  # a heavy one
+[[bench]]
+name = "actors"
+harness = false
+required-features = ["prover"]
+
 [lints.clippy]
 module-inception = { level = "allow", priority = 0 }
 # AIR fill code is byte-position-indexed throughout (val_b[0..8],

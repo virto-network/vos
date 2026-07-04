@@ -19,9 +19,9 @@
 # Caveat: the optimised binary is tuned for the training workload
 # shape (currently the Add-bench profile harness).  Real-world
 # workloads with very different opcode mixes may see less gain.
-# To retrain for a specific workload, replace the test selector in
+# To retrain for a specific workload, replace the bench selector in
 # step 2 with one exercising that workload (e.g.,
-# `--test prove_vos_actor -- profile_hash_bench`).
+# `--bench actors -- profile_hash_bench`).
 #
 # Requires: rustup component llvm-tools-preview (auto-installed if
 # missing).
@@ -59,9 +59,8 @@ echo "=== Step 2b/3: Training run — clerk-private-pay (ECALL + ledger) ==="
 # synthetic Add traces.  Falls back silently if the actor blob isn't
 # available in the local checkout (common on contributor machines).
 RUSTFLAGS="-C target-cpu=native -Cprofile-generate=$PROFDIR" \
-  cargo test -p zkpvm --features prover --release --test prove_vos_actor \
+  cargo bench -p zkpvm --features prover --bench actors \
   -- profile_clerk_private_pay_bench_mobile profile_clerk_private_pay_bench \
-  --nocapture --test-threads 1 \
   > /dev/null \
   || echo ">>> WARNING: clerk-private-pay-bench training skipped (actor blob missing); PGO will be ALU-tuned only."
 # Both MOBILE (fri_blowup=2) and STANDARD (fri_blowup=16) shapes are
