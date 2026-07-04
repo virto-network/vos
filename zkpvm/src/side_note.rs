@@ -478,55 +478,6 @@ impl SideNote {
         self.ristretto_field_rows.push(row);
     }
 
-    /// Step 4: walk the chip's row stream and set every producer
-    /// row's `producer_multiplicity` to the count of downstream
-    /// consumer rows that reference it via `a_source_row` /
-    /// `b_source_row`.  Op rows (add/sub/mul) and OUTPUT rows
-    /// consume `a`; op rows additionally consume `b`.  Run this AFTER
-    /// composing all chip rows and BEFORE prove (the prove path
-    /// reads `producer_multiplicity` into a trace column that
-    /// scales the register-file lookup emission).
-    ///
-    /// O(n) over `ristretto_field_rows.len()`.  Idempotent.
-    #[cfg(feature = "prover")]
-    pub fn finalize_ristretto_multiplicities(&mut self) {
-        for r in self.ristretto_field_rows.iter_mut() {
-            r.producer_multiplicity = 0;
-        }
-        let n = self.ristretto_field_rows.len();
-        for i in 0..n {
-            let row = self.ristretto_field_rows[i];
-            if row.is_real == 0 || row.is_input != 0 {
-                // INPUT rows have no a/b source — skip consumer accounting
-                // for them.  Padding (is_real=0) likewise.
-                if row.is_input != 0 { /* still real, but no consumer fields */ }
-            }
-            if row.is_real == 0 {
-                continue;
-            }
-            // OUTPUT and op rows consume `a`.
-            if row.is_input == 0 {
-                let a_src = row.a_source_row as usize;
-                if a_src < n {
-                    let cur = self.ristretto_field_rows[a_src].producer_multiplicity;
-                    self.ristretto_field_rows[a_src].producer_multiplicity = cur
-                        .checked_add(1)
-                        .expect("producer_multiplicity overflowed u16");
-                }
-            }
-            // Op rows additionally consume `b` (NOT input nor output).
-            if row.is_input == 0 && row.is_output == 0 {
-                let b_src = row.b_source_row as usize;
-                if b_src < n {
-                    let cur = self.ristretto_field_rows[b_src].producer_multiplicity;
-                    self.ristretto_field_rows[b_src].producer_multiplicity = cur
-                        .checked_add(1)
-                        .expect("producer_multiplicity overflowed u16");
-                }
-            }
-        }
-    }
-
     /// R1f boundary capture: convert each captured Ristretto255 ECALL
     /// record into a balanced 6-row block on the chip:
     ///

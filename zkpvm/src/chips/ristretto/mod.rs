@@ -287,7 +287,8 @@ pub enum Column {
     /// `IsReal · IsMul` — full mul-row selector.
     #[size = 1]
     RealMulH,
-    /// `IsReal · (1 - IsOutput)` — register-file producer multiplicity.
+    /// `IsReal · (1 - IsOutput)` — register-file producer GATE (boolean;
+    /// 1 on producer rows = input + op rows, 0 on output/padding).
     #[size = 1]
     ProducerGateH,
     /// `IsReal · (1 - IsInput)` — register-file consumer-A multiplicity
@@ -298,6 +299,18 @@ pub enum Column {
     /// multiplicity (op-rows only).
     #[size = 1]
     ConsumerBGateH,
+    /// How many downstream FieldOp consumers reference this row's `out`
+    /// (op rows consume `a` and `b`; output rows consume `a`).  Computed
+    /// from the source threading in `generate_main_trace`; the register-
+    /// file producer emits its `out` scaled by this so a coordinate reused
+    /// several times (point doubling / addition) still balances.
+    #[size = 1]
+    ProducerMultiplicity,
+    /// `ProducerGateH · ProducerMultiplicity` deg-flatten helper — the
+    /// actual multiplicity the register-file producer emits (0 on
+    /// output/padding via the gate).
+    #[size = 1]
+    ProducerEmissionMult,
 
     /// 64-byte mul schoolbook partial-sum helper:
     /// `MulPartialSum[k] := Σ_{i+j=k, i,j<32} FieldA[i] · FieldB[j]`
@@ -420,6 +433,9 @@ impl BuiltInComponent for RistrettoChip {
         let producer_gate_h = crate::trace::trace_eval!(trace_eval, Column::ProducerGateH);
         let consumer_a_gate_h = crate::trace::trace_eval!(trace_eval, Column::ConsumerAGateH);
         let consumer_b_gate_h = crate::trace::trace_eval!(trace_eval, Column::ConsumerBGateH);
+        let producer_mult = crate::trace::trace_eval!(trace_eval, Column::ProducerMultiplicity);
+        let producer_emission_mult =
+            crate::trace::trace_eval!(trace_eval, Column::ProducerEmissionMult);
         let mul_partial_sum = crate::trace::trace_eval!(trace_eval, Column::MulPartialSum);
 
         // ── Shared FieldOp algebra ──
@@ -555,11 +571,21 @@ impl BuiltInComponent for RistrettoChip {
         // NOT output rows which only consume).
         // Gate via deg-1 helper columns so multiplicities stay at
         // deg ≤ 1 and paired-batch lookup constraints stay at deg ≤ 2.
+        //
+        // ProducerEmissionMult deg-flatten helper: the producer emits its
+        // `out` with multiplicity ProducerMultiplicity (its downstream
+        // consumer count), gated to producer rows via ProducerGateH so
+        // output/padding rows emit nothing.  Pinning it to a committed
+        // column keeps the per-byte producer emission at deg ≤ 2.
+        eval.add_constraint(
+            producer_emission_mult[0].clone()
+                - producer_gate_h[0].clone() * producer_mult[0].clone(),
+        );
         for k in 0..32 {
             // Producer.
             eval.add_to_relation(RelationEntry::new(
                 regfile_lookup,
-                producer_gate_h[0].clone().into(),
+                producer_emission_mult[0].clone().into(),
                 &[
                     row_idx_lo[0].clone(),
                     row_idx_hi[0].clone(),
@@ -641,6 +667,30 @@ impl BuiltInProverComponent for RistrettoChip {
         let log_size = ristretto_log_size(side_note).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
+        // Register-file producer multiplicities: count how many downstream
+        // consumers reference each row's `out` (op rows consume `a` and `b`;
+        // output rows consume `a`).  The producer emits its `out` scaled by
+        // this count, so a coordinate reused several times within one point
+        // doubling / addition still balances.  Computed here from the source
+        // threading so no caller has to pre-finalize the witness field.
+        let mut producer_mult = alloc::vec![0u32; side_note.ristretto_field_rows.len()];
+        for r in side_note.ristretto_field_rows.iter() {
+            if r.is_real == 0 {
+                continue;
+            }
+            if r.is_input == 0 {
+                let a_src = r.a_source_row as usize;
+                if a_src < producer_mult.len() {
+                    producer_mult[a_src] += 1;
+                }
+            }
+            if r.is_input == 0 && r.is_output == 0 {
+                let b_src = r.b_source_row as usize;
+                if b_src < producer_mult.len() {
+                    producer_mult[b_src] += 1;
+                }
+            }
+        }
         // Borrow the rows — the side_note is shared with the
         // verifier-side active_components selection, which checks
         // `ristretto_field_rows.is_empty()` to decide whether the
@@ -719,6 +769,13 @@ impl BuiltInProverComponent for RistrettoChip {
             trace.fill_columns(row_i, real_b && !out_b, Column::ProducerGateH);
             trace.fill_columns(row_i, real_b && !inp_b, Column::ConsumerAGateH);
             trace.fill_columns(row_i, real_b && !inp_b && !out_b, Column::ConsumerBGateH);
+
+            // Producer multiplicity (downstream consumer count) + the gated
+            // emission helper the register-file producer actually emits.
+            let pm = producer_mult.get(row_i).copied().unwrap_or(0);
+            trace.fill_columns(row_i, BaseField::from(pm), Column::ProducerMultiplicity);
+            let emission = if real_b && !out_b { pm } else { 0 };
+            trace.fill_columns(row_i, BaseField::from(emission), Column::ProducerEmissionMult);
 
             // MulPartialSum[k] = Σ a[i]·b[j] for i+j=k.  Values can
             // exceed u8/u16 (up to 32 × 255² ≈ 2 million); fill via BaseField.
@@ -855,14 +912,19 @@ impl BuiltInProverComponent for RistrettoChip {
         let b_cols = crate::trace::original_base_column!(component_trace, Column::FieldB);
         let is_input_col = crate::trace::original_base_column!(component_trace, Column::IsInput);
         let is_output_col = crate::trace::original_base_column!(component_trace, Column::IsOutput);
+        let producer_emission_mult = crate::trace::original_base_column!(
+            component_trace,
+            Column::ProducerEmissionMult
+        );
         let one_packed =
             || stwo::prover::backend::simd::m31::PackedM31::broadcast(BaseField::from(1u32));
         for k in 0..32 {
-            // Producer: is_real * (1 - is_output)
+            // Producer: ProducerEmissionMult (= ProducerGateH · multiplicity),
+            // so a producer consumed N times emits N copies of its `out`.
             logup.add_to_relation_with(
                 regfile,
-                [is_real[0].clone(), is_output_col[0].clone()],
-                |[real, output_flag]| (real * (one_packed() - output_flag)).into(),
+                [producer_emission_mult[0].clone()],
+                |[m]| m.into(),
                 &[
                     row_idx_lo_pp[0].clone(),
                     row_idx_hi_pp[0].clone(),

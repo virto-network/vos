@@ -725,28 +725,67 @@ fn prove_blake2b_precompile() {
     eprintln!("Blake2b precompile: PROVED!");
 }
 
-/// End-to-end chip-on test.  Pre-populates
-/// `side_note.ristretto_field_rows` with a single field-add row
-/// (1 + 2 = 3 mod p), turns the chip on via the
-/// `ristretto_field_rows.is_empty()` activity hook, and proves +
-/// verifies.  Validates that the AIR's per-row constraints
-/// (R1c-3..R1c-5-b) hold against real witness data — separate from
-/// the ECALL boundary path.
-///
-/// Ignored: the chip's register-file lookup requires every consumer
-/// (a, b) byte to have a matching producer (some prior row's `out`).
-/// This test pushes a single row with default a_source = b_source = 0
-/// — no producer exists for the consumed values, so logup fails.
-/// Re-enable once the chip gains an INPUT-PRODUCER row class or
-/// ECALL-boundary producer mechanism.
+/// Prove + verify a pre-built RistrettoChip side note against the
+/// chip-isolated components (`RangeMultiplicity256` + `RistrettoChip`)
+/// only — the full-machine path rejects step-less traces via the Z0
+/// boundary binding (see `prove_ristretto_chip_closed_chain_input_output`).
+/// Returns whether it both proves AND verifies.
+fn prove_verify_ristretto_isolated(side_note: &mut zkpvm::SideNote) -> bool {
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let components: &[&'static dyn zkpvm::harness::MachineProverComponent] =
+        &[&zkpvm::chips::RangeMultiplicity256, &zkpvm::chips::RistrettoChip];
+    let Ok(proof) = zkpvm::prove_with_explicit_components(side_note, config, components) else {
+        return false;
+    };
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    let verifier_components: Vec<&dyn zkpvm::harness::MachineComponent> = components
+        .iter()
+        .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
+        .collect();
+    zkpvm::verify_with_explicit_components(proof, side_note, &verifier_components, components, &policy)
+        .is_ok()
+}
+
+/// Prove a single field-op row (add / sub / mul) in a balanced,
+/// chip-isolated chain: `fill_input` producers feed the row's two
+/// operands and a `fill_output` consumer drains its result, so the
+/// RistrettoChip register-file logup closes.  Returns whether the chain
+/// proves AND verifies, so negative tests can assert a tampered row is
+/// rejected.
+fn prove_field_op_row_isolated(row: zkpvm::chips::ristretto::witness::FieldOpRow) -> bool {
+    use zkpvm::chips::ristretto::witness::{fill_input, fill_output};
+
+    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
+    // Rows 0/1: input producers for the two operands.
+    side_note.add_ristretto_field_row(fill_input(row.a));
+    side_note.add_ristretto_field_row(fill_input(row.b));
+    // Row 2: the op under test, consuming the two producers.
+    let mut op = row;
+    op.a_source_row = 0;
+    op.b_source_row = 1;
+    side_note.add_ristretto_field_row(op);
+    // Row 3: output consumer draining the op's result.
+    side_note.add_ristretto_field_row(fill_output(op.out, 2));
+
+    prove_verify_ristretto_isolated(&mut side_note)
+}
+
+/// End-to-end chip-on test.  Wraps a single field-add row (1 + 2 = 3
+/// mod p) in a balanced input→op→output chain and proves + verifies it
+/// against the RistrettoChip in isolation.  Validates that the AIR's
+/// per-row constraints (R1c-3..R1c-5-b) hold against real witness data —
+/// separate from the ECALL boundary path.
 #[test]
-#[ignore]
 fn prove_ristretto_chip_field_add() {
     use zkpvm::chips::ristretto::witness::fill_add;
-
-    // Empty PVM trace — the chip-on test exercises only RistrettoChip
-    // rows, not any CPU steps.
-    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
     // Single field-add row: 1 + 2 = 3 mod p.
     let mut a = [0u8; 32];
@@ -755,93 +794,51 @@ fn prove_ristretto_chip_field_add() {
     b[0] = 2;
     let row = fill_add(a, b);
     assert_eq!(row.out[0], 3);
-    side_note.add_ristretto_field_row(row);
 
-    // Chip needs to flip on via activity_from_steps' new check on
-    // ristretto_field_rows.is_empty().
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("RistrettoChip field-add proving failed");
-    // Permissive policy for the chip-level smoke test (matches the
-    // pow_bits/queries/blowup of the test config above).
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("RistrettoChip field-add verification failed");
+    assert!(
+        prove_field_op_row_isolated(row),
+        "RistrettoChip field-add should prove + verify"
+    );
     eprintln!("RistrettoChip field-add: PROVED + VERIFIED");
 }
 
 /// Chip-on test for field-mul.  Exercises the full is_mul row
 /// constraint chain (schoolbook R1c-4-b → 2-pass reduction R1c-5-b
-/// → final < p check R1c-3-bis).
-///
-/// Ignored: single bare rows can't prove — see
-/// prove_ristretto_chip_field_add for the same reason.
+/// → final < p check R1c-3-bis) inside a balanced input→op→output chain.
 #[test]
-#[ignore]
 fn prove_ristretto_chip_field_mul() {
     use zkpvm::chips::ristretto::witness::fill_mul;
 
-    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
-
-    // Smallest non-zero case: 1 · 1 = 1.  This bare single row can't
-    // prove (see doc above); the all-zero case 0·0=0 is covered by
-    // prove_ristretto_chip_field_mul_zero below.
+    // Smallest non-zero case: 1 · 1 = 1.  The all-zero case 0·0=0 is
+    // covered by prove_ristretto_chip_field_mul_zero below.
     let mut a = [0u8; 32];
     a[0] = 1;
     let mut b = [0u8; 32];
     b[0] = 1;
     let row = fill_mul(a, b);
     assert_eq!(row.out[0], 1);
-    side_note.add_ristretto_field_row(row);
 
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("RistrettoChip field-mul proving failed");
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("RistrettoChip field-mul verification failed");
+    assert!(
+        prove_field_op_row_isolated(row),
+        "RistrettoChip field-mul should prove + verify"
+    );
     eprintln!("RistrettoChip field-mul: PROVED + VERIFIED");
 }
 
 /// Negative tests confirming the chip's per-row constraints reject
-/// malformed witnesses.  Runs prove with invalid witnesses; each
-/// MUST fail.  This is the audit evidence that within-row soundness
-/// is intact.
-///
-/// Ignored: single bare rows can't prove (consumer side unbalanced
-/// without INPUT-PRODUCER mechanism).  Re-enable with a 2-row
-/// chained setup, or rely on the unrelated-rows-rejected
-/// attestation.  The per-row constraints themselves live in the chip.
+/// malformed witnesses.  Each tampered row is wrapped in a balanced
+/// input→op→output chain (via `prove_field_op_row_isolated`) and MUST
+/// fail to prove-or-verify.  This is the audit evidence that within-row
+/// soundness is intact.
 #[test]
-#[ignore]
 fn ristretto_chip_negative_per_row_soundness_audit() {
     use zkpvm::chips::ristretto::witness::{FieldOpRow, fill_add, fill_mul, fill_sub};
 
+    // Wrap the row under test in a balanced chain: an honest witness
+    // proves + verifies; any per-row tamper breaks a constraint (or the
+    // output-consumer lookup) and is rejected.
     fn try_prove(row: FieldOpRow) -> bool {
-        let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
-        side_note.add_ristretto_field_row(row);
-        let config = zkpvm::PcsConfig {
-            pow_bits: 5,
-            fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-            lifting_log_size: None,
-        };
-        zkpvm::prove_with_config(&mut side_note, config).is_ok()
+        prove_field_op_row_isolated(row)
     }
 
     let mut a_small = [0u8; 32];
@@ -1269,46 +1266,30 @@ fn prove_ristretto_chip_closed_chain_input_output() {
     eprintln!("Soundness chain: per-row + inter-row + boundary all CLOSED.");
 }
 
-/// Ignored: needs the INPUT-PRODUCER mechanism.
+/// Chip-on test for field-mul of the all-zero case (0·0=0) in a
+/// balanced input→op→output chain.
 #[test]
-#[ignore]
 fn prove_ristretto_chip_field_mul_zero() {
     use zkpvm::chips::ristretto::witness::fill_mul;
 
-    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let row = fill_mul([0u8; 32], [0u8; 32]);
     assert_eq!(row.is_mul, 1);
     assert_eq!(row.out, [0u8; 32]);
-    side_note.add_ristretto_field_row(row);
 
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("RistrettoChip field-mul (zero) proving failed");
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("RistrettoChip field-mul (zero) verification failed");
+    assert!(
+        prove_field_op_row_isolated(row),
+        "RistrettoChip field-mul (0·0=0) should prove + verify"
+    );
     eprintln!("RistrettoChip field-mul (0·0=0): PROVED + VERIFIED");
 }
 
 /// Chip-on test for field-mul with operands that overflow 2²⁵⁶,
 /// exercising the full reduction chain (pass-1 fold + pass-2 fold +
-/// top-bit fold + final < p).
-///
-/// Ignored: needs the INPUT-PRODUCER mechanism.
+/// top-bit fold + final < p) in a balanced input→op→output chain.
 #[test]
-#[ignore]
 fn prove_ristretto_chip_field_mul_with_reduction() {
     use zkpvm::chips::ristretto::witness::fill_mul;
 
-    let mut side_note = zkpvm::SideNote::new(Vec::new(), Vec::new(), Vec::new());
     let mut a = [0u8; 32];
     let mut b = [0u8; 32];
     for i in 0..32 {
@@ -1319,22 +1300,11 @@ fn prove_ristretto_chip_field_mul_with_reduction() {
     }
     a[31] &= 0x7f;
     b[31] &= 0x7f;
-    side_note.add_ristretto_field_row(fill_mul(a, b));
 
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let proof = zkpvm::prove_with_config(&mut side_note, config)
-        .expect("RistrettoChip field-mul (with reduction) proving failed");
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("RistrettoChip field-mul (with reduction) verification failed");
+    assert!(
+        prove_field_op_row_isolated(fill_mul(a, b)),
+        "RistrettoChip field-mul (with reduction) should prove + verify"
+    );
     eprintln!("RistrettoChip field-mul (full reduction): PROVED + VERIFIED");
 }
 
@@ -2211,14 +2181,8 @@ fn prove_scalar_mul_chained_add() {
     zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
 }
 
-/// Source-threaded `point_double` end-to-end.
-///
-/// Ignored: a multiplicity-balance issue makes verify reject with
-/// "claimed logup sum is not zero".  The chip itself is intact
-/// (closed_chain_input_output passes); the bench-level safety net
-/// covers the same chip code paths.
+/// Source-threaded `point_double` end-to-end, proved chip-isolated.
 #[test]
-#[ignore]
 fn prove_ristretto_chip_double_chained() {
     use zkpvm::chips::ristretto::point::{
         ExtendedPointSources, point_double_rows_chained, point_identity,
@@ -2259,26 +2223,15 @@ fn prove_ristretto_chip_double_chained() {
     side_note.add_ristretto_field_row(fill_output(doubled.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(doubled.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let proof =
-        zkpvm::prove_with_config(&mut side_note, config).expect("doubling-chained should prove");
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
+    assert!(
+        prove_verify_ristretto_isolated(&mut side_note),
+        "doubling-chained should prove + verify"
+    );
+    eprintln!("RistrettoChip point-double chained: PROVED + VERIFIED");
 }
 
-/// Source-threaded `point_add` end-to-end.  See
-/// `prove_ristretto_chip_double_chained` — same multiplicity-balance
-/// issue.
+/// Source-threaded `point_add` end-to-end, proved chip-isolated.
 #[test]
-#[ignore]
 fn prove_ristretto_chip_add_chained() {
     use zkpvm::chips::ristretto::point::{
         ED25519_TWO_D, ExtendedPointSources, point_add_rows_chained, point_identity,
@@ -2333,26 +2286,17 @@ fn prove_ristretto_chip_add_chained() {
     side_note.add_ristretto_field_row(fill_output(sum.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(sum.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let proof = zkpvm::prove_with_config(&mut side_note, config).expect("add-chained should prove");
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
+    assert!(
+        prove_verify_ristretto_isolated(&mut side_note),
+        "add-chained should prove + verify"
+    );
+    eprintln!("RistrettoChip point-add chained: PROVED + VERIFIED");
 }
 
 /// Small-scalar ladder (k=5, 3 bits) — exercises the full chained
 /// `scalar_mult_rows_chained` driver with multi-iteration source
-/// threading.  Same multiplicity-balance issue as the other two
-/// chained tests above.
+/// threading, proved chip-isolated.
 #[test]
-#[ignore]
 fn prove_ristretto_chip_scalar_mult_chained_small() {
     use zkpvm::chips::ristretto::point::{
         ED25519_TWO_D, ExtendedPointSources, point_identity, scalar_mult_rows_chained,
@@ -2415,17 +2359,9 @@ fn prove_ristretto_chip_scalar_mult_chained_small() {
     side_note.add_ristretto_field_row(fill_output(result.z, out_sources.z_source));
     side_note.add_ristretto_field_row(fill_output(result.t, out_sources.t_source));
 
-    let config = zkpvm::PcsConfig {
-        pow_bits: 5,
-        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-    };
-    let proof =
-        zkpvm::prove_with_config(&mut side_note, config).expect("scalar-mult-chained should prove");
-    let policy = zkpvm::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy).expect("verify");
+    assert!(
+        prove_verify_ristretto_isolated(&mut side_note),
+        "scalar-mult-chained should prove + verify"
+    );
+    eprintln!("RistrettoChip scalar-mult chained: PROVED + VERIFIED");
 }
