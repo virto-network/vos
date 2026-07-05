@@ -59,11 +59,21 @@ fn trace_fibonacci_actor() {
     );
 
     let mut tracing = TracingPvm::new(interp);
-    let exit = tracing.run();
+    // Drive the lifecycle stubs so bootstrap hostcalls are serviced and the
+    // actor runs its full `start` handler (fib compute).
+    let exit = tracing.run_with_vos_stubs();
     let steps = tracing.into_trace();
     eprintln!("Execution: {} steps, exit={exit:?}", steps.len());
 
-    assert!(!steps.is_empty(), "should have executed some steps");
+    // A correctly-built actor runs thousands of steps (bootstrap + compute).
+    // A stale / mis-built ELF traps almost immediately (2 steps, `Panic`) —
+    // catch that loudly instead of silently "tracing" a broken run.
+    assert!(
+        steps.len() > 1000 && !format!("{exit:?}").contains("Panic"),
+        "fibonacci actor only traced {} steps (exit={exit:?}) — stale/mis-built \
+         ELF? rebuild with `cd examples/actors/fibonacci && cargo actor`",
+        steps.len()
+    );
     eprintln!("First: pc={} {:?}", steps[0].pc, steps[0].opcode);
     eprintln!(
         "Last:  pc={} {:?}",
@@ -84,39 +94,12 @@ fn trace_fibonacci_actor() {
     }
 }
 
-#[test]
-fn prove_fibonacci_actor() {
-    let Some(blob) = load_fibonacci_blob() else {
-        return;
-    };
-    let parsed = program::parse_blob(&blob).expect("failed to parse JAR blob");
-
-    // Extract code and bitmask
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_data = code_data.expect("no CODE capability in blob");
-    let code_blob = program::parse_code_blob(&code_data).expect("failed to parse code blob");
-
-    let (interp, _flat_mem) = interpreter_from_blob(&blob, 10_000_000);
-    let mut tracing = TracingPvm::new(interp);
-    let exit = tracing.run();
-    let steps = tracing.into_trace();
-    eprintln!("Traced {} steps, exit={exit:?}", steps.len());
-
-    let mut side_note =
-        zkpvm::SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
-            .with_jump_table(code_blob.jump_table.to_vec());
-    let proof = prove(&mut side_note).expect("proving failed");
-    eprintln!("Proof generated: {} claimed sums", proof.claimed_sums.len());
-
-    verify(proof, &side_note).expect("verification failed");
-    eprintln!("Verification passed!");
-}
+// Proving the full fibonacci actor trace end-to-end is benchmark-scale (the
+// bootstrap alone pads to log-16, ~10 GB even under the MOBILE config), so it
+// lives in `benches/actors.rs::profile_fibonacci_actor`, not here. The
+// `trace_fibonacci_actor` guard above catches a broken/stale ELF, and the
+// prove+verify pipeline is covered by the smaller `chip_isolated` harness
+// tests and the ecall-boundary tests.
 
 // ── Generic actor profile helper ──
 

@@ -2,7 +2,7 @@
 //!
 //! Pure-ALU actor with no external I/O, suitable for ZK proving benchmarks.
 
-use vos::{actor, messages};
+use vos::prelude::*;
 
 #[actor]
 struct Fibonacci {
@@ -17,8 +17,11 @@ impl Fibonacci {
 
     #[msg]
     async fn start(&self, _ctx: &mut Context<Self>) {
-        let result = fib(self.n);
-        println!("fib({}) = {}", self.n, result);
+        // Pure-ALU: `black_box` the input so `fib` isn't const-folded and
+        // the result so it isn't elided — no I/O (no string formatting), so
+        // the trace stays small and provable.
+        let n = core::hint::black_box(self.n);
+        core::hint::black_box(fib(n));
     }
 }
 

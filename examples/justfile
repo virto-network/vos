@@ -8,6 +8,7 @@
 build:
     cd agents/scheduler && cargo actor
     cd actors/greeter && cargo actor
+    cd actors/fibonacci && cargo actor
     cd actors/counter && cargo actor
     cd actors/fizzbuzz && cargo actor
     cd actors/hasher && cargo actor
