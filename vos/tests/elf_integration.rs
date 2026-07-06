@@ -6116,6 +6116,213 @@ fn clerk_ledger_bootstrap_and_create_account() {
     assert_eq!(panics, 0, "actor panics during clerk-ledger test: {panics}");
 }
 
+// ── voucher-check canonical proving provenance ───────────────────────
+//
+// The `voucher-check` program's canonical profile + commitment allowlist
+// + segment-step bound. The prover is program-agnostic (it takes a
+// transpiled PVM blob + these caller-supplied parameters), so this
+// provenance lives with the verification system that uses it — here, the
+// issuing-bank stand-in that drives the federation e2e below. In
+// production it is owned by whichever system verifies vouchers (a
+// substrate pallet, a PVM actor); each re-pins its own copy against the
+// published voucher-check build. `voucher_check_commitment_drift_guard`
+// re-derives + guards these values.
+
+/// Per-segment step bound for canonical chain proving. The canonical
+/// profile + commitment allowlist were measured/pinned against this bound;
+/// a different segment size reshapes the segments and lands the chain on
+/// commitments outside the allowlist.
+const CHAIN_SEG_STEPS: usize = 100_000;
+
+/// Gas bound for tracing the voucher-check transition (matches the prover's
+/// generous trace budget).
+const VC_TRACE_GAS: u64 = 100_000_000;
+
+/// Canonical-shape forcing profile for `voucher-check`, indexed by
+/// `zkpvm::chip_idx`. `zkpvm::prove_canonical` pads each forcing-set chip's
+/// main trace up to `PROFILE[chip_idx]` so every segment's
+/// preprocessed-bearing chips share one `log_size`; `0` = not forced.
+/// Forcing set: BLAKE2B(1), BLAKE2B_BOUNDARY(2), MEMORY_PAGE(4),
+/// RISTRETTO(23), RIST_ECALL(24), FIXED_BASE_CONSUMER(26), COMB_ANCHOR(27),
+/// COMB_SCALAR_BOUNDARY(28), COMB_COMPRESS(29), COMB_COMPRESS_OUTPUT(30).
+const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
+    0, 14, 17, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 0, 11, 6, 5, 6, 5,
+];
+
+/// Published canonical-shape program-commitment ALLOWLIST for
+/// `voucher-check` (production Blake2s channel). The commitment is the
+/// preprocessed-trace Merkle root; under canonical proving every segment of
+/// the conservation transition collapses to one of these — `[0]` = a
+/// comb-free segment (the vast majority), `[1]` = a segment carrying one
+/// fixed-base scalar mult. `verify_chain` accepts a chain whose every
+/// segment commitment is in this set.
+const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
+    // C_0 — comb-free canonical shape.
+    // blake2s 6d1eeb24edaeef9ba6aa16e55b32c49c3d46702c0bee6b35ab3d643f8296584f
+    [
+        0x6d, 0x1e, 0xeb, 0x24, 0xed, 0xae, 0xef, 0x9b, 0xa6, 0xaa, 0x16, 0xe5, 0x5b, 0x32, 0xc4,
+        0x9c, 0x3d, 0x46, 0x70, 0x2c, 0x0b, 0xee, 0x6b, 0x35, 0xab, 0x3d, 0x64, 0x3f, 0x82, 0x96,
+        0x58, 0x4f,
+    ],
+    // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
+    // blake2s a0cbbf47f880e3be8785b5bc72eef48ef101a0c17808b74d4ce91019020f6278
+    [
+        0xa0, 0xcb, 0xbf, 0x47, 0xf8, 0x80, 0xe3, 0xbe, 0x87, 0x85, 0xb5, 0xbc, 0x72, 0xee, 0xf4,
+        0x8e, 0xf1, 0x01, 0xa0, 0xc1, 0x78, 0x08, 0xb7, 0x4d, 0x4c, 0xe9, 0x10, 0x19, 0x02, 0x0f,
+        0x62, 0x78,
+    ],
+];
+
+/// Path to the pre-built `voucher-check.elf`. Honors `VOUCHER_CHECK_ELF`
+/// for a non-canonical location, else the build-relative path.
+fn voucher_check_elf_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("VOUCHER_CHECK_ELF") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from(format!(
+        "{}/../examples/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    ))
+}
+
+/// Read + transpile `voucher-check.elf` and locate its `__VOS_WITNESS`
+/// buffer, returning `(pvm_blob, witness_addr)` — the ELF→blob→witness
+/// pipeline that the program-agnostic prover leaves to the caller. The
+/// issuing bank (this test) owns it. Panics with a build hint if the ELF is
+/// missing (the caller is inside the opt-in real-STARK path).
+fn voucher_check_pvm() -> (Vec<u8>, usize) {
+    let elf = std::fs::read(voucher_check_elf_path())
+        .expect("voucher-check.elf not built — run `just build-voucher-check`");
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile voucher-check");
+    let addr = vos::zk::witness_addr(&elf).expect("voucher-check.elf must export __VOS_WITNESS");
+    (blob, addr as usize)
+}
+
+/// Drift guard for the relocated `VOUCHER_CHECK_COMMITMENTS` allowlist:
+/// re-derive C_0 (a comb-free segment) and C_1 (the comb segment) by
+/// canonical proving over the CURRENT `voucher-check.elf` transpiled with
+/// vos's grey-transpiler, and assert they equal the baked values. Fails
+/// loudly if the AIR, the canonical profile, the segment-step bound, the
+/// voucher-check ELF, or the transpiler shifts the program commitment —
+/// re-run and re-pin `VOUCHER_CHECK_COMMITMENTS` from the printed values
+/// (and re-pin the `allowlist` any verification system configured with
+/// `set_prover`).
+///
+/// Heavy (canonical prove of 2 segments, minutes); `#[ignore]`. Run:
+///   cargo test -p vos --release --test elf_integration \
+///     voucher_check_commitment_drift_guard -- --ignored --nocapture
+#[test]
+#[ignore]
+fn voucher_check_commitment_drift_guard() {
+    use vos::Encode;
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (blob, addr) = voucher_check_pvm();
+    let registrar = cipher_clerk::crypto::Keypair::generate();
+    let (public, witness, _value, _blinding) = build_conservation_transition(&registrar);
+    let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
+
+    let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
+        .expect("trace the voucher-check conservation transition");
+    let total = full.steps.len();
+    assert!(
+        total > 1_000_000,
+        "trace is only {total} steps — guest early-exited (stale voucher-check ELF?)"
+    );
+    let bounds = zkpvm::segment::segment_bounds(total, CHAIN_SEG_STEPS);
+    let n = bounds.len();
+    let comb_seg = (0..n)
+        .find(|&i| {
+            let (a, b) = bounds[i];
+            !zkpvm::segment::segment_side_note(&full, a, b)
+                .ristretto_comb_calls
+                .is_empty()
+        })
+        .expect("the conservation transition must contain a fixed-base scalar mult (comb) segment");
+
+    let prove_seg = |i: usize| -> [u8; 32] {
+        let (a, b) = bounds[i];
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let proof = zkpvm::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
+            .unwrap_or_else(|e| panic!("prove_canonical seg {i} [{a},{b}): {e:?}"));
+        // Channel-agnostic 32-byte form ([u8; 32] under Blake2s).
+        zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof))
+    };
+    let c0 = prove_seg(0);
+    let c1 = prove_seg(comb_seg);
+    let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    eprintln!("C_0 (comb-free) = {}", hex(&c0));
+    eprintln!("C_1 (one comb)  = {}", hex(&c1));
+    assert_eq!(
+        c0, VOUCHER_CHECK_COMMITMENTS[0],
+        "C_0 drifted — re-pin VOUCHER_CHECK_COMMITMENTS[0]"
+    );
+    assert_eq!(
+        c1, VOUCHER_CHECK_COMMITMENTS[1],
+        "C_1 drifted — re-pin VOUCHER_CHECK_COMMITMENTS[1]"
+    );
+}
+
+/// Standalone canonical-chain ACCEPT path (no federation): prove the
+/// conservation transition as a segment chain through the general prover
+/// and verify it through `verify_chain_segments` against the pinned
+/// allowlist + io-binding, then assert a forged `root_after` (io-hash
+/// mismatch) rejects. This is the Tranche B prove→verify round-trip minus
+/// the 2-node / libp2p / CAS plumbing (which the `clerk_ledger_two_bank_
+/// federation` real-STARK path adds), so it exercises the accept path at a
+/// much lower memory ceiling. Heavy (canonical chain prove, minutes);
+/// `#[ignore]`. Run:
+///   RUST_MIN_STACK=268435456 cargo test -p vos --release --test \
+///     elf_integration voucher_check_chain_accept_path -- --ignored --nocapture
+#[test]
+#[ignore]
+fn voucher_check_chain_accept_path() {
+    use vos::Encode;
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (blob, addr) = voucher_check_pvm();
+    let registrar = cipher_clerk::crypto::Keypair::generate();
+    let (public, witness, _value, _blinding) = build_conservation_transition(&registrar);
+    let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
+
+    let segments = prover_extension::prove_chain_segments(
+        &blob,
+        &witness_buf,
+        addr,
+        CHAIN_SEG_STEPS,
+        &VOUCHER_CHECK_CANONICAL_PROFILE,
+    )
+    .expect("prove_chain_segments over the conservation transition");
+    eprintln!("proved {} canonical segments", segments.len());
+
+    let allowlist: Vec<u8> = VOUCHER_CHECK_COMMITMENTS.iter().flatten().copied().collect();
+    let io_public = cipher_clerk::voucher::proof::public_bytes(&public);
+
+    // Honest chain: verifies against the pinned allowlist + the io-binding.
+    assert!(
+        prover_extension::verify_chain_segments(&allowlist, &segments, &io_public, &[1u8]),
+        "an honest canonical chain must verify against the pinned allowlist + io-binding"
+    );
+    // Forged io: a different `root_after` → different `public_bytes` → the
+    // final segment's STARK-bound io-hash does not match → reject.
+    let mut forged = public.clone();
+    forged.state_root_after = [0xEE; 32];
+    assert!(
+        !prover_extension::verify_chain_segments(
+            &allowlist,
+            &segments,
+            &cipher_clerk::voucher::proof::public_bytes(&forged),
+            &[1u8]
+        ),
+        "a forged root_after (io-hash mismatch) must reject"
+    );
+    eprintln!("chain accept-path GREEN: honest chain verifies, forged root_after rejects");
+}
+
 /// Federation wire-through W3 producer: build a self-contained
 /// conservation transition (2 accounts, 1 settled debit) on a `VecLedger`,
 /// REGISTERED BY `registrar` so the resulting `voucher::proof::Public.issuer
@@ -6421,12 +6628,18 @@ fn clerk_ledger_two_bank_federation() {
         ServiceId::HYPERSPACE_REGISTRY,
     );
     node_a.register_at_id(
-        AgentConfig::new(bridge_blob.clone()).with_consistency(Consistency::Ephemeral),
+        AgentConfig::new(bridge_blob.clone())
+            .with_consistency(Consistency::Ephemeral)
+            .network_reachable(),
         bridge_a_id,
     );
+    // Local, but authoritative state deliberately served cross-bank (peer
+    // banks read accounts over the network) — opt out of the device-private
+    // confinement gate.
     node_a.register_at_id(
         AgentConfig::new(ledger_blob.clone())
             .with_consistency(Consistency::Local)
+            .network_reachable()
             .persist(&dir_a),
         clerk_a_id,
     );
@@ -6449,21 +6662,26 @@ fn clerk_ledger_two_bank_federation() {
         ServiceId::HYPERSPACE_REGISTRY,
     );
     node_b.register_at_id(
-        AgentConfig::new(bridge_blob).with_consistency(Consistency::Ephemeral),
+        AgentConfig::new(bridge_blob)
+            .with_consistency(Consistency::Ephemeral)
+            .network_reachable(),
         bridge_b_id,
     );
     node_b.register_at_id(
         AgentConfig::new(ledger_blob)
             .with_consistency(Consistency::Local)
+            .network_reachable()
             .persist(&dir_b),
         clerk_b_id,
     );
     // clerk-bridge on B: holds the bank-B IVK secret + peer-A
     // clerk pubkey + dedup set. Persisted (Local) so the dedup
-    // state survives across actor restarts.
+    // state survives across actor restarts. Reached cross-node by peer
+    // banks submitting vouchers, so it opts out of confinement too.
     node_b.register_at_id(
         AgentConfig::new(clerk_bridge_blob)
             .with_consistency(Consistency::Local)
+            .network_reachable()
             .persist(&dir_b),
         clerk_bridge_b_id,
     );
@@ -7860,29 +8078,21 @@ fn clerk_ledger_two_bank_federation() {
         // immutable invocations with mutable registrations.
         let prover_id = node_b.register_extension(ExtensionConfig::new(prover_so));
 
-        use prover_extension::ProverRef;
-        let prover_ref = ProverRef::at(prover_id);
+        // The trusted commitment allowlist is voucher-check provenance —
+        // the concatenation of the accepted 32-byte canonical commitments
+        // (see VOUCHER_CHECK_COMMITMENTS). It is the sole cross-program
+        // anchor the bridge hands `verify_chain`. The general prover is
+        // program-agnostic (it resolves no programs); the operator supplies it.
+        let allowlist_bytes: Vec<u8> = VOUCHER_CHECK_COMMITMENTS.iter().flatten().copied().collect();
 
-        // The trusted program commitment is provenance: fetch it from the
-        // prover (v1 baked) and configure the bridge with it. It's the
-        // sole cross-program anchor the bridge hands `verify`.
-        let voucher_commitment =
-            vos::block_on(prover_ref.program_commitment(&mut &node_b, b"voucher-check".to_vec()))
-                .expect("invoke program_commitment");
-        assert_eq!(
-            voucher_commitment.len(),
-            32,
-            "voucher-check program commitment is the 32-byte Merkle root"
-        );
-
-        // Wire bank B's bridge to the prover + trusted commitment.
+        // Wire bank B's bridge to the prover + trusted allowlist.
         // `set_prover` is legal post-bootstrap (idempotent in identical
         // args).
         assert_eq!(
             vos::block_on(bridge_actor.set_prover(
                 &mut &node_b,
                 prover_id.0,
-                voucher_commitment.clone()
+                allowlist_bytes.clone()
             ))
             .expect("invoke set_prover"),
             BridgeStatus::Ok,
@@ -7923,13 +8133,25 @@ fn clerk_ledger_two_bank_federation() {
                 "conservation witness exceeds the guest __VOS_WITNESS buffer ({} B)",
                 witness_buf.len()
             );
+            // The issuing bank owns the ELF→blob→witness pipeline the
+            // program-agnostic prover leaves to the caller: transpile
+            // voucher-check.elf and locate its __VOS_WITNESS buffer, then hand
+            // the blob + address + the
+            // caller-held seg_steps + canonical profile to the prover.
+            let (vc_blob, vc_witness_addr) = voucher_check_pvm();
             // Offline: prove the canonical segment chain (minutes), as
             // per-segment proof bytes.
-            let segments = prover_extension::prove_chain_segments(b"voucher-check", &witness_buf)
-                .expect(
-                    "prove_chain_segments over the conservation transition \
-                     (stale voucher-check ELF? run `just build-voucher-check`)",
-                );
+            let segments = prover_extension::prove_chain_segments(
+                &vc_blob,
+                &witness_buf,
+                vc_witness_addr,
+                CHAIN_SEG_STEPS,
+                &VOUCHER_CHECK_CANONICAL_PROFILE,
+            )
+            .expect(
+                "prove_chain_segments over the conservation transition \
+                 (stale voucher-check ELF? run `just build-voucher-check`)",
+            );
             // Seed each segment proof on bank A (the SENDER) and ship a MANIFEST.
             // Each canonical segment proof (~3 MiB) is under the 8 MiB single-shot
             // cross-node frame cap (MAX_FRAME_BYTES), so bank B's verifier fetches
