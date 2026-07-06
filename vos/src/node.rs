@@ -178,9 +178,9 @@ pub struct AgentConfig {
     /// (the messenger's MLS keys, CSPRNG seed, decrypted plaintext) and
     /// must never leave the device — those stay confined (the default,
     /// `false`). But a single-node agent can also be authoritative state
-    /// deliberately served over the network — a per-bank `clerk-ledger`
-    /// answering cross-bank reads, a stateless bridge — and those set this
-    /// so the confinement gate lets peer invokes through. No effect on
+    /// deliberately served over the network — a per-node authoritative store
+    /// answering remote reads, a stateless forwarding bridge — and those set
+    /// this so the confinement gate lets peer invokes through. No effect on
     /// `Crdt`/`Raft` agents (never confined) — see
     /// [`Consistency::is_node_confined`] and [`NodeService::dispatch_invoke`].
     pub network_reachable: bool,
@@ -336,9 +336,9 @@ impl AgentConfig {
 
     /// Let remote peers invoke this node-confined (`Local`/`Ephemeral`)
     /// agent — for single-node state that is authoritative-but-network-
-    /// served (a per-bank `clerk-ledger`, a bridge) rather than device-
-    /// private. Leaves device-private agents (the messenger) confined by
-    /// default. See [`AgentConfig::network_reachable`].
+    /// served (a per-node authoritative store, a forwarding bridge) rather
+    /// than device-private. Leaves device-private agents (the messenger)
+    /// confined by default. See [`AgentConfig::network_reachable`].
     pub fn network_reachable(mut self) -> Self {
         self.network_reachable = true;
         self
@@ -1053,8 +1053,9 @@ struct AgentInfo {
     /// Whether this agent opted OUT of the device-private network gate
     /// (see [`AgentConfig::network_reachable`]). When `true`, a
     /// `Local`/`Ephemeral` agent still answers remote peer invokes — for
-    /// authoritative-but-network-served single-node state (a per-bank
-    /// clerk-ledger, a bridge). Ignored for `Crdt`/`Raft` (never confined).
+    /// authoritative-but-network-served single-node state (a per-node
+    /// authoritative store, a bridge). Ignored for `Crdt`/`Raft` (never
+    /// confined).
     network_reachable: bool,
 }
 
@@ -1422,8 +1423,8 @@ impl NodeService {
             .or_else(|| if to != to_unscoped { info.get(&to_unscoped) } else { None });
         entry.is_some_and(|i| {
             // A `network_reachable` opt-out keeps an authoritative-but-
-            // network-served single-node agent (clerk-ledger, a bridge)
-            // reachable; only genuinely device-private agents stay confined.
+            // network-served single-node agent (an authoritative store, a
+            // bridge) reachable; only device-private agents stay confined.
             i.consistency.is_some_and(Consistency::is_node_confined) && !i.network_reachable
         })
     }
@@ -2166,7 +2167,7 @@ impl VosNode {
     ///
     /// Idempotent on equal bytes; the hash is collision-resistant.
     /// Used by producers to stash a STARK proof before sending a
-    /// voucher whose `proof.bytes` carries the returned hash.
+    /// message whose proof-reference field carries the returned hash.
     ///
     /// When [`proof_blobs_dir`](Self::with_proof_blobs_dir) is set,
     /// also writes the bytes to `{dir}/{hex_hash}`. Disk errors are
@@ -6301,8 +6302,8 @@ fn handle_blob_get(rest: &[u8], blob_fetch: &BlobFetchCtx<'_>) -> Vec<u8> {
 
             // Hint leg — single targeted request. Short-circuits
             // the whole call when the hint is right (the common
-            // case in production: bridge knows which peer issued
-            // the voucher).
+            // case in production: the requester knows which peer
+            // produced the proof).
             if let Some(peer) = hint_peer {
                 let rx = net.send_fetch_proof_blob(peer, hash);
                 if let Ok(Some(bytes)) = rx.recv_timeout(BLOB_HINT_LEG_TIMEOUT) {

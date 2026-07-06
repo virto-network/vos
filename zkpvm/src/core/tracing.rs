@@ -769,9 +769,9 @@ fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: 
 // canonical compressed Ristretto encoding of `k * P`, or `[0u8; 32]`
 // (compressed identity) on either non-canonical scalar bytes or an
 // invalid input point encoding.  This is exactly the function the
-// RistrettoChip will be constrained to compute — by going through the
-// same crate cipher-clerk uses, the precompile's input/output
-// agreement with cipher-clerk's own crypto is by construction.
+// RistrettoChip will be constrained to compute — by going through
+// `curve25519-dalek`, the precompile's input/output agreement with
+// the reference crypto is by construction.
 
 fn scalar_binop_sw(op_id: u32, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     use curve25519_dalek::scalar::Scalar;

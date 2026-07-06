@@ -2,12 +2,9 @@
 //!
 //! These functions encapsulate the "parse a PVM blob → build an
 //! Interpreter → run a trace → assemble a SideNote" pipeline that
-//! every prove-side caller of an actor binary needs. The helpers
-//! lived as copy-pasted boilerplate in `voucher_check_smoke.rs`,
-//! `prove_vos_actor.rs`, and the `clerk-prover` extension until Phase
-//! Z0's review surfaced the duplication; consolidating them here
-//! keeps the trace-assembly invariants in one place (precompile
-//! record forwarding, ristretto boundary ingest, stack-pointer seed).
+//! every prove-side caller of an actor binary needs, keeping the
+//! trace-assembly invariants in one place (precompile record
+//! forwarding, ristretto boundary ingest, stack-pointer seed).
 //!
 //! Callers that need to inject runtime witness state into a known
 //! flat_mem offset (e.g. the host prover patching an actor's
@@ -38,7 +35,7 @@ use crate::core::tracing::TracingPvm;
 /// DATA cap, matching the `vosx run`-time convention.
 ///
 /// `gas` caps execution length. Pass a generous bound for production
-/// traces (e.g. `100_000_000` for the voucher-check workload) and
+/// traces (e.g. `100_000_000` for a heavy crypto workload) and
 /// expect `ExitReason::OutOfGas` if the actor exceeds it.
 ///
 /// Returns `None` if the blob isn't parseable or lacks a CODE cap.

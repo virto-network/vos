@@ -64,7 +64,7 @@ pub const ECALL_RISTRETTO_POINT_ADD: u32 = 111;
 /// u64-backend's `montgomery_mul / sub / pack` chain).  Output is
 /// always a canonical 32-byte scalar in [0, ℓ); the host-side
 /// reference goes through `curve25519-dalek` so the result agrees
-/// bit-for-bit with cipher-clerk's expected scalar values.
+/// bit-for-bit with the dalek reference values.
 pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 112;
 
 /// Hostcall ID for scalar multiplication mod ℓ (Schnorr/Ristretto

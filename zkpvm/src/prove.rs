@@ -185,7 +185,7 @@ pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
 /// latency-sensitive flows like *private tap-to-pay*.
 ///
 /// Same 96-bit conjectured security as `prove()` but ~2× faster on
-/// real PVM workloads (clerk-private-pay-bench: ~0.7 s vs ~1.4 s on
+/// real PVM workloads (a ristretto-heavy workload: ~0.7 s vs ~1.4 s on
 /// the reference Intel Core Ultra 7 155H).  Cost: proof size ~1.6×
 /// larger.  Acceptable trade for tap-to-pay where prove time
 /// dominates user experience.
@@ -713,7 +713,7 @@ fn prove_impl_with_components_overridden(
     // memory ledgers, RistrettoChip, …) only read those, so they run on
     // rayon with shared `&SideNote`.  Mirrors the producer/consumer
     // split already used by interaction-trace generation a few stages
-    // below.  Measured saving on log17 clerk-private-pay-bench (MOBILE):
+    // below.  Measured saving on log17 a ristretto-heavy workload (MOBILE):
     // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
     let mut traces: Vec<Option<ComponentTrace>> = (0..components.len()).map(|_| None).collect();
@@ -880,7 +880,7 @@ fn prove_impl_with_components_overridden(
     // `tree_builder.extend_evals` is mutating, so we do that
     // sequentially after the parallel pass.
     //
-    // Measured win at log17 clerk-private-pay-bench (MOBILE config):
+    // Measured win at log17 a ristretto-heavy workload (MOBILE config):
     // ~140 ms → ~50–70 ms with the default thread pool cap (10
     // threads); brings total prove time from 0.71 s to ~0.62 s.
     let t = Instant::now();

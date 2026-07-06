@@ -2,11 +2,10 @@
 //! entry points — no ELF, no transpile, no proving.
 //!
 //! The real proof-level happy path (prove a segment chain → verify it
-//! against a canonical commitment allowlist + io-binding → redeem) lives
-//! with the verification system it belongs to — the clerk-bridge
-//! federation flow in `vos/tests/elf_integration.rs`
-//! (`clerk_ledger_two_bank_federation`). Here we only pin the cheap
-//! reject/guard paths that short-circuit before any STARK work.
+//! against a canonical commitment allowlist + io-binding) lives with the
+//! systems that use the prover — e.g. the federation flow in
+//! `vos/tests/elf_integration.rs`. Here we only pin the cheap reject/guard
+//! paths that short-circuit before any STARK work.
 
 use prover_extension::{
     decode_chain_manifest, encode_chain_manifest, verify_chain_segments, verify_proof_bytes,

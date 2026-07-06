@@ -128,20 +128,20 @@ impl Prover {
     }
 
     /// Prove `pvm_blob` over `witness_bytes` as a canonical-shape SEGMENT
-    /// CHAIN — the federation path for traces too large for a single proof
-    /// (the conservation transition is millions of steps). Segments at
-    /// `seg_steps`, proves each with canonical-shape proving against the
-    /// caller-supplied `profile`, and returns `bincode(Vec<Vec<u8>>)` — the
-    /// per-segment `bincode(Proof)` bytes (one entry per segment, in chain
-    /// order). Empty `Vec` on any failure.
+    /// CHAIN — for traces too large for a single proof (the conservation-of-
+    /// value transition, say, is millions of steps). Segments at `seg_steps`,
+    /// proves each with canonical-shape proving against the caller-supplied
+    /// `profile`, and returns `bincode(Vec<Vec<u8>>)` — the per-segment
+    /// `bincode(Proof)` bytes (one entry per segment, in chain order). Empty
+    /// `Vec` on any failure.
     ///
     /// The caller content-addresses each segment SEPARATELY (`put_proof_blob`),
     /// assembles + CASes a [`ChainManifest`] of the hashes, and ships the
-    /// manifest's single 32-byte hash in the voucher's `proof.bytes` (unchanged
-    /// wire shape — one hash). Per-segment delivery keeps every cross-node blob
-    /// under the 8 MiB frame cap, which the single concatenated chain blob
-    /// cannot. Heavy + offline (the issuing bank proves before sending the
-    /// voucher).
+    /// manifest's single 32-byte hash wherever its protocol carries a proof
+    /// reference (unchanged wire shape — one hash). Per-segment delivery keeps
+    /// every cross-node blob under the 8 MiB frame cap, which the single
+    /// concatenated chain blob cannot. Heavy + offline (the producer proves
+    /// before shipping).
     #[msg]
     async fn prove_chain(
         &self,
@@ -205,7 +205,7 @@ impl Prover {
         }
         let allowlist: Vec<CommitmentHash> =
             allowlist.chunks_exact(32).map(CommitmentHash::from).collect();
-        // 1) Fetch the manifest (the single voucher hash addresses it).
+        // 1) Fetch the manifest (the single caller-supplied hash addresses it).
         let Some(manifest_bytes) = ctx.blob_get(hash, hint).await else {
             return 0;
         };
@@ -315,9 +315,10 @@ pub fn verify_proof_bytes(
 ///
 /// PER-SEGMENT DELIVERY: the caller content-addresses each segment SEPARATELY
 /// (`put_proof_blob`), assembles a [`ChainManifest`] of the resulting hashes,
-/// CASes the manifest, and ships the manifest's single 32-byte hash in the
-/// voucher (unchanged wire shape — one hash). This keeps every cross-node blob
-/// under the 8 MiB frame cap (`MAX_FRAME_BYTES`): one canonical segment proof is
+/// CASes the manifest, and ships the manifest's single 32-byte hash as its
+/// protocol's proof reference (unchanged wire shape — one hash). This keeps
+/// every cross-node blob under the 8 MiB frame cap (`MAX_FRAME_BYTES`): one
+/// canonical segment proof is
 /// ~3 MiB, whereas the single concatenated `bincode(Vec<Proof>)` chain blob
 /// (~N × 3 MiB ≈ hundreds of MiB) is not deliverable in one frame. The verifier
 /// re-assembles the chain by fetching each segment via the manifest (see
@@ -343,7 +344,7 @@ pub fn prove_chain_segments(
 /// A chain delivered as per-segment proof CAS hashes, in chain order. The
 /// producer puts each segment proof into the host proof-blob store SEPARATELY
 /// and lists the resulting 32-byte hashes here; the manifest is itself CASed and
-/// its single hash rides in the voucher's `proof.bytes`. Because the manifest is
+/// its single hash rides in the caller's proof reference. Because the manifest is
 /// content-addressed, its segment list (count + order) is integrity-bound to
 /// that hash — a verifier that fetches and verifies EVERY listed segment, plus
 /// the chain's boundary-continuity + entering-root anchor + final io-binding,

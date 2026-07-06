@@ -85,7 +85,7 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       boundary-binding recompute updated). The B5 register read-run merge
 ///       is disabled (one entry per row). So a from-scratch prover can no
 ///       longer forge a register/RAM read — in particular the closing read
-///       that pins `final_state.registers` / the voucher io-hash is now
+///       that pins `final_state.registers` / the actor io-hash is now
 ///       sound. AIR change: new columns + the wider register relation, so
 ///       the proof bytes differ (gate: `tests/ledger_readconsistency_gate.rs`).
 ///       `memory_commitment` is still outside the binding.

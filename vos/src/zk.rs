@@ -28,9 +28,9 @@
 //!   of a different program.  A name-tag in the hash would be a third,
 //!   redundant copy of identity — and a *claim* (a tag can be reused for
 //!   different code) rather than a *proof* (a commitment cannot).
-//! - **The human name** ("voucher-check") belongs in the provenance /
-//!   catalog layer (program_id → trusted commitment), where naming,
-//!   versioning, and governance actually live.
+//! - **The human name** (a program's catalog name) belongs in the
+//!   provenance / catalog layer (program_id → trusted commitment), where
+//!   naming, versioning, and governance actually live.
 //! - **Which operation** within a multi-handler program, when a protocol
 //!   needs to distinguish, is just another *public input* the actor
 //!   folds into `public` — one concept (public inputs), not a separate
@@ -338,7 +338,7 @@ where
 /// guest and verifier agree by construction, with no rkyv-layout /
 /// cross-crate coupling.
 ///
-/// e.g. `vos::zk::bind_io_bytes(&cipher_clerk::voucher::proof::public_bytes(&p), &[1u8])`.
+/// e.g. `vos::zk::bind_io_bytes(&my_public_bytes, &[1u8])`.
 /// Same halt/φ[9..12] placement and last-binding-wins semantics as
 /// [`bind_io`].
 #[cfg(feature = "pvm")]

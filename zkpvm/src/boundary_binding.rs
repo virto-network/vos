@@ -47,7 +47,7 @@
 //!   sound against a from-scratch prover: a cross-row `#[mask_next_row]`
 //!   `prev_value` binding, a range-checked `(reg, ts)` sortedness gadget,
 //!   and an `is_write` tuple limb together force the closing read's value
-//!   — and hence the voucher io-hash in `final_state.registers[9..13]` —
+//!   — and hence the actor io-hash in `final_state.registers[9..13]` —
 //!   to equal the trace's actual final register state. Combined with the
 //!   metadata→column binding here, registers are a fully bound public
 //!   input (gate: `tests/ledger_readconsistency_gate.rs`).
