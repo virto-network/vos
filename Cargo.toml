@@ -16,6 +16,7 @@ members = [
     "extensions/ai",
     "extensions/dev",
     "extensions/http-gateway",
+    "extensions/prover",
     "examples/extensions/*",
 ]
 exclude = [

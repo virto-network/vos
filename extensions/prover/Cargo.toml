@@ -1,0 +1,45 @@
+[package]
+name = "prover-extension"
+version = "0.1.0"
+edition = "2024"
+
+# General-purpose host-side zkpvm prover + verifier over transpiled PVM
+# blobs. The caller delivers the PVM blob + the `__VOS_WITNESS` address +
+# opaque witness bytes; the prover patches the witness into the blob,
+# proves the trace, and composes STARK validity with the tagless
+# io-binding. It is a PURE PVM prover: it carries no per-program crypto
+# knowledge and no ELF/transpile machinery (no grey-transpiler, no ELF
+# symbol reader). A bridge dispatches `prove` / `verify` here.
+#
+# Lives as a native `.so` because zkpvm-verifier can't build for the PVM
+# guest (javm -> blst C-build + workspace stwo feature inheritance), so
+# in-actor verification isn't viable — see the general-prover plan.
+
+[features]
+default = ["bin", "extension"]
+bin = []
+extension = []
+# Forward zkpvm's row-by-row constraint asserter (no FRI/blowup/commit, so
+# far lighter than a full prove) for verifying large traces that OOM under
+# `prove`. Test-only: `cargo test -p prover-extension --features debug-constraints`.
+debug-constraints = ["zkpvm/debug-internals"]
+# Native-recursion Stage-0 (P5.0/P5.1): prove + verify under the Poseidon2-M31
+# PCS. Flips `CommitmentHash` to `P2Hash`; the re-bake recipe + drift guard
+# recompute `{C_0,C_1}` under the new hash. Off by default (production Blake2s).
+poseidon2-channel = ["zkpvm/poseidon2-channel", "zkpvm-verifier/poseidon2-channel"]
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+vos = { path = "../../vos", default-features = false, features = ["extension"] }
+# zkpvm prover (trace_blob + prove_mobile / prove_canonical) and the
+# host-side standalone verifier. The caller delivers the transpiled PVM
+# blob, so no ELF/transpile machinery lives here.
+zkpvm = { workspace = true }
+zkpvm-verifier = { workspace = true }
+bincode = "1"

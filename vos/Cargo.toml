@@ -13,7 +13,7 @@ readme.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -61,6 +61,10 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
+# Host-side ELF symbol reader — locates a provable actor's `__VOS_WITNESS`
+# buffer address (`vos::zk::witness_addr`) so a caller can hand the host
+# prover the witness-injection offset. std-only.
+object = { version = "0.36", default-features = false, features = ["std", "read_core", "elf"], optional = true }
 # Host-side OS entropy for the BOOT_CONTEXT seam: mints a fresh per-boot
 # `boot_token` + the host-local `device_id`. `std`-gated — the no_std riscv
 # guest reaches the host via the BOOT_CONTEXT ecall and never links this.
@@ -143,12 +147,18 @@ clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
 # pre-built ELF separately and only need the Ref surface from
 # the rlib.
 clerk-bridge = { path = "../actors/clerk-bridge", default-features = false }
-# General-purpose host-side prover extension. Tests use ProverRef to
-# drive prove / verify / program_commitment from the federation flow
-# (producer calls prove(program_id, witness) → puts bytes in CAS →
-# ships hash via voucher.proof.bytes; verifier bridge dispatches
-# verify) and as a blob_get probe in proof_blob_cross_node.
-prover-extension = { path = "../examples/extensions/prover" }
+# General-purpose host-side prover extension. Tests drive the federation
+# flow (producer transpiles voucher-check.elf + calls prove_chain_segments
+# → puts each segment + a manifest in CAS → ships the manifest hash via
+# voucher.proof.bytes; verifier bridge dispatches verify_chain against the
+# caller-supplied allowlist) and use it as a blob_get probe in
+# proof_blob_cross_node.
+prover-extension = { path = "../extensions/prover" }
+# zkpvm canonical prover + segmentation — the `voucher_check_commitment_
+# drift_guard` re-derives the pinned VOUCHER_CHECK_COMMITMENTS by proving
+# two canonical segments. Already in the dev-dep graph via prover-extension;
+# named directly here so the guard can call it.
+zkpvm = { workspace = true }
 # Host-side cipher-clerk with `signing` so tests can build
 # signed CreateAccount events to push through the ledger. Pulls in
 # OsRng-backed signing — fine on host; the actor itself never
