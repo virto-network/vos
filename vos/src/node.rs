@@ -172,6 +172,18 @@ pub struct AgentConfig {
     pub data_dir: Option<std::path::PathBuf>,
     /// Replication / persistence semantics for this agent.
     pub consistency: Consistency,
+    /// Opt a node-confined (`Local`/`Ephemeral`) agent OUT of the
+    /// device-private network gate, so remote peers may invoke it. The
+    /// gate exists for agents whose single-node state is device-private
+    /// (the messenger's MLS keys, CSPRNG seed, decrypted plaintext) and
+    /// must never leave the device — those stay confined (the default,
+    /// `false`). But a single-node agent can also be authoritative state
+    /// deliberately served over the network — a per-bank `clerk-ledger`
+    /// answering cross-bank reads, a stateless bridge — and those set this
+    /// so the confinement gate lets peer invokes through. No effect on
+    /// `Crdt`/`Raft` agents (never confined) — see
+    /// [`Consistency::is_node_confined`] and [`NodeService::dispatch_invoke`].
+    pub network_reachable: bool,
     /// 32-byte handle that identifies the *replication group* this
     /// agent belongs to. Replicas of the same logical actor on
     /// different nodes share this id and use it to find each other
@@ -253,6 +265,7 @@ impl AgentConfig {
             storage: Vec::new(),
             data_dir: None,
             consistency: Consistency::Ephemeral,
+            network_reachable: false,
             replication_id: None,
             #[cfg(feature = "storage")]
             pre_opened_db: None,
@@ -318,6 +331,16 @@ impl AgentConfig {
     /// Pick the replication/persistence strategy.
     pub fn with_consistency(mut self, c: Consistency) -> Self {
         self.consistency = c;
+        self
+    }
+
+    /// Let remote peers invoke this node-confined (`Local`/`Ephemeral`)
+    /// agent — for single-node state that is authoritative-but-network-
+    /// served (a per-bank `clerk-ledger`, a bridge) rather than device-
+    /// private. Leaves device-private agents (the messenger) confined by
+    /// default. See [`AgentConfig::network_reachable`].
+    pub fn network_reachable(mut self) -> Self {
+        self.network_reachable = true;
         self
     }
 
@@ -1027,6 +1050,12 @@ struct AgentInfo {
     /// [`NodeService::dispatch_invoke`] to refuse inbound *remote* calls
     /// to a node-confined agent — see [`Consistency::is_node_confined`].
     consistency: Option<Consistency>,
+    /// Whether this agent opted OUT of the device-private network gate
+    /// (see [`AgentConfig::network_reachable`]). When `true`, a
+    /// `Local`/`Ephemeral` agent still answers remote peer invokes — for
+    /// authoritative-but-network-served single-node state (a per-bank
+    /// clerk-ledger, a bridge). Ignored for `Crdt`/`Raft` (never confined).
+    network_reachable: bool,
 }
 
 /// Shared per-agent shutdown flags (`id.0 → flag`). `Arc<Mutex>` so the
@@ -1391,9 +1420,12 @@ impl NodeService {
         let entry = info
             .get(&to)
             .or_else(|| if to != to_unscoped { info.get(&to_unscoped) } else { None });
-        entry
-            .and_then(|i| i.consistency)
-            .is_some_and(Consistency::is_node_confined)
+        entry.is_some_and(|i| {
+            // A `network_reachable` opt-out keeps an authoritative-but-
+            // network-served single-node agent (clerk-ledger, a bridge)
+            // reachable; only genuinely device-private agents stay confined.
+            i.consistency.is_some_and(Consistency::is_node_confined) && !i.network_reachable
+        })
     }
 
     /// `true` when `caller` is this daemon's own operator — the CLI identity
@@ -2399,6 +2431,7 @@ impl VosNode {
                 kind: crate::extension::ExtensionKind::Actor as u8,
                 serves_addr: None,
                 consistency: Some(config.consistency),
+                network_reachable: config.network_reachable,
             },
         );
 
@@ -2620,6 +2653,7 @@ impl VosNode {
                 // Native extensions have no consistency tier; they relay
                 // through their own caps model and stay network-reachable.
                 consistency: None,
+                network_reachable: true,
             },
         );
 
@@ -6849,6 +6883,7 @@ mod tests {
                 kind: crate::extension::ExtensionKind::Actor as u8,
                 serves_addr: None,
                 consistency: None,
+                network_reachable: false,
             },
         );
         assert!(node.has_agent(id));
@@ -8783,6 +8818,7 @@ mod tests {
                     kind: crate::extension::ExtensionKind::Actor as u8,
                     serves_addr: None,
                     consistency,
+                    network_reachable: false,
                 },
             )])));
             let mut service =
@@ -9025,6 +9061,7 @@ mod tests {
                 kind: crate::extension::ExtensionKind::Transport as u8,
                 serves_addr: Some("127.0.0.1:8080".into()),
                 consistency: None,
+                network_reachable: true,
             },
         )])));
 
@@ -9090,6 +9127,7 @@ mod tests {
                 kind: 2,
                 serves_addr: Some("127.0.0.1:8080".into()),
                 consistency: None,
+                network_reachable: true,
             },
         )])));
 
