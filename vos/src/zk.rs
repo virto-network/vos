@@ -195,6 +195,31 @@ pub unsafe fn read_witness_buffer(ptr: *const u8, cap: usize) -> Option<Witness>
     Some((public, secret))
 }
 
+/// Host-side: find the flat-memory address of the `__VOS_WITNESS` symbol
+/// in a provable actor's ELF — the offset the host `prover` extension
+/// patches opaque witness bytes into before tracing. `None` if the file
+/// isn't an ELF, the symbol is absent, or its address is `0` (unresolved).
+///
+/// The transpiled PVM blob preserves the ELF's flat-memory layout, so this
+/// address equals the blob offset `zkpvm::actor::trace_blob_with_patches`
+/// (and hence the prover's `prove` / `prove_chain`) expects. A caller that
+/// holds an actor ELF transpiles it and locates the witness buffer here,
+/// then hands both to the (ELF-agnostic) prover.
+#[cfg(feature = "std")]
+pub fn witness_addr(elf: &[u8]) -> Option<u64> {
+    use object::{Object, ObjectSymbol};
+    let obj = object::File::parse(elf).ok()?;
+    for sym in obj.symbols() {
+        if sym.name().ok() == Some("__VOS_WITNESS") {
+            let addr = sym.address();
+            if addr != 0 {
+                return Some(addr);
+            }
+        }
+    }
+    None
+}
+
 /// Declare the standard ZK witness-injection buffer `__VOS_WITNESS` of
 /// `$n` bytes, plus a `__vos_read_witness()` helper that reads the
 /// conventional length-prefixed `(public, secret)` payload back (see
