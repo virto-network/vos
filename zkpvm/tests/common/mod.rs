@@ -78,9 +78,8 @@ pub fn prove_and_verify(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
 /// non-zero) from "structural pair-shape blow-up" (sums zero, prover still
 /// rejects).  See `crates/zkpvm/src/chips/cpu/CONSTRAINTS.md`.
 ///
-/// Phase 44 gated `debug_claimed_sums` behind the `debug-internals`
-/// feature; this helper is therefore only available with
-/// `cargo test --features zkpvm/debug-internals`.
+/// This helper requires the `debug-internals` feature
+/// (`cargo test --features zkpvm/debug-internals`).
 #[cfg(feature = "debug-internals")]
 pub fn prove_and_verify_with_debug(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
     let mut side_note = zkpvm::SideNote::new(steps, code.to_vec(), bitmask.to_vec());
@@ -119,7 +118,7 @@ pub fn forge_two_reg_result(op: Opcode, rd: u8, ra: u8, input: u64, forged: u64)
     prove_and_verify(steps, &code, &bitmask);
 }
 
-/// Phase 13b negative-test helper: trace a TwoReg program, mutate one of
+/// Negative-test helper: trace a TwoReg program, mutate one of
 /// `steps[0]`'s instruction-tuple columns (opcode/imm/reg_a/reg_b/reg_d/
 /// skip_len), then prove + verify.  The ProgramMemory consumer demands a
 /// tuple matching the canonical decoding of `code` at the step's PC, so

@@ -2,34 +2,35 @@
 
 //! Mode::External voucher-proof pipeline smoke test.
 //!
-//! Loads `examples/actors/voucher-check`'s PVM ELF (which runs
-//! `cipher_clerk::voucher::proof::check` over a hardcoded witness),
-//! traces the execution, calls `zkpvm::prove`, then verifies via
-//! `zkpvm_verifier::verify_standalone` against the program-commitment
-//! hash extracted from the proof.
+//! Loads `examples/actors/voucher-check`'s PVM ELF, traces a bare run
+//! (no injected witness — the guest early-exits without proving),
+//! proves it, then verifies via `zkpvm_verifier::verify_standalone`
+//! against the program-commitment hash extracted from the proof.
 //!
 //! Pins:
-//!   - cipher-clerk's `voucher::proof::check` runs to completion on PVM
-//!     (no `Trap` panic from a check-rule violation).
-//!   - The prove/verify pipeline accepts the resulting trace.
+//!   - A witness-less run is NOT a proving run: the guest returns
+//!     early with a small trace and no io-hash binding.
+//!   - The prove/verify pipeline accepts the resulting trace, and
+//!     post-prove edits of the proof's boundary fields reject while
+//!     `memory_commitment` stays unbound
+//!     (`boundary_fields_are_tamper_evident`; the from-scratch-prover
+//!     binding gate lives in `tests/boundary_binding.rs`).
 //!   - The proof's program commitment is deterministic — a second prove
 //!     of the same blob yields the same commitment, which is what
 //!     `verify_standalone` checks against.
 //!
-//! This is the foundation for the Mode::External round-trip:
-//! production paths reuse the same prove → verify_standalone shape,
-//! with the witness varying per-voucher instead of being hardcoded.
+//! Witness-driven behavior (io-hash reflects the public input, the
+//! kernel re-execution reaches the precompiles) lives in the prover
+//! extension's harness (`prove_transition.rs`), which builds real
+//! succinct witnesses; the transition trace is segment-chain-sized,
+//! far past what a smoke prove here could cover.
 //!
 //! Build the actor first:
 //!     just build-voucher-check
 //! Or directly:
 //!     cd examples/actors/voucher-check && cargo +nightly build --release
 
-use zkpvm::core::tracing::TracingPvm;
 use zkpvm::{SideNote, program_commitment_hex, program_commitment_of_proof, prove, prove_mobile};
-
-use cipher_clerk::crypto::{Amount, AuthKey, Blinding};
-use cipher_clerk::voucher::proof::{Public, Secret};
 
 /// Load the voucher-check actor's ELF and transpile to a PVM blob.
 /// Skips the test (prints SKIP and returns None) when the ELF is
@@ -62,44 +63,38 @@ fn side_note_for_trace(blob: &[u8], gas: u64) -> SideNote {
     side_note
 }
 
-/// Smoke test: voucher-check.elf traces cleanly under the PVM
-/// tracing interpreter. Confirms cipher_clerk::voucher::proof::check
-/// compiles + runs to completion on PVM via cipher-clerk's
-/// `pvm-precompile` feature for Pedersen ops, with the expected
-/// number of Ristretto ECALLs recorded.
-///
-/// This is the gating test: a successful trace proves the
-/// guest-side path of the Mode::External round-trip works.  The
-/// proof-generation step (below, currently `#[ignore]`) is a
-/// follow-on once the constraints-not-satisfied issue is resolved.
+/// Smoke test: voucher-check.elf traces cleanly under the PVM tracing
+/// interpreter with NO injected witness. The guest must treat that as
+/// "not a proving run" and return early — a small trace with no crypto
+/// ECALLs, no panic. (The witness-driven path, where the kernel
+/// re-execution reaches the precompiles, is covered by the prover
+/// extension's `traced_io_hash_reflects_public_input`.)
 #[test]
-fn trace_voucher_check_hardcoded() {
+fn trace_voucher_check_bare_run() {
     let Some(blob) = load_voucher_check_blob() else {
         return;
     };
     let side_note = side_note_for_trace(&blob, 100_000_000);
-    // Expected from the hardcoded witness: one Amount::commit, which
-    // is 2 fixed-base scalar mults (v·G + b·H) + 1 point add.  The
-    // 4th/2nd come from the to_dalek check inside Blinding::to_dalek
-    // and the to_bytes round trip on the Pedersen H constant.  These
-    // numbers are pinned so a future cipher-clerk change to
-    // Amount::commit surfaces here, not at prove time.
     assert!(
-        !side_note.ristretto_calls.is_empty(),
-        "trace must record at least one Ristretto scalar mult ECALL — \
-         indicates cipher-clerk's pvm-precompile path is wired"
+        !side_note.steps.is_empty(),
+        "bare run must still execute (decode + early exit)"
     );
     assert!(
-        !side_note.ristretto_comb_calls.is_empty(),
-        "ingest_ristretto_boundary must route fixed-base calls to the \
-         comb-method path (RistrettoCombTable + FixedBaseConsumer chips)"
+        side_note.steps.len() < 100_000,
+        "bare run must early-exit with a SMALL trace ({} steps) — a large \
+         trace means the guest ran the kernel on garbage instead of \
+         detecting the missing witness",
+        side_note.steps.len()
     );
-    eprintln!("Steps: {}", side_note.steps.len());
+    assert!(
+        side_note.ristretto_calls.is_empty(),
+        "a witness-less run must not reach the crypto path"
+    );
 }
 
-/// Full prove + verify_standalone round-trip.
+/// Full prove + verify_standalone round-trip over the bare-run trace.
 #[test]
-fn prove_verify_voucher_check_hardcoded() {
+fn prove_verify_voucher_check_bare_run() {
     let Some(blob) = load_voucher_check_blob() else {
         return;
     };
@@ -136,8 +131,7 @@ fn prove_verify_voucher_check_hardcoded() {
 /// Run with `cargo test -p zkpvm --features debug-internals --test
 /// voucher_check_smoke debug_voucher_check_constraints -- --nocapture`
 /// to get a `row #X, constraint #Y` panic from the first chip whose
-/// assertions don't hold.  Use this to chase down task #7 (the
-/// ConstraintsNotSatisfied failure that gates real STARK proofs).
+/// assertions don't hold.
 #[cfg(feature = "debug-internals")]
 #[test]
 fn debug_voucher_check_constraints() {
@@ -212,226 +206,19 @@ fn voucher_check_program_commitment_is_deterministic() {
     );
 }
 
-/// Dynamic-witness round-trip: patch __VOS_WITNESS with two distinct
-/// (Public, Secret) tuples and assert the resulting traces differ.
-/// Pins that the voucher-check actor reads the witness from BSS and
-/// that the witness actually flows through `check`, so per-voucher
-/// proofs (once task #7 lands) will have per-voucher commitments.
-#[test]
-fn dynamic_witness_changes_trace() {
-    let Some(blob) = load_voucher_check_blob() else {
-        return;
-    };
-    let elf = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
-    ))
-    .expect("read voucher-check ELF for symbol lookup");
-    let witness_addr =
-        find_witness_buffer_addr(&elf).expect("__VOS_WITNESS symbol in voucher-check ELF");
-
-    let trace_with = |amount: u64, blinding_byte: u8| -> (usize, [u8; 32]) {
-        let amount_blinding =
-            Blinding::from_bytes([blinding_byte; 32]).expect("canonical Ristretto scalar");
-        let amount_commit = Amount::commit(amount, &amount_blinding);
-        let public = Public {
-            issuer: AuthKey([0x11u8; 32]),
-            amount_commit,
-            state_root_before: [0xAAu8; 32],
-            state_root_after: [0xBBu8; 32],
-        };
-        let secret = Secret {
-            amount,
-            amount_blinding,
-            sender_balance_before: amount + 1, // tightest passing bound
-        };
-        let public_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&public)
-            .expect("rkyv encode Public")
-            .to_vec();
-        let secret_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&secret)
-            .expect("rkyv encode Secret")
-            .to_vec();
-        let witness = encode_witness(&public_bytes, &secret_bytes);
-
-        let (interp, mut flat_mem) =
-            zkpvm::actor::interpreter_from_blob(&blob, 100_000_000).expect("interpreter from blob");
-        let end = (witness_addr as usize)
-            .checked_add(witness.len())
-            .expect("witness fits in usize");
-        assert!(
-            end <= flat_mem.len(),
-            "__VOS_WITNESS {witness_addr:#x} + {} > flat_mem {}",
-            witness.len(),
-            flat_mem.len()
-        );
-        flat_mem[witness_addr as usize..end].copy_from_slice(&witness);
-
-        let mut interp = interp;
-        interp.flat_mem = flat_mem;
-        let mut tracing = TracingPvm::new(interp);
-        let _ = tracing.run_with_vos_stubs();
-        let step_count = tracing.steps.len();
-        // Snapshot final flat_mem and digest it. Different witnesses
-        // → different intermediate scalar-mult bytes in memory →
-        // different digest.  blake3 since it's already in zkpvm's
-        // dep tree; the choice of hash isn't load-bearing — we just
-        // need a deterministic content digest.
-        let final_mem = tracing.pvm.flat_mem.clone();
-        let digest: [u8; 32] = blake3::hash(&final_mem).into();
-        (step_count, digest)
-    };
-
-    // Two distinct witnesses → expect different traces. Different
-    // `amount` + different blinding → different Amount::commit
-    // output → different memory writes inside Amount::commit's
-    // intermediate compress chain → different post-trace flat_mem
-    // digest.
-    let (steps_a, digest_a) = trace_with(100, 2);
-    let (steps_b, digest_b) = trace_with(50, 5);
-    eprintln!(
-        "dynamic witness — A: {steps_a} steps digest={}, B: {steps_b} steps digest={}",
-        hex(&digest_a),
-        hex(&digest_b),
-    );
-    assert!(
-        steps_a > 1000,
-        "dynamic-witness trace A should run real work"
-    );
-    assert!(
-        steps_b > 1000,
-        "dynamic-witness trace B should run real work"
-    );
-    assert_ne!(
-        digest_a, digest_b,
-        "different witnesses must produce different flat_mem digests — \
-         confirms the witness actually flows through check"
-    );
-
-    // Third trace with the SAME witness as A — must reproduce A's
-    // digest exactly. Pins determinism: the prover and verifier can
-    // both compute the digest from public/secret bytes and they'll
-    // agree.
-    let (_steps_c, digest_c) = trace_with(100, 2);
-    assert_eq!(
-        digest_a, digest_c,
-        "identical witness must produce identical flat_mem digest"
-    );
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
-
-/// ZK actor-IO ABI input-sensitivity: the io-hash bound into φ[9..12]
-/// must actually depend on the `Public` the actor ran on — i.e. the
-/// `vos::zk::bind_io_bytes(&public_bytes, &[1u8])` call in `start` binds
-/// the real witness, not a constant.
+/// Tamper-evidence + binding test for `final_state.registers`:
+/// flipping any byte of any register on a FINISHED proof must make
+/// `verify_standalone` reject. Two mechanisms fire: the FS-transcript
+/// mix (post-prove edits shift the verifier's challenges) and the
+/// boundary-binding claimed-sum check (the edited metadata no longer
+/// matches the committed closing-chip column).
 ///
-/// Cheap trace-level check (no prove): after `run_with_vos_stubs`, the
-/// guest's halt sequence has placed the io-hash in φ[9..12], so the
-/// final `tracing.pvm.registers[9..13]` reconstruct `public_io_hash`
-/// (same LE decode).  Two distinct witnesses must bind two distinct
-/// hashes; the same witness must rebind identically.  C3's
-/// `actor_io_hash_is_bound_and_nonzero` separately proves this same
-/// window is STARK-bound, so input-dependence here means the *proof*'s
-/// public output is tied to the public input.
-#[test]
-fn actor_io_hash_reflects_public_input() {
-    let Some(blob) = load_voucher_check_blob() else {
-        return;
-    };
-    let elf = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
-    ))
-    .expect("read voucher-check ELF for symbol lookup");
-    let witness_addr =
-        find_witness_buffer_addr(&elf).expect("__VOS_WITNESS symbol in voucher-check ELF");
-
-    let io_hash_for = |amount: u64, blinding_byte: u8| -> [u8; 32] {
-        let amount_blinding =
-            Blinding::from_bytes([blinding_byte; 32]).expect("canonical Ristretto scalar");
-        let amount_commit = Amount::commit(amount, &amount_blinding);
-        let public = Public {
-            issuer: AuthKey([0x11u8; 32]),
-            amount_commit,
-            state_root_before: [0xAAu8; 32],
-            state_root_after: [0xBBu8; 32],
-        };
-        let secret = Secret {
-            amount,
-            amount_blinding,
-            sender_balance_before: amount + 1,
-        };
-        let public_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&public)
-            .expect("rkyv encode Public")
-            .to_vec();
-        let secret_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&secret)
-            .expect("rkyv encode Secret")
-            .to_vec();
-        let witness = encode_witness(&public_bytes, &secret_bytes);
-
-        let (interp, mut flat_mem) =
-            zkpvm::actor::interpreter_from_blob(&blob, 100_000_000).expect("interpreter from blob");
-        let end = (witness_addr as usize) + witness.len();
-        flat_mem[witness_addr as usize..end].copy_from_slice(&witness);
-        let mut interp = interp;
-        interp.flat_mem = flat_mem;
-        let mut tracing = TracingPvm::new(interp);
-        let _ = tracing.run_with_vos_stubs();
-
-        // Reconstruct the io-hash from final φ[9..12] — the same LE
-        // decode `Proof::public_io_hash` performs on final_state.registers.
-        let mut h = [0u8; 32];
-        for (i, w) in tracing.pvm.registers[9..13].iter().enumerate() {
-            h[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
-        }
-        h
-    };
-
-    let hash_a = io_hash_for(100, 2);
-    let hash_b = io_hash_for(50, 5);
-    eprintln!("io-hash A={}, B={}", hex(&hash_a), hex(&hash_b));
-    assert_ne!(
-        hash_a, [0u8; 32],
-        "bind_io_bytes must place a non-zero io-hash in φ[9..12]"
-    );
-    assert_ne!(
-        hash_a, hash_b,
-        "different Public must bind a different io-hash — the binding is \
-         not actually a function of the public input"
-    );
-    assert_eq!(
-        hash_a,
-        io_hash_for(100, 2),
-        "identical Public must bind an identical io-hash (determinism)"
-    );
-}
-
-/// Phase Z0 load-bearing test: a proof's `final_state.registers` is
-/// genuinely STARK-bound (not just decorative metadata the prover
-/// fills in). Tampering with any byte of any register post-prove
-/// must make `verify_standalone` reject.
-///
-/// Without this guarantee, the higher-level io-binding the prover
-/// extension checks (`proof.public_io_hash() == compute_io_hash(
-/// public, return)`, read from the φ[9..12] registers) is
-/// meaningless — a cheating prover could compute
-/// the proof for any witness then write whatever hash they want
-/// into the metadata field.
-///
-/// The chip closing the register-memory ledger (Phase Z0's
-/// `RegisterMemoryClosingChip`) consumes a synthetic per-register
-/// read at `closing_ts`; the read-consistency constraint forces
-/// each row's value to equal the previous ledger row's value
-/// (= the actual last-written value of that register), so any
-/// post-prove tamper to `final_state.registers` causes the
-/// closing chip's claimed values to diverge from what the ledger
-/// already pinned.
+/// SCOPE: this exercises POST-PROVE tampering only. It does NOT cover a
+/// from-scratch prover who forges the closing read's COLUMN via the
+/// register ledger's free `prev_value` — that column→trace gap is open
+/// (see `chips/register_memory_closing.rs`), so the io-binding the
+/// prover extension checks is sound against an honest prover but not yet
+/// against a malicious one.
 #[test]
 fn final_state_registers_are_stark_bound() {
     let Some(blob) = load_voucher_check_blob() else {
@@ -476,9 +263,14 @@ fn final_state_registers_are_stark_bound() {
 /// `halt_with_output_bound` places a 32-byte `vos::zk::compute_io_hash`
 /// value into the final-state register window φ[9..12] as part of the
 /// halting ecall (the four hash words ride in `a2..a5` as inline-asm
-/// `in` operands).  Phase Z0 already binds `final_state.registers`, so
-/// the hash is a tamper-evident public output read back by
-/// `Proof::public_io_hash` — no new ECALL, no prover changes.
+/// `in` operands).  The closing chip pins the final-register columns
+/// and the boundary-binding check equates `final_state.registers` to
+/// them, so the hash is read back by `Proof::public_io_hash` — no new
+/// ECALL, no prover changes.  (The column→trace link rests on the
+/// register-ledger read-consistency, sound against an honest prover;
+/// the from-scratch-prover gap is tracked in
+/// `chips/register_memory_closing.rs`. These honest-prover tests are
+/// unaffected.)
 ///
 /// This pins the mechanism end-to-end at the zkpvm level: the binding is
 /// non-zero (the actor really bound a hash), deterministic across
@@ -536,18 +328,18 @@ fn actor_io_hash_is_bound_and_nonzero() {
     }
 }
 
-/// Phase Z0-init load-bearing test: `proof.initial_state.registers`
-/// is STARK-bound, symmetric to `final_state.registers`. The boundary
-/// chip emits per-register tuples at `ts = 0` sourced from
-/// `side_note.initial_regs`, and `prove()` makes the proof field
-/// equal to that source. The FS-transcript mix ties the metadata
-/// field to the verifier's challenge derivation; tampering shifts
+/// Initial-state register binding, load-bearing:
+/// `proof.initial_state.registers` is STARK-bound, symmetric to
+/// `final_state.registers`. The boundary chip emits per-register tuples
+/// at `ts = 0` sourced from `side_note.initial_regs`, and `prove()` makes
+/// the proof field equal to that source. The FS-transcript mix ties the
+/// metadata field to the verifier's challenge derivation; tampering shifts
 /// lookup elements and breaks constraint satisfaction.
 ///
-/// This closes the `verify_chain` gap that Z0 (final-only) left open:
+/// Binding only the final state would leave a `verify_chain` gap:
 /// without binding both ends, an attacker could chain a segment N
-/// proof (final_state Z0-bound) to a tampered segment N+1
-/// (initial_state was unbound metadata) and pass the chain check
+/// proof (final_state bound) to a tampered segment N+1
+/// (initial_state unbound metadata) and pass the chain check
 /// while segment N+1's actual trace started from arbitrary registers.
 #[test]
 fn initial_state_registers_are_stark_bound() {
@@ -586,14 +378,14 @@ fn initial_state_registers_are_stark_bound() {
     );
 }
 
-/// Phase Z0 hardening: `verify_standalone` must reject any proof with
+/// `verify_standalone` must reject any proof with
 /// `component_mask = 0` at the current `format_version`. The mask-zero
 /// sentinel is the chip-isolated `prove_with_explicit_components` marker,
 /// and chip-isolated proofs deliberately skip the FS-transcript mix of
 /// `final_state.registers` on the prover side. Without this reject, an
 /// attacker could ship a chip-isolated proof (no prover-side mix) to
 /// `verify_standalone` and tamper the metadata field unobserved —
-/// bypassing the entire Z0 binding.
+/// bypassing the entire register binding.
 #[test]
 fn verify_standalone_rejects_mask_zero() {
     let Some(blob) = load_voucher_check_blob() else {
@@ -621,22 +413,16 @@ fn verify_standalone_rejects_mask_zero() {
     );
 }
 
-/// Phase Z0 + Z0-init scope: registers only, both ends. The `pc` and
-/// `memory_commitment` fields on `proof.initial_state` and
-/// `proof.final_state` are NOT bound — they travel as metadata
-/// alongside the proof. This test pins the scope: tampering any of
-/// the four leaves `verify_standalone` happily accepting the proof.
-///
-/// The day someone wires these into the FS transcript (or a future
-/// "Z1" / "Z2" chip closes the program-memory and memory ledgers
-/// analogously), they'll need to update this test instead of
-/// inheriting a silent binding.
-///
-/// If this test starts failing, that's good news — *something* has
-/// taken responsibility for one of these fields. Find out what, and
-/// rewrite this test to reflect the new scope.
+/// Boundary-field tamper-evidence: registers, pc and timestamp on both
+/// `proof.initial_state` and `proof.final_state` are FS-mixed, so editing
+/// any of them on a FINISHED proof shifts the verifier's challenges and
+/// the proof rejects — this test exercises exactly that post-prove
+/// edit. (Such edits ALSO fail the boundary-binding claimed-sum check;
+/// the from-scratch prover that mixes a lie from the start is covered by
+/// `tests/boundary_binding.rs`.) `memory_commitment` is neither mixed nor
+/// bound, so editing it still verifies.
 #[test]
-fn boundary_non_register_fields_are_not_bound() {
+fn boundary_fields_are_tamper_evident() {
     let Some(blob) = load_voucher_check_blob() else {
         return;
     };
@@ -646,116 +432,46 @@ fn boundary_non_register_fields_are_not_bound() {
 
     use zkpvm_verifier::{PcsPolicy, verify_standalone_with_pcs_policy};
 
-    // Final-state pc — unbound.
+    // pc — tamper-evident on both ends (v4).
     let mut tampered_pc = proof.clone();
     tampered_pc.final_state.pc ^= 0x1000;
-    verify_standalone_with_pcs_policy(tampered_pc, prog_hash, &PcsPolicy::MOBILE).expect(
-        "Z0 binds registers only — tamper of final_state.pc must still verify. \
-         If this fails, something else is binding pc; update the test or the scope doc.",
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_pc, prog_hash, &PcsPolicy::MOBILE).is_err(),
+        "v4 mixes final_state.pc — editing a finished proof must reject"
+    );
+    let mut tampered_initial_pc = proof.clone();
+    tampered_initial_pc.initial_state.pc ^= 0x1000;
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_initial_pc, prog_hash, &PcsPolicy::MOBILE)
+            .is_err(),
+        "v4 mixes initial_state.pc — editing a finished proof must reject"
     );
 
-    // Final-state memory_commitment — unbound.
+    // timestamp — tamper-evident on both ends (v4).
+    let mut tampered_ts = proof.clone();
+    tampered_ts.final_state.timestamp ^= 1;
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_ts, prog_hash, &PcsPolicy::MOBILE).is_err(),
+        "v4 mixes final_state.timestamp — editing a finished proof must reject"
+    );
+    let mut tampered_initial_ts = proof.clone();
+    tampered_initial_ts.initial_state.timestamp ^= 1;
+    assert!(
+        verify_standalone_with_pcs_policy(tampered_initial_ts, prog_hash, &PcsPolicy::MOBILE)
+            .is_err(),
+        "v4 mixes initial_state.timestamp — editing a finished proof must reject"
+    );
+
+    // memory_commitment — still unbound metadata on both ends.
     let mut tampered_mem = proof.clone();
     tampered_mem.final_state.memory_commitment[0] ^= 0xff;
     verify_standalone_with_pcs_policy(tampered_mem, prog_hash, &PcsPolicy::MOBILE).expect(
-        "Z0 binds registers only — tamper of final_state.memory_commitment must \
-         still verify. If this fails, something else is binding it; update the \
-         test or the scope doc.",
+        "memory_commitment is not circuit-derived — tamper must still verify. \
+         If this fails, a memory-ledger closing landed; update the scope doc.",
     );
-
-    // Initial-state pc — unbound (Z0-init's FS-mix covers only
-    // initial_state.registers).
-    let mut tampered_initial_pc = proof.clone();
-    tampered_initial_pc.initial_state.pc ^= 0x1000;
-    verify_standalone_with_pcs_policy(tampered_initial_pc, prog_hash, &PcsPolicy::MOBILE)
-        .expect("Z0-init binds registers only — tamper of initial_state.pc must still verify.");
-
-    // Initial-state memory_commitment — unbound.
     let mut tampered_initial_mem = proof;
     tampered_initial_mem.initial_state.memory_commitment[0] ^= 0xff;
     verify_standalone_with_pcs_policy(tampered_initial_mem, prog_hash, &PcsPolicy::MOBILE).expect(
-        "Z0-init binds registers only — tamper of initial_state.memory_commitment \
-         must still verify.",
+        "initial_state.memory_commitment is not circuit-derived — tamper must still verify.",
     );
-}
-
-/// Mirrors the prover extension's `__VOS_WITNESS` encoding so the
-/// test exercises the same length-prefixed `[u32 len][public][u32
-/// len][secret]` layout the prover patches in.
-fn encode_witness(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(4 + public_bytes.len() + 4 + secret_bytes.len());
-    v.extend_from_slice(&(public_bytes.len() as u32).to_le_bytes());
-    v.extend_from_slice(public_bytes);
-    v.extend_from_slice(&(secret_bytes.len() as u32).to_le_bytes());
-    v.extend_from_slice(secret_bytes);
-    v
-}
-
-/// Minimal ELF symbol lookup — just enough to find __VOS_WITNESS's
-/// virtual address. Manual parsing instead of pulling `object` here
-/// since the integration test already has plenty of deps.
-fn find_witness_buffer_addr(elf: &[u8]) -> Option<u64> {
-    // ELF64 header layout: magic at 0..16, e_shoff at 0x28, e_shnum
-    // at 0x3C, e_shstrndx at 0x3E, section header size at 0x3A.
-    if elf.len() < 0x40 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 {
-        return None;
-    }
-    let e_shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().ok()?) as usize;
-    let e_shentsize = u16::from_le_bytes(elf[0x3A..0x3C].try_into().ok()?) as usize;
-    let e_shnum = u16::from_le_bytes(elf[0x3C..0x3E].try_into().ok()?) as usize;
-
-    // Walk section headers to find .symtab + .strtab.
-    let mut symtab_off = 0usize;
-    let mut symtab_size = 0usize;
-    let mut strtab_off = 0usize;
-    let mut strtab_size = 0usize;
-    for i in 0..e_shnum {
-        let sh = e_shoff + i * e_shentsize;
-        if sh + 64 > elf.len() {
-            return None;
-        }
-        let sh_type = u32::from_le_bytes(elf[sh + 4..sh + 8].try_into().ok()?);
-        let sh_off = u64::from_le_bytes(elf[sh + 24..sh + 32].try_into().ok()?) as usize;
-        let sh_size = u64::from_le_bytes(elf[sh + 32..sh + 40].try_into().ok()?) as usize;
-        if sh_type == 2 {
-            symtab_off = sh_off;
-            symtab_size = sh_size;
-        } else if sh_type == 3 {
-            // Multiple STRTABs exist; the one linked from symtab via
-            // sh_link is the right one. For our small ELFs the last
-            // STRTAB is .strtab; .shstrtab is earlier.
-            strtab_off = sh_off;
-            strtab_size = sh_size;
-        }
-    }
-    if symtab_off == 0 || strtab_off == 0 {
-        return None;
-    }
-
-    // ELF64 Sym is 24 bytes: name(4) info(1) other(1) shndx(2) value(8) size(8).
-    let sym_entsize = 24usize;
-    for i in 0..(symtab_size / sym_entsize) {
-        let s = symtab_off + i * sym_entsize;
-        if s + sym_entsize > elf.len() {
-            break;
-        }
-        let name_off = u32::from_le_bytes(elf[s..s + 4].try_into().ok()?) as usize;
-        if name_off == 0 || strtab_off + name_off >= strtab_off + strtab_size {
-            continue;
-        }
-        let name_start = strtab_off + name_off;
-        let name_end = elf[name_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|n| name_start + n)
-            .unwrap_or(name_start);
-        let name = core::str::from_utf8(&elf[name_start..name_end]).ok()?;
-        if name == "__VOS_WITNESS" {
-            let value = u64::from_le_bytes(elf[s + 8..s + 16].try_into().ok()?);
-            if value != 0 {
-                return Some(value);
-            }
-        }
-    }
-    None
 }

@@ -1,7 +1,7 @@
 #![cfg(feature = "prover")]
 
 //! Negative-test corpus for CpuChip's memory constraints + MemoryChip
-//! ledger consistency (Phase 15-prep).
+//! ledger consistency.
 //!
 //! Each test crafts an honest store/load trace, mutates a memory-related
 //! witness column (mem_write.value, mem_read.value, mem_read.address),
@@ -71,11 +71,11 @@ fn store_load_positive_smoke() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// Phase 15-load-result fix: forging regs_after[dest_reg] on a Load step
-// is now caught by the per-byte active-byte binding constraint
+// Forging regs_after[dest_reg] on a Load step is caught by the per-byte
+// active-byte binding constraint
 // (`is_load · mem_byte_active[i] · (result[i] - mem_value[i]) = 0`).
-// Inactive bytes are not yet bound — that's the "tighten signed-load
-// extension" follow-up that would need a per-variant IsLoadSigned flag.
+// Inactive bytes are not bound; tightening signed-load extension would
+// need a per-variant IsLoadSigned flag.
 #[test]
 #[should_panic(expected = "failed")]
 fn store_then_load_forged_dest_reg_rejected() {
@@ -91,7 +91,7 @@ fn store_forged_value_rejected() {
     // byte than what was actually stored.  The store consumer emits
     // (addr, forged_value, ts, is_write=1).  The matching load demands
     // (addr, real_value_from_register, ts, is_write=0) from the ledger.
-    // They no longer balance.
+    // The two tuples do not balance.
     let (code, bitmask, mut steps) = trace_store_load(0x42, 0x1000);
     if let Some(ref mut w) = steps[0].mem_write {
         w.value = 0xFF; // honest = 0x42
@@ -242,10 +242,10 @@ fn load_u64_forged_address_rejected() {
 // ── is_write discriminator forge tests ────────────────────────────────────
 // CpuChip emits the MemoryAccess lookup tuple (addr, value, ts, is_write)
 // with `is_write = is_store_col`.  IsStore is itself pinned to the
-// canonical opcode via ProgramMemoryChip (Phase 23).  These tests hit the
-// remaining "small" gap noted in PLAN: explicit forge-and-reject coverage
-// for the is_write lookup field (vs. having soundness inferred from
-// IsStore being opcode-pinned + ledger balance).
+// canonical opcode via ProgramMemoryChip.  These tests give explicit
+// forge-and-reject coverage for the is_write lookup field, rather than
+// inferring its soundness from IsStore being opcode-pinned + ledger
+// balance.
 
 #[test]
 #[should_panic(expected = "failed")]

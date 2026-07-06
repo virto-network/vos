@@ -97,7 +97,7 @@ fewer rows) recovers the regression.
 
 ## Older — Session 1 + Session 2.1 producer side (parallel trace-gen + PGO with STANDARD training)
 
-`tests/prove_vos_actor.rs::profile_clerk_private_pay_bench{,_mobile}`
+`benches/actors.rs::profile_clerk_private_pay_bench{,_mobile}`
 is the canonical tap-to-pay bench: clerk-private-pay-bench actor
 (Pedersen + Schnorr + commitment + signing payload, ~24 K PVM
 steps).  Median of 5 trials, post B3 audit + parallel
@@ -136,8 +136,8 @@ Reproducing the PGO build:
 ```
 bash scripts/build-pgo.sh   # ~10 min on the reference desktop
 RUSTFLAGS="-C target-cpu=native -Cprofile-use=/tmp/zkpvm-pgo-data/merged.profdata" \
-  cargo test -p zkpvm --release --test prove_vos_actor \
-  profile_clerk_private_pay_bench_mobile -- --exact --nocapture
+  cargo bench -p zkpvm --features prover --bench actors \
+  -- profile_clerk_private_pay_bench_mobile
 ```
 
 Verifier-side, MOBILE proofs require
@@ -177,7 +177,7 @@ program in user-space.
 
 ## Synthetic Add64 sweep
 
-`tests/bench_prove.rs` generates a program of N sequential
+`benches/prove.rs` generates a program of N sequential
 `Add64` instructions (N = 2^log_size) followed by `Trap`, traces
 it, proves it, and verifies the proof.  Times are wall-clock
 end-to-end on this machine.
@@ -381,7 +381,8 @@ pre-Phase-54, 2 000–2 300 at Phase 54g).  Below log_size 10 per-
 chip fixed overhead dominates (the lookup-table chips have
 minimum sizes regardless of step count).  Above log_size 14 we
 run out of memory on a 16 GB machine — `bench_prove_log16` is
-`#[ignore]`d for that reason.
+left out of the default `cargo bench --bench prove` set for that
+reason (run it explicitly by name on a box with the headroom).
 
 ### Per-stage breakdown at log_size = 14 (Phase 54k)
 
@@ -409,9 +410,10 @@ Trace shape at log_size = 14, post-Phase-54k:
 
 ## Real-world workloads
 
-`tests/prove_vos_actor.rs` proves real RISC-V actors compiled to
-PVM via the `grey-transpiler` toolchain.  Numbers below are at
-branch tip with the same prover config.
+`benches/actors.rs` proves real RISC-V actors compiled to
+PVM via the `grey-transpiler` toolchain (the functional
+counterparts live in `tests/prove_vos_actor.rs`).  Numbers below
+are at branch tip with the same prover config.
 
 ### `hash_bench` (bare-metal hash benchmark)
 
@@ -579,9 +581,10 @@ inside `compute_final_memory_commitment`.  At log_size = 14:
 | FRI committed evals  | (× blowup factor 16) ≈ 9.5 GB peak  |
 | Initial memory clone | 4 MB / call                         |
 
-`bench_prove_log16` (32 768 cycles) is `#[ignore]`d because
-the FRI committed evals at that scale exceed 16 GB on a typical
-desktop.  Plan accordingly when sizing actor proving boxes:
+`bench_prove_log16` (32 768 cycles) is left out of the default
+`cargo bench` set because the FRI committed evals at that scale
+exceed 16 GB on a typical desktop.  Plan accordingly when sizing
+actor proving boxes:
 `log_size + 4 + log2(main_cols × 16) ≈ 30+` of working memory
 under SimdBackend.
 
@@ -589,21 +592,19 @@ under SimdBackend.
 
 ```sh
 # Synthetic Add sweep (log10/12/14)
-cargo test -p zkpvm --features prover --release --test bench_prove \
-    -- bench_prove_log10 bench_prove_log12 bench_prove_log14 \
-    --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench prove \
+    -- bench_prove_log10 bench_prove_log12 bench_prove_log14
 
 # Per-stage profile at log14
-cargo test -p zkpvm --features prover --release --test bench_prove \
-    -- profile_log14 --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench prove -- profile_log14
 
 # hash_bench actor profile
-cargo test -p zkpvm --features prover --release --test prove_vos_actor \
-    -- profile_hash_bench --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench actors \
+    -- profile_hash_bench
 
 # fibonacci actor profile
-cargo test -p zkpvm --features prover --release --test prove_vos_actor \
-    -- profile_fibonacci_actor --nocapture --test-threads 1
+cargo bench -p zkpvm --features prover --bench actors \
+    -- profile_fibonacci_actor
 ```
 
 Numbers will vary across hardware; the per-stage shape (main
@@ -629,9 +630,10 @@ the upstream Stwo announcement numbers.
   `production_pcs_config()` (96-bit security).  A `pow_bits = 0,
   n_queries = 1` test config proves ~3× faster but rejects
   under `PcsPolicy::STANDARD`.  See SECURITY.md.
-- **`bench_prove_log16` is `#[ignore]`d.**  Run explicitly with
-  `--ignored` on a ≥16 GB box; expect ~80 s prove time, ~5 s
-  verify, ~610 KB proof.
+- **`bench_prove_log16` is left out of the default bench set.**
+  Run it explicitly by name (`cargo bench --bench prove -- log16`)
+  on a ≥16 GB box; expect ~80 s prove time, ~5 s verify, ~610 KB
+  proof.
 
 ---
 
@@ -686,8 +688,8 @@ log_sizes:               [15, 11, 16, 10, 16, 4, 4, 15, 9, 8, 8, 6, 8, 10, 11, 1
 
 Reproducer:
 ```sh
-cargo test --features prover --release --test prove_vos_actor \
-    profile_clerk_private_pay_bench -p zkpvm -- --nocapture
+cargo bench -p zkpvm --features prover --bench actors \
+    -- profile_clerk_private_pay_bench
 ```
 
 ### Sub-second roadmap
@@ -702,7 +704,8 @@ The 3.85 s baseline is therefore a *real* shipped milestone, not a stepping ston
 
 ### Test coverage (re-authored after Stwo-bump revert)
 
-Step-9–19 chip code is exercised by 13 tests in `tests/prove_vos_actor.rs`:
+Step-9–19 chip code is exercised by tests in `tests/prove_vos_actor.rs`
+plus actor/chip benchmarks in `benches/actors.rs`:
 
 - `prove_ristretto_via_ecall_boundary` — single `ecalli 200` (scalar_mult) end-to-end
 - `prove_ristretto_point_add_via_ecall_boundary` — single `ecalli 201` (point_add)
@@ -712,10 +715,10 @@ Step-9–19 chip code is exercised by 13 tests in `tests/prove_vos_actor.rs`:
 - `prove_scalar_mult_then_point_add` — cross-type (scalar_mult + point_add)
 - `prove_two_ristretto_scalar_mult_ecalls` — two same-type, same output
 - `prove_scalar_mul_chained_add` — Schnorr-shaped `mul + add` chain
-- `profile_hot_pcs_clerk_private_pay_bench` — diagnostic, no prove
-- `profile_clerk_private_pay_bench` — full Phase-2 end-to-end (the headline test)
+- `profile_hot_pcs_clerk_private_pay_bench` — diagnostic, no prove (bench, `benches/actors.rs`)
+- `profile_clerk_private_pay_bench` — full Phase-2 end-to-end, the headline workload (bench, `benches/actors.rs`)
 - `prove_ristretto_chip_with_input_producers` — RistrettoChip dangling chain (negative)
 - `prove_ristretto_chip_closed_chain_input_output` — RistrettoChip balanced chain (positive)
-- `bench_ristretto_chip_soundness_complete_chain` — 10K-op chain bench (`#[ignore]`'d)
+- `bench_ristretto_chip_soundness_complete_chain` — 10K-op chain bench (`benches/actors.rs`, explicit-name-only)
 
 Three Step-4 chained tests (`prove_ristretto_chip_double_chained`, `add_chained`, `scalar_mult_chained_small`) are `#[ignore]`'d pending re-investigation: re-author drift from the lost originals trips a logup-balance issue. The chip code paths they cover are exercised by `closed_chain_input_output` and the bench, so coverage isn't lost.

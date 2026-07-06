@@ -1,4 +1,4 @@
-//! Phase 54f — `CompareChip`: per-compare-or-branch-row chip.
+//! `CompareChip`: per-compare-or-branch-row chip.
 //!
 //! CpuChip emits one CompareLookup producer per `is_compare + is_branch`
 //! row; CompareChip consumes once per real row.  CompareChip witnesses
@@ -62,8 +62,8 @@ pub enum Column {
     CmpCarry,
     #[size = 1]
     IsPadding,
-    // (B3 audit dropped CmpLtFlagBoolH + CmpCarryBoolH — booleans
-    // are now enforced unconditionally as `X·(1-X)=0`.)
+    // No boolean-helper columns: the cmp_lt_flag and cmp_carry booleans
+    // are enforced unconditionally as `X·(1-X)=0`.
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -91,8 +91,8 @@ impl BuiltInComponent for CompareChip {
 
         // Boolean constraint on padding.
         eval.add_constraint(is_padding[0].clone() * (E::F::one() - is_padding[0].clone()));
-        // B3 audit: cmp_lt_flag + cmp_carry[i] booleans enforced
-        // unconditionally — trace fill defaults both to 0 on padding.
+        // cmp_lt_flag + cmp_carry[i] booleans enforced unconditionally —
+        // trace fill defaults both to 0 on padding.
         let is_real = E::F::one() - is_padding[0].clone();
         eval.add_constraint(cmp_lt_flag[0].clone() * (E::F::one() - cmp_lt_flag[0].clone()));
         for i in 0..WORD_SIZE {
@@ -183,9 +183,8 @@ impl BuiltInProverComponent for CompareChip {
             trace.fill_columns_bytes(row, &e.cmp_sub_result, Column::CmpSubResult);
             trace.fill_columns_bytes(row, &e.cmp_carry, Column::CmpCarry);
             trace.fill_columns(row, false, Column::IsPadding);
-            // Phase I-cmp helper fills.  Boolean helpers are 0 in valid
+            // Helper fills.  Boolean helpers are 0 in valid
             // traces (cmp_lt_flag, cmp_carry[i] ∈ {0, 1}).
-            // (B3 audit dropped CmpLtFlagBoolH + CmpCarryBoolH fills.)
         }
 
         for row in entries.len()..num_rows {

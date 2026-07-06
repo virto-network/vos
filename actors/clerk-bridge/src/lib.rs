@@ -270,15 +270,16 @@ pub struct ClerkBridge {
     /// `set_prover`; persisted across actor restarts as part of
     /// the rkyv archive.
     prover_id: u32,
-    /// Trusted program commitment (the 32-byte preprocessed-trace
-    /// Merkle root of the `voucher-check` program) the bridge hands
-    /// the general prover's `verify` as the program-identity anchor.
-    /// Obtained out-of-band from the prover's
-    /// `program_commitment(b"voucher-check")` and set alongside the
-    /// id via `set_prover`. Empty/short ⇒ External-mode dispatch is
-    /// rejected by the prover (`commitment.len() != 32`) — a
-    /// misconfigured commitment can never silently accept.
-    program_commitment: Vec<u8>,
+    /// Trusted canonical commitment ALLOWLIST for the `voucher-check`
+    /// program — the concatenation of the accepted 32-byte
+    /// preprocessed-trace Merkle roots (`32·N` bytes) the bridge hands
+    /// the general prover's `verify_chain` as the program-identity
+    /// anchor. It is voucher-check provenance, supplied out-of-band by
+    /// the operator via `set_prover` (the general prover is
+    /// program-agnostic). Empty ⇒ External-mode dispatch is rejected by the
+    /// prover (no accepted commitment) — a misconfigured allowlist can
+    /// never silently accept.
+    allowlist: Vec<u8>,
 }
 
 #[messages]
@@ -290,7 +291,7 @@ impl ClerkBridge {
             peers: Vec::new(),
             received: Vec::new(),
             prover_id: 0,
-            program_commitment: Vec::new(),
+            allowlist: Vec::new(),
         }
     }
 
@@ -338,15 +339,16 @@ impl ClerkBridge {
 
     /// Configure the general `prover` extension to dispatch
     /// Mode::External voucher proofs to, together with the trusted
-    /// `program_commitment` (the 32-byte program-identity anchor for
-    /// `voucher-check` — obtain it from the prover's
-    /// `program_commitment(b"voucher-check")`). Setting `prover_id = 0`
-    /// disables prover dispatch (External-mode vouchers then fall
-    /// through the wire-signature check, same as Signature-mode).
+    /// canonical commitment `allowlist` (the concatenation of the
+    /// accepted 32-byte program-identity anchors for `voucher-check`,
+    /// `32·N` bytes — voucher-check provenance the operator holds).
+    /// Setting `prover_id = 0` disables prover dispatch (External-mode
+    /// vouchers then fall through the wire-signature check, same as
+    /// Signature-mode).
     ///
-    /// The commitment is the SOLE cross-program soundness anchor the
-    /// bridge supplies to `verify`; a wrong/empty one makes the prover
-    /// reject every External proof (deny-by-default) rather than
+    /// The allowlist is the SOLE cross-program soundness anchor the
+    /// bridge supplies to `verify_chain`; a wrong/empty one makes the
+    /// prover reject every External proof (deny-by-default) rather than
     /// silently accept.
     ///
     /// Idempotent in identical arguments. Separate from `bootstrap` so
@@ -354,12 +356,12 @@ impl ClerkBridge {
     /// about prover dispatch keep working with `prover_id` defaulted to
     /// 0.
     #[msg]
-    async fn set_prover(&mut self, prover_id: u32, program_commitment: Vec<u8>) -> Status {
+    async fn set_prover(&mut self, prover_id: u32, allowlist: Vec<u8>) -> Status {
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
         self.prover_id = prover_id;
-        self.program_commitment = program_commitment;
+        self.allowlist = allowlist;
         Status::Ok
     }
 
@@ -477,7 +479,7 @@ impl ClerkBridge {
         if dispatch_external_proof(
             ctx,
             self.prover_id,
-            &self.program_commitment,
+            &self.allowlist,
             &voucher,
             &peer_clerk_pubkey,
             peer_prefix,
@@ -589,7 +591,7 @@ impl ClerkBridge {
         if dispatch_external_proof(
             ctx,
             self.prover_id,
-            &self.program_commitment,
+            &self.allowlist,
             &voucher,
             &peer_clerk_pubkey,
             peer_prefix,
@@ -704,12 +706,15 @@ fn reply(status: Status) -> SubmitVoucherReply {
 ///     unreachable" from "proof rejected" — same state-hiding
 ///     posture as `VoucherInvalid`.
 ///
-/// The prover's `verify` composes two checks: STARK validity against
-/// `program_commitment` (which program) AND the tagless io-binding
-/// `proof.public_io_hash() == compute_io_hash(public_bytes,
-/// return_bytes)` (which I/O). So the bridge must hand it:
-///   - `program_commitment`: the trusted commitment configured via
-///     `set_prover` (the verifier's program-identity anchor).
+/// The prover's `verify_chain` composes three checks: every segment's
+/// program commitment is in the caller-supplied `allowlist` (which program),
+/// chain continuity + entering-image anchoring across the segments, AND the
+/// tagless io-binding on the FINAL segment `public_io_hash() ==
+/// compute_io_hash(public_bytes, return_bytes)` (which I/O). So the bridge
+/// must hand it:
+///   - `allowlist`: the trusted canonical commitment allowlist configured
+///     via `set_prover` (the concatenation of accepted 32-byte
+///     commitments) — the verifier's program-identity anchor.
 ///   - `public_bytes`: cipher-clerk's explicit, domain-separated
 ///     `voucher::proof::public_bytes(&public)` — THE canonical
 ///     proof-input encoding, byte-identical to what voucher-check's
@@ -722,14 +727,17 @@ fn reply(status: Status) -> SubmitVoucherReply {
 ///   - `return_bytes`: voucher-check's `1` success return as a raw byte
 ///     (`vec![1u8]`).
 ///
-/// `voucher.proof.bytes` is the 32-byte content address of the actual
-/// STARK in the producer node's proof-blob store; the extension fetches
-/// the bytes via `ctx.blob_get` (with `peer_prefix` as a fan-out hint)
-/// rather than the bridge shipping multi-MB through PVM dispatch.
+/// `voucher.proof.bytes` is the 32-byte content address of the chain MANIFEST
+/// (the list of per-segment proof CAS hashes) in the producer node's proof-blob
+/// store (unchanged wire shape — one hash); the extension fetches the manifest
+/// via `ctx.blob_get` (with `peer_prefix` as a fan-out hint) and then each
+/// per-segment proof the same way, rather than the bridge shipping multi-MB
+/// through PVM dispatch. Per-segment delivery keeps every cross-node blob under
+/// the 8 MiB frame cap, which the single concatenated chain blob exceeds.
 async fn dispatch_external_proof(
     ctx: &mut vos::Context<ClerkBridge>,
     prover_id: u32,
-    program_commitment: &[u8],
+    allowlist: &[u8],
     voucher: &Voucher,
     peer_clerk_pubkey: &AuthKey,
     peer_prefix: u16,
@@ -756,8 +764,12 @@ async fn dispatch_external_proof(
     // federation e2e is the guest↔bridge agreement gate.
     let public_bytes = cipher_clerk::voucher::proof::public_bytes(&public);
     let return_bytes = vec![1u8];
-    let msg = vos::value::Msg::new("verify")
-        .with("program_commitment", program_commitment.to_vec())
+    // The proof is a canonical-shape SEGMENT CHAIN: `proof.bytes` addresses a
+    // manifest of per-segment proof blobs, and the extension verifies the
+    // chain against the caller-supplied canonical commitment `allowlist`.
+    // Wire shape is unchanged — still one 32-byte hash.
+    let msg = vos::value::Msg::new("verify_chain")
+        .with("allowlist", allowlist.to_vec())
         .with("proof_hash", voucher.proof.bytes.clone())
         .with("public_bytes", public_bytes)
         .with("return_bytes", return_bytes)

@@ -2,7 +2,7 @@
 
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
-// Memory is now flat_mem in Interpreter
+// Memory is flat_mem in Interpreter
 use javm::PVM_REGISTER_COUNT;
 
 use zkpvm::core::tracing::TracingPvm;
@@ -339,7 +339,7 @@ fn prove_neg_add_imm64() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// ── Mul tests (now constrained via schoolbook multiplication) ──
+// ── Mul tests (constrained via schoolbook multiplication) ──
 
 #[test]
 fn prove_mul64_small() {
@@ -368,7 +368,7 @@ fn prove_mul32_overflow() {
     test_three_reg_op(Opcode::Mul32, 0x10000, 0x10000, 0);
 }
 
-// ── Bitwise tests (now constrained via algebraic identity on AND result) ──
+// ── Bitwise tests (constrained via algebraic identity on AND result) ──
 
 #[test]
 fn prove_xnor() {
@@ -401,7 +401,7 @@ fn prove_xor_self() {
     test_three_reg_op(Opcode::Xor, 0xAAAA_BBBB_CCCC_DDDD, 0xAAAA_BBBB_CCCC_DDDD, 0);
 }
 
-// ── Compare tests (SetLtU now constrained via cmp_carry chain) ──
+// ── Compare tests (SetLtU constrained via cmp_carry chain) ──
 
 #[test]
 fn prove_set_lt_u_true() {
@@ -495,7 +495,7 @@ fn prove_reverse_bytes() {
     verify(proof, &side_note).expect("verification failed");
 }
 
-// Phase 33: CountSetBits (CSB64 / CSB32) via PopcountChip.
+// CountSetBits (CSB64 / CSB32) via PopcountChip.
 #[test]
 fn prove_count_set_bits_64_smoke() {
     // CountSetBits64 is TwoReg: φ'[rd] = popcount(φ[ra])
@@ -594,7 +594,7 @@ fn prove_count_set_bits_32_smoke() {
     verify(proof, &side_note).expect("verification failed");
 }
 
-// Phase 34: LeadingZeroBits / TrailingZeroBits via BitcountChip.
+// LeadingZeroBits / TrailingZeroBits via BitcountChip.
 #[test]
 fn prove_leading_zero_bits_64_smoke() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
@@ -879,6 +879,62 @@ fn prove_cmov_nz_taken() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
+/// CmovIzImm/CmovNzImm move the IMMEDIATE into regs[ra] guarded by regs[rb]
+/// — operand roles differ from the register cmovs (the moved value is the
+/// imm, the condition is rb, the destination is ra). Exercises the
+/// `is_cmov_imm` operand swap: val_b ← imm (pinned to ImmBytes), val_d ←
+/// regs[rb] (gates ValDIsZero).
+fn test_cmov_imm(opcode: Opcode, cond: u64, imm: i32, expected: u64) {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 99; // old destination value (kept on a not-taken cmov)
+    regs[1] = cond;
+    let steps = run_two_reg_imm(opcode, 0, 1, imm as i64, regs);
+    assert_eq!(
+        steps[0].regs_after[0], expected,
+        "{opcode:?}: cond={cond} imm={imm} → {:#x}, expected {expected:#x}",
+        steps[0].regs_after[0]
+    );
+    let imm_bytes = (imm as u32).to_le_bytes();
+    let code = vec![
+        opcode as u8,
+        0x10,
+        imm_bytes[0],
+        imm_bytes[1],
+        imm_bytes[2],
+        imm_bytes[3],
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_cmov_iz_imm_taken() {
+    test_cmov_imm(Opcode::CmovIzImm, 0, 42, 42);
+}
+
+#[test]
+fn prove_cmov_iz_imm_not_taken() {
+    test_cmov_imm(Opcode::CmovIzImm, 5, 42, 99);
+}
+
+#[test]
+fn prove_cmov_nz_imm_taken() {
+    test_cmov_imm(Opcode::CmovNzImm, 5, 42, 42);
+}
+
+#[test]
+fn prove_cmov_nz_imm_not_taken() {
+    test_cmov_imm(Opcode::CmovNzImm, 0, 42, 99);
+}
+
+#[test]
+fn prove_cmov_nz_imm_taken_negative_imm() {
+    // Sign-extended immediate: all 8 ImmBytes are nonzero, so the
+    // val_b ↔ ImmBytes binding is exercised beyond the low 4 bytes.
+    test_cmov_imm(Opcode::CmovNzImm, 7, -2, 0xFFFF_FFFF_FFFF_FFFE);
+}
+
 // ── MinU/MaxU tests ──
 
 #[test]
@@ -1005,7 +1061,7 @@ fn prove_mul_upper_uu_large() {
     );
 }
 
-// ── Phase 32: RotL64 ──
+// ── RotL64 ──
 
 #[test]
 fn prove_rotate_l64_smoke() {
@@ -1042,7 +1098,7 @@ fn prove_rotate_l64_by_one() {
     test_three_reg_op(Opcode::RotL64, 0x8000_0000_0000_0001, 1, 0x3);
 }
 
-// ── Phase 35: RotR64 ──
+// ── RotR64 ──
 
 #[test]
 fn prove_rotate_r64_smoke() {
@@ -1081,7 +1137,7 @@ fn prove_rotate_r64_by_one_zero_lsb() {
     test_three_reg_op(Opcode::RotR64, 0x2, 1, 0x1);
 }
 
-// ── Phase 36: RotL32 / RotR32 ──
+// ── RotL32 / RotR32 ──
 
 #[test]
 fn prove_rotate_l32_smoke() {
@@ -1134,7 +1190,7 @@ fn prove_rotate_r32_full_word() {
     test_three_reg_op(Opcode::RotR32, a_lo as u64, 32, expected);
 }
 
-// ── Phase 40: RotR64ImmAlt / RotR32ImmAlt (swapped operand convention) ──
+// ── RotR64ImmAlt / RotR32ImmAlt (swapped operand convention) ──
 
 #[test]
 fn prove_rotate_r64_imm_alt_smoke() {

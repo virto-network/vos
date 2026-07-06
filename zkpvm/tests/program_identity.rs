@@ -1,6 +1,10 @@
-#![cfg(feature = "prover")]
+// Not under `poseidon2-channel`: builds a "wrong" commitment via
+// `ProgramCommitment::from(&[u8])` — `Blake2sHash` has that conversion but
+// `P2Hash` (the Poseidon2-M31 commitment) does not. Program-identity under P2
+// is covered by `verifier/tests/poseidon2_canonical_segment.rs`.
+#![cfg(all(feature = "prover", not(feature = "poseidon2-channel")))]
 
-//! Phase 13f: program-identity public API.
+//! Program-identity public API.
 //!
 //! In zkpvm, a proof's preprocessed-trace Merkle root IS the program
 //! commitment.  These tests demonstrate the publish-once / verify-many

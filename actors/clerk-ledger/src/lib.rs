@@ -147,6 +147,28 @@ pub struct ClerkLedger {
     note_commitments: Vec<[u8; 32]>,
 }
 
+impl ClerkLedger {
+    /// Composite SMT root over the actor's full kernel-checked state —
+    /// accounts/transfers/journal plus the bookkeeping sets (external
+    /// ids, voided transfers, pending statuses), per cipher-clerk's
+    /// state-root format.
+    fn composite_root(&self) -> [u8; 32] {
+        let pending: Vec<([u8; 16], u8)> = self
+            .pending_statuses
+            .iter()
+            .map(|p| (p.id, p.status))
+            .collect();
+        compute_state_root(
+            &self.accounts,
+            &self.transfers,
+            self.journal.as_ref(),
+            &self.external_ids,
+            &self.voided_transfers,
+            &pending,
+        )
+    }
+}
+
 #[messages]
 impl ClerkLedger {
     fn new() -> Self {
@@ -352,8 +374,7 @@ impl ClerkLedger {
         // after and store both alongside the transfer id. Voucher
         // emission anchors to this pair so the receiver can verify
         // the transfer happened "between" two known ledger states.
-        let root_before =
-            compute_state_root(&self.accounts, &self.transfers, self.journal.as_ref());
+        let root_before = self.composite_root();
 
         let mut view = LedgerView::new(
             &mut self.accounts,
@@ -378,8 +399,7 @@ impl ClerkLedger {
         // would be a degenerate anchor with no value; the caller can
         // detect failure via the returned status.
         if status == Status::Ok {
-            let root_after =
-                compute_state_root(&self.accounts, &self.transfers, self.journal.as_ref());
+            let root_after = self.composite_root();
             let entry = TransferRootEntry {
                 id: transfer.id.0,
                 root_before,
@@ -457,13 +477,14 @@ impl ClerkLedger {
         self.transfers.len() as u32
     }
 
-    /// Composite SMT root: `smt_node_hash(smt_node_hash(accounts_root,
-    /// transfers_root), journals_root)`. This is the 32-byte state
-    /// anchor every voucher / disclosure proof / cross-clerk
-    /// message will commit to. Returns an empty `Vec` if the ledger
-    /// isn't bootstrapped — the all-zero root would be a forgeable
-    /// anchor, so callers must distinguish "no root" from "this is
-    /// the root".
+    /// Composite SMT root over the full kernel-checked state (accounts,
+    /// transfers, journal + the external-id / voided / pending
+    /// bookkeeping sub-SMTs) — see [`ClerkLedger::composite_root`]. This
+    /// is the 32-byte state anchor every voucher / disclosure proof /
+    /// cross-clerk message commits to. Returns an empty `Vec` if the
+    /// ledger isn't bootstrapped — the all-zero root would be a
+    /// forgeable anchor, so callers must distinguish "no root" from
+    /// "this is the root".
     ///
     /// Runtime cost: O(N · log N) per call (rebuilds sorted leaf
     /// hashes then walks 128 SMT levels). Allocation-free recursion
@@ -474,7 +495,7 @@ impl ClerkLedger {
     #[msg]
     async fn state_root(&self) -> Vec<u8> {
         match self.journal.as_ref() {
-            Some(j) => compute_state_root(&self.accounts, &self.transfers, Some(j)).to_vec(),
+            Some(_) => self.composite_root().to_vec(),
             None => Vec::new(),
         }
     }

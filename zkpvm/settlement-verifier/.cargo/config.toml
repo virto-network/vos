@@ -1,0 +1,28 @@
+# Cross-build commands for the P4.3 buildability spike.
+#
+#   wasm32 (GREEN — Substrate-pallet fallback venue):
+#       cargo build --release --target wasm32-unknown-unknown
+#
+#   PVM / JAM-refine (riscv64em-javm, os:none) — GREEN:
+#       cargo build --release --target riscv64em-javm.json \
+#         -Zbuild-std=core,alloc,compiler_builtins \
+#         -Zbuild-std-features=compiler-builtins-mem
+#     Requires the pinned nightly (JSON target-spec schema) + rust-src.
+#     RESOLVED (was: no_std/no-atomics blockers). Two changes unblocked it:
+#       (1) stwo's only std-only verify-graph dep is `dashmap` (→ crossbeam-utils
+#           + lock_api), used ONLY in `pub mod prover` (feature-gated). The
+#           vendored stwo under `vendor/` makes `dashmap` optional + prover-gated
+#           (see the `[patch]` in Cargo.toml); with default-features = false it
+#           leaves the graph entirely. tracing-subscriber/rand were NOT actually
+#           pulled into the verify build; blst/rayon were already eliminated.
+#       (2) The remaining `core::sync::atomic` users (foldhash's global seed,
+#           tracing-core callsites) need atomics. JAM PVM is RV64EM with NO `a`
+#           extension, so the target sets `max-atomic-width: 64` WITHOUT `+a`:
+#           the atomics lower to `__atomic_*` LIBCALLS (no atomic instructions),
+#           and the build references only `__atomic_load_{1,8}`, provided as
+#           single-core plain-load shims in `lib.rs` (`pvm_atomic_shim`).
+#
+# build-std and json-target-spec are intentionally NOT set as active keys here
+# (build-std would force a slow std rebuild on every host `cargo build`).  The
+# pinned nightly accepts the `.json` target path directly; pass build-std on the
+# command line as shown above.  This file is documentation-only.

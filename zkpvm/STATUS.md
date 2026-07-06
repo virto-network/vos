@@ -178,11 +178,26 @@ commit.
 
 ## Open soundness gaps
 
-None known on the common path.  Every PVM ISA opcode reachable
-from RISC-V actor code (or from synthetic forge tests) is bound
-by an algebraic constraint or terminally constrained.  The
-items the earlier draft of this file listed have all been
-closed:
+**Register / RAM ledger read-consistency is BOUND (format v6).**
+`RegisterMemoryChip` and `MemoryChip` enforce read-after-write
+soundly against a from-scratch prover: each read's value is bound
+cross-row to the previous same-key row's value (`#[mask_next_row]`
+`prev_value` binding), the ledger is sorted by `(key, ts)` via a
+range-checked sortedness gadget (self-contained 24-bit decomposition),
+and `is_write` is part of the logup tuple (register ledger widened to
+18 limbs; the RAM tuple already carried it) so a read can't masquerade
+as a write to skip the check.  This closes the previously-honest-only
+gap — in particular the closing read that pins `final_state.registers`
+/ the voucher io-hash is now sound.  Gate:
+`tests/ledger_readconsistency_gate.rs`; see
+`docs/plans/ledger-read-consistency.md`.  `proof.memory_commitment`
+remains separately unbound (computed outside the circuit — an
+in-circuit memory-image commitment is still future work).
+
+**Per-opcode ISA coverage: no known gaps.**  Every PVM ISA opcode
+reachable from RISC-V actor code (or from synthetic forge tests) is
+bound by an algebraic constraint or terminally constrained.  The
+items the earlier draft of this file listed have all been closed:
 
 - Memory: MemValue on indirect stores `[28]`; MemValue on
   StoreImm / StoreImmInd `[27]`; MemAddr on direct StoreImm

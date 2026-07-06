@@ -16,6 +16,12 @@ prover = ["dep:rayon", "dep:blake3", "dep:curve25519-dalek"]
 # "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
 # modes when adding constraints.
 debug-internals = ["prover"]
+# Native-recursion Stage-0 (P5.0): swap the segment PCS commit + Fiat-Shamir
+# transcript from production Blake2s to the M31-algebraic Poseidon2-M31 stack
+# (`src/poseidon2`), retargeting the commit/prove backend to CpuBackend. Selects
+# the `recursion_pcs` aliases; bumps the proof wire format. Off by default — the
+# production mobile prover stays on Blake2s/SimdBackend.
+poseidon2-channel = []
 
 [dependencies]
 zkpvm-derive = { workspace = true }
@@ -35,8 +41,14 @@ blake3 = { version = "1", optional = true }
 curve25519-dalek = { version = "4.1", optional = true, default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 
 [dev-dependencies]
-grey-transpiler = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+# Carries the `SLT rd, x0, rs2` x0-as-rs1 lowering the voucher-check ELF needs,
+# plus the `SLLI/SRLI/SRAI rd, x0, n` fix (shift x0 → 0, not RA) that makes the
+# settlement verify ACCEPT on the JAM PVM (tests/settle_run.rs).
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ec9debbec0bd06c686af8a24fabe222491558481" }
 bincode = "1"
+# no_std + serde wire format shared with the PVM settlement verifier
+# (settlement-verifier): the fixture this crate serializes is deserialized there.
+postcard = { version = "1", features = ["alloc"] }
 zkpvm-verifier = { workspace = true }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
 # Dynamic-witness smoke test (voucher_check_smoke.rs) builds
@@ -56,6 +68,27 @@ required-features = ["prover"]
 
 [[example]]
 name = "prove_and_verify"
+required-features = ["prover"]
+
+# Proving benchmarks (measurement, not correctness — see benches/prove.rs).
+# `harness = false` + a custom `main` keeps them out of `cargo test` and runs
+# them serially (one prove at a time, so large traces never contend for RAM).
+#   cargo bench --bench prove                 # default safe set
+#   cargo bench --bench prove -- log16        # a specific heavy one
+[[bench]]
+name = "prove"
+harness = false
+required-features = ["prover"]
+
+# Actor-workload proving benchmarks (measurement, not correctness — see
+# benches/actors.rs).  Same `harness = false` + custom `main` pattern as the
+# `prove` bench: kept out of `cargo test`, run serially so a large actor trace
+# never contends for RAM with another.
+#   cargo bench --bench actors                              # default safe set
+#   cargo bench --bench actors -- profile_clerk_refine_bench  # a heavy one
+[[bench]]
+name = "actors"
+harness = false
 required-features = ["prover"]
 
 [lints.clippy]

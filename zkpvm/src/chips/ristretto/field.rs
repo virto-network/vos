@@ -254,9 +254,9 @@ mod tests {
     use curve25519_dalek::scalar::Scalar;
 
     /// Scalar field arithmetic in dalek operates mod ℓ (the prime
-    /// 2²⁵² + 27742...), not mod p = 2²⁵⁵-19.  But `Scalar` is the
-    /// only `Bytes` ↔ canonical-element bijection cipher-clerk uses
-    /// at the boundary, and we just want a smoke test that our 256-
+    /// 2²⁵² + 27742...), not mod p = 2²⁵⁵-19.  But `Scalar` is dalek's
+    /// only `Bytes` ↔ canonical-element bijection at the boundary, and
+    /// we just want a smoke test that our 256-
     /// bit schoolbook + reduction is internally consistent — not that
     /// it agrees with dalek's *scalar* arithmetic, which is a
     /// different ring.

@@ -26,8 +26,32 @@ pub(crate) struct OpcodeFlags {
     pub is_neg_add: bool,
     pub is_set_lt_u: bool,
     pub is_set_lt_s: bool,
+    /// Swap modifier for `SetGtSImm`/`SetGtUImm` (`SLT rd, x0, rs2` lowers
+    /// to these). SetGt is computed as "swap operands + SetLt": the
+    /// instruction keeps `is_set_lt_s`/`is_set_lt_u` (so the existing result
+    /// constraint + compare partition apply), and `is_set_gt` swaps the
+    /// operand source so `val_b = imm`, `val_d = regs[rb]` — making the
+    /// signed/unsigned less-than comparison compute `imm < reg = reg > imm`,
+    /// the greater-than result. NOT a compare-partition sub-flag.
+    pub is_set_gt: bool,
     pub is_cmov_iz: bool,
     pub is_cmov_nz: bool,
+    /// CmovIzImm/CmovNzImm operand swap: the register cmov convention puts
+    /// the moved value in `val_b` and the condition in `val_d` (which
+    /// `ValDIsZero` gates), but the imm variants move the IMMEDIATE guarded
+    /// by `regs[rb]`. `is_cmov_imm` swaps the source so `val_b = imm`,
+    /// `val_d = regs[rb]`. The swap mechanism mirrors `is_set_gt` /
+    /// `is_rotate_r_imm_alt`, BUT — unlike `is_rotate_r_imm_alt`, which is
+    /// packed into the 48-flag program-memory bag (opcode-bound) — neither
+    /// `is_cmov_imm` nor `is_set_gt` is in that bag, so they are free
+    /// witness columns bound only transitively via the register-pinned
+    /// `result` (the same model as the other unpacked compare sub-flags
+    /// `is_set_lt_s/u`, `is_cmov_iz/nz`). Sound because each flag only
+    /// ADDS a pin (`flag·(val_b−ImmBytes)=0`) and gates nothing else:
+    /// asserting it spuriously can only over-constrain, and omitting it on
+    /// a real swapped row reduces to the pre-existing compare-operand model.
+    /// NOT a compare-partition sub-flag; co-occurs with `is_cmov_iz/nz`.
+    pub is_cmov_imm: bool,
     pub is_min_s: bool,
     pub is_min_u: bool,
     pub is_max_s: bool,
@@ -51,38 +75,38 @@ pub(crate) struct OpcodeFlags {
     pub is_store: bool,
     pub is_mul_upper: bool,
     pub is_exit: bool,
-    /// Phase 12b-1: BitManip permutation/zero-extend ops.
+    /// BitManip permutation/zero-extend ops.
     pub is_reverse_bytes: bool,
     pub is_zero_ext_16: bool,
-    /// Phase 12b-2: BitManip sign-extend ops.
+    /// BitManip sign-extend ops.
     pub is_sign_ext_8: bool,
     pub is_sign_ext_16: bool,
-    /// Phase 13e-redux: per-opcode terminal flag.  True only for Opcode::Trap.
+    /// Per-opcode terminal flag.  True only for Opcode::Trap.
     /// Distinct from `is_exit`, which also covers Ecalli (soft exit, may
     /// resume) and JumpInd / LoadImmJumpInd (dynamic dispatch).  Drives the
     /// terminal-row constraint that forbids any successor real row after
     /// Trap.
     pub is_trap: bool,
-    /// Phase 13d: per-opcode flag for `Opcode::JumpInd`.  Drives the
+    /// Per-opcode flag for `Opcode::JumpInd`.  Drives the
     /// runtime-target binding via JumpTableChip — `addr = (regs[reg_a]
     /// + imm) mod 2^32`, then `next_pc = jump_table[addr/2 - 1]` (the
     /// chip's preprocessed lookup).
     pub is_jump_ind: bool,
-    /// Phase 13d-loadimmjumpind: per-opcode flag for
+    /// Per-opcode flag for
     /// `Opcode::LoadImmJumpInd`.  Same JumpTableChip lookup as JumpInd
     /// but with `addr = (regs[rb] + imm_y) mod 2^32` (val_d + imm_y_low4
     /// in the AIR).  Bound via a separate carry chain into
     /// LoadImmJumpIndAddr.
     pub is_load_imm_jump_ind: bool,
-    /// Phase 12c: split `is_mul_upper` into the three signedness variants
-    /// so the AIR can apply the correct sign correction to the result.
+    /// The three signedness variants of `is_mul_upper`, so the AIR can
+    /// apply the correct sign correction to the result.
     /// `is_mul_upper_uu` ⇒ result = unsigned-product high 64.
     /// `is_mul_upper_su` ⇒ result = signed-unsigned high = unsigned high − sa·val_d.
     /// `is_mul_upper_ss` ⇒ result = signed-signed   high = unsigned high − sa·val_d − sb·val_b.
     pub is_mul_upper_uu: bool,
     pub is_mul_upper_su: bool,
     pub is_mul_upper_ss: bool,
-    /// Phase 16: signed div/rem variants (DivS32/DivS64/RemS32/RemS64).
+    /// Signed div/rem variants (DivS32/DivS64/RemS32/RemS64).
     /// Drives the sign-correction at the divrem schoolbook's high bytes:
     ///   high(q_u·d_u + r_u) ≡ sq·d_u + sd·q_u + sr − sa  (mod 2^64)
     /// where sa/sd/sq/sr are the dividend/divisor/quotient/remainder
@@ -90,7 +114,7 @@ pub(crate) struct OpcodeFlags {
     /// fails proving — the schoolbook's high bytes aren't zero in
     /// two's-complement.
     pub is_div_s: bool,
-    /// Phase 20: per-size signed-load flags (covers direct + indirect
+    /// Per-size signed-load flags (covers direct + indirect
     /// variants: LoadI8 / LoadIndI8 → is_load_i8, etc.).  Drive the
     /// inactive-byte sign-extension binding for `result[i]` on
     /// `i ≥ MemSize`.  Without this, a prover could write garbage in
@@ -99,31 +123,30 @@ pub(crate) struct OpcodeFlags {
     pub is_load_i8: bool,
     pub is_load_i16: bool,
     pub is_load_i32: bool,
-    /// Phase 23: per-size memory-access flags covering both load and
+    /// Per-size memory-access flags covering both load and
     /// store variants.  Pin `MemSize = 1·is_mem_size_1 + 2·is_mem_size_2
     /// + 4·is_mem_size_4 + 8·is_mem_size_8`, so the prover can't pick a
-    /// MemSize inconsistent with the opcode (closes the gap left at the
-    /// end of Phase 22).  Exactly one is set per memory-op row, all
-    /// zero on non-memory rows.
+    /// MemSize inconsistent with the opcode.  Exactly one is set per
+    /// memory-op row, all zero on non-memory rows.
     pub is_mem_size_1: bool,
     pub is_mem_size_2: bool,
     pub is_mem_size_4: bool,
     pub is_mem_size_8: bool,
-    /// Phase 24: 1 iff this opcode is `StoreU8 / StoreU16 / StoreU32 /
+    /// 1 iff this opcode is `StoreU8 / StoreU16 / StoreU32 /
     /// StoreU64` (OneRegOneImm category — *direct* store, not Ind or
     /// Imm).  For these the trace fill's default arm puts `regs[ra]`
     /// (the source value) into `val_b`, so MemValue's active bytes
     /// can be pinned to `val_b`'s bytes by a single constraint.
     /// StoreInd* / StoreImm* / StoreImmInd* leave the source value in
-    /// a different place and need their own bindings (deferred).
+    /// a different place and need their own bindings.
     pub is_store_direct: bool,
-    /// Phase 25: 1 iff this opcode is one of the *direct* loads
+    /// 1 iff this opcode is one of the *direct* loads
     /// `LoadU8 / LoadI8 / LoadU16 / LoadI16 / LoadU32 / LoadI32 /
     /// LoadU64` (OneRegOneImm category).  For these the address is
     /// just the immediate (`addr = imm`); paired with IsStoreDirect
     /// drives the `MemAddr = ImmBytes[0..4]` binding.
     pub is_load_direct: bool,
-    /// Phase 26: 1 iff this opcode is one of the *indirect* memory
+    /// 1 iff this opcode is one of the *indirect* memory
     /// ops — LoadInd[U/I][8/16/32/64] (TwoRegOneImm), StoreInd[U/I]
     /// [8/16/32/64] (TwoRegOneImm), or StoreImmInd[U][8/16/32/64]
     /// (OneRegTwoImm).  For all three categories the trace fill
@@ -132,7 +155,7 @@ pub(crate) struct OpcodeFlags {
     /// match arm).  Drives the byte-wise add-with-carry chain
     /// pinning `MemAddr = (val_b + ImmBytes) mod 2^32`.
     pub is_mem_indirect: bool,
-    /// Phase 27: 1 iff this opcode is one of `StoreImm[U][8/16/32/64]`
+    /// 1 iff this opcode is one of `StoreImm[U][8/16/32/64]`
     /// (TwoImm category) or `StoreImmInd[U][8/16/32/64]`
     /// (OneRegTwoImm category).  In both cases the *value* written
     /// to memory is `imm_y` (already pinned to canonical via
@@ -140,20 +163,20 @@ pub(crate) struct OpcodeFlags {
     /// MemValue ↔ ImmYBytes binding for the low 4 bytes.  MemSize=8
     /// imm_y values are out of scope (would need ImmYBytesHi[4]).
     pub is_store_imm_any: bool,
-    /// Phase 27: 1 iff this opcode is one of `StoreImm[U][8/16/32/64]`
+    /// 1 iff this opcode is one of `StoreImm[U][8/16/32/64]`
     /// (TwoImm only — the *direct*-addressing immediate-source
     /// store).  For these `addr = imm_x = step.imm`, so the
-    /// MemAddr binding shape is the same as Phase 25's direct path.
+    /// MemAddr binding shape is the same as the direct-load path.
     pub is_store_imm_direct: bool,
-    /// Phase 28: 1 iff this opcode is one of `StoreIndU[8/16/32/64]`
+    /// 1 iff this opcode is one of `StoreIndU[8/16/32/64]`
     /// (TwoRegOneImm — *register-source* indirect store).  For
     /// these the value written to memory is `regs[ra]`, which
     /// isn't in val_b (val_b holds the *base* regs[rb] for
-    /// TwoRegOneImm).  Drives the new RegValA column + producer
+    /// TwoRegOneImm).  Drives the RegValA column + producer
     /// emission to the register-memory ledger, plus the
     /// MemValue ↔ RegValA byte-wise binding.
     pub is_store_ind: bool,
-    /// Phase 32: 1 iff this opcode is `RotL64` — rotate-left 64-bit.
+    /// 1 iff this opcode is `RotL64` — rotate-left 64-bit.
     /// PVM defines `RotL64(a, n) = (a << n) | (a >> (64 − n))` for
     /// `n ∈ [0, 63]`.  Encoded via the existing mul-schoolbook
     /// (val_d = 2^n) which produces both the low 64 (= `a << n`
@@ -162,28 +185,26 @@ pub(crate) struct OpcodeFlags {
     /// (by construction), OR = byte-wise SUM, so
     /// `result = UnsignedProductLow + mul_high` (no carry).
     /// Drives the schoolbook re-route (low-64 → UnsignedProductLow)
-    /// + the rotation result binding.  RotR64 / RotL32 / RotR32
-    /// are deferred to later phases.
+    /// + the rotation result binding.
     pub is_rotate_l64: bool,
-    /// Phase 33: 1 iff this opcode is `CountSetBits64` or `CountSetBits32`.
+    /// 1 iff this opcode is `CountSetBits64` or `CountSetBits32`.
     /// Drives the per-byte popcount lookup `(val_d[i], BytePopcount[i]) ∈
     /// popcount` plus the result binding `result[0] =
     /// sum(BytePopcount[0..N])` (N = 8 for 64-bit, N = 4 for 32-bit) and
     /// `result[1..8] = 0`.
     pub is_count_set_bits: bool,
-    /// Phase 34: 1 iff this opcode is `LeadingZeroBits64` or
+    /// 1 iff this opcode is `LeadingZeroBits64` or
     /// `LeadingZeroBits32`.  Drives the per-byte bitcount lookup
     /// `(val_d[i], BitOpLzByte[i], BitOpTzByte[i]) ∈ bitcount` plus
     /// the LZ result binding (sums over the first-non-zero MSB-direction
     /// indicator), with default `64` (or `32` if Is32Bit) when val_d
     /// is zero.  Result high bytes pinned to 0.
     pub is_lzb: bool,
-    /// Phase 34: 1 iff this opcode is `TrailingZeroBits64` or
+    /// 1 iff this opcode is `TrailingZeroBits64` or
     /// `TrailingZeroBits32`.  Symmetric to is_lzb but using the
-    /// LSB-direction first-non-zero indicator (Phase 29's
-    /// ValDPartialNZ).
+    /// LSB-direction first-non-zero indicator (ValDPartialNZ).
     pub is_tzb: bool,
-    /// Phase 35: 1 iff this opcode is `RotR64` / `RotR64Imm`.
+    /// 1 iff this opcode is `RotR64` / `RotR64Imm`.
     /// PVM defines `RotR64(a, n) = (a >> n) | (a << (64 − n))` for
     /// `n ∈ [0, 63]`.  Encoded by setting `val_d = 2^((64 − n) mod
     /// 64)` (instead of `2^n` like RotL64); the mul-schoolbook
@@ -191,20 +212,20 @@ pub(crate) struct OpcodeFlags {
     /// whose byte-wise sum equals the rotated-right value (no
     /// carry — bits non-overlapping by construction).
     pub is_rotate_r64: bool,
-    /// Phase 36: 1 iff this opcode is `RotL32`.  Same shape as
+    /// 1 iff this opcode is `RotL32`.  Same shape as
     /// RotL64 but over a 32-bit value with sign-extension in the
-    /// high 4 bytes (Phase 19).  Re-uses the 32-bit mul-schoolbook
+    /// high 4 bytes.  Re-uses the 32-bit mul-schoolbook
     /// (val_d = 2^(n mod 32)) whose low-32 bytes go to
     /// UnsignedProductLow[0..4] and high-32 to mul_high[0..4]; the
     /// rotate result is byte-wise sum of those two halves over
     /// bytes 0..4.
     pub is_rotate_l32: bool,
-    /// Phase 36: 1 iff this opcode is `RotR32` / `RotR32Imm`.
+    /// 1 iff this opcode is `RotR32` / `RotR32Imm`.
     /// Mirror of is_rotate_r64 but with modulus 32: val_d =
     /// 2^((32 − n) mod 32); result low 4 bytes = UnsignedProductLow
     /// + mul_high; high 4 bytes = sign-extension.
     pub is_rotate_r32: bool,
-    /// Phase 40: 1 iff this opcode is `RotR64ImmAlt` or
+    /// 1 iff this opcode is `RotR64ImmAlt` or
     /// `RotR32ImmAlt` — the swapped-source variants where the
     /// immediate is the rotated value and `regs[rb]` is the shift
     /// amount (vs. RotR64Imm / RotR32Imm where the convention is
@@ -329,7 +350,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.div_rem_op = 0;
             f.is_32bit = true;
         }
-        // Phase 32: RotL64 reuses the mul-schoolbook (val_d = 2^n)
+        // RotL64 reuses the mul-schoolbook (val_d = 2^n)
         // to compute both halves of `a · 2^n`; result = low + high.
         Opcode::RotL64 => {
             f.is_shift = true;
@@ -337,7 +358,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_mul = true;
             f.is_rotate_l64 = true;
         }
-        // Phase 36: RotL32 — 32-bit mul-schoolbook re-route, val_d = 2^(n mod 32).
+        // RotL32 — 32-bit mul-schoolbook re-route, val_d = 2^(n mod 32).
         Opcode::RotL32 => {
             f.is_shift = true;
             f.shift_op = 3;
@@ -345,21 +366,17 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_mul = true;
             f.is_rotate_l32 = true;
         }
-        // Phase 35: RotR64 + RotR64Imm — value in val_b, shift in
+        // RotR64 + RotR64Imm — value in val_b, shift in
         // val_d.  Encoded via the mul-schoolbook with `val_d =
         // 2^((64 − n) mod 64)`; result = low + high (identical sum
         // shape to RotL64 but with the complementary shift amount).
-        // RotR64ImmAlt keeps the shift_op=4 / no-constraint encoding
-        // because its operand convention (imm is the rotated value,
-        // regs[rb] is the shift) clashes with the AIR's val_b/val_d
-        // layout — would need swapped trace fill, deferred.
         Opcode::RotR64 | Opcode::RotR64Imm => {
             f.is_shift = true;
             f.shift_op = 4;
             f.is_mul = true;
             f.is_rotate_r64 = true;
         }
-        // Phase 40: RotR64ImmAlt — value = imm, shift = regs[rb].
+        // RotR64ImmAlt — value = imm, shift = regs[rb].
         // Set is_rotate_r64 so the existing rotate-r logic fires;
         // is_rotate_r_imm_alt drives the swapped trace fill.
         Opcode::RotR64ImmAlt => {
@@ -369,9 +386,8 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_rotate_r64 = true;
             f.is_rotate_r_imm_alt = true;
         }
-        // Phase 36: RotR32 + RotR32Imm — value in val_b, shift in val_d.
-        // Same shape as RotR64 but with modulus 32.  RotR32ImmAlt
-        // deferred for the same operand-swap reason as RotR64ImmAlt.
+        // RotR32 + RotR32Imm — value in val_b, shift in val_d.
+        // Same shape as RotR64 but with modulus 32.
         Opcode::RotR32 | Opcode::RotR32Imm => {
             f.is_shift = true;
             f.shift_op = 4;
@@ -379,7 +395,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_mul = true;
             f.is_rotate_r32 = true;
         }
-        // Phase 40: RotR32ImmAlt — same swap as RotR64ImmAlt but 32-bit.
+        // RotR32ImmAlt — same swap as RotR64ImmAlt but 32-bit.
         Opcode::RotR32ImmAlt => {
             f.is_shift = true;
             f.shift_op = 4;
@@ -398,20 +414,27 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_set_lt_s = true;
         }
         Opcode::SetGtUImm => {
+            // SetGt = swap operands + SetLt: keep is_set_lt_u (drives the
+            // result + compare partition); is_set_gt swaps val_b/val_d so the
+            // unsigned less-than becomes unsigned greater-than.
             f.is_compare = true;
             f.is_set_lt_u = true;
-        } // SetGt = swap + SetLt
+            f.is_set_gt = true;
+        }
         Opcode::SetGtSImm => {
             f.is_compare = true;
             f.is_set_lt_s = true;
+            f.is_set_gt = true;
         }
         Opcode::CmovIz | Opcode::CmovIzImm => {
             f.is_compare = true;
             f.is_cmov_iz = true;
+            f.is_cmov_imm = op == Opcode::CmovIzImm;
         }
         Opcode::CmovNz | Opcode::CmovNzImm => {
             f.is_compare = true;
             f.is_cmov_nz = true;
+            f.is_cmov_imm = op == Opcode::CmovNzImm;
         }
         Opcode::Min => {
             f.is_compare = true;
@@ -434,9 +457,6 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_move = true;
         }
         // BitManip (TwoReg unary ops).
-        // Constrained (Phase 12b): ZeroExtend16, ReverseBytes (this commit).
-        // Still prover-trusted: CountSetBits, LeadingZeroBits, TrailingZeroBits,
-        // SignExtend8/16, Sbrk — see Phase 12a/12b-2/12f.
         Opcode::ZeroExtend16 => {
             f.is_zero_ext_16 = true;
         }
@@ -470,12 +490,11 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_tzb = true;
             f.is_32bit = true;
         }
-        // Phase 41: Sbrk panics on execution (JAR v0.8.0 removed it
-        // from the ISA — replaced by the grow_heap hostcall).  Mark
-        // it terminal in the same way as Trap so the Phase 13e-redux
-        // no-successor-row constraint fires.  is_exit covers the
-        // execution-stops semantics; is_trap forbids any subsequent
-        // real row.
+        // Sbrk panics on execution (not part of the ISA — the
+        // grow_heap hostcall is used instead).  Mark it terminal in
+        // the same way as Trap so the no-successor-row constraint
+        // fires.  is_exit covers the execution-stops semantics;
+        // is_trap forbids any subsequent real row.
         Opcode::Sbrk => {
             f.is_exit = true;
             f.is_trap = true;
@@ -571,7 +590,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // Loads — `is_mem_size_*` covers both load and store; set per
         // width.  `is_load_direct` set on the OneRegOneImm-category
         // direct loads (no Ind variant), driving the MemAddr ↔ ImmBytes
-        // binding (Phase 25).
+        // binding.
         Opcode::LoadU8 => {
             f.is_load = true;
             f.is_mem_size_1 = true;
@@ -648,9 +667,9 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_mem_size_4 = true;
             f.is_mem_indirect = true;
         }
-        // Stores — split by addressing mode (Phase 24 needs is_store_direct
-        // set only on the OneRegOneImm-category direct stores; Ind / Imm
-        // / ImmInd handle their source values differently).
+        // Stores — split by addressing mode.  is_store_direct is set
+        // only on the OneRegOneImm-category direct stores; Ind / Imm
+        // / ImmInd handle their source values differently.
         Opcode::StoreU8 => {
             f.is_store = true;
             f.is_mem_size_1 = true;
@@ -824,8 +843,7 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Phase 13c (extended in 13e-redux + 13d + 13d-loadimmjumpind + 12c + 16 + 20 + 23 + 24 + 25 + 26 + 27 + 28 + 32 + 33 + 34 + 35 + 36 + 40):
-/// extract the 48 category/sub-category flags in the order matching
+/// Extract the 48 category/sub-category flags in the order matching
 /// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.

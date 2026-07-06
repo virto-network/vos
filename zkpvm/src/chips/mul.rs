@@ -1,11 +1,9 @@
-//! Phase 54a/b/c — `MulChip`: per-multiplication-row chip.
+//! `MulChip`: per-multiplication-row chip.
 //!
-//! Phase 54a established the lookup wiring (CpuChip ↔ MulChip producer/
-//! consumer balance).  Phase 54b moved the schoolbook byte-level
-//! carry-chain constraint here, dropping MulCarry/MulCarryHi from
-//! CpuChip.  Phase 54c moves the Phase 12c MulUpper SS/SU sign-
-//! correction here, dropping UnsignedProductHi/MulCorrTermA/B/Carry
-//! from CpuChip.
+//! Responsibilities: the lookup wiring (CpuChip ↔ MulChip producer/
+//! consumer balance); the schoolbook byte-level carry-chain constraint
+//! (via MulCarry/MulCarryHi); and the MulUpper SS/SU sign-correction
+//! (via UnsignedProductHi/MulCorrTermA/B/Carry).
 //!
 //! Lookup tuple (47 limbs): val_b[8] + val_d[8] + result[8] +
 //! mul_high[8] + unsigned_product_low[8] + sign_bit_b + sign_bit_d +
@@ -61,40 +59,40 @@ pub enum Column {
     /// High 64 bits of the mul output (post-variant-dispatch).
     #[size = 8]
     MulHigh,
-    /// Phase 54b: low 64 bits of the unsigned schoolbook product.
+    /// Low 64 bits of the unsigned schoolbook product.
     #[size = 8]
     UnsignedProductLow,
-    /// Phase 54b: high 64 bits of the unsigned schoolbook product
+    /// High 64 bits of the unsigned schoolbook product
     /// (positions 8..15 from the 16-position chain).
     #[size = 8]
     UnsignedProductHi,
-    /// Phase 54b: per-position low byte of the schoolbook carry.  16
+    /// Per-position low byte of the schoolbook carry.  16
     /// positions; full carry = MulCarry + 256·MulCarryHi.
     #[size = 16]
     MulCarry,
-    /// Phase 54b: per-position high byte of the schoolbook carry.
+    /// Per-position high byte of the schoolbook carry.
     #[size = 16]
     MulCarryHi,
-    /// Phase 54c: sign-correction term `sa·val_d` (low 64 bits).
+    /// Sign-correction term `sa·val_d` (low 64 bits).
     /// `sa·val_d` for SU/SS rows; 0 for UU.
     #[size = 8]
     MulCorrTermA,
-    /// Phase 54c: sign-correction term `sb·val_b` (low 64 bits).
+    /// Sign-correction term `sb·val_b` (low 64 bits).
     /// `sb·val_b` for SS rows; 0 for UU/SU.
     #[size = 8]
     MulCorrTermB,
-    /// Phase 54c: per-byte carry chain for `result + term_a + term_b ≡
+    /// Per-byte carry chain for `result + term_a + term_b ≡
     /// unsigned_product_hi (mod 2^64)` on is_mul_upper rows.
     #[size = 8]
     MulCorrCarry,
-    /// Phase 54c: bit 7 of val_b's MSB (sa).  Pinned by CpuChip's
+    /// Bit 7 of val_b's MSB (sa).  Pinned by CpuChip's
     /// nibble-AND lookups; flowed in via the lookup tuple.
     #[size = 1]
     SignBitB,
-    /// Phase 54c: bit 7 of val_d's MSB (sb).
+    /// Bit 7 of val_d's MSB (sb).
     #[size = 1]
     SignBitD,
-    /// Phase 54d: rotate-class flags driving result-variant dispatch.
+    /// Rotate-class flags driving result-variant dispatch.
     /// Pinned via the lookup tuple to CpuChip's IsRotate{L,R}{64,32}.
     #[size = 1]
     IsRotateL64,
@@ -120,7 +118,7 @@ pub enum Column {
     #[size = 1]
     IsPadding,
 
-    // ── Phase I-mul Stwo-v2.x degree-flatten helpers ──
+    // ── Stwo-v2.x degree-flatten helpers ──
     //
     // Stwo's lifted protocol enforces algebraic constraint degree ≤ 2.
     // Several MulChip constraints sit at degree 3-5 in their natural
@@ -164,7 +162,7 @@ pub enum Column {
     #[size = 8]
     PartialSum32,
 
-    /// Sign-correction body helpers (Phase 54c flatten).
+    /// Sign-correction body helpers.
     /// `SignDA[i] := SignBitB · ValD[i]` for i=0..8 (deg 2 def).
     #[size = 8]
     SignDA,
@@ -218,7 +216,7 @@ impl BuiltInComponent for MulChip {
         let is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
-        // ── Phase I-mul degree-flatten helpers ──
+        // ── Degree-flatten helpers ──
         let not_padding_64bit = crate::trace::trace_eval!(trace_eval, Column::NotPadding64bit);
         let mul_lo_active = crate::trace::trace_eval!(trace_eval, Column::MulLoActive);
         let mul_upper_active = crate::trace::trace_eval!(trace_eval, Column::MulUpperActive);
@@ -249,10 +247,10 @@ impl BuiltInComponent for MulChip {
         let is_mul_upper_e = is_mu_uu[0].clone() + is_mu_su[0].clone() + is_mu_ss[0].clone();
         let is_64bit = E::F::one() - is_32bit[0].clone();
 
-        // ── Phase I-mul helper-defining constraints ──
+        // ── Helper-defining constraints ──
         // Each helper is one main-trace column; the constraint here pins
         // it to the algebraic expression so a malicious prover can't
-        // diverge from the gates the original chip used.  All deg 2.
+        // diverge from the intended gates.  All deg 2.
         eval.add_constraint(not_padding_64bit[0].clone() - is_real.clone() * is_64bit.clone());
         eval.add_constraint(
             mul_lo_active[0].clone() - not_padding_64bit[0].clone() * is_mul_lo[0].clone(),
@@ -306,9 +304,9 @@ impl BuiltInComponent for MulChip {
         eval.add_constraint(is_real.clone() * (variant_sum.clone() - E::F::one()));
         eval.add_constraint(is_padding[0].clone() * variant_sum);
 
-        // ── Phase 54b: schoolbook byte-level carry chain (Phase I-mul flattened) ──
+        // ── Schoolbook byte-level carry chain (helper-flattened) ──
         // PartialSum64/32 and MulLoActive / MulUpperActive / Is32BitActive
-        // helpers compress the original deg-4/5 selector × quadratic-body
+        // helpers compress the natural deg-4/5 selector × quadratic-body
         // expressions to deg-2 (selector_h × linear_body).
         let f256: E::F = E::F::from(BaseField::from(256));
         let full_carry =
@@ -329,7 +327,7 @@ impl BuiltInComponent for MulChip {
             } else {
                 uph[k - 8].clone()
             };
-            // Body now linear in column refs (PartialSum64[k] is one helper col).
+            // Body is linear in column refs (PartialSum64[k] is one helper col).
             let c_normal = out_normal + full_carry(k) * f256.clone()
                 - partial_sum_64[k].clone()
                 - carry_in.clone();
@@ -353,20 +351,20 @@ impl BuiltInComponent for MulChip {
             eval.add_constraint(is_32bit_active[0].clone() * c);
         }
 
-        // ── Phase 54c: Phase 12c MulUpper SS/SU sign-correction ──
+        // ── MulUpper SS/SU sign-correction ──
         //   high(a_s × b_s) ≡ high(a_u × b_u) − sa·b_u − sb·a_u  (mod 2^64)
         // Materialised as `result + term_a + term_b ≡ uph (mod 2^64)`
         // with byte-level carry chain.  TermA/B definitions:
         //   TermA[i]: SU/SS → sa·val_d[i]; UU → 0.
         //   TermB[i]: SS    → sb·val_b[i]; UU/SU → 0.
         for i in 0..WORD_SIZE {
-            // TermA (Phase I-mul flattened): SignDA[i] = SignBitB · ValD[i].
+            // TermA (helper-flattened): SignDA[i] = SignBitB · ValD[i].
             eval.add_constraint(
                 (is_mu_su[0].clone() + is_mu_ss[0].clone())
                     * (term_a[i].clone() - sign_d_a[i].clone()),
             );
             eval.add_constraint(is_mu_uu[0].clone() * term_a[i].clone());
-            // TermB (Phase I-mul flattened): SignDB[i] = SignBitD · ValB[i].
+            // TermB (helper-flattened): SignDB[i] = SignBitD · ValB[i].
             eval.add_constraint(is_mu_ss[0].clone() * (term_b[i].clone() - sign_d_b[i].clone()));
             eval.add_constraint((is_mu_uu[0].clone() + is_mu_su[0].clone()) * term_b[i].clone());
         }
@@ -389,20 +387,20 @@ impl BuiltInComponent for MulChip {
             );
         }
 
-        // ── Phase 54d: result-variant dispatch (Phase 32/36 binding) ──
+        // ── Result-variant dispatch ──
         // For non-rotate is_mul_lo 64-bit: result[i] = upl[i].
         // For RotL64 / RotR64: result[i] = upl[i] + mul_high[i] (byte-wise
         //   sum, no carry — bits non-overlapping by construction of rotation).
         // For non-rotate is_mul_lo 32-bit: result[0..4] = upl[0..4].
         // For RotL32 / RotR32: result[0..4] = upl[0..4] + mul_high[0..4].
         // 32-bit upper result limbs (i ∈ 4..8) are pinned by CpuChip's
-        // Phase 19 sign-extension constraint (still on CpuChip side).
+        // sign-extension constraint (on CpuChip side).
         {
             let is_rotate_64_either = is_rot_l64[0].clone() + is_rot_r64[0].clone();
             for i in 0..WORD_SIZE {
-                // Non-rotate path (Phase I-mul flattened): mul_lo_no_rotate64
-                // is the deg-1 helper standing in for the original 4-factor
-                // gate `is_real · is_64bit · is_mul_lo · (1 - rot_l - rot_r)`.
+                // Non-rotate path (helper-flattened): mul_lo_no_rotate64
+                // is the deg-1 helper standing in for the 4-factor gate
+                // `is_real · is_64bit · is_mul_lo · (1 - rot_l - rot_r)`.
                 eval.add_constraint(
                     mul_lo_no_rotate64[0].clone() * (result[i].clone() - upl[i].clone()),
                 );
@@ -509,7 +507,7 @@ impl BuiltInProverComponent for MulChip {
             trace.fill_columns(row, e.is_32bit, Column::Is32Bit);
             trace.fill_columns(row, false, Column::IsPadding);
 
-            // ── Phase I-mul helper fills ──
+            // ── Helper fills ──
             // Selector helpers — in valid traces, evaluated bool products.
             let real = true; // not padding
             let np_64 = real && !e.is_32bit;

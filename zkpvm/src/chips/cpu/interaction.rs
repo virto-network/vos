@@ -1,4 +1,4 @@
-//! CpuChip interaction-trace generation (Phase 47 split).
+//! CpuChip interaction-trace generation.
 //!
 //! Mirror of `cpu/mod.rs::add_constraints` on the prover side: every
 //! lookup the verifier's `add_constraints` consumes/produces gets a
@@ -29,7 +29,7 @@ use crate::lookups::{
     DivRemLookupElements, JumpTableLookupElements, LogupTraceBuilder, MemoryAccessLookupElements,
     MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
     ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-    RegisterMemoryLookupElements,
+    RegisterMemoryLookupElements, RistrettoCallLookupElements,
 };
 use crate::trace::component::ComponentTrace;
 
@@ -61,10 +61,10 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // Phase 54f: cmp_sub_result Range256 lookup moved to CompareChip.
+    // The cmp_sub_result Range256 lookup lives in CompareChip, not here.
     // Bind the per-op flag columns here — referenced by the
     // ProgramMemory consumer's closure-based slot overrides
-    // (Phase 53d/53e folds) further below.
+    // (folded categories) further below.
     let is_setltu_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtU);
     let is_setlts_col = crate::trace::original_base_column!(component_trace, Column::IsSetLtS);
     let is_cmoviz_col = crate::trace::original_base_column!(component_trace, Column::IsCmovIz);
@@ -85,8 +85,8 @@ pub(super) fn generate_interaction_trace(
     let is_br_gt_s_col = crate::trace::original_base_column!(component_trace, Column::IsBrGtS);
 
     // Memory access lookups — byte-level (up to 8 entries per memory op)
-    // Phase 53f: IsStore folded — `is_write` is the sum of the 3
-    // store-class sub-flags (IsStoreDirect + IsStoreImmAny + IsStoreInd).
+    // `is_write` is the sum of the 3 store-class sub-flags
+    // (IsStoreDirect + IsStoreImmAny + IsStoreInd).
     let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
     let is_store_direct_mem =
         crate::trace::original_base_column!(component_trace, Column::IsStoreDirect);
@@ -98,15 +98,32 @@ pub(super) fn generate_interaction_trace(
     let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
     let mem_byte_active =
         crate::trace::original_base_column!(component_trace, Column::MemByteActive);
+    let mem_byte_carry1 =
+        crate::trace::original_base_column!(component_trace, Column::MemByteAddrCarry1);
+    let mem_byte_carry2 =
+        crate::trace::original_base_column!(component_trace, Column::MemByteAddrCarry2);
+    let mem_byte_carry3 =
+        crate::trace::original_base_column!(component_trace, Column::MemByteAddrCarry3);
 
     // For each byte offset 0..8, produce a byte-level lookup entry
     // Tuple: (addr+i [4], value_byte_i [1], timestamp[8], is_write[1])
     // Multiplicity: mem_byte_active[i] (1 if byte is within access size, 0 otherwise)
+    //
+    // The byte address is the CANONICAL little-endian decomposition of
+    // `MemAddr + i`, carrying across address bytes via MemByteAddrCarry{1,2,3}
+    // — a misaligned multi-byte access can cross a 256-byte boundary, so the
+    // low byte alone (`addr[0] + i`) would overflow 255 and not match the
+    // MemoryChip ledger. The carries telescope, so the numeric address is
+    // always `base + i`; the ledger's canonical bytes pin them.
     for byte_idx in 0..8usize {
         let byte_offset = PackedBaseField::broadcast(BaseField::from(byte_idx as u32));
+        let p256 = PackedBaseField::broadcast(BaseField::from(256));
         let mem_addr_c = mem_addr.clone();
         let mem_value_c = mem_value.clone();
         let timestamp_c = timestamp.clone();
+        let c1 = mem_byte_carry1[byte_idx].clone();
+        let c2 = mem_byte_carry2[byte_idx].clone();
+        let c3 = mem_byte_carry3[byte_idx].clone();
         let is_sd_c = is_store_direct_mem[0].clone();
         let is_sia_c = is_store_imm_any_mem[0].clone();
         let is_si_c = is_store_ind_mem[0].clone();
@@ -114,14 +131,17 @@ pub(super) fn generate_interaction_trace(
             mem_lookup,
             [mem_byte_active[byte_idx].clone()],
             |[active]| active.into(),
-            14, // tuple size: addr[4] + value[1] + timestamp[8] + is_write[1]
+            15, // tuple: addr[4] + value[1] + timestamp[8] + is_write[1] + is_closing[1]
             |vec_idx| {
-                let mut tuple = Vec::with_capacity(14);
-                // addr + byte_idx (add offset to low byte)
-                tuple.push(mem_addr_c[0].at(vec_idx) + byte_offset);
-                for j in 1..4 {
-                    tuple.push(mem_addr_c[j].at(vec_idx));
-                }
+                let mut tuple = Vec::with_capacity(15);
+                let cy1 = c1.at(vec_idx);
+                let cy2 = c2.at(vec_idx);
+                let cy3 = c3.at(vec_idx);
+                // Canonical bytes of MemAddr + byte_idx, with carry.
+                tuple.push(mem_addr_c[0].at(vec_idx) + byte_offset - p256 * cy1);
+                tuple.push(mem_addr_c[1].at(vec_idx) + cy1 - p256 * cy2);
+                tuple.push(mem_addr_c[2].at(vec_idx) + cy2 - p256 * cy3);
+                tuple.push(mem_addr_c[3].at(vec_idx) + cy3);
                 // value byte
                 tuple.push(mem_value_c[byte_idx].at(vec_idx));
                 // timestamp
@@ -130,6 +150,8 @@ pub(super) fn generate_interaction_trace(
                 }
                 // is_write = IsStoreDirect + IsStoreImmAny + IsStoreInd
                 tuple.push(is_sd_c.at(vec_idx) + is_sia_c.at(vec_idx) + is_si_c.at(vec_idx));
+                // is_closing = 0 (CpuChip never emits closing reads)
+                tuple.push(PackedBaseField::broadcast(BaseField::from(0u32)));
                 tuple
             },
         );
@@ -167,19 +189,17 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // Phase 54e: bitwise-op nibble emissions moved to BitwiseChip.
-    // CpuChip still emits Phase 17 sign-bit nibble pinning lookups
-    // (and paired range checks) against BitwiseAndLookup further
-    // below — keep the binding + the sixteen constant so those
-    // sites resolve.
+    // The bitwise-op nibble emissions live in BitwiseChip; CpuChip emits
+    // the sign-bit nibble pinning lookups (and paired range checks)
+    // against BitwiseAndLookup further below — the binding + the sixteen
+    // constant are kept so those sites resolve.
     let bitwise_and: &BitwiseAndLookupElements = lookup_elements.as_ref();
     let sixteen = PackedBaseField::broadcast(BaseField::from(16));
 
     // Power-of-two lookup: (shift_amount, val_d[8]) when shift is constrained.
-    // Phase 35 / 36 split: classic emission keyed on ShiftAmount with
-    // multiplicity `is_shift_c · (1 − is_rotate_r64 − is_rotate_r32)`,
-    // plus a new emission keyed on ShiftAmountCompl with multiplicity
-    // `is_rotate_r64 + is_rotate_r32`.
+    // Two emissions: one keyed on ShiftAmount with multiplicity
+    // `is_shift_c · (1 − is_rotate_r64 − is_rotate_r32)`, and one keyed
+    // on ShiftAmountCompl with multiplicity `is_rotate_r64 + is_rotate_r32`.
     let pow2_lookup: &PowerOfTwoLookupElements = lookup_elements.as_ref();
     let shift_amount_col =
         crate::trace::original_base_column!(component_trace, Column::ShiftAmount);
@@ -206,8 +226,8 @@ pub(super) fn generate_interaction_trace(
             &tuple,
         );
     }
-    // Phase 35 / 36: separate PowerOfTwo emission for RotR64 / RotR32
-    // keyed on ShiftAmountCompl.
+    // Separate PowerOfTwo emission for RotR64 / RotR32 keyed on
+    // ShiftAmountCompl.
     {
         let mut tuple: Vec<_> = vec![shift_amount_compl_col[0].clone()];
         tuple.extend_from_slice(&val_d_cols);
@@ -222,7 +242,7 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // Phase 33: Popcount lookup — per-byte (val_d[i], BytePopcount[i]) on
+    // Popcount lookup — per-byte (val_d[i], BytePopcount[i]) on
     // CountSetBits rows.  Mirror of the verifier-side emission.
     {
         let popcount_lookup: &PopcountLookupElements = lookup_elements.as_ref();
@@ -240,7 +260,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // Phase 34: Bitcount lookup — per-byte (val_d[i], BitOpLzByte[i],
+    // Bitcount lookup — per-byte (val_d[i], BitOpLzByte[i],
     // BitOpTzByte[i]) on LZ/TZ rows.  Multiplicity = is_lzb + is_tzb.
     {
         let bitcount_lookup: &BitcountLookupElements = lookup_elements.as_ref();
@@ -258,7 +278,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Register-memory producer emissions (Phase 9d) ──
+    // ── Register-memory producer emissions ──
     // Three potential register accesses per step: ValB read, ValD read,
     // Result write.  Each is gated by its Is* flag and emits a tuple
     // (reg_idx[1], value[8], timestamp[8]) matching RegisterMemoryChip's
@@ -272,13 +292,19 @@ pub(super) fn generate_interaction_trace(
     let result_is_reg = crate::trace::original_base_column!(component_trace, Column::ResultIsReg);
     let result_reg_idx = crate::trace::original_base_column!(component_trace, Column::ResultRegIdx);
     let result_cols = crate::trace::original_base_column!(component_trace, Column::Result);
+    // is_write is the last register-tuple limb (binds reads vs writes — see
+    // RegisterMemoryChip).  Constant per emission: 0 for reads, 1 for the
+    // result write.
+    let is_write_read = crate::trace::component::FinalizedColumn::Constant(BaseField::from(0u32));
+    let is_write_write = crate::trace::component::FinalizedColumn::Constant(BaseField::from(1u32));
     {
-        // Phase 9g: use RegValB (raw register value) rather than ValB so
+        // Use RegValB (raw register value) rather than ValB so
         // 32-bit-truncated ops still emit the authentic register value.
         let reg_val_b_cols = crate::trace::original_base_column!(component_trace, Column::RegValB);
         let mut tuple: Vec<_> = vec![val_b_reg_idx[0].clone()];
         tuple.extend_from_slice(&reg_val_b_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_read.clone());
         logup.add_to_relation_with(
             reg_lookup,
             [val_b_is_reg[0].clone()],
@@ -287,12 +313,13 @@ pub(super) fn generate_interaction_trace(
         );
     }
     {
-        // Phase 9f: use RegValD (raw register value) instead of ValD
+        // Use RegValD (raw register value) instead of ValD
         // (which gets rewritten to 2^shift_amount for shift ops).
         let reg_val_d_cols = crate::trace::original_base_column!(component_trace, Column::RegValD);
         let mut tuple: Vec<_> = vec![val_d_reg_idx[0].clone()];
         tuple.extend_from_slice(&reg_val_d_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_read.clone());
         logup.add_to_relation_with(
             reg_lookup,
             [val_d_is_reg[0].clone()],
@@ -300,7 +327,7 @@ pub(super) fn generate_interaction_trace(
             &tuple,
         );
     }
-    // Phase 28: RegValA producer (paired emission for parity).
+    // RegValA producer (paired emission for parity).
     {
         let reg_val_a_cols = crate::trace::original_base_column!(component_trace, Column::RegValA);
         let reg_a_cols = crate::trace::original_base_column!(component_trace, Column::RegA);
@@ -309,6 +336,7 @@ pub(super) fn generate_interaction_trace(
         let mut tuple: Vec<_> = vec![reg_a_cols[0].clone()];
         tuple.extend_from_slice(&reg_val_a_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_read.clone());
         for _ in 0..2 {
             logup.add_to_relation_with(
                 reg_lookup,
@@ -322,6 +350,7 @@ pub(super) fn generate_interaction_trace(
         let mut tuple: Vec<_> = vec![result_reg_idx[0].clone()];
         tuple.extend_from_slice(&result_cols);
         tuple.extend_from_slice(&timestamp);
+        tuple.push(is_write_write.clone());
         logup.add_to_relation_with(
             reg_lookup,
             [result_is_reg[0].clone()],
@@ -330,14 +359,13 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── Phase 9e: blake2b ECALL register reads (φ[7], [8], [9], [10]) ──
+    // ── blake2b ECALL register reads (φ[7], [8], [9], [10]) ──
     // 4 extra register-memory producers emitted only at blake2b ECALL
-    // steps.  Per the off-by-three fix, the actor's a0/a1/a2/a3 map
-    // to PVM φ[7/8/9/10].  The `Column::Phi*` names are kept as
-    // pre-fix slot labels (h_ptr=Phi10, m_ptr=Phi11, t_low=Phi12,
-    // f_flag=Phi7) — see `mod.rs::ECALL_REG_IDXS` for the
-    // slot-to-register mapping that aligns with `trace_fill.rs`'s
-    // sources.
+    // steps.  The actor's a0/a1/a2/a3 map to PVM φ[7/8/9/10].  The
+    // `Column::Phi*` names are slot labels that do not match the register
+    // mapping (h_ptr=Phi10, m_ptr=Phi11, t_low=Phi12, f_flag=Phi7) —
+    // see `mod.rs::ECALL_REG_IDXS` for the slot-to-register mapping that
+    // aligns with `trace_fill.rs`'s sources.
     let is_blake_ecall = crate::trace::original_base_column!(component_trace, Column::IsBlakeEcall);
     let phi7 = crate::trace::original_base_column!(component_trace, Column::Phi7);
     let phi10 = crate::trace::original_base_column!(component_trace, Column::Phi10);
@@ -354,9 +382,9 @@ pub(super) fn generate_interaction_trace(
             reg_lookup,
             [is_blake_ecall[0].clone()],
             |[active]| active.into(),
-            17,
+            18,
             move |v| {
-                let mut t = Vec::with_capacity(17);
+                let mut t = Vec::with_capacity(18);
                 t.push(idx_const);
                 for c in &val_c {
                     t.push(c.at(v));
@@ -364,12 +392,14 @@ pub(super) fn generate_interaction_trace(
                 for c in &ts_c {
                     t.push(c.at(v));
                 }
+                // is_write = 0 (blake2b ECALL register accesses are reads).
+                t.push(PackedBaseField::broadcast(BaseField::from(0u32)));
                 t
             },
         );
     }
 
-    // ── Blake2b call binding (Phase 8c) ──
+    // ── Blake2b call binding ──
     // Producer side: at any step where IsBlakeEcall is set, emit
     //   (phi10[0..4], phi11[0..4], phi12[0..8], phi7_bool, timestamp[0..8])
     // Blake2bChip emits the matching consumer at IsFirstOfCompression so
@@ -391,7 +421,86 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── BitManip SE nibble lookups (Phase 12b-2) ──
+    // ── Ristretto ECALL register reads + RELATION-A ──
+    // Prover-side mirror of the mod.rs producers, in the same order: three
+    // register-read producers (φ[7], φ[8], φ[9]-except-112), then five per-id
+    // RELATION-A producers.  Operand pointers reuse the Phi10/Phi11/Phi12
+    // slots (= φ[7,8,9]); the RELATION-A ptr slots are in RistrettoEcallChip
+    // trace-layout order.
+    {
+        let ristretto_call: &RistrettoCallLookupElements = lookup_elements.as_ref();
+        let is_110 = crate::trace::original_base_column!(component_trace, Column::Is110Ecall);
+        let is_111 = crate::trace::original_base_column!(component_trace, Column::Is111Ecall);
+        let is_112 = crate::trace::original_base_column!(component_trace, Column::Is112Ecall);
+        let is_113 = crate::trace::original_base_column!(component_trace, Column::Is113Ecall);
+        let is_114 = crate::trace::original_base_column!(component_trace, Column::Is114Ecall);
+
+        // Register-read producers: (reg_idx, value[8], ts[8], is_write=0).
+        // φ[7] and φ[8] for all five ids; φ[9] for all except 112.
+        for (reg_idx, value, not_112) in [
+            (7u32, phi10.clone(), false),
+            (8u32, phi11.clone(), false),
+            (9u32, phi12.clone(), true),
+        ] {
+            let idx_const = PackedBaseField::broadcast(BaseField::from(reg_idx));
+            let val_c = value;
+            let ts_c = timestamp.clone();
+            let mult_cols = [
+                is_110[0].clone(),
+                is_111[0].clone(),
+                is_112[0].clone(),
+                is_113[0].clone(),
+                is_114[0].clone(),
+            ];
+            logup.add_to_relation_computed(
+                reg_lookup,
+                mult_cols,
+                move |[a, b, c, d, e]| {
+                    if not_112 {
+                        (a + b + d + e).into()
+                    } else {
+                        (a + b + c + d + e).into()
+                    }
+                },
+                18,
+                move |v| {
+                    let mut t = Vec::with_capacity(18);
+                    t.push(idx_const);
+                    for c in &val_c {
+                        t.push(c.at(v));
+                    }
+                    for c in &ts_c {
+                        t.push(c.at(v));
+                    }
+                    t.push(PackedBaseField::broadcast(BaseField::from(0u32)));
+                    t
+                },
+            );
+        }
+
+        // RELATION-A producers: (id, ptr0[4], ptr1[4], ptr2[4], ts[8]).
+        // ptr slots in RistrettoEcallChip trace-layout order (sub-block
+        // 0/1/2 base ptr); each is the low 4 bytes of a Phi slot.
+        for (id, p0, p1, p2, mult) in [
+            (110u32, &phi11, &phi10, &phi12, is_110[0].clone()),
+            (111u32, &phi10, &phi11, &phi12, is_111[0].clone()),
+            (112u32, &phi10, &phi10, &phi11, is_112[0].clone()),
+            (113u32, &phi10, &phi11, &phi12, is_113[0].clone()),
+            (114u32, &phi10, &phi11, &phi12, is_114[0].clone()),
+        ] {
+            let mut tuple: Vec<_> = Vec::with_capacity(21);
+            tuple.push(crate::trace::component::FinalizedColumn::Constant(
+                BaseField::from(id),
+            ));
+            tuple.extend_from_slice(&p0[0..4]);
+            tuple.extend_from_slice(&p1[0..4]);
+            tuple.extend_from_slice(&p2[0..4]);
+            tuple.extend_from_slice(&timestamp);
+            logup.add_to_relation_with(ristretto_call, [mult], |[active]| active.into(), &tuple);
+        }
+    }
+
+    // ── BitManip SE nibble lookups ──
     // 4 emissions paired with verifier-side (2a, 2b, 3a, 3b).  Last block
     // before finalize() so they pair within themselves.
     {
@@ -446,7 +555,7 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── Phase 13b/c + 55b: ProgramMemory consumer (prover-side, 2 paired, 31 limbs) ──
+    // ── ProgramMemory consumer (prover-side, 2 paired, 31 limbs) ──
     {
         let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
         let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
@@ -501,7 +610,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Phase 55b: ByteToBits decomposition consumer (prover-side, 6 emissions) ──
+    // ── ByteToBits decomposition consumer (prover-side, 6 emissions) ──
     //
     // Mirrors the 6 verifier-side emissions in cpu/mod.rs.  Each tuple
     // is `(FlagByteI, bit0, ..., bit7)` with bit_j either an
@@ -848,7 +957,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Phase 13d: JumpTable consumer (prover-side, 2 paired, 8 limbs) ──
+    // ── JumpTable consumer (prover-side, 2 paired, 8 limbs) ──
     {
         let jt: &JumpTableLookupElements = lookup_elements.as_ref();
         let is_jump_ind_col =
@@ -865,7 +974,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Phase 13d-loadimmjumpind: JumpTable consumer for LoadImmJumpInd ──
+    // ── JumpTable consumer for LoadImmJumpInd ──
     {
         let jt: &JumpTableLookupElements = lookup_elements.as_ref();
         let is_lij_col =
@@ -882,7 +991,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Phase 17: sign-bit nibble lookups (8 emissions) ──
+    // ── sign-bit nibble lookups (8 emissions) ──
     // Mirrors the verifier-side block placed just before
     // finalize_logup_in_pairs.  Same tuple shape, same multiplicity
     // (is_real per row), same emission order.
@@ -1005,7 +1114,7 @@ pub(super) fn generate_interaction_trace(
             },
         );
 
-        // Phase 19: SignBitResult — pin to bit 7 of result[3].
+        // SignBitResult — pin to bit 7 of result[3].
         let result_cols = crate::trace::original_base_column!(component_trace, Column::Result);
         let sign_bit_result_col =
             crate::trace::original_base_column!(component_trace, Column::SignBitResult);
@@ -1035,7 +1144,7 @@ pub(super) fn generate_interaction_trace(
             },
         );
 
-        // Phase 20: LoadSignBit — pin to bit 7 of LoadSignSrc.
+        // LoadSignBit — pin to bit 7 of LoadSignSrc.
         let load_sign_src =
             crate::trace::original_base_column!(component_trace, Column::LoadSignSrc);
         let load_sign_bit_col =
@@ -1067,13 +1176,12 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // Phase 21 → 54i: DivCmpDiff Range256 emissions moved to
-    // DivRemChip (witnesses + range-checks on its own trace).
+    // DivCmpDiff Range256 emissions live in DivRemChip
+    // (witnesses + range-checks on its own trace).
 
-    // Phase 30 → 54j-redux: AbsCmpDiff Range256 emissions moved
-    // to DivRemChip.
+    // AbsCmpDiff Range256 emissions live in DivRemChip.
 
-    // ── Phase 54a/b/c/d: MultiplicationLookup producer (prover-side mirror) ──
+    // ── MultiplicationLookup producer (prover-side mirror) ──
     // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
     //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
     {
@@ -1143,8 +1251,8 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Phase 54g/54i/54k: DivRemLookup producer (prover-side mirror) ──
-    // 40-limb tuple (54k dropped div_corr_hi, added 4 sign bits).
+    // ── DivRemLookup producer (prover-side mirror) ──
+    // 40-limb tuple (includes 4 sign bits).
     {
         let divrem_p54g: &DivRemLookupElements = lookup_elements.as_ref();
         let val_b_p54g = crate::trace::original_base_column!(component_trace, Column::ValB);
@@ -1181,7 +1289,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Phase 54f: CompareLookup producer (prover-side mirror) ──
+    // ── CompareLookup producer (prover-side mirror) ──
     // Tuple (17 limbs): val_b[8] + val_d[8] + cmp_lt_flag.
     // Multiplicity = is_compare + is_branch (= sum of 18 sub-flags).
     {
@@ -1277,7 +1385,7 @@ pub(super) fn generate_interaction_trace(
         }
     }
 
-    // ── Phase 54e: BitwiseLookup producer (prover-side mirror) ──
+    // ── BitwiseLookup producer (prover-side mirror) ──
     // Tuple (30 limbs): val_b[8] + val_d[8] + result[8] + 6 sub-flags.
     {
         let bitwise_p54e: &BitwiseLookupElements = lookup_elements.as_ref();

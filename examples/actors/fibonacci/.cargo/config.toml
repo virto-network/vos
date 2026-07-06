@@ -1,6 +1,8 @@
-[build]
-target = "riscv64em-javm.json"
-# Inject no_std/no_main so actors look like normal Rust.
+# Per-target rustflags so the same source compiles for all three
+# build flavors. `-Zcrate-attr` injects crate-level attributes the
+# user shouldn't have to write.
+
+[target.riscv64em-javm]
 rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
@@ -9,7 +11,18 @@ rustflags = [
     "-Aunused-attributes",
 ]
 
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-Zunstable-options",
+    "-Zcrate-attr=no_std",
+    "-Aunused-attributes",
+]
+
+# `cargo actor` produces the riscv64 ELF (compiles the lib as a bin so
+# the PVM entry point is emitted); `cargo wasm` the wasm32 cdylib.
+[alias]
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-javm.json"
+wasm = "build --release --no-default-features --target wasm32-unknown-unknown"
+
 [unstable]
-build-std = ["core", "alloc", "compiler_builtins"]
-build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true

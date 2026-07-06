@@ -1,6 +1,6 @@
 //! JumpTableChip — preprocessed table committing to the program's
 //! jump_table[].  Closes the JumpInd / LoadImmJumpInd target-trust
-//! soundness gap (Phase 13d).
+//! soundness gap.
 //!
 //! At runtime, JumpInd computes a virtual address `addr =
 //! (regs[reg_a] + imm) mod 2^32` and dispatches to

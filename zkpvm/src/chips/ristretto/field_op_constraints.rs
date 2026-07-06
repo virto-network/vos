@@ -5,18 +5,18 @@
 //! (comb-method running sum) can pin identical FieldOpRow algebra
 //! without duplicating ~400 lines of constraint code.
 //!
-//! What this emits (mirrors mod.rs's R1c-3..R1c-5-b blocks):
+//! What this emits (mirrors mod.rs's per-row FieldOp blocks):
 //!   - Helper-defining constraints for the deg-flatten witness columns
 //!     (RealAddH, RealSubH, RealMulH, ProducerGateH, ConsumerAGateH,
 //!     ConsumerBGateH, MulPartialSum[0..64]).
 //!   - Boolean checks on every flag + carry-chain bit.
 //!   - Real-row partition: exactly one of is_add/is_sub/is_mul/
 //!     is_input/is_output is 1 on real rows.
-//!   - Add chain (R1c-3): byte-sum + conditional p-reduction.
-//!   - Final-form check (R1c-3-bis): chain closure `out < p`.
-//!   - Sub chain (R1c-3-quat): two-sided forward-carry.
-//!   - Schoolbook mul chain (R1c-4-b).
-//!   - Pass-1 reduction `lo + 38·hi` (R1c-5-b).
+//!   - Add chain: byte-sum + conditional p-reduction.
+//!   - Final-form check: chain closure `out < p`.
+//!   - Sub chain: two-sided forward-carry.
+//!   - Schoolbook mul chain.
+//!   - Pass-1 reduction `lo + 38·hi`.
 //!   - Pass-2 reduction `pass1_lo + 38·pass1_hi`.
 //!   - Top-bit fold + final FieldOut binding for is_mul rows.
 //!
@@ -91,7 +91,7 @@ pub struct FieldOpRefs<'a, F> {
     pub is_input: &'a [F],
     pub is_output: &'a [F],
     pub is_real: &'a [F],
-    /// Phase I-ristretto deg-flatten helpers (1 cell each).
+    /// Deg-flatten helpers (1 cell each).
     pub real_add_h: &'a [F],
     pub real_sub_h: &'a [F],
     pub real_mul_h: &'a [F],
@@ -153,7 +153,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
     let consumer_b_gate_h = r.consumer_b_gate_h;
     let mul_partial_sum = r.mul_partial_sum;
 
-    // ── Phase I-ristretto deg-flatten helpers ──
+    // ── Deg-flatten helpers ──
     eval.add_constraint(real_add_h[0].clone() - is_real[0].clone() * is_add[0].clone());
     eval.add_constraint(real_sub_h[0].clone() - is_real[0].clone() * is_sub[0].clone());
     eval.add_constraint(real_mul_h[0].clone() - is_real[0].clone() * is_mul[0].clone());
@@ -216,7 +216,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
     eval.add_constraint(not_real.clone() * is_input[0].clone());
     eval.add_constraint(not_real * is_output[0].clone());
 
-    // ── R1c-3: byte-wise sum chain (is_add rows) ──
+    // ── Byte-wise sum chain (is_add rows) ──
     for i in 0..32 {
         let carry_in = if i == 0 {
             E::F::zero()
@@ -228,7 +228,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
         eval.add_constraint(real_add_h[0].clone() * (lhs - rhs));
     }
 
-    // ── R1c-3: conditional-reduction sub-chain (is_add rows) ──
+    // ── Conditional-reduction sub-chain (is_add rows) ──
     for i in 0..32 {
         let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
         let borrow_in = if i == 0 {
@@ -242,10 +242,10 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
         eval.add_constraint(real_add_h[0].clone() * constraint);
     }
 
-    // ── R1c-3-bis: final-form `out < p` chain closure (real rows) ──
+    // ── Final-form `out < p` chain closure (real rows) ──
     eval.add_constraint(is_real[0].clone() * ff_brw[31].clone());
 
-    // ── R1c-3-quat: is_sub two-sided carry chain ──
+    // ── is_sub two-sided carry chain ──
     for i in 0..32 {
         let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
         let cy_obb_in = if i == 0 {
@@ -271,7 +271,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
         real_sub_h[0].clone() * (sub_chain_brw[31].clone() - sub_chain_aip[31].clone()),
     );
 
-    // ── R1c-4-b: schoolbook 256×256 multiplication chain ──
+    // ── Schoolbook 256×256 multiplication chain ──
     let full_carry = |k: usize| -> E::F {
         mul_carry[k].clone()
             + mul_carry_mid[k].clone() * f256.clone()
@@ -291,7 +291,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
     // Closure: full_carry(63) = 0.
     eval.add_constraint(real_mul_h[0].clone() * full_carry(63));
 
-    // ── R1c-5-b: pass-1 reduction `lo + 38·hi` ──
+    // ── Pass-1 reduction `lo + 38·hi` ──
     let pass1_full_carry =
         |k: usize| -> E::F { pass1_carry[k].clone() + pass1_carry_mid[k].clone() * f256.clone() };
     let pass1_hi_value = || -> E::F { pass1_hi[0].clone() + pass1_hi[1].clone() * f256.clone() };
@@ -309,7 +309,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
     }
     eval.add_constraint(real_mul_h[0].clone() * (pass1_full_carry(31) - pass1_hi_value()));
 
-    // ── R1c-5-b: pass-2 reduction `pass1_lo + 38·pass1_hi` ──
+    // ── Pass-2 reduction `pass1_lo + 38·pass1_hi` ──
     for k in 0..32 {
         let carry_in = if k == 0 {
             E::F::zero()
@@ -331,7 +331,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
         real_mul_h[0].clone() * (pass2_carry[31].clone() - pass2_carry_out[0].clone()),
     );
 
-    // ── R1c-5-b: top-bit fold (+ 38·pass2_carry_out + 19·pass2_top_bit) ──
+    // ── Top-bit fold (+ 38·pass2_carry_out + 19·pass2_top_bit) ──
     let inject0_after = f38.clone() * pass2_carry_out[0].clone()
         + E::F::from(BaseField::from(19u32)) * pass2_top_bit[0].clone();
     for k in 0..32 {
@@ -363,7 +363,7 @@ pub fn add_field_op_constraints<E: EvalAtRow>(eval: &mut E, r: &FieldOpRefs<'_, 
     eval.add_constraint(pass2_carry_out[0].clone() * (E::F::one() - pass2_carry_out[0].clone()));
     eval.add_constraint(pass2_top_bit[0].clone() * (E::F::one() - pass2_top_bit[0].clone()));
 
-    // ── R1c-5-b: final FieldOut = after_top_bit − is_overflow·p (is_mul rows) ──
+    // ── Final FieldOut = after_top_bit − is_overflow·p (is_mul rows) ──
     for i in 0..32 {
         let p_i = E::F::from(BaseField::from(P_BYTE_CONSTS[i] as u32));
         let borrow_in = if i == 0 {

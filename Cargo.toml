@@ -16,6 +16,7 @@ members = [
     "extensions/ai",
     "extensions/dev",
     "extensions/http-gateway",
+    "extensions/prover",
     "examples/extensions/*",
 ]
 exclude = [
@@ -54,6 +55,12 @@ exclude = [
     # Excluded so `cargo build --workspace` + the pre-commit hook never try to
     # build it on the default toolchain.
     "miri/transport-soundness",
+    # The on-chain settlement verifier: a verify-only Poseidon2-M31 stwo
+    # verifier with its OWN `[workspace]`, pinning stwo with
+    # `default-features = false`.  Excluded so its feature resolution never
+    # co-resolves with javm/prover-stwo (which would drag blst/rayon) — that
+    # isolation is what makes it buildable for wasm32/PVM.
+    "zkpvm/settlement-verifier",
 ]
 
 [workspace.package]
@@ -81,6 +88,34 @@ readme = "README.md"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# `cargo test` builds Stwo's SIMD prover and the zkpvm trace/constraint
+# code at opt-level 0, where the prover runs several times slower and holds
+# its multi-GB FRI working set for longer. Optimize just the proving-hot
+# crates (leaving the rest of the workspace at opt-level 0 for fast
+# incremental compiles); these crates rarely recompile, so the cost is paid
+# once. debug-assertions stay on so zkpvm's internal invariant checks still
+# fire in tests. Measured on the reference box: a log14-padded prove drops
+# ~4.4s → ~3.5s; turning debug-assertions off on these crates would reach
+# ~2.6s (near the ~2.3s fat-LTO release) at the cost of those checks.
+# Set under both test (`cargo test`) and dev (`cargo run`/demos) profiles.
+[profile.test.package.stwo]
+opt-level = 3
+[profile.test.package.stwo-constraint-framework]
+opt-level = 3
+[profile.test.package.zkpvm]
+opt-level = 3
+[profile.test.package.zkpvm-verifier]
+opt-level = 3
+
+[profile.dev.package.stwo]
+opt-level = 3
+[profile.dev.package.stwo-constraint-framework]
+opt-level = 3
+[profile.dev.package.zkpvm]
+opt-level = 3
+[profile.dev.package.zkpvm-verifier]
+opt-level = 3
 
 [workspace.dependencies]
 # Internal crates

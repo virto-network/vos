@@ -242,7 +242,7 @@ pub(super) fn g_traced(
         and_t_hi,
         and_t_lo_hi,
         and_t_hi_hi,
-        // Phase 2b witnesses are zero by default; the trace-gen loop fills
+        // Output-derivation witnesses are zero by default; the trace-gen loop fills
         // them on the last row of each compression.
         output: [0u8; 64],
         h_hi: [0u8; 64],
@@ -252,7 +252,7 @@ pub(super) fn g_traced(
         out_xor1_hi: [0u8; 64],
         out_and2: [0u8; 64],
         out_and2_hi: [0u8; 64],
-        // Phase 8b ECALL-binding witnesses — filled by the outer loop from
+        // ECALL-binding witnesses — filled by the outer loop from
         // the matching blake2b_mem_op (or zero if none).  Address columns
         // are deterministic from HPtr/MPtr plus the byte offset.
         h_ptr: [0u8; 4],
@@ -276,7 +276,7 @@ pub(super) fn row_v_after(r: &GRow) -> [[u8; 8]; 16] {
     v_after
 }
 
-/// Fill the Phase 2b output-derivation witnesses on the last row of a
+/// Fill the output-derivation witnesses on the last row of a
 /// compression.  `v_after` is the v[0..16] state AFTER this row's G-call.
 pub(super) fn fill_output_witnesses(row: &mut GRow, v_after: &[u64; 16]) {
     let mut v_after_bytes = [[0u8; 8]; 16];

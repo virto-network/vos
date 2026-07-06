@@ -69,8 +69,8 @@ const TAG_MANIFEST_RESP: u8 = 0x43;
 const TAG_RAFT_STATUS_REQ: u8 = 0x44;
 const TAG_RAFT_STATUS_RESP: u8 = 0x45;
 // Content-addressed proof-blob fetch. Consumers ship the 32-byte
-// hash carried by a Mode::External voucher; producers (or any
-// node that has the bytes cached) serve them back. Large STARK
+// hash of a proof they want; producers (or any node that has the
+// bytes cached) serve them back. Large STARK
 // payloads (~1.4 MiB today) ride a single frame thanks to the
 // `MAX_FRAME_BYTES` cap below — chunked transport lands in a
 // later cycle once production proofs start to push past it.

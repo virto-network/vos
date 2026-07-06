@@ -2,10 +2,11 @@
 //!
 //! A framework-level convention for binding a zkpvm proof of an actor
 //! handler to the specific `(public_inputs, return_value)` tuple a
-//! caller asserts it ran on — turning Phase Z0's STARK-bound
-//! `final_state.registers` from "the registers are bound" into "the
-//! caller can assert this proof corresponds to this exact `(public,
-//! return)`".
+//! caller asserts it ran on — placing that tuple's hash in
+//! `final_state.registers` (φ[9..12]) so the caller can assert this
+//! proof corresponds to this exact `(public, return)`. (SOUNDNESS
+//! CAVEAT below: the register binding is currently complete only
+//! against an honest prover — see step 2.)
 //!
 //! ## What the hash binds (and what it deliberately does NOT)
 //!
@@ -27,9 +28,9 @@
 //!   of a different program.  A name-tag in the hash would be a third,
 //!   redundant copy of identity — and a *claim* (a tag can be reused for
 //!   different code) rather than a *proof* (a commitment cannot).
-//! - **The human name** ("voucher-check") belongs in the provenance /
-//!   catalog layer (program_id → trusted commitment), where naming,
-//!   versioning, and governance actually live.
+//! - **The human name** (a program's catalog name) belongs in the
+//!   provenance / catalog layer (program_id → trusted commitment), where
+//!   naming, versioning, and governance actually live.
 //! - **Which operation** within a multi-handler program, when a protocol
 //!   needs to distinguish, is just another *public input* the actor
 //!   folds into `public` — one concept (public inputs), not a separate
@@ -49,10 +50,17 @@
 //! 2. The actor's halt sequence places that hash into the final-state
 //!    register window φ[9..12] (RISC-V `a2..a5`) via inline-asm `in`
 //!    operands on the halting `ecall` (see `actors::run`'s
-//!    `halt_with_output_bound`).  Phase Z0's closing chip already
-//!    STARK-binds `final_state.registers`, so the hash becomes a
-//!    tamper-evident public output with no tracer/host cooperation — no
-//!    new ECALL, no prover changes.
+//!    `halt_with_output_bound`).  Phase Z0's closing chip pins the
+//!    final-register columns and the verifier's boundary-binding check
+//!    (`zkpvm::boundary_binding`, v5) equates `final_state.registers` to
+//!    them — no new ECALL, no prover changes.  SOUNDNESS CAVEAT: that
+//!    column is pinned to the trace's true final registers only by the
+//!    register-ledger read-consistency, which is currently vacuous
+//!    against a from-scratch prover (`prev_value` is a free witness), so
+//!    a malicious prover can still forge this hash; closing that needs
+//!    the register-ledger read-consistency fix (see
+//!    `zkpvm::chips::register_memory_closing`). Sound against an honest
+//!    prover today.
 //! 3. The host verifier reconstructs the hash from the proof via
 //!    [`zkpvm::Proof::public_io_hash`] and compares it against a locally
 //!    recomputed [`compute_io_hash`] — alongside the STARK validity
@@ -187,6 +195,31 @@ pub unsafe fn read_witness_buffer(ptr: *const u8, cap: usize) -> Option<Witness>
     Some((public, secret))
 }
 
+/// Host-side: find the flat-memory address of the `__VOS_WITNESS` symbol
+/// in a provable actor's ELF — the offset the host `prover` extension
+/// patches opaque witness bytes into before tracing. `None` if the file
+/// isn't an ELF, the symbol is absent, or its address is `0` (unresolved).
+///
+/// The transpiled PVM blob preserves the ELF's flat-memory layout, so this
+/// address equals the blob offset `zkpvm::actor::trace_blob_with_patches`
+/// (and hence the prover's `prove` / `prove_chain`) expects. A caller that
+/// holds an actor ELF transpiles it and locates the witness buffer here,
+/// then hands both to the (ELF-agnostic) prover.
+#[cfg(feature = "std")]
+pub fn witness_addr(elf: &[u8]) -> Option<u64> {
+    use object::{Object, ObjectSymbol};
+    let obj = object::File::parse(elf).ok()?;
+    for sym in obj.symbols() {
+        if sym.name().ok() == Some("__VOS_WITNESS") {
+            let addr = sym.address();
+            if addr != 0 {
+                return Some(addr);
+            }
+        }
+    }
+    None
+}
+
 /// Declare the standard ZK witness-injection buffer `__VOS_WITNESS` of
 /// `$n` bytes, plus a `__vos_read_witness()` helper that reads the
 /// conventional length-prefixed `(public, secret)` payload back (see
@@ -305,7 +338,7 @@ where
 /// guest and verifier agree by construction, with no rkyv-layout /
 /// cross-crate coupling.
 ///
-/// e.g. `vos::zk::bind_io_bytes(&cipher_clerk::voucher::proof::public_bytes(&p), &[1u8])`.
+/// e.g. `vos::zk::bind_io_bytes(&my_public_bytes, &[1u8])`.
 /// Same halt/φ[9..12] placement and last-binding-wins semantics as
 /// [`bind_io`].
 #[cfg(feature = "pvm")]

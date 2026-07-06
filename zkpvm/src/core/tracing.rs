@@ -53,6 +53,10 @@ pub struct ScalarBinopRecord {
 
 #[derive(Clone, Debug)]
 pub struct ScalarBinopMemOp {
+    /// ECALL id (113 = SCALAR_MUL_MOD_L, 114 = SCALAR_ADD_MOD_L).  Carried so
+    /// RistrettoEcallChip can emit the matching RELATION-A `id` limb (the two
+    /// share an identical memory layout but CpuChip produces a per-imm id).
+    pub op_id: u32,
     pub a_ptr: u32,
     pub b_ptr: u32,
     pub output_ptr: u32,
@@ -110,11 +114,10 @@ pub struct RistrettoPointAddMemOp {
 /// dispatch fixed-base scalar mults (Ristretto255 basepoint G) onto
 /// the comb-method path and variable-base mults onto double-and-add.
 ///
-/// Session 2.1 of `crates/zkpvm/PERF_ROADMAP.md`: this enum is the
-/// side-note plumbing for the comb method.  The chip side (lookup
-/// relation, preprocessed columns, fixed-base row class) is the
-/// follow-up; today the field is informational and the chip still
-/// runs the variable-base path for every record.
+/// This enum is the side-note plumbing for the comb method.  The chip
+/// side (lookup relation, preprocessed columns, fixed-base row class)
+/// is the follow-up; today the field is informational and the chip
+/// still runs the variable-base path for every record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ScalarMultKind {
     /// Default: input point is not a registered fixed base.  Chip
@@ -528,15 +531,13 @@ impl TracingPvm {
         });
     }
 
-    /// Step 18: scalar mul/add mod ℓ.  Reads 32 + 32, writes 32.
+    /// Scalar mul/add mod ℓ.  Reads 32 + 32, writes 32.
     fn handle_scalar_binop_ecall(&mut self, op_id: u32) {
         // PVM A0/A1/A2 = φ[7/8/9] per grey-transpiler's mapping.  The
         // shim's `in("a0") a_ptr, in("a1") b_ptr, in("a2") output_ptr`
-        // routes pointers to those PVM registers.  Pre-fix the handler
-        // read φ[10/11/12] (= a3/a4/a5) and saw shim's `in("a3") 0u64,
-        // in("a4") 0u64, in("a5") VOS_OBJECT_CAP` padding.  Same
-        // off-by-three pattern as the other ECALL handlers; no
-        // CpuChip-side binding tuple, so handler-only fix.
+        // routes pointers to those PVM registers — not a3/a4/a5
+        // (φ[10/11/12]), which the shim pads with `0, 0, VOS_OBJECT_CAP`.
+        // No CpuChip-side binding tuple, so this is handler-only.
         let a_ptr_u = self.pvm.registers[7] as usize;
         let b_ptr_u = self.pvm.registers[8] as usize;
         let output_ptr_u = self.pvm.registers[9] as usize;
@@ -569,6 +570,7 @@ impl TracingPvm {
             output: out_bytes,
         });
         self.scalar_binop_mem_ops.push(ScalarBinopMemOp {
+            op_id,
             a_ptr,
             b_ptr,
             output_ptr,
@@ -767,9 +769,9 @@ fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: 
 // canonical compressed Ristretto encoding of `k * P`, or `[0u8; 32]`
 // (compressed identity) on either non-canonical scalar bytes or an
 // invalid input point encoding.  This is exactly the function the
-// RistrettoChip will be constrained to compute — by going through the
-// same crate cipher-clerk uses, the precompile's input/output
-// agreement with cipher-clerk's own crypto is by construction.
+// RistrettoChip will be constrained to compute — by going through
+// `curve25519-dalek`, the precompile's input/output agreement with
+// the reference crypto is by construction.
 
 fn scalar_binop_sw(op_id: u32, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     use curve25519_dalek::scalar::Scalar;
@@ -855,7 +857,7 @@ pub(crate) fn decode_immediate(decoded_args: &args::Args) -> u64 {
 }
 
 /// Extract branch/jump target address from decoded args (0 if none).
-/// Phase 13d-loadimmjumpind: extract the second immediate (`imm_y`) for
+/// Extract the second immediate (`imm_y`) for
 /// opcodes that have one (TwoImm, RegTwoImm, TwoRegTwoImm).  Default 0
 /// for everything else.  LoadImmJumpInd uses this as the jump-offset
 /// (added to regs[rb] for djump dispatch); the existing `imm` holds

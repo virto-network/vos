@@ -1,6 +1,6 @@
 //! Host-side reference implementation of the Ristretto255 compress
 //! algorithm, expressed over our `field::Bytes` type so the
-//! `RistrettoCombCompressChip` (R1e-bis output binding) can derive
+//! `RistrettoCombCompressChip` can derive
 //! per-call witness intermediates without going through dalek's
 //! private FieldElement representation.
 //!

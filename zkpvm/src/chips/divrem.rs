@@ -1,21 +1,21 @@
-//! Phase 54g / 54i / 54k / 54j-redux — `DivRemChip`: per-divrem-row chip.
+//! `DivRemChip`: per-divrem-row chip.
 //!
 //! CpuChip emits one DivRemLookup producer per `is_div_rem=1` row;
 //! DivRemChip consumes once per real row.  DivRemChip witnesses
 //! three carry chains internally:
 //!
-//!   1. (54g) Schoolbook `q·d + r = b` (low 8 bytes) /
+//!   1. Schoolbook `q·d + r = b` (low 8 bytes) /
 //!      `q·d + r = div_corr_hi mod 2^64` (high 8 bytes), in both
 //!      64-bit and 32-bit forms.
-//!   2. (54i) Unsigned `r < d` uniqueness on
+//!   2. Unsigned `r < d` uniqueness on
 //!      `is_div_rem · ¬div_by_zero · ¬is_div_s` rows.
-//!   3. (54k) DivS sign-correction chain pinning DivCorrHi to
+//!   3. DivS sign-correction chain pinning DivCorrHi to
 //!      `sq·d + sd·q + sr − sb (mod 2^64)` on
 //!      `is_div_rem · ¬div_by_zero · is_div_s` rows.  64-bit chain
 //!      covers all 8 bytes; 32-bit chain covers low 4.
 //!
-//! Phase 54j-redux adds the full Phase 30 |val_d|<|div_remainder|
-//! chain (was on CpuChip).  The two's-complement conditional
+//! The chip also includes the full |val_d|<|div_remainder|
+//! comparison chain.  The two's-complement conditional
 //! negation chains compute AbsD/AbsR from val_d/div_remainder
 //! gated on sign_bit_d/sign_bit_r (flowed from CpuChip via the
 //! lookup tuple); the AbsCmp chain pins |val_d|>|div_remainder|
@@ -89,28 +89,27 @@ pub enum Column {
     DivByZero,
     #[size = 1]
     Is32Bit,
-    /// Phase 54i: signed-div flag (flowed via the lookup tuple).  Gates
+    /// Signed-div flag (flowed via the lookup tuple).  Gates
     /// the unsigned r<d uniqueness chain off so DivS rows aren't forced
-    /// through the unsigned predicate (DivS uses |r|<|d| separately —
-    /// Phase 30 / 54j).
+    /// through the unsigned predicate (DivS uses |r|<|d| separately).
     #[size = 1]
     IsDivS,
-    /// Phase 54i: per-byte `val_d + ~div_remainder + 1` chain witness
+    /// Per-byte `val_d + ~div_remainder + 1` chain witness
     /// (used on unsigned div rows to pin r < d).  Range-checked via
     /// Range256 on every real row.
     #[size = 8]
     DivCmpDiff,
-    /// Phase 54i: per-byte boolean carry of the chain.  Top carry = 1
+    /// Per-byte boolean carry of the chain.  Top carry = 1
     /// on unsigned div rows.
     #[size = 8]
     DivCmpCarry,
-    /// Phase 54k: per-byte carry of the DivS sign-correction chain.
+    /// Per-byte carry of the DivS sign-correction chain.
     /// Boolean per byte.
     #[size = 8]
     DivCorrCarry,
-    /// Phase 54k: 4 sign bits flowed from CpuChip via the lookup
-    /// tuple.  Used by the Phase 16/18 sign-correction chain (54k)
-    /// and the Phase 30 conditional-negation chain (54j-redux).
+    /// 4 sign bits flowed from CpuChip via the lookup
+    /// tuple.  Used by the sign-correction chain
+    /// and the conditional-negation chain.
     #[size = 1]
     SignBitB,
     #[size = 1]
@@ -119,19 +118,19 @@ pub enum Column {
     SignBitQ,
     #[size = 1]
     SignBitR,
-    /// Phase 54j-redux: |val_d| via two's-complement negation gated
+    /// |val_d| via two's-complement negation gated
     /// on sign_bit_d.  Internal witness; not flowed.
     #[size = 8]
     AbsD,
     #[size = 8]
     AbsDCarry,
-    /// Phase 54j-redux: |div_remainder| via two's-complement negation
+    /// |div_remainder| via two's-complement negation
     /// gated on sign_bit_r.
     #[size = 8]
     AbsR,
     #[size = 8]
     AbsRCarry,
-    /// Phase 54j-redux: per-byte `abs_d + ~abs_r + 1` chain witness.
+    /// Per-byte `abs_d + ~abs_r + 1` chain witness.
     /// Range-checked via Range256.  Top carry forced to 1 on signed
     /// div rows (`is_div_rem · ¬div_by_zero · is_div_s`).
     #[size = 8]
@@ -141,7 +140,7 @@ pub enum Column {
     #[size = 1]
     IsPadding,
 
-    // ── Phase I-divrem Stwo-v2.x degree-flatten helpers ──
+    // ── Stwo-v2.x degree-flatten helpers ──
     //
     // DivRemChip's natural form has constraints at degree 3-6, primarily
     // because the gating chains use up to 4 binary flags before
@@ -198,7 +197,7 @@ pub enum Column {
     #[size = 8]
     DivCmpCarryB,
 
-    /// DivS chain quadratic body helpers (Phase 54k flatten).
+    /// DivS chain quadratic body helpers.
     /// `SignQValDH[i] := SignBitQ · ValD[i]`
     #[size = 8]
     SignQValDH,
@@ -212,10 +211,9 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for DivRemChip {
-    /// Phase I-divrem flatten: dropped from 3 back to 2 — every
-    /// degree-3+ constraint has been lifted via helper columns
+    /// Every degree-3+ constraint is lifted via helper columns
     /// (DivActiveH, DivS64H, DivCmpCarryB, DivPartialSum64/32, etc.) so
-    /// the chip's actual algebraic degree is now ≤ 2.  Stwo v2.x's
+    /// the chip's actual algebraic degree is ≤ 2.  Stwo v2.x's
     /// lifted protocol enforces actual degree, not declared bound, but
     /// we keep the declared bound aligned for clarity.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
@@ -257,7 +255,7 @@ impl BuiltInComponent for DivRemChip {
         let abs_cmp_carry = crate::trace::trace_eval!(trace_eval, Column::AbsCmpCarry);
         let is_padding = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
 
-        // ── Phase I-divrem degree-flatten helpers ──
+        // ── Degree-flatten helpers ──
         let div_active_h = crate::trace::trace_eval!(trace_eval, Column::DivActiveH);
         let not_padding_div_h = crate::trace::trace_eval!(trace_eval, Column::NotPaddingDivH);
         let div_active_64_h = crate::trace::trace_eval!(trace_eval, Column::DivActive64H);
@@ -292,7 +290,7 @@ impl BuiltInComponent for DivRemChip {
         let is_64bit = E::F::one() - is_32bit[0].clone();
         let div_active = is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone());
 
-        // ── Phase I-divrem helper-defining constraints ──
+        // ── Helper-defining constraints ──
         eval.add_constraint(
             div_active_h[0].clone()
                 - is_div_rem[0].clone() * (E::F::one() - div_by_zero[0].clone()),
@@ -356,14 +354,14 @@ impl BuiltInComponent for DivRemChip {
         }
         let _ = div_active; // helpers above replace it everywhere below
 
-        // ── Phase 54g: schoolbook carry chain ──
+        // ── Schoolbook carry chain ──
         let f256: E::F = E::F::from(BaseField::from(256));
         let full_carry =
             |k: usize| -> E::F { mul_carry[k].clone() + mul_carry_hi[k].clone() * f256.clone() };
 
         // 64-bit chain (16 positions).  Low 8 → val_b; high 8 → div_corr_hi.
-        // Phase I-divrem flatten: gate is DivActive64H (deg 1 helper);
-        // partial-sum body lifted into DivPartialSum64[k] (deg 1 helper).
+        // Gate is DivActive64H (deg 1 helper); partial-sum body lifted
+        // into DivPartialSum64[k] (deg 1 helper).
         for k in 0..16usize {
             let rem_term = if k < WORD_SIZE {
                 div_remainder[k].clone()
@@ -411,16 +409,16 @@ impl BuiltInComponent for DivRemChip {
             eval.add_constraint(div_active_32_h[0].clone() * c);
         }
 
-        // ── Phase 54i: r < d uniqueness chain (unsigned div rows) ──
+        // ── r < d uniqueness chain (unsigned div rows) ──
         // Encoded as the carry chain for `val_d - 1 - div_remainder`
         // (= `val_d + ~div_remainder` with carry_in[0] = 0).  The top
         // carry is 1 iff `val_d > div_remainder`.  Without this, the
         // schoolbook q·d+r=b alone admits (q-1, r+d) as another valid
-        // pair — see CpuChip's prior comment block at the same spot.
+        // pair — see the corresponding comment block in CpuChip.
         // Boolean carry on every real row so the column can't drift
         // even when div_u_active=0.
-        // Phase I-divrem flatten: boolean carry pinned via DivCmpCarryB
-        // helper; gate becomes is_real · helper (deg 2).
+        // Boolean carry pinned via DivCmpCarryB helper; gate becomes
+        // is_real · helper (deg 2).
         for i in 0..WORD_SIZE {
             eval.add_constraint(is_real.clone() * div_cmp_carry_b[i].clone());
         }
@@ -446,8 +444,8 @@ impl BuiltInComponent for DivRemChip {
             div_u_active_h[0].clone() * (E::F::one() - div_cmp_carry[WORD_SIZE - 1].clone()),
         );
 
-        // ── Phase 54k: DivS sign-correction chain ──
-        // Was Phase 16/18 on CpuChip.  Pins
+        // ── DivS sign-correction chain ──
+        // Pins
         //   div_corr_hi[i] + div_corr_carry[i]·256 + (i==0 ? sb : 0)
         //     = sq·val_d[i] + sd·div_quotient[i] + carry_in + (i==0 ? sr : 0)
         // on `is_real · is_div_rem · ¬div_by_zero · is_div_s` rows.
@@ -455,23 +453,17 @@ impl BuiltInComponent for DivRemChip {
         //
         // No boolean constraint on DivCorrCarry: the trace fill writes
         // carry values in {-1, 0, 1, 2} (see CpuChip trace_fill.rs's
-        // Phase 16 block, lines 706-712 region), which are not boolean.
-        // The original CpuChip Phase 16/18 had no boolean here either —
-        // div_corr_hi is range-checked implicitly via the schoolbook
-        // chain (its bytes are bytes of high(q·d+r) mod 2^64), and the
-        // prover's freedom in div_corr_carry doesn't enable false
-        // proofs given the schoolbook + chain identities.
-        // Phase I-divrem flatten: gate via DivS64H / DivS32H (deg 1
-        // helpers).  Body has `sign_bit_q · val_d[i]` and `sign_bit_d ·
-        // div_quotient[i]` quadratic terms — but they're already deg 2
-        // and gated by deg-1 helper, so total deg 3.  STILL TOO HIGH —
-        // need body helpers too.
-        // Materialise SignQ_ValD[i] and SignD_DivQ[i] inline in the
-        // helper-defining section above… actually, easier: the gate is
-        // deg 1 (helper), the body has terms like `sign_bit_q · val_d[i]`
-        // (deg 2), so total = deg 3.  Need to lift the body too.
+        // sign-correction fill), which are not boolean.  A boolean
+        // constraint is not needed here — div_corr_hi is range-checked
+        // implicitly via the schoolbook chain (its bytes are bytes of
+        // high(q·d+r) mod 2^64), and the prover's freedom in
+        // div_corr_carry doesn't enable false proofs given the
+        // schoolbook + chain identities.
         //
-        // Use two more body helpers for the DivS chain:
+        // Gate via DivS64H / DivS32H (deg-1 helpers).  The body's
+        // `sign_bit_q · val_d[i]` and `sign_bit_d · div_quotient[i]`
+        // quadratic terms are lifted into body helpers so that gate ×
+        // body stays deg 2:
         //   sign_q_d[i]  := sign_bit_q · val_d[i]
         //   sign_d_q[i]  := sign_bit_d · div_quotient[i]
         // Then body = div_corr_hi + div_corr_carry·256 + extra_lhs -
@@ -542,16 +534,15 @@ impl BuiltInComponent for DivRemChip {
             );
         }
 
-        // ── Phase 54j-redux: |val_d| / |div_remainder| via two's-
-        // complement conditional negation + |val_d|>|div_remainder|
-        // comparison chain (was Phase 30 on CpuChip) ──
+        // ── |val_d| / |div_remainder| via two's-complement conditional
+        // negation + |val_d|>|div_remainder| comparison chain ──
         //
         // Conditional negation per value X (one of val_d, div_remainder):
         //   sign(X) = 0: Abs[i] = X[i],  AbsCarry[i] = 0
         //   sign(X) = 1: Abs[i] + AbsCarry[i]·256 = (255 − X[i]) + carry_in
         //                 with carry_in[0] = 1 (the +1 of two's complement).
-        // Phase I-divrem flatten: AbsD/AbsR conditional negation chains
-        // gated via RealNotSdH / RealSdH (and Sr counterparts).  Each is
+        // AbsD/AbsR conditional negation chains gated via
+        // RealNotSdH / RealSdH (and Sr counterparts).  Each is
         // a deg-1 helper; chain bodies are linear.
         let f_255: E::F = E::F::from(BaseField::from(255));
         // AbsD chain.
@@ -608,8 +599,8 @@ impl BuiltInComponent for DivRemChip {
                         - carry_in),
             );
         }
-        // Top carry = 1 on signed-div rows.  Phase I-divrem: gate via
-        // DivSActiveH (deg 1 helper).
+        // Top carry = 1 on signed-div rows.  Gate via DivSActiveH
+        // (deg 1 helper).
         eval.add_constraint(
             div_s_active_h[0].clone() * (E::F::one() - abs_cmp_carry[WORD_SIZE - 1].clone()),
         );
@@ -709,7 +700,7 @@ impl BuiltInProverComponent for DivRemChip {
             trace.fill_columns_bytes(row, &e.abs_cmp_carry, Column::AbsCmpCarry);
             trace.fill_columns(row, false, Column::IsPadding);
 
-            // ── Phase I-divrem helper fills ──
+            // ── Helper fills ──
             // IsDivRem is hardcoded `true` for every real entry (above);
             // div_active = is_div_rem && !div_by_zero collapses to !div_by_zero.
             let div_active = !e.div_by_zero;

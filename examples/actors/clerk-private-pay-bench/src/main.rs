@@ -21,8 +21,7 @@
 //! benchmark this is a fine stand-in for OsRng (which isn't available
 //! under no_std/PVM anyway).
 
-use vos::{actor, messages};
-vos::pvm_main!(crate::ClerkPrivatePayBench);
+use vos::{actor, messages, Context};
 
 use cipher_clerk::prelude::*;
 use cipher_clerk::ids::{AccountId, EntryId, TransferId, TxTemplateId};

@@ -35,8 +35,9 @@
 
 use crate::Proof;
 
-/// Program-identity hash type — alias for stwo's Blake2s Merkle root.
-pub type ProgramCommitment = stwo::core::vcs::blake2_hash::Blake2sHash;
+/// Program-identity hash type — the preprocessed-trace Merkle root, in the
+/// per-build PCS hash (Blake2s by default; `P2Hash` under `poseidon2-channel`).
+pub type ProgramCommitment = crate::recursion_pcs::ProverMerkleHash;
 
 /// Extract the program-commitment Merkle root from a proof.
 ///

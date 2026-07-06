@@ -1,18 +1,12 @@
 //! Per-row witness builder for field arithmetic rows in the
 //! RistrettoChip trace.
 //!
-//! Phase R1c-2 lands the column shape and the witness-fill function
-//! that produces, for one host-side field operation, the byte
-//! decomposition the chip's constraints (R1c-3 onwards) will pin.
+//! Produces, for one host-side field operation, the byte decomposition
+//! that the chip's constraints pin.  Cross-checked end-to-end against
+//! the host reference in `field.rs`.
 //!
-//! No constraints fire here yet — the chip in `mod.rs` is still the
-//! R1b empty stub and `add_constraints` does nothing.  This module
-//! exists so the witness side is in place, end-to-end testable
-//! against the host reference in `field.rs`, before constraint blocks
-//! land row-by-row.
-//!
-//! Each row witnesses ONE field operation.  The full chip will
-//! interleave many such rows per scalar mult (R1e schedules them).
+//! Each row witnesses ONE field operation.  The full chip interleaves
+//! many such rows per scalar mult.
 
 #![cfg(feature = "prover")]
 
@@ -20,7 +14,7 @@ use super::field::{self, Bytes};
 
 /// One row of field-arithmetic witness data.  Lives in `SideNote`-
 /// equivalent host memory until the chip's `generate_main_trace`
-/// reads it and lays it into the per-column array (R1c-3+).
+/// reads it and lays it into the per-column array.
 ///
 /// All byte arrays are little-endian, consistent with `field::Bytes`.
 #[derive(Clone, Copy, Debug)]
@@ -55,15 +49,15 @@ pub struct FieldOpRow {
     /// Closure: equals `sub_chain_carry_aip[31]`.
     /// Zero throughout on is_add / is_mul rows.
     pub sub_chain_borrow: [u8; 32],
-    /// R1f-fix: per-position carry chain for `a + is_underflow·p`
+    /// Per-position carry chain for `a + is_underflow·p`
     /// on is_sub rows.  Closure: equals `sub_chain_borrow[31]`.
     /// Zero throughout on is_add / is_mul rows.
     pub sub_chain_carry_aip: [u8; 32],
-    /// R1c-4: unreduced 64-byte schoolbook product `a · b` for
+    /// Unreduced 64-byte schoolbook product `a · b` for
     /// is_mul rows.  Bytes 0..32 are the low half; 32..64 the high
     /// half.  Zero throughout on is_add / is_sub rows.
     pub mul_product: [u8; 64],
-    /// R1c-4: per-position carry chain split into 3 bytes (lo, mid,
+    /// Per-position carry chain split into 3 bytes (lo, mid,
     /// hi) per position.  full_carry[k] = mul_carry[k] + 256·mul_carry_mid[k]
     /// + 65536·mul_carry_hi[k].  At most ~21 bits / position — the
     /// hi byte is usually 0 but reserved for the maximum-density
@@ -71,61 +65,59 @@ pub struct FieldOpRow {
     pub mul_carry: [u8; 64],
     pub mul_carry_mid: [u8; 64],
     pub mul_carry_hi: [u8; 64],
-    /// R1c-5-a: pass-1 reduction fold `lo + 38·hi` low 32 bytes.
+    /// Pass-1 reduction fold `lo + 38·hi` low 32 bytes.
     pub pass1_lo: [u8; 32],
-    /// R1c-5-a: pass-1 overflow head (≤ 38, fits in 2 bytes).
+    /// Pass-1 overflow head (≤ 38, fits in 2 bytes).
     pub pass1_hi: [u8; 2],
-    /// R1c-5-a: pass-1 carry chain split as low + mid bytes.
+    /// Pass-1 carry chain split as low + mid bytes.
     pub pass1_carry: [u8; 32],
     pub pass1_carry_mid: [u8; 32],
-    /// R1c-5-a: pass-2 fold `pass1_lo + 38·pass1_hi` low 32 bytes.
+    /// Pass-2 fold `pass1_lo + 38·pass1_hi` low 32 bytes.
     pub pass2_lo: [u8; 32],
-    /// R1c-5-a: pass-2 carry-out (single bit).
+    /// Pass-2 carry-out (single bit).
     pub pass2_carry_out: u8,
-    /// R1c-5-a: per-position pass-2 carry chain.
+    /// Per-position pass-2 carry chain.
     pub pass2_carry: [u8; 32],
-    /// R1c-5-a: top bit of pass2_lo[31] before the +19 step.
+    /// Top bit of pass2_lo[31] before the +19 step.
     pub pass2_top_bit: u8,
-    /// R1c-5-a: pass-2 result with bit 255 cleared and +19 folded
+    /// Pass-2 result with bit 255 cleared and +19 folded
     /// in if pass2_carry_out + pass2_top_bit indicates the value
     /// crossed 2²⁵⁵.  This is the value that goes through
     /// final-form `< p` check on the way to FieldOut.
     pub after_top_bit: [u8; 32],
-    /// R1c-5-a: per-position +19 step carry chain.
+    /// Per-position +19 step carry chain.
     pub after_top_carry: [u8; 32],
     /// Operation classifier — exactly one of these is 1 on a real row.
     pub is_add: u8,
     pub is_sub: u8,
     pub is_mul: u8,
-    /// R1e-bdry: 1 iff this row is a boundary-INPUT producer (no
+    /// 1 iff this row is a boundary-INPUT producer (no
     /// field-op constraints, no consumer emissions; only emits
     /// producer tuples for `out`).  Mutually exclusive with
     /// is_add/is_sub/is_mul on real rows.
     pub is_input: u8,
-    /// R1e-bdry: 1 iff this row is a boundary-OUTPUT consumer
+    /// 1 iff this row is a boundary-OUTPUT consumer
     /// (drains the chain's final out via consumer A).  No producer,
     /// no consumer B, no field-op constraints.
     pub is_output: u8,
-    /// R1e-pent: row-id of the row whose `out` produces this row's
+    /// Row-id of the row whose `out` produces this row's
     /// `a`.  Bound to the chip's `RistrettoRegisterFile` lookup.
     /// 0 by default (sentinel "input" row); writers must set
     /// correctly when chaining.
     pub a_source_row: u16,
-    /// R1e-pent: row-id of the row whose `out` produces this row's `b`.
+    /// Row-id of the row whose `out` produces this row's `b`.
     pub b_source_row: u16,
     /// 0 iff this is a padding / unused row.
     pub is_real: u8,
-    /// Step 4: number of distinct downstream consumer rows that
-    /// reference THIS row's `out` via their `a_source_row` /
-    /// `b_source_row`.  The chip scales the producer lookup
-    /// emission by this count, so a single op row's output can be
-    /// consumed N times without inserting passthrough rows.
-    /// Defaults to 1 on real producer rows (input + add/sub/mul);
-    /// 0 on output and padding rows (chip enforces both).  Witness
-    /// builders that compose multi-consumer chains MUST set this
-    /// correctly per row, else the chip's lookup won't balance.
-    /// Stored as u16 — full 256-bit scalar-mult ladders push some
-    /// producers (zero, basepoint coords) past 256.
+    /// Number of distinct downstream consumer rows that reference THIS
+    /// row's `out` via their `a_source_row` / `b_source_row`.  The
+    /// register-file producer emits its `out` scaled by this count, so a
+    /// single op row's output can be consumed N times without inserting
+    /// passthrough rows.  RistrettoChip recomputes this from the source
+    /// threading in its own trace-gen; the sibling consumer chips
+    /// (fixed-base / comb) read the stored value, which they set via
+    /// their own finalize.  Stored as u16 — full 256-bit scalar-mult
+    /// ladders push some producers (zero, basepoint coords) past 256.
     pub producer_multiplicity: u16,
 }
 
@@ -172,7 +164,7 @@ impl Default for FieldOpRow {
 /// Build a witness row for `out = (a + b) mod p`.  Re-runs the host
 /// reference to get the canonical output, then re-derives the byte-
 /// wise carry chain and `is_overflow` bit so they line up with the
-/// constraint chain the chip will pin in R1c-3.
+/// constraint chain the chip pins.
 pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
     // Pre-condition that the chip will also enforce: a, b < p.
     debug_assert!(less_than_p(&a), "operand a must be canonical (< p)");
@@ -276,8 +268,9 @@ pub fn fill_add(a: Bytes, b: Bytes) -> FieldOpRow {
         is_real: 1,
         a_source_row: 0, // caller sets via post-fill mutation if chaining
         b_source_row: 0,
-        // Set by `SideNote::finalize_ristretto_multiplicities()` from
-        // observed consumer counts; default 0 here.
+        // For RistrettoChip this is computed by the chip's own trace-gen
+        // from the source threading; the stored value is only read by the
+        // sibling consumer chips (which set it via their own finalize).
         producer_multiplicity: 0,
     }
 }
@@ -294,7 +287,7 @@ pub fn fill_sub(a: Bytes, b: Bytes) -> FieldOpRow {
     let out = field::sub(&a, &b);
     let is_underflow: u8 = if !ge_bytes(&a, &b) { 1 } else { 0 };
 
-    // R1f-fix: two-sided carry chains witnessing the byte-wise
+    // Two-sided carry chains witnessing the byte-wise
     // equality `out + b == a + is_underflow·p`.  Each side has its
     // own forward-carry chain in {0, 1}; closure asserts the final
     // carries are equal (i.e. both sides reach the same total).
@@ -408,7 +401,7 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
     debug_assert!(less_than_p(&a));
     debug_assert!(less_than_p(&b));
 
-    // ── Schoolbook (R1c-4) ──
+    // ── Schoolbook ──
     let mut prod = [0u32; 64];
     for i in 0..32 {
         for j in 0..32 {
@@ -479,9 +472,8 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         pass2_carry[k] = (nc & 0xff) as u8;
         // Carry can be ~15 bits at positions 0-1, but the chip's
         // pass2_carry column is 1 byte.  At higher positions carry
-        // is ≤ 1.  This is a constraint-soundness issue we'll
-        // revisit in R1e-pent — for now we widen pass2_carry to a
-        // byte and assert it fits.
+        // is ≤ 1.  pass2_carry is widened to a byte and asserted to
+        // fit.
         debug_assert!(
             nc < 256,
             "pass2_carry overflowed 1 byte at position {k} (= {nc})"
@@ -564,12 +556,12 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
         final_form_borrow,
         sub_chain_borrow: [0u8; 32],    // unused on is_mul rows
         sub_chain_carry_aip: [0u8; 32], // unused on is_mul rows
-        // Schoolbook witnesses (R1c-4).
+        // Schoolbook witnesses.
         mul_product,
         mul_carry,
         mul_carry_mid,
         mul_carry_hi,
-        // Reduction witnesses (R1c-5).
+        // Reduction witnesses.
         pass1_lo,
         pass1_hi,
         pass1_carry,
@@ -592,7 +584,7 @@ pub fn fill_mul(a: Bytes, b: Bytes) -> FieldOpRow {
     }
 }
 
-/// R1e-bdry: build a boundary-INPUT producer row.  Holds the
+/// Build a boundary-INPUT producer row.  Holds the
 /// supplied boundary value in `out`; emits per-byte producer
 /// tuples (so subsequent op rows can consume from this row's
 /// row_id) without firing field-op constraints or consumer
@@ -616,15 +608,15 @@ pub fn fill_input(value: Bytes) -> FieldOpRow {
     row.final_form_borrow = final_form_borrow;
     row.is_input = 1;
     row.is_real = 1;
-    // Multiplicity set by `SideNote::finalize_ristretto_multiplicities`.
+    // Multiplicity is computed by the consuming chip's trace-gen.
     row
 }
 
-/// R1e-bdry: build a boundary-OUTPUT consumer row.  Sets `a` to the
+/// Build a boundary-OUTPUT consumer row.  Sets `a` to the
 /// value being drained and points `a_source_row` to the row that
 /// produced it.  No producer, no consumer B, no field-op
-/// constraints.  Used to close the chain in chip-only tests; in R1f,
-/// the ECALL OUTPUT boundary takes this role via MemoryChip writes.
+/// constraints.  Used to close the chain in chip-only tests; the
+/// ECALL OUTPUT boundary takes this role via MemoryChip writes.
 pub fn fill_output(value: Bytes, source_row: u16) -> FieldOpRow {
     let mut row = FieldOpRow::default();
     row.a = value;
@@ -640,16 +632,15 @@ pub fn fill_padding() -> FieldOpRow {
     FieldOpRow::default()
 }
 
-/// R1f-soundness: host-side row-sequence composition validator.
+/// Host-side row-sequence composition validator.
 /// Confirms every real row's `a` and `b` either match a prior real
 /// row's `out` (composed), or appear in `boundary_inputs` (chip
 /// inputs from outside, e.g. ECALL scalar / point bytes).  Returns
 /// `Err(reason)` for any unattested input.
 ///
 /// Provides soundness assurance for trusted witness builders
-/// (catches bugs in the point-op generators) until R1e-pent's
-/// register-file lookup lands the same check at the chip-constraint
-/// level.
+/// (catches bugs in the point-op generators); the chip's register-file
+/// lookup enforces the same check at the chip-constraint level.
 pub fn validate_row_sequence_composes(
     rows: &[FieldOpRow],
     boundary_inputs: &[Bytes],
@@ -675,15 +666,15 @@ pub fn validate_row_sequence_composes(
     Ok(())
 }
 
-/// R1c-6: square-and-multiply ladder rows for `base^exp mod p`.
+/// Square-and-multiply ladder rows for `base^exp mod p`.
 ///
 /// Emits a sequence of is_mul `FieldOpRow`s that, when chained
 /// together (each row's `out` is the next row's input where the
 /// schedule says so), compute `base^exp mod p`.  No new chip
-/// primitive — the chip's existing is_mul row constraints
-/// (R1c-4-b schoolbook + R1c-5-b reduction) cover each emitted row.
+/// primitive — the chip's is_mul row constraints (schoolbook +
+/// reduction) cover each emitted row.
 ///
-/// The chip-level row scheduler (R1e) is responsible for binding
+/// The chip-level row scheduler is responsible for binding
 /// each row's `FieldA` / `FieldB` to the appropriate
 /// previously-emitted output via boundary lookups; this function
 /// just emits the rows in the canonical order so the host knows
@@ -727,7 +718,7 @@ pub fn pow_rows(base: Bytes, exp: Bytes) -> alloc::vec::Vec<FieldOpRow> {
     rows
 }
 
-/// R1c-6: convenience driver for `a⁻¹ mod p` via Fermat's little
+/// Convenience driver for `a⁻¹ mod p` via Fermat's little
 /// theorem (`a^(p−2)`).  Each emitted row is a fully-constrained
 /// is_mul row; the final row's `out` equals `field::inv(a)`.
 pub fn inv_rows(a: Bytes) -> alloc::vec::Vec<FieldOpRow> {
@@ -752,8 +743,8 @@ pub fn inv_rows(a: Bytes) -> alloc::vec::Vec<FieldOpRow> {
 }
 
 /// True iff `a` (32 bytes LE) is strictly less than p = 2²⁵⁵-19.
-/// Used as a witness pre-condition; the chip will pin canonicality at
-/// the boundary lookup (R1e).
+/// Used as a witness pre-condition; the chip pins canonicality at
+/// the boundary lookup.
 fn less_than_p(a: &Bytes) -> bool {
     for i in (0..32).rev() {
         match a[i].cmp(&field::P_BYTES[i]) {

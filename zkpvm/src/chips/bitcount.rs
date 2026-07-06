@@ -1,4 +1,4 @@
-//! Phase 34: BitcountChip — 256-row lookup table proving
+//! BitcountChip — 256-row lookup table proving
 //! `(byte, byte.leading_zeros(), byte.trailing_zeros())`.
 //!
 //! Each row holds `(byte, lz_byte, tz_byte)` for `byte ∈ [0, 256)`.

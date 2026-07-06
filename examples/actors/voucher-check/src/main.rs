@@ -1,43 +1,46 @@
-//! voucher-check — PVM guest binary whose execution IS the witness for a
-//! `cipher_clerk::voucher::proof::check` proof.
+//! voucher-check — PVM guest whose traced execution IS the witness for a
+//! **confidential state-transition** behind a `Mode::External` voucher.
 //!
-//! ## Two entry paths
+//! ## What it proves (conservation-of-value)
 //!
-//! Both run `cipher_clerk::voucher::proof::check`; the difference is
-//! how (Public, Secret) reach the function.
+//! The guest decodes a `(cipher_clerk::voucher::proof::Public,
+//! cipher_clerk::succinct::SuccinctTransitionWitness)` pair from the
+//! standard ZK witness buffer `__VOS_WITNESS` and PROVES, via
+//! [`SuccinctTransitionWitness::verify_transition`]:
 //!
-//! 1. **`start` (lifecycle on_start hook)** — reads (Public, Secret)
-//!    from the standard ZK witness buffer `__VOS_WITNESS` (declared via
-//!    `vos::zk::witness_buffer!`). The host `prover` extension writes the
-//!    rkyv-archived bytes into the flat-mem region backing that buffer
-//!    before `TracingPvm::run` (locating it by ELF symbol name), and the
-//!    trace ingests them via a normal `volatile_read`. Falls back to a
-//!    hardcoded witness when the buffer is empty (e.g. a regular
-//!    `vosx run` invocation, or a v0 smoke test).
+//! 1. the touched leaves' Merkle paths reconstruct the voucher's bound
+//!    `state_root_before` (balances are READ from the committed ledger via
+//!    the proofs, not asserted as a free input — the hole the old
+//!    `voucher::proof::check` left open);
+//! 2. applying the batch yields exactly `state_root_after`, with the
+//!    kernel enforcing double-entry zero-sum, **no-overdraft**, idempotency
+//!    and signatures; and
+//! 3. every event applied cleanly.
 //!
-//! 2. **`verify_check(public_bytes, secret_bytes)` (mailbox message)**
-//!    — production-shape path: take the witness as message args. Used
-//!    when invoking the actor through the actor framework's normal
-//!    INVOKE channel (cross-actor call from a host extension or
-//!    another actor). The prove path doesn't currently use this —
-//!    static BSS is deterministic per-ELF, mailbox payloads embed
-//!    runtime-allocated pointers that drift between runs.
+//! It then ties the voucher's `amount_commit` to a debit the batch
+//! actually applied ([`SuccinctTransitionWitness::has_debit_commit`]) and
+//! binds the voucher's `public_bytes` into the proof's tagless io-hash. Any
+//! rule violation panics → `Trap` → the proof won't verify.
 //!
-//! Returns `1` on success, `0` if either argument fails to decode.
-//! A check-rule violation panics inside `check` and surfaces as
-//! `Trap` exit + non-zero panics counter.
+//! ## Witness injection
+//!
+//! The host `prover` extension patches the rkyv-archived `(Public,
+//! SuccinctTransitionWitness)` into `__VOS_WITNESS` (located by ELF symbol)
+//! before `TracingPvm::run`. A bare `vosx run` (no injected witness) is not
+//! a proving run; `start` returns early in that case — the prover always
+//! injects a witness before tracing.
 
-use cipher_clerk::crypto::{Amount, AuthKey, Blinding};
-use cipher_clerk::voucher::proof::{self, Public, Secret};
+use cipher_clerk::succinct::SuccinctTransitionWitness;
+use cipher_clerk::voucher::proof::{self, Public};
 use vos::prelude::*;
 
-// Standard ZK witness-injection buffer `__VOS_WITNESS` (1024 bytes: the
-// current rkyv (Public ~128 B, Secret ~64 B) fits comfortably). The host
-// `prover` extension patches opaque witness bytes here before tracing,
-// located by the `__VOS_WITNESS` ELF symbol; `__vos_read_witness()` reads
-// the conventional length-prefixed `(public, secret)` payload back. Bump
-// the size if the witness grows.
-vos::zk::witness_buffer!(1024);
+// Standard ZK witness-injection buffer `__VOS_WITNESS`. A
+// `SuccinctTransitionWitness` carries only the batch's TOUCHED leaves +
+// their Merkle authentication paths against `state_root_before` (not the
+// whole ledger), so its size — and the guest's re-execution cost — scale
+// with the batch, not the ledger. The buffer lives in `.bss` (static),
+// distinct from the PVM heap the kernel re-execution allocates on.
+vos::zk::witness_buffer!(16384);
 
 #[actor]
 struct VoucherCheck;
@@ -48,93 +51,60 @@ impl VoucherCheck {
         VoucherCheck
     }
 
-    /// Lifecycle `on_start` hook. Reads (Public, Secret) from
-    /// `__VOS_WITNESS`; falls back to a hardcoded witness when the
-    /// buffer's length prefix is zero. Calls
-    /// `cipher_clerk::voucher::proof::check` — Trap on success,
-    /// panic on rule violation.
+    /// Lifecycle `on_start` hook — the prove path. Reads `(Public,
+    /// SuccinctTransitionWitness)` from `__VOS_WITNESS`, proves the bound
+    /// state-transition, ties the voucher to the proven debit, and binds
+    /// the voucher `public_bytes` into the proof's io-hash.
     #[msg]
     async fn start(&self, _ctx: &mut Context<Self>) -> u8 {
-        let (public, secret) = match read_witness() {
-            Some((p, s)) => (p, s),
-            None => hardcoded_witness(),
+        let Some((public, witness)) = read_witness() else {
+            // No injected witness — not a proving run (e.g. a bare
+            // `vosx run`). Nothing to prove; the prover always injects.
+            return 1;
         };
-        proof::check(&public, &secret);
-        // ZK actor-IO ABI (tagless): bind this proof to the asserted
-        // `(public, return)`.  The public half is cipher-clerk's explicit,
-        // domain-separated `public_bytes` — THE canonical proof-input
-        // encoding (byte-identical to what a Signature-mode proof signs and
-        // what the bridge's verifier reconstructs, with no rkyv-layout
-        // coupling); the return half is the raw `1` success marker.  (The
-        // witness still arrives as the rkyv `Public` archive — see
-        // `read_witness` — this only changes what gets *bound*, not what
-        // gets *decoded*.)  The hash lands in the Phase-Z0-bound final-state
-        // registers φ[9..12] at halt; the host verifier (the `prover`
-        // extension's `verify`) recomputes
-        // `vos::zk::compute_io_hash(public_bytes, return_bytes)` and checks
-        // equality, composed with the STARK-validity check against
-        // voucher-check's program commitment.  No actor/message tag is
-        // bound — the commitment is the program identity.
+
+        // 1. Conservation-of-value: the issuer's ledger at the bound
+        //    `state_root_before` really transitions to `state_root_after`
+        //    by applying this batch — balances read from the snapshot, no
+        //    overdraft, double-entry, all kernel-enforced. Panics on any
+        //    violation (≡ "the proof won't verify").
+        witness.verify_transition(public.state_root_before, public.state_root_after);
+
+        // 2. Tie THIS voucher to the proven debit: its `amount_commit` must
+        //    be a debit the batch actually applied. Without this, a valid
+        //    transition for an unrelated batch could be passed off as
+        //    proving this voucher. (Always enforced when a witness is
+        //    present — an empty batch has no debit and would be a
+        //    root_before==root_after mint hole otherwise.)
+        assert!(
+            witness.has_debit_commit(&public.amount_commit),
+            "voucher amount_commit is not a debit in the proven batch"
+        );
+
+        // 3. Bind the voucher's public inputs (tagless io-ABI). The host
+        //    verifier (`prover` extension's `verify`) recomputes
+        //    `compute_io_hash(public_bytes, [1])` and checks equality,
+        //    composed with STARK validity against voucher-check's program
+        //    commitment. The public encoding is unchanged from D1.
         let public_bytes = proof::public_bytes(&public);
         vos::zk::bind_io_bytes(&public_bytes, &[1u8]);
         1
     }
-
-    /// Mailbox message handler — production-shape (Public, Secret)
-    /// passing via actor framework. See module docs for why the
-    /// prove path uses `start` instead.
-    #[msg]
-    async fn verify_check(
-        &self,
-        _ctx: &mut Context<Self>,
-        public_bytes: Vec<u8>,
-        secret_bytes: Vec<u8>,
-    ) -> u8 {
-        let Ok(public) = vos::rkyv::from_bytes::<Public, vos::rkyv::rancor::Error>(&public_bytes)
-        else {
-            return 0;
-        };
-        let Ok(secret) = vos::rkyv::from_bytes::<Secret, vos::rkyv::rancor::Error>(&secret_bytes)
-        else {
-            return 0;
-        };
-        proof::check(&public, &secret);
-        1
-    }
 }
 
-/// Decode (Public, Secret) from the prover-patched `__VOS_WITNESS`
-/// buffer (via the `witness_buffer!`-emitted `__vos_read_witness`).
-/// Returns `None` if the buffer is unpatched or either rkyv archive
-/// fails to decode — the caller falls back to the hardcoded witness.
-/// The framework owns the volatile length-prefixed read; this actor
-/// only owns the decode of its own `(Public, Secret)` layout.
-fn read_witness() -> Option<(Public, Secret)> {
-    let (public_bytes, secret_bytes) = __vos_read_witness()?;
+/// Decode `(voucher::Public, SuccinctTransitionWitness)` from the
+/// prover-patched `__VOS_WITNESS` buffer (via the `witness_buffer!`-emitted
+/// `__vos_read_witness`). Returns `None` if the buffer is unpatched or
+/// either rkyv archive fails to decode — `start` then treats it as a
+/// non-proving run. The public half is the voucher `Public` (bound); the
+/// secret half is the `SuccinctTransitionWitness` (touched leaves + Merkle
+/// paths + openings + batch).
+fn read_witness() -> Option<(Public, SuccinctTransitionWitness)> {
+    let (public_bytes, witness_bytes) = __vos_read_witness()?;
     let public = vos::rkyv::from_bytes::<Public, vos::rkyv::rancor::Error>(&public_bytes).ok()?;
-    let secret = vos::rkyv::from_bytes::<Secret, vos::rkyv::rancor::Error>(&secret_bytes).ok()?;
-    Some((public, secret))
-}
-
-/// Fallback hardcoded (Public, Secret). Bytes are chosen so `check`
-/// passes: `amount_commit == Pedersen(amount, blinding)` and
-/// `sender_balance_before >= amount`. Used when the static buffer
-/// hasn't been patched (regular invocation outside the prover).
-fn hardcoded_witness() -> (Public, Secret) {
-    let amount: u64 = 100;
-    let amount_blinding =
-        Blinding::from_bytes([2u8; 32]).expect("[2u8; 32] is a canonical Ristretto scalar");
-    let amount_commit = Amount::commit(amount, &amount_blinding);
-    let public = Public {
-        issuer: AuthKey([0x11u8; 32]),
-        amount_commit,
-        state_root_before: [0xAAu8; 32],
-        state_root_after: [0xBBu8; 32],
-    };
-    let secret = Secret {
-        amount,
-        amount_blinding,
-        sender_balance_before: 1_000,
-    };
-    (public, secret)
+    let witness = vos::rkyv::from_bytes::<SuccinctTransitionWitness, vos::rkyv::rancor::Error>(
+        &witness_bytes,
+    )
+    .ok()?;
+    Some((public, witness))
 }

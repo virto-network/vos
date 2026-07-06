@@ -1,7 +1,6 @@
 #![cfg(feature = "prover")]
 
-//! Negative-test corpus for CpuChip's control-flow constraints
-//! (Phase 15-prep).
+//! Negative-test corpus for CpuChip's control-flow constraints.
 //!
 //! Each test crafts an honest branch trace, mutates a control-flow
 //! witness column (branch_taken, next_pc), and asserts prove+verify

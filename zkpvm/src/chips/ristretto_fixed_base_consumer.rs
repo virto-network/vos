@@ -1,16 +1,15 @@
-//! Session 2.1 step 5(b) + column-shrink — RistrettoFixedBaseConsumerChip.
+//! RistrettoFixedBaseConsumerChip.
 //!
 //! Per fixed-basepoint scalar mult call, lays out:
 //!   - 4 IsInput coord rows per window (X/Y/Z/T of `T[i][k_i]`).
 //!   - 18 FieldOp add rows per window for the point-add formula
 //!     `Acc' = Acc + T[i][k_i]` (see `point.rs::point_add_rows_chained`).
 //!
-//! The previous "lookup-anchor" row that carried (WindowIdx,
-//! ScalarWindow, X/Y/Z/T) and emitted the 130-limb
-//! `RistrettoCombLookupElements` tuple has been split out into
-//! `RistrettoCombAnchorChip` (sibling chip with 64 rows per call).
-//! That trims ~137 cells from this chip's per-row width and saves
-//! ~1.1 M cells at log_size=13 (8192 rows).
+//! The "lookup-anchor" row that carries (WindowIdx, ScalarWindow,
+//! X/Y/Z/T) and emits the 130-limb `RistrettoCombLookupElements`
+//! tuple lives in the sibling `RistrettoCombAnchorChip` (64 rows per
+//! call), keeping ~137 cells off this chip's per-row width and
+//! ~1.1 M cells off the prover at log_size=13 (8192 rows).
 //!
 //! Soundness chain:
 //!   - `RistrettoCombAnchorChip` emits the 130-limb comb relation
@@ -147,7 +146,7 @@ pub enum Column {
     IsOutput,
     #[size = 1]
     IsReal,
-    // Phase I-ristretto deg-flatten helpers — defined by FieldOp helper.
+    // Deg-flatten helpers — defined by FieldOp helper.
     #[size = 1]
     RealAddH,
     #[size = 1]
@@ -213,7 +212,7 @@ pub enum PreprocessedColumn {
     /// `ByteIdx[k] = k` for k=0..32.
     #[size = 32]
     ByteIdx,
-    /// R1e-bis Batch 4b: 1 iff this row is one of the 4 final-Acc
+    /// 1 iff this row is one of the 4 final-Acc
     /// mul rows of window 63 within a real per-call block — i.e.,
     /// the rows producing X3 / Y3 / T3 / Z3 of the running
     /// accumulator at the end of the comb chain.  Per-call block
@@ -612,7 +611,7 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
             ));
         }
 
-        // ── Final-Acc cross-chip producer (Batch 4b) ──
+        // ── Final-Acc cross-chip producer ──
         // On each of the 4 final-Acc rows of window 63 in real
         // per-call blocks (gated by IsFinalAccProducer), emit 32
         // producer tuples `(call_idx, coord_kind, byte_idx, out[k])`
@@ -642,8 +641,14 @@ impl BuiltInComponent for RistrettoFixedBaseConsumerChip {
 impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = log_size_for(consumer_n_rows(side_note));
+    fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
+        // Canonical-shape: use the (possibly forced) main-trace `log_size`
+        // (threaded by the erased layer). The RowIndex/ByteIdx columns are
+        // pure-positional; `IsFinalAccProducer`/`FinalAcc*` stay gated on the
+        // real call-blocks (`real_n_rows` below), so this chip's preprocessed
+        // CONTENT still depends on the per-segment comb-call count — which is
+        // why a segment chain needs the small published commitment allowlist
+        // {C_0, C_1, …} rather than a single commitment.
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
         let real_n_rows = consumer_n_rows(side_note);
@@ -690,8 +695,16 @@ impl BuiltInProverComponent for RistrettoFixedBaseConsumerChip {
     }
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         let rows = build_consumer_rows(side_note);
-        let log_size = log_size_for(rows.len());
+        let log_size = log_size_for(rows.len()).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
         for row_i in 0..num_rows {
@@ -895,7 +908,7 @@ fn fill_consumer_row(trace: &mut TraceBuilder<Column>, row_i: usize, cr: &Consum
         Column::BSourceRowHi,
     );
 
-    // Phase I-ristretto deg-flatten helpers.
+    // Deg-flatten helpers.
     let real_b = r.is_real != 0;
     let add_b = r.is_add != 0;
     let sub_b = r.is_sub != 0;

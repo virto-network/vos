@@ -281,7 +281,7 @@ pub enum Column {
     OutAnd2,
     #[size = 64]
     OutAnd2Hi,
-    // ── Phase 8b: ECALL memory binding ──────────────────────────
+    // ── ECALL memory binding ──────────────────────────
     // HPtr / MPtr are the register values φ[10]/φ[11] at the ECALL step,
     // CallTs is its timestamp.  Inter-row equality keeps them constant
     // within a compression so the 256 byte-level memory lookups emitted
@@ -324,26 +324,26 @@ pub enum Column {
     HWrAddrB2,
     #[size = 64]
     HWrAddrB3,
-    // Row type
+    // Row type.  mask_next_row so Blake2bBoundaryChip's IsReal-continuity
+    // anchor can read the next row; Blake2bChip leaves the next value unused.
     #[size = 1]
+    #[mask_next_row]
     IsReal,
-    // Phase I gate helpers — Stwo v2.x lifted-protocol degree flatten.
+    // Gate helpers — Stwo v2.x lifted-protocol degree flatten.
     // GateH        = IsReal · (1 - IsLastOfCompression)
     // InitGateH    = IsReal · IsFirstOfCompression
     // OutputGateH  = IsReal · IsLastOfCompression
     // Each is the per-row product of `IsReal` (main) and one of the
     // `IsFirstOfCompression`/`IsLastOfCompression` preprocessed columns.
     // Lifting these into helper columns drops the gate's algebraic
-    // degree from 2 to 1 in every gated constraint, paving the way for
-    // the rest of the I-blake2b-N rewrites.  See
-    // `STWO_PHASE_I_BLAKE2B.md` for the full plan.
+    // degree from 2 to 1 in every gated constraint.
     #[size = 1]
     GateH,
     #[size = 1]
     InitGateH,
     #[size = 1]
     OutputGateH,
-    // Phase I-blake2b-2 carry-bound helpers — flatten the degree-3 / -4
+    // Carry-bound helpers — flatten the degree-3 / -4
     // carry-domain constraints to degree 2.
     //
     // For Carry1 / Carry3 (3-input adds, c ∈ {0,1,2}):
@@ -373,14 +373,14 @@ pub enum Column {
     Carry4XcM1,
     #[size = 8]
     Rot63XcM1,
-    // Phase I-blake2b-3 F-bound helper.
+    // F-bound helper.
     //   FBoundH := F · (F-1)        (deg 2 helper-defining)
     //   is_real · FBoundH = 0        (deg 2; was `is_real · F · (F-1)`,
     //                                 deg 3, before flatten)
     // F ∈ {0,1} so FBoundH is always 0 in valid traces.
     #[size = 1]
     FBoundH,
-    // Phase I-blake2b-4 input-match sum helpers — flatten the 4 input
+    // Input-match sum helpers — flatten the 4 input
     // identity constraints (a_in / b_in / c_in / d_in vs the active V slot).
     //
     // Original (deg 3): is_real · (a_in[i] - Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i])
@@ -397,7 +397,7 @@ pub enum Column {
     InMatchC,
     #[size = 8]
     InMatchD,
-    // Phase I-blake2b-5 Mx / My slot-selection helpers — flatten the
+    // Mx / My slot-selection helpers — flatten the
     // 2 SIGMA-driven message-byte selectors.
     //
     // Original (deg 3): is_real · (mx[i] - Σ_k IsMxSlot[k] · M[k][i])
@@ -409,7 +409,7 @@ pub enum Column {
     MxSlotSum,
     #[size = 8]
     MySlotSum,
-    // Phase I-blake2b-6 V_next sum helpers — flatten the 16 V-state
+    // V_next sum helpers — flatten the 16 V-state
     // update constraints from degree 3 to degree 2.
     //
     // Original (deg 3): GateH · (V_next[k][i] - Σ_j IsGIdx[j] · contribution_j(k, i))
@@ -485,7 +485,7 @@ pub enum PreprocessedColumn {
     #[size = 1]
     IsLastOfCompression,
     /// 1 iff (r % 96) == 0 — first G-call of a compression.  Reserved for
-    /// the Phase 2 initial-state derivation constraint; currently unused.
+    /// the initial-state derivation constraint; currently unused.
     #[size = 1]
     IsFirstOfCompression,
     /// IsMxSlot[k] = 1 iff SIGMA[round(r)][2·g_idx(r)] == k (ie this row's

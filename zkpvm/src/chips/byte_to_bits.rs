@@ -1,8 +1,8 @@
-//! Phase 55a: ByteToBitsChip — 256-row lookup table proving
+//! ByteToBitsChip — 256-row lookup table proving
 //! `(byte, bit0, bit1, bit2, bit3, bit4, bit5, bit6, bit7)` where
 //! `byte = sum_{i=0..8} 2^i * bit_i`.
 //!
-//! Phase 55b's flag-packing uses this chip: ProgramMemoryChip's
+//! The flag-packing scheme uses this chip: ProgramMemoryChip's
 //! preprocessed table holds the 48 category/sub-category flags as 6
 //! packed bytes; CpuChip's main trace mirrors the 6 packed bytes plus
 //! the 48 individual flag columns it already commits to.  Per CpuChip
@@ -13,9 +13,10 @@
 //! committed columns and bind through the lookup balance to the
 //! canonical packed byte that was decoded from the opcode.
 //!
-//! In Phase 55a this chip is wired with no consumers (Multiplicity
-//! all zero, claimed_sum 0) — it just commits the preprocessed
-//! decomposition table.  Phase 55b adds the CpuChip-side consumer.
+//! This chip can be wired with or without consumers.  With no
+//! consumers, Multiplicity is all zero and claimed_sum is 0 — it just
+//! commits the preprocessed decomposition table.  The CpuChip-side
+//! consumer populates it otherwise.
 //!
 //! Mirrors the BitcountChip / PopcountChip pattern: a fixed
 //! preprocessed table plus a Multiplicity column counted from
@@ -56,9 +57,9 @@ const BYTE_TO_BITS_LOG_SIZE: u32 = 8; // 2^8 = 256 rows
 
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Multiplicity: how many CpuChip emissions hit this byte.  Phase
-    /// 55a leaves this all zero (no consumers); Phase 55b populates it
-    /// from CpuChip's per-row flag-byte decomposition emissions.
+    /// Multiplicity: how many CpuChip emissions hit this byte.  Zero
+    /// when wired with no consumers; populated by the CpuChip-side
+    /// consumer's per-row flag-byte decomposition emissions otherwise.
     #[size = 1]
     Multiplicity,
 }

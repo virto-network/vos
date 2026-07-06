@@ -111,13 +111,26 @@
 extern crate alloc;
 
 pub mod air_column;
+pub mod boundary_binding;
 pub mod chips;
 pub mod core;
 mod framework;
 pub mod framework_access;
 mod lookups;
 pub mod proof;
+pub mod segment;
 pub mod trace;
+
+// Native-recursion Stage-0: the Poseidon2-M31 PCS primitives + the per-build
+// PCS selection. Both are `no_std`-clean (verifier path uses them too); their
+// prover-only pieces are `#[cfg(feature = "prover")]` within.
+pub mod poseidon2;
+pub mod recursion_pcs;
+
+// The page-hash spec constants + tag chaining states are needed by the new
+// memory-Merkle chips' `add_constraints` (verifier-side, `no_std`); the
+// `SideNote` / segment / host-tree-building parts are `#[cfg(prover)]` within.
+pub mod page_merkle;
 
 #[cfg(feature = "prover")]
 pub mod side_note;
@@ -153,7 +166,10 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 // hash.  Both prover and verifier must agree on inclusion — `active_components`
 // is the single source of truth and is deterministic from `SideNote`.
 /// Indices into [`BASE_COMPONENTS`] for chips referenced by name in
-/// `ChipActivity::is_active` and other bit-position-sensitive sites.
+/// `ChipActivity::is_active`, `Proof::component_mask` bit positions,
+/// and other bit-position-sensitive sites (e.g. the boundary-binding
+/// check in `boundary_binding`, which the standalone verifier also
+/// uses — hence public and feature-ungated).
 ///
 /// Indexed positions are coupled to the declaration order of
 /// `BASE_COMPONENTS`. If you reorder the array, update these constants
@@ -162,37 +178,39 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 /// constants double as documentation for which chip each match arm
 /// in `is_active` refers to, so they're kept even for chips that
 /// don't currently appear in a match arm.
-#[cfg(feature = "prover")]
 #[allow(dead_code)]
-pub(crate) mod chip_idx {
+pub mod chip_idx {
     pub const CPU: usize = 0;
     pub const BLAKE2B: usize = 1;
-    pub const MEMORY: usize = 2;
-    pub const MEMORY_BOUNDARY: usize = 3;
-    pub const REGISTER_MEMORY: usize = 4;
-    pub const REGISTER_MEMORY_BOUNDARY: usize = 5;
-    pub const REGISTER_MEMORY_CLOSING: usize = 6;
-    pub const PROGRAM_BOUNDARY: usize = 7;
-    pub const PROGRAM_MEMORY: usize = 8;
-    pub const JUMP_TABLE: usize = 9;
-    pub const RANGE_MULTIPLICITY_256: usize = 10;
-    pub const BITWISE_LOOKUP: usize = 11;
-    pub const POWER_OF_TWO: usize = 12;
-    pub const POPCOUNT: usize = 13;
-    pub const BITCOUNT: usize = 14;
-    pub const BYTE_TO_BITS: usize = 15;
-    pub const MUL: usize = 16;
-    pub const BITWISE: usize = 17;
-    pub const COMPARE: usize = 18;
-    pub const DIVREM: usize = 19;
-    pub const RISTRETTO: usize = 20;
-    pub const RISTRETTO_ECALL: usize = 21;
-    pub const RISTRETTO_COMB_TABLE: usize = 22;
-    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 23;
-    pub const RISTRETTO_COMB_ANCHOR: usize = 24;
-    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 25;
-    pub const RISTRETTO_COMB_COMPRESS: usize = 26;
-    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 27;
+    pub const BLAKE2B_BOUNDARY: usize = 2;
+    pub const MEMORY: usize = 3;
+    pub const MEMORY_PAGE: usize = 4;
+    pub const MEMORY_MERKLE: usize = 5;
+    pub const MEMORY_ROOT_BOUNDARY: usize = 6;
+    pub const REGISTER_MEMORY: usize = 7;
+    pub const REGISTER_MEMORY_BOUNDARY: usize = 8;
+    pub const REGISTER_MEMORY_CLOSING: usize = 9;
+    pub const PROGRAM_BOUNDARY: usize = 10;
+    pub const PROGRAM_MEMORY: usize = 11;
+    pub const JUMP_TABLE: usize = 12;
+    pub const RANGE_MULTIPLICITY_256: usize = 13;
+    pub const BITWISE_LOOKUP: usize = 14;
+    pub const POWER_OF_TWO: usize = 15;
+    pub const POPCOUNT: usize = 16;
+    pub const BITCOUNT: usize = 17;
+    pub const BYTE_TO_BITS: usize = 18;
+    pub const MUL: usize = 19;
+    pub const BITWISE: usize = 20;
+    pub const COMPARE: usize = 21;
+    pub const DIVREM: usize = 22;
+    pub const RISTRETTO: usize = 23;
+    pub const RISTRETTO_ECALL: usize = 24;
+    pub const RISTRETTO_COMB_TABLE: usize = 25;
+    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 26;
+    pub const RISTRETTO_COMB_ANCHOR: usize = 27;
+    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 28;
+    pub const RISTRETTO_COMB_COMPRESS: usize = 29;
+    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 30;
     /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
     /// assertion in `lib.rs` checks this against the actual array length.
     pub const COUNT: usize = RISTRETTO_COMB_COMPRESS_OUTPUT + 1;
@@ -202,8 +220,11 @@ pub(crate) mod chip_idx {
 const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::CpuChip,
     &chips::Blake2bChip, // OPTIONAL — gated by !side_note.blake2b_calls.is_empty()
+    &chips::Blake2bBoundaryChip, // Phase A — proves the memory-page Merkle blake2b compressions
     &chips::MemoryChip,
-    &chips::MemoryBoundaryChip,
+    &chips::MemoryPageChip, // Phase A — per-page boundary writes/reads + leaf hashes
+    &chips::MemoryMerkleChip, // Phase A — Merkle merge rows
+    &chips::MemoryRootBoundaryChip, // Phase A — root sink (bound to public roots)
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
     &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers
@@ -243,8 +264,11 @@ const _: () = {
 const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::CpuChip,
     &chips::Blake2bChip,
+    &chips::Blake2bBoundaryChip,
     &chips::MemoryChip,
-    &chips::MemoryBoundaryChip,
+    &chips::MemoryPageChip,
+    &chips::MemoryMerkleChip,
+    &chips::MemoryRootBoundaryChip,
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
     &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers
@@ -259,6 +283,8 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::ByteToBitsChip, // Phase 55a
     &chips::MulChip,
     &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip, // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
+    &chips::DivRemChip,  // Phase 54g — consumer of DivRemLookup
     &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, mirrored in verifier-only build
     &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, mirrored in verifier-only build
     &chips::RistrettoCombTableChip,
@@ -268,6 +294,15 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::RistrettoCombCompressChip,
     &chips::RistrettoCombCompressOutputChip,
 ];
+
+#[cfg(not(feature = "prover"))]
+const _: () = {
+    assert!(
+        BASE_COMPONENTS.len() == chip_idx::COUNT,
+        "BASE_COMPONENTS length must match chip_idx::COUNT — chip added or removed without \
+         updating the constants in chip_idx",
+    );
+};
 
 /// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
 /// Returns the components active for THIS trace, in declaration order.
@@ -487,22 +522,34 @@ pub use proof::{
     PcsPolicy, Proof, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
     SegmentState, check_pcs_policy,
 };
+#[doc(hidden)]
+#[cfg(feature = "prover")]
+pub use prove::prove_with_boundary_override;
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, install_thread_pool, production_pcs_config, production_pcs_config_mobile, prove,
-    prove_mobile, prove_profiled, prove_profiled_with_config, prove_with_config,
-    prove_with_explicit_components,
+    ProveProfile, install_thread_pool, natural_log_sizes_for, prepare_side_note_for_verification,
+    production_pcs_config, production_pcs_config_mobile, prove, prove_canonical, prove_mobile,
+    prove_profiled, prove_profiled_with_config, prove_with_config, prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
-pub use prove::{debug_assert_constraints_explicit, debug_claimed_sums};
+pub use prove::{
+    debug_assert_constraints_explicit, debug_assert_constraints_streaming, debug_claimed_sums,
+    debug_claimed_sums_streaming,
+};
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
 pub use stwo::core::fri::FriConfig;
 pub use stwo::core::pcs::PcsConfig;
 #[cfg(feature = "prover")]
 pub use verify::{
-    DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_explicit_components,
-    verify_with_max_log_size, verify_with_options, verify_with_pcs_policy,
+    ComponentOodsMask, DEFAULT_MAX_LOG_SIZE, OodsReconstruction, reconstruct_oods_for_recursion,
+    verify, verify_chain, verify_with_explicit_components, verify_with_max_log_size,
+    verify_with_options, verify_with_pcs_policy,
+};
+#[cfg(all(feature = "prover", feature = "poseidon2-channel"))]
+pub use verify::{
+    DeepBatch, RecursionData, RecursionTranscript, extract_recursion_data,
+    record_canonical_transcript,
 };
 
 /// Phase I.0 chip-isolated harness surface — re-exports the trait

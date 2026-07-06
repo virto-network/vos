@@ -1,4 +1,4 @@
-//! CpuChip main-trace generation (Phase 47 split).
+//! CpuChip main-trace generation.
 //!
 //! Holds the per-step witness fill: for every traced PVM step, write
 //! the corresponding row of every CpuChip column.  The column shapes
@@ -16,7 +16,10 @@
 
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 
-use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
+use crate::core::ecall::{
+    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
+    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+};
 use crate::core::step::WORD_SIZE;
 use crate::side_note::SideNote;
 use crate::trace::builder::{FinalizedTrace, TraceBuilder};
@@ -24,6 +27,19 @@ use crate::trace::builder::{FinalizedTrace, TraceBuilder};
 use super::classify::{classify_opcode, dest_reg, uses_immediate};
 use super::columns::Column;
 use super::reg_access::step_reg_accesses;
+
+/// Carry chain for `NextTimestamp = Timestamp + 1`: carry i is 1 iff
+/// limbs 0..=i of `ts` are all 0xff (the increment overflows through
+/// them).  Limb 7 has no outgoing carry.
+fn fill_ts_carry(trace: &mut TraceBuilder<Column>, row: usize, ts: u64) {
+    let mut carry = [0u8; 7];
+    let mut all_ff = true;
+    for (i, c) in carry.iter_mut().enumerate() {
+        all_ff = all_ff && ((ts >> (8 * i)) & 0xff) == 0xff;
+        *c = all_ff as u8;
+    }
+    trace.fill_columns_bytes(row, &carry, Column::TsCarry);
+}
 
 pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
     let num_steps = side_note.num_steps();
@@ -41,9 +57,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns_bytes(row, &step.next_pc.to_le_bytes(), Column::NextPc);
         trace.fill_columns(row, step.opcode as u8, Column::Opcode);
         trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
-        // Phase 13b: 8-byte immediate witness for the ProgramMemory lookup.
+        // 8-byte immediate witness for the ProgramMemory lookup.
         trace.fill_columns_bytes(row, &step.imm.to_le_bytes(), Column::ImmBytes);
-        // Phase 13b: charge ProgramMemoryChip for this step's instruction
+        // charge ProgramMemoryChip for this step's instruction
         // fetch.  Two consumer emissions per step (paired) → producer
         // multiplicity = 2 · count_at_pc.
         *side_note.program_memory_counts.entry(step.pc).or_insert(0) += 2;
@@ -65,23 +81,33 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let flags = classify_opcode(step.opcode);
 
         // Source operands.  Default convention (used by all but
-        // the Phase-40 swap):
+        // the rotate-imm-alt swap):
         //   ThreeReg     → (regs[ra], regs[rb])
         //   TwoRegOneImm → (regs[rb], imm)
         //   TwoReg       → (0, regs[rb])
         //   OneRegImmOffset → (regs[ra], imm)  [imm-compare branches]
         //   Other immediate-source ops → (0, imm)
         //
-        // Phase 40: RotR64ImmAlt / RotR32ImmAlt swap the source
-        // convention — the immediate is the rotated value, the
-        // register is the shift amount.  In AIR terms: val_b ←
-        // imm, val_d ← regs[rb].
+        // RotR64ImmAlt / RotR32ImmAlt swap the source convention —
+        // the immediate is the rotated value, the register is the
+        // shift amount.  In AIR terms: val_b ← imm, val_d ← regs[rb].
         let (mut val_b, mut val_d) = match step.opcode.category() {
             javm::instruction::InstructionCategory::ThreeReg => {
                 (step.regs_before[step.reg_a], step.regs_before[step.reg_b])
             }
             javm::instruction::InstructionCategory::TwoRegOneImm if flags.is_rotate_r_imm_alt => {
-                // Phase 40 swap.
+                // Rotate-imm-alt swap.
+                (step.imm, step.regs_before[step.reg_b])
+            }
+            javm::instruction::InstructionCategory::TwoRegOneImm if flags.is_set_gt => {
+                // SetGt swap: val_b ← imm, val_d ← regs[rb], so the SetLt
+                // comparison computes (imm < reg) = (reg > imm) = the GT result.
+                (step.imm, step.regs_before[step.reg_b])
+            }
+            javm::instruction::InstructionCategory::TwoRegOneImm if flags.is_cmov_imm => {
+                // CmovIzImm/CmovNzImm swap: val_b ← imm (the moved value, so
+                // the cmov result constraint `result = val_b` binds it),
+                // val_d ← regs[rb] (the condition ValDIsZero gates).
                 (step.imm, step.regs_before[step.reg_b])
             }
             javm::instruction::InstructionCategory::TwoRegOneImm => {
@@ -96,13 +122,13 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             _ => (step.regs_before[step.reg_a], step.regs_before[step.reg_b]),
         };
 
-        // For left/right shifts and Phase-32/36 rotates: save shift
-        // amount, then replace val_d with 2^shift_amount.
+        // For left/right shifts and rotates: save shift amount, then
+        // replace val_d with 2^shift_amount.
         //
-        // Phase 35 / 36: RotR64 / RotR32 are also pow2-replacements,
-        // but with val_d = 2^((modulus − n_real) mod modulus) (the
-        // complement) so the mul-schoolbook's low+high yields the
-        // rotated-right value.  modulus = 32 for 32-bit, 64 for 64-bit.
+        // RotR64 / RotR32 are also pow2-replacements, but with
+        // val_d = 2^((modulus − n_real) mod modulus) (the complement)
+        // so the mul-schoolbook's low+high yields the rotated-right
+        // value.  modulus = 32 for 32-bit, 64 for 64-bit.
         let mut saved_shift_amount: u8 = 0;
         let mut saved_shift_amount_compl: u8 = 0;
         let mut saved_shift_quotient_compl: u64 = 0;
@@ -177,10 +203,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let mut mul_carry = [0u8; 16];
         let mut mul_carry_hi = [0u8; 16];
         let mut unsigned_product_hi_bytes = [0u8; WORD_SIZE];
-        // Phase 32: low-64 bytes of the unsigned schoolbook product.
+        // Low-64 bytes of the unsigned schoolbook product.
         // Filled on 64-bit `is_mul_low` rows so the schoolbook
-        // constraint is satisfied (the schoolbook now writes
-        // low-64 here instead of `result`).
+        // constraint is satisfied (the schoolbook writes low-64
+        // here rather than to `result`).
         let mut unsigned_product_low_bytes = [0u8; WORD_SIZE];
         let mut mul_corr_term_a = [0u8; WORD_SIZE];
         let mut mul_corr_term_b = [0u8; WORD_SIZE];
@@ -188,8 +214,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         if flags.is_mul {
             let full = (val_b as u128) * (val_d as u128);
             if flags.is_32bit {
-                // 32-bit: split at 32 bits.  Phase 36: low-32 →
-                // UnsignedProductLow[0..4] (was: result[0..4]).
+                // 32-bit: split at 32 bits.  low-32 →
+                // UnsignedProductLow[0..4].
                 let low32 = full as u32;
                 let low_bytes = low32.to_le_bytes();
                 unsigned_product_low_bytes[..4].copy_from_slice(&low_bytes);
@@ -240,7 +266,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 mul_carry_hi[out_limbs - 1] = (carry >> 8) as u8;
             }
 
-            // Phase 12c: sign-correction columns for MulUpper SS / SU.
+            // Sign-correction columns for MulUpper SS / SU.
             // TermA = sa·val_d (SU/SS); TermB = sb·val_b (SS only).
             // Carry chain: result + TermA + TermB ≡ unsigned_high (mod 2^64).
             if flags.is_mul_upper && !flags.is_32bit {
@@ -270,15 +296,15 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 }
             }
         }
-        // Phase 54b: MulCarry/MulCarryHi moved to MulChip.
-        // Phase 54c: UnsignedProductHi + MulCorrTermA/B/Carry moved to MulChip.
-        // Phase 54d: MulHigh + UnsignedProductLow moved to MulChip.
+        // MulCarry/MulCarryHi, UnsignedProductHi, MulCorrTermA/B/Carry,
+        // MulHigh, and UnsignedProductLow are witnessed on MulChip, not
+        // CpuChip.
+        //
+        // MulEntry capture happens below — it needs sign_bit_b/sign_bit_d,
+        // which are computed further down.
 
-        // Phase 54a/b/c/d: MulEntry capture moved below — needs
-        // sign_bit_b/sign_bit_d which are computed further down.
-
-        // ── Bitwise auxiliary (Phase 54e: BitwiseChip witnesses
-        //   AndResult/ValBHiNib/ValDHiNib/AndResultHiNib now) ──
+        // ── Bitwise auxiliary (BitwiseChip witnesses
+        //   AndResult/ValBHiNib/ValDHiNib/AndResultHiNib) ──
         let mut and_result = [0u8; WORD_SIZE];
         let mut val_b_hi_nib = [0u8; WORD_SIZE];
         let mut val_d_hi_nib = [0u8; WORD_SIZE];
@@ -311,7 +337,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         }
 
         // ── Compare auxiliary (populated for is_compare OR is_branch) ──
-        // Phase 54f: CmpCarry + CmpSubResult moved to CompareChip;
+        // CmpCarry + CmpSubResult are witnessed on CompareChip;
         // CompareChip mirrors via side_note.compare_entries.
         let mut cmp_carry = [0u8; WORD_SIZE];
         let mut cmp_sub_result = [0u8; WORD_SIZE];
@@ -341,7 +367,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let val_d_is_zero: u8 = if val_d == 0 { 1 } else { 0 };
         trace.fill_columns(row, val_d_is_zero, Column::ValDIsZero);
 
-        // Phase 29: byte-wise val_d zero-check infrastructure.
+        // Byte-wise val_d zero-check infrastructure.
         //   - ValDByteInv[i] = 1/val_d[i] in M31 when val_d[i] ≠ 0;
         //     0 (or any value) when val_d[i] = 0.
         //   - ValDPartialNZ[i] = OR(val_d[0..=i] != 0) as a 0/1 byte.
@@ -361,9 +387,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         }
         trace.fill_columns_base_field(row, &val_d_byte_inv, Column::ValDByteInv);
         trace.fill_columns_bytes(row, &val_d_partial_nz, Column::ValDPartialNZ);
-        // Phase 17: SignBitB/D are now pinned to bit 7 of the
-        // multiplexed source byte (val_b[7] in 64-bit, val_b[3] in
-        // 32-bit) via nibble-AND lookups at the end of add_constraints.
+        // SignBitB/D are pinned to bit 7 of the multiplexed source
+        // byte (val_b[7] in 64-bit, val_b[3] in 32-bit) via nibble-AND
+        // lookups at the end of add_constraints.
         // Compute the source byte explicitly and derive the sign +
         // hi-nibble + lo-nibble from it; bit-31-of-u64 and bit-63-of-u64
         // give the same answer when val_b[4..8] are constrained to 0
@@ -386,7 +412,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, sign_src_b, Column::SignSrcB);
         trace.fill_columns(row, sign_src_d, Column::SignSrcD);
 
-        // Phase 54a/b/c: capture this mul row for MulChip's main trace.
+        // Capture this mul row for MulChip's main trace.
         // Placed after sign_bit_b/d so MulEntry can carry them too.
         if flags.is_mul {
             let mul_high_u64 = u64::from_le_bytes(mul_high);
@@ -426,12 +452,14 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
         let eq_flag: u8 = if val_b == val_d { 1 } else { 0 };
         trace.fill_columns(row, eq_flag, Column::EqFlag);
-        // Phase 54h: ByteEq[8] + ByteDiffInv[8] dropped — branch
-        // constraints now read `val_b[i] - val_d[i]` directly.
+        // Branch constraints read `val_b[i] - val_d[i]` directly, so
+        // there are no ByteEq / ByteDiffInv columns to fill.
         trace.fill_columns(row, flags.is_set_lt_u, Column::IsSetLtU);
         trace.fill_columns(row, flags.is_set_lt_s, Column::IsSetLtS);
+        trace.fill_columns(row, flags.is_set_gt, Column::IsSetGt);
         trace.fill_columns(row, flags.is_cmov_iz, Column::IsCmovIz);
         trace.fill_columns(row, flags.is_cmov_nz, Column::IsCmovNz);
+        trace.fill_columns(row, flags.is_cmov_imm, Column::IsCmovImm);
         trace.fill_columns(row, flags.is_min_s, Column::IsMinS);
         trace.fill_columns(row, flags.is_min_u, Column::IsMinU);
         trace.fill_columns(row, flags.is_max_s, Column::IsMaxS);
@@ -455,17 +483,16 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         };
         trace.fill_columns(row, shift_amount, Column::ShiftAmount);
         trace.fill_columns(row, flags.shift_op, Column::ShiftOp);
-        // Phase 32 / 35 / 36: extend IsShiftConstrained to cover all
-        // four rotate variants.  val_d gets rewritten to a power of
-        // two; the val_d-vs-RegValD cross-constraint then skips
-        // equality on those rows.
+        // IsShiftConstrained covers all four rotate variants.  val_d
+        // gets rewritten to a power of two; the val_d-vs-RegValD
+        // cross-constraint then skips equality on those rows.
         let is_shift_constrained = (flags.is_shift && flags.shift_op <= 2)
             || flags.is_rotate_l64
             || flags.is_rotate_r64
             || flags.is_rotate_l32
             || flags.is_rotate_r32;
         trace.fill_columns(row, is_shift_constrained, Column::IsShiftConstrained);
-        // Phase 35 / 36: rotate flags + complementary shift columns.
+        // Rotate flags + complementary shift columns.
         trace.fill_columns(row, flags.is_rotate_r64, Column::IsRotateR64);
         trace.fill_columns(row, flags.is_rotate_l32, Column::IsRotateL32);
         trace.fill_columns(row, flags.is_rotate_r32, Column::IsRotateR32);
@@ -481,8 +508,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_sub, Column::IsSub);
         trace.fill_columns(row, flags.is_mul, Column::IsMul);
 
-        // Phase I-cpu Wave-1 selector helpers (filled inline next to
-        // the flags they're derived from).
+        // Selector helpers (filled inline next to the flags they're
+        // derived from).
         let is_64bit_b = !flags.is_32bit;
         trace.fill_columns(row, flags.is_add && is_64bit_b, Column::IsAdd64bitH);
         trace.fill_columns(row, flags.is_add && flags.is_32bit, Column::IsAdd32bitH);
@@ -504,18 +531,18 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         );
         trace.fill_columns(row, flags.is_sub && flags.is_32bit, Column::IsSub32bitH);
         trace.fill_columns(row, flags.is_mul && flags.is_32bit, Column::IsMul32bitH);
-        // Wave-2 helpers depend on val_b/val_d/cmp_lt_flag/sign_bit_b/d/
+        // Some helpers depend on val_b/val_d/cmp_lt_flag/sign_bit_b/d/
         // div_by_zero, which are computed later in this iteration.  See
-        // "Phase I-cpu Wave-2 helper fills" near the end of the loop body.
-        // Phase 53: IsMulUpper folded into the (mu_uu+mu_su+mu_ss)
-        // sum expression — no CpuChip column to fill.
+        // the deferred helper-column fills near the end of the loop body.
+        // IsMulUpper is folded into the (mu_uu+mu_su+mu_ss) sum
+        // expression — no CpuChip column to fill.
         trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
         trace.fill_columns(row, flags.is_mul_upper_su, Column::IsMulUpperSU);
         trace.fill_columns(row, flags.is_mul_upper_ss, Column::IsMulUpperSS);
         trace.fill_columns(row, flags.is_div_s, Column::IsDivS);
-        // Phase 53c: IsBitwise folded — no column to fill.
+        // IsBitwise is folded — no column to fill.
         trace.fill_columns(row, flags.is_shift, Column::IsShift);
-        // Phase 53d: IsCompare folded — no column to fill.
+        // IsCompare is folded — no column to fill.
         trace.fill_columns(row, flags.is_move, Column::IsMove);
         trace.fill_columns(row, flags.is_32bit, Column::Is32Bit);
         trace.fill_columns(row, flags.is_and, Column::IsAnd);
@@ -525,7 +552,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_or_inv, Column::IsOrInv);
         trace.fill_columns(row, flags.is_xnor, Column::IsXnor);
         trace.fill_columns(row, flags.is_neg_add, Column::IsNegAdd);
-        // Phase 53e: IsBranch folded into the 10 br_* sub-flag sum.
+        // IsBranch is folded into the 10 br_* sub-flag sum.
         trace.fill_columns(row, flags.is_br_eq, Column::IsBrEq);
         trace.fill_columns(row, flags.is_br_ne, Column::IsBrNe);
         trace.fill_columns(row, flags.is_br_lt_u, Column::IsBrLtU);
@@ -548,11 +575,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_trap, Column::IsTrap);
         trace.fill_columns(row, flags.is_jump_ind, Column::IsJumpInd);
         trace.fill_columns(row, flags.is_load_imm_jump_ind, Column::IsLoadImmJumpInd);
-        // Phase 13d-loadimmjumpind: ImmYBytes always carries low 4 bytes
-        // of step.imm_y so the prog_mem lookup balances on every row
-        // (canonical = 0 for non-LoadImmJumpInd ops).
+        // ImmYBytes always carries low 4 bytes of step.imm_y so the
+        // prog_mem lookup balances on every row (canonical = 0 for
+        // non-LoadImmJumpInd ops).
         trace.fill_columns_bytes(row, &(step.imm_y as u32).to_le_bytes(), Column::ImmYBytes);
-        // Phase 13d: per-byte add-with-carry chain for JumpIndAddr =
+        // Per-byte add-with-carry chain for JumpIndAddr =
         // (val_b + step.imm) mod 2^32.  The constraint is gated by
         // IsJumpInd, so on non-JumpInd rows the columns are left at
         // zero (default fill).  The runtime addr feeds JumpTableChip's
@@ -583,7 +610,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 }
             }
         }
-        // Phase 13d-loadimmjumpind: LoadImmJumpInd carry chain for
+        // LoadImmJumpInd carry chain for
         // LoadImmJumpIndAddr = (val_d + imm_y) mod 2^32.
         if flags.is_load_imm_jump_ind {
             let val_d_lo = (val_d as u32).to_le_bytes();
@@ -608,7 +635,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 }
             }
         }
-        // Sign-extend witnesses (Phase 12b-2): high nibble + bit-7 of the
+        // Sign-extend witnesses: high nibble + bit-7 of the
         // sign-source byte.  val_d[0] for SE8, val_d[1] for SE16.  Zero on
         // non-SE rows; the lookup multiplicities below are gated to match.
         let (se_src_byte, se_active) = if flags.is_sign_ext_8 {
@@ -650,9 +677,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 // division so the byte-level decomposition matches
                 // two's complement (e.g. -100/7 → q = -14 →
                 // q.to_le_bytes() = 0xF2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF).
-                // Phase 16: previously the trace used unsigned division
-                // for DivS too — silently wrong on negatives, hidden
-                // because no positive DivS test had a negative operand.
                 let (q_bytes, r_bytes): ([u8; 8], [u8; 8]) = if flags.is_div_s {
                     if flags.is_32bit {
                         let b32 = dividend as i32;
@@ -664,13 +688,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                         } else {
                             (b32 / d32, b32 % d32)
                         };
-                        // Phase 19: sign-extend div_quotient / div_remainder
+                        // Sign-extend div_quotient / div_remainder
                         // to match the result column (which is the
                         // interpreter's `q as i64 as u64`).  The 32-bit
-                        // schoolbook + Phase 18 sign-correction chain
-                        // only reference [0..4]; the result-quotient
-                        // binding requires [4..8] to track sign-
-                        // extension too.
+                        // schoolbook + sign-correction chain only
+                        // reference [0..4]; the result-quotient binding
+                        // requires [4..8] to track sign-extension too.
                         (
                             (q32 as i64 as u64).to_le_bytes(),
                             (r32 as i64 as u64).to_le_bytes(),
@@ -740,9 +763,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     div_mul_carry_hi[out_limbs - 1] = (carry >> 8) as u8;
                 }
 
-                // Phase 16: DivS sign-correction for the 64-bit
-                // schoolbook's high bytes.  See the "DivS sign
-                // correction" constraint block in add_constraints.
+                // DivS sign-correction for the 64-bit schoolbook's
+                // high bytes.  See the "DivS sign correction"
+                // constraint block in add_constraints.
                 //
                 //   div_corr_hi[i] + carry_out·256 + (i==0 ? sa : 0)
                 //     = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
@@ -779,7 +802,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                         div_corr_carry[i] = carry as u8;
                     }
                 } else if flags.is_div_s && flags.is_32bit {
-                    // Phase 18: 32-bit DivS sign-correction.
+                    // 32-bit DivS sign-correction.
                     // Same equation as the 64-bit case but over 4
                     // bytes; sa/sd/sq/sr derive from byte 3 (32-bit
                     // sign), not byte 7.  DivCorrHi[4..8] and
@@ -843,16 +866,15 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         }
         trace.fill_columns_bytes(row, &div_quotient, Column::DivQuotient);
         trace.fill_columns_bytes(row, &div_remainder, Column::DivRemainder);
-        // Phase 54g: DivMulCarry/DivMulCarryHi moved to DivRemChip.
+        // DivMulCarry/DivMulCarryHi are witnessed on DivRemChip.
         trace.fill_columns(row, div_by_zero, Column::DivByZero);
-        // Phase 16 → 54k: DivCorrHi[8] + DivCorrCarry[8] no longer
-        // CpuChip columns.  div_corr_hi / div_corr_carry are
-        // captured in DivRemEntry below and witnessed on DivRemChip.
+        // DivCorrHi[8] + DivCorrCarry[8] are not CpuChip columns;
+        // div_corr_hi / div_corr_carry are captured in DivRemEntry
+        // below and witnessed on DivRemChip.
 
-        // Phase 21 → 54i: DivCmpDiff / DivCmpCarry chain witnesses
-        // moved to DivRemChip.  Compute them here only on divrem
-        // rows so they can flow into the DivRemEntry below; non-divrem
-        // rows skip the work entirely.
+        // DivCmpDiff / DivCmpCarry chain witnesses live on DivRemChip.
+        // Compute them here only on divrem rows so they can flow into
+        // the DivRemEntry below; non-divrem rows skip the work entirely.
         let mut div_cmp_diff = [0u8; WORD_SIZE];
         let mut div_cmp_carry = [0u8; WORD_SIZE];
         if flags.is_div_rem {
@@ -870,13 +892,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             }
         }
 
-        // Phase 54g/54i/54k: DivRemEntry push deferred until after
-        // sign_bit_q/r are computed (Phase 17/18 block below) so
-        // they can flow into DivRemChip via the entry.
+        // DivRemEntry push is deferred until after sign_bit_q/r are
+        // computed (the sign-bit block below) so they can flow into
+        // DivRemChip via the entry.
 
-        // Phase 31: byte-wise zero-check for div_remainder
-        // (mirrors Phase 29's pattern for val_d).  Drives the
-        // sign-of-r uniqueness constraint.
+        // Byte-wise zero-check for div_remainder (mirrors the val_d
+        // pattern above).  Drives the sign-of-r uniqueness constraint.
         let mut val_r_byte_inv = [stwo::core::fields::m31::BaseField::from(0u32); 8];
         let mut val_r_partial_nz = [0u8; 8];
         let mut running_nz: u8 = 0;
@@ -891,11 +912,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns_base_field(row, &val_r_byte_inv, Column::ValRByteInv);
         trace.fill_columns_bytes(row, &val_r_partial_nz, Column::ValRPartialNZ);
 
-        // Phase 30 → 54j-redux: |val_d| / |div_remainder| chains
-        // and the AbsCmp comparison chain moved to DivRemChip.
-        // We still compute the bytes here so the DivRemEntry can
-        // ship them; only divrem rows allocate, and on those rows
-        // the AbsCmpDiff bytes feed the Range256 multiplicity.
+        // |val_d| / |div_remainder| chains and the AbsCmp comparison
+        // chain live on DivRemChip.  Compute the bytes here so the
+        // DivRemEntry can ship them; only divrem rows allocate, and on
+        // those rows the AbsCmpDiff bytes feed the Range256 multiplicity.
         let mut abs_d = [0u8; WORD_SIZE];
         let mut abs_d_carry = [0u8; WORD_SIZE];
         let mut abs_r = [0u8; WORD_SIZE];
@@ -948,9 +968,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 range_bytes.push(b);
             }
         }
-        // Phase 17 / 18: SignBitQ / SignBitR are pinned to bit 7
-        // of the multiplexed source byte (div_quotient[7] in
-        // 64-bit, div_quotient[3] in 32-bit; same for remainder).
+        // SignBitQ / SignBitR are pinned to bit 7 of the multiplexed
+        // source byte (div_quotient[7] in 64-bit, div_quotient[3] in
+        // 32-bit; same for remainder).
         // On non-divrem rows div_quotient/remainder bytes are all
         // 0, so SignBitQ/R fall to 0 — consistent with the
         // nibble lookups.
@@ -971,11 +991,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, sign_src_q, Column::SignSrcQ);
         trace.fill_columns(row, sign_src_r, Column::SignSrcR);
 
-        // Phase 54g/54i/54k: capture this row for DivRemChip's
-        // main trace.  Pushed here (rather than just after
-        // div_quotient/div_remainder are filled) so all 4 sign
-        // bits are available — DivRemChip's Phase 16/18 sign-
-        // correction chain reads them via the lookup tuple.
+        // Capture this row for DivRemChip's main trace.  Pushed here
+        // (rather than just after div_quotient/div_remainder are
+        // filled) so all 4 sign bits are available — DivRemChip's
+        // sign-correction chain reads them via the lookup tuple.
         if flags.is_div_rem {
             let div_quotient_u64 = u64::from_le_bytes(div_quotient);
             let div_remainder_u64 = u64::from_le_bytes(div_remainder);
@@ -1008,9 +1027,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 });
         }
 
-        // Phase 17 / 18: hi nibbles + BitwiseLookupChip charges
-        // for the 8 sign-bit pinning lookups emitted on every
-        // real row.
+        // Hi nibbles + BitwiseLookupChip charges for the 8 sign-bit
+        // pinning lookups emitted on every real row.
         let hi_b = sign_src_b >> 4;
         let lo_b = sign_src_b & 0xF;
         let hi_d = sign_src_d >> 4;
@@ -1032,9 +1050,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         *side_note.bitwise_and_counts.entry((hi_r, 8)).or_insert(0) += 1;
         *side_note.bitwise_and_counts.entry((lo_r, 0xF)).or_insert(0) += 1;
 
-        // Phase 19: SignBitResult / ResultHiNib pinning.  On
-        // padding rows result_bytes = 0 so SignBitResult = 0
-        // (consistent with the lookup).
+        // SignBitResult / ResultHiNib pinning.  On padding rows
+        // result_bytes = 0 so SignBitResult = 0 (consistent with
+        // the lookup).
         let sign_bit_result = (result_bytes[3] >> 7) & 1;
         let hi_res = result_bytes[3] >> 4;
         let lo_res = result_bytes[3] & 0xF;
@@ -1049,26 +1067,26 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // ── Memory access columns ──
         trace.fill_columns(row, flags.is_exit, Column::IsExit);
         trace.fill_columns(row, flags.is_load, Column::IsLoad);
-        // Phase 53f: IsStore folded — sum of the 3 store sub-flags.
-        // Phase 20: signed-load flags + sign-bit pinning.
+        // IsStore is folded — sum of the 3 store sub-flags.
+        // Signed-load flags + sign-bit pinning.
         trace.fill_columns(row, flags.is_load_i8, Column::IsLoadI8);
         trace.fill_columns(row, flags.is_load_i16, Column::IsLoadI16);
         trace.fill_columns(row, flags.is_load_i32, Column::IsLoadI32);
-        // Phase 23: per-size flags (cover both load and store variants).
+        // Per-size flags (cover both load and store variants).
         trace.fill_columns(row, flags.is_mem_size_1, Column::IsMemSize1);
         trace.fill_columns(row, flags.is_mem_size_2, Column::IsMemSize2);
         trace.fill_columns(row, flags.is_mem_size_4, Column::IsMemSize4);
         trace.fill_columns(row, flags.is_mem_size_8, Column::IsMemSize8);
-        // Phase 24: direct-store flag (StoreU8/16/32/64 only).
+        // Direct-store flag (StoreU8/16/32/64 only).
         trace.fill_columns(row, flags.is_store_direct, Column::IsStoreDirect);
-        // Phase 25: direct-load flag (LoadU8/I8/U16/I16/U32/I32/U64).
+        // Direct-load flag (LoadU8/I8/U16/I16/U32/I32/U64).
         trace.fill_columns(row, flags.is_load_direct, Column::IsLoadDirect);
-        // Phase 26: indirect-mem flag + MemAddr add-with-carry chain.
+        // Indirect-mem flag + MemAddr add-with-carry chain.
         trace.fill_columns(row, flags.is_mem_indirect, Column::IsMemIndirect);
-        // Phase 27: StoreImm / StoreImmInd flags.
+        // StoreImm / StoreImmInd flags.
         trace.fill_columns(row, flags.is_store_imm_any, Column::IsStoreImmAny);
         trace.fill_columns(row, flags.is_store_imm_direct, Column::IsStoreImmDirect);
-        // Phase 28: StoreInd flag + RegValA (regs_before[reg_a]).
+        // StoreInd flag + RegValA (regs_before[reg_a]).
         trace.fill_columns(row, flags.is_store_ind, Column::IsStoreInd);
         let reg_val_a_u64 = if flags.is_store_ind {
             step.regs_before[step.reg_a]
@@ -1076,11 +1094,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             0
         };
         trace.fill_columns(row, reg_val_a_u64, Column::RegValA);
-        // Phase 32: RotL64 flag.  RotL64's val_d gets rewritten to
-        // 2^n + ShiftQuotient infra fires (gated on the extended
-        // IsShiftConstrained above).
+        // RotL64 flag.  RotL64's val_d gets rewritten to 2^n +
+        // ShiftQuotient infra fires (gated on the IsShiftConstrained
+        // above).
         trace.fill_columns(row, flags.is_rotate_l64, Column::IsRotateL64);
-        // Phase 33: CountSetBits — fill IsCountSetBits flag and the 8
+        // CountSetBits — fill IsCountSetBits flag and the 8
         // BytePopcount witnesses, and charge popcount_counts for each
         // active emission so PopcountChip's multiplicity column balances.
         trace.fill_columns(row, flags.is_count_set_bits, Column::IsCountSetBits);
@@ -1094,7 +1112,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 side_note.popcount_counts[val_d_bytes[i] as usize] += 1;
             }
         }
-        // Phase 34: LeadingZeroBits / TrailingZeroBits witnesses.
+        // LeadingZeroBits / TrailingZeroBits witnesses.
         // Per-byte LZ/TZ (8 if byte = 0, else byte.leading_zeros() /
         // trailing_zeros()).  ValDPartialNZMsb (MSB-direction OR over
         // 8 bytes) and ValDPartialNZMsbLo (MSB-direction OR over the
@@ -1180,32 +1198,85 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 byte_active[i] = 1;
             }
             trace.fill_columns_bytes(row, &byte_active, Column::MemByteActive);
+            // Per-byte address carry chain: byte `i` lives at `address + i`,
+            // whose canonical little-endian bytes need carry propagation when
+            // the access crosses a 256/65536/16M boundary (a misaligned
+            // multi-byte access can). Emit the carries out of address bytes
+            // 0,1,2 for each of the 8 byte offsets so the lookup tuple's
+            // address matches the MemoryChip ledger's canonical decomposition.
+            let mut c1 = [0u8; 8];
+            let mut c2 = [0u8; 8];
+            let mut c3 = [0u8; 8];
+            let a0 = m.address & 0xff;
+            let a1 = (m.address >> 8) & 0xff;
+            let a2 = (m.address >> 16) & 0xff;
+            for i in 0..8u32 {
+                c1[i as usize] = ((a0 + i) >> 8) as u8;
+                c2[i as usize] = ((a1 + c1[i as usize] as u32) >> 8) as u8;
+                c3[i as usize] = ((a2 + c2[i as usize] as u32) >> 8) as u8;
+            }
+            trace.fill_columns_bytes(row, &c1, Column::MemByteAddrCarry1);
+            trace.fill_columns_bytes(row, &c2, Column::MemByteAddrCarry2);
+            trace.fill_columns_bytes(row, &c3, Column::MemByteAddrCarry3);
         }
 
         // NextTimestamp = timestamp + 1
         trace.fill_columns(row, step.timestamp + 1, Column::NextTimestamp);
+        fill_ts_carry(&mut trace, row, step.timestamp);
 
-        // ── Blake2b ECALL binding (Phase 8c) ──
+        // ── Blake2b ECALL binding ──
         // Detect Ecalli with imm == ECALL_BLAKE2B_COMPRESS and snapshot the
         // regs_before values that the precompile reads.
         //
-        // Register convention (post off-by-three fix): the
-        // zkpvm-precompiles shim puts a0/a1/a2/a3 → h_ptr/m_ptr/t_low/f_flag,
-        // which grey-transpiler maps to PVM φ[7/8/9/10].  The
-        // `Column::Phi*` names below are semantic slot labels for
-        // the Blake2bCall lookup tuple — Phi10 holds h_ptr (sourced
-        // from φ[7]), Phi11 holds m_ptr (φ[8]), Phi12 holds t_low
-        // (φ[9]), and Phi7 holds the full u64 of f_flag (φ[10]).
-        // The slot-to-register-index re-routing happens in the
-        // ECALL_REG_IDXS array on the producer side; keeping the
-        // legacy column names minimises the cross-file diff at the
-        // cost of a little local confusion (the column comments
-        // below carry the slot's actual semantic meaning).
+        // Register convention: the zkpvm-precompiles shim puts
+        // a0/a1/a2/a3 → h_ptr/m_ptr/t_low/f_flag, which grey-transpiler
+        // maps to PVM φ[7/8/9/10].  The `Column::Phi*` names below are
+        // semantic slot labels for the Blake2bCall lookup tuple — Phi10
+        // holds h_ptr (sourced from φ[7]), Phi11 holds m_ptr (φ[8]),
+        // Phi12 holds t_low (φ[9]), and Phi7 holds the full u64 of
+        // f_flag (φ[10]).  The slot-to-register-index re-routing happens
+        // in the ECALL_REG_IDXS array on the producer side; the Phi*
+        // column names are kept as-is (they don't match the slot
+        // semantics) to avoid renaming across files, at the cost of a
+        // little local confusion (the column comments below carry the
+        // slot's actual semantic meaning).
         let is_blake_ecall = matches!(
             step.opcode,
             crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
         ) && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
         trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
+        // Ristretto ECALL gates: one boolean per id.
+        // Same imm-match shape as IsBlakeEcall; the operand pointers reuse the
+        // Phi10/Phi11/Phi12 slots (= regs_before[7,8,9]) filled below.
+        let is_ecall = matches!(
+            step.opcode,
+            crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64,
+            Column::Is110Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_RISTRETTO_POINT_ADD as u64,
+            Column::Is111Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64,
+            Column::Is112Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_SCALAR_MUL_MOD_L as u64,
+            Column::Is113Ecall,
+        );
+        trace.fill_columns(
+            row,
+            is_ecall && step.imm == ECALL_SCALAR_ADD_MOD_L as u64,
+            Column::Is114Ecall,
+        );
         // Phi10 slot ← h_ptr (a0 = x10 = PVM φ[7]).
         trace.fill_columns(row, step.regs_before[7], Column::Phi10);
         // Phi11 slot ← m_ptr (a1 = x11 = PVM φ[8]).
@@ -1215,27 +1286,34 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Phi7 slot ← f_flag (a3 = x13 = PVM φ[10]).
         let phi7_u64 = step.regs_before[10];
         trace.fill_columns(row, phi7_u64, Column::Phi7);
-        let phi7_bool: u8 = if phi7_u64 != 0 { 1 } else { 0 };
-        trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
-        // Phi7Inv = field-element inverse of (Phi7 interpreted as u64, mod M31).
-        // If Phi7 == 0 we store 0; the boolean-identity constraint
-        //   Phi7Bool · (1 - Phi7_combined · Phi7Inv_combined) = 0
-        // forces Phi7Inv to be the real inverse whenever Phi7Bool = 1.
-        let phi7_inv_u64: u64 = if phi7_u64 != 0 {
-            // Combine bytes with powers of 256 modulo the M31 prime,
-            // then invert.  Rust's u128 multiplication + manual mod is
-            // enough since M31 = 2^31 - 1.
-            const M31_P: u64 = (1u64 << 31) - 1;
+        // The `Phi7` column holds the M31 field-reduction of this u64, and the
+        // boolean-identity constraints — `(1 − Phi7Bool) · Phi7 = 0` and
+        // `Phi7Bool · (Phi7 · Phi7Inv − 1) = 0` (mod.rs) — operate
+        // on that *field* value. So `Phi7Bool` / `Phi7Inv` MUST be derived
+        // from the reduced field element, NOT the raw u64: a nonzero u64 that
+        // is ≡ 0 mod M31 (a nonzero multiple of 2³¹−1, e.g. 0x7FFF_FFFF in
+        // x13 on a non-ECALL row) reduces to the zero field element, so a
+        // u64-based `Phi7Bool = 1` leaves `Phi7·Phi7Inv = 0 ≠ 1` and makes
+        // the gadget unsatisfiable. (The sole real consumer, blake2b's
+        // `f_flag`, is 0/1, where field == u64 — this only corrects the
+        // otherwise-unconstrained x13 values on non-blake2b rows.)
+        const M31_P: u64 = (1u64 << 31) - 1;
+        let phi7_field: u64 = {
             let mut combined: u64 = 0;
-            let bytes = phi7_u64.to_le_bytes();
             let mut pow: u64 = 1;
-            for b in bytes {
+            for b in phi7_u64.to_le_bytes() {
                 combined = (combined + (b as u64) * pow) % M31_P;
                 pow = (pow * 256) % M31_P;
             }
-            // Fermat's little theorem: inverse = combined^(p-2) mod p.
+            combined
+        };
+        let phi7_bool: u8 = if phi7_field != 0 { 1 } else { 0 };
+        trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
+        // Phi7Inv = field inverse of the reduced value (0 when it is 0).
+        // Fermat's little theorem: inverse = v^(p-2) mod p.
+        let phi7_inv_u64: u64 = if phi7_field != 0 {
             let mut result: u64 = 1;
-            let mut base = combined;
+            let mut base = phi7_field;
             let mut exp = M31_P - 2;
             while exp > 0 {
                 if exp & 1 == 1 {
@@ -1250,7 +1328,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         };
         trace.fill_columns(row, phi7_inv_u64, Column::Phi7Inv);
 
-        // ── Register-memory producer descriptors (Phase 9d) ──
+        // ── Register-memory producer descriptors ──
         let accesses = step_reg_accesses(step);
         trace.fill_columns(row, accesses.val_b_read.is_some(), Column::ValBIsReg);
         trace.fill_columns(
@@ -1271,9 +1349,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             Column::ResultRegIdx,
         );
 
-        // ── Phase I-cpu Wave-2 helper fills ──
+        // ── Deferred helper-column fills ──
         // All inputs (val_b, val_d, sign_bit_b, sign_bit_d, cmp_lt_flag,
-        // div_by_zero, val_d_is_zero, flags.div_rem_op) are now in scope.
+        // div_by_zero, val_d_is_zero, flags.div_rem_op) are in scope.
         {
             use stwo::core::fields::m31::BaseField;
             let signs_diff_b = (sign_bit_b ^ sign_bit_d) != 0;
@@ -1332,9 +1410,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 Column::IsDivRem32bitH,
             );
 
-            // ── Wave-3 helpers ──
-            // val_d_byte_inv / val_d_partial_nz are filled at line 356-357.
-            // Reuse the locals from that fill.
+            // ── val_d byte-indicator helpers ──
+            // val_d_byte_inv / val_d_partial_nz are filled earlier in
+            // this loop.  Reuse the locals from that fill.
             let mut indicator = [BaseField::from(0u32); 8];
             let mut ind_minus1 = [BaseField::from(0u32); 8];
             let mut part_nz_times_ind = [BaseField::from(0u32); 8];
@@ -1381,12 +1459,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 Column::DbzActiveRemH,
             );
 
-            // ── Wave-4a helpers ──
-            // (B3 audit dropped SignExtBitBoolH — sign_ext_bit is now
-            // boolean unconditional and the helper is no longer needed.)
+            // ── Partial-NZ (MSB direction) times-indicator helpers ──
             // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
-            // val_d_partial_nz_msb is computed at line ~1025+ AFTER this
-            // helper-fill block — we need to compute it here independently.
+            // val_d_partial_nz_msb is computed later in this loop, after
+            // this helper-fill block — compute it here independently.
             let mut pnz_msb = [0u8; 8];
             let mut running_msb: u8 = 0;
             for i in (0..WORD_SIZE).rev() {
@@ -1414,7 +1490,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             }
             trace.fill_columns_base_field(row, &pnz_msb_lo_times_ind, Column::PartNZMsbLoTimesIndH);
 
-            // ── Wave-4b: TZ/LZ result-binding helpers ──
+            // ── TZ/LZ result-binding helpers ──
             // is_first_nz[i] = partial[i] - partial[i-1] (i ∈ 0..8)
             //                = 1 at the first nonzero byte, else 0.
             // TzLo4H = sum_{i<4} is_first_nz[i] · (8i + TzByte[i]).
@@ -1495,7 +1571,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, flags.is_lzb && is_64bit_b, Column::IsLzb64H);
             trace.fill_columns(row, flags.is_lzb && flags.is_32bit, Column::IsLzb32H);
 
-            // ── Wave-5: Branch / sequential PC selectors ──
+            // ── Branch / sequential PC selectors ──
             let bt = step.branch_taken;
             let eq_b = eq_flag != 0;
             let is_branch_b = flags.is_br_eq
@@ -1510,8 +1586,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 || flags.is_br_gt_s;
             trace.fill_columns(row, flags.is_br_eq && bt, Column::IsBrEqTakenH);
             trace.fill_columns(row, flags.is_br_ne && !bt, Column::IsBrNeNotTakenH);
-            // (B3 audit dropped EqFlagBoolH; eq_flag is now boolean
-            // unconditional.)
             trace.fill_columns(
                 row,
                 is_compare_b && eq_b || is_branch_b && eq_b,
@@ -1519,14 +1593,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             );
             trace.fill_columns(row, is_branch_b && bt, Column::IsBranchTakenH);
 
-            // ── Wave-6: memory monotonicity helper ──
-            // (B3 audit dropped BranchTakenBoolH and MemByteActiveBoolH —
-            // both flags are now boolean unconditional.)
+            // ── Memory monotonicity helper ──
             let zeros8 = [0u8; 8];
             trace.fill_columns_bytes(row, &zeros8, Column::MemByteActiveMonoH);
         }
 
-        // Phase 9g: raw register value behind ValB + IsTruncated flag.
+        // Raw register value behind ValB + IsTruncated flag.
         let reg_val_b_u64 = accesses.val_b_read.map(|(_, v)| v).unwrap_or(0);
         trace.fill_columns(row, reg_val_b_u64, Column::RegValB);
         let is_truncated: u8 = if flags.is_32bit
@@ -1538,7 +1610,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         };
         trace.fill_columns(row, is_truncated, Column::IsTruncated);
 
-        // Phase 9f: raw register value behind ValD + the shift quotient.
+        // Raw register value behind ValD + the shift quotient.
         let reg_val_d_u64 = accesses.val_d_read.map(|(_, v)| v).unwrap_or(0);
         trace.fill_columns(row, reg_val_d_u64, Column::RegValD);
         let shift_q: u64 = if (flags.is_shift && flags.shift_op <= 2)
@@ -1564,7 +1636,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             }
         }
 
-        // ── Phase 55b: pack the 48 individual flags into 6 bytes ──
+        // ── Pack the 48 individual flags into 6 bytes ──
         // The packing matches `program_memory::pack_flags` and the
         // canonical 48-flag layout in `classify_opcode_for_program_memory`.
         // Per-row byte-to-bits lookups (in cpu/mod.rs) bind individual
@@ -1585,7 +1657,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             side_note.byte_to_bits_counts[fb as usize] += 1;
         }
 
-        // ── Phase I-cpu Wave-7 helper fills ──
+        // ── Boolean / selector helper fills ──
         // is_truncated, val_b_is_reg / val_d_is_reg / result_is_reg,
         // phi7_bool, is_blake_ecall_b, is_shift_constrained are all
         // booleans (or u8 ∈ {0,1}) in valid traces.  All Bool-helpers
@@ -1601,9 +1673,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let is_32bit_b = flags.is_32bit;
         let is_shift_c_b = is_shift_constrained;
         let is_rot_r_either_b = flags.is_rotate_r64 || flags.is_rotate_r32;
-        // (B3 audit dropped 6 *BoolH helpers — IsTruncated/ValBIsReg/
-        // ValDIsReg/ResultIsReg/Phi7Bool/IsBlakeEcall — all now
-        // enforced as unconditional `X·(1-X)=0`.)
+        // IsTruncated / ValBIsReg / ValDIsReg / ResultIsReg / Phi7Bool /
+        // IsBlakeEcall are enforced as unconditional `X·(1-X)=0`, so they
+        // need no boolean-helper columns.
         // Selector helpers.
         trace.fill_columns(row, real_b && is_32bit_b, Column::Real32bitH);
         trace.fill_columns(row, val_b_is_reg_b, Column::ValBIsRegH);
@@ -1649,7 +1721,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns_base_field(row, &[BaseField::from(prod as u32)], Column::Phi7TimesInvH);
         let _ = (val_b_is_reg_b, val_d_is_reg_b, result_is_reg_b);
 
-        // Wave 7-fix: missed deg-3 patterns in CpuChip.
+        // Additional degree-3 selector patterns in CpuChip.
         trace.fill_columns(
             row,
             flags.is_rotate_r_imm_alt && !is_truncated_b,
@@ -1666,10 +1738,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             Column::Is32ShiftCH,
         );
 
-        // ── Wave 8 helper fills (residuals) ──
+        // ── Residual helper fills ──
         trace.fill_columns(row, flags.is_trap, Column::IsRealTrapH);
-        // (B3 audit dropped MemAddrCarryBoolH — mem_addr_carry per-byte
-        // booleans are now enforced unconditionally.)
         // Is64bitPopcountHiH = (1 - is_32bit) · (popcount[4]+...+popcount[7]).
         let is_64bit_b = !flags.is_32bit;
         let pop_hi: u32 = if is_64bit_b {
@@ -1695,7 +1765,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             }
         }
         trace.fill_columns_bytes(row, &load_not_active, Column::IsLoadLocalNotActiveH);
-        // ValR* helpers (Phase 31).  In valid traces ind_minus_1 = 0.
+        // ValR* helpers.  In valid traces ind_minus_1 = 0.
         // val_r_byte_inv and val_r_partial_nz are computed earlier from
         // div_remainder (the local array), so use that as the source —
         // the constraint reads `div_remainder_top[i]·val_r_byte_inv_top[i]`.
@@ -1712,7 +1782,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns_base_field(row, &vr_indicator, Column::ValRByteIndicatorH);
         trace.fill_columns_base_field(row, &[BaseField::from(0u32); 8], Column::ValRByteIndMinus1H);
         trace.fill_columns_base_field(row, &vr_part_nz_times_ind, Column::ValRPartNZTimesIndH);
-        // DivS Phase 31 helpers.
+        // DivS remainder-sign helpers.
         let div_s_not_dbz_b = flags.is_div_s && (div_by_zero == 0);
         trace.fill_columns(row, div_s_not_dbz_b, Column::IsDivSNotDbzH);
         // DivSActivePartialH = (IsDivSNotDbz) · ValRPartialNZ[7].
@@ -1722,7 +1792,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             0
         };
         trace.fill_columns_base_field(row, &[BaseField::from(dsap_v)], Column::DivSActivePartialH);
-        // Wave 8 fix (lookup mult): IsShiftCNotRotrH = is_shift_c · (1 - rot_r64 - rot_r32).
+        // Lookup-multiplicity helper: IsShiftCNotRotrH = is_shift_c · (1 - rot_r64 - rot_r32).
         let no_rotr = !flags.is_rotate_r64 && !flags.is_rotate_r32;
         trace.fill_columns(
             row,
@@ -1738,11 +1808,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         side_note.add_bitwise_and(a, b);
     }
 
-    // DIAGNOSTIC scaffolding for next-session bisection.  Set
-    // CPU_DUMP=1 in the env to dump row-0 + row-1 helper values
-    // to stderr; useful for spot-checking that witness fill
-    // matches expected algebraic values.  Confirmed (this session)
-    // that 50+ helpers checked all match — bug is elsewhere.
+    // Diagnostic scaffolding.  Set CPU_DUMP=1 in the env to dump
+    // row-0 + row-1 helper values to stderr; useful for spot-checking
+    // that witness fill matches expected algebraic values.
     if std::env::var("CPU_DUMP").is_ok() {
         use crate::air_column::AirColumn;
         let cols_to_dump: &[(&str, Column)] = &[
@@ -1863,12 +1931,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, true, Column::IsPadding);
         trace.fill_columns(row, ts, Column::Timestamp);
         trace.fill_columns(row, ts + 1, Column::NextTimestamp);
-        // Wave-2 helper GateDivH = (DivRemOp - 2)·(DivRemOp - 3).
-        // Constraint is unconditional (no is_real gate); on padding
-        // rows DivRemOp = 0, so GateDivH must be filled with
-        // (0 - 2)·(0 - 3) = 6.  Other Wave helpers reduce to zero
-        // when their cofactors are zero on padding, so they don't
-        // need an explicit fill.
+        fill_ts_carry(&mut trace, row, ts);
+        // GateDivH = (DivRemOp - 2)·(DivRemOp - 3).  Constraint is
+        // unconditional (no is_real gate); on padding rows DivRemOp = 0,
+        // so GateDivH must be filled with (0 - 2)·(0 - 3) = 6.  Other
+        // helpers reduce to zero when their cofactors are zero on
+        // padding, so they don't need an explicit fill.
         trace.fill_columns_base_field(
             row,
             &[stwo::core::fields::m31::BaseField::from(6u32)],

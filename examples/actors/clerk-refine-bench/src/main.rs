@@ -8,8 +8,7 @@
 //! pre-signed Transfers and an Oracle/LedgerState, deferred to the
 //! per-privacy-level clerk-l0/l1/l2/l3 actors under crates/actors/.
 
-use vos::{actor, messages};
-vos::pvm_main!(crate::ClerkRefineBench);
+use vos::prelude::*;
 use cipher_clerk::ids::{AccountId, JournalId, TransferId, TxTemplateId, EntryId};
 use cipher_clerk::types::{Account, Transfer};
 use cipher_clerk::types::flags::{Direction, Layer};

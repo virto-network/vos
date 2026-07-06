@@ -130,7 +130,7 @@ fn prove_fallthrough() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// Negative test (Phase 12h): Fallthrough is classified with no special control-
+// Fallthrough is classified with no special control-
 // flow flags (is_branch=is_jump=is_exit=0), so the sequential-PC constraint
 // (next_pc = pc + 1 + skip_len) must fire on it.  If the constraint is missing
 // or mis-gated, a forged next_pc would produce a "valid" proof.
@@ -209,26 +209,21 @@ fn prove_unlikely() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// Phase 13d: JumpInd's `next_pc = jump_table[(regs[reg_a] + imm)/2 - 1]`
-// is now bound by JumpTableChip — a preprocessed table committing to the
-// program's jump_table[].  CpuChip's per-step JumpInd consumer demands
+// JumpInd's `next_pc = jump_table[(regs[reg_a] + imm)/2 - 1]` is bound
+// by JumpTableChip — a preprocessed table committing to the program's
+// jump_table[].  CpuChip's per-step JumpInd consumer demands
 // `(addr = val_b + imm, target = next_pc)` against that table.  An
 // attacker dispatching to a valid-but-wrong table entry (different addr
 // from val_b+imm) breaks the lookup.
 //
-// LoadImmJumpInd is *not* covered yet — separate gap, filed as a
-// tripwire below.  Its target uses regs[rb] + imm_y where imm_y is
-// the SECOND immediate; the current trace stores step.imm = imm_x
-// (the load value) and there's no column for imm_y, so binding
-// requires either a new LoadImmJumpIndOffset column or piping imm_y
-// through PvmStep.
-// Phase 13d-loadimmjumpind: LoadImmJumpInd's `next_pc =
-// jump_table[(regs[rb]+imm_y)/2 - 1]` is now bound by JumpTableChip via
-// the same lookup as JumpInd, but with a separate carry chain pinning
-// LoadImmJumpIndAddr = (val_d + imm_y) low 32 bits.
+// LoadImmJumpInd's `next_pc = jump_table[(regs[rb]+imm_y)/2 - 1]` is
+// bound by JumpTableChip via the same lookup as JumpInd, but with a
+// separate carry chain pinning LoadImmJumpIndAddr = (val_d + imm_y) low
+// 32 bits.  imm_y is the SECOND immediate, distinct from step.imm =
+// imm_x (the load value).
 //
-// Note: only the JUMP target is bound; the LOAD side
-// (`regs[ra] = imm_x`) is still prover-trusted.  Filed as a follow-up.
+// Only the JUMP target is bound; the LOAD side (`regs[ra] = imm_x`) is
+// prover-trusted.
 #[test]
 fn load_imm_jump_ind_positive_smoke() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
@@ -384,17 +379,16 @@ fn jump_ind_forged_target_rejected() {
     verify(proof, &side_note).expect("verification failed");
 }
 
-// Phase 15-branch-target-fix: ProgramMemoryChip now publishes the
-// canonical absolute branch target as a preprocessed `BranchTargetCanon`
-// column (= `pc + sign_extend(signed_offset)` for static jumps/branches,
-// 0 for JumpInd/LoadImmJumpInd and non-branch ops).  CpuChip emits its
-// `BranchTarget` column into the prog_mem tuple, so the existing
-// per-step lookup pins it to the canonical decoding.
+// ProgramMemoryChip publishes the canonical absolute branch target as a
+// preprocessed `BranchTargetCanon` column (= `pc +
+// sign_extend(signed_offset)` for static jumps/branches, 0 for
+// JumpInd/LoadImmJumpInd and non-branch ops).  CpuChip emits its
+// `BranchTarget` column into the prog_mem tuple, so the per-step lookup
+// pins it to the canonical decoding.
 //
 // This test forges a Jump's branch_target/next_pc/successor.pc to
-// dispatch to a *different* valid BB start.  Pre-fix this passed (gap
-// open); post-fix the prog_mem lookup mismatches the canonical and
-// rejects.
+// dispatch to a *different* valid BB start; the prog_mem lookup
+// mismatches the canonical target and rejects.
 #[test]
 #[should_panic(expected = "failed")]
 fn jump_forged_branch_target_rejected_by_prog_mem_lookup() {
@@ -441,18 +435,15 @@ fn jump_forged_branch_target_rejected_by_prog_mem_lookup() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// Phase 13e-redux: Trap has a per-opcode `IsTrap` flag (distinct from
-// `IsExit`, which also covers Ecalli/JumpInd that legitimately have
-// successors).  The terminal-row constraint
-// `is_real · is_trap · (1 - is_padding_next) = 0` forbids any successor
-// real row after Trap.
+// Trap has a per-opcode `IsTrap` flag (distinct from `IsExit`, which
+// also covers Ecalli/JumpInd that legitimately have successors).  The
+// terminal-row constraint `is_real · is_trap · (1 - is_padding_next) = 0`
+// forbids any successor real row after Trap.
 //
 // This test forges a "second Trap" after the real one with all continuity
 // fields (timestamp, pc, gas, regs) carefully consistent — even with the
 // ProgramExecution chain + ProgramMemory tuple all balanced, the IsTrap
-// terminal constraint catches the splice.  Before 13e-redux this test
-// passed (gap open); the flip to `#[should_panic]` was the closure of
-// the documented gap.
+// terminal constraint catches the splice.
 #[test]
 #[should_panic(expected = "failed")]
 fn trap_followed_by_trap_clone_rejected_by_terminal_constraint() {
@@ -742,9 +733,9 @@ fn prove_loop_add() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// ── Phase 41: Sbrk as terminal opcode ─────────────────────────────────────
+// ── Sbrk as terminal opcode ────────────────────────────────────────────────
 // Sbrk panics on execution (JAR v0.8.0 removed it from the ISA in favour of
-// the grow_heap hostcall).  Phase 41 marks Sbrk as is_exit + is_trap so the
+// the grow_heap hostcall).  Sbrk is marked is_exit + is_trap so the
 // terminal-row constraint forbids any successor real row, matching the
 // interpreter's panic-and-stop semantics.
 
@@ -776,8 +767,8 @@ fn prove_sbrk_terminal() {
 fn sbrk_followed_by_clone_rejected_by_terminal_constraint() {
     // Same shape as `trap_followed_by_trap_clone_rejected_by_terminal_constraint`
     // but for Sbrk: synthesize a "second Sbrk" step after the real one with
-    // all continuity fields plausibly consistent.  The Phase 41 IsTrap flag
-    // (set on Sbrk) drives Phase 13e-redux's terminal-row constraint
+    // all continuity fields plausibly consistent.  Sbrk's IsTrap flag drives
+    // the terminal-row constraint
     // (`is_real · is_trap · (1 - is_padding_next) = 0`) → splice rejected.
     let regs = [0u64; PVM_REGISTER_COUNT];
     let code = vec![Opcode::Sbrk as u8];
