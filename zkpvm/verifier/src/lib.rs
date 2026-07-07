@@ -5,7 +5,7 @@
 // preprocessed trace commitment (which is deterministic per program).
 //
 // no_std-ready: the verifier path of zkpvm pulls only verifier-side stwo,
-// alloc::*, and core::*.  The wasm32-unknown-unknown smoke test (11d) is
+// alloc::*, and core::*.  The wasm32-unknown-unknown smoke test is
 // blocked on an upstream javm fix (CODE_WINDOW_SIZE = 1 << 32 overflows on
 // 32-bit usize); the host-side `cargo build --no-default-features` still
 // validates no_std compatibility.
@@ -34,7 +34,7 @@ use zkpvm::recursion_pcs::{ProverChannel, ProverMerkleChannel};
 // `proof.format_version` themselves for early rejection at the network
 // boundary, or just rely on `verify_standalone`'s built-in check.
 pub use zkpvm::{PROOF_FORMAT_VERSION, Proof};
-// Phase 49: PcsPolicy floor — see SECURITY.md "Proof shape".
+// PcsPolicy floor — see SECURITY.md "Proof shape".
 pub use zkpvm::proof::{
     PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
     check_pcs_policy,
@@ -106,7 +106,7 @@ pub fn verify_standalone_with_max_log_size(
     )
 }
 
-/// Phase 49: enforce a custom `PcsPolicy` (FRI shape + PoW floor)
+/// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
 /// on `proof.pcs_config`.  Most deployers want `PcsPolicy::STANDARD`;
 /// override for stricter (more security) or looser (test harness)
 /// floors.  See SECURITY.md "Proof shape".
@@ -125,7 +125,7 @@ pub fn verify_standalone_with_options(
     max_log_size: u32,
     policy: &PcsPolicy,
 ) -> Result<(), VerificationError> {
-    // Phase 42: reject proofs from a different AIR shape early, before
+    // Reject proofs from a different AIR shape early, before
     // any cryptographic work.  Done first because every subsequent
     // length check assumes the AIR shape this verifier was compiled
     // against.
@@ -135,18 +135,17 @@ pub fn verify_standalone_with_options(
             PROOF_FORMAT_VERSION, proof.format_version,
         )));
     }
-    // Phase Z0 hardening: `component_mask = 0` was a Phase 60 back-compat
-    // sentinel meaning "fall back to count-based inference over the full
-    // BASE_COMPONENTS" — it's how older proofs reached the verifier
-    // before dynamic chip selection landed. With `format_version` now
-    // bumped past those proofs, the only producer of `mask = 0` is the
-    // chip-isolated `prove_with_explicit_components` path, whose proofs
-    // are documented as "not verifiable via verify_standalone".
+    // `component_mask = 0` is a back-compat sentinel meaning "fall back
+    // to count-based inference over the full BASE_COMPONENTS", predating
+    // dynamic chip selection. With `format_version` bumped past those
+    // proofs, the only producer of `mask = 0` is the chip-isolated
+    // `prove_with_explicit_components` path, whose proofs are documented
+    // as "not verifiable via verify_standalone".
     //
     // Reject early. Without this gate, a malicious prover could ship a
     // chip-isolated proof (no FS-transcript mix on the prover side) to
     // verify_standalone, slipping `proof.final_state.registers` past the
-    // Z0 binding — the standalone verifier would also skip the mix and
+    // register-boundary binding — the standalone verifier would also skip the mix and
     // tampered registers would verify cleanly.
     if proof.component_mask == 0 {
         return Err(VerificationError::InvalidStructure(
@@ -155,7 +154,7 @@ pub fn verify_standalone_with_options(
                 .to_string(),
         ));
     }
-    // Phase 43: cap log_sizes so a malicious prover can't force the
+    // Cap log_sizes so a malicious prover can't force the
     // verifier into arbitrarily large Merkle commitments.  We check
     // each component's log_size individually against the cap; the
     // dominant cost in verification is roughly O(2^max_log_size · k)
@@ -167,7 +166,7 @@ pub fn verify_standalone_with_options(
              (set max_log_size higher or reject this proof)"
         )));
     }
-    // Phase 49: enforce the PcsPolicy floor — reject under-spec'd
+    // Enforce the PcsPolicy floor — reject under-spec'd
     // pcs_configs (low pow_bits, low n_queries, low log_blowup_factor)
     // before any cryptographic work.  Default policy is
     // PcsPolicy::STANDARD; deployers needing more / less specify a
@@ -205,14 +204,15 @@ pub fn verify_standalone_with_options(
             "component_mask popcount does not match num_components".to_string(),
         ));
     }
-    // Phase A (v7): reject `initial_state.timestamp < 1` per segment (the
+    // v7: reject `initial_state.timestamp < 1` per segment (the
     // production consumer verifies single proofs here, not only the chain
     // wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
     // ts=0 per-page boundary writes from being forged as real steps, and (with
     // the CpuChip ts-chain) lands every step ts in [initial_ts, final_ts).
     if initial_state.timestamp < 1 {
         return Err(VerificationError::InvalidStructure(
-            "initial_state.timestamp must be >= 1 (Phase A memory-boundary anchoring)".to_string(),
+            "initial_state.timestamp must be >= 1 (memory-boundary anchoring, format v7)"
+                .to_string(),
         ));
     }
 
@@ -254,7 +254,7 @@ pub fn verify_standalone_with_options(
         );
     }
 
-    // Phase Z0: mix `proof.{initial,final}_state` (registers, pc,
+    // Mix `proof.{initial,final}_state` (registers, pc,
     // timestamp) into the FS transcript. The `component_mask = 0`
     // reject at the top of this function guarantees we only reach here
     // for production proofs that included the boundary + closing chip
@@ -272,9 +272,9 @@ pub fn verify_standalone_with_options(
     verifier_channel.mix_u64(initial_state.timestamp);
     verifier_channel.mix_u64(final_state.pc as u64);
     verifier_channel.mix_u64(final_state.timestamp);
-    // Phase A (v7): entering then exit RAM Merkle root, 4 LE u64 each.
+    // v7: entering then exit RAM Merkle root, 4 LE u64 each.
     // Unconditional — the component_mask=0 reject above guarantees a
-    // production proof with the Phase-A chips.
+    // production proof with the memory-page Merkle chips.
     for chunk in initial_state.memory_root.chunks_exact(8) {
         verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
     }
@@ -422,7 +422,7 @@ pub fn verify_chain_standalone_with_options(
             "verify_chain_standalone: empty proof chain".to_string(),
         ));
     }
-    // Phase A: anchor the chain's entering image — proofs[0] must start from the
+    // Anchor the chain's entering image — proofs[0] must start from the
     // verifier-supplied expected root (the memory analogue of program identity).
     if proofs[0].initial_state.memory_root != expected_initial_root {
         return Err(VerificationError::InvalidStructure(
@@ -432,8 +432,8 @@ pub fn verify_chain_standalone_with_options(
         ));
     }
     // Boundary continuity: each segment's final state must equal the next
-    // segment's initial state.  Bound for registers/pc/timestamp (and, Phase A,
-    // the memory root) by each segment's in-circuit boundary binding.
+    // segment's initial state.  Bound for registers/pc/timestamp (and the
+    // memory root) by each segment's in-circuit boundary binding.
     for window in proofs.windows(2) {
         if window[0].final_state != window[1].initial_state {
             return Err(VerificationError::InvalidStructure(format!(

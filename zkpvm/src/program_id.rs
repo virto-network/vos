@@ -1,4 +1,4 @@
-//! Program-identity commitment (Phase 13f).
+//! Program-identity commitment.
 //!
 //! In zkpvm, a proof's preprocessed-trace Merkle root IS the program
 //! commitment.  No separate computation is needed — the prover commits to
@@ -18,7 +18,7 @@
 //!      AND its preprocessed commitment matches `hash`.
 //!
 //! Why this works: ProgramMemoryChip's preprocessed columns
-//! (Phase 13a/c) include every PC's decoded instruction tuple plus the
+//! include every PC's decoded instruction tuple plus the
 //! 20 category flags; two programs with different bytecode necessarily
 //! produce different ProgramMemoryChip preprocessed columns, and
 //! therefore different Merkle roots.  The other chips' preprocessed

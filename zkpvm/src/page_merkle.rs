@@ -1,4 +1,4 @@
-//! Host-side page Merkle tree for the RAM boundary binding (Phase A).
+//! Host-side page Merkle tree for the RAM boundary binding.
 //!
 //! The zkVM RAM is committed as a complete binary Merkle tree of depth
 //! [`DEPTH`], keyed by **page address** (`addr >> PAGE_BITS`): each leaf is the

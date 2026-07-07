@@ -19,9 +19,9 @@ use crate::recursion_pcs::ProverMerkleHasher;
 /// `zkpvm::verify` and `zkpvm_verifier::verify_standalone`.
 ///
 /// History:
-///   1 — Phases 32-41 wrap (Rotate / BitManip / 32-bit-shift / Sbrk
-///       all bound; PROG_MEMORY_N_FLAGS = 48; 14 components).
-///   2 — Phase Z0: `RegisterMemoryClosingChip` added at index 6,
+///   1 — Rotate / BitManip / 32-bit-shift / Sbrk all bound;
+///       PROG_MEMORY_N_FLAGS = 48; 14 components.
+///   2 — `RegisterMemoryClosingChip` added at index 6,
 ///       shifting every higher chip index by +1; closes the register-
 ///       memory ledger by consuming a synthetic per-register read at
 ///       `closing_ts = last_step.timestamp + 1`, pinning the final
@@ -31,7 +31,7 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       `chips/register_memory_closing.rs`: the mix does NOT bind the
 ///       separate metadata FIELD against a from-scratch prover.) Older
 ///       proofs reject at the `format_version` gate.
-///   3 — Phase Z0-init: FS-transcript also mixes
+///   3 — FS-transcript also mixes
 ///       `proof.initial_state.registers` (before the existing
 ///       `final_state.registers` mix) — same tamper-evidence on the
 ///       initial side; the boundary chip already commits `initial_regs`
@@ -89,7 +89,7 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       sound. AIR change: new columns + the wider register relation, so
 ///       the proof bytes differ (gate: `tests/ledger_readconsistency_gate.rs`).
 ///       `memory_commitment` is still outside the binding.
-///   7 — In-circuit RAM-image binding (Phase A; closes the memory-continuity
+///   7 — In-circuit RAM-image binding (closes the memory-continuity
 ///       gap `memory_commitment` left open). RAM is committed as a page-keyed
 ///       blake2b Merkle tree; per segment the prover proves a boundary
 ///       multiproof binding the entering page images to `initial_state
@@ -104,7 +104,7 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       components (`COUNT` 28 → 31, `MemoryBoundaryChip` deleted), a wider
 ///       `MemoryAccess` tuple (`is_closing`), and a new `MerkleNode` relation,
 ///       so the proof bytes differ.
-///   8 — Ristretto memory-op `ts` binding (Phase A prereq 0.2; closes the
+///   8 — Ristretto memory-op `ts` binding (closes the
 ///       money-path ts-forgery gap where the three ristretto memory producers
 ///       set `ts` as a free witness). CpuChip gains five `Is{110..114}Ecall`
 ///       gates that emit a `RistrettoCall` (RELATION A) producer + register
@@ -120,7 +120,7 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       verifiers must reject.
 #[cfg(not(feature = "poseidon2-channel"))]
 pub const PROOF_FORMAT_VERSION: u32 = 8;
-/// Native-recursion Stage-0 (P5.0): the PCS commit hash + Fiat-Shamir
+/// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
 /// (v8) and a Poseidon2-M31 verifier (v9) therefore reject each other's proofs.
@@ -135,7 +135,7 @@ pub struct SegmentState {
     pub timestamp: u64,
     pub registers: [u64; 13],
     pub memory_commitment: [u8; 32], // blake3(flat_mem); computed outside the circuit, unbound
-    /// Page-Merkle root of the RAM image AT THIS boundary (Phase A, format v7):
+    /// Page-Merkle root of the RAM image AT THIS boundary (format v7):
     /// bound in-circuit by the boundary multiproof + `MemoryRootBoundaryChip`,
     /// so cross-segment continuity (`final_state == next.initial_state`)
     /// genuinely forces memory continuity.  A segment binds `initial_state
@@ -157,7 +157,7 @@ pub struct Proof {
     pub claimed_sums: Vec<SecureField>,
     pub log_sizes: Vec<u32>,
     pub num_components: usize,
-    /// Phase 60: bit i set ⇔ chip i in BASE_COMPONENTS was active for
+    /// Bit i set ⇔ chip i in BASE_COMPONENTS was active for
     /// this proof.  Allows the standalone verifier (no SideNote) to
     /// reconstruct the exact active-chip selection the prover used.
     /// Defaults to `0` for back-compat with older proofs (the verifier
@@ -184,7 +184,7 @@ fn proof_format_version_default() -> u32 {
 }
 
 impl Proof {
-    /// Phase ZK-ABI: reconstruct the 32-byte actor-IO binding hash from
+    /// Reconstruct the 32-byte actor-IO binding hash from
     /// the final-state register window φ[9..13].
     ///
     /// A binding actor places `H = compute_io_hash(public, return)` (see
@@ -244,7 +244,7 @@ pub const STANDARD_MIN_FRI_QUERIES: usize = 19;
 pub const STANDARD_MIN_FRI_LOG_BLOWUP: u32 = 4;
 
 // ── Mobile / low-latency policy ────────────────────────────────────
-// Track B (Phase 58 followup): trades proof size for prove speed.
+// Track B: trades proof size for prove speed.
 // Target: low-power devices where the prove-time-vs-proof-size
 // curve favours faster prove.  ~2.5× faster than STANDARD on the
 // reference bench at log14, ~1.4× larger proof.
