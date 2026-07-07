@@ -1587,20 +1587,35 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     let id = node.register(AgentConfig::new(counter_blob));
     let counter = CrdtCounterRef::at(id);
 
-    // Build a valid TAG_DYNAMIC + Msg("inc") payload, padded
-    // to exactly 4096 bytes by inserting zero bytes between the
-    // TAG_DYNAMIC byte and the rkyv-archived Msg. rkyv archives
-    // are tail-anchored — the Archived type sits at the END of
-    // the buffer — so leading padding is tolerated by
-    // `access_unchecked` while trailing padding would break it.
+    // Build a valid TAG_DYNAMIC + Msg("inc") payload, padded by inserting
+    // zero bytes between the TAG_DYNAMIC byte and the rkyv-archived Msg.
+    // rkyv archives are tail-anchored — the Archived type sits at the END
+    // of the buffer — so leading padding is tolerated by `access_unchecked`
+    // while trailing padding would break it.
+    //
+    // The guest FETCH buffer is BUF_SIZE (4096). `node.invoke` wraps every
+    // inbox payload with a 6-byte Unauthenticated caller prefix
+    // (TAG_CALLER_PREFIX + 5 flag bytes — see `wrap_with_unauthenticated_prefix`),
+    // so the WIRE item the guest fetches is `6 + payload`. Size the payload so
+    // that wrapped item is EXACTLY BUF_SIZE — the exact-fit boundary that
+    // `fetch_raw` must accept (`n == buf.len()`) rather than reject as
+    // truncated. (A payload whose wrapped item would exceed BUF_SIZE is
+    // genuinely undeliverable through this path and is silently dropped — a
+    // separate limitation of the fixed guest buffer.)
+    const CALLER_PREFIX_LEN: usize = 6;
+    let target = 4096 - CALLER_PREFIX_LEN; // wrapped wire item == BUF_SIZE
     let m = Msg::new("inc");
     let encoded = m.encode();
-    let pad_len = 4096 - 1 - encoded.len();
-    let mut payload = Vec::with_capacity(4096);
+    let pad_len = target - 1 - encoded.len();
+    let mut payload = Vec::with_capacity(target);
     payload.push(TAG_DYNAMIC);
     payload.extend(std::iter::repeat(0u8).take(pad_len));
     payload.extend_from_slice(&encoded);
-    assert_eq!(payload.len(), 4096, "payload size at the boundary");
+    assert_eq!(
+        payload.len(),
+        target,
+        "payload sized so the 6-byte-wrapped wire item lands on the BUF_SIZE boundary"
+    );
 
     // Use `node.invoke` rather than node.outbox_sender so the
     // agent thread's invoke loop processes our payload without
@@ -4681,8 +4696,19 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
     // change_membership, B becomes a voter.
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use vos::network::{Network, NetworkConfig, RaftJoinResult, derive_node_prefix};
+    use vos::network::{Network, NetworkConfig, NetworkService, RaftJoinResult, derive_node_prefix};
     use vos::raft::{RaftWorker, Role, WorkerConfig};
+
+    // A's inbound `RaftJoinReq` is admission-gated on a `NetworkService`
+    // (`raft_join_authorized`); production checks the registry's
+    // NODE_ROLE_VOTER set, but this wire-path test runs no registry, so
+    // install a stub that authorizes the enrolled joiner.
+    struct JoinAuthAll;
+    impl NetworkService for JoinAuthAll {
+        fn raft_join_authorized(&self, _prefix: u16) -> bool {
+            true
+        }
+    }
 
     let kp_a = libp2p::identity::Keypair::generate_ed25519();
     let kp_b = libp2p::identity::Keypair::generate_ed25519();
@@ -4734,6 +4760,7 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
         None,
     );
     net_a.register_raft_handler(rep_id, Arc::new(worker_a.handler()));
+    net_a.set_service(Arc::new(JoinAuthAll));
     let h_a = worker_a.handler();
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until && h_a.role() != Role::Leader {
