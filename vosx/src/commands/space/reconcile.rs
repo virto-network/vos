@@ -124,6 +124,13 @@ pub struct AgentDef {
     /// for one-off services typically want `ephemeral`.
     #[serde(default = "default_consistency")]
     pub consistency: String,
+    /// Opt a network-served but node-confined (`local`/`ephemeral`) agent OUT
+    /// of the device-confinement gate so remote peers can reach it — for the
+    /// cross-bank `clerk-bridge` and cross-space `space-bridge`. `false`
+    /// (confined, device-private) by default; `crdt`/`raft` agents are never
+    /// confined and ignore it.
+    #[serde(default)]
+    pub network_reachable: bool,
     /// Constructor args. Values are resolved against the
     /// actor's `.vos_meta` so e.g. `Vec<u32>` typed args
     /// automatically map a list of agent names to their
@@ -843,6 +850,7 @@ fn reconcile_one(
         consistency,
         install_args,
         install_payloads,
+        agent.network_reachable,
         Vec::new(),
     ))
     .map_err(|e| anyhow::anyhow!("registry.install('{}'): {e}", agent.name))?;
@@ -1161,6 +1169,26 @@ mod tests {
         assert_eq!(m.agents.len(), 1);
         assert_eq!(m.agents[0].name, "counter");
         assert_eq!(m.agents[0].consistency, "crdt");
+        assert!(
+            !m.agents[0].network_reachable,
+            "network_reachable is confined (false) by default"
+        );
+    }
+
+    #[test]
+    fn parses_network_reachable_opt_in() {
+        // A network-served bridge opts out of the device-confinement gate.
+        let s = r#"
+            space = "bank-a"
+            [[agent]]
+            name = "clerk-bridge"
+            path = "actors/clerk-bridge.elf"
+            consistency = "ephemeral"
+            network_reachable = true
+        "#;
+        let m: Manifest = toml::from_str(s).unwrap();
+        assert!(m.agents[0].network_reachable);
+        assert_eq!(m.agents[0].consistency, "ephemeral");
     }
 
     #[test]

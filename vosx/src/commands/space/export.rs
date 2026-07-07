@@ -55,6 +55,11 @@ fn print_manifest(
         println!("program_hash   = {:?}", hex::encode(a.program_hash));
         println!("replication_id = {:?}", hex::encode(a.replication_id));
         println!("consistency    = {:?}", consistency_name(a.consistency));
+        // Only emitted when opted in — confined is the default, so a re-import
+        // of an omitted field correctly defaults back to false.
+        if a.network_reachable {
+            println!("network_reachable = true");
+        }
         println!();
     }
 

@@ -136,6 +136,13 @@ pub struct AgentRow {
     /// 0 = Ephemeral, 1 = Local, 2 = Crdt, 3 = Raft. Mirrors
     /// `vos::node::Consistency` discriminants.
     pub consistency: u8,
+    /// Opt this node-confined (`Local`/`Ephemeral`) agent OUT of the
+    /// device-confinement gate so remote peers can reach it — for the
+    /// network-served bridges (`clerk-bridge`, `space-bridge`). `false`
+    /// (confined, device-private) by default; `Crdt`/`Raft` agents are never
+    /// confined and ignore it. See
+    /// [`vos::node::AgentConfig::network_reachable`].
+    pub network_reachable: bool,
     /// rkyv-encoded `vos::init::InitArgs` captured at install
     /// time. New replicas use this to bootstrap their copy of
     /// the agent before its first message arrives. Empty when
@@ -885,6 +892,7 @@ impl SpaceRegistry {
         consistency: u8,
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
+        network_reachable: bool,
         auth: Vec<u8>,
     ) -> Status {
         if !self.authorize_op(
@@ -899,6 +907,7 @@ impl SpaceRegistry {
                     &[consistency],
                     &install_args,
                     &install_payloads,
+                    &[network_reachable as u8],
                 ],
             ),
             &auth,
@@ -980,6 +989,7 @@ impl SpaceRegistry {
                 program_version,
                 replication_id,
                 consistency,
+                network_reachable,
                 install_args,
                 install_payloads,
             },
@@ -2492,6 +2502,7 @@ mod tests {
                 consistency,
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
+                network_reachable: false,
                 auth: root_auth(
                     "install",
                     &[
@@ -2503,6 +2514,7 @@ mod tests {
                         &[consistency],
                         &[],
                         &[],
+                        &[0u8],
                     ],
                 ),
             },
@@ -2539,6 +2551,54 @@ mod tests {
         assert!(may_transition_to(3, 2)); // Raft -> Crdt (rank-equal lateral)
         assert!(may_transition_to(2, 1)); // Crdt -> Local (narrow)
         assert!(!may_transition_to(0, 1)); // Ephemeral -> Local (widen) denied
+    }
+
+    #[test]
+    fn install_persists_network_reachable() {
+        let mut r = registry();
+        let hash = alloc::vec![7u8; 32];
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Publish {
+                    name: String::from("p"),
+                    version: String::from("1"),
+                    hash: hash.clone(),
+                    auth: root_auth("publish", &[b"p", b"1", &hash]),
+                },
+            ),
+            Status::Ok
+        );
+        // A confined (Ephemeral) bridge that opts into network reachability.
+        let rep = fresh_rep_id();
+        let st = dispatch(
+            &mut r,
+            Install {
+                instance_name: String::from("bridge"),
+                program_name: String::from("p"),
+                program_version: String::from("1"),
+                program_hash: hash.clone(),
+                replication_id: rep.clone(),
+                consistency: 0, // Ephemeral
+                install_args: Vec::new(),
+                install_payloads: Vec::new(),
+                network_reachable: true,
+                auth: root_auth(
+                    "install",
+                    &[b"bridge", b"p", b"1", &hash, &rep, &[0u8], &[], &[], &[1u8]],
+                ),
+            },
+        );
+        assert_eq!(st, Status::Ok);
+        let row = r.agents.iter().find(|a| a.instance_name == "bridge").unwrap();
+        assert!(
+            row.network_reachable,
+            "install must persist network_reachable=true onto the AgentRow"
+        );
+        // The default install path stays confined.
+        assert_eq!(install_at(&mut r, "counter", 2 /* Crdt */), Status::Ok);
+        let c = r.agents.iter().find(|a| a.instance_name == "counter").unwrap();
+        assert!(!c.network_reachable, "default install is confined");
     }
 
     #[test]
@@ -2964,7 +3024,7 @@ mod tests {
         let forged = auth_as(
             &attacker_key,
             "install",
-            &[b"evil", b"p", b"1", &hash, &rep, &[2u8], &[], &[]],
+            &[b"evil", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8]],
         );
         let status = dispatch_as_system(
             &mut r,
@@ -2977,6 +3037,7 @@ mod tests {
                 consistency: 2,
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
+                network_reachable: false,
                 auth: forged,
             },
         );
@@ -3043,6 +3104,7 @@ mod tests {
                 consistency: 2,
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
+                network_reachable: false,
                 auth: Vec::new(),
             },
         );
@@ -3343,7 +3405,7 @@ mod tests {
         let rep = alloc::vec![5u8; 32];
         let install_auth = root_auth(
             "install",
-            &[b"res", b"p", b"1", &hash, &rep, &[2u8], &[], &[]],
+            &[b"res", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8]],
         );
         let install = |r: &mut SpaceRegistry| {
             dispatch(
@@ -3357,6 +3419,7 @@ mod tests {
                     consistency: 2,
                     install_args: Vec::new(),
                     install_payloads: Vec::new(),
+                    network_reachable: false,
                     auth: install_auth.clone(),
                 },
             )
@@ -3390,9 +3453,10 @@ mod tests {
                     consistency: 2,
                     install_args: Vec::new(),
                     install_payloads: Vec::new(),
+                    network_reachable: false,
                     auth: root_auth(
                         "install",
-                        &[b"res", b"p", b"1", &hash, &rep2, &[2u8], &[], &[]],
+                        &[b"res", b"p", b"1", &hash, &rep2, &[2u8], &[], &[], &[0u8]],
                     ),
                 },
             ),
@@ -3433,9 +3497,10 @@ mod tests {
                     consistency: 2,
                     install_args: Vec::new(),
                     install_payloads: Vec::new(),
+                    network_reachable: false,
                     auth: root_auth(
                         "install",
-                        &[b"app", b"p", b"1", &h1, &rep, &[2u8], &[], &[]],
+                        &[b"app", b"p", b"1", &h1, &rep, &[2u8], &[], &[], &[0u8]],
                     ),
                 },
             ),
