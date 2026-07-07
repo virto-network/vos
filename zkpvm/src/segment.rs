@@ -17,11 +17,13 @@
 //!   - pc/timestamp columns are pinned to the trace (CpuChip
 //!     program-execution chaining), so the continuity equality forces
 //!     real pc/timestamp continuity.
-//!   - register columns are pinned to the trace only by the register
-//!     ledger's read-consistency, which is currently vacuous against a
-//!     from-scratch prover (`prev_value` is a free witness) — so
-//!     register continuity is NOT yet enforced against a malicious
-//!     prover (see `chips/register_memory_closing.rs`).
+//!   - register columns are pinned to the trace by the register ledger's
+//!     read-consistency (v6: a cross-row `#[mask_next_row]` `prev_value`
+//!     binding + a `(reg, ts)` sortedness gadget + an `is_write` limb),
+//!     which is sound against a from-scratch prover (gate:
+//!     `tests/ledger_readconsistency_gate.rs`), so the continuity
+//!     equality forces genuine register continuity too (see
+//!     `chips/register_memory_closing.rs`).
 //!   - `memory_commitment` is a hash computed outside the circuit (not
 //!     even FS-mixed), so memory continuity trusts the prover. Closing
 //!     it needs an in-circuit memory-image commitment (couples with the

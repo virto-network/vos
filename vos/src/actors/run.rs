@@ -322,10 +322,12 @@ fn halt_with_output(data: &[u8]) -> ! {
 /// columns and the verifier's boundary-binding check equates the
 /// metadata to them (`zkpvm::Proof::public_io_hash`).  No new ECALL, no
 /// tracer/prover cooperation, no register-ledger surgery: it is ordinary
-/// register state at halt.  (Soundness caveat: the closing-read column
-/// binds to the true final register only via the register-ledger
-/// read-consistency, vacuous against a from-scratch prover today — see
-/// `crate::zk` and `zkpvm::chips::register_memory_closing`.)
+/// register state at halt.  The closing-read column binds to the true
+/// final register via the register-ledger read-consistency (v6: cross-row
+/// `prev_value` + `(reg, ts)` sortedness + `is_write` limb), which is
+/// sound against a from-scratch prover (gate
+/// `zkpvm/tests/ledger_readconsistency_gate.rs`) — see `crate::zk` and
+/// `zkpvm::chips::register_memory_closing`.
 ///
 /// a2→φ[9], a3→φ[10], a4→φ[11], a5→φ[12] per grey-transpiler's RISC-V→PVM
 /// mapping — the exact window `public_io_hash` reconstructs.
