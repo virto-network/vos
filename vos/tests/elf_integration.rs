@@ -1587,20 +1587,35 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     let id = node.register(AgentConfig::new(counter_blob));
     let counter = CrdtCounterRef::at(id);
 
-    // Build a valid TAG_DYNAMIC + Msg("inc") payload, padded
-    // to exactly 4096 bytes by inserting zero bytes between the
-    // TAG_DYNAMIC byte and the rkyv-archived Msg. rkyv archives
-    // are tail-anchored — the Archived type sits at the END of
-    // the buffer — so leading padding is tolerated by
-    // `access_unchecked` while trailing padding would break it.
+    // Build a valid TAG_DYNAMIC + Msg("inc") payload, padded by inserting
+    // zero bytes between the TAG_DYNAMIC byte and the rkyv-archived Msg.
+    // rkyv archives are tail-anchored — the Archived type sits at the END
+    // of the buffer — so leading padding is tolerated by `access_unchecked`
+    // while trailing padding would break it.
+    //
+    // The guest FETCH buffer is BUF_SIZE (4096). `node.invoke` wraps every
+    // inbox payload with a 6-byte Unauthenticated caller prefix
+    // (TAG_CALLER_PREFIX + 5 flag bytes — see `wrap_with_unauthenticated_prefix`),
+    // so the WIRE item the guest fetches is `6 + payload`. Size the payload so
+    // that wrapped item is EXACTLY BUF_SIZE — the exact-fit boundary that
+    // `fetch_raw` must accept (`n == buf.len()`) rather than reject as
+    // truncated. (A payload whose wrapped item would exceed BUF_SIZE is
+    // genuinely undeliverable through this path and is silently dropped — a
+    // separate limitation of the fixed guest buffer.)
+    const CALLER_PREFIX_LEN: usize = 6;
+    let target = 4096 - CALLER_PREFIX_LEN; // wrapped wire item == BUF_SIZE
     let m = Msg::new("inc");
     let encoded = m.encode();
-    let pad_len = 4096 - 1 - encoded.len();
-    let mut payload = Vec::with_capacity(4096);
+    let pad_len = target - 1 - encoded.len();
+    let mut payload = Vec::with_capacity(target);
     payload.push(TAG_DYNAMIC);
     payload.extend(std::iter::repeat(0u8).take(pad_len));
     payload.extend_from_slice(&encoded);
-    assert_eq!(payload.len(), 4096, "payload size at the boundary");
+    assert_eq!(
+        payload.len(),
+        target,
+        "payload sized so the 6-byte-wrapped wire item lands on the BUF_SIZE boundary"
+    );
 
     // Use `node.invoke` rather than node.outbox_sender so the
     // agent thread's invoke loop processes our payload without
@@ -4681,8 +4696,19 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
     // change_membership, B becomes a voter.
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use vos::network::{Network, NetworkConfig, RaftJoinResult, derive_node_prefix};
+    use vos::network::{Network, NetworkConfig, NetworkService, RaftJoinResult, derive_node_prefix};
     use vos::raft::{RaftWorker, Role, WorkerConfig};
+
+    // A's inbound `RaftJoinReq` is admission-gated on a `NetworkService`
+    // (`raft_join_authorized`); production checks the registry's
+    // NODE_ROLE_VOTER set, but this wire-path test runs no registry, so
+    // install a stub that authorizes the enrolled joiner.
+    struct JoinAuthAll;
+    impl NetworkService for JoinAuthAll {
+        fn raft_join_authorized(&self, _prefix: u16) -> bool {
+            true
+        }
+    }
 
     let kp_a = libp2p::identity::Keypair::generate_ed25519();
     let kp_b = libp2p::identity::Keypair::generate_ed25519();
@@ -4734,6 +4760,7 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
         None,
     );
     net_a.register_raft_handler(rep_id, Arc::new(worker_a.handler()));
+    net_a.set_service(Arc::new(JoinAuthAll));
     let h_a = worker_a.handler();
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until && h_a.role() != Role::Leader {
@@ -5404,7 +5431,9 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
         ServiceId::HYPERSPACE_REGISTRY,
     );
     node_a.register_at_id(
-        AgentConfig::new(bridge_blob.clone()).with_consistency(Consistency::Ephemeral),
+        AgentConfig::new(bridge_blob.clone())
+            .with_consistency(Consistency::Ephemeral)
+            .network_reachable(),
         bridge_a_id,
     );
     node_a.attach_network(net_a);
@@ -5425,7 +5454,9 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
         ServiceId::HYPERSPACE_REGISTRY,
     );
     node_b.register_at_id(
-        AgentConfig::new(bridge_blob).with_consistency(Consistency::Ephemeral),
+        AgentConfig::new(bridge_blob)
+            .with_consistency(Consistency::Ephemeral)
+            .network_reachable(),
         bridge_b_id,
     );
     // The forward target on B. Crdt + persist so the inc state
@@ -6145,8 +6176,19 @@ const VC_TRACE_GAS: u64 = 100_000_000;
 /// Forcing set: BLAKE2B(1), BLAKE2B_BOUNDARY(2), MEMORY_PAGE(4),
 /// RISTRETTO(23), RIST_ECALL(24), FIXED_BASE_CONSUMER(26), COMB_ANCHOR(27),
 /// COMB_SCALAR_BOUNDARY(28), COMB_COMPRESS(29), COMB_COMPRESS_OUTPUT(30).
+///
+/// BLAKE2B_BOUNDARY and MEMORY_PAGE floors are 18/11 — the natural size a
+/// FULL (`seg_steps`) segment reaches — so the short trailing segment (whose
+/// natural sizes are smaller) is padded up to the same shape and collapses to
+/// C_0 rather than a third commitment. Floors below the full-segment natural
+/// (the earlier 17/10) left full segments un-forced and the short segment on
+/// the floor, so the chain landed a segment outside the allowlist. NOTE: this
+/// pins the floor to THIS transition's full-segment shape; a batch whose full
+/// segments need a larger blake2b/memory-page size would exceed these floors —
+/// the robust fix is padding the trailing segment to `seg_steps` (see the
+/// last-segment-continuity item in docs/plans/proving-time.md §6).
 const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
-    0, 14, 17, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 0, 11, 6, 5, 6, 5,
+    0, 14, 18, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 0, 11, 6, 5, 6, 5,
 ];
 
 /// Published canonical-shape program-commitment ALLOWLIST for
@@ -6165,11 +6207,11 @@ const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
         0x58, 0x4f,
     ],
     // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
-    // blake2s a0cbbf47f880e3be8785b5bc72eef48ef101a0c17808b74d4ce91019020f6278
+    // blake2s 5c899bde74c0a9c575687bb9233850cd594ff654362f10ba579c35a970c3e2ce
     [
-        0xa0, 0xcb, 0xbf, 0x47, 0xf8, 0x80, 0xe3, 0xbe, 0x87, 0x85, 0xb5, 0xbc, 0x72, 0xee, 0xf4,
-        0x8e, 0xf1, 0x01, 0xa0, 0xc1, 0x78, 0x08, 0xb7, 0x4d, 0x4c, 0xe9, 0x10, 0x19, 0x02, 0x0f,
-        0x62, 0x78,
+        0x5c, 0x89, 0x9b, 0xde, 0x74, 0xc0, 0xa9, 0xc5, 0x75, 0x68, 0x7b, 0xb9, 0x23, 0x38, 0x50,
+        0xcd, 0x59, 0x4f, 0xf6, 0x54, 0x36, 0x2f, 0x10, 0xba, 0x57, 0x9c, 0x35, 0xa9, 0x70, 0xc3,
+        0xe2, 0xce,
     ],
 ];
 
@@ -6262,6 +6304,87 @@ fn voucher_check_commitment_drift_guard() {
     assert_eq!(
         c1, VOUCHER_CHECK_COMMITMENTS[1],
         "C_1 drifted — re-pin VOUCHER_CHECK_COMMITMENTS[1]"
+    );
+}
+
+/// Allowlist-completeness gate: EVERY distinct canonical segment shape of the
+/// conservation transition must land in the pinned `VOUCHER_CHECK_COMMITMENTS`
+/// allowlist. The drift guard only pins seg 0 + the first comb segment; this
+/// prints the per-segment comb-call histogram (trace-only, cheap) then proves
+/// one representative per distinct comb count PLUS seg 0 and the last (short)
+/// segment, asserting each commitment is in the allowlist. Catches an
+/// incomplete allowlist — e.g. the short trailing segment landing on a third
+/// commitment when a canonical-profile floor under-forces it (the 2026-07
+/// `verify_chain` ProofInvalid) — without proving all ~76 segments. Run:
+///   RUST_MIN_STACK=268435456 cargo test -p vos --release --test elf_integration \
+///     voucher_check_allowlist_coverage -- --ignored --nocapture
+#[test]
+#[ignore]
+fn voucher_check_allowlist_coverage() {
+    use vos::Encode;
+    let (blob, addr) = voucher_check_pvm();
+    let registrar = cipher_clerk::crypto::Keypair::generate();
+    let (public, witness, _v, _b) = build_conservation_transition(&registrar);
+    let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
+    let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
+        .expect("trace the conservation transition");
+    let total = full.steps.len();
+    let bounds = zkpvm::segment::segment_bounds(total, CHAIN_SEG_STEPS);
+    let n = bounds.len();
+    eprintln!("total steps = {total}, segments = {n}, seg_steps = {CHAIN_SEG_STEPS}");
+
+    // Comb-count per segment (trace-only — no proving).
+    let counts: Vec<usize> = bounds
+        .iter()
+        .map(|&(a, b)| zkpvm::segment::segment_side_note(&full, a, b).ristretto_comb_calls.len())
+        .collect();
+    let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for &c in &counts {
+        *hist.entry(c).or_default() += 1;
+    }
+    eprintln!("comb-count histogram (combs_per_segment -> #segments): {hist:?}");
+
+    // Probe seg 0, the last (possibly short) segment, and the first segment of
+    // each distinct comb count. Prove each and check allowlist membership.
+    let mut probe: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    probe.insert(0);
+    probe.insert(n - 1);
+    for i in 0..n {
+        if counts[..i].iter().all(|&x| x != counts[i]) {
+            probe.insert(i);
+        }
+    }
+    let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    eprintln!("proving {} representative segments: {probe:?}", probe.len());
+    let mut commit_of: std::collections::BTreeMap<usize, [u8; 32]> = Default::default();
+    for i in probe {
+        let (a, b) = bounds[i];
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let proof = zkpvm::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
+            .unwrap_or_else(|e| panic!("prove_canonical seg {i} [{a},{b}): {e:?}"));
+        let c =
+            zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
+        eprintln!(
+            "seg {i:3} steps={:7} combs={} commitment={} in_allowlist={}",
+            b - a,
+            counts[i],
+            hex(&c),
+            VOUCHER_CHECK_COMMITMENTS.contains(&c)
+        );
+        commit_of.insert(i, c);
+    }
+    // Every probed segment (including the short tail) must be in the pinned
+    // allowlist; a miss means the allowlist is incomplete for this transition —
+    // extend it, or raise the under-forcing canonical-profile floor so the
+    // segment collapses onto an existing commitment.
+    let missing: Vec<String> = commit_of
+        .iter()
+        .filter(|(_, c)| !VOUCHER_CHECK_COMMITMENTS.contains(c))
+        .map(|(i, c)| format!("seg{i}={}", hex(c)))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "segments outside VOUCHER_CHECK_COMMITMENTS: {missing:?}"
     );
 }
 
