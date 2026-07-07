@@ -111,7 +111,14 @@ macro_rules! decode_or_bad_input {
 
 // ── Actor ───────────────────────────────────────────────────────
 
-#[actor]
+pub mod roles;
+pub use roles::{CLERK_LEDGER_SPACE_ROLE_MAP, ClerkLedgerRole};
+
+#[actor(
+    role = ClerkLedgerRole,
+    default_role = ClerkLedgerRole::None,
+    space_role_map = CLERK_LEDGER_SPACE_ROLE_MAP,
+)]
 pub struct ClerkLedger {
     journal: Option<CcJournal>,
     /// Sorted by `id` ascending; lookups via `binary_search_by_key`.
@@ -193,7 +200,7 @@ impl ClerkLedger {
     /// One-time initialization. Records the journal id, registrar
     /// pubkey, and journal type code. Idempotent in identical
     /// arguments.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Operator)]
     async fn bootstrap(
         &mut self,
         journal_id: Vec<u8>,
@@ -239,7 +246,7 @@ impl ClerkLedger {
     /// Accept a registrar-signed `CreateAccount`. Signature gate
     /// before any state-dependent rejection so attackers can't
     /// probe state by submitting junk-signed creates.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Operator)]
     async fn create_account(
         &mut self,
         create_account_bytes: Vec<u8>,
@@ -295,7 +302,7 @@ impl ClerkLedger {
     /// clerk-ledger `Status` taxonomy. On `Status::Ok` the transfer
     /// is recorded in state and the touched accounts' balance
     /// commits are updated via the Pedersen homomorphism.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Operator)]
     async fn apply_transfer(
         &mut self,
         transfer_bytes: Vec<u8>,
@@ -422,7 +429,7 @@ impl ClerkLedger {
     }
 
     /// Read an account by id.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn account(&self, id: Vec<u8>) -> Option<CcAccount> {
         let id_bytes: [u8; 16] = try_array(id)?;
         self.accounts
@@ -432,7 +439,7 @@ impl ClerkLedger {
     }
 
     /// Read a transfer by id.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn transfer(&self, id: Vec<u8>) -> Option<CcTransfer> {
         let id_bytes: [u8; 16] = try_array(id)?;
         self.transfers
@@ -453,7 +460,7 @@ impl ClerkLedger {
     /// `state_root_before` / `state_root_after` set from this pair
     /// and `signature` produced by the bank's clerk-key off-actor.
     /// Keeping the signing key out of replicated actor state.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn transfer_state_roots(&self, id: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)> {
         let id_bytes: [u8; 16] = try_array(id)?;
         self.transfer_roots
@@ -467,12 +474,12 @@ impl ClerkLedger {
             })
     }
 
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn account_count(&self) -> u32 {
         self.accounts.len() as u32
     }
 
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn transfer_count(&self) -> u32 {
         self.transfers.len() as u32
     }
@@ -492,7 +499,7 @@ impl ClerkLedger {
     /// return; no persistent SMT state. The picky-fast path
     /// (incremental cached sub-SMTs) is a follow-up optimisation;
     /// today's demo scale doesn't pressure it.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn state_root(&self) -> Vec<u8> {
         match self.journal.as_ref() {
             Some(_) => self.composite_root().to_vec(),
@@ -517,7 +524,7 @@ impl ClerkLedger {
     /// commitment isn't 32 bytes. (Pedersen-point validity beyond
     /// length is the kernel's / verifier's concern; clerk-ledger
     /// just stores bytes.)
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Operator)]
     async fn submit_note_commitment(&mut self, commitment: Vec<u8>) -> Status {
         let Some(bytes) = try_array::<32>(commitment) else {
             return Status::BadInput;
@@ -527,14 +534,14 @@ impl ClerkLedger {
     }
 
     /// Number of note commitments in the L3 pool.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn note_commitment_count(&self) -> u32 {
         self.note_commitments.len() as u32
     }
 
     /// Read a note commitment by its insertion index. Returns an
     /// empty `Vec` for out-of-range indices.
-    #[msg]
+    #[msg(role = ClerkLedgerRole::Member)]
     async fn note_commitment_at(&self, index: u32) -> Vec<u8> {
         self.note_commitments
             .get(index as usize)
