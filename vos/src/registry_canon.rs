@@ -82,6 +82,9 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
             let consistency = a.get_u8("consistency")?;
             let install_args = a.get_bytes("install_args")?;
             let install_payloads = a.get_bytes("install_payloads")?;
+            // Absent field (e.g. an older client) defaults to false (confined),
+            // matching the mutator's decode of a missing bool param.
+            let network_reachable = a.get_bool("network_reachable").unwrap_or(false);
             canonical_op_bytes(
                 "install",
                 &[
@@ -93,6 +96,7 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
                     &[consistency],
                     &install_args,
                     &install_payloads,
+                    &[network_reachable as u8],
                 ],
             )
         }
@@ -179,7 +183,8 @@ mod tests {
             .with("replication_id", alloc::vec![9u8; 32])
             .with("consistency", 2u64)
             .with("install_args", alloc::vec![1u8, 2, 3])
-            .with("install_payloads", Vec::<u8>::new());
+            .with("install_payloads", Vec::<u8>::new())
+            .with("network_reachable", true);
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
             reg(
@@ -193,6 +198,7 @@ mod tests {
                     &[2u8],
                     &[1u8, 2, 3],
                     &[],
+                    &[1u8],
                 ],
             ),
         );

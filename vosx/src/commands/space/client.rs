@@ -397,6 +397,7 @@ impl DaemonClient {
             consistency,
             install_args,
             install_payloads,
+            false, // network_reachable: CLI/dev installs stay confined by default
             Vec::new(),
         ))
         .map_err(|e| anyhow::anyhow!("registry.install(): {e}"))

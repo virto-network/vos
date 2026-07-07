@@ -1235,6 +1235,12 @@ fn agent_config_from_row(
     if needs_replication {
         cfg = cfg.with_replication_id(a.replication_id);
     }
+    // A node-confined (Local/Ephemeral) agent opts out of the device gate so
+    // remote peers can reach it — the network-served bridges. No-op for
+    // Crdt/Raft (never confined).
+    if a.network_reachable {
+        cfg = cfg.network_reachable();
+    }
     if !a.install_args.is_empty() {
         cfg = cfg.with_storage(vec![(
             vos::lifecycle::INIT_KEY.to_vec(),
