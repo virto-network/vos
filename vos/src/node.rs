@@ -3851,7 +3851,7 @@ fn handle_invoke_request(
     // agent can populate Context::caller and role bytes from the caller info.
     // Format: see lifecycle::TAG_CALLER_PREFIX.
     let payload = encode_caller_prefix(&req);
-    runtime.send_to(svc_id, payload);
+    send_if_deliverable(runtime, svc_id, payload);
     runtime.run_blocking();
 
     // Route any external transfers the dispatch produced.
@@ -4044,6 +4044,37 @@ fn wrap_with_unauthenticated_prefix(msg: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Enqueue `payload` for `svc_id` only if the guest can actually fetch it.
+///
+/// The actor's dispatch loop reads each queued item into a fixed `BUF_SIZE`
+/// buffer (`lifecycle::fetch_raw`), so an item larger than that is
+/// undeliverable: `fetch_raw` reports truncation (`n > buf.len()`) and the loop
+/// treats it as end-of-queue, dropping the oversize item AND skipping anything
+/// queued behind it in the same round. Enqueuing such an item is never useful,
+/// so refuse it LOUDLY here rather than silently poisoning the queue. `payload`
+/// is the already-wrapped dispatch item (caller-prefix header included), so the
+/// effective message ceiling is `BUF_SIZE` minus that header.
+///
+/// This guard lives in the VOS dispatch layer, not `VosRuntime::send_to`, so
+/// the JAR/JAM-aligned runtime and the `FETCH` hostcall stay buffer-size-
+/// agnostic (a guest with a larger buffer would accept a larger item). Returns
+/// `true` when the item fit and was enqueued.
+fn send_if_deliverable(runtime: &mut VosRuntime, svc_id: ServiceId, payload: Vec<u8>) -> bool {
+    use crate::actors::lifecycle::BUF_SIZE;
+    if payload.len() > BUF_SIZE {
+        tracing::warn!(
+            service = svc_id.0,
+            payload_len = payload.len(),
+            buf_size = BUF_SIZE,
+            "refusing undeliverable dispatch: wrapped payload exceeds the guest FETCH buffer \
+             (BUF_SIZE); the actor cannot receive it — reduce the message size",
+        );
+        return false;
+    }
+    runtime.send_to(svc_id, payload);
+    true
+}
+
 /// Wrap the request's message bytes with a caller-info header so the
 /// PVM agent can populate `Context::caller` and the role bytes from caller info.
 ///
@@ -4208,7 +4239,7 @@ fn dispatch_once(
         } else {
             wrap_with_unauthenticated_prefix(&payload)
         };
-        runtime.send_to(svc_id, payload);
+        send_if_deliverable(runtime, svc_id, payload);
     }
     runtime.run_blocking();
 

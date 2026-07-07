@@ -19,8 +19,11 @@ use super::{
 #[cfg(feature = "pvm")]
 use alloc::vec::Vec;
 
-/// Buffer size for hostcall data exchange.
-#[cfg(feature = "pvm")]
+/// Buffer size for guest hostcall data exchange — the fixed buffer the actor
+/// dispatch loop reads each queued FETCH item into. A host that enqueues an
+/// item larger than this cannot deliver it (the guest's `fetch_raw` reports
+/// truncation and drops it; see `node::send_if_deliverable`), so this is shared
+/// host/guest ABI rather than gated to the guest (`pvm`) build.
 pub(crate) const BUF_SIZE: usize = 4096;
 
 /// Well-known storage key for actor constructor arguments.
