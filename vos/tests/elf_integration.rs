@@ -6696,13 +6696,18 @@ fn clerk_ledger_two_bank_federation() {
     // What this test pins:
     //   1. After convergence, A's hyperspace registry resolves
     //      "clerk-b" / "bridge-b" to B's ServiceIds, and vice versa.
-    //   2. From node_a, ClerkLedgerRef::at(clerk_b_id).account(bob_id)
-    //      reaches bank B's local clerk-ledger via prefix routing and
-    //      returns Bob's account record — cross-bank read works.
-    //   3. The reverse path (B reading Alice from A) also works.
+    //   2. Cross-bank routing resolves: from node_a, an OPEN handler
+    //      on clerk_b_id (journal_id — bank identity, not a balance)
+    //      routes to bank B's ledger via prefix addressing and
+    //      returns B's journal id. The reverse path (A from B) too.
+    //   3. The ledger ACL bites external peers: the same cross-bank
+    //      path to a Member-gated read (account) is refused with
+    //      ClientError::Forbidden. Confidential balances leave a bank
+    //      only through the bridge (§5), never a direct peer read.
     //   4. Per-bank state isolation: bank A's clerk-ledger does NOT
-    //      have Bob (he was only created on B). A non-existent read
-    //      returns None, not a stale cross-bank hit.
+    //      have Bob (he was only created on B). A LOCAL read on A
+    //      (operator-authority, System caller) returns None, not a
+    //      stale cross-bank hit.
     //   5. Cross-bank voucher round-trip: bank A applies a same-bank
     //      transfer, queries transfer_state_roots, builds + signs a
     //      cipher_clerk::voucher::Voucher anchored to those roots
@@ -6729,6 +6734,7 @@ fn clerk_ledger_two_bank_federation() {
     use space_registry::SpaceRegistryRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
+    use vos::actors::client::ClientError;
     use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
 
@@ -6876,9 +6882,11 @@ fn clerk_ledger_two_bank_federation() {
             .network_reachable(),
         bridge_a_id,
     );
-    // Local, but authoritative state deliberately served cross-bank (peer
-    // banks read accounts over the network) — opt out of the device-private
-    // confinement gate.
+    // Local, but reachable cross-bank so peers can route to it: open
+    // handlers (journal_id/ping) answer any peer, while the ledger ACL
+    // refuses the gated balance/transfer reads. Opt out of the
+    // device-private confinement gate so the dispatch reaches the role
+    // gate (and is refused there) rather than bouncing as Unreachable.
     node_a.register_at_id(
         AgentConfig::new(ledger_blob.clone())
             .with_consistency(Consistency::Local)
@@ -7082,41 +7090,59 @@ fn clerk_ledger_two_bank_federation() {
         Status::Ok
     );
 
-    // ── 3) Cross-bank read via typed Ref + prefix routing ───────
+    // ── 3) Cross-bank routing + the ledger ACL boundary ─────────
     //
-    // From node_a, invoke ClerkLedgerRef::at(clerk_b_id).account(bob_id).
-    // The ServiceId's top 16 bits = prefix_b, so the mailbox routes
-    // the dispatch to node_b over libp2p. Node_b's local clerk-ledger
-    // handles it and the typed reply rides back. No bridge needed for
-    // this — direct ServiceId addressing is the simpler federation
-    // primitive when the caller already knows the target ServiceId
-    // (e.g., obtained via the hyperspace resolve above).
-    let bob_remote = vos::block_on(ledger_b.account(&mut &node_a, bob_id.to_vec()))
-        .expect("cross-bank account(bob) from A")
-        .expect("bob exists on B");
-    assert_eq!(bob_remote.id.0, bob_id, "bob's id round-trips cross-bank");
+    // From node_a, invoke a Ref on clerk_b_id. The ServiceId's top 16
+    // bits = prefix_b, so the mailbox routes the dispatch to node_b
+    // over libp2p, node_b's local clerk-ledger handles it, and the
+    // typed reply rides back. Two facts get pinned:
+    //
+    //   a) Routing resolves. `journal_id` is an OPEN handler (bank
+    //      identity, not a balance), so a cross-bank peer may call it.
+    //      node_a reads back bank B's journal id — the prefix route
+    //      landed on B's ledger.
+    //   b) The ACL bites external peers. `account` is Member-gated and
+    //      node_a is not a member of bank B's space, so the SAME
+    //      cross-bank path is refused with `ClientError::Forbidden`.
+    //      Confidential balances never leave a bank by a direct peer
+    //      read; cross-bank value moves only through the bridge (§5).
+    let b_journal_from_a = vos::block_on(ledger_b.journal_id(&mut &node_a))
+        .expect("cross-bank journal_id(B) from A routes");
     assert_eq!(
-        bob_remote.journal_id, journal_b,
-        "bob is anchored to bank B's journal"
+        b_journal_from_a,
+        journal_b.0.to_vec(),
+        "cross-bank route lands on bank B's ledger (its journal id)"
     );
+    let a_journal_from_b = vos::block_on(ledger_a.journal_id(&mut &node_b))
+        .expect("cross-bank journal_id(A) from B routes");
     assert_eq!(
-        bob_remote.auth_key, bob_kp.public,
-        "bob's auth key matches what B registered"
+        a_journal_from_b,
+        journal_a.0.to_vec(),
+        "reverse cross-bank route lands on bank A's ledger"
     );
 
-    // Reverse direction: B reads Alice from A's ledger.
-    let alice_remote = vos::block_on(ledger_a.account(&mut &node_b, alice_id.to_vec()))
-        .expect("cross-bank account(alice) from B")
-        .expect("alice exists on A");
-    assert_eq!(alice_remote.id.0, alice_id);
-    assert_eq!(alice_remote.journal_id, journal_a);
+    assert!(
+        matches!(
+            vos::block_on(ledger_b.account(&mut &node_a, bob_id.to_vec())),
+            Err(ClientError::Forbidden)
+        ),
+        "cross-bank account(bob) from A must be refused by the ledger ACL"
+    );
+    assert!(
+        matches!(
+            vos::block_on(ledger_a.account(&mut &node_b, alice_id.to_vec())),
+            Err(ClientError::Forbidden)
+        ),
+        "cross-bank account(alice) from B must be refused by the ledger ACL"
+    );
 
     // ── 4) Per-bank state isolation ─────────────────────────────
     //
     // Bob was only created on B. A's local ledger must not have
-    // him — i.e., a cross-bank query for Bob targeting A's ledger
-    // returns None, not a stale hit propagated through some shared
-    // state. (clerk-ledger has Consistency::Local, no replication.)
+    // him — i.e., a LOCAL query for Bob on A's own ledger (System
+    // caller, bypasses the ACL) returns None, not a stale hit
+    // propagated through some shared state. (clerk-ledger has
+    // Consistency::Local, no replication.)
     let bob_on_a = vos::block_on(ledger_a.account(&mut &node_a, bob_id.to_vec()))
         .expect("local account(bob) on A");
     assert!(
