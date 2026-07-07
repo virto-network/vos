@@ -298,12 +298,17 @@ pub fn verify_standalone_with_options(
     // BINDS `proof.{initial,final}_state` to the committed boundary
     // COLUMNS; the mix above alone is only tamper-evidence against
     // post-prove edits, not against a from-scratch prover. pc/timestamp
-    // columns are pinned to the trace, so those become genuine bound
-    // public inputs; the register columns (and the voucher io-hash read
-    // from `final_state.registers[9..13]`) are pinned to the trace only
-    // by the register-ledger read-consistency, which is vacuous against
-    // a from-scratch prover today — see `zkpvm::boundary_binding` and
-    // `chips/register_memory_closing.rs`. A mask missing any binding
+    // columns are pinned to the trace by CpuChip program-execution
+    // chaining; the register columns (and the voucher io-hash read from
+    // `final_state.registers[9..13]`) are pinned to the trace by
+    // `RegisterMemoryChip` read-consistency (v6: a cross-row
+    // `#[mask_next_row]` `prev_value` binding, a range-checked
+    // `(reg, ts)` sortedness gadget, and an `is_write` tuple limb),
+    // which is sound against a from-scratch prover (gate:
+    // `zkpvm/tests/ledger_readconsistency_gate.rs`) — see
+    // `zkpvm::boundary_binding` and `chips/register_memory_closing.rs`.
+    // So registers/pc/timestamp are all genuine bound public inputs. A
+    // mask missing any binding
     // chip cannot bind its boundary states and is rejected outright (all
     // three are unconditionally active in the production prove path).
     let Some(boundary_positions) =

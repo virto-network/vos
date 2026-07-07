@@ -52,15 +52,16 @@
 //!    operands on the halting `ecall` (see `actors::run`'s
 //!    `halt_with_output_bound`).  Phase Z0's closing chip pins the
 //!    final-register columns and the verifier's boundary-binding check
-//!    (`zkpvm::boundary_binding`, v5) equates `final_state.registers` to
-//!    them — no new ECALL, no prover changes.  SOUNDNESS CAVEAT: that
-//!    column is pinned to the trace's true final registers only by the
-//!    register-ledger read-consistency, which is currently vacuous
-//!    against a from-scratch prover (`prev_value` is a free witness), so
-//!    a malicious prover can still forge this hash; closing that needs
-//!    the register-ledger read-consistency fix (see
-//!    `zkpvm::chips::register_memory_closing`). Sound against an honest
-//!    prover today.
+//!    (`zkpvm::boundary_binding`) equates `final_state.registers` to
+//!    them — no new ECALL, no prover changes.  That equality binds the
+//!    public registers to the committed closing-chip columns, and those
+//!    columns are pinned to the trace's true final registers by
+//!    `RegisterMemoryChip` read-consistency — a cross-row
+//!    `#[mask_next_row]` `prev_value` binding, a range-checked
+//!    `(reg, ts)` sortedness gadget, and an `is_write` tuple limb — so a
+//!    forged closing read (and hence a forged io-hash) is rejected
+//!    in-circuit, sound against a from-scratch prover (gate:
+//!    `zkpvm/tests/ledger_readconsistency_gate.rs`).
 //! 3. The host verifier reconstructs the hash from the proof via
 //!    [`zkpvm::Proof::public_io_hash`] and compares it against a locally
 //!    recomputed [`compute_io_hash`] — alongside the STARK validity
