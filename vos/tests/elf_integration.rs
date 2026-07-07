@@ -6177,16 +6177,29 @@ const VC_TRACE_GAS: u64 = 100_000_000;
 /// RISTRETTO(23), RIST_ECALL(24), FIXED_BASE_CONSUMER(26), COMB_ANCHOR(27),
 /// COMB_SCALAR_BOUNDARY(28), COMB_COMPRESS(29), COMB_COMPRESS_OUTPUT(30).
 ///
-/// BLAKE2B_BOUNDARY and MEMORY_PAGE floors are 18/11 — the natural size a
-/// FULL (`seg_steps`) segment reaches — so the short trailing segment (whose
-/// natural sizes are smaller) is padded up to the same shape and collapses to
-/// C_0 rather than a third commitment. Floors below the full-segment natural
-/// (the earlier 17/10) left full segments un-forced and the short segment on
-/// the floor, so the chain landed a segment outside the allowlist. NOTE: this
-/// pins the floor to THIS transition's full-segment shape; a batch whose full
-/// segments need a larger blake2b/memory-page size would exceed these floors —
-/// the robust fix is padding the trailing segment to `seg_steps` (see the
-/// last-segment-continuity item in docs/plans/proving-time.md §6).
+/// BLAKE2B_BOUNDARY and MEMORY_PAGE floors are 18/11 — the size a FULL
+/// (`seg_steps`) segment reaches — so the short trailing segment, whose natural
+/// sizes are smaller, is forced up to the same shape and collapses to C_0
+/// rather than a third commitment. The earlier 17/10 floors sat BELOW the
+/// full-segment natural, leaving full segments unforced (they used 18/11) while
+/// the short segment sat on the floor (17/10) — a mismatch that landed the
+/// chain's tail outside the allowlist.
+///
+/// These two chips size on the NUMBER of blake2b / memory-page OPERATIONS in a
+/// segment (content), not on its step count — so padding the tail with no-op
+/// steps would NOT canonicalize them; forcing the floor is the only lever. The
+/// floors are the observed per-segment MAXIMA for this transition: the
+/// federation e2e verifies all 76 segments against {C_0, C_1}, which can only
+/// hold if no segment's natural size exceeds a floor. Because the succinct
+/// witness fixes per-operation cost (constant-depth SMT paths regardless of
+/// ledger size), per-segment operation DENSITY is bounded (it does not grow
+/// with the ledger), so the fixed-profile approach stays sound across batch
+/// sizes — but 18/11 are the measured maxima for this transition's operation
+/// pattern, not a proven bound, so a differently-shaped transition (or a
+/// pathologically dense window) is re-derived and caught by
+/// `voucher_check_commitment_drift_guard` + `voucher_check_allowlist_coverage`.
+/// Collapsing any-length chain to ONE commitment (so no floor tuning is ever
+/// needed) is the recursive-aggregation work in docs/plans/proving-time.md §6.
 const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
     0, 14, 18, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 0, 11, 6, 5, 6, 5,
 ];
