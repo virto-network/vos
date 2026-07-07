@@ -1822,6 +1822,8 @@ fn crdt_counter_init_payloads_dispatch() {
 #[test]
 #[cfg(feature = "network")]
 fn crdt_counter_converges_across_nodes_live() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // Cycle 5 end-to-end: stand up two networked VosNodes with the
     // crdt-counter actor registered on both under the same
     // replication_id. Drive each side once with `inc()`, wait for
@@ -2033,6 +2035,8 @@ fn crdt_counter_converges_across_nodes_live() {
 #[test]
 #[cfg(feature = "network")]
 fn crdt_scheduler_install_propagates_across_nodes() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // CRDT replication of an agent that drives sub-actors. The
     // scheduler tracks state (`round`, `children`, `run_queue`)
     // and on each external dispatch invokes its registered children
@@ -2233,6 +2237,8 @@ fn crdt_scheduler_install_propagates_across_nodes() {
 #[test]
 #[cfg(feature = "network")]
 fn crdt_counter_burst_converges_under_concurrent_load() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // Robustness probe: the existing convergence test does one
     // inc() per side. Real workloads will have bursts of writes
     // racing with each other and with the sync ticker. This
@@ -2353,6 +2359,13 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
     )
     .expect("Hello completes");
 
+    // The peer-connection wait above (and the Hello handshake) is
+    // request-response — separate from the gossipsub mesh that carries the CRDT
+    // deltas. That mesh grafts a heartbeat or two after both sides subscribe;
+    // bursting before it forms drops early deltas and stalls convergence (the
+    // flake). Let the mesh settle first.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
     let inc_payload = || -> Vec<u8> {
         let m = Msg::new("inc");
         let encoded = m.encode();
@@ -2394,19 +2407,22 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
         v.as_u64()
     };
 
+    // Bidirectional concurrent-load convergence is borderline at 15s under a
+    // busy box even with `net_serial`; 30s gives margin (free on success —
+    // `wait_for` returns the moment it converges).
     let final_a = wait_for(
         || match read_count(&node_a, counter_a) {
             Some(c) if c == EXPECTED => Some(c),
             _ => None,
         },
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
     );
     let final_b = wait_for(
         || match read_count(&node_b, counter_b) {
             Some(c) if c == EXPECTED => Some(c),
             _ => None,
         },
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
     );
     let observed_a = read_count(&node_a, counter_a);
     let observed_b = read_count(&node_b, counter_b);
@@ -2427,6 +2443,18 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
 }
 
 #[cfg(feature = "network")]
+/// Serialize the network/multi-node e2e tests against each other. Each starts
+/// libp2p nodes and waits for gossip/raft convergence within a fixed deadline;
+/// running several at once under `cargo test`'s default parallelism starves them
+/// of CPU and contends on mDNS/ports, so convergence occasionally misses the
+/// deadline (flaky — a different couple fail per run). This guard lets each run
+/// alone while non-network tests still parallelize. Poison-tolerant so a
+/// panicking test can't wedge the rest.
+fn net_serial() -> std::sync::MutexGuard<'static, ()> {
+    static NET_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    NET_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, deadline: std::time::Duration) -> Option<T> {
     let until = std::time::Instant::now() + deadline;
     loop {
@@ -3091,6 +3119,8 @@ fn crdt_counter_shutdown_under_active_load() {
 #[test]
 #[cfg(feature = "network")]
 fn crdt_counter_offline_node_catches_up_after_restart() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // Cross-node restart: A and B start in sync, both at
     // count=1. A shuts down. While A is offline, B drives
     // additional `inc()` calls. A restarts against the same
@@ -3776,6 +3806,8 @@ fn raft_counter_single_node_replays_log_after_restart() {
 #[test]
 #[cfg(feature = "network")]
 fn raft_counter_three_node_replicates_state_to_all_replicas() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // Phase 5 boundary: the close-the-loop test for Consistency::Raft.
     //
     // Three networked VosNodes register a crdt-counter with
@@ -4069,6 +4101,8 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
 #[test]
 #[cfg(feature = "network")]
 fn raft_three_node_cluster_compacts_log_after_replication() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // Phase 6: log compaction. Three networked nodes form a Raft
     // cluster, the leader proposes 64 entries (well past the
     // worker's default `Config::compact_hysteresis = 16`), every
@@ -4482,6 +4516,8 @@ fn invoked_child_storage_isolated_from_parent_journal() {
 #[test]
 #[cfg(feature = "network")]
 fn raft_dynamic_join_grows_single_node_cluster_to_three() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // Phase B boundary: a fresh node joins a running Raft cluster
     // at runtime via `WorkerHandle::change_membership` (Ongaro
     // §4.3 joint consensus).
@@ -4746,6 +4782,8 @@ fn raft_dynamic_join_grows_single_node_cluster_to_three() {
 #[test]
 #[cfg(feature = "network")]
 fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // End-to-end test of the `Frame::RaftJoinReq` wire path.
     //
     // Direct API path is already covered by
@@ -4922,6 +4960,8 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
 #[test]
 #[cfg(feature = "network")]
 fn raft_status_req_returns_absent_for_unknown_group() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // `vosx ps` queries every connected peer for every Raft
     // group in the manifest. Peers that don't host a particular
     // group must reply `present = false` so the client can
@@ -5025,6 +5065,8 @@ fn raft_status_req_returns_absent_for_unknown_group() {
 #[test]
 #[cfg(feature = "network")]
 fn manifest_req_returns_installed_provider_payload() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // Regression: `vosx join <bootnode>` (without `--manifest`)
     // hits `Frame::ManifestReq` to fetch the bootnode's
     // space.toml + actor blobs. The bootnode side requires a
@@ -5133,6 +5175,8 @@ version = "0.1.0"
 #[test]
 #[cfg(feature = "network")]
 fn hyperspace_resolve_returns_remote_host_prefix() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // End-to-end test for the hyperspace runtime — proves the
     // load-bearing claim:
     //
@@ -5349,6 +5393,8 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
 #[test]
 #[cfg(feature = "network")]
 fn cross_space_bridge_forward_dispatches_to_local_target() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // End-to-end test for the bridge actor — proves the load-bearing
     // claim of the cross-space gateway pattern:
     //
@@ -6629,6 +6675,8 @@ fn encode_witness_payload(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
 
 #[test]
 fn clerk_ledger_two_bank_federation() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
     // End-to-end federation demo. Two bank spaces (A, B), each
     // independently running its own confidential ledger, join a
     // shared hyperspace and discover each other through it. Pins
