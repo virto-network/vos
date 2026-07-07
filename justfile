@@ -40,6 +40,18 @@ build-settle:
       -Zbuild-std-features=compiler-builtins-mem \
       --features pvm-settle --bin settle
 
+# Build the host-loaded artifacts the elf_integration e2e needs beyond the
+# example PVM actors: the built-in actor ELFs (actors/*), the voucher-check
+# guest, and the prover extension .so (debug for the default e2e, release for
+# the opt-in real-STARK path). `test-pvm` depends on this, so a vos change can't
+# leave a STALE ELF/.so behind — the recurring trap where a stale actor ELF
+# surfaces as `register_remote Unreachable` and a stale voucher-check /
+# prover .so as a `ProofInvalid`. (Run `just build-actors` by hand if you invoke
+# `cargo test` directly instead of through `just test-pvm`.)
+build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge build-voucher-check
+    cargo build -p prover-extension
+    cargo build -p prover-extension --release
+
 # ── Test ────────────────────────────────────────────────────────────
 
 # Run all tests (workspace + integration)
@@ -56,8 +68,12 @@ test-wasm: build-wasm
     node examples/wasm/js/test-fetch.mjs
     node examples/wasm/js/test-persist.mjs
 
-# Run PVM-related integration tests (requires built PVM actors)
-test-pvm: build-extensions
+# Run the elf_integration e2e against FRESHLY-built artifacts. Depends on the
+# full artifact set (workspace + extensions + example PVM actors + built-in
+# actor ELFs + prover .so) so a vos change never runs the e2e against a stale
+# ELF/.so. This is the safe way to run the e2e; prefer it over a bare
+# `cargo test -p vos --test elf_integration`.
+test-pvm: build-crates build-extensions build-pvm build-actors
     cargo test -p vos --test elf_integration -- --nocapture
 
 # Run a single test by name
