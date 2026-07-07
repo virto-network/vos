@@ -1599,9 +1599,10 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // so the WIRE item the guest fetches is `6 + payload`. Size the payload so
     // that wrapped item is EXACTLY BUF_SIZE — the exact-fit boundary that
     // `fetch_raw` must accept (`n == buf.len()`) rather than reject as
-    // truncated. (A payload whose wrapped item would exceed BUF_SIZE is
-    // genuinely undeliverable through this path and is silently dropped — a
-    // separate limitation of the fixed guest buffer.)
+    // truncated. (A payload whose wrapped item would EXCEED BUF_SIZE is
+    // genuinely undeliverable through the fixed guest buffer;
+    // `node::send_if_deliverable` refuses it with a `warn!` rather than
+    // silently dropping it — see `fetch_over_buf_size_boundary_is_refused`.)
     const CALLER_PREFIX_LEN: usize = 6;
     let target = 4096 - CALLER_PREFIX_LEN; // wrapped wire item == BUF_SIZE
     let m = Msg::new("inc");
@@ -1629,6 +1630,64 @@ fn fetch_at_buf_size_boundary_delivers_message() {
          dropped it because `fetch_raw` checked `n < buf.len()` and the \
          runtime returned `copy_len` (== buf.len() for exact fits), so \
          the actor never saw the inc()",
+    );
+
+    node.shutdown();
+    let _ = node.collect();
+}
+
+/// Complement to `fetch_at_buf_size_boundary_delivers_message`: a payload ONE
+/// byte over the boundary (wrapped wire item == BUF_SIZE + 1) cannot fit the
+/// guest's fixed FETCH buffer. `node::send_if_deliverable` refuses such an item
+/// (with a `warn!`) instead of enqueuing a doomed item that the guest would drop
+/// on truncation — so the actor never sees the message and its state is
+/// unchanged. Pins the BUF_SIZE ceiling so a change to the caller-prefix size or
+/// the guest buffer is caught here.
+#[test]
+fn fetch_over_buf_size_boundary_is_refused() {
+    use crdt_counter::CrdtCounterRef;
+    use vos::Encode;
+    use vos::node::{AgentConfig, VosNode};
+    use vos::value::{Msg, TAG_DYNAMIC};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let counter_path = format!(
+        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        workspace,
+    );
+    let counter_data = match std::fs::read(&counter_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: crdt-counter actor not built");
+            return;
+        }
+    };
+    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+
+    let mut node = VosNode::new();
+    let id = node.register(AgentConfig::new(counter_blob));
+    let counter = CrdtCounterRef::at(id);
+
+    // One byte OVER the boundary: with the 6-byte caller-prefix wrap the wire
+    // item is BUF_SIZE + 1 (4097), which the guest's 4096-byte FETCH buffer
+    // cannot hold — send_if_deliverable refuses it.
+    const CALLER_PREFIX_LEN: usize = 6;
+    let target = 4096 - CALLER_PREFIX_LEN + 1; // wrapped wire item == BUF_SIZE + 1
+    let m = Msg::new("inc");
+    let encoded = m.encode();
+    let pad_len = target - 1 - encoded.len();
+    let mut payload = Vec::with_capacity(target);
+    payload.push(TAG_DYNAMIC);
+    payload.extend(std::iter::repeat(0u8).take(pad_len));
+    payload.extend_from_slice(&encoded);
+    assert_eq!(payload.len(), target);
+
+    let _ = node.invoke(id, payload);
+
+    let count = vos::block_on(counter.get(&mut &node)).expect("get must succeed");
+    assert_eq!(
+        count, 0,
+        "an over-BUF_SIZE message must NOT be delivered (refused by send_if_deliverable)"
     );
 
     node.shutdown();
