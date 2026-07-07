@@ -1,7 +1,7 @@
 # CpuChip constraint authoring rules
 
 A handful of structural rules that aren't obvious from the stwo API but bit us
-during Phase 12 development.  Read these before adding new constraints or
+in practice.  Read these before adding new constraints or
 lookup emissions to `add_constraints` / `generate_interaction_trace`.
 
 ## 1. `finalize_logup_in_pairs` pairs by emission order
@@ -35,11 +35,11 @@ So if you add a single new emission, you **must** add a partner alongside —
 or defer until another commit adds its own and ship them together.  Two
 common patterns:
 
-- **Pair within a feature.**  The Phase 12b-2 SE block emits 4 lookups in a
+- **Pair within a feature.**  The SignExtend block emits 4 lookups in a
   trailing block; pair count even, no parity flip elsewhere.
-- **Bundle Phase 13b + 13c.**  13b adds the program-memory tuple consumer;
-  13c adds the flag-binding emission.  Shipped together = 2 new emissions,
-  parity preserved.
+- **Bundle two features.**  One adds the program-memory tuple consumer;
+  the other adds the flag-binding emission.  Shipped together = 2 new
+  emissions, parity preserved.
 
 ## 2. Inserting emissions in the middle reshuffles every later pair
 
@@ -58,10 +58,10 @@ emission individually is degree-bounded.
 `generate_interaction_trace`), in **even-count blocks**, so they pair within
 themselves and never reshuffle pre-existing pair shapes.
 
-This is what made the Phase 12b-2 SignExtend constraints work after they
-initially failed: the 4 nibble-AND lookups were moved from inline (near the
-related ground constraints) to a final block right before
-`finalize_logup_in_pairs`.  Search for `Phase 12b-2` in `mod.rs` for the
+This is what the SignExtend constraints require: the 4 nibble-AND lookups
+sit in a final block right before `finalize_logup_in_pairs` rather than
+inline near the related ground constraints.  See the "Sign-extend nibble
+lookups" block near the end of `add_constraints` in `mod.rs` for the
 canonical example.
 
 ## 3. Verifier-side and prover-side emissions must match exactly

@@ -22,15 +22,15 @@ pub struct SideNote {
     pub num_initial_mem_entries: usize,
     /// Power-of-two lookup counts: shift_amount → multiplicity (set by CpuChip).
     pub power_of_two_counts: Vec<u32>,
-    /// Phase 33: popcount lookup counts: byte → multiplicity (set by CpuChip
+    /// Popcount lookup counts: byte → multiplicity (set by CpuChip
     /// on CountSetBits32 / CountSetBits64 rows).
     pub popcount_counts: Vec<u32>,
-    /// Phase 34: bitcount (lz, tz) lookup counts: byte → multiplicity (set
+    /// Bitcount (lz, tz) lookup counts: byte → multiplicity (set
     /// by CpuChip on LeadingZeroBits / TrailingZeroBits rows).
     pub bitcount_counts: Vec<u32>,
-    /// Phase 55a: byte-to-bits decomposition lookup counts (set by
-    /// CpuChip's per-row flag-byte decomposition emissions in Phase 55b).
-    /// In Phase 55a no consumers emit, so all entries are zero.
+    /// Byte-to-bits decomposition lookup counts, set by CpuChip's
+    /// per-row flag-byte decomposition emissions.  When no consumer
+    /// emits, all entries are zero.
     pub byte_to_bits_counts: Vec<u32>,
     /// Session 2.1: RistrettoCombTableChip multiplicity counts.
     /// Indexed by `row = window_idx * 16 + scalar_window` (window_idx
@@ -95,7 +95,7 @@ pub struct SideNote {
     /// register-memory ledger's read-consistency constraint will
     /// reject any non-zero final value.
     pub final_regs: [u64; NUM_REGS],
-    /// Phase Z0: gate for the closing-chip ledger augmentation and the
+    /// Gate for the closing-chip ledger augmentation and the
     /// `final_state.registers` FS-transcript mix.  Set to `true` by the
     /// default `prove()` path because `BASE_COMPONENTS` includes
     /// `RegisterMemoryClosingChip`; left `false` by chip-isolated
@@ -106,37 +106,37 @@ pub struct SideNote {
     /// include the closing chip in an explicit slice should set this
     /// to `true` themselves.
     pub closing_chip_active: bool,
-    /// Phase 13a: per-PC count of CpuChip steps that fetched the instruction
-    /// at that PC.  Populated in Phase 13b once CpuChip emits the
-    /// ProgramMemory consumer; in Phase 13a the chip exists with zero
-    /// multiplicity everywhere (its claimed_sum is 0).
+    /// Per-PC count of CpuChip steps that fetched the instruction
+    /// at that PC.  Populated once CpuChip emits the ProgramMemory
+    /// consumer; until then the chip has zero multiplicity everywhere
+    /// (its claimed_sum is 0).
     pub program_memory_counts: HashMap<u32, u32>,
-    /// Phase 13d: program's jump_table — the set of valid dynamic-dispatch
+    /// Program's jump_table — the set of valid dynamic-dispatch
     /// targets used by JumpInd / LoadImmJumpInd.  Empty for programs that
     /// don't use indirect jumps (most negative tests).  JumpTableChip
     /// commits to it via its preprocessed Addr/Target columns; CpuChip's
     /// JumpInd consumer demands `(addr=val_b+imm, target=next_pc)`
     /// against that table, balancing dispatch-by-runtime-index.
     pub jump_table: Vec<u32>,
-    /// Phase 13d: per-jump-table-index count of JumpInd dispatches.  Indexed
+    /// Per-jump-table-index count of JumpInd dispatches.  Indexed
     /// by `addr/2 - 1` where `addr = (regs[reg_a] + imm) mod 2^32`; entry N
     /// = number of times the program dispatched through `jump_table[N]`.
     /// Set by CpuChip's trace fill from the JumpInd steps; consumed by
     /// JumpTableChip's main-trace fill as Multiplicity.
     pub jump_table_counts: Vec<u32>,
-    /// Phase 54a: per-mul-row witness pushed by CpuChip's trace_fill so
+    /// Per-mul-row witness pushed by CpuChip's trace_fill so
     /// MulChip's main trace mirrors CpuChip's val_b/val_d/result/mul_high
     /// exactly.  Must match the column values CpuChip writes — see
     /// chips/mul.rs's collect path.
     pub mul_entries: Vec<MulEntry>,
-    /// Phase 54e: per-bitwise-row witness pushed by CpuChip's trace_fill
+    /// Per-bitwise-row witness pushed by CpuChip's trace_fill
     /// so BitwiseChip's main trace mirrors CpuChip's val_b/val_d/result
     /// + and_result + nibble decompositions exactly.
     pub bitwise_entries: Vec<BitwiseEntry>,
-    /// Phase 54f: per-compare-or-branch-row witness pushed by CpuChip
+    /// Per-compare-or-branch-row witness pushed by CpuChip
     /// so CompareChip's AIR can re-prove the unsigned-LT carry chain.
     pub compare_entries: Vec<CompareEntry>,
-    /// Phase 54g: per-divrem-row witness for DivRemChip.
+    /// Per-divrem-row witness for DivRemChip.
     pub divrem_entries: Vec<DivRemEntry>,
     /// R1e-quat: per-row witness for RistrettoChip's field-arithmetic
     /// rows (is_add / is_sub / is_mul rows produced by the host-side
@@ -148,7 +148,7 @@ pub struct SideNote {
     /// chip's lookup balance stays at 0 = 0.
     #[cfg(feature = "prover")]
     pub ristretto_field_rows: Vec<crate::chips::ristretto::witness::FieldOpRow>,
-    /// Phase A memory-page Merkle boundary payload, built on the prove path by
+    /// Memory-page Merkle boundary payload, built on the prove path by
     /// [`SideNote::ingest_memory_pages`].  Holds the listed pages' entering /
     /// exit images, the boundary multiproof (leaves + merge schedule + roots),
     /// and seeds `merkle_blake2b_calls`.  `MemoryChip` reads it to inject the
@@ -184,22 +184,22 @@ pub struct MemoryPagePayload {
     pub multiproof: crate::page_merkle::MerkleMultiproof,
 }
 
-/// Phase 54g/54i/54k — Single divrem-row witness for the DivRemLookup
-/// balance.  div_corr_hi / div_corr_carry are DivRemChip-internal
-/// (Phase 54k); the 4 sign bits flow from CpuChip via the lookup
-/// tuple so DivRemChip can run the Phase 16/18 sign-correction chains.
+/// Single divrem-row witness for the DivRemLookup
+/// balance.  div_corr_hi / div_corr_carry are DivRemChip-internal;
+/// the 4 sign bits flow from CpuChip via the lookup
+/// tuple so DivRemChip can run the sign-correction chains.
 #[derive(Clone, Debug)]
 pub struct DivRemEntry {
     pub val_b: u64,
     pub val_d: u64,
     pub div_quotient: u64,
     pub div_remainder: u64,
-    /// Phase 54k: high 8 bytes of the schoolbook output.  Internal to
+    /// High 8 bytes of the schoolbook output.  Internal to
     /// DivRemChip — pinned by the schoolbook chain on DivU rows and
     /// additionally by the sign-correction chain on DivS rows.
     pub div_corr_hi: [u8; 8],
-    /// Phase 54k: per-byte carry of the Phase 16/18 sign-correction
-    /// chain.  Internal witness on DivRemChip.
+    /// Per-byte carry of the sign-correction chain.  Internal
+    /// witness on DivRemChip.
     pub div_corr_carry: [u8; 8],
     pub div_mul_carry: [u8; 16],
     pub div_mul_carry_hi: [u8; 16],
@@ -212,14 +212,14 @@ pub struct DivRemEntry {
     /// real DivRemChip row.
     pub div_cmp_diff: [u8; 8],
     pub div_cmp_carry: [u8; 8],
-    /// Phase 54k: 4 sign bits flowed from CpuChip.  Bound on CpuChip
-    /// via Phase 17/18 nibble lookups; consumed here for the DivS
+    /// 4 sign bits flowed from CpuChip.  Bound on CpuChip
+    /// via nibble lookups; consumed here for the DivS
     /// sign-correction chain.
     pub sign_bit_b: u8,
     pub sign_bit_d: u8,
     pub sign_bit_q: u8,
     pub sign_bit_r: u8,
-    /// Phase 54j-redux: |val_d| / |div_remainder| via two's-complement
+    /// |val_d| / |div_remainder| via two's-complement
     /// conditional negation + comparison chain.  All six arrays are
     /// DivRemChip-internal; gated on sign_bit_d/sign_bit_r.
     pub abs_d: [u8; 8],
@@ -230,7 +230,7 @@ pub struct DivRemEntry {
     pub abs_cmp_carry: [u8; 8],
 }
 
-/// Phase 54f — Single compare-or-branch-row witness for the
+/// Single compare-or-branch-row witness for the
 /// CompareLookup balance.
 #[derive(Clone, Debug)]
 pub struct CompareEntry {
@@ -242,7 +242,7 @@ pub struct CompareEntry {
     pub cmp_carry: [u8; 8],
 }
 
-/// Phase 54e — Single bitwise-row witness for the BitwiseLookup balance.
+/// Single bitwise-row witness for the BitwiseLookup balance.
 #[derive(Clone, Debug)]
 pub struct BitwiseEntry {
     pub val_b: u64,
@@ -267,17 +267,17 @@ pub struct MulEntry {
     pub val_d: u64,
     pub result: u64,
     pub mul_high: u64,
-    /// Phase 54b: schoolbook low/high outputs (separate from `result`,
+    /// Schoolbook low/high outputs (separate from `result`,
     /// which differs per variant — see CpuChip's result-binding logic
     /// for non-rotate Mul64 / RotL64 / MulUpper variants).
     pub unsigned_product_low: u64,
     pub unsigned_product_hi: u64,
-    /// Phase 54b: per-position carry of the schoolbook chain (16 bytes).
+    /// Per-position carry of the schoolbook chain (16 bytes).
     /// `mul_carry + 256·mul_carry_hi` reconstructs the full ≤16-bit
     /// carry; busiest at position k=3 for 0xFFFF_FFFF² ≈ 0x3FB.
     pub mul_carry: [u8; 16],
     pub mul_carry_hi: [u8; 16],
-    /// Phase 54c: Phase 12c sign-correction terms.
+    /// Sign-correction terms.
     /// `term_a` = sa·val_d for SU/SS, 0 for UU.
     /// `term_b` = sb·val_b for SS, 0 elsewhere.
     pub mul_corr_term_a: [u8; 8],
@@ -285,11 +285,11 @@ pub struct MulEntry {
     /// Per-byte carry chain for `result + term_a + term_b ≡
     /// unsigned_product_hi (mod 2^64)` on is_mul_upper rows.
     pub mul_corr_carry: [u8; 8],
-    /// Phase 54c: bit 7 of val_b's MSB (val_b[7] for 64-bit, val_b[3]
-    /// for 32-bit).  Used by Phase 12c sign correction.
+    /// Bit 7 of val_b's MSB (val_b[7] for 64-bit, val_b[3]
+    /// for 32-bit).  Used by sign correction.
     pub sign_bit_b: u8,
     pub sign_bit_d: u8,
-    /// Phase 54d: rotate-class flags driving result-variant dispatch.
+    /// Rotate-class flags driving result-variant dispatch.
     pub is_rotate_l64: bool,
     pub is_rotate_r64: bool,
     pub is_rotate_l32: bool,
@@ -379,7 +379,7 @@ impl SideNote {
         }
     }
 
-    /// Phase A: build the memory-page Merkle boundary payload for this segment
+    /// Build the memory-page Merkle boundary payload for this segment
     /// (design §0–§3).  Enumerates the touched pages (always adding page 0, so
     /// the listed set is never empty and the new chips stay unconditionally
     /// active), takes the entering image (`initial_memory`) and the exit image
@@ -612,7 +612,7 @@ impl SideNote {
     /// 3 once Batches 3d/3e add the y_negate and s_neg checks.
     ///
     /// Mirrors `populate_ristretto_comb_counts`'s pattern: idempotent
-    /// (does NOT zero the counts, since CpuChip's Phase-55b
+    /// (does NOT zero the counts, since CpuChip's
     /// flag-byte decomposition also writes here — additive
     /// bookkeeping) and called both from chip-isolated tests and
     /// from `ingest_ristretto_boundary` for production traces.

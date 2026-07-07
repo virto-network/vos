@@ -25,7 +25,7 @@ use crate::trace::{
     eval::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX},
 };
 
-// Phase 60: prove_impl uses super::active_components(side_note) instead
+// prove_impl uses super::active_components(side_note) instead
 // of the static BASE_COMPONENTS list to skip dormant chips.
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
@@ -303,7 +303,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
     balances
 }
 
-/// Phase I.0 debug: pinpoint the failing constraint when prove fails with
+/// Debug: pinpoint the failing constraint when prove fails with
 /// `ConstraintsNotSatisfied`.  Generates the same main + interaction trace
 /// that `prove_with_explicit_components` would, then runs Stwo's
 /// `AssertEvaluator` row-by-row and panics with `row #X, constraint #Y`
@@ -454,7 +454,7 @@ pub fn debug_claimed_sums_streaming(
 /// regions this dominates `prove`'s memory footprint.  Future work
 /// could swap this for an in-place Merkle commitment over the byte-
 /// level memory ledger (which we already build for the MemoryChip).
-/// Phase A: the entering / exit RAM page-Merkle roots for this segment, from
+/// The entering / exit RAM page-Merkle roots for this segment, from
 /// the ingested page payload.  Falls back to the all-zero root only on the
 /// never-proved empty path (no payload).
 fn segment_memory_roots(side_note: &SideNote) -> ([u8; 32], [u8; 32]) {
@@ -477,7 +477,7 @@ fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
 }
 
 /// Normalize a `SideNote` the way the production prove path does before
-/// trace generation: activate the closing chip (Z0 ledger augmentation +
+/// trace generation: activate the closing chip (ledger augmentation +
 /// FS-transcript mix + component selection all key off it) and backfill
 /// the initial/final register images from the trace.
 ///
@@ -488,7 +488,7 @@ fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
 /// and honest proofs fail with `OodsNotMatching`. `prove` applies it
 /// itself; calling this twice is idempotent.
 pub fn prepare_side_note_for_verification(side_note: &mut SideNote) {
-    // Phase Z0: the default path always uses BASE_COMPONENTS which
+    // The default path always uses BASE_COMPONENTS which
     // includes `RegisterMemoryClosingChip`. Mark the side_note so the
     // ledger augmentation + FS-transcript mix engage and
     // `proof.final_state.registers` becomes a load-bearing public
@@ -528,7 +528,7 @@ fn prove_impl(
     profile: bool,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     prepare_side_note_for_verification(side_note);
-    // Phase 60: filter BASE_COMPONENTS to active chips for THIS trace.
+    // Filter BASE_COMPONENTS to active chips for THIS trace.
     // Verifier reconstructs the same list via active_components_verifier().
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
@@ -536,7 +536,7 @@ fn prove_impl(
     prove_impl_with_components(side_note, config, profile, components, component_mask, &[])
 }
 
-/// Phase I.0: chip-isolated prove path.  Bypasses `active_components` so
+/// Chip-isolated prove path.  Bypasses `active_components` so
 /// callers can pick an arbitrary component slice — used by the chip-rewrite
 /// validation harness to prove a single high-bound chip + its lookup
 /// closure without dragging in always-active CpuChip.  See
@@ -683,11 +683,11 @@ fn prove_impl_with_components_overridden(
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     use std::time::Instant;
 
-    // Phase 9a: RegisterMemoryBoundaryChip needs `initial_regs`
+    // RegisterMemoryBoundaryChip needs `initial_regs`
     // populated.
     backfill_initial_regs(side_note);
 
-    // Phase Z0: refresh `final_regs` when the closing chip is in the
+    // Refresh `final_regs` when the closing chip is in the
     // component set, so a caller that constructed the SideNote with
     // stale final_regs can't accidentally produce a proof whose
     // claimed final state diverges from the actual trace's last step.
@@ -698,7 +698,7 @@ fn prove_impl_with_components_overridden(
         backfill_final_regs(side_note);
     }
 
-    // Phase A: build the memory-page Merkle boundary payload (listed pages,
+    // Build the memory-page Merkle boundary payload (listed pages,
     // entering/exit images, multiproof, merge schedule, `merkle_blake2b_calls`)
     // before trace generation — `MemoryChip` injects the per-page ledger entries
     // from it, `MemoryPageChip` / `MemoryMerkleChip` / `MemoryRootBoundaryChip`
@@ -851,7 +851,7 @@ fn prove_impl_with_components_overridden(
         prover_channel.mix_u64(final_pc);
         prover_channel.mix_u64(final_ts);
 
-        // Phase A (format v7): mix the entering / exit RAM Merkle roots right
+        // Format v7: mix the entering / exit RAM Merkle roots right
         // after final_ts and before the lookup-element draw, so the verifier's
         // MemoryRootBoundary claimed-sum recomputation is sound (the roots are
         // public inputs the lookup elements are drawn against).  Order: entering
@@ -962,7 +962,7 @@ fn prove_impl_with_components_overridden(
     // sourced from `side_note.initial_regs` (the same field the
     // boundary chip's main trace emits from), not `first.regs_before`,
     // so the proof field and the chip's committed values are equal
-    // by construction. The Z0-init FS-transcript mix relies on this
+    // by construction. The closing-chip FS-transcript mix relies on this
     // invariant — if the proof field could diverge from what the chip
     // committed, the verifier would mix bytes that don't match what
     // the prover mixed and honest proofs would fail to verify.
@@ -971,7 +971,7 @@ fn prove_impl_with_components_overridden(
     // because the constraint system already requires
     // `initial_regs == first.regs_before` (boundary chip producers
     // balance CpuChip first-step read consumers via the ledger).
-    // Phase A roots: entering root on initial_state, exit root on final_state —
+    // Memory-page Merkle roots: entering root on initial_state, exit root on final_state —
     // the same values mixed into the FS transcript above and bound by
     // MemoryRootBoundaryChip, so the proof fields equal the committed columns.
     let (root_before, root_after) = segment_memory_roots(side_note);
@@ -1023,7 +1023,7 @@ fn prove_impl_with_components_overridden(
         None => (initial_state, final_state),
     };
 
-    // Phase 60: caller supplies the bitmask (empty for chip-isolated harness).
+    // Caller supplies the bitmask (empty for chip-isolated harness).
     Ok((
         Proof {
             format_version: PROOF_FORMAT_VERSION,

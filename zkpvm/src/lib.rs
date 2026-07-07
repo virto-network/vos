@@ -161,7 +161,7 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 // chip itself.  Table chips populate their multiplicity column by reading counts
 // that consumers accumulate into SideNote during trace generation.
 //
-// Phase 60: Blake2bChip is OPTIONAL.  Skipped when no blake2b ECALL fired in the
+// Blake2bChip is OPTIONAL.  Skipped when no blake2b ECALL fired in the
 // trace.  Saves ~10% prove time and ~57% proof size on workloads that don't
 // hash.  Both prover and verifier must agree on inclusion — `active_components`
 // is the single source of truth and is deterministic from `SideNote`.
@@ -220,35 +220,35 @@ pub mod chip_idx {
 const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::CpuChip,
     &chips::Blake2bChip, // OPTIONAL — gated by !side_note.blake2b_calls.is_empty()
-    &chips::Blake2bBoundaryChip, // Phase A — proves the memory-page Merkle blake2b compressions
+    &chips::Blake2bBoundaryChip, // proves the memory-page Merkle blake2b compressions
     &chips::MemoryChip,
-    &chips::MemoryPageChip, // Phase A — per-page boundary writes/reads + leaf hashes
-    &chips::MemoryMerkleChip, // Phase A — Merkle merge rows
-    &chips::MemoryRootBoundaryChip, // Phase A — root sink (bound to public roots)
+    &chips::MemoryPageChip, // per-page boundary writes/reads + leaf hashes
+    &chips::MemoryMerkleChip, // Merkle merge rows
+    &chips::MemoryRootBoundaryChip, // root sink (bound to public roots)
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
-    &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers
+    &chips::RegisterMemoryClosingChip, // pins proof.final_state.registers
     &chips::ProgramBoundaryChip,
-    &chips::ProgramMemoryChip, // 13a — producer-only until CpuChip consumer in 13b
-    &chips::JumpTableChip,     // 13d — producer of jump_table[] lookups
+    &chips::ProgramMemoryChip, // producer-only until the CpuChip consumer is added
+    &chips::JumpTableChip,     // producer of jump_table[] lookups
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
-    &chips::PopcountChip,           // Phase 33 — per-byte popcount lookup table
-    &chips::BitcountChip,           // Phase 34 — per-byte (lz, tz) lookup table
-    &chips::ByteToBitsChip, // Phase 55a — per-byte 8-bit decomposition lookup table (dormant in 55a; consumers added in 55b)
-    &chips::MulChip,        // Phase 54a — consumer of MultiplicationLookup
-    &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
-    &chips::CompareChip, // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
-    &chips::DivRemChip,  // Phase 54g — consumer of DivRemLookup
-    &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, gated by activity.ristretto
-    &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, gated by activity.ristretto_ecall
-    &chips::RistrettoCombTableChip, // Session 2.1 step 4 — OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoFixedBaseConsumerChip, // Session 2.1 step 5(b) — OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombAnchorChip, // Session 2.1 column-shrink — OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombScalarBoundaryChip, // Session 2.1 step 8 partial — OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombCompressChip, // R1e-bis Batch 2-3 — OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombCompressOutputChip, // R1e-bis Batch 4a — OPTIONAL, gated by activity.ristretto_comb
+    &chips::PopcountChip,           // per-byte popcount lookup table
+    &chips::BitcountChip,           // per-byte (lz, tz) lookup table
+    &chips::ByteToBitsChip, // per-byte 8-bit decomposition lookup table (dormant until consumers are added)
+    &chips::MulChip,        // consumer of MultiplicationLookup
+    &chips::BitwiseChip, // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip, // consumer of CompareLookup, producer of Range256 lookups
+    &chips::DivRemChip,  // consumer of DivRemLookup
+    &chips::RistrettoChip, // OPTIONAL precompile, gated by activity.ristretto
+    &chips::RistrettoEcallChip, // OPTIONAL, gated by activity.ristretto_ecall
+    &chips::RistrettoCombTableChip, // OPTIONAL, gated by activity.ristretto_comb
+    &chips::RistrettoFixedBaseConsumerChip, // OPTIONAL, gated by activity.ristretto_comb
+    &chips::RistrettoCombAnchorChip, // column-shrink — OPTIONAL, gated by activity.ristretto_comb
+    &chips::RistrettoCombScalarBoundaryChip, // OPTIONAL, gated by activity.ristretto_comb
+    &chips::RistrettoCombCompressChip, // OPTIONAL, gated by activity.ristretto_comb
+    &chips::RistrettoCombCompressOutputChip, // OPTIONAL, gated by activity.ristretto_comb
 ];
 
 #[cfg(feature = "prover")]
@@ -271,7 +271,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::MemoryRootBoundaryChip,
     &chips::RegisterMemoryChip,
     &chips::RegisterMemoryBoundaryChip,
-    &chips::RegisterMemoryClosingChip, // Phase Z0 — pins proof.final_state.registers
+    &chips::RegisterMemoryClosingChip, // pins proof.final_state.registers
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip,
     &chips::JumpTableChip,
@@ -280,13 +280,13 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::PowerOfTwoChip,
     &chips::PopcountChip,
     &chips::BitcountChip,
-    &chips::ByteToBitsChip, // Phase 55a
+    &chips::ByteToBitsChip, // per-byte 8-bit decomposition lookup table
     &chips::MulChip,
-    &chips::BitwiseChip, // Phase 54e — consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
-    &chips::CompareChip, // Phase 54f — consumer of CompareLookup, producer of Range256 lookups
-    &chips::DivRemChip,  // Phase 54g — consumer of DivRemLookup
-    &chips::RistrettoChip, // Phase R1b — OPTIONAL precompile, mirrored in verifier-only build
-    &chips::RistrettoEcallChip, // Step 13 — OPTIONAL, mirrored in verifier-only build
+    &chips::BitwiseChip, // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip, // consumer of CompareLookup, producer of Range256 lookups
+    &chips::DivRemChip,  // consumer of DivRemLookup
+    &chips::RistrettoChip, // OPTIONAL precompile, mirrored in verifier-only build
+    &chips::RistrettoEcallChip, // OPTIONAL, mirrored in verifier-only build
     &chips::RistrettoCombTableChip,
     &chips::RistrettoFixedBaseConsumerChip,
     &chips::RistrettoCombAnchorChip,
@@ -304,7 +304,7 @@ const _: () = {
     );
 };
 
-/// Phase 60: deterministic, side-note-driven filter on `BASE_COMPONENTS`.
+/// Deterministic, side-note-driven filter on `BASE_COMPONENTS`.
 /// Returns the components active for THIS trace, in declaration order.
 ///
 /// Both prover and verifier MUST construct the same list.  The predicate
@@ -317,8 +317,8 @@ const _: () = {
 /// CpuChip or MemoryChip ⇒ all relevant lookup balances stay 0=0.
 ///
 /// Index 1 in `BASE_COMPONENTS` is Blake2bChip — skipping that index is
-/// the current implementation.  When more chips become conditional
-/// (Phase 60+ followups), each gains a corresponding index check.
+/// the current implementation.  When more chips become conditional,
+/// each gains a corresponding index check.
 #[cfg(feature = "prover")]
 pub fn active_components(
     side_note: &side_note::SideNote,
@@ -331,7 +331,7 @@ pub fn active_components(
         .collect()
 }
 
-/// Phase 60: per-chip activity flags inferred from `side_note.steps`
+/// Per-chip activity flags inferred from `side_note.steps`
 /// alone (no entries-vec dependency), so the predicate can run BEFORE
 /// CpuChip's trace_fill populates side_note's per-family entries.
 ///
@@ -369,7 +369,7 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         {
             a.ristretto_ecall = true;
         }
-        // Step 13 ECALL gates: point-add and scalar-reduce-wide
+        // The point-add and scalar-reduce-wide ECALLs
         // activate the RistrettoEcallChip but not RistrettoChip
         // (those don't fire field-op rows).
         if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
@@ -426,10 +426,10 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     if !side_note.ristretto_field_rows.is_empty() {
         a.ristretto = true;
     }
-    // Session 2.1 step 4: comb-method consumer + producer chips fire
+    // Comb-method consumer + producer chips fire
     // when at least one fixed-basepoint scalar mult call is queued in
-    // `ristretto_comb_calls`.  In production this is populated by step
-    // 8's ECALL routing; in chip-isolated tests the harness pushes
+    // `ristretto_comb_calls`.  In production this is populated by the
+    // ECALL routing; in chip-isolated tests the harness pushes
     // calls directly.
     if !side_note.ristretto_comb_calls.is_empty() {
         a.ristretto_comb = true;
@@ -482,7 +482,7 @@ impl ChipActivity {
     }
 }
 
-/// Phase 60: bitmask of active chips (bit i ⇔ BASE_COMPONENTS[i] is
+/// Bitmask of active chips (bit i ⇔ BASE_COMPONENTS[i] is
 /// included).  Embedded in `Proof::component_mask` so the standalone
 /// verifier can reconstruct the active set without a SideNote.
 #[cfg(feature = "prover")]
@@ -497,7 +497,7 @@ pub(crate) fn active_component_mask(side_note: &side_note::SideNote) -> u32 {
     mask
 }
 
-/// Phase 60: verifier-side mirror of `active_components`, returning the
+/// Verifier-side mirror of `active_components`, returning the
 /// same selection upcast to `&dyn MachineComponent`.
 #[cfg(feature = "prover")]
 pub(crate) fn active_components_verifier(
@@ -552,7 +552,7 @@ pub use verify::{
     record_canonical_transcript,
 };
 
-/// Phase I.0 chip-isolated harness surface — re-exports the trait
+/// Chip-isolated harness surface — re-exports the trait
 /// objects callers need to assemble an explicit component slice for
 /// `prove_with_explicit_components` / `verify_with_explicit_components`.
 /// Intended only for the v2.x chip-rewrite validation harness; production

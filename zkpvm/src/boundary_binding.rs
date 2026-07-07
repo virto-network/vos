@@ -84,7 +84,7 @@ pub struct BoundaryChipPositions {
     pub register_boundary: usize,
     pub register_closing: usize,
     pub program_boundary: usize,
-    /// Position of `MemoryRootBoundaryChip` (Phase A / format v7), which
+    /// Position of `MemoryRootBoundaryChip` (format v7), which
     /// consumes the single root `MerkleNode` `(0, 0, initial_root, final_root)`.
     pub memory_root_boundary: usize,
 }

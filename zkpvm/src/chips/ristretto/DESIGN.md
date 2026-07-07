@@ -247,9 +247,9 @@ Rejected alternatives:
   the field-arithmetic cost but lose it back at the seam.
 - **Dual-flavor (`k*G_basepoint` separate from `k*P`)** — better
   performance for the basepoint case (precomputed table → no doublings)
-  but doubles the chip surface and the integration churn. Defer to a
-  Phase R2 specialization; Phase R1 covers basepoint via the same
-  general primitive.
+  but doubles the chip surface and the integration churn. Defer a
+  specialized basepoint chip; the general primitive covers the
+  basepoint case.
 - **Multi-scalar (`k₁*G + k₂*P → R`)** — perfect shape for Schnorr
   *verify*, but `cipher-clerk` only verifies server-side; the *user* on
   the device only signs and commits. Defer until a recipient-side
@@ -504,9 +504,9 @@ field `ChipActivity.ristretto: bool`. Index allocation in
 Proofs without any Ristretto ECALLs skip the chip entirely — pure-
 compute actors (fibonacci, hasher, hash-bench) pay nothing.
 
-## 8. Phased implementation plan
+## 8. Implementation plan
 
-**Phase R1a — Plumbing (1 commit)**:
+**R1a — Plumbing (1 commit)**:
 - `ECALL_RISTRETTO_SCALAR_MULT` in `src/core/ecall.rs`.
 - `RistrettoRecord`, `RistrettoMemOp`, `handle_ristretto_scalar_mult_ecall`
   in `src/core/tracing.rs`. Native impl uses `dalek` directly (this
@@ -516,34 +516,34 @@ compute actors (fibonacci, hasher, hash-bench) pay nothing.
   `Ecalli(200)` program and asserts the output bytes match a dalek
   computation done outside the VM.
 
-**Phase R1b — Empty chip stub (1 commit)**:
+**R1b — Empty chip stub (1 commit)**:
 - `chips/ristretto/mod.rs` with a chip that has zero rows but valid
   AIR/preprocessed/interaction shapes. Wire into BASE_COMPONENTS,
   active_components, ChipActivity. Verify gated correctly: existing
   proofs unaffected.
 
-**Phase R1c — Field arithmetic primitives (~3-5 commits)**:
+**R1c — Field arithmetic primitives (~3-5 commits)**:
 - M31 implementation of `field_mul_p25519`, `field_add_p25519`,
   `field_sub_p25519`, `field_inv_p25519` (inverse via fermat's).
 - Per-op constraint blocks. Heavy lifting; benchmark independently.
 
-**Phase R1d — Edwards point operations (~2-3 commits)**:
+**R1d — Edwards point operations (~2-3 commits)**:
 - Doubling and addition formulas in extended coords.
 - Per-row constraint block composition.
 
-**Phase R1e — Scalar mult full loop (~2 commits)**:
+**R1e — Scalar mult full loop (~2 commits)**:
 - NAF window decomposition.
 - Main loop trace generation.
 - Boundary memory lookups.
 
-**Phase R1f — End-to-end test (1 commit)**:
+**R1f — End-to-end test (1 commit)**:
 - `prove_ristretto_via_ecall` test mirroring `prove_blake2b_via_ecall`
   (`tests/prove_vos_actor.rs:677`). Smallest possible exercise.
 - Re-run `clerk-private-pay-bench` with cipher-clerk patched to use
   the ECALL — measure prove time, confirm sub-X-second target.
 
 Realistic effort estimate: **3-5 weeks of focused work**, dominated by
-Phase R1c (field mod-p arithmetic in M31) and Phase R1d (Edwards
+R1c (field mod-p arithmetic in M31) and R1d (Edwards
 point ops + their carry-chain witnesses).
 
 ## 9. What this design doesn't yet answer
@@ -561,7 +561,7 @@ point ops + their carry-chain witnesses).
   is that worth a separate MSM precompile or do we just call k*P
   twice + a point-add precompile?
 - **Fixed-base optimization** — basepoint mult could be ~5× faster
-  with a precomputed table chip; defer to Phase R2 unless
+  with a precomputed table chip; defer unless
   measurements show it's the difference between 1.2 s and 0.8 s.
 
 ## 10c. ACTUAL prove-time measurement (R1f-combined)
@@ -658,5 +658,5 @@ mobile SoC.**
 That's already well into "tap and pay it feels instant" territory
 (Apple Pay's contactless handshake takes ~500 ms; a 2 s background
 prove that finishes by the time the receipt prints is fine UX).
-Sub-second remains the north star; Phase R2 (specialized basepoint
-chip + multi-scalar chip) is what closes the last factor.
+Sub-second remains the north star; a specialized basepoint chip plus
+a multi-scalar chip is what closes the last factor.

@@ -83,7 +83,7 @@ pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationErro
 }
 
 /// Caller-supplied per-component `log_size` cap variant of `verify`.
-/// See `verify` for the default and `Phase 43` for the rationale.
+/// See `verify` for the default and the `max_log_size` cap rationale.
 pub fn verify_with_max_log_size(
     proof: Proof,
     side_note: &SideNote,
@@ -97,7 +97,7 @@ pub fn verify_with_max_log_size(
     )
 }
 
-/// Phase 49: enforce a custom `PcsPolicy` (FRI shape + PoW floor)
+/// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
 /// on `proof.pcs_config`.  Most deployers want `PcsPolicy::STANDARD`;
 /// override for stricter (more security) or looser (test harness)
 /// floors.  See SECURITY.md "Proof shape".
@@ -116,7 +116,7 @@ pub fn verify_with_options(
     max_log_size: u32,
     policy: &crate::proof::PcsPolicy,
 ) -> Result<(), VerificationError> {
-    // Phase 60: select active components from side_note (same predicate
+    // Select active components from side_note (same predicate
     // the prover used).  See `active_components_verifier` doc-comment.
     let components_owned = super::active_components_verifier(side_note);
     let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
@@ -140,7 +140,7 @@ pub fn verify_with_options(
     )
 }
 
-/// Phase I.0 chip-isolated verify path — pair with `prove_with_explicit_components`.
+/// Chip-isolated verify path — pair with `prove_with_explicit_components`.
 ///
 /// `components` is the verifier-trait view of the chip set (used for the
 /// constraint check).  `prover_components` is the prover-trait view of the
@@ -184,7 +184,7 @@ fn verify_with_options_explicit_components(
     prover_components: &[&dyn crate::framework::MachineProverComponent],
     boundary_positions: Option<crate::boundary_binding::BoundaryChipPositions>,
 ) -> Result<(), VerificationError> {
-    // Phase 42: reject proofs from a different AIR shape early, before
+    // Reject proofs from a different AIR shape early, before
     // any cryptographic work.  `format_version` is bumped whenever the
     // chip list / column counts / lookup-tuple shape changes in a way
     // that would make an older verifier silently accept the wrong thing.
@@ -195,14 +195,14 @@ fn verify_with_options_explicit_components(
             proof.format_version,
         )));
     }
-    // Phase 43: cap log_sizes so a malicious prover can't force a
+    // Cap log_sizes so a malicious prover can't force a
     // giant Merkle commitment phase.
     if let Some(&offending) = proof.log_sizes.iter().find(|&&ls| ls > max_log_size) {
         return Err(VerificationError::InvalidStructure(format!(
             "proof log_size {offending} exceeds cap {max_log_size}"
         )));
     }
-    // Phase 49: enforce the PcsPolicy floor — reject under-spec'd
+    // Enforce the PcsPolicy floor — reject under-spec'd
     // pcs_configs before any cryptographic work.  Default policy is
     // PcsPolicy::STANDARD.
     if let Err(msg) = crate::proof::check_pcs_policy(&proof.pcs_config, policy) {
@@ -260,7 +260,7 @@ fn verify_with_options_explicit_components(
         commitment_scheme.commit(proof.commitments[idx], &log_sizes[idx], verifier_channel);
     }
 
-    // Phase Z0: mix `proof.{initial,final}_state` (registers, pc,
+    // Mix `proof.{initial,final}_state` (registers, pc,
     // timestamp) into the FS transcript. Mirrors the prover-side mix in
     // `prove.rs` immediately after the main-trace commit, so the lookup
     // elements drawn next depend on the claimed boundary states. Gated
@@ -281,7 +281,7 @@ fn verify_with_options_explicit_components(
         verifier_channel.mix_u64(initial_state.timestamp);
         verifier_channel.mix_u64(final_state.pc as u64);
         verifier_channel.mix_u64(final_state.timestamp);
-        // Phase A (v7): entering then exit RAM Merkle root, 4 LE u64 each.
+        // Format v7: entering then exit RAM Merkle root, 4 LE u64 each.
         for chunk in initial_state.memory_root.chunks_exact(8) {
             verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
         }
@@ -355,7 +355,7 @@ fn verify_preprocessed_trace(
     config: &PcsConfig,
     components: &[&dyn crate::framework::MachineProverComponent],
 ) -> Result<(), VerificationError> {
-    // Phase 60: caller passes the same prover-trait component set the
+    // The caller passes the same prover-trait component set the
     // prover used (either `active_components(side_note)` for the default
     // path, or an explicit slice for the chip-isolated harness).  This
     // helper actually re-runs prover-side preprocessing-trace generation
@@ -396,7 +396,7 @@ fn verify_preprocessed_trace(
 }
 
 /// One active component's OODS mask, sliced from a real proof's `sampled_values`
-/// for the P5.2 recursion verifier-AIR — the chip's columns in read order, ready
+/// for the recursion verifier-AIR — the chip's columns in read order, ready
 /// to drive the auto-witnessing evaluator. `mask[interaction][column][offset]`;
 /// the preprocessed tree (`mask[0]`) is the FULL column set, indexed through
 /// `preproc_indices` (stwo's preprocessed remap).
@@ -428,7 +428,7 @@ pub struct OodsReconstruction {
 }
 
 /// Replay a real canonical segment proof's verifier transcript to the OODS point
-/// and return everything the P5.2 verifier-AIR needs to re-evaluate the inner
+/// and return everything the verifier-AIR needs to re-evaluate the inner
 /// composition in-AIR (the per-component masks sliced from `sampled_values`, the
 /// drawn `lookup_elements`/`random_coeff`/`oods_point`-derived scalars, the
 /// per-component `claimed_sum`/`log_size`) plus the proof's own composition value.

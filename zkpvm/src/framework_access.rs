@@ -13,7 +13,7 @@ use crate::recursion_pcs::ProverChannel;
 
 use crate::BASE_COMPONENTS;
 
-/// Phase 60: select the active-chip indices from the proof's
+/// Select the active-chip indices from the proof's
 /// `component_mask`.  Bit i set ⇔ chip i was active.
 ///
 /// Back-compat: `mask == 0` (default for older proofs) falls back to
@@ -44,7 +44,7 @@ pub fn draw_all_lookup_elements(
 ///
 /// `BuiltInComponentEval` and the per-chip lookup-element tuples are
 /// crate-private, so a chip's `add_constraints` can only be driven with an
-/// arbitrary evaluator from inside the crate. The P5.2 verifier-AIR uses this to
+/// arbitrary evaluator from inside the crate. The verifier-AIR uses this to
 /// walk each canonical component's own generic `evaluate` at the OODS point and
 /// re-derive its composition contribution in-AIR. `chip_idx` is its index in
 /// `BASE_COMPONENTS` (= [`crate::chip_idx`]); `lookup` must carry the same
