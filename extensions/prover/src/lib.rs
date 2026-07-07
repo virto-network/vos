@@ -69,6 +69,15 @@ use zkpvm_verifier::{CommitmentHash, PcsPolicy, verify_standalone_with_pcs_polic
 /// exceeds it traces to `OutOfGas` and the prove fails (empty reply).
 const TRACE_GAS: u64 = 100_000_000;
 
+/// Defensive ceiling on the number of segments a chain manifest may list.
+/// A verifier fetches + STARK-verifies every listed segment, so an
+/// oversized manifest is an unbounded-work (DoS) lever. Legitimate chains
+/// are tens of segments (the conservation transition is ~76); this cap is
+/// far above any real chain — a belt-and-suspenders bound over the invoke's
+/// own gas metering. Bump it if a deployment segments a genuinely larger
+/// batch.
+const MAX_CHAIN_SEGMENTS: usize = 65_536;
+
 #[actor]
 struct Prover;
 
@@ -212,7 +221,7 @@ impl Prover {
         let Some(manifest) = decode_chain_manifest(&manifest_bytes) else {
             return 0;
         };
-        if manifest.is_empty() {
+        if manifest.is_empty() || manifest.len() > MAX_CHAIN_SEGMENTS {
             return 0;
         }
         // 2) STREAM the chain: fetch each per-segment proof, verify it, and DROP
@@ -395,7 +404,7 @@ pub fn verify_chain_segments(
     if allowlist_bytes.is_empty() || allowlist_bytes.len() % 32 != 0 {
         return false;
     }
-    if segment_blobs.is_empty() {
+    if segment_blobs.is_empty() || segment_blobs.len() > MAX_CHAIN_SEGMENTS {
         return false;
     }
     let allowlist: Vec<CommitmentHash> = allowlist_bytes
