@@ -106,13 +106,25 @@ Wave 1 among trusted operators is fine on signatures/proof. Admitting banks you
 do **not** already trust needs the real solvency backstop, in two coupled
 pieces:
 
-- **Receiver-side prior-state anchor** (application layer, tractable): the
-  bridge pins each incoming voucher's `state_root_before` to a value it
-  independently holds — chaining a peer's last-seen `state_root_after` into the
-  next expected `state_root_before` (`PeerEntry` needs a root field), via
-  `verify_against(issuer, Some(expected))`. This prevents history-forking after
-  a first observed root; it never anchors the *first* voucher — the true anchor
-  is settlement.
+- **Receiver-side prior-state anchor** (application layer) — **LANDED**. Each
+  `PeerEntry` carries `last_root_after: Option<[u8; 32]>`; once the bridge
+  accepts a voucher from a peer, that peer's next voucher must declare
+  `state_root_before == last_root_after`, forcing a single linear voucher chain
+  per peer. The first voucher is unanchored — the true anchor is settlement.
+  Placed as a distinct check **after** the external-proof dispatch and the dedup
+  check (NOT folded into `verify(Some(..))`), so a bad proof still reports
+  `ProofInvalid` and a replay still reports `VoucherReplayed`; only a fresh,
+  correctly-signed, non-chaining voucher collapses to `VoucherInvalid`. The
+  cursor advances only on acceptance and is preserved across a key-rotation
+  re-register (the chain tracks the peer's ledger, not its signing key).
+  **Limits (carry forward):** (a) it stores a *claimed* `root_after` — in
+  Signature-mode nothing proves the roots reflect real ledger state (only an
+  External proof or on-chain settlement does); (b) it fails **closed** — a peer
+  whose ledger advances off this channel (a voucher to a different receiver, or
+  any non-vouchered transfer) declares an unseen `state_root_before` and is
+  rejected, and since rejections don't advance the cursor the channel can wedge
+  until settlement. There is no wedge-recovery in Wave 1 by design; the
+  sanctioned recovery is the Wave-2 on-chain settlement anchor.
 - **On-chain settlement-verifier** (the real backstop): each bank proves its
   vault delta on-chain and the chain runs the inter-vault zero-sum
   reconciliation (`zkpvm/settlement-verifier`, Poseidon2-M31; `build-settle`

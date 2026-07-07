@@ -7763,6 +7763,41 @@ fn clerk_ledger_two_bank_federation() {
         "bridge must record exactly one redeemed voucher"
     );
 
+    // F2 receiver-side anchor bites: a SECOND voucher from bank-a whose
+    // state_root_before does NOT chain to the last accepted root_after
+    // (= root_after of V1) must be refused (StateRootMismatch collapses to
+    // VoucherInvalid), and must NOT be recorded in the dedup set. The
+    // roots are a distinct triple from V1, so dedup misses and the anchor
+    // is the sole gate; [0x33;32] cannot equal a real SMT root. Signature
+    // mode so the external-proof dispatch is a no-op.
+    let stale_anchor_env = EncryptedEnvelope::seal(value, &blinding, &bank_b_ivk_pk)
+        .expect("seal stale-anchor voucher envelope");
+    let stale_anchor_voucher = Voucher::sign(
+        amt,
+        stale_anchor_env,
+        [0x33u8; 32], // state_root_before ≠ root_after(V1)
+        [0x44u8; 32],
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let stale_anchor_reply = vos::block_on(bridge_actor.submit_voucher(
+        &mut &node_b,
+        stale_anchor_voucher.to_bytes(),
+        b"bank-a".to_vec(),
+    ))
+    .expect("invoke submit_voucher (stale anchor)");
+    assert_eq!(
+        stale_anchor_reply.status,
+        BridgeStatus::VoucherInvalid,
+        "a voucher whose state_root_before does not chain to the last accepted root_after must be refused by the receiver-side anchor",
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
+            .expect("invoke redeemed_count (post-stale-anchor)"),
+        1,
+        "anchor rejection must not poison the dedup set",
+    );
+
     // Replay through the bridge: same voucher bytes, same peer.
     // The bridge's dedup set already has the transfer-triple, so
     // the reply is BridgeStatus::VoucherReplayed with empty
@@ -8393,6 +8428,23 @@ fn clerk_ledger_two_bank_federation() {
             use vos::Encode;
             let dedup_before_happy = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
                 .expect("redeemed_count pre-happy");
+            // The real-STARK voucher attests a SYNTHETIC conservation
+            // transition (build_conservation_transition), a state chain
+            // independent of bank-a's live ledger vouchers (V1/V2). Give it
+            // its own peer channel so the receiver-side anchor treats it as
+            // a fresh chain (first voucher unanchored) rather than demanding
+            // it chain to bank-a's last live root_after. Same clerk key +
+            // prefix hint as bank-a.
+            assert_eq!(
+                vos::block_on(bridge_actor.register_peer(
+                    &mut &node_b,
+                    b"bank-a-stark".to_vec(),
+                    registrar_a.public.0.to_vec(),
+                    prefix_a as u32,
+                ))
+                .expect("invoke register_peer (bank-a-stark)"),
+                BridgeStatus::Ok,
+            );
             // Issued by registrar_a so the witness's Public.issuer == the peer
             // clerk pubkey the bridge reconstructs public_bytes from.
             let (public, witness, value, blinding) = build_conservation_transition(&registrar_a);
@@ -8453,7 +8505,7 @@ fn clerk_ledger_two_bank_federation() {
             let reply_happy = vos::block_on(bridge_actor.submit_voucher(
                 &mut &node_b,
                 voucher_happy.to_bytes(),
-                b"bank-a".to_vec(),
+                b"bank-a-stark".to_vec(),
             ))
             .expect("invoke submit_voucher (Mode::External, real canonical chain)");
             assert_eq!(
@@ -8493,7 +8545,7 @@ fn clerk_ledger_two_bank_federation() {
             let reply_forge = vos::block_on(bridge_actor.submit_voucher(
                 &mut &node_b,
                 voucher_forge.to_bytes(),
-                b"bank-a".to_vec(),
+                b"bank-a-stark".to_vec(),
             ))
             .expect("invoke submit_voucher (forged root_after on a real chain)");
             assert_eq!(

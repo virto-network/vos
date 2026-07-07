@@ -37,9 +37,10 @@
 //! - `ivk_secret_bytes`: this bank's incoming-viewing-key secret,
 //!   canonical 32-byte Ristretto scalar. Used per-call to
 //!   reconstruct an `IncomingViewingKey` and open envelopes.
-//! - `peers`: sorted-by-name `(peer_name, peer_clerk_pubkey)`
-//!   entries. Pre-shared at federation join time via
-//!   `register_peer`.
+//! - `peers`: sorted-by-name `(peer_name, peer_clerk_pubkey,
+//!   node_prefix, last_root_after)` entries. Pre-shared at
+//!   federation join time via `register_peer`; `last_root_after`
+//!   is the receiver-side state-root anchor cursor (see caveats).
 //! - `received`: sorted dedup set of voucher transfer-triples
 //!   (`blake2b_256(amount_commit || root_before || root_after)`).
 //!
@@ -51,11 +52,28 @@
 //!   ECALL — or run clerk-bridge in a single non-replicated
 //!   process. Documented to flag the gap rather than ship it
 //!   silently.
-//! - **Verify-only.** This slice does NOT credit the local
-//!   recipient. The host caller takes the returned (value,
-//!   blinding) and builds an inflow transfer or note submit on
-//!   clerk-ledger. A future slice will add cross-actor dispatch
-//!   so the bridge owns the full ingress flow.
+//! - **Verify-only (`submit_voucher`).** This path does NOT credit
+//!   the local recipient — the host caller takes the returned
+//!   (value, blinding) and builds an inflow transfer or note submit
+//!   on clerk-ledger. (`redeem_voucher` DOES own the full ingress:
+//!   it validates the inflow and dispatches to
+//!   `clerk-ledger.apply_transfer` atomically.)
+//! - **Receiver-side state-root anchor (best-effort, not finality).**
+//!   Each peer entry carries `last_root_after`: once the bridge
+//!   accepts a voucher from a peer, that peer's NEXT voucher must
+//!   declare `state_root_before == last_root_after`, forcing a
+//!   single linear voucher chain per peer (the first voucher is
+//!   unanchored). This blocks replay, reordering, and forking of
+//!   the voucher sequence *as this receiver sees it*. It does NOT
+//!   prove the roots reflect real ledger state — in Signature-mode
+//!   the stored `root_after` is merely what the peer signed; only
+//!   an External proof or Wave-2 on-chain settlement grounds them.
+//!   It also fails CLOSED: a peer whose ledger legitimately advances
+//!   off this channel (a voucher to a different receiver, or any
+//!   non-vouchered transfer) declares a `state_root_before` this
+//!   bridge never observed and is rejected — and because rejections
+//!   don't advance the cursor, that channel can wedge until
+//!   settlement. Best-effort linearization, not settlement finality.
 
 use cipher_clerk::crypto::AuthKey;
 use cipher_clerk::types::Transfer as CcTransfer;
@@ -154,6 +172,18 @@ pub struct PeerEntry {
     /// peers registered before the prefix field landed default
     /// to this and stay correct (just less efficient).
     pub node_prefix: u16,
+    /// Last `state_root_after` this bridge ACCEPTED from this peer
+    /// (a `submit_voucher` that opened the envelope, or a
+    /// `redeem_voucher` the ledger accepted). `None` until the
+    /// first accepted voucher — the first voucher from a peer is
+    /// never anchored (there is no prior observed root). On every
+    /// subsequent voucher the bridge requires
+    /// `voucher.state_root_before == last_root_after`, forcing a
+    /// single linear voucher chain per peer. This is best-effort
+    /// linearization, not settlement finality — see the actor-level
+    /// "receiver-side state-root anchor" doc for the exact
+    /// guarantee and its limits.
+    pub last_root_after: Option<[u8; 32]>,
 }
 
 /// Reply envelope for `submit_voucher`. Same shape pattern as
@@ -405,9 +435,18 @@ impl ClerkBridge {
             name: peer_name,
             clerk_pubkey: AuthKey(pk_bytes),
             node_prefix: (node_prefix & 0xFFFF) as u16,
+            last_root_after: None,
         };
         match self.peers.binary_search_by(|e| e.name.cmp(&entry.name)) {
-            Ok(i) => self.peers[i] = entry,
+            // Re-register (idempotent refresh OR key rotation): update
+            // the pubkey/prefix but PRESERVE the state-root anchor. The
+            // chain tracks the peer's ledger progression, orthogonal to
+            // its signing key; rewinding to None on a rotation would
+            // reopen the fork/replay window the anchor closes.
+            Ok(i) => {
+                self.peers[i].clerk_pubkey = entry.clerk_pubkey;
+                self.peers[i].node_prefix = entry.node_prefix;
+            }
             Err(i) => self.peers.insert(i, entry),
         }
         Status::Ok
@@ -434,13 +473,16 @@ impl ClerkBridge {
     ///   4. Voucher signature verifies against the peer's clerk
     ///      pubkey.
     ///   5. Transfer-triple dedup-key not previously redeemed.
-    ///   6. EncryptedEnvelope opens with the bootstrap IVK
+    ///   6. State-root anchor: `voucher.state_root_before` equals
+    ///      the last `state_root_after` accepted from this peer
+    ///      (skipped for the peer's first voucher).
+    ///   7. EncryptedEnvelope opens with the bootstrap IVK
     ///      secret.
     ///
-    /// Only on (6) does the bridge record the voucher in the
-    /// dedup set — earlier rejection paths leave state untouched
-    /// so a malformed-but-not-replayed voucher can be re-submitted
-    /// after being fixed.
+    /// Only on (7) does the bridge record the voucher in the dedup
+    /// set and advance the peer's anchor — earlier rejection paths
+    /// leave state untouched so a malformed-but-not-replayed voucher
+    /// can be re-submitted after being fixed.
     #[msg]
     async fn submit_voucher(
         &mut self,
@@ -452,9 +494,13 @@ impl ClerkBridge {
             return reply(Status::NotBootstrapped);
         }
 
-        let (peer_clerk_pubkey, peer_prefix) =
+        let (peer_clerk_pubkey, peer_prefix, expected_root) =
             match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
-                Ok(i) => (self.peers[i].clerk_pubkey, self.peers[i].node_prefix),
+                Ok(i) => (
+                    self.peers[i].clerk_pubkey,
+                    self.peers[i].node_prefix,
+                    self.peers[i].last_root_after,
+                ),
                 Err(_) => return reply(Status::UnknownPeer),
             };
 
@@ -463,10 +509,11 @@ impl ClerkBridge {
             None => return reply(Status::VoucherInvalid),
         };
 
-        // E5: consumer-facing acceptance check. `None` anchor → exactly
-        // `verify_signature` (the bridge has no per-peer expected pre-state
-        // to pin), so the rejection still collapses to `VoucherInvalid`.
-        // External-proof dispatch + replay/dedup stay actor-side below.
+        // E5: consumer-facing signature check. Passing `None` keeps this
+        // to `verify_signature`; the state-root anchor is a distinct check
+        // applied below (after external-proof dispatch + dedup) so a bad
+        // signature collapses to `VoucherInvalid` here and a non-chaining
+        // root does the same at the anchor.
         if voucher.verify(&peer_clerk_pubkey, None).is_err() {
             return reply(Status::VoucherInvalid);
         }
@@ -499,6 +546,17 @@ impl ClerkBridge {
             return reply(Status::VoucherReplayed);
         }
 
+        // Receiver-side state-root anchor. Placed AFTER the external-proof
+        // dispatch and the dedup check so a bad proof still reports
+        // ProofInvalid and a replay still reports VoucherReplayed; a
+        // genuine non-chaining voucher collapses to VoucherInvalid.
+        // `expected_root == None` (first voucher from this peer) skips it.
+        if let Some(expected) = expected_root
+            && voucher.state_root_before != expected
+        {
+            return reply(Status::VoucherInvalid);
+        }
+
         // SAFETY: bootstrap validates canonicality on entry, so
         // from_bytes never returns None once `local_ledger_id != 0`
         // (which we already gated on above). The expect message
@@ -517,6 +575,14 @@ impl ClerkBridge {
         match self.received.binary_search(&dedup_key) {
             Ok(_) => { /* unreachable — checked above */ }
             Err(i) => self.received.insert(i, dedup_key),
+        }
+        // Advance the per-peer anchor to this voucher's post-state. Only
+        // here, on the acceptance path — a rejected voucher leaves the
+        // chain where the last accepted one left it. Re-resolve by name:
+        // the earlier lookup's borrow is gone and its index may be stale
+        // after the await.
+        if let Ok(pi) = self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            self.peers[pi].last_root_after = Some(voucher.state_root_after);
         }
 
         SubmitVoucherReply {
@@ -575,16 +641,20 @@ impl ClerkBridge {
         if self.local_ledger_id == 0 {
             return early_redeem(Status::NotBootstrapped);
         }
-        let (peer_clerk_pubkey, peer_prefix) =
+        let (peer_clerk_pubkey, peer_prefix, expected_root) =
             match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
-                Ok(i) => (self.peers[i].clerk_pubkey, self.peers[i].node_prefix),
+                Ok(i) => (
+                    self.peers[i].clerk_pubkey,
+                    self.peers[i].node_prefix,
+                    self.peers[i].last_root_after,
+                ),
                 Err(_) => return early_redeem(Status::UnknownPeer),
             };
         let Some(voucher) = Voucher::from_bytes(&voucher_bytes) else {
             return early_redeem(Status::VoucherInvalid);
         };
-        // E5: same consumer-facing check as submit_voucher (signature-only;
-        // `None` anchor ⇒ rejection is `VoucherInvalid`).
+        // E5: signature-only check (same as submit_voucher); the state-root
+        // anchor is applied below, after external-proof dispatch + dedup.
         if voucher.verify(&peer_clerk_pubkey, None).is_err() {
             return early_redeem(Status::VoucherInvalid);
         }
@@ -604,6 +674,16 @@ impl ClerkBridge {
         let dedup_key = voucher.redemption_key();
         if self.received.binary_search(&dedup_key).is_ok() {
             return early_redeem(Status::VoucherReplayed);
+        }
+
+        // Receiver-side state-root anchor (see submit_voucher). After the
+        // external-proof dispatch + dedup so bad proofs stay ProofInvalid
+        // and replays stay VoucherReplayed; a non-chaining voucher
+        // collapses to VoucherInvalid. Skipped for the peer's first voucher.
+        if let Some(expected) = expected_root
+            && voucher.state_root_before != expected
+        {
+            return early_redeem(Status::VoucherInvalid);
         }
 
         // Decode the inflow Transfer (host-side rkyv archive) and
@@ -672,6 +752,12 @@ impl ClerkBridge {
             match self.received.binary_search(&dedup_key) {
                 Ok(_) => { /* unreachable — checked above */ }
                 Err(i) => self.received.insert(i, dedup_key),
+            }
+            // Advance the per-peer anchor to this voucher's post-state,
+            // atomically with the ledger accept (the rejection paths above
+            // never reach here, so the anchor only moves on acceptance).
+            if let Ok(pi) = self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+                self.peers[pi].last_root_after = Some(voucher.state_root_after);
             }
             RedeemReply {
                 status: Status::Ok,
