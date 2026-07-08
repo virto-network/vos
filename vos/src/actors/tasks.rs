@@ -95,6 +95,51 @@ pub struct TaskRecord {
     pub reply: Vec<u8>,
 }
 
+impl TaskRecord {
+    /// Run one drive pass for this record: invoke the child with the
+    /// saved `(state, msg)` and fold the outcome back in.
+    #[cfg(feature = "pvm")]
+    fn apply_drive_outcome(&mut self) {
+        use super::lifecycle::{InvokeResult, invoke_hash};
+        use super::run::service_code_hash;
+
+        let code_hash = match self.child {
+            Child::Task(hash) => hash,
+            Child::Peer(service_id) => service_code_hash(service_id),
+        };
+        match invoke_hash(&code_hash, &self.msg, &self.state) {
+            InvokeResult::Done { state, reply } => {
+                // An empty state envelope means the child ran with no
+                // state delivery path at all (short error-shape
+                // envelope) — keep what we had rather than wipe it.
+                if !state.is_empty() {
+                    self.state = state;
+                }
+                self.reply = reply;
+                self.status = TaskStatus::Done;
+            }
+            InvokeResult::Yielded { state, reply } => {
+                if !state.is_empty() {
+                    self.state = state;
+                }
+                self.reply = reply;
+                self.status = TaskStatus::Yielded;
+            }
+            InvokeResult::Panicked | InvokeResult::Error(_) => {
+                self.status = TaskStatus::Panicked;
+            }
+            InvokeResult::NotFound => self.status = TaskStatus::NotFound,
+            InvokeResult::OutOfGas => self.status = TaskStatus::OutOfGas,
+            InvokeResult::TooBig => self.status = TaskStatus::TooBig,
+        }
+    }
+
+    #[cfg(not(feature = "pvm"))]
+    fn apply_drive_outcome(&mut self) {
+        self.status = TaskStatus::NotFound;
+    }
+}
+
 /// The parent's task table. Embed as an rkyv field of the parent
 /// actor; spawn from handlers, drive from a tick handler.
 #[derive(
@@ -147,44 +192,16 @@ impl Tasks {
     /// pass (e.g. a self-`tick`). Outcomes surface distinctly per
     /// record; failed tasks stay put until the parent retries or
     /// cancels them.
-    #[cfg(feature = "pvm")]
+    ///
+    /// Children run over the PVM INVOKE channel; on non-PVM builds
+    /// (host rlib compilation of actor crates) there is nothing to
+    /// invoke into and every runnable record resolves `NotFound`.
     pub fn drive(&mut self) -> usize {
-        use super::lifecycle::{InvokeResult, invoke_hash};
-        use super::run::service_code_hash;
-
         for (_, record) in &mut self.records {
             if !record.status.is_runnable() {
                 continue;
             }
-            let code_hash = match record.child {
-                Child::Task(hash) => hash,
-                Child::Peer(service_id) => service_code_hash(service_id),
-            };
-            match invoke_hash(&code_hash, &record.msg, &record.state) {
-                InvokeResult::Done { state, reply } => {
-                    // An empty state envelope means the child ran with
-                    // no state delivery path at all (short error-shape
-                    // envelope) — keep what we had rather than wipe it.
-                    if !state.is_empty() {
-                        record.state = state;
-                    }
-                    record.reply = reply;
-                    record.status = TaskStatus::Done;
-                }
-                InvokeResult::Yielded { state, reply } => {
-                    if !state.is_empty() {
-                        record.state = state;
-                    }
-                    record.reply = reply;
-                    record.status = TaskStatus::Yielded;
-                }
-                InvokeResult::Panicked | InvokeResult::Error(_) => {
-                    record.status = TaskStatus::Panicked;
-                }
-                InvokeResult::NotFound => record.status = TaskStatus::NotFound,
-                InvokeResult::OutOfGas => record.status = TaskStatus::OutOfGas,
-                InvokeResult::TooBig => record.status = TaskStatus::TooBig,
-            }
+            record.apply_drive_outcome();
         }
         self.pending()
     }
