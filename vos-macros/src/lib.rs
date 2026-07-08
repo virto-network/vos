@@ -1400,16 +1400,23 @@ fn client_decode_body(
                 vos::value::Value::Bytes(b) => {
                     let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
                     av.extend_from_slice(&b);
-                    // SAFETY: emitted by the macro for caller-supplied
-                    // Value::Bytes that the actor protocol promises is a
-                    // valid rkyv archive of `#inner`; AlignedVec<16> gives
-                    // the required alignment.
-                    let archived = unsafe {
-                        vos::rkyv::access_unchecked::<<#inner as vos::rkyv::Archive>::Archived>(&av)
-                    };
-                    vos::rkyv::deserialize::<#inner, vos::rkyv::rancor::Error>(archived)
-                        .map(Some)
-                        .map_err(|_| vos::actors::client::ClientError::Decode)
+                    // The reply is peer-supplied and crosses a trust
+                    // boundary (another node / space produced it), so it
+                    // is validated rather than trusted: `rkyv::access`
+                    // checks alignment, bounds, pointer windows, and (via
+                    // bytecheck) per-type invariants. A corrupted or
+                    // version-skewed archive returns `Decode` here instead
+                    // of the UB `access_unchecked` would invite. AlignedVec<16>
+                    // supplies the alignment `access` requires.
+                    match vos::rkyv::access::<
+                        <#inner as vos::rkyv::Archive>::Archived,
+                        vos::rkyv::rancor::Error,
+                    >(&av) {
+                        Ok(archived) => vos::rkyv::deserialize::<#inner, vos::rkyv::rancor::Error>(archived)
+                            .map(Some)
+                            .map_err(|_| vos::actors::client::ClientError::Decode),
+                        Err(_) => Err(vos::actors::client::ClientError::Decode),
+                    }
                 }
                 other => Err(vos::actors::client::ClientError::UnexpectedReply(
                     alloc::format!("{:?}", other))),
@@ -1483,13 +1490,16 @@ fn client_decode_body(
                 vos::value::Value::Bytes(b) => {
                     let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
                     av.extend_from_slice(&b);
-                    // SAFETY: see the Option<T> arm above — same contract,
-                    // with `#ty` as the archive type.
-                    let archived = unsafe {
-                        vos::rkyv::access_unchecked::<<#ty as vos::rkyv::Archive>::Archived>(&av)
-                    };
-                    vos::rkyv::deserialize::<#ty, vos::rkyv::rancor::Error>(archived)
-                        .map_err(|_| vos::actors::client::ClientError::Decode)
+                    // Checked access — see the Option<T> arm above for why
+                    // a peer-supplied reply must be validated, not trusted.
+                    match vos::rkyv::access::<
+                        <#ty as vos::rkyv::Archive>::Archived,
+                        vos::rkyv::rancor::Error,
+                    >(&av) {
+                        Ok(archived) => vos::rkyv::deserialize::<#ty, vos::rkyv::rancor::Error>(archived)
+                            .map_err(|_| vos::actors::client::ClientError::Decode),
+                        Err(_) => Err(vos::actors::client::ClientError::Decode),
+                    }
                 }
                 other => Err(vos::actors::client::ClientError::UnexpectedReply(
                     alloc::format!("{:?}", other))),
