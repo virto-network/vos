@@ -337,6 +337,28 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.agent('{instance_name}'): {e}"))
     }
 
+    /// Ask the connected daemon for its view of a Raft group
+    /// (identified by `replication_id`) via a `RaftStatusReq` frame —
+    /// role, term, leader hint, and member prefixes. Errors if the
+    /// daemon peer isn't reachable or doesn't answer in time; a
+    /// `present = false` reply (daemon isn't running that group) is
+    /// returned as-is for the caller to report.
+    pub fn raft_status(
+        &self,
+        replication_id: [u8; 32],
+    ) -> anyhow::Result<vos::network::RaftStatusReply> {
+        let net = self
+            .node
+            .network()
+            .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
+        let peer = net.peer_for_prefix(self.daemon_prefix).ok_or_else(|| {
+            anyhow::anyhow!("daemon peer (prefix {:#06x}) not connected", self.daemon_prefix)
+        })?;
+        net.send_raft_status_req(peer, replication_id)
+            .recv_timeout(invoke_timeout())
+            .map_err(|_| anyhow::anyhow!("no raft-status reply from daemon within timeout"))
+    }
+
     /// Fetch the raw `.vos_meta` blob the registry has on file
     /// for the agent's program. Empty when no meta is
     /// registered (older binaries) — callers treat that as
