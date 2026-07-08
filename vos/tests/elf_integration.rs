@@ -8775,6 +8775,64 @@ fn clerk_ledger_two_bank_federation() {
         BridgeStatus::UnknownPeer,
     );
 
+    // S4: wedge → recovery. A voucher declaring a `state_root_before` the
+    // bridge never accepted is rejected (the F2 anchor fails closed), which
+    // wedges the channel. `anchor_reset` re-anchors to that root — the
+    // sanctioned post-settlement recovery — and the same voucher then
+    // chains cleanly.
+    let wedge_before = [0x5Au8; 32];
+    let wedge_after = [0x5Bu8; 32];
+    let wedge_blinding = cipher_clerk::crypto::Blinding([9u8; 32]);
+    let wedge_value: u64 = 7;
+    let wedge_amt = Amount::commit(wedge_value, &wedge_blinding);
+    let wedge_env = EncryptedEnvelope::seal(wedge_value, &wedge_blinding, &bank_b_ivk_pk)
+        .expect("seal wedge envelope");
+    let wedge_voucher = Voucher::sign(
+        wedge_amt,
+        wedge_env,
+        wedge_before,
+        wedge_after,
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let wedge_bytes = wedge_voucher.to_bytes();
+    assert_eq!(
+        vos::block_on(bridge_actor.submit_voucher(
+            &mut &node_b,
+            wedge_bytes.clone(),
+            b"bank-a".to_vec(),
+        ))
+        .expect("submit wedge voucher")
+        .status,
+        BridgeStatus::VoucherInvalid,
+        "a non-chaining voucher wedges the channel (F2 fails closed)"
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.anchor_reset(
+            &mut &node_b,
+            b"bank-a".to_vec(),
+            wedge_before.to_vec(),
+        ))
+        .expect("invoke anchor_reset"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.anchor_reset(&mut &node_b, b"bank-z".to_vec(), wedge_before.to_vec()))
+            .expect("invoke anchor_reset unknown"),
+        BridgeStatus::UnknownPeer,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.submit_voucher(
+            &mut &node_b,
+            wedge_bytes,
+            b"bank-a".to_vec(),
+        ))
+        .expect("resubmit after anchor_reset")
+        .status,
+        BridgeStatus::Ok,
+        "anchor_reset re-anchors the channel so the voucher chains again"
+    );
+
     // ── Cleanup ────────────────────────────────────────────────
     let results_a = node_a.collect();
     let results_b = node_b.collect();

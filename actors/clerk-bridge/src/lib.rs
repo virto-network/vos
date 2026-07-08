@@ -876,6 +876,35 @@ impl ClerkBridge {
             .map(|s| s.to_vec())
             .unwrap_or_default()
     }
+
+    /// Post-settlement wedge recovery. The F2 receiver-side anchor fails
+    /// CLOSED: a peer whose ledger legitimately advanced off this channel
+    /// (or across a settled window boundary) declares a `state_root_before`
+    /// this bridge never observed, is rejected, and — because rejections
+    /// don't advance the cursor — that channel wedges. `anchor_reset`
+    /// re-anchors the peer's `last_root_after` to `root` (the settled
+    /// window's closing root), so the peer's next voucher chains cleanly
+    /// again. This makes settlement the *sanctioned* recovery for the wedge
+    /// the anchor deliberately leaves open. Operator-gated — the operator
+    /// asserts the settlement occurred (the bridge, on the bank's space,
+    /// can't see the venue's settled log); same authority as
+    /// `window_rotate`.
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn anchor_reset(&mut self, peer_name: Vec<u8>, root: Vec<u8>) -> Status {
+        if self.local_ledger_id == 0 {
+            return Status::NotBootstrapped;
+        }
+        let Some(root_bytes) = try_array::<32>(root) else {
+            return Status::BadInput;
+        };
+        match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => {
+                self.peers[i].last_root_after = Some(root_bytes);
+                Status::Ok
+            }
+            Err(_) => Status::UnknownPeer,
+        }
+    }
 }
 
 /// Build an error reply with empty value+blinding.

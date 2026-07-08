@@ -103,5 +103,34 @@ decoding.
   node_prefix`) — the demo is single-currency, and its two existing callers
   (the two-bank e2e) stay untouched. Revisit if multi-currency federation
   is added: add `currency: u32` to `register_peer` → `PeerEntry`.
-- **S4** — next: `anchor_reset(peer, root)` Operator handler on the bridge.
-- **S5/S6** — manifests + multi-node 3-space e2e.
+- **S4** — done. `anchor_reset(peer, root)` (Operator) on clerk-bridge:
+  re-anchors `last_root_after` to a settled window's closing root, the
+  sanctioned recovery for the F2 fail-closed wedge. Two-bank e2e now proves
+  wedge → recovery: a non-chaining voucher is `VoucherInvalid`, then
+  `anchor_reset` re-anchors and the same voucher chains (`Ok`).
+- **S5/S6** — next: manifests + multi-node 3-space e2e.
+
+## S4 close-protocol conventions (for the S3 driver / S9 runbook)
+
+These are driver/script conventions the bridge code enables; they live in
+the bloque repo's driver + runbook (workstream E), recorded here so the
+handler contract they rely on is explicit.
+
+- **Quiesce barrier.** `reconcile` demands *identical* voucher sets on both
+  sides of a byte-identical window, and it is a bare `Err` with no
+  partial/dispute path — one in-flight voucher at close fails *both*
+  windows. So the close script must: stop issuing → assert every issued
+  `redemption_key` (both directions) appears in the counterpart bridge's
+  dedup set (`redeemed_count` + the per-triple check) → `window_rotate`
+  both directions → derive claims from the just-closed window's
+  `window_net` + the driver's issuer accumulator.
+- **Divergence diagnostics.** Commitments are opaque, so a bare
+  `NetFlowMismatch` is undebuggable. The `voucher_count` + `rk_set_hash`
+  submitted alongside each claim (`clerk-settle::claim_diagnostics`)
+  localize a mismatch without opening any commitment: count differs ⇒
+  in-flight/missed voucher; count equal but hash differs ⇒ set divergence.
+  Recovery is resubmission of a corrected claim (the venue's claim store is
+  replace-until-settled), then re-`settle_window`.
+- **Wedge recovery.** After a recorded settlement, `anchor_reset(peer,
+  settled_closing_root)` on *both* banks' bridges re-opens the voucher
+  channels for the next window.
