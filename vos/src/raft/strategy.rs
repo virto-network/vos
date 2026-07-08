@@ -31,7 +31,10 @@ use std::time::Duration;
 
 use redb::Database;
 
-use crate::commit::{CommitError, CommitStrategy, STATE_KEY, STATE_TABLE};
+use crate::commit::{
+    AgentDelta, CommitError, CommitReceipt, CommitStrategy, KV_TABLE, STATE_KEY, STATE_TABLE,
+    split_delta,
+};
 use crate::effect_log::EffectLog;
 
 use super::log::{RaftLog, RaftMeta};
@@ -210,12 +213,13 @@ impl RaftCommit {
     }
 
     /// Append a new log entry, advance `commit_index` and
-    /// `last_applied`, and persist the supplied post-apply state —
+    /// `last_applied`, and persist the post-apply delta rows —
     /// all in one redb txn. Single-node only; multi-mode routes
     /// through the cluster worker before reaching this point.
     fn append_and_apply_single_node(
         &mut self,
-        state: &[u8],
+        state: Option<&[u8]>,
+        rest: &[(&[u8], &[u8])],
         payload: &[u8],
     ) -> Result<(), CommitError> {
         let term = self.meta.current_term;
@@ -233,8 +237,16 @@ impl RaftCommit {
         self.meta.last_applied = new_index;
         self.meta.write_in_txn(&txn)?;
         {
-            let mut state_table = txn.open_table(STATE_TABLE)?;
-            state_table.insert(STATE_KEY, state)?;
+            if let Some(state) = state {
+                let mut state_table = txn.open_table(STATE_TABLE)?;
+                state_table.insert(STATE_KEY, state)?;
+            }
+            if !rest.is_empty() {
+                let mut kv = txn.open_table(KV_TABLE)?;
+                for (key, value) in rest {
+                    kv.insert(*key, *value)?;
+                }
+            }
         }
         txn.commit()?;
         Ok(())
@@ -250,54 +262,80 @@ impl CommitStrategy for RaftCommit {
         }
     }
 
-    fn commit(&mut self, state: &[u8]) -> Result<(), CommitError> {
-        // Plain commit path — used by post-replay state
-        // materialization in the agent's cold-start flow AND
-        // the follower's apply-on-commit-advance path. Doesn't
-        // append a log entry (no log to attach), only updates the
-        // materialized state row + advances `last_applied` to
-        // match the worker's `commit_index` (everything up to
-        // commit_index has now been applied to produce `state`).
-        if state == self.last_state.as_slice() {
-            return Ok(());
-        }
-        // Reload meta to learn the worker's current commit_index.
-        // The agent calls commit() after running the replay loop
-        // up through every committed log entry, so commit_index
-        // is the exact point our `last_applied` should reach.
-        self.meta = RaftMeta::load(&self.db)?;
-        let new_last_applied = self.meta.commit_index;
-        let txn = self.db.begin_write()?;
-        {
-            let mut state_table = txn.open_table(STATE_TABLE)?;
-            state_table.insert(STATE_KEY, state)?;
-        }
-        if new_last_applied > self.meta.last_applied {
-            self.meta.last_applied = new_last_applied;
-            // Write ONLY META_LAST_APPLIED, not the full
-            // RaftMeta — we loaded `self.meta` earlier; the
-            // worker may have advanced `commit_index` /
-            // `current_term` since, and writing the full row
-            // would clobber those advances with our stale
-            // snapshot.
-            self.meta.write_host_fields_in_txn(&txn)?;
-        }
-        txn.commit()?;
-        self.last_state = state.to_vec();
-        Ok(())
-    }
+    fn commit(&mut self, delta: &AgentDelta<'_>) -> Result<CommitReceipt, CommitError> {
+        let (state, rest) = split_delta(delta);
+        let state_changed = state.is_some_and(|s| s != self.last_state.as_slice());
 
-    fn commit_with_log(&mut self, state: &[u8], log: &EffectLog) -> Result<(), CommitError> {
-        // Skip-on-unchanged — pure reads must not bloat the log.
-        // Even stronger here than for CRDT because every Raft
-        // entry costs an RTT under multi-node mode.
-        if state == self.last_state.as_slice() {
-            return Ok(());
+        let Some(log) = delta.log else {
+            // Log-less commit — post-replay state materialization in
+            // the agent's cold-start flow AND the follower's
+            // apply-on-commit-advance path. Doesn't append a log entry
+            // (no log to attach), only updates the materialized rows +
+            // advances `last_applied` to match the worker's
+            // `commit_index` (everything up to commit_index has now
+            // been applied to produce this delta).
+            if !state_changed && rest.is_empty() {
+                return Ok(CommitReceipt {
+                    node_appended: false,
+                });
+            }
+            // Reload meta to learn the worker's current commit_index.
+            // The agent calls this after running the replay loop
+            // up through every committed log entry, so commit_index
+            // is the exact point our `last_applied` should reach.
+            self.meta = RaftMeta::load(&self.db)?;
+            let new_last_applied = self.meta.commit_index;
+            let txn = self.db.begin_write()?;
+            {
+                if state_changed
+                    && let Some(state) = state
+                {
+                    let mut state_table = txn.open_table(STATE_TABLE)?;
+                    state_table.insert(STATE_KEY, state)?;
+                }
+                if !rest.is_empty() {
+                    let mut kv = txn.open_table(KV_TABLE)?;
+                    for (key, value) in &rest {
+                        kv.insert(*key, *value)?;
+                    }
+                }
+            }
+            if new_last_applied > self.meta.last_applied {
+                self.meta.last_applied = new_last_applied;
+                // Write ONLY META_LAST_APPLIED, not the full
+                // RaftMeta — we loaded `self.meta` earlier; the
+                // worker may have advanced `commit_index` /
+                // `current_term` since, and writing the full row
+                // would clobber those advances with our stale
+                // snapshot.
+                self.meta.write_host_fields_in_txn(&txn)?;
+            }
+            txn.commit()?;
+            if state_changed
+                && let Some(state) = state
+            {
+                self.last_state = state.to_vec();
+            }
+            return Ok(CommitReceipt {
+                node_appended: false,
+            });
+        };
+
+        // Durable-node rule, raft flavor: pure reads must not bloat the
+        // log — even stronger here than for CRDT because every entry
+        // costs an RTT under multi-node mode. An effect-bearing v3
+        // dispatch appends even when state is unchanged; v2 deltas fall
+        // back to value comparison.
+        if !state_changed && !delta.effect_bearing && rest.is_empty() {
+            return Ok(CommitReceipt {
+                node_appended: false,
+            });
         }
+        let state_write = state_changed.then_some(state).flatten();
         let payload = log.to_bytes();
         match &self.role {
             Role::SingleNode => {
-                self.append_and_apply_single_node(state, &payload)?;
+                self.append_and_apply_single_node(state_write, &rest, &payload)?;
             }
             #[cfg(feature = "network")]
             Role::Multi { worker, apply_rx } => {
@@ -305,7 +343,7 @@ impl CommitStrategy for RaftCommit {
                 let handle = worker.handler();
                 let idx = handle.propose(payload).map_err(|e| match e {
                     ProposeError::NotLeader => CommitError::Config(
-                        "raft commit_with_log: this replica is not the leader".into(),
+                        "raft commit: this replica is not the leader".into(),
                     ),
                     ProposeError::Storage(inner) => inner,
                 })?;
@@ -320,7 +358,7 @@ impl CommitStrategy for RaftCommit {
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining.is_zero() {
                         return Err(CommitError::Config(alloc::format!(
-                            "raft commit_with_log: propose at index {idx} did not \
+                            "raft commit: propose at index {idx} did not \
                              reach a quorum within {} ms",
                             self.cfg.propose_timeout_ms,
                         )));
@@ -330,22 +368,22 @@ impl CommitStrategy for RaftCommit {
                         Ok(_) => continue, // earlier index — keep waiting
                         Err(std_mpsc::RecvTimeoutError::Timeout) => {
                             return Err(CommitError::Config(alloc::format!(
-                                "raft commit_with_log: timeout waiting for index {idx}",
+                                "raft commit: timeout waiting for index {idx}",
                             )));
                         }
                         Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                             return Err(CommitError::Config(
-                                "raft commit_with_log: worker apply channel closed".into(),
+                                "raft commit: worker apply channel closed".into(),
                             ));
                         }
                     }
                 }
-                // Quorum-committed. Persist the state row +
+                // Quorum-committed. Persist the delta rows +
                 // bump `last_applied` in our own txn (the worker
                 // owns log + commit_index + voted_for + snap
                 // pointer; the host owns state + last_applied).
                 // Atomic write so a crash here either rolls
-                // back the apply entirely or commits state and
+                // back the apply entirely or commits the rows and
                 // last_applied together. `write_host_fields_in_txn`
                 // touches ONLY `META_LAST_APPLIED` so we don't
                 // race the worker's concurrent writes to the
@@ -354,15 +392,31 @@ impl CommitStrategy for RaftCommit {
                 self.meta.last_applied = self.meta.last_applied.max(idx);
                 let txn = self.db.begin_write()?;
                 {
-                    let mut state_table = txn.open_table(STATE_TABLE)?;
-                    state_table.insert(STATE_KEY, state)?;
+                    if let Some(state) = state_write {
+                        let mut state_table = txn.open_table(STATE_TABLE)?;
+                        state_table.insert(STATE_KEY, state)?;
+                    }
+                    if !rest.is_empty() {
+                        let mut kv = txn.open_table(KV_TABLE)?;
+                        for (key, value) in &rest {
+                            kv.insert(*key, *value)?;
+                        }
+                    }
                 }
                 self.meta.write_host_fields_in_txn(&txn)?;
                 txn.commit()?;
             }
         }
-        self.last_state = state.to_vec();
-        Ok(())
+        if let Some(state) = state_write {
+            self.last_state = state.to_vec();
+        }
+        Ok(CommitReceipt {
+            node_appended: true,
+        })
+    }
+
+    fn restore_writes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
+        crate::commit::read_kv_rows(&self.db)
     }
 
     fn replay_logs(&self) -> Result<Vec<EffectLog>, CommitError> {

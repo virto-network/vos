@@ -575,6 +575,21 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     ///
     /// [`take_dispatch_anchor`]: VosRuntime::take_dispatch_anchor
     dispatch_anchor: HashMap<u32, (u8, [u8; 32])>,
+    /// Ordered storage writes applied to each top-level service's own
+    /// rows since the last [`take_dispatch_delta`] — the whole-agent
+    /// delta the host commits durably ([`crate::commit::AgentDelta`]).
+    /// Child-row writes are excluded (children with rows are a legacy
+    /// shape the Tasks model retires); continuation headers never ride
+    /// the journal, so host bookkeeping never appears here.
+    ///
+    /// [`take_dispatch_delta`]: VosRuntime::take_dispatch_delta
+    dispatch_writes: HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Per-service marker: some applied v3 work-result carried effects
+    /// since the last [`take_dispatch_delta`]. Input to the
+    /// durable-node rule.
+    ///
+    /// [`take_dispatch_delta`]: VosRuntime::take_dispatch_delta
+    dispatch_effect_bearing: HashMap<u32, bool>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -611,6 +626,8 @@ impl<D: DataLayer> VosRuntime<D> {
             last_reply: HashMap::new(),
             last_status: HashMap::new(),
             dispatch_anchor: HashMap::new(),
+            dispatch_writes: HashMap::new(),
+            dispatch_effect_bearing: HashMap::new(),
         }
     }
 
@@ -622,6 +639,20 @@ impl<D: DataLayer> VosRuntime<D> {
     /// compares it during replay.
     pub fn take_dispatch_anchor(&mut self, svc_id: ServiceId) -> Option<(u8, [u8; 32])> {
         self.dispatch_anchor.remove(&svc_id.0)
+    }
+
+    /// Take the dispatch's whole-agent storage delta for `svc_id` since
+    /// the previous take: the ordered writes that landed on the
+    /// service's own rows (`STATE_KEY` included) and whether any
+    /// applied v3 work-result carried effects. The host commits these
+    /// as one [`crate::commit::AgentDelta`].
+    pub fn take_dispatch_delta(&mut self, svc_id: ServiceId) -> (Vec<(Vec<u8>, Vec<u8>)>, bool) {
+        (
+            self.dispatch_writes.remove(&svc_id.0).unwrap_or_default(),
+            self.dispatch_effect_bearing
+                .remove(&svc_id.0)
+                .unwrap_or(false),
+        )
     }
 
     /// Take and return the most recent dispatch's reply bytes for
@@ -948,6 +979,9 @@ impl<D: DataLayer> VosRuntime<D> {
                             if let Some(anchor) = absorbed.anchor {
                                 self.dispatch_anchor.entry(svc_id).or_insert(anchor);
                             }
+                            if absorbed.effect_bearing {
+                                self.dispatch_effect_bearing.insert(svc_id, true);
+                            }
                             // Capture the reply bytes for the host's
                             // synchronous-invoke path. Always insert,
                             // even for empty replies (Unit-returning
@@ -1095,9 +1129,17 @@ impl<D: DataLayer> VosRuntime<D> {
             // Each entry carries its origin service_id — children
             // INVOKEd inside this refine produced their own writes,
             // and they need to land on the child's storage row, not
-            // the dispatching service's.
+            // the dispatching service's. The ticked service's own
+            // writes are additionally captured as its dispatch delta
+            // for the durable commit.
             for (write_svc_id, key, value) in journal.writes.drain(..) {
                 storage.write(ServiceId(write_svc_id), &key, &value);
+                if write_svc_id == svc_id {
+                    self.dispatch_writes
+                        .entry(svc_id)
+                        .or_default()
+                        .push((key, value));
+                }
             }
             for (hash, data) in journal.preimages.drain(..) {
                 self.preimages.insert(hash, data);

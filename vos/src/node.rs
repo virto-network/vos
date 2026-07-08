@@ -1893,7 +1893,7 @@ fn soft_restart_crdt(
         .unwrap_or_default();
     if !state.is_empty() {
         strategy
-            .commit(&state)
+            .commit_state(&state)
             .map_err(|e| format!("post-soft-restart commit: {e}"))?;
     }
     Ok(())
@@ -3528,6 +3528,16 @@ fn agent_thread(
         runtime
             .storage
             .write(svc_id, crate::lifecycle::STATE_KEY_BYTES, &state_bytes);
+        // Rehydrate the rest of the agent's keyspace — the non-STATE
+        // rows previous deltas persisted.
+        match strategy.restore_writes() {
+            Ok(rows) => {
+                for (key, value) in rows {
+                    runtime.storage.write(svc_id, &key, &value);
+                }
+            }
+            Err(e) => warn!(%id, error = %e, "agent: restoring non-state rows failed"),
+        }
         info!(%id, bytes = state_bytes.len(), "agent: restored state");
     } else if recording_enabled {
         // Cold-start replay: pull every log out of the DAG and
@@ -3553,7 +3563,7 @@ fn agent_thread(
                     .map(|v| v.to_vec())
                     .unwrap_or_default();
                 if !state.is_empty()
-                    && let Err(e) = strategy.commit(&state)
+                    && let Err(e) = strategy.commit_state(&state)
                 {
                     let err = format!("post-replay commit failed: {e}");
                     error!(%id, "{err}");
@@ -3892,21 +3902,31 @@ fn handle_invoke_request(
         .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
         .map(|v| v.to_vec())
         .unwrap_or_default();
-    // The anchor of the state this dispatch ran against — recorded
-    // normatively in the log node; replay divergence detection compares
-    // against it. Taken even when not recording so a stale entry never
-    // leaks into the next dispatch's log.
+    // The whole-agent delta this dispatch produced: its ordered writes
+    // (STATE_KEY included), the anchor of the state it ran against
+    // (recorded normatively in the log node — replay divergence
+    // detection compares against it), and the effect-bearing marker
+    // driving the durable-node rule. Taken even when not recording so
+    // stale entries never leak into the next dispatch.
+    let (writes, effect_bearing) = runtime.take_dispatch_delta(svc_id);
     let dispatch_anchor = runtime.take_dispatch_anchor(svc_id);
+    let anchor = dispatch_anchor.unwrap_or((crate::effect_log::ANCHOR_UNRECORDED, [0u8; 32]));
     let commit_result = if recording_enabled {
         let mut log = runtime.finish_recording().expect("recording was started");
-        if let Some((kind, anchor)) = dispatch_anchor {
-            log.set_anchor(kind, anchor);
-        }
-        strategy.commit_with_log(&state, &log)
-    } else if !state.is_empty() {
-        strategy.commit(&state)
+        log.set_anchor(anchor.0, anchor.1);
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: Some(&log),
+            effect_bearing,
+        })
     } else {
-        Ok(())
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: None,
+            effect_bearing,
+        })
     };
 
     if let Err(e) = commit_result {
@@ -4301,23 +4321,28 @@ fn dispatch_once(
     // succeeds so a failed commit (e.g. Raft `NotLeader`) leaks nothing.
     let external = drive_capturing_external(runtime, svc_id);
 
-    let state = runtime
-        .storage
-        .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
-        .map(|v| v.to_vec())
-        .unwrap_or_default();
-
-    // See handle_invoke_request — taken unconditionally so stale anchors
-    // never leak across dispatches.
+    // See handle_invoke_request — the dispatch's whole-agent delta,
+    // taken unconditionally so stale entries never leak across
+    // dispatches.
+    let (writes, effect_bearing) = runtime.take_dispatch_delta(svc_id);
     let dispatch_anchor = runtime.take_dispatch_anchor(svc_id);
+    let anchor = dispatch_anchor.unwrap_or((crate::effect_log::ANCHOR_UNRECORDED, [0u8; 32]));
     if recorded {
         let mut log = runtime.finish_recording().expect("recording was started");
-        if let Some((kind, anchor)) = dispatch_anchor {
-            log.set_anchor(kind, anchor);
-        }
-        strategy.commit_with_log(&state, &log)?;
-    } else if !state.is_empty() {
-        strategy.commit(&state)?;
+        log.set_anchor(anchor.0, anchor.1);
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: Some(&log),
+            effect_bearing,
+        })?;
+    } else {
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: None,
+            effect_bearing,
+        })?;
     }
 
     // Commit succeeded (the `?` above returns early on failure): the
@@ -6594,7 +6619,7 @@ fn persist(
     id: ServiceId,
 ) {
     let bytes = instance.save_state();
-    if let Err(e) = strategy.commit(&bytes) {
+    if let Err(e) = strategy.commit_state(&bytes) {
         warn!(%id, error = %e, "extension: failed to persist state");
     }
 }
@@ -9430,8 +9455,13 @@ mod tests {
             fn restore(&mut self) -> Option<Vec<u8>> {
                 None
             }
-            fn commit(&mut self, _state: &[u8]) -> Result<(), crate::commit::CommitError> {
-                Err(crate::commit::CommitError::Config("forced commit failure".into()))
+            fn commit(
+                &mut self,
+                _delta: &crate::commit::AgentDelta<'_>,
+            ) -> Result<crate::commit::CommitReceipt, crate::commit::CommitError> {
+                Err(crate::commit::CommitError::Config(
+                    "forced commit failure".into(),
+                ))
             }
         }
 
