@@ -1813,6 +1813,7 @@ fn replay_dag_into_runtime(
         // during replay (it anchors whatever the runtime just served
         // it) and detects nothing.
         let recorded_anchor = (log.anchor_kind, log.anchor);
+        let recorded_caller = log.caller_prefix;
         let _ = runtime.take_dispatch_anchor(svc_id);
         // Replayed dispatches populate the same per-dispatch delta
         // trackers real dispatches do; nothing commits them during
@@ -1832,16 +1833,18 @@ fn replay_dag_into_runtime(
         // nodes instead would drop on_start's state transition and
         // break the anchor chain for every node after.
         //
-        // Non-empty dispatches: recorded effects were authorised by
-        // *some* caller at record time (M7). For replay determinism,
-        // wrap with the trusted-System prefix so the M6 role check
-        // passes the same way it did originally. If/when we record
-        // the original caller's role bytes in the log, we can replay
-        // with that exact identity instead.
+        // Non-empty dispatches replay under the RECORDED caller
+        // prefix — the original caller's trust flag and role grants —
+        // so every gate decision reproduces exactly: a role-refused
+        // dispatch replays as refused (its durable node may still
+        // carry framework effects like the genesis state write), a
+        // granted one as granted. Legacy logs without a recorded
+        // prefix decode as trusted-System, their historical replay
+        // identity.
         if msg.is_empty() {
             runtime.send_to(svc_id, Vec::new());
         } else {
-            runtime.send_to(svc_id, encode_replay_payload(&msg));
+            runtime.send_to(svc_id, encode_replay_payload(&recorded_caller, &msg));
         }
         runtime.run_blocking();
         // External transfers emitted during replay had their
@@ -3898,6 +3901,7 @@ fn handle_invoke_request(
             req.msg = signed;
         }
     }
+    let dispatch_caller_prefix = caller_prefix_bytes(&req);
     if recording_enabled {
         runtime.begin_recording(req.msg.clone());
     }
@@ -3939,6 +3943,7 @@ fn handle_invoke_request(
     let commit_result = if recording_enabled {
         let mut log = runtime.finish_recording().expect("recording was started");
         log.set_anchor(anchor.0, anchor.1);
+        log.set_caller_prefix(dispatch_caller_prefix);
         strategy.commit(&crate::commit::AgentDelta {
             writes: &writes,
             anchor,
@@ -4094,14 +4099,10 @@ fn forbidden_envelope() -> Vec<u8> {
 /// emits a trusted-System prefix so the role
 /// check passes during replay — original authorisation is
 /// implicit in the fact the log was committed.
-fn encode_replay_payload(msg: &[u8]) -> Vec<u8> {
+fn encode_replay_payload(prefix: &crate::effect_log::CallerPrefix, msg: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(6 + msg.len());
     out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
-    out.push(1); // trust_flag = System
-    out.push(0); // has_space_role
-    out.push(0); // space byte (unused)
-    out.push(0); // has_actor_local_role
-    out.push(0); // actor_local byte (unused)
+    out.extend_from_slice(prefix);
     out.extend_from_slice(msg);
     out
 }
@@ -4187,6 +4188,19 @@ fn drive_capturing_external(
 ///   [5] actor_local_role byte
 ///   [6..] original message bytes
 fn encode_caller_prefix(req: &InvokeRequest) -> Vec<u8> {
+    let prefix = caller_prefix_bytes(req);
+    let mut out = Vec::with_capacity(6 + req.msg.len());
+    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+    out.extend_from_slice(&prefix);
+    out.extend_from_slice(&req.msg);
+    out
+}
+
+/// The 5 caller-prefix bytes of [`encode_caller_prefix`], standalone —
+/// recorded in the dispatch's EffectLog so replay re-runs the dispatch
+/// under the original caller's authority (a role-refused dispatch must
+/// replay as refused).
+fn caller_prefix_bytes(req: &InvokeRequest) -> crate::effect_log::CallerPrefix {
     let trust_flag: u8 = if req.caller.is_trusted() { 1 } else { 0 };
     let (has_space, space_byte) = match req.space_role {
         Some(b) => (1u8, b),
@@ -4196,15 +4210,13 @@ fn encode_caller_prefix(req: &InvokeRequest) -> Vec<u8> {
         Some(b) => (1u8, b),
         None => (0u8, 0u8),
     };
-    let mut out = Vec::with_capacity(6 + req.msg.len());
-    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
-    out.push(trust_flag);
-    out.push(has_space);
-    out.push(space_byte);
-    out.push(has_actor_local);
-    out.push(actor_local_byte);
-    out.extend_from_slice(&req.msg);
-    out
+    [
+        trust_flag,
+        has_space,
+        space_byte,
+        has_actor_local,
+        actor_local_byte,
+    ]
 }
 
 /// INVOKE. Used by the cross-thread invoke path so a yielded child on
@@ -4355,6 +4367,10 @@ fn dispatch_once(
     if recorded {
         let mut log = runtime.finish_recording().expect("recording was started");
         log.set_anchor(anchor.0, anchor.1);
+        // Tell-style dispatches were wrapped Unauthenticated; kicks
+        // (empty msg) carry no prefix and replay as raw empties, so the
+        // recorded prefix is unused for them.
+        log.set_caller_prefix([0, 0, 0, 0, 0]);
         strategy.commit(&crate::commit::AgentDelta {
             writes: &writes,
             anchor,
@@ -7390,16 +7406,20 @@ mod tests {
     }
 
     #[test]
-    fn replay_payload_uses_system_trust() {
-        // Replay re-runs already-committed log entries; the
-        // original authorisation is implicit in the commit.
-        // System trust here is intentional — but only when the
-        // bytes come from the replay log, never from an inbox.
+    fn replay_payload_carries_recorded_caller() {
+        // Replay re-runs a committed log entry under the RECORDED
+        // caller prefix, so the original gate decision reproduces —
+        // refused stays refused, granted stays granted. Legacy logs
+        // decode as CALLER_SYSTEM, their historical replay identity.
         let inner = b"logged-msg";
-        let wrapped = encode_replay_payload(inner);
+        let recorded: crate::effect_log::CallerPrefix = [0, 1, 3, 0, 0];
+        let wrapped = encode_replay_payload(&recorded, inner);
         assert_eq!(wrapped[0], crate::actors::lifecycle::TAG_CALLER_PREFIX);
-        assert_eq!(wrapped[1], 1, "replay must use trust_flag=System");
+        assert_eq!(&wrapped[1..6], &recorded[..]);
         assert_eq!(&wrapped[6..], &inner[..]);
+
+        let legacy = encode_replay_payload(&crate::effect_log::CALLER_SYSTEM, inner);
+        assert_eq!(legacy[1], 1, "legacy logs replay as trusted-System");
     }
 
     #[test]
