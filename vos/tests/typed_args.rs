@@ -89,6 +89,13 @@ mod fixture {
         fn echo_root(&self, root: [u8; 32]) -> [u8; 32] {
             root
         }
+
+        /// `Result<T>` return — the schema records the success type `T`,
+        /// not `Result` (the error surfaces as `ClientError`).
+        #[msg]
+        fn try_thing(&self) -> Result<u32> {
+            Ok(3)
+        }
     }
 }
 
@@ -335,4 +342,44 @@ fn byte_array_field_meta_records_normalized_type() {
         .expect("echo_root meta present");
     assert_eq!(m.fields[0].name, "root");
     assert_eq!(m.fields[0].ty, "[u8;32]");
+}
+
+// ── G27a: return types in schema metadata ──────────────────────────
+
+fn meta_return(name: &str) -> &'static str {
+    VaultMsg::META
+        .messages
+        .iter()
+        .find(|m| m.name == name)
+        .unwrap_or_else(|| panic!("{name} meta present"))
+        .returns
+}
+
+#[test]
+fn message_meta_records_return_types() {
+    assert_eq!(meta_return("last_receipt"), "Receipt");
+    assert_eq!(meta_return("deposit"), "u64");
+    assert_eq!(meta_return("echo_root"), "[u8;32]");
+    assert_eq!(meta_return("pin_roots"), "u32");
+    // Result<u32> unwraps to the success type.
+    assert_eq!(meta_return("try_thing"), "u32");
+}
+
+#[test]
+fn return_types_survive_meta_encode_decode() {
+    // The compile-time META round-trips through the binary .vos_meta
+    // codec with return types intact (trailing-append section).
+    let (buf, len) = vos::metadata::encode::<4096>(&VaultMsg::META);
+    let parsed = vos::metadata::decode(&buf[..len]).expect("decode");
+    let by = |name: &str| {
+        parsed
+            .messages
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("{name} present"))
+    };
+    assert_eq!(by("last_receipt").returns, "Receipt");
+    assert_eq!(by("echo_root").returns, "[u8;32]");
+    assert_eq!(by("deposit").returns, "u64");
+    assert_eq!(by("try_thing").returns, "u32");
 }

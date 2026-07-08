@@ -122,7 +122,7 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
             }
             let target_id = client.resolve_target(target)?;
             let reply = client.invoke_dyn(target_id, &Msg::new(wire))?;
-            return render_reply(reply);
+            return render_reply(reply, None);
         }
 
         let method_meta = meta
@@ -153,7 +153,8 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         let target_id = client.resolve_target(target)?;
         tracing::debug!("invoking {method} on {target_id}");
         let reply = client.invoke_dyn(target_id, &msg)?;
-        render_reply(reply)
+        let ret_ty = method_meta.map(|m| m.returns.as_str());
+        render_reply(reply, ret_ty)
     })
 }
 
@@ -210,11 +211,14 @@ fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> any
             .with("space_id", space_id.to_vec())
             .with("cert", cert),
     )?;
-    render_reply(reply2)
+    render_reply(reply2, None)
 }
 
 /// Render an invoke reply to stdout, JSON or text per the global format.
-fn render_reply(reply: Value) -> anyhow::Result<()> {
+/// `ret_ty` is the handler's declared return type from the schema (when
+/// known); it labels an otherwise-opaque `Value::Bytes` reply so an
+/// operator can tell a `[u8;32]` root from a `Receipt` blob.
+fn render_reply(reply: Value, ret_ty: Option<&str>) -> anyhow::Result<()> {
     if output::is_json() {
         output::print_json(&unwrap_json_string(output::value_to_json(&reply)));
     } else {
@@ -226,6 +230,15 @@ fn render_reply(reply: Value) -> anyhow::Result<()> {
                 // fields, so print the payload verbatim rather than
                 // rust-Debug-formatting the wrapping `Str(...)`.
                 println!("{s}");
+            }
+            Value::Bytes(b) => {
+                // Bytes are opaque — render as hex, prefixed with the
+                // declared type name when the schema carries one.
+                let hex = hex::encode(&b);
+                match ret_ty {
+                    Some(ty) if !ty.is_empty() && ty != "()" => println!("{ty}: 0x{hex}"),
+                    _ => println!("0x{hex}"),
+                }
             }
             other => println!("{other:?}"),
         }
@@ -555,6 +568,7 @@ mod tests {
             is_query: false,
             fields: vec![field],
             exposed_to_cli: true,
+            returns: "u32".into(),
         };
         let err = build_msg("add", Some(&m), &["a=notanumber"]).unwrap_err();
         assert!(err.to_string().contains("u64"), "{err}");

@@ -468,6 +468,15 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let option_inner = success_after_result.as_ref().and_then(option_inner_type);
 
+        // Canonical return-type string for the schema (`Result<T, E>`
+        // already unwrapped to `T` by `success_after_result`; unit /
+        // no-return renders `()`). Mirrors the reply-encoding branch so
+        // the label matches what actually lands on the wire.
+        let returns_str = success_after_result
+            .as_ref()
+            .map(ty_string)
+            .unwrap_or_else(|| "()".to_string());
+
         // Reply-encoding step: how to convert the handler's
         // returned value into the `Value` we hand to
         // `ctx.__set_reply`. Three shapes, in order:
@@ -608,6 +617,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #msg_name_str,
                 is_query: #query_val,
                 fields: &[ #( #field_metas ),* ],
+                returns: #returns_str,
             }
         });
         if exposed_to_cli {

@@ -269,6 +269,7 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
     // dispatch failure (panic / non-DONE status / no route / timeout) →
     // `502`. This is what preserves the panic→502 distinction in
     // transport mode.
+    let ret_ty = method_meta.as_ref().map(|m| m.returns.as_str());
     match ctx.ask_dispatch(target, &payload).await {
         Some(reply_bytes) if reply_bytes.is_empty() => {
             // Handler returned `()` successfully → JSON null.
@@ -281,12 +282,28 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
             // misaligned slices that came back through the invoke
             // envelope unwrap.
             match <vos::value::Value as vos::Decode>::try_decode(&reply_bytes) {
-                Some(value) => json(200, value_to_json(&value)),
+                Some(value) => label_return(json(200, value_to_json(&value)), ret_ty),
                 None => text(502, "upstream returned malformed reply"),
             }
         }
         None => text(502, "upstream error or shutdown"),
     }
+}
+
+/// Attach the schema's declared return type as an `x-vos-return-type`
+/// response header. A `Value::Bytes` reply renders as an opaque hex
+/// string in the JSON body (JSON has no blob type); the header tells a
+/// client whether those bytes are a `[u8;32]` root, a `Vec<u8>` proof,
+/// or a custom struct. No-op for unit / unknown return types.
+fn label_return(mut resp: Response, ret_ty: Option<&str>) -> Response {
+    if let Some(ty) = ret_ty
+        && !ty.is_empty()
+        && ty != "()"
+        && let Ok(value) = http::HeaderValue::from_str(ty)
+    {
+        resp.headers_mut().insert("x-vos-return-type", value);
+    }
+    resp
 }
 
 /// Self-documenting schema endpoints. Public — schema is no more
@@ -488,6 +505,15 @@ fn openapi_operation_for(
     let http_method = if msg.is_query { "get" } else { "post" };
     let summary = format!("{actor_name}::{}", msg.name);
     let operation_id = format!("{actor_name}_{}", msg.name);
+    // Label the response with the declared return type when the schema
+    // carries one; a `Value::Bytes` reply (custom struct / [u8;N] /
+    // Vec<u8>) renders as a hex string, and this is where the type name
+    // that disambiguates it is documented (mirrors the live
+    // `x-vos-return-type` header).
+    let response_desc = match msg.returns.as_str() {
+        "" | "()" => "JSON-encoded return value".to_string(),
+        ty => format!("JSON-encoded return value (type: {ty})"),
+    };
 
     if msg.is_query {
         let parameters: Vec<_> = msg
@@ -507,7 +533,7 @@ fn openapi_operation_for(
                 "summary": summary,
                 "operationId": operation_id,
                 "parameters": parameters,
-                "responses": { "200": { "description": "JSON-encoded return value" } }
+                "responses": { "200": { "description": response_desc } }
             }
         })
     } else {
@@ -533,7 +559,7 @@ fn openapi_operation_for(
                         }
                     }
                 },
-                "responses": { "200": { "description": "JSON-encoded return value" } }
+                "responses": { "200": { "description": response_desc } }
             }
         })
     }

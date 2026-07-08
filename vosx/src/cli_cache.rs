@@ -315,12 +315,14 @@ mod tests {
                     is_query: false,
                     fields: vec![],
                     exposed_to_cli: true,
+                    returns: String::new(),
                 },
                 ParsedMessage {
                     name: "status".into(),
                     is_query: false,
                     fields: vec![],
                     exposed_to_cli: true,
+                    returns: String::new(),
                 },
                 ParsedMessage {
                     name: "internal".into(),
@@ -330,6 +332,7 @@ mod tests {
                         ty: "u32".into(),
                     }],
                     exposed_to_cli: false,
+                    returns: String::new(),
                 },
             ],
             constructor: vec![],
