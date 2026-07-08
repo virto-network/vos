@@ -301,6 +301,42 @@ impl RefineJournal {
             }
         }
     }
+
+    /// Snapshot the journal's current lengths so one dispatch's appended
+    /// effects can be delimited and, on a trap, discarded without
+    /// disturbing effects committed by earlier dispatches in the tick.
+    fn mark(&self) -> JournalMark {
+        JournalMark {
+            writes: self.writes.len(),
+            transfers: self.transfers.len(),
+            preimages: self.preimages.len(),
+            self_messages: self.self_messages.len(),
+            new_services: self.new_services.len(),
+        }
+    }
+
+    /// Discard every effect appended since `mark` — the writes,
+    /// transfers, preimages, self-messages and service creations a
+    /// panicked dispatch journaled, including child-INVOKE effects that
+    /// were absorbed into this journal during it.
+    fn rollback_to(&mut self, mark: JournalMark) {
+        self.writes.truncate(mark.writes);
+        self.transfers.truncate(mark.transfers);
+        self.preimages.truncate(mark.preimages);
+        self.self_messages.truncate(mark.self_messages);
+        self.new_services.truncate(mark.new_services);
+    }
+}
+
+/// Length snapshot of a [`RefineJournal`] delimiting one dispatch's
+/// appended effects, for discard-on-trap.
+#[derive(Clone, Copy)]
+struct JournalMark {
+    writes: usize,
+    transfers: usize,
+    preimages: usize,
+    self_messages: usize,
+    new_services: usize,
 }
 
 // --- Per-service storage ---
@@ -724,6 +760,10 @@ impl<D: DataLayer> VosRuntime<D> {
                 let mut round_items = std::mem::take(&mut items);
                 round_items.retain(|item| !item.is_empty());
 
+                // Delimit this dispatch's journal contributions so a trap
+                // can drop them whole (A2 discard-on-panic).
+                let dispatch_mark = journal.mark();
+
                 let halted = run_refine_kernel(
                     &mut kernel,
                     svc_id,
@@ -839,6 +879,13 @@ impl<D: DataLayer> VosRuntime<D> {
                         break;
                     }
                 } else {
+                    // Guest trapped (panic / OOG / page fault) before
+                    // halting: discard everything this dispatch journaled —
+                    // including child-INVOKE effects absorbed into the
+                    // parent's journal — so a panicked handler commits
+                    // nothing from its own tick. Effects committed by
+                    // earlier dispatches in this tick are kept.
+                    journal.rollback_to(dispatch_mark);
                     *panics += 1;
                     break;
                 }

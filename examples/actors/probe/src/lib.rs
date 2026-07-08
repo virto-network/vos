@@ -7,7 +7,12 @@
 //!   so a batch of several `ping`s must be delivered across ticks
 //!   without dropping the un-fetched remainder.
 //! - [`seen`](Probe::seen) — reads back the delivered count.
+//! - [`boom`](Probe::boom) — asks a child (which journals a write via
+//!   its cold-start hook), then traps; the host must discard the whole
+//!   dispatch — the absorbed child write included — so a panicked
+//!   handler commits nothing.
 
+use vos::abi::service::ServiceId;
 use vos::prelude::*;
 
 #[actor]
@@ -34,5 +39,22 @@ impl Probe {
     #[msg]
     async fn seen(&self) -> u32 {
         self.seen
+    }
+
+    /// Ask `child` (a leaker, whose cold-start hook journals a write into
+    /// this dispatch), then trap. The absorbed child write must be
+    /// discarded with the rest of the panicked dispatch — nothing commits.
+    #[msg]
+    async fn boom(&mut self, ctx: &mut Context<Self>, child: u32) {
+        let _ = ctx.ask(ServiceId(child), &Msg::new("start")).await;
+        panic!("boom: discard-on-panic regression");
+    }
+
+    /// Ask `child` and return normally — the baseline companion to
+    /// `boom`. The child's absorbed write commits when this dispatch
+    /// completes, proving the discard test isn't vacuous.
+    #[msg]
+    async fn relay(&mut self, ctx: &mut Context<Self>, child: u32) {
+        let _ = ctx.ask(ServiceId(child), &Msg::new("start")).await;
     }
 }

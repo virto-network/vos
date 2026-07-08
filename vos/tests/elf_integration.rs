@@ -10351,3 +10351,71 @@ fn probe_yield_mid_batch_delivers_all_mail() {
         "all three pings must be delivered across ticks, not just the first"
     );
 }
+
+/// Register a probe (parent) and a leaker (child) in `rt`, returning
+/// their service ids. The leaker's cold-start hook journals a write to
+/// its own row that the parent's dispatch absorbs when it asks it.
+fn probe_and_leaker(rt: &mut VosRuntime) -> (vos::abi::service::ServiceId, vos::abi::service::ServiceId) {
+    let probe = transpile_actor(&example_elf("probe"));
+    let leaker = transpile_actor(&example_elf("leaker"));
+    let p_idx = rt.register_service_blob(probe);
+    let parent = rt.register_service(p_idx);
+    let l_idx = rt.register_service_blob(leaker);
+    let child = rt.register_service(l_idx);
+    (parent, child)
+}
+
+fn dynamic_msg(name: &str, child: u32) -> Vec<u8> {
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let encoded = Msg::new(name).with("child", child).encode();
+    let mut p = vec![TAG_DYNAMIC];
+    p.extend_from_slice(&encoded);
+    p
+}
+
+#[test]
+fn probe_relay_commits_child_effect() {
+    // Baseline for the discard-on-panic test: an asked leaker's
+    // cold-start write, absorbed into the parent's journal, commits when
+    // the parent returns normally. If this ever fails the discard test
+    // below would be vacuous.
+    let mut rt = VosRuntime::new();
+    let (parent, child) = probe_and_leaker(&mut rt);
+    rt.send_to(parent, dynamic_msg("relay", child.0));
+    rt.run_blocking();
+    assert_eq!(rt.panics, 0, "relay parent should not panic");
+    assert_eq!(
+        rt.storage.read(child, b"leaker_mark"),
+        Some(&b"1"[..]),
+        "an asked leaker's absorbed write commits when the parent completes"
+    );
+}
+
+#[test]
+fn probe_panic_discards_absorbed_child_effect() {
+    // A2: a handler that traps must commit nothing from its own tick —
+    // including effects a child INVOKE absorbed into the parent's
+    // journal. `boom` asks a leaker (whose cold-start hook journals a
+    // write into this dispatch), then panics; the host must roll back
+    // the whole dispatch so the leaker's write never reaches storage.
+    // Before the fix the absorbed write committed even though the asking
+    // parent trapped (companion baseline: probe_relay_commits_child_effect).
+    use vos::runtime::GasConfig;
+
+    // A guest panic spins in the panic handler until it OOGs, so keep
+    // the refine budget small enough that the parent traps quickly.
+    let mut rt = VosRuntime::with_gas_config(GasConfig {
+        refine_gas: 20_000_000,
+    });
+    let (parent, child) = probe_and_leaker(&mut rt);
+    rt.send_to(parent, dynamic_msg("boom", child.0));
+    rt.run_blocking();
+
+    assert!(rt.panics >= 1, "the boom parent should have trapped");
+    assert_eq!(
+        rt.storage.read(child, b"leaker_mark"),
+        None,
+        "the leaker's absorbed write must be discarded when the asking parent traps"
+    );
+}
