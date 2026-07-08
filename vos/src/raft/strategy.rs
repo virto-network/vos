@@ -507,6 +507,13 @@ impl CommitStrategy for RaftCommit {
         commit_index > self.meta.last_applied
     }
 
+    fn linear_history(&self) -> bool {
+        // The raft log is a single totally-ordered chain — a replayed
+        // dispatch that re-emits a different anchor than recorded is
+        // real divergence, never a merge artifact.
+        true
+    }
+
     fn is_writable(&self) -> bool {
         match &self.role {
             // Single-node mode is always writable — the agent

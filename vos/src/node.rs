@@ -1805,15 +1805,6 @@ fn replay_dag_into_runtime(
     }
     for (i, log) in logs.into_iter().enumerate() {
         let msg = log.msg.clone();
-        // A log entry with no dispatch message — a CRDT genesis /
-        // boundary node — has no handler to replay and no recorded
-        // state effect, so skip it. Replaying it would wrap an empty
-        // payload in the M7 caller prefix; the actor strips the prefix
-        // back to empty bytes and `Decode::decode` panics ("empty
-        // bytes"). The real operations live in the non-empty entries.
-        if msg.is_empty() {
-            continue;
-        }
         // The (kind, anchor) recorded in this durable log node — the
         // state the ORIGINAL dispatch ran against. The replayed
         // dispatch must re-emit the same anchor, or the rebuilt state
@@ -1824,13 +1815,27 @@ fn replay_dag_into_runtime(
         let recorded_anchor = (log.anchor_kind, log.anchor);
         let _ = runtime.take_dispatch_anchor(svc_id);
         runtime.begin_replay(log);
-        // M7 — recorded effects were authorised by *some* caller
-        // at record time. For replay determinism, wrap with the
-        // trusted-System prefix so the M6 role check passes the
-        // same way it did originally. If/when we record the
-        // original caller's role bytes in the log, we can replay
+        // An empty-msg node is a recorded kick dispatch — the
+        // host-synthesized wake-up whose whole semantic is "run
+        // on_start". Replay it as exactly that: a raw empty payload
+        // (never prefix-wrapped — the actor would strip the prefix
+        // back to empty bytes and panic decoding them as a message;
+        // the runtime instead filters the empty item and the guest
+        // runs its cold-start path with no mail). Skipping these
+        // nodes instead would drop on_start's state transition and
+        // break the anchor chain for every node after.
+        //
+        // Non-empty dispatches: recorded effects were authorised by
+        // *some* caller at record time (M7). For replay determinism,
+        // wrap with the trusted-System prefix so the M6 role check
+        // passes the same way it did originally. If/when we record
+        // the original caller's role bytes in the log, we can replay
         // with that exact identity instead.
-        runtime.send_to(svc_id, encode_replay_payload(&msg));
+        if msg.is_empty() {
+            runtime.send_to(svc_id, Vec::new());
+        } else {
+            runtime.send_to(svc_id, encode_replay_payload(&msg));
+        }
         runtime.run_blocking();
         // External transfers emitted during replay had their
         // original effects at record time; we don't re-issue them.
@@ -1848,11 +1853,23 @@ fn replay_dag_into_runtime(
         if recorded_anchor.0 != crate::effect_log::ANCHOR_UNRECORDED
             && replayed_anchor != Some(recorded_anchor)
         {
-            return Err(format!(
-                "replay diverged at log #{i}: re-emitted work-result anchor \
-                 {replayed_anchor:02x?} != recorded {recorded_anchor:02x?} — \
-                 rebuilt state history differs from the committed one",
-            ));
+            if strategy.linear_history() {
+                return Err(format!(
+                    "replay diverged at log #{i}: re-emitted work-result anchor \
+                     {replayed_anchor:02x?} != recorded {recorded_anchor:02x?} — \
+                     rebuilt state history differs from the committed one",
+                ));
+            }
+            // Merged-DAG replay serializes concurrent branches into an
+            // order their recorded anchors never observed — expected,
+            // not divergence. Kept observable for diagnostics.
+            debug!(
+                %svc_id,
+                log = i,
+                ?replayed_anchor,
+                ?recorded_anchor,
+                "replayed anchor differs from recorded (merged-DAG serialization)",
+            );
         }
     }
     Ok(())

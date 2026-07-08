@@ -260,6 +260,20 @@ pub trait CommitStrategy: Send {
         true
     }
 
+    /// Whether this strategy's durable history is a single totally-
+    /// ordered chain (Raft) rather than a mergeable DAG (CRDT). Governs
+    /// how replay treats a recorded-anchor mismatch: on a linear
+    /// history every replayed dispatch must re-emit exactly the
+    /// recorded anchor (a mismatch is real divergence — fail); on a
+    /// merged DAG, concurrent branches replay in a serialization their
+    /// recorded anchors never saw, so mismatches are expected and only
+    /// observable (the reconciliation policy for parallel histories is
+    /// an explicit open spike — the anchor guarantees detectability,
+    /// not a policy).
+    fn linear_history(&self) -> bool {
+        false
+    }
+
     /// Whether the agent must run a sync reload (soft-restart) to fold in DAG
     /// nodes the backing store gained out-of-band — the soft-restart's whole
     /// reason to exist (a peer merge by the sync ticker, or a follower applying
