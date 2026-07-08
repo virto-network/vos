@@ -462,7 +462,17 @@ pub fn run_refine_service<A: super::Actor>() {
     // as `usize` because `A` differs per service; safe because PVM is
     // single-threaded.
     static mut ACTOR_HOLDER: usize = 0;
+    // The work-result anchor: `(anchor_kind, anchor)` committing to the
+    // state this refine runs against. Computed on cold start from the
+    // exact serialized bytes READ returned (before deserialization);
+    // carried forward across warm restarts in flat_mem, advancing to
+    // `blake2b(S)` whenever a work-result's final state was `S` — so
+    // the up-to-64 work-results of one tick form the anchor chain the
+    // host verifies against its journal overlay.
+    static mut CURRENT_ANCHOR: (u8, [u8; 32]) =
+        (crate::refine_payload::ANCHOR_GENESIS, [0u8; 32]);
     let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
+    let anchor_ptr = addr_of_mut!(CURRENT_ANCHOR);
     let mut cold_start = false;
     // SAFETY: PVM is single-threaded; the static-mut access goes via
     // a raw pointer (no shared/exclusive ref conflict). The cast from
@@ -482,6 +492,7 @@ pub fn run_refine_service<A: super::Actor>() {
             // large state as missing and silently resurrect the actor
             // as default, persisting the wipe on the next save.
             let state = lifecycle::read_persisted_state_owned();
+            *anchor_ptr = crate::refine_payload::anchor_for(state.as_deref());
             let boxed = Box::new(lifecycle::load_or_create::<A>(state.as_deref()));
             *holder_ptr = Box::into_raw(boxed) as usize;
         }
@@ -543,7 +554,27 @@ pub fn run_refine_service<A: super::Actor>() {
     {
         let new_state_bytes = super::codec::Encode::encode(&*actor_ref);
         let reply_bytes = ctx.take_reply_bytes();
-        let payload = ctx.drain_into_refine_payload(new_state_bytes, reply_bytes);
+        // Emit the post-dispatch state as the final Write{STATE_KEY}
+        // effect only when it changed from the anchored state. Genesis
+        // always emits: there is no prior blob to be equal to, and the
+        // first work-result is what materializes the actor's row.
+        // SAFETY: single-threaded PVM, raw-pointer access as above.
+        let (anchor_kind, anchor) = unsafe { *anchor_ptr };
+        let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
+        let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS
+            || new_hash != anchor;
+        let payload = ctx.drain_into_refine_payload(
+            anchor_kind,
+            anchor,
+            state_changed.then_some(new_state_bytes),
+            reply_bytes,
+        );
+        if state_changed {
+            // SAFETY: single-threaded PVM, raw-pointer access as above.
+            unsafe {
+                *anchor_ptr = (crate::refine_payload::ANCHOR_STATE_HASH, new_hash);
+            }
+        }
         drop(ctx);
         let encoded = payload.encode();
         out_buf.clear();
