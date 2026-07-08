@@ -1814,6 +1814,13 @@ fn replay_dag_into_runtime(
         // it) and detects nothing.
         let recorded_anchor = (log.anchor_kind, log.anchor);
         let _ = runtime.take_dispatch_anchor(svc_id);
+        // Replayed dispatches populate the same per-dispatch delta
+        // trackers real dispatches do; nothing commits them during
+        // replay (the durable history already holds them), so drain
+        // them — leaking a replayed dispatch's effect-bearing marker
+        // into the next real dispatch would make a pure read on a Raft
+        // follower propose (and fail NotLeader, dropping its reply).
+        let _ = runtime.take_dispatch_delta(svc_id);
         runtime.begin_replay(log);
         // An empty-msg node is a recorded kick dispatch — the
         // host-synthesized wake-up whose whole semantic is "run
@@ -1850,6 +1857,7 @@ fn replay_dag_into_runtime(
             ));
         }
         let replayed_anchor = runtime.take_dispatch_anchor(svc_id);
+        let _ = runtime.take_dispatch_delta(svc_id);
         if recorded_anchor.0 != crate::effect_log::ANCHOR_UNRECORDED
             && replayed_anchor != Some(recorded_anchor)
         {
