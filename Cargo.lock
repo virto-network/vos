@@ -1209,6 +1209,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "clerk-settle"
+version = "0.1.0"
+dependencies = [
+ "cipher-clerk",
+ "vos",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7746,6 +7754,7 @@ dependencies = [
  "clap",
  "clerk-bridge",
  "clerk-ledger",
+ "clerk-settle",
  "crdt-counter",
  "dlmalloc",
  "ed25519-dalek",

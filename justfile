@@ -48,7 +48,7 @@ build-settle:
 # surfaces as `register_remote Unreachable` and a stale voucher-check /
 # prover .so as a `ProofInvalid`. (Run `just build-actors` by hand if you invoke
 # `cargo test` directly instead of through `just test-pvm`.)
-build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge build-voucher-check
+build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge build-clerk-settle build-voucher-check
     cargo build -p prover-extension
     cargo build -p prover-extension --release
 
@@ -124,6 +124,15 @@ build-clerk-ledger:
 # clerk-ledger).
 build-clerk-bridge:
     cd actors/clerk-bridge; cargo +nightly actor
+
+
+# Build the clerk-settle actor — the settlement venue agent that
+# runs on the third (venue) space. Registers banks, accepts signed
+# net-flow claims, and reconciles a window's two claims (their
+# Pedersen commitments must cancel). Same toolchain as the other
+# clerk actors.
+build-clerk-settle:
+    cd actors/clerk-settle; cargo +nightly actor
 
 
 # Build the voucher-check PVM guest — the binary whose traced

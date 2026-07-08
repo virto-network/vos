@@ -61,5 +61,28 @@ written in the `Vec<u8>` + manual-decode idiom, matching the existing
 clerk actors.
 
 **Retype TODO (after G25 lands):** replace the `Vec<u8>` args below with
-typed rkyv structs / `[u8; N]` and drop the `decode_or_bad_input!`-style
-decoding. Call sites to revisit will be listed here as the handlers land.
+typed rkyv structs / `[u8; N]` and drop the `try_array`/`from_bytes`-style
+decoding.
+
+- `clerk-settle` (`actors/clerk-settle/src/lib.rs` + `store.rs`):
+  `register_bank(name, clerk_pubkey)` → `clerk_pubkey: [u8; 32]`;
+  `submit_claim(claim, voucher_count, rk_set_hash)` → `rk_set_hash: [u8; 32]`
+  (claim stays opaque bytes — it's a foreign `SettlementClaim` wire form);
+  `settle_window` / `settlement_status` / `claim_diagnostics` bank names stay
+  `Vec<u8>` (opaque), the `claimant`/`peer` args → `[u8; 32]`. `ClaimReport`
+  is already a typed rkyv return.
+
+## Progress
+
+- **G6** — done, committed. Raft caller-identity gate proven.
+- **S1** — done. `actors/clerk-settle` crate (venue actor): `register_bank`
+  (Operator), `submit_claim` (open, claim-signature-authed), `settle_window`
+  (Operator) → `cipher_clerk::settlement::reconcile`; claim store
+  replace-until-settled + freeze-on-settle with a version byte; watch-view
+  reads. 8 in-crate unit tests + `raft_clerk_settle_bilateral_settlement`
+  e2e (venue Raft ×2, Operator handlers via leader-forward + node-peer
+  grant, open `submit_claim` via follower, bilateral zero-sum settle,
+  replication convergence). cipher-clerk `settlement` feature enabled for
+  this crate only.
+- **S2/S4** — next: clerk-bridge window/claim accumulation + `anchor_reset`.
+- **S5/S6** — manifests + multi-node 3-space e2e.

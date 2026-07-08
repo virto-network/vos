@@ -1,0 +1,48 @@
+[workspace]
+
+[package]
+name = "clerk-settle"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bin"]
+# `bin` enables PVM entry-point emission. Default-on so a plain
+# `cargo build` (or `cargo actor`) produces an actor ELF; consumers
+# depending on this crate as a Ref source turn it off via
+# `default-features = false` so no entries land in their link.
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "wasm-bootstrap"] }
+
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "wasm32")))'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension"] }
+
+# cipher-clerk with ONLY `settlement`: the bilateral net-settlement
+# kernel (`SettlementClaim`, `reconcile`) plus the wire types +
+# signature verification it pulls in via `voucher`/`viewing-keys`.
+# `default-features = false` keeps the off-VM helpers (MemLedger,
+# OsRng signing) out so the actor builds for PVM without getrandom.
+# The venue only VERIFIES claim signatures and reconciles — it never
+# signs — so `signing` stays a dev-only concern.
+[dependencies]
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["settlement"] }
+
+# Host-only: `signing` + `helpers` let the in-lib unit tests mint
+# signed `SettlementClaim`s (the worked cancellation example) to push
+# through the store + reconcile paths. dev-deps don't reach the PVM
+# build, so OsRng never lands in the riscv actor.
+[dev-dependencies]
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["settlement", "signing", "helpers"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

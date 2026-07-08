@@ -147,6 +147,11 @@ clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
 # pre-built ELF separately and only need the Ref surface from
 # the rlib.
 clerk-bridge = { path = "../actors/clerk-bridge", default-features = false }
+# Settlement venue actor — host tests use ClerkSettleRef to drive
+# register_bank / submit_claim / settle_window against the wire ABI.
+# default-features = false keeps the PVM bin glue out; tests load the
+# pre-built ELF separately and only need the Ref surface from the rlib.
+clerk-settle = { path = "../actors/clerk-settle", default-features = false }
 # General-purpose host-side prover extension. Tests drive the federation
 # flow (producer transpiles voucher-check.elf + calls prove_chain_segments
 # → puts each segment + a manifest in CAS → ships the manifest hash via
@@ -164,7 +169,7 @@ zkpvm = { workspace = true }
 # OsRng-backed signing — fine on host; the actor itself never
 # links it (the clerk-ledger crate keeps cipher-clerk on
 # default-features = []).
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["signing", "viewing-keys", "voucher", "notes", "helpers"] }
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["signing", "viewing-keys", "voucher", "notes", "helpers", "settlement"] }
 # Used by a single robustness test that hand-corrupts the
 # actor's persisted state to simulate schema drift.
 redb = "2"
