@@ -195,7 +195,7 @@ impl ClerkSettle {
     /// name. Re-registering the same name overwrites the pubkey (an operator
     /// asserting the bank rotated its clerk key). Operator-gated.
     #[msg(role = ClerkSettleRole::Operator)]
-    async fn register_bank(&mut self, name: Vec<u8>, clerk_pubkey: Vec<u8>) -> Status {
+    async fn register_bank(&mut self, name: Vec<u8>, clerk_pubkey: [u8; 32]) -> Status {
         store::register_bank(&mut self.banks, name, clerk_pubkey)
     }
 
@@ -209,7 +209,7 @@ impl ClerkSettle {
         &mut self,
         claim: Vec<u8>,
         voucher_count: u32,
-        rk_set_hash: Vec<u8>,
+        rk_set_hash: [u8; 32],
     ) -> Status {
         store::submit_claim(
             &self.banks,
@@ -304,8 +304,8 @@ impl ClerkSettle {
     #[msg]
     async fn claim_diagnostics(
         &self,
-        claimant: Vec<u8>,
-        peer: Vec<u8>,
+        claimant: [u8; 32],
+        peer: [u8; 32],
         currency: u32,
         window_start: u64,
         window_end: u64,

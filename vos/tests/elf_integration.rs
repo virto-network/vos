@@ -8811,13 +8811,13 @@ fn clerk_ledger_two_bank_federation() {
         vos::block_on(bridge_actor.anchor_reset(
             &mut &node_b,
             b"bank-a".to_vec(),
-            wedge_before.to_vec(),
+            wedge_before,
         ))
         .expect("invoke anchor_reset"),
         BridgeStatus::Ok,
     );
     assert_eq!(
-        vos::block_on(bridge_actor.anchor_reset(&mut &node_b, b"bank-z".to_vec(), wedge_before.to_vec()))
+        vos::block_on(bridge_actor.anchor_reset(&mut &node_b, b"bank-z".to_vec(), wedge_before))
             .expect("invoke anchor_reset unknown"),
         BridgeStatus::UnknownPeer,
     );
@@ -9538,7 +9538,7 @@ fn raft_clerk_settle_bilateral_settlement() {
             vos::block_on(venue.register_bank(
                 &mut &*follower_node,
                 b"bank-a".to_vec(),
-                bank_a_kp.public.0.to_vec(),
+                bank_a_kp.public.0,
             )),
             Err(ClientError::Forbidden)
         ),
@@ -9589,8 +9589,8 @@ fn raft_clerk_settle_bilateral_settlement() {
 
     // ── register_bank (Operator) via follower → leader ──────────
     for (name, pk) in [
-        (b"bank-a".to_vec(), bank_a_kp.public.0.to_vec()),
-        (b"bank-b".to_vec(), bank_b_kp.public.0.to_vec()),
+        (b"bank-a".to_vec(), bank_a_kp.public.0),
+        (b"bank-b".to_vec(), bank_b_kp.public.0),
     ] {
         assert_eq!(
             vos::block_on(venue.register_bank(&mut &*follower_node, name, pk))
@@ -9626,13 +9626,13 @@ fn raft_clerk_settle_bilateral_settlement() {
     )
     .to_bytes();
     assert_eq!(
-        vos::block_on(venue.submit_claim(&mut &*follower_node, claim_ab, 1u32, [1u8; 32].to_vec()))
+        vos::block_on(venue.submit_claim(&mut &*follower_node, claim_ab, 1u32, [1u8; 32]))
             .expect("submit_claim A routes"),
         Status::Ok,
         "open submit_claim forwards to the leader and commits without a grant"
     );
     assert_eq!(
-        vos::block_on(venue.submit_claim(&mut &*follower_node, claim_ba, 1u32, [2u8; 32].to_vec()))
+        vos::block_on(venue.submit_claim(&mut &*follower_node, claim_ba, 1u32, [2u8; 32]))
             .expect("submit_claim B routes"),
         Status::Ok,
     );
@@ -9720,7 +9720,6 @@ fn multi_node_three_space_settlement_capstone() {
     use space_registry::SpaceRegistryRef;
     use std::time::Duration;
     use vos::abi::service::ServiceId;
-    use vos::actors::client::ClientError;
     use vos::network::{Network, NetworkConfig, RaftRole, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
 
@@ -10136,8 +10135,8 @@ fn multi_node_three_space_settlement_capstone() {
     // ── Venue: register both banks (Operator, locally on the leader). ──
     let venue = ClerkSettleRef::at(leader_settle);
     for (name, pk) in [
-        (b"bank-a".to_vec(), bank_a_clerk.public.0.to_vec()),
-        (b"bank-b".to_vec(), bank_b_clerk.public.0.to_vec()),
+        (b"bank-a".to_vec(), bank_a_clerk.public.0),
+        (b"bank-b".to_vec(), bank_b_clerk.public.0),
     ] {
         assert_eq!(
             vos::block_on(venue.register_bank(&mut &*venue_leader_node, name, pk))
@@ -10173,7 +10172,7 @@ fn multi_node_three_space_settlement_capstone() {
             &mut &node_a1,
             claim_a.clone(),
             1u32,
-            [0xA0u8; 32].to_vec(),
+            [0xA0u8; 32],
         ),
     );
     assert!(
@@ -10182,12 +10181,12 @@ fn multi_node_three_space_settlement_capstone() {
     );
     // Targeting the leader (resolved via the hyperspace above) commits.
     assert_eq!(
-        vos::block_on(venue.submit_claim(&mut &node_a1, claim_a, 2u32, [0xA1u8; 32].to_vec()))
+        vos::block_on(venue.submit_claim(&mut &node_a1, claim_a, 2u32, [0xA1u8; 32]))
             .expect("bank A submit_claim to venue leader"),
         SettleStatus::Ok,
     );
     assert_eq!(
-        vos::block_on(venue.submit_claim(&mut &node_b1, claim_b, 1u32, [0xB1u8; 32].to_vec()))
+        vos::block_on(venue.submit_claim(&mut &node_b1, claim_b, 1u32, [0xB1u8; 32]))
             .expect("bank B submit_claim to venue leader"),
         SettleStatus::Ok,
     );
@@ -10238,7 +10237,7 @@ fn multi_node_three_space_settlement_capstone() {
         "a non-chaining voucher wedges the channel"
     );
     assert_eq!(
-        vos::block_on(bridge_a.anchor_reset(&mut &node_a1, b"bank-b".to_vec(), wedge_before.to_vec()))
+        vos::block_on(bridge_a.anchor_reset(&mut &node_a1, b"bank-b".to_vec(), wedge_before))
             .expect("anchor_reset"),
         BridgeStatus::Ok,
     );

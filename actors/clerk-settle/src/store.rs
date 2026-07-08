@@ -61,24 +61,17 @@ fn settled_index(
     })
 }
 
-fn try_array<const N: usize>(bytes: Vec<u8>) -> Option<[u8; N]> {
-    bytes.try_into().ok()
-}
-
 pub(crate) fn register_bank(
     banks: &mut Vec<BankEntry>,
     name: Vec<u8>,
-    clerk_pubkey: Vec<u8>,
+    clerk_pubkey: [u8; 32],
 ) -> Status {
     if name.is_empty() {
         return Status::BadInput;
     }
-    let Some(pk) = try_array::<32>(clerk_pubkey) else {
-        return Status::BadInput;
-    };
     match banks.binary_search_by(|e| e.name.cmp(&name)) {
-        Ok(i) => banks[i].clerk_pubkey = pk,
-        Err(i) => banks.insert(i, BankEntry { name, clerk_pubkey: pk }),
+        Ok(i) => banks[i].clerk_pubkey = clerk_pubkey,
+        Err(i) => banks.insert(i, BankEntry { name, clerk_pubkey }),
     }
     Status::Ok
 }
@@ -89,11 +82,8 @@ pub(crate) fn submit_claim(
     settled: &[SettledEntry],
     claim: Vec<u8>,
     voucher_count: u32,
-    rk_set_hash: Vec<u8>,
+    rk_set_hash: [u8; 32],
 ) -> Status {
-    let Some(rk_hash) = try_array::<32>(rk_set_hash) else {
-        return Status::BadInput;
-    };
     let Some(parsed) = SettlementClaim::from_bytes(&claim) else {
         return Status::BadInput;
     };
@@ -131,7 +121,7 @@ pub(crate) fn submit_claim(
         version: CLAIM_VERSION_V1,
         claim_bytes: claim,
         voucher_count,
-        rk_set_hash: rk_hash,
+        rk_set_hash,
     };
     // Latest-signed wins for an unsettled window.
     match find_claim(
@@ -217,20 +207,13 @@ pub(crate) fn settlement_status(
 
 pub(crate) fn claim_diagnostics(
     claims: &[StoredClaim],
-    claimant: Vec<u8>,
-    peer: Vec<u8>,
+    claimant: [u8; 32],
+    peer: [u8; 32],
     currency: u32,
     window_start: u64,
     window_end: u64,
 ) -> ClaimReport {
-    let (Some(c), Some(p)) = (try_array::<32>(claimant), try_array::<32>(peer)) else {
-        return ClaimReport {
-            present: false,
-            voucher_count: 0,
-            rk_set_hash: Vec::new(),
-        };
-    };
-    match find_claim(claims, &c, &p, currency, window_start, window_end) {
+    match find_claim(claims, &claimant, &peer, currency, window_start, window_end) {
         Some(i) => ClaimReport {
             present: true,
             voucher_count: claims[i].voucher_count,
@@ -298,11 +281,11 @@ mod tests {
     fn register_bank_inserts_sorted_and_refreshes() {
         let mut banks = Vec::new();
         assert_eq!(
-            register_bank(&mut banks, b"bank-b".to_vec(), [2u8; 32].to_vec()),
+            register_bank(&mut banks, b"bank-b".to_vec(), [2u8; 32]),
             Status::Ok
         );
         assert_eq!(
-            register_bank(&mut banks, b"bank-a".to_vec(), [1u8; 32].to_vec()),
+            register_bank(&mut banks, b"bank-a".to_vec(), [1u8; 32]),
             Status::Ok
         );
         // Sorted by name.
@@ -310,18 +293,15 @@ mod tests {
         assert_eq!(banks[1].name, b"bank-b");
         // Re-register overwrites the pubkey (key rotation).
         assert_eq!(
-            register_bank(&mut banks, b"bank-a".to_vec(), [9u8; 32].to_vec()),
+            register_bank(&mut banks, b"bank-a".to_vec(), [9u8; 32]),
             Status::Ok
         );
         assert_eq!(banks.len(), 2);
         assert_eq!(banks[0].clerk_pubkey, [9u8; 32]);
-        // Bad inputs.
+        // An empty name is refused; the pubkey length is now a compile-time
+        // invariant of the typed `[u8; 32]` arg.
         assert_eq!(
-            register_bank(&mut banks, Vec::new(), [1u8; 32].to_vec()),
-            Status::BadInput
-        );
-        assert_eq!(
-            register_bank(&mut banks, b"x".to_vec(), vec![0u8; 31]),
+            register_bank(&mut banks, Vec::new(), [1u8; 32]),
             Status::BadInput
         );
     }
@@ -335,13 +315,13 @@ mod tests {
         // Neither registered.
         let mut claims = Vec::new();
         assert_eq!(
-            submit_claim(&[], &mut claims, &[], claim_a.clone(), 3, [1u8; 32].to_vec()),
+            submit_claim(&[], &mut claims, &[], claim_a.clone(), 3, [1u8; 32]),
             Status::UnknownBank
         );
         // Only claimant registered — the peer is still unknown.
         let banks = vec![bank_entry("bank-a", a.public.0)];
         assert_eq!(
-            submit_claim(&banks, &mut claims, &[], claim_a, 3, [1u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &[], claim_a, 3, [1u8; 32]),
             Status::UnknownBank
         );
         assert!(claims.is_empty());
@@ -359,7 +339,7 @@ mod tests {
         let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
         let mut claims = Vec::new();
         assert_eq!(
-            submit_claim(&banks, &mut claims, &[], claim_a, 3, [1u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &[], claim_a, 3, [1u8; 32]),
             Status::SignatureInvalid
         );
         assert!(claims.is_empty());
@@ -374,7 +354,7 @@ mod tests {
 
         let (claim1, _) = canceling_pair(&a, &b, WINDOW, commit(10, 7));
         assert_eq!(
-            submit_claim(&banks, &mut claims, &[], claim1, 3, [0xAAu8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &[], claim1, 3, [0xAAu8; 32]),
             Status::Ok
         );
         assert_eq!(claims.len(), 1);
@@ -384,7 +364,7 @@ mod tests {
         // new row, diagnostics refreshed.
         let (claim2, _) = canceling_pair(&a, &b, WINDOW, commit(12, 5));
         assert_eq!(
-            submit_claim(&banks, &mut claims, &[], claim2, 4, [0xBBu8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &[], claim2, 4, [0xBBu8; 32]),
             Status::Ok
         );
         assert_eq!(claims.len(), 1);
@@ -403,11 +383,11 @@ mod tests {
 
         let (claim_ab, claim_ba) = canceling_pair(&a, &b, WINDOW, commit(10, 7));
         assert_eq!(
-            submit_claim(&banks, &mut claims, &settled, claim_ab, 2, [1u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &settled, claim_ab, 2, [1u8; 32]),
             Status::Ok
         );
         assert_eq!(
-            submit_claim(&banks, &mut claims, &settled, claim_ba, 1, [2u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &settled, claim_ba, 1, [2u8; 32]),
             Status::Ok
         );
 
@@ -435,7 +415,7 @@ mod tests {
         // Frozen: a further submit for this window is refused.
         let (again, _) = canceling_pair(&a, &b, WINDOW, commit(99, 3));
         assert_eq!(
-            submit_claim(&banks, &mut claims, &settled, again, 9, [3u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &settled, again, 9, [3u8; 32]),
             Status::AlreadySettled
         );
         // And re-settling is an idempotent no-op.
@@ -473,11 +453,11 @@ mod tests {
             SettlementClaim::sign(b.public, a.public, USD, WINDOW.0, WINDOW.1, net, &b.secret)
                 .to_bytes();
         assert_eq!(
-            submit_claim(&banks, &mut claims, &settled, claim_ab, 1, [0u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &settled, claim_ab, 1, [0u8; 32]),
             Status::Ok
         );
         assert_eq!(
-            submit_claim(&banks, &mut claims, &settled, claim_ba, 1, [0u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &settled, claim_ba, 1, [0u8; 32]),
             Status::Ok
         );
         assert_eq!(
@@ -497,7 +477,7 @@ mod tests {
         assert!(settled.is_empty());
         let (fixed, _) = canceling_pair(&a, &b, WINDOW, commit(5, 4));
         assert_eq!(
-            submit_claim(&banks, &mut claims, &settled, fixed, 1, [0u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &settled, fixed, 1, [0u8; 32]),
             Status::Ok
         );
     }
@@ -513,7 +493,7 @@ mod tests {
         // Only one directional claim present.
         let (claim_ab, _) = canceling_pair(&a, &b, WINDOW, commit(10, 7));
         assert_eq!(
-            submit_claim(&banks, &mut claims, &settled, claim_ab, 1, [0u8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &settled, claim_ab, 1, [0u8; 32]),
             Status::Ok
         );
         assert_eq!(
@@ -554,14 +534,14 @@ mod tests {
 
         let (claim_ab, _) = canceling_pair(&a, &b, WINDOW, commit(10, 7));
         assert_eq!(
-            submit_claim(&banks, &mut claims, &[], claim_ab, 5, [0xEEu8; 32].to_vec()),
+            submit_claim(&banks, &mut claims, &[], claim_ab, 5, [0xEEu8; 32]),
             Status::Ok
         );
 
         let present = claim_diagnostics(
             &claims,
-            a.public.0.to_vec(),
-            b.public.0.to_vec(),
+            a.public.0,
+            b.public.0,
             USD,
             WINDOW.0,
             WINDOW.1,
@@ -573,8 +553,8 @@ mod tests {
         // A directional key with no stored claim.
         let absent = claim_diagnostics(
             &claims,
-            b.public.0.to_vec(),
-            a.public.0.to_vec(),
+            b.public.0,
+            a.public.0,
             USD,
             WINDOW.0,
             WINDOW.1,

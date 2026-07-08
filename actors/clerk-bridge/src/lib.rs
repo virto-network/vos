@@ -890,16 +890,13 @@ impl ClerkBridge {
     /// can't see the venue's settled log); same authority as
     /// `window_rotate`.
     #[msg(role = ClerkBridgeRole::Operator)]
-    async fn anchor_reset(&mut self, peer_name: Vec<u8>, root: Vec<u8>) -> Status {
+    async fn anchor_reset(&mut self, peer_name: Vec<u8>, root: [u8; 32]) -> Status {
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
-        let Some(root_bytes) = try_array::<32>(root) else {
-            return Status::BadInput;
-        };
         match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
             Ok(i) => {
-                self.peers[i].last_root_after = Some(root_bytes);
+                self.peers[i].last_root_after = Some(root);
                 Status::Ok
             }
             Err(_) => Status::UnknownPeer,

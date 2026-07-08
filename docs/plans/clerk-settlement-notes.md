@@ -52,25 +52,30 @@ follower restart re-converges.
   `submit_claim` stays an OPEN handler (auth = the bank's claim signature),
   so it is unaffected.
 
-## Handler arg typing (G25 status)
+## Handler arg typing (G25/G26) — DONE (rebased onto master)
 
-G25 (custom rkyv structs as `#[msg]` args) has **not** landed on master as
-of the branch point (`macros-typed-args` sits at the same commit as
-master). New handlers on `clerk-settle` and `clerk-bridge` are therefore
-written in the `Vec<u8>` + manual-decode idiom, matching the existing
-clerk actors.
+The branch was **rebased onto master `353743c8`** (which carries stream D:
+G28 `7fc261dc`, G25 `cb65822c`, G26 `18dc34d1`, G27a `2762905b`) — clean, no
+conflicts. The handlers I added are now **born typed** with G26 `[u8; N]`
+args and the `try_array` decoding dropped:
 
-**Retype TODO (after G25 lands):** replace the `Vec<u8>` args below with
-typed rkyv structs / `[u8; N]` and drop the `try_array`/`from_bytes`-style
-decoding.
+- `clerk-settle`: `register_bank(name: Vec<u8>, clerk_pubkey: [u8; 32])`;
+  `submit_claim(claim: Vec<u8>, voucher_count, rk_set_hash: [u8; 32])`
+  (`claim` stays opaque — a foreign `SettlementClaim` wire form);
+  `claim_diagnostics(claimant: [u8; 32], peer: [u8; 32], …)`. Bank names stay
+  `Vec<u8>` (opaque). `ClaimReport` was already a typed rkyv return.
+- `clerk-bridge`: `anchor_reset(peer_name: Vec<u8>, root: [u8; 32])`.
 
-- `clerk-settle` (`actors/clerk-settle/src/lib.rs` + `store.rs`):
-  `register_bank(name, clerk_pubkey)` → `clerk_pubkey: [u8; 32]`;
-  `submit_claim(claim, voucher_count, rk_set_hash)` → `rk_set_hash: [u8; 32]`
-  (claim stays opaque bytes — it's a foreign `SettlementClaim` wire form);
-  `settle_window` / `settlement_status` / `claim_diagnostics` bank names stay
-  `Vec<u8>` (opaque), the `claimant`/`peer` args → `[u8; 32]`. `ClaimReport`
-  is already a typed rkyv return.
+`store.rs` free fns + unit tests + the e2e Ref call sites were updated to
+match (e.g. `pk.to_vec()` → `pk`). A wrong-length pubkey is now a
+compile-time invariant of the typed arg, so the old `BadInput`-on-bad-length
+paths/tests were dropped.
+
+**Not retyped (out of workstream-C scope):** the pre-existing clerk-ledger /
+clerk-bridge handlers (`bootstrap`, `create_account`, `register_peer`,
+`submit_voucher`, …) stay `Vec<u8>` — retyping them is the broader E-A
+"retype the clerk handlers" cleanup that touches the two-bank e2e's many
+existing call sites; a follow-up, not this branch.
 
 ## Progress
 
