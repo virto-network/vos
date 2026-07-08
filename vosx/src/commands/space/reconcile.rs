@@ -571,6 +571,7 @@ pub fn reconcile(
     manifest: &Manifest,
     manifest_dir: &Path,
     daemon_prefix: u16,
+    space_id: &[u8; 32],
 ) -> anyhow::Result<Vec<crate::commands::space::endpoint::ExtensionCaps>> {
     use crate::commands::space::endpoint::ExtensionCaps;
     validate_manifest_names(manifest)?;
@@ -671,7 +672,16 @@ pub fn reconcile(
     };
 
     for agent in flatten(&manifest.agents) {
-        reconcile_one(node, &reg, agent, manifest_dir, daemon_prefix, &name_ids, node_is_admin)?;
+        reconcile_one(
+            node,
+            &reg,
+            agent,
+            manifest_dir,
+            daemon_prefix,
+            &name_ids,
+            node_is_admin,
+            space_id,
+        )?;
     }
 
     Ok(ext_caps)
@@ -685,6 +695,7 @@ fn reconcile_one(
     _daemon_prefix: u16,
     name_ids: &BTreeMap<String, u32>,
     node_is_admin: bool,
+    space_id: &[u8; 32],
 ) -> anyhow::Result<()> {
     // 1. Resolve and cache the agent's blob.
     let elf_path = manifest_dir.join(&agent.path);
@@ -818,7 +829,7 @@ fn reconcile_one(
     })?;
 
     let replication_id = match agent.replication_id.as_deref() {
-        Some("auto") | None => auto_replication_id(&agent.name, &program_hash),
+        Some("auto") | None => auto_replication_id(space_id, &agent.name, &program_hash),
         Some("off") => [0u8; 32],
         Some(hex) => {
             let v = hex::decode(hex.trim_start_matches("0x")).map_err(|_| {

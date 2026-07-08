@@ -561,4 +561,73 @@ mod tests {
         );
         assert!(!absent.present);
     }
+
+    /// Native end-to-end of the settlement SIGN convention — the
+    /// `issuer ⊕ receiver → reconcile` composition the ELF federation e2es
+    /// exercise, pinned here without a PVM rebuild. Each bank's claimed net
+    /// flow is `issuer_term ⊕ receiver_term`, where the receiver term is the
+    /// negated sum of the commits it accepted. This test rebuilds that shape
+    /// with local point math (it does not call
+    /// `clerk_bridge::window::accumulate_neg` — that fold's own sign is
+    /// pinned by the bridge crate's `worked_example_two_bank_net_flows_cancel`);
+    /// what it pins is that the composition, signed this way, cancels through
+    /// `settle_window`/`reconcile`. A sign regression in the composition or the
+    /// store/reconcile drive makes the commitments miss cancellation, so
+    /// `settle_window` returns `NetFlowMismatch` and this fails under plain
+    /// `cargo test`.
+    #[test]
+    fn settle_window_accepts_composed_issuer_minus_receiver_terms() {
+        let a = Keypair::generate();
+        let b = Keypair::generate();
+        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let mut claims = Vec::new();
+        let mut settled = Vec::new();
+
+        // Two cross-clerk vouchers this window: A→B for 10, B→A for 3, with
+        // DISTINCT blindings as real vouchers carry. Both banks derive their
+        // terms from the SAME two commits, so the blindings cancel by
+        // construction.
+        let c_ab = commit(10, 7); // A issued to B
+        let c_ba = commit(3, 9); // B issued to A
+
+        // receiver = ⊖Σ(accepted commits); issuer = Σ(issued commits);
+        // net = issuer ⊕ receiver — the accumulate_neg-shaped derivation.
+        let neg = |x: &Amount| Amount::from_point(&-x.to_point().unwrap());
+        let add = |x: &Amount, y: &Amount| {
+            Amount::from_point(&(x.to_point().unwrap() + y.to_point().unwrap()))
+        };
+        let net_a = add(&c_ab, &neg(&c_ba)); // issued c_ab, received c_ba
+        let net_b = add(&c_ba, &neg(&c_ab)); // issued c_ba, received c_ab
+
+        let claim_a =
+            SettlementClaim::sign(a.public, b.public, USD, WINDOW.0, WINDOW.1, net_a, &a.secret)
+                .to_bytes();
+        let claim_b =
+            SettlementClaim::sign(b.public, a.public, USD, WINDOW.0, WINDOW.1, net_b, &b.secret)
+                .to_bytes();
+        assert_eq!(
+            submit_claim(&banks, &mut claims, &settled, claim_a, 2, [1u8; 32]),
+            Status::Ok
+        );
+        assert_eq!(
+            submit_claim(&banks, &mut claims, &settled, claim_b, 2, [2u8; 32]),
+            Status::Ok
+        );
+        assert_eq!(
+            settle_window(
+                &banks,
+                &claims,
+                &mut settled,
+                b"bank-a".to_vec(),
+                b"bank-b".to_vec(),
+                USD,
+                WINDOW.0,
+                WINDOW.1,
+            ),
+            Status::Ok,
+            "composed issuer ⊕ receiver net flows must cancel and settle",
+        );
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].outcome, Status::Ok as u8);
+    }
 }
