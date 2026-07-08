@@ -10463,3 +10463,219 @@ fn probe_ask_status_distinguishes_too_big_from_crash() {
         "a small child reply fits and completes normally"
     );
 }
+
+// ═══ A9: witness-delivered Tasks — live ≡ traced ═════════════════════
+//
+// The keystone property: a Task invocation delivers (state, msg) by
+// patching the child's initial memory image at its __VOS_WITNESS
+// address — the same channel zkpvm's tracer patches — so the live run
+// and a traced re-execution start from byte-identical images and
+// produce byte-identical work-results.
+
+/// TAG_DYNAMIC-framed dynamic message bytes.
+fn task_gate_dyn_msg(msg: &vos::value::Msg) -> Vec<u8> {
+    let encoded = vos::Encode::encode(msg);
+    let mut p = Vec::with_capacity(1 + encoded.len());
+    p.push(vos::value::TAG_DYNAMIC);
+    p.extend_from_slice(&encoded);
+    p
+}
+
+/// Dispatch a dynamic message to a top-level service and decode the
+/// reply Value. Panics on a dropped reply (guest panic / reject).
+fn task_gate_ask(
+    rt: &mut VosRuntime,
+    id: vos::abi::service::ServiceId,
+    msg: &vos::value::Msg,
+) -> vos::value::Value {
+    rt.send_to(id, task_gate_dyn_msg(msg));
+    rt.run_blocking();
+    let bytes = rt.take_last_reply(id).expect("dispatch must produce a reply");
+    // An empty reply is a Unit return — e.g. when a dispatch chained
+    // into self-tick re-entries and the final tick's reply won.
+    if bytes.is_empty() {
+        return vos::value::Value::Unit;
+    }
+    vos::Decode::decode(&bytes)
+}
+
+#[test]
+fn task_invoke_live_equals_traced() {
+    use vos::refine_payload::{ANCHOR_GENESIS, RefinePayload};
+    use vos::value::{Msg, Value};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let witness_addr =
+        vos::zk::witness_addr(&tally_elf).expect("tally must export __VOS_WITNESS") as u32;
+    let tally_blob = transpile_actor(&tally_elf);
+
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    let task_hash = rt.register_task_blob(tally_blob.clone(), witness_addr);
+
+    // ── Live: the scheduler spawns Child::Task(tally) with add(5) and
+    // drives it to Done inside one dispatch. ─────────────────────────
+    let add_msg = task_gate_dyn_msg(&Msg::new("add").with("n", 5u64));
+    let spawn_reply = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", add_msg.clone()),
+    );
+    let task_id = spawn_reply.as_u64().expect("run_task replies the task id");
+    assert_eq!(rt.panics, 0, "no guest may panic on the task path");
+    assert_eq!(rt.work_result_rejects, 0, "no work-result may be rejected");
+
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", task_id));
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Done as u32),
+        "add(5) is one-shot: the drive pass completes it"
+    );
+    let live_state = task_gate_ask(&mut rt, sched_id, &Msg::new("task_state").with("id", task_id))
+        .as_bytes()
+        .expect("task_state replies bytes")
+        .to_vec();
+    let live_reply = task_gate_ask(&mut rt, sched_id, &Msg::new("task_reply").with("id", task_id))
+        .as_bytes()
+        .expect("task_reply replies bytes")
+        .to_vec();
+    assert!(!live_state.is_empty(), "add(5) changes the tally's state");
+    let live_reply_value: Value = vos::Decode::decode(&live_reply);
+    assert_eq!(live_reply_value, Value::U64(5));
+
+    // ── Traced: replay the exact invocation the prover would — the
+    // unmodified blob plus the same input patched at the same witness
+    // address. ───────────────────────────────────────────────────────
+    let input = vos::task_abi::encode_task_input(&[], &add_msg);
+
+    // Image equality: the live kernel's initial image must equal the
+    // prover-patched image byte for byte over the blob-declared pages
+    // (the live arena may map extra heap beyond them).
+    let live_img = rt
+        .task_initial_image(&task_hash, &[], &add_msg)
+        .expect("live task image");
+    let (mut interp, mut traced_img) =
+        zkpvm::actor::interpreter_from_blob(&tally_blob, 100_000_000).expect("parse tally blob");
+    let (start, end) = (witness_addr as usize, witness_addr as usize + input.len());
+    traced_img[start..end].copy_from_slice(&input);
+    interp.flat_mem = traced_img.clone();
+    assert!(
+        live_img.len() >= traced_img.len(),
+        "live image must cover the blob-declared pages"
+    );
+    assert_eq!(
+        &live_img[..traced_img.len()],
+        traced_img.as_slice(),
+        "live and traced initial images must be byte-identical"
+    );
+
+    let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
+    // zkpvm pins its own javm rev, so its ExitReason is a different
+    // type than vos's javm — compare the Debug form; the decodable v3
+    // payload below is the real halt proof.
+    let exit = format!("{:?}", tracing.run_with_vos_stubs());
+    assert!(
+        exit == "HostCall(0)" || exit == "Ecall",
+        "traced task must halt cleanly, got {exit}"
+    );
+    let ptr = tracing.pvm.registers[7] as usize;
+    let len = tracing.pvm.registers[8] as usize;
+    let raw = &tracing.pvm.flat_mem[ptr..ptr + len];
+    let mut traced_payload =
+        RefinePayload::decode(raw).expect("traced halt output is a v3 work-result");
+    assert_eq!(traced_payload.anchor_kind, ANCHOR_GENESIS);
+    let traced_state = traced_payload
+        .take_state_write()
+        .expect("add(5) emits a state write");
+
+    assert_eq!(
+        traced_state, live_state,
+        "traced re-execution must produce the exact state the live TaskRecord holds"
+    );
+    assert_eq!(
+        traced_payload.reply, live_reply,
+        "traced re-execution must produce the exact reply the live run observed"
+    );
+}
+
+#[test]
+fn task_suspension_resumes_through_task_record() {
+    // A yielding Task suspends as pure data — its TaskRecord — and the
+    // parent's drive passes (self-scheduled ticks) resume it with the
+    // saved state until completion: tally's `work` runs three steps
+    // (1+2+3) across three invocations.
+    use vos::value::{Msg, Value};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let witness_addr =
+        vos::zk::witness_addr(&tally_elf).expect("tally must export __VOS_WITNESS") as u32;
+    let tally_blob = transpile_actor(&tally_elf);
+
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    let task_hash = rt.register_task_blob(tally_blob, witness_addr);
+
+    let work_msg = task_gate_dyn_msg(&Msg::new("work"));
+    // The job yields, so run_task's dispatch chains into self-tick
+    // re-entries and the dispatch reply is the final tick's Unit — the
+    // task id is the table's first allocation instead.
+    let _ = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", work_msg),
+    );
+    let task_id = 0u64;
+    assert_eq!(rt.panics, 0);
+    assert_eq!(rt.work_result_rejects, 0);
+
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", task_id));
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Done as u32),
+        "three drive passes (spawn + self-ticks) complete the job"
+    );
+    let reply = task_gate_ask(&mut rt, sched_id, &Msg::new("task_reply").with("id", task_id))
+        .as_bytes()
+        .expect("task_reply replies bytes")
+        .to_vec();
+    let reply_value: Value = vos::Decode::decode(&reply);
+    assert_eq!(
+        reply_value,
+        Value::U64(6),
+        "work accumulates 1+2+3 across three resumed invocations"
+    );
+}
