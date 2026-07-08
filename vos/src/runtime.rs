@@ -1014,9 +1014,22 @@ impl<D: DataLayer> VosRuntime<D> {
                     // halting: discard everything this dispatch journaled —
                     // including child-INVOKE effects absorbed into the
                     // parent's journal — so a panicked handler commits
-                    // nothing from its own tick. Effects committed by
-                    // earlier dispatches in this tick are kept.
+                    // nothing from its own tick.
+                    //
+                    // Atomicity contract, explicit: the commit unit is one
+                    // ITERATION (one work-result), not the whole
+                    // self-message chain. Effects applied by earlier
+                    // iterations in this tick stand — same rule as a
+                    // mid-chain anchor rejection. What must NOT stand is
+                    // the reply: an earlier iteration's reply is an
+                    // intermediate of an unfinished chain, and leaving it
+                    // in last_reply would surface the panic to the caller
+                    // as STATUS_DONE with stale bytes. Drop it so
+                    // take_last_reply returns None and the caller sees
+                    // Panicked.
                     journal.rollback_to(dispatch_mark);
+                    self.last_reply.remove(&svc_id);
+                    self.last_status.remove(&svc_id);
                     *panics += 1;
                     break;
                 }
@@ -1648,6 +1661,16 @@ fn handle_invoke(
         .vm_mut(0)
         .transition(javm::vm_pool::VmState::Running);
 
+    // Delimit this child invoke's journal contributions — the state
+    // delivery below, the child's own hostcall writes, and anything a
+    // grandchild absorbed — so a trap or a rejected work-result inside
+    // the nested run discards them whole. The top-level dispatch mark
+    // only protects the PARENT's dispatch boundary; without this nested
+    // mark, a caught child panic (surfaced as an error status the
+    // parent handles) would leave the child's partial writes in the
+    // journal and commit them with the parent's tick.
+    let invoke_mark = journal.mark();
+
     // Unpack invoke input: [state_len:u32 LE][state][msg].
     // Journal the state onto the child's row under STATE_KEY so service
     // children (run_refine_service) can cold-start via READ — through
@@ -1693,6 +1716,7 @@ fn handle_invoke(
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
                 error!(pc, ?target_svc_id, "child invoke panicked");
+                journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
@@ -1703,6 +1727,7 @@ fn handle_invoke(
                 );
             }
             KernelResult::OutOfGas => {
+                journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
@@ -1713,6 +1738,7 @@ fn handle_invoke(
                 );
             }
             KernelResult::PageFault(_addr) => {
+                journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
@@ -1766,6 +1792,7 @@ fn handle_invoke(
             let expected = crate::refine_payload::anchor_for(Some(&child_prior_state));
             if (payload.anchor_kind, payload.anchor) != expected {
                 error!(?target_svc_id, "child invoke: work-result anchor mismatch");
+                journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
@@ -1800,6 +1827,7 @@ fn handle_invoke(
     } else if claims_refine_payload(&raw_output) {
         // Claims a payload version but doesn't decode — fail loud.
         error!(?target_svc_id, "child invoke: malformed work-result");
+        journal.rollback_to(invoke_mark);
         alloc::vec![STATUS_PANICKED]
     } else {
         raw_output
