@@ -41,6 +41,13 @@ pub struct SpaceEntry {
     /// `space join`; `space new` leaves it empty.
     #[serde(default)]
     pub bootnodes: Vec<String>,
+    /// Hyperspace (federation) name this space belongs to, if any.
+    /// Persisted at the first `space up --manifest` that declares
+    /// `hyperspace = "…"` so a later bare `space up` re-attaches the
+    /// space to the federation instead of silently detaching it. Empty
+    /// when the space is not a hyperspace member.
+    #[serde(default)]
+    pub hyperspace: String,
 }
 
 impl SpaceEntry {
@@ -157,6 +164,7 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
         data_dir,
         registry_hash: String::new(),
         bootnodes: Vec::new(),
+        hyperspace: String::new(),
     }
 }
 
@@ -206,12 +214,33 @@ mod tests {
                 data_dir: "/tmp/data".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
+                hyperspace: "bank-federation".into(),
             },
         );
         save_to(&idx, &p).unwrap();
         let back = load_from(&p).unwrap();
         assert_eq!(back.spaces.len(), 1);
         assert_eq!(back.spaces[0].name, "demo");
+        // Hyperspace membership survives the index round-trip so a bare
+        // `space up` re-attaches to the federation.
+        assert_eq!(back.spaces[0].hyperspace, "bank-federation");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn missing_hyperspace_field_defaults_empty() {
+        // A pre-hyperspace spaces.toml (no `hyperspace` key) must still
+        // load — the field is `#[serde(default)]` — with membership
+        // treated as "not a hyperspace member".
+        let p = tmp_path("nohs");
+        std::fs::write(
+            &p,
+            "[[space]]\nid = \"aa\"\nname = \"old\"\ncreated_at = \"\"\n",
+        )
+        .unwrap();
+        let idx = load_from(&p).unwrap();
+        assert_eq!(idx.spaces.len(), 1);
+        assert!(idx.spaces[0].hyperspace.is_empty());
         let _ = std::fs::remove_file(&p);
     }
 
@@ -228,6 +257,7 @@ mod tests {
                 data_dir: "".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
+                hyperspace: String::new(),
             },
         );
         upsert(
@@ -239,6 +269,7 @@ mod tests {
                 data_dir: "".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
+                hyperspace: String::new(),
             },
         );
         assert_eq!(idx.spaces.len(), 1);
@@ -258,6 +289,7 @@ mod tests {
                 data_dir: "".into(),
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
+                hyperspace: String::new(),
             },
         );
         assert_eq!(find(&idx, &id_a).unwrap().name, "alpha");

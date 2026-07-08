@@ -116,9 +116,29 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .as_ref()
         .map(|p| crate::commands::space::reconcile::parse_manifest_file(p))
         .transpose()?;
-    let hyperspace = parsed_manifest
+    let manifest_hyperspace = parsed_manifest
         .as_ref()
         .and_then(|(m, _)| m.hyperspace.clone());
+    // Effective membership: a manifest value wins (and is persisted
+    // below); otherwise fall back to what the index remembers, so a
+    // bare `space up` — a restart without --manifest — re-attaches the
+    // space to its federation instead of silently detaching it.
+    let persisted_hyperspace = (!entry.hyperspace.is_empty()).then(|| entry.hyperspace.clone());
+    let hyperspace = manifest_hyperspace.clone().or(persisted_hyperspace);
+
+    // First `space up --manifest` (or a manifest that changes the name)
+    // records the hyperspace in the spaces index so subsequent boots
+    // re-attach without needing the manifest again.
+    if let Some(name) = &manifest_hyperspace
+        && entry.hyperspace != *name
+    {
+        let mut updated = entry.clone();
+        updated.hyperspace = name.clone();
+        let mut idx = spaces_index::load()?;
+        spaces_index::upsert(&mut idx, updated);
+        spaces_index::save(&idx)?;
+        tracing::info!("persisted hyperspace '{name}' for space '{}'", entry.name);
+    }
 
     // Agents that declared `device_secret = true` — they get a node-local
     // secret seed provisioned post-spawn (see `provision_device_seeds`).
