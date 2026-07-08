@@ -1,0 +1,43 @@
+# Bank space manifest — bank-a, one of the two federating banks in the
+# settlement showcase (bank-b uses examples/space-bank-b.toml, the venue uses
+# examples/space-venue.toml). The operational multi-node bring-up — the dial
+# graph, voter enrollment, per-node ports, and the node-peer Admin grants the
+# Raft leader-forward needs — lives in the bloque/bank-federation repo; this
+# manifest just pins the correct per-agent postures.
+#
+# IMPORTANT — distinct replication_id per bank. The auto replication_id is
+# `blake2b(agent_name || blob)` and is NOT scoped by space_id, so if both
+# banks named their ledger "clerk-ledger" with the same ELF and left the id
+# on "auto", the two banks' ledgers would collide into ONE Raft group. Each
+# bank therefore pins its own replication_id below; the (up to 3) nodes of a
+# SINGLE bank share it — that is the bank's Raft cluster — and the two banks
+# differ.
+space = "bank-a"
+version = "0.1.0"
+
+# Federate over the shared hyperspace: every bank AND the venue declare the
+# same name, so each node additionally spawns a registry replica into the
+# hyperspace group and cross-space `resolve` falls through to it.
+hyperspace = "bank-federation"
+
+[[agent]]
+name = "clerk-ledger"
+path = "../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf"
+# Raft from genesis — high availability across the bank operator's nodes.
+# The monotone locality seal forbids widening Local -> Raft later, so it must
+# be Raft from the start. Raft is tier-2 and answers the network by design;
+# no network_reachable opt-out needed. The read handlers are role-gated, so
+# the private read surface lives in the ACLs, not the confinement tier.
+consistency = "raft"
+replication_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[agent]]
+name = "clerk-bridge"
+path = "../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf"
+# Local (NOT Ephemeral): the bridge holds the F2 `last_root_after` anchor,
+# the voucher dedup set, AND the per-window receiver-term sums — all of which
+# must survive a restart (an Ephemeral restart would zero the receiver sum
+# and reopen the replay window). network_reachable so peer banks can submit
+# vouchers cross-space; Local is node-confined, so the opt-out is required.
+consistency = "local"
+network_reachable = true

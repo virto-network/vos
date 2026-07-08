@@ -7763,6 +7763,83 @@ fn clerk_ledger_two_bank_federation() {
         "bridge must record exactly one redeemed voucher"
     );
 
+    // S2: accepting the voucher folded its `amount_commit` into the
+    // receiver term for (bank-a, DEMO_CURRENCY, window 0) as the negated
+    // point — the mandatory receiver half of bank B's settlement claim.
+    let recv_term = vos::block_on(bridge_actor.window_net(
+        &mut &node_b,
+        b"bank-a".to_vec(),
+        clerk_bridge::DEMO_CURRENCY,
+        0,
+    ))
+    .expect("invoke window_net");
+    let expected_neg = cipher_clerk::crypto::Amount::from_point(
+        &-received
+            .amount_commit
+            .to_point()
+            .expect("voucher commit decompresses"),
+    );
+    assert_eq!(
+        recv_term,
+        expected_neg.0.to_vec(),
+        "window_net must equal the negated accepted amount_commit"
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.current_window(&mut &node_b, b"bank-a".to_vec()))
+            .expect("invoke current_window"),
+        0,
+        "the peer starts in window 0"
+    );
+
+    // Commit-binding: a voucher whose sealed envelope value does not open
+    // its `amount_commit` must be refused (VoucherInvalid) and must not
+    // poison the dedup set or the receiver term. Without the bind, the
+    // receiver would credit the envelope value (99) while the window
+    // settled for the committed value (50) — silent loss at settlement.
+    // Distinct commitment ⇒ distinct redemption key (dedup misses), and it
+    // chains off V1's root_after so it clears the anchor and reaches the
+    // commit-binding check.
+    let mm_blinding = cipher_clerk::crypto::Blinding([3u8; 32]);
+    let mm_commit = Amount::commit(50, &mm_blinding);
+    let mm_env = EncryptedEnvelope::seal(99, &mm_blinding, &bank_b_ivk_pk)
+        .expect("seal mismatched envelope");
+    let mm_voucher = Voucher::sign(
+        mm_commit,
+        mm_env,
+        root_after,
+        [0x44u8; 32],
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let mm_reply = vos::block_on(bridge_actor.submit_voucher(
+        &mut &node_b,
+        mm_voucher.to_bytes(),
+        b"bank-a".to_vec(),
+    ))
+    .expect("invoke submit_voucher (commit-binding)");
+    assert_eq!(
+        mm_reply.status,
+        BridgeStatus::VoucherInvalid,
+        "a voucher whose envelope value != amount_commit must be refused",
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.redeemed_count(&mut &node_b)).expect("redeemed_count"),
+        1,
+        "the rejected mismatch voucher must not enter the dedup set",
+    );
+    // The receiver term is unchanged — the rejected voucher folded nothing.
+    assert_eq!(
+        vos::block_on(bridge_actor.window_net(
+            &mut &node_b,
+            b"bank-a".to_vec(),
+            clerk_bridge::DEMO_CURRENCY,
+            0,
+        ))
+        .expect("invoke window_net"),
+        expected_neg.0.to_vec(),
+        "a refused voucher must not move the receiver term",
+    );
+
     // F2 receiver-side anchor bites: a SECOND voucher from bank-a whose
     // state_root_before does NOT chain to the last accepted root_after
     // (= root_after of V1) must be refused (StateRootMismatch collapses to
@@ -8727,6 +8804,84 @@ fn clerk_ledger_two_bank_federation() {
         "bridge-b's where_am_i must be bridge-b's own id (not A's local bridge shadow)"
     );
 
+    // S2: rotating the settlement window advances the peer's operational
+    // bracket. The bank operator drives it locally (Caller::System), so the
+    // Operator gate is bypassed; a non-operator peer would be refused.
+    assert_eq!(
+        vos::block_on(bridge_actor.window_rotate(&mut &node_b, b"bank-a".to_vec()))
+            .expect("invoke window_rotate"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.current_window(&mut &node_b, b"bank-a".to_vec()))
+            .expect("invoke current_window after rotate"),
+        1,
+        "window_rotate opens the next bracket",
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.window_rotate(&mut &node_b, b"bank-z".to_vec()))
+            .expect("invoke window_rotate unknown"),
+        BridgeStatus::UnknownPeer,
+    );
+
+    // S4: wedge → recovery. A voucher declaring a `state_root_before` the
+    // bridge never accepted is rejected (the F2 anchor fails closed), which
+    // wedges the channel. `anchor_reset` re-anchors to that root — the
+    // sanctioned post-settlement recovery — and the same voucher then
+    // chains cleanly.
+    let wedge_before = [0x5Au8; 32];
+    let wedge_after = [0x5Bu8; 32];
+    let wedge_blinding = cipher_clerk::crypto::Blinding([9u8; 32]);
+    let wedge_value: u64 = 7;
+    let wedge_amt = Amount::commit(wedge_value, &wedge_blinding);
+    let wedge_env = EncryptedEnvelope::seal(wedge_value, &wedge_blinding, &bank_b_ivk_pk)
+        .expect("seal wedge envelope");
+    let wedge_voucher = Voucher::sign(
+        wedge_amt,
+        wedge_env,
+        wedge_before,
+        wedge_after,
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let wedge_bytes = wedge_voucher.to_bytes();
+    assert_eq!(
+        vos::block_on(bridge_actor.submit_voucher(
+            &mut &node_b,
+            wedge_bytes.clone(),
+            b"bank-a".to_vec(),
+        ))
+        .expect("submit wedge voucher")
+        .status,
+        BridgeStatus::VoucherInvalid,
+        "a non-chaining voucher wedges the channel (F2 fails closed)"
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.anchor_reset(
+            &mut &node_b,
+            b"bank-a".to_vec(),
+            wedge_before,
+        ))
+        .expect("invoke anchor_reset"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.anchor_reset(&mut &node_b, b"bank-z".to_vec(), wedge_before))
+            .expect("invoke anchor_reset unknown"),
+        BridgeStatus::UnknownPeer,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.submit_voucher(
+            &mut &node_b,
+            wedge_bytes,
+            b"bank-a".to_vec(),
+        ))
+        .expect("resubmit after anchor_reset")
+        .status,
+        BridgeStatus::Ok,
+        "anchor_reset re-anchors the channel so the voucher chains again"
+    );
+
     // ── Cleanup ────────────────────────────────────────────────
     let results_a = node_a.collect();
     let results_b = node_b.collect();
@@ -8737,4 +8892,1419 @@ fn clerk_ledger_two_bank_federation() {
         .sum();
     let _ = std::fs::remove_dir_all(&dir_root);
     assert_eq!(panics, 0, "actor panics during federation test: {panics}");
+}
+
+/// G6 — the Raft caller-identity gate for Operator-gated clerk mutators.
+///
+/// A `clerk-ledger` runs Raft-replicated across a bank's nodes. Its
+/// money-path mutators (`bootstrap`, `create_account`, `apply_transfer`)
+/// are `#[msg(role = Operator)]`. The load-bearing question this test
+/// pins: when such a mutator crosses a node boundary to reach the Raft
+/// leader, the caller is attributed to the *forwarding/peer node's*
+/// PeerId — not to the original in-process `Caller::System`/`Caller::Actor`
+/// identity, which is lost the moment the invoke leaves the node
+/// (`vos/src/node.rs`'s `agent_forward_to_raft_leader` and the inbound
+/// `dispatch_invoke` both surface the connecting peer). So an Operator
+/// gate on a Raft agent can only be satisfied by granting the voter
+/// node's own peer a space role that maps to `Operator` — exactly the
+/// "chronos lesson".
+///
+/// This exercises that attribution deterministically by driving each
+/// Operator-gated mutator as a cross-node invoke from the follower to
+/// the leader's ledger replica (so the leader sees `Caller::Peer(follower)`
+/// and resolves its role from the local space-registry), and asserts:
+///
+///   1. Ungranted → `ClientError::Forbidden` (the gate bites the node peer).
+///   2. After granting the follower's node peer `AUTH_ROLE_ADMIN`
+///      (→ `ClerkLedgerRole::Operator`) → the same mutators commit through
+///      Raft and both replicas converge on one state root.
+///   3. Kill + restart the follower → it replays its persisted log and
+///      re-converges on the leader's state root.
+///
+/// Its resolution — node-peer grants, NOT a System-relayed forward — is
+/// what the demo's grant script provisions for every voter, and what
+/// `clerk-settle`'s own Operator-gated handlers (`register_bank`,
+/// `settle_window`) inherit.
+#[test]
+#[cfg(feature = "network")]
+fn raft_clerk_ledger_operator_gate_under_leader_forward() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
+
+    use cipher_clerk::conventions::{BankCode, Iso4217};
+    use cipher_clerk::crypto::{Amount, Blinding, Keypair};
+    use cipher_clerk::ids::JournalId;
+    use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
+    use cipher_clerk::types::{Account, Layer, Transfer};
+    use clerk_ledger::{ClerkLedgerRef, Opening, Status};
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{AUTH_ROLE_ADMIN, SpaceRegistryRef, canonical_op_bytes, pack_auth};
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::actors::client::ClientError;
+    use vos::network::{Network, NetworkConfig, RaftRole, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    // ── Load ELFs ───────────────────────────────────────────────
+    let ledger_path = format!(
+        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let ledger_elf = match std::fs::read(&ledger_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: clerk-ledger not built (run `just build-clerk-ledger`)");
+            return;
+        }
+    };
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let ledger_blob = grey_transpiler::link_elf(&ledger_elf).expect("transpile clerk-ledger");
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile space-registry");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_raft_clerk_gate_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // The Raft ledger replicas share one replication id; the space-registry
+    // (which resolves the node-peer grant on whichever node is leader) is a
+    // CRDT replicated across both nodes so a grant converges cluster-wide.
+    let mk_id = |label: &[u8]| -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(label);
+        h.update(&ledger_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+    let ledger_rep = mk_id(b"raft-clerk-gate/ledger");
+    let reg_rep = mk_id(b"raft-clerk-gate/registry");
+
+    // ── libp2p bring-up ─────────────────────────────────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    if prefix_a == prefix_b {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a.clone(),
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: true,
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b.clone(),
+        local_prefix: prefix_b,
+        listen: vec![listen.clone()],
+        bootstrap: vec![a_dial.clone()],
+        auto_dial_mdns: true,
+    });
+    wait_for(
+        || net_b.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_b binds");
+
+    // Name-derived ledger ids: the low 16 bits (the local id) are shared
+    // across replicas so Raft leader re-targeting `(prefix << 16) | local`
+    // resolves; the top 16 bits carry the owning node's prefix so a
+    // cross-node invoke routes to that node.
+    let ledger_id = |prefix: u16| ServiceId(space_registry::instance_service_id("clerk", prefix));
+    let ledger_a = ledger_id(prefix_a);
+    let ledger_b = ledger_id(prefix_b);
+    let members = vec![prefix_a, prefix_b];
+
+    // ── Node A ──────────────────────────────────────────────────
+    //
+    // The network is attached BEFORE the Raft ledger registers: the
+    // RaftWorker's status handler + AppendEntries transport are wired at
+    // register time from the already-attached network, so a leaderless
+    // worker never forms if the order is reversed.
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.attach_network(net_a);
+    node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(reg_rep),
+        ServiceId::REGISTRY,
+    );
+    node_a.register_at_id(
+        AgentConfig::new(ledger_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(members.clone())
+            .with_replication_id(ledger_rep)
+            .persist(&dir_a),
+        ledger_a,
+    );
+
+    // ── Node B ──────────────────────────────────────────────────
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.attach_network(net_b);
+    node_b.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(reg_rep),
+        ServiceId::REGISTRY,
+    );
+    node_b.register_at_id(
+        AgentConfig::new(ledger_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(members.clone())
+            .with_replication_id(ledger_rep)
+            .persist(&dir_b),
+        ledger_b,
+    );
+
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    wait_for(
+        || {
+            (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("libp2p Hello handshake");
+
+    // ── Wait for a stable leader, identify leader/follower ───────
+    let (leader_prefix, follower_prefix) = wait_for(
+        || {
+            let sa = net_a_arc.local_raft_status(&ledger_rep)?;
+            let sb = net_b_arc.local_raft_status(&ledger_rep)?;
+            match (sa.role, sb.role) {
+                (RaftRole::Leader, RaftRole::Follower) => Some((prefix_a, prefix_b)),
+                (RaftRole::Follower, RaftRole::Leader) => Some((prefix_b, prefix_a)),
+                _ => None,
+            }
+        },
+        Duration::from_secs(30),
+    )
+    .expect("a stable single leader emerges");
+
+    let leader_ledger = ledger_id(leader_prefix);
+    let follower_node: &VosNode = if follower_prefix == prefix_a {
+        &node_a
+    } else {
+        &node_b
+    };
+    let follower_peer = if follower_prefix == prefix_a {
+        net_a_arc.peer_id().to_bytes()
+    } else {
+        net_b_arc.peer_id().to_bytes()
+    };
+    let leader_peer = if leader_prefix == prefix_a {
+        net_a_arc.peer_id().to_bytes()
+    } else {
+        net_b_arc.peer_id().to_bytes()
+    };
+
+    // ── Ledger identity the mutators anchor to ──────────────────
+    let registrar = Keypair::generate();
+    let journal = JournalId::random();
+    let ledger = ClerkLedgerRef::at(leader_ledger);
+    let ts: u64 = 3_000_000;
+
+    // ── 1) Ungranted node peer → Operator mutator is Forbidden ──
+    //
+    // Drive `bootstrap` from the follower to the leader's ledger. The
+    // leader attributes it to the follower's PeerId, resolves NO role
+    // for it (empty registry), and the Operator gate refuses. This is
+    // the "the gate bites the forwarding node peer" half of the lesson.
+    assert!(
+        matches!(
+            vos::block_on(ledger.bootstrap(
+                &mut &*follower_node,
+                journal.0.to_vec(),
+                registrar.public.0.to_vec(),
+                1u32,
+            )),
+            Err(ClientError::Forbidden)
+        ),
+        "ungranted follower-node peer must be refused by the Operator gate"
+    );
+
+    // ── 2) Grant both voter node peers AUTH_ROLE_ADMIN ──────────
+    //
+    // A fresh operator key anchors the registry's genesis root and signs
+    // the grants. The grant op is authored System-side (bypassing the
+    // registry's own Admin gate) but still carries a root signature that
+    // `authorize_op` verifies — so the grant is a real, replay-safe row,
+    // not a test backdoor.
+    let root_key = SigningKey::from_bytes(&[7u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+    let grant_auth = |who: &[u8]| -> Vec<u8> {
+        let canonical =
+            canonical_op_bytes("grant_role", &[who, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()]);
+        let sig = root_key.sign(&canonical).to_bytes();
+        pack_auth(&root_peer, &sig)
+    };
+    let registry = SpaceRegistryRef::at(ServiceId::REGISTRY);
+
+    // Anchor the genesis root and grant both voter node peers on ONE
+    // replica; the CRDT registry converges the grant to the other node,
+    // so whichever node is leader resolves the grant from its own replica.
+    // Both peers are granted so an election flip mid-test can't strand the
+    // resolving side.
+    assert_eq!(
+        vos::block_on(registry.set_root(&mut &node_a, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+    for who in [&follower_peer, &leader_peer] {
+        assert_eq!(
+            vos::block_on(registry.grant_role(
+                &mut &node_a,
+                who.clone(),
+                AUTH_ROLE_ADMIN,
+                1u64,
+                grant_auth(who),
+            ))
+            .expect("grant_role"),
+            space_registry::Status::Ok,
+        );
+    }
+    // The grant must be resolvable where the leader checks it — on both
+    // replicas, since either can hold leadership.
+    wait_for(
+        || {
+            let a = vos::block_on(registry.peer_role(&mut &node_a, follower_peer.clone())).ok()?;
+            let b = vos::block_on(registry.peer_role(&mut &node_b, follower_peer.clone())).ok()?;
+            (a == AUTH_ROLE_ADMIN && b == AUTH_ROLE_ADMIN).then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("follower node peer resolves to ADMIN on both replicas");
+
+    // ── 3) Granted node peer → Operator mutators commit via Raft ─
+    //
+    // Every mutator is driven from the follower to the leader's ledger,
+    // so each one exercises the cross-node caller attribution the grant
+    // now satisfies.
+    assert_eq!(
+        vos::block_on(ledger.bootstrap(
+            &mut &*follower_node,
+            journal.0.to_vec(),
+            registrar.public.0.to_vec(),
+            1u32,
+        ))
+        .expect("bootstrap routes"),
+        Status::Ok,
+        "granted peer's bootstrap must pass the Operator gate"
+    );
+
+    let alice_kp = Keypair::generate();
+    let alice = Account::asset(journal, alice_kp.public, Iso4217::USD, BankCode::Checking);
+    let alice_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&CcCreateAccount::signed(
+        alice.clone(),
+        &registrar.secret,
+    ))
+    .expect("encode alice")
+    .to_vec();
+    assert_eq!(
+        vos::block_on(ledger.create_account(&mut &*follower_node, alice_bytes, ts))
+            .expect("create alice routes"),
+        Status::Ok
+    );
+
+    let pool_kp = Keypair::generate();
+    let pool = Account::asset(journal, pool_kp.public, Iso4217::USD, BankCode::Vault);
+    let pool_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&CcCreateAccount::signed(
+        pool.clone(),
+        &registrar.secret,
+    ))
+    .expect("encode pool")
+    .to_vec();
+    assert_eq!(
+        vos::block_on(ledger.create_account(&mut &*follower_node, pool_bytes, ts))
+            .expect("create pool routes"),
+        Status::Ok
+    );
+
+    let blinding = Blinding([1u8; 32]);
+    let amt = Amount::commit(100, &blinding);
+    let signed_transfer = Transfer::builder(journal)
+        .debit(&alice, Layer::Settled, amt)
+        .credit(&pool, Layer::Settled, amt)
+        .signed_with(&[(&alice, &alice_kp.secret)]);
+    let transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&signed_transfer)
+        .expect("encode transfer")
+        .to_vec();
+    let openings = vec![Opening {
+        amount: amt,
+        value: 100,
+        blinding,
+    }];
+    let openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .expect("encode openings")
+        .to_vec();
+    assert_eq!(
+        vos::block_on(ledger.apply_transfer(
+            &mut &*follower_node,
+            transfer_bytes,
+            openings_bytes,
+            ts + 100,
+        ))
+        .expect("apply_transfer routes"),
+        Status::Ok,
+        "granted peer's apply_transfer must commit through the leader"
+    );
+
+    // ── 4) Both replicas converge on one non-empty state root ────
+    //
+    // Local reads (`Caller::System`, Member gate bypassed) so we observe
+    // each replica's own committed state directly.
+    let read_root = |node: &VosNode, id: ServiceId| -> Option<Vec<u8>> {
+        vos::block_on(ClerkLedgerRef::at(id).state_root(&mut &*node)).ok()
+    };
+    let converged_root = wait_for(
+        || {
+            let ra = read_root(&node_a, ledger_a)?;
+            let rb = read_root(&node_b, ledger_b)?;
+            (!ra.is_empty() && ra == rb).then_some(ra)
+        },
+        Duration::from_secs(20),
+    )
+    .expect("both replicas converge on the same non-empty state root");
+
+    // ── 5) Kill + restart node B; assert it re-converges ─────────
+    //
+    // In a 2-voter group, downing a node freezes new writes (quorum is
+    // both), so this proves persistence + rejoin: B reloads its log and
+    // comes back on the same root. Killing B regardless of its Raft role
+    // is safe — the surviving node holds the committed state and the pair
+    // re-elects once B returns.
+    let _ = node_b.collect();
+    drop(net_b_arc);
+
+    let net_b2 = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
+    });
+    let mut node_b2 = VosNode::with_prefix(prefix_b);
+    node_b2.attach_network(net_b2);
+    node_b2.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(reg_rep),
+        ServiceId::REGISTRY,
+    );
+    node_b2.register_at_id(
+        AgentConfig::new(ledger_blob)
+            .with_consistency(Consistency::Raft)
+            .with_members(members)
+            .with_replication_id(ledger_rep)
+            .persist(&dir_b),
+        ledger_b,
+    );
+    let net_b2_arc = node_b2.network().expect("net_b2");
+    wait_for(
+        || {
+            (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b2_arc.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("B re-Hellos A after restart");
+
+    let final_b = wait_for(
+        || (read_root(&node_b2, ledger_b)? == converged_root).then_some(()),
+        Duration::from_secs(20),
+    );
+    assert!(
+        final_b.is_some(),
+        "restarted follower must re-converge on the pre-kill state root; last={:?}",
+        read_root(&node_b2, ledger_b)
+    );
+    assert_eq!(
+        read_root(&node_a, ledger_a),
+        Some(converged_root),
+        "leader keeps the committed root across the follower restart"
+    );
+
+    // ── Cleanup ─────────────────────────────────────────────────
+    let mut panics = 0u32;
+    for r in node_a.collect().iter().chain(node_b2.collect().iter()) {
+        panics += r.panics;
+    }
+    let _ = std::fs::remove_dir_all(&dir_root);
+    assert_eq!(panics, 0, "actor panics during raft clerk gate test: {panics}");
+}
+
+/// S1 — `clerk-settle` bilateral settlement end-to-end under Raft.
+///
+/// Stands the venue actor up Raft-replicated across two nodes and drives a
+/// full window settlement through the leader-forward path that G6 pinned:
+///
+///   - `register_bank` (Operator-gated) driven follower → leader, passing
+///     only because the follower's node peer holds the `Admin` grant — the
+///     same caller-attribution rule as clerk-ledger, now inherited by
+///     clerk-settle.
+///   - `submit_claim` (OPEN handler) driven follower → leader for BOTH
+///     banks' signed net-flow claims: the open handler forwards to the
+///     leader and commits without any grant (submitting banks are not
+///     venue members).
+///   - `settle_window` (Operator-gated) driven follower → leader: the two
+///     Pedersen net-flow commitments cancel, the window is recorded, and
+///     the settled log replicates to both replicas.
+#[test]
+#[cfg(feature = "network")]
+fn raft_clerk_settle_bilateral_settlement() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
+
+    use cipher_clerk::crypto::{Amount, Blinding, Keypair};
+    use cipher_clerk::settlement::SettlementClaim;
+    use clerk_settle::{ClerkSettleRef, Status};
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{AUTH_ROLE_ADMIN, SpaceRegistryRef, canonical_op_bytes, pack_auth};
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::actors::client::ClientError;
+    use vos::network::{Network, NetworkConfig, RaftRole, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    /// ISO-4217 USD — the fixed demo currency constant.
+    const USD: u32 = 840;
+    const WINDOW: (u64, u64) = (1_000, 2_000);
+
+    // ── Load ELFs ───────────────────────────────────────────────
+    let settle_path = format!(
+        "{}/../actors/clerk-settle/target/riscv64em-javm/release/clerk_settle.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let settle_elf = match std::fs::read(&settle_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: clerk-settle not built (run `just build-clerk-settle`)");
+            return;
+        }
+    };
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let settle_blob = grey_transpiler::link_elf(&settle_elf).expect("transpile clerk-settle");
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile space-registry");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_raft_settle_{}_{}", std::process::id(), stamp));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let mk_id = |label: &[u8]| -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(label);
+        h.update(&settle_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+    let settle_rep = mk_id(b"raft-settle/venue");
+    let reg_rep = mk_id(b"raft-settle/registry");
+
+    // ── libp2p bring-up ─────────────────────────────────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    if prefix_a == prefix_b {
+        eprintln!("SKIP: prefix collision");
+        return;
+    }
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: true,
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial: libp2p::Multiaddr =
+        a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
+    });
+    wait_for(
+        || net_b.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_b binds");
+
+    let venue_id = |prefix: u16| ServiceId(space_registry::instance_service_id("venue", prefix));
+    let venue_a = venue_id(prefix_a);
+    let venue_b = venue_id(prefix_b);
+    let members = vec![prefix_a, prefix_b];
+
+    // Network attached before the Raft venue registers (see G6).
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a.attach_network(net_a);
+    node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(reg_rep),
+        ServiceId::REGISTRY,
+    );
+    node_a.register_at_id(
+        AgentConfig::new(settle_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(members.clone())
+            .with_replication_id(settle_rep)
+            .persist(&dir_a),
+        venue_a,
+    );
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b.attach_network(net_b);
+    node_b.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(reg_rep),
+        ServiceId::REGISTRY,
+    );
+    node_b.register_at_id(
+        AgentConfig::new(settle_blob)
+            .with_consistency(Consistency::Raft)
+            .with_members(members)
+            .with_replication_id(settle_rep)
+            .persist(&dir_b),
+        venue_b,
+    );
+
+    let net_a_arc = node_a.network().expect("net_a");
+    let net_b_arc = node_b.network().expect("net_b");
+    wait_for(
+        || {
+            (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
+        Duration::from_secs(15),
+    )
+    .expect("libp2p Hello handshake");
+
+    let (leader_prefix, follower_prefix) = wait_for(
+        || {
+            let sa = net_a_arc.local_raft_status(&settle_rep)?;
+            let sb = net_b_arc.local_raft_status(&settle_rep)?;
+            match (sa.role, sb.role) {
+                (RaftRole::Leader, RaftRole::Follower) => Some((prefix_a, prefix_b)),
+                (RaftRole::Follower, RaftRole::Leader) => Some((prefix_b, prefix_a)),
+                _ => None,
+            }
+        },
+        Duration::from_secs(30),
+    )
+    .expect("a stable single leader emerges");
+
+    let leader_venue = venue_id(leader_prefix);
+    let follower_node: &VosNode = if follower_prefix == prefix_a {
+        &node_a
+    } else {
+        &node_b
+    };
+    let follower_peer = if follower_prefix == prefix_a {
+        net_a_arc.peer_id().to_bytes()
+    } else {
+        net_b_arc.peer_id().to_bytes()
+    };
+    let leader_peer = if leader_prefix == prefix_a {
+        net_a_arc.peer_id().to_bytes()
+    } else {
+        net_b_arc.peer_id().to_bytes()
+    };
+
+    let venue = ClerkSettleRef::at(leader_venue);
+
+    // ── Operator gate bites the ungranted node peer ─────────────
+    let bank_a_kp = Keypair::generate();
+    let bank_b_kp = Keypair::generate();
+    assert!(
+        matches!(
+            vos::block_on(venue.register_bank(
+                &mut &*follower_node,
+                b"bank-a".to_vec(),
+                bank_a_kp.public.0,
+            )),
+            Err(ClientError::Forbidden)
+        ),
+        "ungranted follower peer must be refused by the register_bank Operator gate"
+    );
+
+    // ── Grant both voter node peers Admin ───────────────────────
+    let root_key = SigningKey::from_bytes(&[9u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+    let grant_auth = |who: &[u8]| -> Vec<u8> {
+        let canonical =
+            canonical_op_bytes("grant_role", &[who, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()]);
+        let sig = root_key.sign(&canonical).to_bytes();
+        pack_auth(&root_peer, &sig)
+    };
+    let registry = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    assert_eq!(
+        vos::block_on(registry.set_root(&mut &node_a, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+    for who in [&follower_peer, &leader_peer] {
+        assert_eq!(
+            vos::block_on(registry.grant_role(
+                &mut &node_a,
+                who.clone(),
+                AUTH_ROLE_ADMIN,
+                1u64,
+                grant_auth(who),
+            ))
+            .expect("grant_role"),
+            space_registry::Status::Ok,
+        );
+    }
+    wait_for(
+        || {
+            let a = vos::block_on(registry.peer_role(&mut &node_a, follower_peer.clone())).ok()?;
+            let b = vos::block_on(registry.peer_role(&mut &node_b, follower_peer.clone())).ok()?;
+            (a == AUTH_ROLE_ADMIN && b == AUTH_ROLE_ADMIN).then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("follower node peer resolves to ADMIN on both replicas");
+
+    // ── register_bank (Operator) via follower → leader ──────────
+    for (name, pk) in [
+        (b"bank-a".to_vec(), bank_a_kp.public.0),
+        (b"bank-b".to_vec(), bank_b_kp.public.0),
+    ] {
+        assert_eq!(
+            vos::block_on(venue.register_bank(&mut &*follower_node, name, pk))
+                .expect("register_bank routes"),
+            Status::Ok,
+        );
+    }
+
+    // ── submit_claim (OPEN) via follower → leader, both banks ────
+    //
+    // A pays B 10 (commit C); B's mirror claim nets the negated point, so
+    // the two Pedersen net-flow commitments cancel to identity.
+    let net_ab = Amount::commit(10, &Blinding([7u8; 32]));
+    let net_ba = Amount::from_point(&-net_ab.to_point().unwrap());
+    let claim_ab = SettlementClaim::sign(
+        bank_a_kp.public,
+        bank_b_kp.public,
+        USD,
+        WINDOW.0,
+        WINDOW.1,
+        net_ab,
+        &bank_a_kp.secret,
+    )
+    .to_bytes();
+    let claim_ba = SettlementClaim::sign(
+        bank_b_kp.public,
+        bank_a_kp.public,
+        USD,
+        WINDOW.0,
+        WINDOW.1,
+        net_ba,
+        &bank_b_kp.secret,
+    )
+    .to_bytes();
+    assert_eq!(
+        vos::block_on(venue.submit_claim(&mut &*follower_node, claim_ab, 1u32, [1u8; 32]))
+            .expect("submit_claim A routes"),
+        Status::Ok,
+        "open submit_claim forwards to the leader and commits without a grant"
+    );
+    assert_eq!(
+        vos::block_on(venue.submit_claim(&mut &*follower_node, claim_ba, 1u32, [2u8; 32]))
+            .expect("submit_claim B routes"),
+        Status::Ok,
+    );
+
+    // ── settle_window (Operator) via follower → leader ──────────
+    assert_eq!(
+        vos::block_on(venue.settle_window(
+            &mut &*follower_node,
+            b"bank-a".to_vec(),
+            b"bank-b".to_vec(),
+            USD,
+            WINDOW.0,
+            WINDOW.1,
+        ))
+        .expect("settle_window routes"),
+        Status::Ok,
+        "the two net-flow commitments must cancel"
+    );
+
+    // ── Both replicas converge on one settled window ────────────
+    let settled_on = |node: &VosNode, id: ServiceId| -> Option<u32> {
+        vos::block_on(ClerkSettleRef::at(id).settled_count(&mut &*node)).ok()
+    };
+    wait_for(
+        || (settled_on(&node_a, venue_a) == Some(1) && settled_on(&node_b, venue_b) == Some(1)).then_some(()),
+        Duration::from_secs(20),
+    )
+    .expect("the settled window replicates to both venue nodes");
+    assert_eq!(
+        vos::block_on(ClerkSettleRef::at(venue_a).settlement_status(
+            &mut &node_a,
+            b"bank-a".to_vec(),
+            b"bank-b".to_vec(),
+            USD,
+            WINDOW.0,
+            WINDOW.1,
+        ))
+        .expect("settlement_status read"),
+        Status::Ok as u8,
+    );
+
+    // ── Cleanup ─────────────────────────────────────────────────
+    let mut panics = 0u32;
+    for r in node_a.collect().iter().chain(node_b.collect().iter()) {
+        panics += r.panics;
+    }
+    let _ = std::fs::remove_dir_all(&dir_root);
+    assert_eq!(panics, 0, "actor panics during raft clerk-settle test: {panics}");
+}
+
+/// S6 — the multi-node, three-space settlement capstone.
+///
+/// Five in-process nodes across three spaces sharing one hyperspace:
+///   - venue ×2 (v_a, v_b): `clerk-settle` Raft-replicated.
+///   - bank-A ×2 (a1, a2): a1 runs bank-A's `clerk-bridge`; a2 is bank-A's
+///     second node (exercises hyperspace resolution from a non-primary node).
+///   - bank-B ×1 (b1): bank-B's `clerk-bridge`.
+///
+/// It composes the whole settlement pipeline the demo stands on:
+///   - **bidirectional vouchers** — bank A issues to bank B's bridge and
+///     bank B issues to bank A's bridge (the existing e2e only flowed A→B);
+///     each bridge folds the accepted commit into its receiver term;
+///   - **window rotate → quiesce → both claims → zero-sum settle** — both
+///     banks' drivers combine their issuer term with the bridge's receiver
+///     term into a signed `SettlementClaim`; the two net-flow commitments
+///     cancel and the venue records the window;
+///   - **cross-space `submit_claim`** resolved via the hyperspace registry,
+///     with the follower/leader routing reality pinned (a raft write to a
+///     venue follower does NOT auto-forward on the inbound path — it must
+///     target the leader);
+///   - **`anchor_reset` unwedges** a deliberately wedged voucher channel.
+#[test]
+#[cfg(feature = "network")]
+fn multi_node_three_space_settlement_capstone() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
+
+    use cipher_clerk::crypto::{Amount, Blinding, Keypair};
+    use cipher_clerk::proof::Proof as CcProof;
+    use cipher_clerk::settlement::SettlementClaim;
+    use cipher_clerk::viewing_keys::{EncryptedEnvelope, SpendKey};
+    use cipher_clerk::voucher::Voucher;
+    use clerk_bridge::{ClerkBridgeRef, DEMO_CURRENCY, Status as BridgeStatus};
+    use clerk_settle::{ClerkSettleRef, Status as SettleStatus};
+    use space_registry::SpaceRegistryRef;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{Network, NetworkConfig, RaftRole, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    const WINDOW: (u64, u64) = (0, 0);
+
+    // ── Load ELFs ───────────────────────────────────────────────
+    let mk_path = |crate_dir: &str, elf: &str| {
+        format!(
+            "{}/../actors/{crate_dir}/target/riscv64em-javm/release/{elf}",
+            env!("CARGO_MANIFEST_DIR"),
+        )
+    };
+    let read_elf = |p: String, what: &str| -> Option<Vec<u8>> {
+        match std::fs::read(&p) {
+            Ok(d) => Some(d),
+            Err(_) => {
+                eprintln!("SKIP: {what} not built");
+                None
+            }
+        }
+    };
+    let (Some(settle_elf), Some(bridge_elf), Some(registry_elf)) = (
+        read_elf(mk_path("clerk-settle", "clerk_settle.elf"), "clerk-settle"),
+        read_elf(mk_path("clerk-bridge", "clerk_bridge.elf"), "clerk-bridge"),
+        read_elf(mk_path("space-registry", "space_registry.elf"), "space-registry"),
+    ) else {
+        return;
+    };
+    let settle_blob = grey_transpiler::link_elf(&settle_elf).expect("transpile clerk-settle");
+    let bridge_blob = grey_transpiler::link_elf(&bridge_elf).expect("transpile clerk-bridge");
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile space-registry");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_capstone_{}_{}", std::process::id(), stamp));
+    let mk_dir = |tag: &str| {
+        let d = dir_root.join(tag);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    };
+    let (dir_va, dir_vb, dir_a1, dir_a2, dir_b1) = (
+        mk_dir("va"),
+        mk_dir("vb"),
+        mk_dir("a1"),
+        mk_dir("a2"),
+        mk_dir("b1"),
+    );
+
+    let mk_rep = |label: &[u8]| -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(label);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+    // One shared hyperspace registry across all five nodes; a Raft group for
+    // the venue's clerk-settle.
+    let hs_rep = mk_rep(b"capstone/hyperspace");
+    let venue_rep = mk_rep(b"capstone/venue-settle");
+
+    // ── Five networks, meshed via explicit dial chains + mDNS. ──
+    let kps: Vec<libp2p::identity::Keypair> =
+        (0..5).map(|_| libp2p::identity::Keypair::generate_ed25519()).collect();
+    let prefixes: Vec<u16> = kps
+        .iter()
+        .map(|k| derive_node_prefix(&libp2p::PeerId::from(k.public())))
+        .collect();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for p in &prefixes {
+            if !seen.insert(*p) {
+                eprintln!("SKIP: prefix collision");
+                return;
+            }
+        }
+    }
+    let (pv_a, pv_b, pa1, pa2, pb1) =
+        (prefixes[0], prefixes[1], prefixes[2], prefixes[3], prefixes[4]);
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let start_net = |kp: libp2p::identity::Keypair,
+                     prefix: u16,
+                     bootstrap: Vec<libp2p::Multiaddr>|
+     -> (Network, libp2p::Multiaddr) {
+        let net = Network::start(NetworkConfig {
+            keypair: kp,
+            local_prefix: prefix,
+            listen: vec![listen.clone()],
+            bootstrap,
+            auto_dial_mdns: true,
+        });
+        let addr = wait_for(
+            || net.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net binds");
+        let dial = addr.with(libp2p::multiaddr::Protocol::P2p(net.peer_id()));
+        (net, dial)
+    };
+
+    let (net_va, dial_va) = start_net(kps[0].clone(), pv_a, vec![]);
+    let (net_vb, dial_vb) = start_net(kps[1].clone(), pv_b, vec![dial_va.clone()]);
+    let (net_a1, dial_a1) = start_net(kps[2].clone(), pa1, vec![dial_va.clone(), dial_vb.clone()]);
+    let (net_a2, dial_a2) = start_net(
+        kps[3].clone(),
+        pa2,
+        vec![dial_va.clone(), dial_vb.clone(), dial_a1.clone()],
+    );
+    let (net_b1, _dial_b1) = start_net(
+        kps[4].clone(),
+        pb1,
+        vec![dial_va, dial_vb, dial_a1, dial_a2],
+    );
+
+    // ── Register per node: shared hyperspace registry + space agent. ──
+    let settle_id = |prefix: u16| ServiceId(space_registry::instance_service_id("clerk-settle", prefix));
+    let bridge_a_id = ServiceId(space_registry::instance_service_id("bank-a-bridge", pa1));
+    let bridge_b_id = ServiceId(space_registry::instance_service_id("bank-b-bridge", pb1));
+    let venue_members = vec![pv_a, pv_b];
+
+    let register_hs = |node: &mut VosNode, dir: &std::path::Path| {
+        node.register_at_id(
+            AgentConfig::new(registry_blob.clone())
+                .with_consistency(Consistency::Crdt)
+                .persist(dir)
+                .with_replication_id(hs_rep),
+            ServiceId::HYPERSPACE_REGISTRY,
+        );
+    };
+
+    // Venue nodes: clerk-settle Raft (network attached before register).
+    let mut node_va = VosNode::with_prefix(pv_a);
+    node_va.attach_network(net_va);
+    register_hs(&mut node_va, &dir_va);
+    node_va.register_at_id(
+        AgentConfig::new(settle_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(venue_members.clone())
+            .with_replication_id(venue_rep)
+            .persist(&dir_va),
+        settle_id(pv_a),
+    );
+
+    let mut node_vb = VosNode::with_prefix(pv_b);
+    node_vb.attach_network(net_vb);
+    register_hs(&mut node_vb, &dir_vb);
+    node_vb.register_at_id(
+        AgentConfig::new(settle_blob)
+            .with_consistency(Consistency::Raft)
+            .with_members(venue_members)
+            .with_replication_id(venue_rep)
+            .persist(&dir_vb),
+        settle_id(pv_b),
+    );
+
+    // Bank-A node 1: clerk-bridge (Local). Node 2: hyperspace only.
+    let mut node_a1 = VosNode::with_prefix(pa1);
+    node_a1.attach_network(net_a1);
+    register_hs(&mut node_a1, &dir_a1);
+    node_a1.register_at_id(
+        AgentConfig::new(bridge_blob.clone())
+            .with_consistency(Consistency::Local)
+            .network_reachable()
+            .persist(&dir_a1),
+        bridge_a_id,
+    );
+
+    let mut node_a2 = VosNode::with_prefix(pa2);
+    node_a2.attach_network(net_a2);
+    register_hs(&mut node_a2, &dir_a2);
+
+    // Bank-B node: clerk-bridge (Local).
+    let mut node_b1 = VosNode::with_prefix(pb1);
+    node_b1.attach_network(net_b1);
+    register_hs(&mut node_b1, &dir_b1);
+    node_b1.register_at_id(
+        AgentConfig::new(bridge_blob)
+            .with_consistency(Consistency::Local)
+            .network_reachable()
+            .persist(&dir_b1),
+        bridge_b_id,
+    );
+
+    // ── Wait for a full libp2p mesh. ────────────────────────────
+    let arc_va = node_va.network().expect("va net");
+    let arc_vb = node_vb.network().expect("vb net");
+    let arc_a1 = node_a1.network().expect("a1 net");
+    let arc_a2 = node_a2.network().expect("a2 net");
+    let arc_b1 = node_b1.network().expect("b1 net");
+    let arcs = [&arc_va, &arc_vb, &arc_a1, &arc_a2, &arc_b1];
+    wait_for(
+        || {
+            for (i, arc) in arcs.iter().enumerate() {
+                for (j, &pfx) in prefixes.iter().enumerate() {
+                    if i != j && arc.peer_for_prefix(pfx).is_none() {
+                        return None;
+                    }
+                }
+            }
+            Some(())
+        },
+        Duration::from_secs(30),
+    )
+    .expect("five-node full mesh");
+
+    // ── Venue leader/follower. ──────────────────────────────────
+    let (venue_leader, venue_follower) = wait_for(
+        || {
+            let ra = arc_va.local_raft_status(&venue_rep)?;
+            let rb = arc_vb.local_raft_status(&venue_rep)?;
+            match (ra.role, rb.role) {
+                (RaftRole::Leader, RaftRole::Follower) => Some((pv_a, pv_b)),
+                (RaftRole::Follower, RaftRole::Leader) => Some((pv_b, pv_a)),
+                _ => None,
+            }
+        },
+        Duration::from_secs(30),
+    )
+    .expect("venue elects a stable leader");
+    let venue_leader_node: &VosNode = if venue_leader == pv_a { &node_va } else { &node_vb };
+    let leader_settle = settle_id(venue_leader);
+    let follower_settle = settle_id(venue_follower);
+
+    // ── Advertise the venue's clerk-settle into the hyperspace. ─
+    // Advertise the LEADER's prefix so a cross-space resolve lands on the
+    // node that can accept the raft write (a follower does not forward on
+    // the inbound path — pinned below).
+    let hs_leader = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+    assert_eq!(
+        vos::block_on(hs_leader.register_remote(
+            &mut &*venue_leader_node,
+            "clerk-settle".into(),
+            venue_leader as u32,
+        ))
+        .expect("register_remote clerk-settle"),
+        space_registry::Status::Ok,
+    );
+
+    // Hyperspace resolution from bank-A's SECOND node (a2) — the CRDT
+    // registry converged there and a2 can route cross-space to the venue.
+    let resolved_from_a2 = wait_for(
+        || {
+            let got = vos::block_on(
+                SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY)
+                    .resolve(&mut &node_a2, "clerk-settle".into(), pa2 as u64),
+            )
+            .ok()?;
+            (got == leader_settle.0).then_some(got)
+        },
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        resolved_from_a2,
+        Some(leader_settle.0),
+        "hyperspace resolve from bank-A's second node must yield the venue's clerk-settle id"
+    );
+
+    // ── Bank identities + bidirectional vouchers. ───────────────
+    let bank_a_clerk = Keypair::generate();
+    let bank_b_clerk = Keypair::generate();
+    let bank_a_ivk = SpendKey::generate().incoming_viewing_key();
+    let bank_b_ivk = SpendKey::generate().incoming_viewing_key();
+    let bank_a_ivk_pk = bank_a_ivk.public();
+    let bank_b_ivk_pk = bank_b_ivk.public();
+
+    let bridge_a = ClerkBridgeRef::at(bridge_a_id);
+    let bridge_b = ClerkBridgeRef::at(bridge_b_id);
+    // Bootstrap each bridge with a dummy ledger id (submit_voucher never
+    // dispatches to a ledger; only redeem_voucher would) + its IVK secret.
+    assert_eq!(
+        vos::block_on(bridge_a.bootstrap(&mut &node_a1, 1u32, bank_a_ivk.to_bytes().to_vec()))
+            .expect("bootstrap bridge-a"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_b.bootstrap(&mut &node_b1, 1u32, bank_b_ivk.to_bytes().to_vec()))
+            .expect("bootstrap bridge-b"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.register_peer(
+            &mut &node_a1,
+            b"bank-b".to_vec(),
+            bank_b_clerk.public.0.to_vec(),
+            pb1 as u32,
+        ))
+        .expect("bridge-a register_peer bank-b"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_b.register_peer(
+            &mut &node_b1,
+            b"bank-a".to_vec(),
+            bank_a_clerk.public.0.to_vec(),
+            pa1 as u32,
+        ))
+        .expect("bridge-b register_peer bank-a"),
+        BridgeStatus::Ok,
+    );
+
+    // Build a voucher `issuer` → `receiver_ivk_pk` for `value`.
+    let build_voucher = |value: u64,
+                         blind: u8,
+                         receiver_ivk_pk: &cipher_clerk::crypto::AuthKey,
+                         root_before: [u8; 32],
+                         root_after: [u8; 32],
+                         issuer_secret: &cipher_clerk::crypto::SecretKey|
+     -> (Amount, Vec<u8>) {
+        let blinding = Blinding([blind; 32]);
+        let commit = Amount::commit(value, &blinding);
+        let envelope =
+            EncryptedEnvelope::seal(value, &blinding, receiver_ivk_pk).expect("seal envelope");
+        let voucher = Voucher::sign(
+            commit,
+            envelope,
+            root_before,
+            root_after,
+            CcProof::default(),
+            issuer_secret,
+        );
+        (commit, voucher.to_bytes())
+    };
+
+    // A → B (commit C_ab), sealed under bank B's IVK, signed by bank A.
+    let (c_ab, voucher_ab) = build_voucher(
+        10,
+        0x03,
+        &bank_b_ivk_pk,
+        [0x11u8; 32],
+        [0x12u8; 32],
+        &bank_a_clerk.secret,
+    );
+    // B → A (commit C_ba), sealed under bank A's IVK, signed by bank B.
+    let (c_ba, voucher_ba) = build_voucher(
+        4,
+        0x04,
+        &bank_a_ivk_pk,
+        [0x21u8; 32],
+        [0x22u8; 32],
+        &bank_b_clerk.secret,
+    );
+
+    // Ship each voucher cross-node to the counterpart bridge (the issuing
+    // bank's node submits to the receiving bank's bridge).
+    assert_eq!(
+        vos::block_on(bridge_b.submit_voucher(&mut &node_a1, voucher_ab, b"bank-a".to_vec()))
+            .expect("A ships voucher to bridge-b")
+            .status,
+        BridgeStatus::Ok,
+        "bank B's bridge accepts bank A's voucher"
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.submit_voucher(&mut &node_b1, voucher_ba, b"bank-b".to_vec()))
+            .expect("B ships voucher to bridge-a")
+            .status,
+        BridgeStatus::Ok,
+        "bank A's bridge accepts bank B's voucher"
+    );
+
+    // ── Quiesce: rotate both bridges' windows (closing window 0). ─
+    assert_eq!(
+        vos::block_on(bridge_a.window_rotate(&mut &node_a1, b"bank-b".to_vec()))
+            .expect("rotate bridge-a"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_b.window_rotate(&mut &node_b1, b"bank-a".to_vec()))
+            .expect("rotate bridge-b"),
+        BridgeStatus::Ok,
+    );
+
+    // ── Both banks' drivers derive their net-flow claims. ───────
+    // net_flow(bank) = issuer_term ⊕ receiver_term, where the receiver term
+    // is the bridge's negated sum for the closed window.
+    let add_commits = |a: &Amount, b: &Amount| -> Amount {
+        Amount::from_point(&(a.to_point().unwrap() + b.to_point().unwrap()))
+    };
+    let recv_a_bytes =
+        vos::block_on(bridge_a.window_net(&mut &node_a1, b"bank-b".to_vec(), DEMO_CURRENCY, WINDOW.0))
+            .expect("bridge-a window_net");
+    let recv_b_bytes =
+        vos::block_on(bridge_b.window_net(&mut &node_b1, b"bank-a".to_vec(), DEMO_CURRENCY, WINDOW.0))
+            .expect("bridge-b window_net");
+    let recv_a = Amount(recv_a_bytes.try_into().expect("32-byte receiver term A"));
+    let recv_b = Amount(recv_b_bytes.try_into().expect("32-byte receiver term B"));
+    // Bank A issued C_ab; bank B issued C_ba (issuer terms the drivers keep).
+    let net_a = add_commits(&c_ab, &recv_a); // C_ab ⊖ C_ba
+    let net_b = add_commits(&c_ba, &recv_b); // C_ba ⊖ C_ab
+    let claim_a = SettlementClaim::sign(
+        bank_a_clerk.public,
+        bank_b_clerk.public,
+        DEMO_CURRENCY,
+        WINDOW.0,
+        WINDOW.1,
+        net_a,
+        &bank_a_clerk.secret,
+    )
+    .to_bytes();
+    let claim_b = SettlementClaim::sign(
+        bank_b_clerk.public,
+        bank_a_clerk.public,
+        DEMO_CURRENCY,
+        WINDOW.0,
+        WINDOW.1,
+        net_b,
+        &bank_b_clerk.secret,
+    )
+    .to_bytes();
+
+    // ── Venue: register both banks (Operator, locally on the leader). ──
+    let venue = ClerkSettleRef::at(leader_settle);
+    for (name, pk) in [
+        (b"bank-a".to_vec(), bank_a_clerk.public.0),
+        (b"bank-b".to_vec(), bank_b_clerk.public.0),
+    ] {
+        assert_eq!(
+            vos::block_on(venue.register_bank(&mut &*venue_leader_node, name, pk))
+                .expect("register_bank"),
+            SettleStatus::Ok,
+        );
+    }
+
+    // Wait for the registrations to replicate to BOTH venue replicas, so a
+    // claim submitted to the follower reaches the write path (not an early
+    // UnknownBank short-circuit on stale state).
+    let bank_count_on = |node: &VosNode, prefix: u16| -> Option<u32> {
+        vos::block_on(ClerkSettleRef::at(settle_id(prefix)).bank_count(&mut &*node)).ok()
+    };
+    wait_for(
+        || {
+            (bank_count_on(&node_va, pv_a) == Some(2) && bank_count_on(&node_vb, pv_b) == Some(2))
+                .then_some(())
+        },
+        Duration::from_secs(20),
+    )
+    .expect("bank registrations replicate to both venue nodes");
+
+    // ── submit_claim: the follower/leader routing reality. ──────
+    // A cross-space submit_claim that WOULD commit, sent to the venue
+    // FOLLOWER, is refused: the follower's raft agent drops the write (it is
+    // not the leader) and the inbound libp2p path does NOT auto-forward — so
+    // the driver must target the leader. (A claim that short-circuits before
+    // the write — e.g. UnknownBank — could return from a follower; this one
+    // is valid against the now-replicated banks, so it reaches the write.)
+    let follower_result = vos::block_on(
+        ClerkSettleRef::at(follower_settle).submit_claim(
+            &mut &node_a1,
+            claim_a.clone(),
+            1u32,
+            [0xA0u8; 32],
+        ),
+    );
+    assert!(
+        follower_result.is_err(),
+        "a committing submit_claim to a venue follower must not succeed (no inbound forward); got {follower_result:?}"
+    );
+    // Targeting the leader (resolved via the hyperspace above) commits.
+    assert_eq!(
+        vos::block_on(venue.submit_claim(&mut &node_a1, claim_a, 2u32, [0xA1u8; 32]))
+            .expect("bank A submit_claim to venue leader"),
+        SettleStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(venue.submit_claim(&mut &node_b1, claim_b, 1u32, [0xB1u8; 32]))
+            .expect("bank B submit_claim to venue leader"),
+        SettleStatus::Ok,
+    );
+
+    // ── settle_window at the leader → zero-sum → replicates. ────
+    assert_eq!(
+        vos::block_on(venue.settle_window(
+            &mut &*venue_leader_node,
+            b"bank-a".to_vec(),
+            b"bank-b".to_vec(),
+            DEMO_CURRENCY,
+            WINDOW.0,
+            WINDOW.1,
+        ))
+        .expect("settle_window"),
+        SettleStatus::Ok,
+        "the two banks' net-flow commitments must cancel"
+    );
+    let settled_on = |node: &VosNode, prefix: u16| -> Option<u32> {
+        vos::block_on(ClerkSettleRef::at(settle_id(prefix)).settled_count(&mut &*node)).ok()
+    };
+    wait_for(
+        || {
+            (settled_on(&node_va, pv_a) == Some(1) && settled_on(&node_vb, pv_b) == Some(1))
+                .then_some(())
+        },
+        Duration::from_secs(20),
+    )
+    .expect("the settled window replicates to both venue nodes");
+
+    // ── anchor_reset unwedges a deliberately wedged channel. ────
+    // A voucher from bank B declaring an unseen prior root wedges bank A's
+    // bridge; anchor_reset re-anchors and the same voucher then chains.
+    let wedge_before = [0x99u8; 32];
+    let (_wc, wedge_bytes) = build_voucher(
+        3,
+        0x05,
+        &bank_a_ivk_pk,
+        wedge_before,
+        [0x9Au8; 32],
+        &bank_b_clerk.secret,
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.submit_voucher(&mut &node_a1, wedge_bytes.clone(), b"bank-b".to_vec()))
+            .expect("submit wedge voucher")
+            .status,
+        BridgeStatus::VoucherInvalid,
+        "a non-chaining voucher wedges the channel"
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.anchor_reset(&mut &node_a1, b"bank-b".to_vec(), wedge_before))
+            .expect("anchor_reset"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.submit_voucher(&mut &node_a1, wedge_bytes, b"bank-b".to_vec()))
+            .expect("resubmit after anchor_reset")
+            .status,
+        BridgeStatus::Ok,
+        "anchor_reset re-anchors the channel so the voucher chains again"
+    );
+
+    // ── Cleanup ─────────────────────────────────────────────────
+    let mut panics = 0u32;
+    for node in [node_va, node_vb, node_a1, node_a2, node_b1] {
+        for r in node.collect() {
+            panics += r.panics;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir_root);
+    assert_eq!(panics, 0, "actor panics during capstone test: {panics}");
 }

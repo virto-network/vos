@@ -83,6 +83,19 @@ use clerk_ledger::ClerkLedgerRef;
 use vos::abi::service::ServiceId;
 use vos::prelude::*;
 
+mod window;
+
+pub mod roles;
+pub use roles::{CLERK_BRIDGE_SPACE_ROLE_MAP, ClerkBridgeRole};
+
+/// The fixed demo settlement currency (ISO-4217 USD). Vouchers carry no
+/// currency (`cipher-clerk/src/voucher/mod.rs`), so the bridge stamps this
+/// into the receiver-term accumulator key. Multi-currency federation would
+/// instead carry a per-peer currency on `register_peer`; the accumulator is
+/// keyed by currency from the start so commitments never silently mix under
+/// one claim.
+pub const DEMO_CURRENCY: u32 = 840;
+
 // ── Handler status ──────────────────────────────────────────────
 
 /// Return type for `bootstrap` / `register_peer` /
@@ -184,6 +197,29 @@ pub struct PeerEntry {
     /// "receiver-side state-root anchor" doc for the exact
     /// guarantee and its limits.
     pub last_root_after: Option<[u8; 32]>,
+    /// Current settlement window (operational bracket) for this peer.
+    /// Starts at `0`; `window_rotate` advances it. The receiver-term
+    /// accumulator ([`WindowNetEntry`]) is keyed by this value, so rotating
+    /// closes the current bracket and opens the next. Vouchers carry no
+    /// window id — the bracket is bank-operator authority, not wire data.
+    pub window: u64,
+}
+
+/// Receiver-term accumulator for one `(peer, currency, window)`: the running
+/// NEGATED sum of accepted vouchers' `amount_commit` as a Pedersen point
+/// (`Amount` bytes). The per-bank driver point-adds this to its issuer term
+/// to form the net flow it signs into a `SettlementClaim`; because both
+/// banks derive from the same voucher commitments, the blindings cancel and
+/// the two claims sum to identity (which the venue's `reconcile` checks).
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct WindowNetEntry {
+    pub peer_name: Vec<u8>,
+    pub currency: u32,
+    pub window: u64,
+    pub neg_sum: [u8; 32],
 }
 
 /// Reply envelope for `submit_voucher`. Same shape pattern as
@@ -270,7 +306,11 @@ macro_rules! decode_or_else {
 
 // ── Actor ───────────────────────────────────────────────────────
 
-#[actor]
+#[actor(
+    role = ClerkBridgeRole,
+    default_role = ClerkBridgeRole::None,
+    space_role_map = CLERK_BRIDGE_SPACE_ROLE_MAP,
+)]
 pub struct ClerkBridge {
     /// Local clerk-ledger ServiceId, packed as u32. `0` means
     /// not-yet-bootstrapped — every non-bootstrap handler
@@ -310,6 +350,11 @@ pub struct ClerkBridge {
     /// prover (no accepted commitment) — a misconfigured allowlist can
     /// never silently accept.
     allowlist: Vec<u8>,
+    /// Receiver-term accumulators, one per `(peer, currency, window)`. Each
+    /// holds the negated sum of the `amount_commit`s this bridge has
+    /// accepted from that peer in that window — the mandatory receiver half
+    /// of the peer's settlement claim (see [`WindowNetEntry`]).
+    window_nets: Vec<WindowNetEntry>,
 }
 
 #[messages]
@@ -322,6 +367,7 @@ impl ClerkBridge {
             received: Vec::new(),
             prover_id: 0,
             allowlist: Vec::new(),
+            window_nets: Vec::new(),
         }
     }
 
@@ -436,6 +482,7 @@ impl ClerkBridge {
             clerk_pubkey: AuthKey(pk_bytes),
             node_prefix: (node_prefix & 0xFFFF) as u16,
             last_root_after: None,
+            window: 0,
         };
         match self.peers.binary_search_by(|e| e.name.cmp(&entry.name)) {
             // Re-register (idempotent refresh OR key rotation): update
@@ -568,6 +615,22 @@ impl ClerkBridge {
             None => return reply(Status::EnvelopeUnreadable),
         };
 
+        // Bind the credited opening to the settled commitment. The value
+        // the operator credits comes from the envelope; the amount folded
+        // into the settlement net flow comes from `amount_commit`. Nothing
+        // upstream ties them together — the issuer signs both independently
+        // — so without this check a malicious issuer could seal value 100
+        // while committing to 10 (the receiver credits 100 but the window
+        // settles for 10), or ship a non-canonical `amount_commit` that the
+        // receiver term folds as the identity. Byte equality against a
+        // freshly recomputed canonical commitment forces the two to agree
+        // AND forces `amount_commit` to be a valid Ristretto point. The
+        // blinding is canonical (envelope.open returns it via
+        // Blinding::from_bytes), so `commit` cannot panic.
+        if cipher_clerk::crypto::Amount::commit(value, &blinding) != voucher.amount_commit {
+            return reply(Status::VoucherInvalid);
+        }
+
         // Commit to the dedup set after a successful open. From
         // here the host caller has the opening and can credit the
         // recipient; a second submit with the same triple would
@@ -576,13 +639,23 @@ impl ClerkBridge {
             Ok(_) => { /* unreachable — checked above */ }
             Err(i) => self.received.insert(i, dedup_key),
         }
-        // Advance the per-peer anchor to this voucher's post-state. Only
-        // here, on the acceptance path — a rejected voucher leaves the
-        // chain where the last accepted one left it. Re-resolve by name:
-        // the earlier lookup's borrow is gone and its index may be stale
-        // after the await.
+        // Advance the per-peer anchor to this voucher's post-state, and
+        // fold the accepted commit into the current window's receiver term
+        // — the two move together so the settlement sum and the anchor
+        // never diverge. Only here, on the acceptance path — a rejected
+        // voucher leaves both where the last accepted one left them.
+        // Re-resolve by name: the earlier lookup's borrow is gone and its
+        // index may be stale after the await.
         if let Ok(pi) = self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
             self.peers[pi].last_root_after = Some(voucher.state_root_after);
+            let window = self.peers[pi].window;
+            window::accumulate_neg(
+                &mut self.window_nets,
+                &peer_name,
+                DEMO_CURRENCY,
+                window,
+                &voucher.amount_commit,
+            );
         }
 
         SubmitVoucherReply {
@@ -721,6 +794,15 @@ impl ClerkBridge {
         if voucher.envelope.open(&ivk).is_none() {
             return early_redeem(Status::EnvelopeUnreadable);
         }
+        // Reject a non-canonical `amount_commit` before it reaches the
+        // ledger or the receiver term. `validate_inflow` above pins the
+        // inflow amounts to `amount_commit` byte-for-byte, and the ledger
+        // checks the openings, so the value path is already bound here;
+        // this guard closes the degenerate-commit route symmetrically with
+        // submit_voucher and makes the receiver-term fold total.
+        if voucher.amount_commit.to_point().is_none() {
+            return early_redeem(Status::VoucherInvalid);
+        }
 
         // Cross-actor dispatch: invoke clerk-ledger's
         // apply_transfer handler on the same node. The mailbox
@@ -753,11 +835,20 @@ impl ClerkBridge {
                 Ok(_) => { /* unreachable — checked above */ }
                 Err(i) => self.received.insert(i, dedup_key),
             }
-            // Advance the per-peer anchor to this voucher's post-state,
-            // atomically with the ledger accept (the rejection paths above
-            // never reach here, so the anchor only moves on acceptance).
+            // Advance the per-peer anchor to this voucher's post-state and
+            // fold the accepted commit into the current window's receiver
+            // term, atomically with the ledger accept (the rejection paths
+            // above never reach here, so both only move on acceptance).
             if let Ok(pi) = self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
                 self.peers[pi].last_root_after = Some(voucher.state_root_after);
+                let window = self.peers[pi].window;
+                window::accumulate_neg(
+                    &mut self.window_nets,
+                    &peer_name,
+                    DEMO_CURRENCY,
+                    window,
+                    &voucher.amount_commit,
+                );
             }
             RedeemReply {
                 status: Status::Ok,
@@ -768,6 +859,72 @@ impl ClerkBridge {
                 status: Status::LedgerRejected,
                 ledger_status: ledger_status_byte,
             }
+        }
+    }
+
+    /// Rotate the settlement window for a peer: close the current bracket
+    /// and open the next (`window += 1`). The next window's receiver term
+    /// starts empty; the closed window's `window_net` stays queryable for
+    /// claim production. Operator-gated — bracketing a window is bank-
+    /// operator authority, the same authority as S4's `anchor_reset`.
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn window_rotate(&mut self, peer_name: Vec<u8>) -> Status {
+        if self.local_ledger_id == 0 {
+            return Status::NotBootstrapped;
+        }
+        match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => {
+                self.peers[i].window += 1;
+                Status::Ok
+            }
+            Err(_) => Status::UnknownPeer,
+        }
+    }
+
+    /// The peer's current settlement window (operational bracket), or
+    /// `u64::MAX` if the peer is unknown.
+    #[msg]
+    async fn current_window(&self, peer_name: Vec<u8>) -> u64 {
+        match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => self.peers[i].window,
+            Err(_) => u64::MAX,
+        }
+    }
+
+    /// The receiver term for `(peer, currency, window)` — the negated sum
+    /// of accepted vouchers' `amount_commit` as a 32-byte Pedersen point.
+    /// Empty `Vec` when nothing has accumulated there (a window with no
+    /// accepted vouchers contributes the identity/zero term to the claim).
+    #[msg]
+    async fn window_net(&self, peer_name: Vec<u8>, currency: u32, window: u64) -> Vec<u8> {
+        window::window_net(&self.window_nets, &peer_name, currency, window)
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Post-settlement wedge recovery. The F2 receiver-side anchor fails
+    /// CLOSED: a peer whose ledger legitimately advanced off this channel
+    /// (or across a settled window boundary) declares a `state_root_before`
+    /// this bridge never observed, is rejected, and — because rejections
+    /// don't advance the cursor — that channel wedges. `anchor_reset`
+    /// re-anchors the peer's `last_root_after` to `root` (the settled
+    /// window's closing root), so the peer's next voucher chains cleanly
+    /// again. This makes settlement the *sanctioned* recovery for the wedge
+    /// the anchor deliberately leaves open. Operator-gated — the operator
+    /// asserts the settlement occurred (the bridge, on the bank's space,
+    /// can't see the venue's settled log); same authority as
+    /// `window_rotate`.
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn anchor_reset(&mut self, peer_name: Vec<u8>, root: [u8; 32]) -> Status {
+        if self.local_ledger_id == 0 {
+            return Status::NotBootstrapped;
+        }
+        match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => {
+                self.peers[i].last_root_after = Some(root);
+                Status::Ok
+            }
+            Err(_) => Status::UnknownPeer,
         }
     }
 }
