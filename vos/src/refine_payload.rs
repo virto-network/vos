@@ -355,6 +355,14 @@ impl RefinePayload {
 /// composed with the entering-memory-image root check — the state
 /// anchor and the image root do different jobs and neither subsumes
 /// the other.
+///
+/// Not yet wired into the halt path: the witness-delivered Task ABI
+/// (A9) establishes byte-identical live/traced images and work-results,
+/// but composing this fold into the io-hash at halt is the `#[provable]`
+/// pipeline's job (B2). This helper is the frozen wire it will call;
+/// until then a Task binds only its handler's `bind_io` (or the empty
+/// default), so a Task's proof does not yet commit to its state
+/// transition. See `work-result-contract.md` §5.
 pub fn folded_public(
     anchor_kind: u8,
     anchor: &[u8; 32],

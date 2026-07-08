@@ -561,6 +561,11 @@ pub fn run_refine_service<A: super::Actor>() {
         // SAFETY: single-threaded PVM, raw-pointer access as above.
         let (anchor_kind, anchor) = unsafe { *anchor_ptr };
         let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
+        // Empty state is genesis, not a hash anchor — the host's overlay
+        // computes `anchor_for(Some(empty)) == GENESIS`, so a fieldless
+        // (empty-encoding) actor must carry genesis forward or its next
+        // self-message iteration would AnchorMismatch and silently drop.
+        let new_is_empty = new_state_bytes.is_empty();
         let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS
             || new_hash != anchor;
         let payload = ctx.drain_into_refine_payload(
@@ -572,7 +577,11 @@ pub fn run_refine_service<A: super::Actor>() {
         if state_changed {
             // SAFETY: single-threaded PVM, raw-pointer access as above.
             unsafe {
-                *anchor_ptr = (crate::refine_payload::ANCHOR_STATE_HASH, new_hash);
+                *anchor_ptr = if new_is_empty {
+                    (crate::refine_payload::ANCHOR_GENESIS, [0u8; 32])
+                } else {
+                    (crate::refine_payload::ANCHOR_STATE_HASH, new_hash)
+                };
             }
         }
         drop(ctx);
