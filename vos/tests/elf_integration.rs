@@ -10308,3 +10308,46 @@ fn multi_node_three_space_settlement_capstone() {
     let _ = std::fs::remove_dir_all(&dir_root);
     assert_eq!(panics, 0, "actor panics during capstone test: {panics}");
 }
+
+#[test]
+fn probe_yield_mid_batch_delivers_all_mail() {
+    // A1: a handler that yields mid-batch must not drop the messages the
+    // guest had not yet FETCHed before it suspended. The probe's `ping`
+    // handler counts one message then yields, so three `ping`s queued in
+    // a single tick are consumed one per tick — the un-fetched remainder
+    // must re-queue rather than evaporate. `seen` therefore ends at 3.
+    // Before the fix the second and third `ping` were dropped and `seen`
+    // stayed at 1.
+    use vos::value::{Msg, TAG_DYNAMIC, Value};
+    use vos::{Decode, Encode};
+
+    fn dynamic(name: &str) -> Vec<u8> {
+        let encoded = Msg::new(name).encode();
+        let mut p = Vec::with_capacity(1 + encoded.len());
+        p.push(TAG_DYNAMIC);
+        p.extend_from_slice(&encoded);
+        p
+    }
+
+    let elf = example_elf("probe");
+    let blob = transpile_actor(&elf);
+    let mut rt = VosRuntime::new();
+    let id = register_svc(&mut rt, blob);
+
+    for _ in 0..3 {
+        rt.send_to(id, dynamic("ping"));
+    }
+    rt.run_blocking();
+    assert_eq!(rt.panics, 0, "probe panicked delivering the ping batch");
+
+    rt.send_to(id, dynamic("seen"));
+    rt.run_blocking();
+    let reply = rt.take_last_reply(id).expect("seen produced no reply");
+    let seen = <Value as Decode>::decode(&reply)
+        .as_u32()
+        .expect("seen returns u32");
+    assert_eq!(
+        seen, 3,
+        "all three pings must be delivered across ticks, not just the first"
+    );
+}

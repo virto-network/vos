@@ -809,21 +809,26 @@ impl<D: DataLayer> VosRuntime<D> {
                             &mut self.data,
                             &mut journal,
                         );
-                        // Spill any self-directed transfers from the
-                        // payload's effects as pending transfers for next
-                        // tick. On a JAM host, accumulate would replay
-                        // these via hostcalls; VOS must match.
+                        // Re-queue mail the guest had not FETCHed before it
+                        // yielded, then any self-directed transfers. A
+                        // handler that yields mid-batch leaves the rest of
+                        // this round's items unconsumed; dropping them would
+                        // silently lose messages. Both redeliver next tick —
+                        // un-fetched mail first — and the saved continuation
+                        // warm-restarts the guest to process them. On a JAM
+                        // host, accumulate would replay the self-transfers
+                        // via hostcalls; VOS must match.
+                        for msg in round_items.drain(..) {
+                            new_transfers.push((ServiceId(svc_id), msg));
+                        }
                         for msg in journal.self_messages.drain(..) {
                             new_transfers.push((ServiceId(svc_id), msg));
                         }
-                        // No automatic wake-up: a yielded service that
-                        // produced no self-message has nothing more to
-                        // do under its own steam. The continuation is
-                        // saved so a future external message
-                        // (typically an INVOKE from a parent agent
-                        // that owns the dispatch loop) can resume it.
-                        // The host is intentionally dumb — orchestration
-                        // is the caller's responsibility.
+                        // Nothing left to redeliver means no wake-up: the
+                        // service stays suspended until a future external
+                        // message (typically a parent agent's INVOKE, which
+                        // owns the dispatch loop) resumes the continuation.
+                        // The host injects no synthetic self-transfer.
                         break;
                     }
 

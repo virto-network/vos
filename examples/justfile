@@ -18,6 +18,7 @@ build:
     cd actors/pipeline && cargo actor
     cd actors/crdt-counter && cargo actor
     cd actors/pushy && cargo actor
+    cd actors/probe && cargo actor
 
 run: build
     cargo run --manifest-path ../Cargo.toml -p vosx -- start space.toml --no-persist
