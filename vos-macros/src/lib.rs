@@ -493,10 +493,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
+        } else if success_after_result.as_ref().is_some_and(is_byte_array) {
+            // `[u8; N]` return → raw bytes, symmetric with the arg path.
+            quote! { vos::value::Value::Bytes(reply.to_vec()) }
         } else {
             let ty_str = success_after_result
                 .as_ref()
-                .map(|t| quote!(#t).to_string().replace(' ', ""))
+                .map(ty_string)
                 .unwrap_or_else(|| "()".to_string());
             if PRIMITIVES.contains(&ty_str.as_str()) {
                 quote! { reply.into() }
@@ -588,7 +591,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .zip(field_types.iter())
             .map(|(name, ty)| {
                 let name_str = name.to_string();
-                let ty_str = quote!(#ty).to_string();
+                // Whitespace-free so `[u8; 32]` records as `[u8;32]` and
+                // `Vec < u8 >` as `Vec<u8>` — the CLI, gateway, and
+                // OpenAPI renderer all match against this canonical form.
+                let ty_str = ty_string(ty);
                 quote! {
                     vos::metadata::FieldMeta {
                         name: #name_str,
@@ -676,7 +682,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .iter()
             .map(|(name, ty)| {
                 let name_str = name.to_string();
-                let ty_str = quote!(#ty).to_string();
+                let ty_str = ty_string(ty);
                 quote! {
                     vos::metadata::FieldMeta {
                         name: #name_str,
@@ -1401,6 +1407,18 @@ fn client_decode_body(
         };
     }
 
+    // `[u8; N]` reply → raw bytes, length-checked into the array.
+    if is_byte_array(ty) {
+        return quote! {
+            match #value_ident {
+                vos::value::Value::Bytes(b) => <#ty>::try_from(b.as_slice())
+                    .map_err(|_| vos::actors::client::ClientError::Decode),
+                other => Err(vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", other))),
+            }
+        };
+    }
+
     let ty_str = ty.to_token_stream().to_string().replace(' ', "");
     match ty_str.as_str() {
         "()" => quote! { Ok(()) },
@@ -1520,6 +1538,18 @@ fn is_primitive_ty(ty: &syn::Type) -> bool {
     PRIMITIVES.contains(&ty_string(ty).as_str())
 }
 
+/// `true` if `ty` is a fixed-size byte array `[u8; N]`. These travel as
+/// raw `Value::Bytes` of exactly `N` bytes (not rkyv-wrapped), so a
+/// hex / `@file` CLI argument maps straight onto them, the reply reads
+/// back symmetrically, and the length can be validated at the edge —
+/// the natural shape for ids, roots, hashes, and public keys.
+fn is_byte_array(ty: &syn::Type) -> bool {
+    let syn::Type::Array(arr) = ty else {
+        return false;
+    };
+    matches!(arr.elem.as_ref(), syn::Type::Path(p) if p.path.is_ident("u8"))
+}
+
 /// The typed `Args` accessor for a whitelisted scalar argument type,
 /// or `None` for types that travel rkyv-encoded (custom structs,
 /// `Vec<[u8; 32]>`, …). Drives the `from_msg` extraction.
@@ -1552,6 +1582,12 @@ fn from_msg_arg(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
     if let Some(accessor) = whitelist_accessor(ty) {
         return quote! { let #name: #ty = msg.args.#accessor(#name_str)?; };
     }
+    if is_byte_array(ty) {
+        // Raw bytes → fixed array; a length mismatch yields `None`.
+        return quote! {
+            let #name: #ty = <#ty>::try_from(msg.args.get(#name_str)?.as_bytes()?).ok()?;
+        };
+    }
     quote! {
         let #name: #ty = vos::rkyv::from_bytes::<#ty, vos::rkyv::rancor::Error>(
             msg.args.get(#name_str)?.as_bytes()?,
@@ -1570,6 +1606,9 @@ fn ref_arg_with(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
     let name_str = name.to_string();
     if is_primitive_ty(ty) {
         return quote! { .with(#name_str, #name) };
+    }
+    if is_byte_array(ty) {
+        return quote! { .with(#name_str, vos::value::Value::Bytes(#name.to_vec())) };
     }
     quote! {
         .with(

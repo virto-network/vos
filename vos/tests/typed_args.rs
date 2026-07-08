@@ -83,6 +83,12 @@ mod fixture {
         fn pin_roots(&mut self, roots: Vec<[u8; 32]>) -> u32 {
             roots.len() as u32
         }
+
+        /// `[u8; 32]` argument and return — raw-bytes wire shape (G26).
+        #[msg]
+        fn echo_root(&self, root: [u8; 32]) -> [u8; 32] {
+            root
+        }
     }
 }
 
@@ -272,4 +278,61 @@ fn from_msg_rejects_wrong_variant_for_custom_arg() {
     // The right name but a scalar where bytes are expected.
     let msg = Msg::new("record").with("receipt", Value::U64(3));
     assert!(VaultMsg::from_msg(&msg).is_none());
+}
+
+// ── G26: [u8; N] arguments and returns ─────────────────────────────
+
+#[test]
+fn byte_array_arg_and_reply_travel_as_raw_bytes() {
+    let root = [5u8; 32];
+    let mut inv = CapturingInvoker {
+        reply: Some(Value::Bytes(root.to_vec())),
+        ..Default::default()
+    };
+    let vault = VaultRef::at(ServiceId(3));
+    let got = vos::block_on(vault.echo_root(&mut inv, root)).expect("invoke");
+    // Reply decodes back into the fixed array (G26 reply path).
+    assert_eq!(got, root);
+    let msg = inv.captured_msg();
+    // The arg is raw bytes of exactly 32 — not rkyv-framed.
+    match msg.args.get("root") {
+        Some(Value::Bytes(b)) => assert_eq!(b.len(), 32),
+        other => panic!("expected 32 raw bytes, got {other:?}"),
+    }
+    let VaultMsg::EchoRoot(inner) = VaultMsg::from_msg(&msg).expect("from_msg decodes [u8;32]")
+    else {
+        panic!("expected EchoRoot variant");
+    };
+    assert_eq!(inner.root, root);
+}
+
+#[test]
+fn byte_array_reply_wrong_length_is_rejected() {
+    let mut inv = CapturingInvoker {
+        reply: Some(Value::Bytes(vec![0u8; 31])),
+        ..Default::default()
+    };
+    let vault = VaultRef::at(ServiceId(3));
+    let got = vos::block_on(vault.echo_root(&mut inv, [0u8; 32]));
+    assert!(
+        matches!(got, Err(ClientError::Decode)),
+        "31 bytes must not decode into [u8;32], got {got:?}"
+    );
+}
+
+#[test]
+fn from_msg_rejects_wrong_length_byte_array_arg() {
+    let msg = Msg::new("echo_root").with("root", Value::Bytes(vec![1u8; 10]));
+    assert!(VaultMsg::from_msg(&msg).is_none());
+}
+
+#[test]
+fn byte_array_field_meta_records_normalized_type() {
+    let m = VaultMsg::META
+        .messages
+        .iter()
+        .find(|m| m.name == "echo_root")
+        .expect("echo_root meta present");
+    assert_eq!(m.fields[0].name, "root");
+    assert_eq!(m.fields[0].ty, "[u8;32]");
 }
