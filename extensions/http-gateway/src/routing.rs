@@ -422,7 +422,7 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
 ///   `i32/i64`         → `integer` (`int32`/`int64`)
 ///   `bool`            → `boolean`
 ///   `String`          → `string`
-///   `Vec<u8>`         → `string` (`byte`)
+///   `Vec<u8>` `[u8;N]` → `string` (`byte`)
 ///   `Vec<u32>`        → `array` of integers
 ///   `Vec<String>`     → `array` of strings
 ///   any other         → `string` (fallback — generic UI still works)
@@ -570,7 +570,15 @@ fn openapi_operation_for(
 /// through to `{ "type": "string" }` so the operation is
 /// still inspectable, just less precisely typed than ideal.
 fn vos_ty_to_openapi(ty: &str) -> serde_json::Value {
-    match ty {
+    // Types are recorded whitespace-free by the macro; normalize so
+    // older pretty-printed `Vec < u8 >` blobs document correctly too
+    // (they previously fell through to a plain `string`).
+    let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    // `[u8; N]` — a fixed-length byte array, rendered as a hex string.
+    if ty.starts_with("[u8;") && ty.ends_with(']') {
+        return serde_json::json!({ "type": "string", "format": "byte" });
+    }
+    match ty.as_str() {
         "u8" => serde_json::json!({ "type": "integer", "format": "uint8" }),
         "u16" => serde_json::json!({ "type": "integer", "format": "uint16" }),
         "u32" => serde_json::json!({ "type": "integer", "format": "uint32" }),
@@ -723,10 +731,31 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
     } else {
         None
     };
-    // The schema renders field types pretty-printed with spaces
-    // (e.g. `Vec < u8 >`); strip whitespace so the arms below can use
-    // the canonical spelling.
+    // Types are recorded whitespace-free by the macro; older binaries
+    // may still carry a pretty-printed `Vec < u8 >`, so strip whitespace
+    // to match either spelling.
     let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    // `Vec<u8>` and `[u8; N]` handler args both need `Value::Bytes`,
+    // which the JSON layer never produces directly. Accept either a hex
+    // string (symmetric with how `Bytes` replies render — copy a hex
+    // value out of a reply and pass it straight back) or a JSON array of
+    // byte-valued numbers; pass an existing `Bytes` through. Without
+    // this, every bytes-arg handler (clerk's bootstrap / create_account
+    // / apply_transfer / account(id) / …) silently fails the actor's
+    // `from_dynamic` and round-trips to a misleading "200 null". The
+    // actor's `from_msg` validates the `[u8; N]` length.
+    if ty == "Vec<u8>" || (ty.starts_with("[u8;") && ty.ends_with(']')) {
+        return if let Some(s) = as_str {
+            crate::json::hex_decode(s).map(Value::Bytes)
+        } else if let Value::ListU32(ref nums) = v {
+            nums.iter()
+                .map(|&n| u8::try_from(n).ok())
+                .collect::<Option<Vec<u8>>>()
+                .map(Value::Bytes)
+        } else {
+            v.as_bytes().map(|b| Value::Bytes(b.to_vec()))
+        };
+    }
     match ty.as_str() {
         "u8" => as_str
             .and_then(|s| s.parse::<u8>().ok())
@@ -760,27 +789,6 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
             Value::Str(_) => Some(v),
             _ => None,
         },
-        // `Vec<u8>` handler args need `Value::Bytes`, which the JSON
-        // layer never produces directly. Accept either a hex string
-        // (symmetric with how `Bytes` replies render — copy a hex
-        // value out of a reply and pass it straight back) or a JSON
-        // array of byte-valued numbers; pass an existing `Bytes`
-        // through. Without this, every `Vec<u8>`-arg handler (clerk's
-        // bootstrap / create_account / apply_transfer / account(id) /
-        // …) silently fails the actor's `from_dynamic` and round-trips
-        // to a misleading "200 null".
-        "Vec<u8>" => {
-            if let Some(s) = as_str {
-                crate::json::hex_decode(s).map(Value::Bytes)
-            } else if let Value::ListU32(ref nums) = v {
-                nums.iter()
-                    .map(|&n| u8::try_from(n).ok())
-                    .collect::<Option<Vec<u8>>>()
-                    .map(Value::Bytes)
-            } else {
-                v.as_bytes().map(|b| Value::Bytes(b.to_vec()))
-            }
-        }
         // Complex types we don't coerce — pass the original
         // through unchanged so the actor's `from_msg` accessor
         // gets a chance to evaluate the shape. Returning
@@ -923,6 +931,44 @@ mod tests {
                 ("q".into(), "&".into()),
             ],
         );
+    }
+
+    #[test]
+    fn coerce_vec_u8_from_hex_string() {
+        use vos::value::Value;
+        let got = coerce_to_type(Value::Str("0xdead".into()), "Vec<u8>");
+        assert_eq!(got, Some(Value::Bytes(vec![0xde, 0xad])));
+    }
+
+    #[test]
+    fn coerce_byte_array_from_hex_string() {
+        use vos::value::Value;
+        // Length is not checked here — the actor's from_msg validates it.
+        let got = coerce_to_type(Value::Str("01020304".into()), "[u8;4]");
+        assert_eq!(got, Some(Value::Bytes(vec![1, 2, 3, 4])));
+    }
+
+    #[test]
+    fn coerce_bytes_from_spaced_type() {
+        use vos::value::Value;
+        // Older binaries pretty-print the type; whitespace is stripped.
+        let got = coerce_to_type(Value::Str("ab".into()), "Vec < u8 >");
+        assert_eq!(got, Some(Value::Bytes(vec![0xab])));
+    }
+
+    #[test]
+    fn openapi_byte_array_documents_as_byte_string() {
+        let s = vos_ty_to_openapi("[u8;32]");
+        assert_eq!(s["type"], "string");
+        assert_eq!(s["format"], "byte");
+    }
+
+    #[test]
+    fn openapi_vec_u8_spaced_still_byte_string() {
+        // The whitespace bug previously documented this as a plain string.
+        let s = vos_ty_to_openapi("Vec < u8 >");
+        assert_eq!(s["type"], "string");
+        assert_eq!(s["format"], "byte");
     }
 
     #[test]
