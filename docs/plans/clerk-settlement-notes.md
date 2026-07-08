@@ -84,5 +84,24 @@ decoding.
   grant, open `submit_claim` via follower, bilateral zero-sum settle,
   replication convergence). cipher-clerk `settlement` feature enabled for
   this crate only.
-- **S2/S4** — next: clerk-bridge window/claim accumulation + `anchor_reset`.
+- **S2** — done. clerk-bridge receiver-term accumulation: per-`(peer,
+  currency, window)` negated sum of accepted vouchers' `amount_commit`,
+  folded at the same accept points as the F2 anchor (both `submit_voucher`
+  and `redeem_voucher`); `window_rotate(peer)` (Operator) + `current_window`
+  + `window_net(peer, currency, window)` reads. Currency = fixed
+  `DEMO_CURRENCY = 840` (register_peer's ABI kept stable — a per-peer
+  currency param is the multi-currency forward step). Point arithmetic uses
+  only `Amount::to_point`/`from_point` (no `curve25519` direct dep, no
+  `settlement` feature on the bridge). The normative worked example is
+  `window::tests::worked_example_two_bank_net_flows_cancel`; the two-bank
+  e2e now asserts `window_net` == negated accepted commit end-to-end.
+  clerk-bridge gained a roles module (Operator gate) for `window_rotate`
+  (and S4's `anchor_reset`).
+
+  **Currency decision:** the accumulator key carries currency from the
+  start, but `register_peer` stays 3-arg (`peer_name, clerk_pubkey,
+  node_prefix`) — the demo is single-currency, and its two existing callers
+  (the two-bank e2e) stay untouched. Revisit if multi-currency federation
+  is added: add `currency: u32` to `register_peer` → `PeerEntry`.
+- **S4** — next: `anchor_reset(peer, root)` Operator handler on the bridge.
 - **S5/S6** — manifests + multi-node 3-space e2e.

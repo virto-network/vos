@@ -7763,6 +7763,34 @@ fn clerk_ledger_two_bank_federation() {
         "bridge must record exactly one redeemed voucher"
     );
 
+    // S2: accepting the voucher folded its `amount_commit` into the
+    // receiver term for (bank-a, DEMO_CURRENCY, window 0) as the negated
+    // point — the mandatory receiver half of bank B's settlement claim.
+    let recv_term = vos::block_on(bridge_actor.window_net(
+        &mut &node_b,
+        b"bank-a".to_vec(),
+        clerk_bridge::DEMO_CURRENCY,
+        0,
+    ))
+    .expect("invoke window_net");
+    let expected_neg = cipher_clerk::crypto::Amount::from_point(
+        &-received
+            .amount_commit
+            .to_point()
+            .expect("voucher commit decompresses"),
+    );
+    assert_eq!(
+        recv_term,
+        expected_neg.0.to_vec(),
+        "window_net must equal the negated accepted amount_commit"
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.current_window(&mut &node_b, b"bank-a".to_vec()))
+            .expect("invoke current_window"),
+        0,
+        "the peer starts in window 0"
+    );
+
     // F2 receiver-side anchor bites: a SECOND voucher from bank-a whose
     // state_root_before does NOT chain to the last accepted root_after
     // (= root_after of V1) must be refused (StateRootMismatch collapses to
@@ -8725,6 +8753,26 @@ fn clerk_ledger_two_bank_federation() {
     assert_eq!(
         bridge_b_self, bridge_b_id.0,
         "bridge-b's where_am_i must be bridge-b's own id (not A's local bridge shadow)"
+    );
+
+    // S2: rotating the settlement window advances the peer's operational
+    // bracket. The bank operator drives it locally (Caller::System), so the
+    // Operator gate is bypassed; a non-operator peer would be refused.
+    assert_eq!(
+        vos::block_on(bridge_actor.window_rotate(&mut &node_b, b"bank-a".to_vec()))
+            .expect("invoke window_rotate"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.current_window(&mut &node_b, b"bank-a".to_vec()))
+            .expect("invoke current_window after rotate"),
+        1,
+        "window_rotate opens the next bracket",
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.window_rotate(&mut &node_b, b"bank-z".to_vec()))
+            .expect("invoke window_rotate unknown"),
+        BridgeStatus::UnknownPeer,
     );
 
     // ── Cleanup ────────────────────────────────────────────────
