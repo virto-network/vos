@@ -586,7 +586,7 @@ impl<D: DataLayer> VosRuntime<D> {
 
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
         let idx = self.blobs.len();
-        self.blob_by_hash.insert(simple_hash(&blob), idx);
+        self.blob_by_hash.insert(blob_hash(&blob), idx);
         self.blobs.push(blob);
         idx
     }
@@ -1704,12 +1704,11 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
         .push((svc_id, crate::lifecycle::STATE_KEY_BYTES.to_vec(), vec![]));
 }
 
-fn simple_hash(data: &[u8]) -> [u8; 32] {
-    let mut h = [0u8; 32];
-    for (i, &byte) in data.iter().enumerate() {
-        h[i % 32] ^= byte.wrapping_add(i as u8);
-    }
-    h
+/// blake2b-256 content hash keying `blob_by_hash`. Collision-resistant, so
+/// a code-hash-identified INVOKE cannot be pointed at a forged blob — the
+/// prior XOR fold was trivially collidable.
+fn blob_hash(data: &[u8]) -> [u8; 32] {
+    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/blob-addr/v1", &[data])
 }
 
 #[cfg(test)]
@@ -1728,6 +1727,21 @@ mod tests {
         let rt = VosRuntime::with_gas_config(g);
         let cfg = rt.gas_config();
         assert_eq!(cfg.refine_gas, 12_345);
+    }
+
+    #[test]
+    fn blob_hash_content_addresses_registered_blobs() {
+        // blake2b keying is deterministic, distinguishes near-identical
+        // blobs (the old XOR fold collided readily), and register_blob's
+        // key resolves back to the blob index.
+        let a = vec![1u8, 2, 3];
+        let b = vec![1u8, 2, 4];
+        assert_ne!(blob_hash(&a), blob_hash(&b));
+        assert_eq!(blob_hash(&a), blob_hash(&a));
+
+        let mut rt = VosRuntime::new();
+        let idx = rt.register_blob(a.clone());
+        assert_eq!(rt.blob_by_hash.get(&blob_hash(&a)), Some(&idx));
     }
 
     #[test]
@@ -1755,7 +1769,7 @@ mod tests {
         // Verify that PROVIDE + NEW during refine results in the service
         // being registered after the tick commits.
         let mut rt = VosRuntime::new();
-        let code_hash = simple_hash(&[0xAB; 16]);
+        let code_hash = blob_hash(&[0xAB; 16]);
         // Pre-populate preimages with a dummy "code blob"
         rt.preimages.insert(code_hash, vec![0xAB; 16]);
 
