@@ -1814,6 +1814,15 @@ fn replay_dag_into_runtime(
         if msg.is_empty() {
             continue;
         }
+        // The (kind, anchor) recorded in this durable log node — the
+        // state the ORIGINAL dispatch ran against. The replayed
+        // dispatch must re-emit the same anchor, or the rebuilt state
+        // history has diverged. This is the normative divergence check:
+        // the guest's own anchor self-check passes by construction
+        // during replay (it anchors whatever the runtime just served
+        // it) and detects nothing.
+        let recorded_anchor = (log.anchor_kind, log.anchor);
+        let _ = runtime.take_dispatch_anchor(svc_id);
         runtime.begin_replay(log);
         // M7 — recorded effects were authorised by *some* caller
         // at record time. For replay determinism, wrap with the
@@ -1833,6 +1842,16 @@ fn replay_dag_into_runtime(
                  handler is non-deterministic",
                 replay.position(),
                 replay.was_exhausted(),
+            ));
+        }
+        let replayed_anchor = runtime.take_dispatch_anchor(svc_id);
+        if recorded_anchor.0 != crate::effect_log::ANCHOR_UNRECORDED
+            && replayed_anchor != Some(recorded_anchor)
+        {
+            return Err(format!(
+                "replay diverged at log #{i}: re-emitted work-result anchor \
+                 {replayed_anchor:02x?} != recorded {recorded_anchor:02x?} — \
+                 rebuilt state history differs from the committed one",
             ));
         }
     }
@@ -3873,8 +3892,16 @@ fn handle_invoke_request(
         .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
         .map(|v| v.to_vec())
         .unwrap_or_default();
+    // The anchor of the state this dispatch ran against — recorded
+    // normatively in the log node; replay divergence detection compares
+    // against it. Taken even when not recording so a stale entry never
+    // leaks into the next dispatch's log.
+    let dispatch_anchor = runtime.take_dispatch_anchor(svc_id);
     let commit_result = if recording_enabled {
-        let log = runtime.finish_recording().expect("recording was started");
+        let mut log = runtime.finish_recording().expect("recording was started");
+        if let Some((kind, anchor)) = dispatch_anchor {
+            log.set_anchor(kind, anchor);
+        }
         strategy.commit_with_log(&state, &log)
     } else if !state.is_empty() {
         strategy.commit(&state)
@@ -4280,8 +4307,14 @@ fn dispatch_once(
         .map(|v| v.to_vec())
         .unwrap_or_default();
 
+    // See handle_invoke_request — taken unconditionally so stale anchors
+    // never leak across dispatches.
+    let dispatch_anchor = runtime.take_dispatch_anchor(svc_id);
     if recorded {
-        let log = runtime.finish_recording().expect("recording was started");
+        let mut log = runtime.finish_recording().expect("recording was started");
+        if let Some((kind, anchor)) = dispatch_anchor {
+            log.set_anchor(kind, anchor);
+        }
         strategy.commit_with_log(&state, &log)?;
     } else if !state.is_empty() {
         strategy.commit(&state)?;

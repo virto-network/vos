@@ -567,6 +567,14 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// the host from `is_suspended`. Cleared by
     /// [`take_last_status`](VosRuntime::take_last_status).
     last_status: HashMap<u32, u8>,
+    /// `(kind, anchor)` of the FIRST work-result applied per service
+    /// since the last [`take_dispatch_anchor`] — i.e. the anchor of the
+    /// state the dispatch ran against, before any same-tick chain
+    /// advanced it. The host stamps it into the dispatch's EffectLog
+    /// node; replay divergence detection compares against that record.
+    ///
+    /// [`take_dispatch_anchor`]: VosRuntime::take_dispatch_anchor
+    dispatch_anchor: HashMap<u32, (u8, [u8; 32])>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -602,7 +610,18 @@ impl<D: DataLayer> VosRuntime<D> {
             effect_mode: crate::effect_log::EffectMode::Inactive,
             last_reply: HashMap::new(),
             last_status: HashMap::new(),
+            dispatch_anchor: HashMap::new(),
         }
+    }
+
+    /// Take the `(kind, anchor)` of the first work-result applied for
+    /// `svc_id` since the previous take — the anchor of the state the
+    /// dispatch ran against. `None` when no anchored work-result was
+    /// applied (v2 blobs, old-style actors, pure-trap dispatches). The
+    /// host stamps this into the dispatch's EffectLog before commit and
+    /// compares it during replay.
+    pub fn take_dispatch_anchor(&mut self, svc_id: ServiceId) -> Option<(u8, [u8; 32])> {
+        self.dispatch_anchor.remove(&svc_id.0)
     }
 
     /// Take and return the most recent dispatch's reply bytes for
@@ -922,6 +941,13 @@ impl<D: DataLayer> VosRuntime<D> {
                     };
                     let continue_next = match applied {
                         Ok(Some(absorbed)) => {
+                            // First applied work-result of this dispatch:
+                            // its anchor is the state the dispatch ran
+                            // against (later chain iterations anchor
+                            // interior states).
+                            if let Some(anchor) = absorbed.anchor {
+                                self.dispatch_anchor.entry(svc_id).or_insert(anchor);
+                            }
                             // Capture the reply bytes for the host's
                             // synchronous-invoke path. Always insert,
                             // even for empty replies (Unit-returning
