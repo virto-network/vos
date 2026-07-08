@@ -49,7 +49,10 @@ operators, and every later type reuses the same voucher/settlement wire.
    `network_reachable` opt-out. Replication is scoped to the operator's
    enrolled nodes via `AgentConfig.members` + `NODE_ROLE_VOTER` voter
    enrollment. (Note the monotone locality **seal**: a `Local` agent can't be
-   widened to `Raft` later — register it `Raft` from the start.)
+   widened to `Raft` later — register it `Raft` from the start.) **DONE** —
+   the example manifests register the ledger `raft` from genesis
+   (`examples/space-bank.toml`, and `examples/space-clerk-demo.toml`), and the
+   settlement venue's `clerk-settle` is `raft` too (`examples/space-venue.toml`).
 
 2. **Role-gate the ledger's read handlers.** A `Raft` ledger answers *any*
    peer, gated only by each handler's own `#[msg(role)]`. Today
@@ -61,12 +64,17 @@ operators, and every later type reuses the same voucher/settlement wire.
    ACLs, not the confinement tier.**
 
 3. **`network_reachable` manifest wiring (④) — for the bridges.** The
-   cross-bank `clerk-bridge` and cross-space `space-bridge` are `Ephemeral`
-   (stateless gateways, no private data) and *must* answer the network. They
-   stay confined-by-default and need the `network_reachable` opt-out threaded
-   from the manifest → the author-signed `AgentRow` (mirrored in
-   `vos/src/registry_canon.rs`, fail-closed drift guard) → `agent_config_from_row`.
-   This is needed regardless of the ledger being `Raft`.
+   cross-bank `clerk-bridge` and cross-space `space-bridge` both *must* answer
+   the network but are node-confined tiers, so both need the
+   `network_reachable` opt-out threaded from the manifest → the author-signed
+   `AgentRow` (mirrored in `vos/src/registry_canon.rs`, fail-closed drift
+   guard) → `agent_config_from_row`. Their state postures differ, and the
+   difference is load-bearing: `space-bridge` is a stateless gateway
+   (`Ephemeral`), but `clerk-bridge` is **`Local`, not `Ephemeral`** — it
+   holds the receiver-side `last_root_after` anchor, the voucher dedup set,
+   AND the per-window receiver-term sums, all of which must survive a restart
+   (an `Ephemeral` restart would zero the receiver sum and reopen the replay
+   window). This is needed regardless of the ledger being `Raft`.
 
 4. **Cross-bank goes through the bridge, never a direct ledger read.** The
    voucher settlement flow never reads a peer's ledger: bank A reads its *own*
@@ -77,8 +85,9 @@ operators, and every later type reuses the same voucher/settlement wire.
 
 Trust model for Wave 1: mutually-known operators. Vouchers settle on
 `Mode::Signature` (the issuer vouches with its clerk key) or the
-`Mode::External` real-STARK proof — the receiver-side prior-state **anchor** is
-not yet wired, which is acceptable while peers are pre-shared and trusted.
+`Mode::External` real-STARK proof — the receiver-side prior-state **anchor**
+(F2) is now wired (below), and cross-window continuity is grounded by
+per-window settlement on the venue.
 
 ## Why confinement works the way it does
 
@@ -92,9 +101,10 @@ reason the gate exists).
 
 The subtlety: *state shareability* and *network reachability* are correlated
 but not identical. The messenger is confined-state **and** network-private
-(aligned). But the `Ephemeral` bridges hold nothing private yet must answer the
-network, and a `Raft` ledger answers the network yet has a private read
-surface. `AgentConfig.network_reachable` is the per-actor patch that decouples
+(aligned). But the bridges must answer the network yet are node-confined tiers
+(the `Ephemeral` `space-bridge` holds nothing; the `Local` `clerk-bridge`
+holds the anchor/dedup/window state but nothing *private*), and a `Raft` ledger
+answers the network yet has a private read surface. `AgentConfig.network_reachable` is the per-actor patch that decouples
 the two axes; the finer long-term boundary is **per-handler visibility** (a
 `network_visible` flag mirroring the existing `exposed_to_cli` per-`#[msg]`
 flag), so consistency goes back to meaning only *state* shareability. Not
@@ -123,8 +133,11 @@ pieces:
   whose ledger advances off this channel (a voucher to a different receiver, or
   any non-vouchered transfer) declares an unseen `state_root_before` and is
   rejected, and since rejections don't advance the cursor the channel can wedge
-  until settlement. There is no wedge-recovery in Wave 1 by design; the
-  sanctioned recovery is the Wave-2 on-chain settlement anchor.
+  until settlement. The sanctioned recovery is settlement itself: the venue
+  (`clerk-settle`) reconciles the window's two net-flow claims, and each bank's
+  operator then calls `anchor_reset(peer, settled_closing_root)` on its
+  `clerk-bridge` to re-anchor `last_root_after` and re-open the channel for the
+  next window. (Wave 2 moves the same claim reconciliation on-chain.)
 - **On-chain settlement-verifier** (the real backstop): each bank proves its
   vault delta on-chain and the chain runs the inter-vault zero-sum
   reconciliation (`zkpvm/settlement-verifier`, Poseidon2-M31; `build-settle`

@@ -108,7 +108,31 @@ decoding.
   sanctioned recovery for the F2 fail-closed wedge. Two-bank e2e now proves
   wedge → recovery: a non-chaining voucher is `VoucherInvalid`, then
   `anchor_reset` re-anchors and the same voucher chains (`Ok`).
-- **S5/S6** — next: manifests + multi-node 3-space e2e.
+- **S5** — done. Example manifests `examples/space-bank-a.toml`,
+  `space-bank-b.toml`, `space-venue.toml` (bank: clerk-ledger `raft` +
+  clerk-bridge `local`+`network_reachable`; venue: clerk-settle `raft`;
+  shared `hyperspace = "bank-federation"`). `space-clerk-demo.toml` updated
+  to the same postures (closes bank-federation.md item 1 in-repo).
+  `bank-federation.md` corrected: the "Ephemeral bridges" wording now
+  distinguishes the stateless `space-bridge` (`Ephemeral`) from the stateful
+  `clerk-bridge` (`Local`); item 1 marked DONE; the F2 anchor marked wired;
+  the wedge-recovery paragraph now points to settlement + `anchor_reset`.
+- **S6** — next: multi-node 3-space e2e.
+
+## S5 finding — auto replication_id is NOT space-scoped (trap for S7 / bloque)
+
+`vosx`'s `auto_replication_id(agent_name, program_hash)`
+(`vosx/src/commands/space/common.rs`, called from `reconcile.rs`) hashes
+only `(name, blob)` — no `space_id`. So two DIFFERENT spaces that name an
+agent identically with the same ELF and leave `replication_id = "auto"`
+collide into ONE replication group. For the federation (bank-a and bank-b
+both name their ledger `clerk-ledger`), that would merge the two banks'
+Raft ledgers. The reference bank manifests therefore **pin a distinct
+`replication_id` per bank**; the operational bloque manifests must do the
+same (or use per-bank agent names). The venue is unaffected (single venue,
+distinct `clerk-settle` name). Worth considering folding `space_id` into
+`auto_replication_id` in `vosx` (workstream F), which would make `"auto"`
+safe across spaces.
 
 ## S4 close-protocol conventions (for the S3 driver / S9 runbook)
 
