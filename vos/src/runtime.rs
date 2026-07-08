@@ -523,6 +523,12 @@ pub type ExternalInvokeFn = Box<dyn Fn(ServiceId, &[u8]) -> Option<ExternalInvok
 pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     blobs: Vec<Vec<u8>>,
     blob_by_hash: HashMap<[u8; 32], usize>,
+    /// Witness-buffer address per **Task** blob (code hash →
+    /// `__VOS_WITNESS` flat-memory offset). Registration here is what
+    /// makes a full-hash INVOKE run in Task mode: `(state, msg)`
+    /// patched into the initial image, tracer-parity hostcalls, no
+    /// child rows, effects folded into the parent's keyspace.
+    task_witness: HashMap<[u8; 32], u32>,
     services: HashMap<u32, ServiceInfo>,
     next_id: u32,
     pub storage: ServiceStorage,
@@ -611,6 +617,7 @@ impl<D: DataLayer> VosRuntime<D> {
         Self {
             blobs: Vec::new(),
             blob_by_hash: HashMap::new(),
+            task_witness: HashMap::new(),
             services: HashMap::new(),
             next_id: 1,
             storage: ServiceStorage::new(),
@@ -766,6 +773,46 @@ impl<D: DataLayer> VosRuntime<D> {
         self.register_blob(blob)
     }
 
+    /// Register a **Task** blob: an anonymous, code-hash-identified pure
+    /// child (`vos::agent::Tasks`, `Child::Task`). `witness_addr` is the
+    /// blob's `__VOS_WITNESS` flat-memory offset (from the ELF symbol,
+    /// [`crate::zk::witness_addr`] — the transpiled blob preserves the
+    /// layout). Returns the content hash parents invoke by. Tasks get no
+    /// ServiceId and no storage row; a full-hash INVOKE of this hash
+    /// runs witness-delivered.
+    pub fn register_task_blob(&mut self, blob: Vec<u8>, witness_addr: u32) -> [u8; 32] {
+        let hash = blob_hash(&blob);
+        self.register_blob(blob);
+        self.task_witness.insert(hash, witness_addr);
+        hash
+    }
+
+    /// The initial memory image a Task invocation of `code_hash` with
+    /// `(state, msg)` executes from — built through the same kernel +
+    /// patch path the live INVOKE uses. This is the live half of the
+    /// live≡traced equality gate: a prover patching the same input at
+    /// the same witness address into the unmodified blob must arrive at
+    /// this exact image.
+    pub fn task_initial_image(
+        &mut self,
+        code_hash: &[u8; 32],
+        state: &[u8],
+        msg: &[u8],
+    ) -> Option<Vec<u8>> {
+        let &witness_addr = self.task_witness.get(code_hash)?;
+        let &blob_idx = self.blob_by_hash.get(code_hash)?;
+        let blob = self.blobs.get(blob_idx)?;
+        let input = crate::task_abi::encode_task_input(state, msg);
+        let kernel = build_task_kernel(
+            blob,
+            witness_addr,
+            &input,
+            DEFAULT_GAS,
+            &mut self.code_cache,
+        )?;
+        Some(kernel.extract_flat_mem().0)
+    }
+
     pub fn register_service(&mut self, blob_idx: usize) -> ServiceId {
         let id = self.next_id;
         self.next_id += 1;
@@ -856,6 +903,7 @@ impl<D: DataLayer> VosRuntime<D> {
 
         let blobs = &self.blobs;
         let blob_by_hash = &self.blob_by_hash;
+        let task_witness = &self.task_witness;
         let services = &self.services;
         let storage = &mut self.storage;
         let refine_gas = self.gas.refine_gas;
@@ -944,6 +992,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     &self.preimages,
                     blobs,
                     blob_by_hash,
+                    task_witness,
                     services,
                     &mut self.effect_mode,
                     &mut self.code_cache,
@@ -1201,6 +1250,7 @@ fn run_refine_kernel(
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    task_witness: &HashMap<[u8; 32], u32>,
     services: &HashMap<u32, ServiceInfo>,
     mode: &mut crate::effect_log::EffectMode,
     code_cache: &mut javm::CodeCache,
@@ -1242,6 +1292,7 @@ fn run_refine_kernel(
                     preimages,
                     blobs,
                     blob_by_hash,
+                    task_witness,
                     services,
                     code_cache,
                     0,
@@ -1268,6 +1319,7 @@ fn handle_refine_hostcall(
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    task_witness: &HashMap<[u8; 32], u32>,
     services: &HashMap<u32, ServiceInfo>,
     code_cache: &mut javm::CodeCache,
     depth: usize,
@@ -1445,8 +1497,10 @@ fn handle_refine_hostcall(
         hostcall::INVOKE => {
             let result = handle_invoke(
                 kernel,
+                svc_id,
                 blobs,
                 blob_by_hash,
+                task_witness,
                 services,
                 storage,
                 preimages,
@@ -1534,14 +1588,245 @@ fn record_and_write_invoke(
     output.len() as u64
 }
 
+/// Split an invoke input `[state_len: u32 LE][state][msg]` into its
+/// halves. Inputs shorter than the length prefix are all message
+/// (legacy raw invokes).
+fn split_invoke_input(input: &[u8]) -> (&[u8], &[u8]) {
+    if input.len() >= 4 {
+        let state_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+        let state_end = (4 + state_len).min(input.len());
+        (&input[4..state_end], &input[state_end..])
+    } else {
+        (&[], input)
+    }
+}
+
+/// Build a Task child's kernel: fresh instance from the blob, VOS
+/// precompile caps installed, `(state, msg)` input patched into the
+/// initial image at the blob's witness address — the exact image a
+/// prover's `trace_blob_with_patches` reconstructs from the unmodified
+/// blob plus the same patch.
+fn build_task_kernel(
+    blob: &[u8],
+    witness_addr: u32,
+    input: &[u8],
+    gas: Gas,
+    code_cache: &mut javm::CodeCache,
+) -> Option<InvocationKernel> {
+    let mut child = InvocationKernel::new_cached(blob, &[], gas, code_cache).ok()?;
+    install_vos_precompile_caps(&mut child);
+    child.set_active_reg(7, 0);
+    let _ = child
+        .vm_arena
+        .vm_mut(0)
+        .transition(javm::vm_pool::VmState::Running);
+    kwrite(&mut child, witness_addr, input);
+    Some(child)
+}
+
+/// Serve one hostcall of a Task child with EXACTLY the observable
+/// semantics `zkpvm`'s `TracingPvm::run_with_vos_stubs` gives the
+/// traced re-execution — this table is the live half of live≡proved:
+///
+/// - the blake2b precompile executes natively (the tracer runs it too,
+///   constrained in-circuit by Blake2bChip) with registers echoed back
+///   untouched, exactly as the tracer leaves them;
+/// - `GAS`/`FETCH`/`STORAGE_R`/`STORAGE_W`/`INFO`/`DEBUG_WRITE`/`OUTPUT`
+///   echo the registers untouched — the tracer's "lucky stub" set. A
+///   Task built on `run_task_service` never issues the input ones
+///   (witness-delivered, READ/FETCH-free by construction); a handler
+///   that does gets the same garbage the trace would. `DEBUG_WRITE`
+///   additionally mirrors to stderr — a host-side effect the guest
+///   cannot observe;
+/// - everything else (INVOKE, TRANSFER, NOW_MS, the ristretto
+///   precompiles — no vos host handler yet, though the tracer has one)
+///   returns `false`: fail loud, exactly where the tracer would end the
+///   trace un-halted and the proof could not complete.
+fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
+    let echo7 = kernel.active_reg(7);
+    let echo8 = kernel.active_reg(8);
+    match call_id {
+        crate::crypto::ECALL_BLAKE2B_COMPRESS => {
+            let h_ptr = kernel.active_reg(7) as u32;
+            let m_ptr = kernel.active_reg(8) as u32;
+            let t_low = kernel.active_reg(9);
+            let f_flag = kernel.active_reg(10) != 0;
+            let h_bytes = kread(kernel, h_ptr, 64);
+            let m_bytes = kread(kernel, m_ptr, 128);
+            if h_bytes.len() != 64 || m_bytes.len() != 128 {
+                return false;
+            }
+            let mut h: [u8; 64] = h_bytes.try_into().unwrap();
+            let m: [u8; 128] = m_bytes.try_into().unwrap();
+            crate::crypto::blake2b::host_compress_block(&mut h, &m, t_low as u128, f_flag);
+            kwrite(kernel, h_ptr, &h);
+        }
+        hostcall::GAS
+        | hostcall::FETCH
+        | hostcall::STORAGE_R
+        | hostcall::STORAGE_W
+        | hostcall::INFO
+        | hostcall::OUTPUT => {}
+        hostcall::DEBUG_WRITE => {
+            let buf = kread(kernel, echo7 as u32, echo8 as usize);
+            let _ = std::io::stderr().write_all(&buf);
+            let _ = std::io::stderr().flush();
+        }
+        other => {
+            error!(call_id = other, "task child: hostcall outside the refine-pure set");
+            return false;
+        }
+    }
+    kernel.resume_protocol_call(echo7, echo8);
+    true
+}
+
+/// Run a witness-delivered Task invocation (the A9 invoke mode): patch
+/// `(state, msg)` into the child's initial image, run it under the
+/// tracer-parity hostcall table, verify + convert its v3 work-result.
+/// No child ServiceId, no child storage row — the extracted state goes
+/// to the parent's envelope and the remaining effects fold into the
+/// PARENT's keyspace.
+#[allow(clippy::too_many_arguments)]
+fn run_task_invoke(
+    caller: &mut InvocationKernel,
+    blob: &[u8],
+    witness_addr: u32,
+    parent_svc_id: u32,
+    state: &[u8],
+    msg: &[u8],
+    gas: Gas,
+    journal: &mut RefineJournal,
+    code_cache: &mut javm::CodeCache,
+    output_ptr: u32,
+    output_buf_len: usize,
+    depth: usize,
+    mode: &mut crate::effect_log::EffectMode,
+) -> u64 {
+    use crate::actors::run::{STATUS_DONE, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED};
+
+    let input = crate::task_abi::encode_task_input(state, msg);
+    let Some(mut child) = build_task_kernel(blob, witness_addr, &input, gas, code_cache) else {
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_PANICKED],
+            depth,
+            mode,
+        );
+    };
+
+    let invoke_mark = journal.mark();
+    loop {
+        match child.run() {
+            KernelResult::Halt(_) => break,
+            KernelResult::Panic | KernelResult::PageFault(_) => {
+                journal.rollback_to(invoke_mark);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    output_buf_len,
+                    &[STATUS_PANICKED],
+                    depth,
+                    mode,
+                );
+            }
+            KernelResult::OutOfGas => {
+                journal.rollback_to(invoke_mark);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    output_buf_len,
+                    &[STATUS_OOG],
+                    depth,
+                    mode,
+                );
+            }
+            KernelResult::ProtocolCall { slot } => {
+                if !handle_task_hostcall(&mut child, slot as u32) {
+                    journal.rollback_to(invoke_mark);
+                    return record_and_write_invoke(
+                        caller,
+                        output_ptr,
+                        output_buf_len,
+                        &[STATUS_PANICKED],
+                        depth,
+                        mode,
+                    );
+                }
+            }
+        }
+    }
+
+    let out_ptr = child.active_reg(7) as u32;
+    let out_len = (child.active_reg(8) as usize).min(1 << 20);
+    let raw_output = kread(&child, out_ptr, out_len);
+
+    // Tasks are v3-native — run_task_service is the only entry that can
+    // produce this halt shape; anything else is a mis-built blob.
+    let payload = match RefinePayload::decode(&raw_output) {
+        Some(p) if p.version == crate::refine_payload::REFINE_PAYLOAD_VERSION => p,
+        _ => {
+            error!(parent_svc_id, "task child: halt output is not a v3 work-result");
+            journal.rollback_to(invoke_mark);
+            return record_and_write_invoke(
+                caller,
+                output_ptr,
+                output_buf_len,
+                &[STATUS_PANICKED],
+                depth,
+                mode,
+            );
+        }
+    };
+    let mut payload = payload;
+
+    // Parity: the child's anchor must commit to exactly the state the
+    // parent delivered (genesis when it delivered none).
+    let expected = crate::refine_payload::anchor_for(Some(state));
+    if (payload.anchor_kind, payload.anchor) != expected {
+        error!(parent_svc_id, "task child: work-result anchor mismatch");
+        journal.rollback_to(invoke_mark);
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_PANICKED],
+            depth,
+            mode,
+        );
+    }
+
+    // Child state to the parent envelope (echo the input when
+    // unchanged); every remaining effect folds into the PARENT's
+    // keyspace — a Task has no rows of its own.
+    let child_state = payload.take_state_write().unwrap_or_else(|| state.to_vec());
+    journal.absorb_effects(core::mem::take(&mut payload.effects), parent_svc_id);
+
+    let status = if payload.continue_next {
+        STATUS_YIELDED
+    } else {
+        STATUS_DONE
+    };
+    let mut out = Vec::with_capacity(1 + 4 + child_state.len() + payload.reply.len());
+    out.push(status);
+    out.extend_from_slice(&(child_state.len() as u32).to_le_bytes());
+    out.extend_from_slice(&child_state);
+    out.extend_from_slice(&payload.reply);
+    record_and_write_invoke(caller, output_ptr, output_buf_len, &out, depth, mode)
+}
+
 /// Handle INVOKE: run a child PVM at PC=0 (refine). The child reads
 /// storage via the parent's snapshot and writes effects into the
 /// parent's journal, so nested invokes share the parent's commit.
 #[allow(clippy::too_many_arguments)]
 fn handle_invoke(
     caller: &mut InvocationKernel,
+    parent_svc_id: u32,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    task_witness: &HashMap<[u8; 32], u32>,
     services: &HashMap<u32, ServiceInfo>,
     storage: &mut ServiceStorage,
     preimages: &HashMap<[u8; 32], Vec<u8>>,
@@ -1596,6 +1881,38 @@ fn handle_invoke(
     }
 
     let code_hash = kread_hash(caller, hash_ptr);
+
+    // Task mode: a full-hash invoke of a registered Task blob runs
+    // witness-delivered — `(state, msg)` patched into the initial
+    // image, no ServiceId, no storage row, effects folded into the
+    // invoking parent's keyspace.
+    if let Some(&witness_addr) = task_witness.get(&code_hash)
+        && let Some(&blob_idx) = blob_by_hash.get(&code_hash)
+        && let Some(blob) = blobs.get(blob_idx)
+    {
+        let input = kread(caller, input_ptr, input_len);
+        let (state, msg) = split_invoke_input(&input);
+        let gas = if gas_limit == 0 {
+            DEFAULT_GAS
+        } else {
+            gas_limit.min(DEFAULT_GAS)
+        };
+        return run_task_invoke(
+            caller,
+            blob,
+            witness_addr,
+            parent_svc_id,
+            state,
+            msg,
+            gas,
+            journal,
+            code_cache,
+            output_ptr,
+            output_buf_len,
+            depth,
+            mode,
+        );
+    }
 
     // The actor framework's `service_code_hash(svc_id)` packs the
     // target ServiceId into the first 4 bytes of `code_hash` and
@@ -1836,6 +2153,7 @@ fn handle_invoke(
                     preimages,
                     blobs,
                     blob_by_hash,
+                    task_witness,
                     services,
                     code_cache,
                     depth,
