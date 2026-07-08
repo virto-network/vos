@@ -342,6 +342,33 @@ impl RefinePayload {
     }
 }
 
+/// The folded public layout for provable Tasks (frozen with this wire):
+///
+/// ```text
+/// public' = anchor_kind (1) || anchor (32) || transition_digest (32)
+///           || app_public_bytes
+/// ```
+///
+/// The fixed-width prefix makes the fold injective. Guests bind
+/// `io_hash(public', reply)` at halt; verifiers reconstruct `public'`
+/// identically before the io-hash equality check. Sound only when
+/// composed with the entering-memory-image root check — the state
+/// anchor and the image root do different jobs and neither subsumes
+/// the other.
+pub fn folded_public(
+    anchor_kind: u8,
+    anchor: &[u8; 32],
+    transition_digest: &[u8; 32],
+    app_public: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(65 + app_public.len());
+    out.push(anchor_kind);
+    out.extend_from_slice(anchor);
+    out.extend_from_slice(transition_digest);
+    out.extend_from_slice(app_public);
+    out
+}
+
 /// Encode the legacy v2 wire. The guest framework no longer emits it;
 /// this pins the format already-installed blobs speak so host-compat
 /// paths (version dispatch, state-field synthesis) stay testable.
