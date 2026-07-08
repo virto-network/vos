@@ -6733,6 +6733,7 @@ mod tests {
                     .with("consistency", consistency as u64)
                     .with("install_args", Vec::<u8>::new())
                     .with("install_payloads", Vec::<u8>::new())
+                    .with("network_reachable", false)
                     .with(
                         "auth",
                         auth_as(
@@ -6748,6 +6749,7 @@ mod tests {
                                 &[consistency],
                                 &[],
                                 &[],
+                                &[0u8], // network_reachable = false
                             ],
                         ),
                     ),
