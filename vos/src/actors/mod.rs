@@ -19,6 +19,7 @@ pub mod init;
 pub mod lifecycle;
 pub mod metadata;
 pub mod run;
+pub mod tasks;
 pub mod value;
 
 /// Cooperative multi-task executor for native extensions. Only compiled in an

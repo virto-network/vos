@@ -166,6 +166,12 @@ pub use actors::run_task_entry;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 
+/// The agent model: parent-managed children — `Tasks` tables of
+/// `Child::{Task, Peer}` records, spawned and driven from handlers.
+pub mod agent {
+    pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
+}
+
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]
 pub mod hostcalls {
