@@ -1743,8 +1743,13 @@ fn handle_invoke(
     // Journal the state onto the child's row under STATE_KEY so service
     // children (run_refine_service) can cold-start via READ — through
     // the journal, not a direct storage write, so a trapped dispatch
-    // rolls it back with everything else. Also deliver as FETCH items
-    // for legacy children (run_refine).
+    // rolls it back with everything else. Only the message is delivered
+    // as a FETCH item: a state item would be consumed by the service
+    // child's message loop, where an empty one (fresh spawn) reads as
+    // "no more mail" and stops the loop before the message arrives, and
+    // a non-empty one mis-dispatches as a message. The FETCH-delivered
+    // state channel (`run_refine` legacy children) is retired; READ is
+    // the one state channel.
     let mut child_items = if input.len() >= 4 {
         let state_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
         let state_end = (4 + state_len).min(input.len());
@@ -1758,11 +1763,11 @@ fn handle_invoke(
             ));
         }
 
-        let mut items = vec![state.to_vec()];
         if state_end < input.len() {
-            items.push(input[state_end..].to_vec());
+            vec![input[state_end..].to_vec()]
+        } else {
+            Vec::new()
         }
-        items
     } else {
         vec![input]
     };
