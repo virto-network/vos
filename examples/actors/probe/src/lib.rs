@@ -65,4 +65,18 @@ impl Probe {
     async fn tell_out(&mut self, ctx: &mut Context<Self>, target: u32) {
         ctx.tell(ServiceId(target), &Msg::new("noop"));
     }
+
+    /// Invoke `child` through a deliberately tiny output buffer and
+    /// report the resulting status byte, so a test can tell an oversize
+    /// reply (`STATUS_TOO_BIG`) from a crash (`STATUS_PANICKED`) or a
+    /// reply that fits (`STATUS_DONE`). The small buffer drives the host's
+    /// buffer-cap path regardless of the child's actual size.
+    #[msg]
+    async fn ask_small_buf(&mut self, _ctx: &mut Context<Self>, child: u32) -> u8 {
+        let hash = vos::service_code_hash(child);
+        let input = [0u8; 4]; // state_len = 0, no message
+        let mut out = [0u8; 512];
+        let n = vos::hostcalls::invoke(&hash, &input, 0, &mut out) as usize;
+        if n >= 1 { out[0] } else { vos::STATUS_DONE }
+    }
 }

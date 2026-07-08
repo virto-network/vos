@@ -10419,3 +10419,46 @@ fn probe_panic_discards_absorbed_child_effect() {
         "the leaker's absorbed write must be discarded when the asking parent traps"
     );
 }
+
+#[test]
+fn probe_ask_status_distinguishes_too_big_from_crash() {
+    // A5: an oversize child reply comes back as STATUS_TOO_BIG, distinct
+    // from a crash (STATUS_PANICKED). The 4 KiB child-invoke wall used to
+    // substitute PANICKED for an over-buffer reply, conflating the two.
+    // `bloat` fills 80 KiB of state (past the 64 KiB INVOKE buffer);
+    // `crasher` page-faults; `leaker` returns a small reply that fits.
+    use vos::value::{Msg, TAG_DYNAMIC, Value};
+    use vos::{Decode, Encode};
+
+    let mut rt = VosRuntime::new();
+    let probe = register_svc(&mut rt, transpile_actor(&example_elf("probe")));
+    let bloat = register_svc(&mut rt, transpile_actor(&example_elf("bloat")));
+    let crasher = register_svc(&mut rt, transpile_actor(&example_elf("crasher")));
+    let leaker = register_svc(&mut rt, transpile_actor(&example_elf("leaker")));
+
+    let mut ask = |rt: &mut VosRuntime, child: u32| -> u8 {
+        let enc = Msg::new("ask_small_buf").with("child", child).encode();
+        let mut m = vec![TAG_DYNAMIC];
+        m.extend_from_slice(&enc);
+        rt.send_to(probe, m);
+        rt.run_blocking();
+        let reply = rt.take_last_reply(probe).expect("ask_small_buf produced no reply");
+        <Value as Decode>::decode(&reply).as_u8().expect("ask_small_buf returns u8")
+    };
+
+    assert_eq!(
+        ask(&mut rt, bloat.0),
+        vos::STATUS_TOO_BIG,
+        "an oversize child reply must surface as TOO_BIG, not a crash"
+    );
+    assert_eq!(
+        ask(&mut rt, crasher.0),
+        vos::STATUS_PANICKED,
+        "a genuinely crashing child stays PANICKED"
+    );
+    assert_eq!(
+        ask(&mut rt, leaker.0),
+        vos::STATUS_DONE,
+        "a small child reply fits and completes normally"
+    );
+}

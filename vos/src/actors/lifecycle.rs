@@ -248,6 +248,8 @@ pub enum InvokeResult {
     NotFound,
     /// Actor ran out of gas.
     OutOfGas,
+    /// Child's reply exceeded the caller's output buffer.
+    TooBig,
     /// Unknown error status byte.
     Error(u8),
 }
@@ -278,10 +280,18 @@ pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult
     input[4 + state.len()..].copy_from_slice(message);
 
     let hash = super::run::service_code_hash(service_id);
+    // Reply buffer. Kept on the stack at BUF_SIZE: heap-allocating a
+    // larger one corrupts the guest heap of actors that already use most
+    // of the fixed 256 KiB arena (the clerk ledger), and GROW_HEAP is a
+    // host no-op, so the reply ceiling cannot be raised without first
+    // growing the guest heap. A reply past BUF_SIZE still surfaces as
+    // STATUS_TOO_BIG (below) rather than a truncated crash.
     let mut output = [0u8; BUF_SIZE];
     let n = crate::abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
 
-    use super::run::{STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED};
+    use super::run::{
+        STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_TOO_BIG, STATUS_YIELDED,
+    };
 
     // Short output = error status byte only (no state/reply envelope)
     if n < 5 {
@@ -290,6 +300,7 @@ pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult
                 STATUS_PANICKED => InvokeResult::Panicked,
                 STATUS_NOT_FOUND => InvokeResult::NotFound,
                 STATUS_OOG => InvokeResult::OutOfGas,
+                STATUS_TOO_BIG => InvokeResult::TooBig,
                 STATUS_DONE => InvokeResult::Done {
                     state: Vec::new(),
                     reply: Vec::new(),

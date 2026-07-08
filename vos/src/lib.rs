@@ -149,8 +149,8 @@ pub use actors::{
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
-    STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED,
-    service_code_hash,
+    InvokeStatus, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
+    STATUS_TOO_BIG, STATUS_YIELDED, service_code_hash,
 };
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the

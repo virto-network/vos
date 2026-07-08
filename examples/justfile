@@ -20,6 +20,8 @@ build:
     cd actors/pushy && cargo actor
     cd actors/probe && cargo actor
     cd actors/leaker && cargo actor
+    cd actors/bloat && cargo actor
+    cd actors/crasher && cargo actor
 
 run: build
     cargo run --manifest-path ../Cargo.toml -p vosx -- start space.toml --no-persist

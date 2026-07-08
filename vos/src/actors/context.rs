@@ -318,6 +318,7 @@ impl<A: Actor> Context<A> {
                 InvokeResult::Panicked => super::run::Ask::ready_err(InvokeError::Panicked),
                 InvokeResult::NotFound => super::run::Ask::ready_err(InvokeError::NotFound),
                 InvokeResult::OutOfGas => super::run::Ask::ready_err(InvokeError::OutOfGas),
+                InvokeResult::TooBig => super::run::Ask::ready_err(InvokeError::TooBig),
                 InvokeResult::Error(s) => super::run::Ask::ready_err(InvokeError::Unknown(s)),
             }
         }

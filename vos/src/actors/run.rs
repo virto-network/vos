@@ -379,21 +379,38 @@ fn halt_with_output_bound(_data: &[u8], _io_hash: &[u8; 32]) -> ! {
     panic!("halt_with_output_bound is only supported on RISC-V targets");
 }
 
-/// Exit status: actor processed all messages normally.
-pub const STATUS_DONE: u8 = 0x00;
-/// Exit status: actor handler yielded (wants re-invocation).
-pub const STATUS_YIELDED: u8 = 0x01;
-/// Exit status: child actor panicked during invoke.
-pub const STATUS_PANICKED: u8 = 0x02;
-/// Exit status: target service not found during invoke.
-pub const STATUS_NOT_FOUND: u8 = 0x03;
-/// Exit status: child actor ran out of gas during invoke.
-pub const STATUS_OOG: u8 = 0x04;
-/// Refusal status: the dispatch-layer auth gate denied the call
-/// before the target actor ran. Distinct from `STATUS_PANICKED`
-/// so a refused remote caller surfaces "permission denied" rather
-/// than colliding with a real actor panic.
-pub const STATUS_FORBIDDEN: u8 = 0x05;
+/// First byte of a refine exit status / INVOKE reply envelope.
+/// Wire-stable discriminants — do not renumber.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvokeStatus {
+    /// Actor processed all messages normally.
+    Done = 0x00,
+    /// Handler yielded (wants re-invocation).
+    Yielded = 0x01,
+    /// Child actor trapped (panic / page fault) during invoke.
+    Panicked = 0x02,
+    /// Target service not found during invoke.
+    NotFound = 0x03,
+    /// Child actor ran out of gas during invoke.
+    OutOfGas = 0x04,
+    /// Dispatch-layer auth gate denied the call before the target
+    /// ran. Distinct from `Panicked` so a refused caller surfaces
+    /// "permission denied" rather than colliding with a real panic.
+    Forbidden = 0x05,
+    /// Child's reply exceeded the caller's output buffer. Distinct
+    /// from `Panicked` so an oversize reply is not misreported as a
+    /// crash.
+    TooBig = 0x06,
+}
+
+pub const STATUS_DONE: u8 = InvokeStatus::Done as u8;
+pub const STATUS_YIELDED: u8 = InvokeStatus::Yielded as u8;
+pub const STATUS_PANICKED: u8 = InvokeStatus::Panicked as u8;
+pub const STATUS_NOT_FOUND: u8 = InvokeStatus::NotFound as u8;
+pub const STATUS_OOG: u8 = InvokeStatus::OutOfGas as u8;
+pub const STATUS_FORBIDDEN: u8 = InvokeStatus::Forbidden as u8;
+pub const STATUS_TOO_BIG: u8 = InvokeStatus::TooBig as u8;
 
 // ── Service refine phase (PC=0, JAM-pure) ─────────────────────────────
 

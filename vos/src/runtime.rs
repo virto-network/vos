@@ -1265,19 +1265,20 @@ fn handle_refine_hostcall(
 /// carries a non-zero length in its high 32 bits (`output_buf_len`),
 /// the runtime refuses to write more than that into the caller's
 /// PVM memory. An over-cap reply is replaced with a one-byte
-/// `STATUS_PANICKED` envelope at the caller's `output_ptr`, so the
-/// guest sees `InvokeError::Panicked` rather than having its stack
-/// silently overrun. A length of 0 means a legacy guest predating
-/// the ABI extension — fall through to the unbounded write.
+/// `STATUS_TOO_BIG` envelope at the caller's `output_ptr`, so the
+/// guest sees `InvokeError::TooBig` — distinct from a crash — rather
+/// than having its buffer silently overrun. A length of 0 means a
+/// legacy guest predating the ABI extension — fall through to the
+/// unbounded write.
 ///
 /// **Recording cap enforcement.** When recording, the session
 /// carries a per-reply byte cap (16 KiB by default). Outputs larger
 /// than that cap are replaced — both in the log and in the caller's
-/// buffer — with a single STATUS_PANICKED byte. The caller's PVM
-/// observes `InvokeError::Panicked`; replay reproduces the same
-/// observation bit-for-bit. The intent is to keep DAG nodes bounded
-/// so a runaway worker can't poison consensus replicas with multi-MB
-/// payloads.
+/// buffer — with a single STATUS_PANICKED byte. This is a distinct
+/// consensus-safety truncation (SOUND-1) from the buffer cap above:
+/// it keeps DAG nodes bounded so a runaway worker can't poison
+/// consensus replicas with multi-MB payloads, and it stays PANICKED
+/// so the recorded observation is unchanged.
 fn record_and_write_invoke(
     caller: &mut InvocationKernel,
     output_ptr: u32,
@@ -1286,15 +1287,15 @@ fn record_and_write_invoke(
     depth: usize,
     mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
-    use crate::actors::run::STATUS_PANICKED;
+    use crate::actors::run::{STATUS_PANICKED, STATUS_TOO_BIG};
 
-    // Buffer cap fires first — if the reply doesn't fit in the
-    // caller's PVM buffer, kwrite would overrun. Surface it as a
-    // panic. This also feeds the recording log a STATUS_PANICKED
-    // marker (see Recording branch below), so replay sees the
-    // same observation.
+    // Buffer cap fires first — if the reply doesn't fit in the caller's
+    // PVM buffer, kwrite would overrun. Surface a distinct STATUS_TOO_BIG
+    // (not STATUS_PANICKED) so the guest can tell an oversize reply from a
+    // real crash. Feed the recording log the same marker so replay sees
+    // the same observation.
     if output_buf_len > 0 && output.len() > output_buf_len {
-        let truncated = alloc::vec![STATUS_PANICKED];
+        let truncated = alloc::vec![STATUS_TOO_BIG];
         if depth == 1
             && let crate::effect_log::EffectMode::Recording(s) = mode
         {
@@ -1307,6 +1308,8 @@ fn record_and_write_invoke(
     if depth == 1
         && let crate::effect_log::EffectMode::Recording(s) = mode
     {
+        // Consensus-safety cap (SOUND-1): stays STATUS_PANICKED so the
+        // recorded/replayed observation is unchanged.
         if output.len() > s.cap() {
             let truncated = alloc::vec![STATUS_PANICKED];
             s.record(truncated.clone());
@@ -1602,7 +1605,7 @@ fn handle_invoke(
     // invoke wire format [status:u8][state_len:u32][state][reply] so the
     // caller's guest-side invoke_raw can parse it uniformly.
     let out_ptr = child.active_reg(7) as u32;
-    let out_len = (child.active_reg(8) as usize).min(4096);
+    let out_len = (child.active_reg(8) as usize).min(1 << 20);
     let raw_output = kread(&child, out_ptr, out_len);
 
     let output = if let Some(payload) = RefinePayload::decode(&raw_output) {

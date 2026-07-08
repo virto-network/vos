@@ -40,8 +40,9 @@ pub use exec::{ExecIo, TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
 pub use run::{
-    Ask, HostIo, RunResult, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG,
-    STATUS_PANICKED, STATUS_YIELDED, Yield, noop_waker, run_blocking, service_code_hash, try_poll,
+    Ask, HostIo, InvokeStatus, RunResult, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND,
+    STATUS_OOG, STATUS_PANICKED, STATUS_TOO_BIG, STATUS_YIELDED, Yield, noop_waker, run_blocking,
+    service_code_hash, try_poll,
 };
 #[cfg(feature = "service")]
 pub use run::run_refine_service;
