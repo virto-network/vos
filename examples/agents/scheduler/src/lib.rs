@@ -1,56 +1,24 @@
-//! Scheduler agent — orchestrator that drives guest actors via invoke().
+//! Scheduler agent — orchestrator driving children through
+//! `vos::agent::Tasks`.
 //!
-//! Runs as a full JAM service (refine+accumulate). Discovers registered actors
-//! from init args (written to storage by the host), and accepts runtime
-//! `install` messages to register new actors dynamically.
+//! Peers (registered actors discovered from init args or installed at
+//! runtime) and anonymous code-hash Tasks share one table: spawn queues
+//! a record, `tick` drives every runnable record once, and yielded
+//! children stay in the table as data — their state rides inside this
+//! agent's own committed state.
 //!
-//! On start, sends a dynamic `start` message to each child. Actors without
-//! a `start` handler silently skip it. Actors that yield get re-invoked in
-//! subsequent tick rounds.
+//! On start, sends a dynamic `start` message to each configured child.
+//! Actors without a `start` handler silently skip it. Children that
+//! yield are re-driven in subsequent tick rounds; finished and failed
+//! records stay inspectable through the probe handlers.
 
-use vos::lifecycle::InvokeResult;
+use vos::agent::{Child, Tasks};
 use vos::prelude::*;
-/// No artificial cap — the runtime's per-tick iteration limit + gas
-/// budget provide the safety ceiling. Across ticks, continuations
-/// let the scheduler run indefinitely.
-const MAX_ROUNDS: u32 = u32::MAX;
-
-/// Invoke a child and handle the result. Returns Some(state) if yielded.
-fn invoke_child(svc_id: u32, msg: &Msg, state: &[u8]) -> Option<Vec<u8>> {
-    match lifecycle::invoke(svc_id, msg, state) {
-        InvokeResult::Yielded { state, .. } => Some(state),
-        InvokeResult::Done { .. } => {
-            log::info!("agent: child {} completed", svc_id);
-            None
-        }
-        InvokeResult::Panicked => {
-            log::info!("agent: child {} panicked, dropping", svc_id);
-            None
-        }
-        InvokeResult::NotFound => {
-            log::info!("agent: child {} not found, dropping", svc_id);
-            None
-        }
-        InvokeResult::OutOfGas => {
-            log::info!("agent: child {} out of gas, dropping", svc_id);
-            None
-        }
-        InvokeResult::TooBig => {
-            log::info!("agent: child {} reply too big, dropping", svc_id);
-            None
-        }
-        InvokeResult::Error(s) => {
-            log::info!("agent: child {} error (0x{:02x}), dropping", svc_id, s);
-            None
-        }
-    }
-}
 
 #[actor]
 struct Agent {
     round: u32,
-    /// (service_id, message, actor_state)
-    run_queue: Vec<(u32, Msg, Vec<u8>)>,
+    tasks: Tasks,
     children: Vec<u32>,
 }
 
@@ -58,61 +26,55 @@ struct Agent {
 impl Agent {
     fn new(children: Vec<u32>) -> Self {
         log::info!("agent: init");
-
-        // The host kicks us with a dynamic `start` message — no need to
-        // self-schedule from the constructor (refine forbids raw
-        // TRANSFER hostcalls).
-
         Agent {
             round: 0,
-            run_queue: Vec::new(),
+            tasks: Tasks::new(),
             children,
         }
     }
 
-    /// Register a new actor at runtime and invoke it immediately.
+    /// Register a new peer actor at runtime and drive it immediately.
     #[msg]
     async fn install(&mut self, actor_id: u32, ctx: &mut Context<Self>) {
         self.children.push(actor_id);
         log::info!("agent: installed actor {}", actor_id);
-
-        let start_msg = Msg::new("start");
-        if let Some(state) = invoke_child(actor_id, &start_msg, &[]) {
-            self.run_queue.push((actor_id, start_msg, state));
-            self.maybe_schedule_tick(ctx);
-        }
+        self.tasks.spawn(Child::Peer(actor_id), &Msg::new("start"));
+        self.drive_round(ctx);
     }
 
-    /// Invoke all registered actors with a dynamic `start` message.
+    /// Spawn an anonymous code-hash Task with a pre-encoded message
+    /// and drive it. Returns the task id for the probe handlers.
+    #[msg]
+    async fn run_task(
+        &mut self,
+        code_hash: [u8; 32],
+        task_msg: Vec<u8>,
+        ctx: &mut Context<Self>,
+    ) -> u64 {
+        let id = self.tasks.spawn_raw(Child::Task(code_hash), task_msg);
+        self.drive_round(ctx);
+        id
+    }
+
+    /// Drive all configured peers with a dynamic `start` message.
     /// Actors without a `start` handler silently skip it.
     #[msg]
     async fn start(&mut self, ctx: &mut Context<Self>) {
-        let start_msg = Msg::new("start");
-        for &child_id in &self.children.clone() {
-            if let Some(state) = invoke_child(child_id, &start_msg, &[]) {
-                self.run_queue.push((child_id, start_msg.clone(), state));
-            }
+        for &child_id in &self.children {
+            self.tasks.spawn(Child::Peer(child_id), &Msg::new("start"));
         }
-        self.maybe_schedule_tick(ctx);
+        self.drive_round(ctx);
     }
 
-    /// Re-invoke yielded children.
+    /// Re-drive yielded children.
     #[msg]
     async fn tick(&mut self, ctx: &mut Context<Self>) {
         self.round += 1;
-
-        let queue: Vec<_> = self.run_queue.drain(..).collect();
-        for (svc_id, msg, prev_state) in queue {
-            if let Some(state) = invoke_child(svc_id, &msg, &prev_state) {
-                self.run_queue.push((svc_id, msg, state));
-            }
-        }
-
-        self.maybe_schedule_tick(ctx);
+        self.drive_round(ctx);
     }
 
-    fn maybe_schedule_tick(&self, ctx: &mut vos::Context<Self>) {
-        if !self.run_queue.is_empty() && self.round < MAX_ROUNDS {
+    fn drive_round(&mut self, ctx: &mut vos::Context<Self>) {
+        if self.tasks.drive() > 0 {
             ctx.tell(ctx.id(), &Msg::new("tick"));
         }
     }
@@ -132,5 +94,28 @@ impl Agent {
     async fn get_children(&self) -> Vec<u32> {
         self.children.clone()
     }
-}
 
+    /// Probe — a task's status discriminant
+    /// ([`vos::agent::TaskStatus`]), or 0xFF for an unknown id.
+    #[msg]
+    async fn task_status(&self, id: u64) -> u32 {
+        self.tasks.status(id).map(|s| s as u32).unwrap_or(0xFF)
+    }
+
+    /// Probe — a task's most recent reply bytes.
+    #[msg]
+    async fn task_reply(&self, id: u64) -> Vec<u8> {
+        self.tasks.reply(id).map(|r| r.to_vec()).unwrap_or_default()
+    }
+
+    /// Probe — a task's saved state (its TaskRecord state as of the
+    /// last work-result). The live≡traced gate compares a traced
+    /// re-execution's emitted state against exactly these bytes.
+    #[msg]
+    async fn task_state(&self, id: u64) -> Vec<u8> {
+        self.tasks
+            .get(id)
+            .map(|r| r.state.clone())
+            .unwrap_or_default()
+    }
+}

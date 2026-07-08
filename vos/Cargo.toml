@@ -124,6 +124,12 @@ blake2b_simd = { version = "1", default-features = false }
 # via the test crate's own resolution so the integration tests can
 # `use vos::runtime::*` etc.
 crdt-counter = { path = "../examples/actors/crdt-counter", default-features = false }
+# Scheduler agent (the vos::agent::Tasks reference orchestrator) and
+# the tally Task fixture — dev-deps so host CI compiles their rlibs
+# even without the riscv toolchain; the e2e loads their pre-built ELFs
+# separately. `default-features = false` keeps the PVM bin glue out.
+scheduler = { path = "../examples/agents/scheduler", default-features = false }
+tally = { path = "../examples/actors/tally", default-features = false }
 # Built-in PVM actor — host tests need the typed `SpaceRegistryRef`
 # to drive the registry over the network. `default-features = false`
 # keeps the `bin` (PVM entry-point) glue out of the host link;

@@ -100,6 +100,60 @@ mod from_redb {
 /// `DagNode` wire bytes.
 pub type NodeValidator = alloc::sync::Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>;
 
+/// The whole-agent durable unit for one dispatch: everything the
+/// dispatch's applied work-results changed, committed in one backend
+/// transaction (work-result contract §7).
+pub struct AgentDelta<'a> {
+    /// Ordered storage writes from the applied work-results —
+    /// `STATE_KEY` included, as just another key. No deletes: the wire
+    /// has no delete effect. Tasks have no rows of their own, so this
+    /// stays small.
+    pub writes: &'a [(Vec<u8>, Vec<u8>)],
+    /// `(kind, anchor)` the delta was applied against. NORMATIVE, not
+    /// just audit: replay divergence detection compares each replayed
+    /// dispatch's re-emitted anchor against the value recorded in the
+    /// log node ([`crate::effect_log::EffectLog::anchor`]).
+    /// [`crate::effect_log::ANCHOR_UNRECORDED`] when the dispatch
+    /// carried no anchor (v2 blobs, old-style actors).
+    pub anchor: (u8, [u8; 32]),
+    /// EffectLog node: inbound msg + depth-1 invoke replies, anchor
+    /// stamped. `None` for commits with nothing to replay (post-replay
+    /// materialization, follower apply, extension persistence).
+    pub log: Option<&'a crate::effect_log::EffectLog>,
+    /// At least one applied v3 work-result carried effects. Drives the
+    /// durable-node rule: an effect-bearing dispatch must produce a
+    /// durable log node even when the state blob is unchanged (e.g. a
+    /// Transfer-only dispatch). `false` for v2 deltas — those guests
+    /// emit their full state unconditionally, so "carries effects"
+    /// would turn every pure read into a node; value comparison decides
+    /// for them instead.
+    pub effect_bearing: bool,
+}
+
+impl<'a> AgentDelta<'a> {
+    /// Delta carrying only a full-state write and no log — the
+    /// post-replay materialization / follower-apply / extension shape.
+    /// `writes` is the caller-owned single-pair buffer (the borrow has
+    /// to outlive the delta).
+    pub fn state_only(writes: &'a [(Vec<u8>, Vec<u8>)]) -> Self {
+        Self {
+            writes,
+            anchor: (crate::effect_log::ANCHOR_UNRECORDED, [0u8; 32]),
+            log: None,
+            effect_bearing: false,
+        }
+    }
+}
+
+/// What a [`CommitStrategy::commit`] durably produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitReceipt {
+    /// Whether a durable log node (DAG node / raft entry) was appended.
+    /// `false` for skipped no-ops, state-only materializations, and
+    /// non-replicating strategies.
+    pub node_appended: bool,
+}
+
 pub trait CommitStrategy: Send {
     /// Return previously-persisted state, if any.
     ///
@@ -110,22 +164,54 @@ pub trait CommitStrategy: Send {
     /// and rebuild state by replaying each entry.
     fn restore(&mut self) -> Option<Vec<u8>>;
 
-    /// Persist the actor's current state.
-    ///
-    /// Implementations may skip the backend write when the bytes
-    /// haven't changed since the last successful commit.
-    fn commit(&mut self, state: &[u8]) -> Result<(), CommitError>;
+    /// Return the non-STATE agent rows persisted by previous deltas,
+    /// so the host can rehydrate the runtime's storage alongside
+    /// [`restore`](Self::restore). Strategies without a KV backend
+    /// return an empty vec.
+    fn restore_writes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
+        Ok(Vec::new())
+    }
 
-    /// Persist state alongside the observed-effect log from the
-    /// dispatch that produced it. Replicating strategies append a
-    /// DAG node with the log as payload; non-replicating strategies
-    /// ignore the log and fall through to [`commit`](Self::commit).
+    /// Durably commit one dispatch's whole-agent delta in a single
+    /// backend transaction.
+    ///
+    /// Skip rules: a delta with no writes and no effect-bearing log is
+    /// a pure read — nothing persists, no node appends. A state write
+    /// whose bytes equal the last committed state is treated as
+    /// unchanged (v2 guests re-emit their full state every dispatch).
+    /// An effect-bearing delta appends a durable log node even when
+    /// state is unchanged.
+    fn commit(&mut self, delta: &AgentDelta<'_>) -> Result<CommitReceipt, CommitError>;
+
+    /// Convenience: commit a bare full-state blob (no log, no effects).
+    /// The pre-delta `commit(&[u8])` call shape — post-replay
+    /// materialization, follower apply, extension persistence.
+    fn commit_state(&mut self, state: &[u8]) -> Result<CommitReceipt, CommitError> {
+        let writes = [(
+            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+            state.to_vec(),
+        )];
+        self.commit(&AgentDelta::state_only(&writes))
+    }
+
+    /// Convenience: commit a full-state blob alongside its effect log.
+    /// The pre-delta `commit_with_log` call shape, kept for tests and
+    /// simple embedders; the agent thread builds real deltas.
     fn commit_with_log(
         &mut self,
         state: &[u8],
-        _log: &crate::effect_log::EffectLog,
-    ) -> Result<(), CommitError> {
-        self.commit(state)
+        log: &crate::effect_log::EffectLog,
+    ) -> Result<CommitReceipt, CommitError> {
+        let writes = [(
+            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+            state.to_vec(),
+        )];
+        self.commit(&AgentDelta {
+            writes: &writes,
+            anchor: (log.anchor_kind, log.anchor),
+            log: Some(log),
+            effect_bearing: false,
+        })
     }
 
     /// Return the stored effect logs in causal (topological) order.
@@ -174,6 +260,20 @@ pub trait CommitStrategy: Send {
         true
     }
 
+    /// Whether this strategy's durable history is a single totally-
+    /// ordered chain (Raft) rather than a mergeable DAG (CRDT). Governs
+    /// how replay treats a recorded-anchor mismatch: on a linear
+    /// history every replayed dispatch must re-emit exactly the
+    /// recorded anchor (a mismatch is real divergence — fail); on a
+    /// merged DAG, concurrent branches replay in a serialization their
+    /// recorded anchors never saw, so mismatches are expected and only
+    /// observable (the reconciliation policy for parallel histories is
+    /// an explicit open spike — the anchor guarantees detectability,
+    /// not a policy).
+    fn linear_history(&self) -> bool {
+        false
+    }
+
     /// Whether the agent must run a sync reload (soft-restart) to fold in DAG
     /// nodes the backing store gained out-of-band — the soft-restart's whole
     /// reason to exist (a peer merge by the sync ticker, or a follower applying
@@ -200,15 +300,17 @@ impl CommitStrategy for NoCommit {
     fn restore(&mut self) -> Option<Vec<u8>> {
         None
     }
-    fn commit(&mut self, _state: &[u8]) -> Result<(), CommitError> {
-        Ok(())
+    fn commit(&mut self, _delta: &AgentDelta<'_>) -> Result<CommitReceipt, CommitError> {
+        Ok(CommitReceipt {
+            node_appended: false,
+        })
     }
 }
 
 // ── redb-backed local strategy ──────────────────────────────────────
 
 #[cfg(feature = "storage")]
-pub use local::{LocalCommit, STATE_KEY, STATE_TABLE};
+pub use local::{KV_TABLE, LocalCommit, STATE_KEY, STATE_TABLE, read_kv_rows, split_delta};
 
 #[cfg(feature = "storage")]
 pub use crdt::{Blake2b, CrdtCommit, DAG_TABLE, ROOTS_KEY, read_dag_node, read_roots};
@@ -225,8 +327,51 @@ mod local {
     /// the same row when they share a database file.
     pub const STATE_KEY: &str = "actor";
 
-    /// Persists state to a redb database, skipping writes when the
-    /// serialized bytes are unchanged from the last commit.
+    /// redb table holding the agent's non-STATE storage rows — the rest
+    /// of the whole-agent delta ([`AgentDelta::writes`]) beyond the
+    /// materialized state blob. Shared by every storage-backed strategy
+    /// so the same database file carries the complete agent keyspace.
+    pub const KV_TABLE: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("agent_kv");
+
+    /// Split a delta's ordered writes into the last `STATE_KEY` value
+    /// (last-wins per key) and the non-STATE rows, preserving order.
+    pub fn split_delta<'a>(
+        delta: &'a AgentDelta<'_>,
+    ) -> (Option<&'a [u8]>, Vec<(&'a [u8], &'a [u8])>) {
+        let mut state = None;
+        let mut rest = Vec::new();
+        for (key, value) in delta.writes {
+            if key.as_slice() == crate::lifecycle::STATE_KEY_BYTES {
+                state = Some(value.as_slice());
+            } else {
+                rest.push((key.as_slice(), value.as_slice()));
+            }
+        }
+        (state, rest)
+    }
+
+    /// Read every persisted non-STATE agent row from [`KV_TABLE`].
+    /// Backs [`CommitStrategy::restore_writes`] for the storage-backed
+    /// strategies.
+    pub fn read_kv_rows(db: &redb::Database) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
+        use redb::ReadableTable;
+        let txn = db.begin_read()?;
+        let table = match txn.open_table(KV_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            rows.push((k.value().to_vec(), v.value().to_vec()));
+        }
+        Ok(rows)
+    }
+
+    /// Persists the agent delta to a redb database, skipping the write
+    /// when nothing changed from the last commit.
     pub struct LocalCommit {
         db: redb::Database,
         last: Vec<u8>,
@@ -259,18 +404,40 @@ mod local {
             Some(bytes)
         }
 
-        fn commit(&mut self, state: &[u8]) -> Result<(), CommitError> {
-            if state == self.last {
-                return Ok(());
+        fn restore_writes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
+            read_kv_rows(&self.db)
+        }
+
+        fn commit(&mut self, delta: &AgentDelta<'_>) -> Result<CommitReceipt, CommitError> {
+            let (state, rest) = split_delta(delta);
+            let state_changed = state.is_some_and(|s| s != self.last.as_slice());
+            if !state_changed && rest.is_empty() {
+                return Ok(CommitReceipt {
+                    node_appended: false,
+                });
             }
             let txn = self.db.begin_write()?;
             {
-                let mut table = txn.open_table(STATE_TABLE)?;
-                table.insert(STATE_KEY, state)?;
+                if state_changed
+                    && let Some(state) = state
+                {
+                    let mut table = txn.open_table(STATE_TABLE)?;
+                    table.insert(STATE_KEY, state)?;
+                }
+                if !rest.is_empty() {
+                    let mut kv = txn.open_table(KV_TABLE)?;
+                    for (key, value) in &rest {
+                        kv.insert(*key, *value)?;
+                    }
+                }
             }
             txn.commit()?;
-            self.last = state.to_vec();
-            Ok(())
+            if let Some(state) = state {
+                self.last = state.to_vec();
+            }
+            Ok(CommitReceipt {
+                node_appended: false,
+            })
         }
     }
 }
@@ -679,15 +846,12 @@ mod crdt {
             }
         }
 
-        fn commit(&mut self, state: &[u8]) -> Result<(), CommitError> {
-            // A plain commit without a log entry means the caller has
-            // no new CRDT operation to record (e.g. a manual state
-            // patch). Still persist the state atomically.
-            self.write_atomic(state, None)
+        fn commit(&mut self, delta: &AgentDelta<'_>) -> Result<CommitReceipt, CommitError> {
+            self.write_atomic(delta)
         }
 
-        fn commit_with_log(&mut self, state: &[u8], log: &EffectLog) -> Result<(), CommitError> {
-            self.write_atomic(state, Some(log))
+        fn restore_writes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
+            super::read_kv_rows(&self.db)
         }
 
         fn reload(&mut self) -> Result<(), CommitError> {
@@ -788,23 +952,24 @@ mod crdt {
     }
 
     impl CrdtCommit {
-        fn write_atomic(
-            &mut self,
-            state: &[u8],
-            log: Option<&EffectLog>,
-        ) -> Result<(), CommitError> {
-            // Skip when the state is unchanged from the previous
-            // commit, even if a log was supplied. A dispatch that
-            // observed external replies but didn't mutate state is
-            // a pure read — appending a DAG node for it would
-            // pollute consensus history with no-op events. Replay
-            // can skip this dispatch entirely; the next state-
-            // changing commit will produce a fresh DAG node.
-            // Skipping also means we don't allocate a `seq` value
-            // for read-only dispatches — `next_seq` only advances
-            // when a real event lands on the DAG.
-            if state == self.last_state.as_slice() {
-                return Ok(());
+        fn write_atomic(&mut self, delta: &AgentDelta<'_>) -> Result<CommitReceipt, CommitError> {
+            let (state, rest) = super::split_delta(delta);
+            let state_changed = state.is_some_and(|s| s != self.last_state.as_slice());
+
+            // The durable-node rule (work-result contract §4): a
+            // dispatch whose payload carried no effects is a pure read
+            // — nothing persists, no node appends, no `seq` allocates.
+            // An effect-bearing dispatch appends a node even when the
+            // state blob is unchanged (a Transfer-only dispatch is
+            // real history that replay must reproduce). v2 deltas
+            // (`effect_bearing == false`) fall back to value
+            // comparison, since those guests re-emit their full state
+            // on every halt.
+            let append_node = delta.log.is_some() && (state_changed || delta.effect_bearing);
+            if !state_changed && rest.is_empty() && !append_node {
+                return Ok(CommitReceipt {
+                    node_appended: false,
+                });
             }
 
             // Hold the commit lock across "compute new DAG node
@@ -827,15 +992,17 @@ mod crdt {
             // CrdtEvent stamped with our origin + the next seq so
             // the resulting CID is globally unique even when other
             // replicas commit byte-identical EffectLogs concurrently.
-            let new_cid_bytes_seq = log.map(|log| {
-                let event = CrdtEvent::new(self.replica_origin, self.next_seq, log.clone());
-                let children = self.clock.roots().clone();
-                let node = DagNode::new(event, children);
-                let cid = node.cid();
-                let bytes = node.to_bytes();
-                let allocated_seq = self.next_seq;
-                (cid, bytes, allocated_seq)
-            });
+            let new_cid_bytes_seq = append_node
+                .then(|| delta.log.expect("append_node implies a log"))
+                .map(|log| {
+                    let event = CrdtEvent::new(self.replica_origin, self.next_seq, log.clone());
+                    let children = self.clock.roots().clone();
+                    let node = DagNode::new(event, children);
+                    let cid = node.cid();
+                    let bytes = node.to_bytes();
+                    let allocated_seq = self.next_seq;
+                    (cid, bytes, allocated_seq)
+                });
 
             let roots_bytes = match &new_cid_bytes_seq {
                 Some((cid, _, _)) => {
@@ -851,10 +1018,20 @@ mod crdt {
             let txn = self.db.begin_write()?;
             {
                 let mut state_table = txn.open_table(STATE_TABLE)?;
-                state_table.insert(STATE_KEY, state)?;
+                if state_changed
+                    && let Some(state) = state
+                {
+                    state_table.insert(STATE_KEY, state)?;
+                }
                 state_table.insert(ROOTS_KEY, roots_bytes.as_slice())?;
                 state_table.insert(NEXT_SEQ_KEY, next_seq_after.to_le_bytes().as_slice())?;
 
+                if !rest.is_empty() {
+                    let mut kv = txn.open_table(super::KV_TABLE)?;
+                    for (key, value) in &rest {
+                        kv.insert(*key, *value)?;
+                    }
+                }
                 if let Some((cid, bytes, _)) = &new_cid_bytes_seq {
                     let mut dag_table = txn.open_table(DAG_TABLE)?;
                     dag_table.insert(cid.as_ref(), bytes.as_slice())?;
@@ -863,14 +1040,19 @@ mod crdt {
             txn.commit()?;
 
             // Update in-memory clock to reflect the newly committed
-            // roots. For a log-less commit the roots are unchanged.
+            // roots. For a node-less commit the roots are unchanged.
+            let node_appended = new_cid_bytes_seq.is_some();
             if let Some((cid, _, _)) = new_cid_bytes_seq {
                 self.clock = MerkleClock::new();
                 self.clock.add_roots(core::iter::once(cid));
             }
             self.next_seq = next_seq_after;
-            self.last_state = state.to_vec();
-            Ok(())
+            if state_changed
+                && let Some(state) = state
+            {
+                self.last_state = state.to_vec();
+            }
+            Ok(CommitReceipt { node_appended })
         }
     }
 
@@ -998,7 +1180,7 @@ mod tests {
     fn no_commit_restore_none() {
         let mut s = NoCommit;
         assert!(s.restore().is_none());
-        assert!(s.commit(b"anything").is_ok());
+        assert!(s.commit_state(b"anything").is_ok());
     }
 
     #[cfg(feature = "storage")]
@@ -1329,10 +1511,114 @@ mod tests {
 
         // Plain commit with unchanged state — no new DAG node should
         // be appended (roots stay the same).
-        cc.commit(b"state").unwrap();
+        cc.commit_state(b"state").unwrap();
         assert_eq!(cc.clock().roots(), &roots_after_first);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn effect_bearing_unchanged_state_appends_node() {
+        // The durable-node rule: a v3 dispatch that carried effects but
+        // left the state blob unchanged (e.g. Transfer-only) MUST land
+        // in durable history — the pre-A8 skip dropped these entirely.
+        // A pure read (no effects) still appends nothing.
+        use crate::effect_log::EffectLog;
+
+        let path = temp_db_path("crdt_effect_node");
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+
+        let writes = [(
+            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+            b"state".to_vec(),
+        )];
+        let log1 = EffectLog::for_msg(b"m1".to_vec());
+        let r1 = cc
+            .commit(&AgentDelta {
+                writes: &writes,
+                anchor: (0x00, [0u8; 32]),
+                log: Some(&log1),
+                effect_bearing: true,
+            })
+            .unwrap();
+        assert!(r1.node_appended, "state-changing dispatch appends");
+
+        // Effect-bearing, state unchanged (no state write in the delta).
+        let log2 = EffectLog::for_msg(b"m2".to_vec());
+        let r2 = cc
+            .commit(&AgentDelta {
+                writes: &[],
+                anchor: (0x01, [1u8; 32]),
+                log: Some(&log2),
+                effect_bearing: true,
+            })
+            .unwrap();
+        assert!(
+            r2.node_appended,
+            "effect-bearing dispatch with unchanged state must produce a durable node"
+        );
+
+        // Pure read: no writes, no effects — nothing durable.
+        let log3 = EffectLog::for_msg(b"m3".to_vec());
+        let r3 = cc
+            .commit(&AgentDelta {
+                writes: &[],
+                anchor: (0x01, [1u8; 32]),
+                log: Some(&log3),
+                effect_bearing: false,
+            })
+            .unwrap();
+        assert!(!r3.node_appended, "pure reads must not pollute history");
+
+        let logs = cc.replay_logs().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].msg, b"m1");
+        assert_eq!(logs[1].msg, b"m2");
+        assert_eq!(
+            cc.restore().as_deref(),
+            Some(&b"state"[..]),
+            "state row untouched by the state-unchanged node"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn non_state_writes_persist_and_restore() {
+        // The whole-agent delta: non-STATE rows land in the KV table in
+        // the same txn as the state row and come back via
+        // restore_writes on reopen.
+        let db_path = temp_db_path("local_kv");
+        let dir = db_path.parent().unwrap().to_path_buf();
+        {
+            let mut lc = LocalCommit::open(&db_path).unwrap();
+            let writes = [
+                (b"row-a".to_vec(), b"1".to_vec()),
+                (
+                    crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                    b"state".to_vec(),
+                ),
+                (b"row-b".to_vec(), b"2".to_vec()),
+            ];
+            lc.commit(&AgentDelta::state_only(&writes)).unwrap();
+        }
+        {
+            let mut lc = LocalCommit::open(&db_path).unwrap();
+            assert_eq!(lc.restore().as_deref(), Some(&b"state"[..]));
+            let mut rows = lc.restore_writes().unwrap();
+            rows.sort();
+            assert_eq!(
+                rows,
+                vec![
+                    (b"row-a".to_vec(), b"1".to_vec()),
+                    (b"row-b".to_vec(), b"2".to_vec()),
+                ],
+                "non-STATE rows must survive a restart"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "storage")]
@@ -1369,7 +1655,7 @@ mod tests {
         {
             let mut lc = LocalCommit::open(&db_path).unwrap();
             assert!(lc.restore().is_none(), "fresh db has no state");
-            lc.commit(b"hello").unwrap();
+            lc.commit_state(b"hello").unwrap();
         }
         {
             let mut lc = LocalCommit::open(&db_path).unwrap();
@@ -1377,9 +1663,9 @@ mod tests {
             // Writing the same bytes is a no-op — verify by checking
             // the db file mtime doesn't change. Instead, we just
             // confirm commit returns Ok (the skip path returns Ok too).
-            lc.commit(b"hello").unwrap();
+            lc.commit_state(b"hello").unwrap();
             // Write new bytes and re-read.
-            lc.commit(b"world").unwrap();
+            lc.commit_state(b"world").unwrap();
             assert_eq!(lc.restore().as_deref(), Some(&b"world"[..]));
         }
 

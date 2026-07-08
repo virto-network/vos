@@ -673,19 +673,34 @@ impl<A: Actor> Context<A> {
 
     // ── Refine output packing (framework-internal) ───────────────────
 
-    /// Drain the pending effect queues into a `RefinePayload` ready to be
-    /// emitted as the refine output. Used by `run_refine_service`.
+    /// Drain the pending effect queues into a v3 `RefinePayload` ready to
+    /// be emitted as the refine output. Used by `run_refine_service`.
+    ///
+    /// `(anchor_kind, anchor)` commit to the state this refine ran
+    /// against; `state_write` is the post-dispatch serialized actor
+    /// state, passed only when it changed — it becomes the FINAL
+    /// `Write{STATE_KEY}` within the Write batch (last-wins per key, so
+    /// it shadows any handler-issued write on the same key), ahead of
+    /// the Transfer/Provide/New batches.
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
     pub fn drain_into_refine_payload(
         &mut self,
-        state: Vec<u8>,
+        anchor_kind: u8,
+        anchor: [u8; 32],
+        state_write: Option<Vec<u8>>,
         reply: Vec<u8>,
     ) -> crate::refine_payload::RefinePayload {
         use crate::refine_payload::{Effect, RefinePayload};
         let mut effects: Vec<Effect> = Vec::new();
         for (key, value) in self.pending_writes.drain(..) {
             effects.push(Effect::Write { key, value });
+        }
+        if let Some(value) = state_write {
+            effects.push(Effect::Write {
+                key: crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                value,
+            });
         }
         for tell in self.pending_tells.drain(..) {
             effects.push(Effect::Transfer {
@@ -700,11 +715,13 @@ impl<A: Actor> Context<A> {
             effects.push(Effect::New { code_hash });
         }
         RefinePayload {
-            state,
+            anchor_kind,
+            anchor,
             reply,
             effects,
             continue_next: self.self_schedule,
             forbidden: self.forbidden,
+            ..RefinePayload::new()
         }
     }
 }

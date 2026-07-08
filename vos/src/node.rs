@@ -1805,23 +1805,47 @@ fn replay_dag_into_runtime(
     }
     for (i, log) in logs.into_iter().enumerate() {
         let msg = log.msg.clone();
-        // A log entry with no dispatch message — a CRDT genesis /
-        // boundary node — has no handler to replay and no recorded
-        // state effect, so skip it. Replaying it would wrap an empty
-        // payload in the M7 caller prefix; the actor strips the prefix
-        // back to empty bytes and `Decode::decode` panics ("empty
-        // bytes"). The real operations live in the non-empty entries.
-        if msg.is_empty() {
-            continue;
-        }
+        // The (kind, anchor) recorded in this durable log node — the
+        // state the ORIGINAL dispatch ran against. The replayed
+        // dispatch must re-emit the same anchor, or the rebuilt state
+        // history has diverged. This is the normative divergence check:
+        // the guest's own anchor self-check passes by construction
+        // during replay (it anchors whatever the runtime just served
+        // it) and detects nothing.
+        let recorded_anchor = (log.anchor_kind, log.anchor);
+        let recorded_caller = log.caller_prefix;
+        let _ = runtime.take_dispatch_anchor(svc_id);
+        // Replayed dispatches populate the same per-dispatch delta
+        // trackers real dispatches do; nothing commits them during
+        // replay (the durable history already holds them), so drain
+        // them — leaking a replayed dispatch's effect-bearing marker
+        // into the next real dispatch would make a pure read on a Raft
+        // follower propose (and fail NotLeader, dropping its reply).
+        let _ = runtime.take_dispatch_delta(svc_id);
         runtime.begin_replay(log);
-        // M7 — recorded effects were authorised by *some* caller
-        // at record time. For replay determinism, wrap with the
-        // trusted-System prefix so the M6 role check passes the
-        // same way it did originally. If/when we record the
-        // original caller's role bytes in the log, we can replay
-        // with that exact identity instead.
-        runtime.send_to(svc_id, encode_replay_payload(&msg));
+        // An empty-msg node is a recorded kick dispatch — the
+        // host-synthesized wake-up whose whole semantic is "run
+        // on_start". Replay it as exactly that: a raw empty payload
+        // (never prefix-wrapped — the actor would strip the prefix
+        // back to empty bytes and panic decoding them as a message;
+        // the runtime instead filters the empty item and the guest
+        // runs its cold-start path with no mail). Skipping these
+        // nodes instead would drop on_start's state transition and
+        // break the anchor chain for every node after.
+        //
+        // Non-empty dispatches replay under the RECORDED caller
+        // prefix — the original caller's trust flag and role grants —
+        // so every gate decision reproduces exactly: a role-refused
+        // dispatch replays as refused (its durable node may still
+        // carry framework effects like the genesis state write), a
+        // granted one as granted. Legacy logs without a recorded
+        // prefix decode as trusted-System, their historical replay
+        // identity.
+        if msg.is_empty() {
+            runtime.send_to(svc_id, Vec::new());
+        } else {
+            runtime.send_to(svc_id, encode_replay_payload(&recorded_caller, &msg));
+        }
         runtime.run_blocking();
         // External transfers emitted during replay had their
         // original effects at record time; we don't re-issue them.
@@ -1834,6 +1858,29 @@ fn replay_dag_into_runtime(
                 replay.position(),
                 replay.was_exhausted(),
             ));
+        }
+        let replayed_anchor = runtime.take_dispatch_anchor(svc_id);
+        let _ = runtime.take_dispatch_delta(svc_id);
+        if recorded_anchor.0 != crate::effect_log::ANCHOR_UNRECORDED
+            && replayed_anchor != Some(recorded_anchor)
+        {
+            if strategy.linear_history() {
+                return Err(format!(
+                    "replay diverged at log #{i}: re-emitted work-result anchor \
+                     {replayed_anchor:02x?} != recorded {recorded_anchor:02x?} — \
+                     rebuilt state history differs from the committed one",
+                ));
+            }
+            // Merged-DAG replay serializes concurrent branches into an
+            // order their recorded anchors never observed — expected,
+            // not divergence. Kept observable for diagnostics.
+            debug!(
+                %svc_id,
+                log = i,
+                ?replayed_anchor,
+                ?recorded_anchor,
+                "replayed anchor differs from recorded (merged-DAG serialization)",
+            );
         }
     }
     Ok(())
@@ -1874,7 +1921,7 @@ fn soft_restart_crdt(
         .unwrap_or_default();
     if !state.is_empty() {
         strategy
-            .commit(&state)
+            .commit_state(&state)
             .map_err(|e| format!("post-soft-restart commit: {e}"))?;
     }
     Ok(())
@@ -3509,6 +3556,16 @@ fn agent_thread(
         runtime
             .storage
             .write(svc_id, crate::lifecycle::STATE_KEY_BYTES, &state_bytes);
+        // Rehydrate the rest of the agent's keyspace — the non-STATE
+        // rows previous deltas persisted.
+        match strategy.restore_writes() {
+            Ok(rows) => {
+                for (key, value) in rows {
+                    runtime.storage.write(svc_id, &key, &value);
+                }
+            }
+            Err(e) => warn!(%id, error = %e, "agent: restoring non-state rows failed"),
+        }
         info!(%id, bytes = state_bytes.len(), "agent: restored state");
     } else if recording_enabled {
         // Cold-start replay: pull every log out of the DAG and
@@ -3534,7 +3591,7 @@ fn agent_thread(
                     .map(|v| v.to_vec())
                     .unwrap_or_default();
                 if !state.is_empty()
-                    && let Err(e) = strategy.commit(&state)
+                    && let Err(e) = strategy.commit_state(&state)
                 {
                     let err = format!("post-replay commit failed: {e}");
                     error!(%id, "{err}");
@@ -3844,6 +3901,7 @@ fn handle_invoke_request(
             req.msg = signed;
         }
     }
+    let dispatch_caller_prefix = caller_prefix_bytes(&req);
     if recording_enabled {
         runtime.begin_recording(req.msg.clone());
     }
@@ -3873,13 +3931,32 @@ fn handle_invoke_request(
         .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
         .map(|v| v.to_vec())
         .unwrap_or_default();
+    // The whole-agent delta this dispatch produced: its ordered writes
+    // (STATE_KEY included), the anchor of the state it ran against
+    // (recorded normatively in the log node — replay divergence
+    // detection compares against it), and the effect-bearing marker
+    // driving the durable-node rule. Taken even when not recording so
+    // stale entries never leak into the next dispatch.
+    let (writes, effect_bearing) = runtime.take_dispatch_delta(svc_id);
+    let dispatch_anchor = runtime.take_dispatch_anchor(svc_id);
+    let anchor = dispatch_anchor.unwrap_or((crate::effect_log::ANCHOR_UNRECORDED, [0u8; 32]));
     let commit_result = if recording_enabled {
-        let log = runtime.finish_recording().expect("recording was started");
-        strategy.commit_with_log(&state, &log)
-    } else if !state.is_empty() {
-        strategy.commit(&state)
+        let mut log = runtime.finish_recording().expect("recording was started");
+        log.set_anchor(anchor.0, anchor.1);
+        log.set_caller_prefix(dispatch_caller_prefix);
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: Some(&log),
+            effect_bearing,
+        })
     } else {
-        Ok(())
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: None,
+            effect_bearing,
+        })
     };
 
     if let Err(e) = commit_result {
@@ -4022,14 +4099,10 @@ fn forbidden_envelope() -> Vec<u8> {
 /// emits a trusted-System prefix so the role
 /// check passes during replay — original authorisation is
 /// implicit in the fact the log was committed.
-fn encode_replay_payload(msg: &[u8]) -> Vec<u8> {
+fn encode_replay_payload(prefix: &crate::effect_log::CallerPrefix, msg: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(6 + msg.len());
     out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
-    out.push(1); // trust_flag = System
-    out.push(0); // has_space_role
-    out.push(0); // space byte (unused)
-    out.push(0); // has_actor_local_role
-    out.push(0); // actor_local byte (unused)
+    out.extend_from_slice(prefix);
     out.extend_from_slice(msg);
     out
 }
@@ -4115,6 +4188,19 @@ fn drive_capturing_external(
 ///   [5] actor_local_role byte
 ///   [6..] original message bytes
 fn encode_caller_prefix(req: &InvokeRequest) -> Vec<u8> {
+    let prefix = caller_prefix_bytes(req);
+    let mut out = Vec::with_capacity(6 + req.msg.len());
+    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+    out.extend_from_slice(&prefix);
+    out.extend_from_slice(&req.msg);
+    out
+}
+
+/// The 5 caller-prefix bytes of [`encode_caller_prefix`], standalone —
+/// recorded in the dispatch's EffectLog so replay re-runs the dispatch
+/// under the original caller's authority (a role-refused dispatch must
+/// replay as refused).
+fn caller_prefix_bytes(req: &InvokeRequest) -> crate::effect_log::CallerPrefix {
     let trust_flag: u8 = if req.caller.is_trusted() { 1 } else { 0 };
     let (has_space, space_byte) = match req.space_role {
         Some(b) => (1u8, b),
@@ -4124,15 +4210,13 @@ fn encode_caller_prefix(req: &InvokeRequest) -> Vec<u8> {
         Some(b) => (1u8, b),
         None => (0u8, 0u8),
     };
-    let mut out = Vec::with_capacity(6 + req.msg.len());
-    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
-    out.push(trust_flag);
-    out.push(has_space);
-    out.push(space_byte);
-    out.push(has_actor_local);
-    out.push(actor_local_byte);
-    out.extend_from_slice(&req.msg);
-    out
+    [
+        trust_flag,
+        has_space,
+        space_byte,
+        has_actor_local,
+        actor_local_byte,
+    ]
 }
 
 /// INVOKE. Used by the cross-thread invoke path so a yielded child on
@@ -4274,17 +4358,32 @@ fn dispatch_once(
     // succeeds so a failed commit (e.g. Raft `NotLeader`) leaks nothing.
     let external = drive_capturing_external(runtime, svc_id);
 
-    let state = runtime
-        .storage
-        .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
-        .map(|v| v.to_vec())
-        .unwrap_or_default();
-
+    // See handle_invoke_request — the dispatch's whole-agent delta,
+    // taken unconditionally so stale entries never leak across
+    // dispatches.
+    let (writes, effect_bearing) = runtime.take_dispatch_delta(svc_id);
+    let dispatch_anchor = runtime.take_dispatch_anchor(svc_id);
+    let anchor = dispatch_anchor.unwrap_or((crate::effect_log::ANCHOR_UNRECORDED, [0u8; 32]));
     if recorded {
-        let log = runtime.finish_recording().expect("recording was started");
-        strategy.commit_with_log(&state, &log)?;
-    } else if !state.is_empty() {
-        strategy.commit(&state)?;
+        let mut log = runtime.finish_recording().expect("recording was started");
+        log.set_anchor(anchor.0, anchor.1);
+        // Tell-style dispatches were wrapped Unauthenticated; kicks
+        // (empty msg) carry no prefix and replay as raw empties, so the
+        // recorded prefix is unused for them.
+        log.set_caller_prefix([0, 0, 0, 0, 0]);
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: Some(&log),
+            effect_bearing,
+        })?;
+    } else {
+        strategy.commit(&crate::commit::AgentDelta {
+            writes: &writes,
+            anchor,
+            log: None,
+            effect_bearing,
+        })?;
     }
 
     // Commit succeeded (the `?` above returns early on failure): the
@@ -6561,7 +6660,7 @@ fn persist(
     id: ServiceId,
 ) {
     let bytes = instance.save_state();
-    if let Err(e) = strategy.commit(&bytes) {
+    if let Err(e) = strategy.commit_state(&bytes) {
         warn!(%id, error = %e, "extension: failed to persist state");
     }
 }
@@ -7307,16 +7406,20 @@ mod tests {
     }
 
     #[test]
-    fn replay_payload_uses_system_trust() {
-        // Replay re-runs already-committed log entries; the
-        // original authorisation is implicit in the commit.
-        // System trust here is intentional — but only when the
-        // bytes come from the replay log, never from an inbox.
+    fn replay_payload_carries_recorded_caller() {
+        // Replay re-runs a committed log entry under the RECORDED
+        // caller prefix, so the original gate decision reproduces —
+        // refused stays refused, granted stays granted. Legacy logs
+        // decode as CALLER_SYSTEM, their historical replay identity.
         let inner = b"logged-msg";
-        let wrapped = encode_replay_payload(inner);
+        let recorded: crate::effect_log::CallerPrefix = [0, 1, 3, 0, 0];
+        let wrapped = encode_replay_payload(&recorded, inner);
         assert_eq!(wrapped[0], crate::actors::lifecycle::TAG_CALLER_PREFIX);
-        assert_eq!(wrapped[1], 1, "replay must use trust_flag=System");
+        assert_eq!(&wrapped[1..6], &recorded[..]);
         assert_eq!(&wrapped[6..], &inner[..]);
+
+        let legacy = encode_replay_payload(&crate::effect_log::CALLER_SYSTEM, inner);
+        assert_eq!(legacy[1], 1, "legacy logs replay as trusted-System");
     }
 
     #[test]
@@ -9397,8 +9500,13 @@ mod tests {
             fn restore(&mut self) -> Option<Vec<u8>> {
                 None
             }
-            fn commit(&mut self, _state: &[u8]) -> Result<(), crate::commit::CommitError> {
-                Err(crate::commit::CommitError::Config("forced commit failure".into()))
+            fn commit(
+                &mut self,
+                _delta: &crate::commit::AgentDelta<'_>,
+            ) -> Result<crate::commit::CommitReceipt, crate::commit::CommitError> {
+                Err(crate::commit::CommitError::Config(
+                    "forced commit failure".into(),
+                ))
             }
         }
 

@@ -13,17 +13,41 @@
 //!     during refine (`WRITE`, `TRANSFER`, `PROVIDE`, `PREIMAGE_PROVIDE`)
 //!     are **journaled** by the runtime, not applied immediately. The
 //!     framework instead buffers them into the guest's halt
-//!     `RefinePayload`, which the runtime absorbs into the same journal.
+//!     `RefinePayload` — post-dispatch actor state included, as an
+//!     ordinary final `Write{STATE_KEY}` effect — which the runtime
+//!     verifies and absorbs into the same journal
+//!     ([`absorb_work_result`]). There is no host state special-case:
+//!     the work-result bytes are the whole truth.
+//!   * **The anchor chain.** Each v3 work-result carries an anchor
+//!     committing to the state it ran against. The host checks it
+//!     against the *effective* state — the journal-overlay view
+//!     ([`RefineJournal::journaled_read`]) falling back to committed
+//!     storage — because one tick runs up to [`MAX_REFINE_ITERATIONS`]
+//!     re-entries whose work-results chain: iteration N anchors the hash
+//!     of iteration N−1's final state, which only reaches storage at end
+//!     of tick. A mismatch rejects the work-result whole: nothing from
+//!     it applies, its reply is dropped so the caller retries, and the
+//!     guest is cold-restarted (warm holder dropped). Mid-chain,
+//!     iterations before the rejected one stand.
 //!   * **The journal drain is the commit boundary — accumulate on VOS.**
 //!     After refine halts, the runtime replays the journal directly:
 //!     writes flush to storage, preimages land in the preimage map,
 //!     transfers join `pending_transfers` for the next tick. There is no
-//!     second PVM invocation — the native drain *is* the accumulate.
+//!     second PVM invocation — the native drain is an *optimization of*
+//!     the byte-defined apply semantic in `crate::refine_payload`, which
+//!     a guest APPLY on a JAM host executes identically.
 //!
 //! This keeps refine bounded and deterministic while still honoring the
 //! JAM invariant that all state mutation is structurally one commit.
 //! When on-chain bridging lands, journaled cross-service transfers will
 //! be routed to a pallet submission instead of `pending_transfers`.
+//!
+//! Version negotiation: the host dispatches on the payload's leading
+//! version byte. `0x02` blobs (already installed) get legacy handling —
+//! the decoder synthesizes their state field into a final
+//! `Write{STATE_KEY}` and anchor checks are skipped. `0x03` is what the
+//! framework emits. Unknown versions and malformed payloads fail loud
+//! (treated like a trapped dispatch), never silently as defaults.
 //!
 //! Self-directed transfers (a service sending to itself) become
 //! **intra-round re-entries**: the runtime re-invokes the same service
@@ -38,20 +62,25 @@
 //! When a service's refine sets `continue_next = true` (a `yield_now` /
 //! `sleep` handler), the runtime:
 //!
-//!   * already holds the actor's serialized state — `STATE_KEY` is
-//!     written into the journal on every mutating dispatch, not just on
-//!     yield — so a cold restart at PC=0 rehydrates it via `READ`; and
+//!   * already holds the actor's serialized state — the guest emits a
+//!     `Write{STATE_KEY}` effect on every state-changing dispatch, not
+//!     just on yield — so a cold restart at PC=0 rehydrates it via
+//!     `READ`; and
 //!   * captures `flat_mem` into the [`DataLayer`] with a
 //!     [`ContinuationHeader`](crate::pvm_image::ContinuationHeader) so
 //!     the next tick restores the kernel via `InvocationKernel::new_warm`
 //!     — the guest's `ACTOR_HOLDER` static is already populated and it
 //!     skips the `READ` + deserialize.
 //!
-//! The warm-restart overlay is a top-level-service optimization only
-//! (invoke children always cold-start via `new_cached`); its absence
-//! never changes semantics. There is no automatic wake-up: a service
-//! that yielded with nothing left to do under its own steam is resumed
-//! by the next external message (typically a parent agent's INVOKE).
+//! Continuation header saves/clears are VOS host bookkeeping: written
+//! directly to [`ServiceStorage`], never through the journal, never
+//! targeting `STATE_KEY` — they are not part of any work-result and must
+//! not shadow one. The warm-restart overlay is a top-level-service
+//! optimization only (invoke children always cold-start via
+//! `new_cached`); its absence never changes semantics. There is no
+//! automatic wake-up: a service that yielded with nothing left to do
+//! under its own steam is resumed by the next external message
+//! (typically a parent agent's INVOKE).
 //!
 //! ## Memory model
 //!
@@ -339,6 +368,92 @@ struct JournalMark {
     new_services: usize,
 }
 
+// --- Work-result apply (the contract's normative semantics) ---
+
+/// Why an emitted work-result was rejected instead of applied. Either
+/// way, nothing from the work-result applies and its reply is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkResultError {
+    /// The halt output claimed a known RefinePayload version but did not
+    /// decode (v3: strict canonical rules). Fail-loud, like a trap.
+    Malformed,
+    /// The v3 anchor did not commit to the effective state the
+    /// work-result would apply against — a stale work-result (or a
+    /// divergent replica / buggy guest on the serialized path).
+    AnchorMismatch,
+}
+
+/// Dispatch-relevant summary of one applied work-result.
+#[derive(Debug)]
+struct AbsorbedWorkResult {
+    continue_next: bool,
+    forbidden: bool,
+    reply: Vec<u8>,
+    /// v3 payload carried at least one effect. Input to the durable-node
+    /// rule: an effect-bearing dispatch must produce a durable log node
+    /// even when the state blob is unchanged. Always `false` for v2
+    /// (those guests emit their full state unconditionally, so the rule
+    /// is evaluated by value comparison at the commit strategy instead).
+    effect_bearing: bool,
+    /// The `(kind, anchor)` the work-result declared and the host
+    /// verified. `None` for v2 payloads (no anchor on that wire).
+    anchor: Option<(u8, [u8; 32])>,
+}
+
+/// Verify and absorb one decoded work-result into the journal — the
+/// single applier the native drain, the intra-tick anchor chain, and the
+/// v2/v3 parity tests all go through.
+///
+/// The anchor is checked against the **effective** state: the last
+/// `Write{STATE_KEY}` absorbed from previously accepted work-results in
+/// the same apply scope ([`RefineJournal::journaled_read`]), falling back
+/// to committed storage. Checking against raw storage instead would
+/// reject every multi-iteration tick — see the module docs.
+fn absorb_work_result(
+    journal: &mut RefineJournal,
+    storage: &ServiceStorage,
+    svc_id: u32,
+    payload: RefinePayload,
+) -> Result<AbsorbedWorkResult, WorkResultError> {
+    let anchor = if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
+        let effective = journal
+            .journaled_read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
+            .or_else(|| storage.read(ServiceId(svc_id), crate::lifecycle::STATE_KEY_BYTES));
+        let expected = crate::refine_payload::anchor_for(effective);
+        if (payload.anchor_kind, payload.anchor) != expected {
+            return Err(WorkResultError::AnchorMismatch);
+        }
+        Some((payload.anchor_kind, payload.anchor))
+    } else {
+        None
+    };
+    let effect_bearing = anchor.is_some() && !payload.effects.is_empty();
+    journal.absorb_effects(payload.effects, svc_id);
+    Ok(AbsorbedWorkResult {
+        continue_next: payload.continue_next,
+        forbidden: payload.forbidden,
+        reply: payload.reply,
+        effect_bearing,
+        anchor,
+    })
+}
+
+/// Whether halt-output bytes claim to be a RefinePayload wire version
+/// the host knows. Used to distinguish "malformed payload — fail loud"
+/// from "old-style `[status][state_len][state][reply]` envelope" when
+/// [`RefinePayload::decode`] returns `None`. Old-style envelopes lead
+/// with a status byte, and no reachable status collides: traps never
+/// halt, so `STATUS_PANICKED` (0x02) is never emitted as an envelope
+/// head, and 0x03+ statuses only appear in sub-5-byte error envelopes
+/// the invoke path packs host-side.
+fn claims_refine_payload(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.first(),
+        Some(&crate::refine_payload::REFINE_PAYLOAD_V2)
+            | Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
+    )
+}
+
 // --- Per-service storage ---
 
 #[derive(Default)]
@@ -408,6 +523,12 @@ pub type ExternalInvokeFn = Box<dyn Fn(ServiceId, &[u8]) -> Option<ExternalInvok
 pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     blobs: Vec<Vec<u8>>,
     blob_by_hash: HashMap<[u8; 32], usize>,
+    /// Witness-buffer address per **Task** blob (code hash →
+    /// `__VOS_WITNESS` flat-memory offset). Registration here is what
+    /// makes a full-hash INVOKE run in Task mode: `(state, msg)`
+    /// patched into the initial image, tracer-parity hostcalls, no
+    /// child rows, effects folded into the parent's keyspace.
+    task_witness: HashMap<[u8; 32], u32>,
     services: HashMap<u32, ServiceInfo>,
     next_id: u32,
     pub storage: ServiceStorage,
@@ -416,6 +537,11 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// Count of services that panicked in refine this runtime's lifetime.
     /// Exposed so tests can detect silent guest crashes.
     pub panics: u32,
+    /// Count of work-results rejected (anchor mismatch or malformed
+    /// payload) this runtime's lifetime. On the serialized agent thread a
+    /// non-zero value means a bug or a divergent replica; exposed so
+    /// tests can assert the parity property (a healthy run never rejects).
+    pub work_result_rejects: u32,
     gas: GasConfig,
     /// Pluggable data layer for continuation blob storage.
     pub data: D,
@@ -447,6 +573,29 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// the host from `is_suspended`. Cleared by
     /// [`take_last_status`](VosRuntime::take_last_status).
     last_status: HashMap<u32, u8>,
+    /// `(kind, anchor)` of the FIRST work-result applied per service
+    /// since the last [`take_dispatch_anchor`] — i.e. the anchor of the
+    /// state the dispatch ran against, before any same-tick chain
+    /// advanced it. The host stamps it into the dispatch's EffectLog
+    /// node; replay divergence detection compares against that record.
+    ///
+    /// [`take_dispatch_anchor`]: VosRuntime::take_dispatch_anchor
+    dispatch_anchor: HashMap<u32, (u8, [u8; 32])>,
+    /// Ordered storage writes applied to each top-level service's own
+    /// rows since the last [`take_dispatch_delta`] — the whole-agent
+    /// delta the host commits durably ([`crate::commit::AgentDelta`]).
+    /// Child-row writes are excluded (children with rows are a legacy
+    /// shape the Tasks model retires); continuation headers never ride
+    /// the journal, so host bookkeeping never appears here.
+    ///
+    /// [`take_dispatch_delta`]: VosRuntime::take_dispatch_delta
+    dispatch_writes: HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Per-service marker: some applied v3 work-result carried effects
+    /// since the last [`take_dispatch_delta`]. Input to the
+    /// durable-node rule.
+    ///
+    /// [`take_dispatch_delta`]: VosRuntime::take_dispatch_delta
+    dispatch_effect_bearing: HashMap<u32, bool>,
 }
 
 impl VosRuntime<MemoryDataLayer> {
@@ -468,12 +617,14 @@ impl<D: DataLayer> VosRuntime<D> {
         Self {
             blobs: Vec::new(),
             blob_by_hash: HashMap::new(),
+            task_witness: HashMap::new(),
             services: HashMap::new(),
             next_id: 1,
             storage: ServiceStorage::new(),
             preimages: HashMap::new(),
             pending_transfers: Vec::new(),
             panics: 0,
+            work_result_rejects: 0,
             gas,
             data,
             code_cache: javm::CodeCache::new(),
@@ -481,7 +632,34 @@ impl<D: DataLayer> VosRuntime<D> {
             effect_mode: crate::effect_log::EffectMode::Inactive,
             last_reply: HashMap::new(),
             last_status: HashMap::new(),
+            dispatch_anchor: HashMap::new(),
+            dispatch_writes: HashMap::new(),
+            dispatch_effect_bearing: HashMap::new(),
         }
+    }
+
+    /// Take the `(kind, anchor)` of the first work-result applied for
+    /// `svc_id` since the previous take — the anchor of the state the
+    /// dispatch ran against. `None` when no anchored work-result was
+    /// applied (v2 blobs, old-style actors, pure-trap dispatches). The
+    /// host stamps this into the dispatch's EffectLog before commit and
+    /// compares it during replay.
+    pub fn take_dispatch_anchor(&mut self, svc_id: ServiceId) -> Option<(u8, [u8; 32])> {
+        self.dispatch_anchor.remove(&svc_id.0)
+    }
+
+    /// Take the dispatch's whole-agent storage delta for `svc_id` since
+    /// the previous take: the ordered writes that landed on the
+    /// service's own rows (`STATE_KEY` included) and whether any
+    /// applied v3 work-result carried effects. The host commits these
+    /// as one [`crate::commit::AgentDelta`].
+    pub fn take_dispatch_delta(&mut self, svc_id: ServiceId) -> (Vec<(Vec<u8>, Vec<u8>)>, bool) {
+        (
+            self.dispatch_writes.remove(&svc_id.0).unwrap_or_default(),
+            self.dispatch_effect_bearing
+                .remove(&svc_id.0)
+                .unwrap_or(false),
+        )
     }
 
     /// Take and return the most recent dispatch's reply bytes for
@@ -595,6 +773,46 @@ impl<D: DataLayer> VosRuntime<D> {
         self.register_blob(blob)
     }
 
+    /// Register a **Task** blob: an anonymous, code-hash-identified pure
+    /// child (`vos::agent::Tasks`, `Child::Task`). `witness_addr` is the
+    /// blob's `__VOS_WITNESS` flat-memory offset (from the ELF symbol,
+    /// [`crate::zk::witness_addr`] — the transpiled blob preserves the
+    /// layout). Returns the content hash parents invoke by. Tasks get no
+    /// ServiceId and no storage row; a full-hash INVOKE of this hash
+    /// runs witness-delivered.
+    pub fn register_task_blob(&mut self, blob: Vec<u8>, witness_addr: u32) -> [u8; 32] {
+        let hash = blob_hash(&blob);
+        self.register_blob(blob);
+        self.task_witness.insert(hash, witness_addr);
+        hash
+    }
+
+    /// The initial memory image a Task invocation of `code_hash` with
+    /// `(state, msg)` executes from — built through the same kernel +
+    /// patch path the live INVOKE uses. This is the live half of the
+    /// live≡traced equality gate: a prover patching the same input at
+    /// the same witness address into the unmodified blob must arrive at
+    /// this exact image.
+    pub fn task_initial_image(
+        &mut self,
+        code_hash: &[u8; 32],
+        state: &[u8],
+        msg: &[u8],
+    ) -> Option<Vec<u8>> {
+        let &witness_addr = self.task_witness.get(code_hash)?;
+        let &blob_idx = self.blob_by_hash.get(code_hash)?;
+        let blob = self.blobs.get(blob_idx)?;
+        let input = crate::task_abi::encode_task_input(state, msg);
+        let kernel = build_task_kernel(
+            blob,
+            witness_addr,
+            &input,
+            DEFAULT_GAS,
+            &mut self.code_cache,
+        )?;
+        Some(kernel.extract_flat_mem().0)
+    }
+
     pub fn register_service(&mut self, blob_idx: usize) -> ServiceId {
         let id = self.next_id;
         self.next_id += 1;
@@ -685,6 +903,7 @@ impl<D: DataLayer> VosRuntime<D> {
 
         let blobs = &self.blobs;
         let blob_by_hash = &self.blob_by_hash;
+        let task_witness = &self.task_witness;
         let services = &self.services;
         let storage = &mut self.storage;
         let refine_gas = self.gas.refine_gas;
@@ -773,6 +992,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     &self.preimages,
                     blobs,
                     blob_by_hash,
+                    task_witness,
                     services,
                     &mut self.effect_mode,
                     &mut self.code_cache,
@@ -780,19 +1000,37 @@ impl<D: DataLayer> VosRuntime<D> {
                     &self.external_invoke,
                 );
 
-                // Absorb the guest's RefinePayload output (if any) into
+                // Verify + absorb the guest's work-result (if any) into
                 // the journal. This covers the actor framework's
                 // effect-buffering path where `set_refine_mode(true)`
-                // packs writes/transfers into the refine output.
+                // packs writes/transfers — and the post-dispatch state,
+                // as a final Write{STATE_KEY} effect — into the refine
+                // output. There is no host state special-case.
                 if let Some(payload_bytes) = halted {
-                    // Determine whether the guest wants to continue next tick.
                     // Two output formats: RefinePayload (service actors) or
                     // old-style [status:u8][state_len:u32][state...][reply...]
                     // (invoked actors). Both can signal yield/continue.
-                    let (continue_next, actor_state) =
-                        if let Some(payload) = RefinePayload::decode(&payload_bytes) {
-                            let cn = payload.continue_next;
-                            let state = payload.state;
+                    let applied = match RefinePayload::decode(&payload_bytes) {
+                        Some(payload) => {
+                            absorb_work_result(&mut journal, storage, svc_id, payload).map(Some)
+                        }
+                        None if claims_refine_payload(&payload_bytes) => {
+                            Err(WorkResultError::Malformed)
+                        }
+                        None => Ok(None),
+                    };
+                    let continue_next = match applied {
+                        Ok(Some(absorbed)) => {
+                            // First applied work-result of this dispatch:
+                            // its anchor is the state the dispatch ran
+                            // against (later chain iterations anchor
+                            // interior states).
+                            if let Some(anchor) = absorbed.anchor {
+                                self.dispatch_anchor.entry(svc_id).or_insert(anchor);
+                            }
+                            if absorbed.effect_bearing {
+                                self.dispatch_effect_bearing.insert(svc_id, true);
+                            }
                             // Capture the reply bytes for the host's
                             // synchronous-invoke path. Always insert,
                             // even for empty replies (Unit-returning
@@ -803,41 +1041,43 @@ impl<D: DataLayer> VosRuntime<D> {
                             // here would conflate the two and let
                             // panics surface to the host as silent
                             // success.
-                            self.last_reply.insert(svc_id, payload.reply.clone());
-                            // M6 — propagate the M6 forbidden flag from
-                            // the refine payload so the host can
+                            self.last_reply.insert(svc_id, absorbed.reply);
+                            // M6 — propagate the forbidden flag from
+                            // the work-result so the host can
                             // surface the actor-emitted refusal as a
                             // STATUS_FORBIDDEN envelope. Other
                             // statuses stay implicit (DONE / YIELDED
                             // are inferred from is_suspended).
-                            if payload.forbidden {
+                            if absorbed.forbidden {
                                 self.last_status
                                     .insert(svc_id, crate::actors::run::STATUS_FORBIDDEN);
                             }
-                            journal.absorb_effects(payload.effects, svc_id);
-                            (cn, state)
-                        } else {
-                            // Old-style format: status byte 0x01 = yielded.
-                            let cn = !payload_bytes.is_empty()
-                                && payload_bytes[0] == crate::actors::run::STATUS_YIELDED;
-                            (cn, Vec::new())
-                        };
-
-                    // Persist the actor's serialized state on every
-                    // dispatch — not just when yielding. A one-shot
-                    // handler that mutates `self` and returns must
-                    // still have its mutation reach the storage row
-                    // (and therefore the commit strategy) so CRDT /
-                    // Local persistence sees the actual end-of-tick
-                    // state instead of stale bytes from the previous
-                    // dispatch. Empty state means nothing changed.
-                    if !actor_state.is_empty() {
-                        journal.writes.push((
-                            svc_id,
-                            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-                            actor_state,
-                        ));
-                    }
+                            absorbed.continue_next
+                        }
+                        // Old-style format: status byte 0x01 = yielded.
+                        Ok(None) => {
+                            !payload_bytes.is_empty()
+                                && payload_bytes[0] == crate::actors::run::STATUS_YIELDED
+                        }
+                        Err(err) => {
+                            // Reject the work-result whole: nothing it
+                            // carries applies, its reply is dropped (the
+                            // caller sees a failure and retries), and the
+                            // guest is cold-restarted so its next dispatch
+                            // re-reads durable state. Mid-chain,
+                            // iterations before this one stand — the
+                            // continuation is cleared directly (host
+                            // bookkeeping), not via the discarded journal
+                            // suffix.
+                            error!(svc_id, ?err, "service: work-result rejected");
+                            journal.rollback_to(dispatch_mark);
+                            self.last_reply.remove(&svc_id);
+                            self.last_status.remove(&svc_id);
+                            clear_continuation(storage, &mut self.data, svc_id);
+                            self.work_result_rejects += 1;
+                            break;
+                        }
+                    };
 
                     if continue_next {
                         let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
@@ -847,7 +1087,7 @@ impl<D: DataLayer> VosRuntime<D> {
                             heap_base,
                             heap_top,
                             &mut self.data,
-                            &mut journal,
+                            storage,
                         );
                         // Re-queue mail the guest had not FETCHed before it
                         // yielded, then any self-directed transfers. A
@@ -875,7 +1115,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     if journal.self_messages.is_empty() {
                         // Guest signalled it's done; clear any prior
                         // continuation and exit the refine loop.
-                        clear_continuation(&mut journal, storage, &mut self.data, svc_id);
+                        clear_continuation(storage, &mut self.data, svc_id);
                         break;
                     }
                 } else {
@@ -883,9 +1123,22 @@ impl<D: DataLayer> VosRuntime<D> {
                     // halting: discard everything this dispatch journaled —
                     // including child-INVOKE effects absorbed into the
                     // parent's journal — so a panicked handler commits
-                    // nothing from its own tick. Effects committed by
-                    // earlier dispatches in this tick are kept.
+                    // nothing from its own tick.
+                    //
+                    // Atomicity contract, explicit: the commit unit is one
+                    // ITERATION (one work-result), not the whole
+                    // self-message chain. Effects applied by earlier
+                    // iterations in this tick stand — same rule as a
+                    // mid-chain anchor rejection. What must NOT stand is
+                    // the reply: an earlier iteration's reply is an
+                    // intermediate of an unfinished chain, and leaving it
+                    // in last_reply would surface the panic to the caller
+                    // as STATUS_DONE with stale bytes. Drop it so
+                    // take_last_reply returns None and the caller sees
+                    // Panicked.
                     journal.rollback_to(dispatch_mark);
+                    self.last_reply.remove(&svc_id);
+                    self.last_status.remove(&svc_id);
                     *panics += 1;
                     break;
                 }
@@ -910,7 +1163,7 @@ impl<D: DataLayer> VosRuntime<D> {
                         heap_base,
                         heap_top,
                         &mut self.data,
-                        &mut journal,
+                        storage,
                     );
                     // Re-queue leftover self-messages for next tick.
                     for msg in items.drain(..) {
@@ -925,9 +1178,17 @@ impl<D: DataLayer> VosRuntime<D> {
             // Each entry carries its origin service_id — children
             // INVOKEd inside this refine produced their own writes,
             // and they need to land on the child's storage row, not
-            // the dispatching service's.
+            // the dispatching service's. The ticked service's own
+            // writes are additionally captured as its dispatch delta
+            // for the durable commit.
             for (write_svc_id, key, value) in journal.writes.drain(..) {
                 storage.write(ServiceId(write_svc_id), &key, &value);
+                if write_svc_id == svc_id {
+                    self.dispatch_writes
+                        .entry(svc_id)
+                        .or_default()
+                        .push((key, value));
+                }
             }
             for (hash, data) in journal.preimages.drain(..) {
                 self.preimages.insert(hash, data);
@@ -989,6 +1250,7 @@ fn run_refine_kernel(
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    task_witness: &HashMap<[u8; 32], u32>,
     services: &HashMap<u32, ServiceInfo>,
     mode: &mut crate::effect_log::EffectMode,
     code_cache: &mut javm::CodeCache,
@@ -1030,6 +1292,7 @@ fn run_refine_kernel(
                     preimages,
                     blobs,
                     blob_by_hash,
+                    task_witness,
                     services,
                     code_cache,
                     0,
@@ -1056,6 +1319,7 @@ fn handle_refine_hostcall(
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    task_witness: &HashMap<[u8; 32], u32>,
     services: &HashMap<u32, ServiceInfo>,
     code_cache: &mut javm::CodeCache,
     depth: usize,
@@ -1233,8 +1497,10 @@ fn handle_refine_hostcall(
         hostcall::INVOKE => {
             let result = handle_invoke(
                 kernel,
+                svc_id,
                 blobs,
                 blob_by_hash,
+                task_witness,
                 services,
                 storage,
                 preimages,
@@ -1322,14 +1588,245 @@ fn record_and_write_invoke(
     output.len() as u64
 }
 
+/// Split an invoke input `[state_len: u32 LE][state][msg]` into its
+/// halves. Inputs shorter than the length prefix are all message
+/// (legacy raw invokes).
+fn split_invoke_input(input: &[u8]) -> (&[u8], &[u8]) {
+    if input.len() >= 4 {
+        let state_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+        let state_end = (4 + state_len).min(input.len());
+        (&input[4..state_end], &input[state_end..])
+    } else {
+        (&[], input)
+    }
+}
+
+/// Build a Task child's kernel: fresh instance from the blob, VOS
+/// precompile caps installed, `(state, msg)` input patched into the
+/// initial image at the blob's witness address — the exact image a
+/// prover's `trace_blob_with_patches` reconstructs from the unmodified
+/// blob plus the same patch.
+fn build_task_kernel(
+    blob: &[u8],
+    witness_addr: u32,
+    input: &[u8],
+    gas: Gas,
+    code_cache: &mut javm::CodeCache,
+) -> Option<InvocationKernel> {
+    let mut child = InvocationKernel::new_cached(blob, &[], gas, code_cache).ok()?;
+    install_vos_precompile_caps(&mut child);
+    child.set_active_reg(7, 0);
+    let _ = child
+        .vm_arena
+        .vm_mut(0)
+        .transition(javm::vm_pool::VmState::Running);
+    kwrite(&mut child, witness_addr, input);
+    Some(child)
+}
+
+/// Serve one hostcall of a Task child with EXACTLY the observable
+/// semantics `zkpvm`'s `TracingPvm::run_with_vos_stubs` gives the
+/// traced re-execution — this table is the live half of live≡proved:
+///
+/// - the blake2b precompile executes natively (the tracer runs it too,
+///   constrained in-circuit by Blake2bChip) with registers echoed back
+///   untouched, exactly as the tracer leaves them;
+/// - `GAS`/`FETCH`/`STORAGE_R`/`STORAGE_W`/`INFO`/`DEBUG_WRITE`/`OUTPUT`
+///   echo the registers untouched — the tracer's "lucky stub" set. A
+///   Task built on `run_task_service` never issues the input ones
+///   (witness-delivered, READ/FETCH-free by construction); a handler
+///   that does gets the same garbage the trace would. `DEBUG_WRITE`
+///   additionally mirrors to stderr — a host-side effect the guest
+///   cannot observe;
+/// - everything else (INVOKE, TRANSFER, NOW_MS, the ristretto
+///   precompiles — no vos host handler yet, though the tracer has one)
+///   returns `false`: fail loud, exactly where the tracer would end the
+///   trace un-halted and the proof could not complete.
+fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
+    let echo7 = kernel.active_reg(7);
+    let echo8 = kernel.active_reg(8);
+    match call_id {
+        crate::crypto::ECALL_BLAKE2B_COMPRESS => {
+            let h_ptr = kernel.active_reg(7) as u32;
+            let m_ptr = kernel.active_reg(8) as u32;
+            let t_low = kernel.active_reg(9);
+            let f_flag = kernel.active_reg(10) != 0;
+            let h_bytes = kread(kernel, h_ptr, 64);
+            let m_bytes = kread(kernel, m_ptr, 128);
+            if h_bytes.len() != 64 || m_bytes.len() != 128 {
+                return false;
+            }
+            let mut h: [u8; 64] = h_bytes.try_into().unwrap();
+            let m: [u8; 128] = m_bytes.try_into().unwrap();
+            crate::crypto::blake2b::host_compress_block(&mut h, &m, t_low as u128, f_flag);
+            kwrite(kernel, h_ptr, &h);
+        }
+        hostcall::GAS
+        | hostcall::FETCH
+        | hostcall::STORAGE_R
+        | hostcall::STORAGE_W
+        | hostcall::INFO
+        | hostcall::OUTPUT => {}
+        hostcall::DEBUG_WRITE => {
+            let buf = kread(kernel, echo7 as u32, echo8 as usize);
+            let _ = std::io::stderr().write_all(&buf);
+            let _ = std::io::stderr().flush();
+        }
+        other => {
+            error!(call_id = other, "task child: hostcall outside the refine-pure set");
+            return false;
+        }
+    }
+    kernel.resume_protocol_call(echo7, echo8);
+    true
+}
+
+/// Run a witness-delivered Task invocation (the A9 invoke mode): patch
+/// `(state, msg)` into the child's initial image, run it under the
+/// tracer-parity hostcall table, verify + convert its v3 work-result.
+/// No child ServiceId, no child storage row — the extracted state goes
+/// to the parent's envelope and the remaining effects fold into the
+/// PARENT's keyspace.
+#[allow(clippy::too_many_arguments)]
+fn run_task_invoke(
+    caller: &mut InvocationKernel,
+    blob: &[u8],
+    witness_addr: u32,
+    parent_svc_id: u32,
+    state: &[u8],
+    msg: &[u8],
+    gas: Gas,
+    journal: &mut RefineJournal,
+    code_cache: &mut javm::CodeCache,
+    output_ptr: u32,
+    output_buf_len: usize,
+    depth: usize,
+    mode: &mut crate::effect_log::EffectMode,
+) -> u64 {
+    use crate::actors::run::{STATUS_DONE, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED};
+
+    let input = crate::task_abi::encode_task_input(state, msg);
+    let Some(mut child) = build_task_kernel(blob, witness_addr, &input, gas, code_cache) else {
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_PANICKED],
+            depth,
+            mode,
+        );
+    };
+
+    let invoke_mark = journal.mark();
+    loop {
+        match child.run() {
+            KernelResult::Halt(_) => break,
+            KernelResult::Panic | KernelResult::PageFault(_) => {
+                journal.rollback_to(invoke_mark);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    output_buf_len,
+                    &[STATUS_PANICKED],
+                    depth,
+                    mode,
+                );
+            }
+            KernelResult::OutOfGas => {
+                journal.rollback_to(invoke_mark);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    output_buf_len,
+                    &[STATUS_OOG],
+                    depth,
+                    mode,
+                );
+            }
+            KernelResult::ProtocolCall { slot } => {
+                if !handle_task_hostcall(&mut child, slot as u32) {
+                    journal.rollback_to(invoke_mark);
+                    return record_and_write_invoke(
+                        caller,
+                        output_ptr,
+                        output_buf_len,
+                        &[STATUS_PANICKED],
+                        depth,
+                        mode,
+                    );
+                }
+            }
+        }
+    }
+
+    let out_ptr = child.active_reg(7) as u32;
+    let out_len = (child.active_reg(8) as usize).min(1 << 20);
+    let raw_output = kread(&child, out_ptr, out_len);
+
+    // Tasks are v3-native — run_task_service is the only entry that can
+    // produce this halt shape; anything else is a mis-built blob.
+    let payload = match RefinePayload::decode(&raw_output) {
+        Some(p) if p.version == crate::refine_payload::REFINE_PAYLOAD_VERSION => p,
+        _ => {
+            error!(parent_svc_id, "task child: halt output is not a v3 work-result");
+            journal.rollback_to(invoke_mark);
+            return record_and_write_invoke(
+                caller,
+                output_ptr,
+                output_buf_len,
+                &[STATUS_PANICKED],
+                depth,
+                mode,
+            );
+        }
+    };
+    let mut payload = payload;
+
+    // Parity: the child's anchor must commit to exactly the state the
+    // parent delivered (genesis when it delivered none).
+    let expected = crate::refine_payload::anchor_for(Some(state));
+    if (payload.anchor_kind, payload.anchor) != expected {
+        error!(parent_svc_id, "task child: work-result anchor mismatch");
+        journal.rollback_to(invoke_mark);
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_PANICKED],
+            depth,
+            mode,
+        );
+    }
+
+    // Child state to the parent envelope (echo the input when
+    // unchanged); every remaining effect folds into the PARENT's
+    // keyspace — a Task has no rows of its own.
+    let child_state = payload.take_state_write().unwrap_or_else(|| state.to_vec());
+    journal.absorb_effects(core::mem::take(&mut payload.effects), parent_svc_id);
+
+    let status = if payload.continue_next {
+        STATUS_YIELDED
+    } else {
+        STATUS_DONE
+    };
+    let mut out = Vec::with_capacity(1 + 4 + child_state.len() + payload.reply.len());
+    out.push(status);
+    out.extend_from_slice(&(child_state.len() as u32).to_le_bytes());
+    out.extend_from_slice(&child_state);
+    out.extend_from_slice(&payload.reply);
+    record_and_write_invoke(caller, output_ptr, output_buf_len, &out, depth, mode)
+}
+
 /// Handle INVOKE: run a child PVM at PC=0 (refine). The child reads
 /// storage via the parent's snapshot and writes effects into the
 /// parent's journal, so nested invokes share the parent's commit.
 #[allow(clippy::too_many_arguments)]
 fn handle_invoke(
     caller: &mut InvocationKernel,
+    parent_svc_id: u32,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
+    task_witness: &HashMap<[u8; 32], u32>,
     services: &HashMap<u32, ServiceInfo>,
     storage: &mut ServiceStorage,
     preimages: &HashMap<[u8; 32], Vec<u8>>,
@@ -1384,6 +1881,38 @@ fn handle_invoke(
     }
 
     let code_hash = kread_hash(caller, hash_ptr);
+
+    // Task mode: a full-hash invoke of a registered Task blob runs
+    // witness-delivered — `(state, msg)` patched into the initial
+    // image, no ServiceId, no storage row, effects folded into the
+    // invoking parent's keyspace.
+    if let Some(&witness_addr) = task_witness.get(&code_hash)
+        && let Some(&blob_idx) = blob_by_hash.get(&code_hash)
+        && let Some(blob) = blobs.get(blob_idx)
+    {
+        let input = kread(caller, input_ptr, input_len);
+        let (state, msg) = split_invoke_input(&input);
+        let gas = if gas_limit == 0 {
+            DEFAULT_GAS
+        } else {
+            gas_limit.min(DEFAULT_GAS)
+        };
+        return run_task_invoke(
+            caller,
+            blob,
+            witness_addr,
+            parent_svc_id,
+            state,
+            msg,
+            gas,
+            journal,
+            code_cache,
+            output_ptr,
+            output_buf_len,
+            depth,
+            mode,
+        );
+    }
 
     // The actor framework's `service_code_hash(svc_id)` packs the
     // target ServiceId into the first 4 bytes of `code_hash` and
@@ -1517,27 +2046,59 @@ fn handle_invoke(
         .vm_mut(0)
         .transition(javm::vm_pool::VmState::Running);
 
+    // Delimit this child invoke's journal contributions — the state
+    // delivery below, the child's own hostcall writes, and anything a
+    // grandchild absorbed — so a trap or a rejected work-result inside
+    // the nested run discards them whole. The top-level dispatch mark
+    // only protects the PARENT's dispatch boundary; without this nested
+    // mark, a caught child panic (surfaced as an error status the
+    // parent handles) would leave the child's partial writes in the
+    // journal and commit them with the parent's tick.
+    let invoke_mark = journal.mark();
+
     // Unpack invoke input: [state_len:u32 LE][state][msg].
-    // Write state to the child's storage under STATE_KEY so service
-    // children (run_refine_service) can cold-start via READ. Also
-    // deliver as FETCH items for legacy children (run_refine).
+    // Journal the state onto the child's row under STATE_KEY so service
+    // children (run_refine_service) can cold-start via READ — through
+    // the journal, not a direct storage write, so a trapped dispatch
+    // rolls it back with everything else. Only the message is delivered
+    // as a FETCH item: a state item would be consumed by the service
+    // child's message loop, where an empty one (fresh spawn) reads as
+    // "no more mail" and stops the loop before the message arrives, and
+    // a non-empty one mis-dispatches as a message. The FETCH-delivered
+    // state channel (`run_refine` legacy children) is retired; READ is
+    // the one state channel.
     let mut child_items = if input.len() >= 4 {
         let state_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
         let state_end = (4 + state_len).min(input.len());
         let state = &input[4..state_end];
 
         if !state.is_empty() {
-            storage.write(target_svc_id, crate::lifecycle::STATE_KEY_BYTES, state);
+            journal.writes.push((
+                target_svc_id.0,
+                crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                state.to_vec(),
+            ));
         }
 
-        let mut items = vec![state.to_vec()];
         if state_end < input.len() {
-            items.push(input[state_end..].to_vec());
+            vec![input[state_end..].to_vec()]
+        } else {
+            Vec::new()
         }
-        items
     } else {
         vec![input]
     };
+
+    // The state the child will observe as its prior state — the journal
+    // overlay (the delivery write above included) falling back to
+    // committed storage. This is what the child's v3 anchor must commit
+    // to, and what the envelope echoes when the child's state is
+    // unchanged, so parents always see the authoritative full state.
+    let child_prior_state: Vec<u8> = journal
+        .journaled_read(target_svc_id.0, crate::lifecycle::STATE_KEY_BYTES)
+        .or_else(|| storage.read(target_svc_id, crate::lifecycle::STATE_KEY_BYTES))
+        .map(|v| v.to_vec())
+        .unwrap_or_default();
 
     loop {
         match child.run() {
@@ -1545,6 +2106,7 @@ fn handle_invoke(
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
                 error!(pc, ?target_svc_id, "child invoke panicked");
+                journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
@@ -1555,6 +2117,7 @@ fn handle_invoke(
                 );
             }
             KernelResult::OutOfGas => {
+                journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
@@ -1565,6 +2128,7 @@ fn handle_invoke(
                 );
             }
             KernelResult::PageFault(_addr) => {
+                journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
                     caller,
                     output_ptr,
@@ -1589,6 +2153,7 @@ fn handle_invoke(
                     preimages,
                     blobs,
                     blob_by_hash,
+                    task_witness,
                     services,
                     code_cache,
                     depth,
@@ -1601,30 +2166,60 @@ fn handle_invoke(
     }
 
     // Copy the child's halt output into the caller's output buffer.
-    // If the child is a service (outputs RefinePayload), convert to the
-    // invoke wire format [status:u8][state_len:u32][state][reply] so the
-    // caller's guest-side invoke_raw can parse it uniformly.
+    // If the child is a service (outputs RefinePayload), run the
+    // child-invoke conversion — the fourth applier of the work-result
+    // contract (§4b): the child's final Write{STATE_KEY} becomes the
+    // envelope's state field and is STRIPPED before absorb, so child
+    // state travels to the *parent*, never to a child storage row.
     let out_ptr = child.active_reg(7) as u32;
     let out_len = (child.active_reg(8) as usize).min(1 << 20);
     let raw_output = kread(&child, out_ptr, out_len);
 
-    let output = if let Some(payload) = RefinePayload::decode(&raw_output) {
-        // Service child: convert RefinePayload → invoke wire format.
-        // Absorb effects into the parent's journal.
-        journal.absorb_effects(payload.effects, target_svc_id.0);
+    let output = if let Some(mut payload) = RefinePayload::decode(&raw_output) {
+        // Parity check: a v3 child's anchor must commit to exactly the
+        // state the host staged for it. A mismatch means a buggy guest
+        // or a doctored blob — apply nothing, surface a crash.
+        if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
+            let expected = crate::refine_payload::anchor_for(Some(&child_prior_state));
+            if (payload.anchor_kind, payload.anchor) != expected {
+                error!(?target_svc_id, "child invoke: work-result anchor mismatch");
+                journal.rollback_to(invoke_mark);
+                return record_and_write_invoke(
+                    caller,
+                    output_ptr,
+                    output_buf_len,
+                    &[STATUS_PANICKED],
+                    depth,
+                    mode,
+                );
+            }
+        }
+
+        // When the child emitted no state write (state unchanged), echo
+        // the state the host delivered so scheduler-style TaskRecords
+        // are never silently emptied.
+        let child_state = payload
+            .take_state_write()
+            .unwrap_or_else(|| child_prior_state.clone());
+        journal.absorb_effects(core::mem::take(&mut payload.effects), target_svc_id.0);
 
         let status = if payload.continue_next {
             crate::actors::run::STATUS_YIELDED
         } else {
             crate::actors::run::STATUS_DONE
         };
-        let sl = (payload.state.len() as u32).to_le_bytes();
-        let mut out = Vec::with_capacity(1 + 4 + payload.state.len() + payload.reply.len());
+        let sl = (child_state.len() as u32).to_le_bytes();
+        let mut out = Vec::with_capacity(1 + 4 + child_state.len() + payload.reply.len());
         out.push(status);
         out.extend_from_slice(&sl);
-        out.extend_from_slice(&payload.state);
+        out.extend_from_slice(&child_state);
         out.extend_from_slice(&payload.reply);
         out
+    } else if claims_refine_payload(&raw_output) {
+        // Claims a payload version but doesn't decode — fail loud.
+        error!(?target_svc_id, "child invoke: malformed work-result");
+        journal.rollback_to(invoke_mark);
+        alloc::vec![STATUS_PANICKED]
     } else {
         raw_output
     };
@@ -1632,15 +2227,17 @@ fn handle_invoke(
     record_and_write_invoke(caller, output_ptr, output_buf_len, &output, depth, mode)
 }
 
-/// Capture a continuation: hash flat_mem, store in the data layer,
-/// and push a ContinuationHeader to the journal.
+/// Capture a continuation: hash flat_mem, store in the data layer, and
+/// record the ContinuationHeader directly in storage. Host bookkeeping —
+/// deliberately not journaled, so it is never part of a work-result's
+/// apply scope and never shadows a payload's state write.
 fn save_continuation<D: crate::data_layer::DataLayer>(
     svc_id: u32,
     flat_mem: Vec<u8>,
     heap_base: u32,
     heap_top: u32,
     data: &mut D,
-    journal: &mut RefineJournal,
+    storage: &mut ServiceStorage,
 ) {
     let commitment = crate::pvm_image::commit(&flat_mem);
     let flat_mem_len = flat_mem.len() as u32;
@@ -1655,11 +2252,11 @@ fn save_continuation<D: crate::data_layer::DataLayer>(
         commitment,
         registers: [0; 13],
     };
-    journal.writes.push((
-        svc_id,
-        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
-        header.encode(),
-    ));
+    storage.write(
+        ServiceId(svc_id),
+        crate::lifecycle::CONTINUATION_HEADER_KEY,
+        &header.encode(),
+    );
 }
 
 /// Load a continuation for a service: read header from storage (checking
@@ -1680,12 +2277,15 @@ fn load_continuation<D: crate::data_layer::DataLayer>(
     Some((body, header.heap_base, header.heap_top))
 }
 
-/// Clear any prior continuation for a service by writing empty header
-/// and state keys and removing the body from the data layer.
-/// No-op if the service has no continuation.
+/// Clear any prior continuation for a service: remove the body from the
+/// data layer and delete the header row directly. Host bookkeeping —
+/// never journaled, and it must never touch `STATE_KEY` (an empty state
+/// write here would clobber the payload's state under last-wins and
+/// break the next dispatch's anchor). State teardown, if ever intended,
+/// must be an explicit guest-emitted effect. No-op if the service has no
+/// continuation.
 fn clear_continuation<D: crate::data_layer::DataLayer>(
-    journal: &mut RefineJournal,
-    storage: &ServiceStorage,
+    storage: &mut ServiceStorage,
     data: &mut D,
     svc_id: u32,
 ) {
@@ -1697,14 +2297,7 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
     if let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) {
         pollster::block_on(data.remove(&header.commitment));
     }
-    journal.writes.push((
-        svc_id,
-        crate::lifecycle::CONTINUATION_HEADER_KEY.to_vec(),
-        vec![],
-    ));
-    journal
-        .writes
-        .push((svc_id, crate::lifecycle::STATE_KEY_BYTES.to_vec(), vec![]));
+    storage.delete(id, crate::lifecycle::CONTINUATION_HEADER_KEY);
 }
 
 /// blake2b-256 content hash keying `blob_by_hash`. Collision-resistant, so
@@ -1745,6 +2338,174 @@ mod tests {
         let mut rt = VosRuntime::new();
         let idx = rt.register_blob(a.clone());
         assert_eq!(rt.blob_by_hash.get(&blob_hash(&a)), Some(&idx));
+    }
+
+    // ── Work-result apply parity (v2 vs v3) ─────────────────────────
+    //
+    // The one property the version negotiation must hold: a v2 payload
+    // and the v3 payload describing the same logical transition absorb
+    // into byte-identical journal contents. These drive the same
+    // `absorb_work_result` the tick loop uses.
+
+    fn state_key() -> Vec<u8> {
+        crate::lifecycle::STATE_KEY_BYTES.to_vec()
+    }
+
+    fn drain_to_storage(journal: &mut RefineJournal, storage: &mut ServiceStorage) {
+        for (svc, key, value) in journal.writes.drain(..) {
+            storage.write(ServiceId(svc), &key, &value);
+        }
+    }
+
+    #[test]
+    fn v2_and_v3_absorb_identically() {
+        use crate::refine_payload::{self, Effect, RefinePayload, anchor_for};
+
+        let svc = 7u32;
+        let prior_state = b"prior".to_vec();
+        let new_state = b"new-state".to_vec();
+        let effects = vec![
+            Effect::Write {
+                key: b"row".to_vec(),
+                value: vec![1, 2],
+            },
+            Effect::Transfer {
+                target: 9,
+                memo: b"memo".to_vec(),
+            },
+        ];
+
+        // v2: state as an explicit field on the wire.
+        let v2_bytes =
+            refine_payload::encode_v2(&new_state, b"reply", &effects, false, false);
+
+        // v3: state as the final Write{STATE_KEY} + a verified anchor.
+        let (anchor_kind, anchor) = anchor_for(Some(&prior_state));
+        let mut v3_effects = effects.clone();
+        v3_effects.push(Effect::Write {
+            key: state_key(),
+            value: new_state.clone(),
+        });
+        let v3_bytes = RefinePayload {
+            anchor_kind,
+            anchor,
+            reply: b"reply".to_vec(),
+            effects: v3_effects,
+            ..RefinePayload::new()
+        }
+        .encode();
+
+        let run = |bytes: &[u8]| {
+            let mut storage = ServiceStorage::new();
+            storage.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, &prior_state);
+            let mut journal = RefineJournal::default();
+            let payload = RefinePayload::decode(bytes).expect("decodes");
+            let absorbed =
+                absorb_work_result(&mut journal, &storage, svc, payload).expect("applies");
+            let writes = journal.writes.clone();
+            let transfers = journal.transfers.clone();
+            drain_to_storage(&mut journal, &mut storage);
+            let end_state = storage
+                .read(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES)
+                .map(|v| v.to_vec());
+            (writes, transfers, end_state, absorbed.reply)
+        };
+
+        let (w2, t2, s2, r2) = run(&v2_bytes);
+        let (w3, t3, s3, r3) = run(&v3_bytes);
+        assert_eq!(w2, w3, "journal writes must match across versions");
+        assert_eq!(t2, t3, "journal transfers must match across versions");
+        assert_eq!(s2, s3, "end-of-tick state must match across versions");
+        assert_eq!(s2.as_deref(), Some(new_state.as_slice()));
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn v3_anchor_checks_against_journal_overlay() {
+        use crate::refine_payload::{Effect, RefinePayload, anchor_for};
+
+        // Iteration N's anchor is the hash of iteration N−1's final
+        // state, which lives only in the journal until end of tick —
+        // the check must pass against the overlay, and a check against
+        // committed storage alone would have rejected it.
+        let svc = 3u32;
+        let mut storage = ServiceStorage::new();
+        storage.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"s0");
+        let mut journal = RefineJournal::default();
+
+        let mk = |prior: &[u8], next: &[u8]| {
+            let (anchor_kind, anchor) = anchor_for(Some(prior));
+            RefinePayload {
+                anchor_kind,
+                anchor,
+                effects: vec![Effect::Write {
+                    key: state_key(),
+                    value: next.to_vec(),
+                }],
+                ..RefinePayload::new()
+            }
+        };
+
+        // Iteration 1: anchors committed storage (s0), writes s1.
+        absorb_work_result(&mut journal, &storage, svc, mk(b"s0", b"s1"))
+            .expect("iteration 1 applies");
+        // Iteration 2: anchors the OVERLAY state (s1), not storage (s0).
+        absorb_work_result(&mut journal, &storage, svc, mk(b"s1", b"s2"))
+            .expect("iteration 2 must verify against the journal overlay");
+        // A stale anchor (still s0) must reject.
+        let err = absorb_work_result(&mut journal, &storage, svc, mk(b"s0", b"s3"))
+            .expect_err("stale anchor must reject");
+        assert_eq!(err, WorkResultError::AnchorMismatch);
+        // Nothing from the rejected work-result applied.
+        assert_eq!(
+            journal.journaled_read(svc, crate::lifecycle::STATE_KEY_BYTES),
+            Some(&b"s2"[..]),
+        );
+    }
+
+    #[test]
+    fn v3_genesis_anchor_requires_absent_or_empty_state() {
+        use crate::refine_payload::RefinePayload;
+
+        let svc = 4u32;
+        let storage = ServiceStorage::new();
+        let mut journal = RefineJournal::default();
+
+        // Fresh service: genesis applies.
+        absorb_work_result(&mut journal, &storage, svc, RefinePayload::new())
+            .expect("genesis against absent state applies");
+
+        // Existing state: genesis rejects.
+        let mut seeded = ServiceStorage::new();
+        seeded.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"present");
+        let err = absorb_work_result(&mut journal, &seeded, svc, RefinePayload::new())
+            .expect_err("genesis against present state must reject");
+        assert_eq!(err, WorkResultError::AnchorMismatch);
+
+        // Empty-value STATE_KEY row counts as genesis (ServiceStorage
+        // stores empty writes as present).
+        let mut empty_row = ServiceStorage::new();
+        empty_row.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"");
+        absorb_work_result(&mut journal, &empty_row, svc, RefinePayload::new())
+            .expect("genesis against empty state applies");
+    }
+
+    #[test]
+    fn v2_payloads_skip_anchor_checks() {
+        use crate::refine_payload::{self, RefinePayload};
+
+        // A v2 guest knows nothing about anchors; its payload applies
+        // against any prior state.
+        let svc = 5u32;
+        let mut storage = ServiceStorage::new();
+        storage.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"whatever");
+        let mut journal = RefineJournal::default();
+        let bytes = refine_payload::encode_v2(b"next", b"", &[], false, false);
+        let payload = RefinePayload::decode(&bytes).unwrap();
+        let absorbed =
+            absorb_work_result(&mut journal, &storage, svc, payload).expect("v2 applies");
+        assert_eq!(absorbed.anchor, None);
+        assert!(!absorbed.effect_bearing, "v2 never sets effect_bearing");
     }
 
     #[test]

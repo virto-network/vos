@@ -266,13 +266,22 @@ pub fn invoke(service_id: u32, message: &super::value::Msg, state: &[u8]) -> Inv
 /// calls the invoke hostcall, and unpacks the output.
 #[cfg(feature = "pvm")]
 pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult {
+    invoke_hash(&super::run::service_code_hash(service_id), message, state)
+}
+
+/// Invoke a child by its full 32-byte code hash — the Task shape
+/// (`vos::agent::Child::Task`): the host runs the content-addressed
+/// blob witness-delivered, with no ServiceId and no storage row.
+/// Same input packing and output envelope as [`invoke_raw`].
+#[cfg(feature = "pvm")]
+pub fn invoke_hash(code_hash: &[u8; 32], message: &[u8], state: &[u8]) -> InvokeResult {
     let total = 4 + state.len() + message.len();
     let mut input = alloc::vec![0u8; total];
     input[0..4].copy_from_slice(&(state.len() as u32).to_le_bytes());
     input[4..4 + state.len()].copy_from_slice(state);
     input[4 + state.len()..].copy_from_slice(message);
 
-    let hash = super::run::service_code_hash(service_id);
+    let hash = *code_hash;
     // Reply buffer. Kept on the stack at BUF_SIZE: heap-allocating a
     // larger one corrupts the guest heap of actors that already use most
     // of the fixed 256 KiB arena (the clerk ledger), and GROW_HEAP is a

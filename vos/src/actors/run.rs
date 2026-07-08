@@ -462,7 +462,17 @@ pub fn run_refine_service<A: super::Actor>() {
     // as `usize` because `A` differs per service; safe because PVM is
     // single-threaded.
     static mut ACTOR_HOLDER: usize = 0;
+    // The work-result anchor: `(anchor_kind, anchor)` committing to the
+    // state this refine runs against. Computed on cold start from the
+    // exact serialized bytes READ returned (before deserialization);
+    // carried forward across warm restarts in flat_mem, advancing to
+    // `blake2b(S)` whenever a work-result's final state was `S` — so
+    // the up-to-64 work-results of one tick form the anchor chain the
+    // host verifies against its journal overlay.
+    static mut CURRENT_ANCHOR: (u8, [u8; 32]) =
+        (crate::refine_payload::ANCHOR_GENESIS, [0u8; 32]);
     let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
+    let anchor_ptr = addr_of_mut!(CURRENT_ANCHOR);
     let mut cold_start = false;
     // SAFETY: PVM is single-threaded; the static-mut access goes via
     // a raw pointer (no shared/exclusive ref conflict). The cast from
@@ -482,6 +492,7 @@ pub fn run_refine_service<A: super::Actor>() {
             // large state as missing and silently resurrect the actor
             // as default, persisting the wipe on the next save.
             let state = lifecycle::read_persisted_state_owned();
+            *anchor_ptr = crate::refine_payload::anchor_for(state.as_deref());
             let boxed = Box::new(lifecycle::load_or_create::<A>(state.as_deref()));
             *holder_ptr = Box::into_raw(boxed) as usize;
         }
@@ -543,7 +554,36 @@ pub fn run_refine_service<A: super::Actor>() {
     {
         let new_state_bytes = super::codec::Encode::encode(&*actor_ref);
         let reply_bytes = ctx.take_reply_bytes();
-        let payload = ctx.drain_into_refine_payload(new_state_bytes, reply_bytes);
+        // Emit the post-dispatch state as the final Write{STATE_KEY}
+        // effect only when it changed from the anchored state. Genesis
+        // always emits: there is no prior blob to be equal to, and the
+        // first work-result is what materializes the actor's row.
+        // SAFETY: single-threaded PVM, raw-pointer access as above.
+        let (anchor_kind, anchor) = unsafe { *anchor_ptr };
+        let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
+        // Empty state is genesis, not a hash anchor — the host's overlay
+        // computes `anchor_for(Some(empty)) == GENESIS`, so a fieldless
+        // (empty-encoding) actor must carry genesis forward or its next
+        // self-message iteration would AnchorMismatch and silently drop.
+        let new_is_empty = new_state_bytes.is_empty();
+        let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS
+            || new_hash != anchor;
+        let payload = ctx.drain_into_refine_payload(
+            anchor_kind,
+            anchor,
+            state_changed.then_some(new_state_bytes),
+            reply_bytes,
+        );
+        if state_changed {
+            // SAFETY: single-threaded PVM, raw-pointer access as above.
+            unsafe {
+                *anchor_ptr = if new_is_empty {
+                    (crate::refine_payload::ANCHOR_GENESIS, [0u8; 32])
+                } else {
+                    (crate::refine_payload::ANCHOR_STATE_HASH, new_hash)
+                };
+            }
+        }
         drop(ctx);
         let encoded = payload.encode();
         out_buf.clear();
@@ -560,6 +600,75 @@ pub fn run_refine_service<A: super::Actor>() {
     let io_hash =
         crate::zk::__take_pending_io_hash().unwrap_or_else(|| crate::zk::compute_io_hash(&[], &[]));
     halt_with_output_bound(out_buf, &io_hash);
+}
+
+// ── Task refine (witness-delivered input, always cold) ───────────────
+
+/// Refine entry for **Task** blobs — anonymous, code-hash-identified
+/// pure children (`vos::agent::Tasks`, `Child::Task`).
+///
+/// Input arrives exclusively through the witness buffer patched into
+/// the initial memory image at `witness_ptr` (see [`crate::task_abi`]):
+/// no `READ`, no `FETCH` — refine-pure by construction, so the live
+/// invocation and a traced re-execution start from byte-identical
+/// images and every Task is one `#[provable]` away from being a proof
+/// guest.
+///
+/// Tasks are always cold: no `ACTOR_HOLDER`, no warm restart — a
+/// suspended Task is its serialized state in the parent's TaskRecord,
+/// and resume is a fresh invocation with that state patched back in.
+/// One `(state, msg)` in, one work-result out:
+///
+/// 1. Decode `(state, msg)` from the witness buffer; anchor over the
+///    exact state bytes (genesis when empty).
+/// 2. `load_or_create::<A>(state)` and dispatch the single message
+///    (effects buffer into the context — refine mode).
+/// 3. Halt with the v3 `RefinePayload`: state as the final
+///    `Write{STATE_KEY}` when changed, reply, effects, `continue_next`
+///    from `yield_now`/`sleep`.
+///
+/// An unpatched buffer panics (fail loud): a Task blob is only
+/// meaningful under a witness-delivering invoker — running one as a
+/// registry service or bare refine is a deployment error, not a case
+/// to limp through.
+#[cfg(feature = "service")]
+pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: usize) {
+    use super::context::ServiceId;
+    use super::lifecycle;
+
+    crate::log_impl::install_pvm_logger();
+    set_refine_mode(true);
+
+    // SAFETY: the macro-emitted `__VOS_WITNESS` static spans exactly
+    // `witness_cap` readable bytes.
+    let (state, msg) = unsafe { crate::task_abi::read_task_input(witness_ptr, witness_cap) }
+        .expect("task input not patched — Task blobs run only under a witness-delivering invoker");
+
+    let (anchor_kind, anchor) = crate::refine_payload::anchor_for(Some(&state));
+    let mut actor = lifecycle::load_or_create::<A>(Some(&state));
+    let mut ctx = super::Context::new(ServiceId(0));
+
+    let _ = lifecycle::dispatch_one::<A>(&msg, &mut actor, &mut ctx);
+
+    let new_state_bytes = super::codec::Encode::encode(&actor);
+    let reply_bytes = ctx.take_reply_bytes();
+    let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
+    let state_changed =
+        anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != anchor;
+    let payload = ctx.drain_into_refine_payload(
+        anchor_kind,
+        anchor,
+        state_changed.then_some(new_state_bytes),
+        reply_bytes,
+    );
+    let encoded = payload.encode();
+    // Same halt binding as run_refine_service: a handler that called
+    // vos::zk::bind_io stashed the real (public, return) hash; default
+    // to the empty binding otherwise. The kernel is discarded after one
+    // invocation, so no output-buffer reuse is needed.
+    let io_hash =
+        crate::zk::__take_pending_io_hash().unwrap_or_else(|| crate::zk::compute_io_hash(&[], &[]));
+    halt_with_output_bound(&encoded, &io_hash);
 }
 
 // ── Refine phase (all actors) ─────────────────────────────────────────

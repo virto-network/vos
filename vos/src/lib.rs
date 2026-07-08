@@ -96,6 +96,7 @@ pub mod zk;
 
 pub mod actors;
 pub mod refine_payload;
+pub mod task_abi;
 
 pub mod effect_log;
 pub mod effects;
@@ -160,8 +161,16 @@ pub use actors::{
 pub use actors::exec::{TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
 pub use actors::run_refine_entry;
+#[cfg(feature = "service")]
+pub use actors::run_task_entry;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
+
+/// The agent model: parent-managed children — `Tasks` tables of
+/// `Child::{Task, Peer}` records, spawned and driven from handlers.
+pub mod agent {
+    pub use crate::actors::tasks::{Child, TaskId, TaskRecord, TaskStatus, Tasks};
+}
 
 /// Re-export guest hostcalls for direct use by actors (e.g. agent calling invoke).
 #[cfg(feature = "pvm")]

@@ -19,6 +19,28 @@
 
 use alloc::vec::Vec;
 
+/// `anchor_kind` sentinel for a log whose dispatch recorded no anchor:
+/// logs written before anchors existed, and v2 dispatches (no anchor on
+/// that wire). Replay divergence detection skips these. Distinct from
+/// `ANCHOR_GENESIS` (0x00), which is a real, comparable anchor.
+pub const ANCHOR_UNRECORDED: u8 = 0xFF;
+
+/// Caller-prefix bytes recorded per dispatch — the M7 wire the host
+/// prepends so the guest's dispatch gate sees the caller's trust flag
+/// and role grants: `[trust_flag, has_space_role, space_role,
+/// has_actor_local_role, actor_local_role]`. Recording them makes
+/// replay re-run each dispatch under the ORIGINAL caller's authority,
+/// so a role-refused dispatch replays as refused — replaying everything
+/// as trusted-System would re-admit refused calls and diverge the
+/// rebuilt state from the committed history.
+pub type CallerPrefix = [u8; 5];
+
+/// The trusted-System caller prefix — the replay identity for logs
+/// recorded before caller prefixes existed (those dispatches were
+/// replayed as System historically; keeping that default preserves
+/// their behavior).
+pub const CALLER_SYSTEM: CallerPrefix = [1, 0, 0, 0, 0];
+
 /// Default size cap for a single `ctx.ask` reply, in bytes.
 ///
 /// Replies from workers or other actors that exceed this cap are
@@ -41,6 +63,19 @@ pub struct EffectLog {
     /// Reply bytes in `ctx.ask` call order. Empty for pure actors
     /// and read-only dispatches.
     pub replies: Vec<Vec<u8>>,
+    /// `(kind, anchor)` of the work-result this dispatch applied
+    /// against — NORMATIVE, not just audit: replay divergence detection
+    /// compares each re-emitted work-result's anchor against this
+    /// recorded value (the self-check against effective state passes by
+    /// construction during replay and detects nothing).
+    /// [`ANCHOR_UNRECORDED`] when the dispatch carried no anchor.
+    pub anchor_kind: u8,
+    /// The recorded anchor bytes; zero-filled when unrecorded.
+    pub anchor: [u8; 32],
+    /// The M7 caller-prefix bytes this dispatch ran under; replay wraps
+    /// the message with exactly these so gate decisions reproduce
+    /// (see [`CallerPrefix`]). [`CALLER_SYSTEM`] for legacy logs.
+    pub caller_prefix: CallerPrefix,
 }
 
 impl EffectLog {
@@ -49,7 +84,24 @@ impl EffectLog {
         Self {
             msg,
             replies: Vec::new(),
+            anchor_kind: ANCHOR_UNRECORDED,
+            anchor: [0u8; 32],
+            caller_prefix: CALLER_SYSTEM,
         }
+    }
+
+    /// Record the `(kind, anchor)` the dispatch's first work-result
+    /// declared (and the runtime verified). Stamped by the host after
+    /// the dispatch completes, before the log is committed.
+    pub fn set_anchor(&mut self, kind: u8, anchor: [u8; 32]) {
+        self.anchor_kind = kind;
+        self.anchor = anchor;
+    }
+
+    /// Record the caller-prefix bytes the dispatch ran under. Stamped
+    /// by the host alongside the anchor, before the log commits.
+    pub fn set_caller_prefix(&mut self, prefix: CallerPrefix) {
+        self.caller_prefix = prefix;
     }
 
     /// Append the next reply captured during dispatch.
@@ -82,6 +134,7 @@ impl EffectLog {
     /// ```text
     /// [msg_len:u64 LE][msg][n_replies:u64 LE]
     /// ( [reply_len:u64 LE][reply] )*
+    /// [anchor_kind:u8][anchor:32B][caller_prefix:5B]
     /// ```
     ///
     /// The encoding is deterministic and unambiguous, so two
@@ -89,7 +142,7 @@ impl EffectLog {
     /// (and thus the same CID) without coordination.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            16 + self.msg.len() + self.replies.iter().map(|r| 8 + r.len()).sum::<usize>(),
+            16 + 33 + self.msg.len() + self.replies.iter().map(|r| 8 + r.len()).sum::<usize>(),
         );
         buf.extend_from_slice(&(self.msg.len() as u64).to_le_bytes());
         buf.extend_from_slice(&self.msg);
@@ -98,12 +151,19 @@ impl EffectLog {
             buf.extend_from_slice(&(reply.len() as u64).to_le_bytes());
             buf.extend_from_slice(reply);
         }
+        buf.push(self.anchor_kind);
+        buf.extend_from_slice(&self.anchor);
+        buf.extend_from_slice(&self.caller_prefix);
         buf
     }
 
     /// Deserialize from bytes produced by [`to_bytes`]. Returns
     /// `None` if the buffer is malformed, truncated, or has
-    /// trailing garbage.
+    /// trailing garbage. Bytes ending right after the replies are the
+    /// pre-anchor encoding — accepted, decoding as
+    /// [`ANCHOR_UNRECORDED`] + [`CALLER_SYSTEM`] so stored DAGs keep
+    /// replaying with their historical semantics (no anchor to compare,
+    /// trusted-System replay identity).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut pos = 0;
         let msg_len = read_u64(bytes, &mut pos)? as usize;
@@ -116,10 +176,27 @@ impl EffectLog {
             replies.push(take(bytes, &mut pos, len)?.to_vec());
         }
 
-        if pos != bytes.len() {
-            return None;
-        }
-        Some(Self { msg, replies })
+        let (anchor_kind, anchor, caller_prefix) = if pos == bytes.len() {
+            (ANCHOR_UNRECORDED, [0u8; 32], CALLER_SYSTEM)
+        } else {
+            let kind = *bytes.get(pos)?;
+            pos += 1;
+            let mut anchor = [0u8; 32];
+            anchor.copy_from_slice(take(bytes, &mut pos, 32)?);
+            let mut prefix = [0u8; 5];
+            prefix.copy_from_slice(take(bytes, &mut pos, 5)?);
+            if pos != bytes.len() {
+                return None;
+            }
+            (kind, anchor, prefix)
+        };
+        Some(Self {
+            msg,
+            replies,
+            anchor_kind,
+            anchor,
+            caller_prefix,
+        })
     }
 }
 
@@ -479,7 +556,14 @@ mod tests {
         let mut log = EffectLog::for_msg(b"xx".to_vec());
         log.record_reply(b"yy".to_vec());
         let bytes = log.to_bytes();
+        // Cutting at exactly the pre-anchor boundary is the accepted
+        // legacy encoding (see pre_anchor_encoding_decodes_as_unrecorded);
+        // every other truncation must fail.
+        let legacy_boundary = bytes.len() - 38;
         for cut in 0..bytes.len() {
+            if cut == legacy_boundary {
+                continue;
+            }
             assert!(
                 EffectLog::from_bytes(&bytes[..cut]).is_none(),
                 "truncated at {cut} should fail",
@@ -501,6 +585,36 @@ mod tests {
         b.record_reply(b"r2".to_vec());
 
         assert_eq!(a.to_bytes(), b.to_bytes());
+    }
+
+    #[test]
+    fn anchor_roundtrips() {
+        let mut log = EffectLog::for_msg(b"m".to_vec());
+        assert_eq!(log.anchor_kind, ANCHOR_UNRECORDED);
+        log.set_anchor(0x01, [7u8; 32]);
+        let decoded = EffectLog::from_bytes(&log.to_bytes()).expect("decode");
+        assert_eq!(decoded, log);
+        assert_eq!(decoded.anchor_kind, 0x01);
+        assert_eq!(decoded.anchor, [7u8; 32]);
+    }
+
+    #[test]
+    fn pre_anchor_encoding_decodes_as_unrecorded() {
+        // Bytes from before the anchor suffix existed (msg + replies
+        // only) must keep decoding so stored DAGs replay; they surface
+        // as ANCHOR_UNRECORDED, which divergence detection skips.
+        let mut log = EffectLog::for_msg(b"legacy".to_vec());
+        log.record_reply(b"r".to_vec());
+        let with_suffix = log.to_bytes();
+        let legacy = &with_suffix[..with_suffix.len() - 38];
+        let decoded = EffectLog::from_bytes(legacy).expect("legacy decodes");
+        assert_eq!(decoded.msg, b"legacy");
+        assert_eq!(decoded.replies, alloc::vec![b"r".to_vec()]);
+        assert_eq!(decoded.anchor_kind, ANCHOR_UNRECORDED);
+        assert_eq!(decoded.caller_prefix, CALLER_SYSTEM);
+
+        // But a partial suffix is still malformed.
+        assert!(EffectLog::from_bytes(&with_suffix[..with_suffix.len() - 1]).is_none());
     }
 
     #[test]
