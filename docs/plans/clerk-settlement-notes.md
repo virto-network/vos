@@ -203,3 +203,77 @@ handler contract they rely on is explicit.
 - **Wedge recovery.** After a recorded settlement, `anchor_reset(peer,
   settled_closing_root)` on *both* banks' bridges re-opens the voucher
   channels for the next window.
+
+## Adversarial review 2026-07-08 (pre-merge) — fixed here + carried forward
+
+A 4-lens adversarial review ran before merge. One money-path blocker was
+**fixed on this branch**; the rest are DoS/griefing or test-coverage that
+cannot produce a *wrong* settlement (the venue's `settle_window`
+cancellation check is the monetary gate) and are recorded here.
+
+**FIXED — commit-binding (was a silent receiver-loss route).**
+`submit_voucher` opened the envelope and credited its value, and folded
+`amount_commit` into the settlement receiver term, but never checked the
+two agree — the issuer signs both independently. A malicious issuer could
+seal value 100 while committing to 10 (receiver credits 100, window settles
+10), or ship a non-canonical `amount_commit` the receiver term folds as the
+identity (window settles clean while the receiver is out the credited
+value). Fixed by a fail-closed
+`Amount::commit(value, &blinding) == voucher.amount_commit` check on the
+submit accept path (byte equality also forces `amount_commit` canonical),
+mirrored by a `to_point().is_some()` guard on `redeem_voucher`. Regression:
+`elf_integration.rs` two-bank e2e (mismatched-envelope voucher →
+`VoucherInvalid`, dedup + receiver term untouched). This makes
+`window::sub_commit`'s `None` arms unreachable defense-in-depth (comment
+corrected).
+
+**Carried forward — Wave-1 limits (no wrong-settlement risk; documented,
+not code-blocking):**
+
+- **Claim store has no freshness/supersession.** `submit_claim` is open and
+  claims carry no nonce/sequence, so a wire observer can resubmit a bank's
+  *earlier* signed claim to roll back a corrected one
+  (`store.rs` replace-until-settled overwrites unconditionally). It cannot
+  forge a claim (signature is checked against the registered claimant
+  pubkey) and cannot produce a wrong settlement (cancellation still gates
+  `settle_window`), but it can get a window settled+frozen on a stale voucher
+  set. **Close-protocol rule:** re-verify `claim_diagnostics` immediately
+  before `settle_window`. **Wave-2:** carry a monotonic per-(claimant, pair,
+  currency, window) sequence inside the signed claim and reject
+  non-increasing replacements.
+- **Claim store is grow-only.** `(currency, window)` are attacker-chosen
+  fields inside the signed claim; a registered bank can push unbounded
+  distinct-keyed rows. **Wave-2:** cap rows per pair, or reject
+  `currency != DEMO_CURRENCY` / windows outside a band of the venue's
+  current window.
+- **Diagnostics are unauthenticated.** `voucher_count` / `rk_set_hash` ride
+  *outside* the signed claim — an operator-triage hint only, spoofable by the
+  submitter. Never gate an automated decision on them.
+- **rkyv fail-to-fresh on upgrade.** This branch adds fields to the
+  clerk-bridge state (`PeerEntry.window`, `ClerkBridge.window_nets`) and the
+  new clerk-settle actor. An existing bridge's archived state fails
+  `try_decode` and resets to `new()` (the accepted node_prefix precedent) —
+  wiping `local_ledger_id`, the peers table, the F2 anchor, and the dedup
+  set. **Operational rule:** stand bridges up fresh when deploying this
+  branch (or re-bootstrap → re-register peers → `anchor_reset`).
+
+**Carried forward — test-coverage fast-follow (add with the S3 driver / S6
+hardening; the properties hold, the guards just aren't pinned):**
+
+- Cross-node **Operator-gate enforcement** on `anchor_reset` / `window_rotate`
+  is never asserted (every test drives them as local `Caller::System`, which
+  bypasses the gate). Add: an ungranted cross-node peer → `Forbidden` for
+  each (one assert each, using the existing mesh).
+- The **`redeem_voucher`-path receiver-term fold** (the production
+  money-moving ingress) has no `window_net` assertion — only the
+  `submit_voucher` path is checked. Add a `window_net` assertion after a
+  redeem so deleting that fold fails a test.
+- No **non-Ok clerk-settle Status** crosses the wire in any e2e (all venue
+  assertions compare against `Ok` = 0). Add one wire-level negative
+  (`UnknownBank` before registration, or `AlreadySettled` after settling) so
+  an rkyv discriminant drift is caught.
+- The **issuer ⊕ receiver → `reconcile`** composition is proven only by the
+  ELF-gated e2es; the native `window` test uses a hand-rolled `add/is_zero`.
+  Add a native clerk-settle test that composes accumulate_neg-derived terms,
+  signs both claims, and drives `store::settle_window` so a sign regression
+  fails plain `cargo test`.

@@ -70,8 +70,10 @@ pub(crate) fn window_net(
 
 /// `a ⊖ b` over the Pedersen group. A degenerate (non-decompressable)
 /// operand is treated as the identity so accumulation can never panic on a
-/// malformed commit — a signature-verified voucher never carries one, but
-/// the receiver term must not be a crash oracle regardless.
+/// malformed commit. The accept paths (`submit_voucher`/`redeem_voucher`)
+/// already reject a non-canonical `amount_commit` before folding it in, so
+/// the `None` arms are unreachable defense-in-depth — the receiver term
+/// must not be a crash oracle even if that ingress guard ever regresses.
 fn sub_commit(a: &Amount, b: &Amount) -> Amount {
     match (a.to_point(), b.to_point()) {
         (Some(pa), Some(pb)) => Amount::from_point(&(pa - pb)),

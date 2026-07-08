@@ -615,6 +615,22 @@ impl ClerkBridge {
             None => return reply(Status::EnvelopeUnreadable),
         };
 
+        // Bind the credited opening to the settled commitment. The value
+        // the operator credits comes from the envelope; the amount folded
+        // into the settlement net flow comes from `amount_commit`. Nothing
+        // upstream ties them together — the issuer signs both independently
+        // — so without this check a malicious issuer could seal value 100
+        // while committing to 10 (the receiver credits 100 but the window
+        // settles for 10), or ship a non-canonical `amount_commit` that the
+        // receiver term folds as the identity. Byte equality against a
+        // freshly recomputed canonical commitment forces the two to agree
+        // AND forces `amount_commit` to be a valid Ristretto point. The
+        // blinding is canonical (envelope.open returns it via
+        // Blinding::from_bytes), so `commit` cannot panic.
+        if cipher_clerk::crypto::Amount::commit(value, &blinding) != voucher.amount_commit {
+            return reply(Status::VoucherInvalid);
+        }
+
         // Commit to the dedup set after a successful open. From
         // here the host caller has the opening and can credit the
         // recipient; a second submit with the same triple would
@@ -777,6 +793,15 @@ impl ClerkBridge {
             .expect("bootstrap guarantees canonical IVK secret");
         if voucher.envelope.open(&ivk).is_none() {
             return early_redeem(Status::EnvelopeUnreadable);
+        }
+        // Reject a non-canonical `amount_commit` before it reaches the
+        // ledger or the receiver term. `validate_inflow` above pins the
+        // inflow amounts to `amount_commit` byte-for-byte, and the ledger
+        // checks the openings, so the value path is already bound here;
+        // this guard closes the degenerate-commit route symmetrically with
+        // submit_voucher and makes the receiver-term fold total.
+        if voucher.amount_commit.to_point().is_none() {
+            return early_redeem(Status::VoucherInvalid);
         }
 
         // Cross-actor dispatch: invoke clerk-ledger's

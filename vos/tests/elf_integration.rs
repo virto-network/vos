@@ -7791,6 +7791,55 @@ fn clerk_ledger_two_bank_federation() {
         "the peer starts in window 0"
     );
 
+    // Commit-binding: a voucher whose sealed envelope value does not open
+    // its `amount_commit` must be refused (VoucherInvalid) and must not
+    // poison the dedup set or the receiver term. Without the bind, the
+    // receiver would credit the envelope value (99) while the window
+    // settled for the committed value (50) — silent loss at settlement.
+    // Distinct commitment ⇒ distinct redemption key (dedup misses), and it
+    // chains off V1's root_after so it clears the anchor and reaches the
+    // commit-binding check.
+    let mm_blinding = cipher_clerk::crypto::Blinding([3u8; 32]);
+    let mm_commit = Amount::commit(50, &mm_blinding);
+    let mm_env = EncryptedEnvelope::seal(99, &mm_blinding, &bank_b_ivk_pk)
+        .expect("seal mismatched envelope");
+    let mm_voucher = Voucher::sign(
+        mm_commit,
+        mm_env,
+        root_after,
+        [0x44u8; 32],
+        CcProof::default(),
+        &registrar_a.secret,
+    );
+    let mm_reply = vos::block_on(bridge_actor.submit_voucher(
+        &mut &node_b,
+        mm_voucher.to_bytes(),
+        b"bank-a".to_vec(),
+    ))
+    .expect("invoke submit_voucher (commit-binding)");
+    assert_eq!(
+        mm_reply.status,
+        BridgeStatus::VoucherInvalid,
+        "a voucher whose envelope value != amount_commit must be refused",
+    );
+    assert_eq!(
+        vos::block_on(bridge_actor.redeemed_count(&mut &node_b)).expect("redeemed_count"),
+        1,
+        "the rejected mismatch voucher must not enter the dedup set",
+    );
+    // The receiver term is unchanged — the rejected voucher folded nothing.
+    assert_eq!(
+        vos::block_on(bridge_actor.window_net(
+            &mut &node_b,
+            b"bank-a".to_vec(),
+            clerk_bridge::DEMO_CURRENCY,
+            0,
+        ))
+        .expect("invoke window_net"),
+        expected_neg.0.to_vec(),
+        "a refused voucher must not move the receiver term",
+    );
+
     // F2 receiver-side anchor bites: a SECOND voucher from bank-a whose
     // state_root_before does NOT chain to the last accepted root_after
     // (= root_after of V1) must be refused (StateRootMismatch collapses to

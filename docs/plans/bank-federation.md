@@ -51,7 +51,8 @@ operators, and every later type reuses the same voucher/settlement wire.
    enrollment. (Note the monotone locality **seal**: a `Local` agent can't be
    widened to `Raft` later — register it `Raft` from the start.) **DONE** —
    the example manifests register the ledger `raft` from genesis
-   (`examples/space-bank.toml`, and `examples/space-clerk-demo.toml`), and the
+   (`examples/space-bank-a.toml`, `examples/space-bank-b.toml`, and
+   `examples/space-clerk-demo.toml`), and the
    settlement venue's `clerk-settle` is `raft` too (`examples/space-venue.toml`).
 
 2. **Role-gate the ledger's read handlers.** A `Raft` ledger answers *any*
