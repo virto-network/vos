@@ -10423,10 +10423,11 @@ fn probe_panic_discards_absorbed_child_effect() {
 #[test]
 fn probe_ask_status_distinguishes_too_big_from_crash() {
     // A5: an oversize child reply comes back as STATUS_TOO_BIG, distinct
-    // from a crash (STATUS_PANICKED). The 4 KiB child-invoke wall used to
+    // from a crash (STATUS_PANICKED). The child-invoke wall used to
     // substitute PANICKED for an over-buffer reply, conflating the two.
-    // `bloat` fills 80 KiB of state (past the 64 KiB INVOKE buffer);
-    // `crasher` page-faults; `leaker` returns a small reply that fits.
+    // `bloat` returns 1 KiB of state through `ask_small_buf`'s 512-byte
+    // buffer (over-buffer → TOO_BIG); `crasher` page-faults (→ PANICKED);
+    // `leaker` returns a small reply that fits (→ DONE).
     use vos::value::{Msg, TAG_DYNAMIC, Value};
     use vos::{Decode, Encode};
 
@@ -10436,7 +10437,7 @@ fn probe_ask_status_distinguishes_too_big_from_crash() {
     let crasher = register_svc(&mut rt, transpile_actor(&example_elf("crasher")));
     let leaker = register_svc(&mut rt, transpile_actor(&example_elf("leaker")));
 
-    let mut ask = |rt: &mut VosRuntime, child: u32| -> u8 {
+    let ask = |rt: &mut VosRuntime, child: u32| -> u8 {
         let enc = Msg::new("ask_small_buf").with("child", child).encode();
         let mut m = vec![TAG_DYNAMIC];
         m.extend_from_slice(&enc);

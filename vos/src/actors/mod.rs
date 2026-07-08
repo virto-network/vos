@@ -9,8 +9,7 @@
 //!
 //! - `ctx.tell(target, payload)` — fire-and-forget message (queues transfer)
 //! - `ctx.ask(target, payload)` — synchronous query (suspends until result)
-//! - `ctx.yield_now()` — commit state, self-schedule, halt
-//! - `ctx.sleep(n)` — commit state, sleep N ticks, halt
+//! - `ctx.yield_now()` — commit state, self-schedule, halt (alias: `ctx.sleep`)
 
 mod actor;
 pub mod auth;

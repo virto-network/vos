@@ -508,7 +508,7 @@ pub fn run_refine_service<A: super::Actor>() {
     }
 
     // Dispatch messages. flush_effects() inside dispatch_one is a no-op
-    // in refine mode — effects accumulate in the context's pending_* vecs.
+    // for service builds — effects accumulate in the context's pending_* vecs.
     if started {
         loop {
             let n = lifecycle::fetch_raw(&mut buf);
