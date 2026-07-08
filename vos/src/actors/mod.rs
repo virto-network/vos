@@ -44,7 +44,7 @@ pub use run::{
     service_code_hash, try_poll,
 };
 #[cfg(feature = "service")]
-pub use run::run_refine_service;
+pub use run::{run_refine_service, run_task_service};
 pub use value::InvokeError;
 
 /// JAM refine entry (PC=0). Always uses the service lifecycle so
@@ -58,6 +58,15 @@ pub fn run_refine_entry<A: Actor>() {
 #[cfg(all(feature = "pvm", not(feature = "service")))]
 pub fn run_refine_entry<A: Actor>() {
     run::run_refine::<A>()
+}
+
+/// JAM refine entry (PC=0) for **Task** blobs: input is the
+/// witness-delivered `(state, msg)` at `witness_ptr` instead of
+/// READ/FETCH — see [`run::run_task_service`]. Emitted as `_start` by
+/// `#[actor(task)]`.
+#[cfg(feature = "service")]
+pub fn run_task_entry<A: Actor>(witness_ptr: *const u8, witness_cap: usize) {
+    run::run_task_service::<A>(witness_ptr, witness_cap)
 }
 
 // --- Guest panic handler ---

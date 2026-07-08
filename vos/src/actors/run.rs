@@ -593,6 +593,75 @@ pub fn run_refine_service<A: super::Actor>() {
     halt_with_output_bound(out_buf, &io_hash);
 }
 
+// ── Task refine (witness-delivered input, always cold) ───────────────
+
+/// Refine entry for **Task** blobs — anonymous, code-hash-identified
+/// pure children (`vos::agent::Tasks`, `Child::Task`).
+///
+/// Input arrives exclusively through the witness buffer patched into
+/// the initial memory image at `witness_ptr` (see [`crate::task_abi`]):
+/// no `READ`, no `FETCH` — refine-pure by construction, so the live
+/// invocation and a traced re-execution start from byte-identical
+/// images and every Task is one `#[provable]` away from being a proof
+/// guest.
+///
+/// Tasks are always cold: no `ACTOR_HOLDER`, no warm restart — a
+/// suspended Task is its serialized state in the parent's TaskRecord,
+/// and resume is a fresh invocation with that state patched back in.
+/// One `(state, msg)` in, one work-result out:
+///
+/// 1. Decode `(state, msg)` from the witness buffer; anchor over the
+///    exact state bytes (genesis when empty).
+/// 2. `load_or_create::<A>(state)` and dispatch the single message
+///    (effects buffer into the context — refine mode).
+/// 3. Halt with the v3 `RefinePayload`: state as the final
+///    `Write{STATE_KEY}` when changed, reply, effects, `continue_next`
+///    from `yield_now`/`sleep`.
+///
+/// An unpatched buffer panics (fail loud): a Task blob is only
+/// meaningful under a witness-delivering invoker — running one as a
+/// registry service or bare refine is a deployment error, not a case
+/// to limp through.
+#[cfg(feature = "service")]
+pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: usize) {
+    use super::context::ServiceId;
+    use super::lifecycle;
+
+    crate::log_impl::install_pvm_logger();
+    set_refine_mode(true);
+
+    // SAFETY: the macro-emitted `__VOS_WITNESS` static spans exactly
+    // `witness_cap` readable bytes.
+    let (state, msg) = unsafe { crate::task_abi::read_task_input(witness_ptr, witness_cap) }
+        .expect("task input not patched — Task blobs run only under a witness-delivering invoker");
+
+    let (anchor_kind, anchor) = crate::refine_payload::anchor_for(Some(&state));
+    let mut actor = lifecycle::load_or_create::<A>(Some(&state));
+    let mut ctx = super::Context::new(ServiceId(0));
+
+    let _ = lifecycle::dispatch_one::<A>(&msg, &mut actor, &mut ctx);
+
+    let new_state_bytes = super::codec::Encode::encode(&actor);
+    let reply_bytes = ctx.take_reply_bytes();
+    let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
+    let state_changed =
+        anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != anchor;
+    let payload = ctx.drain_into_refine_payload(
+        anchor_kind,
+        anchor,
+        state_changed.then_some(new_state_bytes),
+        reply_bytes,
+    );
+    let encoded = payload.encode();
+    // Same halt binding as run_refine_service: a handler that called
+    // vos::zk::bind_io stashed the real (public, return) hash; default
+    // to the empty binding otherwise. The kernel is discarded after one
+    // invocation, so no output-buffer reuse is needed.
+    let io_hash =
+        crate::zk::__take_pending_io_hash().unwrap_or_else(|| crate::zk::compute_io_hash(&[], &[]));
+    halt_with_output_bound(&encoded, &io_hash);
+}
+
 // ── Refine phase (all actors) ─────────────────────────────────────────
 
 /// Refine-only actor lifecycle — JAR refine phase (PC=0).

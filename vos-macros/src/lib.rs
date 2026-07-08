@@ -104,12 +104,36 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     // a `pvm_main!()` invocation nor a separate `main.rs`. The helper
     // symbol `__VOS_ACTOR_META_ENCODED` carries a `__VOS_` prefix so
     // it doesn't shadow anything in the user's module.
+    //
+    // For `#[actor(task)]` blobs, `_start` is the witness-delivered
+    // task entry instead, and a `__VOS_WITNESS` buffer is emitted for
+    // the invoker (and the prover) to patch `(state, msg)` into — the
+    // same symbol/patching convention as `vos::zk::witness_buffer!`.
+    let entry = match parsed.task_buf {
+        Some(task_buf) => quote! {
+            #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+            #[unsafe(no_mangle)]
+            static mut __VOS_WITNESS: [u8; #task_buf] = [0u8; #task_buf];
+
+            #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn _start() {
+                vos::run_task_entry::<#name>(
+                    ::core::ptr::addr_of!(__VOS_WITNESS) as *const u8,
+                    #task_buf,
+                );
+            }
+        },
+        None => quote! {
+            #[cfg(all(target_arch = "riscv64", feature = "bin"))]
+            #[unsafe(no_mangle)]
+            pub extern "C" fn _start() {
+                vos::run_refine_entry::<#name>();
+            }
+        },
+    };
     let pvm_entries = quote! {
-        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn _start() {
-            vos::run_refine_entry::<#name>();
-        }
+        #entry
 
         #[cfg(all(target_arch = "riscv64", feature = "bin"))]
         const __VOS_ACTOR_META_ENCODED: ([u8; 4096], usize) =
@@ -1210,6 +1234,12 @@ struct ActorAttrs {
     /// M7 — token stream for `Actor::SPACE_ROLE_MAP` (a const
     /// SpaceRoleMap<Self::Role>). Defaults to vos::NO_ROLES_MAP.
     space_role_map: proc_macro2::TokenStream,
+    /// `Some(buffer_size)` when the actor is a **Task** blob
+    /// (`#[actor(task)]` / `#[actor(task = N)]`): `_start` becomes the
+    /// witness-delivered task entry and a `__VOS_WITNESS` buffer of
+    /// that many bytes is emitted for the invoker (and the prover) to
+    /// patch `(state, msg)` into.
+    task_buf: Option<usize>,
 }
 
 /// Parse `#[actor(...)]` attributes.
@@ -1235,6 +1265,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
         role_ty: quote! { vos::NoRoles },
         default_role: quote! { vos::NoRoles::Any },
         space_role_map: quote! { vos::NO_ROLES_MAP },
+        task_buf: None,
     };
     if attr.is_empty() {
         return out;
@@ -1292,11 +1323,31 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
                 let val = &nv.value;
                 out.space_role_map = quote! { #val };
             }
+            // Task blob: `task` (default 16 KiB witness buffer) or
+            // `task = N` for a custom size. The buffer bounds the
+            // provable `state ‖ msg` — see the work-result contract's
+            // proving ceilings; large state belongs to SMT anchors,
+            // not a bigger buffer.
+            syn::Meta::Path(p) if p.is_ident("task") => {
+                out.task_buf = Some(DEFAULT_TASK_BUF);
+            }
+            syn::Meta::NameValue(nv) if nv.path.is_ident("task") => {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(n),
+                    ..
+                }) = &nv.value
+                {
+                    out.task_buf = Some(n.base10_parse().unwrap_or(DEFAULT_TASK_BUF));
+                }
+            }
             _ => {}
         }
     }
     out
 }
+
+/// Default `__VOS_WITNESS` capacity for `#[actor(task)]` blobs.
+const DEFAULT_TASK_BUF: usize = 16 * 1024;
 
 fn parse_kind_str(s: &str) -> u8 {
     match s {

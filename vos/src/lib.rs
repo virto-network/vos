@@ -96,6 +96,7 @@ pub mod zk;
 
 pub mod actors;
 pub mod refine_payload;
+pub mod task_abi;
 
 pub mod effect_log;
 pub mod effects;
@@ -160,6 +161,8 @@ pub use actors::{
 pub use actors::exec::{TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
 pub use actors::run_refine_entry;
+#[cfg(feature = "service")]
+pub use actors::run_task_entry;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 
