@@ -468,6 +468,15 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let option_inner = success_after_result.as_ref().and_then(option_inner_type);
 
+        // Canonical return-type string for the schema (`Result<T, E>`
+        // already unwrapped to `T` by `success_after_result`; unit /
+        // no-return renders `()`). Mirrors the reply-encoding branch so
+        // the label matches what actually lands on the wire.
+        let returns_str = success_after_result
+            .as_ref()
+            .map(ty_string)
+            .unwrap_or_else(|| "()".to_string());
+
         // Reply-encoding step: how to convert the handler's
         // returned value into the `Value` we hand to
         // `ctx.__set_reply`. Three shapes, in order:
@@ -493,25 +502,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
+        } else if success_after_result.as_ref().is_some_and(is_byte_array) {
+            // `[u8; N]` return → raw bytes, symmetric with the arg path.
+            quote! { vos::value::Value::Bytes(reply.to_vec()) }
         } else {
             let ty_str = success_after_result
                 .as_ref()
-                .map(|t| quote!(#t).to_string().replace(' ', ""))
+                .map(ty_string)
                 .unwrap_or_else(|| "()".to_string());
-            const PRIMITIVES: &[&str] = &[
-                "()",
-                "bool",
-                "u8",
-                "u16",
-                "u32",
-                "u64",
-                "i32",
-                "i64",
-                "String",
-                "Vec<u8>",
-                "Vec<u32>",
-                "Vec<String>",
-            ];
             if PRIMITIVES.contains(&ty_str.as_str()) {
                 quote! { reply.into() }
             } else {
@@ -602,7 +600,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .zip(field_types.iter())
             .map(|(name, ty)| {
                 let name_str = name.to_string();
-                let ty_str = quote!(#ty).to_string();
+                // Whitespace-free so `[u8; 32]` records as `[u8;32]` and
+                // `Vec < u8 >` as `Vec<u8>` — the CLI, gateway, and
+                // OpenAPI renderer all match against this canonical form.
+                let ty_str = ty_string(ty);
                 quote! {
                     vos::metadata::FieldMeta {
                         name: #name_str,
@@ -616,6 +617,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #msg_name_str,
                 is_query: #query_val,
                 fields: &[ #( #field_metas ),* ],
+                returns: #returns_str,
             }
         });
         if exposed_to_cli {
@@ -629,13 +631,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let extractions: Vec<_> = field_names
                 .iter()
                 .zip(field_types.iter())
-                .map(|(name, ty)| {
-                    let name_str = name.to_string();
-                    let accessor = type_to_accessor(ty);
-                    quote! {
-                        let #name: #ty = msg.args.#accessor(#name_str)?;
-                    }
-                })
+                .map(|(name, ty)| from_msg_arg(name, ty))
                 .collect();
             quote! {
                 #( #extractions )*
@@ -696,7 +692,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .iter()
             .map(|(name, ty)| {
                 let name_str = name.to_string();
-                let ty_str = quote!(#ty).to_string();
+                let ty_str = ty_string(ty);
                 quote! {
                     vos::metadata::FieldMeta {
                         name: #name_str,
@@ -1054,10 +1050,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let with_calls: Vec<proc_macro2::TokenStream> = m
                 .args
                 .iter()
-                .map(|(n, _)| {
-                    let n_str = n.to_string();
-                    quote! { .with(#n_str, #n) }
-                })
+                .map(|(n, t)| ref_arg_with(n, t))
                 .collect();
             let return_ty: proc_macro2::TokenStream = match &m.success_ty {
                 None => quote! { () },
@@ -1400,17 +1393,36 @@ fn client_decode_body(
                 vos::value::Value::Bytes(b) => {
                     let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
                     av.extend_from_slice(&b);
-                    // SAFETY: emitted by the macro for caller-supplied
-                    // Value::Bytes that the actor protocol promises is a
-                    // valid rkyv archive of `#inner`; AlignedVec<16> gives
-                    // the required alignment.
-                    let archived = unsafe {
-                        vos::rkyv::access_unchecked::<<#inner as vos::rkyv::Archive>::Archived>(&av)
-                    };
-                    vos::rkyv::deserialize::<#inner, vos::rkyv::rancor::Error>(archived)
-                        .map(Some)
-                        .map_err(|_| vos::actors::client::ClientError::Decode)
+                    // The reply is peer-supplied and crosses a trust
+                    // boundary (another node / space produced it), so it
+                    // is validated rather than trusted: `rkyv::access`
+                    // checks alignment, bounds, pointer windows, and (via
+                    // bytecheck) per-type invariants. A corrupted or
+                    // version-skewed archive returns `Decode` here instead
+                    // of the UB `access_unchecked` would invite. AlignedVec<16>
+                    // supplies the alignment `access` requires.
+                    match vos::rkyv::access::<
+                        <#inner as vos::rkyv::Archive>::Archived,
+                        vos::rkyv::rancor::Error,
+                    >(&av) {
+                        Ok(archived) => vos::rkyv::deserialize::<#inner, vos::rkyv::rancor::Error>(archived)
+                            .map(Some)
+                            .map_err(|_| vos::actors::client::ClientError::Decode),
+                        Err(_) => Err(vos::actors::client::ClientError::Decode),
+                    }
                 }
+                other => Err(vos::actors::client::ClientError::UnexpectedReply(
+                    alloc::format!("{:?}", other))),
+            }
+        };
+    }
+
+    // `[u8; N]` reply → raw bytes, length-checked into the array.
+    if is_byte_array(ty) {
+        return quote! {
+            match #value_ident {
+                vos::value::Value::Bytes(b) => <#ty>::try_from(b.as_slice())
+                    .map_err(|_| vos::actors::client::ClientError::Decode),
                 other => Err(vos::actors::client::ClientError::UnexpectedReply(
                     alloc::format!("{:?}", other))),
             }
@@ -1483,18 +1495,140 @@ fn client_decode_body(
                 vos::value::Value::Bytes(b) => {
                     let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
                     av.extend_from_slice(&b);
-                    // SAFETY: see the Option<T> arm above — same contract,
-                    // with `#ty` as the archive type.
-                    let archived = unsafe {
-                        vos::rkyv::access_unchecked::<<#ty as vos::rkyv::Archive>::Archived>(&av)
-                    };
-                    vos::rkyv::deserialize::<#ty, vos::rkyv::rancor::Error>(archived)
-                        .map_err(|_| vos::actors::client::ClientError::Decode)
+                    // Checked access — see the Option<T> arm above for why
+                    // a peer-supplied reply must be validated, not trusted.
+                    match vos::rkyv::access::<
+                        <#ty as vos::rkyv::Archive>::Archived,
+                        vos::rkyv::rancor::Error,
+                    >(&av) {
+                        Ok(archived) => vos::rkyv::deserialize::<#ty, vos::rkyv::rancor::Error>(archived)
+                            .map_err(|_| vos::actors::client::ClientError::Decode),
+                        Err(_) => Err(vos::actors::client::ClientError::Decode),
+                    }
                 }
                 other => Err(vos::actors::client::ClientError::UnexpectedReply(
                     alloc::format!("{:?}", other))),
             }
         },
+    }
+}
+
+/// Scalar / collection types that map directly onto a `Value` variant:
+/// they impl `Into<Value>` (sender side) and have a typed `Args`
+/// accessor (receiver side). Everything else travels rkyv-encoded
+/// inside `Value::Bytes`. `()` is here for the reply path (a unit
+/// return encodes as `Value::Unit`); it never appears as an argument.
+/// Both the `#[msg]` argument path and the reply path branch on this
+/// one list so the two sides can never disagree about what is a
+/// primitive.
+const PRIMITIVES: &[&str] = &[
+    "()",
+    "bool",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "i32",
+    "i64",
+    "String",
+    "Vec<u8>",
+    "Vec<u32>",
+    "Vec<String>",
+];
+
+/// Canonical, whitespace-free rendering of a type (`Vec<u8>`, not
+/// `Vec < u8 >`). Used everywhere a type is matched against a string.
+fn ty_string(ty: &syn::Type) -> String {
+    quote!(#ty).to_string().replace(' ', "")
+}
+
+/// `true` if `ty` is one of the [`PRIMITIVES`] that convert straight
+/// to a `Value` variant via `Into<Value>`.
+fn is_primitive_ty(ty: &syn::Type) -> bool {
+    PRIMITIVES.contains(&ty_string(ty).as_str())
+}
+
+/// `true` if `ty` is a fixed-size byte array `[u8; N]`. These travel as
+/// raw `Value::Bytes` of exactly `N` bytes (not rkyv-wrapped), so a
+/// hex / `@file` CLI argument maps straight onto them, the reply reads
+/// back symmetrically, and the length can be validated at the edge —
+/// the natural shape for ids, roots, hashes, and public keys.
+fn is_byte_array(ty: &syn::Type) -> bool {
+    let syn::Type::Array(arr) = ty else {
+        return false;
+    };
+    matches!(arr.elem.as_ref(), syn::Type::Path(p) if p.path.is_ident("u8"))
+}
+
+/// The typed `Args` accessor for a whitelisted scalar argument type,
+/// or `None` for types that travel rkyv-encoded (custom structs,
+/// `Vec<[u8; 32]>`, …). Drives the `from_msg` extraction.
+fn whitelist_accessor(ty: &syn::Type) -> Option<proc_macro2::TokenStream> {
+    Some(match ty_string(ty).as_str() {
+        "u8" => quote! { get_u8 },
+        "u16" => quote! { get_u16 },
+        "u32" => quote! { get_u32 },
+        "u64" => quote! { get_u64 },
+        "i32" => quote! { get_i32 },
+        "i64" => quote! { get_i64 },
+        "bool" => quote! { get_bool },
+        "String" => quote! { get_str },
+        "Vec<u8>" => quote! { get_bytes },
+        "Vec<u32>" => quote! { get_list_u32 },
+        "Vec<String>" => quote! { get_list_str },
+        _ => return None,
+    })
+}
+
+/// The `from_msg` extraction statement for one `#[msg]` argument —
+/// `let <name>: <ty> = <expr>;`. Whitelisted scalars read through the
+/// typed `Args` accessor; any other type is decoded from rkyv
+/// `Value::Bytes` via checked `from_bytes`. Every failure mode (missing
+/// arg, wrong `Value` variant, decode failure) yields `None` from
+/// `from_msg` through `?`, so a malformed dynamic message is rejected
+/// rather than mis-dispatched.
+fn from_msg_arg(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
+    let name_str = name.to_string();
+    if let Some(accessor) = whitelist_accessor(ty) {
+        return quote! { let #name: #ty = msg.args.#accessor(#name_str)?; };
+    }
+    if is_byte_array(ty) {
+        // Raw bytes → fixed array; a length mismatch yields `None`.
+        return quote! {
+            let #name: #ty = <#ty>::try_from(msg.args.get(#name_str)?.as_bytes()?).ok()?;
+        };
+    }
+    quote! {
+        let #name: #ty = vos::rkyv::from_bytes::<#ty, vos::rkyv::rancor::Error>(
+            msg.args.get(#name_str)?.as_bytes()?,
+        )
+        .ok()?;
+    }
+}
+
+/// The `Msg::with(name, value)` call that encodes one `{Actor}Ref`
+/// argument. Whitelisted scalars pass through their `Into<Value>`
+/// impl; any other type is rkyv-encoded into `Value::Bytes`, the exact
+/// inverse of [`from_msg_arg`]. The wire shape for whitelisted types is
+/// unchanged, so callers written against the old scalar-only surface
+/// keep working.
+fn ref_arg_with(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
+    let name_str = name.to_string();
+    if is_primitive_ty(ty) {
+        return quote! { .with(#name_str, #name) };
+    }
+    if is_byte_array(ty) {
+        return quote! { .with(#name_str, vos::value::Value::Bytes(#name.to_vec())) };
+    }
+    quote! {
+        .with(
+            #name_str,
+            vos::value::Value::Bytes(
+                vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&#name)
+                    .expect("rkyv encode")
+                    .to_vec(),
+            ),
+        )
     }
 }
 

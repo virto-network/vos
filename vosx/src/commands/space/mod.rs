@@ -40,6 +40,7 @@ pub mod op_sign;
 pub mod payload_codec;
 pub mod programs;
 pub mod publish;
+pub mod raft_status;
 pub mod reconcile;
 pub mod role;
 pub mod subscriptions;
@@ -227,6 +228,16 @@ pub enum SpaceCommand {
         /// Optional extension instance name to filter to.
         instance: Option<String>,
     },
+    /// Show the connected daemon's view of a Raft agent's group —
+    /// role, term, leader, and member node prefixes. Reads the
+    /// existing `RaftStatusReq` plumbing; use it to find the leader
+    /// before an Operator-gated write and to watch failover.
+    /// `--format json` for machine consumption.
+    RaftStatus {
+        space: String,
+        /// Raft agent instance name (as in `vosx space agents`).
+        instance: String,
+    },
     /// Manage Node + Identity members. Subcommands: list,
     /// add-node, remove-node, add-identity, remove-identity.
     /// Bare `space members <space>` lists.
@@ -382,6 +393,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Agents { space } => agents::run(&space),
         SpaceCommand::Describe { space, instance } => describe::run(&space, &instance),
         SpaceCommand::Caps { space, instance } => caps::run(&space, instance.as_deref()),
+        SpaceCommand::RaftStatus { space, instance } => raft_status::run(&space, &instance),
         SpaceCommand::Members { space, command } => members::run(members::Args { space, command }),
         SpaceCommand::Role { space, command } => role::run(role::Args { space, command }),
         SpaceCommand::Forget { space, yes } => forget::run(forget::Args { space, yes }),

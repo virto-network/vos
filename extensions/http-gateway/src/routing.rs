@@ -269,6 +269,7 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
     // dispatch failure (panic / non-DONE status / no route / timeout) →
     // `502`. This is what preserves the panic→502 distinction in
     // transport mode.
+    let ret_ty = method_meta.as_ref().map(|m| m.returns.as_str());
     match ctx.ask_dispatch(target, &payload).await {
         Some(reply_bytes) if reply_bytes.is_empty() => {
             // Handler returned `()` successfully → JSON null.
@@ -281,12 +282,28 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
             // misaligned slices that came back through the invoke
             // envelope unwrap.
             match <vos::value::Value as vos::Decode>::try_decode(&reply_bytes) {
-                Some(value) => json(200, value_to_json(&value)),
+                Some(value) => label_return(json(200, value_to_json(&value)), ret_ty),
                 None => text(502, "upstream returned malformed reply"),
             }
         }
         None => text(502, "upstream error or shutdown"),
     }
+}
+
+/// Attach the schema's declared return type as an `x-vos-return-type`
+/// response header. A `Value::Bytes` reply renders as an opaque hex
+/// string in the JSON body (JSON has no blob type); the header tells a
+/// client whether those bytes are a `[u8;32]` root, a `Vec<u8>` proof,
+/// or a custom struct. No-op for unit / unknown return types.
+fn label_return(mut resp: Response, ret_ty: Option<&str>) -> Response {
+    if let Some(ty) = ret_ty
+        && !ty.is_empty()
+        && ty != "()"
+        && let Ok(value) = http::HeaderValue::from_str(ty)
+    {
+        resp.headers_mut().insert("x-vos-return-type", value);
+    }
+    resp
 }
 
 /// Self-documenting schema endpoints. Public — schema is no more
@@ -405,7 +422,7 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
 ///   `i32/i64`         → `integer` (`int32`/`int64`)
 ///   `bool`            → `boolean`
 ///   `String`          → `string`
-///   `Vec<u8>`         → `string` (`byte`)
+///   `Vec<u8>` `[u8;N]` → `string` (`byte`)
 ///   `Vec<u32>`        → `array` of integers
 ///   `Vec<String>`     → `array` of strings
 ///   any other         → `string` (fallback — generic UI still works)
@@ -488,6 +505,15 @@ fn openapi_operation_for(
     let http_method = if msg.is_query { "get" } else { "post" };
     let summary = format!("{actor_name}::{}", msg.name);
     let operation_id = format!("{actor_name}_{}", msg.name);
+    // Label the response with the declared return type when the schema
+    // carries one; a `Value::Bytes` reply (custom struct / [u8;N] /
+    // Vec<u8>) renders as a hex string, and this is where the type name
+    // that disambiguates it is documented (mirrors the live
+    // `x-vos-return-type` header).
+    let response_desc = match msg.returns.as_str() {
+        "" | "()" => "JSON-encoded return value".to_string(),
+        ty => format!("JSON-encoded return value (type: {ty})"),
+    };
 
     if msg.is_query {
         let parameters: Vec<_> = msg
@@ -507,7 +533,7 @@ fn openapi_operation_for(
                 "summary": summary,
                 "operationId": operation_id,
                 "parameters": parameters,
-                "responses": { "200": { "description": "JSON-encoded return value" } }
+                "responses": { "200": { "description": response_desc } }
             }
         })
     } else {
@@ -533,7 +559,7 @@ fn openapi_operation_for(
                         }
                     }
                 },
-                "responses": { "200": { "description": "JSON-encoded return value" } }
+                "responses": { "200": { "description": response_desc } }
             }
         })
     }
@@ -544,7 +570,15 @@ fn openapi_operation_for(
 /// through to `{ "type": "string" }` so the operation is
 /// still inspectable, just less precisely typed than ideal.
 fn vos_ty_to_openapi(ty: &str) -> serde_json::Value {
-    match ty {
+    // Types are recorded whitespace-free by the macro; normalize so
+    // older pretty-printed `Vec < u8 >` blobs document correctly too
+    // (they previously fell through to a plain `string`).
+    let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    // `[u8; N]` — a fixed-length byte array, rendered as a hex string.
+    if ty.starts_with("[u8;") && ty.ends_with(']') {
+        return serde_json::json!({ "type": "string", "format": "byte" });
+    }
+    match ty.as_str() {
         "u8" => serde_json::json!({ "type": "integer", "format": "uint8" }),
         "u16" => serde_json::json!({ "type": "integer", "format": "uint16" }),
         "u32" => serde_json::json!({ "type": "integer", "format": "uint32" }),
@@ -697,10 +731,31 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
     } else {
         None
     };
-    // The schema renders field types pretty-printed with spaces
-    // (e.g. `Vec < u8 >`); strip whitespace so the arms below can use
-    // the canonical spelling.
+    // Types are recorded whitespace-free by the macro; older binaries
+    // may still carry a pretty-printed `Vec < u8 >`, so strip whitespace
+    // to match either spelling.
     let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    // `Vec<u8>` and `[u8; N]` handler args both need `Value::Bytes`,
+    // which the JSON layer never produces directly. Accept either a hex
+    // string (symmetric with how `Bytes` replies render — copy a hex
+    // value out of a reply and pass it straight back) or a JSON array of
+    // byte-valued numbers; pass an existing `Bytes` through. Without
+    // this, every bytes-arg handler (clerk's bootstrap / create_account
+    // / apply_transfer / account(id) / …) silently fails the actor's
+    // `from_dynamic` and round-trips to a misleading "200 null". The
+    // actor's `from_msg` validates the `[u8; N]` length.
+    if ty == "Vec<u8>" || (ty.starts_with("[u8;") && ty.ends_with(']')) {
+        return if let Some(s) = as_str {
+            crate::json::hex_decode(s).map(Value::Bytes)
+        } else if let Value::ListU32(ref nums) = v {
+            nums.iter()
+                .map(|&n| u8::try_from(n).ok())
+                .collect::<Option<Vec<u8>>>()
+                .map(Value::Bytes)
+        } else {
+            v.as_bytes().map(|b| Value::Bytes(b.to_vec()))
+        };
+    }
     match ty.as_str() {
         "u8" => as_str
             .and_then(|s| s.parse::<u8>().ok())
@@ -734,27 +789,6 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
             Value::Str(_) => Some(v),
             _ => None,
         },
-        // `Vec<u8>` handler args need `Value::Bytes`, which the JSON
-        // layer never produces directly. Accept either a hex string
-        // (symmetric with how `Bytes` replies render — copy a hex
-        // value out of a reply and pass it straight back) or a JSON
-        // array of byte-valued numbers; pass an existing `Bytes`
-        // through. Without this, every `Vec<u8>`-arg handler (clerk's
-        // bootstrap / create_account / apply_transfer / account(id) /
-        // …) silently fails the actor's `from_dynamic` and round-trips
-        // to a misleading "200 null".
-        "Vec<u8>" => {
-            if let Some(s) = as_str {
-                crate::json::hex_decode(s).map(Value::Bytes)
-            } else if let Value::ListU32(ref nums) = v {
-                nums.iter()
-                    .map(|&n| u8::try_from(n).ok())
-                    .collect::<Option<Vec<u8>>>()
-                    .map(Value::Bytes)
-            } else {
-                v.as_bytes().map(|b| Value::Bytes(b.to_vec()))
-            }
-        }
         // Complex types we don't coerce — pass the original
         // through unchanged so the actor's `from_msg` accessor
         // gets a chance to evaluate the shape. Returning
@@ -897,6 +931,44 @@ mod tests {
                 ("q".into(), "&".into()),
             ],
         );
+    }
+
+    #[test]
+    fn coerce_vec_u8_from_hex_string() {
+        use vos::value::Value;
+        let got = coerce_to_type(Value::Str("0xdead".into()), "Vec<u8>");
+        assert_eq!(got, Some(Value::Bytes(vec![0xde, 0xad])));
+    }
+
+    #[test]
+    fn coerce_byte_array_from_hex_string() {
+        use vos::value::Value;
+        // Length is not checked here — the actor's from_msg validates it.
+        let got = coerce_to_type(Value::Str("01020304".into()), "[u8;4]");
+        assert_eq!(got, Some(Value::Bytes(vec![1, 2, 3, 4])));
+    }
+
+    #[test]
+    fn coerce_bytes_from_spaced_type() {
+        use vos::value::Value;
+        // Older binaries pretty-print the type; whitespace is stripped.
+        let got = coerce_to_type(Value::Str("ab".into()), "Vec < u8 >");
+        assert_eq!(got, Some(Value::Bytes(vec![0xab])));
+    }
+
+    #[test]
+    fn openapi_byte_array_documents_as_byte_string() {
+        let s = vos_ty_to_openapi("[u8;32]");
+        assert_eq!(s["type"], "string");
+        assert_eq!(s["format"], "byte");
+    }
+
+    #[test]
+    fn openapi_vec_u8_spaced_still_byte_string() {
+        // The whitespace bug previously documented this as a plain string.
+        let s = vos_ty_to_openapi("Vec < u8 >");
+        assert_eq!(s["type"], "string");
+        assert_eq!(s["format"], "byte");
     }
 
     #[test]

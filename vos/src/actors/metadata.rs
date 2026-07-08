@@ -27,11 +27,14 @@
 //! [cli_methods_count:u16 LE]
 //!   [name_len:u16 LE][name_bytes...]
 //!   ...
+//! [returns_count:u16 LE]        (one entry per message, in order)
+//!   [ty_len:u16 LE][ty_bytes...]
+//!   ...
 //! ```
 //!
 //! Each trailing section is append-only: older decoders that don't
-//! know about `kind` / `caps` / `cli_methods` stop reading at the
-//! previous section and the corresponding `ParsedMeta` field
+//! know about `kind` / `caps` / `cli_methods` / `returns` stop reading
+//! at the previous section and the corresponding `ParsedMeta` field
 //! defaults to empty/false. This is how the format has evolved
 //! without breaking older actor binaries.
 
@@ -54,6 +57,13 @@ pub struct MessageMeta {
     pub name: &'static str,
     pub is_query: bool,
     pub fields: &'static [FieldMeta],
+    /// Declared return type, rendered whitespace-free (`u64`,
+    /// `[u8;32]`, `Vec<u8>`, a custom struct name, …), with any
+    /// `Result<T, E>` unwrapped to `T` — the error surfaces separately
+    /// as `ClientError`. `()` for a unit / no-return handler. Emitted
+    /// in a trailing `.vos_meta` section (see [`encode`]), so blobs
+    /// that predate it decode to an empty string.
+    pub returns: &'static str,
 }
 
 /// Actor descriptor — actor name, messages, and constructor params.
@@ -260,6 +270,31 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         c += 1;
     }
 
+    // Per-message return-type names (added 2026-07 for reply labeling).
+    // Same trailing-append discipline: one entry per message in message
+    // order, so a decoder cross-references by index. Blobs produced
+    // before this section simply stop after cli_methods and every
+    // `ParsedMessage.returns` defaults to the empty string.
+    let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut r = 0;
+    while r < meta.messages.len() {
+        let ret_bytes = meta.messages[r].returns.as_bytes();
+        let [lo, hi] = (ret_bytes.len() as u16).to_le_bytes();
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
+        let mut i = 0;
+        while i < ret_bytes.len() {
+            buf[pos + i] = ret_bytes[i];
+            i += 1;
+        }
+        pos += ret_bytes.len();
+        r += 1;
+    }
+
     (buf, pos)
 }
 
@@ -280,6 +315,7 @@ mod tests {
                     name: "run",
                     is_query: false,
                     fields: &[],
+                    returns: "()",
                 },
                 MessageMeta {
                     name: "status",
@@ -288,6 +324,7 @@ mod tests {
                         name: "verbose",
                         ty: "bool",
                     }],
+                    returns: "[u8;32]",
                 },
             ],
             constructor: &[FieldMeta {
@@ -307,11 +344,13 @@ mod tests {
         assert_eq!(parsed.messages[0].name, "run");
         assert!(!parsed.messages[0].is_query);
         assert!(parsed.messages[0].fields.is_empty());
+        assert_eq!(parsed.messages[0].returns, "()");
         assert_eq!(parsed.messages[1].name, "status");
         assert!(parsed.messages[1].is_query);
         assert_eq!(parsed.messages[1].fields.len(), 1);
         assert_eq!(parsed.messages[1].fields[0].name, "verbose");
         assert_eq!(parsed.messages[1].fields[0].ty, "bool");
+        assert_eq!(parsed.messages[1].returns, "[u8;32]");
         assert_eq!(parsed.constructor.len(), 1);
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
@@ -401,16 +440,19 @@ mod tests {
                     name: "stop",
                     is_query: false,
                     fields: &[],
+                    returns: "()",
                 },
                 MessageMeta {
                     name: "status",
                     is_query: true,
                     fields: &[],
+                    returns: "String",
                 },
                 MessageMeta {
                     name: "internal_only",
                     is_query: false,
                     fields: &[],
+                    returns: "()",
                 },
             ],
             constructor: &[],
@@ -528,6 +570,10 @@ mod decode {
         /// surface). Used by `vosx <ext> <cmd>` to filter the
         /// handler list to those exposed to the CLI.
         pub exposed_to_cli: bool,
+        /// Declared return type (whitespace-free, `Result` unwrapped).
+        /// Empty when the blob predates the `returns` section. The CLI
+        /// and gateway use it to label an otherwise-opaque reply.
+        pub returns: String,
     }
 
     /// Parsed actor metadata from binary metadata.
@@ -575,6 +621,8 @@ mod decode {
                 // once that section parses successfully — see the
                 // post-caps block below.
                 exposed_to_cli: false,
+                // Filled in from the trailing `returns` section.
+                returns: String::new(),
             });
         }
 
@@ -632,6 +680,22 @@ mod decode {
                 };
                 if let Some(msg) = messages.iter_mut().find(|m| m.name == name) {
                     msg.exposed_to_cli = true;
+                }
+            }
+        }
+
+        // Per-message return types (added 2026-07). Cross-referenced by
+        // index — the encoder writes one entry per message in order.
+        // Trailing-append: an absent section leaves every `returns` empty.
+        if pos < data.len()
+            && let Some(ret_count) = read_u16(data, &mut pos)
+        {
+            for i in 0..ret_count as usize {
+                let Some(ty) = read_str(data, &mut pos) else {
+                    break;
+                };
+                if let Some(msg) = messages.get_mut(i) {
+                    msg.returns = ty;
                 }
             }
         }

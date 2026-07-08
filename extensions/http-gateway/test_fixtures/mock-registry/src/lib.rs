@@ -34,11 +34,13 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 name: "text",
                 ty: "String",
             }],
+            returns: "String",
         },
         MessageMeta {
             name: "last_text",
             is_query: true,
             fields: &[],
+            returns: "String",
         },
         MessageMeta {
             name: "add",
@@ -53,11 +55,13 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                     ty: "u32",
                 },
             ],
+            returns: "u32",
         },
         MessageMeta {
             name: "last_sum",
             is_query: true,
             fields: &[],
+            returns: "u32",
         },
         MessageMeta {
             name: "flip",
@@ -66,11 +70,13 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 name: "b",
                 ty: "bool",
             }],
+            returns: "bool",
         },
         MessageMeta {
             name: "flip_count",
             is_query: true,
             fields: &[],
+            returns: "u32",
         },
         MessageMeta {
             name: "sum_list",
@@ -79,6 +85,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 name: "xs",
                 ty: "Vec<u32>",
             }],
+            returns: "u32",
         },
         MessageMeta {
             name: "concat",
@@ -87,6 +94,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 name: "parts",
                 ty: "Vec<String>",
             }],
+            returns: "String",
         },
         MessageMeta {
             name: "range",
@@ -95,6 +103,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 name: "n",
                 ty: "u32",
             }],
+            returns: "Vec<u32>",
         },
         MessageMeta {
             name: "split",
@@ -103,16 +112,19 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 name: "s",
                 ty: "String",
             }],
+            returns: "Vec<String>",
         },
         MessageMeta {
             name: "ping",
             is_query: true,
             fields: &[],
+            returns: "()",
         },
         MessageMeta {
             name: "boom",
             is_query: true,
             fields: &[],
+            returns: "u32",
         },
     ],
     constructor: &[],

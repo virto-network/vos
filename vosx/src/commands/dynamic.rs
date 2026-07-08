@@ -122,7 +122,7 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
             }
             let target_id = client.resolve_target(target)?;
             let reply = client.invoke_dyn(target_id, &Msg::new(wire))?;
-            return render_reply(reply);
+            return render_reply(reply, None);
         }
 
         let method_meta = meta
@@ -153,7 +153,8 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         let target_id = client.resolve_target(target)?;
         tracing::debug!("invoking {method} on {target_id}");
         let reply = client.invoke_dyn(target_id, &msg)?;
-        render_reply(reply)
+        let ret_ty = method_meta.map(|m| m.returns.as_str());
+        render_reply(reply, ret_ty)
     })
 }
 
@@ -210,11 +211,14 @@ fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> any
             .with("space_id", space_id.to_vec())
             .with("cert", cert),
     )?;
-    render_reply(reply2)
+    render_reply(reply2, None)
 }
 
 /// Render an invoke reply to stdout, JSON or text per the global format.
-fn render_reply(reply: Value) -> anyhow::Result<()> {
+/// `ret_ty` is the handler's declared return type from the schema (when
+/// known); it labels an otherwise-opaque `Value::Bytes` reply so an
+/// operator can tell a `[u8;32]` root from a `Receipt` blob.
+fn render_reply(reply: Value, ret_ty: Option<&str>) -> anyhow::Result<()> {
     if output::is_json() {
         output::print_json(&unwrap_json_string(output::value_to_json(&reply)));
     } else {
@@ -226,6 +230,15 @@ fn render_reply(reply: Value) -> anyhow::Result<()> {
                 // fields, so print the payload verbatim rather than
                 // rust-Debug-formatting the wrapping `Str(...)`.
                 println!("{s}");
+            }
+            Value::Bytes(b) => {
+                // Bytes are opaque — render as hex, prefixed with the
+                // declared type name when the schema carries one.
+                let hex = hex::encode(&b);
+                match ret_ty {
+                    Some(ty) if !ty.is_empty() && ty != "()" => println!("{ty}: 0x{hex}"),
+                    _ => println!("0x{hex}"),
+                }
             }
             other => println!("{other:?}"),
         }
@@ -375,9 +388,28 @@ fn build_msg(
 /// rather than at the actor); without a schema, the same loose
 /// heuristic `space call` uses (numeric → u64, true/false →
 /// bool, else string) keeps the no-schema path working.
+///
+/// Two byte-oriented conveniences match `space call`:
+///   - `key=@path` reads the file's raw bytes (any type — large
+///     opaque blobs like proofs / ELFs);
+///   - a schema-typed `Vec<u8>` or `[u8; N]` field accepts a hex
+///     string (optionally `0x`-prefixed), symmetric with how a
+///     `Value::Bytes` reply renders, so a reply can be pasted back.
 fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Result<Msg> {
+    // `@path` reads raw file bytes regardless of the declared type.
+    if let Some(path) = v.strip_prefix('@') {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow!("read '{path}' for arg '{k}': {e}"))?;
+        return Ok(msg.with(k, bytes));
+    }
+
+    // Types are recorded whitespace-free by the macro, but older
+    // binaries may carry a pretty-printed `Vec < u8 >`; normalize so
+    // the arms match either.
+    let ty = field_ty.map(normalize_ty);
     let parse_err = |ty: &str| anyhow!("arg '{k}': expected {ty}, got {v:?}");
-    Ok(match field_ty {
+    let hex_err = |ty: &str| anyhow!("arg '{k}': expected hex bytes for {ty}, got {v:?}");
+    Ok(match ty.as_deref() {
         Some("u8") => msg.with(k, v.parse::<u8>().map_err(|_| parse_err("u8"))?),
         Some("u16") => msg.with(k, v.parse::<u16>().map_err(|_| parse_err("u16"))?),
         Some("u32") => msg.with(k, v.parse::<u32>().map_err(|_| parse_err("u32"))?),
@@ -386,6 +418,13 @@ fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Resu
         Some("i64") => msg.with(k, v.parse::<i64>().map_err(|_| parse_err("i64"))?),
         Some("bool") => msg.with(k, v.parse::<bool>().map_err(|_| parse_err("bool"))?),
         Some("String") => msg.with(k, v.to_string()),
+        // `Vec<u8>` and `[u8; N]` args travel as `Value::Bytes`; a hex
+        // string is the shell-friendly spelling. Length is validated
+        // by the actor's `from_msg` for `[u8; N]`.
+        Some(t) if t == "Vec<u8>" || is_byte_array_ty(t) => {
+            let bytes = hex_decode(v).ok_or_else(|| hex_err(t))?;
+            msg.with(k, bytes)
+        }
         // No schema or unrecognised type — fall back to the
         // legacy heuristic so `space call`-equivalent commands
         // keep working on agents that haven't registered meta.
@@ -399,6 +438,25 @@ fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Resu
             }
         }
     })
+}
+
+/// Whitespace-free rendering of a schema type string.
+fn normalize_ty(ty: &str) -> String {
+    ty.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// `true` for a `[u8; N]` type string (already whitespace-free).
+fn is_byte_array_ty(ty: &str) -> bool {
+    ty.starts_with("[u8;") && ty.ends_with(']')
+}
+
+/// Decode a hex string (optional `0x` prefix) into bytes; `None` on odd
+/// length or a non-hex digit. Symmetric with the `0x<hex>` a
+/// `Value::Bytes` reply renders as, so a reply can be pasted back as an
+/// argument. Mirrors the gateway's `hex_decode`.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(s).ok()
 }
 
 fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Result<()> {
@@ -555,9 +613,67 @@ mod tests {
             is_query: false,
             fields: vec![field],
             exposed_to_cli: true,
+            returns: "u32".into(),
         };
         let err = build_msg("add", Some(&m), &["a=notanumber"]).unwrap_err();
         assert!(err.to_string().contains("u64"), "{err}");
+    }
+
+    fn bytes_field(name: &str, ty: &str) -> ParsedMessage {
+        ParsedMessage {
+            name: "x".into(),
+            is_query: false,
+            fields: vec![vos::metadata::ParsedField {
+                name: name.into(),
+                ty: ty.into(),
+            }],
+            exposed_to_cli: true,
+            returns: "()".into(),
+        }
+    }
+
+    #[test]
+    fn apply_arg_vec_u8_decodes_0x_hex() {
+        let m = bytes_field("blob", "Vec<u8>");
+        let msg = build_msg("x", Some(&m), &["blob=0xdeadbeef"]).unwrap();
+        assert_eq!(
+            msg.args.get("blob"),
+            Some(&Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]))
+        );
+    }
+
+    #[test]
+    fn apply_arg_byte_array_decodes_bare_hex() {
+        let m = bytes_field("root", "[u8;4]");
+        let msg = build_msg("x", Some(&m), &["root=01020304"]).unwrap();
+        assert_eq!(msg.args.get("root"), Some(&Value::Bytes(vec![1, 2, 3, 4])));
+    }
+
+    #[test]
+    fn apply_arg_normalizes_spaced_byte_type() {
+        // Older binaries render `Vec < u8 >`; it must still hex-decode.
+        let m = bytes_field("blob", "Vec < u8 >");
+        let msg = build_msg("x", Some(&m), &["blob=ab"]).unwrap();
+        assert_eq!(msg.args.get("blob"), Some(&Value::Bytes(vec![0xab])));
+    }
+
+    #[test]
+    fn apply_arg_bytes_reject_non_hex() {
+        let m = bytes_field("blob", "Vec<u8>");
+        let err = build_msg("x", Some(&m), &["blob=nothex"]).unwrap_err();
+        assert!(err.to_string().contains("hex"), "{err}");
+    }
+
+    #[test]
+    fn apply_arg_at_file_reads_raw_bytes() {
+        let path =
+            std::env::temp_dir().join(format!("vosx-apply-arg-{}.bin", std::process::id()));
+        std::fs::write(&path, [9u8, 8, 7]).unwrap();
+        let arg = format!("data=@{}", path.display());
+        // `@file` works regardless of schema (here: no schema at all).
+        let msg = build_msg("x", None, &[arg.as_str()]).unwrap();
+        assert_eq!(msg.args.get("data"), Some(&Value::Bytes(vec![9, 8, 7])));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
