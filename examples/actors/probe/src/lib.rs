@@ -57,4 +57,12 @@ impl Probe {
     async fn relay(&mut self, ctx: &mut Context<Self>, child: u32) {
         let _ = ctx.ask(ServiceId(child), &Msg::new("start")).await;
     }
+
+    /// Fire a fire-and-forget transfer at `target`. When `target` is not
+    /// a service in this runtime it becomes an external transfer the node
+    /// routes through its outbox — used to pin commit-then-outbox order.
+    #[msg]
+    async fn tell_out(&mut self, ctx: &mut Context<Self>, target: u32) {
+        ctx.tell(ServiceId(target), &Msg::new("noop"));
+    }
 }

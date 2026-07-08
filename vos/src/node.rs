@@ -3852,24 +3852,22 @@ fn handle_invoke_request(
     // Format: see lifecycle::TAG_CALLER_PREFIX.
     let payload = encode_caller_prefix(&req);
     send_if_deliverable(runtime, svc_id, payload);
-    runtime.run_blocking();
 
-    // Route any external transfers the dispatch produced.
-    let external = runtime.drain_external_transfers(svc_id);
-    for (target, memo) in external {
-        let _ = outbox.send(Envelope {
-            from: from_id,
-            to: target,
-            payload: memo,
-        });
-    }
+    // Drive to quiescence, buffering external transfers as we go. The
+    // runtime discards transfers to services it doesn't host on the tick
+    // that would deliver them, so draining after each tick is the only
+    // way to capture them. They are routed only after the commit below
+    // succeeds: routing before commit leaked messages when the commit
+    // failed (e.g. Raft `NotLeader` because we lost leadership between
+    // dispatch and commit) — the caller retries against the new leader,
+    // which routes them there, so an early send would duplicate, and if
+    // the retry never comes, orphan them.
+    let external = drive_capturing_external(runtime, svc_id);
 
-    // Persist before replying. If the commit fails (e.g. Raft
-    // `NotLeader` because we lost leadership between dispatch
-    // and commit), we drop the reply so the caller sees
-    // `Unreachable` and can retry against the new leader. Doing
-    // it in this order means the client only sees success when
-    // the state is durable.
+    // Persist before replying. If the commit fails, we drop the reply so
+    // the caller sees `Unreachable` and can retry against the new leader.
+    // Doing it in this order means the client only sees success when the
+    // state is durable.
     let state = runtime
         .storage
         .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
@@ -3885,11 +3883,12 @@ fn handle_invoke_request(
     };
 
     if let Err(e) = commit_result {
-        // Drop the reply (caller surfaces `Unreachable`) and
-        // soft-restart to bring the runtime back in sync with
-        // the durable log. Don't bubble the error — a transient
-        // `NotLeader` shouldn't kill the agent thread.
-        warn!(%svc_id, error = %e, "commit failed; soft-restarting and dropping reply");
+        // Drop the reply (caller surfaces `Unreachable`) and the buffered
+        // transfers (nothing durable produced them), then soft-restart to
+        // bring the runtime back in sync with the durable log. Don't
+        // bubble the error — a transient `NotLeader` shouldn't kill the
+        // agent thread.
+        warn!(%svc_id, error = %e, "commit failed; soft-restarting, dropping reply and transfers");
         drop(req.reply);
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Err(restart_err) = soft_restart_crdt(runtime, svc_id, strategy) {
@@ -3898,7 +3897,17 @@ fn handle_invoke_request(
         return Ok(());
     }
 
-    // Commit succeeded. Pack the reply as the full invoke wire
+    // Commit succeeded: the state is durable, so route the buffered
+    // external transfers now.
+    for (target, memo) in external {
+        let _ = outbox.send(Envelope {
+            from: from_id,
+            to: target,
+            payload: memo,
+        });
+    }
+
+    // Pack the reply as the full invoke wire
     // envelope `[status][state_len:u32][state][reply]` so the
     // caller's PVM sees the same shape it would for a local
     // INVOKE. `is_suspended` after `run_blocking` tells us the
@@ -4075,6 +4084,24 @@ fn send_if_deliverable(runtime: &mut VosRuntime, svc_id: ServiceId, payload: Vec
     true
 }
 
+/// Drive the runtime to quiescence, buffering the external transfers each
+/// tick produces before the next tick would discard them. The runtime
+/// drops transfers addressed to services it doesn't host on the tick that
+/// tries to deliver them, so a plain `run_blocking()` followed by one
+/// `drain_external_transfers` loses any transfer bound for another agent;
+/// draining after each tick captures them for the node to route.
+fn drive_capturing_external(
+    runtime: &mut VosRuntime,
+    svc_id: ServiceId,
+) -> Vec<(ServiceId, Vec<u8>)> {
+    let mut external = Vec::new();
+    while runtime.has_work() {
+        runtime.tick_blocking();
+        external.extend(runtime.drain_external_transfers(svc_id));
+    }
+    external
+}
+
 /// Wrap the request's message bytes with a caller-info header so the
 /// PVM agent can populate `Context::caller` and the role bytes from caller info.
 ///
@@ -4241,16 +4268,11 @@ fn dispatch_once(
         };
         send_if_deliverable(runtime, svc_id, payload);
     }
-    runtime.run_blocking();
 
-    let external = runtime.drain_external_transfers(svc_id);
-    for (target, memo) in external {
-        let _ = outbox.send(Envelope {
-            from: from_id,
-            to: target,
-            payload: memo,
-        });
-    }
+    // Drive to quiescence, buffering external transfers each tick before
+    // the next tick discards them; route them only after the commit
+    // succeeds so a failed commit (e.g. Raft `NotLeader`) leaks nothing.
+    let external = drive_capturing_external(runtime, svc_id);
 
     let state = runtime
         .storage
@@ -4263,6 +4285,16 @@ fn dispatch_once(
         strategy.commit_with_log(&state, &log)?;
     } else if !state.is_empty() {
         strategy.commit(&state)?;
+    }
+
+    // Commit succeeded (the `?` above returns early on failure): the
+    // state is durable, so route the buffered transfers now.
+    for (target, memo) in external {
+        let _ = outbox.send(Envelope {
+            from: from_id,
+            to: target,
+            payload: memo,
+        });
     }
     Ok(())
 }
@@ -9320,5 +9352,74 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
         drop(routes);
         h.join().unwrap();
+    }
+
+    /// A3 — commit-then-outbox: a dispatch that produces an external
+    /// transfer must route it only after the commit succeeds. A failed
+    /// commit routes nothing (no leak); a subsequent successful attempt
+    /// routes exactly once (the failed attempt did not duplicate).
+    #[test]
+    fn dispatch_routes_external_transfers_only_after_commit() {
+        use crate::actors::codec::Encode;
+        use crate::value::{Msg, TAG_DYNAMIC};
+        use std::sync::mpsc;
+
+        let workspace = env!("CARGO_MANIFEST_DIR");
+        let elf_path = format!(
+            "{workspace}/../examples/actors/probe/target/riscv64em-javm/release/probe.elf"
+        );
+        let Ok(elf) = std::fs::read(&elf_path) else {
+            eprintln!("SKIP: probe ELF not built — run: just build-pvm");
+            return;
+        };
+        let blob = grey_transpiler::link_elf(&elf).expect("probe transpiles");
+
+        let mut runtime = VosRuntime::new();
+        let blob_idx = runtime.register_service_blob(blob);
+        let probe = runtime.register_service(blob_idx);
+
+        // A tell to a service this runtime does not host is an external
+        // transfer routed through the node's outbox.
+        let external_target = ServiceId(0xEE00);
+        let tell = {
+            let enc = Msg::new("tell_out").with("target", external_target.0).encode();
+            let mut m = vec![TAG_DYNAMIC];
+            m.extend_from_slice(&enc);
+            m
+        };
+
+        let (tx, rx) = mpsc::channel::<Envelope>();
+
+        struct FailCommit;
+        impl crate::commit::CommitStrategy for FailCommit {
+            fn restore(&mut self) -> Option<Vec<u8>> {
+                None
+            }
+            fn commit(&mut self, _state: &[u8]) -> Result<(), crate::commit::CommitError> {
+                Err(crate::commit::CommitError::Config("forced commit failure".into()))
+            }
+        }
+
+        // First attempt: the commit fails, so nothing may be routed.
+        let mut fail = FailCommit;
+        let r = dispatch_once(&mut runtime, probe, &tx, probe, Some(tell.clone()), &mut fail, false);
+        assert!(r.is_err(), "the failing strategy must surface its commit error");
+        assert!(
+            rx.try_recv().is_err(),
+            "a failed commit must route no external transfer"
+        );
+
+        // Retry with a strategy that commits: the transfer routes once.
+        let mut ok = crate::commit::NoCommit;
+        let r = dispatch_once(&mut runtime, probe, &tx, probe, Some(tell), &mut ok, false);
+        assert!(r.is_ok(), "the succeeding strategy must commit");
+        let env = rx
+            .try_recv()
+            .expect("a committed dispatch routes its external transfer");
+        assert_eq!(env.to, external_target);
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one transfer routed — the failed attempt left nothing to duplicate"
+        );
     }
 }
