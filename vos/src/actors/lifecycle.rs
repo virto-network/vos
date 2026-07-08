@@ -187,14 +187,7 @@ pub fn exit_status<A: Actor>(ctx: &Context<A>) -> Vec<u8> {
         return alloc::vec![STATUS_FORBIDDEN];
     }
     if ctx.self_scheduled() {
-        let ticks = ctx.sleep_ticks();
-        if ticks > 0 {
-            let mut s = alloc::vec![STATUS_YIELDED];
-            s.extend_from_slice(&ticks.to_le_bytes());
-            s
-        } else {
-            alloc::vec![STATUS_YIELDED]
-        }
+        alloc::vec![STATUS_YIELDED]
     } else {
         alloc::vec![STATUS_DONE]
     }

@@ -55,7 +55,6 @@ pub struct Context<A: Actor> {
 
     // Cooperative scheduling
     self_schedule: bool,
-    sleep_ticks: u32,
 
     // Worker host I/O: the handler yields with a request, the host
     // fulfills it and provides the result before re-polling.
@@ -89,7 +88,6 @@ impl<A: Actor> Context<A> {
             pending_provides: Vec::new(),
             reply: None,
             self_schedule: false,
-            sleep_ticks: 0,
             host_io_request: None,
             host_io_result: None,
             _phantom: core::marker::PhantomData,
@@ -566,11 +564,13 @@ impl<A: Actor> Context<A> {
         super::run::Yield::once()
     }
 
-    /// Checkpoint state and sleep for N ticks.
-    /// Each invocation runs one iteration; state is saved automatically.
-    pub fn sleep(&mut self, ticks: u32) -> super::run::Yield {
+    /// Checkpoint state and yield. `sleep` is an alias for
+    /// [`yield_now`](Self::yield_now): no host implements a multi-tick
+    /// sleep, so `ticks` is ignored — the actor is simply re-scheduled
+    /// next tick. Kept for source compatibility and as the natural name
+    /// for a periodic-work loop.
+    pub fn sleep(&mut self, _ticks: u32) -> super::run::Yield {
         self.self_schedule = true;
-        self.sleep_ticks = ticks;
         super::run::Yield::once()
     }
 
@@ -650,11 +650,6 @@ impl<A: Actor> Context<A> {
     /// Check if a yield_now or sleep was requested.
     pub fn self_scheduled(&self) -> bool {
         self.self_schedule
-    }
-
-    /// Get the number of ticks to sleep (0 = yield_now).
-    pub fn sleep_ticks(&self) -> u32 {
-        self.sleep_ticks
     }
 
     /// Flush all queued effects.
