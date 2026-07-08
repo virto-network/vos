@@ -117,7 +117,47 @@ decoding.
   distinguishes the stateless `space-bridge` (`Ephemeral`) from the stateful
   `clerk-bridge` (`Local`); item 1 marked DONE; the F2 anchor marked wired;
   the wedge-recovery paragraph now points to settlement + `anchor_reset`.
-- **S6** — next: multi-node 3-space e2e.
+- **S6** — done. `multi_node_three_space_settlement_capstone`: five
+  in-process nodes (venue ×2 clerk-settle Raft, bank-A ×2 with a bridge on
+  a1, bank-B ×1) sharing one hyperspace registry. Asserts: hyperspace
+  resolution from bank-A's SECOND node; BIDIRECTIONAL vouchers (A→B and B→A,
+  each bridge folding the accepted commit into its receiver term); window
+  rotate → quiesce → both drivers derive `issuer ⊕ receiver` claims → the
+  two net-flow commitments cancel → `settle_window` records the window and
+  replicates to both venue nodes; `anchor_reset` unwedges a deliberately
+  wedged channel. Uses `submit_voucher` (verify + accumulate) — no
+  clerk-ledger needed for the settlement demonstration — and drives the
+  venue's Operator handlers locally on the leader as `Caller::System` (the
+  leader-forward + grant path is already proven by G6/S1), so S6 needs no
+  per-space registries or grants, only the shared hyperspace registry.
+
+## S6 finding — submit_claim follower routing (shapes the S3 driver)
+
+The plan framed `submit_claim` "arriving at the venue follower → leader-
+forward on the open handler". The actual behavior is more nuanced and the
+driver must account for it:
+
+- A `submit_claim` that would **short-circuit before the write**
+  (`UnknownBank` / `BadInput` / `SignatureInvalid` / `AlreadySettled`) can
+  return a status from a **follower** — no commit is needed, so the reply
+  comes back normally.
+- A `submit_claim` that **would commit** (valid claim, banks registered),
+  sent to a follower, is **refused**: the follower's raft agent drops the
+  write and the inbound libp2p `dispatch_invoke` does NOT auto-forward
+  (leader-forward only fires on the agent/extension *outbound* paths, per
+  G6). It surfaces to the caller as an error.
+
+So the driver must **target the venue leader** for `submit_claim` (resolve
+`clerk-settle` via the hyperspace, then pick the leader via `raft-status`),
+exactly as it already must for the Operator-gated `register_bank` /
+`settle_window`. There is no free follower→leader forward for the open
+write on the direct cross-space path.
+
+## Track S complete
+
+G6 · S1 · S2 · S4 · S5 · S6 all landed on branch `clerk-settlement` (one
+commit per item). Not pushed (awaiting review). Deferred: clerk handler
+retyping when stream D's G25 reaches master (see the retype TODO above).
 
 ## S5 finding — auto replication_id is NOT space-scoped (trap for S7 / bloque)
 

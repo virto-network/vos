@@ -9682,3 +9682,581 @@ fn raft_clerk_settle_bilateral_settlement() {
     let _ = std::fs::remove_dir_all(&dir_root);
     assert_eq!(panics, 0, "actor panics during raft clerk-settle test: {panics}");
 }
+
+/// S6 — the multi-node, three-space settlement capstone.
+///
+/// Five in-process nodes across three spaces sharing one hyperspace:
+///   - venue ×2 (v_a, v_b): `clerk-settle` Raft-replicated.
+///   - bank-A ×2 (a1, a2): a1 runs bank-A's `clerk-bridge`; a2 is bank-A's
+///     second node (exercises hyperspace resolution from a non-primary node).
+///   - bank-B ×1 (b1): bank-B's `clerk-bridge`.
+///
+/// It composes the whole settlement pipeline the demo stands on:
+///   - **bidirectional vouchers** — bank A issues to bank B's bridge and
+///     bank B issues to bank A's bridge (the existing e2e only flowed A→B);
+///     each bridge folds the accepted commit into its receiver term;
+///   - **window rotate → quiesce → both claims → zero-sum settle** — both
+///     banks' drivers combine their issuer term with the bridge's receiver
+///     term into a signed `SettlementClaim`; the two net-flow commitments
+///     cancel and the venue records the window;
+///   - **cross-space `submit_claim`** resolved via the hyperspace registry,
+///     with the follower/leader routing reality pinned (a raft write to a
+///     venue follower does NOT auto-forward on the inbound path — it must
+///     target the leader);
+///   - **`anchor_reset` unwedges** a deliberately wedged voucher channel.
+#[test]
+#[cfg(feature = "network")]
+fn multi_node_three_space_settlement_capstone() {
+    // Serialize network e2e tests (see net_serial).
+    let _net = net_serial();
+
+    use cipher_clerk::crypto::{Amount, Blinding, Keypair};
+    use cipher_clerk::proof::Proof as CcProof;
+    use cipher_clerk::settlement::SettlementClaim;
+    use cipher_clerk::viewing_keys::{EncryptedEnvelope, SpendKey};
+    use cipher_clerk::voucher::Voucher;
+    use clerk_bridge::{ClerkBridgeRef, DEMO_CURRENCY, Status as BridgeStatus};
+    use clerk_settle::{ClerkSettleRef, Status as SettleStatus};
+    use space_registry::SpaceRegistryRef;
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::actors::client::ClientError;
+    use vos::network::{Network, NetworkConfig, RaftRole, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    const WINDOW: (u64, u64) = (0, 0);
+
+    // ── Load ELFs ───────────────────────────────────────────────
+    let mk_path = |crate_dir: &str, elf: &str| {
+        format!(
+            "{}/../actors/{crate_dir}/target/riscv64em-javm/release/{elf}",
+            env!("CARGO_MANIFEST_DIR"),
+        )
+    };
+    let read_elf = |p: String, what: &str| -> Option<Vec<u8>> {
+        match std::fs::read(&p) {
+            Ok(d) => Some(d),
+            Err(_) => {
+                eprintln!("SKIP: {what} not built");
+                None
+            }
+        }
+    };
+    let (Some(settle_elf), Some(bridge_elf), Some(registry_elf)) = (
+        read_elf(mk_path("clerk-settle", "clerk_settle.elf"), "clerk-settle"),
+        read_elf(mk_path("clerk-bridge", "clerk_bridge.elf"), "clerk-bridge"),
+        read_elf(mk_path("space-registry", "space_registry.elf"), "space-registry"),
+    ) else {
+        return;
+    };
+    let settle_blob = grey_transpiler::link_elf(&settle_elf).expect("transpile clerk-settle");
+    let bridge_blob = grey_transpiler::link_elf(&bridge_elf).expect("transpile clerk-bridge");
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile space-registry");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root =
+        std::env::temp_dir().join(format!("vos_capstone_{}_{}", std::process::id(), stamp));
+    let mk_dir = |tag: &str| {
+        let d = dir_root.join(tag);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    };
+    let (dir_va, dir_vb, dir_a1, dir_a2, dir_b1) = (
+        mk_dir("va"),
+        mk_dir("vb"),
+        mk_dir("a1"),
+        mk_dir("a2"),
+        mk_dir("b1"),
+    );
+
+    let mk_rep = |label: &[u8]| -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(label);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+    // One shared hyperspace registry across all five nodes; a Raft group for
+    // the venue's clerk-settle.
+    let hs_rep = mk_rep(b"capstone/hyperspace");
+    let venue_rep = mk_rep(b"capstone/venue-settle");
+
+    // ── Five networks, meshed via explicit dial chains + mDNS. ──
+    let kps: Vec<libp2p::identity::Keypair> =
+        (0..5).map(|_| libp2p::identity::Keypair::generate_ed25519()).collect();
+    let prefixes: Vec<u16> = kps
+        .iter()
+        .map(|k| derive_node_prefix(&libp2p::PeerId::from(k.public())))
+        .collect();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for p in &prefixes {
+            if !seen.insert(*p) {
+                eprintln!("SKIP: prefix collision");
+                return;
+            }
+        }
+    }
+    let (pv_a, pv_b, pa1, pa2, pb1) =
+        (prefixes[0], prefixes[1], prefixes[2], prefixes[3], prefixes[4]);
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+
+    let start_net = |kp: libp2p::identity::Keypair,
+                     prefix: u16,
+                     bootstrap: Vec<libp2p::Multiaddr>|
+     -> (Network, libp2p::Multiaddr) {
+        let net = Network::start(NetworkConfig {
+            keypair: kp,
+            local_prefix: prefix,
+            listen: vec![listen.clone()],
+            bootstrap,
+            auto_dial_mdns: true,
+        });
+        let addr = wait_for(
+            || net.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net binds");
+        let dial = addr.with(libp2p::multiaddr::Protocol::P2p(net.peer_id()));
+        (net, dial)
+    };
+
+    let (net_va, dial_va) = start_net(kps[0].clone(), pv_a, vec![]);
+    let (net_vb, dial_vb) = start_net(kps[1].clone(), pv_b, vec![dial_va.clone()]);
+    let (net_a1, dial_a1) = start_net(kps[2].clone(), pa1, vec![dial_va.clone(), dial_vb.clone()]);
+    let (net_a2, dial_a2) = start_net(
+        kps[3].clone(),
+        pa2,
+        vec![dial_va.clone(), dial_vb.clone(), dial_a1.clone()],
+    );
+    let (net_b1, _dial_b1) = start_net(
+        kps[4].clone(),
+        pb1,
+        vec![dial_va, dial_vb, dial_a1, dial_a2],
+    );
+
+    // ── Register per node: shared hyperspace registry + space agent. ──
+    let settle_id = |prefix: u16| ServiceId(space_registry::instance_service_id("clerk-settle", prefix));
+    let bridge_a_id = ServiceId(space_registry::instance_service_id("bank-a-bridge", pa1));
+    let bridge_b_id = ServiceId(space_registry::instance_service_id("bank-b-bridge", pb1));
+    let venue_members = vec![pv_a, pv_b];
+
+    let register_hs = |node: &mut VosNode, dir: &std::path::Path| {
+        node.register_at_id(
+            AgentConfig::new(registry_blob.clone())
+                .with_consistency(Consistency::Crdt)
+                .persist(dir)
+                .with_replication_id(hs_rep),
+            ServiceId::HYPERSPACE_REGISTRY,
+        );
+    };
+
+    // Venue nodes: clerk-settle Raft (network attached before register).
+    let mut node_va = VosNode::with_prefix(pv_a);
+    node_va.attach_network(net_va);
+    register_hs(&mut node_va, &dir_va);
+    node_va.register_at_id(
+        AgentConfig::new(settle_blob.clone())
+            .with_consistency(Consistency::Raft)
+            .with_members(venue_members.clone())
+            .with_replication_id(venue_rep)
+            .persist(&dir_va),
+        settle_id(pv_a),
+    );
+
+    let mut node_vb = VosNode::with_prefix(pv_b);
+    node_vb.attach_network(net_vb);
+    register_hs(&mut node_vb, &dir_vb);
+    node_vb.register_at_id(
+        AgentConfig::new(settle_blob)
+            .with_consistency(Consistency::Raft)
+            .with_members(venue_members)
+            .with_replication_id(venue_rep)
+            .persist(&dir_vb),
+        settle_id(pv_b),
+    );
+
+    // Bank-A node 1: clerk-bridge (Local). Node 2: hyperspace only.
+    let mut node_a1 = VosNode::with_prefix(pa1);
+    node_a1.attach_network(net_a1);
+    register_hs(&mut node_a1, &dir_a1);
+    node_a1.register_at_id(
+        AgentConfig::new(bridge_blob.clone())
+            .with_consistency(Consistency::Local)
+            .network_reachable()
+            .persist(&dir_a1),
+        bridge_a_id,
+    );
+
+    let mut node_a2 = VosNode::with_prefix(pa2);
+    node_a2.attach_network(net_a2);
+    register_hs(&mut node_a2, &dir_a2);
+
+    // Bank-B node: clerk-bridge (Local).
+    let mut node_b1 = VosNode::with_prefix(pb1);
+    node_b1.attach_network(net_b1);
+    register_hs(&mut node_b1, &dir_b1);
+    node_b1.register_at_id(
+        AgentConfig::new(bridge_blob)
+            .with_consistency(Consistency::Local)
+            .network_reachable()
+            .persist(&dir_b1),
+        bridge_b_id,
+    );
+
+    // ── Wait for a full libp2p mesh. ────────────────────────────
+    let arc_va = node_va.network().expect("va net");
+    let arc_vb = node_vb.network().expect("vb net");
+    let arc_a1 = node_a1.network().expect("a1 net");
+    let arc_a2 = node_a2.network().expect("a2 net");
+    let arc_b1 = node_b1.network().expect("b1 net");
+    let arcs = [&arc_va, &arc_vb, &arc_a1, &arc_a2, &arc_b1];
+    wait_for(
+        || {
+            for (i, arc) in arcs.iter().enumerate() {
+                for (j, &pfx) in prefixes.iter().enumerate() {
+                    if i != j && arc.peer_for_prefix(pfx).is_none() {
+                        return None;
+                    }
+                }
+            }
+            Some(())
+        },
+        Duration::from_secs(30),
+    )
+    .expect("five-node full mesh");
+
+    // ── Venue leader/follower. ──────────────────────────────────
+    let (venue_leader, venue_follower) = wait_for(
+        || {
+            let ra = arc_va.local_raft_status(&venue_rep)?;
+            let rb = arc_vb.local_raft_status(&venue_rep)?;
+            match (ra.role, rb.role) {
+                (RaftRole::Leader, RaftRole::Follower) => Some((pv_a, pv_b)),
+                (RaftRole::Follower, RaftRole::Leader) => Some((pv_b, pv_a)),
+                _ => None,
+            }
+        },
+        Duration::from_secs(30),
+    )
+    .expect("venue elects a stable leader");
+    let venue_leader_node: &VosNode = if venue_leader == pv_a { &node_va } else { &node_vb };
+    let leader_settle = settle_id(venue_leader);
+    let follower_settle = settle_id(venue_follower);
+
+    // ── Advertise the venue's clerk-settle into the hyperspace. ─
+    // Advertise the LEADER's prefix so a cross-space resolve lands on the
+    // node that can accept the raft write (a follower does not forward on
+    // the inbound path — pinned below).
+    let hs_leader = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+    assert_eq!(
+        vos::block_on(hs_leader.register_remote(
+            &mut &*venue_leader_node,
+            "clerk-settle".into(),
+            venue_leader as u32,
+        ))
+        .expect("register_remote clerk-settle"),
+        space_registry::Status::Ok,
+    );
+
+    // Hyperspace resolution from bank-A's SECOND node (a2) — the CRDT
+    // registry converged there and a2 can route cross-space to the venue.
+    let resolved_from_a2 = wait_for(
+        || {
+            let got = vos::block_on(
+                SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY)
+                    .resolve(&mut &node_a2, "clerk-settle".into(), pa2 as u64),
+            )
+            .ok()?;
+            (got == leader_settle.0).then_some(got)
+        },
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        resolved_from_a2,
+        Some(leader_settle.0),
+        "hyperspace resolve from bank-A's second node must yield the venue's clerk-settle id"
+    );
+
+    // ── Bank identities + bidirectional vouchers. ───────────────
+    let bank_a_clerk = Keypair::generate();
+    let bank_b_clerk = Keypair::generate();
+    let bank_a_ivk = SpendKey::generate().incoming_viewing_key();
+    let bank_b_ivk = SpendKey::generate().incoming_viewing_key();
+    let bank_a_ivk_pk = bank_a_ivk.public();
+    let bank_b_ivk_pk = bank_b_ivk.public();
+
+    let bridge_a = ClerkBridgeRef::at(bridge_a_id);
+    let bridge_b = ClerkBridgeRef::at(bridge_b_id);
+    // Bootstrap each bridge with a dummy ledger id (submit_voucher never
+    // dispatches to a ledger; only redeem_voucher would) + its IVK secret.
+    assert_eq!(
+        vos::block_on(bridge_a.bootstrap(&mut &node_a1, 1u32, bank_a_ivk.to_bytes().to_vec()))
+            .expect("bootstrap bridge-a"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_b.bootstrap(&mut &node_b1, 1u32, bank_b_ivk.to_bytes().to_vec()))
+            .expect("bootstrap bridge-b"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.register_peer(
+            &mut &node_a1,
+            b"bank-b".to_vec(),
+            bank_b_clerk.public.0.to_vec(),
+            pb1 as u32,
+        ))
+        .expect("bridge-a register_peer bank-b"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_b.register_peer(
+            &mut &node_b1,
+            b"bank-a".to_vec(),
+            bank_a_clerk.public.0.to_vec(),
+            pa1 as u32,
+        ))
+        .expect("bridge-b register_peer bank-a"),
+        BridgeStatus::Ok,
+    );
+
+    // Build a voucher `issuer` → `receiver_ivk_pk` for `value`.
+    let build_voucher = |value: u64,
+                         blind: u8,
+                         receiver_ivk_pk: &cipher_clerk::crypto::AuthKey,
+                         root_before: [u8; 32],
+                         root_after: [u8; 32],
+                         issuer_secret: &cipher_clerk::crypto::SecretKey|
+     -> (Amount, Vec<u8>) {
+        let blinding = Blinding([blind; 32]);
+        let commit = Amount::commit(value, &blinding);
+        let envelope =
+            EncryptedEnvelope::seal(value, &blinding, receiver_ivk_pk).expect("seal envelope");
+        let voucher = Voucher::sign(
+            commit,
+            envelope,
+            root_before,
+            root_after,
+            CcProof::default(),
+            issuer_secret,
+        );
+        (commit, voucher.to_bytes())
+    };
+
+    // A → B (commit C_ab), sealed under bank B's IVK, signed by bank A.
+    let (c_ab, voucher_ab) = build_voucher(
+        10,
+        0x03,
+        &bank_b_ivk_pk,
+        [0x11u8; 32],
+        [0x12u8; 32],
+        &bank_a_clerk.secret,
+    );
+    // B → A (commit C_ba), sealed under bank A's IVK, signed by bank B.
+    let (c_ba, voucher_ba) = build_voucher(
+        4,
+        0x04,
+        &bank_a_ivk_pk,
+        [0x21u8; 32],
+        [0x22u8; 32],
+        &bank_b_clerk.secret,
+    );
+
+    // Ship each voucher cross-node to the counterpart bridge (the issuing
+    // bank's node submits to the receiving bank's bridge).
+    assert_eq!(
+        vos::block_on(bridge_b.submit_voucher(&mut &node_a1, voucher_ab, b"bank-a".to_vec()))
+            .expect("A ships voucher to bridge-b")
+            .status,
+        BridgeStatus::Ok,
+        "bank B's bridge accepts bank A's voucher"
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.submit_voucher(&mut &node_b1, voucher_ba, b"bank-b".to_vec()))
+            .expect("B ships voucher to bridge-a")
+            .status,
+        BridgeStatus::Ok,
+        "bank A's bridge accepts bank B's voucher"
+    );
+
+    // ── Quiesce: rotate both bridges' windows (closing window 0). ─
+    assert_eq!(
+        vos::block_on(bridge_a.window_rotate(&mut &node_a1, b"bank-b".to_vec()))
+            .expect("rotate bridge-a"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_b.window_rotate(&mut &node_b1, b"bank-a".to_vec()))
+            .expect("rotate bridge-b"),
+        BridgeStatus::Ok,
+    );
+
+    // ── Both banks' drivers derive their net-flow claims. ───────
+    // net_flow(bank) = issuer_term ⊕ receiver_term, where the receiver term
+    // is the bridge's negated sum for the closed window.
+    let add_commits = |a: &Amount, b: &Amount| -> Amount {
+        Amount::from_point(&(a.to_point().unwrap() + b.to_point().unwrap()))
+    };
+    let recv_a_bytes =
+        vos::block_on(bridge_a.window_net(&mut &node_a1, b"bank-b".to_vec(), DEMO_CURRENCY, WINDOW.0))
+            .expect("bridge-a window_net");
+    let recv_b_bytes =
+        vos::block_on(bridge_b.window_net(&mut &node_b1, b"bank-a".to_vec(), DEMO_CURRENCY, WINDOW.0))
+            .expect("bridge-b window_net");
+    let recv_a = Amount(recv_a_bytes.try_into().expect("32-byte receiver term A"));
+    let recv_b = Amount(recv_b_bytes.try_into().expect("32-byte receiver term B"));
+    // Bank A issued C_ab; bank B issued C_ba (issuer terms the drivers keep).
+    let net_a = add_commits(&c_ab, &recv_a); // C_ab ⊖ C_ba
+    let net_b = add_commits(&c_ba, &recv_b); // C_ba ⊖ C_ab
+    let claim_a = SettlementClaim::sign(
+        bank_a_clerk.public,
+        bank_b_clerk.public,
+        DEMO_CURRENCY,
+        WINDOW.0,
+        WINDOW.1,
+        net_a,
+        &bank_a_clerk.secret,
+    )
+    .to_bytes();
+    let claim_b = SettlementClaim::sign(
+        bank_b_clerk.public,
+        bank_a_clerk.public,
+        DEMO_CURRENCY,
+        WINDOW.0,
+        WINDOW.1,
+        net_b,
+        &bank_b_clerk.secret,
+    )
+    .to_bytes();
+
+    // ── Venue: register both banks (Operator, locally on the leader). ──
+    let venue = ClerkSettleRef::at(leader_settle);
+    for (name, pk) in [
+        (b"bank-a".to_vec(), bank_a_clerk.public.0.to_vec()),
+        (b"bank-b".to_vec(), bank_b_clerk.public.0.to_vec()),
+    ] {
+        assert_eq!(
+            vos::block_on(venue.register_bank(&mut &*venue_leader_node, name, pk))
+                .expect("register_bank"),
+            SettleStatus::Ok,
+        );
+    }
+
+    // Wait for the registrations to replicate to BOTH venue replicas, so a
+    // claim submitted to the follower reaches the write path (not an early
+    // UnknownBank short-circuit on stale state).
+    let bank_count_on = |node: &VosNode, prefix: u16| -> Option<u32> {
+        vos::block_on(ClerkSettleRef::at(settle_id(prefix)).bank_count(&mut &*node)).ok()
+    };
+    wait_for(
+        || {
+            (bank_count_on(&node_va, pv_a) == Some(2) && bank_count_on(&node_vb, pv_b) == Some(2))
+                .then_some(())
+        },
+        Duration::from_secs(20),
+    )
+    .expect("bank registrations replicate to both venue nodes");
+
+    // ── submit_claim: the follower/leader routing reality. ──────
+    // A cross-space submit_claim that WOULD commit, sent to the venue
+    // FOLLOWER, is refused: the follower's raft agent drops the write (it is
+    // not the leader) and the inbound libp2p path does NOT auto-forward — so
+    // the driver must target the leader. (A claim that short-circuits before
+    // the write — e.g. UnknownBank — could return from a follower; this one
+    // is valid against the now-replicated banks, so it reaches the write.)
+    let follower_result = vos::block_on(
+        ClerkSettleRef::at(follower_settle).submit_claim(
+            &mut &node_a1,
+            claim_a.clone(),
+            1u32,
+            [0xA0u8; 32].to_vec(),
+        ),
+    );
+    assert!(
+        follower_result.is_err(),
+        "a committing submit_claim to a venue follower must not succeed (no inbound forward); got {follower_result:?}"
+    );
+    // Targeting the leader (resolved via the hyperspace above) commits.
+    assert_eq!(
+        vos::block_on(venue.submit_claim(&mut &node_a1, claim_a, 2u32, [0xA1u8; 32].to_vec()))
+            .expect("bank A submit_claim to venue leader"),
+        SettleStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(venue.submit_claim(&mut &node_b1, claim_b, 1u32, [0xB1u8; 32].to_vec()))
+            .expect("bank B submit_claim to venue leader"),
+        SettleStatus::Ok,
+    );
+
+    // ── settle_window at the leader → zero-sum → replicates. ────
+    assert_eq!(
+        vos::block_on(venue.settle_window(
+            &mut &*venue_leader_node,
+            b"bank-a".to_vec(),
+            b"bank-b".to_vec(),
+            DEMO_CURRENCY,
+            WINDOW.0,
+            WINDOW.1,
+        ))
+        .expect("settle_window"),
+        SettleStatus::Ok,
+        "the two banks' net-flow commitments must cancel"
+    );
+    let settled_on = |node: &VosNode, prefix: u16| -> Option<u32> {
+        vos::block_on(ClerkSettleRef::at(settle_id(prefix)).settled_count(&mut &*node)).ok()
+    };
+    wait_for(
+        || {
+            (settled_on(&node_va, pv_a) == Some(1) && settled_on(&node_vb, pv_b) == Some(1))
+                .then_some(())
+        },
+        Duration::from_secs(20),
+    )
+    .expect("the settled window replicates to both venue nodes");
+
+    // ── anchor_reset unwedges a deliberately wedged channel. ────
+    // A voucher from bank B declaring an unseen prior root wedges bank A's
+    // bridge; anchor_reset re-anchors and the same voucher then chains.
+    let wedge_before = [0x99u8; 32];
+    let (_wc, wedge_bytes) = build_voucher(
+        3,
+        0x05,
+        &bank_a_ivk_pk,
+        wedge_before,
+        [0x9Au8; 32],
+        &bank_b_clerk.secret,
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.submit_voucher(&mut &node_a1, wedge_bytes.clone(), b"bank-b".to_vec()))
+            .expect("submit wedge voucher")
+            .status,
+        BridgeStatus::VoucherInvalid,
+        "a non-chaining voucher wedges the channel"
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.anchor_reset(&mut &node_a1, b"bank-b".to_vec(), wedge_before.to_vec()))
+            .expect("anchor_reset"),
+        BridgeStatus::Ok,
+    );
+    assert_eq!(
+        vos::block_on(bridge_a.submit_voucher(&mut &node_a1, wedge_bytes, b"bank-b".to_vec()))
+            .expect("resubmit after anchor_reset")
+            .status,
+        BridgeStatus::Ok,
+        "anchor_reset re-anchors the channel so the voucher chains again"
+    );
+
+    // ── Cleanup ─────────────────────────────────────────────────
+    let mut panics = 0u32;
+    for node in [node_va, node_vb, node_a1, node_a2, node_b1] {
+        for r in node.collect() {
+            panics += r.panics;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir_root);
+    assert_eq!(panics, 0, "actor panics during capstone test: {panics}");
+}
