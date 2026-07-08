@@ -99,29 +99,17 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // PVM entry-point block — emitted only on riscv64 actor builds
-    // with the `bin` feature on. The macro emits these entries here,
-    // so the user's lib.rs needs neither a `pvm_main!()` invocation
-    // nor a separate `main.rs`. The
-    // helper symbols (`__VOS_ACTOR_META_ENCODED`,
-    // `_KEEP_ACCUMULATE`) are named with leading underscores /
-    // a `__VOS_` prefix so they don't shadow anything in the
-    // user's module.
+    // with the `bin` feature on. The macro emits the single refine
+    // entry (`_start`, PC=0) here, so the user's lib.rs needs neither
+    // a `pvm_main!()` invocation nor a separate `main.rs`. The helper
+    // symbol `__VOS_ACTOR_META_ENCODED` carries a `__VOS_` prefix so
+    // it doesn't shadow anything in the user's module.
     let pvm_entries = quote! {
         #[cfg(all(target_arch = "riscv64", feature = "bin"))]
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() {
             vos::run_refine_entry::<#name>();
         }
-
-        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
-        #[unsafe(no_mangle)]
-        pub extern "C" fn accumulate() {
-            vos::run_accumulate_entry::<#name>();
-        }
-
-        #[cfg(all(target_arch = "riscv64", feature = "bin"))]
-        #[used]
-        static _KEEP_ACCUMULATE: unsafe extern "C" fn() = accumulate;
 
         #[cfg(all(target_arch = "riscv64", feature = "bin"))]
         const __VOS_ACTOR_META_ENCODED: ([u8; 4096], usize) =
@@ -218,7 +206,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// - `{Name}Msg` enum with rkyv derives
 /// - `Message<T>` trait impls for each handler
-/// - `_start` / `accumulate` PVM entry points
+/// - `_start` PVM entry point (PC=0, refine)
 /// - `.vos_meta` section with actor metadata
 #[proc_macro_attribute]
 pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -991,7 +979,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             vos::metadata::encode::<4096>(&#enum_name::META);
     };
 
-    // PVM entry points (`_start`, `accumulate`, `.vos_meta`) are
+    // PVM entry points (`_start`, `.vos_meta`) are
     // auto-emitted by the `#[actor]` macro itself, gated on
     // `cfg(all(target_arch = "riscv64", feature = "bin"))` so:
     //   - host / worker / wasm builds skip them (different arch),

@@ -3,14 +3,12 @@
 //! Refine cannot mutate state. Instead, the guest's `run_refine_service`
 //! captures the new actor state and the queued side effects, encodes them
 //! into a single byte blob, and halts with that blob as its output. The
-//! runtime puts the blob into a `WorkResult::Ok(_)` operand and hands it
-//! to the accumulate stage via `FETCH`. The guest's
-//! `run_accumulate_service` decodes the blob and replays each effect via
-//! a real accumulate hostcall.
+//! host absorbs that blob, decodes it, and applies each effect natively
+//! into its storage — there is no second PVM invocation (see
+//! `crate::runtime`).
 //!
 //! This module is `no_std` so the same constants and helpers are visible
-//! to both the guest framework (encoding) and the host runtime (parsing,
-//! when needed for tests or tracing).
+//! to both the guest framework (encoding) and the host runtime (parsing).
 //!
 //! ## Wire layout (version 2)
 //!
@@ -58,7 +56,7 @@ pub const EFFECT_TRANSFER: u8 = 0x02;
 pub const EFFECT_PROVIDE: u8 = 0x03;
 pub const EFFECT_NEW: u8 = 0x04;
 
-/// One side effect to be replayed by accumulate.
+/// One side effect the host applies natively at commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Write { key: Vec<u8>, value: Vec<u8> },
@@ -85,42 +83,6 @@ pub struct RefinePayload {
 impl RefinePayload {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Replay all buffered effects via accumulate-phase hostcalls.
-    ///
-    /// This is the default accumulate commit path: each effect queued
-    /// during refine is applied via the corresponding real hostcall
-    /// (WRITE, TRANSFER, PROVIDE, NEW). Also handles self-scheduling
-    /// when `continue_next` is set.
-    #[cfg(feature = "service")]
-    pub fn replay_effects(&self) {
-        use crate::abi::pvm::hostcalls;
-        use crate::abi::service::ServiceId;
-        use crate::actors::lifecycle;
-
-        for eff in &self.effects {
-            match eff {
-                Effect::Write { key, value } => {
-                    hostcalls::write(key, value);
-                }
-                Effect::Transfer { target, memo } => {
-                    hostcalls::transfer(ServiceId(*target), 0, 0, memo);
-                }
-                Effect::Provide { hash, data } => {
-                    hostcalls::provide(hash, data);
-                }
-                Effect::New { code_hash } => {
-                    hostcalls::new_service(code_hash);
-                }
-            }
-        }
-
-        if self.continue_next && !self.state.is_empty() {
-            hostcalls::write(lifecycle::STATE_KEY_BYTES, &self.state);
-            let self_id = lifecycle::service_id();
-            hostcalls::transfer(ServiceId(self_id), 0, 0, &[]);
-        }
     }
 
     /// Encode to the wire format.

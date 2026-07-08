@@ -14,9 +14,6 @@ use super::run::RunResult;
 /// - [`on_start`](Actor::on_start) — runs once on cold start, after
 ///   `create()`, before the message loop. Long-running actors place their
 ///   main loop here; `yield_now`/`sleep` work as usual.
-/// - [`on_commit`](Actor::on_commit) — runs during the accumulate
-///   phase to commit refine effects. Override to customize how state is
-///   persisted (e.g. summarization on JAM, proof generation on vosx).
 ///
 /// ## With macros
 ///
@@ -116,21 +113,6 @@ pub trait Actor: Sized + Encode + Decode {
     /// Dispatch a typed message to the appropriate handler.
     /// Returns `Complete(true)` to stop, `Complete(false)` to continue, `Yielded` to suspend.
     fn dispatch(&mut self, msg: Self::Message, ctx: &mut Context<Self>) -> RunResult<bool>;
-
-    /// Called during the accumulate phase to commit refine effects.
-    ///
-    /// The default implementation replays all buffered effects (WRITE,
-    /// TRANSFER, PROVIDE, NEW) via accumulate-phase hostcalls — this is
-    /// the standard JAM-compatible path.
-    ///
-    /// Override to customize accumulate behavior:
-    /// - **JAM**: summarize or aggregate data before on-chain storage
-    /// - **vosx**: generate a ZK proof to send to external actors
-    /// - **Custom**: any accumulate-phase commit logic
-    #[cfg(feature = "service")]
-    fn on_commit(&self, payload: &crate::refine_payload::RefinePayload) {
-        payload.replay_effects();
-    }
 
     /// Called when a message handler returns an error. Return `true` to
     /// stop processing remaining messages in this batch, `false` to continue.

@@ -1,9 +1,9 @@
 //! Cooperative single-threaded executor for VOS actor programs.
 //!
-//! ## JAM lifecycle entry points
+//! ## Lifecycle entry point
 //!
-//! Services built with the actor framework expose two distinct entries
-//! that map onto the JAM refine→accumulate split:
+//! Services built with the actor framework expose a single entry at
+//! PC=0 — the JAR refine body:
 //!
 //! - [`run_refine_service`] (`_start`, PC=0): the **pure** refine body.
 //!   Reads persisted state via the read-only `READ` hostcall, dispatches
@@ -12,13 +12,9 @@
 //!   Side-effecting hostcalls are *forbidden* at this stage — the
 //!   framework's `Context` honours an internal refine-mode flag and
 //!   buffers `WRITE`/`TRANSFER`/`PROVIDE`/`NEW` into the payload's
-//!   effects list instead of issuing them.
-//!
-//! - [`run_accumulate_service`] (`accumulate`, PC=5): the **commit**
-//!   body. The host hands the refine payload back as a single FETCH
-//!   item; this function decodes it and replays each effect via the
-//!   real accumulate-phase hostcall. `INVOKE` is unavailable here —
-//!   accumulate is structurally a state-mutating commit pass.
+//!   effects list instead of issuing them. The host absorbs that
+//!   payload and applies the effects natively (`crate::runtime`); there
+//!   is no second PVM invocation.
 //!
 //! Invoked actors (no `service` feature) use [`run_refine`] instead:
 //! one PVM at PC=0 with state delivered as the first FETCH item and the
@@ -250,9 +246,9 @@ impl Future for HostIo {
 /// (`WRITE`, `TRANSFER`, `PROVIDE`, `NEW`). The framework's
 /// `Context::flush_effects` checks this flag and, when set, *buffers*
 /// effects in the context's pending vectors instead of issuing hostcalls
-/// — `run_refine_service` then drains them into the refine output payload.
-/// `run_accumulate_service` clears the flag and applies the same effects
-/// via real hostcalls.
+/// — `run_refine_service` then drains them into the refine output payload,
+/// which the host absorbs and applies natively. Service actors run
+/// exclusively in refine, so the flag stays set for their whole life.
 ///
 /// Safe because PVM is single-threaded.
 #[cfg(feature = "service")]
@@ -279,19 +275,6 @@ pub fn is_refine_mode() -> bool {
 }
 
 // ── Halt ──────────────────────────────────────────────────────────────
-
-/// Halt the PVM (no output). Used by accumulate (service mode).
-#[cfg(all(feature = "service", target_arch = "riscv64"))]
-fn halt() -> ! {
-    // SAFETY: terminal PVM hostcall. `noreturn` — no liveness after.
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("t0") 0u64, // IPC_SLOT = REPLY → RootHalt
-            options(noreturn),
-        );
-    }
-}
 
 /// Halt with output data in registers a0 (ptr) and a1 (len).
 #[cfg(target_arch = "riscv64")]
@@ -384,11 +367,6 @@ fn halt_with_output_bound(data: &[u8], io_hash: &[u8; 32]) -> ! {
             options(noreturn),
         );
     }
-}
-
-#[cfg(all(feature = "service", not(target_arch = "riscv64")))]
-fn halt() -> ! {
-    panic!("halt is only supported on RISC-V targets");
 }
 
 #[cfg(all(feature = "pvm", not(target_arch = "riscv64")))]
@@ -567,50 +545,6 @@ pub fn run_refine_service<A: super::Actor>() {
     halt_with_output_bound(out_buf, &io_hash);
 }
 
-// ── Service accumulate phase (PC=5, JAM-pure commit) ──────────────────
-
-/// JAM-pure accumulate entry for service actors.
-///
-/// Runs at PC=5. The only stage allowed to mutate state. Receives one
-/// `RefinePayload` per work item via FETCH and replays each effect via
-/// the corresponding accumulate-phase hostcall. Does **not** run user
-/// handlers — accumulate is purely structural.
-#[cfg(feature = "service")]
-pub fn run_accumulate_service<A: super::Actor>() {
-    use super::lifecycle::{self, BUF_SIZE};
-    use crate::refine_payload::RefinePayload;
-
-    set_refine_mode(false);
-
-    // FETCH each refine output operand. The runtime hands one
-    // `RefinePayload`-encoded blob per FETCH call.
-    //
-    // NB: this is a slimmed encoding — the full JAM operand layout
-    // (`encode_operand` from grey-state) wraps these bytes with package
-    // headers, an accumulate_gas field, and a `WorkResult` tag. The
-    // host-side runtime constructs that wrapper today; this guest body
-    // currently consumes the inner refine payload directly. A follow-up
-    // commit will switch the FETCH layout to include the full operand
-    // header so the same blob is bit-identical with on-chain accumulate.
-    // FETCH 1: the refine output payload (effects to replay).
-    let mut buf = [0u8; BUF_SIZE];
-    let n = lifecycle::fetch_raw(&mut buf);
-    if n > 0 {
-        if let Some(payload) = RefinePayload::decode(&buf[..n]) {
-            // Deserialize the actor from refine state for on_commit.
-            // With rkyv this is essentially zero-copy (pointer cast).
-            let actor = lifecycle::load_or_create::<A>(if payload.state.is_empty() {
-                None
-            } else {
-                Some(&payload.state)
-            });
-            actor.on_commit(&payload);
-        }
-    }
-
-    halt();
-}
-
 // ── Refine phase (all actors) ─────────────────────────────────────────
 
 /// Refine-only actor lifecycle — JAR refine phase (PC=0).
@@ -633,7 +567,7 @@ pub fn run_refine<A: super::Actor>() {
 
     let mut ctx = super::Context::new(ServiceId(0));
 
-    // FETCH 2+: messages (same loop as accumulate)
+    // FETCH 2+: messages
     loop {
         let n = lifecycle::fetch_raw(&mut buf);
         if n == 0 {

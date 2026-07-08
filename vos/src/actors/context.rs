@@ -44,7 +44,7 @@ pub struct Context<A: Actor> {
     /// surface the Sprint-2 dispatch-layer gate produced.
     forbidden: bool,
 
-    // Effect queues (flushed in accumulate)
+    // Effect queues (drained into the refine output payload)
     pending_tells: Vec<PendingTell>,
     pending_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pending_spawns: Vec<[u8; 32]>,
@@ -649,45 +649,14 @@ impl<A: Actor> Context<A> {
 
     /// Flush all queued effects.
     ///
-    /// Behaviour depends on the current execution stage:
-    ///
-    /// - **Refine mode** (`run_refine_service`): effects stay queued in the
-    ///   pending vectors so `run_refine_service` can drain them into the
-    ///   refine output payload. JAM forbids state-mutating hostcalls in
-    ///   refine, so we cannot issue them here.
-    /// - **Accumulate mode** (`run_accumulate_service`): effects are issued
-    ///   directly via accumulate-phase hostcalls. This is the only stage
-    ///   that mutates state.
-    /// - **Non-service builds**: effects are dropped (invoked actors don't
-    ///   have a host stage to flush to).
+    /// - **Service builds**: service actors run exclusively in refine,
+    ///   which cannot mutate state. The queued effects stay in the
+    ///   pending vectors for `run_refine_service` to drain into the
+    ///   refine output payload — the host absorbs that payload and
+    ///   applies the effects natively.
+    /// - **Non-service builds**: effects are dropped (invoked actors
+    ///   don't have a host commit stage to flush to).
     pub fn flush_effects(&mut self) {
-        #[cfg(feature = "service")]
-        {
-            // Refine cannot mutate state — leave the pending_* queues
-            // populated so the caller can pack them into the refine output.
-            if super::run::is_refine_mode() {
-                return;
-            }
-
-            use crate::abi::pvm::hostcalls;
-
-            for (key, value) in self.pending_writes.drain(..) {
-                hostcalls::write(&key, &value);
-            }
-
-            for tell in self.pending_tells.drain(..) {
-                hostcalls::transfer(tell.target, 0, 0, &tell.payload);
-            }
-
-            for (hash, data) in self.pending_provides.drain(..) {
-                hostcalls::provide(&hash, &data);
-            }
-
-            for code_hash in self.pending_spawns.drain(..) {
-                hostcalls::new_service(&code_hash);
-            }
-        }
-
         #[cfg(not(feature = "service"))]
         {
             self.pending_writes.clear();

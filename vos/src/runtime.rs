@@ -6,19 +6,19 @@
 //!
 //! ## Execution model (JAM-aligned, refine-only top level)
 //!
-//! The new JAVM kernel collapses the old dual-entry PC=0/PC=5 split
-//! into a single entry at PC=0; phase selection happens via φ[7] (0 =
-//! refine, 1 = accumulate). VOS runs top-level services exclusively in
-//! refine (φ[7]=0):
+//! The JAVM kernel runs a single entry at PC=0 — the JAR refine body.
+//! VOS drives top-level services exclusively in refine:
 //!
 //!   * **Refine is the hot loop.** State-mutating hostcalls issued
 //!     during refine (`WRITE`, `TRANSFER`, `PROVIDE`, `PREIMAGE_PROVIDE`)
-//!     are **journaled** by the runtime, not applied immediately.
-//!   * **Accumulate is the commit boundary.** After refine halts, the
-//!     runtime replays the journal directly: writes flush to storage,
-//!     preimages land in the preimage map, transfers join
-//!     `pending_transfers` for the next tick. No second PVM invocation
-//!     — the replay *is* the accumulate body.
+//!     are **journaled** by the runtime, not applied immediately. The
+//!     framework instead buffers them into the guest's halt
+//!     `RefinePayload`, which the runtime absorbs into the same journal.
+//!   * **The journal drain is the commit boundary — accumulate on VOS.**
+//!     After refine halts, the runtime replays the journal directly:
+//!     writes flush to storage, preimages land in the preimage map,
+//!     transfers join `pending_transfers` for the next tick. There is no
+//!     second PVM invocation — the native drain *is* the accumulate.
 //!
 //! This keeps refine bounded and deterministic while still honoring the
 //! JAM invariant that all state mutation is structurally one commit.
@@ -33,27 +33,25 @@
 //! Nested `INVOKE` children also run at PC=0 under the same refine
 //! policy; their effects merge into the parent's journal.
 //!
-//! ## Continuations (JAM-compatible + VOS optimization)
+//! ## Continuations (host-side warm restart)
 //!
-//! When a service's refine phase sets `continue_next = true`:
+//! When a service's refine sets `continue_next = true` (a `yield_now` /
+//! `sleep` handler), the runtime:
 //!
-//! 1. **JAM-compatible path** (works on any conformant host): the
-//!    serialized actor state from the refine payload is written to
-//!    `STATE_KEY` in the journal, and a self-directed transfer is
-//!    enqueued. On the next tick the guest cold-starts at PC=0,
-//!    reads `STATE_KEY` via `READ`, and deserializes its actor —
-//!    no host cooperation required.
+//!   * already holds the actor's serialized state — `STATE_KEY` is
+//!     written into the journal on every mutating dispatch, not just on
+//!     yield — so a cold restart at PC=0 rehydrates it via `READ`; and
+//!   * captures `flat_mem` into the [`DataLayer`] with a
+//!     [`ContinuationHeader`](crate::pvm_image::ContinuationHeader) so
+//!     the next tick restores the kernel via `InvocationKernel::new_warm`
+//!     — the guest's `ACTOR_HOLDER` static is already populated and it
+//!     skips the `READ` + deserialize.
 //!
-//! 2. **VOS optimization** (transparent fast path): the runtime also
-//!    captures `flat_mem` into the [`DataLayer`] and writes a
-//!    [`ContinuationHeader`](crate::pvm_image::ContinuationHeader)
-//!    to the journal. On the next tick the kernel is restored via
-//!    `InvocationKernel::new_warm` — the guest's `ACTOR_HOLDER`
-//!    static is already populated so it skips the `READ` + deserialize.
-//!
-//! Path (1) ensures services work on JAR without modification.
-//! Path (2) is a host-side optimization that avoids serialization
-//! overhead when the host supports flat_mem overlay.
+//! The warm-restart overlay is a top-level-service optimization only
+//! (invoke children always cold-start via `new_cached`); its absence
+//! never changes semantics. There is no automatic wake-up: a service
+//! that yielded with nothing left to do under its own steam is resumed
+//! by the next external message (typically a parent agent's INVOKE).
 //!
 //! ## Memory model
 //!
@@ -86,31 +84,17 @@ const MAX_INVOKE_DEPTH: usize = 8;
 /// runtime from a misbuilt guest that self-schedules forever.
 const MAX_REFINE_ITERATIONS: usize = 64;
 
-/// Per-stage gas budgets for one service tick.
+/// Gas budget for one service tick.
 #[derive(Debug, Clone, Copy)]
 pub struct GasConfig {
     /// Maximum gas a single refine invocation may burn.
     pub refine_gas: Gas,
-    /// Upper bound on accumulate gas (retained for API compat; the
-    /// runtime does not currently enter a second PVM at commit time,
-    /// but on-chain bridging will consume this budget).
-    pub accumulate_gas_max: Gas,
-    /// Default accumulate gas when a service has no manifest override.
-    pub accumulate_gas_default: Gas,
-}
-
-impl GasConfig {
-    pub fn clamp_accumulate(&self, requested: Gas) -> Gas {
-        requested.min(self.accumulate_gas_max)
-    }
 }
 
 impl Default for GasConfig {
     fn default() -> Self {
         Self {
             refine_gas: DEFAULT_GAS,
-            accumulate_gas_max: DEFAULT_GAS,
-            accumulate_gas_default: DEFAULT_GAS,
         }
     }
 }
@@ -725,7 +709,8 @@ impl<D: DataLayer> VosRuntime<D> {
                     }
                 };
                 install_vos_precompile_caps(&mut kernel);
-                // φ[7] = 0 → refine phase.
+                // Zero the entry register (a0 / φ[7]). The guest runs the
+                // single refine entry at PC=0 and reads no phase selector.
                 kernel.set_active_reg(7, 0);
                 // Transition VM 0 from Ready → Running so kernel.run() executes.
                 let _ = kernel
@@ -1680,38 +1665,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gas_config_default_is_balanced() {
+    fn gas_config_default_refine_gas() {
         let g = GasConfig::default();
         assert_eq!(g.refine_gas, DEFAULT_GAS);
-        assert_eq!(g.accumulate_gas_default, DEFAULT_GAS);
-        assert_eq!(g.accumulate_gas_max, DEFAULT_GAS);
-        assert!(g.accumulate_gas_default <= g.accumulate_gas_max);
-    }
-
-    #[test]
-    fn gas_config_clamps_accumulate() {
-        let g = GasConfig {
-            refine_gas: 1_000,
-            accumulate_gas_max: 500,
-            accumulate_gas_default: 200,
-        };
-        assert_eq!(g.clamp_accumulate(200), 200);
-        assert_eq!(g.clamp_accumulate(500), 500);
-        assert_eq!(g.clamp_accumulate(10_000), 500);
     }
 
     #[test]
     fn runtime_with_gas_config_uses_overrides() {
-        let g = GasConfig {
-            refine_gas: 12_345,
-            accumulate_gas_max: 6_789,
-            accumulate_gas_default: 4_321,
-        };
+        let g = GasConfig { refine_gas: 12_345 };
         let rt = VosRuntime::with_gas_config(g);
         let cfg = rt.gas_config();
         assert_eq!(cfg.refine_gas, 12_345);
-        assert_eq!(cfg.accumulate_gas_max, 6_789);
-        assert_eq!(cfg.accumulate_gas_default, 4_321);
     }
 
     #[test]

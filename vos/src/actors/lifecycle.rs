@@ -31,10 +31,10 @@ pub(crate) const BUF_SIZE: usize = 4096;
 pub const INIT_KEY: &[u8] = b"__vos_init";
 
 /// Per-service storage key under which the runtime records a
-/// suspended PVM's `ContinuationHeader`. Written by the framework's
-/// `run_accumulate_service` via a real `WRITE` hostcall when refine
-/// set `continue_next = true`; read by the runtime at the start of
-/// the next tick to rehydrate.
+/// suspended PVM's `ContinuationHeader`. Written by the host runtime
+/// (`save_continuation`) into the tick's journal when refine sets
+/// `continue_next = true`; read at the start of the next tick to
+/// warm-restart the kernel.
 ///
 /// The leading NUL keeps this key disjoint from any guest-chosen
 /// key: guest keys originate from `Encode`d Rust types whose rkyv
@@ -45,7 +45,7 @@ pub const CONTINUATION_HEADER_KEY: &[u8] = b"\0__vos_cont";
 #[cfg(feature = "service")]
 const STATE_KEY: &[u8] = b"__vos_actor_state";
 
-/// Public alias of `STATE_KEY` so the refine/accumulate framework code can
+/// Public alias of `STATE_KEY` so the refine framework and host code can
 /// reference it without re-declaring the constant. Always available — even
 /// without the `service` feature — so non-service callers can interpret
 /// refine output payloads.

@@ -18,12 +18,12 @@ fn example_elf(name: &str) -> Vec<u8> {
     }
 }
 
-/// Transpile an ELF to a JAM service PVM blob (dual entry: refine + accumulate).
+/// Transpile an ELF to a JAM service PVM blob (single refine entry at PC=0).
 fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
     grey_transpiler::link_elf(elf_data).expect("transpile failed")
 }
 
-/// Register a service blob and create a service (dual-entry, accumulate at PC=5).
+/// Register a service blob and create a service.
 fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos::abi::service::ServiceId {
     let blob_idx = rt.register_service_blob(blob);
     rt.register_service(blob_idx)
@@ -76,7 +76,7 @@ fn greeter_metadata_from_elf() {
 
 #[test]
 fn agent_service_lifecycle() {
-    // The scheduler agent is a service (accumulate at PC=5). Verify it inits and halts.
+    // The scheduler agent is a service. Verify it inits and halts.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
         "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
@@ -145,7 +145,7 @@ fn cooperative_loop_with_greeter() {
     let agent_blob_idx = rt.register_service_blob(agent_blob);
     let agent_id = rt.register_service(agent_blob_idx);
 
-    // Register greeter as service blob (dual-entry for invoke at PC=0)
+    // Register greeter as service blob (invoked at PC=0)
     let greeter_blob_idx = rt.register_service_blob(greeter_blob);
     let greeter_id = rt.register_service(greeter_blob_idx);
 
