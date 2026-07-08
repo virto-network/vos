@@ -581,8 +581,16 @@ impl<A: Actor> Context<A> {
         self.pending_writes.push((key.to_vec(), value.to_vec()));
     }
 
-    /// Queue a new service spawn from a code hash.
-    /// The code blob must already be available as a preimage (via [`provide`]).
+    /// Queue a new service spawn from a code hash. The code blob must
+    /// already be available as a preimage (via [`provide`]).
+    ///
+    /// The spawn is buffered as an effect; the host assigns the child's
+    /// `ServiceId` only when the parent's tick commits, after this
+    /// dispatch has returned. So `spawn` does not — and cannot yet —
+    /// hand the caller the new id. Returning it needs a deterministic
+    /// id reserved at buffer time (and replicated identically across
+    /// CRDT/Raft replicas), which lands with the `vos::agent::Tasks`
+    /// work that reshapes child identity.
     pub fn spawn(&mut self, code_hash: [u8; 32]) {
         self.pending_spawns.push(code_hash);
     }
@@ -595,8 +603,9 @@ impl<A: Actor> Context<A> {
     }
 
     /// Install a new child service from a code blob and its content hash.
-    /// Convenience that calls [`provide`] + [`spawn`] and returns the
-    /// assigned service ID (via the NEW hostcall return value).
+    /// Convenience that calls [`provide`] + [`spawn`]. Like [`spawn`], it
+    /// does not return the child's `ServiceId` — the host assigns that at
+    /// commit time (see [`spawn`](Self::spawn)).
     ///
     /// The caller must provide the correct content hash. Use
     /// `blake2b_simd::blake2b(blob).as_bytes()` or the host's hashing
