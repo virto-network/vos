@@ -63,6 +63,26 @@ mod fixture {
                 tag: [0u8; 32],
             }
         }
+
+        /// Scalar argument — must keep the pre-existing `Value::U64`
+        /// wire shape so callers written against the old surface work.
+        #[msg]
+        fn deposit(&mut self, amount: u64) -> u64 {
+            amount
+        }
+
+        /// Custom rkyv struct as an argument (G25).
+        #[msg]
+        fn record(&mut self, receipt: Receipt) -> u64 {
+            receipt.id
+        }
+
+        /// `Vec<[u8; 32]>` argument — the allowlist-style shape that
+        /// falls out of the custom-struct path (G25).
+        #[msg]
+        fn pin_roots(&mut self, roots: Vec<[u8; 32]>) -> u32 {
+            roots.len() as u32
+        }
     }
 }
 
@@ -83,6 +103,37 @@ impl Invoker for MockInvoker {
     ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
         let reply = self.reply.clone();
         async move { Ok(reply) }
+    }
+}
+
+/// An `Invoker` that captures the encoded request payload (so the
+/// `{Actor}Ref` sender bound can be inspected / round-tripped through
+/// `from_msg`) and returns a canned reply.
+#[derive(Default)]
+struct CapturingInvoker {
+    payload: Option<Vec<u8>>,
+    reply: Option<Value>,
+}
+
+impl Invoker for CapturingInvoker {
+    fn invoke(
+        &mut self,
+        _target: ServiceId,
+        payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
+        self.payload = Some(payload);
+        let reply = self.reply.clone().unwrap_or(Value::U64(0));
+        async move { Ok(reply) }
+    }
+}
+
+impl CapturingInvoker {
+    /// Decode the captured `[TAG_DYNAMIC] ++ rkyv(Msg)` payload back
+    /// into the dynamic `Msg` the daemon dispatch layer would see.
+    fn captured_msg(&self) -> Msg {
+        let payload = self.payload.as_ref().expect("a request was captured");
+        assert_eq!(payload[0], vos::value::TAG_DYNAMIC, "dynamic tag prefix");
+        <Msg as vos::Decode>::decode(&payload[1..])
     }
 }
 
@@ -149,9 +200,76 @@ fn ref_rejects_truncated_custom_reply() {
     );
 }
 
-// Keep the dynamic-dispatch surface referenced so later commits build
-// on a compiling base.
 #[test]
 fn from_msg_rejects_unknown_method() {
     assert!(VaultMsg::from_msg(&Msg::new("nope")).is_none());
+}
+
+// ── G25: custom rkyv structs as arguments ──────────────────────────
+
+#[test]
+fn scalar_arg_keeps_its_wire_shape() {
+    // A whitelisted scalar must still travel as its own `Value`
+    // variant, not rkyv-wrapped — this is the backward-compat contract.
+    let mut inv = CapturingInvoker::default();
+    let vault = VaultRef::at(ServiceId(1));
+    let _ = vos::block_on(vault.deposit(&mut inv, 500u64)).expect("invoke");
+    let msg = inv.captured_msg();
+    assert_eq!(msg.name, "deposit");
+    assert_eq!(msg.args.get("amount"), Some(&Value::U64(500)));
+    let VaultMsg::Deposit(inner) = VaultMsg::from_msg(&msg).expect("from_msg decodes") else {
+        panic!("expected Deposit variant");
+    };
+    assert_eq!(inner.amount, 500);
+}
+
+#[test]
+fn custom_struct_arg_round_trips_ref_to_from_msg() {
+    let receipt = Receipt {
+        id: 99,
+        tag: [7u8; 32],
+    };
+    let mut inv = CapturingInvoker::default();
+    let vault = VaultRef::at(ServiceId(5));
+    let _ = vos::block_on(vault.record(&mut inv, receipt.clone())).expect("invoke");
+    let msg = inv.captured_msg();
+    // On the wire, a custom struct is rkyv bytes.
+    assert!(
+        matches!(msg.args.get("receipt"), Some(Value::Bytes(_))),
+        "custom struct arg must travel as Value::Bytes"
+    );
+    let VaultMsg::Record(inner) = VaultMsg::from_msg(&msg).expect("from_msg decodes custom arg")
+    else {
+        panic!("expected Record variant");
+    };
+    assert_eq!(inner.receipt, receipt);
+}
+
+#[test]
+fn vec_byte_array_arg_round_trips() {
+    let roots = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+    let mut inv = CapturingInvoker::default();
+    let vault = VaultRef::at(ServiceId(9));
+    let _ = vos::block_on(vault.pin_roots(&mut inv, roots.clone())).expect("invoke");
+    let msg = inv.captured_msg();
+    let VaultMsg::PinRoots(inner) = VaultMsg::from_msg(&msg).expect("from_msg decodes Vec<[u8;32]>")
+    else {
+        panic!("expected PinRoots variant");
+    };
+    assert_eq!(inner.roots, roots);
+}
+
+#[test]
+fn from_msg_rejects_corrupted_custom_arg() {
+    // A `record` message whose `receipt` bytes are not a valid archive
+    // must fail `from_msg` (checked `from_bytes`) rather than mis-decode.
+    let msg = Msg::new("record").with("receipt", Value::Bytes(vec![0x00, 0x99, 0xab]));
+    assert!(VaultMsg::from_msg(&msg).is_none());
+}
+
+#[test]
+fn from_msg_rejects_wrong_variant_for_custom_arg() {
+    // The right name but a scalar where bytes are expected.
+    let msg = Msg::new("record").with("receipt", Value::U64(3));
+    assert!(VaultMsg::from_msg(&msg).is_none());
 }
