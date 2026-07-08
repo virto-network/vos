@@ -131,15 +131,29 @@ pub fn genesis_node_validator(space_id: [u8; 32]) -> vos::commit::NodeValidator 
 }
 
 /// Auto-derive a `replication_id` for an installed agent.
-/// `blake2b("vos-replication-id/v1" || instance_name || 0 || program_hash)`.
-/// Two replicas that install the same program with the same
-/// `instance_name` auto-discover each other on the gossipsub
-/// topic this id maps to. Host-only — set at install time
-/// from vosx and stored on the registry's `AgentRow`.
-pub fn auto_replication_id(instance_name: &str, program_hash: &[u8; 32]) -> [u8; 32] {
+/// `blake2b("vos-replication-id/v1" || space_id || 0 || instance_name || 0
+/// || program_hash)`. Two replicas that install the same program under the
+/// same `instance_name` IN THE SAME SPACE auto-discover each other on the
+/// gossipsub topic this id maps to. Scoping by `space_id` is load-bearing:
+/// without it, two DIFFERENT spaces that name an agent identically with the
+/// same ELF (bank-a and bank-b both running `clerk-ledger`) would collide
+/// into ONE replication group and silently merge their Raft ledgers.
+/// Deterministic in its inputs. Host-only — set at install time from vosx
+/// and stored on the registry's `AgentRow`.
+pub fn auto_replication_id(
+    space_id: &[u8; 32],
+    instance_name: &str,
+    program_hash: &[u8; 32],
+) -> [u8; 32] {
     vos::crypto::blake2b_hash(
         b"vos-replication-id/v1",
-        &[&[0u8], instance_name.as_bytes(), &[0u8], program_hash],
+        &[
+            space_id,
+            &[0u8],
+            instance_name.as_bytes(),
+            &[0u8],
+            program_hash,
+        ],
     )
 }
 
@@ -318,10 +332,32 @@ mod tests {
 
     #[test]
     fn replication_id_includes_instance_name() {
+        let space = [0x11u8; 32];
         let h = [0xCDu8; 32];
-        let a = auto_replication_id("alpha", &h);
-        let b = auto_replication_id("beta", &h);
+        let a = auto_replication_id(&space, "alpha", &h);
+        let b = auto_replication_id(&space, "beta", &h);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn replication_id_is_space_scoped() {
+        // Two DIFFERENT spaces installing the same (instance_name, blob) must
+        // get DISTINCT replication ids — otherwise bank-a's and bank-b's
+        // identically-named `clerk-ledger` would merge into one Raft group.
+        let h = [0xCDu8; 32];
+        let space_a = [0x01u8; 32];
+        let space_b = [0x02u8; 32];
+        assert_ne!(
+            auto_replication_id(&space_a, "clerk-ledger", &h),
+            auto_replication_id(&space_b, "clerk-ledger", &h),
+            "same (name, blob) in different spaces must not collide",
+        );
+        // Deterministic: the SAME (space, name, blob) is stable across calls.
+        assert_eq!(
+            auto_replication_id(&space_a, "clerk-ledger", &h),
+            auto_replication_id(&space_a, "clerk-ledger", &h),
+            "same space + name + blob must be stable",
+        );
     }
 
     #[test]

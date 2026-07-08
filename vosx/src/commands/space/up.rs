@@ -261,6 +261,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &manifest,
             &manifest_dir,
             local_prefix,
+            &space_id,
         )?;
     }
 

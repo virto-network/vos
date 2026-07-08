@@ -67,7 +67,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     .map_err(|_| anyhow::anyhow!("--replication-id must be 64 hex"))?
                     .0
             }
-            None => auto_replication_id(&instance_name, &program.hash),
+            None => {
+                let space_id = client
+                    .entry
+                    .id_bytes()
+                    .ok_or_else(|| anyhow::anyhow!("space id in index is not 32 bytes of hex"))?;
+                auto_replication_id(&space_id, &instance_name, &program.hash)
+            }
         };
 
         let status = client.install(

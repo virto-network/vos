@@ -203,20 +203,18 @@ impl ClerkLedger {
     #[msg(role = ClerkLedgerRole::Operator)]
     async fn bootstrap(
         &mut self,
-        journal_id: Vec<u8>,
-        registrar_pubkey: Vec<u8>,
+        journal_id: [u8; 16],
+        registrar_pubkey: [u8; 32],
         code: u32,
     ) -> Status {
-        let Some(jid_bytes) = try_array::<16>(journal_id) else {
-            return Status::BadInput;
-        };
-        let Some(pk_bytes) = try_array::<32>(registrar_pubkey) else {
-            return Status::BadInput;
-        };
         if code > u16::MAX as u32 {
             return Status::BadInput;
         }
-        let proposed = CcJournal::new(CcJournalId(jid_bytes), AuthKey(pk_bytes), code as u16);
+        let proposed = CcJournal::new(
+            CcJournalId(journal_id),
+            AuthKey(registrar_pubkey),
+            code as u16,
+        );
         match &self.journal {
             None => {
                 self.journal = Some(proposed);
@@ -430,20 +428,18 @@ impl ClerkLedger {
 
     /// Read an account by id.
     #[msg(role = ClerkLedgerRole::Member)]
-    async fn account(&self, id: Vec<u8>) -> Option<CcAccount> {
-        let id_bytes: [u8; 16] = try_array(id)?;
+    async fn account(&self, id: [u8; 16]) -> Option<CcAccount> {
         self.accounts
-            .binary_search_by_key(&id_bytes, |a| a.id.0)
+            .binary_search_by_key(&id, |a| a.id.0)
             .ok()
             .map(|i| self.accounts[i].clone())
     }
 
     /// Read a transfer by id.
     #[msg(role = ClerkLedgerRole::Member)]
-    async fn transfer(&self, id: Vec<u8>) -> Option<CcTransfer> {
-        let id_bytes: [u8; 16] = try_array(id)?;
+    async fn transfer(&self, id: [u8; 16]) -> Option<CcTransfer> {
         self.transfers
-            .binary_search_by_key(&id_bytes, |t| t.id.0)
+            .binary_search_by_key(&id, |t| t.id.0)
             .ok()
             .map(|i| self.transfers[i].clone())
     }
@@ -461,10 +457,9 @@ impl ClerkLedger {
     /// and `signature` produced by the bank's clerk-key off-actor.
     /// Keeping the signing key out of replicated actor state.
     #[msg(role = ClerkLedgerRole::Member)]
-    async fn transfer_state_roots(&self, id: Vec<u8>) -> Option<(Vec<u8>, Vec<u8>)> {
-        let id_bytes: [u8; 16] = try_array(id)?;
+    async fn transfer_state_roots(&self, id: [u8; 16]) -> Option<(Vec<u8>, Vec<u8>)> {
         self.transfer_roots
-            .binary_search_by_key(&id_bytes, |e| e.id)
+            .binary_search_by_key(&id, |e| e.id)
             .ok()
             .map(|i| {
                 (

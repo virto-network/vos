@@ -5762,8 +5762,8 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let journal = JournalId::random();
     let status = vos::block_on(ledger.bootstrap(
         &mut &node,
-        journal.0.to_vec(),
-        registrar.public.0.to_vec(),
+        journal.0,
+        registrar.public.0,
         1u32,
     ))
     .expect("invoke bootstrap");
@@ -5806,7 +5806,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // event_ts == seed), so the stored account differs from the
     // submitted one in exactly the timestamp field — assert the
     // rest is byte-identical and check the timestamp explicitly.
-    let stored = vos::block_on(ledger.account(&mut &node, alice_id.to_vec()))
+    let stored = vos::block_on(ledger.account(&mut &node, alice_id))
         .expect("invoke account")
         .expect("alice should be on file");
     assert_eq!(stored.timestamp, ts, "kernel must stamp event_ts on accept");
@@ -5977,10 +5977,10 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // Verify the kernel updated alice's Settled debit and pool's
     // Settled credit by exactly `amt`. (Starting from BalancePair::ZERO,
     // the Pedersen sum after one entry is the entry's own commit.)
-    let alice_after = vos::block_on(ledger.account(&mut &node, alice_id.to_vec()))
+    let alice_after = vos::block_on(ledger.account(&mut &node, alice_id))
         .expect("alice account read")
         .expect("alice exists");
-    let pool_after = vos::block_on(ledger.account(&mut &node, pool_id.to_vec()))
+    let pool_after = vos::block_on(ledger.account(&mut &node, pool_id))
         .expect("pool account read")
         .expect("pool exists");
     let settled = cipher_clerk::types::Layer::Settled.as_index();
@@ -6004,7 +6004,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     );
 
     // Transfer is persisted with the kernel-stamped event_ts.
-    let stored_transfer = vos::block_on(ledger.transfer(&mut &node, transfer_id.to_vec()))
+    let stored_transfer = vos::block_on(ledger.transfer(&mut &node, transfer_id))
         .expect("transfer read")
         .expect("transfer exists");
     assert_eq!(stored_transfer.id.0, transfer_id);
@@ -6018,7 +6018,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // (the bank constructs a voucher anchored to these roots;
     // the receiving bank checks them against the wire payload).
     let (root_before, root_after) =
-        vos::block_on(ledger.transfer_state_roots(&mut &node, transfer_id.to_vec()))
+        vos::block_on(ledger.transfer_state_roots(&mut &node, transfer_id))
             .expect("invoke transfer_state_roots")
             .expect("recorded for accepted transfer");
     assert_eq!(
@@ -6045,7 +6045,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     );
 
     // Unknown transfer id → None.
-    let missing = vos::block_on(ledger.transfer_state_roots(&mut &node, vec![0u8; 16]))
+    let missing = vos::block_on(ledger.transfer_state_roots(&mut &node, [0u8; 16]))
         .expect("invoke transfer_state_roots (missing)");
     assert!(missing.is_none(), "unknown transfer id must yield None");
 
@@ -7040,8 +7040,8 @@ fn clerk_ledger_two_bank_federation() {
     assert_eq!(
         vos::block_on(ledger_a.bootstrap(
             &mut &node_a,
-            journal_a.0.to_vec(),
-            registrar_a.public.0.to_vec(),
+            journal_a.0,
+            registrar_a.public.0,
             1u32,
         ))
         .expect("ledger_a bootstrap"),
@@ -7050,8 +7050,8 @@ fn clerk_ledger_two_bank_federation() {
     assert_eq!(
         vos::block_on(ledger_b.bootstrap(
             &mut &node_b,
-            journal_b.0.to_vec(),
-            registrar_b.public.0.to_vec(),
+            journal_b.0,
+            registrar_b.public.0,
             1u32,
         ))
         .expect("ledger_b bootstrap"),
@@ -7123,14 +7123,14 @@ fn clerk_ledger_two_bank_federation() {
 
     assert!(
         matches!(
-            vos::block_on(ledger_b.account(&mut &node_a, bob_id.to_vec())),
+            vos::block_on(ledger_b.account(&mut &node_a, bob_id)),
             Err(ClientError::Forbidden)
         ),
         "cross-bank account(bob) from A must be refused by the ledger ACL"
     );
     assert!(
         matches!(
-            vos::block_on(ledger_a.account(&mut &node_b, alice_id.to_vec())),
+            vos::block_on(ledger_a.account(&mut &node_b, alice_id)),
             Err(ClientError::Forbidden)
         ),
         "cross-bank account(alice) from B must be refused by the ledger ACL"
@@ -7143,13 +7143,13 @@ fn clerk_ledger_two_bank_federation() {
     // caller, bypasses the ACL) returns None, not a stale hit
     // propagated through some shared state. (clerk-ledger has
     // Consistency::Local, no replication.)
-    let bob_on_a = vos::block_on(ledger_a.account(&mut &node_a, bob_id.to_vec()))
+    let bob_on_a = vos::block_on(ledger_a.account(&mut &node_a, bob_id))
         .expect("local account(bob) on A");
     assert!(
         bob_on_a.is_none(),
         "bob must NOT appear on A — confidential ledger state is per-bank"
     );
-    let alice_on_b = vos::block_on(ledger_b.account(&mut &node_b, alice_id.to_vec()))
+    let alice_on_b = vos::block_on(ledger_b.account(&mut &node_b, alice_id))
         .expect("local account(alice) on B");
     assert!(
         alice_on_b.is_none(),
@@ -7232,7 +7232,7 @@ fn clerk_ledger_two_bank_federation() {
 
     // Read back the anchor pair clerk-ledger captured on accept.
     let (root_before_vec, root_after_vec) =
-        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id.to_vec()))
+        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id))
             .expect("invoke transfer_state_roots")
             .expect("anchor recorded for accepted transfer");
     let root_before: [u8; 32] = root_before_vec.try_into().expect("32-byte root_before");
@@ -7435,7 +7435,7 @@ fn clerk_ledger_two_bank_federation() {
     // Bob's Settled credit balance MUST equal the voucher's
     // amount_commit — the cross-bank value transfer is now
     // visible on bank B's books.
-    let bob_after = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+    let bob_after = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
         .expect("read bob on B")
         .expect("bob exists");
     let settled = Layer::Settled.as_index();
@@ -7496,7 +7496,7 @@ fn clerk_ledger_two_bank_federation() {
     // — a rejected transfer doesn't mutate state. Belt + braces:
     // catches any future regression that returns the failure
     // status but still committed.
-    let bob_after_replay = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+    let bob_after_replay = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
         .expect("read bob on B post-replay")
         .expect("bob exists");
     assert_eq!(
@@ -7984,7 +7984,7 @@ fn clerk_ledger_two_bank_federation() {
         Status::Ok,
     );
     let (root_before_2_vec, root_after_2_vec) =
-        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_2.to_vec()))
+        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_2))
             .expect("invoke transfer_state_roots T2")
             .expect("anchor recorded for T2");
     let root_before_2: [u8; 32] = root_before_2_vec.try_into().expect("32-byte root_before_2");
@@ -8033,11 +8033,22 @@ fn clerk_ledger_two_bank_federation() {
 
     // Snapshot Bob's current Settled.cr commit and the bridge's
     // dedup count so we can pin the deltas.
-    let bob_before = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+    let bob_before = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
         .expect("read bob pre-redeem")
         .expect("bob exists");
     let dedup_before = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
         .expect("invoke redeemed_count (pre-redeem)");
+    // Snapshot the receiver term to pin that the redeem path folds too:
+    // submit_voucher's fold is checked in 5e, and redeem_voucher is the
+    // production money-moving ingress. Deleting its accumulate_neg call would
+    // leave this term unchanged and fail the post-redeem assertion below.
+    let recv_term_before_redeem = vos::block_on(bridge_actor.window_net(
+        &mut &node_b,
+        b"bank-a".to_vec(),
+        clerk_bridge::DEMO_CURRENCY,
+        0,
+    ))
+    .expect("invoke window_net (pre-redeem)");
 
     // Atomic happy path.
     let redeem_reply = vos::block_on(bridge_actor.redeem_voucher(
@@ -8059,7 +8070,7 @@ fn clerk_ledger_two_bank_federation() {
         Status::Ok as u8,
         "ledger must accept the bridge-dispatched inflow (ledger=OK)"
     );
-    let bob_after_redeem = vos::block_on(ledger_b.account(&mut &node_b, bob_id.to_vec()))
+    let bob_after_redeem = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
         .expect("read bob post-redeem")
         .expect("bob exists");
     assert_ne!(
@@ -8072,6 +8083,32 @@ fn clerk_ledger_two_bank_federation() {
         dedup_after,
         dedup_before + 1,
         "bridge must atomically record one new redemption"
+    );
+    // The redeem folded voucher_2's amount_commit (amt2) into window 0's
+    // receiver term as the negated point: new == old ⊖ amt2. The peer is
+    // still in window 0 (window_rotate happens later), so this accumulates
+    // on top of V1's submit_voucher fold.
+    let recv_term_after_redeem = vos::block_on(bridge_actor.window_net(
+        &mut &node_b,
+        b"bank-a".to_vec(),
+        clerk_bridge::DEMO_CURRENCY,
+        0,
+    ))
+    .expect("invoke window_net (post-redeem)");
+    let recv_before_point = Amount(
+        recv_term_before_redeem
+            .as_slice()
+            .try_into()
+            .expect("32-byte receiver term"),
+    )
+    .to_point()
+    .expect("receiver term decompresses");
+    let expected_recv_after =
+        Amount::from_point(&(recv_before_point - amt2.to_point().expect("amt2 decompresses")));
+    assert_eq!(
+        recv_term_after_redeem,
+        expected_recv_after.0.to_vec(),
+        "redeem_voucher must fold amt2 into the receiver term (old ⊖ amt2)"
     );
 
     // Replay through redeem_voucher: bridge dedup catches it
@@ -8125,7 +8162,7 @@ fn clerk_ledger_two_bank_federation() {
         Status::Ok,
     );
     let (root_before_3_vec, root_after_3_vec) =
-        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_3.to_vec()))
+        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_3))
             .expect("transfer_state_roots T3")
             .expect("anchor recorded for T3");
     let envelope_3 = EncryptedEnvelope::seal(value3, &blinding3, &bank_b_ivk_pk).unwrap();
@@ -8678,7 +8715,7 @@ fn clerk_ledger_two_bank_federation() {
             Status::Ok,
         );
         let (root_before_4_vec, root_after_4_vec) =
-            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_4.to_vec()))
+            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_4))
                 .expect("transfer_state_roots T4")
                 .expect("anchor for T4");
         let root_before_4: [u8; 32] = root_before_4_vec.try_into().expect("32-byte");
@@ -8760,7 +8797,7 @@ fn clerk_ledger_two_bank_federation() {
             Status::Ok,
         );
         let (root_before_5_vec, root_after_5_vec) =
-            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_5.to_vec()))
+            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_5))
                 .expect("transfer_state_roots T5")
                 .expect("anchor for T5");
         let envelope_v5 =
@@ -8822,6 +8859,32 @@ fn clerk_ledger_two_bank_federation() {
         vos::block_on(bridge_actor.window_rotate(&mut &node_b, b"bank-z".to_vec()))
             .expect("invoke window_rotate unknown"),
         BridgeStatus::UnknownPeer,
+    );
+
+    // Cross-node Operator-gate enforcement. Every window_rotate / anchor_reset
+    // above drove the bridge locally (Caller::System bypasses the gate). A
+    // cross-node invoke from bank A's node authenticates as node A's peer,
+    // which holds no role in bank B's space-registry, so the Operator gate
+    // refuses it — the gate that stops a peer bank from steering bank B's
+    // settlement accounting. The role check runs before the handler body, so
+    // an ungranted caller is refused regardless of peer_name.
+    assert!(
+        matches!(
+            vos::block_on(bridge_actor.window_rotate(&mut &node_a, b"bank-a".to_vec())),
+            Err(ClientError::Forbidden)
+        ),
+        "cross-node window_rotate from an ungranted peer must be Forbidden"
+    );
+    assert!(
+        matches!(
+            vos::block_on(bridge_actor.anchor_reset(
+                &mut &node_a,
+                b"bank-a".to_vec(),
+                [0u8; 32],
+            )),
+            Err(ClientError::Forbidden)
+        ),
+        "cross-node anchor_reset from an ungranted peer must be Forbidden"
     );
 
     // S4: wedge → recovery. A voucher declaring a `state_root_before` the
@@ -9145,8 +9208,8 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
         matches!(
             vos::block_on(ledger.bootstrap(
                 &mut &*follower_node,
-                journal.0.to_vec(),
-                registrar.public.0.to_vec(),
+                journal.0,
+                registrar.public.0,
                 1u32,
             )),
             Err(ClientError::Forbidden)
@@ -9218,8 +9281,8 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
     assert_eq!(
         vos::block_on(ledger.bootstrap(
             &mut &*follower_node,
-            journal.0.to_vec(),
-            registrar.public.0.to_vec(),
+            journal.0,
+            registrar.public.0,
             1u32,
         ))
         .expect("bootstrap routes"),
@@ -9721,6 +9784,29 @@ fn raft_clerk_settle_bilateral_settlement() {
         ))
         .expect("settlement_status read"),
         Status::Ok as u8,
+    );
+
+    // A non-Ok Status must survive the wire round-trip. Every venue assertion
+    // above compares against Ok=0, so an rkyv discriminant drift on the Status
+    // enum would go unnoticed. An unregistered claimant short-circuits to
+    // UnknownBank before any commit, so the follower replies the status
+    // directly across the wire.
+    let bank_c_kp = Keypair::generate();
+    let claim_c = SettlementClaim::sign(
+        bank_c_kp.public,
+        bank_a_kp.public,
+        USD,
+        WINDOW.0,
+        WINDOW.1,
+        Amount::commit(1, &Blinding([5u8; 32])),
+        &bank_c_kp.secret,
+    )
+    .to_bytes();
+    assert_eq!(
+        vos::block_on(venue.submit_claim(&mut &*follower_node, claim_c, 1u32, [5u8; 32]))
+            .expect("submit_claim (unregistered claimant) routes"),
+        Status::UnknownBank,
+        "an unregistered claimant must surface UnknownBank across the wire",
     );
 
     // ── Cleanup ─────────────────────────────────────────────────
