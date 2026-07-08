@@ -31,10 +31,10 @@ pub(crate) const BUF_SIZE: usize = 4096;
 pub const INIT_KEY: &[u8] = b"__vos_init";
 
 /// Per-service storage key under which the runtime records a
-/// suspended PVM's `ContinuationHeader`. Written by the framework's
-/// `run_accumulate_service` via a real `WRITE` hostcall when refine
-/// set `continue_next = true`; read by the runtime at the start of
-/// the next tick to rehydrate.
+/// suspended PVM's `ContinuationHeader`. Written by the host runtime
+/// (`save_continuation`) into the tick's journal when refine sets
+/// `continue_next = true`; read at the start of the next tick to
+/// warm-restart the kernel.
 ///
 /// The leading NUL keeps this key disjoint from any guest-chosen
 /// key: guest keys originate from `Encode`d Rust types whose rkyv
@@ -45,7 +45,7 @@ pub const CONTINUATION_HEADER_KEY: &[u8] = b"\0__vos_cont";
 #[cfg(feature = "service")]
 const STATE_KEY: &[u8] = b"__vos_actor_state";
 
-/// Public alias of `STATE_KEY` so the refine/accumulate framework code can
+/// Public alias of `STATE_KEY` so the refine framework and host code can
 /// reference it without re-declaring the constant. Always available — even
 /// without the `service` feature — so non-service callers can interpret
 /// refine output payloads.
@@ -187,14 +187,7 @@ pub fn exit_status<A: Actor>(ctx: &Context<A>) -> Vec<u8> {
         return alloc::vec![STATUS_FORBIDDEN];
     }
     if ctx.self_scheduled() {
-        let ticks = ctx.sleep_ticks();
-        if ticks > 0 {
-            let mut s = alloc::vec![STATUS_YIELDED];
-            s.extend_from_slice(&ticks.to_le_bytes());
-            s
-        } else {
-            alloc::vec![STATUS_YIELDED]
-        }
+        alloc::vec![STATUS_YIELDED]
     } else {
         alloc::vec![STATUS_DONE]
     }
@@ -248,6 +241,8 @@ pub enum InvokeResult {
     NotFound,
     /// Actor ran out of gas.
     OutOfGas,
+    /// Child's reply exceeded the caller's output buffer.
+    TooBig,
     /// Unknown error status byte.
     Error(u8),
 }
@@ -278,10 +273,18 @@ pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult
     input[4 + state.len()..].copy_from_slice(message);
 
     let hash = super::run::service_code_hash(service_id);
+    // Reply buffer. Kept on the stack at BUF_SIZE: heap-allocating a
+    // larger one corrupts the guest heap of actors that already use most
+    // of the fixed 256 KiB arena (the clerk ledger), and GROW_HEAP is a
+    // host no-op, so the reply ceiling cannot be raised without first
+    // growing the guest heap. A reply past BUF_SIZE still surfaces as
+    // STATUS_TOO_BIG (below) rather than a truncated crash.
     let mut output = [0u8; BUF_SIZE];
     let n = crate::abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
 
-    use super::run::{STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED};
+    use super::run::{
+        STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_TOO_BIG, STATUS_YIELDED,
+    };
 
     // Short output = error status byte only (no state/reply envelope)
     if n < 5 {
@@ -290,6 +293,7 @@ pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult
                 STATUS_PANICKED => InvokeResult::Panicked,
                 STATUS_NOT_FOUND => InvokeResult::NotFound,
                 STATUS_OOG => InvokeResult::OutOfGas,
+                STATUS_TOO_BIG => InvokeResult::TooBig,
                 STATUS_DONE => InvokeResult::Done {
                     state: Vec::new(),
                     reply: Vec::new(),

@@ -35,7 +35,7 @@ build-pvm:
 # fixture first ONLY if the proof format changed:
 #   cargo test -p zkpvm --test settle_fixture
 build-settle:
-    cd zkpvm/settlement-verifier && cargo build --release --target riscv64em-javm.json \
+    cd zkpvm/settlement-verifier; cargo build --release --target riscv64em-javm.json \
       -Zbuild-std=core,alloc,compiler_builtins \
       -Zbuild-std-features=compiler-builtins-mem \
       --features pvm-settle --bin settle

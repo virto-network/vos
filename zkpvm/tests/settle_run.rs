@@ -26,7 +26,7 @@ const REJECT: u64 = 0x5E5;
 fn settle_verify_accepts_on_pvm() {
     let elf_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/recursion-verifier/target/riscv64em-javm/release/settle.elf"
+        "/settlement-verifier/target/riscv64em-javm/release/settle.elf"
     );
     let elf = match std::fs::read(elf_path) {
         Ok(b) => b,

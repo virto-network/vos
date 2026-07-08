@@ -10,11 +10,7 @@ use vos::runtime::{GasConfig, VosRuntime};
 
 pub fn run(program: &Path, payloads: &[PathBuf], hex: &[String], gas: u64) {
     let blob = load_blob(program);
-    let mut rt = VosRuntime::with_gas_config(GasConfig {
-        refine_gas: gas,
-        accumulate_gas_max: gas,
-        accumulate_gas_default: gas,
-    });
+    let mut rt = VosRuntime::with_gas_config(GasConfig { refine_gas: gas });
 
     let idx = rt.register_service_blob(blob);
     let id = rt.register_service(idx);

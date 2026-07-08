@@ -71,7 +71,7 @@ Handlers get `&mut Context`:
   child to completion, resumes the caller with the reply.
 - `ctx.yield_now().await` — checkpoint state, let other actors
   run; refine resumes on next tick.
-- `ctx.sleep(n).await` — sleep for N ticks.
+- `ctx.sleep(n).await` — alias for `yield_now` (the tick count is not honored).
 - `ctx.store(key, value)` — queue a storage write (applied
   in accumulate).
 

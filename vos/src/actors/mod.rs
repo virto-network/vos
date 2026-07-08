@@ -9,8 +9,7 @@
 //!
 //! - `ctx.tell(target, payload)` — fire-and-forget message (queues transfer)
 //! - `ctx.ask(target, payload)` — synchronous query (suspends until result)
-//! - `ctx.yield_now()` — commit state, self-schedule, halt
-//! - `ctx.sleep(n)` — commit state, sleep N ticks, halt
+//! - `ctx.yield_now()` — commit state, self-schedule, halt (alias: `ctx.sleep`)
 
 mod actor;
 pub mod auth;
@@ -40,11 +39,12 @@ pub use exec::{ExecIo, TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
 pub use run::run_refine;
 pub use run::{
-    Ask, HostIo, RunResult, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG,
-    STATUS_PANICKED, STATUS_YIELDED, Yield, noop_waker, run_blocking, service_code_hash, try_poll,
+    Ask, HostIo, InvokeStatus, RunResult, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND,
+    STATUS_OOG, STATUS_PANICKED, STATUS_TOO_BIG, STATUS_YIELDED, Yield, noop_waker, run_blocking,
+    service_code_hash, try_poll,
 };
 #[cfg(feature = "service")]
-pub use run::{run_accumulate_service, run_refine_service};
+pub use run::run_refine_service;
 pub use value::InvokeError;
 
 /// JAM refine entry (PC=0). Always uses the service lifecycle so
@@ -58,16 +58,6 @@ pub fn run_refine_entry<A: Actor>() {
 #[cfg(all(feature = "pvm", not(feature = "service")))]
 pub fn run_refine_entry<A: Actor>() {
     run::run_refine::<A>()
-}
-
-/// JAM accumulate entry (PC=5). Services replay refine effects via
-/// real hostcalls. Not meaningful for invoked actors.
-#[cfg(feature = "service")]
-pub fn run_accumulate_entry<A: Actor>() {
-    run::run_accumulate_service::<A>()
-}
-#[cfg(all(feature = "pvm", not(feature = "service")))]
-pub fn run_accumulate_entry<A: Actor>() { /* no-op for invoked actors */
 }
 
 // --- Guest panic handler ---

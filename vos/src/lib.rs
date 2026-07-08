@@ -149,8 +149,8 @@ pub use actors::{
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
-    STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED,
-    service_code_hash,
+    InvokeStatus, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
+    STATUS_TOO_BIG, STATUS_YIELDED, service_code_hash,
 };
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the
@@ -159,7 +159,7 @@ pub use actors::{
 #[cfg(feature = "extension")]
 pub use actors::exec::{TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]
-pub use actors::{run_accumulate_entry, run_refine_entry};
+pub use actors::run_refine_entry;
 #[cfg(feature = "macros")]
 pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
 
@@ -170,9 +170,6 @@ pub mod hostcalls {
 }
 
 // --- Runtime infrastructure (host-only) ---
-
-#[cfg(feature = "std")]
-pub mod operand;
 
 #[cfg(feature = "std")]
 pub mod runtime;

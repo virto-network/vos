@@ -6,19 +6,19 @@
 //!
 //! ## Execution model (JAM-aligned, refine-only top level)
 //!
-//! The new JAVM kernel collapses the old dual-entry PC=0/PC=5 split
-//! into a single entry at PC=0; phase selection happens via φ[7] (0 =
-//! refine, 1 = accumulate). VOS runs top-level services exclusively in
-//! refine (φ[7]=0):
+//! The JAVM kernel runs a single entry at PC=0 — the JAR refine body.
+//! VOS drives top-level services exclusively in refine:
 //!
 //!   * **Refine is the hot loop.** State-mutating hostcalls issued
 //!     during refine (`WRITE`, `TRANSFER`, `PROVIDE`, `PREIMAGE_PROVIDE`)
-//!     are **journaled** by the runtime, not applied immediately.
-//!   * **Accumulate is the commit boundary.** After refine halts, the
-//!     runtime replays the journal directly: writes flush to storage,
-//!     preimages land in the preimage map, transfers join
-//!     `pending_transfers` for the next tick. No second PVM invocation
-//!     — the replay *is* the accumulate body.
+//!     are **journaled** by the runtime, not applied immediately. The
+//!     framework instead buffers them into the guest's halt
+//!     `RefinePayload`, which the runtime absorbs into the same journal.
+//!   * **The journal drain is the commit boundary — accumulate on VOS.**
+//!     After refine halts, the runtime replays the journal directly:
+//!     writes flush to storage, preimages land in the preimage map,
+//!     transfers join `pending_transfers` for the next tick. There is no
+//!     second PVM invocation — the native drain *is* the accumulate.
 //!
 //! This keeps refine bounded and deterministic while still honoring the
 //! JAM invariant that all state mutation is structurally one commit.
@@ -33,27 +33,25 @@
 //! Nested `INVOKE` children also run at PC=0 under the same refine
 //! policy; their effects merge into the parent's journal.
 //!
-//! ## Continuations (JAM-compatible + VOS optimization)
+//! ## Continuations (host-side warm restart)
 //!
-//! When a service's refine phase sets `continue_next = true`:
+//! When a service's refine sets `continue_next = true` (a `yield_now` /
+//! `sleep` handler), the runtime:
 //!
-//! 1. **JAM-compatible path** (works on any conformant host): the
-//!    serialized actor state from the refine payload is written to
-//!    `STATE_KEY` in the journal, and a self-directed transfer is
-//!    enqueued. On the next tick the guest cold-starts at PC=0,
-//!    reads `STATE_KEY` via `READ`, and deserializes its actor —
-//!    no host cooperation required.
+//!   * already holds the actor's serialized state — `STATE_KEY` is
+//!     written into the journal on every mutating dispatch, not just on
+//!     yield — so a cold restart at PC=0 rehydrates it via `READ`; and
+//!   * captures `flat_mem` into the [`DataLayer`] with a
+//!     [`ContinuationHeader`](crate::pvm_image::ContinuationHeader) so
+//!     the next tick restores the kernel via `InvocationKernel::new_warm`
+//!     — the guest's `ACTOR_HOLDER` static is already populated and it
+//!     skips the `READ` + deserialize.
 //!
-//! 2. **VOS optimization** (transparent fast path): the runtime also
-//!    captures `flat_mem` into the [`DataLayer`] and writes a
-//!    [`ContinuationHeader`](crate::pvm_image::ContinuationHeader)
-//!    to the journal. On the next tick the kernel is restored via
-//!    `InvocationKernel::new_warm` — the guest's `ACTOR_HOLDER`
-//!    static is already populated so it skips the `READ` + deserialize.
-//!
-//! Path (1) ensures services work on JAR without modification.
-//! Path (2) is a host-side optimization that avoids serialization
-//! overhead when the host supports flat_mem overlay.
+//! The warm-restart overlay is a top-level-service optimization only
+//! (invoke children always cold-start via `new_cached`); its absence
+//! never changes semantics. There is no automatic wake-up: a service
+//! that yielded with nothing left to do under its own steam is resumed
+//! by the next external message (typically a parent agent's INVOKE).
 //!
 //! ## Memory model
 //!
@@ -86,31 +84,17 @@ const MAX_INVOKE_DEPTH: usize = 8;
 /// runtime from a misbuilt guest that self-schedules forever.
 const MAX_REFINE_ITERATIONS: usize = 64;
 
-/// Per-stage gas budgets for one service tick.
+/// Gas budget for one service tick.
 #[derive(Debug, Clone, Copy)]
 pub struct GasConfig {
     /// Maximum gas a single refine invocation may burn.
     pub refine_gas: Gas,
-    /// Upper bound on accumulate gas (retained for API compat; the
-    /// runtime does not currently enter a second PVM at commit time,
-    /// but on-chain bridging will consume this budget).
-    pub accumulate_gas_max: Gas,
-    /// Default accumulate gas when a service has no manifest override.
-    pub accumulate_gas_default: Gas,
-}
-
-impl GasConfig {
-    pub fn clamp_accumulate(&self, requested: Gas) -> Gas {
-        requested.min(self.accumulate_gas_max)
-    }
 }
 
 impl Default for GasConfig {
     fn default() -> Self {
         Self {
             refine_gas: DEFAULT_GAS,
-            accumulate_gas_max: DEFAULT_GAS,
-            accumulate_gas_default: DEFAULT_GAS,
         }
     }
 }
@@ -317,6 +301,42 @@ impl RefineJournal {
             }
         }
     }
+
+    /// Snapshot the journal's current lengths so one dispatch's appended
+    /// effects can be delimited and, on a trap, discarded without
+    /// disturbing effects committed by earlier dispatches in the tick.
+    fn mark(&self) -> JournalMark {
+        JournalMark {
+            writes: self.writes.len(),
+            transfers: self.transfers.len(),
+            preimages: self.preimages.len(),
+            self_messages: self.self_messages.len(),
+            new_services: self.new_services.len(),
+        }
+    }
+
+    /// Discard every effect appended since `mark` — the writes,
+    /// transfers, preimages, self-messages and service creations a
+    /// panicked dispatch journaled, including child-INVOKE effects that
+    /// were absorbed into this journal during it.
+    fn rollback_to(&mut self, mark: JournalMark) {
+        self.writes.truncate(mark.writes);
+        self.transfers.truncate(mark.transfers);
+        self.preimages.truncate(mark.preimages);
+        self.self_messages.truncate(mark.self_messages);
+        self.new_services.truncate(mark.new_services);
+    }
+}
+
+/// Length snapshot of a [`RefineJournal`] delimiting one dispatch's
+/// appended effects, for discard-on-trap.
+#[derive(Clone, Copy)]
+struct JournalMark {
+    writes: usize,
+    transfers: usize,
+    preimages: usize,
+    self_messages: usize,
+    new_services: usize,
 }
 
 // --- Per-service storage ---
@@ -566,7 +586,7 @@ impl<D: DataLayer> VosRuntime<D> {
 
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
         let idx = self.blobs.len();
-        self.blob_by_hash.insert(simple_hash(&blob), idx);
+        self.blob_by_hash.insert(blob_hash(&blob), idx);
         self.blobs.push(blob);
         idx
     }
@@ -725,7 +745,8 @@ impl<D: DataLayer> VosRuntime<D> {
                     }
                 };
                 install_vos_precompile_caps(&mut kernel);
-                // φ[7] = 0 → refine phase.
+                // Zero the entry register (a0 / φ[7]). The guest runs the
+                // single refine entry at PC=0 and reads no phase selector.
                 kernel.set_active_reg(7, 0);
                 // Transition VM 0 from Ready → Running so kernel.run() executes.
                 let _ = kernel
@@ -738,6 +759,10 @@ impl<D: DataLayer> VosRuntime<D> {
                 // suspended services with continuations).
                 let mut round_items = std::mem::take(&mut items);
                 round_items.retain(|item| !item.is_empty());
+
+                // Delimit this dispatch's journal contributions so a trap
+                // can drop them whole (A2 discard-on-panic).
+                let dispatch_mark = journal.mark();
 
                 let halted = run_refine_kernel(
                     &mut kernel,
@@ -824,21 +849,26 @@ impl<D: DataLayer> VosRuntime<D> {
                             &mut self.data,
                             &mut journal,
                         );
-                        // Spill any self-directed transfers from the
-                        // payload's effects as pending transfers for next
-                        // tick. On a JAM host, accumulate would replay
-                        // these via hostcalls; VOS must match.
+                        // Re-queue mail the guest had not FETCHed before it
+                        // yielded, then any self-directed transfers. A
+                        // handler that yields mid-batch leaves the rest of
+                        // this round's items unconsumed; dropping them would
+                        // silently lose messages. Both redeliver next tick —
+                        // un-fetched mail first — and the saved continuation
+                        // warm-restarts the guest to process them. On a JAM
+                        // host, accumulate would replay the self-transfers
+                        // via hostcalls; VOS must match.
+                        for msg in round_items.drain(..) {
+                            new_transfers.push((ServiceId(svc_id), msg));
+                        }
                         for msg in journal.self_messages.drain(..) {
                             new_transfers.push((ServiceId(svc_id), msg));
                         }
-                        // No automatic wake-up: a yielded service that
-                        // produced no self-message has nothing more to
-                        // do under its own steam. The continuation is
-                        // saved so a future external message
-                        // (typically an INVOKE from a parent agent
-                        // that owns the dispatch loop) can resume it.
-                        // The host is intentionally dumb — orchestration
-                        // is the caller's responsibility.
+                        // Nothing left to redeliver means no wake-up: the
+                        // service stays suspended until a future external
+                        // message (typically a parent agent's INVOKE, which
+                        // owns the dispatch loop) resumes the continuation.
+                        // The host injects no synthetic self-transfer.
                         break;
                     }
 
@@ -849,6 +879,13 @@ impl<D: DataLayer> VosRuntime<D> {
                         break;
                     }
                 } else {
+                    // Guest trapped (panic / OOG / page fault) before
+                    // halting: discard everything this dispatch journaled —
+                    // including child-INVOKE effects absorbed into the
+                    // parent's journal — so a panicked handler commits
+                    // nothing from its own tick. Effects committed by
+                    // earlier dispatches in this tick are kept.
+                    journal.rollback_to(dispatch_mark);
                     *panics += 1;
                     break;
                 }
@@ -1228,19 +1265,20 @@ fn handle_refine_hostcall(
 /// carries a non-zero length in its high 32 bits (`output_buf_len`),
 /// the runtime refuses to write more than that into the caller's
 /// PVM memory. An over-cap reply is replaced with a one-byte
-/// `STATUS_PANICKED` envelope at the caller's `output_ptr`, so the
-/// guest sees `InvokeError::Panicked` rather than having its stack
-/// silently overrun. A length of 0 means a legacy guest predating
-/// the ABI extension — fall through to the unbounded write.
+/// `STATUS_TOO_BIG` envelope at the caller's `output_ptr`, so the
+/// guest sees `InvokeError::TooBig` — distinct from a crash — rather
+/// than having its buffer silently overrun. A length of 0 means a
+/// legacy guest predating the ABI extension — fall through to the
+/// unbounded write.
 ///
 /// **Recording cap enforcement.** When recording, the session
 /// carries a per-reply byte cap (16 KiB by default). Outputs larger
 /// than that cap are replaced — both in the log and in the caller's
-/// buffer — with a single STATUS_PANICKED byte. The caller's PVM
-/// observes `InvokeError::Panicked`; replay reproduces the same
-/// observation bit-for-bit. The intent is to keep DAG nodes bounded
-/// so a runaway worker can't poison consensus replicas with multi-MB
-/// payloads.
+/// buffer — with a single STATUS_PANICKED byte. This is a distinct
+/// consensus-safety truncation (SOUND-1) from the buffer cap above:
+/// it keeps DAG nodes bounded so a runaway worker can't poison
+/// consensus replicas with multi-MB payloads, and it stays PANICKED
+/// so the recorded observation is unchanged.
 fn record_and_write_invoke(
     caller: &mut InvocationKernel,
     output_ptr: u32,
@@ -1249,15 +1287,15 @@ fn record_and_write_invoke(
     depth: usize,
     mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
-    use crate::actors::run::STATUS_PANICKED;
+    use crate::actors::run::{STATUS_PANICKED, STATUS_TOO_BIG};
 
-    // Buffer cap fires first — if the reply doesn't fit in the
-    // caller's PVM buffer, kwrite would overrun. Surface it as a
-    // panic. This also feeds the recording log a STATUS_PANICKED
-    // marker (see Recording branch below), so replay sees the
-    // same observation.
+    // Buffer cap fires first — if the reply doesn't fit in the caller's
+    // PVM buffer, kwrite would overrun. Surface a distinct STATUS_TOO_BIG
+    // (not STATUS_PANICKED) so the guest can tell an oversize reply from a
+    // real crash. Feed the recording log the same marker so replay sees
+    // the same observation.
     if output_buf_len > 0 && output.len() > output_buf_len {
-        let truncated = alloc::vec![STATUS_PANICKED];
+        let truncated = alloc::vec![STATUS_TOO_BIG];
         if depth == 1
             && let crate::effect_log::EffectMode::Recording(s) = mode
         {
@@ -1270,6 +1308,8 @@ fn record_and_write_invoke(
     if depth == 1
         && let crate::effect_log::EffectMode::Recording(s) = mode
     {
+        // Consensus-safety cap (SOUND-1): stays STATUS_PANICKED so the
+        // recorded/replayed observation is unchanged.
         if output.len() > s.cap() {
             let truncated = alloc::vec![STATUS_PANICKED];
             s.record(truncated.clone());
@@ -1565,7 +1605,7 @@ fn handle_invoke(
     // invoke wire format [status:u8][state_len:u32][state][reply] so the
     // caller's guest-side invoke_raw can parse it uniformly.
     let out_ptr = child.active_reg(7) as u32;
-    let out_len = (child.active_reg(8) as usize).min(4096);
+    let out_len = (child.active_reg(8) as usize).min(1 << 20);
     let raw_output = kread(&child, out_ptr, out_len);
 
     let output = if let Some(payload) = RefinePayload::decode(&raw_output) {
@@ -1667,12 +1707,11 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
         .push((svc_id, crate::lifecycle::STATE_KEY_BYTES.to_vec(), vec![]));
 }
 
-fn simple_hash(data: &[u8]) -> [u8; 32] {
-    let mut h = [0u8; 32];
-    for (i, &byte) in data.iter().enumerate() {
-        h[i % 32] ^= byte.wrapping_add(i as u8);
-    }
-    h
+/// blake2b-256 content hash keying `blob_by_hash`. Collision-resistant, so
+/// a code-hash-identified INVOKE cannot be pointed at a forged blob — the
+/// prior XOR fold was trivially collidable.
+fn blob_hash(data: &[u8]) -> [u8; 32] {
+    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/blob-addr/v1", &[data])
 }
 
 #[cfg(test)]
@@ -1680,38 +1719,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gas_config_default_is_balanced() {
+    fn gas_config_default_refine_gas() {
         let g = GasConfig::default();
         assert_eq!(g.refine_gas, DEFAULT_GAS);
-        assert_eq!(g.accumulate_gas_default, DEFAULT_GAS);
-        assert_eq!(g.accumulate_gas_max, DEFAULT_GAS);
-        assert!(g.accumulate_gas_default <= g.accumulate_gas_max);
-    }
-
-    #[test]
-    fn gas_config_clamps_accumulate() {
-        let g = GasConfig {
-            refine_gas: 1_000,
-            accumulate_gas_max: 500,
-            accumulate_gas_default: 200,
-        };
-        assert_eq!(g.clamp_accumulate(200), 200);
-        assert_eq!(g.clamp_accumulate(500), 500);
-        assert_eq!(g.clamp_accumulate(10_000), 500);
     }
 
     #[test]
     fn runtime_with_gas_config_uses_overrides() {
-        let g = GasConfig {
-            refine_gas: 12_345,
-            accumulate_gas_max: 6_789,
-            accumulate_gas_default: 4_321,
-        };
+        let g = GasConfig { refine_gas: 12_345 };
         let rt = VosRuntime::with_gas_config(g);
         let cfg = rt.gas_config();
         assert_eq!(cfg.refine_gas, 12_345);
-        assert_eq!(cfg.accumulate_gas_max, 6_789);
-        assert_eq!(cfg.accumulate_gas_default, 4_321);
+    }
+
+    #[test]
+    fn blob_hash_content_addresses_registered_blobs() {
+        // blake2b keying is deterministic, distinguishes near-identical
+        // blobs (the old XOR fold collided readily), and register_blob's
+        // key resolves back to the blob index.
+        let a = vec![1u8, 2, 3];
+        let b = vec![1u8, 2, 4];
+        assert_ne!(blob_hash(&a), blob_hash(&b));
+        assert_eq!(blob_hash(&a), blob_hash(&a));
+
+        let mut rt = VosRuntime::new();
+        let idx = rt.register_blob(a.clone());
+        assert_eq!(rt.blob_by_hash.get(&blob_hash(&a)), Some(&idx));
     }
 
     #[test]
@@ -1739,7 +1772,7 @@ mod tests {
         // Verify that PROVIDE + NEW during refine results in the service
         // being registered after the tick commits.
         let mut rt = VosRuntime::new();
-        let code_hash = simple_hash(&[0xAB; 16]);
+        let code_hash = blob_hash(&[0xAB; 16]);
         // Pre-populate preimages with a dummy "code blob"
         rt.preimages.insert(code_hash, vec![0xAB; 16]);
 

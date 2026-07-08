@@ -18,12 +18,12 @@ fn example_elf(name: &str) -> Vec<u8> {
     }
 }
 
-/// Transpile an ELF to a JAM service PVM blob (dual entry: refine + accumulate).
+/// Transpile an ELF to a JAM service PVM blob (single refine entry at PC=0).
 fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
     grey_transpiler::link_elf(elf_data).expect("transpile failed")
 }
 
-/// Register a service blob and create a service (dual-entry, accumulate at PC=5).
+/// Register a service blob and create a service.
 fn register_svc(rt: &mut VosRuntime, blob: Vec<u8>) -> vos::abi::service::ServiceId {
     let blob_idx = rt.register_service_blob(blob);
     rt.register_service(blob_idx)
@@ -76,7 +76,7 @@ fn greeter_metadata_from_elf() {
 
 #[test]
 fn agent_service_lifecycle() {
-    // The scheduler agent is a service (accumulate at PC=5). Verify it inits and halts.
+    // The scheduler agent is a service. Verify it inits and halts.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
         "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
@@ -145,7 +145,7 @@ fn cooperative_loop_with_greeter() {
     let agent_blob_idx = rt.register_service_blob(agent_blob);
     let agent_id = rt.register_service(agent_blob_idx);
 
-    // Register greeter as service blob (dual-entry for invoke at PC=0)
+    // Register greeter as service blob (invoked at PC=0)
     let greeter_blob_idx = rt.register_service_blob(greeter_blob);
     let greeter_id = rt.register_service(greeter_blob_idx);
 
@@ -10307,4 +10307,159 @@ fn multi_node_three_space_settlement_capstone() {
     }
     let _ = std::fs::remove_dir_all(&dir_root);
     assert_eq!(panics, 0, "actor panics during capstone test: {panics}");
+}
+
+#[test]
+fn probe_yield_mid_batch_delivers_all_mail() {
+    // A1: a handler that yields mid-batch must not drop the messages the
+    // guest had not yet FETCHed before it suspended. The probe's `ping`
+    // handler counts one message then yields, so three `ping`s queued in
+    // a single tick are consumed one per tick — the un-fetched remainder
+    // must re-queue rather than evaporate. `seen` therefore ends at 3.
+    // Before the fix the second and third `ping` were dropped and `seen`
+    // stayed at 1.
+    use vos::value::{Msg, TAG_DYNAMIC, Value};
+    use vos::{Decode, Encode};
+
+    fn dynamic(name: &str) -> Vec<u8> {
+        let encoded = Msg::new(name).encode();
+        let mut p = Vec::with_capacity(1 + encoded.len());
+        p.push(TAG_DYNAMIC);
+        p.extend_from_slice(&encoded);
+        p
+    }
+
+    let elf = example_elf("probe");
+    let blob = transpile_actor(&elf);
+    let mut rt = VosRuntime::new();
+    let id = register_svc(&mut rt, blob);
+
+    for _ in 0..3 {
+        rt.send_to(id, dynamic("ping"));
+    }
+    rt.run_blocking();
+    assert_eq!(rt.panics, 0, "probe panicked delivering the ping batch");
+
+    rt.send_to(id, dynamic("seen"));
+    rt.run_blocking();
+    let reply = rt.take_last_reply(id).expect("seen produced no reply");
+    let seen = <Value as Decode>::decode(&reply)
+        .as_u32()
+        .expect("seen returns u32");
+    assert_eq!(
+        seen, 3,
+        "all three pings must be delivered across ticks, not just the first"
+    );
+}
+
+/// Register a probe (parent) and a leaker (child) in `rt`, returning
+/// their service ids. The leaker's cold-start hook journals a write to
+/// its own row that the parent's dispatch absorbs when it asks it.
+fn probe_and_leaker(rt: &mut VosRuntime) -> (vos::abi::service::ServiceId, vos::abi::service::ServiceId) {
+    let probe = transpile_actor(&example_elf("probe"));
+    let leaker = transpile_actor(&example_elf("leaker"));
+    let p_idx = rt.register_service_blob(probe);
+    let parent = rt.register_service(p_idx);
+    let l_idx = rt.register_service_blob(leaker);
+    let child = rt.register_service(l_idx);
+    (parent, child)
+}
+
+fn dynamic_msg(name: &str, child: u32) -> Vec<u8> {
+    use vos::value::{Msg, TAG_DYNAMIC};
+    use vos::Encode;
+    let encoded = Msg::new(name).with("child", child).encode();
+    let mut p = vec![TAG_DYNAMIC];
+    p.extend_from_slice(&encoded);
+    p
+}
+
+#[test]
+fn probe_relay_commits_child_effect() {
+    // Baseline for the discard-on-panic test: an asked leaker's
+    // cold-start write, absorbed into the parent's journal, commits when
+    // the parent returns normally. If this ever fails the discard test
+    // below would be vacuous.
+    let mut rt = VosRuntime::new();
+    let (parent, child) = probe_and_leaker(&mut rt);
+    rt.send_to(parent, dynamic_msg("relay", child.0));
+    rt.run_blocking();
+    assert_eq!(rt.panics, 0, "relay parent should not panic");
+    assert_eq!(
+        rt.storage.read(child, b"leaker_mark"),
+        Some(&b"1"[..]),
+        "an asked leaker's absorbed write commits when the parent completes"
+    );
+}
+
+#[test]
+fn probe_panic_discards_absorbed_child_effect() {
+    // A2: a handler that traps must commit nothing from its own tick —
+    // including effects a child INVOKE absorbed into the parent's
+    // journal. `boom` asks a leaker (whose cold-start hook journals a
+    // write into this dispatch), then panics; the host must roll back
+    // the whole dispatch so the leaker's write never reaches storage.
+    // Before the fix the absorbed write committed even though the asking
+    // parent trapped (companion baseline: probe_relay_commits_child_effect).
+    use vos::runtime::GasConfig;
+
+    // A guest panic spins in the panic handler until it OOGs, so keep
+    // the refine budget small enough that the parent traps quickly.
+    let mut rt = VosRuntime::with_gas_config(GasConfig {
+        refine_gas: 20_000_000,
+    });
+    let (parent, child) = probe_and_leaker(&mut rt);
+    rt.send_to(parent, dynamic_msg("boom", child.0));
+    rt.run_blocking();
+
+    assert!(rt.panics >= 1, "the boom parent should have trapped");
+    assert_eq!(
+        rt.storage.read(child, b"leaker_mark"),
+        None,
+        "the leaker's absorbed write must be discarded when the asking parent traps"
+    );
+}
+
+#[test]
+fn probe_ask_status_distinguishes_too_big_from_crash() {
+    // A5: an oversize child reply comes back as STATUS_TOO_BIG, distinct
+    // from a crash (STATUS_PANICKED). The child-invoke wall used to
+    // substitute PANICKED for an over-buffer reply, conflating the two.
+    // `bloat` returns 1 KiB of state through `ask_small_buf`'s 512-byte
+    // buffer (over-buffer → TOO_BIG); `crasher` page-faults (→ PANICKED);
+    // `leaker` returns a small reply that fits (→ DONE).
+    use vos::value::{Msg, TAG_DYNAMIC, Value};
+    use vos::{Decode, Encode};
+
+    let mut rt = VosRuntime::new();
+    let probe = register_svc(&mut rt, transpile_actor(&example_elf("probe")));
+    let bloat = register_svc(&mut rt, transpile_actor(&example_elf("bloat")));
+    let crasher = register_svc(&mut rt, transpile_actor(&example_elf("crasher")));
+    let leaker = register_svc(&mut rt, transpile_actor(&example_elf("leaker")));
+
+    let ask = |rt: &mut VosRuntime, child: u32| -> u8 {
+        let enc = Msg::new("ask_small_buf").with("child", child).encode();
+        let mut m = vec![TAG_DYNAMIC];
+        m.extend_from_slice(&enc);
+        rt.send_to(probe, m);
+        rt.run_blocking();
+        let reply = rt.take_last_reply(probe).expect("ask_small_buf produced no reply");
+        <Value as Decode>::decode(&reply).as_u8().expect("ask_small_buf returns u8")
+    };
+
+    assert_eq!(
+        ask(&mut rt, bloat.0),
+        vos::STATUS_TOO_BIG,
+        "an oversize child reply must surface as TOO_BIG, not a crash"
+    );
+    assert_eq!(
+        ask(&mut rt, crasher.0),
+        vos::STATUS_PANICKED,
+        "a genuinely crashing child stays PANICKED"
+    );
+    assert_eq!(
+        ask(&mut rt, leaker.0),
+        vos::STATUS_DONE,
+        "a small child reply fits and completes normally"
+    );
 }

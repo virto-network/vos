@@ -35,6 +35,10 @@ fn invoke_child(svc_id: u32, msg: &Msg, state: &[u8]) -> Option<Vec<u8>> {
             log::info!("agent: child {} out of gas, dropping", svc_id);
             None
         }
+        InvokeResult::TooBig => {
+            log::info!("agent: child {} reply too big, dropping", svc_id);
+            None
+        }
         InvokeResult::Error(s) => {
             log::info!("agent: child {} error (0x{:02x}), dropping", svc_id, s);
             None

@@ -44,7 +44,7 @@ pub struct Context<A: Actor> {
     /// surface the Sprint-2 dispatch-layer gate produced.
     forbidden: bool,
 
-    // Effect queues (flushed in accumulate)
+    // Effect queues (drained into the refine output payload)
     pending_tells: Vec<PendingTell>,
     pending_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pending_spawns: Vec<[u8; 32]>,
@@ -55,7 +55,6 @@ pub struct Context<A: Actor> {
 
     // Cooperative scheduling
     self_schedule: bool,
-    sleep_ticks: u32,
 
     // Worker host I/O: the handler yields with a request, the host
     // fulfills it and provides the result before re-polling.
@@ -89,7 +88,6 @@ impl<A: Actor> Context<A> {
             pending_provides: Vec::new(),
             reply: None,
             self_schedule: false,
-            sleep_ticks: 0,
             host_io_request: None,
             host_io_result: None,
             _phantom: core::marker::PhantomData,
@@ -318,6 +316,7 @@ impl<A: Actor> Context<A> {
                 InvokeResult::Panicked => super::run::Ask::ready_err(InvokeError::Panicked),
                 InvokeResult::NotFound => super::run::Ask::ready_err(InvokeError::NotFound),
                 InvokeResult::OutOfGas => super::run::Ask::ready_err(InvokeError::OutOfGas),
+                InvokeResult::TooBig => super::run::Ask::ready_err(InvokeError::TooBig),
                 InvokeResult::Error(s) => super::run::Ask::ready_err(InvokeError::Unknown(s)),
             }
         }
@@ -565,11 +564,13 @@ impl<A: Actor> Context<A> {
         super::run::Yield::once()
     }
 
-    /// Checkpoint state and sleep for N ticks.
-    /// Each invocation runs one iteration; state is saved automatically.
-    pub fn sleep(&mut self, ticks: u32) -> super::run::Yield {
+    /// Checkpoint state and yield. `sleep` is an alias for
+    /// [`yield_now`](Self::yield_now): no host implements a multi-tick
+    /// sleep, so `ticks` is ignored — the actor is simply re-scheduled
+    /// next tick. Kept for source compatibility and as the natural name
+    /// for a periodic-work loop.
+    pub fn sleep(&mut self, _ticks: u32) -> super::run::Yield {
         self.self_schedule = true;
-        self.sleep_ticks = ticks;
         super::run::Yield::once()
     }
 
@@ -580,8 +581,16 @@ impl<A: Actor> Context<A> {
         self.pending_writes.push((key.to_vec(), value.to_vec()));
     }
 
-    /// Queue a new service spawn from a code hash.
-    /// The code blob must already be available as a preimage (via [`provide`]).
+    /// Queue a new service spawn from a code hash. The code blob must
+    /// already be available as a preimage (via [`provide`]).
+    ///
+    /// The spawn is buffered as an effect; the host assigns the child's
+    /// `ServiceId` only when the parent's tick commits, after this
+    /// dispatch has returned. So `spawn` does not — and cannot yet —
+    /// hand the caller the new id. Returning it needs a deterministic
+    /// id reserved at buffer time (and replicated identically across
+    /// CRDT/Raft replicas), which lands with the `vos::agent::Tasks`
+    /// work that reshapes child identity.
     pub fn spawn(&mut self, code_hash: [u8; 32]) {
         self.pending_spawns.push(code_hash);
     }
@@ -594,8 +603,9 @@ impl<A: Actor> Context<A> {
     }
 
     /// Install a new child service from a code blob and its content hash.
-    /// Convenience that calls [`provide`] + [`spawn`] and returns the
-    /// assigned service ID (via the NEW hostcall return value).
+    /// Convenience that calls [`provide`] + [`spawn`]. Like [`spawn`], it
+    /// does not return the child's `ServiceId` — the host assigns that at
+    /// commit time (see [`spawn`](Self::spawn)).
     ///
     /// The caller must provide the correct content hash. Use
     /// `blake2b_simd::blake2b(blob).as_bytes()` or the host's hashing
@@ -642,52 +652,16 @@ impl<A: Actor> Context<A> {
         self.self_schedule
     }
 
-    /// Get the number of ticks to sleep (0 = yield_now).
-    pub fn sleep_ticks(&self) -> u32 {
-        self.sleep_ticks
-    }
-
     /// Flush all queued effects.
     ///
-    /// Behaviour depends on the current execution stage:
-    ///
-    /// - **Refine mode** (`run_refine_service`): effects stay queued in the
-    ///   pending vectors so `run_refine_service` can drain them into the
-    ///   refine output payload. JAM forbids state-mutating hostcalls in
-    ///   refine, so we cannot issue them here.
-    /// - **Accumulate mode** (`run_accumulate_service`): effects are issued
-    ///   directly via accumulate-phase hostcalls. This is the only stage
-    ///   that mutates state.
-    /// - **Non-service builds**: effects are dropped (invoked actors don't
-    ///   have a host stage to flush to).
+    /// - **Service builds**: service actors run exclusively in refine,
+    ///   which cannot mutate state. The queued effects stay in the
+    ///   pending vectors for `run_refine_service` to drain into the
+    ///   refine output payload — the host absorbs that payload and
+    ///   applies the effects natively.
+    /// - **Non-service builds**: effects are dropped (invoked actors
+    ///   don't have a host commit stage to flush to).
     pub fn flush_effects(&mut self) {
-        #[cfg(feature = "service")]
-        {
-            // Refine cannot mutate state — leave the pending_* queues
-            // populated so the caller can pack them into the refine output.
-            if super::run::is_refine_mode() {
-                return;
-            }
-
-            use crate::abi::pvm::hostcalls;
-
-            for (key, value) in self.pending_writes.drain(..) {
-                hostcalls::write(&key, &value);
-            }
-
-            for tell in self.pending_tells.drain(..) {
-                hostcalls::transfer(tell.target, 0, 0, &tell.payload);
-            }
-
-            for (hash, data) in self.pending_provides.drain(..) {
-                hostcalls::provide(&hash, &data);
-            }
-
-            for code_hash in self.pending_spawns.drain(..) {
-                hostcalls::new_service(&code_hash);
-            }
-        }
-
         #[cfg(not(feature = "service"))]
         {
             self.pending_writes.clear();
