@@ -330,19 +330,22 @@ fn is_top_level_help(argv: &[String]) -> bool {
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
     const BUILTIN_VERBS: &[&str] =
         &["run", "space", "dev", "ai", "zk", "help-schema", "help", "whoami"];
-    // Skip global flags; only `--format` / `--space` take a
-    // value, the rest are boolean-shaped. We do NOT recognise
-    // `--space` here (it's a dynamic-only flag) — its presence
-    // is a strong "user wants dynamic dispatch" signal anyway.
+    // Skip global flags; `--format` / `--out` take a value, the
+    // rest are boolean-shaped. `--out` is a dynamic-only flag but
+    // we skip its value here (rather than `return true`) so its path
+    // isn't mistaken for the verb — a builtin after it still routes to
+    // clap (which then rejects the stray `--out`, fine — it's
+    // meaningless for builtins). `--space` we do force dynamic on —
+    // its presence is a strong "user wants dynamic dispatch" signal.
     let mut i = 0;
     while i < argv.len() {
         let a = &argv[i];
         match a.as_str() {
-            "--format" => {
+            "--format" | "--out" => {
                 i += 2;
                 continue;
             }
-            s if s.starts_with("--format=") => {}
+            s if s.starts_with("--format=") || s.starts_with("--out=") => {}
             "--space" => return true,
             s if s.starts_with("--space=") => return true,
             "-v" | "--verbose" => {}
@@ -479,6 +482,19 @@ mod routing_tests {
         ])));
         assert!(should_dynamic_dispatch(&s(&["--format=json", "gateway"])));
         assert!(should_dynamic_dispatch(&s(&["-v", "gateway"])));
+    }
+
+    #[test]
+    fn out_flag_value_is_skipped_not_taken_as_verb() {
+        // `--out path` before the target: the path must not be
+        // mistaken for the verb, and a builtin still reaches clap.
+        assert!(should_dynamic_dispatch(&s(&[
+            "--out", "f.bin", "prover", "get_blob"
+        ])));
+        assert!(should_dynamic_dispatch(&s(&["--out=f.bin", "prover"])));
+        assert!(!should_dynamic_dispatch(&s(&[
+            "--out", "f.bin", "space", "export"
+        ])));
     }
 
     #[test]

@@ -49,6 +49,11 @@ struct ParsedArgv {
     space: Option<String>,
     positional: Vec<String>,
     wants_help: bool,
+    /// `--out <path>`: divert the reply to a file instead of stdout.
+    /// A `Value::Bytes` reply is written byte-exact (the shell-friendly
+    /// way to pull a proof/ELF/blob out); any other reply writes its
+    /// text rendering.
+    out: Option<String>,
 }
 
 /// Entry point. `argv` is everything after the executable name —
@@ -122,7 +127,7 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
             }
             let target_id = client.resolve_target(target)?;
             let reply = client.invoke_dyn(target_id, &Msg::new(wire))?;
-            return render_reply(reply, None);
+            return render_reply(reply, None, parsed.out.as_deref());
         }
 
         let method_meta = meta
@@ -154,7 +159,7 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         tracing::debug!("invoking {method} on {target_id}");
         let reply = client.invoke_dyn(target_id, &msg)?;
         let ret_ty = method_meta.map(|m| m.returns.as_str());
-        render_reply(reply, ret_ty)
+        render_reply(reply, ret_ty, parsed.out.as_deref())
     })
 }
 
@@ -211,39 +216,81 @@ fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> any
             .with("space_id", space_id.to_vec())
             .with("cert", cert),
     )?;
-    render_reply(reply2, None)
+    render_reply(reply2, None, None)
 }
 
-/// Render an invoke reply to stdout, JSON or text per the global format.
+/// Render an invoke reply. Without `--out` it goes to stdout, JSON or text
+/// per the global format. With `--out <path>` it is diverted to that file:
+/// a `Value::Bytes` reply is written byte-exact (opaque blobs — proofs,
+/// ELFs, files — pulled out without hex round-tripping), any other reply
+/// writes the same rendering it would print on stdout (JSON under
+/// `--format json`, text otherwise); either way a one-line summary (byte
+/// count + kind) goes to stderr so stdout stays clean for piping.
+///
 /// `ret_ty` is the handler's declared return type from the schema (when
 /// known); it labels an otherwise-opaque `Value::Bytes` reply so an
 /// operator can tell a `[u8;32]` root from a `Receipt` blob.
-fn render_reply(reply: Value, ret_ty: Option<&str>) -> anyhow::Result<()> {
+fn render_reply(reply: Value, ret_ty: Option<&str>, out: Option<&str>) -> anyhow::Result<()> {
+    if let Some(path) = out {
+        let (bytes, kind) = match reply {
+            Value::Bytes(b) => {
+                let kind = match ret_ty {
+                    Some(ty) if !ty.is_empty() && ty != "()" => ty.to_string(),
+                    _ => "bytes".to_string(),
+                };
+                (b, kind)
+            }
+            // Non-bytes replies have no byte-exact form; write the same
+            // rendering stdout would show — JSON in json mode (so a piped
+            // consumer still gets JSON), text otherwise — newline-terminated.
+            other => {
+                let (mut rendered, kind) = if output::is_json() {
+                    let json =
+                        serde_json::to_string(&unwrap_json_string(output::value_to_json(&other)))
+                            .unwrap_or_else(|_| render_text(&other, ret_ty));
+                    (json, "json".to_string())
+                } else {
+                    (render_text(&other, ret_ty), "text".to_string())
+                };
+                rendered.push('\n');
+                (rendered.into_bytes(), kind)
+            }
+        };
+        std::fs::write(path, &bytes).map_err(|e| anyhow!("write reply to '{path}': {e}"))?;
+        eprintln!("wrote {} bytes ({kind}) to {path}", bytes.len());
+        return Ok(());
+    }
+
     if output::is_json() {
         output::print_json(&unwrap_json_string(output::value_to_json(&reply)));
     } else {
-        match reply {
-            Value::Unit => println!("()"),
-            Value::Str(s) if looks_like_json_object_or_array(&s) => {
-                // `vosx gateway describe` returns a JSON-shaped string;
-                // in text mode the user is most likely scanning for
-                // fields, so print the payload verbatim rather than
-                // rust-Debug-formatting the wrapping `Str(...)`.
-                println!("{s}");
-            }
-            Value::Bytes(b) => {
-                // Bytes are opaque — render as hex, prefixed with the
-                // declared type name when the schema carries one.
-                let hex = hex::encode(&b);
-                match ret_ty {
-                    Some(ty) if !ty.is_empty() && ty != "()" => println!("{ty}: 0x{hex}"),
-                    _ => println!("0x{hex}"),
-                }
-            }
-            other => println!("{other:?}"),
-        }
+        println!("{}", render_text(&reply, ret_ty));
     }
     Ok(())
+}
+
+/// Text rendering of a reply `Value` — shared by stdout text mode and the
+/// `--out` file path so the two never drift.
+fn render_text(reply: &Value, ret_ty: Option<&str>) -> String {
+    match reply {
+        Value::Unit => "()".to_string(),
+        Value::Str(s) if looks_like_json_object_or_array(s) => {
+            // `vosx gateway describe` returns a JSON-shaped string; the
+            // user is most likely scanning for fields, so surface the
+            // payload verbatim rather than rust-Debug-formatting `Str(...)`.
+            s.clone()
+        }
+        Value::Bytes(b) => {
+            // Bytes are opaque — render as hex, prefixed with the declared
+            // type name when the schema carries one.
+            let hex = hex::encode(b);
+            match ret_ty {
+                Some(ty) if !ty.is_empty() && ty != "()" => format!("{ty}: 0x{hex}"),
+                _ => format!("0x{hex}"),
+            }
+        }
+        other => format!("{other:?}"),
+    }
 }
 
 /// Map a universal lifecycle verb to its reserved host-side wire method
@@ -294,6 +341,7 @@ fn parse_argv(argv: &[String]) -> anyhow::Result<ParsedArgv> {
     let mut space: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut wants_help = false;
+    let mut out: Option<String> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -310,6 +358,18 @@ fn parse_argv(argv: &[String]) -> anyhow::Result<ParsedArgv> {
             }
             s if s.starts_with("--space=") => {
                 space = Some(s.trim_start_matches("--space=").to_string());
+            }
+            "--out" => {
+                out = Some(
+                    argv.get(i + 1)
+                        .ok_or_else(|| anyhow!("`--out` requires a path"))?
+                        .clone(),
+                );
+                i += 2;
+                continue;
+            }
+            s if s.starts_with("--out=") => {
+                out = Some(s.trim_start_matches("--out=").to_string());
             }
             // Global flags that don't take a value; main already
             // handled them (or will via tracing/output state).
@@ -332,6 +392,7 @@ fn parse_argv(argv: &[String]) -> anyhow::Result<ParsedArgv> {
         space,
         positional,
         wants_help,
+        out,
     })
 }
 
@@ -389,17 +450,29 @@ fn build_msg(
 /// heuristic `space call` uses (numeric → u64, true/false →
 /// bool, else string) keeps the no-schema path working.
 ///
-/// Two byte-oriented conveniences match `space call`:
+/// Byte- and list-oriented conveniences:
 ///   - `key=@path` reads the file's raw bytes (any type — large
-///     opaque blobs like proofs / ELFs);
+///     opaque blobs like proofs / ELFs); `key=@-` reads stdin,
+///     the complement of `--out` for piping blobs through;
 ///   - a schema-typed `Vec<u8>` or `[u8; N]` field accepts a hex
 ///     string (optionally `0x`-prefixed), symmetric with how a
-///     `Value::Bytes` reply renders, so a reply can be pasted back.
+///     `Value::Bytes` reply renders, so a reply can be pasted back;
+///   - a `Vec<u32>` / `Vec<String>` field accepts a comma-separated
+///     list (`ids=1,2,3`).
 fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Result<Msg> {
-    // `@path` reads raw file bytes regardless of the declared type.
+    // `@path` reads raw file bytes regardless of the declared type;
+    // `@-` reads stdin to end (the complement of `--out`).
     if let Some(path) = v.strip_prefix('@') {
-        let bytes = std::fs::read(path)
-            .map_err(|e| anyhow!("read '{path}' for arg '{k}': {e}"))?;
+        let bytes = if path == "-" {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| anyhow!("read stdin for arg '{k}': {e}"))?;
+            buf
+        } else {
+            std::fs::read(path).map_err(|e| anyhow!("read '{path}' for arg '{k}': {e}"))?
+        };
         return Ok(msg.with(k, bytes));
     }
 
@@ -418,6 +491,28 @@ fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Resu
         Some("i64") => msg.with(k, v.parse::<i64>().map_err(|_| parse_err("i64"))?),
         Some("bool") => msg.with(k, v.parse::<bool>().map_err(|_| parse_err("bool"))?),
         Some("String") => msg.with(k, v.to_string()),
+        // Comma-separated lists → `Value::ListU32` / `Value::ListStr`.
+        // An empty value is the empty list. `Vec<u32>` elements are
+        // trimmed (numbers carry no meaningful whitespace); `Vec<String>`
+        // elements are taken verbatim so a literal space survives.
+        Some("Vec<u32>") => {
+            let list = v
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| p.parse::<u32>())
+                .collect::<Result<Vec<u32>, _>>()
+                .map_err(|_| parse_err("Vec<u32> (comma-separated)"))?;
+            msg.with(k, list)
+        }
+        Some("Vec<String>") => {
+            let list: Vec<String> = if v.is_empty() {
+                Vec::new()
+            } else {
+                v.split(',').map(str::to_string).collect()
+            };
+            msg.with(k, list)
+        }
         // `Vec<u8>` and `[u8; N]` args travel as `Value::Bytes`; a hex
         // string is the shell-friendly spelling. Length is validated
         // by the actor's `from_msg` for `[u8; N]`.
@@ -599,6 +694,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_argv_extracts_out_flag_in_either_position() {
+        let p = parse_argv(&s(&["prover", "get_blob", "--out", "f.bin"])).unwrap();
+        assert_eq!(p.out.as_deref(), Some("f.bin"));
+        assert_eq!(p.positional, s(&["prover", "get_blob"]));
+
+        let p = parse_argv(&s(&["--out=f.bin", "prover", "get_blob"])).unwrap();
+        assert_eq!(p.out.as_deref(), Some("f.bin"));
+        assert_eq!(p.positional, s(&["prover", "get_blob"]));
+    }
+
+    #[test]
+    fn parse_argv_rejects_dangling_out() {
+        let err = parse_argv(&s(&["prover", "get_blob", "--out"])).unwrap_err();
+        assert!(err.to_string().contains("requires a path"), "{err}");
+    }
+
+    #[test]
     fn build_msg_uses_schema_type_when_present() {
         // Schema says `a: u64`, so a non-u64 input is rejected
         // up front — the legacy heuristic would silently fall
@@ -673,6 +785,58 @@ mod tests {
         // `@file` works regardless of schema (here: no schema at all).
         let msg = build_msg("x", None, &[arg.as_str()]).unwrap();
         assert_eq!(msg.args.get("data"), Some(&Value::Bytes(vec![9, 8, 7])));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn apply_arg_list_u32_splits_commas() {
+        let m = bytes_field("ids", "Vec<u32>");
+        let msg = build_msg("x", Some(&m), &["ids=1, 2 ,3"]).unwrap();
+        assert_eq!(msg.args.get("ids"), Some(&Value::ListU32(vec![1, 2, 3])));
+    }
+
+    #[test]
+    fn apply_arg_list_u32_rejects_non_numeric() {
+        let m = bytes_field("ids", "Vec<u32>");
+        let err = build_msg("x", Some(&m), &["ids=1,two,3"]).unwrap_err();
+        assert!(err.to_string().contains("Vec<u32>"), "{err}");
+    }
+
+    #[test]
+    fn apply_arg_list_str_splits_commas_verbatim() {
+        let m = bytes_field("tags", "Vec<String>");
+        let msg = build_msg("x", Some(&m), &["tags=a,b c,d"]).unwrap();
+        assert_eq!(
+            msg.args.get("tags"),
+            Some(&Value::ListStr(vec![
+                "a".into(),
+                "b c".into(),
+                "d".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn render_reply_out_writes_bytes_raw() {
+        let path =
+            std::env::temp_dir().join(format!("vosx-out-bytes-{}.bin", std::process::id()));
+        render_reply(
+            Value::Bytes(vec![1, 2, 3, 0xff]),
+            Some("[u8;4]"),
+            Some(path.to_str().unwrap()),
+        )
+        .unwrap();
+        // Byte-exact: no hex, no trailing newline.
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 0xff]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn render_reply_out_writes_text_for_non_bytes() {
+        let path =
+            std::env::temp_dir().join(format!("vosx-out-text-{}.txt", std::process::id()));
+        render_reply(Value::Unit, None, Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "()\n");
         let _ = std::fs::remove_file(&path);
     }
 
