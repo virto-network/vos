@@ -3,13 +3,9 @@ name = "vosx"
 description = "Host CLI for VOS — peer-to-peer OS for collaborative, replicated apps. Run actors on a deterministic PVM, manage spaces, replicate state via CRDT or Raft."
 keywords = ["vos", "p2p", "actor", "crdt", "cli"]
 categories = ["command-line-utilities", "network-programming", "wasm"]
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-authors.workspace = true
-readme.workspace = true
+version = "0.1.0"
+edition = "2024"
+authors = ["Daniel Olano <daniel@olanod.com>"]
 # Ship the prebuilt space-registry blob inside the crate so
 # `cargo install vosx` from crates.io has the actor available
 # out of the box. The blob is regenerated from the local actor
@@ -23,18 +19,11 @@ include = [
     "blobs/dev_project.elf",
 ]
 
-[features]
-# `vosx zk pin` — the provable-program catalog pinning tool. Off by default:
-# it pulls the full zkpvm prover (stwo), which roughly doubles vosx's build.
-# Enable for publish-time pinning: `cargo build -p vosx --features zk-pin`.
-zk-pin = ["dep:zkpvm"]
-
 [dependencies]
 vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage", "network"] }
-# zkpvm canonical prover + tracer + page-Merkle (behind `zk-pin`): `vosx zk pin`
-# transpiles a provable ELF, traces a representative run, and measures the
-# commitment allowlist + entering-image root for the catalog artifact.
-zkpvm = { workspace = true, optional = true }
+# `vosx zk pin` transpiles the provable ELF here and delegates the heavy
+# zkpvm measurement to the prover extension's `measure_catalog` handler, so
+# vosx pulls no zkpvm/stwo.
 # Direct dep for ELF → PVM blob conversion. vos uses it
 # transitively but doesn't re-export, so vosx pulls its own.
 # `version` is what crates.io resolves at publish time.

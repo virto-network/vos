@@ -6530,7 +6530,7 @@ fn voucher_check_chain_accept_path() {
     // drift-guard + coverage + parity tests validate them; live paths read the
     // catalog). `voucher_check_catalog_matches_pinned_constants` guards parity.
     let vc_pin = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
-        .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)")
+        .expect("load voucher-check catalog (regenerate with `vosx zk pin`)")
         .require("voucher-check")
         .expect("catalog pins voucher-check")
         .clone();
@@ -8515,7 +8515,7 @@ fn clerk_ledger_two_bank_federation() {
         // program-agnostic (the operator supplies it). `vc_pin` also drives the
         // producer's seg-steps + canonical profile under the real-STARK gate.
         let vc_pin = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
-            .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)")
+            .expect("load voucher-check catalog (regenerate with `vosx zk pin`)")
             .require("voucher-check")
             .expect("catalog pins voucher-check")
             .clone();
@@ -10851,7 +10851,7 @@ fn voucher_check_chain_anchor_path() {
     // the hardcoded constants — this is the federation flow reading its allowlist
     // source. `voucher_check_catalog_matches_pinned_constants` guards their parity.
     let catalog = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
-        .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)");
+        .expect("load voucher-check catalog (regenerate with `vosx zk pin`)");
     let pin = catalog
         .require("voucher-check")
         .expect("catalog pins voucher-check")
@@ -10938,7 +10938,7 @@ fn voucher_check_catalog_path() -> std::path::PathBuf {
 #[test]
 fn voucher_check_catalog_matches_pinned_constants() {
     let catalog = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
-        .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)");
+        .expect("load voucher-check catalog (regenerate with `vosx zk pin`)");
     let pin = catalog
         .require("voucher-check")
         .expect("catalog pins voucher-check");

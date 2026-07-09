@@ -7869,7 +7869,6 @@ dependencies = [
  "vos",
  "vos-shell",
  "vrf",
- "zkpvm",
 ]
 
 [[package]]
