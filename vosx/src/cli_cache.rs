@@ -114,6 +114,11 @@ pub struct MethodMeta {
     pub exposed_to_cli: bool,
     #[serde(default)]
     pub fields: Vec<MethodField>,
+    /// One-line handler description (from `.vos_meta`), so `vosx --help`
+    /// can show it without dialling the daemon. Additive: old caches
+    /// (no `doc` key) load empty.
+    #[serde(default)]
+    pub doc: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -181,6 +186,7 @@ pub fn update_target(space: &str, target: &str, meta: &ParsedMeta) {
                 name: m.name.clone(),
                 is_query: m.is_query,
                 exposed_to_cli: m.exposed_to_cli,
+                doc: m.doc.clone(),
                 fields: m
                     .fields
                     .iter()
@@ -316,6 +322,8 @@ mod tests {
                     fields: vec![],
                     exposed_to_cli: true,
                     returns: String::new(),
+                    doc: "Stop the gateway.".into(),
+                    timeout_ms: 0,
                 },
                 ParsedMessage {
                     name: "status".into(),
@@ -323,6 +331,8 @@ mod tests {
                     fields: vec![],
                     exposed_to_cli: true,
                     returns: String::new(),
+                    doc: String::new(),
+                    timeout_ms: 0,
                 },
                 ParsedMessage {
                     name: "internal".into(),
@@ -333,11 +343,14 @@ mod tests {
                     }],
                     exposed_to_cli: false,
                     returns: String::new(),
+                    doc: String::new(),
+                    timeout_ms: 0,
                 },
             ],
             constructor: vec![],
             kind: 1,
             caps: vec![],
+            doc: String::new(),
         }
     }
 
@@ -369,6 +382,7 @@ mod tests {
                     is_query: false,
                     exposed_to_cli: true,
                     fields: vec![],
+                    doc: String::new(),
                 }],
             },
         );
@@ -401,6 +415,7 @@ mod tests {
                 name: m.name.clone(),
                 is_query: m.is_query,
                 exposed_to_cli: m.exposed_to_cli,
+                doc: m.doc.clone(),
                 fields: m
                     .fields
                     .iter()
@@ -429,6 +444,8 @@ mod tests {
         let internal = t.methods.iter().find(|m| m.name == "internal").unwrap();
         assert!(stop.exposed_to_cli);
         assert!(!internal.exposed_to_cli);
+        // The metadata-v2 doc round-trips through the TOML cache.
+        assert_eq!(stop.doc, "Stop the gateway.");
         let _ = std::fs::remove_file(&p);
     }
 

@@ -30,13 +30,22 @@
 //! [returns_count:u16 LE]        (one entry per message, in order)
 //!   [ty_len:u16 LE][ty_bytes...]
 //!   ...
+//! [doc_count:u16 LE]            (one entry per message, in order)
+//!   [doc_len:u16 LE][doc_bytes...]
+//!   ...
+//! [actor_doc_len:u16 LE][actor_doc_bytes...]
+//! [timeout_count:u16 LE]        (one entry per message, in order)
+//!   [timeout_ms:u32 LE]
+//!   ...
 //! ```
 //!
 //! Each trailing section is append-only: older decoders that don't
-//! know about `kind` / `caps` / `cli_methods` / `returns` stop reading
-//! at the previous section and the corresponding `ParsedMeta` field
-//! defaults to empty/false. This is how the format has evolved
-//! without breaking older actor binaries.
+//! know about `kind` / `caps` / `cli_methods` / `returns` / the metadata-v2
+//! doc + timeout sections stop reading at the previous section and the
+//! corresponding `ParsedMeta` field defaults to empty/false/0. This is how
+//! the format has evolved without breaking older actor binaries. New
+//! sections MUST be appended at the end, never inserted — decoding is
+//! strictly positional.
 
 /// Field descriptor — name and type as strings.
 pub struct FieldMeta {
@@ -64,6 +73,15 @@ pub struct MessageMeta {
     /// in a trailing `.vos_meta` section (see [`encode`]), so blobs
     /// that predate it decode to an empty string.
     pub returns: &'static str,
+    /// One-line handler description — the first paragraph of the
+    /// handler's `///` doc, captured by the `#[msg]` macro. Empty when
+    /// undocumented. Trailing `.vos_meta` section; old blobs decode empty.
+    pub doc: &'static str,
+    /// Per-handler invoke timeout in milliseconds; `0` = the client's
+    /// default. Set with `#[msg(timeout_ms = N)]` for handlers that
+    /// legitimately run past the default (a minutes-long prove/measure).
+    /// Trailing section; old blobs decode `0`.
+    pub timeout_ms: u32,
 }
 
 /// Actor descriptor — actor name, messages, and constructor params.
@@ -91,6 +109,10 @@ pub struct ActorMeta {
     /// emitted by the actor macro; the registry serves the same
     /// blob so `vosx` can extend clap from cached schemas.
     pub cli_methods: &'static [&'static str],
+    /// One-line actor description — the first paragraph of the actor
+    /// struct's `///` doc, threaded through `Actor::DOC` by the macro.
+    /// Empty when undocumented. Trailing section; old blobs decode empty.
+    pub doc: &'static str,
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -295,6 +317,60 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         r += 1;
     }
 
+    // Per-message doc strings (metadata v2, 2026-07). One entry per message
+    // in order, index-crossref like `returns`. Blobs produced before this
+    // section stop after `returns` and every `ParsedMessage.doc` is empty.
+    let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut d = 0;
+    while d < meta.messages.len() {
+        let doc_bytes = meta.messages[d].doc.as_bytes();
+        let [lo, hi] = (doc_bytes.len() as u16).to_le_bytes();
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
+        let mut i = 0;
+        while i < doc_bytes.len() {
+            buf[pos + i] = doc_bytes[i];
+            i += 1;
+        }
+        pos += doc_bytes.len();
+        d += 1;
+    }
+
+    // Actor-level doc string (metadata v2). A single length-prefixed
+    // string. Absent → `ParsedMeta.doc` empty.
+    let actor_doc = meta.doc.as_bytes();
+    let [lo, hi] = (actor_doc.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut i = 0;
+    while i < actor_doc.len() {
+        buf[pos + i] = actor_doc[i];
+        i += 1;
+    }
+    pos += actor_doc.len();
+
+    // Per-message invoke timeouts (metadata v2), u32 LE each, one per
+    // message in order. Absent → every `ParsedMessage.timeout_ms` is 0.
+    let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut t = 0;
+    while t < meta.messages.len() {
+        let [b0, b1, b2, b3] = meta.messages[t].timeout_ms.to_le_bytes();
+        buf[pos] = b0;
+        buf[pos + 1] = b1;
+        buf[pos + 2] = b2;
+        buf[pos + 3] = b3;
+        pos += 4;
+        t += 1;
+    }
+
     (buf, pos)
 }
 
@@ -316,6 +392,8 @@ mod tests {
                     is_query: false,
                     fields: &[],
                     returns: "()",
+                    doc: "",
+                    timeout_ms: 0,
                 },
                 MessageMeta {
                     name: "status",
@@ -325,6 +403,8 @@ mod tests {
                         ty: "bool",
                     }],
                     returns: "[u8;32]",
+                    doc: "",
+                    timeout_ms: 0,
                 },
             ],
             constructor: &[FieldMeta {
@@ -334,6 +414,7 @@ mod tests {
             kind: 0,
             caps: &[],
             cli_methods: &[],
+            doc: "",
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -366,6 +447,7 @@ mod tests {
             kind: 1, // Service
             caps: &[],
             cli_methods: &[],
+            doc: "",
         };
         let (buf, len) = encode::<128>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -399,6 +481,7 @@ mod tests {
             kind: 1,
             caps: &["net.tcp.bind", "net.tcp.connect", "tokio-runtime"],
             cli_methods: &[],
+            doc: "",
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -441,24 +524,31 @@ mod tests {
                     is_query: false,
                     fields: &[],
                     returns: "()",
+                    doc: "",
+                    timeout_ms: 0,
                 },
                 MessageMeta {
                     name: "status",
                     is_query: true,
                     fields: &[],
                     returns: "String",
+                    doc: "",
+                    timeout_ms: 0,
                 },
                 MessageMeta {
                     name: "internal_only",
                     is_query: false,
                     fields: &[],
                     returns: "()",
+                    doc: "",
+                    timeout_ms: 0,
                 },
             ],
             constructor: &[],
             kind: 1,
             caps: &[],
             cli_methods: &["stop", "status"],
+            doc: "",
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -539,6 +629,76 @@ mod tests {
         assert!(stop.fields.is_empty());
         assert!(status.fields.is_empty());
     }
+
+    #[test]
+    fn docs_and_timeout_roundtrip() {
+        // Metadata v2: per-message docs, actor doc, and per-message
+        // timeout_ms survive a full encode→decode round-trip.
+        const META: ActorMeta = ActorMeta {
+            actor_name: "Prover",
+            messages: &[
+                MessageMeta {
+                    name: "prove",
+                    is_query: false,
+                    fields: &[],
+                    returns: "u64",
+                    doc: "Enqueue a prove job.",
+                    timeout_ms: 600_000,
+                },
+                MessageMeta {
+                    name: "status",
+                    is_query: true,
+                    fields: &[],
+                    returns: "u8",
+                    doc: "",
+                    timeout_ms: 0,
+                },
+            ],
+            constructor: &[],
+            kind: 0,
+            caps: &[],
+            cli_methods: &["prove"],
+            doc: "A pure-PVM prover/verifier.",
+        };
+        let (buf, len) = encode::<512>(&META);
+        let parsed = decode(&buf[..len]).expect("decode");
+        assert_eq!(parsed.doc, "A pure-PVM prover/verifier.");
+        assert_eq!(parsed.messages[0].doc, "Enqueue a prove job.");
+        assert_eq!(parsed.messages[0].timeout_ms, 600_000);
+        assert_eq!(parsed.messages[1].doc, "");
+        assert_eq!(parsed.messages[1].timeout_ms, 0);
+        // Earlier sections still decode alongside the new ones.
+        assert_eq!(parsed.messages[0].returns, "u64");
+        assert!(parsed.messages[0].exposed_to_cli);
+    }
+
+    #[test]
+    fn metadata_v2_sections_absent_default_empty_and_zero() {
+        // A blob that stops after the `returns` section (pre-metadata-v2)
+        // must still decode, with docs empty and timeouts 0. Layout:
+        // name "W", 1 msg "run" (!query, 0 fields), 0 ctor, kind 0,
+        // 0 caps, 0 cli, then a returns section [count=1]["u64"].
+        let blob: &[u8] = &[
+            1, 0, b'W', // actor name "W"
+            1, 0, // msg_count = 1
+            3, 0, b'r', b'u', b'n', // msg name "run"
+            0,    // is_query = false
+            0, 0, // field_count = 0
+            0, 0, // ctor_count = 0
+            0, // kind = Actor
+            0, 0, // caps_count = 0
+            0, 0, // cli_methods_count = 0
+            1, 0, // returns_count = 1
+            3, 0, b'u', b'6', b'4', // returns[0] = "u64"
+                  // no doc / actor-doc / timeout sections
+        ];
+        let parsed = decode(blob).expect("decode");
+        assert_eq!(parsed.doc, "");
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].returns, "u64");
+        assert_eq!(parsed.messages[0].doc, "");
+        assert_eq!(parsed.messages[0].timeout_ms, 0);
+    }
 }
 
 /// Parsed metadata + the `decode` / `from_elf` / `raw_section_from_elf`
@@ -574,6 +734,12 @@ mod decode {
         /// Empty when the blob predates the `returns` section. The CLI
         /// and gateway use it to label an otherwise-opaque reply.
         pub returns: String,
+        /// One-line handler description (metadata v2). Empty when the
+        /// blob predates the doc section or the handler is undocumented.
+        pub doc: String,
+        /// Per-handler invoke timeout in milliseconds (metadata v2);
+        /// `0` = the client's default. Empty/old blobs decode `0`.
+        pub timeout_ms: u32,
     }
 
     /// Parsed actor metadata from binary metadata.
@@ -589,6 +755,9 @@ mod decode {
         /// Declared capability tokens (Phase 6). Empty when the
         /// blob predates the field.
         pub caps: Vec<String>,
+        /// One-line actor description (metadata v2). Empty when the
+        /// blob predates the doc section or the actor is undocumented.
+        pub doc: String,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -623,6 +792,9 @@ mod decode {
                 exposed_to_cli: false,
                 // Filled in from the trailing `returns` section.
                 returns: String::new(),
+                // Filled in from the metadata-v2 doc / timeout sections.
+                doc: String::new(),
+                timeout_ms: 0,
             });
         }
 
@@ -700,12 +872,51 @@ mod decode {
             }
         }
 
+        // Per-message doc strings (metadata v2). Index-crossref like
+        // `returns`. Absent → every `doc` empty.
+        if pos < data.len()
+            && let Some(doc_count) = read_u16(data, &mut pos)
+        {
+            for i in 0..doc_count as usize {
+                let Some(doc) = read_str(data, &mut pos) else {
+                    break;
+                };
+                if let Some(msg) = messages.get_mut(i) {
+                    msg.doc = doc;
+                }
+            }
+        }
+
+        // Actor-level doc string (metadata v2). A single string; absent → empty.
+        let mut doc = String::new();
+        if pos < data.len()
+            && let Some(s) = read_str(data, &mut pos)
+        {
+            doc = s;
+        }
+
+        // Per-message invoke timeouts (metadata v2), u32 LE each,
+        // index-crossref. Absent → every `timeout_ms` stays 0.
+        if pos < data.len()
+            && let Some(to_count) = read_u16(data, &mut pos)
+        {
+            for i in 0..to_count as usize {
+                let Some(ms) = read_u32(data, &mut pos) else {
+                    break;
+                };
+                if let Some(msg) = messages.get_mut(i) {
+                    msg.timeout_ms = ms;
+                }
+            }
+        }
+
         Some(ParsedMeta {
             actor_name,
             messages,
             constructor,
             kind,
             caps,
+            doc,
         })
     }
 
@@ -715,6 +926,20 @@ mod decode {
         }
         let val = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
         *pos += 2;
+        Some(val)
+    }
+
+    fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
+        if *pos + 4 > data.len() {
+            return None;
+        }
+        let val = u32::from_le_bytes([
+            data[*pos],
+            data[*pos + 1],
+            data[*pos + 2],
+            data[*pos + 3],
+        ]);
+        *pos += 4;
         Some(val)
     }
 

@@ -748,6 +748,8 @@ mod tests {
                     ],
                     exposed_to_cli: true,
                     returns: "u64".into(),
+                    doc: String::new(),
+                    timeout_ms: 0,
                 },
                 ParsedMessage {
                     name: "reset".into(),
@@ -755,11 +757,14 @@ mod tests {
                     fields: vec![],
                     exposed_to_cli: true,
                     returns: "()".into(),
+                    doc: String::new(),
+                    timeout_ms: 0,
                 },
             ],
             constructor: vec![],
             kind: 0,
             caps: vec![],
+            doc: String::new(),
         };
         let engine = ConsoleEngine::new(Arc::new(Mock { schema })).unwrap();
         App::new(engine).unwrap().with_label("demo")

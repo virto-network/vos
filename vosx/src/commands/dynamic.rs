@@ -157,7 +157,16 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         let msg = build_msg(method, method_meta, &method_args)?;
         let target_id = client.resolve_target(target)?;
         tracing::debug!("invoking {method} on {target_id}");
-        let reply = client.invoke_dyn(target_id, &msg)?;
+        // A handler that declares `#[msg(timeout_ms = N)]` (a slow prove /
+        // measure) gets its own wait; everything else uses the default.
+        let reply = match method_meta.map(|m| m.timeout_ms).filter(|&ms| ms > 0) {
+            Some(ms) => client.invoke_dyn_with_timeout(
+                target_id,
+                &msg,
+                std::time::Duration::from_millis(ms as u64),
+            )?,
+            None => client.invoke_dyn(target_id, &msg)?,
+        };
         let ret_ty = method_meta.map(|m| m.returns.as_str());
         render_reply(reply, ret_ty, parsed.out.as_deref())
     })
@@ -571,6 +580,7 @@ fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Resu
                 serde_json::json!({
                     "name": msg.name,
                     "is_query": msg.is_query,
+                    "doc": msg.doc,
                     "fields": msg.fields.iter().map(|f| serde_json::json!({
                         "name": f.name,
                         "type": f.ty,
@@ -581,13 +591,18 @@ fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Resu
         output::print_json(&serde_json::json!({
             "target": target,
             "actor_name": m.actor_name,
+            "doc": m.doc,
             "methods": methods,
         }));
         return Ok(());
     }
     println!("usage: vosx {target} <method> [key=value ...]");
     println!();
-    println!("actor: {}", m.actor_name);
+    if m.doc.is_empty() {
+        println!("actor: {}", m.actor_name);
+    } else {
+        println!("actor: {} — {}", m.actor_name, m.doc);
+    }
     let exposed: Vec<&ParsedMessage> = m.messages.iter().filter(|x| x.exposed_to_cli).collect();
     if exposed.is_empty() {
         println!();
@@ -598,8 +613,8 @@ fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Resu
     println!("methods:");
     for msg in exposed {
         let q = if msg.is_query { " (query)" } else { "" };
-        if msg.fields.is_empty() {
-            println!("  {}(){q}", msg.name);
+        let sig = if msg.fields.is_empty() {
+            format!("  {}(){q}", msg.name)
         } else {
             let args = msg
                 .fields
@@ -607,7 +622,12 @@ fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Resu
                 .map(|f| format!("{}={}", f.name, f.ty))
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("  {}  {args}{q}", msg.name);
+            format!("  {}  {args}{q}", msg.name)
+        };
+        if msg.doc.is_empty() {
+            println!("{sig}");
+        } else {
+            println!("{sig} — {}", msg.doc);
         }
     }
     Ok(())
@@ -629,6 +649,7 @@ fn print_method_surface(
             "target": target,
             "method": msg.name,
             "is_query": msg.is_query,
+            "doc": msg.doc,
             "fields": msg.fields.iter().map(|f| serde_json::json!({
                 "name": f.name,
                 "type": f.ty,
@@ -650,6 +671,9 @@ fn print_method_surface(
     };
     let q = if msg.is_query { " (query)" } else { "" };
     println!("usage: vosx {target} {method}{args}{q}");
+    if !msg.doc.is_empty() {
+        println!("  {}", msg.doc);
+    }
     Ok(())
 }
 
@@ -726,6 +750,8 @@ mod tests {
             fields: vec![field],
             exposed_to_cli: true,
             returns: "u32".into(),
+            doc: String::new(),
+            timeout_ms: 0,
         };
         let err = build_msg("add", Some(&m), &["a=notanumber"]).unwrap_err();
         assert!(err.to_string().contains("u64"), "{err}");
@@ -741,6 +767,8 @@ mod tests {
             }],
             exposed_to_cli: true,
             returns: "()".into(),
+            doc: String::new(),
+            timeout_ms: 0,
         }
     }
 

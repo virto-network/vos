@@ -35,12 +35,16 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 ty: "String",
             }],
             returns: "String",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "last_text",
             is_query: true,
             fields: &[],
             returns: "String",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "add",
@@ -56,12 +60,16 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 },
             ],
             returns: "u32",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "last_sum",
             is_query: true,
             fields: &[],
             returns: "u32",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "flip",
@@ -71,12 +79,16 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 ty: "bool",
             }],
             returns: "bool",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "flip_count",
             is_query: true,
             fields: &[],
             returns: "u32",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "sum_list",
@@ -86,6 +98,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 ty: "Vec<u32>",
             }],
             returns: "u32",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "concat",
@@ -95,6 +109,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 ty: "Vec<String>",
             }],
             returns: "String",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "range",
@@ -104,6 +120,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 ty: "u32",
             }],
             returns: "Vec<u32>",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "split",
@@ -113,31 +131,38 @@ const KITCHEN_META: ActorMeta = ActorMeta {
                 ty: "String",
             }],
             returns: "Vec<String>",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "ping",
             is_query: true,
             fields: &[],
             returns: "()",
+            doc: "",
+            timeout_ms: 0,
         },
         MessageMeta {
             name: "boom",
             is_query: true,
             fields: &[],
             returns: "u32",
+            doc: "",
+            timeout_ms: 0,
         },
     ],
     constructor: &[],
     kind: 0,
     caps: &[],
     cli_methods: &[],
+    doc: "",
 };
 
 /// Pre-encoded meta blob — same wire bytes the bundled registry's
 /// `.vos_meta` section carries on PVM actors. Generated at const
 /// eval; `LEN` is the actual byte count, `BUF` holds it plus
 /// trailing zeros up to the fixed-size buffer.
-const KITCHEN_META_ENCODED: ([u8; 512], usize) = encode::<512>(&KITCHEN_META);
+const KITCHEN_META_ENCODED: ([u8; 1024], usize) = encode::<1024>(&KITCHEN_META);
 
 #[actor]
 #[derive(Default)]

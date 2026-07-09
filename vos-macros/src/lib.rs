@@ -7,6 +7,62 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_input};
 
+/// First paragraph of a doc comment: the `#[doc = "..."]` text joined
+/// with spaces (each line trimmed), stopping at the first blank line.
+/// Empty string when the item is undocumented. Feeds `ActorMeta.doc`
+/// and per-message `MessageMeta.doc` in the `.vos_meta` blob so
+/// `vosx <target>` help can show one-liners without the actor's Rust
+/// source.
+///
+/// Works for both `///` line comments (one `#[doc]` attr per line) and
+/// block `/** … */` / explicit multi-line `#[doc = "…"]` (one attr with
+/// interior newlines): the blank-line break fires on interior newlines
+/// too, and a leading `*` block-comment decoration is dropped.
+fn first_doc_paragraph(attrs: &[syn::Attribute]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        let syn::Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) = &nv.value
+        else {
+            continue;
+        };
+        let value = s.value();
+        // Split on interior newlines so a block `/** … */` comment or a
+        // multi-line `#[doc = "…"]` breaks at the first blank line exactly
+        // like consecutive `///` lines. `value.lines()` yields nothing for
+        // an empty attr — the blank `///` case — so handle that after.
+        let mut saw_line = false;
+        for raw in value.lines() {
+            saw_line = true;
+            // Trim, then drop a leading `*` block-comment decoration
+            // (` * text` → `text`, a bare ` *` separator → empty).
+            let line = raw.trim();
+            let line = line.strip_prefix('*').unwrap_or(line).trim();
+            if line.is_empty() {
+                if lines.is_empty() {
+                    continue;
+                }
+                return lines.join(" ");
+            }
+            lines.push(line.to_string());
+        }
+        // An empty `///` attr (a blank line between `///` blocks) yields no
+        // lines above; it is itself the paragraph break once we have content.
+        if !saw_line && !lines.is_empty() {
+            return lines.join(" ");
+        }
+    }
+    lines.join(" ")
+}
+
 /// Makes a struct a VOS actor.
 ///
 /// 1. Adds rkyv `Archive`/`Serialize`/`Deserialize` derives
@@ -63,6 +119,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let vis = &input.vis;
     let attrs = &input.attrs;
+    // First paragraph of the struct's `///` doc → `Actor::DOC` → the
+    // actor-level line in `.vos_meta` (shown by `vosx <target>` help).
+    let actor_doc = first_doc_paragraph(&input.attrs);
     let fields = &input.fields;
 
     // Re-emit struct with rkyv derives injected
@@ -137,8 +196,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         #entry
 
         #[cfg(all(target_arch = "riscv64", feature = "bin"))]
-        const __VOS_ACTOR_META_ENCODED: ([u8; 4096], usize) =
-            vos::metadata::encode::<4096>(
+        const __VOS_ACTOR_META_ENCODED: ([u8; 16384], usize) =
+            vos::metadata::encode::<16384>(
                 &<<#name as vos::Actor>::Message>::META,
             );
 
@@ -197,6 +256,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Declared capability tokens. Empty by default; overridden
             // from `#[actor(caps = [...])]`.
             const CAPS: &'static [&'static str] = &[ #( #caps_lits ),* ];
+
+            // One-line actor description from the struct's `///` doc.
+            const DOC: &'static str = #actor_doc;
 
             fn create() -> Self {
                 Self::__vos_create()
@@ -320,12 +382,23 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         //                          a syn::Expr so paths like
         //                          `MyRole::Maintainer` work.
         //
-        // Permissive iteration so future bare idents / keys land
-        // without breaking older actors.
+        // Unknown keys are tolerated (their fallthrough arm returns Ok) so
+        // future attrs land without breaking older actors — but a malformed
+        // value on a KNOWN key (an out-of-range `timeout_ms`, a `role` that
+        // isn't an expression) fails loudly with a compile error rather than
+        // silently defaulting.
         let mut exposed_to_cli = false;
         let mut role_expr: Option<syn::Expr> = None;
-        if let Some(attr) = msg_attr {
-            let _ = attr.parse_nested_meta(|meta| {
+        // `#[msg(timeout_ms = N)]` — per-handler invoke timeout in ms
+        // (0 = client default), recorded in `.vos_meta` so the dispatcher
+        // waits long enough for a legitimately slow handler.
+        let mut timeout_ms: u32 = 0;
+        // Only `#[msg(...)]` with parenthesized args is parsed; bare `#[msg]`
+        // has none (and `parse_nested_meta` would error on the missing parens).
+        if let Some(attr) = msg_attr
+            && matches!(attr.meta, syn::Meta::List(_))
+        {
+            if let Err(e) = attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("cli") {
                     exposed_to_cli = true;
                     return Ok(());
@@ -336,8 +409,16 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     role_expr = Some(expr);
                     return Ok(());
                 }
+                if meta.path.is_ident("timeout_ms") {
+                    let value = meta.value()?;
+                    let lit: syn::LitInt = value.parse()?;
+                    timeout_ms = lit.base10_parse()?;
+                    return Ok(());
+                }
                 Ok(())
-            });
+            }) {
+                return e.to_compile_error().into();
+            }
         }
 
         if !is_msg {
@@ -629,6 +710,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Metadata
         let msg_name_str = method_name.to_string();
+        // First paragraph of the handler's `///` doc → MessageMeta.doc.
+        let method_doc = first_doc_paragraph(&method.attrs);
         let field_metas: Vec<_> = field_names
             .iter()
             .zip(field_types.iter())
@@ -652,6 +735,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 is_query: #query_val,
                 fields: &[ #( #field_metas ),* ],
                 returns: #returns_str,
+                doc: #method_doc,
+                timeout_ms: #timeout_ms,
             }
         });
         if exposed_to_cli {
@@ -860,6 +945,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 // The `vosx <ext> <cmd>` dispatcher filters by this
                 // when extending clap subcommands.
                 cli_methods: &[ #( #cli_method_names ),* ],
+                // Actor-level doc — the struct's `///` first paragraph,
+                // threaded through the Actor trait (defaulted empty).
+                doc: <#actor_ty as vos::Actor>::DOC,
             };
         }
     };
@@ -1021,8 +1109,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(unused_imports)]
         use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 
-        const _VOS_META_ENCODED: ([u8; 4096], usize) =
-            vos::metadata::encode::<4096>(&#enum_name::META);
+        const _VOS_META_ENCODED: ([u8; 16384], usize) =
+            vos::metadata::encode::<16384>(&#enum_name::META);
     };
 
     // PVM entry points (`_start`, `.vos_meta`) are
@@ -1780,4 +1868,53 @@ fn to_pascal_case(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod doc_tests {
+    use super::first_doc_paragraph;
+
+    fn attrs(src: &str) -> Vec<syn::Attribute> {
+        syn::parse_str::<syn::ItemStruct>(src).unwrap().attrs
+    }
+
+    #[test]
+    fn joins_lines_until_first_blank() {
+        let a = attrs("/// First line.\n/// Second line.\n///\n/// A later paragraph.\nstruct X;");
+        assert_eq!(first_doc_paragraph(&a), "First line. Second line.");
+    }
+
+    #[test]
+    fn single_line_doc() {
+        let a = attrs("/// Enqueue a prove job.\nstruct X;");
+        assert_eq!(first_doc_paragraph(&a), "Enqueue a prove job.");
+    }
+
+    #[test]
+    fn empty_when_undocumented() {
+        let a = attrs("struct X;");
+        assert_eq!(first_doc_paragraph(&a), "");
+    }
+
+    #[test]
+    fn ignores_non_doc_attrs() {
+        let a = attrs("/// Doc.\n#[derive(Debug)]\nstruct X;");
+        assert_eq!(first_doc_paragraph(&a), "Doc.");
+    }
+
+    #[test]
+    fn stops_at_interior_blank_line_in_single_attr() {
+        // An explicit multi-line `#[doc]` (or a block comment) is one attr
+        // with interior newlines — the blank line must still break.
+        let a = attrs("#[doc = \" First para.\\n\\n Second para.\"]\nstruct X;");
+        assert_eq!(first_doc_paragraph(&a), "First para.");
+    }
+
+    #[test]
+    fn block_comment_strips_star_and_stops_at_blank() {
+        let a = attrs(
+            "/**\n * First line.\n * still first.\n *\n * Second para.\n */\nstruct X;",
+        );
+        assert_eq!(first_doc_paragraph(&a), "First line. still first.");
+    }
 }

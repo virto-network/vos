@@ -91,6 +91,11 @@ pub trait Actor: Sized + Encode + Decode {
     /// by construction. Override via `#[actor(caps = [...])]`.
     const CAPS: &'static [&'static str] = &[];
 
+    /// One-line actor description, surfaced by `vosx <target>` help.
+    /// The `#[actor]` macro fills it from the first paragraph of the
+    /// struct's `///` doc; empty when undocumented.
+    const DOC: &'static str = "";
+
     /// Create a fresh actor instance with default state.
     /// Any initialization data should arrive as a regular message.
     fn create() -> Self;

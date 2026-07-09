@@ -32,11 +32,14 @@ fn meta(actor: &str, msgs: &[(&str, &[(&str, &str)], bool, bool)]) -> ParsedMeta
                     .collect(),
                 exposed_to_cli: *exposed,
                 returns: String::new(),
+                doc: String::new(),
+                timeout_ms: 0,
             })
             .collect(),
         constructor: vec![],
         kind: 0,
         caps: vec![],
+        doc: String::new(),
     }
 }
 
