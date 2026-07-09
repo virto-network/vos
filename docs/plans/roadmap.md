@@ -27,7 +27,8 @@ bank federation, without regressing it.
   Handlers designate public inputs via `vos::zk::bind_public`.
 - **B1/B3/B8 proving pipeline**: `verify_chain` enforces an entering-image
   anchor and the deployed federation producer ships an anchored manifest
-  (mid-chain-splice gap closed on the money path); `vosx zk pin` catalog is
+  (mid-chain-splice gap closed on the money path); the `vosx zk pin` catalog
+  (measured by the prover extension's `measure_catalog` handler) is
   the allowlist source; an async prove job (enqueue → id → tick worker →
   CAS publish → callback).
 - **Federation (Wave 1)**: clerk-ledger/clerk-bridge + `clerk-settle`
@@ -128,6 +129,11 @@ stands in for the on-chain settlement venue Wave 2 makes real.
 - **The demo** (§2): the in-actor signing handlers (`issue_voucher`,
   issuer accumulation, `sign_claim`, device-secret key) + bloque scripts +
   runbook.
+- **vosx decoupling** → [vosx-decoupling.md](vosx-decoupling.md): retire the
+  hardcoded `ai`/`dev`/`console` commands in favor of the metadata-driven
+  dispatcher (docs + jobs + signing in `.vos_meta`), move system-actor
+  protocol (registry/chronos) into `vos`, end with zero actor/extension
+  crate deps in `vosx`.
 - **B4 verify-side proving**: capture a `ProvableRecord` (anchor,
   `transition_digest`, `app_public`, roots) per provable invocation and a
   `verify_call` that reconstructs `public'` (§4.1) and checks the bound
