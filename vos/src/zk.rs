@@ -347,6 +347,47 @@ pub fn bind_io_bytes(public_bytes: &[u8], return_bytes: &[u8]) {
     __set_pending_io_hash(compute_io_hash(public_bytes, return_bytes));
 }
 
+/// App-level public bytes designated by a provable Task handler, awaiting
+/// the framework's halt composition.
+#[cfg(feature = "pvm")]
+static mut PENDING_PUBLIC: Option<alloc::vec::Vec<u8>> = None;
+
+/// Guest-side (**provable Tasks only**): designate this Task's
+/// application-level PUBLIC inputs.
+///
+/// Unlike [`bind_io`], this does NOT compute a finished io-hash. For a
+/// Task the framework composes the io-hash at halt over
+/// `folded_public(anchor_kind, anchor, transition_digest, app_public)`
+/// and the reply (`work-result-contract.md` §5), so the proof commits to
+/// the state *transition* — the anchored input state plus the exact
+/// applied effects — in addition to whatever bytes are added here.
+/// Default (no call) = empty `app_public`: the transition itself is the
+/// public statement. The finished-hash [`bind_io`] form is ignored for
+/// Task blobs (the framework, not the handler, owns the composition).
+#[cfg(feature = "pvm")]
+pub fn bind_public<P: crate::Encode>(public: &P) {
+    bind_public_bytes(&public.encode());
+}
+
+/// Raw-bytes counterpart to [`bind_public`] — the app-public bytes as an
+/// explicit canonical encoding.
+#[cfg(feature = "pvm")]
+pub fn bind_public_bytes(public_bytes: &[u8]) {
+    let slot = core::ptr::addr_of_mut!(PENDING_PUBLIC);
+    // SAFETY: single-threaded PVM; exclusive access via raw pointer.
+    unsafe { *slot = Some(public_bytes.to_vec()) };
+}
+
+/// Drain the pending app-public bytes. Internal — `run_task_service`
+/// calls this once at halt.
+#[cfg(feature = "pvm")]
+#[doc(hidden)]
+pub fn __take_pending_public() -> Option<alloc::vec::Vec<u8>> {
+    let slot = core::ptr::addr_of_mut!(PENDING_PUBLIC);
+    // SAFETY: single-threaded PVM; exclusive access via raw pointer.
+    unsafe { (*slot).take() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

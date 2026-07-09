@@ -10687,6 +10687,35 @@ fn task_invoke_live_equals_traced() {
     let mut traced_payload =
         RefinePayload::decode(raw).expect("traced halt output is a v3 work-result");
     assert_eq!(traced_payload.anchor_kind, ANCHOR_GENESIS);
+
+    // The Task's bound io-hash (φ[9..12], the value the proof carries as
+    // public_io_hash) must commit to the state TRANSITION, not the empty
+    // placeholder. Reconstruct public' = folded_public(anchor_kind, anchor,
+    // transition_digest, app_public) exactly as a verifier would — tally
+    // designates no app_public, so it is empty — and assert the guest bound
+    // H(public', reply). Computed BEFORE take_state_write, which would strip
+    // the state write out of the digested effects.
+    let mut bound_io = [0u8; 32];
+    for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
+        bound_io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    let public_prime = vos::refine_payload::folded_public(
+        traced_payload.anchor_kind,
+        &traced_payload.anchor,
+        &traced_payload.transition_digest(),
+        &[],
+    );
+    let expected_io = vos::zk::compute_io_hash(&public_prime, &traced_payload.reply);
+    assert_eq!(
+        bound_io, expected_io,
+        "a Task's bound io-hash must commit to its state transition (folded_public §5)"
+    );
+    assert_ne!(
+        bound_io,
+        vos::zk::compute_io_hash(&[], &[]),
+        "the transition binding must not be the empty placeholder"
+    );
+
     let traced_state = traced_payload
         .take_state_write()
         .expect("add(5) emits a state write");

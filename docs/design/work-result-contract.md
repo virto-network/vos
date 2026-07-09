@@ -214,12 +214,22 @@ transition_digest = blake2b-256(
 
   Fixed-width prefix ⇒ injective. Verifiers reconstruct `public'`
   identically before the io-hash equality check.
-- **The framework composes the io-hash at halt** — not the handler. The
-  current `bind_io` stashes a *finished* hash during handler execution, but
-  the digest only exists at pack time; A7/B2 therefore change the stash to
-  carry the handler's raw `app_public_bytes`, and the halt path computes
-  `io_hash(public', return)` itself. Handler-supplied finished hashes are
-  disallowed for provable Tasks.
+- **The framework composes the io-hash at halt** — not the handler
+  (**landed, producer side**). A provable Task handler contributes only its
+  raw `app_public_bytes` via `vos::zk::bind_public`; `run_task_service`
+  composes `io_hash(folded_public(anchor_kind, anchor, transition_digest,
+  app_public), reply)` at halt from the payload's own fields. The
+  finished-hash `bind_io` form is *not* honored for Task blobs (drained so
+  it can't leak). A Task with no `bind_public` call binds the transition
+  with empty `app_public` — the transition itself is the public statement.
+  The verify side — a consumer reconstructing `public'` from a recorded
+  `(anchor_kind, anchor, transition_digest, app_public)` and checking the
+  bound io-hash — lands with the `ProvableRecord` capture (B4). **B4 trap:**
+  the guest digests the effects list *including* the final
+  `Write{STATE_KEY}`, but the §4b child-invoke consumer strips that write
+  (`take_state_write`) before absorbing. A `ProvableRecord` must therefore
+  retain the state write (or re-derive it) so the reconstructed
+  `transition_digest` matches the guest's — digest the pre-strip payload.
 - **`return` = the payload's exact reply bytes, normatively.** Today the
   return half is handler-discretionary with an empty/empty fallback
   (`run.rs:565-566`) — mere convention. For provable Tasks the generated
