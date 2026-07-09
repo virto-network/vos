@@ -1,0 +1,44 @@
+version = 1
+
+[[program]]
+name = "voucher-check"
+commitments = [
+    "6d1eeb24edaeef9ba6aa16e55b32c49c3d46702c0bee6b35ab3d643f8296584f",
+    "5c899bde74c0a9c575687bb9233850cd594ff654362f10ba579c35a970c3e2ce",
+]
+canonical_profile = [
+    0,
+    14,
+    18,
+    0,
+    11,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    4,
+    7,
+    0,
+    11,
+    6,
+    5,
+    6,
+    5,
+]
+seg_steps = 100000
+witness_addr = 546672
+unpatched_image_root = "143f59d1f2207618414012370d29afbaf813c947423973769f0160607e34f176"

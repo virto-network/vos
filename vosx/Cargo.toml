@@ -23,8 +23,18 @@ include = [
     "blobs/dev_project.elf",
 ]
 
+[features]
+# `vosx zk pin` — the provable-program catalog pinning tool. Off by default:
+# it pulls the full zkpvm prover (stwo), which roughly doubles vosx's build.
+# Enable for publish-time pinning: `cargo build -p vosx --features zk-pin`.
+zk-pin = ["dep:zkpvm"]
+
 [dependencies]
 vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage", "network"] }
+# zkpvm canonical prover + tracer + page-Merkle (behind `zk-pin`): `vosx zk pin`
+# transpiles a provable ELF, traces a representative run, and measures the
+# commitment allowlist + entering-image root for the catalog artifact.
+zkpvm = { workspace = true, optional = true }
 # Direct dep for ELF → PVM blob conversion. vos uses it
 # transitively but doesn't re-export, so vosx pulls its own.
 # `version` is what crates.io resolves at publish time.

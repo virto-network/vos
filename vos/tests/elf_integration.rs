@@ -6525,6 +6525,15 @@ fn voucher_check_chain_accept_path() {
         eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
         return;
     }
+    // Proving params + allowlist come from the CATALOG (the allowlist source),
+    // not the VOUCHER_CHECK_* constants — those are now guard-only (the
+    // drift-guard + coverage + parity tests validate them; live paths read the
+    // catalog). `voucher_check_catalog_matches_pinned_constants` guards parity.
+    let vc_pin = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
+        .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)")
+        .require("voucher-check")
+        .expect("catalog pins voucher-check")
+        .clone();
     let (blob, addr) = voucher_check_pvm();
     let registrar = cipher_clerk::crypto::Keypair::generate();
     let (public, witness, _value, _blinding) = build_conservation_transition(&registrar);
@@ -6534,19 +6543,19 @@ fn voucher_check_chain_accept_path() {
         &blob,
         &witness_buf,
         addr,
-        CHAIN_SEG_STEPS,
-        &VOUCHER_CHECK_CANONICAL_PROFILE,
+        vc_pin.seg_steps as usize,
+        &vc_pin.canonical_profile,
     )
     .expect("prove_chain_segments over the conservation transition");
     eprintln!("proved {} canonical segments", segments.len());
 
-    let allowlist: Vec<u8> = VOUCHER_CHECK_COMMITMENTS.iter().flatten().copied().collect();
+    let allowlist: Vec<u8> = vc_pin.allowlist_concat().expect("catalog allowlist decodes");
     let io_public = cipher_clerk::voucher::proof::public_bytes(&public);
 
-    // Honest chain: verifies against the pinned allowlist + the io-binding.
+    // Honest chain: verifies against the catalog allowlist + the io-binding.
     assert!(
         prover_extension::verify_chain_segments(&allowlist, &segments, &io_public, &[1u8]),
-        "an honest canonical chain must verify against the pinned allowlist + io-binding"
+        "an honest canonical chain must verify against the catalog allowlist + io-binding"
     );
     // Forged io: a different `root_after` → different `public_bytes` → the
     // final segment's STARK-bound io-hash does not match → reject.
@@ -8496,12 +8505,22 @@ fn clerk_ledger_two_bank_federation() {
         // immutable invocations with mutable registrations.
         let prover_id = node_b.register_extension(ExtensionConfig::new(prover_so));
 
-        // The trusted commitment allowlist is voucher-check provenance —
-        // the concatenation of the accepted 32-byte canonical commitments
-        // (see VOUCHER_CHECK_COMMITMENTS). It is the sole cross-program
-        // anchor the bridge hands `verify_chain`. The general prover is
-        // program-agnostic (it resolves no programs); the operator supplies it.
-        let allowlist_bytes: Vec<u8> = VOUCHER_CHECK_COMMITMENTS.iter().flatten().copied().collect();
+        // The trusted commitment allowlist is voucher-check provenance, read
+        // from the `vosx zk pin` CATALOG — the allowlist source verifiers consume
+        // — rather than the hardcoded VOUCHER_CHECK_COMMITMENTS. Those constants
+        // are now the drift-guarded pin the catalog is generated from and checked
+        // against (`voucher_check_catalog_matches_pinned_constants`); this money
+        // path reads the catalog live. The allowlist is the sole cross-program
+        // anchor the bridge hands `verify_chain`; the general prover is
+        // program-agnostic (the operator supplies it). `vc_pin` also drives the
+        // producer's seg-steps + canonical profile under the real-STARK gate.
+        let vc_pin = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
+            .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)")
+            .require("voucher-check")
+            .expect("catalog pins voucher-check")
+            .clone();
+        let allowlist_bytes: Vec<u8> =
+            vc_pin.allowlist_concat().expect("catalog allowlist decodes");
 
         // Wire bank B's bridge to the prover + trusted allowlist.
         // `set_prover` is legal post-bootstrap (idempotent in identical
@@ -8576,12 +8595,14 @@ fn clerk_ledger_two_bank_federation() {
             let (vc_blob, vc_witness_addr) = voucher_check_pvm();
             // Offline: prove the canonical segment chain (minutes), as
             // per-segment proof bytes.
+            // Producer reads seg-steps + canonical profile from the catalog too,
+            // so the whole federation path is catalog-driven (not the constants).
             let segments = prover_extension::prove_chain_segments(
                 &vc_blob,
                 &witness_buf,
                 vc_witness_addr,
-                CHAIN_SEG_STEPS,
-                &VOUCHER_CHECK_CANONICAL_PROFILE,
+                vc_pin.seg_steps as usize,
+                &vc_pin.canonical_profile,
             )
             .expect(
                 "prove_chain_segments over the conservation transition \
@@ -8597,11 +8618,19 @@ fn clerk_ledger_two_bank_federation() {
             // of MiB) could not cross one frame; the per-segment manifest is the
             // delivery fix. The voucher's `proof.bytes` carries the single 32-byte
             // hash of the manifest blob (unchanged wire shape — one hash).
+            // Ship an ANCHORED manifest: bind segment 0 to its entering-image
+            // root so bank B's verify_chain enforces the entering-image anchor on
+            // the real money path (a chain spliced onto a doctored initial image
+            // is rejected). The root is segment 0's proved initial_state.
+            // memory_root, read via the prover's helper.
+            let entering_root = prover_extension::segment_initial_root(&segments)
+                .expect("proved chain has an entering-image root");
             let seg_hashes: Vec<[u8; 32]> = segments
                 .into_iter()
                 .map(|s| node_a.put_proof_blob(s))
                 .collect();
-            let manifest_bytes = prover_extension::encode_chain_manifest(&seg_hashes);
+            let manifest_bytes =
+                prover_extension::encode_chain_manifest_anchored(entering_root, &seg_hashes);
             let manifest_hash = node_a.put_proof_blob(manifest_bytes);
             let envelope_happy = EncryptedEnvelope::seal(value, &blinding, &bank_b_ivk_pk)
                 .expect("seal envelope (happy)");
@@ -10793,4 +10822,149 @@ fn task_suspension_resumes_through_task_record() {
         Value::U64(6),
         "work accumulates 1+2+3 across three resumed invocations"
     );
+}
+
+/// Entering-image ANCHOR accept/reject over the REAL voucher-check
+/// conservation chain, DRIVEN OFF THE CATALOG. The sibling
+/// `voucher_check_chain_accept_path` proves the chain against the hardcoded
+/// `VOUCHER_CHECK_*` constants and drops the entering-image anchor. Here we (a)
+/// read the canonical profile / seg-steps / commitment allowlist from the `vosx
+/// zk pin` catalog artifact instead of the constants — the migration onto the
+/// catalog as the allowlist source — and (b) additionally bind segment 0 to its
+/// declared entering-image root via `verify_chain_segments_anchored`:
+///   - the honest chain verifies against its CORRECT entering root (segment 0's
+///     `initial_state.memory_root`, the value an anchored manifest carries);
+///   - a WRONG entering root REJECTS — the doctored-initial-image splice B1
+///     closes on the deployed streaming path.
+/// Heavy (canonical chain prove, minutes); `#[ignore]`. Run:
+///   RUST_MIN_STACK=268435456 cargo test -p vos --release --test \
+///     elf_integration voucher_check_chain_anchor_path -- --ignored --nocapture
+#[test]
+#[ignore]
+fn voucher_check_chain_anchor_path() {
+    use vos::Encode;
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    // Proving parameters come from the CATALOG (the `vosx zk pin` artifact), not
+    // the hardcoded constants — this is the federation flow reading its allowlist
+    // source. `voucher_check_catalog_matches_pinned_constants` guards their parity.
+    let catalog = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
+        .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)");
+    let pin = catalog
+        .require("voucher-check")
+        .expect("catalog pins voucher-check")
+        .clone();
+    let seg_steps = pin.seg_steps as usize;
+    let allowlist = pin.allowlist_concat().expect("catalog allowlist decodes");
+
+    let (blob, addr) = voucher_check_pvm();
+    let registrar = cipher_clerk::crypto::Keypair::generate();
+    let (public, witness, _value, _blinding) = build_conservation_transition(&registrar);
+    let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
+
+    let segments = prover_extension::prove_chain_segments(
+        &blob,
+        &witness_buf,
+        addr,
+        seg_steps,
+        &pin.canonical_profile,
+    )
+    .expect("prove_chain_segments over the conservation transition");
+    eprintln!("proved {} canonical segments", segments.len());
+
+    let io_public = cipher_clerk::voucher::proof::public_bytes(&public);
+
+    // The entering-image root the honest chain starts from — `page_merkle::
+    // image_root` over the entering image equals segment 0's proved
+    // `initial_state.memory_root` by construction (the value an anchored manifest
+    // carries), so an anchored-manifest producer computes it exactly this way.
+    let entering_root = zkpvm::page_merkle::image_root(
+        &zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
+            .expect("trace the entering image")
+            .initial_memory,
+    );
+
+    // Honest chain + CORRECT entering root: verifies (allowlist + continuity +
+    // entering anchor + io-binding all hold).
+    assert!(
+        prover_extension::verify_chain_segments_anchored(
+            &allowlist,
+            &segments,
+            Some(entering_root),
+            &io_public,
+            &[1u8],
+        ),
+        "an honest chain must verify against its correct entering-image root"
+    );
+    // WRONG entering root: rejected — segment 0 no longer starts from the
+    // declared image, even though the allowlist + io-binding still hold.
+    let mut wrong_root = entering_root;
+    wrong_root[0] ^= 0xFF;
+    assert!(
+        !prover_extension::verify_chain_segments_anchored(
+            &allowlist,
+            &segments,
+            Some(wrong_root),
+            &io_public,
+            &[1u8],
+        ),
+        "a wrong entering-image root must reject the chain"
+    );
+    eprintln!("chain anchor-path GREEN: correct entering root verifies, wrong root rejects");
+}
+
+/// Path to the checked-in provable-program catalog — the `vosx zk pin` artifact
+/// verifiers read as the allowlist source. Honors `VOUCHER_CHECK_CATALOG`, else
+/// the build-relative path next to the voucher-check program.
+fn voucher_check_catalog_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("VOUCHER_CHECK_CATALOG") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from(format!(
+        "{}/../examples/actors/voucher-check/catalog.toml",
+        env!("CARGO_MANIFEST_DIR"),
+    ))
+}
+
+/// Migration guard: the checked-in catalog (the `vosx zk pin` artifact the
+/// federation flow reads as the allowlist source) must agree with the
+/// drift-guarded pinned constants. Cheap — no ELF, no proving — so it runs in CI
+/// and keeps the catalog and the legacy `VOUCHER_CHECK_*` constants in lockstep
+/// while the flow migrates onto the catalog (see the catalog-driven
+/// `voucher_check_chain_anchor_path`). If the constants are re-pinned, regenerate
+/// the catalog with `vosx zk pin` (or this fails loudly).
+#[test]
+fn voucher_check_catalog_matches_pinned_constants() {
+    let catalog = vos::zk::ProvableCatalog::load(voucher_check_catalog_path())
+        .expect("load voucher-check catalog (run `vosx zk pin` to regenerate)");
+    let pin = catalog
+        .require("voucher-check")
+        .expect("catalog pins voucher-check");
+    assert_eq!(
+        pin.commitments_bytes().expect("decode catalog commitments"),
+        VOUCHER_CHECK_COMMITMENTS.to_vec(),
+        "catalog allowlist drifted from VOUCHER_CHECK_COMMITMENTS — re-run `vosx zk pin`"
+    );
+    assert_eq!(
+        pin.canonical_profile,
+        VOUCHER_CHECK_CANONICAL_PROFILE.to_vec(),
+        "catalog profile drifted from VOUCHER_CHECK_CANONICAL_PROFILE"
+    );
+    assert_eq!(
+        pin.seg_steps,
+        CHAIN_SEG_STEPS as u64,
+        "catalog seg_steps drifted from CHAIN_SEG_STEPS"
+    );
+    // The pinned witness address must match the live ELF symbol — cheap (symbol
+    // table read only), so gate it on the ELF being built.
+    if voucher_check_elf_path().exists() {
+        let elf = std::fs::read(voucher_check_elf_path()).expect("read voucher-check ELF");
+        assert_eq!(
+            pin.witness_addr,
+            vos::zk::witness_addr(&elf).expect("voucher-check ELF exports __VOS_WITNESS"),
+            "catalog witness_addr drifted from the live ELF symbol"
+        );
+    }
 }

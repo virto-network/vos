@@ -20,3 +20,5 @@ pub mod dev;
 pub mod dynamic;
 pub mod run;
 pub mod space;
+#[cfg(feature = "zk-pin")]
+pub mod zk;

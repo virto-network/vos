@@ -43,3 +43,9 @@ vos = { path = "../../vos", default-features = false, features = ["extension"] }
 zkpvm = { workspace = true }
 zkpvm-verifier = { workspace = true }
 bincode = "1"
+
+[dev-dependencies]
+# Hand-built tiny PVM program for the entering-image anchor test: prove one
+# real MOBILE segment cheaply (no voucher-check ELF, no heavy chain) and drive
+# the per-segment anchor check directly.
+javm = { workspace = true }

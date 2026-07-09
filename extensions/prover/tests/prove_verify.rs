@@ -8,7 +8,8 @@
 //! paths that short-circuit before any STARK work.
 
 use prover_extension::{
-    decode_chain_manifest, encode_chain_manifest, verify_chain_segments, verify_proof_bytes,
+    decode_chain_manifest, encode_chain_manifest, encode_chain_manifest_anchored,
+    verify_chain_segments, verify_chain_segments_anchored, verify_proof_bytes,
 };
 
 /// `verify` guards: malformed inputs reject without panicking — in
@@ -26,20 +27,35 @@ fn verify_malformed_inputs_reject() {
     );
 }
 
-/// Manifest codec round-trips an ordered hash list (order-preserving), and
-/// a garbled blob decodes to `None` (not a panic, not a partial list).
+/// Manifest codec round-trips an ordered hash list (order-preserving) plus the
+/// entering-image root, and a garbled blob decodes to `None` (not a panic, not
+/// a partial list). The legacy `encode_chain_manifest` produces the unanchored
+/// (all-zero root) form; `encode_chain_manifest_anchored` carries a real root.
 #[test]
 fn manifest_codec_roundtrips() {
     let hashes: Vec<[u8; 32]> = (0u8..5).map(|i| [i; 32]).collect();
+
+    // Legacy form: segment hashes preserved, entering root = unanchored sentinel.
     let blob = encode_chain_manifest(&hashes);
-    assert_eq!(
-        decode_chain_manifest(&blob).as_deref(),
-        Some(&hashes[..]),
-        "manifest encode→decode must preserve the ordered segment hashes"
-    );
+    let m = decode_chain_manifest(&blob).expect("legacy manifest must decode");
+    assert_eq!(m.segments, hashes, "encode→decode must preserve the segment order");
+    assert_eq!(m.initial_root, [0u8; 32], "legacy encode is unanchored (zero root)");
+
+    // Anchored form: a non-zero entering root rides alongside the segments.
+    let root = [0x11u8; 32];
+    let anchored = encode_chain_manifest_anchored(root, &hashes);
+    let ma = decode_chain_manifest(&anchored).expect("anchored manifest must decode");
+    assert_eq!(ma.segments, hashes, "anchored encode→decode must preserve the segment order");
+    assert_eq!(ma.initial_root, root, "anchored encode→decode must preserve the entering root");
+
+    // Malformed: not a positive multiple of 32 carrying a root + ≥1 segment.
     assert!(
         decode_chain_manifest(&[0xFFu8; 7]).is_none(),
         "a malformed manifest blob must decode to None"
+    );
+    assert!(
+        decode_chain_manifest(&[0xFFu8; 32]).is_none(),
+        "a root-only manifest (no segments) must decode to None"
     );
 }
 
@@ -72,5 +88,22 @@ fn verify_chain_guards_reject() {
     assert!(
         !verify_chain_segments(&allowlist, &[vec![0xABu8; 32]], io, &[1u8]),
         "an undecodable segment blob must reject"
+    );
+
+    // The anchored variant is at least as strict: supplying an entering-image
+    // anchor never turns a rejected chain into an accepted one, and it still
+    // rejects the same pre-STARK guard inputs (no panic).
+    let root = Some([0x22u8; 32]);
+    assert!(
+        !verify_chain_segments_anchored(&[], &[vec![0u8; 4]], root, io, &[1u8]),
+        "empty allowlist must reject even with an anchor"
+    );
+    assert!(
+        !verify_chain_segments_anchored(&allowlist, &[], root, io, &[1u8]),
+        "empty chain must reject even with an anchor"
+    );
+    assert!(
+        !verify_chain_segments_anchored(&allowlist, &[vec![0xABu8; 32]], root, io, &[1u8]),
+        "an undecodable segment blob must reject even with an anchor"
     );
 }

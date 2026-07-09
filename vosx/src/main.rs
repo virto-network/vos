@@ -110,6 +110,15 @@ enum Command {
         #[command(subcommand)]
         command: commands::ai::AiCommand,
     },
+    /// Provable-program pinning: `vosx zk pin` measures a provable actor's
+    /// canonical commitment allowlist + entering-image root + witness address
+    /// and writes them to a catalog artifact verifiers trust. Built only with
+    /// `--features zk-pin` (it pulls the zkpvm prover).
+    #[cfg(feature = "zk-pin")]
+    Zk {
+        #[command(subcommand)]
+        command: commands::zk::ZkCommand,
+    },
     /// Emit the full CLI schema as pretty-printed JSON. Walks
     /// every subcommand + argument from clap's introspection,
     /// so the dump always matches what the binary accepts.
@@ -228,6 +237,12 @@ fn main() {
                 report_error(e);
             }
         }
+        #[cfg(feature = "zk-pin")]
+        Some(Command::Zk { command }) => {
+            if let Err(e) = commands::zk::run(command) {
+                report_error(e);
+            }
+        }
         Some(Command::HelpSchema) => {
             let schema = help_schema::build(&Cli::command());
             match serde_json::to_string_pretty(&schema) {
@@ -313,7 +328,8 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// (one with `/` or `\`, or starting with `.`) is preserved for
 /// the existing one-shot ELF run path.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
-    const BUILTIN_VERBS: &[&str] = &["run", "space", "dev", "ai", "help-schema", "help", "whoami"];
+    const BUILTIN_VERBS: &[&str] =
+        &["run", "space", "dev", "ai", "zk", "help-schema", "help", "whoami"];
     // Skip global flags; only `--format` / `--space` take a
     // value, the rest are boolean-shaped. We do NOT recognise
     // `--space` here (it's a dynamic-only flag) — its presence
