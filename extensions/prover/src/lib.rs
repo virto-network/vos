@@ -3,7 +3,7 @@
 //!
 //! ## What it does
 //!
-//! Four message handlers. The prover is a PURE PVM prover — it never
+//! The prover is a PURE PVM prover — it never
 //! sees a RISC-V ELF, never transpiles, and never looks up a symbol. The
 //! caller delivers the already-transpiled PVM `pvm_blob` plus the
 //! `witness_addr` (the flat-memory offset of the actor's `__VOS_WITNESS`
@@ -48,6 +48,17 @@
 //!   node can verify a many-hundred-segment chain). The chain `manifest` also
 //!   carries the ENTERING-IMAGE root, which segment 0 is anchored to (the memory
 //!   analogue of the allowlist — closes the doctored-initial-image splice).
+//!
+//! - `measure_catalog(pvm_blob, witness_bytes, witness_addr, seg_steps,
+//!   profile, gas) -> Vec<u8>` — the heavy zkpvm measurement behind
+//!   `vosx zk pin`: the entering-image root over the UNPATCHED image and, when
+//!   a representative `witness_bytes` is supplied, the canonical commitment
+//!   allowlist (`image_root(32) ++ commitment(32)…`). Blob-in like the rest —
+//!   the CLI does the ELF transpile + `__VOS_WITNESS` lookup and writes the
+//!   catalog TOML; this handler only proves.
+//!
+//! Plus the async prove-job set (`prove_chain_async` / `tick` / `job_state` /
+//! `job_result` / `job_release`) described below.
 //!
 //! ## Commitment / allowlist provenance
 //!
@@ -441,9 +452,149 @@ impl Prover {
     async fn job_release(&mut self, _ctx: &mut Context<Self>, job_id: u64) -> u8 {
         u8::from(release_job(&mut self.jobs, job_id))
     }
+
+    /// Measure the pinnable CATALOG fields for a provable PVM program — the
+    /// heavy zkpvm work behind `vosx zk pin`. The CLI transpiles the ELF and
+    /// reads `__VOS_WITNESS` itself (this extension stays a pure PVM prover,
+    /// blob-in), then invokes this to measure:
+    ///   * the ENTERING-IMAGE page-Merkle root over the UNPATCHED image
+    ///     (diagnostic — see `ChainManifest::initial_root`), and
+    ///   * when a representative `witness_bytes` is supplied, the canonical
+    ///     COMMITMENT allowlist (prove one segment per distinct canonical shape).
+    ///
+    /// Returns `image_root(32) ++ commitment(32)…`. An empty `witness_bytes` (the
+    /// `--allowlist` re-pin path, where the caller records a known allowlist)
+    /// yields just the 32-byte root. Empty `Vec` on any failure. SYNCHRONOUS +
+    /// heavy (minutes, tens of GB): a publish-time invoke, so the caller drives
+    /// it with an extended timeout; it runs on this extension's own thread, so a
+    /// busy measure doesn't freeze the node's other services.
+    #[msg]
+    async fn measure_catalog(
+        &self,
+        _ctx: &mut Context<Self>,
+        pvm_blob: Vec<u8>,
+        witness_bytes: Vec<u8>,
+        witness_addr: u64,
+        seg_steps: u64,
+        profile: Vec<u32>,
+        gas: u64,
+    ) -> Vec<u8> {
+        measure_catalog(
+            &pvm_blob,
+            &witness_bytes,
+            witness_addr as usize,
+            seg_steps as usize,
+            &profile,
+            gas,
+        )
+        .unwrap_or_default()
+    }
 }
 
 // ── Core logic (Context-free, unit-testable) ─────────────────────────
+
+/// The heavy measurement behind [`Prover::measure_catalog`] — traces + proves,
+/// so it runs on a 512 MiB thread (a canonical prove overflows the default
+/// ~2 MiB, same reason `verify` uses a large stack). Returns
+/// `image_root(32) ++ commitment(32)…` (just the 32-byte root when `witness` is
+/// empty); `None` on any failure.
+pub fn measure_catalog(
+    pvm_blob: &[u8],
+    witness: &[u8],
+    witness_addr: usize,
+    seg_steps: usize,
+    profile: &[u32],
+    gas: u64,
+) -> Option<Vec<u8>> {
+    // Own everything on the heap so the large-stack thread is 'static.
+    let pvm_blob = pvm_blob.to_vec();
+    let witness = witness.to_vec();
+    let profile = profile.to_vec();
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || measure_catalog_inner(&pvm_blob, &witness, witness_addr, seg_steps, &profile, gas))
+        .ok()?
+        .join()
+        .ok()?
+}
+
+fn measure_catalog_inner(
+    pvm_blob: &[u8],
+    witness: &[u8],
+    witness_addr: usize,
+    seg_steps: usize,
+    profile: &[u32],
+    gas: u64,
+) -> Option<Vec<u8>> {
+    // Entering-image root over the UNPATCHED image (witness buffer all-zero):
+    // trace with no patches and page-Merkle its initial memory. DIAGNOSTIC —
+    // NOT the verifier's entering-image pin (a witness-injecting program's live
+    // segment-0 root is the PATCHED root); see `ChainManifest::initial_root`.
+    let unpatched = zkpvm::actor::trace_blob(pvm_blob, gas)?;
+    let image_root = zkpvm::page_merkle::image_root(&unpatched.initial_memory);
+    let mut out = Vec::with_capacity(32);
+    out.extend_from_slice(&image_root);
+    // Measure the commitment allowlist only when a representative witness is
+    // supplied; the `--allowlist` re-pin path passes an empty witness and
+    // records its own already-trusted allowlist.
+    if !witness.is_empty() {
+        for c in measure_commitments(pvm_blob, witness_addr, witness, seg_steps, profile, gas)? {
+            out.extend_from_slice(&c);
+        }
+    }
+    Some(out)
+}
+
+/// Trace the witness-injected run, segment it, and prove one representative
+/// canonical segment per distinct shape (seg 0, the last/short segment, and the
+/// first segment of each distinct fixed-base-scalar-mult "comb" count), yielding
+/// the distinct program commitments — the canonical allowlist. Mirrors the
+/// federation e2e's `voucher_check_allowlist_coverage` probe so the pinned
+/// allowlist is complete without proving all ~N segments. MUST run on a large
+/// stack — reached via [`measure_catalog`]. `None` on any failure.
+fn measure_commitments(
+    blob: &[u8],
+    witness_addr: usize,
+    witness: &[u8],
+    seg_steps: usize,
+    profile: &[u32],
+    gas: u64,
+) -> Option<Vec<[u8; 32]>> {
+    let full = zkpvm::actor::trace_blob_with_patches(blob, gas, &[(witness_addr, witness)])?;
+    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), seg_steps);
+    let n = bounds.len();
+    if n == 0 {
+        return None;
+    }
+    let comb_counts: Vec<usize> = bounds
+        .iter()
+        .map(|&(a, b)| zkpvm::segment::segment_side_note(&full, a, b).ristretto_comb_calls.len())
+        .collect();
+
+    // Probe seg 0, the last (possibly short) segment, and the first segment of
+    // each distinct comb count — one representative per distinct canonical shape.
+    let mut probe = std::collections::BTreeSet::new();
+    probe.insert(0);
+    probe.insert(n - 1);
+    for i in 0..n {
+        if comb_counts[..i].iter().all(|&x| x != comb_counts[i]) {
+            probe.insert(i);
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for i in probe {
+        let (a, b) = bounds[i];
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let proof = prove_canonical(&mut sn, profile).ok()?;
+        let c = zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
+        if seen.insert(c) {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
 
 // ── Async job-queue logic (Context-free, unit-testable) ──────────────
 
@@ -1072,6 +1223,17 @@ mod job_tests {
             segment_initial_root(&[vec![0xABu8; 16]]),
             None,
             "an undecodable segment 0 yields None, not a panic"
+        );
+    }
+
+    #[test]
+    fn measure_catalog_rejects_garbage_blob() {
+        // A non-PVM blob fails fast at trace (no STARK work), so this stays
+        // cheap — the negative path `measure_catalog` returns on a bad blob.
+        assert_eq!(
+            measure_catalog(&[0xDE, 0xAD, 0xBE, 0xEF], &[], 0, 100, &[], 1_000),
+            None,
+            "an unparseable blob yields None, not a panic"
         );
     }
 
