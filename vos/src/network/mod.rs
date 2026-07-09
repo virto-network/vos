@@ -1096,8 +1096,9 @@ async fn network_main(
     let mut hint_senders: HashMap<[u8; 32], std_mpsc::Sender<PeerId>> = HashMap::new();
 
     // Peers we've already logged an outbound-request dial failure for. A
-    // non-listening client (e.g. a connected `vosx space console`) or a peer
-    // that just departed gets re-targeted every sync/mesh tick; without this
+    // non-listening client (a short-lived `vosx` invoke that dials but never
+    // listens) or a peer that just departed gets re-targeted every
+    // sync/mesh tick; without this
     // the "outbound request failed" WARN floods the daemon's log. Warn once
     // per peer, then suppress until the peer reconnects (which clears it).
     let mut warned_dial_failures: HashSet<PeerId> = HashSet::new();

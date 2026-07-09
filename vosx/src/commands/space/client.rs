@@ -284,18 +284,10 @@ impl DaemonClient {
     }
 
     /// Like [`Self::invoke_dyn`] but returns the RAW reply bytes (empty when
-    /// the reply is empty). Callers that need to distinguish the daemon's
-    /// 5-byte forbidden-refusal envelope from a normal reply use
-    /// this — `invoke_dyn` decodes blindly and would mis-handle a refusal.
-    pub fn invoke_dyn_bytes(
-        &self,
-        target: ServiceId,
-        msg: &vos::value::Msg,
-    ) -> anyhow::Result<Vec<u8>> {
-        self.invoke_dyn_bytes_with_timeout(target, msg, invoke_timeout())
-    }
-
-    /// [`Self::invoke_dyn_bytes`] with an explicit per-call timeout.
+    /// the reply is empty), with an explicit per-call timeout. Callers that
+    /// need to distinguish the daemon's 5-byte forbidden-refusal envelope from
+    /// a normal reply use this — [`Self::invoke_dyn`] decodes blindly and would
+    /// mis-handle a refusal.
     pub fn invoke_dyn_bytes_with_timeout(
         &self,
         target: ServiceId,

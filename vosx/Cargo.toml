@@ -40,8 +40,6 @@ chronos = { path = "../actors/chronos", version = "0.1.0", default-features = fa
 # node.key and the leader's feeder enrols pubkeys + posts per-round reveals to
 # the committee. no_std, pure software (host build).
 vrf = { path = "../vrf" }
-# The sandboxed nushell console engine backing `vosx space console`.
-vos-shell = { path = "../vos-shell" }
 # Wire types for the `vosx dev *` subcommands. The dev extension
 # returns `HashResult` from `compile`/`publish`; the CLI decodes
 # back the same type to surface status/hash to operators.

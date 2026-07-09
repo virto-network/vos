@@ -7875,7 +7875,6 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "vos",
- "vos-shell",
  "vrf",
 ]
 

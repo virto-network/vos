@@ -7,10 +7,9 @@
 //! through the daemon's own auth gate.
 //!
 //! The engine is backend-agnostic: it talks to a space only through the
-//! [`SpaceClient`] trait. The local console (`vosx space console`) implements
-//! it over `DaemonClient`; the SSH transport implements it over
-//! `ServiceCtx::ask_raw_as`. Nothing in this crate is libp2p- or
-//! transport-aware.
+//! [`SpaceClient`] trait, so a host wires it to whatever transport it has
+//! (the SSH console implements it over `ServiceCtx::ask_raw_as`). Nothing
+//! in this crate is libp2p- or transport-aware.
 //!
 //! [nushell]: https://www.nushell.sh/
 
