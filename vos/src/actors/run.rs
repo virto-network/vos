@@ -661,13 +661,28 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
         state_changed.then_some(new_state_bytes),
         reply_bytes,
     );
+    // Provable-Task io-binding (work-result-contract.md §5): the framework
+    // — not the handler — composes the io-hash, over the state TRANSITION.
+    //   public' = folded_public(anchor_kind, anchor, transition_digest, app_public)
+    //   io_hash = H(public', reply)
+    // So a Task's proof commits to the anchored input state and the exact
+    // applied effects (via the transition digest), plus any app-level
+    // public bytes the handler designated with `vos::zk::bind_public`, plus
+    // the reply. A verifier reconstructs `public'` identically from the
+    // recorded (anchor, digest, app_public) and checks the bound io-hash.
+    // bind_io's finished-hash form is not honored for Task blobs — drained
+    // so it can't leak — because the handler does not own the composition.
+    let _ = crate::zk::__take_pending_io_hash();
+    let app_public = crate::zk::__take_pending_public().unwrap_or_default();
+    let transition_digest = payload.transition_digest();
+    let public_prime = crate::refine_payload::folded_public(
+        payload.anchor_kind,
+        &payload.anchor,
+        &transition_digest,
+        &app_public,
+    );
+    let io_hash = crate::zk::compute_io_hash(&public_prime, &payload.reply);
     let encoded = payload.encode();
-    // Same halt binding as run_refine_service: a handler that called
-    // vos::zk::bind_io stashed the real (public, return) hash; default
-    // to the empty binding otherwise. The kernel is discarded after one
-    // invocation, so no output-buffer reuse is needed.
-    let io_hash =
-        crate::zk::__take_pending_io_hash().unwrap_or_else(|| crate::zk::compute_io_hash(&[], &[]));
     halt_with_output_bound(&encoded, &io_hash);
 }
 

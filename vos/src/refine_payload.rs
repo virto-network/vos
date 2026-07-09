@@ -349,20 +349,18 @@ impl RefinePayload {
 ///           || app_public_bytes
 /// ```
 ///
-/// The fixed-width prefix makes the fold injective. Guests bind
-/// `io_hash(public', reply)` at halt; verifiers reconstruct `public'`
-/// identically before the io-hash equality check. Sound only when
-/// composed with the entering-memory-image root check — the state
-/// anchor and the image root do different jobs and neither subsumes
-/// the other.
+/// The fixed-width prefix makes the fold injective. `run_task_service`
+/// composes `io_hash(public', reply)` at the Task halt (the handler
+/// contributes `app_public` via `vos::zk::bind_public`); verifiers
+/// reconstruct `public'` identically before the io-hash equality check.
+/// Sound only when composed with the entering-memory-image root check —
+/// the state anchor and the image root do different jobs and neither
+/// subsumes the other. See `work-result-contract.md` §5.
 ///
-/// Not yet wired into the halt path: the witness-delivered Task ABI
-/// (A9) establishes byte-identical live/traced images and work-results,
-/// but composing this fold into the io-hash at halt is the `#[provable]`
-/// pipeline's job (B2). This helper is the frozen wire it will call;
-/// until then a Task binds only its handler's `bind_io` (or the empty
-/// default), so a Task's proof does not yet commit to its state
-/// transition. See `work-result-contract.md` §5.
+/// `transition_digest` here is taken over the full effects list,
+/// *including* the final `Write{STATE_KEY}`. A verify-side reconstruction
+/// must digest the same effects (before any `take_state_write` strip), or
+/// the recomputed `public'` will not match the guest's binding.
 pub fn folded_public(
     anchor_kind: u8,
     anchor: &[u8; 32],
