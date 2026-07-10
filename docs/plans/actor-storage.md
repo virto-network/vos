@@ -295,7 +295,36 @@ heap; `STATUS_TOO_BIG` regression suite untouched.
 
 **Gate W3**: full e2e incl. federation/showcase suites; registry
 pagination exercised by a vosx-side test; two-replica CRDT convergence
-test over per-key registry writes + deletes.
+test over per-key registry writes + deletes — hardened to byte-compare
+both replicas' *persisted* KV tables and to cold-restart a replica
+with no network attached (pins `commit_rebuilt`).
+
+### W3 hardening (post-review fix arc)
+
+An adversarial review of the W3 branch surfaced one critical and four
+major defects, all fixed on the branch before merge:
+
+1. **Post-replay persistence (critical, substrate)** — see open
+   question 1's third bullet: `CommitStrategy::commit_rebuilt` swaps
+   the whole persisted KV table for the replayed slate.
+2. **Authority co-location** — `root`, `revoke_epochs`,
+   `actor_revoke_epochs`, `consistency_floors` moved to `#[storage]`
+   so a state-blob drift fallback resets authority state as one unit
+   (a blob-reset floor beside surviving grant rows resurrected revoked
+   admins). Pinned by `registry_authority_survives_state_blob_drift`.
+3. **Members cursor** — the identity-phase cursor is the hashed
+   32-byte map key (never empty ⇒ can't collide with the phase-start
+   sentinel and loop `members_all` forever); `add_identity` refuses
+   the empty key. Pinned by `members_pager_terminates_one_row_at_a_time`.
+4. **Page byte budget** — 48 KiB, sized against the 256 KiB guest heap
+   with ~3× per-row residency (read-cache + decoded + encode), not the
+   1 MiB halt cap.
+5. **`effective_role` walks iteratively** — one decoded row live at a
+   time; a grantor cycle (admin self-re-grant) refuses in ≤ table-size
+   hops with O(1) memory instead of OOMing the arena.
+6. **Registry unit suite revived** (39 tests; was uncompilable) via a
+   std dev-dep + mock reset isolation; `host_mappings()` returns
+   `HostMappingPage` with an explicit `more` terminator.
 
 ## Wave 4 — committed storage: `anchor_kind 0x02` (B6 / `vos::zk::state`)
 
