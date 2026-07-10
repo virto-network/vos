@@ -1939,8 +1939,10 @@ fn soft_restart_crdt(
         .map(|v| v.to_vec())
         .unwrap_or_default();
     if !state.is_empty() {
+        // The soft-restart slate was seeded with INIT_KEY alone (above).
+        let rows = rebuilt_rows(runtime, svc_id, &[crate::lifecycle::INIT_KEY]);
         strategy
-            .commit_rebuilt(&state, &rebuilt_rows(runtime, svc_id))
+            .commit_rebuilt(&state, &rows)
             .map_err(|e| format!("post-soft-restart commit: {e}"))?;
     }
     Ok(())
@@ -1948,9 +1950,14 @@ fn soft_restart_crdt(
 
 /// The rebuilt keyspace a replay left in the runtime, ready for
 /// [`CommitStrategy::commit_rebuilt`]: every row except STATE_KEY
-/// (which travels separately as the state blob) and INIT_KEY (host-
-/// seeded from the manifest on every spawn — persisting it would let
-/// a stale copy shadow a manifest edit on the next boot).
+/// (which travels separately as the state blob), the continuation
+/// header (host bookkeeping written outside dispatch deltas by
+/// design — a replica applying the same history incrementally never
+/// persists it, so persisting it here would break cross-replica
+/// byte-parity and re-seed a dangling header whose flat_mem body is
+/// gone), and `host_seeded` keys (rows the host writes from the
+/// manifest on every spawn, INIT_KEY at minimum — persisting one
+/// would let a stale copy shadow a manifest edit on the next boot).
 ///
 /// Local dispatch deltas persist rows incrementally, but the rows a
 /// replay produces for *merged remote* dispatches exist only here in
@@ -1958,12 +1965,18 @@ fn soft_restart_crdt(
 /// (`restore_writes`) comes back missing every remotely-replicated
 /// row, and a later local delta can persist index pages that name
 /// value rows the table doesn't hold.
-fn rebuilt_rows(runtime: &VosRuntime, svc_id: ServiceId) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn rebuilt_rows(
+    runtime: &VosRuntime,
+    svc_id: ServiceId,
+    host_seeded: &[&[u8]],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     runtime
         .storage
         .scan_prefix(svc_id, b"")
         .filter(|(key, _)| {
-            *key != crate::lifecycle::STATE_KEY_BYTES && *key != crate::lifecycle::INIT_KEY
+            *key != crate::lifecycle::STATE_KEY_BYTES
+                && *key != crate::lifecycle::CONTINUATION_HEADER_KEY
+                && !host_seeded.contains(key)
         })
         .map(|(key, value)| (key.to_vec(), value.to_vec()))
         .collect()
@@ -3628,14 +3641,22 @@ fn agent_thread(
                 // Materialize the state AND the rebuilt keyspace into
                 // the strategy so subsequent cold starts hit the fast
                 // path — restore_writes must return what replay just
-                // produced, not whatever earlier deltas persisted.
+                // produced, not whatever earlier deltas persisted. This
+                // slate was seeded with every config.storage row (not
+                // just INIT_KEY), so exclude them all.
                 let state = runtime
                     .storage
                     .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
                     .map(|v| v.to_vec())
                     .unwrap_or_default();
+                let host_seeded: Vec<&[u8]> = config
+                    .storage
+                    .iter()
+                    .map(|(key, _)| key.as_slice())
+                    .collect();
                 if !state.is_empty()
-                    && let Err(e) = strategy.commit_rebuilt(&state, &rebuilt_rows(&runtime, svc_id))
+                    && let Err(e) =
+                        strategy.commit_rebuilt(&state, &rebuilt_rows(&runtime, svc_id, &host_seeded))
                 {
                     let err = format!("post-replay commit failed: {e}");
                     error!(%id, "{err}");
