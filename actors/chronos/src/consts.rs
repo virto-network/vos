@@ -46,16 +46,9 @@ pub const FINALIZED_LAG: usize = 2;
 /// value `REVEAL_WINDOW_EPOCHS + FINALIZED_LAG` epochs behind the clock.
 pub const REVEAL_WINDOW_EPOCHS: u64 = 2;
 
-/// Cap on how far a single **non-establishing** `advance` may move the slot
-/// forward — the future-drift bound (invariant: time is bounded, not trusted).
-/// ~1 hour at the default 250 ms slot. The honest feeder derives the slot from
-/// its own wall-clock and pre-clamps to `now() + MAX_SLOT_JUMP`, so it never
-/// trips this; the cap defends against a glitched/oversized single commit. The
-/// *establishing* advance (from the slot-0 era anchor, before the clock has
-/// moved) is exempt so the clock can jump from the era to the present in one
-/// step. The initial slot itself is feeder-trusted; the committee commit-reveal
-/// hardens the entropy that rides on it.
-pub const MAX_SLOT_JUMP: u64 = 14_400;
+// `MAX_SLOT_JUMP` (the future-drift cap) moved to `vos::chronos` — the feeder
+// pre-clamps to it and this actor enforces it, so it lives with the shared
+// protocol. Re-exported from the crate root.
 
 /// Most-recent rounds retained for `round_at`/`randomness_at` lookups. Older
 /// rounds are pruned from the front; the chain head ([`crate::Chronos::current`])

@@ -28,15 +28,11 @@ vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage"
 # transitively but doesn't re-export, so vosx pulls its own.
 # `version` is what crates.io resolves at publish time.
 grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.1" }
-# The per-space clock + verifiable-randomness service. The daemon
-# feeds it from the raft leader (init/advance via Caller::System) and
-# the typed `ChronosRef` / `AdvanceOutcome` / `MAX_SLOT_JUMP` ride along.
-# `default-features = false` strips the PVM bin entry-point.
-chronos = { path = "../actors/chronos", version = "0.1.0", default-features = false }
-# ECVRF primitive (Phase D v1): each node derives a static VRF keypair from
-# node.key and the leader's feeder enrols pubkeys + posts per-round reveals to
-# the committee. no_std, pure software (host build).
-vrf = { path = "../vrf" }
+# The per-space clock + verifiable-randomness feed now lives in
+# `vos::chronos_feed` (behind vos's `network` feature); its protocol types +
+# the `ChronosRef` client are in `vos::chronos`, and the VRF primitive it uses
+# rides along inside vos — so vosx no longer depends on the chronos actor or
+# vrf directly.
 # Content-addressed cache + IPFS resolver dependency for the
 # blob store. Stays a thin dep — no daemon required for `Path`
 # and `Hash` sources, only `Cid` and `Url` resolution touch

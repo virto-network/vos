@@ -3,7 +3,9 @@
 
 use alloc::vec::Vec;
 
-use crate::Status;
+// `VoterKey` moved to `vos::chronos` (feeder-facing); the internal `RoundDraft`
+// snapshot below still references it, via the crate-root re-export.
+use crate::VoterKey;
 
 /// One committed round of the beacon chain — one folded epoch. Self-verifying:
 /// recomputing `H(domain ‖ prev ‖ round ‖ slot ‖ entropy)` must equal `beacon`
@@ -30,21 +32,6 @@ pub struct BeaconRound {
     /// The entropy folded in this round (`[0; 32]` for the genesis round 0).
     pub entropy: [u8; 32],
     pub beacon: [u8; 32],
-}
-
-/// One committee member's enrolled VRF public key. `voter` is the node's
-/// `peer_id` multihash bytes — the same identity the registry stores as a
-/// `MemberRow.key` for a `NODE_ROLE_VOTER` node, and the same bytes a libp2p
-/// inbound carries as [`vos::Caller::Peer`]. `pubkey` is a canonical
-/// Ristretto255 VRF public key ([`vrf::PublicKey`]); it is **public** — chronos
-/// holds no secret key material.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct VoterKey {
-    pub voter: Vec<u8>,
-    pub pubkey: [u8; 32],
 }
 
 /// One committee member's reveal collected in an open round. `beta` is the
@@ -109,35 +96,5 @@ pub struct RoundProofSet {
     pub reveals: Vec<RevealProof>,
 }
 
-/// A round currently open for reveals, as surfaced by [`crate::Chronos::open_rounds`].
-/// A voter proves over `alpha` and posts a [`crate::Chronos::reveal`] before the
-/// clock reaches `fold_epoch`.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct OpenRound {
-    pub round: u64,
-    pub alpha: [u8; 32],
-    pub open_slot: u64,
-    pub fold_epoch: u64,
-}
-
-/// Result of an `advance`.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct AdvanceOutcome {
-    pub status: Status,
-    /// The clock after the advance (the freshly-stamped slot on success).
-    pub slot: u64,
-    /// The head round number after the advance — bumped iff `folded`.
-    pub round: u64,
-    /// The head beacon after the advance — changed iff `folded`.
-    pub beacon: [u8; 32],
-    /// Whether this advance crossed an epoch boundary and folded a new round.
-    /// A plain clock tick within the current epoch stamps the slot with
-    /// `folded == false` and leaves the chain untouched.
-    pub folded: bool,
-}
+// `OpenRound` (surfaced by `open_rounds`) and `AdvanceOutcome` (returned by
+// `advance`) moved to `vos::chronos` — they are the feeder-facing reply types.

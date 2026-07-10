@@ -104,7 +104,6 @@
 //! the internal module split.
 
 pub mod beacon;
-pub mod committee;
 pub mod consts;
 pub mod roles;
 pub mod rows;
@@ -114,65 +113,25 @@ mod tests;
 
 pub use beacon::{combine_betas, derive_alpha, derive_beacon, verify_chain, verify_combine, verify_round};
 use beacon::{to_entropy, to_pubkey};
-pub use committee::{MAX_COMMITTEE, decode_committee, encode_committee};
+// The feeder-facing protocol — status, the clock/committee/reveal request
+// types, the committee codec, and the future-drift cap — now lives in
+// `vos::chronos` (one source of truth for the host feeder + this actor); we
+// `pub use` it back so the public API and the handlers below are unchanged.
+// The beacon-chain derivations, RBAC role map, and reveal-collection internals
+// stay here.
+pub use vos::chronos::{
+    AdvanceOutcome, MAX_COMMITTEE, MAX_SLOT_JUMP, OpenRound, Status, VoterKey, decode_committee,
+    encode_committee,
+};
 pub use consts::*;
 pub use roles::{CHRONOS_SPACE_ROLE_MAP, ChronosRole};
-pub use rows::{AdvanceOutcome, BeaconRound, OpenRound, RevealProof, RoundProofSet, VoterKey};
+pub use rows::{BeaconRound, RevealProof, RoundProofSet};
 use rows::{RoundDraft, StoredReveal};
 
 use vos::prelude::*;
 
-// ── Status ────────────────────────────────────────────────────────
-
-/// Return type for every `#[msg]` handler below. The `#[repr(u8)]`
-/// discriminants are wire-stable — bumping the type or reordering variants
-/// WILL shift the rkyv archive bytes and break peer nodes running older
-/// builds.
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-#[repr(u8)]
-pub enum Status {
-    Ok = 0,
-    /// Entropy was not exactly [`ENTROPY_LEN`] bytes, or the domain was too
-    /// large.
-    InvalidInput = 1,
-    /// `advance` was called before `init`.
-    NotInitialized = 2,
-    /// `init` was called on an already-initialised service (one-shot).
-    AlreadyInitialized = 3,
-    /// The proposed slot did not move the clock strictly forward (`slot <= now`).
-    StaleSlot = 4,
-    /// The proposed slot leapt more than [`MAX_SLOT_JUMP`] past the current
-    /// slot on a non-establishing advance (the future-drift cap).
-    SlotJumpTooLarge = 5,
-    /// Reserved, unused. The committee handlers are authenticated
-    /// cryptographically (a chronos handler runs on the raft apply path,
-    /// where the originating caller is not preserved), so no handler
-    /// returns a caller-based authorization error.
-    Unauthorized = 6,
-    /// The voter is not in the authorized committee ([`Chronos::set_committee`])
-    /// — enrolment and reveals are only accepted from registry voters.
-    NotAVoter = 7,
-    /// A reveal named a round that is not currently open — it was never
-    /// opened, or its reveal window already closed and it folded.
-    NoSuchRound = 8,
-    /// A reveal's VRF proof did not verify against the voter's enrolled key
-    /// over the round's input `α`.
-    BadProof = 9,
-    /// An `enrol_voter` tried to bind a *different* key to a voter that
-    /// already has one. The first key wins; there is no key rotation (see
-    /// [`Chronos::enrol_voter`]).
-    KeyLocked = 10,
-}
+// `Status` (the handler return type), the request/outcome rows, the committee
+// codec, and `MAX_SLOT_JUMP` are re-exported from `vos::chronos` above.
 
 // ── Actor ─────────────────────────────────────────────────────────
 

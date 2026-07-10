@@ -36,7 +36,7 @@ storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-c
 # discovery). Pulls a substantial dep tree (libp2p + tokio runtime),
 # so it's opt-in. Hosts that want cross-node spaces enable it; bare
 # single-node runs (extensions, no_std actors) don't need it.
-network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
+network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait", "dep:vrf"]
 
 [dependencies]
 vos-macros = { path = "../vos-macros", version = "0.1.0", optional = true }
@@ -76,6 +76,11 @@ merkle-crdt = { path = "../merkle-crdt", version = "0.1.0", features = ["redb"],
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
+# ECVRF primitive (Phase D v1) for the host-side `chronos_feed` feeder: the
+# leader's feeder derives a static VRF keypair from `node.key`, enrols pubkeys,
+# and posts per-round reveals. no_std pure software; rides the `network`
+# feature (the feeder is network-gated). The chronos actor pulls it directly.
+vrf = { path = "../vrf", optional = true }
 # Host-side extension executor: the cooperative scheduler runs host-side,
 # driven by `async-io::block_on(LocalExecutor::run(..))`. `LocalExecutor`
 # keeps the extension's `!Send` per-task futures on the one thread that owns
