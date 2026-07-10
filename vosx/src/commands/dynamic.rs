@@ -261,6 +261,17 @@ fn render_reply(reply: Value, ret_ty: Option<&str>, out: Option<&str>) -> anyhow
         return render_args_record(&args, out);
     }
 
+    // The PVM-friendly sibling of the Args `error` field: a `Vec<String>`
+    // reply whose first line is `error: <msg>` is a failure. A PVM actor
+    // can't rkyv-encode an `Args` record (its `Value` enum doesn't survive
+    // the transpiler), so it signals errors this way; bail so the CLI
+    // exits non-zero, just like the Args case.
+    if let Value::ListStr(items) = &reply
+        && let Some(msg) = items.first().and_then(|f| f.strip_prefix("error: "))
+    {
+        bail!("{msg}");
+    }
+
     if let Some(path) = out {
         let (bytes, kind) = match reply {
             Value::Bytes(b) => {
@@ -318,6 +329,13 @@ fn render_text(reply: &Value, ret_ty: Option<&str>) -> String {
                 Some(ty) if !ty.is_empty() && ty != "()" => format!("{ty}: 0x{hex}"),
                 _ => format!("0x{hex}"),
             }
+        }
+        // A list of strings (a project `tree`, a `log`, a branch list)
+        // reads best one item per line.
+        Value::ListStr(items) => items.join("\n"),
+        Value::ListU32(items) => {
+            let parts: Vec<String> = items.iter().map(|n| n.to_string()).collect();
+            format!("[{}]", parts.join(", "))
         }
         other => format!("{other:?}"),
     }

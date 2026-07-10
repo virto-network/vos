@@ -42,6 +42,13 @@ vosx space up demo --manifest examples/space-crdt-a.toml &
 # sugar on top.
 vosx space call demo counter inc
 vosx space agents demo
+
+# The ergonomic sibling: `vosx <agent> <method> k=v` dispatches
+# dynamically to any installed agent or extension, coercing args
+# against its schema. This is how you drive the dev/ai/prover/
+# messenger extensions now — e.g. `vosx dev compile project_id=… commit=…`
+# — instead of dedicated `vosx dev`/`vosx ai` verbs.
+vosx --space demo counter add a=2 b=3
 vosx space info demo                    # metadata + daemon liveness + RTT
 vosx space export demo > snapshot.toml  # round-trip back to TOML
 ```

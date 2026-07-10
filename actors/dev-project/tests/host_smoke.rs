@@ -595,8 +595,9 @@ fn merge_records_conflict_then_subsequent_commit_resolves() {
     );
     assert_eq!(base.status, STATUS_OK);
 
-    // ours: lib.rs v1.
-    let ours = commit_one_file(&mut s, "main", &base.hash, "src/lib.rs", b"// ours v1\n", 2);
+    // ours: lib.rs v1 (committed to main for its side effect — `main`'s
+    // head is what the merge below treats as "ours").
+    let _ours = commit_one_file(&mut s, "main", &base.hash, "src/lib.rs", b"// ours v1\n", 2);
 
     // theirs (off base): lib.rs v2 — same path, different content.
     let theirs = commit_one_file(&mut s, "feature", &base.hash, "src/lib.rs", b"// theirs v1\n", 3);

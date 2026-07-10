@@ -104,6 +104,22 @@ refresh-bundled-registry: build-registry
        vosx/blobs/space_registry.elf
     @echo "✓ refreshed vosx/blobs/space_registry.elf"
 
+# Build the dev-project actor — the PVM side of the dev toolchain
+# (`space publish --bundled dev-project` installs it). Same `cargo actor`
+# toolchain as the registry; plain `cargo build --release` leaves the ELF
+# stale.
+build-dev-project:
+    cd actors/dev-project; cargo +nightly actor
+
+# Refresh the shipped dev-project blob at `vosx/blobs/dev_project.elf`.
+# `cargo install vosx` reads this file (the dev-tree target path is only
+# present in a working tree). Run after any change to the dev-project
+# actor before publishing.
+refresh-bundled-dev-project: build-dev-project
+    cp actors/dev-project/target/riscv64em-javm/release/dev_project.elf \
+       vosx/blobs/dev_project.elf
+    @echo "✓ refreshed vosx/blobs/dev_project.elf"
+
 # Build the space-bridge actor — built-in PVM actor that
 # every member space of a hyperspace runs as the cross-space
 # gateway. Same toolchain as the registry.

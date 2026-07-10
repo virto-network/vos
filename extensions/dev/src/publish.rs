@@ -26,7 +26,7 @@ use dev_project::{BuildIntent, HASH_BYTES, HashResult, INTENT_PUBLISH, PublishIn
 use vos::Encode;
 use vos::actors::context::ServiceId;
 use vos::log;
-use vos::value::{Msg, Value};
+use vos::value::{Args, Msg, Value};
 
 use crate::DevCtx;
 
@@ -231,6 +231,28 @@ pub async fn publish(
             status: PUBLISH_STATUS_RECORD_FAILED,
             hash: Vec::new(),
         },
+    }
+}
+
+/// Build the self-describing `publish` reply from a [`HashResult`].
+/// Success carries the `publishes`-branch commit hash; any non-OK
+/// status becomes a non-empty `error` (→ non-zero CLI exit) — the
+/// member-refused relay, a not-yet-successful build, a missing blob,
+/// etc. all surface here rather than as an opaque status byte.
+pub fn publish_args(r: HashResult) -> Args {
+    if r.status == STATUS_OK {
+        Args::new()
+            .with("ok", true)
+            .with("status", 0u8)
+            .with("publish_commit", r.hash)
+    } else {
+        let mut err = String::from("publish failed (status ");
+        err.push_str(&r.status.to_string());
+        err.push(')');
+        Args::new()
+            .with("ok", false)
+            .with("status", r.status)
+            .with("error", err)
     }
 }
 

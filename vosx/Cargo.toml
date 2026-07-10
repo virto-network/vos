@@ -40,11 +40,6 @@ chronos = { path = "../actors/chronos", version = "0.1.0", default-features = fa
 # node.key and the leader's feeder enrols pubkeys + posts per-round reveals to
 # the committee. no_std, pure software (host build).
 vrf = { path = "../vrf" }
-# Wire types for the `vosx dev *` subcommands. The dev extension
-# returns `HashResult` from `compile`/`publish`; the CLI decodes
-# back the same type to surface status/hash to operators.
-# `default-features = false` strips the PVM cdylib entry-points.
-dev-project = { path = "../actors/dev-project", default-features = false }
 # Content-addressed cache + IPFS resolver dependency for the
 # blob store. Stays a thin dep — no daemon required for `Path`
 # and `Hash` sources, only `Cid` and `Url` resolution touch

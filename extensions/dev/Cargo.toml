@@ -47,6 +47,10 @@ vos = { path = "../../vos", default-features = false, features = ["extension", "
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "macros", "ping", "identify", "request-response", "gossipsub"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Hex-encode commit hashes into the dynamic-dispatch args the e2e now
+# uses (`commit=<hex>`, `theirs=<hex>`, `build_commit=<hex>`) since the
+# typed `vosx dev` verb was retired in favour of dynamic dispatch.
+hex = "0.4"
 # Used by the AST-parity test to produce the canonical-text form
 # of the counter source and round it through `put_blob_ast`.
 dev-ast = { path = "../../actors/dev-project/dev-ast", version = "0.1.0" }

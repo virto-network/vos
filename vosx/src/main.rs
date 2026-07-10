@@ -95,13 +95,6 @@ enum Command {
         #[command(subcommand)]
         command: commands::space::SpaceCommand,
     },
-    /// Author + publish PVM actors from source held in a dev-project.
-    /// Wraps the dev extension's compile/publish flow and surfaces
-    /// the per-project commit graph through `vosx dev log`.
-    Dev {
-        #[command(subcommand)]
-        command: commands::dev::DevCommand,
-    },
     /// Provable-program pinning: `vosx zk pin` measures a provable actor's
     /// canonical commitment allowlist + entering-image root + witness address
     /// and writes them to a catalog artifact verifiers trust. The heavy zkpvm
@@ -220,11 +213,6 @@ fn main() {
                 report_error(e);
             }
         }
-        Some(Command::Dev { command }) => {
-            if let Err(e) = commands::dev::run(command) {
-                report_error(e);
-            }
-        }
         Some(Command::Zk { command }) => {
             if let Err(e) = commands::zk::run(command) {
                 report_error(e);
@@ -315,8 +303,7 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// (one with `/` or `\`, or starting with `.`) is preserved for
 /// the existing one-shot ELF run path.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
-    const BUILTIN_VERBS: &[&str] =
-        &["run", "space", "dev", "zk", "help-schema", "help", "whoami"];
+    const BUILTIN_VERBS: &[&str] = &["run", "space", "zk", "help-schema", "help", "whoami"];
     // Skip global flags; `--format` / `--out` take a value, the
     // rest are boolean-shaped. `--out` is a dynamic-only flag but
     // we skip its value here (rather than `return true`) so its path
@@ -425,12 +412,14 @@ mod routing_tests {
 
     #[test]
     fn builtin_verbs_use_clap_path() {
-        for v in ["run", "space", "dev", "help-schema", "help"] {
+        for v in ["run", "space", "help-schema", "help"] {
             assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
         }
-        // `ai` is no longer a builtin — `vosx ai generate …` dispatches
-        // dynamically to the ai extension instance.
+        // `ai` and `dev` are no longer builtins — `vosx ai generate …`
+        // and `vosx dev compile …` dispatch dynamically to their
+        // extension instances.
         assert!(should_dynamic_dispatch(&s(&["ai", "generate"])));
+        assert!(should_dynamic_dispatch(&s(&["dev", "compile"])));
     }
 
     #[test]

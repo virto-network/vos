@@ -27,7 +27,7 @@ use dev_project::{
 use vos::Encode;
 use vos::actors::context::ServiceId;
 use vos::log;
-use vos::value::{Msg, TAG_DYNAMIC, Value};
+use vos::value::{Args, Msg, TAG_DYNAMIC, Value};
 
 use crate::DevCtx;
 
@@ -123,22 +123,19 @@ fn log_outcome_stderr(o: &CompileOutcome) {
 }
 
 /// Top-level: compile a source commit and record the result on the
-/// `builds` branch. Returns the build commit's hash on success or
-/// failure (the commit itself encodes which); status only signals
-/// "recording itself broke" (transport / commit handler refused).
-///
-/// The wire shape callers see in `Value::Bytes(HashResult)` is:
-///   * `status == STATUS_OK` + 32-byte build commit hash → done;
-///     decode `intent.ok` from that commit's `intent_data` to
-///     check if cargo actually succeeded.
-///   * `status == COMPILE_STATUS_RECORD_FAILED` + empty hash →
-///     we couldn't even record the build attempt (most often a
-///     transport error or a malformed `source_commit` arg).
+/// `builds` branch. Replies with a self-describing [`Args`] record:
+///   * success → `ok=true`, `status=0`, `build_commit`, `artifact`;
+///   * cargo/cycle failure → `ok=false`, `status`, `build_commit`, and a
+///     non-empty `error` (a stderr excerpt) — the dynamic CLI surfaces
+///     that as a non-zero exit. The failed build is still recorded (with
+///     `intent.ok=0`) so its history survives;
+///   * recording itself broke (transport / malformed source_commit) →
+///     `ok=false`, `error`, no `build_commit`.
 pub async fn compile_and_record(
     ctx: &mut DevCtx,
     project_id: u32,
     source_commit: Vec<u8>,
-) -> HashResult {
+) -> Args {
     let outcome = compile_project(ctx, project_id, source_commit.clone()).await;
     log_outcome_stderr(&outcome);
 
@@ -154,12 +151,7 @@ pub async fn compile_and_record(
     } else if !outcome.stderr.is_empty() {
         match put_blob(ctx, project_id, &outcome.stderr).await {
             Ok(h) => h,
-            Err(_) => {
-                return HashResult {
-                    status: COMPILE_STATUS_RECORD_FAILED,
-                    hash: Vec::new(),
-                };
-            }
+            Err(_) => return record_failed_args(),
         }
     } else {
         vec![0u8; HASH_BYTES]
@@ -176,12 +168,7 @@ pub async fn compile_and_record(
 
     let builds_head = match fetch_head(ctx, project_id, "builds").await {
         Ok(b) => b,
-        Err(_) => {
-            return HashResult {
-                status: COMPILE_STATUS_RECORD_FAILED,
-                hash: Vec::new(),
-            };
-        }
+        Err(_) => return record_failed_args(),
     };
 
     let ts_ms = SystemTime::now()
@@ -204,15 +191,51 @@ pub async fn compile_and_record(
     )
     .await
     {
-        Ok(commit_hash) => HashResult {
-            status: STATUS_OK,
-            hash: commit_hash,
-        },
-        Err(_) => HashResult {
-            status: COMPILE_STATUS_RECORD_FAILED,
-            hash: Vec::new(),
-        },
+        Ok(commit_hash) => compile_outcome_args(&outcome, commit_hash),
+        Err(_) => record_failed_args(),
     }
+}
+
+/// Build the self-describing `compile` reply from the cargo outcome +
+/// the recorded build commit. A non-`STATUS_OK` outcome carries a
+/// non-empty `error` (stderr excerpt), which the dynamic dispatcher
+/// turns into a non-zero exit.
+fn compile_outcome_args(outcome: &CompileOutcome, build_commit: Vec<u8>) -> Args {
+    if outcome.status == STATUS_OK {
+        Args::new()
+            .with("ok", true)
+            .with("status", 0u8)
+            .with("build_commit", build_commit)
+            .with("artifact", outcome.hash.clone())
+    } else {
+        let mut err = String::from("compile failed (status ");
+        err.push_str(&outcome.status.to_string());
+        err.push_str("): ");
+        let excerpt: String = String::from_utf8_lossy(&outcome.stderr)
+            .trim()
+            .chars()
+            .take(2000)
+            .collect();
+        err.push_str(&excerpt);
+        Args::new()
+            .with("ok", false)
+            .with("status", outcome.status)
+            .with("build_commit", build_commit)
+            .with("error", err)
+    }
+}
+
+/// The reply when the build attempt couldn't even be recorded (a
+/// dev-project round-trip failed or the source_commit was malformed).
+fn record_failed_args() -> Args {
+    Args::new()
+        .with("ok", false)
+        .with("status", COMPILE_STATUS_RECORD_FAILED)
+        .with(
+            "error",
+            "recording the build attempt failed (transport error or a malformed source_commit)"
+                .to_string(),
+        )
 }
 
 /// Extract the toolchain channel string out of a `rust-

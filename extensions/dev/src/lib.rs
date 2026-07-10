@@ -29,6 +29,7 @@
 //! handlers reach the host purely through their `&mut Context`.
 
 use vos::prelude::*;
+use vos::value::Args;
 
 mod compile;
 mod deps;
@@ -44,25 +45,27 @@ impl DevExtension {
     }
 
     /// Compile a project commit → PVM ELF, persist it to the blob cache, and
-    /// record a build commit on the project's `builds` branch. Replies with the
-    /// rkyv-encoded [`dev_project::HashResult`] (build commit hash on success,
-    /// or a `COMPILE_STATUS_*` code) — `Value::Bytes` on the wire, as the
-    /// `vosx dev compile` command decodes.
+    /// record a build commit on the project's `builds` branch. Replies with a
+    /// self-describing [`Args`] record: `ok` + `build_commit` + `artifact` on
+    /// success, or a non-empty `error` (a cargo/cycle failure, which the
+    /// dynamic CLI surfaces as a non-zero exit). `project_id` is the
+    /// dev-project instance's ServiceId, `commit` the source commit to build.
     #[msg(cli)]
     async fn compile(
         &mut self,
         project_id: u32,
         commit: Vec<u8>,
         ctx: &mut Context<Self>,
-    ) -> Vec<u8> {
-        let result = compile::compile_and_record(ctx, project_id, commit).await;
-        result.encode()
+    ) -> Args {
+        compile::compile_and_record(ctx, project_id, commit).await
     }
 
     /// Publish a build commit's ELF to the space registry + record an
     /// INTENT_PUBLISH commit on the project's `publishes` branch. Replies with
-    /// the rkyv-encoded [`dev_project::HashResult`] (publish commit hash on
-    /// success, or a `PUBLISH_STATUS_*` code).
+    /// a self-describing [`Args`] record: `ok` + `publish_commit` on success,
+    /// or a non-empty `error` on any refusal (the caller-relayed registry ACL,
+    /// a not-yet-successful build, …) — surfaced by the dynamic CLI as a
+    /// non-zero exit.
     #[msg(cli)]
     async fn publish(
         &mut self,
@@ -71,9 +74,9 @@ impl DevExtension {
         name: String,
         version: String,
         ctx: &mut Context<Self>,
-    ) -> Vec<u8> {
+    ) -> Args {
         let result = publish::publish(ctx, project_id, build_commit, name, version).await;
-        result.encode()
+        publish::publish_args(result)
     }
 }
 

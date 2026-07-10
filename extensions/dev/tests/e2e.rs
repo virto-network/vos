@@ -4,10 +4,10 @@
 //!
 //!   `vosx space new` →
 //!   `vosx space up --manifest <with dev extension>` →
-//!   `vosx dev new myproject` →
+//!   `vosx space publish --bundled dev-project` + `space install …` →
 //!   test-client: put_blob(counter source) + commit on `main` →
-//!   `vosx dev compile myproject` →
-//!   `vosx dev publish myproject counter 0.1.0` →
+//!   `vosx dev compile project_id=… commit=…` (dynamic) →
+//!   `vosx dev publish project_id=… build_commit=… name=… version=…` →
 //!   `vosx space install counter:0.1.0` →
 //!   test-client: counter.inc (twice) → expect 1, 2
 //!
@@ -545,6 +545,106 @@ fn member_config(daemon: &Daemon) -> TempDir {
     cfg
 }
 
+// ── Retired-verb replacements ───────────────────────────────────────
+//
+// The `vosx dev *` verb was retired: `dev new` → `space publish
+// --bundled dev-project` + `space install`; `dev compile`/`dev publish`
+// → dynamic dispatch to the `dev` extension instance with the project's
+// ServiceId + resolved commit; `dev show`/`dev merge` → dynamic dispatch
+// to the project instance itself. These helpers keep the tests readable.
+
+/// Provision a dev-project instance: publish the bundled program
+/// (idempotent) then install an instance under `name`.
+fn provision_project(daemon: &Daemon, name: &str) {
+    run_cli(
+        daemon,
+        &[
+            "space",
+            "publish",
+            &daemon.space_name,
+            "--bundled",
+            "dev-project",
+        ],
+        "space publish --bundled dev-project",
+    );
+    let init = format!("name={name}");
+    run_cli(
+        daemon,
+        &[
+            "space",
+            "install",
+            &daemon.space_name,
+            "dev-project:0.1.0",
+            "--name",
+            name,
+            "--init",
+            &init,
+        ],
+        "space install dev-project",
+    );
+}
+
+/// Resolve `(project_id=<id>, commit=<branch head hex>)` dynamic-dispatch
+/// args for a project. Reconnects a short-lived client just to read the
+/// head (instance ids are deterministic from the name).
+fn dyn_target(daemon: &Daemon, name: &str, branch: &str) -> (String, String) {
+    let client = TestClient::connect(daemon.data_dir());
+    let sid = client.resolve_instance(name);
+    let head = hex::encode(current_head(&client, sid, branch));
+    (format!("project_id={}", sid.0), format!("commit={head}"))
+}
+
+/// `vosx dev compile <name>` → dynamic dispatch to the `dev` extension.
+/// Panics on non-zero exit (happy path).
+fn dev_compile(daemon: &Daemon, name: &str) {
+    let (pid, commit) = dyn_target(daemon, name, "main");
+    run_cli(
+        daemon,
+        &["dev", "compile", &pid, &commit, "--space", &daemon.space_name],
+        "dev compile",
+    );
+}
+
+/// Capture variant of [`dev_compile`] for the failure-mode tests.
+fn dev_compile_capture(daemon: &Daemon, name: &str) -> (i32, String, String) {
+    let (pid, commit) = dyn_target(daemon, name, "main");
+    run_cli_capture(
+        daemon,
+        &["dev", "compile", &pid, &commit, "--space", &daemon.space_name],
+        "dev compile",
+    )
+}
+
+/// `vosx dev publish <name> <prog> <version>` → dynamic dispatch to the
+/// `dev` extension, defaulting `build_commit` to the `builds` branch
+/// head. Panics on non-zero exit.
+fn dev_publish(daemon: &Daemon, name: &str, prog: &str, version: &str) {
+    let (pid, build_commit) = dyn_publish_target(daemon, name);
+    run_cli(
+        daemon,
+        &[
+            "dev",
+            "publish",
+            &pid,
+            &build_commit,
+            &format!("name={prog}"),
+            &format!("version={version}"),
+            "--space",
+            &daemon.space_name,
+        ],
+        "dev publish",
+    );
+}
+
+/// Resolve `(project_id=<id>, build_commit=<builds head hex>)` for a
+/// dynamic `dev publish`.
+fn dyn_publish_target(daemon: &Daemon, name: &str) -> (String, String) {
+    let client = TestClient::connect(daemon.data_dir());
+    let sid = client.resolve_instance(name);
+    let head = hex::encode(current_head(&client, sid, "builds"));
+    (format!("project_id={}", sid.0), format!("build_commit={head}"))
+}
+
 // ── The test ────────────────────────────────────────────────────────
 
 #[test]
@@ -552,16 +652,12 @@ fn dev_compile_publish_install_invoke() {
     ensure_built();
     let daemon = boot_daemon();
 
-    // 1. Provision the dev-project instance via the CLI. The
-    //    daemon's idle-hook spawn-reconcile brings the new agent's
-    //    thread up within a couple of seconds — no restart. The
-    //    first invoke below polls through that window, which is
-    //    the runtime-spawn property this test gates.
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "myproject"],
-        "vosx dev new",
-    );
+    // 1. Provision the dev-project instance. The daemon's idle-hook
+    //    spawn-reconcile brings the new agent's thread up within a
+    //    couple of seconds — no restart. The first invoke below polls
+    //    through that window, which is the runtime-spawn property this
+    //    test gates.
+    provision_project(&daemon, "myproject");
 
     let client = TestClient::connect(daemon.data_dir());
 
@@ -600,13 +696,9 @@ fn dev_compile_publish_install_invoke() {
     let source_commit_hash = decode_hash_result_assert_ok(commit_reply, "commit src");
     assert_eq!(source_commit_hash.len(), 32, "commit hash size");
 
-    // 5. Drive the dev extension's compile via the CLI. Default
-    //    branch is `main`, which we just populated.
-    run_cli(
-        &daemon,
-        &["dev", "compile", "--space", &daemon.space_name, "myproject"],
-        "vosx dev compile",
-    );
+    // 5. Drive the dev extension's compile via dynamic dispatch,
+    //    against the `main` head we just populated.
+    dev_compile(&daemon, "myproject");
 
     // 6. Confirm a build commit appeared on the `builds` branch.
     let log_reply = client.invoke(
@@ -627,19 +719,7 @@ fn dev_compile_publish_install_invoke() {
     );
 
     // 7. Publish under (counter, 0.1.0).
-    run_cli(
-        &daemon,
-        &[
-            "dev",
-            "publish",
-            "--space",
-            &daemon.space_name,
-            "myproject",
-            "counter",
-            "0.1.0",
-        ],
-        "vosx dev publish",
-    );
+    dev_publish(&daemon, "myproject", "counter", "0.1.0");
 
     // 8. Install the published program as an instance named
     //    `counter`. `space install` takes positional <SPACE>
@@ -692,22 +772,14 @@ fn dev_publish_admin_succeeds_member_refused() {
 
     // Admin provisions + compiles a project. The spawn-reconcile
     // brings the agent up mid-run; put_source polls through it.
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "authproj"],
-        "vosx dev new authproj",
-    );
+    provision_project(&daemon, "authproj");
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("authproj");
     let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
     commit_source(&client, project_id, &src_hash);
     drop(client);
 
-    run_cli(
-        &daemon,
-        &["dev", "compile", "--space", &daemon.space_name, "authproj"],
-        "vosx dev compile authproj",
-    );
+    dev_compile(&daemon, "authproj");
 
     // A non-admin operator (fresh identity, no grant → Guest) attempts
     // the same publish. The dev extension relays the member's Guest
@@ -716,17 +788,19 @@ fn dev_publish_admin_succeeds_member_refused() {
     // refusal precedes the publishes-branch commit), so the admin's
     // publish of the same (name, version) below is fresh.
     let member = member_config(&daemon);
+    let (member_pid, member_build) = dyn_publish_target(&daemon, "authproj");
     let (code, _out, err) = run_cli_capture_as(
         &daemon,
         member.path(),
         &[
             "dev",
             "publish",
+            &member_pid,
+            &member_build,
+            "name=counter",
+            "version=0.1.0",
             "--space",
             &daemon.space_name,
-            "authproj",
-            "counter",
-            "0.1.0",
         ],
         "member dev publish",
     );
@@ -747,19 +821,7 @@ fn dev_publish_admin_succeeds_member_refused() {
     // The admin operator (the space creator → Admin) publishes the SAME
     // build under the SAME (name, version) and SUCCEEDS. Same everything
     // but the identity → the member's refusal above was role-driven.
-    run_cli(
-        &daemon,
-        &[
-            "dev",
-            "publish",
-            "--space",
-            &daemon.space_name,
-            "authproj",
-            "counter",
-            "0.1.0",
-        ],
-        "admin dev publish",
-    );
+    dev_publish(&daemon, "authproj", "counter", "0.1.0");
 }
 
 fn decode_hash_result_assert_ok(value: Value, label: &str) -> Vec<u8> {
@@ -801,16 +863,8 @@ fn compile_via_ast_matches_raw_artifact() {
 
     // Provision two independent projects. Both agents spawn from
     // the idle-hook reconcile; put_source polls through the window.
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "proj-raw"],
-        "vosx dev new proj-raw",
-    );
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "proj-ast"],
-        "vosx dev new proj-ast",
-    );
+    provision_project(&daemon, "proj-raw");
+    provision_project(&daemon, "proj-ast");
 
     let client = TestClient::connect(daemon.data_dir());
     let raw_id = client.resolve_instance("proj-raw");
@@ -837,16 +891,8 @@ fn compile_via_ast_matches_raw_artifact() {
     commit_source(&client, ast_id, &ast_hash);
 
     // Compile both.
-    run_cli(
-        &daemon,
-        &["dev", "compile", "--space", &daemon.space_name, "proj-raw"],
-        "vosx dev compile proj-raw",
-    );
-    run_cli(
-        &daemon,
-        &["dev", "compile", "--space", &daemon.space_name, "proj-ast"],
-        "vosx dev compile proj-ast",
-    );
+    dev_compile(&daemon, "proj-raw");
+    dev_compile(&daemon, "proj-ast");
 
     let raw_artifact = artifact_hash_for(&client, raw_id);
     let ast_artifact = artifact_hash_for(&client, ast_id);
@@ -1039,16 +1085,8 @@ fn cross_project_deps_compile_resolves_lib() {
     ensure_built();
     let daemon = boot_daemon();
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "proj-b"],
-        "vosx dev new proj-b",
-    );
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "proj-a"],
-        "vosx dev new proj-a",
-    );
+    provision_project(&daemon, "proj-b");
+    provision_project(&daemon, "proj-a");
     let client = TestClient::connect(daemon.data_dir());
 
     let proj_b_id = client.resolve_instance("proj-b");
@@ -1095,11 +1133,7 @@ fn cross_project_deps_compile_resolves_lib() {
     // Compile A. The dev extension reads proj-a's metadata,
     // resolves proj-b, materialises it under `vendor/proj-b/`,
     // and runs cargo against the workspace.
-    run_cli(
-        &daemon,
-        &["dev", "compile", "--space", &daemon.space_name, "proj-a"],
-        "vosx dev compile proj-a",
-    );
+    dev_compile(&daemon, "proj-a");
 
     let intent = build_intent_for(&client, proj_a_id);
     assert_eq!(
@@ -1115,11 +1149,7 @@ fn cross_project_deps_self_cycle_errors_loudly() {
     ensure_built();
     let daemon = boot_daemon();
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "proj-cycle"],
-        "vosx dev new proj-cycle",
-    );
+    provision_project(&daemon, "proj-cycle");
     let client = TestClient::connect(daemon.data_dir());
 
     let proj_id = client.resolve_instance("proj-cycle");
@@ -1152,17 +1182,7 @@ fn cross_project_deps_self_cycle_errors_loudly() {
     // non-zero exit. Cycle detection runs before cargo, so the
     // build never gets that far — `compile_and_record` writes a
     // build commit with ok=0 and the CLI bails.
-    let (code, stdout, stderr) = run_cli_capture(
-        &daemon,
-        &[
-            "dev",
-            "compile",
-            "--space",
-            &daemon.space_name,
-            "proj-cycle",
-        ],
-        "vosx dev compile proj-cycle",
-    );
+    let (code, stdout, stderr) = dev_compile_capture(&daemon, "proj-cycle");
     assert_ne!(
         code, 0,
         "self-cycle compile should exit non-zero\nstdout: {stdout}\nstderr: {stderr}"
@@ -1217,32 +1237,18 @@ fn dev_compile_surfaces_cargo_failure() {
     ensure_built();
     let daemon = boot_daemon();
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "proj-broken"],
-        "vosx dev new proj-broken",
-    );
+    provision_project(&daemon, "proj-broken");
     let client = TestClient::connect(daemon.data_dir());
 
     let project_id = client.resolve_instance("proj-broken");
     let src_hash = put_source(&client, project_id, "put_blob", BROKEN_SOURCE.as_bytes());
     commit_source(&client, project_id, &src_hash);
 
-    let (code, stdout, stderr) = run_cli_capture(
-        &daemon,
-        &[
-            "dev",
-            "compile",
-            "--space",
-            &daemon.space_name,
-            "proj-broken",
-        ],
-        "vosx dev compile proj-broken",
-    );
+    let (code, stdout, stderr) = dev_compile_capture(&daemon, "proj-broken");
 
     assert_ne!(
         code, 0,
-        "vosx dev compile should exit non-zero on cargo failure\n\
+        "dev compile should exit non-zero on cargo failure\n\
          stdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
@@ -1264,22 +1270,17 @@ fn dev_compile_surfaces_cargo_failure() {
     );
 }
 
-// ── vosx dev show + vosx dev merge ──────────────────────────────────
+// ── project tree + merge (dynamic dispatch to the project instance) ──
 
-/// `vosx dev show --project P` (no path) lists the tree at head.
-/// `vosx dev show --project P PATH` dumps that file's bytes.
-/// Both paths should work against a project with a single
-/// committed file.
+/// `vosx <project> tree commit=…` lists the tree at a commit (one
+/// `path\tsize\tblob8` line per file); the source bytes are fetched
+/// directly by hash. Exercises both against a single committed file.
 #[test]
 fn dev_show_tree_and_file() {
     ensure_built();
     let daemon = boot_daemon();
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "showproj"],
-        "vosx dev new showproj",
-    );
+    provision_project(&daemon, "showproj");
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("showproj");
 
@@ -1287,18 +1288,20 @@ fn dev_show_tree_and_file() {
     let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
     commit_source(&client, project_id, &src_hash);
 
-    // Tree listing — should mention the path + size > 0.
+    // Tree listing — the dev-project's `tree` handler over dynamic
+    // dispatch to the project instance; should mention the path with a
+    // real (non-`?`) size.
+    let main_head = hex::encode(current_head(&client, project_id, "main"));
     let tree_text = run_cli(
         &daemon,
         &[
-            "dev",
-            "show",
+            "showproj",
+            "tree",
+            &format!("commit={main_head}"),
             "--space",
             &daemon.space_name,
-            "--project",
-            "showproj",
         ],
-        "vosx dev show (tree)",
+        "showproj tree",
     );
     assert!(
         tree_text.contains("src/lib.rs"),
@@ -1309,65 +1312,32 @@ fn dev_show_tree_and_file() {
         "tree size column shouldn't fall back to '?', got:\n{tree_text}"
     );
 
-    // File content — should match what we committed.
-    let file_text = run_cli(
-        &daemon,
-        &[
-            "dev",
-            "show",
-            "--space",
-            &daemon.space_name,
-            "--project",
-            "showproj",
-            "src/lib.rs",
-        ],
-        "vosx dev show (file)",
+    // File content — fetch the blob directly and confirm it round-trips
+    // the committed source. (`dev show <path>` was retired with the
+    // verb; browse a tree with `tree` + pull bytes by hash with
+    // `get_blob`.)
+    let blob_reply = client.invoke(
+        project_id,
+        &Msg::new("get_blob").with("hash", src_hash.clone()),
     );
+    let blob_bytes = match blob_reply {
+        Value::Bytes(b) => b,
+        other => panic!("get_blob returned {other:?}"),
+    };
+    let blob = <dev_project::BlobObject as Decode>::try_decode(&blob_bytes)
+        .expect("decode BlobObject");
+    let file_text = String::from_utf8(blob.bytes).expect("source is utf-8");
     assert!(
         file_text.contains("pub struct Counter"),
-        "file dump should contain the counter source, got:\n{file_text}"
+        "file blob should contain the counter source, got:\n{file_text}"
     );
 }
 
-/// `vosx dev show --project P does/not/exist` errors with a
-/// specific message naming the missing path (not a generic
-/// transport failure).
-#[test]
-fn dev_show_missing_path_errors() {
-    ensure_built();
-    let daemon = boot_daemon();
+// (`dev_show_missing_path_errors` retired with the `dev show <path>`
+// command: path-based file dump is gone — browse a tree with the
+// project's `tree` handler and pull bytes by hash with `get_blob`.)
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "showproj2"],
-        "vosx dev new showproj2",
-    );
-    let client = TestClient::connect(daemon.data_dir());
-    let project_id = client.resolve_instance("showproj2");
-    let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
-    commit_source(&client, project_id, &src_hash);
-
-    let (code, _stdout, stderr) = run_cli_capture(
-        &daemon,
-        &[
-            "dev",
-            "show",
-            "--space",
-            &daemon.space_name,
-            "--project",
-            "showproj2",
-            "does/not/exist.rs",
-        ],
-        "vosx dev show missing path",
-    );
-    assert_ne!(code, 0, "show on missing path should exit non-zero");
-    assert!(
-        stderr.contains("does/not/exist.rs") && stderr.contains("not in commit"),
-        "error should name the missing path + reason, got:\n{stderr}"
-    );
-}
-
-/// `vosx dev merge` fast-forwards `main` to a descendant branch's
+/// `vosx <project> merge` fast-forwards `main` to a descendant branch's
 /// head. Sets up a side branch by committing on top of main's
 /// current head and exercises the FF path explicitly.
 #[test]
@@ -1375,11 +1345,7 @@ fn dev_merge_ff_advances_main() {
     ensure_built();
     let daemon = boot_daemon();
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "mergeproj"],
-        "vosx dev new mergeproj",
-    );
+    provision_project(&daemon, "mergeproj");
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("mergeproj");
 
@@ -1406,26 +1372,26 @@ fn dev_merge_ff_advances_main() {
     );
     let side_head = decode_hash_result_assert_ok(side_commit_reply, "commit feature");
 
-    // `vosx dev merge --from feature --into main` should FF.
+    // `vosx mergeproj merge into_branch=main theirs=<feature head>`
+    // should fast-forward main (the merge handler's self-describing
+    // `Args` reply carries `fast_forward`).
     let out = run_cli(
         &daemon,
         &[
-            "dev",
+            "mergeproj",
             "merge",
+            "into_branch=main",
+            &format!("theirs={}", hex::encode(&side_head)),
+            "author=",
+            "ts_ms=0",
             "--space",
             &daemon.space_name,
-            "--project",
-            "mergeproj",
-            "--from",
-            "feature",
-            "--into",
-            "main",
         ],
-        "vosx dev merge feature → main",
+        "mergeproj merge feature → main",
     );
     assert!(
-        out.contains("fast-forwarded"),
-        "merge should report fast-forward, got:\n{out}"
+        out.contains("fast_forward"),
+        "merge should report fast_forward, got:\n{out}"
     );
 
     // main now points at the feature head.
@@ -1436,19 +1402,15 @@ fn dev_merge_ff_advances_main() {
     );
 }
 
-/// `vosx dev merge --into <missing>` returns a clear,
-/// specific error instead of the actor's opaque
-/// `STATUS_NOT_FOUND`.
+/// `vosx <project> merge into_branch=<missing>` returns a clear,
+/// specific error (via the merge reply's `error` field → non-zero
+/// exit) instead of the actor's opaque `STATUS_NOT_FOUND`.
 #[test]
 fn dev_merge_missing_into_errors_clearly() {
     ensure_built();
     let daemon = boot_daemon();
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "mergeproj2"],
-        "vosx dev new mergeproj2",
-    );
+    provision_project(&daemon, "mergeproj2");
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("mergeproj2");
 
@@ -1467,23 +1429,21 @@ fn dev_merge_missing_into_errors_clearly() {
             .with("ts_ms", 1u64)
             .with("change_id", Vec::<u8>::new()),
     );
-    let _ = decode_hash_result_assert_ok(reply, "commit feature");
+    let feature_head = decode_hash_result_assert_ok(reply, "commit feature");
 
     let (code, _stdout, stderr) = run_cli_capture(
         &daemon,
         &[
-            "dev",
+            "mergeproj2",
             "merge",
+            "into_branch=main",
+            &format!("theirs={}", hex::encode(&feature_head)),
+            "author=",
+            "ts_ms=0",
             "--space",
             &daemon.space_name,
-            "--project",
-            "mergeproj2",
-            "--from",
-            "feature",
-            "--into",
-            "main",
         ],
-        "vosx dev merge into missing main",
+        "mergeproj2 merge into missing main",
     );
     assert_ne!(code, 0, "merge into missing branch should fail");
     assert!(
@@ -1516,11 +1476,7 @@ fn dev_project_main_branch_survives_daemon_restart() {
     ensure_built();
     let mut daemon = boot_daemon();
 
-    run_cli(
-        &daemon,
-        &["dev", "new", "--space", &daemon.space_name, "restartproj"],
-        "vosx dev new restartproj",
-    );
+    provision_project(&daemon, "restartproj");
 
     let client = TestClient::connect(daemon.data_dir());
     let project_id = client.resolve_instance("restartproj");

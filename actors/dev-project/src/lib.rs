@@ -50,6 +50,12 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
 use vos::prelude::*;
+// `to_string()` on primitives lives on `alloc::string::ToString`, which
+// is in `std::prelude` on the host but not the riscv64em-javm `no_std`
+// build. Import it explicitly so the tree/merge reply builders compile
+// for both.
+#[allow(unused_imports)]
+use alloc::string::ToString;
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -833,42 +839,74 @@ pub mod store {
         }
     }
 
+    /// Richer merge result. Same `status`/`hash` field names as
+    /// [`HashResult`] (so host-side callers reading only those keep
+    /// working) plus the two facts a caller previously had to re-derive
+    /// with extra round-trips: whether it was a fast-forward, and the
+    /// per-path conflict list. `hash` is empty on error.
+    pub struct MergeOutcome {
+        pub status: u8,
+        pub hash: Vec<u8>,
+        pub fast_forward: bool,
+        pub conflicts: Vec<String>,
+    }
+
+    impl MergeOutcome {
+        fn err(status: u8) -> Self {
+            Self {
+                status,
+                hash: Vec::new(),
+                fast_forward: false,
+                conflicts: Vec::new(),
+            }
+        }
+        fn ff(hash: [u8; HASH_BYTES]) -> Self {
+            Self {
+                status: STATUS_OK,
+                hash: hash.to_vec(),
+                fast_forward: true,
+                conflicts: Vec::new(),
+            }
+        }
+    }
+
     /// Merge `theirs` into `into_branch`. Finds the common
     /// ancestor (walking `parent` pointers — `extras` are
     /// ignored in v1, fine for the linear histories we produce
     /// today), runs `merge_trees`, persists a 2-parent commit
     /// with `extras = [theirs]`, and advances `into_branch`.
-    /// Conflicts are recorded on the commit; the merge is still
-    /// considered successful — callers resolve via subsequent
-    /// plain commits.
+    /// Conflicts are recorded on the commit AND surfaced in the
+    /// [`MergeOutcome`]; the merge is still considered successful —
+    /// callers resolve via subsequent plain commits.
     pub fn merge(
         state: &mut ProjectState,
         into_branch: &str,
         theirs_hash: &[u8],
         author: &[u8],
         ts_ms: u64,
-    ) -> HashResult {
+    ) -> MergeOutcome {
         let Some(branch_idx) = find_branch(state, into_branch) else {
-            return HashResult::err(STATUS_NOT_FOUND);
+            return MergeOutcome::err(STATUS_NOT_FOUND);
         };
         let ours_hash = state.branches[branch_idx].commit;
 
         let Some(theirs_arr) = bytes_to_32(theirs_hash) else {
-            return HashResult::err(STATUS_BAD_HASH);
+            return MergeOutcome::err(STATUS_BAD_HASH);
         };
         if find_commit(state, &theirs_arr).is_none() {
-            return HashResult::err(STATUS_PARENT_NOT_FOUND);
+            return MergeOutcome::err(STATUS_PARENT_NOT_FOUND);
         }
 
         // Fast-forward: theirs is a descendant of ours (or equal).
         // Just advance the branch — no merge commit needed.
         if is_ancestor(state, &ours_hash, &theirs_arr) {
             state.branches[branch_idx].commit = theirs_arr;
-            return HashResult::ok(theirs_arr);
+            return MergeOutcome::ff(theirs_arr);
         }
-        // Already-merged: ours is a descendant of theirs. No-op.
+        // Already-merged: ours is a descendant of theirs. No-op — still
+        // a fast-forward-shaped outcome (no merge commit minted).
         if is_ancestor(state, &theirs_arr, &ours_hash) {
-            return HashResult::ok(ours_hash);
+            return MergeOutcome::ff(ours_hash);
         }
 
         // True three-way merge.
@@ -877,13 +915,14 @@ pub mod store {
         let ours_files = tree_at(state, &ours_hash);
         let theirs_files = tree_at(state, &theirs_arr);
         let merged = merge_trees(&base_files, &ours_files, &theirs_files);
+        let conflict_paths: Vec<String> = merged.conflicts.iter().map(|c| c.path.clone()).collect();
 
         let author_arr = if author.is_empty() {
             [0u8; HASH_BYTES]
         } else {
             match bytes_to_32(author) {
                 Some(h) => h,
-                None => return HashResult::err(STATUS_BAD_HASH),
+                None => return MergeOutcome::err(STATUS_BAD_HASH),
             }
         };
         let mut row = CommitNode {
@@ -906,7 +945,51 @@ pub mod store {
             .unwrap_or_else(|p| p);
         state.commits.insert(pos, row);
         state.branches[branch_idx].commit = hash;
-        HashResult::ok(hash)
+        MergeOutcome {
+            status: STATUS_OK,
+            hash: hash.to_vec(),
+            fast_forward: false,
+            conflicts: conflict_paths,
+        }
+    }
+
+    /// Per-file listing of a commit's tree: one `path\tsize\tblob8`
+    /// line per file (tab-separated; `size` is the blob's byte length,
+    /// `blob8` its 8-hex-char hash prefix). Returns an empty list for
+    /// an unknown commit. Server-side so a caller browses a tree in one
+    /// round-trip instead of an N+1 `get_blob`-per-file size probe.
+    pub fn tree(state: &ProjectState, commit_hash: &[u8]) -> Vec<String> {
+        let Some(commit) = get_commit(state, commit_hash) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(commit.files.len());
+        for f in &commit.files {
+            let size = find_blob(state, &f.blob)
+                .map(|i| state.blobs[i].bytes.len())
+                .unwrap_or(0);
+            let mut line = String::new();
+            line.push_str(&f.path);
+            line.push('\t');
+            line.push_str(&size.to_string());
+            line.push('\t');
+            push_hex8(&mut line, &f.blob);
+            out.push(line);
+        }
+        out
+    }
+
+    /// Append the first 4 bytes of `hash` as 8 lowercase hex chars.
+    fn push_hex8(s: &mut String, hash: &[u8; HASH_BYTES]) {
+        fn nibble(n: u8) -> char {
+            match n {
+                0..=9 => (b'0' + n) as char,
+                _ => (b'a' + (n - 10)) as char,
+            }
+        }
+        for b in &hash[..4] {
+            s.push(nibble(b >> 4));
+            s.push(nibble(b & 0xF));
+        }
     }
 
     fn tree_at(state: &ProjectState, hash: &[u8; HASH_BYTES]) -> Vec<FileEntry> {
@@ -1532,23 +1615,33 @@ impl DevProject {
         )
     }
 
-    /// Three-way merge `theirs` into `into_branch`. Returns the
-    /// resulting commit's hash. Fast-forward inputs (theirs is a
-    /// descendant of ours, or vice versa) bypass the merge
-    /// commit; a true merge produces a 2-parent INTENT_MERGE
-    /// commit with `extras = [theirs]` and any per-path conflicts
-    /// recorded on the commit. Callers resolve conflicts via
-    /// subsequent plain commits — the merge itself is non-
-    /// blocking.
-    #[msg]
+    /// Three-way merge `theirs` into `into_branch`. Replies with
+    /// `fast_forward` / `hash` / `conflicts` lines, or a single
+    /// `error: …` line the CLI surfaces as a non-zero exit (see
+    /// [`merge_outcome_lines`]). Fast-forward inputs (theirs is a
+    /// descendant of ours, or vice versa) bypass the merge commit; a
+    /// true merge produces a 2-parent INTENT_MERGE commit with
+    /// `extras = [theirs]` and any per-path conflicts recorded on the
+    /// commit. Callers resolve conflicts via subsequent plain commits —
+    /// the merge itself is non-blocking.
+    #[msg(cli)]
     async fn merge(
         &mut self,
         into_branch: String,
         theirs: Vec<u8>,
         author: Vec<u8>,
         ts_ms: u64,
-    ) -> HashResult {
-        store::merge(&mut self.state, &into_branch, &theirs, &author, ts_ms)
+    ) -> Vec<String> {
+        let outcome = store::merge(&mut self.state, &into_branch, &theirs, &author, ts_ms);
+        merge_outcome_lines(&into_branch, outcome)
+    }
+
+    /// List a commit's tree — one `path\tsize\tblob8` line per file
+    /// (see [`store::tree`]). Browses a project's files in one
+    /// round-trip; replaces the old `dev show` N+1 size probe.
+    #[msg(cli)]
+    async fn tree(&self, commit: Vec<u8>) -> Vec<String> {
+        store::tree(&self.state, &commit)
     }
 
     /// Wire form of [`store::commit`]. Wire encoding for the file
@@ -1588,5 +1681,64 @@ impl DevProject {
                 change_id: &change_id,
             },
         )
+    }
+}
+
+/// Build the self-describing `merge` reply from a [`store::MergeOutcome`]
+/// as a `Vec<String>` — one `key: value` line — so it survives the PVM
+/// (a `vos::value::Args` record can't: its `Value` enum doesn't
+/// rkyv-encode through the transpiler). Success lists `fast_forward`,
+/// the result `hash`, and any conflict paths inline (no follow-up
+/// `get_commit` needed). Failure is a single `error: <msg>` line, which
+/// the dynamic dispatcher surfaces as a non-zero exit. Strings are built
+/// without `format!` to keep the PVM codegen minimal.
+fn merge_outcome_lines(into_branch: &str, o: store::MergeOutcome) -> Vec<String> {
+    if o.status != STATUS_OK {
+        let mut msg = String::from("error: ");
+        match o.status {
+            STATUS_NOT_FOUND => {
+                msg.push_str("target branch '");
+                msg.push_str(into_branch);
+                msg.push_str("' doesn't exist — pick an existing branch to merge into");
+            }
+            STATUS_BAD_HASH => msg.push_str("merge: 'theirs' isn't a 32-byte commit hash"),
+            STATUS_PARENT_NOT_FOUND => {
+                msg.push_str("merge: 'theirs' commit not found in this project")
+            }
+            _ => {
+                msg.push_str("merge failed (status ");
+                msg.push_str(&o.status.to_string());
+                msg.push(')');
+            }
+        }
+        return vec![msg];
+    }
+
+    let mut lines = Vec::with_capacity(3);
+    let mut ff = String::from("fast_forward: ");
+    ff.push_str(if o.fast_forward { "true" } else { "false" });
+    lines.push(ff);
+    let mut h = String::from("hash: ");
+    push_hex(&mut h, &o.hash);
+    lines.push(h);
+    if !o.conflicts.is_empty() {
+        let mut c = String::from("conflicts: ");
+        c.push_str(&o.conflicts.join(", "));
+        lines.push(c);
+    }
+    lines
+}
+
+/// Append `bytes` as lowercase hex.
+fn push_hex(s: &mut String, bytes: &[u8]) {
+    fn nibble(n: u8) -> char {
+        match n {
+            0..=9 => (b'0' + n) as char,
+            _ => (b'a' + (n - 10)) as char,
+        }
+    }
+    for b in bytes {
+        s.push(nibble(b >> 4));
+        s.push(nibble(b & 0xF));
     }
 }
