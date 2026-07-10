@@ -466,6 +466,31 @@ impl Prover {
         )
         .unwrap_or_default()
     }
+
+    /// Derive the canonical forcing profile for `seg_steps`-step windows —
+    /// the `profile` input `measure_catalog` and `prove_chain` consume.
+    /// Traces the witness-injected run, segments it, and returns the
+    /// per-chip elementwise MAX of every window's natural main-trace
+    /// `log_size` (`[u32; zkpvm::chip_idx::COUNT]`). Trace + trace-gen only
+    /// (no commit, no FRI), so it is far lighter than `measure_catalog` —
+    /// but still minutes on a multi-million-step trace, so callers drive it
+    /// with the same extended timeout. The floors are the observed
+    /// per-window maxima for this witness's op pattern, not a proven bound;
+    /// the drift guard + allowlist-coverage gate catch a reshaped
+    /// transition. Empty list on any failure.
+    #[msg]
+    async fn measure_floors(
+        &self,
+        _ctx: &mut Context<Self>,
+        pvm_blob: Vec<u8>,
+        witness_bytes: Vec<u8>,
+        witness_addr: u64,
+        seg_steps: u64,
+        gas: u64,
+    ) -> Vec<u32> {
+        measure_floors(&pvm_blob, &witness_bytes, witness_addr as usize, seg_steps as usize, gas)
+            .unwrap_or_default()
+    }
 }
 
 // ── Core logic (Context-free, unit-testable) ─────────────────────────
@@ -571,6 +596,66 @@ fn measure_commitments(
         }
     }
     Some(out)
+}
+
+/// The floors measurement behind [`Prover::measure_floors`] — trace-gen of
+/// every component over every window, so it runs on a large-stack thread
+/// like the other measure/prove paths. An empty `witness` traces the
+/// unpatched image (a program that takes no witness); a witness-taking
+/// program MUST supply a representative witness, because its empty-buffer
+/// fallback path has a different execution shape and would yield the wrong
+/// floors. `None` on any failure.
+pub fn measure_floors(
+    pvm_blob: &[u8],
+    witness: &[u8],
+    witness_addr: usize,
+    seg_steps: usize,
+    gas: u64,
+) -> Option<Vec<u32>> {
+    let pvm_blob = pvm_blob.to_vec();
+    let witness = witness.to_vec();
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || {
+            let full = if witness.is_empty() {
+                zkpvm::actor::trace_blob(&pvm_blob, gas)?
+            } else {
+                zkpvm::actor::trace_blob_with_patches(
+                    &pvm_blob,
+                    gas,
+                    &[(witness_addr, witness.as_slice())],
+                )?
+            };
+            floors_over_segments(&full, seg_steps)
+        })
+        .ok()?
+        .join()
+        .ok()?
+}
+
+/// Per-chip elementwise MAX of the natural main-trace `log_size` over every
+/// `seg_steps` window of `full` — the forcing profile under which
+/// `prove_canonical` gives all of a chain's windows an identical shape.
+/// Chips whose size is already uniform get their own size back (forcing is
+/// a no-op); varying chips get the chain-wide max, so the windows collapse
+/// onto the minimal canonical-shape set (distinct shapes remain only where
+/// content differs beyond size, e.g. fixed-base-comb call count).
+fn floors_over_segments(full: &zkpvm::SideNote, seg_steps: usize) -> Option<Vec<u32>> {
+    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), seg_steps);
+    if bounds.is_empty() {
+        return None;
+    }
+    let indices: Vec<usize> = (0..zkpvm::chip_idx::COUNT).collect();
+    let mut floors = vec![0u32; indices.len()];
+    for &(a, b) in &bounds {
+        let mut sn = zkpvm::segment::segment_side_note(full, a, b);
+        for (floor, natural) in
+            floors.iter_mut().zip(zkpvm::natural_log_sizes_for(&mut sn, &indices))
+        {
+            *floor = (*floor).max(natural);
+        }
+    }
+    Some(floors)
 }
 
 // ── Async job-queue logic (Context-free, unit-testable) ──────────────
@@ -1098,6 +1183,96 @@ mod anchor_tests {
         assert!(
             !verify(handler_anchor),
             "verify_chain rejects when the manifest declares a mismatched entering root"
+        );
+    }
+}
+
+#[cfg(test)]
+mod floors_tests {
+    //! `measure_floors` / `floors_over_segments` — the derived canonical
+    //! profile must make a chain's windows collapse onto one commitment,
+    //! and the blob path must fail soft. The heavy real-program run
+    //! (voucher-check floors per `seg_steps`) lives with the rest of the
+    //! provenance gates in `vos/tests/elf_integration.rs`.
+    use super::*;
+    use javm::PVM_REGISTER_COUNT;
+    use javm::instruction::Opcode;
+    use javm::interpreter::Interpreter;
+    use zkpvm::SideNote;
+    use zkpvm::core::tracing::TracingPvm;
+
+    /// Trace a straight-line program long enough to split into windows.
+    fn tiny_trace() -> SideNote {
+        let mut code = Vec::new();
+        for imm in 1..=6u8 {
+            code.extend_from_slice(&[Opcode::Add64 as u8, 0x10, imm]);
+        }
+        code.push(Opcode::Trap as u8);
+        let mut bitmask = vec![0; code.len()];
+        for i in (0..code.len()).step_by(3) {
+            bitmask[i] = 1;
+        }
+        let mut regs = [0u64; PVM_REGISTER_COUNT];
+        regs[0] = 100;
+        regs[1] = 1;
+        let mem = vec![0u8; 4 * 1024 * 1024];
+        let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, mem.clone(), 10_000, 25);
+        let mut tracing = TracingPvm::new(pvm);
+        tracing.run();
+        SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
+    }
+
+    #[test]
+    fn windows_collapse_to_one_commitment_under_derived_floors() {
+        // Canonical proving needs a large stack, same as the deployed paths.
+        std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(|| {
+                let full = tiny_trace();
+                let n = full.steps.len();
+                let seg = n.div_ceil(2);
+                let bounds = zkpvm::segment::segment_bounds(n, seg);
+                assert_eq!(bounds.len(), 2, "the trace must split into two windows");
+
+                let floors = floors_over_segments(&full, seg).expect("floors derive");
+                assert_eq!(floors.len(), zkpvm::chip_idx::COUNT);
+
+                // Monotonicity: a window's events are a subset of the whole
+                // trace's, so whole-trace naturals dominate windowed floors.
+                let whole = floors_over_segments(&full, n).expect("whole-trace floors");
+                for (i, (w, f)) in whole.iter().zip(&floors).enumerate() {
+                    assert!(w >= f, "chip {i}: whole-trace natural {w} < windowed floor {f}");
+                }
+
+                // The property the tool exists for: same-shape windows prove
+                // to ONE canonical commitment under the derived floors.
+                let commitments: Vec<_> = bounds
+                    .iter()
+                    .map(|&(a, b)| {
+                        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+                        let proof = prove_canonical(&mut sn, &floors)
+                            .expect("canonical prove under derived floors");
+                        zkpvm::recursion_pcs::commitment_bytes(
+                            &zkpvm::program_commitment_of_proof(&proof),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    commitments[0], commitments[1],
+                    "windows with equal comb counts must share one commitment"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn measure_floors_rejects_garbage_blob() {
+        assert_eq!(
+            measure_floors(&[0xDE, 0xAD, 0xBE, 0xEF], &[], 0, 100, 1_000),
+            None,
+            "an unparseable blob yields None, not a panic"
         );
     }
 }
