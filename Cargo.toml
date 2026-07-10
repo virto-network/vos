@@ -26,6 +26,7 @@ exclude = [
     "examples/agents/scheduler",
     "examples/actors/tally",
     "examples/actors/big-map",
+    "examples/actors/committed-counter",
     "examples/wasm/*",
     # Built-in PVM actors (riscv64em-javm target) live alongside
     # the workspace crates but build with their own toolchain.

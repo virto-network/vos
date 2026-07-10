@@ -6852,18 +6852,18 @@ const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
 /// segment commitment is in this set.
 const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
     // C_0 — comb-free canonical shape.
-    // blake2s 46e1bede03214805b7b6130286a3c878026dd523a50cc0f62658a5d662f2a5a7
+    // blake2s 25cc5823902e24a32a720b9621f0411f3535760991941bdd33e71cae9a5df833
     [
-        0x46, 0xe1, 0xbe, 0xde, 0x03, 0x21, 0x48, 0x05, 0xb7, 0xb6, 0x13, 0x02, 0x86, 0xa3, 0xc8,
-        0x78, 0x02, 0x6d, 0xd5, 0x23, 0xa5, 0x0c, 0xc0, 0xf6, 0x26, 0x58, 0xa5, 0xd6, 0x62, 0xf2,
-        0xa5, 0xa7,
+        0x25, 0xcc, 0x58, 0x23, 0x90, 0x2e, 0x24, 0xa3, 0x2a, 0x72, 0x0b, 0x96, 0x21, 0xf0, 0x41,
+        0x1f, 0x35, 0x35, 0x76, 0x09, 0x91, 0x94, 0x1b, 0xdd, 0x33, 0xe7, 0x1c, 0xae, 0x9a, 0x5d,
+        0xf8, 0x33,
     ],
     // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
-    // blake2s f5dd7d50f536a474a31b092d93fb1d051abaa7f076dd32f542e5ccff769cd529
+    // blake2s 4805c03e1fd0cdfb2abac250352f1714939550cfac10f8900103d571b70d571f
     [
-        0xf5, 0xdd, 0x7d, 0x50, 0xf5, 0x36, 0xa4, 0x74, 0xa3, 0x1b, 0x09, 0x2d, 0x93, 0xfb, 0x1d,
-        0x05, 0x1a, 0xba, 0xa7, 0xf0, 0x76, 0xdd, 0x32, 0xf5, 0x42, 0xe5, 0xcc, 0xff, 0x76, 0x9c,
-        0xd5, 0x29,
+        0x48, 0x05, 0xc0, 0x3e, 0x1f, 0xd0, 0xcd, 0xfb, 0x2a, 0xba, 0xc2, 0x50, 0x35, 0x2f, 0x17,
+        0x14, 0x93, 0x95, 0x50, 0xcf, 0xac, 0x10, 0xf8, 0x90, 0x01, 0x03, 0xd5, 0x71, 0xb7, 0x0d,
+        0x57, 0x1f,
     ],
 ];
 
@@ -11564,6 +11564,20 @@ fn voucher_check_catalog_matches_pinned_constants() {
             vos::zk::witness_addr(&elf).expect("voucher-check ELF exports __VOS_WITNESS"),
             "catalog witness_addr drifted from the live ELF symbol"
         );
+        // The recorded unpatched image root must match the live blob too —
+        // trace-only (the unpatched guest early-exits on its all-zero
+        // witness), so this catches a guest-framework rebuild that moved
+        // the image without waiting for a prove-path failure.
+        let (blob, _) = voucher_check_pvm();
+        let measured = prover_extension::measure_catalog(&blob, &[], 0, 1, &[], VC_TRACE_GAS)
+            .expect("trace-only measure of the unpatched image root");
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            pin.unpatched_image_root,
+            hex(&measured[..32]),
+            "catalog unpatched_image_root drifted from the live blob — \
+             re-pin with `vosx zk pin` (or update catalog.toml)"
+        );
     }
 }
 
@@ -11656,4 +11670,109 @@ fn storage_map_outgrows_guest_heap() {
 
     node.shutdown();
     let _ = node.collect();
+}
+
+/// A `#[storage(committed)]` map anchors its work-results with
+/// `anchor_kind 0x02` composite roots (docs/plans/actor-storage.md W4.2):
+/// every accepted dispatch below IS the host verifying the chain — a
+/// mis-emitted anchor would AnchorMismatch, drop the reply, and fail
+/// the assert. The guest-maintained incremental root must equal a
+/// host-side full recompute over the known content, survive a cold
+/// process restart (the chain reseeds from the recorded composite
+/// row), and keep moving correctly through inserts and removes.
+#[test]
+fn committed_map_anchors_with_smt_roots() {
+    use committed_counter::CommittedCounterRef;
+    use vos::actors::codec::Encode;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::zk::state::{SmtParams, leaf_hash, root_of_sorted};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let path = format!(
+        "{}/../examples/actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf",
+        workspace,
+    );
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: committed-counter actor not built — run `just build-pvm`");
+            return;
+        }
+    };
+    let blob = grey_transpiler::link_elf(&data).expect("transpile committed-counter");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_committed_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Host-side reference: the fixture's map is CommittedMap<u64, u64>
+    // under vos domains — width 8, leaves hash the rkyv value bytes.
+    let p = SmtParams::vos(8);
+    let reference_root = |entries: &[(u64, u64)]| -> Vec<u8> {
+        let mut leaves: Vec<(Vec<u8>, [u8; 32])> = entries
+            .iter()
+            .map(|(k, v)| (k.to_be_bytes().to_vec(), leaf_hash(&p, &v.encode())))
+            .collect();
+        leaves.sort_unstable();
+        root_of_sorted(&p, &leaves).to_vec()
+    };
+
+    let spawn = |blob: Vec<u8>| -> (VosNode, vos::abi::service::ServiceId) {
+        let mut node = VosNode::with_prefix(0x00ac);
+        let id = node.register(
+            AgentConfig::new(blob)
+                .with_consistency(Consistency::Local)
+                .persist(&dir),
+        );
+        (node, id)
+    };
+
+    // ── Boot 1: genesis → 0x02 chain across dispatches ──────────
+    let (node, id) = spawn(blob.clone());
+    let counter = CommittedCounterRef::at(id);
+    for (k, v) in [(5u64, 50u64), (1, 10), (9, 90)] {
+        assert_eq!(vos::block_on(counter.put(&mut &node, k, v)).expect("put"), 1);
+    }
+    assert_eq!(vos::block_on(counter.get(&mut &node, 1)).expect("get"), 10);
+    assert_eq!(
+        vos::block_on(counter.root(&mut &node)).expect("root"),
+        reference_root(&[(5, 50), (1, 10), (9, 90)]),
+        "guest incremental root must equal the host full recompute",
+    );
+    node.shutdown();
+    let _ = node.collect();
+
+    // ── Boot 2: the anchor chain reseeds from the composite row ─
+    let (node, id) = spawn(blob);
+    let counter = CommittedCounterRef::at(id);
+    assert_eq!(
+        vos::block_on(counter.get(&mut &node, 9)).expect("get after restart"),
+        90,
+    );
+    assert_eq!(
+        vos::block_on(counter.root(&mut &node)).expect("root after restart"),
+        reference_root(&[(5, 50), (1, 10), (9, 90)]),
+        "the committed root must survive a cold restart",
+    );
+    // Mutations keep chaining: an overwrite, a fresh insert, a remove.
+    assert_eq!(vos::block_on(counter.put(&mut &node, 5, 55)).expect("put"), 0);
+    assert_eq!(vos::block_on(counter.put(&mut &node, 2, 20)).expect("put"), 1);
+    assert_eq!(vos::block_on(counter.del(&mut &node, 1)).expect("del"), 1);
+    assert_eq!(
+        vos::block_on(counter.root(&mut &node)).expect("root"),
+        reference_root(&[(5, 55), (9, 90), (2, 20)]),
+        "the root must track post-restart mutations",
+    );
+    let stats = vos::block_on(counter.stats(&mut &node)).expect("stats");
+    assert_eq!(u64::from_le_bytes(stats[..8].try_into().unwrap()), 3);
+    node.shutdown();
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
 }

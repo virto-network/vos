@@ -220,14 +220,41 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let init_storage = if storage_fields.is_empty() {
         quote! {}
     } else {
-        let inits = storage_fields.iter().map(|(ident, prefix)| {
-            let lit = syn::LitByteStr::new(prefix, proc_macro2::Span::call_site());
+        let inits = storage_fields.iter().map(|f| {
+            let ident = &f.ident;
+            let lit = syn::LitByteStr::new(&f.prefix, proc_macro2::Span::call_site());
             quote! { self.#ident.__init(#lit); }
         });
         quote! {
             #[doc(hidden)]
             fn __init_storage(&mut self) {
                 #( #inits )*
+            }
+        }
+    };
+
+    // `#[storage(committed)]` fields: fold their SMT roots (declaration
+    // order — part of the upgrade contract) with the state-blob hash
+    // into the composite root `anchor_kind 0x02` anchors. Actors with
+    // no committed fields keep the trait default (`None` → 0x01).
+    let committed: Vec<&syn::Ident> = storage_fields
+        .iter()
+        .filter(|f| f.committed)
+        .map(|f| &f.ident)
+        .collect();
+    let committed_root = if committed.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            #[doc(hidden)]
+            const COMMITTED: bool = true;
+
+            #[doc(hidden)]
+            fn __committed_root(&self, state_hash: &[u8; 32]) -> Option<[u8; 32]> {
+                Some(vos::zk::state::composite_fold(
+                    state_hash,
+                    [ #( self.#committed.root() ),* ],
+                ))
             }
         }
     };
@@ -265,6 +292,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #init_storage
+
+            #committed_root
 
             async fn on_start(
                 &mut self,
@@ -1384,36 +1413,48 @@ struct ActorAttrs {
 /// The default prefix is `s/<field>/`; pass an explicit
 /// `prefix = "…"` to pin it across a field rename (the prefix names
 /// the rows — changing it orphans them).
-fn extract_storage_fields(input: &mut ItemStruct) -> Vec<(syn::Ident, Vec<u8>)> {
-    let mut out: Vec<(syn::Ident, Vec<u8>)> = Vec::new();
+/// One `#[storage]` field: its ident, key prefix, and whether it is
+/// `committed` (folds into the `anchor_kind 0x02` composite root).
+struct StorageField {
+    ident: syn::Ident,
+    prefix: Vec<u8>,
+    committed: bool,
+}
+
+fn extract_storage_fields(input: &mut ItemStruct) -> Vec<StorageField> {
+    let mut out: Vec<StorageField> = Vec::new();
     let syn::Fields::Named(named) = &mut input.fields else {
         return out;
     };
     for field in named.named.iter_mut() {
-        let mut storage: Option<Option<String>> = None;
+        let mut storage: Option<(Option<String>, bool)> = None;
         field.attrs.retain(|attr| {
             if !attr.path().is_ident("storage") {
                 return true;
             }
             let mut custom = None;
+            let mut committed = false;
             if matches!(attr.meta, syn::Meta::List(_)) {
                 let parsed = attr.parse_nested_meta(|meta| {
                     if meta.path.is_ident("prefix") {
                         let lit: syn::LitStr = meta.value()?.parse()?;
                         custom = Some(lit.value());
                         Ok(())
+                    } else if meta.path.is_ident("committed") {
+                        committed = true;
+                        Ok(())
                     } else {
-                        Err(meta.error("expected `prefix = \"…\"`"))
+                        Err(meta.error("expected `prefix = \"…\"` or `committed`"))
                     }
                 });
                 if let Err(e) = parsed {
                     panic!("#[storage]: {e}");
                 }
             }
-            storage = Some(custom);
+            storage = Some((custom, committed));
             false
         });
-        if let Some(custom) = storage {
+        if let Some((custom, committed)) = storage {
             let ident = field.ident.clone().expect("named field");
             let prefix = custom.unwrap_or_else(|| format!("s/{ident}/"));
             assert!(
@@ -1421,10 +1462,14 @@ fn extract_storage_fields(input: &mut ItemStruct) -> Vec<(syn::Ident, Vec<u8>)> 
                 "#[storage] prefix {prefix:?} collides with the framework keyspace",
             );
             assert!(
-                out.iter().all(|(_, p)| p != prefix.as_bytes()),
+                out.iter().all(|f| f.prefix != prefix.as_bytes()),
                 "#[storage] prefix {prefix:?} is used by two fields",
             );
-            out.push((ident, prefix.into_bytes()));
+            out.push(StorageField {
+                ident,
+                prefix: prefix.into_bytes(),
+                committed,
+            });
         }
     }
     out

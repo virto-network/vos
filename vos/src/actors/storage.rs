@@ -106,6 +106,14 @@ fn with_state<R>(f: impl FnOnce(&mut DispatchState) -> R) -> R {
     DISPATCH.with(|s| f(&mut s.borrow_mut()))
 }
 
+/// Queue a framework-owned row write into the dispatch overlay — the
+/// halt path uses this for the committed-storage composite root, so
+/// the row rides the same drain as the handles' own mutations.
+#[cfg_attr(not(feature = "service"), allow(dead_code))]
+pub(crate) fn store_raw(key: Vec<u8>, value: Vec<u8>) {
+    overlay_store(key, Some(value));
+}
+
 /// Drain the dispatch's queued row mutations (key order, one per key)
 /// and drop the read cache. Called by the framework when packing the
 /// refine payload; the drained rows become `Write`/`Delete` effects

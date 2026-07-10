@@ -41,6 +41,16 @@ pub const INIT_KEY: &[u8] = b"__vos_init";
 /// prefixes never begin with `\0`.
 pub const CONTINUATION_HEADER_KEY: &[u8] = b"\0__vos_cont";
 
+/// Storage key for the committed-storage composite root — the value
+/// `anchor_kind 0x02` anchors. The guest recomputes it at every halt
+/// (`Actor::__committed_root`: the state-blob hash folded with each
+/// committed field's SMT root) and writes it as an ordinary row
+/// effect, so the host's expected-anchor check reads the *prior*
+/// dispatch's composite through the same journal overlay it reads the
+/// state blob through — no per-actor metadata needed host-side. In
+/// the reserved `__vos_` namespace, so user prefixes can't collide.
+pub const COMMITTED_ROOT_KEY: &[u8] = b"__vos_committed_root";
+
 /// Storage key for persisted actor state.
 #[cfg(feature = "service")]
 const STATE_KEY: &[u8] = b"__vos_actor_state";
@@ -154,6 +164,26 @@ pub fn read_persisted_state_owned() -> Option<alloc::vec::Vec<u8>> {
     // under us — impossible within one dispatch, so treat it as
     // corruption and let the caller fall back to a fresh actor.
     (m == n).then_some(full)
+}
+
+/// Read the committed-storage composite root recorded by the previous
+/// dispatch, if any — the cold-start seed for a committed actor's
+/// `anchor_kind 0x02` anchor chain. Exactly 32 bytes when present;
+/// any other stored length is treated as absent (a fresh actor, or a
+/// corrupted row the next halt will overwrite).
+#[cfg(feature = "service")]
+pub(crate) fn read_committed_root() -> Option<[u8; 32]> {
+    use crate::abi::error::HOST_NONE;
+    use crate::abi::pvm::hostcalls;
+
+    let mut buf = [0u8; 64];
+    let n = hostcalls::read(COMMITTED_ROOT_KEY, &mut buf);
+    if n != 32 || n == HOST_NONE {
+        return None;
+    }
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&buf[..32]);
+    Some(root)
 }
 
 /// Fetch the next raw message from the transfer queue.

@@ -441,9 +441,7 @@ fn absorb_work_result(
     payload: RefinePayload,
 ) -> Result<AbsorbedWorkResult, WorkResultError> {
     let anchor = if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
-        let effective =
-            journal.effective_read(storage, svc_id, crate::lifecycle::STATE_KEY_BYTES);
-        let expected = crate::refine_payload::anchor_for(effective);
+        let expected = expected_anchor(journal, storage, svc_id);
         if (payload.anchor_kind, payload.anchor) != expected {
             return Err(WorkResultError::AnchorMismatch);
         }
@@ -460,6 +458,33 @@ fn absorb_work_result(
         effect_bearing,
         anchor,
     })
+}
+
+/// The `(anchor_kind, anchor)` a v3 work-result must carry for this
+/// service's *effective* prior state. Committed-storage actors write
+/// their composite root as an ordinary framework row
+/// ([`COMMITTED_ROOT_KEY`](crate::lifecycle::COMMITTED_ROOT_KEY)), so
+/// once a first dispatch has stored one, the expectation is
+/// `(ANCHOR_SMT_ROOT, that row)` — read through the same journal
+/// overlay as the state blob, which is what advances the expectation
+/// across a tick's chained iterations. Before the row exists (fresh
+/// actor, or a plain 0x01 actor forever) the expectation falls back to
+/// [`anchor_for`](crate::refine_payload::anchor_for) over the state
+/// blob, so genesis and blob-hash anchors are untouched.
+fn expected_anchor(
+    journal: &RefineJournal,
+    storage: &ServiceStorage,
+    svc_id: u32,
+) -> (u8, [u8; 32]) {
+    if let Some(root) = journal.effective_read(storage, svc_id, crate::lifecycle::COMMITTED_ROOT_KEY)
+        && root.len() == 32
+    {
+        let mut anchor = [0u8; 32];
+        anchor.copy_from_slice(root);
+        return (crate::refine_payload::ANCHOR_SMT_ROOT, anchor);
+    }
+    let effective = journal.effective_read(storage, svc_id, crate::lifecycle::STATE_KEY_BYTES);
+    crate::refine_payload::anchor_for(effective)
 }
 
 /// Whether halt-output bytes claim to be a RefinePayload wire version
@@ -1852,7 +1877,9 @@ fn run_task_invoke(
     let mut payload = payload;
 
     // Parity: the child's anchor must commit to exactly the state the
-    // parent delivered (genesis when it delivered none).
+    // parent delivered (genesis when it delivered none). Tasks stay on
+    // blob-hash anchors: a witness-delivered committed root belongs to
+    // the witnessed-read backend, which supplies the leaves it proves.
     let expected = crate::refine_payload::anchor_for(Some(state));
     if (payload.anchor_kind, payload.anchor) != expected {
         error!(parent_svc_id, "task child: work-result anchor mismatch");
@@ -2245,10 +2272,24 @@ fn handle_invoke(
 
     let output = if let Some(mut payload) = RefinePayload::decode(&raw_output) {
         // Parity check: a v3 child's anchor must commit to exactly the
-        // state the host staged for it. A mismatch means a buggy guest
-        // or a doctored blob — apply nothing, surface a crash.
+        // state the host staged for it — or, for a committed-storage
+        // child, the composite root its own keyspace recorded (read
+        // through the same journal overlay; see `expected_anchor`).
+        // A mismatch means a buggy guest or a doctored blob — apply
+        // nothing, surface a crash.
         if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
-            let expected = crate::refine_payload::anchor_for(Some(&child_prior_state));
+            let expected = if let Some(root) = journal.effective_read(
+                storage,
+                target_svc_id.0,
+                crate::lifecycle::COMMITTED_ROOT_KEY,
+            ) && root.len() == 32
+            {
+                let mut anchor = [0u8; 32];
+                anchor.copy_from_slice(root);
+                (crate::refine_payload::ANCHOR_SMT_ROOT, anchor)
+            } else {
+                crate::refine_payload::anchor_for(Some(&child_prior_state))
+            };
             if (payload.anchor_kind, payload.anchor) != expected {
                 error!(?target_svc_id, "child invoke: work-result anchor mismatch");
                 journal.rollback_to(invoke_mark);
@@ -2532,6 +2573,68 @@ mod tests {
             journal.journaled_read(svc, crate::lifecycle::STATE_KEY_BYTES),
             Some(Some(&b"s2"[..])),
         );
+    }
+
+    #[test]
+    fn v3_smt_anchor_follows_the_committed_root_row() {
+        use crate::refine_payload::{ANCHOR_SMT_ROOT, Effect, RefinePayload, anchor_for};
+
+        // A committed-storage actor's expected anchor is its recorded
+        // composite-root row — read through the journal overlay, so a
+        // work-result that rewrites the row advances the expectation
+        // for the next chained iteration, exactly like the state blob.
+        let svc = 4u32;
+        let mut storage = ServiceStorage::new();
+        storage.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"s0");
+        storage.write(
+            ServiceId(svc),
+            crate::lifecycle::COMMITTED_ROOT_KEY,
+            &[0xc1; 32],
+        );
+        let mut journal = RefineJournal::default();
+
+        // A blob-hash claim must reject once a composite row exists.
+        let (k, a) = anchor_for(Some(b"s0"));
+        let stale = RefinePayload {
+            anchor_kind: k,
+            anchor: a,
+            ..RefinePayload::new()
+        };
+        assert_eq!(
+            absorb_work_result(&mut journal, &storage, svc, stale).expect_err("0x01 vs 0x02"),
+            WorkResultError::AnchorMismatch,
+        );
+
+        // The 0x02 claim matching the row applies — and its effects
+        // (a new composite row) advance the expectation in-overlay.
+        let ok = RefinePayload {
+            anchor_kind: ANCHOR_SMT_ROOT,
+            anchor: [0xc1; 32],
+            effects: vec![Effect::Write {
+                key: crate::lifecycle::COMMITTED_ROOT_KEY.to_vec(),
+                value: alloc::vec![0xc2; 32],
+            }],
+            ..RefinePayload::new()
+        };
+        absorb_work_result(&mut journal, &storage, svc, ok).expect("0x02 matches the row");
+
+        let stale2 = RefinePayload {
+            anchor_kind: ANCHOR_SMT_ROOT,
+            anchor: [0xc1; 32],
+            ..RefinePayload::new()
+        };
+        assert_eq!(
+            absorb_work_result(&mut journal, &storage, svc, stale2)
+                .expect_err("stale composite must reject"),
+            WorkResultError::AnchorMismatch,
+        );
+        let next = RefinePayload {
+            anchor_kind: ANCHOR_SMT_ROOT,
+            anchor: [0xc2; 32],
+            ..RefinePayload::new()
+        };
+        absorb_work_result(&mut journal, &storage, svc, next)
+            .expect("the overlay-advanced composite is the expectation");
     }
 
     #[test]

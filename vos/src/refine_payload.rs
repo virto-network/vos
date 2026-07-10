@@ -98,9 +98,13 @@ pub const ANCHOR_GENESIS: u8 = 0x00;
 /// Anchor kind: `anchor = blake2b-256(prior STATE_KEY blob bytes)`.
 pub const ANCHOR_STATE_HASH: u8 = 0x01;
 
-/// Anchor kind reserved for SMT state roots (`vos::zk::state`). The kind
-/// byte reserves the slot so the wire doesn't change; rejected on decode
-/// until the SMT generalization emits it.
+/// Anchor kind: `anchor` is the committed-storage composite root — the
+/// prior state-blob hash folded with each committed field's SMT root
+/// (`vos::zk::state::composite_fold`), as recorded in the actor's
+/// [`COMMITTED_ROOT_KEY`](crate::lifecycle::COMMITTED_ROOT_KEY) row.
+/// Emitted by guests with `#[storage(committed)]` fields once a first
+/// dispatch has written state (their genesis is still
+/// [`ANCHOR_GENESIS`]).
 pub const ANCHOR_SMT_ROOT: u8 = 0x02;
 
 pub const EFFECT_WRITE: u8 = 0x01;
@@ -238,8 +242,10 @@ impl RefinePayload {
                 }
             }
             ANCHOR_STATE_HASH => {}
-            // ANCHOR_SMT_ROOT is reserved: rejecting it now means an SMT
-            // emitter can't silently pass an unprepared host later.
+            // An empty committed tree's root is NOT zero (the empty
+            // chain folds the sentinel up), so 0x02 carries whatever
+            // 32 bytes the composite row held — no content check.
+            ANCHOR_SMT_ROOT => {}
             _ => return None,
         }
         let reply_len = c.read_u32()? as usize;
@@ -728,9 +734,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_smt_anchor_kind() {
+    fn smt_anchor_kind_round_trips_and_unknown_kinds_reject() {
+        // 0x02 is live: any 32-byte composite root decodes (an empty
+        // committed tree's root is non-zero, so no content check).
+        let mut p = RefinePayload::new();
+        p.anchor_kind = ANCHOR_SMT_ROOT;
+        p.anchor = [0xab; 32];
+        let back = RefinePayload::decode(&p.encode()).expect("0x02 decodes");
+        assert_eq!(back.anchor_kind, ANCHOR_SMT_ROOT);
+        assert_eq!(back.anchor, [0xab; 32]);
+        // The next kind byte stays reserved-and-rejected.
         let mut bytes = RefinePayload::new().encode();
-        bytes[2] = ANCHOR_SMT_ROOT;
+        bytes[2] = ANCHOR_SMT_ROOT + 1;
         assert!(RefinePayload::decode(&bytes).is_none());
     }
 

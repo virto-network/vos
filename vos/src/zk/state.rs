@@ -98,6 +98,23 @@ pub fn empty_chain(p: &SmtParams) -> Vec<[u8; 32]> {
     chain
 }
 
+/// Fold a state-blob hash and per-field committed roots into the one
+/// composite `anchor_kind 0x02` anchors — the whole agent keyspace
+/// with the state blob as the designated first leaf. Field order is
+/// the `#[actor]` struct's declaration order (part of the upgrade
+/// contract: reordering committed fields moves the anchor).
+pub fn composite_fold(
+    state_hash: &[u8; 32],
+    roots: impl IntoIterator<Item = [u8; 32]>,
+) -> [u8; 32] {
+    let p = SmtParams::vos(32);
+    let mut acc = *state_hash;
+    for root in roots {
+        acc = node_hash(&p, &acc, &root);
+    }
+    acc
+}
+
 /// Test bit `depth` of `key` counting from the leaves: depth 0 is the
 /// LSB of the last byte, depth `8·width − 1` is the MSB of byte 0.
 pub fn bit_at(p: &SmtParams, key: &[u8], depth: usize) -> bool {
