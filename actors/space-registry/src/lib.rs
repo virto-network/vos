@@ -496,7 +496,11 @@ impl SpaceRegistry {
             .cloned()
     }
 
-    /// Snapshot the full catalog. Pagination can come later.
+    /// Snapshot the program catalog, sorted by `(name, version)`. Left
+    /// unpaginated: `programs` stays blob-backed (so the reply is
+    /// heap-bounded like the table itself) and PVM-actor consumers read it
+    /// arg-free — pagination would break those callers for no reply-cap
+    /// gain until the table actually moves to storage.
     #[msg]
     async fn programs(&self) -> Vec<ProgramRow> {
         self.programs.clone()
@@ -844,16 +848,22 @@ impl SpaceRegistry {
             .cloned()
     }
 
+    /// Snapshot the installed-agent roster, sorted by `instance_name`.
+    /// Unpaginated for the same reason as `programs` — blob-backed and read
+    /// arg-free by PVM actors (messenger, gateway).
     #[msg]
     async fn agents(&self) -> Vec<AgentRow> {
         self.agents.clone()
     }
 
-    /// Lightweight enumeration of installed agent names.
-    /// Returns `Vec<String>` so cross-actor callers without
-    /// `AgentRow` schema knowledge (e.g. the gateway rendering
-    /// `/__schema`) can pull the list without an rkyv dance.
-    /// Same ordering as `agents()` — sorted by `instance_name`.
+    /// Lightweight enumeration of installed agent names, sorted by
+    /// `instance_name`. Returns `Vec<String>` so cross-actor callers
+    /// without `AgentRow` schema knowledge (e.g. the gateway rendering
+    /// `/__schema`) can pull the list without an rkyv dance. Unpaginated on
+    /// purpose: it is names-only, its `agents` backing stays blob-backed
+    /// (so the reply is heap-bounded like `agents` itself), and the gateway
+    /// consumes it arg-free — pagination would break that caller for no
+    /// reply-size gain.
     #[msg]
     async fn agent_names(&self) -> Vec<String> {
         self.agents
