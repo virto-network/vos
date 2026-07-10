@@ -5487,7 +5487,7 @@ fn crdt_registry_writes_and_deletes_converge_across_replicas() {
 
     let mut node_b = VosNode::with_prefix(prefix_b);
     let _reg_b = node_b.register_at_id(
-        AgentConfig::new(registry_blob)
+        AgentConfig::new(registry_blob.clone())
             .with_consistency(Consistency::Crdt)
             .persist(&dir_b)
             .with_replication_id(rep_id),
@@ -5586,8 +5586,57 @@ fn crdt_registry_writes_and_deletes_converge_across_replicas() {
     assert_eq!(members_a.len(), 1, "only the surviving node member remains");
     assert_eq!(members_a[0].prefix, 9, "the survivor is prefix 9");
 
+    // ── Persisted keyspaces are byte-identical ─────────────────
+    // A's rows were persisted incrementally by its local dispatch
+    // deltas; B's were persisted wholesale by the post-replay
+    // `commit_rebuilt` swap. Same history ⇒ same bytes, row for row.
     node_a.collect();
     node_b.collect();
+    let reg_db = |dir: &std::path::Path| {
+        dir.join("agents")
+            .join(format!("{:08x}.redb", ServiceId::REGISTRY.0))
+    };
+    let rows_a = vos::commit::read_kv_rows_at(&reg_db(&dir_a)).expect("read A's persisted rows");
+    let rows_b = vos::commit::read_kv_rows_at(&reg_db(&dir_b)).expect("read B's persisted rows");
+    assert!(
+        !rows_b.is_empty(),
+        "B must durably persist the rows the merge delivered"
+    );
+    assert_eq!(
+        rows_a, rows_b,
+        "persisted storage rows must be byte-identical across replicas"
+    );
+
+    // ── Cold restart B with no network: merged rows survive ────
+    // Reopen B purely from its own files — no peers to re-sync from.
+    // Without the full-keyspace post-replay commit, restore() returns
+    // the state blob but restore_writes() has no rows, so every
+    // remotely-replicated member would vanish (node_role = 0).
+    let mut node_b2 = VosNode::with_prefix(prefix_b);
+    let _reg_b2 = node_b2.register_at_id(
+        AgentConfig::new(registry_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    assert_eq!(
+        vos::block_on(reg.node_role(&mut &node_b2, 9)).expect("node_role after cold restart"),
+        1,
+        "remotely-replicated member must survive a cold restart",
+    );
+    assert_eq!(
+        vos::block_on(reg.node_role(&mut &node_b2, 7)).expect("node_role after cold restart"),
+        0,
+        "the removed member must stay removed after a cold restart",
+    );
+    let members_b2 =
+        vos::block_on(reg_all.members_all(&mut &node_b2)).expect("members_all after cold restart");
+    assert_eq!(
+        members_b2, members_a,
+        "the roster must survive a cold restart byte-identically",
+    );
+    node_b2.collect();
     let _ = std::fs::remove_dir_all(&dir_root);
 }
 

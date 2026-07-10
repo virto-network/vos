@@ -1889,8 +1889,10 @@ fn replay_dag_into_runtime(
 /// Soft restart for a CRDT actor. Picks up whatever the sync
 /// ticker merged into our redb file, throws away the locally-
 /// derived runtime state, replays every log in the merged DAG,
-/// and commits the rebuilt state. Idempotent — calling it twice
-/// in a row produces the same final state.
+/// and commits the rebuilt state plus the whole rebuilt keyspace
+/// (see [`rebuilt_rows`] — merged remote dispatches' rows exist
+/// nowhere else). Idempotent — calling it twice in a row produces
+/// the same final state.
 ///
 /// Called from the agent thread between dispatches when the
 /// sync notifier fires, so blocking is fine. Returns `Err(msg)`
@@ -1938,10 +1940,34 @@ fn soft_restart_crdt(
         .unwrap_or_default();
     if !state.is_empty() {
         strategy
-            .commit_state(&state)
+            .commit_rebuilt(&state, &rebuilt_rows(runtime, svc_id))
             .map_err(|e| format!("post-soft-restart commit: {e}"))?;
     }
     Ok(())
+}
+
+/// The rebuilt keyspace a replay left in the runtime, ready for
+/// [`CommitStrategy::commit_rebuilt`]: every row except STATE_KEY
+/// (which travels separately as the state blob) and INIT_KEY (host-
+/// seeded from the manifest on every spawn — persisting it would let
+/// a stale copy shadow a manifest edit on the next boot).
+///
+/// Local dispatch deltas persist rows incrementally, but the rows a
+/// replay produces for *merged remote* dispatches exist only here in
+/// the runtime — without persisting the full slate, a cold reopen
+/// (`restore_writes`) comes back missing every remotely-replicated
+/// row, and a later local delta can persist index pages that name
+/// value rows the table doesn't hold.
+#[cfg(feature = "storage")]
+fn rebuilt_rows(runtime: &VosRuntime, svc_id: ServiceId) -> Vec<(Vec<u8>, Vec<u8>)> {
+    runtime
+        .storage
+        .scan_prefix(svc_id, b"")
+        .filter(|(key, _)| {
+            *key != crate::lifecycle::STATE_KEY_BYTES && *key != crate::lifecycle::INIT_KEY
+        })
+        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+        .collect()
 }
 
 /// How often the per-replica sync ticker fires. Short enough that
@@ -3600,15 +3626,17 @@ fn agent_thread(
                     };
                 }
                 let _ = logs;
-                // Materialize the state into the strategy so
-                // subsequent cold starts hit the fast path.
+                // Materialize the state AND the rebuilt keyspace into
+                // the strategy so subsequent cold starts hit the fast
+                // path — restore_writes must return what replay just
+                // produced, not whatever earlier deltas persisted.
                 let state = runtime
                     .storage
                     .read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
                     .map(|v| v.to_vec())
                     .unwrap_or_default();
                 if !state.is_empty()
-                    && let Err(e) = strategy.commit_state(&state)
+                    && let Err(e) = strategy.commit_rebuilt(&state, &rebuilt_rows(&runtime, svc_id))
                 {
                     let err = format!("post-replay commit failed: {e}");
                     error!(%id, "{err}");

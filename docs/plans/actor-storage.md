@@ -382,6 +382,25 @@ end-to-end; 0x01 actors byte-for-byte unaffected.
      correct). Tests: `vos::actors::storage::tests::vec_replay_needs_a_cleared_keyspace`
      (final-state proof), `runtime::tests::clear_service_drops_only_that_services_rows`.
      The 3.1 two-replica gate exercises it end-to-end.
+   - *The rebuilt slate must also persist wholesale.* Post-replay
+     materialization committed only the state blob (`commit_state`), while
+     the KV table is written exclusively from *local* dispatch deltas — so
+     the rows replay rebuilt for merged **remote** dispatches lived only in
+     the in-memory runtime. A cold reopen (`restore_writes`) came back
+     missing every remotely-replicated row (a restarted replica answered
+     `node_role = 0` for its peers' voters), and a post-merge local delta
+     could persist index pages naming value rows the table never held —
+     panicking `StorageMapIter` on the first list after restart. Fix:
+     `CommitStrategy::commit_rebuilt(state, rows)` atomically writes the
+     state and *swaps* the whole KV table for the replayed slate (dropping
+     rows the replayed layout no longer produces), implemented for
+     `LocalCommit`/`CrdtCommit`/`RaftCommit` and called from both replay
+     materialization sites (`soft_restart_crdt`, cold-start replay).
+     Tests: `commit_rebuilt_swaps_the_whole_kv_table`,
+     `crdt_commit_rebuilt_swaps_rows_without_appending_history`; the 3.1
+     gate now also byte-compares both replicas' persisted KV tables and
+     cold-restarts a replica with no network attached (both fail without
+     the fix).
 2. **Registry ordering semantics** (3.1): do any registry consumers
    depend on insertion order of `members`/`agents`? If so those become
    `StorageVec` + side index rather than ordered maps.

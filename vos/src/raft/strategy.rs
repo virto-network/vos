@@ -436,6 +436,35 @@ impl CommitStrategy for RaftCommit {
         })
     }
 
+    fn commit_rebuilt(
+        &mut self,
+        state: &[u8],
+        rows: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<CommitReceipt, CommitError> {
+        // Post-replay materialization of the whole rebuilt keyspace —
+        // the log-less commit path's semantics (advance `last_applied`
+        // to the worker's commit_index, append nothing), except the KV
+        // table is swapped wholesale: replay recomputes every row, so
+        // rows the replayed history no longer produces must not linger.
+        self.meta = RaftMeta::load(&self.db)?;
+        let new_last_applied = self.meta.commit_index;
+        let txn = self.db.begin_write()?;
+        {
+            let mut state_table = txn.open_table(STATE_TABLE)?;
+            state_table.insert(STATE_KEY, state)?;
+        }
+        crate::commit::swap_kv_rows(&txn, rows)?;
+        if new_last_applied > self.meta.last_applied {
+            self.meta.last_applied = new_last_applied;
+            self.meta.write_host_fields_in_txn(&txn)?;
+        }
+        txn.commit()?;
+        self.last_state = state.to_vec();
+        Ok(CommitReceipt {
+            node_appended: false,
+        })
+    }
+
     fn restore_writes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
         crate::commit::read_kv_rows(&self.db)
     }
