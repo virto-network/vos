@@ -82,6 +82,7 @@ use cipher_clerk::voucher::Voucher;
 use clerk_ledger::ClerkLedgerRef;
 use vos::abi::service::ServiceId;
 use vos::prelude::*;
+use vos::storage::{StorageMap, StorageSet};
 
 mod window;
 
@@ -199,27 +200,10 @@ pub struct PeerEntry {
     pub last_root_after: Option<[u8; 32]>,
     /// Current settlement window (operational bracket) for this peer.
     /// Starts at `0`; `window_rotate` advances it. The receiver-term
-    /// accumulator ([`WindowNetEntry`]) is keyed by this value, so rotating
+    /// accumulator (`window_nets`) is keyed by this value, so rotating
     /// closes the current bracket and opens the next. Vouchers carry no
     /// window id — the bracket is bank-operator authority, not wire data.
     pub window: u64,
-}
-
-/// Receiver-term accumulator for one `(peer, currency, window)`: the running
-/// NEGATED sum of accepted vouchers' `amount_commit` as a Pedersen point
-/// (`Amount` bytes). The per-bank driver point-adds this to its issuer term
-/// to form the net flow it signs into a `SettlementClaim`; because both
-/// banks derive from the same voucher commitments, the blindings cancel and
-/// the two claims sum to identity (which the venue's `reconcile` checks).
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct WindowNetEntry {
-    pub peer_name: Vec<u8>,
-    pub currency: u32,
-    pub window: u64,
-    pub neg_sum: [u8; 32],
 }
 
 /// Reply envelope for `submit_voucher`. Same shape pattern as
@@ -331,7 +315,13 @@ pub struct ClerkBridge {
     /// re-signing OR re-sealing the envelope — see
     /// vos/tests/elf_integration.rs's voucher-replay coverage
     /// for the rationale.
-    received: Vec<[u8; 32]>,
+    ///
+    /// A `#[storage]` set: each redeemed triple is its own KV row, so the
+    /// dedup set grows past the guest heap and a submit/redeem touches a
+    /// constant handful of rows (one contains, one insert) however many
+    /// vouchers have been settled. Membership is the only query.
+    #[storage]
+    received: StorageSet<[u8; 32]>,
     /// ServiceId of the general `prover` extension this bridge
     /// dispatches `Mode::External` voucher-proof verification
     /// against. `0` means "no prover wired" — External-mode
@@ -353,8 +343,15 @@ pub struct ClerkBridge {
     /// Receiver-term accumulators, one per `(peer, currency, window)`. Each
     /// holds the negated sum of the `amount_commit`s this bridge has
     /// accepted from that peer in that window — the mandatory receiver half
-    /// of the peer's settlement claim (see [`WindowNetEntry`]).
-    window_nets: Vec<WindowNetEntry>,
+    /// of the peer's settlement claim.
+    ///
+    /// A `#[storage]` map keyed by `window::window_key(peer, currency,
+    /// window)` (a 32-byte fold of the operator-opaque, variable-length
+    /// triple) → the running `neg_sum`. Accumulation is a point
+    /// get-or-insert, so it costs one read + one write regardless of how
+    /// many windows the bridge has ever tracked.
+    #[storage]
+    window_nets: StorageMap<[u8; 32], [u8; 32]>,
 }
 
 #[messages]
@@ -364,10 +361,10 @@ impl ClerkBridge {
             local_ledger_id: 0,
             ivk_secret_bytes: [0u8; 32],
             peers: Vec::new(),
-            received: Vec::new(),
+            received: StorageSet::default(),
             prover_id: 0,
             allowlist: Vec::new(),
-            window_nets: Vec::new(),
+            window_nets: StorageMap::default(),
         }
     }
 
@@ -589,7 +586,7 @@ impl ClerkBridge {
         // call; opening again would just leak ciphertext analysis
         // surface to anyone monitoring the bridge.
         let dedup_key = voucher.redemption_key();
-        if self.received.binary_search(&dedup_key).is_ok() {
+        if self.received.contains(&dedup_key) {
             return reply(Status::VoucherReplayed);
         }
 
@@ -635,10 +632,9 @@ impl ClerkBridge {
         // here the host caller has the opening and can credit the
         // recipient; a second submit with the same triple would
         // hit the replay check above.
-        match self.received.binary_search(&dedup_key) {
-            Ok(_) => { /* unreachable — checked above */ }
-            Err(i) => self.received.insert(i, dedup_key),
-        }
+        // Idempotent: the replay check above already returned, so this is
+        // a fresh triple; `insert` returns whether it was new.
+        self.received.insert(&dedup_key);
         // Advance the per-peer anchor to this voucher's post-state, and
         // fold the accepted commit into the current window's receiver term
         // — the two move together so the settlement sum and the anchor
@@ -745,7 +741,7 @@ impl ClerkBridge {
             return early_redeem(Status::ProofInvalid);
         }
         let dedup_key = voucher.redemption_key();
-        if self.received.binary_search(&dedup_key).is_ok() {
+        if self.received.contains(&dedup_key) {
             return early_redeem(Status::VoucherReplayed);
         }
 
@@ -830,11 +826,9 @@ impl ClerkBridge {
         if matches!(ledger_status, clerk_ledger::Status::Ok) {
             // Atomic: only mark redeemed if the ledger accepted.
             // Failed dispatches leave the voucher available for
-            // retry with a corrected inflow.
-            match self.received.binary_search(&dedup_key) {
-                Ok(_) => { /* unreachable — checked above */ }
-                Err(i) => self.received.insert(i, dedup_key),
-            }
+            // retry with a corrected inflow. The replay check above
+            // already returned, so this triple is fresh.
+            self.received.insert(&dedup_key);
             // Advance the per-peer anchor to this voucher's post-state and
             // fold the accepted commit into the current window's receiver
             // term, atomically with the ledger accept (the rejection paths
