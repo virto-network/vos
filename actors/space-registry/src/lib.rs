@@ -923,6 +923,13 @@ impl SpaceRegistry {
         if host_prefix > u16::MAX as u32 {
             return Status::BadPrefix;
         }
+        // An empty name is not resolvable — and it is the
+        // host_mappings() pager's start-of-table sentinel, so a row
+        // carrying it would wedge every drain that follows the
+        // documented cursor protocol.
+        if instance_name.is_empty() {
+            return Status::BadHash;
+        }
         let host_prefix = host_prefix as u16;
         // Idempotent upsert keyed by the instance name.
         self.host_mappings.insert(
@@ -2463,8 +2470,11 @@ mod tests {
         // (grant_supersedes has no self guard; an admin-signed row is
         // not root-signed, so the higher epoch displaces it). The result
         // is grantor == subject — a chain that never bottoms out at the
-        // root. The walk must refuse it in bounded hops with bounded
-        // memory, not recurse the arena away.
+        // root. This pins the semantics (a cycle resolves to NONE) and
+        // termination. The bounded-MEMORY property is the walk's
+        // iterative shape itself — one decoded row live at a time —
+        // which a host-side test can't observe; don't take this suite
+        // as license to revert the walk to recursion.
         let mut r = registry();
         let a_key = SigningKey::from_bytes(&[22u8; 32]);
         let a_peer = peer_id_for(&a_key.verifying_key().to_bytes());
@@ -2611,6 +2621,35 @@ mod tests {
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: attacker }),
             AUTH_ROLE_NONE,
+        );
+    }
+
+    #[test]
+    fn register_remote_rejects_the_empty_name() {
+        // The empty name is host_mappings()'s start-of-table sentinel;
+        // a stored row carrying it would wedge every cursor drain —
+        // and register_remote is unauthenticated, so the row would be
+        // remotely plantable.
+        let mut r = registry();
+        assert_eq!(
+            dispatch(
+                &mut r,
+                RegisterRemote {
+                    instance_name: String::new(),
+                    host_prefix: 7,
+                },
+            ),
+            Status::BadHash,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                RegisterRemote {
+                    instance_name: String::from("alice"),
+                    host_prefix: 7,
+                },
+            ),
+            Status::Ok,
         );
     }
 
