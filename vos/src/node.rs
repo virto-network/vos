@@ -1958,7 +1958,6 @@ fn soft_restart_crdt(
 /// (`restore_writes`) comes back missing every remotely-replicated
 /// row, and a later local delta can persist index pages that name
 /// value rows the table doesn't hold.
-#[cfg(feature = "storage")]
 fn rebuilt_rows(runtime: &VosRuntime, svc_id: ServiceId) -> Vec<(Vec<u8>, Vec<u8>)> {
     runtime
         .storage

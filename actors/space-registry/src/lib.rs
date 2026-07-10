@@ -1817,7 +1817,14 @@ mod tests {
     use vos::actors::context::ServiceId;
 
     fn registry() -> SpaceRegistry {
+        // The mock keyspace and the dispatch overlay are thread-local,
+        // and the test pool reuses threads — every registry starts from
+        // the clean slate a fresh agent keyspace presents.
+        vos::storage::mock::reset();
         let mut r = SpaceRegistry::new();
+        // What the framework's load_or_create does after create():
+        // point each #[storage] handle at its key prefix.
+        vos::actors::Actor::__init_storage(&mut r);
         // Establish the genesis root so signed mutators authorize
         // against it (tests sign every op as the root via `root_auth`).
         let status = dispatch(
@@ -1828,6 +1835,30 @@ mod tests {
         );
         assert_eq!(status, Status::Ok, "set_root on a fresh registry");
         r
+    }
+
+    /// Drain the paginated `actor_acls` handler — tests assert over the
+    /// whole table.
+    fn actor_acls_all(r: &mut SpaceRegistry) -> Vec<ActorAclRow> {
+        let mut out = Vec::new();
+        let mut after_peer = Vec::new();
+        let mut after_agent = String::new();
+        loop {
+            let page = dispatch(
+                r,
+                ActorAcls {
+                    after_peer,
+                    after_agent,
+                    budget: 0,
+                },
+            );
+            out.extend(page.acls);
+            if page.next_peer.is_empty() && page.next_agent.is_empty() {
+                return out;
+            }
+            after_peer = page.next_peer;
+            after_agent = page.next_agent;
+        }
     }
 
     fn run<F: core::future::Future>(fut: F) -> F::Output {
@@ -1903,7 +1934,7 @@ mod tests {
             ),
             2,
         );
-        let all = dispatch(&mut r, ActorAcls);
+        let all = actor_acls_all(&mut r);
         assert_eq!(all.len(), 1);
     }
 
@@ -1927,7 +1958,7 @@ mod tests {
             ),
             3,
         );
-        assert_eq!(dispatch(&mut r, ActorAcls).len(), 1);
+        assert_eq!(actor_acls_all(&mut r).len(), 1);
     }
 
     #[test]
@@ -1962,7 +1993,7 @@ mod tests {
             ),
             AUTH_ROLE_NONE,
         );
-        assert!(dispatch(&mut r, ActorAcls).is_empty());
+        assert!(actor_acls_all(&mut r).is_empty());
     }
 
     #[test]
@@ -2008,7 +2039,7 @@ mod tests {
             ),
             3,
         );
-        assert_eq!(dispatch(&mut r, ActorAcls).len(), 2);
+        assert_eq!(actor_acls_all(&mut r).len(), 2);
     }
 
     #[test]
@@ -2354,6 +2385,101 @@ mod tests {
         )
     }
 
+    /// `grant_role` signed by an arbitrary key — delegation tests,
+    /// where an admin (not the root) authors the grant.
+    fn grant_space_signed(
+        r: &mut SpaceRegistry,
+        signer: &SigningKey,
+        peer: &[u8],
+        role: u8,
+    ) -> Status {
+        let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
+        let canonical = canonical_op_bytes("grant_role", &[peer, &[role], &epoch.to_le_bytes()]);
+        let auth = pack_auth(
+            &peer_id_for(&signer.verifying_key().to_bytes()),
+            &signer.sign(&canonical).to_bytes(),
+        );
+        dispatch(
+            r,
+            GrantRole {
+                peer_id: peer.to_vec(),
+                role,
+                epoch,
+                auth,
+            },
+        )
+    }
+
+    // ── delegation chains (the iterative effective_role walk) ────
+
+    #[test]
+    fn delegated_grant_resolves_through_admin_chain() {
+        // root → A (ADMIN) → B (DEVELOPER): B's role holds only while
+        // every hop up the chain is an undominated ADMIN, and revoking
+        // the delegator voids the whole subtree.
+        let mut r = registry();
+        let a_key = SigningKey::from_bytes(&[21u8; 32]);
+        let a_peer = peer_id_for(&a_key.verifying_key().to_bytes());
+        let b_peer = alloc::vec![0xbb; 4];
+        assert_eq!(grant_space(&mut r, &a_peer, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(
+            grant_space_signed(&mut r, &a_key, &b_peer, AUTH_ROLE_DEVELOPER),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_DEVELOPER,
+        );
+        assert_eq!(revoke_space(&mut r, &a_peer), Status::Ok);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_NONE,
+            "revoking the delegator voids the delegated grant",
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: a_peer }),
+            AUTH_ROLE_NONE,
+        );
+    }
+
+    #[test]
+    fn grantor_cycle_terminates_as_none() {
+        // An effective admin can re-grant themselves at a higher epoch
+        // (grant_supersedes has no self guard; an admin-signed row is
+        // not root-signed, so the higher epoch displaces it). The result
+        // is grantor == subject — a chain that never bottoms out at the
+        // root. The walk must refuse it in bounded hops with bounded
+        // memory, not recurse the arena away.
+        let mut r = registry();
+        let a_key = SigningKey::from_bytes(&[22u8; 32]);
+        let a_peer = peer_id_for(&a_key.verifying_key().to_bytes());
+        let b_key = SigningKey::from_bytes(&[23u8; 32]);
+        let b_peer = peer_id_for(&b_key.verifying_key().to_bytes());
+        assert_eq!(grant_space(&mut r, &a_peer, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(
+            grant_space_signed(&mut r, &a_key, &b_peer, AUTH_ROLE_ADMIN),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_ADMIN,
+        );
+        assert_eq!(
+            grant_space_signed(&mut r, &b_key, &b_peer, AUTH_ROLE_ADMIN),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_NONE,
+            "a grantor cycle resolves to NONE instead of looping",
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: a_peer }),
+            AUTH_ROLE_ADMIN,
+            "the cycle is self-inflicted; the delegator is untouched",
+        );
+    }
+
     #[test]
     fn peer_id_pubkey_extraction_round_trips() {
         let pk = root_key().verifying_key().to_bytes();
@@ -2475,7 +2601,11 @@ mod tests {
 
     #[test]
     fn set_root_is_first_write_wins() {
+        // Pre-genesis registry: built by hand (the `registry()` helper
+        // anchors a root, which is what this test observes happening).
+        vos::storage::mock::reset();
         let mut r = SpaceRegistry::new();
+        vos::actors::Actor::__init_storage(&mut r);
         assert!(dispatch(&mut r, Root).is_empty(), "no root before genesis");
         assert_eq!(
             dispatch(&mut r, SetRoot { root: root_peer_id() }),

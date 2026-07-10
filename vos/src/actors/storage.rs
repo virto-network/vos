@@ -260,10 +260,16 @@ pub mod mock {
         });
     }
 
-    /// Wipe the keyspace (test isolation). Also models the host
-    /// `ServiceStorage::clear_service` a soft restart runs before replay.
+    /// Wipe the keyspace AND the dispatch overlay (test isolation —
+    /// both are thread-local, and the test pool reuses threads). Also
+    /// models the host `ServiceStorage::clear_service` a soft restart
+    /// runs before replay.
     pub fn reset() {
         ROWS.with(|r| r.borrow_mut().clear());
+        super::with_state(|s| {
+            s.cache.clear();
+            s.pending.clear();
+        });
     }
 
     /// Snapshot every row, for byte-identity comparisons across two
