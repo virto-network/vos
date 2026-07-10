@@ -3,12 +3,12 @@ version = 1
 [[program]]
 name = "voucher-check"
 commitments = [
-    "6d1eeb24edaeef9ba6aa16e55b32c49c3d46702c0bee6b35ab3d643f8296584f",
-    "5c899bde74c0a9c575687bb9233850cd594ff654362f10ba579c35a970c3e2ce",
+    "6a82978ab9f521b7167e83f95fcd97892612e97825d686bd84ff7b7283fd11a2",
+    "96863aacba1a896b53051a72b5ff6daf3c67fa2b0eefe94eefdcfb95fe6f892f",
 ]
 canonical_profile = [
     0,
-    14,
+    16,
     18,
     0,
     11,
@@ -31,7 +31,7 @@ canonical_profile = [
     0,
     0,
     4,
-    7,
+    8,
     0,
     11,
     6,
@@ -40,5 +40,5 @@ canonical_profile = [
     5,
 ]
 seg_steps = 100000
-witness_addr = 546672
-unpatched_image_root = "143f59d1f2207618414012370d29afbaf813c947423973769f0160607e34f176"
+witness_addr = 547392
+unpatched_image_root = "4fa2ab7171ec4f3b8bd37067f4f555d64eeb9a8f0f0a33848868d61bc611ad8f"

@@ -6290,23 +6290,27 @@ const VC_TRACE_GAS: u64 = 100_000_000;
 /// the short segment sat on the floor (17/10) — a mismatch that landed the
 /// chain's tail outside the allowlist.
 ///
-/// These two chips size on the NUMBER of blake2b / memory-page OPERATIONS in a
-/// segment (content), not on its step count — so padding the tail with no-op
-/// steps would NOT canonicalize them; forcing the floor is the only lever. The
-/// floors are the observed per-segment MAXIMA for this transition: the
-/// federation e2e verifies all 76 segments against {C_0, C_1}, which can only
-/// hold if no segment's natural size exceeds a floor. Because the succinct
-/// witness fixes per-operation cost (constant-depth SMT paths regardless of
-/// ledger size), per-segment operation DENSITY is bounded (it does not grow
-/// with the ledger), so the fixed-profile approach stays sound across batch
-/// sizes — but 18/11 are the measured maxima for this transition's operation
-/// pattern, not a proven bound, so a differently-shaped transition (or a
-/// pathologically dense window) is re-derived and caught by
-/// `voucher_check_commitment_drift_guard` + `voucher_check_allowlist_coverage`.
+/// These chips size on the NUMBER of blake2b / memory-page / ristretto
+/// OPERATIONS in a segment (content), not on its step count — so padding the
+/// tail with no-op steps would NOT canonicalize them; forcing the floor is
+/// the only lever. The floors are the observed per-segment MAXIMA for this
+/// transition, measured over EVERY segment by the trace-only
+/// `voucher_check_profile_floors_cover_natural_sizes` guard: the federation
+/// e2e verifies all segments against {C_0, C_1}, which can only hold if no
+/// segment's natural size exceeds a floor. Because the succinct witness fixes
+/// per-operation cost (constant-depth SMT paths regardless of ledger size),
+/// per-segment operation DENSITY is bounded (it does not grow with the
+/// ledger), so the fixed-profile approach stays sound across batch sizes —
+/// but the floors are measured maxima for this transition's operation
+/// pattern, not a proven bound; guest-framework or kernel code-size changes
+/// slide operation bursts across segment boundaries and can outgrow them
+/// (BLAKE2B went 14→16 and RISTRETTO_ECALL 7→8 that way). The floor guard
+/// catches it cheaply; `voucher_check_commitment_drift_guard` +
+/// `voucher_check_allowlist_coverage` are the proving-grade confirmation.
 /// Collapsing any-length chain to ONE commitment (so no floor tuning is ever
 /// needed) is the recursive-aggregation work in docs/plans/proving-time.md §6.
 const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
-    0, 14, 18, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 7, 0, 11, 6, 5, 6, 5,
+    0, 16, 18, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 8, 0, 11, 6, 5, 6, 5,
 ];
 
 /// Published canonical-shape program-commitment ALLOWLIST for
@@ -6318,18 +6322,18 @@ const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
 /// segment commitment is in this set.
 const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
     // C_0 — comb-free canonical shape.
-    // blake2s 6d1eeb24edaeef9ba6aa16e55b32c49c3d46702c0bee6b35ab3d643f8296584f
+    // blake2s 6a82978ab9f521b7167e83f95fcd97892612e97825d686bd84ff7b7283fd11a2
     [
-        0x6d, 0x1e, 0xeb, 0x24, 0xed, 0xae, 0xef, 0x9b, 0xa6, 0xaa, 0x16, 0xe5, 0x5b, 0x32, 0xc4,
-        0x9c, 0x3d, 0x46, 0x70, 0x2c, 0x0b, 0xee, 0x6b, 0x35, 0xab, 0x3d, 0x64, 0x3f, 0x82, 0x96,
-        0x58, 0x4f,
+        0x6a, 0x82, 0x97, 0x8a, 0xb9, 0xf5, 0x21, 0xb7, 0x16, 0x7e, 0x83, 0xf9, 0x5f, 0xcd, 0x97,
+        0x89, 0x26, 0x12, 0xe9, 0x78, 0x25, 0xd6, 0x86, 0xbd, 0x84, 0xff, 0x7b, 0x72, 0x83, 0xfd,
+        0x11, 0xa2,
     ],
     // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
-    // blake2s 5c899bde74c0a9c575687bb9233850cd594ff654362f10ba579c35a970c3e2ce
+    // blake2s 96863aacba1a896b53051a72b5ff6daf3c67fa2b0eefe94eefdcfb95fe6f892f
     [
-        0x5c, 0x89, 0x9b, 0xde, 0x74, 0xc0, 0xa9, 0xc5, 0x75, 0x68, 0x7b, 0xb9, 0x23, 0x38, 0x50,
-        0xcd, 0x59, 0x4f, 0xf6, 0x54, 0x36, 0x2f, 0x10, 0xba, 0x57, 0x9c, 0x35, 0xa9, 0x70, 0xc3,
-        0xe2, 0xce,
+        0x96, 0x86, 0x3a, 0xac, 0xba, 0x1a, 0x89, 0x6b, 0x53, 0x05, 0x1a, 0x72, 0xb5, 0xff, 0x6d,
+        0xaf, 0x3c, 0x67, 0xfa, 0x2b, 0x0e, 0xef, 0xe9, 0x4e, 0xef, 0xdc, 0xfb, 0x95, 0xfe, 0x6f,
+        0x89, 0x2f,
     ],
 ];
 
@@ -6356,6 +6360,70 @@ fn voucher_check_pvm() -> (Vec<u8>, usize) {
     let blob = grey_transpiler::link_elf(&elf).expect("transpile voucher-check");
     let addr = vos::zk::witness_addr(&elf).expect("voucher-check.elf must export __VOS_WITNESS");
     (blob, addr as usize)
+}
+
+/// Trace-only floor guard: the canonical-profile floors must dominate every
+/// segment's NATURAL trace size for the forced chips, or full and short
+/// segments stop collapsing onto the pinned allowlist and `verify_chain`
+/// rejects the chain's tail (the 2026-07 ProofInvalid class). The floors are
+/// measured maxima for this transition, so any change to the guest framework
+/// or cipher-clerk kernel can silently outgrow them; this catches that
+/// without proving (the heavy `voucher_check_allowlist_coverage` gate is the
+/// proving-grade confirmation). On failure: raise the printed floor(s) to
+/// the printed natural maximum, then re-pin the allowlist + catalog
+/// (`vosx zk pin`).
+#[test]
+fn voucher_check_profile_floors_cover_natural_sizes() {
+    use vos::Encode;
+    if !voucher_check_elf_path().exists() {
+        eprintln!("SKIP: voucher-check ELF not built — run `just build-voucher-check`");
+        return;
+    }
+    let (blob, addr) = voucher_check_pvm();
+    let registrar = cipher_clerk::crypto::Keypair::generate();
+    let (public, witness, _value, _blinding) = build_conservation_transition(&registrar);
+    let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
+    let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
+        .expect("trace the voucher-check conservation transition");
+    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), CHAIN_SEG_STEPS);
+
+    let forced: Vec<usize> = VOUCHER_CHECK_CANONICAL_PROFILE
+        .iter()
+        .enumerate()
+        .filter(|&(_, &floor)| floor > 0)
+        .map(|(i, _)| i)
+        .collect();
+    let mut max_natural = vec![0u32; forced.len()];
+    for &(a, b) in &bounds {
+        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let naturals = zkpvm::natural_log_sizes_for(&mut sn, &forced);
+        for (m, n) in max_natural.iter_mut().zip(naturals) {
+            *m = (*m).max(n);
+        }
+    }
+    eprintln!("forced-chip natural maxima over {} segments:", bounds.len());
+    for (&idx, &max) in forced.iter().zip(&max_natural) {
+        eprintln!(
+            "  chip {idx:2}: floor {:2}, natural max {max}",
+            VOUCHER_CHECK_CANONICAL_PROFILE[idx]
+        );
+    }
+    let violations: Vec<String> = forced
+        .iter()
+        .zip(&max_natural)
+        .filter(|&(&idx, &max)| max > VOUCHER_CHECK_CANONICAL_PROFILE[idx])
+        .map(|(&idx, &max)| {
+            format!(
+                "chip {idx}: natural max {max} > floor {}",
+                VOUCHER_CHECK_CANONICAL_PROFILE[idx]
+            )
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "canonical-profile floors outgrown: {violations:?} — raise the \
+         floor(s) to the natural maxima and re-pin the allowlist"
+    );
 }
 
 /// Drift guard for the relocated `VOUCHER_CHECK_COMMITMENTS` allowlist:
