@@ -77,10 +77,12 @@ pub enum DispatchResult {
 /// `crdt_counter_survives_corrupted_persisted_state` exercises this.
 #[cfg(feature = "pvm")]
 pub fn load_or_create<A: Actor>(state: Option<&[u8]>) -> A {
-    match state {
+    let mut actor = match state {
         Some(bytes) if !bytes.is_empty() => A::try_decode(bytes).unwrap_or_else(A::create),
         _ => A::create(),
-    }
+    };
+    actor.__init_storage();
+    actor
 }
 
 /// Persist actor state.

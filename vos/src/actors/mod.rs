@@ -19,6 +19,7 @@ pub mod init;
 pub mod lifecycle;
 pub mod metadata;
 pub mod run;
+pub mod storage;
 pub mod tasks;
 pub mod value;
 

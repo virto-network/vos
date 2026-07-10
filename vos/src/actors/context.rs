@@ -709,23 +709,26 @@ impl<A: Actor> Context<A> {
     /// be emitted as the refine output. Used by `run_refine_service`.
     ///
     /// `(anchor_kind, anchor)` commit to the state this refine ran
-    /// against; `state_write` is the post-dispatch serialized actor
-    /// state, passed only when it changed — it becomes the FINAL
-    /// `Write{STATE_KEY}` within the Write batch (last-wins per key, so
-    /// it shadows any handler-issued write on the same key), ahead of
-    /// the Transfer/Provide/New batches.
+    /// against; `row_effects` are the dispatch's drained storage-type
+    /// mutations ([`crate::storage`]), emitted after the handler's own
+    /// `store`/`remove` calls; `state_write` is the post-dispatch
+    /// serialized actor state, passed only when it changed — it becomes
+    /// the FINAL `Write{STATE_KEY}` within the Write batch (last-wins
+    /// per key, so it shadows any handler-issued write on the same
+    /// key), ahead of the Transfer/Provide/New batches.
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
     pub fn drain_into_refine_payload(
         &mut self,
         anchor_kind: u8,
         anchor: [u8; 32],
+        row_effects: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         state_write: Option<Vec<u8>>,
         reply: Vec<u8>,
     ) -> crate::refine_payload::RefinePayload {
         use crate::refine_payload::{Effect, RefinePayload};
         let mut effects: Vec<Effect> = Vec::new();
-        for (key, value) in self.pending_writes.drain(..) {
+        for (key, value) in self.pending_writes.drain(..).chain(row_effects) {
             effects.push(match value {
                 Some(value) => Effect::Write { key, value },
                 None => Effect::Delete { key },

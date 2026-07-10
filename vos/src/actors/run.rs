@@ -571,6 +571,7 @@ pub fn run_refine_service<A: super::Actor>() {
         let payload = ctx.drain_into_refine_payload(
             anchor_kind,
             anchor,
+            super::storage::end_dispatch(),
             state_changed.then_some(new_state_bytes),
             reply_bytes,
         );
@@ -658,6 +659,7 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     let payload = ctx.drain_into_refine_payload(
         anchor_kind,
         anchor,
+        super::storage::end_dispatch(),
         state_changed.then_some(new_state_bytes),
         reply_bytes,
     );
