@@ -97,7 +97,7 @@ use crate::abi::error;
 use crate::abi::hostcall;
 use crate::abi::service::ServiceId;
 use javm::kernel::{InvocationKernel, KernelResult};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use tracing::error;
 
@@ -480,9 +480,12 @@ fn claims_refine_payload(bytes: &[u8]) -> bool {
 
 // --- Per-service storage ---
 
+/// Each service's keyspace is an ordered map so key-adjacent rows can
+/// be range-scanned (storage-type prefetch, row-streamed snapshots);
+/// reads borrow the key directly instead of allocating a lookup pair.
 #[derive(Default)]
 pub struct ServiceStorage {
-    data: HashMap<(u32, Vec<u8>), Vec<u8>>,
+    data: HashMap<u32, BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl ServiceStorage {
@@ -492,16 +495,39 @@ impl ServiceStorage {
 
     pub fn read(&self, service: ServiceId, key: &[u8]) -> Option<&[u8]> {
         self.data
-            .get(&(service.0, key.to_vec()))
+            .get(&service.0)?
+            .get(key)
             .map(|v| v.as_slice())
     }
 
     pub fn write(&mut self, service: ServiceId, key: &[u8], value: &[u8]) {
-        self.data.insert((service.0, key.to_vec()), value.to_vec());
+        self.data
+            .entry(service.0)
+            .or_default()
+            .insert(key.to_vec(), value.to_vec());
     }
 
     pub fn delete(&mut self, service: ServiceId, key: &[u8]) {
-        self.data.remove(&(service.0, key.to_vec()));
+        if let Some(rows) = self.data.get_mut(&service.0) {
+            rows.remove(key);
+        }
+    }
+
+    /// Ordered iteration over one service's rows whose keys start with
+    /// `prefix`, in key order.
+    pub fn scan_prefix<'a>(
+        &'a self,
+        service: ServiceId,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+        self.data
+            .get(&service.0)
+            .into_iter()
+            .flat_map(move |rows| {
+                rows.range(prefix.to_vec()..)
+                    .take_while(move |(k, _)| k.starts_with(prefix))
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            })
     }
 }
 
@@ -2493,6 +2519,29 @@ mod tests {
         assert_eq!(
             journal.journaled_read(svc, crate::lifecycle::STATE_KEY_BYTES),
             Some(Some(&b"s2"[..])),
+        );
+    }
+
+    #[test]
+    fn scan_prefix_is_key_ordered_and_service_scoped() {
+        let mut storage = ServiceStorage::new();
+        let svc = ServiceId(1);
+        storage.write(svc, b"s/acct/b", b"2");
+        storage.write(svc, b"s/acct/a", b"1");
+        storage.write(svc, b"s/acct/c", b"3");
+        storage.write(svc, b"s/other/x", b"9");
+        storage.write(ServiceId(2), b"s/acct/z", b"0");
+        storage.delete(svc, b"s/acct/c");
+
+        let rows: Vec<(&[u8], &[u8])> = storage.scan_prefix(svc, b"s/acct/").collect();
+        assert_eq!(
+            rows,
+            vec![
+                (&b"s/acct/a"[..], &b"1"[..]),
+                (&b"s/acct/b"[..], &b"2"[..]),
+            ],
+            "prefix scan must be key-ordered, prefix-bounded, and blind \
+             to other services' rows"
         );
     }
 
