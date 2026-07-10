@@ -1610,9 +1610,15 @@ fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
 /// entry plus a couple of index pages, so the dispatch stays O(page).
 const PAGE_MAX_ROWS: usize = 128;
 
-/// Encoded-byte budget for one page, comfortably under the 1 MiB
-/// halt-output cap that carries the reply.
-const PAGE_BYTE_BUDGET: usize = 256 * 1024;
+/// Encoded-byte budget for one page. The binding constraint is the
+/// 256 KiB guest heap, not the 1 MiB halt-output cap: while a page is
+/// being built, each row is resident ~3× (the dispatch read-cache's
+/// raw bytes, the decoded row, and `fill_page`'s transient encode), so
+/// the budget must leave the arena headroom for all three plus the
+/// final reply encode. 48 KiB bounds the page's peak footprint around
+/// ~150 KiB worst-case — large rows page earlier, they don't trap the
+/// guest allocator.
+const PAGE_BYTE_BUDGET: usize = 48 * 1024;
 
 /// Tighter page cap for the two role-list handlers: each row resolves an
 /// `effective_role`, an O(chain-depth) point-read walk, so the touched-row
