@@ -15,7 +15,6 @@
 //!   `DaemonClient::invoke_dyn` path `space call` uses. Routing
 //!   into this module is decided in `main` by peeking argv.
 
-pub mod ai;
 pub mod dev;
 pub mod dynamic;
 pub mod run;

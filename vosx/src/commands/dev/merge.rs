@@ -67,9 +67,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // Per-identity default mirrors the ai actor command so
         // the common case "merge what I just suggested" is a
         // one-liner.
-        let from = args.from.clone().unwrap_or_else(|| {
-            crate::commands::ai::actor::default_ai_branch(client.daemon_prefix())
-        });
+        let from = args
+            .from
+            .clone()
+            .unwrap_or_else(|| default_ai_branch(client.daemon_prefix()));
 
         // Resolve the source branch's head — that's `theirs`.
         let theirs = fetch_branch_head(client, project_id, &from)?.ok_or_else(|| {
@@ -260,4 +261,30 @@ fn fetch_commit(
     };
     <dev_project::CommitNode as Decode>::try_decode(&bytes)
         .ok_or_else(|| anyhow::anyhow!("get_commit reply isn't a valid CommitNode"))
+}
+
+/// Per-identity default branch the ai suggestion flow writes to (and `merge`
+/// reads from when `--from` is omitted): `ai/<node-prefix hex>/suggested`. The
+/// node prefix keeps two nodes' defaults distinct; the 4-hex zero-pad keeps the
+/// name predictable.
+fn default_ai_branch(daemon_prefix: u16) -> String {
+    format!("ai/{daemon_prefix:04x}/suggested")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_ai_branch;
+
+    #[test]
+    fn default_ai_branch_is_per_identity() {
+        assert_eq!(default_ai_branch(0x06b7), "ai/06b7/suggested");
+        assert_eq!(default_ai_branch(0x0001), "ai/0001/suggested");
+        assert_eq!(default_ai_branch(0xffff), "ai/ffff/suggested");
+    }
+
+    #[test]
+    fn default_ai_branch_zero_pads_to_four_hex_chars() {
+        assert_eq!(default_ai_branch(0x0042), "ai/0042/suggested");
+        assert_eq!(default_ai_branch(0), "ai/0000/suggested");
+    }
 }

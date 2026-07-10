@@ -1,5 +1,6 @@
-//! AI extension — exposes a `generate(prompt, max_tokens) -> String`
-//! handler backed by a local quantized GGUF model run on the CPU
+//! AI extension — exposes a `generate(prompt, max_tokens) -> u64`
+//! `#[msg(job)]` handler (returns a job id; the streamed text comes back
+//! via `job_poll`) backed by a local quantized GGUF model run on the CPU
 //! via `candle`.
 //!
 //! - **Fetch on first use.** The model and tokenizer files are
@@ -11,22 +12,21 @@
 //!   override every defaultable knob. Defaults aim at a small
 //!   coding model that runs on a laptop CPU
 //!   (Qwen2.5-Coder-0.5B-Instruct Q4_K_M).
-//! - **Two dispatch shapes.** `generate(prompt, max_tokens) -> String`
-//!   is the blocking call; `begin_generate(prompt, max_tokens) -> u64`
-//!   spawns an inference worker and returns a `request_id`, then
-//!   `poll_generation(request_id) -> GenerationChunk` drains
-//!   newly-emitted text. Streaming is the CLI default; the
-//!   blocking call stays for the `--no-stream` / scripted-JSON
-//!   path.
+//! - **Job dispatch.** `generate(prompt, max_tokens) -> u64` is a
+//!   `#[msg(job)]` begin: it spawns an inference worker and returns a
+//!   job id, then the reserved `job_poll(job_id) -> Vec<u8>` (the
+//!   standard `Args { data, done, error }` shape) drains newly-decoded
+//!   tokens and `job_release(job_id) -> u8` drops the finished job. The
+//!   `vosx` generic job driver polls + streams these for you.
 //!
 //! ## Lifecycle
 //!
 //! Plain **actor-mode** extension (`#[actor]` / `#[messages]`) — request-driven,
-//! no `run()` loop. The host drives one invoke (`generate` / `begin_generate` /
-//! `poll_generation`) to completion at a time on this agent's thread. The model
+//! no `run()` loop. The host drives one invoke (`generate` / `job_poll` /
+//! `job_release`) to completion at a time on this agent's thread. The model
 //! loads lazily inside the first generate so daemon startup isn't penalised even
 //! when the manifest enables the extension but nothing invokes it. The live
-//! runtime state ([`runtime::Inner`]: model handle + worker threads) sits behind
+//! runtime state ([`runtime::Inner`]: model handle + the job queue) sits behind
 //! a `Skip`'d `OnceCell` and re-inits lazily from the persisted [`InitConfig`]
 //! after a (re)start. Quiesce one agent with the host's generic `vosx ai stop`
 //! (`__stop`).
@@ -37,19 +37,14 @@ use std::sync::Arc;
 use vos::log;
 use vos::prelude::*;
 
-use crate::requests::GenerationChunk;
 use crate::runtime::Inner;
 
 mod config;
 mod fetch;
 mod generate;
-mod requests;
 mod runtime;
 
 pub use config::InitConfig;
-// `GenerationChunk` is the wire payload `poll_generation` emits.
-// External consumers decode the on-wire form via `vos::value::Args`
-// rather than this typed struct, so it stays crate-private.
 
 #[actor(caps = ["fs.cache", "net.http.outbound", "net.libp2p.dial", "tokio-runtime"])]
 pub struct AiExtension {
@@ -87,44 +82,13 @@ impl AiExtension {
         }
     }
 
-    /// Blocking generate: load the model on first use, run the full
-    /// inference loop on this thread, reply with the concatenated text.
-    /// Replies with a `GenerationChunk` (encoded via `Args` → `Value::Bytes`,
-    /// same wire shape as `poll_generation`) so callers get a structured
-    /// `error` field rather than a stringly-typed prefix. This call blocks
-    /// the agent for the whole inference (acceptable: N=1, the `--no-stream`
-    /// / scripted path); streaming callers use `begin_generate` instead.
-    #[msg(cli)]
+    /// Begin a streaming generation job; returns the job id to poll. The
+    /// worker runs inference on its own thread (holding an `Arc<Inner>` clone,
+    /// so it outlives this handler) and pushes decoded tokens into the shared
+    /// job queue. The `vosx` generic job driver polls + streams; a scripted
+    /// caller polls `job_poll` and releases with `job_release`.
+    #[msg(job, cli)]
     async fn generate(
-        &mut self,
-        prompt: String,
-        max_tokens: u32,
-        _ctx: &mut Context<Self>,
-    ) -> Vec<u8> {
-        let inner = self.inner();
-        let chunk = match runtime::run_generate_blocking(&inner, &prompt, max_tokens) {
-            Ok(text) => GenerationChunk {
-                text,
-                done: true,
-                error: String::new(),
-            },
-            Err(e) => {
-                log::warn!("ai: generate failed: {e:#}");
-                GenerationChunk {
-                    text: String::new(),
-                    done: true,
-                    error: format!("{e}"),
-                }
-            }
-        };
-        chunk.to_args().encode()
-    }
-
-    /// Spawn a streaming inference worker and return its `request_id`. The
-    /// worker runs on its own thread (holding an `Arc<Inner>` clone, so it
-    /// outlives this handler); the caller drains chunks via `poll_generation`.
-    #[msg(cli)]
-    async fn begin_generate(
         &mut self,
         prompt: String,
         max_tokens: u32,
@@ -134,15 +98,19 @@ impl AiExtension {
         runtime::begin_generate(&inner, prompt, max_tokens)
     }
 
-    /// Drain newly-emitted text for a streaming `request_id`. Replies with a
-    /// `GenerationChunk` (encoded via `Args` → `Value::Bytes` so vosx decodes
-    /// it without pulling in candle/tokenizers/hf-hub). On `done = true` the
-    /// request entry is removed.
-    #[msg(cli)]
-    async fn poll_generation(&mut self, request_id: u64, _ctx: &mut Context<Self>) -> Vec<u8> {
-        let inner = self.inner();
-        let chunk = runtime::poll_generation(&inner, request_id);
-        chunk.to_args().encode()
+    /// Reserved `job_poll`: drain a generation's newly-decoded tokens as the
+    /// standard `Args { data, done, error }` reply (encoded so vosx decodes it
+    /// without pulling in candle/tokenizers/hf-hub).
+    #[msg]
+    async fn job_poll(&mut self, job_id: u64, _ctx: &mut Context<Self>) -> Vec<u8> {
+        runtime::poll_generation(&self.inner(), job_id)
+    }
+
+    /// Reserved `job_release`: drop a finished generation job. Idempotent —
+    /// `1` if a job was removed, `0` if the id was already gone.
+    #[msg]
+    async fn job_release(&mut self, job_id: u64, _ctx: &mut Context<Self>) -> u8 {
+        u8::from(runtime::release_generation(&self.inner(), job_id))
     }
 }
 

@@ -194,18 +194,6 @@ impl ModelHandle {
         }
         Ok(())
     }
-
-    /// Blocking wrapper around [`generate_stream`]: drains every
-    /// chunk into one `String` and returns. Used by the old
-    /// `generate` dispatch arm + the CLI's `--no-stream` mode.
-    pub fn generate(&mut self, prompt: &str, max_tokens: u32) -> Result<String> {
-        let mut buf = String::new();
-        self.generate_stream(prompt, max_tokens, |chunk| {
-            buf.push_str(chunk);
-            true
-        })?;
-        Ok(buf)
-    }
 }
 
 /// Open the GGUF file and hand it to candle's quantized Qwen2

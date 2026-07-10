@@ -102,14 +102,6 @@ enum Command {
         #[command(subcommand)]
         command: commands::dev::DevCommand,
     },
-    /// Drive the AI extension's `generate` handler. First-call
-    /// `vosx ai generate` fetches the model (~400MB for the
-    /// default Qwen2.5-Coder-0.5B-Instruct GGUF) into the local
-    /// cache.
-    Ai {
-        #[command(subcommand)]
-        command: commands::ai::AiCommand,
-    },
     /// Provable-program pinning: `vosx zk pin` measures a provable actor's
     /// canonical commitment allowlist + entering-image root + witness address
     /// and writes them to a catalog artifact verifiers trust. The heavy zkpvm
@@ -233,11 +225,6 @@ fn main() {
                 report_error(e);
             }
         }
-        Some(Command::Ai { command }) => {
-            if let Err(e) = commands::ai::run(command) {
-                report_error(e);
-            }
-        }
         Some(Command::Zk { command }) => {
             if let Err(e) = commands::zk::run(command) {
                 report_error(e);
@@ -329,7 +316,7 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// the existing one-shot ELF run path.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
     const BUILTIN_VERBS: &[&str] =
-        &["run", "space", "dev", "ai", "zk", "help-schema", "help", "whoami"];
+        &["run", "space", "dev", "zk", "help-schema", "help", "whoami"];
     // Skip global flags; `--format` / `--out` take a value, the
     // rest are boolean-shaped. `--out` is a dynamic-only flag but
     // we skip its value here (rather than `return true`) so its path
@@ -438,9 +425,12 @@ mod routing_tests {
 
     #[test]
     fn builtin_verbs_use_clap_path() {
-        for v in ["run", "space", "dev", "ai", "help-schema", "help"] {
+        for v in ["run", "space", "dev", "help-schema", "help"] {
             assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
         }
+        // `ai` is no longer a builtin — `vosx ai generate …` dispatches
+        // dynamically to the ai extension instance.
+        assert!(should_dynamic_dispatch(&s(&["ai", "generate"])));
     }
 
     #[test]
