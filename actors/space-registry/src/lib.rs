@@ -238,6 +238,7 @@ pub struct HostMapping {
 // ── Actor ─────────────────────────────────────────────────────────
 
 use vos::prelude::*;
+use vos::storage::{StorageMap, StorageSet};
 
 /// Per-actor SpaceRole map (M7) — declared as a `pub const` so
 /// it survives the `#[actor(space_role_map = ...)]` expansion.
@@ -277,15 +278,21 @@ pub struct SpaceRegistry {
     /// Opaque metadata blobs keyed by program hash. Stored as raw
     /// `.vos_meta` section bytes so the registry stays agnostic
     /// about the schema format (lives in `vos::metadata` on the
-    /// consumer side).
-    metas: Vec<MetaRow>,
+    /// consumer side). A `#[storage]` map so each program's meta is
+    /// its own KV row — read by point `meta_for_program`, never
+    /// enumerated — instead of riding the state blob.
+    #[storage]
+    metas: StorageMap<[u8; 32], MetaRow>,
     /// Opaque metadata blobs for native `.so` extensions, keyed by
     /// the manifest `instance_name`. Service-mode extensions have
     /// no program-hash identity in this catalog (the host loads
     /// them off a filesystem path), so we key by the operator-
     /// visible name. `meta_for_instance` falls through here when
-    /// the name doesn't match an installed PVM agent.
-    extension_metas: Vec<ExtensionMetaRow>,
+    /// the name doesn't match an installed PVM agent. A `#[storage]`
+    /// map keyed by `name_key(instance_name)` (the name folded to a
+    /// fixed-width key); the row keeps the plain name.
+    #[storage]
+    extension_metas: StorageMap<[u8; 32], ExtensionMetaRow>,
     /// Sprint 2 — per-PeerId auth grants. Sorted by `peer_id`
     /// (lexicographic bytes) for binary lookup. Pre-Sprint-2
     /// state archives don't have this field; the actor's
@@ -330,14 +337,16 @@ pub struct SpaceRegistry {
     /// verifies it via the same `space new`/`space verify` root recompute.
     root: Vec<u8>,
     /// Grow-only set of `replication_id`s any `install` has ever
-    /// consumed, sorted ascending. An install whose `replication_id`
-    /// is already here is refused, so a captured `install` op can't be
-    /// replayed to resurrect an uninstalled agent (the tombstone
-    /// outlives the `AgentRow`). A legitimate reinstall uses a fresh
+    /// consumed. An install whose `replication_id` is already here is
+    /// refused, so a captured `install` op can't be replayed to
+    /// resurrect an uninstalled agent (the tombstone outlives the
+    /// `AgentRow`). A legitimate reinstall uses a fresh
     /// `replication_id`. Order-independent: presence is a grow-only
     /// set, so the original install's id blocks the replay regardless
-    /// of merge order.
-    used_replication_ids: Vec<[u8; 32]>,
+    /// of merge order. A `#[storage]` set — only membership is ever
+    /// tested, so the burn/refuse pair is two point ops.
+    #[storage]
+    used_replication_ids: StorageSet<[u8; 32]>,
 }
 
 #[messages]
@@ -347,8 +356,8 @@ impl SpaceRegistry {
             programs: Vec::new(),
             agents: Vec::new(),
             members: Vec::new(),
-            metas: Vec::new(),
-            extension_metas: Vec::new(),
+            metas: StorageMap::default(),
+            extension_metas: StorageMap::default(),
             auth_grants: Vec::new(),
             actor_acls: Vec::new(),
             revoke_epochs: Vec::new(),
@@ -356,7 +365,7 @@ impl SpaceRegistry {
             host_mappings: Vec::new(),
             consistency_floors: Vec::new(),
             root: Vec::new(),
-            used_replication_ids: Vec::new(),
+            used_replication_ids: StorageSet::default(),
         }
     }
 
@@ -499,15 +508,8 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Status::BadHash;
         };
-        let mut idx = 0usize;
-        while idx < self.metas.len() {
-            if self.metas[idx].program_hash == program_hash {
-                self.metas[idx].blob = blob;
-                return Status::Ok;
-            }
-            idx += 1;
-        }
-        self.metas.push(MetaRow { program_hash, blob });
+        // Upsert: one point write, keyed by the program hash.
+        self.metas.insert(&program_hash, &MetaRow { program_hash, blob });
         Status::Ok
     }
 
@@ -520,11 +522,7 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Vec::new();
         };
-        self.metas
-            .iter()
-            .find(|m| m.program_hash == program_hash)
-            .map(|m| m.blob.clone())
-            .unwrap_or_default()
+        self.metas.get(&program_hash).map(|m| m.blob).unwrap_or_default()
     }
 
     /// Convenience join: find an installed agent by name, then
@@ -547,25 +545,15 @@ impl SpaceRegistry {
         while ai < self.agents.len() {
             if self.agents[ai].instance_name == name {
                 let hash = self.agents[ai].program_hash;
-                let mut mi = 0usize;
-                while mi < self.metas.len() {
-                    if self.metas[mi].program_hash == hash {
-                        return self.metas[mi].blob.clone();
-                    }
-                    mi += 1;
-                }
-                return Vec::new();
+                return self.metas.get(&hash).map(|m| m.blob).unwrap_or_default();
             }
             ai += 1;
         }
-        let mut ei = 0usize;
-        while ei < self.extension_metas.len() {
-            if self.extension_metas[ei].instance_name == name {
-                return self.extension_metas[ei].blob.clone();
-            }
-            ei += 1;
-        }
-        Vec::new()
+        // Fall through to the extension-meta table (keyed by name).
+        self.extension_metas
+            .get(&name_key(&name))
+            .map(|e| e.blob)
+            .unwrap_or_default()
     }
 
     /// Record (or replace) the metadata blob for a native
@@ -592,23 +580,19 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.extension_metas.len() {
-            if self.extension_metas[idx].instance_name == instance_name {
-                if blob.is_empty() {
-                    self.extension_metas.remove(idx);
-                } else {
-                    self.extension_metas[idx].blob = blob;
-                }
-                return Status::Ok;
-            }
-            idx += 1;
-        }
-        if !blob.is_empty() {
-            self.extension_metas.push(ExtensionMetaRow {
-                instance_name,
-                blob,
-            });
+        // An empty blob removes the row; otherwise upsert. Both are one
+        // point op, keyed by the instance name.
+        let key = name_key(&instance_name);
+        if blob.is_empty() {
+            self.extension_metas.remove(&key);
+        } else {
+            self.extension_metas.insert(
+                &key,
+                &ExtensionMetaRow {
+                    instance_name,
+                    blob,
+                },
+            );
         }
         Status::Ok
     }
@@ -694,11 +678,7 @@ impl SpaceRegistry {
         // consumed. Order-independent — the original install seeds the
         // id, so the replay is blocked regardless of merge order, and
         // the tombstone outlives the `AgentRow` that `uninstall` removes.
-        if self
-            .used_replication_ids
-            .binary_search(&replication_id)
-            .is_ok()
-        {
+        if self.used_replication_ids.contains(&replication_id) {
             return Status::ReplicationIdReused;
         }
 
@@ -735,9 +715,7 @@ impl SpaceRegistry {
             },
         );
         // Burn the replication_id so it can never seed a second install.
-        if let Err(at) = self.used_replication_ids.binary_search(&replication_id) {
-            self.used_replication_ids.insert(at, replication_id);
-        }
+        self.used_replication_ids.insert(&replication_id);
         Status::Ok
     }
 
@@ -1605,6 +1583,16 @@ fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(b);
     Some(out)
+}
+
+/// Fixed-width `StorageMap` key for a variable-length instance name.
+/// The storage handles need `[u8; 32]` keys, and instance names are
+/// operator-chosen `String`s; fold them with a domain-separated blake2b.
+/// The stored row still carries the plain name, so a listing recovers it —
+/// only the ordered-by-name iteration is forfeit, and no consumer depends
+/// on it (`resolve`/`meta_for_instance` are exact-name point lookups).
+fn name_key(name: &str) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"space-registry/name-key/v1", &[name.as_bytes()])
 }
 
 /// Position of an `AgentRow.consistency` byte on the monotone
