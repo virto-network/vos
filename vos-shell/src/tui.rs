@@ -750,6 +750,7 @@ mod tests {
                     returns: "u64".into(),
                     doc: String::new(),
                     timeout_ms: 0,
+                    mode: 0,
                 },
                 ParsedMessage {
                     name: "reset".into(),
@@ -759,6 +760,7 @@ mod tests {
                     returns: "()".into(),
                     doc: String::new(),
                     timeout_ms: 0,
+                    mode: 0,
                 },
             ],
             constructor: vec![],

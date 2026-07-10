@@ -752,6 +752,7 @@ mod tests {
             returns: "u32".into(),
             doc: String::new(),
             timeout_ms: 0,
+            mode: 0,
         };
         let err = build_msg("add", Some(&m), &["a=notanumber"]).unwrap_err();
         assert!(err.to_string().contains("u64"), "{err}");
@@ -769,6 +770,7 @@ mod tests {
             returns: "()".into(),
             doc: String::new(),
             timeout_ms: 0,
+            mode: 0,
         }
     }
 

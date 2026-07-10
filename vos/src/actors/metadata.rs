@@ -37,6 +37,9 @@
 //! [timeout_count:u16 LE]        (one entry per message, in order)
 //!   [timeout_ms:u32 LE]
 //!   ...
+//! [mode_count:u16 LE]           (one entry per message, in order)
+//!   [mode:u8]                   (0 = sync, 1 = job)
+//!   ...
 //! ```
 //!
 //! Each trailing section is append-only: older decoders that don't
@@ -82,6 +85,11 @@ pub struct MessageMeta {
     /// legitimately run past the default (a minutes-long prove/measure).
     /// Trailing section; old blobs decode `0`.
     pub timeout_ms: u32,
+    /// Dispatch mode: `0` = sync (the reply is the result), `1` = job (the
+    /// handler is a `#[msg(job)]` *begin* returning a `u64` job id; the
+    /// dispatcher then drives poll → stream → release). Trailing section;
+    /// old blobs decode `0`.
+    pub mode: u8,
 }
 
 /// Actor descriptor — actor name, messages, and constructor params.
@@ -371,6 +379,19 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         t += 1;
     }
 
+    // Per-message dispatch mode (metadata v2), one u8 per message in order.
+    // `0` = sync, `1` = job. Absent → every `ParsedMessage.mode` is 0 (sync).
+    let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut md = 0;
+    while md < meta.messages.len() {
+        buf[pos] = meta.messages[md].mode;
+        pos += 1;
+        md += 1;
+    }
+
     (buf, pos)
 }
 
@@ -394,6 +415,7 @@ mod tests {
                     returns: "()",
                     doc: "",
                     timeout_ms: 0,
+                    mode: 0,
                 },
                 MessageMeta {
                     name: "status",
@@ -405,6 +427,7 @@ mod tests {
                     returns: "[u8;32]",
                     doc: "",
                     timeout_ms: 0,
+                    mode: 0,
                 },
             ],
             constructor: &[FieldMeta {
@@ -526,6 +549,7 @@ mod tests {
                     returns: "()",
                     doc: "",
                     timeout_ms: 0,
+                    mode: 0,
                 },
                 MessageMeta {
                     name: "status",
@@ -534,6 +558,7 @@ mod tests {
                     returns: "String",
                     doc: "",
                     timeout_ms: 0,
+                    mode: 0,
                 },
                 MessageMeta {
                     name: "internal_only",
@@ -542,6 +567,7 @@ mod tests {
                     returns: "()",
                     doc: "",
                     timeout_ms: 0,
+                    mode: 0,
                 },
             ],
             constructor: &[],
@@ -644,6 +670,7 @@ mod tests {
                     returns: "u64",
                     doc: "Enqueue a prove job.",
                     timeout_ms: 600_000,
+                    mode: 1,
                 },
                 MessageMeta {
                     name: "status",
@@ -652,6 +679,7 @@ mod tests {
                     returns: "u8",
                     doc: "",
                     timeout_ms: 0,
+                    mode: 0,
                 },
             ],
             constructor: &[],
@@ -665,8 +693,10 @@ mod tests {
         assert_eq!(parsed.doc, "A pure-PVM prover/verifier.");
         assert_eq!(parsed.messages[0].doc, "Enqueue a prove job.");
         assert_eq!(parsed.messages[0].timeout_ms, 600_000);
+        assert_eq!(parsed.messages[0].mode, 1, "job-mode handler round-trips");
         assert_eq!(parsed.messages[1].doc, "");
         assert_eq!(parsed.messages[1].timeout_ms, 0);
+        assert_eq!(parsed.messages[1].mode, 0, "sync handler stays mode 0");
         // Earlier sections still decode alongside the new ones.
         assert_eq!(parsed.messages[0].returns, "u64");
         assert!(parsed.messages[0].exposed_to_cli);
@@ -698,6 +728,7 @@ mod tests {
         assert_eq!(parsed.messages[0].returns, "u64");
         assert_eq!(parsed.messages[0].doc, "");
         assert_eq!(parsed.messages[0].timeout_ms, 0);
+        assert_eq!(parsed.messages[0].mode, 0);
     }
 }
 
@@ -740,6 +771,9 @@ mod decode {
         /// Per-handler invoke timeout in milliseconds (metadata v2);
         /// `0` = the client's default. Empty/old blobs decode `0`.
         pub timeout_ms: u32,
+        /// Dispatch mode (metadata v2): `0` = sync, `1` = job (a
+        /// `#[msg(job)]` begin). Empty/old blobs decode `0`.
+        pub mode: u8,
     }
 
     /// Parsed actor metadata from binary metadata.
@@ -792,9 +826,10 @@ mod decode {
                 exposed_to_cli: false,
                 // Filled in from the trailing `returns` section.
                 returns: String::new(),
-                // Filled in from the metadata-v2 doc / timeout sections.
+                // Filled in from the metadata-v2 doc / timeout / mode sections.
                 doc: String::new(),
                 timeout_ms: 0,
+                mode: 0,
             });
         }
 
@@ -906,6 +941,22 @@ mod decode {
                 };
                 if let Some(msg) = messages.get_mut(i) {
                     msg.timeout_ms = ms;
+                }
+            }
+        }
+
+        // Per-message dispatch mode (metadata v2), one u8 each,
+        // index-crossref. Absent → every `mode` stays 0 (sync).
+        if pos < data.len()
+            && let Some(mode_count) = read_u16(data, &mut pos)
+        {
+            for i in 0..mode_count as usize {
+                let Some(&m) = data.get(pos) else {
+                    break;
+                };
+                pos += 1;
+                if let Some(msg) = messages.get_mut(i) {
+                    msg.mode = m;
                 }
             }
         }

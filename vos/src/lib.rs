@@ -95,6 +95,7 @@ pub mod zk;
 // --- Actor framework (always available, no_std compatible) ---
 
 pub mod actors;
+pub mod jobs;
 pub mod refine_payload;
 pub mod task_abi;
 

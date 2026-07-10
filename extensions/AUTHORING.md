@@ -138,6 +138,78 @@ tick (the host never preempts a handler). Ticking is sequential w.r.t. the
 actor's other `#[msg]` handlers — `tick` takes `&mut self`, so it never
 races them.
 
+## src/lib.rs — long-running work with `#[msg(job)]`
+
+A handler that can't answer on the request path — a minutes-long prove, a
+streamed model generation — is declared `#[msg(job)]`. It is the *begin*
+of an async job: it must return a `u64` job id (the macro enforces the
+`u64` return type) and kick the work off elsewhere. The caller then polls
+until done and releases. This keeps the invoke wire path short: the id
+comes back immediately, the output streams over subsequent polls.
+
+By convention an actor with any job-mode handler also exposes two reserved
+methods, both keyed by the returned id:
+
+- `job_poll(job_id: u64) -> Vec<u8>` — the standard reply is a
+  `vos::value::Args` with `data: Bytes` (output since the last poll),
+  `done: bool` (terminal?), and `error: Str` (non-empty on failure).
+- `job_release(job_id: u64) -> u8` — drop the finished job.
+
+`vos::jobs::JobQueue` backs all three. Embed one in the actor, `begin()`
+an id, have the worker `push`/`finish`/`fail` into it, and delegate
+`job_poll`/`job_release` to `poll_reply`/`release`:
+
+```rust
+use vos::jobs::JobQueue;
+use vos::prelude::*;
+
+#[actor(caps = ["thread.spawn"])]
+pub struct Summarizer {
+    #[rkyv(with = vos::rkyv::with::Skip)]
+    jobs: std::sync::Arc<std::sync::Mutex<JobQueue>>,
+}
+
+#[messages]
+impl Summarizer {
+    pub fn new() -> Self { Self { jobs: Default::default() } }
+
+    /// Begin a summarize job; returns the job id to poll.
+    #[msg(job, cli)]
+    async fn summarize(&mut self, text: String, _ctx: &mut Context<Self>) -> u64 {
+        let id = self.jobs.lock().unwrap().begin();
+        let jobs = self.jobs.clone();       // shared into the worker thread
+        std::thread::spawn(move || {
+            for token in summarize_streaming(&text) {
+                jobs.lock().unwrap().push(id, token.as_bytes());
+            }
+            jobs.lock().unwrap().finish(id); // or .fail(id, msg) on error
+        });
+        id
+    }
+
+    /// Reserved: drain a job's output. `data`/`done`/`error` Args shape.
+    #[msg]
+    async fn job_poll(&mut self, job_id: u64, _ctx: &mut Context<Self>) -> Vec<u8> {
+        self.jobs.lock().unwrap().poll_reply(job_id).encode()
+    }
+
+    /// Reserved: drop a finished job.
+    #[msg]
+    async fn job_release(&mut self, job_id: u64, _ctx: &mut Context<Self>) -> u8 {
+        u8::from(self.jobs.lock().unwrap().release(job_id))
+    }
+}
+```
+
+The worker runs on a separate thread, so the `JobQueue` lives behind an
+`Arc<Mutex<…>>` reachable from both the handler and the worker — don't
+rely on the single-threaded actor assumption for the push path. Actors
+that advance work on `tick` instead (one job per tick, no thread) keep
+the queue as a plain field. The `vosx` dispatcher recognises a job-mode
+method from `.vos_meta` and drives poll → stream → release for you; the
+prover extension (tick-advanced) and the ai extension (thread-streamed)
+are the reference implementations.
+
 ## src/lib.rs — Transport kind
 
 A transport extension serves connections; the host owns the listener.

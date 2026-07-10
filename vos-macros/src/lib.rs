@@ -393,6 +393,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // (0 = client default), recorded in `.vos_meta` so the dispatcher
         // waits long enough for a legitimately slow handler.
         let mut timeout_ms: u32 = 0;
+        // `#[msg(job)]` — the handler is a long-running job *begin*: it must
+        // return a `u64` job id (enforced below), and gets `mode = 1` in
+        // `.vos_meta` so the dispatcher drives poll → stream → release.
+        let mut is_job = false;
         // Only `#[msg(...)]` with parenthesized args is parsed; bare `#[msg]`
         // has none (and `parse_nested_meta` would error on the missing parens).
         if let Some(attr) = msg_attr
@@ -401,6 +405,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             if let Err(e) = attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("cli") {
                     exposed_to_cli = true;
+                    return Ok(());
+                }
+                if meta.path.is_ident("job") {
+                    is_job = true;
                     return Ok(());
                 }
                 if meta.path.is_ident("role") {
@@ -592,6 +600,18 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .map(ty_string)
             .unwrap_or_else(|| "()".to_string());
 
+        // A `#[msg(job)]` handler is a job *begin* — it must return a `u64`
+        // job id (or `Result<u64, _>`, already unwrapped above) for the
+        // dispatcher's job driver to poll on.
+        if is_job && returns_str != "u64" {
+            return syn::Error::new_spanned(
+                &method.sig,
+                "#[msg(job)] handler must return u64 (the job id)",
+            )
+            .to_compile_error()
+            .into();
+        }
+
         // Reply-encoding step: how to convert the handler's
         // returned value into the `Value` we hand to
         // `ctx.__set_reply`. Three shapes, in order:
@@ -712,6 +732,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let msg_name_str = method_name.to_string();
         // First paragraph of the handler's `///` doc → MessageMeta.doc.
         let method_doc = first_doc_paragraph(&method.attrs);
+        // Dispatch mode byte: 1 for `#[msg(job)]`, else 0 (sync).
+        let mode_byte: u8 = if is_job { 1 } else { 0 };
         let field_metas: Vec<_> = field_names
             .iter()
             .zip(field_types.iter())
@@ -737,6 +759,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 returns: #returns_str,
                 doc: #method_doc,
                 timeout_ms: #timeout_ms,
+                mode: #mode_byte,
             }
         });
         if exposed_to_cli {

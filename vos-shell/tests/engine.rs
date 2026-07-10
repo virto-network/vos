@@ -34,6 +34,7 @@ fn meta(actor: &str, msgs: &[(&str, &[(&str, &str)], bool, bool)]) -> ParsedMeta
                 returns: String::new(),
                 doc: String::new(),
                 timeout_ms: 0,
+                mode: 0,
             })
             .collect(),
         constructor: vec![],

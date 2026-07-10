@@ -324,6 +324,7 @@ mod tests {
                     returns: String::new(),
                     doc: "Stop the gateway.".into(),
                     timeout_ms: 0,
+                    mode: 0,
                 },
                 ParsedMessage {
                     name: "status".into(),
@@ -333,6 +334,7 @@ mod tests {
                     returns: String::new(),
                     doc: String::new(),
                     timeout_ms: 0,
+                    mode: 0,
                 },
                 ParsedMessage {
                     name: "internal".into(),
@@ -345,6 +347,7 @@ mod tests {
                     returns: String::new(),
                     doc: String::new(),
                     timeout_ms: 0,
+                    mode: 0,
                 },
             ],
             constructor: vec![],

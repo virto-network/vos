@@ -37,6 +37,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "String",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "last_text",
@@ -45,6 +46,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "String",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "add",
@@ -62,6 +64,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "u32",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "last_sum",
@@ -70,6 +73,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "u32",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "flip",
@@ -81,6 +85,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "bool",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "flip_count",
@@ -89,6 +94,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "u32",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "sum_list",
@@ -100,6 +106,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "u32",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "concat",
@@ -111,6 +118,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "String",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "range",
@@ -122,6 +130,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "Vec<u32>",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "split",
@@ -133,6 +142,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "Vec<String>",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "ping",
@@ -141,6 +151,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "()",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
         MessageMeta {
             name: "boom",
@@ -149,6 +160,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             returns: "u32",
             doc: "",
             timeout_ms: 0,
+            mode: 0,
         },
     ],
     constructor: &[],
