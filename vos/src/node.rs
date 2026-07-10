@@ -901,7 +901,7 @@ pub struct VosNode {
     /// operator's node. `None` (a raw `vosx run` or a test node) leaves
     /// catalog ops unsigned, so the registry refuses them — fail closed.
     /// Set by [`set_operator_signer`](Self::set_operator_signer).
-    operator_signer: Option<crate::registry_canon::CatalogOpSigner>,
+    operator_signer: Option<crate::registry::CatalogOpSigner>,
     /// Map: replication group → local replica handle.
     /// Populated by `register` whenever a CRDT actor with a
     /// `replication_id` is added. Read by [`NodeService`] (db
@@ -3304,7 +3304,7 @@ fn agent_thread(
     raft_fwd: RaftFwd,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
-    operator_signer: Option<crate::registry_canon::CatalogOpSigner>,
+    operator_signer: Option<crate::registry::CatalogOpSigner>,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
     #[cfg(all(feature = "network", feature = "storage"))] sync_rx: Option<mpsc::Receiver<()>>,
 ) -> AgentResult {
@@ -3884,7 +3884,7 @@ fn handle_invoke_request(
     mut req: InvokeRequest,
     strategy: &mut dyn crate::commit::CommitStrategy,
     recording_enabled: bool,
-    operator_signer: Option<&crate::registry_canon::CatalogOpSigner>,
+    operator_signer: Option<&crate::registry::CatalogOpSigner>,
 ) -> Result<(), crate::commit::CommitError> {
     // Only the space-registry thread holds the operator signer for catalog ops.
     // If this dispatch is a signed catalog mutator, author-sign it with
@@ -3897,7 +3897,7 @@ fn handle_invoke_request(
     // the signature is its own (non-admin) operator's, so authorize_op
     // refuses it and the row is consumed from sync instead.
     if let Some(signer) = operator_signer {
-        if let Some(signed) = crate::registry_canon::sign_catalog_op_on_relay(&req.msg, signer) {
+        if let Some(signed) = crate::registry::sign_catalog_op_on_relay(&req.msg, signer) {
             req.msg = signed;
         }
     }

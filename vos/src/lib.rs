@@ -96,6 +96,12 @@ pub mod zk;
 
 pub mod actors;
 pub mod jobs;
+// Space-registry protocol — wire rows, status/role consts, and the
+// consensus-critical canonical signing-byte encodings. Always available
+// (no_std) so the space-registry actor's service/wasm builds can
+// `pub use` them back; the daemon's sign-on-relay path is std-gated
+// inside the module.
+pub mod registry;
 pub mod refine_payload;
 pub mod task_abi;
 
@@ -187,11 +193,6 @@ pub mod runtime;
 
 #[cfg(feature = "std")]
 pub mod node;
-
-// Host-side reconstruction of the registry's signed-op canonical bytes
-// so the daemon can author-sign catalog mutations on relay.
-#[cfg(feature = "std")]
-pub(crate) mod registry_canon;
 
 /// Drive a future to completion on the current thread.
 ///

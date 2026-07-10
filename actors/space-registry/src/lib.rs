@@ -47,18 +47,23 @@ pub const SERVICE_ID_RAW: u32 = 0;
 /// `blake2b("vos-space-id/v1" || genesis_dag_root)`.
 pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id/v1";
 
-// ── Programs ──────────────────────────────────────────────────────
+// ── Protocol (rows, status/role consts, canonical signing bytes) ──
+//
+// The wire types + the consensus-critical canonical encodings now live
+// in `vos::registry` (one source of truth — no host-side mirror). We
+// `pub use` them back so this crate's public API is unchanged and the
+// actor's own state + handlers keep referring to the same names. The
+// verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
+// the moved `ed25519_pubkey_from_peer_id`.
+pub use vos::registry::{
+    ActorAclRow, AgentRow, AuthGrantRow, MemberRow, ProgramRow, Status, AUTH_ROLE_ADMIN,
+    AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN, MEMBER_KIND_IDENTITY,
+    MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
+    PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
+    canonical_op_bytes, ed25519_pubkey_from_peer_id, pack_auth,
+};
 
-/// One row in the program catalog.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct ProgramRow {
-    pub name: String,
-    pub version: String,
-    pub hash: [u8; 32],
-}
+// ── Programs ──────────────────────────────────────────────────────
 
 /// One row in the metadata table — opaque schema bytes attached to a
 /// program hash. The wire payload is the raw `.vos_meta` ELF section
@@ -117,45 +122,6 @@ pub struct BlobRow {
 
 // ── Agents ────────────────────────────────────────────────────────
 
-/// One row in the agent (instance) catalog.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct AgentRow {
-    pub instance_name: String,
-    /// Pinned at install time so a program retag never silently
-    /// changes the code an agent runs.
-    pub program_hash: [u8; 32],
-    /// Display-only references to the program catalog. Agents
-    /// resolve code via `program_hash`; these are for
-    /// `space agents` listings and manifest export.
-    pub program_name: String,
-    pub program_version: String,
-    pub replication_id: [u8; 32],
-    /// 0 = Ephemeral, 1 = Local, 2 = Crdt, 3 = Raft. Mirrors
-    /// `vos::node::Consistency` discriminants.
-    pub consistency: u8,
-    /// Opt this node-confined (`Local`/`Ephemeral`) agent OUT of the
-    /// device-confinement gate so remote peers can reach it — for the
-    /// network-served bridges (`clerk-bridge`, `space-bridge`). `false`
-    /// (confined, device-private) by default; `Crdt`/`Raft` agents are never
-    /// confined and ignore it. See
-    /// [`vos::node::AgentConfig::network_reachable`].
-    pub network_reachable: bool,
-    /// rkyv-encoded `vos::init::InitArgs` captured at install
-    /// time. New replicas use this to bootstrap their copy of
-    /// the agent before its first message arrives. Empty when
-    /// the agent was installed without init args.
-    pub install_args: Vec<u8>,
-    /// Optional one-shot messages to dispatch when the agent
-    /// is first cold-started. rkyv-encoded `Vec<Vec<u8>>`
-    /// where each inner `Vec<u8>` is a `[TAG_DYNAMIC] + rkyv(Msg)`
-    /// payload. Reconciled from the manifest's `on_start = [{msg=…}]`
-    /// list. Empty when the agent has no on_start.
-    pub install_payloads: Vec<u8>,
-}
-
 /// Monotone-locality floor: the narrowest consistency tier (by
 /// shareability) an `instance_name` was ever installed at. Retained
 /// across `uninstall` — unlike the `AgentRow`, which is removed — so
@@ -177,41 +143,6 @@ pub struct ConsistencyFloorRow {
 
 // ── Members ──────────────────────────────────────────────────────
 
-/// Member kind discriminant.
-pub const MEMBER_KIND_NODE: u8 = 0;
-pub const MEMBER_KIND_IDENTITY: u8 = 1;
-
-/// Node role discriminant (only meaningful when `kind = Node`).
-pub const NODE_ROLE_VOTER: u8 = 0;
-pub const NODE_ROLE_OBSERVER: u8 = 1;
-
-/// Identity proof-kind discriminant (only meaningful when
-/// `kind = Identity`).
-pub const PROOF_KIND_MERKLE_INCLUSION: u8 = 0;
-pub const PROOF_KIND_ZK: u8 = 1;
-
-/// One row in the member table — discriminated union over
-/// `Node` and `Identity` shapes flattened into a single record
-/// so the wire format stays a single `Vec<MemberRow>` query.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct MemberRow {
-    /// `MEMBER_KIND_NODE` or `MEMBER_KIND_IDENTITY`.
-    pub kind: u8,
-    /// `peer_id` bytes (Node) or `public_key` bytes (Identity).
-    pub key: Vec<u8>,
-    /// Node prefix; 0 when `kind = Identity`.
-    pub prefix: u16,
-    /// `NODE_ROLE_*` value; 0 when `kind = Identity`.
-    pub role: u8,
-    /// `PROOF_KIND_*` value; 0 when `kind = Node`.
-    pub proof_kind: u8,
-    /// Serialized proof bytes; empty when `kind = Node`.
-    pub proof_data: Vec<u8>,
-}
-
 // ── Auth grants (Sprint 2) ────────────────────────────────────────
 //
 // Separate table from `MemberRow` because the existing `role`
@@ -227,11 +158,6 @@ pub struct MemberRow {
 //
 // `READONLY` is the default for `members` lookups so a peer can
 // see who's enrolled without an explicit grant.
-
-pub const AUTH_ROLE_NONE: u8 = 0;
-pub const AUTH_ROLE_READONLY: u8 = 1;
-pub const AUTH_ROLE_DEVELOPER: u8 = 2;
-pub const AUTH_ROLE_ADMIN: u8 = 3;
 
 /// The space-registry actor's own role hierarchy. Discriminants
 /// match the AUTH_ROLE_* constants above so a space-level grant
@@ -280,31 +206,6 @@ impl vos::RoleByte for SpaceRegistryRole {
     }
 }
 
-/// Per-PeerId auth grant. `peer_id` is the libp2p PeerId in
-/// multihash bytes (same encoding as `MemberRow.key` when
-/// `kind = Node`); `role` is one of the `AUTH_ROLE_*`
-/// constants above.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct AuthGrantRow {
-    pub peer_id: Vec<u8>,
-    pub role: u8,
-    /// Monotonic grant epoch. A grant only takes effect while its
-    /// epoch is strictly above the peer's `revoke_epochs` high-water,
-    /// so a replayed (stale-epoch) grant can never resurrect a revoked
-    /// role and a fresh re-grant must carry a higher epoch (the CLI
-    /// reads [`SpaceRegistry::peer_epoch`] and signs `epoch + 1`).
-    pub epoch: u64,
-    /// PeerId of the op's signer — the delegator. Authority is
-    /// resolved on demand by [`SpaceRegistry::effective_role`]: this
-    /// grant counts only if `grantor` is itself the genesis root or a
-    /// transitively-effective admin, so revoking a delegator voids its
-    /// whole subtree regardless of replay order.
-    pub grantor: Vec<u8>,
-}
-
 /// Grow-only revoke high-water for a space-level grant. `revoke_role`
 /// raises (never lowers) the epoch for `peer_id`; a grant whose epoch
 /// is at or below this is dominated. Order-independent: the high-water
@@ -330,34 +231,6 @@ pub struct ActorRevokeEpochRow {
     pub peer_id: Vec<u8>,
     pub agent_name: String,
     pub epoch: u64,
-}
-
-/// Per-(PeerId, agent_name) ACL row — the M4 actor-local override
-/// table. Lookup precedence in the dispatch path is:
-///
-/// 1. `actor_acls` keyed on `(peer_id, agent_name)`.
-/// 2. Fall back to `auth_grants` keyed on `peer_id` (space-level).
-///
-/// `role` discriminants are interpreted in the *target actor's*
-/// `Role` enum, not [`SpaceRole`](vos::SpaceRole). The registry
-/// stores them opaquely; the host plumbs them through and the
-/// actor decodes via `RoleByte::from_byte`. Sorting key is the
-/// pair `(peer_id_bytes, agent_name_bytes)` for binary lookup.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct ActorAclRow {
-    pub peer_id: Vec<u8>,
-    pub agent_name: String,
-    pub role: u8,
-    /// Monotonic grant epoch — see [`AuthGrantRow::epoch`]. Compared
-    /// against the matching [`ActorRevokeEpochRow`] high-water.
-    pub epoch: u64,
-    /// PeerId of the delegator. The actor-local grant counts only if
-    /// the grantor is a transitively-effective *space* admin (resolved
-    /// via [`SpaceRegistry::effective_role`]).
-    pub grantor: Vec<u8>,
 }
 
 // ── Host mappings (hyperspace addressing) ───────────────────────
@@ -386,106 +259,6 @@ pub struct HostMapping {
 }
 
 // ── Result codes ─────────────────────────────────────────────────
-
-/// Status returned by a mutation handler. `Ok` is always `0`.
-#[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-#[repr(u8)]
-pub enum Status {
-    /// Handler succeeded.
-    Ok = 0,
-    /// A `(name, version)` tag already exists bound to a different hash.
-    TagConflict = 1,
-    /// The referenced row doesn't exist.
-    NotFound = 2,
-    /// A program can't be unpublished while an agent still references it.
-    InUse = 3,
-    /// The referenced program isn't in the catalog.
-    ProgramNotFound = 4,
-    /// An agent with this `instance_name` is already installed.
-    InstanceExists = 5,
-    /// A byte field wasn't the expected fixed length.
-    BadHash = 6,
-    /// The caller's PeerId doesn't carry the auth role required for this
-    /// handler. Distinct from `NotFound` so clients can surface
-    /// "permission denied" specifically.
-    Forbidden = 7,
-    /// Hyperspace `register_remote`: the supplied `host_prefix` doesn't
-    /// match any registered node prefix. Distinct from `NotFound` so
-    /// callers can tell "instance not found" from "host node not enrolled".
-    BadPrefix = 8,
-    /// Monotone-locality guard: `install` refused to (re)create an
-    /// instance at a *wider* consistency tier than the narrowest one the
-    /// same `instance_name` was ever installed at. Confined tiers
-    /// (`Ephemeral`/`Local`) may never be widened into replication by
-    /// reusing a name — widening requires a fresh name. This is the
-    /// defense-in-depth half of the immutable-local seal; the
-    /// load-bearing enforcement is host-side in `vos::node`.
-    ConsistencyWidenDenied = 9,
-    /// Anti-replay guard: `install` refused because its `replication_id`
-    /// was already consumed by a prior install (the id is a grow-only
-    /// tombstone that outlives `uninstall`). A captured `install` op
-    /// replayed to resurrect an uninstalled agent hits this; a legitimate
-    /// reinstall must mint a fresh `replication_id`.
-    ReplicationIdReused = 10,
-    /// Compare-and-swap guard: `upgrade` refused because the instance's
-    /// live program hash no longer matches the `from_hash` the op was
-    /// authored against — a replayed or superseded upgrade (e.g. a
-    /// version rollback re-injected via CRDT). Re-issue against the
-    /// current hash to proceed.
-    StaleUpgrade = 11,
-}
-
-impl Status {
-    /// Decode a status byte (the over-the-wire discriminant) back into a
-    /// `Status`. `None` for an unknown byte. Used by raw callers that
-    /// pull the reply byte directly rather than through a typed `Ref`.
-    pub fn from_u8(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(Self::Ok),
-            1 => Some(Self::TagConflict),
-            2 => Some(Self::NotFound),
-            3 => Some(Self::InUse),
-            4 => Some(Self::ProgramNotFound),
-            5 => Some(Self::InstanceExists),
-            6 => Some(Self::BadHash),
-            7 => Some(Self::Forbidden),
-            8 => Some(Self::BadPrefix),
-            9 => Some(Self::ConsistencyWidenDenied),
-            10 => Some(Self::ReplicationIdReused),
-            11 => Some(Self::StaleUpgrade),
-            _ => None,
-        }
-    }
-}
-
-impl core::fmt::Display for Status {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Status::Ok => "ok",
-            Status::TagConflict => "tag conflict",
-            Status::NotFound => "not found",
-            Status::InUse => "in use",
-            Status::ProgramNotFound => "program not found",
-            Status::InstanceExists => "instance exists",
-            Status::BadHash => "bad hash",
-            Status::Forbidden => "forbidden",
-            Status::BadPrefix => "bad prefix",
-            Status::ConsistencyWidenDenied => "consistency widen denied",
-            Status::ReplicationIdReused => "replication id reused",
-            Status::StaleUpgrade => "stale upgrade",
-        })
-    }
-}
 
 // ── Actor ─────────────────────────────────────────────────────────
 
@@ -2083,41 +1856,6 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
 // resulting Status::Forbidden. `register_remote` stays unsigned: it is
 // the hyperspace/federation surface and has a separate trust model.
 
-/// Domain tag mixed into the canonical bytes an op is signed over.
-/// Prevents a signature from one protocol/version being replayed as
-/// a registry op. Bump if [`canonical_op_bytes`] changes.
-pub const REGISTRY_OP_DOMAIN: &[u8] = b"vos-registry-op/v1";
-
-/// ed25519 signature length.
-pub const OP_SIG_LEN: usize = 64;
-
-/// Canonical byte string a mutation's author signs. Layout:
-/// `domain || u16(op.len) || op || (u32(field.len) || field)*`.
-/// The signer (CLI/daemon) and the verifier (actor) build these
-/// from the same logical args, so the bytes match exactly without
-/// re-encoding the wire `Msg`.
-pub fn canonical_op_bytes(op: &str, fields: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(REGISTRY_OP_DOMAIN);
-    out.extend_from_slice(&(op.len() as u16).to_le_bytes());
-    out.extend_from_slice(op.as_bytes());
-    for f in fields {
-        out.extend_from_slice(&(f.len() as u32).to_le_bytes());
-        out.extend_from_slice(f);
-    }
-    out
-}
-
-/// Pack an authorization blob: `signer_peer_id || signature(64)`.
-/// `signer_peer_id` is libp2p multihash bytes (same encoding as
-/// [`AuthGrantRow::peer_id`]); the verifier splits at `len - 64`.
-pub fn pack_auth(signer_peer_id: &[u8], sig: &[u8; OP_SIG_LEN]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(signer_peer_id.len() + OP_SIG_LEN);
-    out.extend_from_slice(signer_peer_id);
-    out.extend_from_slice(sig);
-    out
-}
-
 /// Split an auth blob into `(signer_peer_id, signature)`. `None` if
 /// it's too short to hold a signature.
 fn unpack_auth(auth: &[u8]) -> Option<(&[u8], [u8; OP_SIG_LEN])> {
@@ -2128,29 +1866,6 @@ fn unpack_auth(auth: &[u8]) -> Option<(&[u8], [u8; OP_SIG_LEN])> {
     let mut s = [0u8; OP_SIG_LEN];
     s.copy_from_slice(sig);
     Some((signer, s))
-}
-
-/// Extract the raw 32-byte ed25519 public key embedded in a libp2p
-/// PeerId. For ed25519, a PeerId is the identity-multihash of the
-/// protobuf-encoded public key, a fixed 38-byte shape:
-///
-/// ```text
-/// 00 24 08 01 12 20 <32-byte ed25519 key>
-/// │  │  └──────────┴ protobuf PublicKey { KeyType::Ed25519=1, key[32] }
-/// │  └ multihash length 0x24 = 36
-/// └ multihash code 0x00 = identity
-/// ```
-///
-/// Returns `None` for any other shape — a non-ed25519 identity can't
-/// be a registry signer in v1.
-pub fn ed25519_pubkey_from_peer_id(peer_id: &[u8]) -> Option<[u8; 32]> {
-    const PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
-    if peer_id.len() != 38 || peer_id[..6] != PREFIX {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&peer_id[6..]);
-    Some(key)
 }
 
 /// Verify ed25519 `sig` over `msg` under the key embedded in
@@ -2165,30 +1880,6 @@ pub fn verify_op_sig(signer_peer_id: &[u8], msg: &[u8], sig: &[u8; OP_SIG_LEN]) 
     };
     let signature = ed25519_dalek::Signature::from_bytes(sig);
     vk.verify_strict(msg, &signature).is_ok()
-}
-
-/// Domain tag for the MLS identity-binding signature (the messenger's
-/// `vos-msg/identity-binding/v1`). Separate from [`REGISTRY_OP_DOMAIN`]
-/// so a registry-op signature can never be replayed as a binding cert.
-pub const BINDING_DOMAIN: &[u8] = b"vos-msg/identity-binding/v1";
-
-/// Canonical bytes the operator's identity key signs to bind an MLS
-/// signature key to a space PeerId: `domain || u16(mls_pubkey.len) ||
-/// mls_pubkey || u16(peer_id.len) || peer_id || space_id`. Shared so the
-/// messenger actor (which verifies the cert on every leaf) and the CLI
-/// (`vosx`, which produces it) build identical bytes from one source —
-/// it lives here next to [`canonical_op_bytes`] because both are
-/// signing-byte builders the PVM actor flavor and the host must agree on.
-pub fn binding_signed_bytes(mls_pubkey: &[u8], peer_id: &[u8], space_id: &[u8; 32]) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(BINDING_DOMAIN.len() + 4 + mls_pubkey.len() + peer_id.len() + 32);
-    out.extend_from_slice(BINDING_DOMAIN);
-    out.extend_from_slice(&(mls_pubkey.len() as u16).to_le_bytes());
-    out.extend_from_slice(mls_pubkey);
-    out.extend_from_slice(&(peer_id.len() as u16).to_le_bytes());
-    out.extend_from_slice(peer_id);
-    out.extend_from_slice(space_id);
-    out
 }
 
 #[cfg(test)]
