@@ -792,21 +792,25 @@ fn reconcile_one(
     //     and consumers fall back to whatever heuristic they
     //     have today.
     if let Some(meta_blob) = vos::metadata::raw_section_from_elf(&elf_bytes) {
-        let status =
-            // Empty `auth`: signed on relay by the daemon (operator key).
-            vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob, Vec::new()))
-                .map_err(|e| anyhow::anyhow!("registry.register_meta('{program_name}'): {e}"))?;
-        if status != Status::Ok {
-            // Don't fail the install — meta registration is a
-            // nice-to-have (and FORBIDDEN on a non-admin node is
-            // expected; the row arrives via sync). Log so a future
-            // operator can spot schema drift.
-            tracing::warn!(
+        // Meta registration is a nice-to-have (it enables schema-aware
+        // coercion for the gateway / dynamic CLIs); it must never abort the
+        // install. Both a non-Ok status (e.g. FORBIDDEN on a non-admin node —
+        // the row arrives via sync) and a transport failure (e.g. a large
+        // `.vos_meta` that overflows the registry guest's FETCH buffer) are
+        // tolerated: log and move on, agent still spawns without a schema.
+        // Empty `auth`: signed on relay by the daemon (operator key).
+        match vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob, Vec::new())) {
+            Ok(Status::Ok) => {
+                tracing::debug!("registered meta for {program_name}:{program_version}");
+            }
+            Ok(status) => tracing::warn!(
                 "register_meta('{program_name}') returned status {status}; \
                  schema-aware coercion disabled for this agent",
-            );
-        } else {
-            tracing::debug!("registered meta for {program_name}:{program_version}");
+            ),
+            Err(e) => tracing::warn!(
+                "register_meta('{program_name}') did not reach the registry ({e}); \
+                 schema-aware coercion disabled for this agent",
+            ),
         }
     } else {
         tracing::debug!("{program_name}:{program_version} has no .vos_meta section; skipping",);
