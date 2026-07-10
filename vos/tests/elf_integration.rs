@@ -5390,6 +5390,207 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
     assert_eq!(panics, 0, "actor panics during hyperspace test: {panics}");
 }
 
+/// W3.1 gate: per-key registry writes AND deletes converge byte-identically
+/// across two CRDT replicas. Node A anchors the genesis root, enrols two
+/// node members (`add_node` — one `Effect::Write` per member into the
+/// storage-typed `nodes` map) then removes one (`remove_node` — an
+/// `Effect::Delete`). Node B, which never saw the ops directly, converges
+/// via gossipsub-CRDT: `node_role` resolves the survivor and denies the
+/// removed one, and B's full member roster is byte-identical to A's — the
+/// soft-restart keyspace clear (`ServiceStorage::clear_service`) rebuilds
+/// B's storage rows from a clean slate instead of replaying onto stale
+/// ones, so the two maps materialize identically.
+#[test]
+#[cfg(feature = "network")]
+fn crdt_registry_writes_and_deletes_converge_across_replicas() {
+    let _net = net_serial();
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{NODE_ROLE_VOTER, SpaceRegistryRef, canonical_op_bytes, pack_auth};
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry actor not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_crdt_reg_converge_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"crdt-registry-converge-test");
+        h.update(&registry_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // ── Networks ───────────────────────────────────────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: true,
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
+    });
+
+    // ── Two registry replicas in one CRDT group ────────────────
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let _reg_a = node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let _reg_b = node_b.register_at_id(
+        AgentConfig::new(registry_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_b.attach_network(net_b);
+
+    let net_a_arc = node_a.network().expect("net_a attached");
+    let net_b_arc = node_b.network().expect("net_b attached");
+    wait_for(
+        || {
+            (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("Hello handshake");
+
+    // ── Anchor the genesis root + sign the node ops ────────────
+    let root_key = SigningKey::from_bytes(&[13u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+    let node_peer = |seed: u8| peer_id_for([seed; 32]);
+    let add_auth = |prefix: u32, peer: &[u8], role: u8| -> Vec<u8> {
+        let canonical = canonical_op_bytes("add_node", &[&prefix.to_le_bytes(), peer, &[role]]);
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+    let remove_auth = |prefix: u32| -> Vec<u8> {
+        let canonical = canonical_op_bytes("remove_node", &[&prefix.to_le_bytes()]);
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let reg_all = vos::registry::RegistryRef::at(ServiceId::REGISTRY);
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node_a, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+
+    // ── Writes: enrol two node members on A ────────────────────
+    for (prefix, seed) in [(7u32, 0x11u8), (9u32, 0x22u8)] {
+        let peer = node_peer(seed);
+        assert_eq!(
+            vos::block_on(reg.add_node(
+                &mut &node_a,
+                prefix,
+                peer.clone(),
+                NODE_ROLE_VOTER,
+                add_auth(prefix, &peer, NODE_ROLE_VOTER),
+            ))
+            .expect("add_node"),
+            space_registry::Status::Ok,
+        );
+    }
+
+    // Both writes converge to B (node_role encodes role+1; VOTER=0 → 1).
+    wait_for(
+        || {
+            let r7 = vos::block_on(reg.node_role(&mut &node_b, 7)).ok()?;
+            let r9 = vos::block_on(reg.node_role(&mut &node_b, 9)).ok()?;
+            (r7 == 1 && r9 == 1).then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("both node members converge to B");
+
+    // ── Delete: remove one node on A ───────────────────────────
+    assert_eq!(
+        vos::block_on(reg.remove_node(&mut &node_a, 7, remove_auth(7))).expect("remove_node"),
+        space_registry::Status::Ok,
+    );
+
+    // The delete converges to B: prefix 7 denied (0), prefix 9 still VOTER.
+    wait_for(
+        || {
+            let r7 = vos::block_on(reg.node_role(&mut &node_b, 7)).ok()?;
+            let r9 = vos::block_on(reg.node_role(&mut &node_b, 9)).ok()?;
+            (r7 == 0 && r9 == 1).then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("remove_node delete converges to B");
+
+    // ── Byte-level convergence: full rosters match ─────────────
+    let members_a = vos::block_on(reg_all.members_all(&mut &node_a)).expect("members_all A");
+    let members_b = vos::block_on(reg_all.members_all(&mut &node_b)).expect("members_all B");
+    assert_eq!(
+        members_a, members_b,
+        "member rosters must converge byte-identically across replicas",
+    );
+    assert_eq!(members_a.len(), 1, "only the surviving node member remains");
+    assert_eq!(members_a[0].prefix, 9, "the survivor is prefix 9");
+
+    node_a.collect();
+    node_b.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
+
 #[test]
 #[cfg(feature = "network")]
 fn cross_space_bridge_forward_dispatches_to_local_target() {
