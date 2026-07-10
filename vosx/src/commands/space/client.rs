@@ -404,6 +404,21 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
     }
 
+    /// Forward a program's `.vos_meta` schema blob to the registry,
+    /// keyed by its program hash, so `meta_for_instance` (and thus
+    /// schema-aware dynamic dispatch) resolves for agents installed off
+    /// this program. Mirrors what the manifest reconciler does; empty
+    /// `auth` is signed on relay by the daemon's operator key.
+    pub fn register_meta(&self, program_hash: Vec<u8>, meta_blob: Vec<u8>) -> anyhow::Result<Status> {
+        vos::block_on(self.registry().register_meta(
+            &mut &self.node,
+            program_hash,
+            meta_blob,
+            Vec::new(),
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.register_meta(): {e}"))
+    }
+
     pub fn unpublish(&self, name: String, version: String) -> anyhow::Result<Status> {
         vos::block_on(
             self.registry()

@@ -52,12 +52,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // Resolve and cache the blob bytes locally.
     let source = BlobSource::parse(&source);
-    let (hash, _bytes) = blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
+    let (hash, bytes) = blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
 
     DaemonClient::with_connect(&args.space, |client| {
         let status = client.publish(name.clone(), version.clone(), hash.0.to_vec())?;
         match status {
             Status::Ok => {
+                forward_meta(client, &hash, &bytes);
                 emit(&name, &version, &hash, false);
                 Ok(())
             }
@@ -99,7 +100,7 @@ fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
         blob_store::cache_put(elf).map_err(|e| anyhow::anyhow!("cache {bundled_name}: {e}"))?;
 
     DaemonClient::with_connect(space, |client| {
-        match client.program(prog_name, version)? {
+        let already_present = match client.program(prog_name, version)? {
             Some(existing) => {
                 let on_disk = BlobHash(existing.hash);
                 if on_disk != cached_hash {
@@ -109,8 +110,7 @@ fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
                          version, or unpublish first."
                     );
                 }
-                emit(prog_name, version, &cached_hash, true);
-                Ok(())
+                true
             }
             None => {
                 let status = client.publish(
@@ -119,19 +119,38 @@ fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
                     cached_hash.0.to_vec(),
                 )?;
                 match status {
-                    Status::Ok => {
-                        emit(prog_name, version, &cached_hash, false);
-                        Ok(())
-                    }
+                    Status::Ok => {}
                     Status::TagConflict => anyhow::bail!(
                         "{prog_name}:{version} TAG_CONFLICT mid-publish — race with another \
                          vosx? Retry.",
                     ),
                     other => anyhow::bail!("registry.publish returned status {other}"),
                 }
+                false
             }
-        }
+        };
+        // Forward the schema (idempotent) so dynamic dispatch resolves
+        // types for the installed instance — even if a prior run
+        // published this program without it.
+        forward_meta(client, &cached_hash, elf);
+        emit(prog_name, version, &cached_hash, already_present);
+        Ok(())
     })
+}
+
+/// Best-effort: forward a program's `.vos_meta` schema blob to the
+/// registry (keyed by program hash) so `meta_for_instance` resolves for
+/// agents installed off it — the precondition for schema-aware dynamic
+/// dispatch. A blob with no meta section, or a non-admin node, is a
+/// no-op (the row arrives via sync / coercion falls back to the
+/// heuristic), so failure never blocks the publish.
+fn forward_meta(client: &DaemonClient, hash: &BlobHash, elf_bytes: &[u8]) {
+    let Some(meta_blob) = vos::metadata::raw_section_from_elf(elf_bytes) else {
+        return;
+    };
+    if let Err(e) = client.register_meta(hash.0.to_vec(), meta_blob) {
+        tracing::debug!("register_meta for bundled/published program skipped: {e}");
+    }
 }
 
 fn emit(name: &str, version: &str, hash: &BlobHash, already_present: bool) {
