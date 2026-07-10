@@ -1910,9 +1910,26 @@ fn soft_restart_crdt(
     strategy
         .reload()
         .map_err(|e| format!("strategy.reload: {e}"))?;
-    runtime
+    // Replay rebuilds every row by re-executing the guest from genesis,
+    // so it must run against the empty slate a cold-boot replay sees —
+    // not just a STATE_KEY-less one. The storage-type meta/index and
+    // `StorageVec` length rows are accumulators: replaying inserts/pushes
+    // onto the live pre-merge rows rebuilds a divergent physical layout
+    // (and doubles a `StorageVec`'s length), which the state anchor does
+    // not cover, so two replicas would silently stop being row-identical.
+    // Wipe the whole keyspace and restore only INIT_KEY — the host-seeded
+    // constructor input the genesis dispatch legitimately reads, which
+    // replay never re-emits.
+    let init = runtime
         .storage
-        .delete(svc_id, crate::lifecycle::STATE_KEY_BYTES);
+        .read(svc_id, crate::lifecycle::INIT_KEY)
+        .map(|v| v.to_vec());
+    runtime.storage.clear_service(svc_id);
+    if let Some(init) = init {
+        runtime
+            .storage
+            .write(svc_id, crate::lifecycle::INIT_KEY, &init);
+    }
     replay_dag_into_runtime(runtime, svc_id, strategy)?;
     let state = runtime
         .storage

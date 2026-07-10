@@ -513,6 +513,18 @@ impl ServiceStorage {
         }
     }
 
+    /// Drop every row for one service — its whole derived keyspace.
+    /// Used before a soft-restart DAG replay so rebuilt collections
+    /// start from the same empty slate a cold-boot replay sees. The
+    /// storage-type meta/index and `StorageVec` length rows are
+    /// accumulators seeded from the current stored bytes, so replaying
+    /// onto surviving rows rebuilds a divergent physical layout (and,
+    /// for `StorageVec`, a divergent length); wiping first makes the
+    /// rebuild deterministic and cross-replica byte-identical.
+    pub fn clear_service(&mut self, service: ServiceId) {
+        self.data.remove(&service.0);
+    }
+
     /// Ordered iteration over one service's rows whose keys start with
     /// `prefix`, in key order.
     pub fn scan_prefix<'a>(
@@ -2542,6 +2554,36 @@ mod tests {
             ],
             "prefix scan must be key-ordered, prefix-bounded, and blind \
              to other services' rows"
+        );
+    }
+
+    #[test]
+    fn clear_service_drops_only_that_services_rows() {
+        let mut storage = ServiceStorage::new();
+        let svc = ServiceId(1);
+        // A mix of STATE, storage-type, and framework rows.
+        storage.write(svc, crate::lifecycle::STATE_KEY_BYTES, b"state");
+        storage.write(svc, b"s/log/l", &2u64.to_le_bytes());
+        storage.write(svc, b"s/log/e\x00\x00\x00\x00\x00\x00\x00\x00", b"a");
+        storage.write(svc, crate::lifecycle::INIT_KEY, b"init-args");
+        storage.write(svc, crate::lifecycle::CONTINUATION_HEADER_KEY, b"cont");
+        // A second service must be untouched.
+        storage.write(ServiceId(2), b"s/log/l", &9u64.to_le_bytes());
+
+        storage.clear_service(svc);
+
+        assert_eq!(storage.read(svc, crate::lifecycle::STATE_KEY_BYTES), None);
+        assert_eq!(storage.read(svc, b"s/log/l"), None);
+        assert_eq!(storage.read(svc, crate::lifecycle::INIT_KEY), None);
+        assert_eq!(
+            storage.read(svc, crate::lifecycle::CONTINUATION_HEADER_KEY),
+            None,
+            "clearing a service drops its warm continuation, forcing a cold replay",
+        );
+        assert_eq!(
+            storage.read(ServiceId(2), b"s/log/l"),
+            Some(&9u64.to_le_bytes()[..]),
+            "clear is service-scoped",
         );
     }
 

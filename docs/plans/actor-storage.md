@@ -352,11 +352,36 @@ end-to-end; 0x01 actors byte-for-byte unaffected.
 
 ## Open questions (resolve before the wave that needs them)
 
-1. **Warm-guest invalidation on out-of-band CRDT merge** (before
-   enabling any cross-dispatch cache, 2.2): when a remote merge rewrites
-   rows under a warm actor, how is today's warm `ACTOR_HOLDER` blob
-   invalidated, and does the same signal reach storage caches? Read the
-   `replay_dag_into_runtime` → agent-thread path in `node.rs` first.
+1. **Warm-guest invalidation on out-of-band CRDT merge** — RESOLVED
+   (W3 substrate commit). Two parts:
+   - *The warm holder is a non-issue.* The warm `ACTOR_HOLDER` blob lives
+     only inside a saved continuation (yield → resume), cleared on the
+     dispatch's `DONE`. CRDT merges run strictly between top-level
+     dispatches (agent-loop Cycle 4, `node.rs`), so no live warm holder
+     spans a merge for a completing-handler actor — the registry never
+     yields. Storage reads are not cached across dispatches in v1 (2.2),
+     so there is no cross-dispatch storage cache to invalidate either.
+   - *The real gate was the replay slate.* `soft_restart_crdt` rebuilds
+     rows by re-executing the DAG from genesis, but deleted only
+     `STATE_KEY` before replaying — onto the live pre-merge storage rows.
+     The meta/index rows and `StorageVec` length rows are accumulators
+     seeded from current stored bytes, so replay diverged: a `StorageVec`
+     doubles its length (positional `push` reads the stale length row),
+     the `next_page` allocator + directory rebuild a physical layout that
+     is no longer byte-identical across replicas (the state anchor does
+     not cover storage rows), and any path-dependent handler reading a
+     collection mid-replay sees the final merged map, not the genesis
+     progression — under Raft (`linear_history`) that surfaces as a fatal
+     `replay diverged` agent tear-down. A `StorageMap`'s *final count*
+     self-heals (inserts are membership-gated), so a count-only test does
+     not catch it — `StorageVec` length and cross-replica row byte-equality
+     do. Fix: `ServiceStorage::clear_service` wipes the whole per-service
+     keyspace before replay (preserving only the host-seeded `INIT_KEY`),
+     symmetric with the empty slate a cold-boot replay already sees
+     (`node.rs` cold path pre-loads only `INIT_KEY`, so it was already
+     correct). Tests: `vos::actors::storage::tests::vec_replay_needs_a_cleared_keyspace`
+     (final-state proof), `runtime::tests::clear_service_drops_only_that_services_rows`.
+     The 3.1 two-replica gate exercises it end-to-end.
 2. **Registry ordering semantics** (3.1): do any registry consumers
    depend on insertion order of `members`/`agents`? If so those become
    `StorageVec` + side index rather than ordered maps.
