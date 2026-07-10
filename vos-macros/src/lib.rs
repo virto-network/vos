@@ -42,7 +42,8 @@ use syn::{FnArg, ImplItem, ItemImpl, ItemStruct, Pat, ReturnType, parse_macro_in
 /// implement `Actor` manually. You still use `#[messages]` for the dispatch enum.
 #[proc_macro_attribute]
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemStruct);
+    let mut input = parse_macro_input!(item as ItemStruct);
+    let storage_fields = extract_storage_fields(&mut input);
     let name = &input.ident;
     let msg_enum = format_ident!("{}Msg", name);
 
@@ -153,6 +154,25 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
     };
 
+    // `#[storage]` fields: point each handle at its key prefix after
+    // every create/decode. Handles archive as units, so this is the
+    // only place the prefix exists — actors without storage fields get
+    // the trait's default no-op.
+    let init_storage = if storage_fields.is_empty() {
+        quote! {}
+    } else {
+        let inits = storage_fields.iter().map(|(ident, prefix)| {
+            let lit = syn::LitByteStr::new(prefix, proc_macro2::Span::call_site());
+            quote! { self.#ident.__init(#lit); }
+        });
+        quote! {
+            #[doc(hidden)]
+            fn __init_storage(&mut self) {
+                #( #inits )*
+            }
+        }
+    };
+
     let expanded = quote! {
         #struct_def
 
@@ -181,6 +201,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn create() -> Self {
                 Self::__vos_create()
             }
+
+            #init_storage
 
             async fn on_start(
                 &mut self,
@@ -1240,6 +1262,61 @@ struct ActorAttrs {
     /// that many bytes is emitted for the invoker (and the prover) to
     /// patch `(state, msg)` into.
     task_buf: Option<usize>,
+}
+
+/// Pull `#[storage]` / `#[storage(prefix = "…")]` off the state
+/// struct's named fields, returning `(field, key-prefix-bytes)` per
+/// storage field. The attribute must be stripped here — nothing else
+/// declares it, so leaving it in the re-emitted struct is a compile
+/// error by design (it only means something on an `#[actor]` struct).
+///
+/// The default prefix is `s/<field>/`; pass an explicit
+/// `prefix = "…"` to pin it across a field rename (the prefix names
+/// the rows — changing it orphans them).
+fn extract_storage_fields(input: &mut ItemStruct) -> Vec<(syn::Ident, Vec<u8>)> {
+    let mut out: Vec<(syn::Ident, Vec<u8>)> = Vec::new();
+    let syn::Fields::Named(named) = &mut input.fields else {
+        return out;
+    };
+    for field in named.named.iter_mut() {
+        let mut storage: Option<Option<String>> = None;
+        field.attrs.retain(|attr| {
+            if !attr.path().is_ident("storage") {
+                return true;
+            }
+            let mut custom = None;
+            if matches!(attr.meta, syn::Meta::List(_)) {
+                let parsed = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("prefix") {
+                        let lit: syn::LitStr = meta.value()?.parse()?;
+                        custom = Some(lit.value());
+                        Ok(())
+                    } else {
+                        Err(meta.error("expected `prefix = \"…\"`"))
+                    }
+                });
+                if let Err(e) = parsed {
+                    panic!("#[storage]: {e}");
+                }
+            }
+            storage = Some(custom);
+            false
+        });
+        if let Some(custom) = storage {
+            let ident = field.ident.clone().expect("named field");
+            let prefix = custom.unwrap_or_else(|| format!("s/{ident}/"));
+            assert!(
+                !prefix.is_empty() && !prefix.starts_with("__vos_"),
+                "#[storage] prefix {prefix:?} collides with the framework keyspace",
+            );
+            assert!(
+                out.iter().all(|(_, p)| p != prefix.as_bytes()),
+                "#[storage] prefix {prefix:?} is used by two fields",
+            );
+            out.push((ident, prefix.into_bytes()));
+        }
+    }
+    out
 }
 
 /// Parse `#[actor(...)]` attributes.
