@@ -57,8 +57,8 @@
 //!   the CLI does the ELF transpile + `__VOS_WITNESS` lookup and writes the
 //!   catalog TOML; this handler only proves.
 //!
-//! Plus the async prove-job set (`prove_chain_async` / `tick` / `job_state` /
-//! `job_result` / `job_release`) described below.
+//! Plus the async prove-job set (`prove_chain_job` / `tick` / `job_poll` /
+//! `job_release`) described below.
 //!
 //! ## Commitment / allowlist provenance
 //!
@@ -74,6 +74,7 @@
 //! the injected path the commitment is stable, so one pinned commitment
 //! verifies every real proof.)
 
+use vos::jobs::JobQueue;
 use vos::prelude::*;
 use zkpvm::{Proof, SegmentState, prove_canonical, prove_mobile};
 use zkpvm_verifier::{CommitmentHash, PcsPolicy, verify_standalone_with_pcs_policy};
@@ -96,11 +97,17 @@ const MAX_CHAIN_SEGMENTS: usize = 65_536;
 // `prove_chain` is a SYNCHRONOUS gas-metered invoke: a caller that asks it
 // blocks for the whole (minutes-long) canonical chain prove, which no real
 // actor dispatch can wait out. The async path decouples proving from the ask:
-// `prove_chain_async` enqueues a job and returns a job id IMMEDIATELY; a later
-// host `tick()` advances one job (proving on a large-stack thread), records the
-// per-segment proof bytes + the entering-image root, and TELLS the requester a
-// callback carrying the job id. The requester then pulls the result
-// (`job_result`) and content-addresses it into the host proof-blob store.
+// `prove_chain_job` (a `#[msg(job)]` begin) enqueues a job and returns a job id
+// IMMEDIATELY; a later host `tick()` advances one job (proving on a large-stack
+// thread), records the per-segment proof bytes + the entering-image root, and
+// TELLS the requester a callback carrying the job id. The requester then pulls
+// the result (`job_poll`) and content-addresses it into the host proof-blob
+// store.
+//
+// Job STATE (output bytes / done / error) lives in a `vos::jobs::JobQueue`,
+// driving the standard `job_poll` / `job_release` surface. The queue holds no
+// inputs, so a separate FIFO `pending` list carries each unproved job's inputs
+// (blob / witness / profile) + its callback target until `tick` proves it.
 //
 // PUBLISH SPLIT: the extension cannot itself CAS-`put` (the host exposes only
 // `blob_get` to extensions — a `put` effect is host-side, `node.rs`-owned). So
@@ -111,77 +118,56 @@ const MAX_CHAIN_SEGMENTS: usize = 65_536;
 // ask path. When a host `blob_put` effect lands (Workstream A), `tick()` can
 // publish directly and callback the manifest hash instead.
 
-/// Lifecycle of an async prove job. `#[repr(u8)]` + rkyv because it is
-/// wire-carried in the persisted [`ProveJob`] (reordering variants would shift
-/// the bytes any peer decodes). "Unknown" is deliberately NOT a variant — it is
-/// a query-boundary concern (an id never enqueued, or already released),
-/// surfaced by `job_state` as [`JOB_STATUS_UNKNOWN`].
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-#[repr(u8)]
-pub enum JobStatus {
-    /// Queued, not yet proved.
-    Pending = 0,
-    /// Proved; result bytes retained for `job_result`.
-    Done = 1,
-    /// Prove failed (bad blob / patch / prove error); result empty.
-    Failed = 2,
-}
+/// Terminal outcome codes carried in the completion callback's `status` field
+/// (`1` = proved, `2` = failed). Wire-preserved from the retired `JobStatus`
+/// enum so the federation callback's shape is unchanged; job STATE otherwise
+/// lives in the [`JobQueue`] (`job_poll` reports `done` / `error`).
+const JOB_DONE: u64 = 1;
+const JOB_FAILED: u64 = 2;
 
-/// `job_state` reply for an id that isn't (or is no longer) queued — a
-/// query-boundary sentinel distinct from the three real [`JobStatus`] codes.
-const JOB_STATUS_UNKNOWN: u8 = 255;
-
-/// One async prove-chain job. Inputs (`pvm_blob`/`witness_bytes`/`profile`) are
-/// retained only while `Pending` and cleared once the job resolves, so a `Done`
-/// job holds just its `result`. `result` (set on `Done`) is
-/// `bincode((initial_root: [u8; 32], segments: Vec<Vec<u8>>))` — the entering
-/// root the requester feeds to [`encode_chain_manifest_anchored`] and the
-/// per-segment proof bytes it content-addresses.
+/// Inputs for one queued prove-chain job that `tick` hasn't proved yet. The
+/// job's output + terminal state live in the [`JobQueue`]; this record holds
+/// only what proving consumes — blob / witness / profile — plus the callback
+/// target, retained in a FIFO `pending` list and dropped once proved. It is
+/// `bincode((initial_root, segments))` the requester later pulls via `job_poll`.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
-pub struct ProveJob {
-    /// Monotonic job id (returned by `prove_chain_async`).
-    pub id: u64,
-    /// Lifecycle code — see [`JobStatus`].
-    pub status: JobStatus,
+struct PendingProve {
+    /// Job id (allocated by the queue's `begin`).
+    id: u64,
     /// ServiceId to callback on completion (`0` = no callback).
-    pub reply_to: u32,
+    reply_to: u32,
     /// Dynamic `Msg` method name (UTF-8) to send the callback as.
-    pub reply_msg: Vec<u8>,
-    /// Transpiled PVM blob to prove (cleared once resolved).
-    pub pvm_blob: Vec<u8>,
-    /// Opaque witness to inject at `witness_addr` (cleared once resolved).
-    pub witness_bytes: Vec<u8>,
+    reply_msg: Vec<u8>,
+    /// Transpiled PVM blob to prove.
+    pvm_blob: Vec<u8>,
+    /// Opaque witness to inject at `witness_addr`.
+    witness_bytes: Vec<u8>,
     /// `__VOS_WITNESS` flat-memory address.
-    pub witness_addr: u64,
+    witness_addr: u64,
     /// Per-segment step bound for canonical proving.
-    pub seg_steps: u64,
-    /// Canonical forcing profile (cleared once resolved).
-    pub profile: Vec<u32>,
-    /// `bincode((initial_root, segments))` once `DONE`; empty otherwise.
-    pub result: Vec<u8>,
+    seg_steps: u64,
+    /// Canonical forcing profile.
+    profile: Vec<u32>,
 }
 
 #[actor]
 struct Prover {
-    /// Async prove-job queue. `prove_chain_async` pushes here; `tick()`
-    /// advances one job per tick and callbacks the requester.
-    jobs: Vec<ProveJob>,
-    /// Next job id to hand out (monotonic, never reused within a run).
-    next_job_id: u64,
+    /// Async prove-job state (output bytes + done/error), driving the standard
+    /// `job_poll` / `job_release` surface.
+    queue: JobQueue,
+    /// Inputs for jobs not yet proved (FIFO); `tick` drains one per tick.
+    pending: Vec<PendingProve>,
 }
 
 #[messages]
 impl Prover {
     fn new() -> Self {
         Prover {
-            jobs: Vec::new(),
-            next_job_id: 1,
+            queue: JobQueue::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -360,18 +346,18 @@ impl Prover {
         1
     }
 
-    /// ASYNC analog of `prove_chain`: enqueue a canonical-chain prove job
-    /// and return a job id IMMEDIATELY, without blocking the caller for the
-    /// (minutes-long) prove. A later host `tick()` proves the job and TELLS
-    /// `reply_to` the dynamic message named `reply_msg` carrying
-    /// `{job_id, status, segments}` (skipped when `reply_to == 0`). The
-    /// requester then pulls the result with `job_result` and content-addresses
-    /// it (see the module's async-jobs note on the publish split).
+    /// ASYNC analog of `prove_chain` (a `#[msg(job)]` begin): enqueue a
+    /// canonical-chain prove job and return a job id IMMEDIATELY, without
+    /// blocking the caller for the (minutes-long) prove. A later host `tick()`
+    /// proves the job and TELLS `reply_to` the dynamic message named `reply_msg`
+    /// carrying `{job_id, status, segments}` (skipped when `reply_to == 0`). The
+    /// requester then pulls the result with `job_poll` and content-addresses it
+    /// (see the module's async-jobs note on the publish split).
     ///
     /// `seg_steps` + `profile` MUST match the program's pinned catalog values,
     /// exactly as for the synchronous `prove_chain`. Returns the job id.
-    #[msg]
-    async fn prove_chain_async(
+    #[msg(job)]
+    async fn prove_chain_job(
         &mut self,
         _ctx: &mut Context<Self>,
         pvm_blob: Vec<u8>,
@@ -382,11 +368,9 @@ impl Prover {
         reply_to: u32,
         reply_msg: Vec<u8>,
     ) -> u64 {
-        let id = self.next_job_id;
-        self.next_job_id = self.next_job_id.wrapping_add(1);
-        self.jobs.push(ProveJob {
+        let id = self.queue.begin();
+        self.pending.push(PendingProve {
             id,
-            status: JobStatus::Pending,
             reply_to,
             reply_msg,
             pvm_blob,
@@ -394,7 +378,6 @@ impl Prover {
             witness_addr,
             seg_steps,
             profile,
-            result: Vec::new(),
         });
         id
     }
@@ -406,51 +389,45 @@ impl Prover {
     /// tick `join`s), so a tick that picks up a job blocks the extension for the
     /// whole (minutes-long) prove — `verify_chain` / `job_*` are served only
     /// BETWEEN jobs (an idle tick returns immediately), not during one. The async
-    /// win B8 delivers is that the requester's `prove_chain_async` returns a job
-    /// id at once instead of blocking on the prove; making the prove itself
-    /// non-blocking (a background thread polled across ticks) is a further step
-    /// that a busy prover would want.
+    /// win is that the requester's `prove_chain_job` returns a job id at once
+    /// instead of blocking on the prove; making the prove itself non-blocking (a
+    /// background thread polled across ticks) is a further step a busy prover
+    /// would want.
     #[msg]
     async fn tick(&mut self, ctx: &mut Context<Self>) {
-        let Some(cb) = advance_one_job(&mut self.jobs) else {
+        let Some(cb) = advance_one_job(&mut self.pending, &mut self.queue) else {
             return;
         };
         if cb.reply_to != 0 {
             let name = String::from_utf8_lossy(&cb.reply_msg).into_owned();
             let msg = vos::value::Msg::new(&name)
                 .with("job_id", cb.job_id)
-                .with("status", cb.status as u64)
+                .with("status", cb.status)
                 .with("segments", cb.segments);
             ctx.tell(vos::abi::service::ServiceId(cb.reply_to), &msg);
         }
     }
 
-    /// Poll an async prove job's state as a [`JobStatus`] byte
-    /// (`Pending`=0 / `Done`=1 / `Failed`=2), or [`JOB_STATUS_UNKNOWN`] (`255`)
-    /// for an id that isn't queued (never enqueued, or already `job_release`d).
-    /// (Named `job_state` so the handler's generated `JobState` message type
-    /// doesn't collide with the [`JobStatus`] enum.)
+    /// Drain an async prove job's output — the standard `job_poll` reply
+    /// (`Args { data, done, error }`). For a completed job `data` is the
+    /// `bincode((initial_root: [u8; 32], segments: Vec<Vec<u8>>))` blob the
+    /// requester decodes, `put_proof_blob`s each segment, and anchors via
+    /// [`encode_chain_manifest_anchored`]. `done` flips at the terminal state;
+    /// `error` is non-empty on a failed prove.
     #[msg]
-    async fn job_state(&self, _ctx: &mut Context<Self>, job_id: u64) -> u8 {
-        job_status_of(&self.jobs, job_id)
+    async fn job_poll(&mut self, _ctx: &mut Context<Self>, job_id: u64) -> Vec<u8> {
+        self.queue.poll_reply(job_id).encode()
     }
 
-    /// Fetch a `DONE` job's result — `bincode((initial_root: [u8; 32],
-    /// segments: Vec<Vec<u8>>))`. The requester decodes it, `put_proof_blob`s
-    /// each segment, and builds the anchored manifest with
-    /// [`encode_chain_manifest_anchored`] over `initial_root`. Empty `Vec` if
-    /// the job is unknown or not yet `DONE` (poll `job_state` first).
-    #[msg]
-    async fn job_result(&self, _ctx: &mut Context<Self>, job_id: u64) -> Vec<u8> {
-        job_result_of(&self.jobs, job_id)
-    }
-
-    /// Drop a finished job, freeing its retained result. Idempotent — returns
-    /// `1` if a job was removed, `0` if the id was already gone. The requester
-    /// calls this once it has pulled + published the result.
+    /// Drop a job, freeing its retained output AND its still-pending inputs
+    /// (so a release before `tick` proves it cancels the prove instead of
+    /// leaving orphaned inputs `advance_one_job` would still run into a
+    /// discarded queue slot). Idempotent — returns `1` if the queue held the
+    /// job, `0` if the id was already gone.
     #[msg]
     async fn job_release(&mut self, _ctx: &mut Context<Self>, job_id: u64) -> u8 {
-        u8::from(release_job(&mut self.jobs, job_id))
+        self.pending.retain(|p| p.id != job_id);
+        u8::from(self.queue.release(job_id))
     }
 
     /// Measure the pinnable CATALOG fields for a provable PVM program — the
@@ -598,34 +575,6 @@ fn measure_commitments(
 
 // ── Async job-queue logic (Context-free, unit-testable) ──────────────
 
-/// Index of the first `Pending` job, or `None` if the queue has none.
-fn next_pending_index(jobs: &[ProveJob]) -> Option<usize> {
-    jobs.iter().position(|j| j.status == JobStatus::Pending)
-}
-
-/// Status byte of `job_id`, or [`JOB_STATUS_UNKNOWN`] if it isn't queued.
-fn job_status_of(jobs: &[ProveJob], job_id: u64) -> u8 {
-    jobs.iter()
-        .find(|j| j.id == job_id)
-        .map_or(JOB_STATUS_UNKNOWN, |j| j.status as u8)
-}
-
-/// A `Done` job's result bytes, or empty if the id is unknown or not yet `Done`.
-fn job_result_of(jobs: &[ProveJob], job_id: u64) -> Vec<u8> {
-    jobs.iter()
-        .find(|j| j.id == job_id && j.status == JobStatus::Done)
-        .map(|j| j.result.clone())
-        .unwrap_or_default()
-}
-
-/// Remove `job_id` from the queue; `true` if a job was dropped, `false` if the
-/// id was already gone (idempotent release).
-fn release_job(jobs: &mut Vec<ProveJob>, job_id: u64) -> bool {
-    let before = jobs.len();
-    jobs.retain(|j| j.id != job_id);
-    jobs.len() != before
-}
-
 /// What the tick handler should `tell` the requester after advancing a job.
 struct JobCallback {
     /// Requester ServiceId (`0` = no callback).
@@ -634,53 +583,58 @@ struct JobCallback {
     reply_msg: Vec<u8>,
     /// The advanced job's id.
     job_id: u64,
-    /// Terminal status ([`JobStatus::Done`] / [`JobStatus::Failed`]).
-    status: JobStatus,
+    /// Terminal outcome code: [`JOB_DONE`] (`1`) or [`JOB_FAILED`] (`2`).
+    status: u64,
     /// Segment count on success (`0` on failure).
     segments: u64,
 }
 
-/// Advance AT MOST ONE pending job: prove it (freeing its inputs), record the
-/// terminal status + retained result, and return the callback intent (`None`
-/// when the queue has no pending job). Context-free so the prove→status→callback
+/// Advance AT MOST ONE pending job: prove the FIFO-oldest job in `pending`,
+/// push its result (or failure) into `queue`, and return the callback intent
+/// (`None` when nothing is pending). Context-free so the prove→state→callback
 /// logic is unit-testable; the handler performs the actual `tell`. A failed
 /// prove (unparseable blob / patch out of range / prove error) resolves the job
-/// to [`JobStatus::Failed`] with an empty result.
-fn advance_one_job(jobs: &mut [ProveJob]) -> Option<JobCallback> {
-    let i = next_pending_index(jobs)?;
-    // Move the inputs out so the (large) blob isn't held twice and the resolved
-    // job retains only its result.
-    let job_id = jobs[i].id;
-    let reply_to = jobs[i].reply_to;
-    let reply_msg = core::mem::take(&mut jobs[i].reply_msg);
-    let pvm_blob = core::mem::take(&mut jobs[i].pvm_blob);
-    let witness_bytes = core::mem::take(&mut jobs[i].witness_bytes);
-    let witness_addr = jobs[i].witness_addr as usize;
-    let seg_steps = jobs[i].seg_steps as usize;
-    let profile = core::mem::take(&mut jobs[i].profile);
+/// via `queue.fail(...)` with no result.
+fn advance_one_job(pending: &mut Vec<PendingProve>, queue: &mut JobQueue) -> Option<JobCallback> {
+    if pending.is_empty() {
+        return None;
+    }
+    // FIFO: take the oldest queued job (and its large blob) out of `pending`.
+    let job = pending.remove(0);
 
-    let (status, segments) =
-        match run_prove_chain_job(&pvm_blob, &witness_bytes, witness_addr, seg_steps, &profile) {
-            Some((root, segments)) => {
-                let n = segments.len() as u64;
-                match bincode::serialize(&(root, segments)) {
-                    Ok(result) => {
-                        jobs[i].result = result;
-                        jobs[i].status = JobStatus::Done;
-                        (JobStatus::Done, n)
-                    }
-                    Err(_) => {
-                        jobs[i].status = JobStatus::Failed;
-                        (JobStatus::Failed, 0)
-                    }
+    let (status, segments) = match run_prove_chain_job(
+        &job.pvm_blob,
+        &job.witness_bytes,
+        job.witness_addr as usize,
+        job.seg_steps as usize,
+        &job.profile,
+    ) {
+        Some((root, segments)) => {
+            let n = segments.len() as u64;
+            match bincode::serialize(&(root, segments)) {
+                Ok(result) => {
+                    queue.push(job.id, &result);
+                    queue.finish(job.id);
+                    (JOB_DONE, n)
+                }
+                Err(_) => {
+                    queue.fail(job.id, "serialize prove result failed");
+                    (JOB_FAILED, 0)
                 }
             }
-            None => {
-                jobs[i].status = JobStatus::Failed;
-                (JobStatus::Failed, 0)
-            }
-        };
-    Some(JobCallback { reply_to, reply_msg, job_id, status, segments })
+        }
+        None => {
+            queue.fail(job.id, "prove failed");
+            (JOB_FAILED, 0)
+        }
+    };
+    Some(JobCallback {
+        reply_to: job.reply_to,
+        reply_msg: job.reply_msg,
+        job_id: job.id,
+        status,
+        segments,
+    })
 }
 
 /// Prove a queued chain job on a large stack, returning `(entering_root,
@@ -1150,70 +1104,86 @@ mod anchor_tests {
 
 #[cfg(test)]
 mod job_tests {
-    //! Async prove-job state-machine unit tests. Exercise the Context-free
-    //! queue logic — enqueue → pick → complete/fail → poll → release — without a
-    //! runtime or any real proving (the heavy prove path rides the existing
-    //! `prove_chain_segments` coverage).
+    //! Prover-specific async-job tests: `advance_one_job` drains the FIFO
+    //! `pending` list, proves one job, and writes its outcome into the
+    //! `JobQueue` (whose lifecycle is covered by `vos::jobs`). Bad-blob jobs
+    //! fail fast at trace, so these stay cheap (no real STARK work).
     use super::*;
 
-    fn pending(id: u64) -> ProveJob {
-        ProveJob {
+    fn pending_job(id: u64, reply_to: u32, reply_msg: &[u8]) -> PendingProve {
+        PendingProve {
             id,
-            status: JobStatus::Pending,
-            reply_to: 0,
-            reply_msg: Vec::new(),
-            pvm_blob: vec![1, 2, 3],
+            reply_to,
+            reply_msg: reply_msg.to_vec(),
+            // Not a valid PVM blob → proving fails fast at trace (cheap).
+            pvm_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
             witness_bytes: Vec::new(),
             witness_addr: 0,
             seg_steps: 100,
             profile: Vec::new(),
-            result: Vec::new(),
         }
     }
 
     #[test]
-    fn queue_lifecycle_enqueue_complete_poll_release() {
-        let mut jobs = vec![pending(1), pending(2)];
-        // FIFO: the first pending job is picked.
-        assert_eq!(next_pending_index(&jobs), Some(0));
+    fn advance_drains_fifo() {
+        let mut queue = JobQueue::new();
+        let id1 = queue.begin();
+        let id2 = queue.begin();
+        let mut pending = vec![pending_job(id1, 0, b""), pending_job(id2, 0, b"")];
 
-        // Complete job 1 (as `tick` does): retain result, free inputs.
-        jobs[0].status = JobStatus::Done;
-        jobs[0].result = vec![9, 9, 9];
-        jobs[0].pvm_blob = Vec::new();
-        // Now the next pending job is 2.
-        assert_eq!(next_pending_index(&jobs), Some(1));
-
-        // Status + result lookups (status byte = the JobStatus discriminant).
-        assert_eq!(job_status_of(&jobs, 1), JobStatus::Done as u8);
-        assert_eq!(job_status_of(&jobs, 2), JobStatus::Pending as u8);
-        assert_eq!(job_status_of(&jobs, 999), JOB_STATUS_UNKNOWN);
-        assert_eq!(job_result_of(&jobs, 1), vec![9, 9, 9]);
-        assert!(job_result_of(&jobs, 2).is_empty(), "a pending job has no result yet");
-        assert!(job_result_of(&jobs, 999).is_empty(), "an unknown job has no result");
-
-        // Release is idempotent and drops the job.
-        assert!(release_job(&mut jobs, 1));
-        assert!(!release_job(&mut jobs, 1), "releasing twice is a no-op");
-        assert_eq!(job_status_of(&jobs, 1), JOB_STATUS_UNKNOWN, "a released job is gone");
-        assert_eq!(next_pending_index(&jobs), Some(0), "job 2 is still pending");
+        // FIFO: the first-enqueued job is advanced first, and leaves `pending`.
+        let cb1 = advance_one_job(&mut pending, &mut queue).expect("first job advances");
+        assert_eq!(cb1.job_id, id1);
+        assert_eq!(pending.len(), 1);
+        let cb2 = advance_one_job(&mut pending, &mut queue).expect("second job advances");
+        assert_eq!(cb2.job_id, id2);
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn failed_job_is_terminal_and_resultless() {
-        let mut j = pending(7);
-        j.status = JobStatus::Failed;
-        let jobs = vec![j];
-        assert_eq!(next_pending_index(&jobs), None, "a failed job is never re-run");
-        assert_eq!(job_status_of(&jobs, 7), JobStatus::Failed as u8);
-        assert!(job_result_of(&jobs, 7).is_empty(), "a failed job exposes no result");
+    fn empty_pending_advances_to_none() {
+        let mut queue = JobQueue::new();
+        let mut pending: Vec<PendingProve> = Vec::new();
+        assert!(advance_one_job(&mut pending, &mut queue).is_none());
     }
 
     #[test]
-    fn empty_queue_has_nothing_pending() {
-        let jobs: Vec<ProveJob> = Vec::new();
-        assert_eq!(next_pending_index(&jobs), None);
-        assert_eq!(job_status_of(&jobs, 1), JOB_STATUS_UNKNOWN);
+    fn release_before_advance_cancels_the_prove() {
+        // Releasing a job before `tick` advances it must drop it from BOTH the
+        // queue and the pending inputs (what job_release does), so the next
+        // advance runs nothing — no orphaned prove into a discarded queue slot.
+        let mut queue = JobQueue::new();
+        let id = queue.begin();
+        let mut pending = vec![pending_job(id, 0, b"")];
+        pending.retain(|p| p.id != id);
+        assert!(queue.release(id));
+        assert!(advance_one_job(&mut pending, &mut queue).is_none());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn bad_blob_job_fails_and_emits_callback() {
+        // A job whose blob is not a valid PVM blob: proving fails fast at trace,
+        // so this stays cheap (no real STARK work) — the negative path a tick
+        // takes when a prove can't complete.
+        let mut queue = JobQueue::new();
+        let id = queue.begin();
+        let mut pending = vec![pending_job(id, 42, b"proved")];
+
+        let cb = advance_one_job(&mut pending, &mut queue).expect("the pending job is advanced");
+        // The callback the tick handler `tell`s to the requester.
+        assert_eq!(cb.reply_to, 42);
+        assert_eq!(cb.reply_msg, b"proved");
+        assert_eq!(cb.job_id, id);
+        assert_eq!(cb.status, JOB_FAILED);
+        assert_eq!(cb.segments, 0);
+        assert!(pending.is_empty(), "the advanced job leaves `pending`");
+
+        // The queue reports the failure via the standard job_poll surface.
+        let (data, done, error) = queue.poll(id);
+        assert!(data.is_empty(), "a failed job has no result bytes");
+        assert!(done);
+        assert!(!error.is_empty(), "a failed job carries an error message");
     }
 
     #[test]
@@ -1235,37 +1205,5 @@ mod job_tests {
             None,
             "an unparseable blob yields None, not a panic"
         );
-    }
-
-    #[test]
-    fn bad_blob_job_fails_and_emits_callback() {
-        // A job whose blob is not a valid PVM blob: proving fails fast at trace,
-        // so this stays cheap (no real STARK work) — the negative path a tick
-        // takes when a prove can't complete.
-        let mut jobs = vec![ProveJob {
-            id: 5,
-            status: JobStatus::Pending,
-            reply_to: 42,
-            reply_msg: b"proved".to_vec(),
-            pvm_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
-            witness_bytes: Vec::new(),
-            witness_addr: 0,
-            seg_steps: 100,
-            profile: Vec::new(),
-            result: Vec::new(),
-        }];
-        let cb = advance_one_job(&mut jobs).expect("the pending job is advanced");
-        // The job resolved to Failed with no retained result.
-        assert_eq!(jobs[0].status, JobStatus::Failed);
-        assert_eq!(job_status_of(&jobs, 5), JobStatus::Failed as u8);
-        assert!(job_result_of(&jobs, 5).is_empty(), "a failed job retains no result");
-        // The tick handler `tell`s exactly this callback to the requester.
-        assert_eq!(cb.reply_to, 42);
-        assert_eq!(cb.reply_msg, b"proved");
-        assert_eq!(cb.job_id, 5);
-        assert_eq!(cb.status, JobStatus::Failed);
-        assert_eq!(cb.segments, 0);
-        // No pending work remains.
-        assert_eq!(next_pending_index(&jobs), None);
     }
 }
