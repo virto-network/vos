@@ -26,10 +26,6 @@
 - [Private Economy: Payments, Voting, Governance](private-economy.md)
 - [Kunekt — Real-Time Collaboration (reserved)](kunekt.md)
 
-## Part III — Implementation
-
-- [Operations Runbook](operations.md)
-
 ## Appendices
 
 - [The Privacy Gap](privacy-gap.md)

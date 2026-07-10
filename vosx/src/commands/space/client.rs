@@ -262,7 +262,21 @@ impl DaemonClient {
         target: ServiceId,
         msg: &vos::value::Msg,
     ) -> anyhow::Result<vos::value::Value> {
-        let reply = self.invoke_dyn_bytes(target, msg)?;
+        self.invoke_dyn_with_timeout(target, msg, invoke_timeout())
+    }
+
+    /// Like [`Self::invoke_dyn`] but with an explicit per-call timeout, for the
+    /// rare handler that legitimately runs far past the 10s default — e.g.
+    /// `vosx zk pin`'s `measure_catalog`, a minutes-long trace + prove. The
+    /// extension runs on its own thread, so a long wait here doesn't stall the
+    /// node's other services.
+    pub fn invoke_dyn_with_timeout(
+        &self,
+        target: ServiceId,
+        msg: &vos::value::Msg,
+        timeout: Duration,
+    ) -> anyhow::Result<vos::value::Value> {
+        let reply = self.invoke_dyn_bytes_with_timeout(target, msg, timeout)?;
         if reply.is_empty() {
             return Ok(vos::value::Value::Unit);
         }
@@ -278,13 +292,22 @@ impl DaemonClient {
         target: ServiceId,
         msg: &vos::value::Msg,
     ) -> anyhow::Result<Vec<u8>> {
+        self.invoke_dyn_bytes_with_timeout(target, msg, invoke_timeout())
+    }
+
+    /// [`Self::invoke_dyn_bytes`] with an explicit per-call timeout.
+    pub fn invoke_dyn_bytes_with_timeout(
+        &self,
+        target: ServiceId,
+        msg: &vos::value::Msg,
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
         use vos::Encode;
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
 
-        let timeout = invoke_timeout();
         self.node
             .invoke_with_timeout(target, payload, timeout)
             .ok_or_else(|| {

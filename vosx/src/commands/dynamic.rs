@@ -339,7 +339,7 @@ fn parse_argv(argv: &[String]) -> anyhow::Result<ParsedArgv> {
 /// `VOSX_SPACE` env; then the single-entry rule for users with
 /// exactly one space in their index. A multi-space user without
 /// either signal gets a list rather than a silent pick.
-fn resolve_space(arg: Option<&str>) -> anyhow::Result<String> {
+pub(crate) fn resolve_space(arg: Option<&str>) -> anyhow::Result<String> {
     if let Some(s) = arg {
         return Ok(s.to_string());
     }

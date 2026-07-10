@@ -11,38 +11,50 @@
 //! (a witness-injecting program's live entering root is the patched root; the
 //! pinnable masked root is pending `docs/design/masked-image-root.md`).
 //!
-//! Pipeline: read the ELF → transpile to a PVM blob (`grey_transpiler`) → locate
-//! `__VOS_WITNESS` → trace the UNPATCHED image for its page-Merkle root → measure
-//! the commitment allowlist by proving one representative canonical segment per
-//! distinct shape (or record a `--allowlist` supplied out-of-band) → upsert the
-//! pin into the catalog.
+//! The CLI owns the ELF/transpile half (which `vosx` already does everywhere):
+//! read the ELF → transpile to a PVM blob (`grey_transpiler`) → locate
+//! `__VOS_WITNESS` → write the catalog TOML. The heavy zkpvm half — trace the
+//! unpatched image for its page-Merkle root, and prove one representative
+//! canonical segment per distinct shape to measure the commitment allowlist —
+//! lives in the **prover extension**'s `measure_catalog` handler, so `vosx`
+//! carries no zkpvm dependency. `pin` therefore needs a space whose daemon has
+//! the prover extension loaded (`vosx space up`).
 //!
 //! The proving step is heavy (canonical prove of a handful of segments, minutes,
-//! tens of GB) — a publish-time tool, not a hot path. Pass `--allowlist` to skip
-//! proving and re-pin only the cheap fields (witness address + entering root)
-//! against an already-established allowlist.
+//! tens of GB) — a publish-time tool, not a hot path. The measure invoke uses an
+//! extended timeout ([`MEASURE_TIMEOUT`]); the extension runs on its own thread,
+//! so a busy pin doesn't stall the node. Pass `--allowlist` to skip proving and
+//! re-pin only the cheap fields (witness address + entering root) against an
+//! already-established allowlist.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use vos::value::{Msg, Value};
 use vos::zk::{ProgramPin, ProvableCatalog, bytes_to_hex, witness_addr};
+
+use crate::commands::dynamic::resolve_space;
+use crate::commands::space::client::DaemonClient;
 
 /// Generous trace-gas ceiling — matches the prover extension's budget so a
 /// program that traces there traces here.
 const TRACE_GAS: u64 = 100_000_000;
 
-/// Stack for the canonical-prove measurement thread. A canonical proof's
-/// prove/verify overflows the default ~2 MiB (the elf_integration federation
-/// path documents `RUST_MIN_STACK=268435456`); give the measurement its own
-/// large stack so the tool works without an env var.
-const PROVE_STACK: usize = 512 * 1024 * 1024;
+/// Timeout for the `measure_catalog` invoke. The prover traces + proves a
+/// handful of canonical segments (minutes, tens of GB), far past the 10s
+/// dispatch default. One hour covers a debug-build measure with headroom; the
+/// prover runs on its own thread, so the wait doesn't stall the node.
+const MEASURE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(clap::Subcommand)]
 pub enum ZkCommand {
     /// Pin a provable actor into a catalog: measure its canonical commitment
     /// allowlist, entering-image root, and witness address, then write them to
-    /// a catalog TOML verifiers consume as the trusted allowlist source.
+    /// a catalog TOML verifiers consume as the trusted allowlist source. Drives
+    /// the prover extension's `measure_catalog` handler, so the space must be
+    /// `up` with the prover extension loaded.
     Pin(PinArgs),
 }
 
@@ -77,6 +89,13 @@ pub struct PinArgs {
     /// Trace-gas ceiling.
     #[arg(long, default_value_t = TRACE_GAS)]
     gas: u64,
+    /// Space whose daemon hosts the prover extension. Defaults to the current
+    /// space (`VOSX_SPACE` or the sole registered space).
+    #[arg(long)]
+    space: Option<String>,
+    /// Registry name of the prover extension instance to drive.
+    #[arg(long, default_value = "prover")]
+    extension: String,
 }
 
 pub fn run(cmd: ZkCommand) -> Result<()> {
@@ -86,6 +105,7 @@ pub fn run(cmd: ZkCommand) -> Result<()> {
 }
 
 fn pin(args: PinArgs) -> Result<()> {
+    // ── ELF/transpile half (host-owned; no zkpvm) ────────────────────
     let elf = std::fs::read(&args.elf)
         .with_context(|| format!("read provable ELF {}", args.elf.display()))?;
     let blob = grey_transpiler::link_elf(&elf)
@@ -94,31 +114,55 @@ fn pin(args: PinArgs) -> Result<()> {
         .with_context(|| format!("{} must export a resolved __VOS_WITNESS", args.elf.display()))?;
     let profile = read_profile(&args.profile)?;
 
-    // Entering-image root over the UNPATCHED image (witness buffer all-zero):
-    // trace with no patches and page-Merkle its initial memory. DIAGNOSTIC —
-    // this is NOT the verifier's entering-image pin: a witness-injecting
-    // program's live segment-0 root is the PATCHED root, which differs here in
-    // the witness region. The pinnable value is the MASKED root (witness region
-    // excluded), pending docs/design/masked-image-root.md.
-    let unpatched = zkpvm::actor::trace_blob(&blob, args.gas)
-        .context("trace unpatched blob for the entering-image root")?;
-    let image_root = zkpvm::page_merkle::image_root(&unpatched.initial_memory);
+    // The witness drives the MEASURE path; the `--allowlist` re-pin path passes
+    // an empty witness (the extension then returns only the entering root) and
+    // records the supplied allowlist instead.
+    let witness = match (&args.witness, &args.allowlist) {
+        (Some(path), _) => std::fs::read(path)
+            .with_context(|| format!("read witness {}", path.display()))?,
+        (None, Some(_)) => Vec::new(),
+        (None, None) => bail!(
+            "--witness <FILE> is required to measure the commitment allowlist \
+             (or pass --allowlist to record a known one)"
+        ),
+    };
 
+    // ── zkpvm half (prover extension over the daemon) ────────────────
+    let space = resolve_space(args.space.as_deref())?;
+    let reply = DaemonClient::with_connect(&space, |client| {
+        let ext = client.resolve_target(&args.extension).map_err(|_| {
+            anyhow!(
+                "no '{}' extension loaded in space '{space}' — add \
+                 `[[extension]] name = \"{}\"` to the manifest and restart `vosx space up`",
+                args.extension,
+                args.extension,
+            )
+        })?;
+        eprintln!("measuring '{}' via the '{}' extension (this is heavy — minutes)…", args.name, args.extension);
+        client.invoke_dyn_with_timeout(
+            ext,
+            &Msg::new("measure_catalog")
+                .with("pvm_blob", blob.clone())
+                .with("witness_bytes", witness.clone())
+                .with("witness_addr", waddr)
+                .with("seg_steps", args.seg_steps)
+                .with("profile", profile.clone())
+                .with("gas", args.gas),
+            MEASURE_TIMEOUT,
+        )
+    })?;
+
+    let (image_root, measured) = parse_measure_reply(reply)?;
+
+    // With `--allowlist`, record the supplied commitments; otherwise use the
+    // ones the extension measured.
     let commitments: Vec<[u8; 32]> = match &args.allowlist {
         Some(list) => {
             let cs = parse_allowlist(list)?;
             eprintln!("recorded {} supplied commitment(s) (proving skipped)", cs.len());
             cs
         }
-        None => {
-            let witness_path = args.witness.as_ref().context(
-                "--witness <FILE> is required to measure the commitment allowlist \
-                 (or pass --allowlist to record a known one)",
-            )?;
-            let witness = std::fs::read(witness_path)
-                .with_context(|| format!("read witness {}", witness_path.display()))?;
-            measure_commitments(&blob, waddr as usize, &witness, args.seg_steps, &profile, args.gas)?
-        }
+        None => measured,
     };
     if commitments.is_empty() {
         bail!("no commitments measured/supplied — nothing to pin");
@@ -154,83 +198,38 @@ fn pin(args: PinArgs) -> Result<()> {
     Ok(())
 }
 
-/// Trace the witness-injected run, segment it, and prove one representative
-/// canonical segment per distinct shape (seg 0, the last/short segment, and the
-/// first segment of each distinct fixed-base-scalar-mult "comb" count), yielding
-/// the distinct program commitments — the canonical allowlist. Mirrors the
-/// federation e2e's `voucher_check_allowlist_coverage` probe so the pinned
-/// allowlist is complete without proving all ~N segments.
-fn measure_commitments(
-    blob: &[u8],
-    witness_addr: usize,
-    witness: &[u8],
-    seg_steps: u64,
-    profile: &[u32],
-    gas: u64,
-) -> Result<Vec<[u8; 32]>> {
-    // Own everything on the heap so the large-stack measurement thread is 'static.
-    let blob = blob.to_vec();
-    let witness = witness.to_vec();
-    let profile = profile.to_vec();
-    let seg_steps = seg_steps as usize;
-    std::thread::Builder::new()
-        .stack_size(PROVE_STACK)
-        .spawn(move || measure_commitments_inner(&blob, witness_addr, &witness, seg_steps, &profile, gas))
-        .context("spawn prove thread")?
-        .join()
-        .map_err(|_| anyhow!("prove thread panicked"))?
-}
-
-fn measure_commitments_inner(
-    blob: &[u8],
-    witness_addr: usize,
-    witness: &[u8],
-    seg_steps: usize,
-    profile: &[u32],
-    gas: u64,
-) -> Result<Vec<[u8; 32]>> {
-    let full = zkpvm::actor::trace_blob_with_patches(blob, gas, &[(witness_addr, witness)])
-        .context("trace the witness-injected run")?;
-    let total = full.steps.len();
-    let bounds = zkpvm::segment::segment_bounds(total, seg_steps);
-    let n = bounds.len();
-    if n == 0 {
-        bail!("empty trace — stale ELF or witness that early-exits?");
+/// Decode a `measure_catalog` reply — `image_root(32) ++ commitment(32)…` —
+/// into the entering-image root and the measured commitments. An empty reply
+/// means the extension failed the measurement (bad blob / trace / prove).
+fn parse_measure_reply(reply: Value) -> Result<([u8; 32], Vec<[u8; 32]>)> {
+    let bytes = match reply {
+        Value::Bytes(b) => b,
+        Value::Unit => bail!(
+            "prover measure_catalog returned nothing — the measurement failed \
+             (unparseable blob, trace out of gas, or prove error). Check the daemon log."
+        ),
+        other => bail!("prover measure_catalog returned {other:?}, expected Bytes"),
+    };
+    if bytes.is_empty() {
+        bail!(
+            "prover measure_catalog failed (empty reply) — unparseable blob, trace out of gas, \
+             or prove error. Check the daemon log."
+        );
     }
-    let comb_counts: Vec<usize> = bounds
-        .iter()
-        .map(|&(a, b)| zkpvm::segment::segment_side_note(&full, a, b).ristretto_comb_calls.len())
+    if bytes.len() % 32 != 0 {
+        bail!("measure_catalog reply is {} bytes, not a multiple of 32", bytes.len());
+    }
+    let mut chunks = bytes.chunks_exact(32);
+    let mut image_root = [0u8; 32];
+    image_root.copy_from_slice(chunks.next().expect("len checked ≥ 32 and 32-aligned"));
+    let commitments = chunks
+        .map(|c| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(c);
+            a
+        })
         .collect();
-
-    // Probe seg 0, the last (possibly short) segment, and the first segment of
-    // each distinct comb count — one representative per distinct canonical shape.
-    let mut probe = std::collections::BTreeSet::new();
-    probe.insert(0);
-    probe.insert(n - 1);
-    for i in 0..n {
-        if comb_counts[..i].iter().all(|&x| x != comb_counts[i]) {
-            probe.insert(i);
-        }
-    }
-    eprintln!(
-        "trace = {total} steps, {n} segments @ {seg_steps}; proving {} representative segment(s)",
-        probe.len()
-    );
-
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for i in probe {
-        let (a, b) = bounds[i];
-        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
-        let proof = zkpvm::prove_canonical(&mut sn, profile)
-            .map_err(|e| anyhow!("prove_canonical seg {i} [{a},{b}): {e:?}"))?;
-        let c = zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
-        eprintln!("  seg {i:3} combs={} commitment={}", comb_counts[i], bytes_to_hex(&c));
-        if seen.insert(c) {
-            out.push(c);
-        }
-    }
-    Ok(out)
+    Ok((image_root, commitments))
 }
 
 /// Parse a canonical profile file: unsigned integers separated by any of

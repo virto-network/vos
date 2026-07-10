@@ -14,6 +14,11 @@ edition = "2024"
 # Lives as a native `.so` because zkpvm-verifier can't build for the PVM
 # guest (javm -> blst C-build + workspace stwo feature inheritance), so
 # in-actor verification isn't viable — see the general-prover plan.
+#
+# The `measure_catalog` handler also serves the `vosx zk pin` publish-time
+# tool: the CLI transpiles the ELF and reads `__VOS_WITNESS` itself (this
+# stays a pure PVM prover), then invokes `measure_catalog` for the heavy
+# zkpvm measurement. That keeps the zkpvm dependency out of `vosx` entirely.
 
 [features]
 default = ["bin", "extension"]
