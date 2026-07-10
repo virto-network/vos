@@ -52,6 +52,9 @@ use core::marker::PhantomData;
 
 use super::codec::{Decode, Encode};
 
+mod committed;
+pub use committed::{CommittedMap, CommittedMapIter};
+
 /// Hard per-value ceiling. A row past this belongs in the blob CAS by
 /// hash, not in the agent keyspace: the guest heap is 256 KiB and every
 /// oversized row rides the halt payload toward the 1 MiB cap.
@@ -378,6 +381,7 @@ macro_rules! unit_archive {
         }
     };
 }
+pub(crate) use unit_archive;
 
 // ── StorageValue ─────────────────────────────────────────────────────
 
