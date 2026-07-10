@@ -188,6 +188,20 @@ pub struct HostMapping {
     pub host_prefix: u16,
 }
 
+/// One page of [`SpaceRegistry::host_mappings`]. `more` is the explicit
+/// terminator: a page can come back short of the row cap because the
+/// byte budget truncated it, so "short page = done" would silently end
+/// a drain early — continue from the last row's `instance_name` while
+/// `more` is true.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct HostMappingPage {
+    pub mappings: Vec<HostMapping>,
+    pub more: bool,
+}
+
 // ── Result codes ─────────────────────────────────────────────────
 
 // ── Actor ─────────────────────────────────────────────────────────
@@ -923,12 +937,13 @@ impl SpaceRegistry {
 
     /// Page the host-mapping table. Diagnostic/test surface; production
     /// callers use `resolve`. Pass an empty `after_name` to start;
-    /// continue from the last returned row's `instance_name`, until a
-    /// short (or empty) page comes back. `budget` caps the page rows
+    /// continue from the last returned row's `instance_name` while the
+    /// page's `more` flag is set (a short page alone doesn't mean done —
+    /// the byte budget can truncate one). `budget` caps the page rows
     /// (0 = the handler's max). Rows come back in key (hashed-name)
     /// order, not name order — the cursor round-trips regardless.
     #[msg]
-    async fn host_mappings(&self, after_name: String, budget: u32) -> Vec<HostMapping> {
+    async fn host_mappings(&self, after_name: String, budget: u32) -> HostMappingPage {
         let skip = (!after_name.is_empty()).then(|| name_key(&after_name));
         let start = skip.unwrap_or([0u8; 32]);
         let mut it = self
@@ -936,8 +951,8 @@ impl SpaceRegistry {
             .iter_from(&start)
             .filter(move |(k, _)| skip != Some(*k))
             .map(|(_, row)| row);
-        let (rows, _more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
-        rows
+        let (mappings, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
+        HostMappingPage { mappings, more }
     }
 
     // ── Members ────────────────────────────────────────────────

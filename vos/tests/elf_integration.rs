@@ -5341,9 +5341,10 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
     let hs_reg_b = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
     let mappings = wait_for(
         || {
-            let m = vos::block_on(hs_reg_b.host_mappings(&mut &node_b, String::new(), 0)).ok()?;
-            if m.iter().any(|h| h.instance_name == "alice") {
-                Some(m)
+            let page =
+                vos::block_on(hs_reg_b.host_mappings(&mut &node_b, String::new(), 0)).ok()?;
+            if page.mappings.iter().any(|h| h.instance_name == "alice") {
+                Some(page.mappings)
             } else {
                 None
             }
