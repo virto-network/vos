@@ -34,7 +34,7 @@
 
 use anyhow::{Context, anyhow, bail};
 use vos::metadata::{ParsedMessage, ParsedMeta};
-use vos::value::{Msg, Value};
+use vos::value::{Args, Msg, Value};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
@@ -247,6 +247,20 @@ fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> any
 /// known); it labels an otherwise-opaque `Value::Bytes` reply so an
 /// operator can tell a `[u8;32]` root from a `Receipt` blob.
 fn render_reply(reply: Value, ret_ty: Option<&str>, out: Option<&str>) -> anyhow::Result<()> {
+    // A handler declaring `returns = "Args"` ships a self-describing record —
+    // a `vos::value::Args` rkyv-encoded into `Value::Bytes`. Decode + pretty-
+    // print it so no consumer needs the handler's Rust structs, and honour the
+    // reply-contract convention: a non-empty `error` field means the handler
+    // failed, so surface it and exit non-zero (the sync analog of a
+    // `#[msg(job)]` job's terminal `error`). Falls through to opaque byte
+    // handling if the bytes don't actually decode as `Args`.
+    if ret_ty == Some("Args")
+        && let Value::Bytes(b) = &reply
+        && let Some(args) = <Args as vos::Decode>::try_decode(b)
+    {
+        return render_args_record(&args, out);
+    }
+
     if let Some(path) = out {
         let (bytes, kind) = match reply {
             Value::Bytes(b) => {
@@ -306,6 +320,91 @@ fn render_text(reply: &Value, ret_ty: Option<&str>) -> String {
             }
         }
         other => format!("{other:?}"),
+    }
+}
+
+/// Render a self-describing `Args`-record reply (`returns = "Args"`).
+///
+/// Reply-contract convention: a non-empty `error` field is a failure — bail
+/// so the CLI exits non-zero (the sync analog of a `#[msg(job)]` job's
+/// terminal `error`, which `drive_job` already surfaces). Otherwise print the
+/// record: `key: value` lines in text mode, a JSON object in JSON mode; an
+/// empty `error` field is dropped from the text rendering as noise. `--out`
+/// writes the same rendering (an Args record has no byte-exact form).
+fn render_args_record(args: &Args, out: Option<&str>) -> anyhow::Result<()> {
+    if let Some(err) = args.get_str("error").filter(|e| !e.is_empty()) {
+        bail!("{err}");
+    }
+
+    let json = output::is_json();
+    match out {
+        Some(path) => {
+            let mut rendered = if json {
+                serde_json::to_string(&args_to_json(args)).unwrap_or_else(|_| args_to_text(args))
+            } else {
+                args_to_text(args)
+            };
+            rendered.push('\n');
+            let kind = if json { "json" } else { "text" };
+            std::fs::write(path, rendered.as_bytes())
+                .map_err(|e| anyhow!("write reply to '{path}': {e}"))?;
+            eprintln!("wrote {} bytes ({kind}) to {path}", rendered.len());
+        }
+        None if json => output::print_json(&args_to_json(args)),
+        None => println!("{}", args_to_text(args)),
+    }
+    Ok(())
+}
+
+/// Text form of an `Args` record: one `key: value` line per field, in
+/// declaration order. An empty `error` field is dropped (present only to
+/// carry a failure, which `render_args_record` handles before this).
+fn args_to_text(args: &Args) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(args.0.len());
+    for (k, v) in &args.0 {
+        if k == "error" && matches!(v, Value::Str(s) if s.is_empty()) {
+            continue;
+        }
+        lines.push(format!("{k}: {}", render_field_value(v)));
+    }
+    if lines.is_empty() {
+        "()".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// JSON form of an `Args` record: an object mapping each field name to its
+/// JSON value (bytes → hex string, per `output::value_to_json`). Every field
+/// is kept, including an empty `error`, so JSON consumers see a stable schema.
+fn args_to_json(args: &Args) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(args.0.len());
+    for (k, v) in &args.0 {
+        map.insert(k.clone(), output::value_to_json(v));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Inline scalar rendering of one `Args` field value for text mode. Bytes are
+/// hex; lists are comma-joined; `Unit` is empty.
+fn render_field_value(v: &Value) -> String {
+    match v {
+        Value::Unit => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::U8(n) => n.to_string(),
+        Value::U16(n) => n.to_string(),
+        Value::U32(n) => n.to_string(),
+        Value::U64(n) => n.to_string(),
+        Value::I32(n) => n.to_string(),
+        Value::I64(n) => n.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::Bytes(b) => format!("0x{}", hex::encode(b)),
+        Value::ListU32(xs) => xs
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::ListStr(xs) => xs.join(", "),
     }
 }
 
@@ -937,6 +1036,70 @@ mod tests {
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn args_text_renders_key_value_lines_in_order() {
+        let args = Args::new()
+            .with("status", 0u8)
+            .with("build_commit", vec![0xabu8, 0xcdu8])
+            .with("ok", true);
+        assert_eq!(
+            args_to_text(&args),
+            "status: 0\nbuild_commit: 0xabcd\nok: true",
+        );
+    }
+
+    #[test]
+    fn args_text_drops_empty_error_but_keeps_populated_one() {
+        // Success record: an empty `error` field is noise, dropped.
+        let ok = Args::new().with("hash", "deadbeef").with("error", "");
+        assert_eq!(args_to_text(&ok), "hash: deadbeef");
+
+        // A populated error would never reach args_to_text (render_args_record
+        // bails first), but the renderer still shows it if asked directly.
+        let bad = Args::new().with("error", "boom");
+        assert_eq!(args_to_text(&bad), "error: boom");
+    }
+
+    #[test]
+    fn args_text_lists_join_with_commas() {
+        let args = Args::new()
+            .with("hashes", vec!["aa".to_string(), "bb".to_string()])
+            .with("ids", vec![1u32, 2u32, 3u32]);
+        assert_eq!(args_to_text(&args), "hashes: aa, bb\nids: 1, 2, 3");
+    }
+
+    #[test]
+    fn args_record_error_field_bails_nonzero() {
+        // The reply-contract convention: a non-empty `error` field is a
+        // failure — render_args_record returns Err (→ non-zero CLI exit)
+        // without printing the record. Checked before any output so it's
+        // safe to assert directly.
+        let args = Args::new()
+            .with("status", 12u8)
+            .with("error", "cargo build failed");
+        let err = render_args_record(&args, None).unwrap_err();
+        assert!(
+            err.to_string().contains("cargo build failed"),
+            "error message should surface: {err}",
+        );
+    }
+
+    #[test]
+    fn args_record_empty_error_is_ok() {
+        // No error (or empty error) → success, renders + returns Ok.
+        let args = Args::new().with("ok", true).with("error", "");
+        assert!(render_args_record(&args, None).is_ok());
+        assert!(render_args_record(&Args::new().with("ok", true), None).is_ok());
+    }
+
+    #[test]
+    fn args_json_object_maps_every_field() {
+        let args = Args::new().with("status", 0u8).with("ok", true);
+        let json = args_to_json(&args);
+        assert_eq!(json["status"], serde_json::json!(0));
+        assert_eq!(json["ok"], serde_json::json!(true));
     }
 
     #[test]
