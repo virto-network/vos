@@ -23,6 +23,14 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 vos = { path = "../../vos", default-features = false, features = ["extension"] }
+# Wire types shared with the dev-project PVM actor (`CommitNode`,
+# `BlobObject`, `HashResult`, intent tags, status codes) — the
+# `actor_change` handler reads a project's tree + writes suggestions
+# back through it. `default-features = false` strips dev-project's
+# `bin` feature so the host-target rlib build skips PVM entry glue.
+dev-project = { path = "../../actors/dev-project", default-features = false }
+# Hex-encode commit hashes in the `actor_change` apply summary.
+hex = "0.4"
 # Local-LLM stack. candle is Rust-native and lets us run quantized
 # GGUF models on CPU without a separate inference server. Pin to a
 # released minor (0.10) so the workspace's dep resolution stays

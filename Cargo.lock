@@ -73,6 +73,8 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-transformers",
+ "dev-project",
+ "hex",
  "hf-hub",
  "tokenizers 0.21.4",
  "toml 0.8.23",

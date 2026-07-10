@@ -18,18 +18,26 @@
 //!   standard `Args { data, done, error }` shape) drains newly-decoded
 //!   tokens and `job_release(job_id) -> u8` drops the finished job. The
 //!   `vosx` generic job driver polls + streams these for you.
+//! - **Actor-source assistant.** `actor_change(project, branch, prompt,
+//!   apply, max_tokens) -> u64` is a second `#[msg(job)]` begin: it
+//!   reads a dev-project's current source over the host invoke path,
+//!   builds a context-rich prompt, streams a completion, and — with
+//!   `apply` — commits the parsed files back to the project. See
+//!   [`actor_change`].
 //!
 //! ## Lifecycle
 //!
 //! Plain **actor-mode** extension (`#[actor]` / `#[messages]`) — request-driven,
-//! no `run()` loop. The host drives one invoke (`generate` / `job_poll` /
-//! `job_release`) to completion at a time on this agent's thread. The model
-//! loads lazily inside the first generate so daemon startup isn't penalised even
-//! when the manifest enables the extension but nothing invokes it. The live
-//! runtime state ([`runtime::Inner`]: model handle + the job queue) sits behind
-//! a `Skip`'d `OnceCell` and re-inits lazily from the persisted [`InitConfig`]
-//! after a (re)start. Quiesce one agent with the host's generic `vosx ai stop`
-//! (`__stop`).
+//! no `run()` loop. The host drives one invoke (`generate` / `actor_change` /
+//! `job_poll` / `job_release`) to completion at a time on this agent's thread.
+//! The model loads lazily inside the first generate so daemon startup isn't
+//! penalised even when the manifest enables the extension but nothing invokes
+//! it. The live runtime state ([`runtime::Inner`]: model handle + the job queue)
+//! sits behind a `Skip`'d `OnceCell` and re-inits lazily from the persisted
+//! [`InitConfig`] after a (re)start. `inner()` itself never `.await`s, so the
+//! `OnceCell` can't be raced even though `actor_change` / `job_poll` do await
+//! host round-trips afterward (the host still drives one invoke at a time).
+//! Quiesce one agent with the host's generic `vosx ai stop` (`__stop`).
 
 use std::cell::OnceCell;
 use std::sync::Arc;
@@ -39,12 +47,18 @@ use vos::prelude::*;
 
 use crate::runtime::Inner;
 
+mod actor_change;
 mod config;
 mod fetch;
 mod generate;
 mod runtime;
 
 pub use config::InitConfig;
+
+/// This extension's actor [`vos::Context`] — the handle `actor_change`
+/// threads through to reach the dev-project actor via `ctx.ask_dispatch`
+/// (the host invoke path).
+pub(crate) type AiCtx = vos::Context<AiExtension>;
 
 #[actor(caps = ["fs.cache", "net.http.outbound", "net.libp2p.dial", "tokio-runtime"])]
 pub struct AiExtension {
@@ -98,12 +112,53 @@ impl AiExtension {
         runtime::begin_generate(&inner, prompt, max_tokens)
     }
 
+    /// Ask the model to write or modify a VOS actor's source, with the
+    /// dev-project's current files injected as context; returns the job id to
+    /// poll. `project` is the dev-project instance's ServiceId (resolve the
+    /// name to an id first, e.g. from `vosx space agents`). `branch` is where
+    /// `--apply` commits and where the prompt context is read from — by
+    /// convention `ai/<your-node-prefix>/suggested` (a per-identity side branch
+    /// `vosx dev merge` also defaults to), falling back to `main` for the
+    /// context when the branch doesn't exist yet. With `apply = true` the
+    /// parsed fenced code blocks are committed back as a new commit on `branch`
+    /// and the summary (files, commit hash, warnings) streams in-band as the
+    /// job's terminal chunk; otherwise the completion is print-only.
+    #[msg(job, cli)]
+    async fn actor_change(
+        &mut self,
+        project: u32,
+        branch: String,
+        prompt: String,
+        apply: bool,
+        max_tokens: u32,
+        ctx: &mut Context<Self>,
+    ) -> u64 {
+        let inner = self.inner();
+        // Resolve the source commit + fetch the project's files up front —
+        // both need the actor's `Context`, which the generation worker lacks.
+        let base_commit = match actor_change::resolve_context_head(ctx, project, &branch).await {
+            Ok(c) => c,
+            Err(msg) => return runtime::begin_failed(&inner, msg),
+        };
+        let files = match actor_change::fetch_project_files(ctx, project, &base_commit).await {
+            Ok(f) => f,
+            Err(msg) => return runtime::begin_failed(&inner, msg),
+        };
+        let full_prompt = actor_change::build_prompt(&files, &prompt);
+        runtime::begin_actor_change(&inner, full_prompt, max_tokens, project, branch, base_commit, apply)
+    }
+
     /// Reserved `job_poll`: drain a generation's newly-decoded tokens as the
     /// standard `Args { data, done, error }` reply (encoded so vosx decodes it
-    /// without pulling in candle/tokenizers/hf-hub).
+    /// without pulling in candle/tokenizers/hf-hub). For an `actor_change
+    /// --apply` job it also finalizes the write-back once generation is done —
+    /// parse + commit happen here because this handler holds the `Context` the
+    /// worker can't.
     #[msg]
-    async fn job_poll(&mut self, job_id: u64, _ctx: &mut Context<Self>) -> Vec<u8> {
-        runtime::poll_generation(&self.inner(), job_id)
+    async fn job_poll(&mut self, job_id: u64, ctx: &mut Context<Self>) -> Vec<u8> {
+        let inner = self.inner();
+        runtime::maybe_finalize_apply(&inner, ctx, job_id).await;
+        runtime::poll_generation(&inner, job_id)
     }
 
     /// Reserved `job_release`: drop a finished generation job. Idempotent —
