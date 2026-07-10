@@ -52,8 +52,8 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
-    ActorAclPage, ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, MemberRow, ProgramRow,
-    SPACE_ID_DOMAIN_TAG, Status,
+    ActorAclPage, ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, MemberPage, MemberRow,
+    ProgramRow, SPACE_ID_DOMAIN_TAG, Status,
     AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN,
     MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
     PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
@@ -273,9 +273,18 @@ pub struct SpaceRegistry {
     programs: Vec<ProgramRow>,
     /// Sorted by `instance_name`.
     agents: Vec<AgentRow>,
-    /// Members; nodes sorted by `prefix` first, then identities
-    /// sorted by `key`.
-    members: Vec<MemberRow>,
+    /// Node members, one `#[storage]` row per node keyed by its `u16`
+    /// `prefix` (a fixed-width key, so iteration is prefix-ordered).
+    /// `node_role` point-gets; `members()` pages nodes before identities.
+    #[storage]
+    nodes: StorageMap<u16, MemberRow>,
+    /// Identity members, one `#[storage]` row per identity keyed by
+    /// `identity_key(public_key)` (variable-length key folded to fixed
+    /// width; the row keeps the plain key). The nodes/identities split
+    /// keeps each a single-key-type map — the old flat `Vec<MemberRow>`
+    /// mixed `u16` prefixes and variable pubkeys.
+    #[storage]
+    identities: StorageMap<[u8; 32], MemberRow>,
     /// Opaque metadata blobs keyed by program hash. Stored as raw
     /// `.vos_meta` section bytes so the registry stays agnostic
     /// about the schema format (lives in `vos::metadata` on the
@@ -360,7 +369,8 @@ impl SpaceRegistry {
         Self {
             programs: Vec::new(),
             agents: Vec::new(),
-            members: Vec::new(),
+            nodes: StorageMap::default(),
+            identities: StorageMap::default(),
             metas: StorageMap::default(),
             extension_metas: StorageMap::default(),
             auth_grants: StorageMap::default(),
@@ -964,26 +974,10 @@ impl SpaceRegistry {
             return Status::Forbidden;
         }
         let prefix = prefix as u16;
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_NODE && cur.prefix == prefix {
-                self.members[idx].key = peer_id;
-                self.members[idx].role = role;
-                return Status::Ok;
-            }
-            // Nodes sort before Identities; within Nodes by prefix.
-            if cur.kind == MEMBER_KIND_NODE && cur.prefix > prefix {
-                break;
-            }
-            if cur.kind == MEMBER_KIND_IDENTITY {
-                break;
-            }
-            idx += 1;
-        }
-        self.members.insert(
-            idx,
-            MemberRow {
+        // Idempotent upsert keyed by the node prefix.
+        self.nodes.insert(
+            &prefix,
+            &MemberRow {
                 kind: MEMBER_KIND_NODE,
                 key: peer_id,
                 prefix,
@@ -1003,17 +997,11 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let prefix = prefix as u16;
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_NODE && cur.prefix == prefix {
-                self.members.remove(idx);
-                return Status::Ok;
-            }
-            idx += 1;
+        if self.nodes.remove(&(prefix as u16)) {
+            Status::Ok
+        } else {
+            Status::NotFound
         }
-        Status::NotFound
     }
 
     /// Add an Identity member. The registry stores the `proof`
@@ -1038,24 +1026,10 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_IDENTITY {
-                if cur.key == public_key {
-                    self.members[idx].proof_kind = proof_kind;
-                    self.members[idx].proof_data = proof_data;
-                    return Status::Ok;
-                }
-                if compare_bytes(&cur.key, &public_key) > 0 {
-                    break;
-                }
-            }
-            idx += 1;
-        }
-        self.members.insert(
-            idx,
-            MemberRow {
+        // Idempotent upsert keyed by the identity public key.
+        self.identities.insert(
+            &identity_key(&public_key),
+            &MemberRow {
                 kind: MEMBER_KIND_IDENTITY,
                 key: public_key,
                 prefix: 0,
@@ -1075,21 +1049,63 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_IDENTITY && cur.key == public_key {
-                self.members.remove(idx);
-                return Status::Ok;
-            }
-            idx += 1;
+        if self.identities.remove(&identity_key(&public_key)) {
+            Status::Ok
+        } else {
+            Status::NotFound
         }
-        Status::NotFound
     }
 
+    /// One page of the member roster, nodes (by prefix) before identities
+    /// (by key) — the single ordered stream the old flat `Vec<MemberRow>`
+    /// presented, now stitched across the two `#[storage]` maps. Pass
+    /// `(0, [])` to start; continue from the returned page's
+    /// `(next_kind, next_key)` while `more` is true. `budget` caps the page.
     #[msg]
-    async fn members(&self) -> Vec<MemberRow> {
-        self.members.clone()
+    async fn members(&self, after_kind: u8, after_key: Vec<u8>, budget: u32) -> MemberPage {
+        let cap = page_rows(budget);
+        // Node phase: whenever the cursor isn't already in the identity
+        // phase (a fresh start, or resuming a node prefix).
+        if after_kind != MEMBER_KIND_IDENTITY {
+            let start: u16 = if after_key.len() == 2 {
+                u16::from_be_bytes([after_key[0], after_key[1]])
+            } else {
+                0
+            };
+            let skip = (after_key.len() == 2).then_some(start);
+            let mut it = self
+                .nodes
+                .iter_from(&start)
+                .filter(move |(k, _)| skip != Some(*k))
+                .map(|(_, m)| m);
+            let (page, more) = fill_page(&mut it, cap, PAGE_BYTE_BUDGET);
+            if !page.is_empty() {
+                return if more {
+                    let next_key = page.last().map(|m| m.prefix.to_be_bytes().to_vec()).unwrap_or_default();
+                    MemberPage { members: page, next_kind: MEMBER_KIND_NODE, next_key, more: true }
+                } else {
+                    // Nodes drained — the next page starts the identity phase.
+                    MemberPage { members: page, next_kind: MEMBER_KIND_IDENTITY, next_key: Vec::new(), more: true }
+                };
+            }
+            // No nodes in range: fall through into the identity phase now.
+        }
+        // Identity phase.
+        let skip = (after_kind == MEMBER_KIND_IDENTITY && !after_key.is_empty())
+            .then(|| identity_key(&after_key));
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut it = self
+            .identities
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k))
+            .map(|(_, m)| m);
+        let (page, more) = fill_page(&mut it, cap, PAGE_BYTE_BUDGET);
+        if more {
+            let next_key = page.last().map(|m| m.key.clone()).unwrap_or_default();
+            MemberPage { members: page, next_kind: MEMBER_KIND_IDENTITY, next_key, more: true }
+        } else {
+            MemberPage { members: page, next_kind: 0, next_key: Vec::new(), more: false }
+        }
     }
 
     /// Raft-join admission probe: the role of the NODE member enrolled at
@@ -1102,10 +1118,8 @@ impl SpaceRegistry {
     /// itself stays Admin-gated at [`add_node`](Self::add_node).
     #[msg]
     async fn node_role(&self, prefix: u64) -> u8 {
-        let prefix = prefix as u16;
-        self.members
-            .iter()
-            .find(|m| m.kind == MEMBER_KIND_NODE && m.prefix == prefix)
+        self.nodes
+            .get(&(prefix as u16))
             .map(|m| m.role.saturating_add(1))
             .unwrap_or(0)
     }
@@ -1660,6 +1674,13 @@ fn acl_key(peer_id: &[u8], agent_name: &str) -> [u8; 32] {
         b"space-registry/acl-key/v1",
         &[&(peer_id.len() as u32).to_be_bytes(), peer_id, agent_name.as_bytes()],
     )
+}
+
+/// Fixed-width `StorageMap` key for an Identity member's variable-length
+/// public key. Nodes key directly by their `u16` prefix (order-preserving);
+/// only identities need folding.
+fn identity_key(public_key: &[u8]) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"space-registry/identity-key/v1", &[public_key])
 }
 
 /// Position of an `AgentRow.consistency` byte on the monotone

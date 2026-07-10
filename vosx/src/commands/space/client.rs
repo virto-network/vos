@@ -386,7 +386,9 @@ impl DaemonClient {
     }
 
     pub fn members(&self) -> anyhow::Result<Vec<MemberRow>> {
-        vos::block_on(self.registry().members(&mut &self.node))
+        // The registry pages the roster (nodes then identities);
+        // `members_all` drains every page into one Vec.
+        vos::block_on(self.registry().members_all(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.members(): {e}"))
     }
 
