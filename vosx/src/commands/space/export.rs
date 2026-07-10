@@ -6,7 +6,7 @@
 //! formats the result as TOML to stdout. Same model as every
 //! other `space *` command — the daemon is the source of truth.
 
-use space_registry::{AgentRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberRow, ProgramRow};
+use vos::registry::{AgentRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberRow, ProgramRow};
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::consistency_name;

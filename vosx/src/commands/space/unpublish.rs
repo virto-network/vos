@@ -1,7 +1,7 @@
 //! `space unpublish` — remove a program from the catalog.
 
 use serde::Serialize;
-use space_registry::{Status};
+use vos::registry::Status;
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;

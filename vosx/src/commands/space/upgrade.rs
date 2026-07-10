@@ -1,7 +1,7 @@
 //! `space upgrade` — repoint an agent at a different program version.
 
 use serde::Serialize;
-use space_registry::{Status};
+use vos::registry::Status;
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::parse_program_ref;

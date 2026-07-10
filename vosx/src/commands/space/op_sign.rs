@@ -8,11 +8,11 @@
 //! the genesis (`space new`) and manifest-reconcile paths.
 //!
 //! The canonical bytes are built by the shared
-//! [`space_registry::canonical_op_bytes`], so the signer and the
+//! [`vos::registry::canonical_op_bytes`], so the signer and the
 //! verifier stay in lockstep without re-encoding the wire `Msg`.
 
 use libp2p::identity::Keypair;
-use space_registry::{OP_SIG_LEN, canonical_op_bytes, pack_auth};
+use vos::registry::{OP_SIG_LEN, canonical_op_bytes, pack_auth};
 
 /// Build the `auth` blob for a signed registry op: the signer's
 /// PeerId bytes followed by an ed25519 signature over the op's
@@ -37,7 +37,11 @@ pub fn op_auth(keypair: &Keypair, op: &str, fields: &[&[u8]]) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use space_registry::{ed25519_pubkey_from_peer_id, verify_op_sig};
+    use vos::registry::ed25519_pubkey_from_peer_id;
+    // `verify_op_sig` (ed25519) deliberately stays in the actor crate so
+    // its `ed25519-dalek` dep never reaches `vos`; this interop test is
+    // the only reason `space-registry` remains a vosx *dev*-dependency.
+    use space_registry::verify_op_sig;
 
     /// The make-or-break interop: a signature produced by a libp2p
     /// `Keypair` (the operator's CLI identity) must verify under the

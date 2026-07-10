@@ -215,9 +215,9 @@ fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> any
         .map_err(|_| anyhow!("space id is not 32 bytes"))?;
 
     // 3. sign the binding cert (shared canonical so it byte-matches the
-    //    messenger verifier — see `space_registry::binding_signed_bytes`)
+    //    messenger verifier — see `vos::registry::binding_signed_bytes`)
     let cert = keypair
-        .sign(&space_registry::binding_signed_bytes(
+        .sign(&vos::registry::binding_signed_bytes(
             &mls_pubkey,
             &operator_peer,
             &space_id,

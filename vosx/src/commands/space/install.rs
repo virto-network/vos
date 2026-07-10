@@ -2,7 +2,7 @@
 //! installed agent.
 
 use serde::Serialize;
-use space_registry::{Status};
+use vos::registry::Status;
 use vos::init::{InitArgs, InitValue};
 
 use crate::commands::space::client::DaemonClient;

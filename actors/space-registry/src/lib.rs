@@ -43,10 +43,6 @@
 /// without first looking us up.
 pub const SERVICE_ID_RAW: u32 = 0;
 
-/// Domain tag for `space_id` derivation. Host computes
-/// `blake2b("vos-space-id/v1" || genesis_dag_root)`.
-pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id/v1";
-
 // ── Protocol (rows, status/role consts, canonical signing bytes) ──
 //
 // The wire types + the consensus-critical canonical encodings now live
@@ -56,11 +52,11 @@ pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id/v1";
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
-    ActorAclRow, AgentRow, AuthGrantRow, MemberRow, ProgramRow, Status, AUTH_ROLE_ADMIN,
-    AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN, MEMBER_KIND_IDENTITY,
-    MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
+    ActorAclRow, AgentRow, AuthGrantRow, MemberRow, ProgramRow, SPACE_ID_DOMAIN_TAG, Status,
+    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN,
+    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
     PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
-    canonical_op_bytes, ed25519_pubkey_from_peer_id, pack_auth,
+    canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id, pack_auth,
 };
 
 // ── Programs ──────────────────────────────────────────────────────
@@ -1788,33 +1784,6 @@ fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
     } else {
         0
     }
-}
-
-// ── Cross-target helpers (host + actor) ───────────────────────────
-
-/// Deterministic per-node `ServiceId` (packed as u32) for an
-/// installed agent named `instance_name` on a node with the
-/// given 16-bit `prefix`.
-///
-/// The low 16 bits are derived from `instance_name` via blake2b
-/// and clamped to `[0x100, 0x7FFF]` so they can't collide with
-/// `ServiceId::REGISTRY` (= 0) or any reserved low system ids.
-/// Stable across restarts of the same node so each instance's
-/// redb path persists.
-///
-/// Cross-target by design — the actor's `resolve` handler and
-/// `vosx`'s host code both call this with the same bytes coming
-/// out. On riscv64 the blake2b dispatches to the host ECALL
-/// precompile; on every other target it runs through
-/// `vos::crypto::blake2b_hash` → `blake2b_simd`.
-pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
-    let raw_bytes: [u8; 2] = vos::crypto::blake2b_hash(
-        b"vos-instance-svc-id/v1",
-        &[&[0u8], instance_name.as_bytes()],
-    );
-    let raw = u16::from_le_bytes(raw_bytes);
-    let local = (raw & 0x7FFF).max(0x100);
-    ((prefix as u32) << 16) | (local as u32)
 }
 
 // ── Signed registry ops ──────────────────────────────────

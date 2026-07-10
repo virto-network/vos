@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use space_registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, SpaceRegistryRef, Status};
+use vos::registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, RegistryRef, Status};
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 
@@ -97,7 +97,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     //    the unsigned anchor (first-write-wins, refused thereafter).
     let operator_kp = crate::identity::load_or_create()?;
     let operator_peer_id = libp2p::PeerId::from(operator_kp.public()).to_bytes();
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let reg = RegistryRef::at(ServiceId::REGISTRY);
 
     let status = vos::block_on(reg.set_root(&mut &node, operator_peer_id.clone()))
         .map_err(|e| anyhow::anyhow!("genesis set_root failed: {e}"))?;

@@ -192,7 +192,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 // ed25519-dalek verify_strict; pack as signer_peer_id || sig(64).
                 let sig = kp.sign(canonical).ok()?;
                 let sig: [u8; 64] = sig.as_slice().try_into().ok()?;
-                Some(space_registry::pack_auth(&operator_bytes, &sig))
+                Some(vos::registry::pack_auth(&operator_bytes, &sig))
             });
             tracing::info!(%operator, "auth: recorded operator for device-local agents");
         }
@@ -619,7 +619,7 @@ fn spawn_installed_agents(
     has_hyperspace: bool,
     policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
-    use space_registry::{SpaceRegistryRef, Status};
+    use vos::registry::{RegistryRef, Status};
     use std::collections::HashSet;
 
     let local_cfg = crate::commands::space::subscriptions::load(data_dir).unwrap_or_default();
@@ -630,7 +630,7 @@ fn spawn_installed_agents(
         );
     }
 
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let reg = RegistryRef::at(ServiceId::REGISTRY);
     let agents =
         vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
@@ -726,7 +726,7 @@ fn spawn_installed_agents(
     // abort boot, since the local space still works without
     // cross-space addressing.
     if has_hyperspace {
-        let hs_reg = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+        let hs_reg = RegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
         for name in agent_names {
             match vos::block_on(hs_reg.register_remote(
                 &mut &*node,
@@ -896,7 +896,7 @@ impl ChronosFeeder {
     }
 
     fn feed(&mut self, node: &mut VosNode, local_prefix: u16) {
-        use space_registry::{MEMBER_KIND_NODE, NODE_ROLE_VOTER, SpaceRegistryRef};
+        use vos::registry::{MEMBER_KIND_NODE, NODE_ROLE_VOTER, RegistryRef};
 
         let chronos_id =
             crate::commands::space::common::instance_service_id("chronos", local_prefix);
@@ -906,7 +906,7 @@ impl ChronosFeeder {
 
         // Resolve the chronos raft group id once (stable from name+program).
         if self.chronos_rep.is_none() {
-            let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+            let reg = RegistryRef::at(ServiceId::REGISTRY);
             let Ok(rows) = vos::block_on(reg.agents(&mut &*node)) else {
                 return; // catalog unavailable — retry next pass
             };
@@ -934,7 +934,7 @@ impl ChronosFeeder {
         // (leader) and the local "am I a voter?" gate. Cached with a TTL so the
         // feeder isn't reading the registry every pass.
         if self.voters_ttl == 0 {
-            let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+            let reg = RegistryRef::at(ServiceId::REGISTRY);
             let Ok(members) = vos::block_on(reg.members(&mut &*node)) else {
                 return; // registry unavailable — retry next pass
             };
@@ -1227,7 +1227,7 @@ enum RowConfig {
 /// `reconcile_installed_agents` pass so both spawn identically.
 fn agent_config_from_row(
     data_dir: &std::path::Path,
-    a: &space_registry::AgentRow,
+    a: &vos::registry::AgentRow,
     policies: &AgentPolicies,
 ) -> anyhow::Result<RowConfig> {
     let program_hash = BlobHash(a.program_hash);
@@ -1446,13 +1446,13 @@ type BootGrace = std::collections::HashMap<(String, [u8; 32]), u32>;
 fn raft_members_for_row(
     node: &VosNode,
     data_dir: &std::path::Path,
-    a: &space_registry::AgentRow,
+    a: &vos::registry::AgentRow,
     local_prefix: u16,
     boot_grace: &mut BootGrace,
 ) -> anyhow::Result<RaftSeed> {
-    use space_registry::{MEMBER_KIND_NODE, NODE_ROLE_VOTER, SpaceRegistryRef};
+    use vos::registry::{MEMBER_KIND_NODE, NODE_ROLE_VOTER, RegistryRef};
 
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let reg = RegistryRef::at(ServiceId::REGISTRY);
     let rows = vos::block_on(reg.members(&mut &*node))
         .map_err(|e| anyhow::anyhow!("query members: {e}"))?;
     let mut voters: Vec<u16> = rows
@@ -1542,7 +1542,7 @@ fn raft_members_for_row(
 /// `known` view when the re-probe fails.
 fn join_raft_group(
     net: &std::sync::Arc<vos::network::Network>,
-    a: &space_registry::AgentRow,
+    a: &vos::registry::AgentRow,
     local_prefix: u16,
     mut leader: u16,
     known: Vec<u16>,
@@ -1681,9 +1681,9 @@ fn reconcile_installed_agents(
     boot_grace: &mut BootGrace,
     policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
-    use space_registry::{SpaceRegistryRef, Status};
+    use vos::registry::{RegistryRef, Status};
 
-    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let reg = RegistryRef::at(ServiceId::REGISTRY);
     let agents =
         vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
@@ -1775,7 +1775,7 @@ fn reconcile_installed_agents(
                     crate::commands::space::common::consistency_name(a.consistency),
                 );
                 if has_hyperspace {
-                    let hs_reg = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
+                    let hs_reg = RegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
                     match vos::block_on(hs_reg.register_remote(
                         &mut &*node,
                         a.instance_name.clone(),

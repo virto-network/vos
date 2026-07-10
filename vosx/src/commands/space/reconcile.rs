@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use space_registry::{ProgramRow, SpaceRegistryRef, Status};
+use vos::registry::{ProgramRow, RegistryRef, Status};
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
 use vos::node::{ExtensionConfig, VosNode};
@@ -206,7 +206,7 @@ fn default_consistency() -> String {
 /// extension code.
 fn register_extension(
     node: &mut VosNode,
-    reg: &SpaceRegistryRef,
+    reg: &RegistryRef,
     ext: &ExtensionDef,
     manifest_dir: &Path,
     daemon_prefix: u16,
@@ -581,7 +581,7 @@ pub fn reconcile(
     // caps` surface).
     let mut ext_caps: Vec<ExtensionCaps> = Vec::new();
 
-    let reg = SpaceRegistryRef::at(ServiceId::new(
+    let reg = RegistryRef::at(ServiceId::new(
         daemon_prefix,
         ServiceId::REGISTRY.local_id(),
     ));
@@ -666,7 +666,7 @@ pub fn reconcile(
             let root = vos::block_on(reg.root(&mut &*node)).unwrap_or_default();
             (!root.is_empty() && root == op)
                 || vos::block_on(reg.peer_role(&mut &*node, op)).unwrap_or(0)
-                    == space_registry::AUTH_ROLE_ADMIN
+                    == vos::registry::AUTH_ROLE_ADMIN
         }
         None => false,
     };
@@ -689,7 +689,7 @@ pub fn reconcile(
 
 fn reconcile_one(
     node: &VosNode,
-    reg: &SpaceRegistryRef,
+    reg: &RegistryRef,
     agent: &AgentDef,
     manifest_dir: &Path,
     _daemon_prefix: u16,
@@ -903,7 +903,7 @@ fn reconcile_one(
         );
         return Ok(());
     }
-    if status == space_registry::Status::ReplicationIdReused {
+    if status == vos::registry::Status::ReplicationIdReused {
         // The `replication_id` is a retired anti-replay tombstone — this
         // agent (or one with the same auto-derived id) was installed and
         // uninstalled before, and an `auto`/fixed id can't be reused.

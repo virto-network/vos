@@ -1,7 +1,7 @@
 //! `space publish` — add a program to the catalog.
 
 use serde::Serialize;
-use space_registry::Status;
+use vos::registry::Status;
 
 use crate::blob_store::{self, BlobHash, BlobSource};
 use crate::bundled;

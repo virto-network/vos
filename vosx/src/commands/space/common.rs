@@ -3,8 +3,8 @@
 //! Mostly host-side concerns: CLI string parsing, tabular
 //! formatting, and the blake2b derivations that vosx needs
 //! before the daemon is even up. The cross-target
-//! `instance_service_id` lives in the space-registry crate
-//! since the actor's `resolve` handler also needs it.
+//! `instance_service_id` lives in `vos::registry` since the
+//! actor's `resolve` handler also needs it.
 
 use vos::abi::service::ServiceId;
 use vos::node::Consistency;
@@ -31,12 +31,12 @@ pub fn truncate(s: &str, max: usize) -> &str {
 }
 
 /// Deterministic per-node `ServiceId` for an installed agent.
-/// Thin wrapper around `space_registry::instance_service_id`
-/// that returns the typed `ServiceId` host code prefers; the
-/// formula itself lives next to the registry actor's `resolve`
-/// handler so both sides agree by construction.
+/// Thin wrapper around `vos::registry::instance_service_id` that
+/// returns the typed `ServiceId` host code prefers; the formula
+/// itself lives in `vos::registry` (the actor's `resolve` handler
+/// calls the same fn) so both sides agree by construction.
 pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
-    ServiceId(space_registry::instance_service_id(instance_name, prefix))
+    ServiceId(vos::registry::instance_service_id(instance_name, prefix))
 }
 
 /// Map a registry-stored `consistency` u8 to the host enum.
@@ -82,7 +82,7 @@ pub fn derive_hyperspace_id(hyperspace_name: &str) -> [u8; 32] {
 /// (called before any daemon is up).
 pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
     vos::crypto::blake2b_hash(
-        space_registry::SPACE_ID_DOMAIN_TAG,
+        vos::registry::SPACE_ID_DOMAIN_TAG,
         &[&[0u8], genesis_dag_root],
     )
 }

@@ -28,9 +28,6 @@ vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage"
 # transitively but doesn't re-export, so vosx pulls its own.
 # `version` is what crates.io resolves at publish time.
 grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.1" }
-# Per-space catalog of programs / agents / members. Source of
-# truth that the new `space *` subcommands operate on.
-space-registry = { path = "../actors/space-registry", version = "0.1.0", default-features = false }
 # The per-space clock + verifiable-randomness service. The daemon
 # feeds it from the raft leader (init/advance via Caller::System) and
 # the typed `ChronosRef` / `AdvanceOutcome` / `MAX_SLOT_JUMP` ride along.
@@ -83,3 +80,13 @@ tracing-log = "0.2"
 # libp2p multiaddr parsing for `--listen` / `--connect`. The
 # rest of the network plumbing is owned by `vos::network`.
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"] }
+
+[dev-dependencies]
+# Dev-only: the registry protocol (rows / status / canonical signing
+# bytes / the `RegistryRef` client) now lives in `vos::registry`, so the
+# shipped `vosx` binary carries no dependency on the space-registry actor
+# crate. It stays a dev-dependency purely for `op_sign`'s interop test,
+# which cross-checks a libp2p-produced signature against the actor's
+# `verify_op_sig` (ed25519 — deliberately kept in the actor so its
+# `ed25519-dalek` dep never reaches `vos`).
+space-registry = { path = "../actors/space-registry", version = "0.1.0", default-features = false }

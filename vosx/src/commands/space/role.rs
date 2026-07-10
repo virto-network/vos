@@ -33,7 +33,7 @@
 
 use clap::Subcommand;
 use serde::Serialize;
-use space_registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, Status};
+use vos::registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, Status};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;

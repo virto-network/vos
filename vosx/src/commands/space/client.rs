@@ -16,8 +16,8 @@
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use space_registry::{AgentRow, MemberRow, ProgramRow, SpaceRegistryRef, Status};
 use vos::abi::service::ServiceId;
+use vos::registry::{AgentRow, MemberRow, ProgramRow, RegistryRef, Status};
 use vos::node::VosNode;
 
 use crate::commands::space::common::instance_service_id;
@@ -185,11 +185,10 @@ impl DaemonClient {
         f(client)
     }
 
-    /// Macro-generated typed `Ref` pointed at the daemon's
-    /// registry. Internal — every typed wrapper goes through
-    /// here.
-    fn registry(&self) -> SpaceRegistryRef {
-        SpaceRegistryRef::at(self.registry_id())
+    /// Dynamic-dispatch registry client pointed at the daemon's
+    /// registry. Internal — every typed wrapper goes through here.
+    fn registry(&self) -> RegistryRef {
+        RegistryRef::at(self.registry_id())
     }
 
     /// The daemon's registry `ServiceId` — `(daemon_prefix, 0)`.
@@ -591,7 +590,7 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.peer_role(): {e}"))
     }
 
-    pub fn auth_grants(&self) -> anyhow::Result<Vec<space_registry::AuthGrantRow>> {
+    pub fn auth_grants(&self) -> anyhow::Result<Vec<vos::registry::AuthGrantRow>> {
         vos::block_on(self.registry().auth_grants(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.auth_grants(): {e}"))
     }
@@ -631,7 +630,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.revoke_actor_role(): {e}"))
     }
 
-    pub fn actor_acls(&self) -> anyhow::Result<Vec<space_registry::ActorAclRow>> {
+    pub fn actor_acls(&self) -> anyhow::Result<Vec<vos::registry::ActorAclRow>> {
         vos::block_on(self.registry().actor_acls(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.actor_acls(): {e}"))
     }

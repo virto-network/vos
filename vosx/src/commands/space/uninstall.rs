@@ -1,7 +1,7 @@
 //! `space uninstall` — tombstone an agent.
 
 use serde::Serialize;
-use space_registry::{Status};
+use vos::registry::Status;
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;

@@ -319,6 +319,34 @@ pub fn binding_signed_bytes(mls_pubkey: &[u8], peer_id: &[u8], space_id: &[u8; 3
     out
 }
 
+// ── Service-id derivation ─────────────────────────────────────────
+
+/// Domain tag for `space_id` derivation. The host computes
+/// `space_id = blake2b("vos-space-id/v1" || genesis_dag_root)`.
+pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id/v1";
+
+/// Deterministic per-node `ServiceId` (raw u32) for an installed
+/// instance. The low 16 bits are `blake2b(instance_name)` folded into
+/// `[0x100, 0x7FFF]` so they can't collide with `ServiceId::REGISTRY`
+/// (= 0) or any reserved low system id; the high 16 bits carry the
+/// node `prefix`. Stable across restarts of the same node so each
+/// instance's redb path persists.
+///
+/// Cross-target by design — the actor's `resolve` handler and the host
+/// (the vosx CLI, the daemon's feeder / reconcile) both call this with
+/// the same bytes coming out. On riscv64 the blake2b dispatches to the
+/// host ECALL precompile; on every other target it runs through
+/// [`crate::crypto::blake2b_hash`] → `blake2b_simd`.
+pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
+    let raw_bytes: [u8; 2] = crate::crypto::blake2b_hash(
+        b"vos-instance-svc-id/v1",
+        &[&[0u8], instance_name.as_bytes()],
+    );
+    let raw = u16::from_le_bytes(raw_bytes);
+    let local = (raw & 0x7FFF).max(0x100);
+    ((prefix as u32) << 16) | (local as u32)
+}
+
 // ── Sign-on-relay (host/daemon side) ──────────────────────────────
 //
 // Folded in from the former `registry_canon` module. The catalog
@@ -330,15 +358,20 @@ pub fn binding_signed_bytes(mls_pubkey: &[u8], peer_id: &[u8], space_id: &[u8; 3
 // converges on — with the operator key it loaded at boot. It rebuilds
 // the exact bytes the registry verifies via [`canonical_op_bytes`].
 
-use alloc::sync::Arc;
-
+// `Msg`/`Value`/`TAG_DYNAMIC`/`Encode` are shared with the always-
+// available `RegistryRef` below; the `Arc`-backed signer + relay signing
+// are host-only (they run in the daemon), so they carry a `std` gate —
+// `alloc::sync` is configured out on the atomic-free riscv actor target.
 use crate::actors::codec::Encode;
 use crate::value::{Msg, TAG_DYNAMIC, Value};
+#[cfg(feature = "std")]
+use alloc::sync::Arc;
 
 /// Signs the canonical bytes of a registry op and returns the packed
 /// `auth` blob (`signer_peer_id || sig(64)`), or `None` if signing
 /// fails. Built by the daemon at boot from the operator's libp2p
 /// identity and held by the space-registry agent thread.
+#[cfg(feature = "std")]
 pub(crate) type CatalogOpSigner = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
 /// If `msg` is one of the signed catalog mutators, rebuild the exact
@@ -347,6 +380,7 @@ pub(crate) type CatalogOpSigner = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + 
 /// `None` for any other method or if a required arg is missing or
 /// ill-typed (fail closed). `register_remote` is deliberately absent — it
 /// is the hyperspace surface with a separate trust model.
+#[cfg(feature = "std")]
 fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
     let a = &msg.args;
     let canon = match msg.name.as_str() {
@@ -429,6 +463,7 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
 /// them with `signer`, and return a re-encoded payload carrying the
 /// operator's `auth` blob (replacing any caller-supplied placeholder).
 /// `None` leaves the original payload untouched.
+#[cfg(feature = "std")]
 pub(crate) fn sign_catalog_op_on_relay(
     payload: &[u8],
     signer: &CatalogOpSigner,
@@ -448,6 +483,527 @@ pub(crate) fn sign_catalog_op_on_relay(
     out.push(TAG_DYNAMIC);
     out.extend_from_slice(&encoded);
     Some(out)
+}
+
+// ── Dynamic registry client ───────────────────────────────────────
+//
+// [`RegistryRef`] is a hand-written typed reference over the registry's
+// dynamic-dispatch wire, replacing the macro-generated `SpaceRegistryRef`
+// from the `space-registry` actor crate. A host consumer (the vosx CLI,
+// the daemon's in-process feeder / reconcile) talks to the registry
+// through it without depending on the actor crate. Every method builds a
+// `Msg` whose name is the handler's name and whose arg keys are the
+// handler's param names, frames it `TAG_DYNAMIC`, invokes, and decodes
+// the reply `Value` into the row/status types above — byte-identical to
+// the wire the generated ref emitted, so the daemon's sign-on-relay and
+// the actor's verifier are unaffected. Generic over `Invoker`, so the
+// same code drives a network invoke (CLI → daemon, arriving as
+// `Caller::Peer`) and a local in-process invoke (daemon → its own
+// registry, arriving as `Caller::System`).
+
+use crate::abi::service::ServiceId;
+use crate::actors::client::{ClientError, Invoker};
+
+/// Decode a `Value::Bytes` rkyv reply into `T` (checked access), mapping
+/// a wrong-shape or undecodable reply to the matching `ClientError` —
+/// mirrors the generated client's reply decode.
+fn decode_rkyv<T: crate::Decode>(value: Value) -> Result<T, ClientError> {
+    match value {
+        Value::Bytes(b) => T::try_decode(&b).ok_or(ClientError::Decode),
+        other => Err(ClientError::UnexpectedReply(alloc::format!("{other:?}"))),
+    }
+}
+
+/// Decode an `Option<T>` reply: `Unit` / empty `Bytes` → `None`, a
+/// populated `Bytes` → rkyv-decoded `Some`.
+fn decode_opt<T: crate::Decode>(value: Value) -> Result<Option<T>, ClientError> {
+    match value {
+        Value::Unit => Ok(None),
+        Value::Bytes(b) if b.is_empty() => Ok(None),
+        Value::Bytes(b) => T::try_decode(&b).map(Some).ok_or(ClientError::Decode),
+        other => Err(ClientError::UnexpectedReply(alloc::format!("{other:?}"))),
+    }
+}
+
+/// Decode a raw `Vec<u8>` reply (a byte-buffer return like
+/// `meta_for_instance` / `root`).
+fn decode_bytes(value: Value) -> Result<Vec<u8>, ClientError> {
+    match value {
+        Value::Bytes(b) => Ok(b),
+        other => Err(ClientError::UnexpectedReply(alloc::format!("{other:?}"))),
+    }
+}
+
+/// Typed reference to a space registry, addressed by `ServiceId`.
+#[derive(Copy, Clone)]
+pub struct RegistryRef {
+    target: ServiceId,
+}
+
+impl RegistryRef {
+    /// Bind to an explicit registry `ServiceId`. Cheap; copy freely.
+    pub const fn at(target: ServiceId) -> Self {
+        Self { target }
+    }
+
+    /// The `ServiceId` this ref points at.
+    pub const fn id(&self) -> ServiceId {
+        self.target
+    }
+
+    /// Frame `msg` as `[TAG_DYNAMIC][rkyv Msg]` and invoke, returning the
+    /// decoded reply `Value`. The single funnel every method goes through.
+    async fn call<I: Invoker>(&self, inv: &mut I, msg: Msg) -> Result<Value, ClientError> {
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        inv.invoke(self.target, payload).await
+    }
+
+    // ── Catalog reads ─────────────────────────────────────────────
+
+    pub async fn programs<I: Invoker>(&self, inv: &mut I) -> Result<Vec<ProgramRow>, ClientError> {
+        decode_rkyv(self.call(inv, Msg::new("programs")).await?)
+    }
+
+    pub async fn program<I: Invoker>(
+        &self,
+        inv: &mut I,
+        name: String,
+        version: String,
+    ) -> Result<Option<ProgramRow>, ClientError> {
+        decode_opt(
+            self.call(inv, Msg::new("program").with("name", name).with("version", version))
+                .await?,
+        )
+    }
+
+    pub async fn agents<I: Invoker>(&self, inv: &mut I) -> Result<Vec<AgentRow>, ClientError> {
+        decode_rkyv(self.call(inv, Msg::new("agents")).await?)
+    }
+
+    pub async fn agent<I: Invoker>(
+        &self,
+        inv: &mut I,
+        instance_name: String,
+    ) -> Result<Option<AgentRow>, ClientError> {
+        decode_opt(
+            self.call(inv, Msg::new("agent").with("instance_name", instance_name))
+                .await?,
+        )
+    }
+
+    pub async fn meta_for_instance<I: Invoker>(
+        &self,
+        inv: &mut I,
+        name: String,
+    ) -> Result<Vec<u8>, ClientError> {
+        decode_bytes(self.call(inv, Msg::new("meta_for_instance").with("name", name)).await?)
+    }
+
+    pub async fn members<I: Invoker>(&self, inv: &mut I) -> Result<Vec<MemberRow>, ClientError> {
+        decode_rkyv(self.call(inv, Msg::new("members")).await?)
+    }
+
+    pub async fn root<I: Invoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
+        decode_bytes(self.call(inv, Msg::new("root")).await?)
+    }
+
+    // ── Auth reads ────────────────────────────────────────────────
+
+    pub async fn peer_role<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+    ) -> Result<u8, ClientError> {
+        let v = self.call(inv, Msg::new("peer_role").with("peer_id", peer_id)).await?;
+        v.as_u8()
+            .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
+    }
+
+    pub async fn peer_epoch<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+    ) -> Result<u64, ClientError> {
+        let v = self.call(inv, Msg::new("peer_epoch").with("peer_id", peer_id)).await?;
+        v.as_u64()
+            .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
+    }
+
+    pub async fn actor_epoch<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+        agent_name: String,
+    ) -> Result<u64, ClientError> {
+        let v = self
+            .call(
+                inv,
+                Msg::new("actor_epoch")
+                    .with("peer_id", peer_id)
+                    .with("agent_name", agent_name),
+            )
+            .await?;
+        v.as_u64()
+            .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
+    }
+
+    pub async fn auth_grants<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<AuthGrantRow>, ClientError> {
+        decode_rkyv(self.call(inv, Msg::new("auth_grants")).await?)
+    }
+
+    pub async fn actor_acls<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<ActorAclRow>, ClientError> {
+        decode_rkyv(self.call(inv, Msg::new("actor_acls")).await?)
+    }
+
+    // ── Genesis / catalog mutators ────────────────────────────────
+
+    pub async fn set_root<I: Invoker>(
+        &self,
+        inv: &mut I,
+        root: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(self.call(inv, Msg::new("set_root").with("root", root)).await?)
+    }
+
+    pub async fn publish<I: Invoker>(
+        &self,
+        inv: &mut I,
+        name: String,
+        version: String,
+        hash: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("publish")
+                    .with("name", name)
+                    .with("version", version)
+                    .with("hash", hash)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn register_meta<I: Invoker>(
+        &self,
+        inv: &mut I,
+        program_hash: Vec<u8>,
+        blob: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("register_meta")
+                    .with("program_hash", program_hash)
+                    .with("blob", blob)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn register_extension_meta<I: Invoker>(
+        &self,
+        inv: &mut I,
+        instance_name: String,
+        blob: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("register_extension_meta")
+                    .with("instance_name", instance_name)
+                    .with("blob", blob)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn unpublish<I: Invoker>(
+        &self,
+        inv: &mut I,
+        name: String,
+        version: String,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("unpublish")
+                    .with("name", name)
+                    .with("version", version)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install<I: Invoker>(
+        &self,
+        inv: &mut I,
+        instance_name: String,
+        program_name: String,
+        program_version: String,
+        program_hash: Vec<u8>,
+        replication_id: Vec<u8>,
+        consistency: u8,
+        install_args: Vec<u8>,
+        install_payloads: Vec<u8>,
+        network_reachable: bool,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("install")
+                    .with("instance_name", instance_name)
+                    .with("program_name", program_name)
+                    .with("program_version", program_version)
+                    .with("program_hash", program_hash)
+                    .with("replication_id", replication_id)
+                    .with("consistency", consistency)
+                    .with("install_args", install_args)
+                    .with("install_payloads", install_payloads)
+                    .with("network_reachable", network_reachable)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upgrade<I: Invoker>(
+        &self,
+        inv: &mut I,
+        instance_name: String,
+        new_program_name: String,
+        new_program_version: String,
+        new_program_hash: Vec<u8>,
+        from_hash: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("upgrade")
+                    .with("instance_name", instance_name)
+                    .with("new_program_name", new_program_name)
+                    .with("new_program_version", new_program_version)
+                    .with("new_program_hash", new_program_hash)
+                    .with("from_hash", from_hash)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn uninstall<I: Invoker>(
+        &self,
+        inv: &mut I,
+        instance_name: String,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("uninstall")
+                    .with("instance_name", instance_name)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn add_node<I: Invoker>(
+        &self,
+        inv: &mut I,
+        prefix: u32,
+        peer_id: Vec<u8>,
+        role: u8,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("add_node")
+                    .with("prefix", prefix)
+                    .with("peer_id", peer_id)
+                    .with("role", role)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn remove_node<I: Invoker>(
+        &self,
+        inv: &mut I,
+        prefix: u32,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("remove_node").with("prefix", prefix).with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn add_identity<I: Invoker>(
+        &self,
+        inv: &mut I,
+        public_key: Vec<u8>,
+        proof_kind: u8,
+        proof_data: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("add_identity")
+                    .with("public_key", public_key)
+                    .with("proof_kind", proof_kind)
+                    .with("proof_data", proof_data)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn remove_identity<I: Invoker>(
+        &self,
+        inv: &mut I,
+        public_key: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("remove_identity")
+                    .with("public_key", public_key)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn grant_role<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+        role: u8,
+        epoch: u64,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("grant_role")
+                    .with("peer_id", peer_id)
+                    .with("role", role)
+                    .with("epoch", epoch)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn revoke_role<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+        epoch: u64,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("revoke_role")
+                    .with("peer_id", peer_id)
+                    .with("epoch", epoch)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn grant_actor_role<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+        agent_name: String,
+        role: u8,
+        epoch: u64,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("grant_actor_role")
+                    .with("peer_id", peer_id)
+                    .with("agent_name", agent_name)
+                    .with("role", role)
+                    .with("epoch", epoch)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn revoke_actor_role<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+        agent_name: String,
+        epoch: u64,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("revoke_actor_role")
+                    .with("peer_id", peer_id)
+                    .with("agent_name", agent_name)
+                    .with("epoch", epoch)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn register_remote<I: Invoker>(
+        &self,
+        inv: &mut I,
+        instance_name: String,
+        host_prefix: u32,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("register_remote")
+                    .with("instance_name", instance_name)
+                    .with("host_prefix", host_prefix),
+            )
+            .await?,
+        )
+    }
 }
 
 #[cfg(test)]
