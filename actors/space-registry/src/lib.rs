@@ -52,7 +52,8 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
-    ActorAclRow, AgentRow, AuthGrantRow, MemberRow, ProgramRow, SPACE_ID_DOMAIN_TAG, Status,
+    ActorAclPage, ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, MemberRow, ProgramRow,
+    SPACE_ID_DOMAIN_TAG, Status,
     AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN,
     MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
     PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
@@ -293,19 +294,21 @@ pub struct SpaceRegistry {
     /// fixed-width key); the row keeps the plain name.
     #[storage]
     extension_metas: StorageMap<[u8; 32], ExtensionMetaRow>,
-    /// Sprint 2 — per-PeerId auth grants. Sorted by `peer_id`
-    /// (lexicographic bytes) for binary lookup. Pre-Sprint-2
-    /// state archives don't have this field; the actor's
-    /// fall-back-to-fresh behaviour on archive decode failure
-    /// (see "Schema evolution" in this file's module doc) lets
-    /// upgrades resync from the DAG.
-    auth_grants: Vec<AuthGrantRow>,
-    /// M4 — per-(peer, agent) actor-local ACL overrides. Sorted
-    /// by `(peer_id, agent_name)` for binary lookup. Empty until
-    /// an operator calls `grant_actor_role`. Falls through to
-    /// `auth_grants` (space-level) when no actor-local grant
-    /// exists for `(peer, target_agent)`.
-    actor_acls: Vec<ActorAclRow>,
+    /// Sprint 2 — per-PeerId auth grants, one row per peer. A `#[storage]`
+    /// map keyed by `peer_key(peer_id)`: `effective_role`/`peer_epoch`
+    /// point-get, `auth_grants()` pages. Pre-Sprint-2 state archives don't
+    /// have this field; the actor's fall-back-to-fresh behaviour on archive
+    /// decode failure (see "Schema evolution" in this file's module doc)
+    /// lets upgrades resync from the DAG.
+    #[storage]
+    auth_grants: StorageMap<[u8; 32], AuthGrantRow>,
+    /// M4 — per-(peer, agent) actor-local ACL overrides, one row per pair.
+    /// A `#[storage]` map keyed by `acl_key(peer_id, agent_name)`. Empty
+    /// until an operator calls `grant_actor_role`. Falls through to
+    /// `auth_grants` (space-level) when no actor-local grant exists for
+    /// `(peer, target_agent)`.
+    #[storage]
+    actor_acls: StorageMap<[u8; 32], ActorAclRow>,
     /// Grow-only revoke high-waters for space-level grants, sorted by
     /// `peer_id`. A grant is dominated while its epoch is at or below
     /// the peer's entry here (see [`AuthGrantRow::epoch`]). Retained
@@ -360,8 +363,8 @@ impl SpaceRegistry {
             members: Vec::new(),
             metas: StorageMap::default(),
             extension_metas: StorageMap::default(),
-            auth_grants: Vec::new(),
-            actor_acls: Vec::new(),
+            auth_grants: StorageMap::default(),
+            actor_acls: StorageMap::default(),
             revoke_epochs: Vec::new(),
             actor_revoke_epochs: Vec::new(),
             host_mappings: StorageMap::default(),
@@ -1132,35 +1135,26 @@ impl SpaceRegistry {
             return Status::Forbidden;
         };
         let grantor = grantor.to_vec();
-        match self
-            .auth_grants
-            .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
-        {
-            Ok(idx) => {
-                // One row per peer: keep the dominant grant under
-                // `grant_supersedes` (root-signed grants are immutable to
-                // non-root displacement; otherwise highest epoch wins).
-                let cur = &self.auth_grants[idx];
-                if grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root) {
-                    self.auth_grants[idx].role = role;
-                    self.auth_grants[idx].epoch = epoch;
-                    self.auth_grants[idx].grantor = grantor;
-                }
-                Status::Ok
-            }
-            Err(insert_at) => {
-                self.auth_grants.insert(
-                    insert_at,
-                    AuthGrantRow {
-                        peer_id,
-                        role,
-                        epoch,
-                        grantor,
-                    },
-                );
-                Status::Ok
-            }
+        // One row per peer: keep the dominant grant under `grant_supersedes`
+        // (root-signed grants are immutable to non-root displacement;
+        // otherwise highest epoch wins). A fresh peer always supersedes.
+        let key = peer_key(&peer_id);
+        let supersedes = match self.auth_grants.get(&key) {
+            Some(cur) => grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root),
+            None => true,
+        };
+        if supersedes {
+            self.auth_grants.insert(
+                &key,
+                &AuthGrantRow {
+                    peer_id,
+                    role,
+                    epoch,
+                    grantor,
+                },
+            );
         }
+        Status::Ok
     }
 
     /// Revoke `peer_id` at `epoch`. Raises the peer's grow-only revoke
@@ -1200,27 +1194,48 @@ impl SpaceRegistry {
     /// metadata is non-secret).
     #[msg]
     async fn peer_epoch(&self, peer_id: Vec<u8>) -> u64 {
-        grant_high_water(&self.auth_grants, &peer_id)
-            .max(revoke_high_water(&self.revoke_epochs, &peer_id))
+        let grant_hw = self
+            .auth_grants
+            .get(&peer_key(&peer_id))
+            .map(|g| g.epoch)
+            .unwrap_or(0);
+        grant_hw.max(revoke_high_water(&self.revoke_epochs, &peer_id))
     }
 
-    /// Full grants list, resolved to *effective* roles — for
-    /// `vosx space role list`. A grant dominated by a revoke or a
-    /// revoked delegator is omitted.
+    /// One page of grants, resolved to *effective* roles — for
+    /// `vosx space role list`. A grant dominated by a revoke or a revoked
+    /// delegator is omitted from `grants`, but the returned
+    /// [`AuthGrantPage::next`] tracks the last *scanned* peer so the caller
+    /// pages the whole table without skipping. Empty `after_peer` starts;
+    /// continue until `next` is empty. `budget` caps the page.
     #[msg]
-    async fn auth_grants(&self) -> Vec<AuthGrantRow> {
-        self.auth_grants
-            .iter()
+    async fn auth_grants(&self, after_peer: Vec<u8>, budget: u32) -> AuthGrantPage {
+        let skip = (!after_peer.is_empty()).then(|| peer_key(&after_peer));
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut raw = self
+            .auth_grants
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k))
+            .map(|(_, g)| g);
+        let (page, more) = fill_page(&mut raw, page_rows(budget).min(ROLE_PAGE_MAX_ROWS), PAGE_BYTE_BUDGET);
+        let next = if more {
+            page.last().map(|g| g.peer_id.clone()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let grants = page
+            .into_iter()
             .filter_map(|g| {
                 let role = self.effective_role(&g.peer_id);
-                (role != AUTH_ROLE_NONE).then(|| AuthGrantRow {
-                    peer_id: g.peer_id.clone(),
+                (role != AUTH_ROLE_NONE).then_some(AuthGrantRow {
+                    peer_id: g.peer_id,
                     role,
                     epoch: g.epoch,
-                    grantor: g.grantor.clone(),
+                    grantor: g.grantor,
                 })
             })
-            .collect()
+            .collect();
+        AuthGrantPage { grants, next }
     }
 
     // ── Actor-local ACLs (M4) ──────────────────────────────────
@@ -1261,35 +1276,27 @@ impl SpaceRegistry {
             return Status::Forbidden;
         };
         let grantor = grantor.to_vec();
-        match self
-            .actor_acls
-            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
-        {
-            Ok(idx) => {
-                // One row per (peer, agent): same root-dominates ordering
-                // as the space-level grants (see `grant_supersedes`).
-                let cur = &self.actor_acls[idx];
-                if grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root) {
-                    self.actor_acls[idx].role = role;
-                    self.actor_acls[idx].epoch = epoch;
-                    self.actor_acls[idx].grantor = grantor;
-                }
-                Status::Ok
-            }
-            Err(insert_at) => {
-                self.actor_acls.insert(
-                    insert_at,
-                    ActorAclRow {
-                        peer_id,
-                        agent_name,
-                        role,
-                        epoch,
-                        grantor,
-                    },
-                );
-                Status::Ok
-            }
+        // One row per (peer, agent): same root-dominates ordering as the
+        // space-level grants (see `grant_supersedes`). A fresh pair always
+        // supersedes.
+        let key = acl_key(&peer_id, &agent_name);
+        let supersedes = match self.actor_acls.get(&key) {
+            Some(cur) => grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root),
+            None => true,
+        };
+        if supersedes {
+            self.actor_acls.insert(
+                &key,
+                &ActorAclRow {
+                    peer_id,
+                    agent_name,
+                    role,
+                    epoch,
+                    grantor,
+                },
+            );
         }
+        Status::Ok
     }
 
     /// Revoke the actor-local grant for `(peer_id, agent_name)` at
@@ -1325,8 +1332,8 @@ impl SpaceRegistry {
     async fn actor_epoch(&self, peer_id: Vec<u8>, agent_name: String) -> u64 {
         let grant = self
             .actor_acls
-            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
-            .map(|idx| self.actor_acls[idx].epoch)
+            .get(&acl_key(&peer_id, &agent_name))
+            .map(|a| a.epoch)
             .unwrap_or(0);
         grant.max(actor_revoke_high_water(
             &self.actor_revoke_epochs,
@@ -1353,26 +1360,55 @@ impl SpaceRegistry {
             .unwrap_or(AUTH_ROLE_NONE)
     }
 
-    /// Full actor-local ACL list, resolved to *effective* roles — for
-    /// `vosx space role list --in <actor>` and operator audit. A grant
-    /// dominated by a revoke or a revoked delegator is omitted.
+    /// One page of actor-local ACLs, resolved to *effective* roles — for
+    /// `vosx space role list --in <actor>` and operator audit. Rows with no
+    /// effective grant (revoked or revoked-delegator) are omitted from
+    /// `acls`; the returned [`ActorAclPage`] cursor tracks the last
+    /// *scanned* `(peer, agent)` so the caller pages the whole table.
+    /// Empty `after_peer`/`after_agent` starts; continue until both are
+    /// empty. `budget` caps the page.
     #[msg]
-    async fn actor_acls(&self) -> Vec<ActorAclRow> {
-        self.actor_acls
-            .iter()
+    async fn actor_acls(
+        &self,
+        after_peer: Vec<u8>,
+        after_agent: String,
+        budget: u32,
+    ) -> ActorAclPage {
+        let skip = (!after_peer.is_empty() || !after_agent.is_empty())
+            .then(|| acl_key(&after_peer, &after_agent));
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut raw = self
+            .actor_acls
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k))
+            .map(|(_, a)| a);
+        let (page, more) = fill_page(&mut raw, page_rows(budget).min(ROLE_PAGE_MAX_ROWS), PAGE_BYTE_BUDGET);
+        let (next_peer, next_agent) = if more {
+            page.last()
+                .map(|a| (a.peer_id.clone(), a.agent_name.clone()))
+                .unwrap_or_default()
+        } else {
+            (Vec::new(), String::new())
+        };
+        let acls = page
+            .into_iter()
             .filter_map(|a| {
                 self.effective_actor_role(&a.peer_id, &a.agent_name)
                     .map(|role| ActorAclRow {
-                        peer_id: a.peer_id.clone(),
-                        agent_name: a.agent_name.clone(),
+                        peer_id: a.peer_id,
+                        agent_name: a.agent_name,
                         role,
                         epoch: a.epoch,
-                        grantor: a.grantor.clone(),
+                        grantor: a.grantor,
                     })
             })
-            .collect()
+            .collect();
+        ActorAclPage {
+            acls,
+            next_peer,
+            next_agent,
+        }
     }
-
 }
 
 // ── Signed-op authorization ────────────────────────────────────────
@@ -1436,17 +1472,14 @@ impl SpaceRegistry {
 
     fn effective_role_depth(&self, peer_id: &[u8], depth: usize) -> u8 {
         // A grant chain longer than the number of grants must contain a
-        // cycle, which can never bottom out at the root — refuse it.
-        if depth > self.auth_grants.len() {
+        // cycle, which can never bottom out at the root — refuse it. The
+        // map's count comes from its meta row (cached for the dispatch).
+        if depth as u64 > self.auth_grants.len() {
             return AUTH_ROLE_NONE;
         }
-        let Ok(idx) = self
-            .auth_grants
-            .binary_search_by(|g| compare_bytes(&g.peer_id, peer_id).cmp(&0))
-        else {
+        let Some(row) = self.auth_grants.get(&peer_key(peer_id)) else {
             return AUTH_ROLE_NONE;
         };
-        let row = &self.auth_grants[idx];
         if row.epoch <= revoke_high_water(&self.revoke_epochs, peer_id) {
             return AUTH_ROLE_NONE;
         }
@@ -1468,11 +1501,7 @@ impl SpaceRegistry {
     /// when there is no row at all so the dispatch path can tell "no
     /// grant" from "role 0".
     fn effective_actor_role(&self, peer_id: &[u8], agent_name: &str) -> Option<u8> {
-        let idx = self
-            .actor_acls
-            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, peer_id, agent_name))
-            .ok()?;
-        let row = &self.actor_acls[idx];
+        let row = self.actor_acls.get(&acl_key(peer_id, agent_name))?;
         if row.epoch <= actor_revoke_high_water(&self.actor_revoke_epochs, peer_id, agent_name) {
             return None;
         }
@@ -1571,14 +1600,6 @@ fn grant_supersedes(
     compare_bytes(new_grantor, cur_grantor) < 0
 }
 
-/// Highest grant epoch recorded for `peer_id`, or 0 if no grant row.
-fn grant_high_water(grants: &[AuthGrantRow], peer_id: &[u8]) -> u64 {
-    match grants.binary_search_by(|g| compare_bytes(&g.peer_id, peer_id).cmp(&0)) {
-        Ok(idx) => grants[idx].epoch,
-        Err(_) => 0,
-    }
-}
-
 fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     if b.len() != 32 {
         return None;
@@ -1596,6 +1617,12 @@ const PAGE_MAX_ROWS: usize = 128;
 /// Encoded-byte budget for one page, comfortably under the 1 MiB
 /// halt-output cap that carries the reply.
 const PAGE_BYTE_BUDGET: usize = 256 * 1024;
+
+/// Tighter page cap for the two role-list handlers: each row resolves an
+/// `effective_role`, an O(chain-depth) point-read walk, so the touched-row
+/// count is `page × depth` rather than `page`. Kept low enough that even a
+/// worst-case delegation chain stays under the per-dispatch row ceiling.
+const ROLE_PAGE_MAX_ROWS: usize = 48;
 
 /// Clamp a caller-supplied page budget to `[1, PAGE_MAX_ROWS]`. A `0`
 /// budget (caller didn't care) takes the max.
@@ -1615,6 +1642,24 @@ fn page_rows(budget: u32) -> usize {
 /// on it (`resolve`/`meta_for_instance` are exact-name point lookups).
 fn name_key(name: &str) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(b"space-registry/name-key/v1", &[name.as_bytes()])
+}
+
+/// Fixed-width `StorageMap` key for a variable-length peer id. One grant
+/// row per peer, so this is the whole key. Ordered iteration is by hashed
+/// key, not peer id — no consumer depends on peer order (grants are point
+/// looked-up in `effective_role`; the list handler pages).
+fn peer_key(peer_id: &[u8]) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"space-registry/peer-key/v1", &[peer_id])
+}
+
+/// Fixed-width `StorageMap` key for an actor-local `(peer_id, agent_name)`
+/// grant. Length-prefix the peer id so `(p‖q, name)` and `(p, q‖name)`
+/// can't collide into the same key.
+fn acl_key(peer_id: &[u8], agent_name: &str) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(
+        b"space-registry/acl-key/v1",
+        &[&(peer_id.len() as u32).to_be_bytes(), peer_id, agent_name.as_bytes()],
+    )
 }
 
 /// Position of an `AgentRow.consistency` byte on the monotone
