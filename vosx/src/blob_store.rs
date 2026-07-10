@@ -191,10 +191,14 @@ fn write_to_cache(hash: &BlobHash, bytes: &[u8]) -> Result<(), BlobError> {
     if p.exists() {
         return Ok(());
     }
-    // Atomic-ish: write to a temp file in the same directory,
-    // then rename. Same-fs rename is atomic on POSIX so partial
-    // bytes never appear under the canonical name.
-    let tmp = dir.join(format!("{}.tmp", hash.to_hex()));
+    // Atomic-ish: write to a temp file in the same directory, then
+    // rename. Same-fs rename is atomic on POSIX so partial bytes never
+    // appear under the canonical name. The temp name carries the pid so
+    // two processes caching the same (new) hash concurrently don't share
+    // a temp — otherwise one's rename moves the file out from under the
+    // other's, which then fails with `ENOENT`. Content-addressed, so
+    // whichever rename lands last wins with identical bytes.
+    let tmp = dir.join(format!("{}.tmp.{}", hash.to_hex(), std::process::id()));
     fs::write(&tmp, bytes)?;
     fs::rename(&tmp, &p)?;
     Ok(())
