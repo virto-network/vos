@@ -5787,6 +5787,138 @@ fn registry_authority_survives_state_blob_drift() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The members pager terminates when driven one row at a time across
+/// both phases (nodes, then identities), with no row duplicated or
+/// dropped. Pins the identity-phase cursor being the *hashed* 32-byte
+/// map key: a cursor derived from the original `public_key` could
+/// round-trip empty and collide with the empty-`next_key` "start of
+/// the identity phase" sentinel, restarting the phase forever. Also
+/// pins `add_identity` refusing the empty key outright.
+#[test]
+fn members_pager_terminates_one_row_at_a_time() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{
+        MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_VOTER, PROOF_KIND_MERKLE_INCLUSION,
+        SpaceRegistryRef, canonical_op_bytes, pack_auth,
+    };
+    use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry actor not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+
+    let root_key = SigningKey::from_bytes(&[13u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+
+    let mut node = VosNode::with_prefix(0x00ab);
+    node.register_at_id(
+        AgentConfig::new(registry_blob).with_consistency(Consistency::Ephemeral),
+        ServiceId::REGISTRY,
+    );
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+
+    for (prefix, seed) in [(3u32, 0x11u8), (5u32, 0x22u8)] {
+        let peer = peer_id_for([seed; 32]);
+        let canonical = canonical_op_bytes(
+            "add_node",
+            &[&prefix.to_le_bytes(), &peer, &[NODE_ROLE_VOTER]],
+        );
+        let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(reg.add_node(&mut &node, prefix, peer, NODE_ROLE_VOTER, auth))
+                .expect("add_node"),
+            space_registry::Status::Ok,
+        );
+    }
+    for seed in [0x41u8, 0x42, 0x43] {
+        let pk = vec![seed; 32];
+        let canonical = canonical_op_bytes(
+            "add_identity",
+            &[&pk, &[PROOF_KIND_MERKLE_INCLUSION], &[]],
+        );
+        let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(reg.add_identity(
+                &mut &node,
+                pk,
+                PROOF_KIND_MERKLE_INCLUSION,
+                Vec::new(),
+                auth,
+            ))
+            .expect("add_identity"),
+            space_registry::Status::Ok,
+        );
+    }
+    // The empty key is refused outright — it is not an identity, and
+    // it is the pager's phase-start sentinel.
+    {
+        let canonical = canonical_op_bytes(
+            "add_identity",
+            &[&[], &[PROOF_KIND_MERKLE_INCLUSION], &[]],
+        );
+        let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(reg.add_identity(
+                &mut &node,
+                Vec::new(),
+                PROOF_KIND_MERKLE_INCLUSION,
+                Vec::new(),
+                auth,
+            ))
+            .expect("add_identity"),
+            space_registry::Status::BadHash,
+        );
+    }
+
+    // Drain one row per page. 5 members ⇒ the drain must finish in
+    // well under 12 iterations; a cursor/sentinel collision loops.
+    let mut kind = MEMBER_KIND_NODE;
+    let mut key: Vec<u8> = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        let page = vos::block_on(reg.members(&mut &node, kind, key.clone(), 1)).expect("members");
+        seen.extend(page.members.iter().map(|m| (m.kind, m.key.clone(), m.prefix)));
+        if !page.more {
+            break;
+        }
+        kind = page.next_kind;
+        key = page.next_key;
+    }
+    assert_eq!(seen.len(), 5, "every member exactly once: {seen:?}");
+    let nodes: Vec<u16> = seen
+        .iter()
+        .filter(|(k, _, _)| *k == MEMBER_KIND_NODE)
+        .map(|(_, _, p)| *p)
+        .collect();
+    let ids: Vec<Vec<u8>> = seen
+        .iter()
+        .filter(|(k, _, _)| *k == MEMBER_KIND_IDENTITY)
+        .map(|(_, key, _)| key.clone())
+        .collect();
+    assert_eq!(nodes, vec![3, 5], "nodes in prefix order");
+    assert_eq!(ids.len(), 3, "all identities present");
+    node.collect();
+}
+
 #[test]
 #[cfg(feature = "network")]
 fn cross_space_bridge_forward_dispatches_to_local_target() {

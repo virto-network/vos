@@ -181,12 +181,15 @@ pub struct ActorAclPage {
 }
 
 /// One page of [`RegistryRef::members`]. Members are two key spaces —
-/// nodes (by `prefix`) then identities (by `public_key`) — stitched into
+/// nodes (by `prefix`) then identities (by hashed key) — stitched into
 /// one ordered stream. The cursor names the phase to resume (`next_kind`)
 /// and the resume-after key within it (`next_key`: a node's 2-byte prefix
-/// or an identity's `public_key`; empty = that phase's start). `more` is
-/// the terminator — `next_kind` alone can't be, since `MEMBER_KIND_NODE`
-/// is `0`. Use [`RegistryRef::members_all`] to drain the whole stream.
+/// or an identity's hashed 32-byte map key; empty = that phase's start).
+/// The identity cursor is the *hashed* key, never the original
+/// `public_key`, so it can't be empty and can't collide with the
+/// phase-start sentinel. `more` is the terminator — `next_kind` alone
+/// can't be, since `MEMBER_KIND_NODE` is `0`. Round-trip the cursor
+/// opaquely. Use [`RegistryRef::members_all`] to drain the whole stream.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
 #[rkyv(crate = rkyv)]
 pub struct MemberPage {

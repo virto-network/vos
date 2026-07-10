@@ -1006,6 +1006,11 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
+        // An empty key is not an identity — and defense in depth for
+        // the members() pager, whose phase-start sentinel is empty.
+        if public_key.is_empty() {
+            return Status::BadHash;
+        }
         // Idempotent upsert keyed by the identity public key.
         self.identities.insert(
             &identity_key(&public_key),
@@ -1070,21 +1075,35 @@ impl SpaceRegistry {
             }
             // No nodes in range: fall through into the identity phase now.
         }
-        // Identity phase.
-        let skip = (after_kind == MEMBER_KIND_IDENTITY && !after_key.is_empty())
-            .then(|| identity_key(&after_key));
+        // Identity phase. The cursor carries the row's *hashed* 32-byte
+        // map key — never the original public key. A hashed cursor can't
+        // be empty, so it can't collide with the empty-`next_key`
+        // "start of the identity phase" sentinel the node phase hands
+        // out (an identity whose original key round-tripped as an empty
+        // cursor would restart the phase forever).
+        let skip: Option<[u8; 32]> = (after_kind == MEMBER_KIND_IDENTITY
+            && after_key.len() == 32)
+            .then(|| {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&after_key);
+                k
+            });
         let start = skip.unwrap_or([0u8; 32]);
         let mut it = self
             .identities
             .iter_from(&start)
-            .filter(move |(k, _)| skip != Some(*k))
-            .map(|(_, m)| m);
+            .filter(move |(k, _)| skip != Some(*k));
         let (page, more) = fill_page(&mut it, cap, PAGE_BYTE_BUDGET);
-        if more {
-            let next_key = page.last().map(|m| m.key.clone()).unwrap_or_default();
-            MemberPage { members: page, next_kind: MEMBER_KIND_IDENTITY, next_key, more: true }
+        let next_key = if more {
+            page.last().map(|(k, _)| k.to_vec()).unwrap_or_default()
         } else {
-            MemberPage { members: page, next_kind: 0, next_key: Vec::new(), more: false }
+            Vec::new()
+        };
+        let members = page.into_iter().map(|(_, m)| m).collect();
+        if more {
+            MemberPage { members, next_kind: MEMBER_KIND_IDENTITY, next_key, more: true }
+        } else {
+            MemberPage { members, next_kind: 0, next_key: Vec::new(), more: false }
         }
     }
 
