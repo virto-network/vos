@@ -379,6 +379,56 @@ major defects, all fixed on the branch before merge:
 **Gate W4**: full gate incl. proving e2e; 0x02 anchors verified
 end-to-end; 0x01 actors byte-for-byte unaffected.
 
+### W4 as built (4.1, 4.2, 4.4 landed; 4.3 remaining)
+
+- **4.1** — `vos::zk::state` generalizes the math to any key width
+  with parameterized domains (cipher-clerk byte-parity pinned against
+  vectors computed by running cipher-clerk itself);
+  `vos::storage::CommittedMap` is the row-backed incremental tree:
+  node rows only at branching points (every stored node has two
+  non-empty children; delete collapses), a root row
+  `[count][root hash][top ref]`, spines recomputed off the empty
+  chain. Mutations touch O(log n) rows; the structure is a pure
+  function of the key set (row-snapshot byte-identity across
+  histories); in-order DFS is the ordered index per decision 4b.
+- **4.2** — the composite root (state-blob hash folded with the
+  committed field roots, declaration order) is ITSELF a framework
+  storage row (`__vos_committed_root`), written at halt only when it
+  moved. The host's expected-anchor check reads that row through the
+  same journal overlay as the state blob — genesis-first-dispatch,
+  chained tick iterations, and cold restart all work with zero
+  host-side metadata. Guest `CURRENT_ANCHOR` carries the blob hash
+  separately (blob-moved ≠ anchor-moved under 0x02). Tasks stay on
+  0x01 until 4.3. Fixture: `examples/actors/committed-counter` + e2e.
+  The guest-framework change took the expected re-pin (cheap half —
+  floors unchanged; drift guard re-proved green), and the catalog
+  lockstep test now also pins `unpatched_image_root` trace-only.
+- **4.4** — clerk-ledger's six kernel collections are
+  `#[storage(committed)]` maps under cipher-clerk's domains with
+  canonical leaf contents (`insert_with_leaf`), so the composite stays
+  byte-identical to the from-scratch rebuild and vouchers keep
+  verifying; `state_root` is O(1); the twice-per-transfer rebuild is
+  gone; `create_accounts` batches ~8 signed creates per 4 KiB message.
+  Capstone green: 10k accounts through the real PVM, a transfer at
+  10k in ~66 ms, and the incremental root byte-equal to a rebuild
+  from the raw persisted rows. Sequenced BEFORE 4.3 deliberately: the
+  ledger's provable path is app-level (voucher-check +
+  `SuccinctTransitionWitness`), so the capstone needs the incremental
+  roots, not the generic witnessed backend.
+- **4.3 (remaining)** — the generic witnessed-read backend for
+  provable Tasks over committed storage. Banked constraints: the
+  two-backend seam is `storage.rs::backend_read` (a Task's STORAGE_R
+  is an echo stub — the witnessed backend must panic on unproven
+  reads, never fall through); Task input staging lives only in
+  `build_task_kernel` and must stay byte-identical with
+  `task_initial_image` + the tracer patch path (live≡traced gate);
+  `__VOS_WITNESS` already carries two layouts (zk pub/sec, VOST task
+  input) and the host never checks buffer capacity; the `.vos_meta`
+  storage section appends after the mode section. A10 (Task effects
+  dropped on replica rebuild — and `commit_rebuilt` now actively
+  swaps them away) gates witnessed Tasks on replicated agents: fix
+  A10 first or keep such actors Local.
+
 ## Open questions (resolve before the wave that needs them)
 
 1. **Warm-guest invalidation on out-of-band CRDT merge** — RESOLVED
@@ -433,10 +483,14 @@ end-to-end; 0x01 actors byte-for-byte unaffected.
 2. **Registry ordering semantics** (3.1): do any registry consumers
    depend on insertion order of `members`/`agents`? If so those become
    `StorageVec` + side index rather than ordered maps.
-3. **SMT leaf domain** (4.1): one tree over the whole keyspace vs one
-   per committed field with a top hash combining field roots. Per-field
-   roots keep proofs smaller and prefixes independent; whole-keyspace is
-   simpler host-side. Decide when porting.
+3. **SMT leaf domain** (4.1): RESOLVED — per-field trees with a top
+   fold. Decision 4b already required it (the unhashed-key SMT doubles
+   as the ordered index, which needs a fixed width per tree), and it
+   is what lets clerk-ledger's fields carry cipher-clerk's domains for
+   voucher parity while the anchor composite folds under vos domains.
+   The composite is a linear fold (state hash, then field roots in
+   declaration order) rather than a balanced tree — field counts are
+   tiny and the fold is what the macro can emit cheaply.
 4. **A10 fix ordering** (4.3): witnessed Tasks on replicated agents
    need the Task-effects-on-rebuild fix; sequence it before 4.4 if the
    ledger stays Raft/CRDT-replicated in the showcase.
