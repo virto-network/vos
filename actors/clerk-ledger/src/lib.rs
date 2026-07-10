@@ -27,25 +27,33 @@
 //!
 //! ## State
 //!
-//! - `journal`: the single `cipher_clerk::types::Journal` this
-//!   ledger is anchored to.
-//! - `accounts`: sorted-by-id `Vec<Account>`.
-//! - `transfers`: sorted-by-id `Vec<Transfer>`. Accepted transfers
-//!   accumulate here; the kernel reads them for void-of /
-//!   pending-finalization lookups.
-//! - `external_ids`: sorted `Vec<[u8; 32]>` — idempotency set.
-//! - `voided_transfers`: sorted `Vec<[u8; 16]>` — TransferIds that
-//!   have been voided; second-void is rejected.
-//! - `pending_statuses`: sorted-by-id `Vec<PendingStatusEntry>` —
-//!   two-phase lifecycle (Pending / Posted / Voided).
-//! - `transfer_roots`: per-accepted-transfer (root_before,
-//!   root_after) anchor pair. Read by voucher emission.
-//! - `note_commitments`: append-only L3 shielded-note pool.
+//! Every collection lives in `#[storage(committed)]` maps — per-key
+//! rows bound by incrementally-maintained SMT roots — so the ledger's
+//! size is bounded by a dispatch's *touched set*, not the account
+//! count, and the composite state root reads in O(1) from the six
+//! per-field root rows instead of an O(N log N) rebuild:
 //!
-//! Cipher-clerk types embed in the actor's rkyv archive (the two
-//! rkyv namespaces unify at the shared 0.8 version), so the kernel
-//! reads from / writes to this state via the `LedgerState` trait
-//! without any encode/decode-per-access overhead.
+//! - `journal`: one-entry committed map (the journal sub-SMT);
+//!   `journal_id` in the blob is the O(1) handle to it.
+//! - `accounts` / `transfers`: committed maps keyed by id.
+//! - `external_ids`: committed map keyed by `external_id_key(eid)`
+//!   (the 16-byte hash), storing the full 32-byte id — idempotency
+//!   set; a slot collision reports "seen" so the kernel rejects.
+//! - `voided_transfers` / `pending_statuses`: committed maps keyed by
+//!   TransferId (presence marker / lifecycle status byte).
+//! - `transfer_roots`: plain storage map — per-accepted-transfer
+//!   (root_before, root_after) anchor pair, read by voucher emission.
+//!   Not part of the composite (vouchers sign the six-subtree shape).
+//! - `note_commitments`: append-only L3 shielded-note pool
+//!   (`StorageVec` — the Merkle leaf order is the insertion order).
+//!
+//! The committed maps carry cipher-clerk's SMT hash domains and leaf
+//! encodings, so the composite root stays byte-identical to a
+//! from-scratch `composite_state_root` rebuild over the same content
+//! — vouchers in flight keep verifying. Cipher-clerk types encode
+//! per-row (the two rkyv namespaces unify at the shared 0.8 version),
+//! and the kernel reads/writes through the `LedgerState` trait as
+//! point operations.
 //!
 //! ## How transfers work
 //!
@@ -79,8 +87,10 @@ use vos::prelude::*;
 pub use status::Status;
 pub use wire::{Opening, PendingStatusEntry, TransferRootEntry};
 
+use cipher_clerk::state_root::{composite_root_from_subroots, journal_leaf_content};
+use vos::storage::{CommittedMap, StorageMap, StorageVec};
+
 use oracle::{NoopOracle, StatefulOracle};
-use smt::compute_state_root;
 use status::map_event_status;
 use view::LedgerView;
 
@@ -120,29 +130,66 @@ pub use roles::{CLERK_LEDGER_SPACE_ROLE_MAP, ClerkLedgerRole};
     space_role_map = CLERK_LEDGER_SPACE_ROLE_MAP,
 )]
 pub struct ClerkLedger {
-    journal: Option<CcJournal>,
-    /// Sorted by `id` ascending; lookups via `binary_search_by_key`.
-    /// BTreeMap-ergonomics deferred until either the grey transpiler
-    /// supports the codegen it emits or `docs/design/table.md`'s
-    /// Table primitive lands.
-    accounts: Vec<CcAccount>,
-    transfers: Vec<CcTransfer>,
-    /// Sorted ascending.
-    external_ids: Vec<[u8; 32]>,
-    /// Sorted ascending — voided TransferIds.
-    voided_transfers: Vec<[u8; 16]>,
-    /// Sorted by `id` ascending.
-    pending_statuses: Vec<PendingStatusEntry>,
-    /// Per-accepted-transfer `(root_before, root_after)` pair.
-    /// Sorted by `id` ascending. Populated by `apply_transfer` at
-    /// the moment the kernel accepts the transfer — `root_before`
-    /// is the composite state root just before the kernel runs,
-    /// `root_after` is the composite state root just after the
-    /// kernel's state mutations land. Voucher emission anchors to
+    /// The bootstrapped journal's id — `None` until `bootstrap`. The
+    /// journal row itself lives in the committed `journal` map (its
+    /// sub-SMT root feeds the composite); the blob keeps only this
+    /// O(1) handle to it.
+    journal_id: Option<[u8; 16]>,
+    /// The six kernel-checked collections, each a committed map under
+    /// cipher-clerk's SMT hash domains so the per-field roots — and
+    /// the composite — stay byte-identical to a from-scratch
+    /// `composite_state_root` rebuild. Leaf contents are supplied per
+    /// insert (`state_root::*_leaf_content`) for the same reason.
+    #[storage(
+        committed,
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
+    )]
+    accounts: CommittedMap<[u8; 16], CcAccount>,
+    #[storage(
+        committed,
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
+    )]
+    transfers: CommittedMap<[u8; 16], CcTransfer>,
+    #[storage(
+        committed,
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
+    )]
+    journal: CommittedMap<[u8; 16], CcJournal>,
+    /// Keyed by `external_id_key(eid)` (16-byte hash of the 32-byte
+    /// id); the value pins the full id, so a hashed-slot collision
+    /// reports "seen" and the kernel rejects instead of aliasing.
+    #[storage(
+        committed,
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
+    )]
+    external_ids: CommittedMap<[u8; 16], [u8; 32]>,
+    #[storage(
+        committed,
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
+    )]
+    voided_transfers: CommittedMap<[u8; 16], u8>,
+    #[storage(
+        committed,
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
+    )]
+    pending_statuses: CommittedMap<[u8; 16], u8>,
+    /// Per-accepted-transfer `(root_before, root_after)` pair,
+    /// keyed by transfer id. Populated by `apply_transfer` at the
+    /// moment the kernel accepts the transfer — `root_before` is the
+    /// composite state root just before the kernel runs, `root_after`
+    /// just after its mutations land. Voucher emission anchors to
     /// these two values; the host-side caller queries
     /// `transfer_state_roots` immediately after `apply_transfer`
-    /// returns `Status::Ok`.
-    transfer_roots: Vec<TransferRootEntry>,
+    /// returns `Status::Ok`. Not part of the composite root (vouchers
+    /// sign the six-subtree shape), so a plain storage map.
+    #[storage]
+    transfer_roots: StorageMap<[u8; 16], TransferRootEntry>,
     /// L3 shielded-note commitments (Pedersen points,
     /// `cipher_clerk::crypto::Amount` bytes). Append-only — the
     /// Merkle-tree leaf order is the insertion order, and
@@ -151,28 +198,31 @@ pub struct ClerkLedger {
     /// opening is held off-ledger by the recipient; this actor
     /// only sees the commitment. Outgoing-side spends would later
     /// publish nullifiers — the spent-set is a follow-up slice.
-    note_commitments: Vec<[u8; 32]>,
+    #[storage]
+    note_commitments: StorageVec<[u8; 32]>,
 }
 
 impl ClerkLedger {
     /// Composite SMT root over the actor's full kernel-checked state —
     /// accounts/transfers/journal plus the bookkeeping sets (external
     /// ids, voided transfers, pending statuses), per cipher-clerk's
-    /// state-root format.
+    /// state-root format. O(1): six root-row reads and five node
+    /// hashes — the roots are maintained incrementally as the maps
+    /// mutate.
     fn composite_root(&self) -> [u8; 32] {
-        let pending: Vec<([u8; 16], u8)> = self
-            .pending_statuses
-            .iter()
-            .map(|p| (p.id, p.status))
-            .collect();
-        compute_state_root(
-            &self.accounts,
-            &self.transfers,
-            self.journal.as_ref(),
-            &self.external_ids,
-            &self.voided_transfers,
-            &pending,
+        composite_root_from_subroots(
+            &self.accounts.root(),
+            &self.transfers.root(),
+            &self.journal.root(),
+            &self.external_ids.root(),
+            &self.voided_transfers.root(),
+            &self.pending_statuses.root(),
         )
+    }
+
+    /// The bootstrapped journal row, if any.
+    fn journal_row(&self) -> Option<CcJournal> {
+        self.journal_id.and_then(|id| self.journal.get(&id))
     }
 }
 
@@ -180,14 +230,15 @@ impl ClerkLedger {
 impl ClerkLedger {
     fn new() -> Self {
         Self {
-            journal: None,
-            accounts: Vec::new(),
-            transfers: Vec::new(),
-            external_ids: Vec::new(),
-            voided_transfers: Vec::new(),
-            pending_statuses: Vec::new(),
-            transfer_roots: Vec::new(),
-            note_commitments: Vec::new(),
+            journal_id: None,
+            accounts: Default::default(),
+            transfers: Default::default(),
+            journal: Default::default(),
+            external_ids: Default::default(),
+            voided_transfers: Default::default(),
+            pending_statuses: Default::default(),
+            transfer_roots: Default::default(),
+            note_commitments: Default::default(),
         }
     }
 
@@ -215,28 +266,27 @@ impl ClerkLedger {
             AuthKey(registrar_pubkey),
             code as u16,
         );
-        match &self.journal {
+        match self.journal_row() {
             None => {
-                self.journal = Some(proposed);
+                self.journal_id = Some(journal_id);
+                let content = journal_leaf_content(&proposed);
+                self.journal
+                    .insert_with_leaf(&journal_id, &proposed, &content);
                 Status::Ok
             }
-            Some(existing) if *existing == proposed => Status::Ok,
+            Some(existing) if existing == proposed => Status::Ok,
             Some(_) => Status::AlreadyBootstrapped,
         }
     }
 
     #[msg]
     async fn journal_id(&self) -> Vec<u8> {
-        self.journal
-            .as_ref()
-            .map(|j| j.id.0.to_vec())
-            .unwrap_or_default()
+        self.journal_id.map(|id| id.to_vec()).unwrap_or_default()
     }
 
     #[msg]
     async fn registrar_pubkey(&self) -> Vec<u8> {
-        self.journal
-            .as_ref()
+        self.journal_row()
             .map(|j| j.registrar_auth_key.0.to_vec())
             .unwrap_or_default()
     }
@@ -250,29 +300,24 @@ impl ClerkLedger {
         create_account_bytes: Vec<u8>,
         batch_seed_timestamp: u64,
     ) -> Status {
-        if self.journal.is_none() {
+        let Some(journal) = self.journal_row() else {
             return Status::NotBootstrapped;
-        }
+        };
 
         let create: CcCreateAccount = decode_or_bad_input!(&create_account_bytes, CcCreateAccount);
 
-        let registrar_key = self
-            .journal
-            .as_ref()
-            .map(|j| j.registrar_auth_key)
-            .expect("bootstrap check above ensures journal is Some");
         let payload = create.account.signing_payload();
-        if !verify_signature(&registrar_key, &payload, &create.signature) {
+        if !verify_signature(&journal.registrar_auth_key, &payload, &create.signature) {
             return Status::SignatureInvalid;
         }
 
         let mut view = LedgerView::new(
             &mut self.accounts,
             &mut self.transfers,
+            &self.journal,
             &mut self.external_ids,
             &mut self.voided_transfers,
             &mut self.pending_statuses,
-            self.journal.as_ref(),
         );
         let mut oracle = NoopOracle;
         let results = apply_account_creations(
@@ -282,6 +327,53 @@ impl ClerkLedger {
             batch_seed_timestamp,
         );
         map_event_status(results[0].status)
+    }
+
+    /// Accept a batch of registrar-signed `CreateAccount`s in one
+    /// dispatch — bulk onboarding (the kernel's
+    /// `apply_account_creations` is batch-native). The caller sizes
+    /// batches to the 4 KiB message cap (~8 signed creates). The same
+    /// signature gate as `create_account` runs per item BEFORE the
+    /// kernel, and one junk-signed item rejects the whole batch
+    /// without touching state. Replies with one `Status` byte per
+    /// item (a single byte on batch-level rejection).
+    #[msg(role = ClerkLedgerRole::Operator)]
+    async fn create_accounts(
+        &mut self,
+        creates_bytes: Vec<u8>,
+        batch_seed_timestamp: u64,
+    ) -> Vec<u8> {
+        let Some(journal) = self.journal_row() else {
+            return vec![Status::NotBootstrapped as u8];
+        };
+        let creates: Vec<CcCreateAccount> =
+            match vos::rkyv::from_bytes::<Vec<CcCreateAccount>, vos::rkyv::rancor::Error>(
+                &creates_bytes,
+            ) {
+                Ok(v) => v,
+                Err(_) => return vec![Status::BadInput as u8],
+            };
+        for create in &creates {
+            let payload = create.account.signing_payload();
+            if !verify_signature(&journal.registrar_auth_key, &payload, &create.signature) {
+                return vec![Status::SignatureInvalid as u8];
+            }
+        }
+        let mut view = LedgerView::new(
+            &mut self.accounts,
+            &mut self.transfers,
+            &self.journal,
+            &mut self.external_ids,
+            &mut self.voided_transfers,
+            &mut self.pending_statuses,
+        );
+        let mut oracle = NoopOracle;
+        let results =
+            apply_account_creations(&mut view, &creates, &mut oracle, batch_seed_timestamp);
+        results
+            .iter()
+            .map(|r| map_event_status(r.status) as u8)
+            .collect()
     }
 
     /// Accept a signed `cipher_clerk::types::Transfer` plus the
@@ -307,7 +399,7 @@ impl ClerkLedger {
         openings_bytes: Vec<u8>,
         batch_seed_timestamp: u64,
     ) -> Status {
-        if self.journal.is_none() {
+        if self.journal_id.is_none() {
             return Status::NotBootstrapped;
         }
         let transfer: CcTransfer = decode_or_bad_input!(&transfer_bytes, CcTransfer);
@@ -364,9 +456,8 @@ impl ClerkLedger {
             }
             let msg = transfer.signing_payload();
             for (acct_id, sig) in distinct_debits.iter().zip(transfer.signatures.iter()) {
-                let acct = match self.accounts.binary_search_by_key(&acct_id.0, |a| a.id.0) {
-                    Ok(i) => &self.accounts[i],
-                    Err(_) => return Status::SignatureInvalid,
+                let Some(acct) = self.accounts.get(&acct_id.0) else {
+                    return Status::SignatureInvalid;
                 };
                 if !verify_signature(&acct.auth_key, &msg, sig) {
                     return Status::SignatureInvalid;
@@ -384,10 +475,10 @@ impl ClerkLedger {
         let mut view = LedgerView::new(
             &mut self.accounts,
             &mut self.transfers,
+            &self.journal,
             &mut self.external_ids,
             &mut self.voided_transfers,
             &mut self.pending_statuses,
-            self.journal.as_ref(),
         );
         let mut oracle = StatefulOracle {
             openings: &openings,
@@ -410,18 +501,10 @@ impl ClerkLedger {
                 root_before,
                 root_after,
             };
-            match self
-                .transfer_roots
-                .binary_search_by_key(&entry.id, |e| e.id)
-            {
-                // A duplicate id at this point means the kernel
-                // accepted twice — replay protection should have
-                // caught it. Defensively overwrite rather than
-                // silently double-insert (which would break
-                // binary_search invariants).
-                Ok(i) => self.transfer_roots[i] = entry,
-                Err(i) => self.transfer_roots.insert(i, entry),
-            }
+            // A duplicate id at this point means the kernel accepted
+            // twice — replay protection should have caught it; the
+            // map upsert overwrites rather than double-records.
+            self.transfer_roots.insert(&entry.id, &entry);
         }
         status
     }
@@ -429,19 +512,13 @@ impl ClerkLedger {
     /// Read an account by id.
     #[msg(role = ClerkLedgerRole::Member)]
     async fn account(&self, id: [u8; 16]) -> Option<CcAccount> {
-        self.accounts
-            .binary_search_by_key(&id, |a| a.id.0)
-            .ok()
-            .map(|i| self.accounts[i].clone())
+        self.accounts.get(&id)
     }
 
     /// Read a transfer by id.
     #[msg(role = ClerkLedgerRole::Member)]
     async fn transfer(&self, id: [u8; 16]) -> Option<CcTransfer> {
-        self.transfers
-            .binary_search_by_key(&id, |t| t.id.0)
-            .ok()
-            .map(|i| self.transfers[i].clone())
+        self.transfers.get(&id)
     }
 
     /// Read the `(state_root_before, state_root_after)` anchor pair
@@ -459,14 +536,8 @@ impl ClerkLedger {
     #[msg(role = ClerkLedgerRole::Member)]
     async fn transfer_state_roots(&self, id: [u8; 16]) -> Option<(Vec<u8>, Vec<u8>)> {
         self.transfer_roots
-            .binary_search_by_key(&id, |e| e.id)
-            .ok()
-            .map(|i| {
-                (
-                    self.transfer_roots[i].root_before.to_vec(),
-                    self.transfer_roots[i].root_after.to_vec(),
-                )
-            })
+            .get(&id)
+            .map(|e| (e.root_before.to_vec(), e.root_after.to_vec()))
     }
 
     #[msg(role = ClerkLedgerRole::Member)]
@@ -488,15 +559,12 @@ impl ClerkLedger {
     /// forgeable anchor, so callers must distinguish "no root" from
     /// "this is the root".
     ///
-    /// Runtime cost: O(N · log N) per call (rebuilds sorted leaf
-    /// hashes then walks 128 SMT levels). Allocation-free recursion
-    /// — each call allocates O(N) for the leaf vec and frees it on
-    /// return; no persistent SMT state. The picky-fast path
-    /// (incremental cached sub-SMTs) is a follow-up optimisation;
-    /// today's demo scale doesn't pressure it.
+    /// Runtime cost: O(1) — six per-field root-row reads and five node
+    /// hashes; the roots are maintained incrementally as the committed
+    /// maps mutate.
     #[msg(role = ClerkLedgerRole::Member)]
     async fn state_root(&self) -> Vec<u8> {
-        match self.journal.as_ref() {
+        match self.journal_id {
             Some(_) => self.composite_root().to_vec(),
             None => Vec::new(),
         }
@@ -524,7 +592,7 @@ impl ClerkLedger {
         let Some(bytes) = try_array::<32>(commitment) else {
             return Status::BadInput;
         };
-        self.note_commitments.push(bytes);
+        self.note_commitments.push(&bytes);
         Status::Ok
     }
 
@@ -539,7 +607,7 @@ impl ClerkLedger {
     #[msg(role = ClerkLedgerRole::Member)]
     async fn note_commitment_at(&self, index: u32) -> Vec<u8> {
         self.note_commitments
-            .get(index as usize)
+            .get(index as u64)
             .map(|c| c.to_vec())
             .unwrap_or_default()
     }

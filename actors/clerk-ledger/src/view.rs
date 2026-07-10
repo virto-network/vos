@@ -1,101 +1,92 @@
-//! `LedgerView` — the borrowed mutable slice over `ClerkLedger`'s
-//! state that implements `cipher_clerk::state::LedgerState`. The
-//! kernel reads from / writes to the actor's fields through this
-//! trait surface; the actor never hands the kernel direct access.
+//! `LedgerView` — the borrowed mutable view over `ClerkLedger`'s
+//! committed storage maps that implements
+//! `cipher_clerk::state::LedgerState`. The kernel reads from / writes
+//! to the actor's state through this trait surface; the actor never
+//! hands the kernel direct access.
+//!
+//! Every operation is a point read or a point write plus the touched
+//! key's SMT branch path — the collections never materialize. Leaf
+//! contents are cipher-clerk's canonical encodings
+//! (`state_root::*_leaf_content`), so the per-field roots — and the
+//! composite [`root`](LedgerState::root) — stay byte-identical to a
+//! from-scratch `composite_state_root` rebuild over the same content.
 //!
 //! Field-targeted construction (rather than `&mut ClerkLedger`)
 //! keeps the borrow narrow — the handler can still touch
 //! `transfer_roots` / `note_commitments` / other state-tracking
-//! Vecs while the kernel runs.
+//! fields while the kernel runs.
 
-use alloc::vec::Vec;
 use cipher_clerk::ids::{
     AccountId as CcAccountId, ExternalId as CcExternalId, JournalId as CcJournalId,
     TransferId as CcTransferId,
 };
 use cipher_clerk::state::{LedgerState, Oracle, PendingStatus};
-use cipher_clerk::types::{Account as CcAccount, Journal as CcJournal, Transfer as CcTransfer};
-
-use crate::smt::compute_state_root;
-use crate::wire::{
-    PENDING_STATUS_PENDING, PENDING_STATUS_POSTED, PENDING_STATUS_VOIDED, PendingStatusEntry,
+use cipher_clerk::state_root::{
+    account_leaf_content, composite_root_from_subroots, external_id_key,
+    external_id_leaf_content, pending_leaf_content, transfer_leaf_content, voided_leaf_content,
 };
+use cipher_clerk::types::{Account as CcAccount, Journal as CcJournal, Transfer as CcTransfer};
+use vos::storage::CommittedMap;
 
-/// Mutable view over the actor's persistent state that implements
-/// cipher-clerk's `LedgerState`. The kernel reads from / writes to
-/// the actor's fields through this trait surface; the actor never
-/// hands the kernel direct access.
+use crate::wire::{PENDING_STATUS_PENDING, PENDING_STATUS_POSTED, PENDING_STATUS_VOIDED};
+
+/// Mutable view over the actor's committed maps that implements
+/// cipher-clerk's `LedgerState`.
 pub(crate) struct LedgerView<'a> {
-    accounts: &'a mut Vec<CcAccount>,
-    transfers: &'a mut Vec<CcTransfer>,
-    external_ids: &'a mut Vec<[u8; 32]>,
-    voided_transfers: &'a mut Vec<[u8; 16]>,
-    pending_statuses: &'a mut Vec<PendingStatusEntry>,
-    journal: Option<&'a CcJournal>,
+    accounts: &'a mut CommittedMap<[u8; 16], CcAccount>,
+    transfers: &'a mut CommittedMap<[u8; 16], CcTransfer>,
+    journal: &'a CommittedMap<[u8; 16], CcJournal>,
+    external_ids: &'a mut CommittedMap<[u8; 16], [u8; 32]>,
+    voided_transfers: &'a mut CommittedMap<[u8; 16], u8>,
+    pending_statuses: &'a mut CommittedMap<[u8; 16], u8>,
 }
 
 impl<'a> LedgerView<'a> {
-    /// Field-targeted constructor — takes disjoint `&mut`s of the
-    /// state vectors the kernel might mutate plus a shared borrow
-    /// of the journal. Avoids the over-broad `&mut ClerkLedger`
-    /// borrow that would prevent the handler from touching any
-    /// other part of `self` while the view is alive.
+    /// Field-targeted constructor — takes disjoint borrows of the
+    /// committed maps the kernel might touch. The journal map is
+    /// read-only here: bootstrap owns journal writes.
     pub(crate) fn new(
-        accounts: &'a mut Vec<CcAccount>,
-        transfers: &'a mut Vec<CcTransfer>,
-        external_ids: &'a mut Vec<[u8; 32]>,
-        voided_transfers: &'a mut Vec<[u8; 16]>,
-        pending_statuses: &'a mut Vec<PendingStatusEntry>,
-        journal: Option<&'a CcJournal>,
+        accounts: &'a mut CommittedMap<[u8; 16], CcAccount>,
+        transfers: &'a mut CommittedMap<[u8; 16], CcTransfer>,
+        journal: &'a CommittedMap<[u8; 16], CcJournal>,
+        external_ids: &'a mut CommittedMap<[u8; 16], [u8; 32]>,
+        voided_transfers: &'a mut CommittedMap<[u8; 16], u8>,
+        pending_statuses: &'a mut CommittedMap<[u8; 16], u8>,
     ) -> Self {
         Self {
             accounts,
             transfers,
+            journal,
             external_ids,
             voided_transfers,
             pending_statuses,
-            journal,
         }
     }
 }
 
 impl LedgerState for LedgerView<'_> {
     fn root(&self) -> [u8; 32] {
-        let pending: Vec<([u8; 16], u8)> = self
-            .pending_statuses
-            .iter()
-            .map(|p| (p.id, p.status))
-            .collect();
-        compute_state_root(
-            self.accounts,
-            self.transfers,
-            self.journal,
-            self.external_ids,
-            self.voided_transfers,
-            &pending,
+        composite_root_from_subroots(
+            &self.accounts.root(),
+            &self.transfers.root(),
+            &self.journal.root(),
+            &self.external_ids.root(),
+            &self.voided_transfers.root(),
+            &self.pending_statuses.root(),
         )
     }
 
     fn get_account(&self, id: &CcAccountId, _o: &mut dyn Oracle) -> Option<CcAccount> {
-        self.accounts
-            .binary_search_by_key(&id.0, |a| a.id.0)
-            .ok()
-            .map(|i| self.accounts[i].clone())
+        self.accounts.get(&id.0)
     }
 
     fn put_account(&mut self, a: CcAccount, _o: &mut dyn Oracle) {
-        let id = a.id.0;
-        match self
-            .accounts
-            .binary_search_by_key(&id, |existing| existing.id.0)
-        {
-            Ok(i) => self.accounts[i] = a,
-            Err(i) => self.accounts.insert(i, a),
-        }
+        let content = account_leaf_content(&a);
+        self.accounts.insert_with_leaf(&a.id.0, &a, &content);
     }
 
     fn get_journal(&self, id: &CcJournalId, _o: &mut dyn Oracle) -> Option<CcJournal> {
-        self.journal.filter(|j| &j.id == id).cloned()
+        self.journal.get(&id.0)
     }
 
     fn put_journal(&mut self, _j: CcJournal, _o: &mut dyn Oracle) {
@@ -105,48 +96,48 @@ impl LedgerState for LedgerView<'_> {
     }
 
     fn get_transfer(&self, id: &CcTransferId, _o: &mut dyn Oracle) -> Option<CcTransfer> {
-        self.transfers
-            .binary_search_by_key(&id.0, |t| t.id.0)
-            .ok()
-            .map(|i| self.transfers[i].clone())
+        self.transfers.get(&id.0)
     }
 
     fn put_transfer(&mut self, t: CcTransfer, _o: &mut dyn Oracle) {
-        let id = t.id.0;
-        match self
-            .transfers
-            .binary_search_by_key(&id, |existing| existing.id.0)
-        {
-            Ok(i) => self.transfers[i] = t,
-            Err(i) => self.transfers.insert(i, t),
-        }
+        let content = transfer_leaf_content(&t);
+        self.transfers.insert_with_leaf(&t.id.0, &t, &content);
     }
 
     fn external_id_seen(&self, eid: &CcExternalId, _o: &mut dyn Oracle) -> bool {
-        self.external_ids.binary_search(&eid.0).is_ok()
+        // The slot is keyed by the id's 16-byte hash; the stored value
+        // pins the full 32-byte id. A different id occupying the slot
+        // (a 2^64 birthday collision) also reports "seen" so the
+        // kernel REJECTS — a collision must never alias one id's
+        // presence into another's acceptance.
+        self.external_ids.get(&external_id_key(&eid.0)).is_some()
     }
 
     fn mark_external_id(&mut self, eid: &CcExternalId, _o: &mut dyn Oracle) {
-        if let Err(i) = self.external_ids.binary_search(&eid.0) {
-            self.external_ids.insert(i, eid.0);
-        }
+        let key = external_id_key(&eid.0);
+        debug_assert!(
+            self.external_ids
+                .get(&key)
+                .is_none_or(|stored| stored == eid.0),
+            "external-id slot collision — seen-check must have rejected first",
+        );
+        let content = external_id_leaf_content(&eid.0);
+        self.external_ids.insert_with_leaf(&key, &eid.0, &content);
     }
 
     fn transfer_voided(&self, id: &CcTransferId, _o: &mut dyn Oracle) -> bool {
-        self.voided_transfers.binary_search(&id.0).is_ok()
+        self.voided_transfers.contains(&id.0)
     }
 
     fn mark_transfer_voided(&mut self, id: &CcTransferId, _o: &mut dyn Oracle) {
-        if let Err(i) = self.voided_transfers.binary_search(&id.0) {
-            self.voided_transfers.insert(i, id.0);
-        }
+        let content = voided_leaf_content(&id.0);
+        self.voided_transfers.insert_with_leaf(&id.0, &1u8, &content);
     }
 
     fn pending_status(&self, id: &CcTransferId, _o: &mut dyn Oracle) -> Option<PendingStatus> {
         self.pending_statuses
-            .binary_search_by_key(&id.0, |e| e.id)
-            .ok()
-            .map(|i| match self.pending_statuses[i].status {
+            .get(&id.0)
+            .map(|status| match status {
                 PENDING_STATUS_PENDING => PendingStatus::Pending,
                 PENDING_STATUS_POSTED => PendingStatus::Posted,
                 PENDING_STATUS_VOIDED => PendingStatus::Voided,
@@ -165,15 +156,7 @@ impl LedgerState for LedgerView<'_> {
             PendingStatus::Posted => PENDING_STATUS_POSTED,
             PendingStatus::Voided => PENDING_STATUS_VOIDED,
         };
-        match self.pending_statuses.binary_search_by_key(&id.0, |e| e.id) {
-            Ok(i) => self.pending_statuses[i].status = val,
-            Err(i) => self.pending_statuses.insert(
-                i,
-                PendingStatusEntry {
-                    id: id.0,
-                    status: val,
-                },
-            ),
-        }
+        let content = pending_leaf_content(&id.0, val);
+        self.pending_statuses.insert_with_leaf(&id.0, &val, &content);
     }
 }

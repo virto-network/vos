@@ -41,6 +41,9 @@ cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features 
 # actor.
 [dev-dependencies]
 cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", features = ["helpers", "signing"] }
+# The unit tests exercise the committed maps against the mock storage
+# backend (`std` provides it); dev-deps never reach the riscv64 build.
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension", "std", "storage", "network"] }
 
 [profile.release]
 opt-level = "s"

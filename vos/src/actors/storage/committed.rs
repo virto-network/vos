@@ -322,11 +322,26 @@ impl<K: FixedKey, V: Encode + Decode> CommittedMap<K, V> {
     /// hash commits the value's encoded bytes, the key is committed by
     /// its tree position.
     pub fn insert(&mut self, key: &K, value: &V) -> bool {
-        let kb = Self::key_bytes(key);
         let encoded = value.encode();
+        self.insert_encoded(key, encoded.clone(), &encoded)
+    }
+
+    /// Insert with caller-supplied leaf content — for trees whose leaf
+    /// encoding is pinned outside vos (clerk-ledger's cipher-clerk
+    /// parity leaves: a domain-tag byte followed by the payload). The
+    /// value row still stores `value`'s own encoding; only the hash
+    /// input differs. The caller owns keeping content and value in
+    /// lockstep — a divergence shows up as a root that no rebuild
+    /// reproduces.
+    pub fn insert_with_leaf(&mut self, key: &K, value: &V, leaf_content: &[u8]) -> bool {
+        self.insert_encoded(key, value.encode(), leaf_content)
+    }
+
+    fn insert_encoded(&mut self, key: &K, value_bytes: Vec<u8>, leaf_content: &[u8]) -> bool {
+        let kb = Self::key_bytes(key);
         let p = self.params();
-        let leaf = state::leaf_hash(&p, &encoded);
-        overlay_store(self.value_row(&kb), Some(encoded));
+        let leaf = state::leaf_hash(&p, leaf_content);
+        overlay_store(self.value_row(&kb), Some(value_bytes));
         self.update_tree(&kb, Some(leaf))
     }
 

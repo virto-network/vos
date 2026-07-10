@@ -11672,6 +11672,233 @@ fn storage_map_outgrows_guest_heap() {
     let _ = node.collect();
 }
 
+/// W4 capstone (docs/plans/actor-storage.md, Gate W4): a
+/// 10,000-account clerk-ledger. Every collection lives in committed
+/// storage, so the blob model's walls (256 KiB guest heap on decode,
+/// the 1 MiB halt cap on re-encode — fatal near 3k accounts) never
+/// come into play: account creation number 10,000 touches the same
+/// bounded row set as number 1, a transfer at 10k accounts commits in
+/// O(touched · log N) rows with its (root_before, root_after) anchors
+/// read in O(1) from the incremental sub-SMT roots, and the actor's
+/// state root equals a host-side from-scratch rebuild over the raw
+/// persisted rows — cipher-clerk's composite, byte for byte.
+#[test]
+fn clerk_ledger_capstone_ten_thousand_accounts() {
+    use cipher_clerk::conventions::{BankCode, Iso4217};
+    use cipher_clerk::crypto::{Amount, Keypair};
+    use cipher_clerk::ids::JournalId;
+    use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
+    use cipher_clerk::state_root::composite_root_from_subroots;
+    use cipher_clerk::types::Account;
+    use clerk_ledger::{ClerkLedgerRef, Status};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::zk::state::{SmtParams, leaf_hash, root_of_sorted};
+
+    const ACCOUNTS: usize = 10_000;
+    const BATCH: usize = 8; // sized to the 4 KiB message cap
+
+    let path = format!(
+        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let elf = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: clerk-ledger not built (run `just build-clerk-ledger`)");
+            return;
+        }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile clerk-ledger");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_capstone_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut node = VosNode::with_prefix(0x00ad);
+    let ledger_id = node.register(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Local)
+            .persist(&dir),
+    );
+    let ledger = ClerkLedgerRef::at(ledger_id);
+    let ts: u64 = 1_000_000;
+
+    let registrar = Keypair::generate();
+    let journal = JournalId::random();
+    let status = vos::block_on(ledger.bootstrap(
+        &mut &node,
+        journal.0,
+        registrar.public.0,
+        1,
+    ))
+    .expect("bootstrap");
+    assert_eq!(status, Status::Ok);
+
+    // ── Load 10k accounts, 8 signed creates per dispatch ────────
+    // One shared holder keypair: auth keys may repeat across
+    // accounts, and one key lets the transfer below sign cheaply.
+    let holder = Keypair::generate();
+    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(ACCOUNTS);
+    let started = std::time::Instant::now();
+    let mut pending_batch: Vec<CcCreateAccount> = Vec::with_capacity(BATCH);
+    for i in 0..ACCOUNTS {
+        let account = Account::asset(journal, holder.public, Iso4217::USD, BankCode::Checking);
+        ids.push(account.id.0);
+        pending_batch.push(CcCreateAccount::signed(account, &registrar.secret));
+        if pending_batch.len() == BATCH || i == ACCOUNTS - 1 {
+            let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&pending_batch)
+                .expect("rkyv encode batch")
+                .to_vec();
+            assert!(bytes.len() < 4096, "batch must fit the message cap");
+            let statuses = vos::block_on(ledger.create_accounts(&mut &node, bytes, ts))
+                .expect("create_accounts");
+            assert_eq!(statuses.len(), pending_batch.len(), "one status per item");
+            assert!(
+                statuses.iter().all(|&s| s == Status::Ok as u8),
+                "batch create failed at account ~{i}: {statuses:?}"
+            );
+            pending_batch.clear();
+        }
+    }
+    eprintln!(
+        "capstone: loaded {ACCOUNTS} accounts in {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        vos::block_on(ledger.account_count(&mut &node)).expect("account_count"),
+        ACCOUNTS as u32,
+    );
+
+    // Spot reads across the keyspace — point rows, no cache help.
+    for probe in [0, ACCOUNTS / 2, ACCOUNTS - 1] {
+        let acct = vos::block_on(ledger.account(&mut &node, ids[probe]))
+            .expect("account read")
+            .expect("account on file");
+        assert_eq!(acct.id.0, ids[probe]);
+    }
+
+    // ── A transfer at 10k accounts ──────────────────────────────
+    let debtor = vos::block_on(ledger.account(&mut &node, ids[17]))
+        .expect("read")
+        .expect("on file");
+    let creditor = vos::block_on(ledger.account(&mut &node, ids[ACCOUNTS - 3]))
+        .expect("read")
+        .expect("on file");
+    let blinding = cipher_clerk::crypto::Blinding([1u8; 32]);
+    let amt = Amount::commit(100, &blinding);
+    let transfer = cipher_clerk::types::Transfer::builder(journal)
+        .debit(&debtor, cipher_clerk::types::Layer::Settled, amt)
+        .credit(&creditor, cipher_clerk::types::Layer::Settled, amt)
+        .signed_with(&[(&debtor, &holder.secret)]);
+    let transfer_id = transfer.id.0;
+    let transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&transfer)
+        .expect("encode transfer")
+        .to_vec();
+    let openings = vec![clerk_ledger::Opening {
+        amount: amt,
+        value: 100,
+        blinding,
+    }];
+    let openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .expect("encode openings")
+        .to_vec();
+
+    let root_before = vos::block_on(ledger.state_root(&mut &node)).expect("state_root");
+    assert_eq!(root_before.len(), 32);
+    let transfer_started = std::time::Instant::now();
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        transfer_bytes,
+        openings_bytes,
+        ts + 7,
+    ))
+    .expect("apply_transfer");
+    assert_eq!(status, Status::Ok, "transfer at 10k accounts must land");
+    eprintln!(
+        "capstone: transfer at {ACCOUNTS} accounts in {:?}",
+        transfer_started.elapsed()
+    );
+    let root_after = vos::block_on(ledger.state_root(&mut &node)).expect("state_root");
+    assert_ne!(root_after, root_before, "the transfer must move the root");
+    let anchors = vos::block_on(ledger.transfer_state_roots(&mut &node, transfer_id))
+        .expect("transfer_state_roots")
+        .expect("anchors recorded");
+    assert_eq!(anchors.0, root_before, "recorded root_before must match");
+    assert_eq!(anchors.1, root_after, "recorded root_after must match");
+
+    let final_root = root_after.clone();
+    node.shutdown();
+    let _ = node.collect();
+
+    // ── From-scratch rebuild over the raw persisted rows ────────
+    // The actor's incremental root must equal cipher-clerk's
+    // composite recomputed from nothing but the durable value rows.
+    let db = dir
+        .join("agents")
+        .join(format!("{:08x}.redb", ledger_id.0));
+    let rows = vos::commit::read_kv_rows_at(&db).expect("read persisted rows");
+    let cc = SmtParams {
+        leaf_domain: b"cipher-clerk/smt/leaf/v1",
+        node_domain: b"cipher-clerk/smt/node/v1",
+        width: 16,
+    };
+    // Collect one sub-SMT's sorted (key, leaf_hash) pairs from the
+    // value rows under `s/<field>/v`; leaf content = tag ‖ payload
+    // (cipher-clerk's canonical encodings; `id_in_leaf` re-derives
+    // the payload for the marker sets whose content embeds the key).
+    let sub_leaves = |field: &str, tag: u8, id_in_leaf: bool| -> Vec<(Vec<u8>, [u8; 32])> {
+        let prefix = format!("s/{field}/v").into_bytes();
+        let mut leaves: Vec<(Vec<u8>, [u8; 32])> = rows
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| {
+                let key = k[prefix.len()..].to_vec();
+                let mut content = vec![tag];
+                if id_in_leaf {
+                    content.extend_from_slice(&key);
+                    if field == "pending_statuses" {
+                        content.extend_from_slice(v);
+                    }
+                } else {
+                    content.extend_from_slice(v);
+                }
+                let hash = leaf_hash(&cc, &content);
+                (key, hash)
+            })
+            .collect();
+        leaves.sort_unstable();
+        leaves
+    };
+    let accounts_root = root_of_sorted(&cc, &sub_leaves("accounts", 0, false));
+    let transfers_root = root_of_sorted(&cc, &sub_leaves("transfers", 1, false));
+    let journal_root = root_of_sorted(&cc, &sub_leaves("journal", 2, false));
+    let eids_root = root_of_sorted(&cc, &sub_leaves("external_ids", 3, false));
+    let voided_root = root_of_sorted(&cc, &sub_leaves("voided_transfers", 4, true));
+    let pending_root = root_of_sorted(&cc, &sub_leaves("pending_statuses", 5, true));
+    let rebuilt = composite_root_from_subroots(
+        &accounts_root,
+        &transfers_root,
+        &journal_root,
+        &eids_root,
+        &voided_root,
+        &pending_root,
+    );
+    assert_eq!(
+        final_root,
+        rebuilt.to_vec(),
+        "the incremental state root must equal a from-scratch rebuild \
+         over the raw persisted rows",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `#[storage(committed)]` map anchors its work-results with
 /// `anchor_kind 0x02` composite roots (docs/plans/actor-storage.md W4.2):
 /// every accepted dispatch below IS the host verifying the chain — a
