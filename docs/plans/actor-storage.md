@@ -1,0 +1,369 @@
+# Actor storage scale-out — prelude storage types over the agent KV
+
+Goal: actors with large or growing collections (clerk-ledger accounts,
+space-registry rows, bridge dedup sets) stop living inside the monolithic
+rkyv state blob and instead declare **typed storage handles**
+(`StorageMap`, `StorageVec`, `StorageSet`, `StorageValue`) whose entries
+are individual rows in the agent's existing key-value store. Reads become
+point `STORAGE_R` calls, writes become per-key `Effect::Write`s, and the
+guest's memory footprint is bounded by the **touched set per dispatch**,
+not the collection size. No new hostcalls — iteration is self-indexed
+data, and the eventual commitment tree (`anchor_kind 0x02`) doubles as
+the ordered index.
+
+Execution model: work wave by wave, one commit per work item, run the
+wave gate before moving on. Waves 1–2 fit one session; waves 3 and 4 are
+each their own session. Read this whole file first; then read the files
+listed in each item before editing them.
+
+## Why (the walls, measured)
+
+The blob model assumes state of tens of KiB (`vos/src/abi/pvm/alloc.rs:5-8`):
+
+- 256 KiB fixed guest heap, `GROW_HEAP` is a host no-op
+  (`alloc.rs:11`, `runtime.rs:1340`); peak live ≈ 4–5× state size.
+- 1 MiB halt-output cap carries the full state write
+  (`runtime.rs:1264`) → clerk-ledger (~305 B/account) dies near 3k
+  accounts.
+- 16 KiB provable-Task witness buffer (`vos-macros/src/lib.rs:1350`)
+  → a provable clerk caps out near 50 accounts.
+- Every mutation re-encodes the whole struct; in CRDT mode every DAG
+  node carries the **full state blob** (`Effect::Write{STATE_KEY}` in
+  the `EffectLog`), so the replication log grows by state-size per write.
+- `ClerkLedger::composite_root` rebuilds an SMT over every account
+  **twice per transfer** (`actors/clerk-ledger/src/lib.rs:382,407`).
+
+The seams already exist: `STORAGE_R`(4)/`STORAGE_W`(5) are a real
+caller-keyed KV end-to-end (guest wrappers → journaled
+`Effect::Write{key,value}`, last-wins per key → `KV_TABLE` "agent_kv" in
+the per-agent redb, restored on boot). The state blob is just the one
+key everyone uses. `anchor_kind 0x02` (SMT state root) is reserved on
+the wire as the sanctioned large-state commitment
+(`refine_payload.rs:99-102`), and the touched-leaf sparse-Merkle witness
+is already proven at the application layer in cipher-clerk
+(witness 1.56 MB → 2.5 KB at 5k accounts).
+
+## Boot checklist (read before any edit)
+
+- `vos/src/refine_payload.rs` — v3 wire: effect tags 0x01–0x04, effects
+  apply in wire order, last-wins per key, post-state = final
+  `Write{STATE_KEY}`; `transition_digest` covers all effects; anchor
+  kinds 0x00/0x01 live, 0x02 reserved-and-rejected.
+- `vos/src/runtime.rs` — `ServiceStorage` (`:459-482`, the in-memory
+  keyspace), `journaled_read` overlay (`:303`), `STORAGE_R`/`STORAGE_W`
+  handlers (`:1365-1386`), `absorb_work_result` anchor check (`:412-439`),
+  `take_dispatch_delta` (`:656`).
+- `vos/src/commit.rs` — `STATE_TABLE`/`KV_TABLE` (`:323-335`),
+  `split_delta`, `LocalCommit::commit` (`:411`), `CrdtCommit`
+  (`:955-1056`), `read_kv_rows` eager hydration (`:357-371`).
+- `vos/src/actors/context.rs` — `store`/`load` (`:580`, `:244`),
+  `pending_writes`, `drain_into_refine_payload` (`:687-717`).
+- `vos/src/actors/lifecycle.rs` — `read_persisted_state_owned`
+  grow-to-exact read (`:137-155`), `BUF_SIZE = 4096` (`:27`).
+- `vos/src/actors/run.rs` — `run_refine_service` cold/warm split,
+  `ACTOR_HOLDER`/`CURRENT_ANCHOR` statics (`:452-500`), state-changed
+  gate (`:562-586`).
+- `vos-macros/src/lib.rs` — rkyv derive injection on the state struct
+  (~`:68-99`); `#[msg]` attr parsing (~`:293-315`).
+- cipher-clerk `merkle.rs` (`SparseMerkleTree`, depth 128, 16-byte
+  keys, `BatchProof`), `view.rs` (`SparseLedger`: panics on unproven
+  reads) — the W4 generalization source.
+- JAM phase discipline (jar `spec/JarBook/Capability.lean:205-208`):
+  `STORAGE_R`/`STORAGE_W` are **accumulate-only** in JAM; vos's
+  refine-legal `STORAGE_R` is a deliberate deviation for `local`
+  consistency. Nothing in this plan may add a hostcall.
+- Recurring trap: PVM e2e tests run prebuilt actor ELFs — **rebuild the
+  ELFs** after touching guest-side code or the tests exercise stale
+  binaries.
+- House rules: no `#[ignore]` tests — fix or delete; timeless comments
+  (no phase narrative); `#[repr(u8)]` rkyv enums over const byte groups;
+  fix pre-existing failures hit mid-task.
+
+## Non-goals (explicitly out of scope)
+
+- **No new hostcalls.** A `SCAN`/`NEXT_KEY` primitive would break actors
+  on a conformant JAM host and buys ~1 ecall per index page over the
+  self-indexed layout. Rejected permanently, not deferred.
+- **No change to phase legality.** `STORAGE_R`-in-refine stays for
+  `local`-consistency actors, documented as a vos-local deviation;
+  provable/replicated paths get the witnessed backend (W4) which is the
+  JAM-portable one.
+- **Lazy host-side hydration.** `read_kv_rows` stays eager (full row
+  load at agent boot). Fine at tens of MB; read-through to redb is a
+  follow-up when an actual space hurts.
+- **Messaging actors** (`msg-log` envelopes, `messenger` plaintext
+  history): they already paginate reads; retyping their logs is a
+  follow-up after W3 proves the shape.
+- **Guest accumulate (A15), masked image root, jar hostcall
+  convergence** — parallel tracks; this plan neither blocks nor waits
+  on them.
+- **Raft InstallSnapshot streaming / CRDT DAG compaction /
+  `vosx space export --state`** — noted follow-ups, not in these waves.
+
+## Design decisions (locked — do not re-litigate)
+
+1. **Types, not annotations.** Laziness must live in the field type's
+   API (point get/insert/range), so the unit of design is the handle
+   type. A `#[storage]` field attribute exists only to tell the macro
+   which fields to exclude from the archived blob and what key prefix
+   to install. ink!'s retreat from implicit-lazy fields to explicit
+   `Mapping` is the precedent: in a metered, provable VM, a host read
+   must be visible in the source.
+2. **Key layout** (per storage field, all rows in the agent's own
+   keyspace): prefix `s/<field>/` (attribute override
+   `#[storage(prefix = "...")]`; renaming a field without pinning the
+   prefix orphans its rows — part of the actor upgrade contract).
+   Within a prefix: value rows `…v/<key>`, index pages `…i/<page_id>`,
+   one meta row `…m` (count + sorted `(split_key, page_id)` directory).
+   `__vos_actor_state` and the `s/` namespace must never collide —
+   the macro rejects a field literally named such that its prefix
+   collides with a framework key.
+3. **Entry-per-row, index-pages-of-keys.** Each map entry is its own
+   row (point read = exactly one value); ordered iteration reads 4 KiB
+   index pages holding keys only (~250 × 16 B keys/page), then fetches
+   values lazily for the requested window. One directory row covers
+   ~200 index pages ≈ 50k keys — enough headroom for every current
+   actor; deeper directories are a follow-up.
+4. **Iteration without hostcalls, three mechanisms.** (a) Self-indexed
+   structures over point reads — legal in JAM accumulate. (b) In W4 the
+   unhashed-key SMT doubles as the ordered index; the node rows a
+   traversal reads *are* the authentication-path material. (c) For
+   refine-phase/provable access, the host prefetches touched
+   leaves + multiproof into the witness (`SparseLedger` pattern) — on
+   JAM, refine has no storage reads at all, so this is the only
+   conformant refine path anyway.
+5. **Deletes are a first-class effect.** New wire tag
+   `EFFECT_DELETE = 0x05`, `Effect::Delete { key }`. Same journal,
+   digest, and replay treatment as `Write`. `Delete{STATE_KEY}` is
+   malformed (decode rejects) — state reset is not expressible as an
+   effect.
+6. **Guest-side buffering is a static journal, not `Context` plumbing.**
+   Handles can't reach `ctx` from state-struct fields; the guest is
+   single-threaded, so storage handles share a guest-global
+   journal + read cache (same pattern as `ACTOR_HOLDER`), overlaid over
+   host reads so a dispatch sees its own pending writes/deletes, and
+   drained into the `RefinePayload` alongside `Context::pending_writes`.
+7. **Interim anchor gap is accepted and documented.** Until W4, storage
+   rows sit outside the 0x01 anchor (which hashes only the STATE blob).
+   Replication stays correct — Raft replays dispatches, CRDT replays
+   effect logs, and keystone's effect-bearing durable-node rule already
+   forces a DAG node for non-STATE writes — but anchor verification
+   does not cover the rows. Provable actors therefore may not use
+   storage types until `anchor_kind 0x02` lands (W4). The A10 bug
+   (Task non-STATE effects dropped on replica rebuild) additionally
+   gates *Tasks* + storage rows on replicated agents.
+8. **Per-value soft cap 4 KiB** (fits `BUF_SIZE`, one `STORAGE_R`
+   round-trip). Values past the cap read via the grow-to-exact heap
+   path with a hard guest-side error at 64 KiB — a quarter of the heap;
+   anything bigger belongs in the proof-blob CAS by hash, not in a row.
+
+---
+
+## Wave 1 — wire + host substrate (delete effect, ordered storage)
+
+### 1.1 `Effect::Delete` on the v3 wire
+
+- `vos/src/refine_payload.rs`: add `EFFECT_DELETE = 0x05`,
+  `Effect::Delete { key: Vec<u8> }`, encode/decode arms,
+  `transition_digest` coverage (it already digests raw effect bytes —
+  add the tag to the canonical encoding), decode-reject
+  `Delete{STATE_KEY}`.
+- `vos/src/runtime.rs`: journal representation — `journal.writes`
+  entries become write-or-tombstone so `journaled_read` returns
+  "absent" for a pending delete (today `Option<&[u8]>` can't distinguish
+  no-entry from tombstone — restructure the overlay accordingly);
+  `absorb_effects` applies deletes via the existing
+  `ServiceStorage::delete`.
+- `vos/src/commit.rs`: `split_delta`/`AgentDelta` carry deletes;
+  `LocalCommit::commit` removes the `KV_TABLE` row; `CrdtCommit`
+  replay (`replay_logs`) applies deletes; Raft path exercises the same
+  `AgentDelta`.
+- `vos/src/actors/context.rs`: `Context::remove(key)` queuing a pending
+  delete; `drain_into_refine_payload` emits it; guest `load` overlays
+  pending deletes as absent.
+- Tests: wire round-trip incl. reserved-key rejection; journal overlay
+  read-after-delete; Local commit removes the row; CRDT two-replica
+  replay converges after delete; digest changes when a delete is added.
+
+### 1.2 `ServiceStorage` → ordered map
+
+- `vos/src/runtime.rs:459-482`: `HashMap<(u32, Vec<u8>), Vec<u8>>` →
+  `BTreeMap` (or per-service `BTreeMap<Vec<u8>, Vec<u8>>` inside a
+  service map — pick whichever keeps `read`/`write`/`delete` signatures
+  stable). Motivation: host-side prefix scans for W4 prefetch and
+  streaming snapshots; behavior-neutral otherwise.
+- Confirm no test depends on hash iteration order.
+
+**Gate W1**: full `cargo test -p vos` + e2e suite green, ELFs rebuilt.
+
+## Wave 2 — guest storage types + macro wiring
+
+### 2.1 `vos::storage` module (guest-side, `service` feature)
+
+- `StorageValue<T>`: one row, get/set/take.
+- `StorageMap<K: FixedKey, V>`: get/insert/remove/contains, ordered
+  `iter_from(start) -> impl Iterator` reading index pages lazily;
+  layout per decision 2/3. `FixedKey` = fixed-width byte keys
+  (`[u8; N]`, u64 via BE encoding) so index pages and, later, SMT paths
+  are well-defined; order = byte order.
+- `StorageVec<T>`: dense `le64(i)` rows + len row; push/get/swap_remove;
+  covers append-only logs (`note_commitments`) and dedup journals.
+- `StorageSet<K>`: `StorageMap<K, ()>` (index pages only, no value
+  rows).
+- Read path: `hostcalls::read` with the 4 KiB stack buffer,
+  grow-to-exact fallback (mirror `read_persisted_state_owned`), hard
+  error past 64 KiB (decision 8). Values rkyv-encoded with the
+  existing `codec::{Encode, Decode}`.
+
+### 2.2 Guest-global storage journal + cache
+
+- New statics beside `ACTOR_HOLDER` (`vos/src/actors/run.rs`):
+  per-dispatch read cache and pending write/delete map, keyed by full
+  row key. Reads check pending → cache → `STORAGE_R`. Drained into the
+  halt payload with the `Context` effects (order within the payload:
+  storage-row effects before the final `Write{STATE_KEY}` — the
+  state-write-last invariant in `drain_into_refine_payload:699` must
+  hold).
+- Cache lifetime: cleared at dispatch end in v1 (correct by
+  construction). Persisting it across warm restarts is safe
+  single-writer but interacts with out-of-band CRDT merges — see open
+  questions; do not enable until answered.
+
+### 2.3 `#[storage]` field attribute in `#[actor]`
+
+- `vos-macros/src/lib.rs`: parse `#[storage]` /
+  `#[storage(prefix = "…")]` on state-struct fields. Handle types
+  implement rkyv `Archive`/`Serialize`/`Deserialize` manually with a
+  unit archived form (they carry no persisted data), so the injected
+  derives need no surgery; the macro generates
+  `__vos_init_storage(&mut self)` installing each handle's prefix from
+  the field name, called from `load_or_create` after decode/create.
+  Uninitialized handles panic on first use (fail loud).
+- Compile-fail tests for prefix collisions and `#[storage]` on
+  non-handle types.
+
+### 2.4 Paged-reply helper
+
+- `vos::storage::page_reply` (or similar): fill a reply from an
+  iterator up to a row-count + byte budget, return
+  `(rows, next_cursor)` — the msg-log `history` pattern
+  (`actors/msg-log/src/lib.rs:182-211`) promoted into the prelude so
+  W3 handlers don't reinvent it.
+
+### 2.5 Wave-2 e2e
+
+- New PVM test actor with a `StorageMap` populated past the 256 KiB
+  heap (≥ 50k small entries via repeated dispatches): point get/insert
+  stay O(touched); ordered range query returns paged results; restart
+  (cold) preserves rows; non-storage actors' state blob byte-identical
+  to before (regression).
+
+**Gate W2**: lib + e2e green; the big-map actor runs within the guest
+heap; `STATUS_TOO_BIG` regression suite untouched.
+
+## Wave 3 — adopt in the worst offenders (replication-safe subset)
+
+### 3.1 space-registry
+
+- `actors/space-registry/src/lib.rs:521-600`: move the byte-payload
+  collections (`blobs`, `metas`, `extension_metas`) and the large
+  row sets (`members`, `auth_grants`, `actor_acls`,
+  `used_replication_ids`, `host_mappings`) to storage types. Small
+  config-like fields stay in the blob.
+- Every full-collection list handler (`programs()`, `agents()`,
+  `members()`, `auth_grants()`, `actor_acls()`, `host_mappings()`)
+  gains cursor + budget pagination via 2.4; callers in `vosx` updated
+  in the same commit (no compat shims — pre-release).
+- Registry is CRDT-replicated with signed ops: verify per-key effects
+  replay under `registry_canon` signing unchanged (writes are already
+  effects; only their granularity changes).
+
+### 3.2 clerk-bridge
+
+- `actors/clerk-bridge/src/lib.rs`: `received` (`:334`) →
+  `StorageSet<[u8;32]>`; `window_nets` (`:357`) → `StorageMap`.
+  `window::accumulate_neg`'s linear scan becomes a point
+  get-or-insert.
+
+### 3.3 NOT clerk-ledger
+
+- The ledger's `composite_root` needs every account; retyping it
+  before incremental commitment would turn each transfer into O(N)
+  point reads. It moves in W4 where the SMT maintains the root
+  incrementally. (Its arrival there also removes today's
+  O(N log N)-twice-per-transfer rebuild.)
+
+**Gate W3**: full e2e incl. federation/showcase suites; registry
+pagination exercised by a vosx-side test; two-replica CRDT convergence
+test over per-key registry writes + deletes.
+
+## Wave 4 — committed storage: `anchor_kind 0x02` (B6 / `vos::zk::state`)
+
+### 4.1 Generalize the SMT into vos
+
+- Port cipher-clerk's `SparseMerkleTree`/`BatchProof` into
+  `vos::zk::state` with nodes stored as agent KV rows (reserved
+  framework prefix, e.g. `__vos_smt/`), raw fixed-width keys as paths
+  (in-order traversal = key order; adversarial-key balance is a
+  non-issue for internal ids — user-keyed committed maps hash the key
+  and forfeit ordered iteration).
+- Incremental root maintenance: a dispatch updates only the node rows
+  on touched-leaf paths (O(touched · log N) reads + writes, all
+  ordinary storage effects).
+
+### 4.2 Composite anchor + wire acceptance
+
+- Anchor = SMT over the agent keyspace with the state blob as one
+  designated leaf. Emit `anchor_kind 0x02` from the guest when any
+  `#[storage(committed)]` field exists; `refine_payload.rs` decode
+  accepts 0x02; `absorb_work_result` verifies against the
+  host-maintained root. `anchor_for` grows a root-aware variant.
+- The B4 trap applies doubly here: the digest still covers the
+  pre-`take_state_write` payload — extend the existing tests.
+
+### 4.3 Witnessed-read backend
+
+- Two-backend read trait behind the handle types: live `STORAGE_R`
+  (local mode / accumulate) vs witnessed leaves verified against the
+  anchored root (provable Tasks; `SparseLedger` semantics — panic on
+  unproven read). Host prefetches touched leaves + multiproof into the
+  witness buffer at dispatch staging; the touched-key set comes from
+  the actor's declared storage metadata (`.vos_meta` gains a storage
+  section — trailing-append evolvable, per the metadata discipline).
+- Prefetch needs a host-side touched-set oracle; v1: the caller's
+  message names the keys (the clerk kernel already works this way —
+  reads only by explicit id). Speculative/discovery reads inside
+  provable tasks stay out of scope.
+
+### 4.4 clerk-ledger onto committed storage
+
+- Retype `accounts`/`transfers`/`external_ids`/`voided_transfers`/
+  `pending_statuses`/`transfer_roots`/`note_commitments` onto committed
+  storage types; `composite_root`/`state_root` served from the
+  incremental SMT root.
+- Capstone gate: 10k-account ledger e2e — transfers commit in
+  O(touched), state root matches a from-scratch rebuild, guest heap
+  never exceeded, and a provable transfer's witness is
+  O(touched · log N) (the cipher-clerk 2.5 KB result reproduced at the
+  actor layer).
+
+**Gate W4**: full gate incl. proving e2e; 0x02 anchors verified
+end-to-end; 0x01 actors byte-for-byte unaffected.
+
+## Open questions (resolve before the wave that needs them)
+
+1. **Warm-guest invalidation on out-of-band CRDT merge** (before
+   enabling any cross-dispatch cache, 2.2): when a remote merge rewrites
+   rows under a warm actor, how is today's warm `ACTOR_HOLDER` blob
+   invalidated, and does the same signal reach storage caches? Read the
+   `replay_dag_into_runtime` → agent-thread path in `node.rs` first.
+2. **Registry ordering semantics** (3.1): do any registry consumers
+   depend on insertion order of `members`/`agents`? If so those become
+   `StorageVec` + side index rather than ordered maps.
+3. **SMT leaf domain** (4.1): one tree over the whole keyspace vs one
+   per committed field with a top hash combining field roots. Per-field
+   roots keep proofs smaller and prefixes independent; whole-keyspace is
+   simpler host-side. Decide when porting.
+4. **A10 fix ordering** (4.3): witnessed Tasks on replicated agents
+   need the Task-effects-on-rebuild fix; sequence it before 4.4 if the
+   ledger stays Raft/CRDT-replicated in the showcase.

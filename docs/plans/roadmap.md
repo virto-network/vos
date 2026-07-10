@@ -147,6 +147,16 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   Tasks into replicated agents.
 
 **VOS-core continuation**
+- **Actor storage scale-out** → `docs/plans/actor-storage.md`: typed
+  storage handles (`StorageMap`/`StorageVec`/`StorageSet`) over the
+  existing agent KV — per-key rows instead of the monolithic state blob,
+  touched-set-bounded guest memory, **no new hostcalls** (JAM keeps
+  `STORAGE_R` accumulate-only; iteration is self-indexed pages, and the
+  W4 SMT doubles as the ordered index). W1 delete effect + ordered
+  `ServiceStorage`; W2 prelude types + `#[storage]` fields; W3
+  space-registry + clerk-bridge adoption; W4 `anchor_kind 0x02`
+  committed storage (B6 / `vos::zk::state`) + clerk-ledger at 10k
+  accounts.
 - A11 `vos::task` step-machine combinators; A12 determinism tiers (record
   NOW_MS / deny BOOT_CONTEXT under Crdt/Raft; hostcall-tier marker in
   `.vos_meta`); A13 DAG checkpointing (bounded replay); A15 guest
