@@ -238,7 +238,7 @@ pub struct HostMapping {
 // ── Actor ─────────────────────────────────────────────────────────
 
 use vos::prelude::*;
-use vos::storage::{StorageMap, StorageSet};
+use vos::storage::{StorageMap, StorageSet, fill_page};
 
 /// Per-actor SpaceRole map (M7) — declared as a `pub const` so
 /// it survives the `#[actor(space_role_map = ...)]` expansion.
@@ -315,11 +315,13 @@ pub struct SpaceRegistry {
     /// Grow-only revoke high-waters for actor-local grants, sorted by
     /// `(peer_id, agent_name)`. Sibling of `revoke_epochs`.
     actor_revoke_epochs: Vec<ActorRevokeEpochRow>,
-    /// Sorted by `instance_name`. Populated on the hyperspace
-    /// registry replica only — the local space-registry leaves
-    /// this empty so its `resolve` keeps the in-space behaviour
-    /// (caller_prefix == host).
-    host_mappings: Vec<HostMapping>,
+    /// Populated on the hyperspace registry replica only — the local
+    /// space-registry leaves this empty so its `resolve` keeps the
+    /// in-space behaviour (caller_prefix == host). A `#[storage]` map
+    /// keyed by `name_key(instance_name)`; `resolve`/`register_remote`
+    /// are point ops and `host_mappings()` pages in name order.
+    #[storage]
+    host_mappings: StorageMap<[u8; 32], HostMapping>,
     /// Monotone-locality floors, sorted by `instance_name`. The
     /// narrowest consistency tier each name was ever installed at;
     /// retained across `uninstall` so `install` can refuse to widen
@@ -362,7 +364,7 @@ impl SpaceRegistry {
             actor_acls: Vec::new(),
             revoke_epochs: Vec::new(),
             actor_revoke_epochs: Vec::new(),
-            host_mappings: Vec::new(),
+            host_mappings: StorageMap::default(),
             consistency_floors: Vec::new(),
             root: Vec::new(),
             used_replication_ids: StorageSet::default(),
@@ -879,7 +881,7 @@ impl SpaceRegistry {
             return instance_service_id(&name, caller_prefix as u16);
         }
         // 2. Hyperspace host mapping (agent hosted on a peer node).
-        if let Some(h) = self.host_mappings.iter().find(|h| h.instance_name == name) {
+        if let Some(h) = self.host_mappings.get(&name_key(&name)) {
             return instance_service_id(&name, h.host_prefix);
         }
         0
@@ -915,21 +917,10 @@ impl SpaceRegistry {
             return Status::BadPrefix;
         }
         let host_prefix = host_prefix as u16;
-        let mut idx = 0usize;
-        while idx < self.host_mappings.len() {
-            let cur = &self.host_mappings[idx];
-            if cur.instance_name == instance_name {
-                self.host_mappings[idx].host_prefix = host_prefix;
-                return Status::Ok;
-            }
-            if cur.instance_name.as_str() > instance_name.as_str() {
-                break;
-            }
-            idx += 1;
-        }
+        // Idempotent upsert keyed by the instance name.
         self.host_mappings.insert(
-            idx,
-            HostMapping {
+            &name_key(&instance_name),
+            &HostMapping {
                 instance_name,
                 host_prefix,
             },
@@ -937,11 +928,23 @@ impl SpaceRegistry {
         Status::Ok
     }
 
-    /// Snapshot the host-mapping table. Diagnostic/test surface;
-    /// production callers use `resolve`.
+    /// Page the host-mapping table. Diagnostic/test surface; production
+    /// callers use `resolve`. Pass an empty `after_name` to start;
+    /// continue from the last returned row's `instance_name`, until a
+    /// short (or empty) page comes back. `budget` caps the page rows
+    /// (0 = the handler's max). Rows come back in key (hashed-name)
+    /// order, not name order — the cursor round-trips regardless.
     #[msg]
-    async fn host_mappings(&self) -> Vec<HostMapping> {
-        self.host_mappings.clone()
+    async fn host_mappings(&self, after_name: String, budget: u32) -> Vec<HostMapping> {
+        let skip = (!after_name.is_empty()).then(|| name_key(&after_name));
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut it = self
+            .host_mappings
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k))
+            .map(|(_, row)| row);
+        let (rows, _more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
+        rows
     }
 
     // ── Members ────────────────────────────────────────────────
@@ -1583,6 +1586,25 @@ fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(b);
     Some(out)
+}
+
+/// Row cap for one page of a list handler. Kept well under the
+/// per-dispatch touched-row ceiling: a page reads one value row per
+/// entry plus a couple of index pages, so the dispatch stays O(page).
+const PAGE_MAX_ROWS: usize = 128;
+
+/// Encoded-byte budget for one page, comfortably under the 1 MiB
+/// halt-output cap that carries the reply.
+const PAGE_BYTE_BUDGET: usize = 256 * 1024;
+
+/// Clamp a caller-supplied page budget to `[1, PAGE_MAX_ROWS]`. A `0`
+/// budget (caller didn't care) takes the max.
+fn page_rows(budget: u32) -> usize {
+    if budget == 0 {
+        PAGE_MAX_ROWS
+    } else {
+        (budget as usize).min(PAGE_MAX_ROWS)
+    }
 }
 
 /// Fixed-width `StorageMap` key for a variable-length instance name.
