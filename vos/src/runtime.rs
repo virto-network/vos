@@ -284,8 +284,11 @@ fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {
 
 #[derive(Default)]
 struct RefineJournal {
-    /// Pending writes, scoped per service: `(svc_id, key, value)`.
-    writes: Vec<(u32, Vec<u8>, Vec<u8>)>,
+    /// Pending row mutations, scoped per service: `(svc_id, key, value)`
+    /// where `None` is a delete tombstone. One ordered list — not
+    /// separate write/delete lists — because last-wins per key depends
+    /// on the interleaving.
+    writes: Vec<(u32, Vec<u8>, Option<Vec<u8>>)>,
     transfers: Vec<(ServiceId, Vec<u8>)>,
     preimages: Vec<([u8; 32], Vec<u8>)>,
     self_messages: Vec<Vec<u8>>,
@@ -295,24 +298,46 @@ struct RefineJournal {
 }
 
 impl RefineJournal {
-    /// Read-your-own-writes for `svc_id`: latest journaled value for
-    /// `key` written by *this* service, if any. Other services' writes
-    /// to the same key are intentionally ignored — STATE_KEY collides
-    /// across services and would otherwise let a parent's encoded
-    /// state shadow a child's STORAGE_R during a nested INVOKE.
-    fn journaled_read(&self, svc_id: u32, key: &[u8]) -> Option<&[u8]> {
+    /// Read-your-own-writes for `svc_id`: latest journaled entry for
+    /// `key` written by *this* service, if any. Outer `None` = no
+    /// journal entry (fall back to committed storage); inner `None` =
+    /// delete tombstone (the key is definitively absent). Other
+    /// services' writes to the same key are intentionally ignored —
+    /// STATE_KEY collides across services and would otherwise let a
+    /// parent's encoded state shadow a child's STORAGE_R during a
+    /// nested INVOKE.
+    fn journaled_read(&self, svc_id: u32, key: &[u8]) -> Option<Option<&[u8]>> {
         self.writes
             .iter()
             .rev()
             .find(|(s, k, _)| *s == svc_id && k.as_slice() == key)
-            .map(|(_, _, v)| v.as_slice())
+            .map(|(_, _, v)| v.as_deref())
+    }
+
+    /// The effective value of `key` for `svc_id`: the journal overlay
+    /// (tombstones read as absent) falling back to committed storage.
+    /// The one read semantic STORAGE_R, the anchor check, and the
+    /// child-invoke prior-state capture all share.
+    fn effective_read<'a>(
+        &'a self,
+        storage: &'a ServiceStorage,
+        svc_id: u32,
+        key: &[u8],
+    ) -> Option<&'a [u8]> {
+        match self.journaled_read(svc_id, key) {
+            Some(entry) => entry,
+            None => storage.read(ServiceId(svc_id), key),
+        }
     }
 
     fn absorb_effects(&mut self, effects: Vec<Effect>, self_id: u32) {
         for eff in effects {
             match eff {
                 Effect::Write { key, value } => {
-                    self.writes.push((self_id, key, value));
+                    self.writes.push((self_id, key, Some(value)));
+                }
+                Effect::Delete { key } => {
+                    self.writes.push((self_id, key, None));
                 }
                 Effect::Transfer { target, memo } => {
                     if target == self_id {
@@ -416,9 +441,8 @@ fn absorb_work_result(
     payload: RefinePayload,
 ) -> Result<AbsorbedWorkResult, WorkResultError> {
     let anchor = if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
-        let effective = journal
-            .journaled_read(svc_id, crate::lifecycle::STATE_KEY_BYTES)
-            .or_else(|| storage.read(ServiceId(svc_id), crate::lifecycle::STATE_KEY_BYTES));
+        let effective =
+            journal.effective_read(storage, svc_id, crate::lifecycle::STATE_KEY_BYTES);
         let expected = crate::refine_payload::anchor_for(effective);
         if (payload.anchor_kind, payload.anchor) != expected {
             return Err(WorkResultError::AnchorMismatch);
@@ -581,15 +605,17 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     ///
     /// [`take_dispatch_anchor`]: VosRuntime::take_dispatch_anchor
     dispatch_anchor: HashMap<u32, (u8, [u8; 32])>,
-    /// Ordered storage writes applied to each top-level service's own
-    /// rows since the last [`take_dispatch_delta`] — the whole-agent
-    /// delta the host commits durably ([`crate::commit::AgentDelta`]).
-    /// Child-row writes are excluded (children with rows are a legacy
-    /// shape the Tasks model retires); continuation headers never ride
-    /// the journal, so host bookkeeping never appears here.
+    /// Ordered storage mutations applied to each top-level service's
+    /// own rows since the last [`take_dispatch_delta`] — the
+    /// whole-agent delta the host commits durably
+    /// ([`crate::commit::AgentDelta`]); `None` values are delete
+    /// tombstones. Child-row writes are excluded (children with rows
+    /// are a legacy shape the Tasks model retires); continuation
+    /// headers never ride the journal, so host bookkeeping never
+    /// appears here.
     ///
     /// [`take_dispatch_delta`]: VosRuntime::take_dispatch_delta
-    dispatch_writes: HashMap<u32, Vec<(Vec<u8>, Vec<u8>)>>,
+    dispatch_writes: HashMap<u32, Vec<(Vec<u8>, Option<Vec<u8>>)>>,
     /// Per-service marker: some applied v3 work-result carried effects
     /// since the last [`take_dispatch_delta`]. Input to the
     /// durable-node rule.
@@ -649,11 +675,14 @@ impl<D: DataLayer> VosRuntime<D> {
     }
 
     /// Take the dispatch's whole-agent storage delta for `svc_id` since
-    /// the previous take: the ordered writes that landed on the
-    /// service's own rows (`STATE_KEY` included) and whether any
-    /// applied v3 work-result carried effects. The host commits these
-    /// as one [`crate::commit::AgentDelta`].
-    pub fn take_dispatch_delta(&mut self, svc_id: ServiceId) -> (Vec<(Vec<u8>, Vec<u8>)>, bool) {
+    /// the previous take: the ordered mutations that landed on the
+    /// service's own rows (`STATE_KEY` included; `None` = delete) and
+    /// whether any applied v3 work-result carried effects. The host
+    /// commits these as one [`crate::commit::AgentDelta`].
+    pub fn take_dispatch_delta(
+        &mut self,
+        svc_id: ServiceId,
+    ) -> (Vec<(Vec<u8>, Option<Vec<u8>>)>, bool) {
         (
             self.dispatch_writes.remove(&svc_id.0).unwrap_or_default(),
             self.dispatch_effect_bearing
@@ -1182,7 +1211,10 @@ impl<D: DataLayer> VosRuntime<D> {
             // writes are additionally captured as its dispatch delta
             // for the durable commit.
             for (write_svc_id, key, value) in journal.writes.drain(..) {
-                storage.write(ServiceId(write_svc_id), &key, &value);
+                match &value {
+                    Some(v) => storage.write(ServiceId(write_svc_id), &key, v),
+                    None => storage.delete(ServiceId(write_svc_id), &key),
+                }
                 if write_svc_id == svc_id {
                     self.dispatch_writes
                         .entry(svc_id)
@@ -1333,8 +1365,6 @@ fn handle_refine_hostcall(
     let a3 = kernel.active_reg(10);
     let a4 = kernel.active_reg(11);
 
-    let id = ServiceId(svc_id);
-
     let (r7, r8): (u64, u64) = match call_id {
         hostcall::GAS => (kernel.active_gas(), 0),
         hostcall::GROW_HEAP => (error::HOST_OK, 0),
@@ -1364,8 +1394,9 @@ fn handle_refine_hostcall(
         hostcall::INFO => (svc_id as u64, 0),
         hostcall::STORAGE_R => {
             let key = kread(kernel, a0 as u32, a1 as usize);
-            let journaled = journal.journaled_read(svc_id, &key).map(|v| v.to_vec());
-            let value = journaled.or_else(|| storage.read(id, &key).map(|v| v.to_vec()));
+            let value = journal
+                .effective_read(storage, svc_id, &key)
+                .map(|v| v.to_vec());
             match value {
                 Some(v) => {
                     let copy_len = v.len().min(a3 as usize);
@@ -1381,7 +1412,7 @@ fn handle_refine_hostcall(
         hostcall::STORAGE_W => {
             let key = kread(kernel, a0 as u32, a1 as usize);
             let value = kread(kernel, a2 as u32, a3 as usize);
-            journal.writes.push((svc_id, key, value));
+            journal.writes.push((svc_id, key, Some(value)));
             (error::HOST_OK, 0)
         }
         hostcall::TRANSFER => {
@@ -2076,7 +2107,7 @@ fn handle_invoke(
             journal.writes.push((
                 target_svc_id.0,
                 crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-                state.to_vec(),
+                Some(state.to_vec()),
             ));
         }
 
@@ -2095,8 +2126,7 @@ fn handle_invoke(
     // to, and what the envelope echoes when the child's state is
     // unchanged, so parents always see the authoritative full state.
     let child_prior_state: Vec<u8> = journal
-        .journaled_read(target_svc_id.0, crate::lifecycle::STATE_KEY_BYTES)
-        .or_else(|| storage.read(target_svc_id, crate::lifecycle::STATE_KEY_BYTES))
+        .effective_read(storage, target_svc_id.0, crate::lifecycle::STATE_KEY_BYTES)
         .map(|v| v.to_vec())
         .unwrap_or_default();
 
@@ -2353,7 +2383,10 @@ mod tests {
 
     fn drain_to_storage(journal: &mut RefineJournal, storage: &mut ServiceStorage) {
         for (svc, key, value) in journal.writes.drain(..) {
-            storage.write(ServiceId(svc), &key, &value);
+            match &value {
+                Some(v) => storage.write(ServiceId(svc), &key, v),
+                None => storage.delete(ServiceId(svc), &key),
+            }
         }
     }
 
@@ -2459,8 +2492,62 @@ mod tests {
         // Nothing from the rejected work-result applied.
         assert_eq!(
             journal.journaled_read(svc, crate::lifecycle::STATE_KEY_BYTES),
-            Some(&b"s2"[..]),
+            Some(Some(&b"s2"[..])),
         );
+    }
+
+    #[test]
+    fn delete_effect_tombstones_and_drains() {
+        use crate::refine_payload::{Effect, RefinePayload};
+
+        let svc = 5u32;
+        let mut storage = ServiceStorage::new();
+        storage.write(ServiceId(svc), b"committed", b"old");
+        let mut journal = RefineJournal::default();
+
+        let payload = RefinePayload {
+            effects: vec![
+                Effect::Write {
+                    key: b"fresh".to_vec(),
+                    value: vec![1],
+                },
+                Effect::Delete {
+                    key: b"fresh".to_vec(),
+                },
+                Effect::Delete {
+                    key: b"committed".to_vec(),
+                },
+                Effect::Delete {
+                    key: b"reborn".to_vec(),
+                },
+                Effect::Write {
+                    key: b"reborn".to_vec(),
+                    value: vec![2],
+                },
+            ],
+            ..RefinePayload::new()
+        };
+        absorb_work_result(&mut journal, &storage, svc, payload).expect("applies");
+
+        // Last-wins per key through the overlay: a tombstone shadows
+        // both the same-tick write and the committed row, and a write
+        // after a tombstone resurrects the key.
+        assert_eq!(journal.effective_read(&storage, svc, b"fresh"), None);
+        assert_eq!(journal.effective_read(&storage, svc, b"committed"), None);
+        assert_eq!(
+            journal.effective_read(&storage, svc, b"reborn"),
+            Some(&[2u8][..]),
+        );
+        // Raw storage still holds the committed row until drain.
+        assert_eq!(
+            storage.read(ServiceId(svc), b"committed"),
+            Some(&b"old"[..]),
+        );
+
+        drain_to_storage(&mut journal, &mut storage);
+        assert_eq!(storage.read(ServiceId(svc), b"fresh"), None);
+        assert_eq!(storage.read(ServiceId(svc), b"committed"), None);
+        assert_eq!(storage.read(ServiceId(svc), b"reborn"), Some(&[2u8][..]));
     }
 
     #[test]

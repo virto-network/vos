@@ -46,7 +46,7 @@ pub struct Context<A: Actor> {
 
     // Effect queues (drained into the refine output payload)
     pending_tells: Vec<PendingTell>,
-    pending_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pending_writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pending_spawns: Vec<[u8; 32]>,
     pending_provides: Vec<([u8; 32], Vec<u8>)>,
 
@@ -240,8 +240,25 @@ impl<A: Actor> Context<A> {
     // --- Storage ---
 
     /// Read and decode a typed value from per-service storage.
+    /// Overlays this dispatch's own queued mutations ([`store`] /
+    /// [`remove`]) so a handler reads what it just wrote — the same
+    /// read-your-own-writes semantic the host journal gives across
+    /// dispatches.
+    ///
+    /// [`store`]: Self::store
+    /// [`remove`]: Self::remove
     #[cfg(feature = "service")]
     pub fn load<T: super::codec::Decode>(&self, key: &[u8]) -> Option<T> {
+        if let Some((_, pending)) = self
+            .pending_writes
+            .iter()
+            .rev()
+            .find(|(k, _)| k.as_slice() == key)
+        {
+            return pending
+                .as_deref()
+                .and_then(|bytes| super::codec::Decode::try_decode(bytes));
+        }
         super::lifecycle::load::<T>(key)
     }
 
@@ -578,7 +595,22 @@ impl<A: Actor> Context<A> {
 
     /// Queue a key-value write to per-service storage.
     pub fn store(&mut self, key: &[u8], value: &[u8]) {
-        self.pending_writes.push((key.to_vec(), value.to_vec()));
+        self.pending_writes.push((key.to_vec(), Some(value.to_vec())));
+    }
+
+    /// Queue a key removal from per-service storage. Last-wins per key
+    /// alongside [`store`](Self::store), in queue order.
+    ///
+    /// Panics on the reserved state key: the wire rejects a state-row
+    /// delete (`Delete{STATE_KEY}` is malformed), so catching the
+    /// programming error here — at the call site — beats the host
+    /// discarding the whole dispatch as a malformed work-result.
+    pub fn remove(&mut self, key: &[u8]) {
+        assert!(
+            key != crate::lifecycle::STATE_KEY_BYTES,
+            "the actor state row cannot be deleted"
+        );
+        self.pending_writes.push((key.to_vec(), None));
     }
 
     /// Queue a new service spawn from a code hash. The code blob must
@@ -694,7 +726,10 @@ impl<A: Actor> Context<A> {
         use crate::refine_payload::{Effect, RefinePayload};
         let mut effects: Vec<Effect> = Vec::new();
         for (key, value) in self.pending_writes.drain(..) {
-            effects.push(Effect::Write { key, value });
+            effects.push(match value {
+                Some(value) => Effect::Write { key, value },
+                None => Effect::Delete { key },
+            });
         }
         if let Some(value) = state_write {
             effects.push(Effect::Write {

@@ -219,7 +219,7 @@ impl RaftCommit {
     fn append_and_apply_single_node(
         &mut self,
         state: Option<&[u8]>,
-        rest: &[(&[u8], &[u8])],
+        rest: &[(&[u8], Option<&[u8]>)],
         payload: &[u8],
     ) -> Result<(), CommitError> {
         let term = self.meta.current_term;
@@ -244,7 +244,14 @@ impl RaftCommit {
             if !rest.is_empty() {
                 let mut kv = txn.open_table(KV_TABLE)?;
                 for (key, value) in rest {
-                    kv.insert(*key, *value)?;
+                    match value {
+                        Some(value) => {
+                            kv.insert(*key, *value)?;
+                        }
+                        None => {
+                            kv.remove(*key)?;
+                        }
+                    }
                 }
             }
         }
@@ -296,7 +303,14 @@ impl CommitStrategy for RaftCommit {
                 if !rest.is_empty() {
                     let mut kv = txn.open_table(KV_TABLE)?;
                     for (key, value) in &rest {
-                        kv.insert(*key, *value)?;
+                        match value {
+                            Some(value) => {
+                                kv.insert(*key, *value)?;
+                            }
+                            None => {
+                                kv.remove(*key)?;
+                            }
+                        }
                     }
                 }
             }
@@ -399,7 +413,14 @@ impl CommitStrategy for RaftCommit {
                     if !rest.is_empty() {
                         let mut kv = txn.open_table(KV_TABLE)?;
                         for (key, value) in &rest {
-                            kv.insert(*key, *value)?;
+                            match value {
+                                Some(value) => {
+                                    kv.insert(*key, *value)?;
+                                }
+                                None => {
+                                    kv.remove(*key)?;
+                                }
+                            }
                         }
                     }
                 }

@@ -104,11 +104,13 @@ pub type NodeValidator = alloc::sync::Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Sen
 /// dispatch's applied work-results changed, committed in one backend
 /// transaction (work-result contract §7).
 pub struct AgentDelta<'a> {
-    /// Ordered storage writes from the applied work-results —
-    /// `STATE_KEY` included, as just another key. No deletes: the wire
-    /// has no delete effect. Tasks have no rows of their own, so this
-    /// stays small.
-    pub writes: &'a [(Vec<u8>, Vec<u8>)],
+    /// Ordered storage mutations from the applied work-results —
+    /// `STATE_KEY` included, as just another key; `None` is a delete
+    /// tombstone (never on `STATE_KEY` — the wire rejects that). One
+    /// ordered list because last-wins per key depends on the
+    /// write/delete interleaving. Tasks have no rows of their own, so
+    /// this stays small.
+    pub writes: &'a [(Vec<u8>, Option<Vec<u8>>)],
     /// `(kind, anchor)` the delta was applied against. NORMATIVE, not
     /// just audit: replay divergence detection compares each replayed
     /// dispatch's re-emitted anchor against the value recorded in the
@@ -135,7 +137,7 @@ impl<'a> AgentDelta<'a> {
     /// post-replay materialization / follower-apply / extension shape.
     /// `writes` is the caller-owned single-pair buffer (the borrow has
     /// to outlive the delta).
-    pub fn state_only(writes: &'a [(Vec<u8>, Vec<u8>)]) -> Self {
+    pub fn state_only(writes: &'a [(Vec<u8>, Option<Vec<u8>>)]) -> Self {
         Self {
             writes,
             anchor: (crate::effect_log::ANCHOR_UNRECORDED, [0u8; 32]),
@@ -189,7 +191,7 @@ pub trait CommitStrategy: Send {
     fn commit_state(&mut self, state: &[u8]) -> Result<CommitReceipt, CommitError> {
         let writes = [(
             crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-            state.to_vec(),
+            Some(state.to_vec()),
         )];
         self.commit(&AgentDelta::state_only(&writes))
     }
@@ -204,7 +206,7 @@ pub trait CommitStrategy: Send {
     ) -> Result<CommitReceipt, CommitError> {
         let writes = [(
             crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-            state.to_vec(),
+            Some(state.to_vec()),
         )];
         self.commit(&AgentDelta {
             writes: &writes,
@@ -334,18 +336,24 @@ mod local {
     pub const KV_TABLE: redb::TableDefinition<&[u8], &[u8]> =
         redb::TableDefinition::new("agent_kv");
 
-    /// Split a delta's ordered writes into the last `STATE_KEY` value
-    /// (last-wins per key) and the non-STATE rows, preserving order.
+    /// Split a delta's ordered mutations into the last `STATE_KEY`
+    /// value (last-wins per key) and the non-STATE rows — `None` values
+    /// are delete tombstones — preserving order.
     pub fn split_delta<'a>(
         delta: &'a AgentDelta<'_>,
-    ) -> (Option<&'a [u8]>, Vec<(&'a [u8], &'a [u8])>) {
+    ) -> (Option<&'a [u8]>, Vec<(&'a [u8], Option<&'a [u8]>)>) {
         let mut state = None;
         let mut rest = Vec::new();
         for (key, value) in delta.writes {
             if key.as_slice() == crate::lifecycle::STATE_KEY_BYTES {
-                state = Some(value.as_slice());
+                // A STATE_KEY tombstone can't decode off the wire; if a
+                // host-built delta carries one anyway, ignoring it here
+                // beats materializing an accidental state wipe.
+                if let Some(value) = value {
+                    state = Some(value.as_slice());
+                }
             } else {
-                rest.push((key.as_slice(), value.as_slice()));
+                rest.push((key.as_slice(), value.as_deref()));
             }
         }
         (state, rest)
@@ -427,7 +435,14 @@ mod local {
                 if !rest.is_empty() {
                     let mut kv = txn.open_table(KV_TABLE)?;
                     for (key, value) in &rest {
-                        kv.insert(*key, *value)?;
+                        match value {
+                            Some(value) => {
+                                kv.insert(*key, *value)?;
+                            }
+                            None => {
+                                kv.remove(*key)?;
+                            }
+                        }
                     }
                 }
             }
@@ -1029,7 +1044,14 @@ mod crdt {
                 if !rest.is_empty() {
                     let mut kv = txn.open_table(super::KV_TABLE)?;
                     for (key, value) in &rest {
-                        kv.insert(*key, *value)?;
+                        match value {
+                            Some(value) => {
+                                kv.insert(*key, *value)?;
+                            }
+                            None => {
+                                kv.remove(*key)?;
+                            }
+                        }
                     }
                 }
                 if let Some((cid, bytes, _)) = &new_cid_bytes_seq {
@@ -1531,7 +1553,7 @@ mod tests {
 
         let writes = [(
             crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-            b"state".to_vec(),
+            Some(b"state".to_vec()),
         )];
         let log1 = EffectLog::for_msg(b"m1".to_vec());
         let r1 = cc
@@ -1595,12 +1617,12 @@ mod tests {
         {
             let mut lc = LocalCommit::open(&db_path).unwrap();
             let writes = [
-                (b"row-a".to_vec(), b"1".to_vec()),
+                (b"row-a".to_vec(), Some(b"1".to_vec())),
                 (
                     crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-                    b"state".to_vec(),
+                    Some(b"state".to_vec()),
                 ),
-                (b"row-b".to_vec(), b"2".to_vec()),
+                (b"row-b".to_vec(), Some(b"2".to_vec())),
             ];
             lc.commit(&AgentDelta::state_only(&writes)).unwrap();
         }
@@ -1619,6 +1641,70 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn delete_tombstone_removes_kv_row() {
+        // A committed row deleted by a later delta is gone from
+        // restore_writes after reopen; deleting an absent row is a
+        // no-op, not an error.
+        let db_path = temp_db_path("local_kv_delete");
+        let dir = db_path.parent().unwrap().to_path_buf();
+        {
+            let mut lc = LocalCommit::open(&db_path).unwrap();
+            let writes = [
+                (b"row-a".to_vec(), Some(b"1".to_vec())),
+                (b"row-b".to_vec(), Some(b"2".to_vec())),
+            ];
+            lc.commit(&AgentDelta::state_only(&writes)).unwrap();
+            let deletes = [(b"row-a".to_vec(), None), (b"row-c".to_vec(), None)];
+            lc.commit(&AgentDelta::state_only(&deletes)).unwrap();
+        }
+        {
+            let lc = LocalCommit::open(&db_path).unwrap();
+            assert_eq!(
+                lc.restore_writes().unwrap(),
+                vec![(b"row-b".to_vec(), b"2".to_vec())],
+                "deleted row must not survive a restart"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn crdt_delete_tombstone_removes_kv_row() {
+        let path = temp_db_path("crdt_kv_delete");
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+        let writes = [(b"row-a".to_vec(), Some(b"1".to_vec()))];
+        cc.commit(&AgentDelta::state_only(&writes)).unwrap();
+        assert_eq!(
+            cc.restore_writes().unwrap(),
+            vec![(b"row-a".to_vec(), b"1".to_vec())],
+        );
+        let deletes = [(b"row-a".to_vec(), None)];
+        cc.commit(&AgentDelta::state_only(&deletes)).unwrap();
+        assert!(
+            cc.restore_writes().unwrap().is_empty(),
+            "deleted row must leave the KV table"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn split_delta_ignores_state_tombstone() {
+        // A STATE_KEY tombstone can't decode off the wire; a host-built
+        // delta carrying one must not materialize as a state wipe.
+        let writes = [
+            (crate::lifecycle::STATE_KEY_BYTES.to_vec(), None),
+            (b"row".to_vec(), Some(b"1".to_vec())),
+        ];
+        let delta = AgentDelta::state_only(&writes);
+        let (state, rest) = split_delta(&delta);
+        assert_eq!(state, None);
+        assert_eq!(rest, vec![(&b"row"[..], Some(&b"1"[..]))]);
     }
 
     #[cfg(feature = "storage")]

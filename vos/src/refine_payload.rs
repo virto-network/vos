@@ -68,8 +68,10 @@
 //!   remainder of the payload)
 //! - `0x03` PROVIDE — `[hash: 32 bytes][data_bytes]`
 //! - `0x04` NEW     — `[code_hash: 32 bytes]`
-//! - `0x05` is reserved for a future delete effect; not emitted (Write
-//!   always carries a value).
+//! - `0x05` DELETE  — `[key_len: u16 LE][key]`; removes the row.
+//!   Participates in last-wins per key like Write. A delete of
+//!   `STATE_KEY` is malformed (state reset is not expressible as an
+//!   effect), rejected on decode.
 
 use alloc::vec::Vec;
 
@@ -105,6 +107,7 @@ pub const EFFECT_WRITE: u8 = 0x01;
 pub const EFFECT_TRANSFER: u8 = 0x02;
 pub const EFFECT_PROVIDE: u8 = 0x03;
 pub const EFFECT_NEW: u8 = 0x04;
+pub const EFFECT_DELETE: u8 = 0x05;
 
 /// Domain separator for [`RefinePayload::transition_digest`].
 pub const TRANSITION_DOMAIN: &[u8] = b"vos/transition/v1";
@@ -134,6 +137,9 @@ pub enum Effect {
     Transfer { target: u32, memo: Vec<u8> },
     Provide { hash: [u8; 32], data: Vec<u8> },
     New { code_hash: [u8; 32] },
+    /// Remove the row at `key`. Last-wins per key alongside Write.
+    /// `Delete{STATE_KEY}` never decodes (see the module docs).
+    Delete { key: Vec<u8> },
 }
 
 /// A complete refine output ready to encode/decode.
@@ -437,6 +443,13 @@ fn encode_effect(out: &mut Vec<u8>, eff: &Effect) {
             push_u32(out, 32);
             out.extend_from_slice(code_hash);
         }
+        Effect::Delete { key } => {
+            out.push(EFFECT_DELETE);
+            let payload_len = 2 + key.len();
+            push_u32(out, payload_len as u32);
+            push_u16(out, key.len() as u16);
+            out.extend_from_slice(key);
+        }
     }
 }
 
@@ -473,6 +486,17 @@ fn decode_effect(c: &mut Cursor<'_>, strict: bool) -> Option<Effect> {
             let mut code_hash = [0u8; 32];
             code_hash.copy_from_slice(pc.read_bytes(32)?);
             Effect::New { code_hash }
+        }
+        EFFECT_DELETE => {
+            let key_len = pc.read_u16()? as usize;
+            let key = pc.read_bytes(key_len)?.to_vec();
+            // State reset is not expressible as an effect: under
+            // last-wins a STATE_KEY tombstone would wipe the actor,
+            // and the anchor chain has no kind for "was deleted".
+            if key.as_slice() == crate::lifecycle::STATE_KEY_BYTES {
+                return None;
+            }
+            Effect::Delete { key }
         }
         _ => return None,
     };
@@ -581,12 +605,63 @@ mod tests {
                     data: vec![0xFF, 0xEE],
                 },
                 Effect::New { code_hash: [7; 32] },
+                Effect::Delete {
+                    key: b"k1".to_vec(),
+                },
             ],
             ..RefinePayload::new()
         };
         let bytes = p.encode();
         let decoded = RefinePayload::decode(&bytes).unwrap();
         assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn rejects_state_key_delete() {
+        let bytes = RefinePayload {
+            effects: vec![Effect::Delete { key: state_key() }],
+            ..RefinePayload::new()
+        }
+        .encode();
+        assert!(RefinePayload::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn rejects_delete_payload_slack() {
+        // Same strict-canonical rule as Write: a Delete payload not
+        // exactly consumed by its fields rejects under v3.
+        let mut bytes = Vec::new();
+        bytes.push(REFINE_PAYLOAD_VERSION);
+        bytes.push(0); // flags
+        bytes.push(ANCHOR_GENESIS);
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reply_len
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // effects_count
+        bytes.push(EFFECT_DELETE);
+        // payload = key_len(2) + "k"(1) = 3, declared 4 with slack.
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.push(b'k');
+        bytes.push(0x00); // slack
+        assert!(RefinePayload::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn transition_digest_distinguishes_delete_from_write() {
+        let base = RefinePayload {
+            effects: vec![Effect::Write {
+                key: b"k".to_vec(),
+                value: Vec::new(),
+            }],
+            ..RefinePayload::new()
+        };
+        let with_delete = RefinePayload {
+            effects: vec![Effect::Delete { key: b"k".to_vec() }],
+            ..RefinePayload::new()
+        };
+        // An empty-value write and a delete are different transitions
+        // (present-and-empty vs absent) and must digest differently.
+        assert_ne!(base.transition_digest(), with_delete.transition_digest());
     }
 
     #[test]
