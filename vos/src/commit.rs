@@ -1078,8 +1078,14 @@ mod crdt {
             // real history that replay must reproduce). v2 deltas
             // (`effect_bearing == false`) fall back to value
             // comparison, since those guests re-emit their full state
-            // on every halt.
-            let append_node = delta.log.is_some() && (state_changed || delta.effect_bearing);
+            // on every halt — but a v2 dispatch that wrote KV rows
+            // under an unchanged state blob still appends: every
+            // persisted row must be replay-derivable, or the next
+            // post-replay materialization (`commit_rebuilt`'s
+            // whole-table swap) destroys it. RaftCommit's guard
+            // already includes `rest`.
+            let append_node =
+                delta.log.is_some() && (state_changed || delta.effect_bearing || !rest.is_empty());
             if !state_changed && rest.is_empty() && !append_node {
                 return Ok(CommitReceipt {
                     node_appended: false,
@@ -1788,6 +1794,52 @@ mod tests {
             cc.restore_writes().unwrap().is_empty(),
             "deleted row must leave the KV table"
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn crdt_row_writes_under_unchanged_state_append_history() {
+        // A v2-style dispatch (effect_bearing = false) that wrote KV
+        // rows while re-emitting a byte-identical state blob must
+        // append a DAG node: every persisted row has to be
+        // replay-derivable, or the next post-replay whole-table swap
+        // (commit_rebuilt) destroys it.
+        let path = temp_db_path("crdt_v2_rows");
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+        let log1 = crate::effect_log::EffectLog::for_msg(b"m1".to_vec());
+        let writes = [(
+            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+            Some(b"s".to_vec()),
+        )];
+        cc.commit(&AgentDelta {
+            writes: &writes,
+            anchor: (0x01, [1u8; 32]),
+            log: Some(&log1),
+            effect_bearing: false,
+        })
+        .unwrap();
+        let log2 = crate::effect_log::EffectLog::for_msg(b"m2".to_vec());
+        let writes2 = [
+            (
+                crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                Some(b"s".to_vec()),
+            ),
+            (b"row".to_vec(), Some(b"1".to_vec())),
+        ];
+        let receipt = cc
+            .commit(&AgentDelta {
+                writes: &writes2,
+                anchor: (0x01, [2u8; 32]),
+                log: Some(&log2),
+                effect_bearing: false,
+            })
+            .unwrap();
+        assert!(
+            receipt.node_appended,
+            "a row-bearing v2 dispatch is real history"
+        );
+        assert_eq!(cc.replay_logs().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
