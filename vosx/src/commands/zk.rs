@@ -25,7 +25,10 @@
 //! extended timeout ([`MEASURE_TIMEOUT`]); the extension runs on its own thread,
 //! so a busy pin doesn't stall the node. Pass `--allowlist` to skip proving and
 //! re-pin only the cheap fields (witness address + entering root) against an
-//! already-established allowlist.
+//! already-established allowlist. Omit `--profile` to DERIVE the canonical
+//! forcing profile first (the prover's `measure_floors`: per-chip max natural
+//! log_size over every `--seg-steps` window) — retuning a deployment's
+//! `seg_steps` is then a single `pin` invocation, no hand-authored profile.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -70,9 +73,17 @@ pub struct PinArgs {
     #[arg(long, value_name = "N")]
     seg_steps: u64,
     /// File holding the canonical forcing profile: `zkpvm::chip_idx::COUNT`
-    /// unsigned integers, whitespace/comma/newline separated (`0` = not forced).
+    /// unsigned integers, whitespace/comma/newline separated (`0` = not
+    /// forced). Omit to DERIVE the profile: pin first drives the prover's
+    /// `measure_floors` (per-chip max natural log_size over every
+    /// `--seg-steps` window of the `--witness` run) and measures the
+    /// allowlist under the derived floors — the whole re-pin in one command.
     #[arg(long, value_name = "FILE")]
-    profile: PathBuf,
+    profile: Option<PathBuf>,
+    /// Write the profile that was pinned (derived or read) to this file, in
+    /// the same format `--profile` reads.
+    #[arg(long, value_name = "FILE")]
+    profile_out: Option<PathBuf>,
     /// Catalog TOML to write (upserts this program; created if absent).
     #[arg(long, value_name = "FILE")]
     out: PathBuf,
@@ -112,7 +123,7 @@ fn pin(args: PinArgs) -> Result<()> {
         .map_err(|e| anyhow!("transpile {}: {e:?}", args.elf.display()))?;
     let waddr = witness_addr(&elf)
         .with_context(|| format!("{} must export a resolved __VOS_WITNESS", args.elf.display()))?;
-    let profile = read_profile(&args.profile)?;
+    let profile_arg = args.profile.as_ref().map(read_profile).transpose()?;
 
     // The witness drives the MEASURE path; the `--allowlist` re-pin path passes
     // an empty witness (the extension then returns only the entering root) and
@@ -126,10 +137,15 @@ fn pin(args: PinArgs) -> Result<()> {
              (or pass --allowlist to record a known one)"
         ),
     };
+    // Deriving floors measures the REAL (witness-injected) run — an empty
+    // witness would profile the fallback path's shape instead.
+    if profile_arg.is_none() && witness.is_empty() {
+        bail!("--witness <FILE> is required to derive the profile (or pass --profile)");
+    }
 
     // ── zkpvm half (prover extension over the daemon) ────────────────
     let space = resolve_space(args.space.as_deref())?;
-    let reply = DaemonClient::with_connect(&space, |client| {
+    let (reply, profile) = DaemonClient::with_connect(&space, |client| {
         let ext = client.resolve_target(&args.extension).map_err(|_| {
             anyhow!(
                 "no '{}' extension loaded in space '{space}' — add \
@@ -138,8 +154,28 @@ fn pin(args: PinArgs) -> Result<()> {
                 args.extension,
             )
         })?;
+        let profile = match profile_arg.clone() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "deriving canonical profile for '{}' at seg_steps={} (trace-only — minutes)…",
+                    args.name, args.seg_steps
+                );
+                let reply = client.invoke_dyn_with_timeout(
+                    ext,
+                    &Msg::new("measure_floors")
+                        .with("pvm_blob", blob.clone())
+                        .with("witness_bytes", witness.clone())
+                        .with("witness_addr", waddr)
+                        .with("seg_steps", args.seg_steps)
+                        .with("gas", args.gas),
+                    MEASURE_TIMEOUT,
+                )?;
+                parse_floors_reply(reply)?
+            }
+        };
         eprintln!("measuring '{}' via the '{}' extension (this is heavy — minutes)…", args.name, args.extension);
-        client.invoke_dyn_with_timeout(
+        let reply = client.invoke_dyn_with_timeout(
             ext,
             &Msg::new("measure_catalog")
                 .with("pvm_blob", blob.clone())
@@ -149,7 +185,8 @@ fn pin(args: PinArgs) -> Result<()> {
                 .with("profile", profile.clone())
                 .with("gas", args.gas),
             MEASURE_TIMEOUT,
-        )
+        )?;
+        Ok((reply, profile))
     })?;
 
     let (image_root, measured) = parse_measure_reply(reply)?;
@@ -171,7 +208,7 @@ fn pin(args: PinArgs) -> Result<()> {
     let pin = ProgramPin {
         name: args.name.clone(),
         commitments: commitments.iter().map(|c| bytes_to_hex(c)).collect(),
-        canonical_profile: profile,
+        canonical_profile: profile.clone(),
         seg_steps: args.seg_steps,
         witness_addr: waddr,
         unpatched_image_root: bytes_to_hex(&image_root),
@@ -187,15 +224,38 @@ fn pin(args: PinArgs) -> Result<()> {
         .save(&args.out)
         .map_err(|e| anyhow!("write catalog {}: {e}", args.out.display()))?;
 
+    if let Some(path) = &args.profile_out {
+        let text = profile.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+        std::fs::write(path, format!("{text}\n"))
+            .with_context(|| format!("write profile {}", path.display()))?;
+    }
+
     eprintln!("pinned '{}' into {}", args.name, args.out.display());
     eprintln!("  witness_addr         = {waddr:#x}");
     eprintln!("  unpatched_image_root = {}", bytes_to_hex(&image_root));
     eprintln!("  seg_steps            = {}", args.seg_steps);
+    if args.profile.is_none() {
+        let text = profile.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+        eprintln!("  profile (derived)    = {text}");
+    }
     eprintln!("  commitments          = {}", commitments.len());
     for c in &commitments {
         eprintln!("    {}", bytes_to_hex(c));
     }
     Ok(())
+}
+
+/// Decode a `measure_floors` reply — the derived canonical profile as a u32
+/// list. An empty list means the extension failed the measurement.
+fn parse_floors_reply(reply: Value) -> Result<Vec<u32>> {
+    match reply {
+        Value::ListU32(floors) if !floors.is_empty() => Ok(floors),
+        Value::ListU32(_) | Value::Unit => bail!(
+            "prover measure_floors returned nothing — the measurement failed \
+             (unparseable blob or trace out of gas). Check the daemon log."
+        ),
+        other => bail!("prover measure_floors returned {other:?}, expected a u32 list"),
+    }
 }
 
 /// Decode a `measure_catalog` reply — `image_root(32) ++ commitment(32)…` —
