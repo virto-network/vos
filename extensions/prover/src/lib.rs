@@ -92,6 +92,21 @@ const TRACE_GAS: u64 = 100_000_000;
 /// batch.
 const MAX_CHAIN_SEGMENTS: usize = 65_536;
 
+/// Run `f` on a dedicated 512 MiB-stack thread and hand back its result. A
+/// canonical prove/verify overflows the default ~2 MiB stack, so every heavy
+/// zkpvm entry point runs through here. `None` when the thread can't spawn
+/// or `f` panics — the fail-soft the callers' empty replies map to.
+fn run_on_large_stack<T: Send + 'static>(
+    f: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(f)
+        .ok()?
+        .join()
+        .ok()?
+}
+
 // ── Async prove jobs ────────────────────────────────────────────
 //
 // `prove_chain` is a SYNCHRONOUS gas-metered invoke: a caller that asks it
@@ -435,16 +450,24 @@ impl Prover {
     /// reads `__VOS_WITNESS` itself (this extension stays a pure PVM prover,
     /// blob-in), then invokes this to measure:
     ///   * the ENTERING-IMAGE page-Merkle root over the UNPATCHED image
-    ///     (diagnostic — see `ChainManifest::initial_root`), and
+    ///     (diagnostic — see `ChainManifest::initial_root`),
+    ///   * when `profile` is EMPTY, the canonical forcing profile itself
+    ///     ([`zkpvm::canonical_profile_for`] over the witness run — same
+    ///     derivation as `measure_floors`, from the one trace this
+    ///     measurement already makes), and
     ///   * when a representative `witness_bytes` is supplied, the canonical
-    ///     COMMITMENT allowlist (prove one segment per distinct canonical shape).
+    ///     COMMITMENT allowlist (prove one segment per distinct canonical shape)
+    ///     under the supplied-or-derived profile.
     ///
-    /// Returns `image_root(32) ++ commitment(32)…`. An empty `witness_bytes` (the
-    /// `--allowlist` re-pin path, where the caller records a known allowlist)
-    /// yields just the 32-byte root. Empty `Vec` on any failure. SYNCHRONOUS +
-    /// heavy (minutes, tens of GB): a publish-time invoke, so the caller drives
-    /// it with an extended timeout; it runs on this extension's own thread, so a
-    /// busy measure doesn't freeze the node's other services.
+    /// Returns `image_root(32) ++ n(u32 LE) ++ profile(u32 LE × n) ++
+    /// commitment(32)…` — the profile the measurement ran under is always
+    /// echoed, so a deriving caller pins exactly what was measured. An empty
+    /// `witness_bytes` (the `--allowlist` re-pin path, where the caller records
+    /// a known allowlist) yields no commitments and skips all proving. Empty
+    /// `Vec` on any failure. SYNCHRONOUS + heavy (minutes, tens of GB): a
+    /// publish-time invoke, so the caller drives it with an extended timeout;
+    /// it runs on this extension's own thread, so a busy measure doesn't
+    /// freeze the node's other services.
     #[msg]
     async fn measure_catalog(
         &self,
@@ -498,8 +521,9 @@ impl Prover {
 /// The heavy measurement behind [`Prover::measure_catalog`] — traces + proves,
 /// so it runs on a 512 MiB thread (a canonical prove overflows the default
 /// ~2 MiB, same reason `verify` uses a large stack). Returns
-/// `image_root(32) ++ commitment(32)…` (just the 32-byte root when `witness` is
-/// empty); `None` on any failure.
+/// `image_root(32) ++ n(u32 LE) ++ profile(u32 LE × n) ++ commitment(32)…`
+/// (no commitments when `witness` is empty; the profile is derived when the
+/// supplied one is empty); `None` on any failure.
 pub fn measure_catalog(
     pvm_blob: &[u8],
     witness: &[u8],
@@ -512,12 +536,9 @@ pub fn measure_catalog(
     let pvm_blob = pvm_blob.to_vec();
     let witness = witness.to_vec();
     let profile = profile.to_vec();
-    std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(move || measure_catalog_inner(&pvm_blob, &witness, witness_addr, seg_steps, &profile, gas))
-        .ok()?
-        .join()
-        .ok()?
+    run_on_large_stack(move || {
+        measure_catalog_inner(&pvm_blob, &witness, witness_addr, seg_steps, &profile, gas)
+    })
 }
 
 fn measure_catalog_inner(
@@ -528,41 +549,54 @@ fn measure_catalog_inner(
     profile: &[u32],
     gas: u64,
 ) -> Option<Vec<u8>> {
+    if seg_steps == 0 {
+        return None;
+    }
     // Entering-image root over the UNPATCHED image (witness buffer all-zero):
     // trace with no patches and page-Merkle its initial memory. DIAGNOSTIC —
     // NOT the verifier's entering-image pin (a witness-injecting program's live
     // segment-0 root is the PATCHED root); see `ChainManifest::initial_root`.
     let unpatched = zkpvm::actor::trace_blob(pvm_blob, gas)?;
     let image_root = zkpvm::page_merkle::image_root(&unpatched.initial_memory);
-    let mut out = Vec::with_capacity(32);
-    out.extend_from_slice(&image_root);
     // Measure the commitment allowlist only when a representative witness is
     // supplied; the `--allowlist` re-pin path passes an empty witness and
-    // records its own already-trusted allowlist.
+    // records its own already-trusted allowlist. An empty profile means
+    // DERIVE it from the same witness trace the allowlist probe uses — one
+    // trace serves both, and the echo below pins exactly what was measured.
+    let mut floors = profile.to_vec();
+    let mut commitments = Vec::new();
     if !witness.is_empty() {
-        for c in measure_commitments(pvm_blob, witness_addr, witness, seg_steps, profile, gas)? {
-            out.extend_from_slice(&c);
+        let full =
+            zkpvm::actor::trace_blob_with_patches(pvm_blob, gas, &[(witness_addr, witness)])?;
+        if floors.is_empty() {
+            floors = zkpvm::canonical_profile_for(&full, seg_steps)?;
         }
+        commitments = measure_commitments(&full, seg_steps, &floors)?;
+    }
+    let mut out = Vec::with_capacity(32 + 4 + floors.len() * 4 + commitments.len() * 32);
+    out.extend_from_slice(&image_root);
+    out.extend_from_slice(&(floors.len() as u32).to_le_bytes());
+    for f in &floors {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    for c in &commitments {
+        out.extend_from_slice(c);
     }
     Some(out)
 }
 
-/// Trace the witness-injected run, segment it, and prove one representative
-/// canonical segment per distinct shape (seg 0, the last/short segment, and the
+/// Segment the traced witness run and prove one representative canonical
+/// segment per distinct shape (seg 0, the last/short segment, and the
 /// first segment of each distinct fixed-base-scalar-mult "comb" count), yielding
 /// the distinct program commitments — the canonical allowlist. Mirrors the
 /// federation e2e's `voucher_check_allowlist_coverage` probe so the pinned
 /// allowlist is complete without proving all ~N segments. MUST run on a large
 /// stack — reached via [`measure_catalog`]. `None` on any failure.
 fn measure_commitments(
-    blob: &[u8],
-    witness_addr: usize,
-    witness: &[u8],
+    full: &zkpvm::SideNote,
     seg_steps: usize,
     profile: &[u32],
-    gas: u64,
 ) -> Option<Vec<[u8; 32]>> {
-    let full = zkpvm::actor::trace_blob_with_patches(blob, gas, &[(witness_addr, witness)])?;
     let bounds = zkpvm::segment::segment_bounds(full.steps.len(), seg_steps);
     let n = bounds.len();
     if n == 0 {
@@ -570,7 +604,7 @@ fn measure_commitments(
     }
     let comb_counts: Vec<usize> = bounds
         .iter()
-        .map(|&(a, b)| zkpvm::segment::segment_side_note(&full, a, b).ristretto_comb_calls.len())
+        .map(|&(a, b)| zkpvm::segment::segment_side_note(full, a, b).ristretto_comb_calls.len())
         .collect();
 
     // Probe seg 0, the last (possibly short) segment, and the first segment of
@@ -588,7 +622,7 @@ fn measure_commitments(
     let mut out = Vec::new();
     for i in probe {
         let (a, b) = bounds[i];
-        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let mut sn = zkpvm::segment::segment_side_note(full, a, b);
         let proof = prove_canonical(&mut sn, profile).ok()?;
         let c = zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
         if seen.insert(c) {
@@ -614,48 +648,18 @@ pub fn measure_floors(
 ) -> Option<Vec<u32>> {
     let pvm_blob = pvm_blob.to_vec();
     let witness = witness.to_vec();
-    std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(move || {
-            let full = if witness.is_empty() {
-                zkpvm::actor::trace_blob(&pvm_blob, gas)?
-            } else {
-                zkpvm::actor::trace_blob_with_patches(
-                    &pvm_blob,
-                    gas,
-                    &[(witness_addr, witness.as_slice())],
-                )?
-            };
-            floors_over_segments(&full, seg_steps)
-        })
-        .ok()?
-        .join()
-        .ok()?
-}
-
-/// Per-chip elementwise MAX of the natural main-trace `log_size` over every
-/// `seg_steps` window of `full` — the forcing profile under which
-/// `prove_canonical` gives all of a chain's windows an identical shape.
-/// Chips whose size is already uniform get their own size back (forcing is
-/// a no-op); varying chips get the chain-wide max, so the windows collapse
-/// onto the minimal canonical-shape set (distinct shapes remain only where
-/// content differs beyond size, e.g. fixed-base-comb call count).
-fn floors_over_segments(full: &zkpvm::SideNote, seg_steps: usize) -> Option<Vec<u32>> {
-    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), seg_steps);
-    if bounds.is_empty() {
-        return None;
-    }
-    let indices: Vec<usize> = (0..zkpvm::chip_idx::COUNT).collect();
-    let mut floors = vec![0u32; indices.len()];
-    for &(a, b) in &bounds {
-        let mut sn = zkpvm::segment::segment_side_note(full, a, b);
-        for (floor, natural) in
-            floors.iter_mut().zip(zkpvm::natural_log_sizes_for(&mut sn, &indices))
-        {
-            *floor = (*floor).max(natural);
-        }
-    }
-    Some(floors)
+    run_on_large_stack(move || {
+        let full = if witness.is_empty() {
+            zkpvm::actor::trace_blob(&pvm_blob, gas)?
+        } else {
+            zkpvm::actor::trace_blob_with_patches(
+                &pvm_blob,
+                gas,
+                &[(witness_addr, witness.as_slice())],
+            )?
+        };
+        zkpvm::canonical_profile_for(&full, seg_steps)
+    })
 }
 
 // ── Async job-queue logic (Context-free, unit-testable) ──────────────
@@ -738,17 +742,12 @@ fn run_prove_chain_job(
     let pvm_blob = pvm_blob.to_vec();
     let witness_bytes = witness_bytes.to_vec();
     let profile = profile.to_vec();
-    std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(move || {
-            let segments =
-                prove_chain_segments(&pvm_blob, &witness_bytes, witness_addr, seg_steps, &profile)?;
-            let root = segment_initial_root(&segments)?;
-            Some((root, segments))
-        })
-        .ok()?
-        .join()
-        .ok()?
+    run_on_large_stack(move || {
+        let segments =
+            prove_chain_segments(&pvm_blob, &witness_bytes, witness_addr, seg_steps, &profile)?;
+        let root = segment_initial_root(&segments)?;
+        Some((root, segments))
+    })
 }
 
 /// The entering-image root of a proved chain: segment 0's
@@ -845,6 +844,9 @@ pub fn prove_chain_segments(
     seg_steps: usize,
     profile: &[u32],
 ) -> Option<Vec<Vec<u8>>> {
+    if seg_steps == 0 {
+        return None;
+    }
     let full = trace_blob(pvm_blob, witness_bytes, witness_addr)?;
     let bounds = zkpvm::segment::segment_bounds(full.steps.len(), seg_steps);
     let mut segments: Vec<Vec<u8>> = Vec::with_capacity(bounds.len());
@@ -1045,22 +1047,17 @@ fn verify_segment_on_large_stack(
     let allowlist = allowlist.to_vec();
     let public = public_bytes.to_vec();
     let return_bytes = return_bytes.to_vec();
-    std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(move || {
-            verify_one_segment(
-                &blob,
-                &allowlist,
-                prev_final.as_ref(),
-                expected_initial_root,
-                is_last,
-                &public,
-                &return_bytes,
-            )
-        })
-        .ok()?
-        .join()
-        .ok()?
+    run_on_large_stack(move || {
+        verify_one_segment(
+            &blob,
+            &allowlist,
+            prev_final.as_ref(),
+            expected_initial_root,
+            is_last,
+            &public,
+            &return_bytes,
+        )
+    })
 }
 
 /// Pure per-segment verify (no threading): decode the proof, check its
@@ -1122,30 +1119,13 @@ mod anchor_tests {
     //! the picture and the entering root is the ONLY variable — isolating the
     //! anchor as the accept/reject cause.
     use super::*;
-    use javm::PVM_REGISTER_COUNT;
-    use javm::instruction::Opcode;
-    use javm::interpreter::Interpreter;
-    use zkpvm::core::tracing::TracingPvm;
-    use zkpvm::{SideNote, prove_mobile};
+    use test_trace::straight_line_side_note;
+    use zkpvm::prove_mobile;
 
     /// Prove a tiny 2-op program as one MOBILE segment; return its bincode(Proof)
     /// blob, its program commitment, and its entering-image root.
     fn tiny_segment() -> (Vec<u8>, CommitmentHash, [u8; 32]) {
-        let code = vec![
-            Opcode::Add64 as u8, 0x10, 2,
-            Opcode::Add64 as u8, 0x12, 3,
-            Opcode::Trap as u8,
-        ];
-        let bitmask = vec![1, 0, 0, 1, 0, 0, 1];
-        let mut regs = [0u64; PVM_REGISTER_COUNT];
-        regs[0] = 100;
-        regs[1] = 1;
-        let mem = vec![0u8; 4 * 1024 * 1024];
-        let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, mem.clone(), 10_000, 25);
-        let mut tracing = TracingPvm::new(pvm);
-        assert_eq!(tracing.run(), javm::ExitReason::Trap);
-        let steps = tracing.into_trace();
-        let mut sn = SideNote::new(steps, code, bitmask).with_memory(mem);
+        let mut sn = straight_line_side_note(2);
         let proof = prove_mobile(&mut sn).expect("prove tiny segment (MOBILE)");
         let commitment = proof.stark_proof.commitments[0];
         let root = proof.initial_state.memory_root;
@@ -1188,23 +1168,19 @@ mod anchor_tests {
 }
 
 #[cfg(test)]
-mod floors_tests {
-    //! `measure_floors` / `floors_over_segments` — the derived canonical
-    //! profile must make a chain's windows collapse onto one commitment,
-    //! and the blob path must fail soft. The heavy real-program run
-    //! (voucher-check floors per `seg_steps`) lives with the rest of the
-    //! provenance gates in `vos/tests/elf_integration.rs`.
-    use super::*;
+mod test_trace {
+    //! Shared tiny-trace fixture: a straight-line `Add64` program traced
+    //! into a [`SideNote`], small enough to prove in-test.
     use javm::PVM_REGISTER_COUNT;
     use javm::instruction::Opcode;
     use javm::interpreter::Interpreter;
     use zkpvm::SideNote;
     use zkpvm::core::tracing::TracingPvm;
 
-    /// Trace a straight-line program long enough to split into windows.
-    fn tiny_trace() -> SideNote {
+    /// Trace `n_adds` `Add64` ops followed by `Trap` into a `SideNote`.
+    pub fn straight_line_side_note(n_adds: u8) -> SideNote {
         let mut code = Vec::new();
-        for imm in 1..=6u8 {
+        for imm in 1..=n_adds {
             code.extend_from_slice(&[Opcode::Add64 as u8, 0x10, imm]);
         }
         code.push(Opcode::Trap as u8);
@@ -1216,11 +1192,24 @@ mod floors_tests {
         regs[0] = 100;
         regs[1] = 1;
         let mem = vec![0u8; 4 * 1024 * 1024];
-        let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, mem.clone(), 10_000, 25);
+        let pvm =
+            Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, mem.clone(), 10_000, 25);
         let mut tracing = TracingPvm::new(pvm);
-        tracing.run();
+        assert_eq!(tracing.run(), javm::ExitReason::Trap);
         SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
     }
+}
+
+#[cfg(test)]
+mod floors_tests {
+    //! Floors derivation (`zkpvm::canonical_profile_for` behind
+    //! `measure_floors`) — the derived profile must make a chain's windows
+    //! collapse onto one commitment, and the blob/seg_steps paths must fail
+    //! soft. The heavy real-program run (voucher-check floors per
+    //! `seg_steps`) lives with the rest of the provenance gates in
+    //! `vos/tests/elf_integration.rs`.
+    use super::*;
+    use test_trace::straight_line_side_note;
 
     #[test]
     fn windows_collapse_to_one_commitment_under_derived_floors() {
@@ -1228,18 +1217,18 @@ mod floors_tests {
         std::thread::Builder::new()
             .stack_size(512 * 1024 * 1024)
             .spawn(|| {
-                let full = tiny_trace();
+                let full = straight_line_side_note(6);
                 let n = full.steps.len();
                 let seg = n.div_ceil(2);
                 let bounds = zkpvm::segment::segment_bounds(n, seg);
                 assert_eq!(bounds.len(), 2, "the trace must split into two windows");
 
-                let floors = floors_over_segments(&full, seg).expect("floors derive");
+                let floors = zkpvm::canonical_profile_for(&full, seg).expect("floors derive");
                 assert_eq!(floors.len(), zkpvm::chip_idx::COUNT);
 
                 // Monotonicity: a window's events are a subset of the whole
                 // trace's, so whole-trace naturals dominate windowed floors.
-                let whole = floors_over_segments(&full, n).expect("whole-trace floors");
+                let whole = zkpvm::canonical_profile_for(&full, n).expect("whole-trace floors");
                 for (i, (w, f)) in whole.iter().zip(&floors).enumerate() {
                     assert!(w >= f, "chip {i}: whole-trace natural {w} < windowed floor {f}");
                 }
@@ -1268,11 +1257,17 @@ mod floors_tests {
     }
 
     #[test]
-    fn measure_floors_rejects_garbage_blob() {
+    fn floors_fail_soft_on_bad_inputs() {
         assert_eq!(
             measure_floors(&[0xDE, 0xAD, 0xBE, 0xEF], &[], 0, 100, 1_000),
             None,
             "an unparseable blob yields None, not a panic"
+        );
+        let full = straight_line_side_note(2);
+        assert_eq!(
+            zkpvm::canonical_profile_for(&full, 0),
+            None,
+            "seg_steps = 0 must refuse, not panic"
         );
     }
 }

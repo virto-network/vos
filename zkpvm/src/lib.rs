@@ -527,9 +527,10 @@ pub use proof::{
 pub use prove::prove_with_boundary_override;
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, install_thread_pool, natural_log_sizes_for, prepare_side_note_for_verification,
-    production_pcs_config, production_pcs_config_mobile, prove, prove_canonical, prove_mobile,
-    prove_profiled, prove_profiled_with_config, prove_with_config, prove_with_explicit_components,
+    ProveProfile, canonical_profile_for, install_thread_pool, natural_log_sizes_for,
+    prepare_side_note_for_verification, production_pcs_config, production_pcs_config_mobile, prove,
+    prove_canonical, prove_mobile, prove_profiled, prove_profiled_with_config, prove_with_config,
+    prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{

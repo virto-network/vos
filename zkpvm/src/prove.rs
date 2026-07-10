@@ -617,6 +617,41 @@ pub fn natural_log_sizes_for(side_note: &mut SideNote, indices: &[usize]) -> Vec
         .collect()
 }
 
+/// The canonical forcing profile for `seg_steps`-step windows of `full`: the
+/// per-chip elementwise MAX of every window's natural main-trace `log_size`
+/// (via [`natural_log_sizes_for`]) — the `min_log_sizes` under which
+/// [`prove_canonical`] gives all of a chain's windows an identical shape.
+/// Chips whose size is already uniform get their own size back (forcing is a
+/// no-op); varying chips get the chain-wide max, so the windows collapse onto
+/// the minimal canonical-shape set (distinct shapes remain only where content
+/// differs beyond size, e.g. fixed-base-comb call count). The floors are the
+/// observed per-window maxima for THIS trace's op pattern, not a proven
+/// bound — a deployment's drift guard + allowlist-coverage gate catch a
+/// reshaped transition. `None` when the trace is empty, `seg_steps` is zero,
+/// or any floor exceeds [`DEFAULT_MAX_LOG_SIZE`](crate::DEFAULT_MAX_LOG_SIZE)
+/// (such a profile could only ever produce verifier-rejected proofs).
+pub fn canonical_profile_for(full: &SideNote, seg_steps: usize) -> Option<Vec<u32>> {
+    if seg_steps == 0 {
+        return None;
+    }
+    let bounds = crate::segment::segment_bounds(full.steps.len(), seg_steps);
+    if bounds.is_empty() {
+        return None;
+    }
+    let indices: Vec<usize> = (0..super::chip_idx::COUNT).collect();
+    let mut floors = vec![0u32; indices.len()];
+    for &(a, b) in &bounds {
+        let mut sn = crate::segment::segment_side_note(full, a, b);
+        for (floor, natural) in floors.iter_mut().zip(natural_log_sizes_for(&mut sn, &indices)) {
+            *floor = (*floor).max(natural);
+        }
+    }
+    floors
+        .iter()
+        .all(|&f| f <= crate::DEFAULT_MAX_LOG_SIZE)
+        .then_some(floors)
+}
+
 fn prove_impl_with_components(
     side_note: &mut SideNote,
     config: PcsConfig,
