@@ -157,6 +157,13 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         let msg = build_msg(method, method_meta, &method_args)?;
         let target_id = client.resolve_target(target)?;
         tracing::debug!("invoking {method} on {target_id}");
+
+        // A job-mode handler (`#[msg(job)]`) is a *begin*: it returns a job id
+        // and the driver polls it, rather than a one-shot reply to render.
+        if method_meta.map(|m| m.mode).unwrap_or(0) == MODE_JOB {
+            return drive_job(client, target_id, &msg, parsed.out.as_deref());
+        }
+
         // A handler that declares `#[msg(timeout_ms = N)]` (a slow prove /
         // measure) gets its own wait; everything else uses the default.
         let reply = match method_meta.map(|m| m.timeout_ms).filter(|&ms| ms > 0) {
@@ -300,6 +307,241 @@ fn render_text(reply: &Value, ret_ty: Option<&str>) -> String {
         }
         other => format!("{other:?}"),
     }
+}
+
+/// Metadata dispatch-mode byte for a `#[msg(job)]` job-begin handler.
+const MODE_JOB: u8 = 1;
+/// `job_poll` cadence — one poll per interval.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Wedge guard: give up after this many consecutive empty, not-done polls
+/// (6000 × 100 ms = 10 min) so a stuck job never hangs the CLI forever. It is a
+/// coarse backstop, not a tight bound — it can't distinguish a genuinely wedged
+/// server from a job that is legitimately silent for a long time (a cold model
+/// download/load, or a second job queued behind a mutex), so it errs generous
+/// and, crucially, does NOT release the job when it fires (see `drive_job`).
+const MAX_EMPTY_TICKS: u32 = 6000;
+
+/// A `--out` sink that writes to a `<path>.partial` sibling and atomically
+/// renames it onto the destination only on `commit`, so a failed / wedged /
+/// interrupted job never clobbers a prior good file (an expensive prover output
+/// is worth protecting from a failed retry). The partial is removed on any
+/// early return via `Drop`.
+struct TempOut {
+    partial: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    file: std::fs::File,
+    committed: bool,
+}
+
+impl TempOut {
+    fn create(dest: &str) -> anyhow::Result<Self> {
+        let dest = std::path::PathBuf::from(dest);
+        let partial = std::path::PathBuf::from(format!("{}.partial", dest.display()));
+        let file = std::fs::File::create(&partial)
+            .map_err(|e| anyhow!("open '{}' for job output: {e}", partial.display()))?;
+        Ok(Self {
+            partial,
+            dest,
+            file,
+            committed: false,
+        })
+    }
+
+    fn write(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write;
+        self.file
+            .write_all(data)
+            .map_err(|e| anyhow!("write job output: {e}"))
+    }
+
+    fn commit(mut self) -> anyhow::Result<()> {
+        use std::io::Write;
+        let _ = self.file.flush();
+        std::fs::rename(&self.partial, &self.dest)
+            .map_err(|e| anyhow!("finalize '{}': {e}", self.dest.display()))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TempOut {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.partial);
+        }
+    }
+}
+
+/// Incrementally decode a streamed byte sequence to printable UTF-8: append
+/// `data` to `carry`, return the longest valid-UTF-8 prefix, and keep any
+/// incomplete trailing multi-byte sequence in `carry` for the next call (so a
+/// character split across two poll chunks renders once, not as two `U+FFFD`).
+/// A genuinely invalid byte is emitted as `U+FFFD` and consumed.
+fn decode_stream_text(carry: &mut Vec<u8>, data: &[u8]) -> String {
+    carry.extend_from_slice(data);
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(carry) {
+            Ok(s) => {
+                out.push_str(s);
+                carry.clear();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // `valid_up_to()` bytes are guaranteed valid UTF-8.
+                out.push_str(std::str::from_utf8(&carry[..valid]).unwrap_or(""));
+                match e.error_len() {
+                    // Invalid byte(s) mid-stream: emit a replacement and skip.
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        carry.drain(..valid + bad);
+                    }
+                    // Incomplete trailing sequence: keep it for the next chunk.
+                    None => {
+                        carry.drain(..valid);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Drive a `#[msg(job)]` handler: invoke the begin (which returns a `u64`
+/// job id), then poll `job_poll` until `done`, surfacing output per the
+/// active output mode. A best-effort `job_release` is sent at the terminal
+/// state (but NOT on the wedge guard — a wedged-looking job may still be
+/// running, and releasing would discard its result).
+///
+/// Output modes:
+///   - text (default): each chunk's `data` streams to stdout as UTF-8 (a
+///     multi-byte character split across polls is carried, not corrupted),
+///     flushed per chunk, with a trailing newline on completion;
+///   - `--out <path>`: each chunk's `data` is written raw to a `.partial`
+///     sibling, renamed onto the destination only on success;
+///   - JSON: chunks are collected, then one object
+///     `{ "data": <utf8-or-hex>, "error": …, "chunks": n }` is emitted.
+fn drive_job(
+    client: &DaemonClient,
+    target_id: vos::abi::service::ServiceId,
+    begin: &Msg,
+    out: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    // Begin: the reply is the u64 job id. `0` is the "refused" sentinel.
+    let id = match client.invoke_dyn(target_id, begin)? {
+        Value::U64(n) => n,
+        other => bail!("job handler did not return a job id (got {other:?})"),
+    };
+    if id == 0 {
+        bail!("job refused by the handler (returned id 0)");
+    }
+
+    let json = output::is_json();
+    let mut out_file = match out {
+        Some(path) => Some(TempOut::create(path)?),
+        None => None,
+    };
+    let mut collected: Vec<u8> = Vec::new(); // JSON-mode aggregation
+    let mut text_carry: Vec<u8> = Vec::new(); // incomplete trailing UTF-8 bytes
+    let mut chunk_count = 0usize;
+    let mut total_bytes = 0usize;
+    let mut empty_ticks = 0u32;
+
+    loop {
+        let reply = client.invoke_dyn(target_id, &Msg::new("job_poll").with("job_id", id))?;
+        let (data, done, error) = decode_job_poll(reply)?;
+
+        if !data.is_empty() {
+            empty_ticks = 0;
+            chunk_count += 1;
+            total_bytes += data.len();
+            if let Some(f) = out_file.as_mut() {
+                f.write(&data)?;
+            } else if json {
+                collected.extend_from_slice(&data);
+            } else {
+                let text = decode_stream_text(&mut text_carry, &data);
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(text.as_bytes());
+                let _ = stdout.flush();
+            }
+        } else if !done {
+            empty_ticks += 1;
+            if empty_ticks > MAX_EMPTY_TICKS {
+                // Do NOT release: the job may still be running server-side (a
+                // slow first output — cold model load, a job queued behind a
+                // mutex). Releasing would discard its result. Leave it for the
+                // daemon to finish + prune; the operator can re-run or Ctrl-C.
+                let secs = MAX_EMPTY_TICKS as u64 * POLL_INTERVAL.as_millis() as u64 / 1000;
+                bail!(
+                    "job {id} produced no output for {secs}s — giving up. It may still be \
+                     running server-side; re-run to poll again."
+                );
+            }
+        }
+
+        if done {
+            // Drained the terminal poll — release before returning.
+            let _ = client.invoke_dyn(target_id, &Msg::new("job_release").with("job_id", id));
+            if !error.is_empty() {
+                bail!("job {id} failed: {error}");
+            }
+            match out_file {
+                Some(f) => {
+                    f.commit()?;
+                    // out is Some whenever out_file was Some.
+                    eprintln!(
+                        "wrote {total_bytes} bytes ({chunk_count} chunks) to {}",
+                        out.unwrap_or_default()
+                    );
+                }
+                None if json => {
+                    let data_json = match String::from_utf8(collected) {
+                        Ok(s) => serde_json::Value::String(s),
+                        Err(e) => {
+                            serde_json::Value::String(format!("0x{}", hex::encode(e.as_bytes())))
+                        }
+                    };
+                    output::print_json(&serde_json::json!({
+                        "data": data_json,
+                        "error": error,
+                        "chunks": chunk_count,
+                    }));
+                }
+                None => {
+                    // Text mode: flush any incomplete trailing bytes, then a
+                    // newline.
+                    if !text_carry.is_empty() {
+                        print!("{}", String::from_utf8_lossy(&text_carry));
+                    }
+                    println!();
+                }
+            }
+            return Ok(());
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Decode a `job_poll` reply — a `Value::Bytes` wrapping an rkyv
+/// `vos::value::Args { data: Bytes, done: bool, error: Str }`.
+fn decode_job_poll(reply: Value) -> anyhow::Result<(Vec<u8>, bool, String)> {
+    let bytes = match reply {
+        Value::Bytes(b) => b,
+        other => bail!("job_poll returned an unexpected reply: {other:?}"),
+    };
+    let args = <vos::value::Args as vos::Decode>::try_decode(&bytes)
+        .ok_or_else(|| anyhow!("job_poll reply is not a decodable Args record"))?;
+    Ok((
+        args.get_bytes("data").unwrap_or_default(),
+        args.get_bool("done").unwrap_or(false),
+        args.get_str("error").unwrap_or_default(),
+    ))
 }
 
 /// Map a universal lifecycle verb to its reserved host-side wire method
@@ -612,7 +854,13 @@ fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Resu
     println!();
     println!("methods:");
     for msg in exposed {
-        let q = if msg.is_query { " (query)" } else { "" };
+        let q = if msg.mode == MODE_JOB {
+            " (job)"
+        } else if msg.is_query {
+            " (query)"
+        } else {
+            ""
+        };
         let sig = if msg.fields.is_empty() {
             format!("  {}(){q}", msg.name)
         } else {
@@ -669,7 +917,13 @@ fn print_method_surface(
                 .join(" "),
         )
     };
-    let q = if msg.is_query { " (query)" } else { "" };
+    let q = if msg.mode == MODE_JOB {
+        " (job)"
+    } else if msg.is_query {
+        " (query)"
+    } else {
+        ""
+    };
     println!("usage: vosx {target} {method}{args}{q}");
     if !msg.doc.is_empty() {
         println!("  {}", msg.doc);
@@ -868,6 +1122,72 @@ mod tests {
         render_reply(Value::Unit, None, Some(path.to_str().unwrap())).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "()\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decode_job_poll_reads_data_done_error() {
+        use vos::Encode;
+        let args = vos::value::Args::new()
+            .with("data", vec![1u8, 2, 3])
+            .with("done", true)
+            .with("error", "oops".to_string());
+        let (data, done, error) = decode_job_poll(Value::Bytes(args.encode())).unwrap();
+        assert_eq!(data, vec![1, 2, 3]);
+        assert!(done);
+        assert_eq!(error, "oops");
+    }
+
+    #[test]
+    fn decode_job_poll_rejects_non_bytes_reply() {
+        let err = decode_job_poll(Value::U64(5)).unwrap_err();
+        assert!(err.to_string().contains("unexpected reply"), "{err}");
+    }
+
+    #[test]
+    fn decode_stream_text_carries_split_utf8() {
+        let mut carry = Vec::new();
+        // Euro sign (0xE2 0x82 0xAC) split across two poll chunks.
+        assert_eq!(decode_stream_text(&mut carry, &[0xE2, 0x82]), "");
+        assert_eq!(decode_stream_text(&mut carry, &[0xAC]), "€");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn decode_stream_text_passes_ascii_and_flags_invalid() {
+        let mut carry = Vec::new();
+        assert_eq!(decode_stream_text(&mut carry, b"hello"), "hello");
+        assert!(carry.is_empty());
+        // A lone continuation byte 0x80 is genuinely invalid → U+FFFD, consumed.
+        assert_eq!(decode_stream_text(&mut carry, &[0x80, b'o', b'k']), "\u{FFFD}ok");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn temp_out_commit_renames_and_drop_removes() {
+        let base = std::env::temp_dir().join(format!("vosx-tempout-{}.bin", std::process::id()));
+        let dest = base.to_str().unwrap();
+        let partial = format!("{dest}.partial");
+
+        // Commit path: bytes land at dest, the .partial is gone.
+        {
+            let mut t = TempOut::create(dest).unwrap();
+            t.write(&[1, 2, 3]).unwrap();
+            t.commit().unwrap();
+        }
+        assert_eq!(std::fs::read(dest).unwrap(), vec![1, 2, 3]);
+        assert!(!std::path::Path::new(&partial).exists());
+        std::fs::remove_file(dest).unwrap();
+
+        // Drop-without-commit path: dest is NOT clobbered, .partial removed.
+        std::fs::write(dest, b"prior-good").unwrap();
+        {
+            let mut t = TempOut::create(dest).unwrap();
+            t.write(&[9, 9, 9]).unwrap();
+            // no commit — simulates a failed/wedged job
+        }
+        assert_eq!(std::fs::read(dest).unwrap(), b"prior-good");
+        assert!(!std::path::Path::new(&partial).exists());
+        std::fs::remove_file(dest).unwrap();
     }
 
     #[test]
