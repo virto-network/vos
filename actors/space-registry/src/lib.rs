@@ -1517,32 +1517,45 @@ impl SpaceRegistry {
     /// before its own revoke during replay) retroactively voids the
     /// whole delegation subtree.
     fn effective_role(&self, peer_id: &[u8]) -> u8 {
-        self.effective_role_depth(peer_id, 0)
-    }
-
-    fn effective_role_depth(&self, peer_id: &[u8], depth: usize) -> u8 {
-        // A grant chain longer than the number of grants must contain a
-        // cycle, which can never bottom out at the root — refuse it. The
-        // map's count comes from its meta row (cached for the dispatch).
-        if depth as u64 > self.auth_grants.len() {
-            return AUTH_ROLE_NONE;
-        }
-        let Some(row) = self.auth_grants.get(&peer_key(peer_id)) else {
+        // The peer's own grant carries the candidate result; the walk
+        // below decides whether it counts.
+        let Some(first) = self.auth_grants.get(&peer_key(peer_id)) else {
             return AUTH_ROLE_NONE;
         };
-        if row.epoch <= self.revoke_floor(peer_id) {
+        if first.epoch <= self.revoke_floor(peer_id) {
             return AUTH_ROLE_NONE;
         }
-        // The grantor must itself be effective. The genesis root is the
-        // base case (always admin, never revocable).
+        let role = first.role;
         let root = self.root_bytes();
-        if !root.is_empty() && root.as_slice() == row.grantor.as_slice() {
-            return row.role;
+        // Walk the grantor chain iteratively, holding ONE decoded row
+        // at a time — a recursive walk pins every row on the guest
+        // arena simultaneously, so a crafted grantor cycle (e.g. an
+        // admin re-granting themselves) OOMs the dispatch once the
+        // table is large. Each intermediate grantor must itself be an
+        // undominated ADMIN, and the chain must bottom out at the
+        // genesis root (always admin, never revocable, needs no row).
+        // A chain with more hops than the table has rows must contain
+        // a cycle, which can never bottom out — refuse it. The map's
+        // count comes from its meta row (cached for the dispatch).
+        let mut grantor = first.grantor;
+        let mut hops = 0u64;
+        let limit = self.auth_grants.len();
+        loop {
+            if !root.is_empty() && root.as_slice() == grantor.as_slice() {
+                return role;
+            }
+            if hops >= limit {
+                return AUTH_ROLE_NONE;
+            }
+            let Some(row) = self.auth_grants.get(&peer_key(&grantor)) else {
+                return AUTH_ROLE_NONE;
+            };
+            if row.epoch <= self.revoke_floor(&grantor) || row.role != AUTH_ROLE_ADMIN {
+                return AUTH_ROLE_NONE;
+            }
+            grantor = row.grantor;
+            hops += 1;
         }
-        if self.effective_role_depth(&row.grantor, depth + 1) == AUTH_ROLE_ADMIN {
-            return row.role;
-        }
-        AUTH_ROLE_NONE
     }
 
     /// Effective actor-local role of `(peer_id, agent_name)`. Like
