@@ -5640,6 +5640,153 @@ fn crdt_registry_writes_and_deletes_converge_across_replicas() {
     let _ = std::fs::remove_dir_all(&dir_root);
 }
 
+/// A state-blob decode failure (upgrade drift, disk corruption) falls
+/// back to a fresh actor struct — but the genesis root, grant rows, and
+/// revoke floors all live in `#[storage]` rows, so the fallback resets
+/// NONE of them. This pins the co-location: when the floors or the root
+/// lived in the blob while grants lived in storage, a drifted blob
+/// reset the floors and un-anchored the root, so re-anchoring the same
+/// root resurrected every revoked admin's surviving grant row.
+#[test]
+fn registry_authority_survives_state_blob_drift() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{
+        AUTH_ROLE_ADMIN, AUTH_ROLE_NONE, SpaceRegistryRef, canonical_op_bytes, pack_auth,
+    };
+    use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry actor not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_reg_drift_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let root_key = SigningKey::from_bytes(&[13u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+    let admin_peer = peer_id_for([0x33; 32]);
+    let epoch = 5u64;
+    let grant_auth = {
+        let canonical = canonical_op_bytes(
+            "grant_role",
+            &[&admin_peer, &[AUTH_ROLE_ADMIN], &epoch.to_le_bytes()],
+        );
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+    let revoke_auth = {
+        let canonical = canonical_op_bytes("revoke_role", &[&admin_peer, &epoch.to_le_bytes()]);
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+
+    let spawn = |blob: Vec<u8>| -> VosNode {
+        let mut node = VosNode::with_prefix(0x00aa);
+        node.register_at_id(
+            AgentConfig::new(blob)
+                .with_consistency(Consistency::Local)
+                .persist(&dir),
+            ServiceId::REGISTRY,
+        );
+        node
+    };
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+
+    // ── Boot 1: anchor, grant, revoke ───────────────────────────
+    let node = spawn(registry_blob.clone());
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(reg.grant_role(
+            &mut &node,
+            admin_peer.clone(),
+            AUTH_ROLE_ADMIN,
+            epoch,
+            grant_auth,
+        ))
+        .expect("grant_role"),
+        space_registry::Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(reg.peer_role(&mut &node, admin_peer.clone())).expect("peer_role"),
+        AUTH_ROLE_ADMIN,
+    );
+    assert_eq!(
+        vos::block_on(reg.revoke_role(&mut &node, admin_peer.clone(), epoch, revoke_auth))
+            .expect("revoke_role"),
+        space_registry::Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(reg.peer_role(&mut &node, admin_peer.clone())).expect("peer_role"),
+        AUTH_ROLE_NONE,
+        "the revoke floor dominates the grant",
+    );
+    node.collect();
+
+    // ── Simulate schema drift: corrupt the persisted state blob ─
+    // try_decode fails on the garbage, so the next boot's
+    // load_or_create falls back to `create()` — the drift path.
+    {
+        let db_path = dir
+            .join("agents")
+            .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
+        let db = redb::Database::open(&db_path).expect("open agent db");
+        let txn = db.begin_write().expect("begin write");
+        {
+            let mut table = txn
+                .open_table(vos::commit::STATE_TABLE)
+                .expect("open state table");
+            table
+                .insert(vos::commit::STATE_KEY, b"drifted-garbage".as_slice())
+                .expect("corrupt state blob");
+        }
+        txn.commit().expect("commit corruption");
+    }
+
+    // ── Boot 2: authority state survives the fallback together ──
+    let node = spawn(registry_blob);
+    assert_eq!(
+        vos::block_on(reg.root(&mut &node)).expect("root"),
+        root_peer,
+        "the anchored root must survive a state-blob drift",
+    );
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node, admin_peer.clone())).expect("set_root"),
+        space_registry::Status::Forbidden,
+        "a drifted blob must not re-open the genesis anchor",
+    );
+    assert_eq!(
+        vos::block_on(reg.peer_role(&mut &node, admin_peer.clone())).expect("peer_role"),
+        AUTH_ROLE_NONE,
+        "a revoked grant must stay revoked across a drift fallback",
+    );
+    node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[cfg(feature = "network")]
 fn cross_space_bridge_forward_dispatches_to_local_target() {
