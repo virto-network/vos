@@ -55,26 +55,26 @@ materialize **all** segment proofs in one buffer (~3 MiB each).
 
 ## Levers, ranked
 
-**1. Smaller segments (local, machinery landed, highest ROI).**
-Peak ∝ 2^Lmax ∝ seg_steps. 100k→12k steps (log-20→log-17) ≈ 28→3.5 GB;
-8k lands comfortably under the 3 GB app budget. This is what every
-production FRI zkVM does (RISC Zero continuations, SP1 shards, OpenVM
-metered execution). Everything hard is already built: `prove_chain` /
-`measure_catalog` / `vosx zk pin` are fully parameterized over
-`seg_steps` (short-tail + per-comb-shape allowlist probing included);
-the verifier is seg-size-agnostic (clerk-bridge stores only the
-allowlist); streaming `verify_chain` is O(1) memory at any chain length;
-`MAX_CHAIN_SEGMENTS = 65 536` clears ~600 segments trivially. Prove
-*time* is roughly a wash (throughput ~constant across log 10–14; slight
-per-segment fixed overhead penalty vs slight FRI superlinearity win).
-**The one real gap: canonical-profile floors.** The BLAKE2B_BOUNDARY /
-MEMORY_PAGE floors are content-driven per-window maxima that must be
-re-derived for each seg_steps, and today the profile file is
-hand-authored — `measure_catalog` needs a floor-measurement mode (trace
-all segments, report per-chip natural-log maxima, emit the profile) so a
-re-pin is one command. Then: re-run `vosx zk pin --seg-steps N`, update
-the three frozen constants in `vos/tests/elf_integration.rs`, re-run the
-two `#[ignore]` gates, commit the catalog.
+**1. Smaller segments (local, machinery landed — MEASURED: stalls at
+~10–11 GiB; see Wave 1.3).** The naive model — peak ∝ 2^Lmax ∝
+seg_steps, so 12k ≈ 3.5 GB — holds only for chips whose rows scale
+with steps (CPU, ledgers). It fails for voucher-check on two chip
+classes the sweep exposed: `PROGRAM_MEMORY` sizes on the code image
+(2^18 rows in every window at every seg_steps), and the
+content-dense chips (BLAKE2B_BOUNDARY, MEMORY) stall at 2^17
+because their ops concentrate in short step ranges. Measured: 8k
+windows still prove at ~10–11 GiB, and per-window time is pinned by
+the padded floors, so total chain time grows ~linearly with window
+count (965 windows ≈ 4 h vs 78 ≈ 32 min). The knob and its tooling
+remain right (every production FRI zkVM shards; the verifier is
+seg-size-agnostic; `MAX_CHAIN_SEGMENTS = 65 536`; the turnkey
+re-pin below), but for THIS transition the lever is spent at 100k —
+the RAM path runs through Wave 4 + a program-memory diet.
+**The tooling gap (floor derivation) is closed:** `vosx zk pin
+--seg-steps N` without `--profile` derives the floors, measures the
+allowlist under them, and records both; then update the three frozen
+constants in `vos/tests/elf_integration.rs`, re-run the two
+`#[ignore]` gates, commit the catalog.
 
 **2. SideNote diet + chain-driver streaming (local).**
 (a) Stop holding the full-chain trace: drive segments with a forward
@@ -148,15 +148,18 @@ lowers to NEON; zkpvm itself has no intrinsics. Setup-level items:
 
 ## Honest wall-clock picture
 
-Small segments make chain-prove *feasible* on phones, not *fast*: 7.6M
-steps at phone throughput is on the order of an hour-plus of background
-work (x86 desktop does it in ~22 min). That is the intended shape — the
-roadmap already treats chain proving as an async job per settlement
-window, off the hot path. The interactive, sub-10 s mobile story is the
-tap-to-pay-scale single proof, which FibRace independently validates at
-our exact field/prover/security point. Also budget for chain *transport*:
-~600 segments × ~3 MiB ≈ 1.8 GB per full conservation proof — streaming
-verify handles the RAM, but network cost pushes toward fewer/bigger
+Chain proving on phones is a Wave-4+5 outcome, not a windowing outcome
+(Wave 1.3 measured the walls: ~10–11 GiB per window at ANY seg_steps,
+and time ∝ window count). Even once RAM fits, 7.6M steps at phone
+throughput is an hour-plus of background work (x86 desktop: ~32 min at
+100k windows). That is the intended shape — the roadmap already treats
+chain proving as an async job per settlement window, off the hot path.
+The interactive, sub-10 s mobile story is the tap-to-pay-scale single
+proof, which FibRace independently validates at our exact
+field/prover/security point. Also budget for chain *transport* if
+windows ever shrink: ~600 segments × ~3 MiB ≈ 1.8 GB per full
+conservation proof — streaming verify handles the RAM, but network
+cost pushes toward fewer/bigger
 settlement windows and, eventually, succinct-witness step reduction.
 
 ## Plan
@@ -181,24 +184,54 @@ settlement windows and, eventually, succinct-witness step reduction.
   sends an empty profile and pins the echo; the `--allowlist` re-pin
   derives via trace-only `measure_floors` and never proves.
   `--profile-out` writes the pinned profile in `--profile` format.
-- **1.3 Measurement run (voucher-check).** Derive floors at
-  seg_steps ∈ {8k, 12k, 16k} via the federation fixture's witness;
-  record floors + per-probe prove RAM/time here. Cross-check first:
-  derived floors at 100k must reproduce the pinned C_0/C_1 (the
-  derived profile is DENSE — max for every chip — where the
-  hand-authored one is sparse; equal commitments at 100k proves the
-  densification is identity-neutral). Pick the production seg_steps:
-  largest value whose probe peak + streamed-trace overhead fits
-  ≤3 GB (expect ~8–12k). Needs the elf_integration harness (the
-  representative witness is the federation fixture's) — a follow-up
-  session with ~free RAM for the 100k baseline comparison.
-- **1.4 Flip the pin.** Re-pin `catalog.toml` + the three frozen
-  constants in `vos/tests/elf_integration.rs` + re-run the two heavy
-  gates. Coordinate: the actor-storage branch re-pins the same
-  constants (guest code-size change) — land after it merges.
+- **1.3 Measurement run (voucher-check) — DONE, and it overturns the
+  segment-shrink model.** Sweep over seg_steps ∈ {8k, 12k, 16k, 100k}
+  (federation-fixture witness, 7.72M steps, x86 desktop, dense derived
+  floors, probes = seg 0 / comb window / short tail):
 
-Exit: one-command re-pin at any `seg_steps`; measured floor/RAM/time
-table for 8–16k; chain prove ≤4 GB on desktop.
+  | seg_steps | segments | derive | probe prove | probe peak RSS |
+  |---|---|---|---|---|
+  | 8k | 965 | 968 s | 11–19 s | **~10–11 GiB** |
+  | 12k | 644 | 702 s | 14–32 s (load-contaminated) | ~11 GiB |
+  | 16k | 483 | 555 s | 10–16 s | ~11–12 GiB |
+  | 100k | 78 | 133 s | 22–30 s | ~28–29 GiB |
+
+  Findings, in order of consequence:
+  1. **Windowing stalls at ~10–11 GiB.** `PROGRAM_MEMORY` is 2^18
+     rows in EVERY window at EVERY seg_steps — it sizes on the
+     program's code image, not on steps — and BLAKE2B_BOUNDARY /
+     MEMORY stall at 2^17 in content-dense windows (ops concentrate
+     in short step ranges). No uniform (or adaptive) windowing gets
+     this transition under ~10 GiB; ≤3 GB needs the LDE-recompute
+     fork (Wave 4, ~2–3×) PLUS a program-memory diet: sparsify code
+     authentication to executed pages per segment (new AIR work,
+     soundness-sensitive) and/or shrink the guest code image.
+  2. **Chain-prove time ∝ window count under canonical padding.**
+     Per-window cost is pinned by the padded floors (~15–25 s here),
+     so 965 windows ≈ 4 h vs 78 windows ≈ 32 min for the same trace.
+     Small uniform windows are a bad trade on time as well as being
+     RAM-ineffective. seg_steps = 100k stays the right default until
+     the walls above move.
+  3. **Every seg_steps collapses to exactly 2 commitments**
+     (comb-free + one-comb, short tail included) under derived
+     floors — the turnkey derivation is functionally correct at all
+     sizes.
+  4. **Dense ≠ sparse: C_0/C_1 MISMATCH at 100k.** Forcing the
+     chips the hand profile leaves at 0 shifts the program
+     commitment, so switching to derived profiles is a full re-pin
+     (self-consistent — the pin records the echoed profile it was
+     measured under), never a drop-in.
+  5. **Floors derivation costs minutes** (968 s at 8k) — the
+     documented O(N²) slice-replay plus per-window trace-gen; the
+     Wave-2.1 streaming driver is what fixes it.
+- **1.4 Flip the pin — NOT NOW.** Per finding 2, stay at
+  seg_steps = 100k; the flip becomes interesting only after the
+  Wave-4 fork + a program-memory diet move the RAM walls. (The
+  actor-storage re-pin has merged; catalogs are current.)
+
+Exit (revised): one-command re-pin at any `seg_steps` ✓; measured
+floor/RAM/time table ✓; the ≤3 GB path now runs through Wave 4 + a
+program-memory diet, not through segment shrink.
 
 ### Wave 2 — chain-driver memory (SideNote diet)
 
@@ -216,7 +249,7 @@ table for 8–16k; chain prove ≤4 GB on desktop.
   page `job_result` per segment.
 
 Exit: chain-prove peak = one segment's prove cost + O(1) driver state;
-≤3 GB end-to-end at the Wave-1 seg_steps.
+also collapses the minutes-long floors derivation (Wave-1.3 finding 5).
 
 ### Wave 3 — aarch64 bring-up
 
@@ -231,5 +264,20 @@ Fork `prover/pcs/` (`CommitmentTreeProver`, `prove_values`,
 `compute_fri_quotients`): drop `Poly.evals` after each tree's Merkle
 root, recompute per-column LDEs from retained coefficients for FRI
 quotients + decommit. Consider bumping stwo 2.2.0→2.3.0 first so the
-fork tracks upstream. Exit: ~2–3× off the per-segment LDE term —
-headroom for bigger segments / lower-end phones.
+fork tracks upstream. Exit: ~2–3× off the per-segment LDE term.
+After Wave 1.3 this is the FIRST-ORDER RAM lever for chain proving
+(segment shrink is spent), and it benefits tap-to-pay equally.
+
+### Wave 5 — program-memory diet (opened by Wave 1.3)
+
+`PROGRAM_MEMORY` costs 2^18 rows in every segment of voucher-check —
+it authenticates the whole code image regardless of what the window
+executed. Two directions, both needed for ≤3 GB chain proving when
+combined with Wave 4: (a) sparsify code authentication to the pages a
+segment actually executes (AIR change, soundness-sensitive — code
+identity must still be pinned chain-wide, e.g. page-Merkle against the
+program commitment); (b) shrink the guest image (the vos::storage
+framework rebuild grew it; a code-size pass on the prelude/kernel pays
+off 1:1 in every segment). Sizing spike first: count PROGRAM_MEMORY
+columns and measure its actual share of the 10–11 GiB window peak
+before committing to (a).
