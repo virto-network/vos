@@ -159,16 +159,70 @@ our exact field/prover/security point. Also budget for chain *transport*:
 verify handles the RAM, but network cost pushes toward fewer/bigger
 settlement windows and, eventually, succinct-witness step reduction.
 
-## Suggested sequence
+## Plan
 
-1. **Floor-measurement mode in `measure_catalog`** + re-pin at
-   seg_steps ≈ 8–16k; fix the `prove_chain` all-proofs-in-one-buffer
-   return. Exit: chain prove ≤4 GB on the desktop, time ≈ wash.
-2. **SideNote diet** (streamed per-segment trace + `PvmStep` shrink).
-   Exit: peak = per-segment cost only; O(N²) replay gone; ≤3 GB.
-3. **aarch64 bring-up**: cross-build (blst/NDK, RUSTFLAGS override),
-   on-device bench of tap-to-pay + one small segment; retrain PGO.
-   Exit: measured phone numbers replacing the 3.5–7 s estimate.
-4. **stwo fork: recompute-LDE-from-coeffs**; measure; offer upstream.
-   Exit: headroom for bigger segments / lower-end phones.
-5. Re-evaluate then: stwo 2.3.0 bump lands wherever convenient in 1–4.
+### Wave 1 — turnkey re-pin (the small-segment enabler)
+
+- **1.1 `measure_floors` in the prover extension.** New `#[msg]`:
+  trace the witness-injected run, segment at `seg_steps`, return the
+  per-chip elementwise max of every window's natural `log_size`
+  (`zkpvm::natural_log_sizes_for`, trace-gen only — no commit/FRI).
+  That vector IS the canonical forcing profile: chips whose size is
+  already uniform get their own size back (forcing is a no-op), varying
+  chips get the chain-wide max, so every window collapses onto the
+  minimal canonical-shape set. Cheap tests: garbage-blob reject +
+  two windows of a tiny trace prove to ONE commitment under the
+  derived floors (the property the tool exists for).
+- **1.2 `vosx zk pin` derives the profile.** `--profile` becomes
+  optional: when omitted (requires `--witness`), pin first invokes
+  `measure_floors`, prints the floors, optionally writes them
+  (`--profile-out`), then measures the allowlist under them — the
+  whole re-pin is one command per `seg_steps`.
+- **1.3 Measurement run (voucher-check).** Derive floors at
+  seg_steps ∈ {8k, 12k, 16k} via the federation fixture's witness;
+  record floors + per-probe prove RAM/time here. Pick the production
+  seg_steps: largest value whose probe peak + streamed-trace overhead
+  fits ≤3 GB (expect ~8–12k). Needs the elf_integration harness (the
+  representative witness is the federation fixture's) — a follow-up
+  session with ~free RAM for the 100k baseline comparison.
+- **1.4 Flip the pin.** Re-pin `catalog.toml` + the three frozen
+  constants in `vos/tests/elf_integration.rs` + re-run the two heavy
+  gates. Coordinate: the actor-storage branch re-pins the same
+  constants (guest code-size change) — land after it merges.
+
+Exit: one-command re-pin at any `seg_steps`; measured floor/RAM/time
+table for 8–16k; chain prove ≤4 GB on desktop.
+
+### Wave 2 — chain-driver memory (SideNote diet)
+
+- **2.1 Streamed per-segment tracing.** Drive `prove_chain_segments`
+  with a forward tracer that threads the memory image + register file
+  across windows instead of holding the full-chain SideNote and
+  re-replaying writes per slice (`segment.rs` documents the O(N²)).
+  Removes the 2.6 GB full-trace residency floor.
+- **2.2 `PvmStep` shrink.** Drop the two full register-file snapshots
+  (~208 of ~350 B/step); keep the written register + value,
+  reconstruct at trace-gen.
+- **2.3 Producer-side proof streaming.** `prove_chain`/the async job
+  materialize `bincode(Vec<Vec<u8>>)` — ~1.8 GB at 600 segments.
+  Spill per-segment proofs (host CAS or extension-local disk) and
+  page `job_result` per segment.
+
+Exit: chain-prove peak = one segment's prove cost + O(1) driver state;
+≤3 GB end-to-end at the Wave-1 seg_steps.
+
+### Wave 3 — aarch64 bring-up
+
+Cross-build for aarch64 (nightly rust-std, NDK/iOS clang for blst,
+`[target.aarch64-*]` rustflags replacing `target-cpu=native`); bench
+tap-to-pay + one small segment on a real phone; retrain PGO on-device.
+Exit: measured phone numbers replacing the 3.5–7 s estimate.
+
+### Wave 4 — stwo fork: recompute-LDE-from-coeffs
+
+Fork `prover/pcs/` (`CommitmentTreeProver`, `prove_values`,
+`compute_fri_quotients`): drop `Poly.evals` after each tree's Merkle
+root, recompute per-column LDEs from retained coefficients for FRI
+quotients + decommit. Consider bumping stwo 2.2.0→2.3.0 first so the
+fork tracks upstream. Exit: ~2–3× off the per-segment LDE term —
+headroom for bigger segments / lower-end phones.
