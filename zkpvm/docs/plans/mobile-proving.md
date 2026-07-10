@@ -69,7 +69,10 @@ count (965 windows ≈ 4 h vs 78 ≈ 32 min). The knob and its tooling
 remain right (every production FRI zkVM shards; the verifier is
 seg-size-agnostic; `MAX_CHAIN_SEGMENTS = 65 536`; the turnkey
 re-pin below), but for THIS transition the lever is spent at 100k —
-the RAM path runs through Wave 4 + a program-memory diet.
+the RAM path runs through Wave 5.1 (content-aware windowing — the
+sizing spike pinned the wall on BLAKE2B_BOUNDARY's 2502 columns at the
+chain-max floor, which STEP-windowing can't cut but cost-budget
+windowing can), with Wave 4 as the multiplier after.
 **The tooling gap (floor derivation) is closed:** `vosx zk pin
 --seg-steps N` without `--profile` derives the floors, measures the
 allowlist under them, and records both; then update the three frozen
@@ -148,9 +151,11 @@ lowers to NEON; zkpvm itself has no intrinsics. Setup-level items:
 
 ## Honest wall-clock picture
 
-Chain proving on phones is a Wave-4+5 outcome, not a windowing outcome
-(Wave 1.3 measured the walls: ~10–11 GiB per window at ANY seg_steps,
-and time ∝ window count). Even once RAM fits, 7.6M steps at phone
+Chain proving on phones is a Wave-5 outcome (content-aware windowing;
+Wave 4 adds margin): Wave 1.3 measured ~10–11 GiB per window at ANY
+uniform seg_steps with time ∝ window count, and the sizing spike
+showed both symptoms share one cause — canonical padding to
+BLAKE2B_BOUNDARY's burst maximum. Even once RAM fits, 7.6M steps at phone
 throughput is an hour-plus of background work (x86 desktop: ~32 min at
 100k windows). That is the intended shape — the roadmap already treats
 chain proving as an async job per settlement window, off the hot path.
@@ -197,15 +202,17 @@ settlement windows and, eventually, succinct-witness step reduction.
   | 100k | 78 | 133 s | 22–30 s | ~28–29 GiB |
 
   Findings, in order of consequence:
-  1. **Windowing stalls at ~10–11 GiB.** `PROGRAM_MEMORY` is 2^18
-     rows in EVERY window at EVERY seg_steps — it sizes on the
-     program's code image, not on steps — and BLAKE2B_BOUNDARY /
-     MEMORY stall at 2^17 in content-dense windows (ops concentrate
-     in short step ranges). No uniform (or adaptive) windowing gets
-     this transition under ~10 GiB; ≤3 GB needs the LDE-recompute
-     fork (Wave 4, ~2–3×) PLUS a program-memory diet: sparsify code
-     authentication to executed pages per segment (new AIR work,
-     soundness-sensitive) and/or shrink the guest code image.
+  1. **Uniform windowing stalls at ~10–11 GiB — and the Wave-5
+     sizing spike identified the culprit precisely.** It is NOT the
+     high-L chips per se: per-chip accounting (cols × 2^(L+2), model
+     total 11.3 GiB ≈ the measured probe peaks) shows
+     **BLAKE2B_BOUNDARY = 88.8%** of the committed bytes — 2502 main
+     columns forced to the chain-max 2^17 rows in every window
+     (hashing concentrates in short step ranges, so step-windowing
+     can't cut its per-window max). PROGRAM_MEMORY, despite L=18, is
+     31+1 columns = **1.4%**. Because the dominant chip is
+     content-scaling, content-aware windowing (Wave 5) removes the
+     wall — no stwo fork or AIR change required for the first ~4×.
   2. **Chain-prove time ∝ window count under canonical padding.**
      Per-window cost is pinned by the padded floors (~15–25 s here),
      so 965 windows ≈ 4 h vs 78 windows ≈ 32 min for the same trace.
@@ -226,12 +233,13 @@ settlement windows and, eventually, succinct-witness step reduction.
      Wave-2.1 streaming driver is what fixes it.
 - **1.4 Flip the pin — NOT NOW.** Per finding 2, stay at
   seg_steps = 100k; the flip becomes interesting only after the
-  Wave-4 fork + a program-memory diet move the RAM walls. (The
+  Wave-5.1 budgeted windowing moves the RAM walls. (The
   actor-storage re-pin has merged; catalogs are current.)
 
 Exit (revised): one-command re-pin at any `seg_steps` ✓; measured
-floor/RAM/time table ✓; the ≤3 GB path now runs through Wave 4 + a
-program-memory diet, not through segment shrink.
+floor/RAM/time table ✓; the ≤3 GB path now runs through Wave 5.1
+(content-aware windowing), with Wave 4 as margin — not through
+uniform segment shrink.
 
 ### Wave 2 — chain-driver memory (SideNote diet)
 
@@ -265,19 +273,61 @@ Fork `prover/pcs/` (`CommitmentTreeProver`, `prove_values`,
 root, recompute per-column LDEs from retained coefficients for FRI
 quotients + decommit. Consider bumping stwo 2.2.0→2.3.0 first so the
 fork tracks upstream. Exit: ~2–3× off the per-segment LDE term.
-After Wave 1.3 this is the FIRST-ORDER RAM lever for chain proving
-(segment shrink is spent), and it benefits tap-to-pay equally.
+Multiplies with Wave 5.1 (2.5–3 GiB → ~1–1.5 GiB windows — headroom
+for low-end phones) and benefits tap-to-pay equally.
 
-### Wave 5 — program-memory diet (opened by Wave 1.3)
+### Wave 5 — content-aware windowing (sizing spike DONE 2026-07-10)
 
-`PROGRAM_MEMORY` costs 2^18 rows in every segment of voucher-check —
-it authenticates the whole code image regardless of what the window
-executed. Two directions, both needed for ≤3 GB chain proving when
-combined with Wave 4: (a) sparsify code authentication to the pages a
-segment actually executes (AIR change, soundness-sensitive — code
-identity must still be pinned chain-wide, e.g. page-Merkle against the
-program commitment); (b) shrink the guest image (the vos::storage
-framework rebuild grew it; a code-size pass on the prelude/kernel pays
-off 1:1 in every segment). Sizing spike first: count PROGRAM_MEMORY
-columns and measure its actual share of the 10–11 GiB window peak
-before committing to (a).
+Per-chip committed-bytes accounting of an 8k canonical window
+(blowup 4, interaction ≈ 0.62 × main; model total 11.3 GiB matches
+the measured probe peaks):
+
+| chip | L | pre+main cols | GiB | share |
+|---|---|---|---|---|
+| BLAKE2B_BOUNDARY | 17 | 43+2502 | 10.0 | **88.8%** |
+| BLAKE2B | 13 | 42+2502 | 0.63 | 5.5% |
+| MEMORY | 17 | 46 | 0.18 | 1.6% |
+| PROGRAM_MEMORY | 18 | 31+1 | 0.16 | 1.4% |
+| CPU | 13 | 592 | 0.15 | 1.3% |
+| everything else | — | — | ~0.15 | ~1.4% |
+
+The wall is ONE chip: BLAKE2B_BOUNDARY's 2502 columns forced to the
+chain-max 2^17 rows (its ops concentrate in short step ranges, so the
+per-window max doesn't fall with seg_steps). Both original Wave-5
+hypotheses are dead: the program-memory diet is pointless (1.4%), and
+the wall is NOT windowing-proof — it's step-windowing-proof.
+
+- **5.1 Content-aware windowing.** Replace `segment_bounds(total,
+  seg_steps)` with a deterministic cost-budget cut: walk the trace
+  accumulating per-chip row counts (blake2b-boundary ops above all)
+  and close a window when any budgeted chip would exceed its cap
+  (e.g. 2^14 boundary rows). Hash-dense stretches get short windows,
+  plain-CPU stretches get long ones — window count stays moderate
+  while EVERY window's floors land near the budget. Projected:
+  boundary 10 GiB → ~1.3 GiB at 2^14; whole window ~2.5–3 GiB. Time
+  improves too — canonical padding waste (every window paying the
+  burst's 2^17/2^18) is what made both uniform-8k (~4 h) and
+  uniform-100k (78 × 2^18-padded windows) expensive; with budgeted
+  floors, total work ≈ actual content rows. Local change:
+  `segment.rs` + `canonical_profile_for` + `prove_chain_segments` +
+  the measure paths; the verifier is untouched (seg-size-agnostic,
+  allowlist still collapses — budgeted floors are uniform across
+  windows by construction). ABI note: window boundaries become
+  trace-determined, so the caller-supplied `seg_steps` becomes the
+  cap/budget knob and the catalog pins the budget alongside the
+  profile — prover and re-measurement must cut identically (a
+  deterministic function of trace + budget). Cost signal: either an
+  O(steps) per-chip row model for the budgeted chips, or greedy
+  window growth probed via `natural_log_sizes_for` on candidate
+  slices (indices subset — just the budgeted chips); the probe
+  route is simpler and exact but leans on the Wave-2.1 streaming
+  driver to avoid the slice-replay cost.
+- **5.2 BLAKE2B_BOUNDARY width diet (AIR investigation).** 2502 main
+  columns for a boundary/binding chip is the widest surface in the
+  AIR (the BLAKE2B core has the same width but sits at L=13). If the
+  boundary rows carry full hash state per row, a narrower binding
+  (or moving rows into the cheaper core chip) multiplies with every
+  other lever. Soundness-sensitive — investigate before touching.
+
+Exit: chain windows ≤3 GiB on desktop via 5.1; a measured
+column-level answer on whether 5.2 is worth AIR surgery.
