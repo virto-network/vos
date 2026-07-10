@@ -18,6 +18,7 @@ build:
     cd actors/math && cargo actor
     cd actors/pipeline && cargo actor
     cd actors/crdt-counter && cargo actor
+    cd actors/big-map && cargo actor
     cd actors/pushy && cargo actor
     cd actors/probe && cargo actor
     cd actors/leaker && cargo actor

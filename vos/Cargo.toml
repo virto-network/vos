@@ -124,6 +124,9 @@ blake2b_simd = { version = "1", default-features = false }
 # via the test crate's own resolution so the integration tests can
 # `use vos::runtime::*` etc.
 crdt-counter = { path = "../examples/actors/crdt-counter", default-features = false }
+# Storage-type pressure fixture — the e2e drives a #[storage] map far
+# past the guest heap through the typed `BigMapRef`.
+big-map = { path = "../examples/actors/big-map", default-features = false }
 # Scheduler agent (the vos::agent::Tasks reference orchestrator) and
 # the tally Task fixture — dev-deps so host CI compiles their rlibs
 # even without the riscv toolchain; the e2e loads their pre-built ELFs

@@ -11036,3 +11036,94 @@ fn voucher_check_catalog_matches_pinned_constants() {
         );
     }
 }
+
+// ── Storage-type collections (docs/plans/actor-storage.md W2) ────────
+
+/// A `#[storage]` map's rows outgrow the 256 KiB guest heap while
+/// every dispatch stays bounded by its touched set: 15k entries
+/// ≈ 550 KiB of value rows + index pages, loaded in ascending-key
+/// batches, then exercised with point reads, ordered paged range
+/// reads, remove/replace, the set fixture, and the blob-resident
+/// field. A blob-resident map of this size could neither decode
+/// (heap) nor commit (the state write alone would dwarf the dispatch
+/// payload).
+#[test]
+fn storage_map_outgrows_guest_heap() {
+    use big_map::BigMapRef;
+    use vos::node::{AgentConfig, VosNode};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("vos=warn")),
+        )
+        .try_init();
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let path = format!(
+        "{}/../examples/actors/big-map/target/riscv64em-javm/release/big_map.elf",
+        workspace,
+    );
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: big-map actor not built — run `just build-pvm`");
+            return;
+        }
+    };
+    let blob = grey_transpiler::link_elf(&data).expect("transpile big-map");
+
+    let mut node = VosNode::new();
+    let id = node.register(AgentConfig::new(blob));
+    let map = BigMapRef::at(id);
+
+    // 60 × 250 ascending keys. Batches stay a few hundred rows because
+    // a dispatch's whole touched set lives in the 256 KiB guest heap
+    // and its per-insert cost climbs with pending-set size (the A5
+    // allocator wall) — the collection is unbounded, the batch is not.
+    let mut count = 0;
+    for batch in 0..60u64 {
+        count = vos::block_on(map.bulk(&mut &node, batch * 250, 250)).expect("bulk");
+    }
+    assert_eq!(count, 15_000);
+    assert_eq!(vos::block_on(map.count(&mut &node)).expect("count"), 15_000);
+
+    // Point reads across the keyspace — none of these rows were touched
+    // by the reading dispatch, so they come off the host, not a cache.
+    assert_eq!(vos::block_on(map.get(&mut &node, 0)).unwrap(), 0);
+    assert_eq!(vos::block_on(map.get(&mut &node, 12_345)).unwrap(), 37_035);
+    assert_eq!(vos::block_on(map.get(&mut &node, 14_999)).unwrap(), 44_997);
+    assert_eq!(
+        vos::block_on(map.get(&mut &node, 15_000)).unwrap(),
+        u64::MAX,
+        "absent key must sentinel"
+    );
+
+    // Ordered paged range read.
+    assert_eq!(
+        vos::block_on(map.sum_range(&mut &node, 100, 10)).unwrap(),
+        3 * (100..110u64).sum::<u64>(),
+    );
+
+    // Remove / replace round-trips (index + value rows stay coherent).
+    assert_eq!(vos::block_on(map.remove(&mut &node, 12_345)).unwrap(), 1);
+    assert_eq!(vos::block_on(map.remove(&mut &node, 12_345)).unwrap(), 0);
+    assert_eq!(vos::block_on(map.get(&mut &node, 12_345)).unwrap(), u64::MAX);
+    assert_eq!(vos::block_on(map.count(&mut &node)).unwrap(), 14_999);
+    assert_eq!(vos::block_on(map.put(&mut &node, 12_345, 7)).unwrap(), 1);
+    assert_eq!(vos::block_on(map.put(&mut &node, 12_345, 8)).unwrap(), 0);
+    assert_eq!(vos::block_on(map.get(&mut &node, 12_345)).unwrap(), 8);
+    assert_eq!(
+        vos::block_on(map.sum_range(&mut &node, 12_344, 3)).unwrap(),
+        3 * 12_344 + 8 + 3 * 12_346,
+        "range read sees the replaced value in order"
+    );
+
+    // Set dedup + the blob-resident field alongside row effects.
+    assert_eq!(vos::block_on(map.mark(&mut &node, [9u8; 32])).unwrap(), 1);
+    assert_eq!(vos::block_on(map.mark(&mut &node, [9u8; 32])).unwrap(), 0);
+    assert_eq!(vos::block_on(map.bump(&mut &node)).unwrap(), 1);
+
+    node.shutdown();
+    let _ = node.collect();
+}
