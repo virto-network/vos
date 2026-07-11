@@ -295,7 +295,36 @@ heap; `STATUS_TOO_BIG` regression suite untouched.
 
 **Gate W3**: full e2e incl. federation/showcase suites; registry
 pagination exercised by a vosx-side test; two-replica CRDT convergence
-test over per-key registry writes + deletes.
+test over per-key registry writes + deletes — hardened to byte-compare
+both replicas' *persisted* KV tables and to cold-restart a replica
+with no network attached (pins `commit_rebuilt`).
+
+### W3 hardening (post-review fix arc)
+
+An adversarial review of the W3 branch surfaced one critical and four
+major defects, all fixed on the branch before merge:
+
+1. **Post-replay persistence (critical, substrate)** — see open
+   question 1's third bullet: `CommitStrategy::commit_rebuilt` swaps
+   the whole persisted KV table for the replayed slate.
+2. **Authority co-location** — `root`, `revoke_epochs`,
+   `actor_revoke_epochs`, `consistency_floors` moved to `#[storage]`
+   so a state-blob drift fallback resets authority state as one unit
+   (a blob-reset floor beside surviving grant rows resurrected revoked
+   admins). Pinned by `registry_authority_survives_state_blob_drift`.
+3. **Members cursor** — the identity-phase cursor is the hashed
+   32-byte map key (never empty ⇒ can't collide with the phase-start
+   sentinel and loop `members_all` forever); `add_identity` refuses
+   the empty key. Pinned by `members_pager_terminates_one_row_at_a_time`.
+4. **Page byte budget** — 48 KiB, sized against the 256 KiB guest heap
+   with ~3× per-row residency (read-cache + decoded + encode), not the
+   1 MiB halt cap.
+5. **`effective_role` walks iteratively** — one decoded row live at a
+   time; a grantor cycle (admin self-re-grant) refuses in ≤ table-size
+   hops with O(1) memory instead of OOMing the arena.
+6. **Registry unit suite revived** (39 tests; was uncompilable) via a
+   std dev-dep + mock reset isolation; `host_mappings()` returns
+   `HostMappingPage` with an explicit `more` terminator.
 
 ## Wave 4 — committed storage: `anchor_kind 0x02` (B6 / `vos::zk::state`)
 
@@ -350,20 +379,118 @@ test over per-key registry writes + deletes.
 **Gate W4**: full gate incl. proving e2e; 0x02 anchors verified
 end-to-end; 0x01 actors byte-for-byte unaffected.
 
+### W4 as built (4.1, 4.2, 4.4 landed; 4.3 remaining)
+
+- **4.1** — `vos::zk::state` generalizes the math to any key width
+  with parameterized domains (cipher-clerk byte-parity pinned against
+  vectors computed by running cipher-clerk itself);
+  `vos::storage::CommittedMap` is the row-backed incremental tree:
+  node rows only at branching points (every stored node has two
+  non-empty children; delete collapses), a root row
+  `[count][root hash][top ref]`, spines recomputed off the empty
+  chain. Mutations touch O(log n) rows; the structure is a pure
+  function of the key set (row-snapshot byte-identity across
+  histories); in-order DFS is the ordered index per decision 4b.
+- **4.2** — the composite root (state-blob hash folded with the
+  committed field roots, declaration order) is ITSELF a framework
+  storage row (`__vos_committed_root`), written at halt only when it
+  moved. The host's expected-anchor check reads that row through the
+  same journal overlay as the state blob — genesis-first-dispatch,
+  chained tick iterations, and cold restart all work with zero
+  host-side metadata. Guest `CURRENT_ANCHOR` carries the blob hash
+  separately (blob-moved ≠ anchor-moved under 0x02). Tasks stay on
+  0x01 until 4.3. Fixture: `examples/actors/committed-counter` + e2e.
+  The guest-framework change took the expected re-pin (cheap half —
+  floors unchanged; drift guard re-proved green), and the catalog
+  lockstep test now also pins `unpatched_image_root` trace-only.
+- **4.4** — clerk-ledger's six kernel collections are
+  `#[storage(committed)]` maps under cipher-clerk's domains with
+  canonical leaf contents (`insert_with_leaf`), so the composite stays
+  byte-identical to the from-scratch rebuild and vouchers keep
+  verifying; `state_root` is O(1); the twice-per-transfer rebuild is
+  gone; `create_accounts` batches ~8 signed creates per 4 KiB message.
+  Capstone green: 10k accounts through the real PVM, a transfer at
+  10k in ~66 ms, and the incremental root byte-equal to a rebuild
+  from the raw persisted rows. Sequenced BEFORE 4.3 deliberately: the
+  ledger's provable path is app-level (voucher-check +
+  `SuccinctTransitionWitness`), so the capstone needs the incremental
+  roots, not the generic witnessed backend.
+- **4.3 (remaining)** — the generic witnessed-read backend for
+  provable Tasks over committed storage. Banked constraints: the
+  two-backend seam is `storage.rs::backend_read` (a Task's STORAGE_R
+  is an echo stub — the witnessed backend must panic on unproven
+  reads, never fall through); Task input staging lives only in
+  `build_task_kernel` and must stay byte-identical with
+  `task_initial_image` + the tracer patch path (live≡traced gate);
+  `__VOS_WITNESS` already carries two layouts (zk pub/sec, VOST task
+  input) and the host never checks buffer capacity; the `.vos_meta`
+  storage section appends after the mode section. A10 (Task effects
+  dropped on replica rebuild — and `commit_rebuilt` now actively
+  swaps them away) gates witnessed Tasks on replicated agents: fix
+  A10 first or keep such actors Local.
+
 ## Open questions (resolve before the wave that needs them)
 
-1. **Warm-guest invalidation on out-of-band CRDT merge** (before
-   enabling any cross-dispatch cache, 2.2): when a remote merge rewrites
-   rows under a warm actor, how is today's warm `ACTOR_HOLDER` blob
-   invalidated, and does the same signal reach storage caches? Read the
-   `replay_dag_into_runtime` → agent-thread path in `node.rs` first.
+1. **Warm-guest invalidation on out-of-band CRDT merge** — RESOLVED
+   (W3 substrate commit). Two parts:
+   - *The warm holder is a non-issue.* The warm `ACTOR_HOLDER` blob lives
+     only inside a saved continuation (yield → resume), cleared on the
+     dispatch's `DONE`. CRDT merges run strictly between top-level
+     dispatches (agent-loop Cycle 4, `node.rs`), so no live warm holder
+     spans a merge for a completing-handler actor — the registry never
+     yields. Storage reads are not cached across dispatches in v1 (2.2),
+     so there is no cross-dispatch storage cache to invalidate either.
+   - *The real gate was the replay slate.* `soft_restart_crdt` rebuilds
+     rows by re-executing the DAG from genesis, but deleted only
+     `STATE_KEY` before replaying — onto the live pre-merge storage rows.
+     The meta/index rows and `StorageVec` length rows are accumulators
+     seeded from current stored bytes, so replay diverged: a `StorageVec`
+     doubles its length (positional `push` reads the stale length row),
+     the `next_page` allocator + directory rebuild a physical layout that
+     is no longer byte-identical across replicas (the state anchor does
+     not cover storage rows), and any path-dependent handler reading a
+     collection mid-replay sees the final merged map, not the genesis
+     progression — under Raft (`linear_history`) that surfaces as a fatal
+     `replay diverged` agent tear-down. A `StorageMap`'s *final count*
+     self-heals (inserts are membership-gated), so a count-only test does
+     not catch it — `StorageVec` length and cross-replica row byte-equality
+     do. Fix: `ServiceStorage::clear_service` wipes the whole per-service
+     keyspace before replay (preserving only the host-seeded `INIT_KEY`),
+     symmetric with the empty slate a cold-boot replay already sees
+     (`node.rs` cold path pre-loads only `INIT_KEY`, so it was already
+     correct). Tests: `vos::actors::storage::tests::vec_replay_needs_a_cleared_keyspace`
+     (final-state proof), `runtime::tests::clear_service_drops_only_that_services_rows`.
+     The 3.1 two-replica gate exercises it end-to-end.
+   - *The rebuilt slate must also persist wholesale.* Post-replay
+     materialization committed only the state blob (`commit_state`), while
+     the KV table is written exclusively from *local* dispatch deltas — so
+     the rows replay rebuilt for merged **remote** dispatches lived only in
+     the in-memory runtime. A cold reopen (`restore_writes`) came back
+     missing every remotely-replicated row (a restarted replica answered
+     `node_role = 0` for its peers' voters), and a post-merge local delta
+     could persist index pages naming value rows the table never held —
+     panicking `StorageMapIter` on the first list after restart. Fix:
+     `CommitStrategy::commit_rebuilt(state, rows)` atomically writes the
+     state and *swaps* the whole KV table for the replayed slate (dropping
+     rows the replayed layout no longer produces), implemented for
+     `LocalCommit`/`CrdtCommit`/`RaftCommit` and called from both replay
+     materialization sites (`soft_restart_crdt`, cold-start replay).
+     Tests: `commit_rebuilt_swaps_the_whole_kv_table`,
+     `crdt_commit_rebuilt_swaps_rows_without_appending_history`; the 3.1
+     gate now also byte-compares both replicas' persisted KV tables and
+     cold-restarts a replica with no network attached (both fail without
+     the fix).
 2. **Registry ordering semantics** (3.1): do any registry consumers
    depend on insertion order of `members`/`agents`? If so those become
    `StorageVec` + side index rather than ordered maps.
-3. **SMT leaf domain** (4.1): one tree over the whole keyspace vs one
-   per committed field with a top hash combining field roots. Per-field
-   roots keep proofs smaller and prefixes independent; whole-keyspace is
-   simpler host-side. Decide when porting.
+3. **SMT leaf domain** (4.1): RESOLVED — per-field trees with a top
+   fold. Decision 4b already required it (the unhashed-key SMT doubles
+   as the ordered index, which needs a fixed width per tree), and it
+   is what lets clerk-ledger's fields carry cipher-clerk's domains for
+   voucher parity while the anchor composite folds under vos domains.
+   The composite is a linear fold (state hash, then field roots in
+   declaration order) rather than a balanced tree — field counts are
+   tiny and the fold is what the macro can emit cheaply.
 4. **A10 fix ordering** (4.3): witnessed Tasks on replicated agents
    need the Task-effects-on-rebuild fix; sequence it before 4.4 if the
    ledger stays Raft/CRDT-replicated in the showcase.

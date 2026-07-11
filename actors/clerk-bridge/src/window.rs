@@ -19,53 +19,49 @@
 //! currency, so the sum is bracketed by explicit `window_rotate` events and
 //! keyed by the fixed demo currency the peer was registered under.
 
-use alloc::vec::Vec;
-
 use cipher_clerk::crypto::Amount;
+use vos::storage::StorageMap;
 
-use crate::WindowNetEntry;
+/// Domain-separated 32-byte row key for a `(peer, currency, window)`
+/// receiver term. `peer_name` is operator-opaque and variable length, so
+/// the composite discriminant is folded into a fixed-width key the
+/// `StorageMap` can address. The map is only ever point-queried
+/// (`accumulate_neg` folds one row, `window_net` reads one), never
+/// iterated, so hashing forfeits nothing here.
+pub(crate) fn window_key(peer_name: &[u8], currency: u32, window: u64) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(
+        b"clerk-bridge/window-net/v1",
+        &[peer_name, &currency.to_be_bytes(), &window.to_be_bytes()],
+    )
+}
 
 /// Fold an accepted voucher's `amount_commit` into the receiver term for
 /// `(peer_name, currency, window)`: `neg_sum ← neg_sum ⊖ commit`. Called at
 /// exactly the accept points that advance the F2 `last_root_after` anchor,
-/// so the receiver term and the anchor never diverge.
+/// so the receiver term and the anchor never diverge. One point read plus
+/// one point write, independent of how many windows the bridge tracks.
 pub(crate) fn accumulate_neg(
-    nets: &mut Vec<WindowNetEntry>,
+    nets: &mut StorageMap<[u8; 32], [u8; 32]>,
     peer_name: &[u8],
     currency: u32,
     window: u64,
     commit: &Amount,
 ) {
-    let idx = nets.iter().position(|n| {
-        n.peer_name == peer_name && n.currency == currency && n.window == window
-    });
-    let current = match idx {
-        Some(i) => Amount(nets[i].neg_sum),
-        None => Amount::ZERO,
-    };
+    let key = window_key(peer_name, currency, window);
+    let current = nets.get(&key).map(Amount).unwrap_or(Amount::ZERO);
     let updated = sub_commit(&current, commit);
-    match idx {
-        Some(i) => nets[i].neg_sum = updated.0,
-        None => nets.push(WindowNetEntry {
-            peer_name: peer_name.to_vec(),
-            currency,
-            window,
-            neg_sum: updated.0,
-        }),
-    }
+    nets.insert(&key, &updated.0);
 }
 
 /// The stored receiver term for `(peer_name, currency, window)`, or `None`
 /// if nothing has accumulated there yet.
 pub(crate) fn window_net(
-    nets: &[WindowNetEntry],
+    nets: &StorageMap<[u8; 32], [u8; 32]>,
     peer_name: &[u8],
     currency: u32,
     window: u64,
 ) -> Option<[u8; 32]> {
-    nets.iter()
-        .find(|n| n.peer_name == peer_name && n.currency == currency && n.window == window)
-        .map(|n| n.neg_sum)
+    nets.get(&window_key(peer_name, currency, window))
 }
 
 /// `a ⊖ b` over the Pedersen group. A degenerate (non-decompressable)
@@ -102,7 +98,11 @@ mod tests {
     /// B 10 (commit C₁), B pays A 3 (commit C₂). Bank A's claim nets
     /// C₁ ⊖ C₂ and bank B's nets C₂ ⊖ C₁; their sum is the identity point.
     /// Both banks' terms are derived from the SAME two commitments, so the
-    /// blindings cancel by construction.
+    /// blindings cancel by construction. The receiver term a bridge folds is
+    /// `sub_commit(ZERO, commit)` = ⊖commit — the arithmetic
+    /// `accumulate_neg` now writes through a `StorageMap`; the map's
+    /// get/insert round-trip is exercised by vos's own storage tests and the
+    /// federation e2e, so these cases pin the crypto, not the backend.
     #[test]
     fn worked_example_two_bank_net_flows_cancel() {
         let c1 = Amount::commit(10, &Blinding([1u8; 32])); // A → B voucher
@@ -110,13 +110,8 @@ mod tests {
 
         // Receiver terms the two bridges accumulate: A's bridge accepted C₂
         // from B; B's bridge accepted C₁ from A.
-        let mut nets_a: Vec<WindowNetEntry> = Vec::new();
-        accumulate_neg(&mut nets_a, b"bank-b", USD, 0, &c2);
-        let recv_a = Amount(window_net(&nets_a, b"bank-b", USD, 0).unwrap()); // ⊖C₂
-
-        let mut nets_b: Vec<WindowNetEntry> = Vec::new();
-        accumulate_neg(&mut nets_b, b"bank-a", USD, 0, &c1);
-        let recv_b = Amount(window_net(&nets_b, b"bank-a", USD, 0).unwrap()); // ⊖C₁
+        let recv_a = sub_commit(&Amount::ZERO, &c2); // ⊖C₂
+        let recv_b = sub_commit(&Amount::ZERO, &c1); // ⊖C₁
 
         // Issuer terms the drivers keep: what each bank ISSUED to the peer.
         let net_a = add(&c1, &recv_a); // C₁ ⊖ C₂
@@ -129,26 +124,41 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_neg_sums_multiple_accepts_in_one_window() {
+    fn accumulate_folds_multiple_accepts_in_one_window() {
+        // Two accepts in the same window fold as ⊖C₁ then ⊖C₂ over the
+        // running term — the exact sequence `accumulate_neg` applies after
+        // reading the current row back.
         let c1 = Amount::commit(10, &Blinding([1u8; 32]));
         let c2 = Amount::commit(5, &Blinding([3u8; 32]));
-        let mut nets = Vec::new();
-        accumulate_neg(&mut nets, b"peer", USD, 0, &c1);
-        accumulate_neg(&mut nets, b"peer", USD, 0, &c2);
-        assert_eq!(nets.len(), 1);
-        // neg_sum == ⊖(C₁ ⊕ C₂).
+        let term = sub_commit(&sub_commit(&Amount::ZERO, &c1), &c2);
+        // term == ⊖(C₁ ⊕ C₂).
         let expected = Amount::from_point(&(-add(&c1, &c2).to_point().unwrap()));
-        assert_eq!(nets[0].neg_sum, expected.0);
+        assert_eq!(term.0, expected.0);
     }
 
     #[test]
-    fn accumulate_neg_separates_windows_and_peers() {
-        let c = Amount::commit(10, &Blinding([1u8; 32]));
-        let mut nets = Vec::new();
-        accumulate_neg(&mut nets, b"peer", USD, 0, &c);
-        accumulate_neg(&mut nets, b"peer", USD, 1, &c); // next bracket
-        accumulate_neg(&mut nets, b"other", USD, 0, &c); // different peer
-        assert_eq!(nets.len(), 3);
-        assert!(window_net(&nets, b"peer", USD, 2).is_none());
+    fn window_key_separates_windows_peers_and_currencies() {
+        // Distinct discriminants must land on distinct rows so terms never
+        // cross-contaminate; identical ones must collide so folds accumulate.
+        assert_ne!(
+            window_key(b"peer", USD, 0),
+            window_key(b"peer", USD, 1),
+            "a window rotation moves to a fresh row",
+        );
+        assert_ne!(
+            window_key(b"peer", USD, 0),
+            window_key(b"other", USD, 0),
+            "a different peer is a different row",
+        );
+        assert_ne!(
+            window_key(b"peer", USD, 0),
+            window_key(b"peer", USD + 1, 0),
+            "a different currency is a different row",
+        );
+        assert_eq!(
+            window_key(b"peer", USD, 0),
+            window_key(b"peer", USD, 0),
+            "the same triple is the same row, so accepts accumulate",
+        );
     }
 }

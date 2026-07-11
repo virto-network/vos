@@ -5341,9 +5341,10 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
     let hs_reg_b = SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
     let mappings = wait_for(
         || {
-            let m = vos::block_on(hs_reg_b.host_mappings(&mut &node_b)).ok()?;
-            if m.iter().any(|h| h.instance_name == "alice") {
-                Some(m)
+            let page =
+                vos::block_on(hs_reg_b.host_mappings(&mut &node_b, String::new(), 0)).ok()?;
+            if page.mappings.iter().any(|h| h.instance_name == "alice") {
+                Some(page.mappings)
             } else {
                 None
             }
@@ -5388,6 +5389,535 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
         .map(|r| r.panics)
         .sum();
     assert_eq!(panics, 0, "actor panics during hyperspace test: {panics}");
+}
+
+/// W3.1 gate: per-key registry writes AND deletes converge byte-identically
+/// across two CRDT replicas. Node A anchors the genesis root, enrols two
+/// node members (`add_node` — one `Effect::Write` per member into the
+/// storage-typed `nodes` map) then removes one (`remove_node` — an
+/// `Effect::Delete`). Node B, which never saw the ops directly, converges
+/// via gossipsub-CRDT: `node_role` resolves the survivor and denies the
+/// removed one, and B's full member roster is byte-identical to A's — the
+/// soft-restart keyspace clear (`ServiceStorage::clear_service`) rebuilds
+/// B's storage rows from a clean slate instead of replaying onto stale
+/// ones, so the two maps materialize identically.
+#[test]
+#[cfg(feature = "network")]
+fn crdt_registry_writes_and_deletes_converge_across_replicas() {
+    let _net = net_serial();
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{NODE_ROLE_VOTER, SpaceRegistryRef, canonical_op_bytes, pack_auth};
+    use std::time::Duration;
+    use vos::abi::service::ServiceId;
+    use vos::network::{Network, NetworkConfig, derive_node_prefix};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry actor not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_crdt_reg_converge_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    let dir_a = dir_root.join("a");
+    let dir_b = dir_root.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let rep_id: [u8; 32] = {
+        let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+        h.update(b"crdt-registry-converge-test");
+        h.update(&registry_blob);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    };
+
+    // ── Networks ───────────────────────────────────────────────
+    let kp_a = libp2p::identity::Keypair::generate_ed25519();
+    let kp_b = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&libp2p::PeerId::from(kp_a.public()));
+    let prefix_b = derive_node_prefix(&libp2p::PeerId::from(kp_b.public()));
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let net_a = Network::start(NetworkConfig {
+        keypair: kp_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: true,
+    });
+    let a_listen = wait_for(
+        || net_a.listen_addrs().into_iter().next(),
+        Duration::from_secs(5),
+    )
+    .expect("net_a binds");
+    let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+    let net_b = Network::start(NetworkConfig {
+        keypair: kp_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![a_dial],
+        auto_dial_mdns: true,
+    });
+
+    // ── Two registry replicas in one CRDT group ────────────────
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let _reg_a = node_a.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_a)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_a.attach_network(net_a);
+
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let _reg_b = node_b.register_at_id(
+        AgentConfig::new(registry_blob.clone())
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    node_b.attach_network(net_b);
+
+    let net_a_arc = node_a.network().expect("net_a attached");
+    let net_b_arc = node_b.network().expect("net_b attached");
+    wait_for(
+        || {
+            (net_a_arc.peer_for_prefix(prefix_b).is_some()
+                && net_b_arc.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("Hello handshake");
+
+    // ── Anchor the genesis root + sign the node ops ────────────
+    let root_key = SigningKey::from_bytes(&[13u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+    let node_peer = |seed: u8| peer_id_for([seed; 32]);
+    let add_auth = |prefix: u32, peer: &[u8], role: u8| -> Vec<u8> {
+        let canonical = canonical_op_bytes("add_node", &[&prefix.to_le_bytes(), peer, &[role]]);
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+    let remove_auth = |prefix: u32| -> Vec<u8> {
+        let canonical = canonical_op_bytes("remove_node", &[&prefix.to_le_bytes()]);
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let reg_all = vos::registry::RegistryRef::at(ServiceId::REGISTRY);
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node_a, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+
+    // ── Writes: enrol two node members on A ────────────────────
+    for (prefix, seed) in [(7u32, 0x11u8), (9u32, 0x22u8)] {
+        let peer = node_peer(seed);
+        assert_eq!(
+            vos::block_on(reg.add_node(
+                &mut &node_a,
+                prefix,
+                peer.clone(),
+                NODE_ROLE_VOTER,
+                add_auth(prefix, &peer, NODE_ROLE_VOTER),
+            ))
+            .expect("add_node"),
+            space_registry::Status::Ok,
+        );
+    }
+
+    // Both writes converge to B (node_role encodes role+1; VOTER=0 → 1).
+    wait_for(
+        || {
+            let r7 = vos::block_on(reg.node_role(&mut &node_b, 7)).ok()?;
+            let r9 = vos::block_on(reg.node_role(&mut &node_b, 9)).ok()?;
+            (r7 == 1 && r9 == 1).then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("both node members converge to B");
+
+    // ── Delete: remove one node on A ───────────────────────────
+    assert_eq!(
+        vos::block_on(reg.remove_node(&mut &node_a, 7, remove_auth(7))).expect("remove_node"),
+        space_registry::Status::Ok,
+    );
+
+    // The delete converges to B: prefix 7 denied (0), prefix 9 still VOTER.
+    wait_for(
+        || {
+            let r7 = vos::block_on(reg.node_role(&mut &node_b, 7)).ok()?;
+            let r9 = vos::block_on(reg.node_role(&mut &node_b, 9)).ok()?;
+            (r7 == 0 && r9 == 1).then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("remove_node delete converges to B");
+
+    // ── Byte-level convergence: full rosters match ─────────────
+    let members_a = vos::block_on(reg_all.members_all(&mut &node_a)).expect("members_all A");
+    let members_b = vos::block_on(reg_all.members_all(&mut &node_b)).expect("members_all B");
+    assert_eq!(
+        members_a, members_b,
+        "member rosters must converge byte-identically across replicas",
+    );
+    assert_eq!(members_a.len(), 1, "only the surviving node member remains");
+    assert_eq!(members_a[0].prefix, 9, "the survivor is prefix 9");
+
+    // ── Persisted keyspaces are byte-identical ─────────────────
+    // A's rows were persisted incrementally by its local dispatch
+    // deltas; B's were persisted wholesale by the post-replay
+    // `commit_rebuilt` swap. Same history ⇒ same bytes, row for row.
+    node_a.collect();
+    node_b.collect();
+    let reg_db = |dir: &std::path::Path| {
+        dir.join("agents")
+            .join(format!("{:08x}.redb", ServiceId::REGISTRY.0))
+    };
+    let rows_a = vos::commit::read_kv_rows_at(&reg_db(&dir_a)).expect("read A's persisted rows");
+    let rows_b = vos::commit::read_kv_rows_at(&reg_db(&dir_b)).expect("read B's persisted rows");
+    assert!(
+        !rows_b.is_empty(),
+        "B must durably persist the rows the merge delivered"
+    );
+    assert_eq!(
+        rows_a, rows_b,
+        "persisted storage rows must be byte-identical across replicas"
+    );
+
+    // ── Cold restart B with no network: merged rows survive ────
+    // Reopen B purely from its own files — no peers to re-sync from.
+    // Without the full-keyspace post-replay commit, restore() returns
+    // the state blob but restore_writes() has no rows, so every
+    // remotely-replicated member would vanish (node_role = 0).
+    let mut node_b2 = VosNode::with_prefix(prefix_b);
+    let _reg_b2 = node_b2.register_at_id(
+        AgentConfig::new(registry_blob)
+            .with_consistency(Consistency::Crdt)
+            .persist(&dir_b)
+            .with_replication_id(rep_id),
+        ServiceId::REGISTRY,
+    );
+    assert_eq!(
+        vos::block_on(reg.node_role(&mut &node_b2, 9)).expect("node_role after cold restart"),
+        1,
+        "remotely-replicated member must survive a cold restart",
+    );
+    assert_eq!(
+        vos::block_on(reg.node_role(&mut &node_b2, 7)).expect("node_role after cold restart"),
+        0,
+        "the removed member must stay removed after a cold restart",
+    );
+    let members_b2 =
+        vos::block_on(reg_all.members_all(&mut &node_b2)).expect("members_all after cold restart");
+    assert_eq!(
+        members_b2, members_a,
+        "the roster must survive a cold restart byte-identically",
+    );
+    node_b2.collect();
+    let _ = std::fs::remove_dir_all(&dir_root);
+}
+
+/// A state-blob decode failure (upgrade drift, disk corruption) falls
+/// back to a fresh actor struct — but the genesis root, grant rows, and
+/// revoke floors all live in `#[storage]` rows, so the fallback resets
+/// NONE of them. This pins the co-location: when the floors or the root
+/// lived in the blob while grants lived in storage, a drifted blob
+/// reset the floors and un-anchored the root, so re-anchoring the same
+/// root resurrected every revoked admin's surviving grant row.
+#[test]
+fn registry_authority_survives_state_blob_drift() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{
+        AUTH_ROLE_ADMIN, AUTH_ROLE_NONE, SpaceRegistryRef, canonical_op_bytes, pack_auth,
+    };
+    use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry actor not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_reg_drift_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let root_key = SigningKey::from_bytes(&[13u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+    let admin_peer = peer_id_for([0x33; 32]);
+    let epoch = 5u64;
+    let grant_auth = {
+        let canonical = canonical_op_bytes(
+            "grant_role",
+            &[&admin_peer, &[AUTH_ROLE_ADMIN], &epoch.to_le_bytes()],
+        );
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+    let revoke_auth = {
+        let canonical = canonical_op_bytes("revoke_role", &[&admin_peer, &epoch.to_le_bytes()]);
+        pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes())
+    };
+
+    let spawn = |blob: Vec<u8>| -> VosNode {
+        let mut node = VosNode::with_prefix(0x00aa);
+        node.register_at_id(
+            AgentConfig::new(blob)
+                .with_consistency(Consistency::Local)
+                .persist(&dir),
+            ServiceId::REGISTRY,
+        );
+        node
+    };
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+
+    // ── Boot 1: anchor, grant, revoke ───────────────────────────
+    let node = spawn(registry_blob.clone());
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(reg.grant_role(
+            &mut &node,
+            admin_peer.clone(),
+            AUTH_ROLE_ADMIN,
+            epoch,
+            grant_auth,
+        ))
+        .expect("grant_role"),
+        space_registry::Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(reg.peer_role(&mut &node, admin_peer.clone())).expect("peer_role"),
+        AUTH_ROLE_ADMIN,
+    );
+    assert_eq!(
+        vos::block_on(reg.revoke_role(&mut &node, admin_peer.clone(), epoch, revoke_auth))
+            .expect("revoke_role"),
+        space_registry::Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(reg.peer_role(&mut &node, admin_peer.clone())).expect("peer_role"),
+        AUTH_ROLE_NONE,
+        "the revoke floor dominates the grant",
+    );
+    node.collect();
+
+    // ── Simulate schema drift: corrupt the persisted state blob ─
+    // try_decode fails on the garbage, so the next boot's
+    // load_or_create falls back to `create()` — the drift path.
+    {
+        let db_path = dir
+            .join("agents")
+            .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
+        let db = redb::Database::open(&db_path).expect("open agent db");
+        let txn = db.begin_write().expect("begin write");
+        {
+            let mut table = txn
+                .open_table(vos::commit::STATE_TABLE)
+                .expect("open state table");
+            table
+                .insert(vos::commit::STATE_KEY, b"drifted-garbage".as_slice())
+                .expect("corrupt state blob");
+        }
+        txn.commit().expect("commit corruption");
+    }
+
+    // ── Boot 2: authority state survives the fallback together ──
+    let node = spawn(registry_blob);
+    assert_eq!(
+        vos::block_on(reg.root(&mut &node)).expect("root"),
+        root_peer,
+        "the anchored root must survive a state-blob drift",
+    );
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node, admin_peer.clone())).expect("set_root"),
+        space_registry::Status::Forbidden,
+        "a drifted blob must not re-open the genesis anchor",
+    );
+    assert_eq!(
+        vos::block_on(reg.peer_role(&mut &node, admin_peer.clone())).expect("peer_role"),
+        AUTH_ROLE_NONE,
+        "a revoked grant must stay revoked across a drift fallback",
+    );
+    node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The members pager terminates when driven one row at a time across
+/// both phases (nodes, then identities), with no row duplicated or
+/// dropped. Pins the identity-phase cursor being the *hashed* 32-byte
+/// map key: a cursor derived from the original `public_key` could
+/// round-trip empty and collide with the empty-`next_key` "start of
+/// the identity phase" sentinel, restarting the phase forever. Also
+/// pins `add_identity` refusing the empty key outright.
+#[test]
+fn members_pager_terminates_one_row_at_a_time() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{
+        MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_VOTER, PROOF_KIND_MERKLE_INCLUSION,
+        SpaceRegistryRef, canonical_op_bytes, pack_auth,
+    };
+    use vos::abi::service::ServiceId;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+
+    let registry_path = format!(
+        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let registry_elf = match std::fs::read(&registry_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: space-registry actor not built (run `just build-registry`)");
+            return;
+        }
+    };
+    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+
+    let root_key = SigningKey::from_bytes(&[13u8; 32]);
+    let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
+        let mut id = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        id.extend_from_slice(&pk);
+        id
+    };
+    let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
+
+    let mut node = VosNode::with_prefix(0x00ab);
+    node.register_at_id(
+        AgentConfig::new(registry_blob).with_consistency(Consistency::Ephemeral),
+        ServiceId::REGISTRY,
+    );
+    let reg = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    assert_eq!(
+        vos::block_on(reg.set_root(&mut &node, root_peer.clone())).expect("set_root"),
+        space_registry::Status::Ok,
+    );
+
+    for (prefix, seed) in [(3u32, 0x11u8), (5u32, 0x22u8)] {
+        let peer = peer_id_for([seed; 32]);
+        let canonical = canonical_op_bytes(
+            "add_node",
+            &[&prefix.to_le_bytes(), &peer, &[NODE_ROLE_VOTER]],
+        );
+        let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(reg.add_node(&mut &node, prefix, peer, NODE_ROLE_VOTER, auth))
+                .expect("add_node"),
+            space_registry::Status::Ok,
+        );
+    }
+    for seed in [0x41u8, 0x42, 0x43] {
+        let pk = vec![seed; 32];
+        let canonical = canonical_op_bytes(
+            "add_identity",
+            &[&pk, &[PROOF_KIND_MERKLE_INCLUSION], &[]],
+        );
+        let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(reg.add_identity(
+                &mut &node,
+                pk,
+                PROOF_KIND_MERKLE_INCLUSION,
+                Vec::new(),
+                auth,
+            ))
+            .expect("add_identity"),
+            space_registry::Status::Ok,
+        );
+    }
+    // The empty key is refused outright — it is not an identity, and
+    // it is the pager's phase-start sentinel.
+    {
+        let canonical = canonical_op_bytes(
+            "add_identity",
+            &[&[], &[PROOF_KIND_MERKLE_INCLUSION], &[]],
+        );
+        let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(reg.add_identity(
+                &mut &node,
+                Vec::new(),
+                PROOF_KIND_MERKLE_INCLUSION,
+                Vec::new(),
+                auth,
+            ))
+            .expect("add_identity"),
+            space_registry::Status::BadHash,
+        );
+    }
+
+    // Drain one row per page. 5 members ⇒ the drain must finish in
+    // well under 12 iterations; a cursor/sentinel collision loops.
+    let mut kind = MEMBER_KIND_NODE;
+    let mut key: Vec<u8> = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        let page = vos::block_on(reg.members(&mut &node, kind, key.clone(), 1)).expect("members");
+        seen.extend(page.members.iter().map(|m| (m.kind, m.key.clone(), m.prefix)));
+        if !page.more {
+            break;
+        }
+        kind = page.next_kind;
+        key = page.next_key;
+    }
+    assert_eq!(seen.len(), 5, "every member exactly once: {seen:?}");
+    let nodes: Vec<u16> = seen
+        .iter()
+        .filter(|(k, _, _)| *k == MEMBER_KIND_NODE)
+        .map(|(_, _, p)| *p)
+        .collect();
+    let ids: Vec<Vec<u8>> = seen
+        .iter()
+        .filter(|(k, _, _)| *k == MEMBER_KIND_IDENTITY)
+        .map(|(_, key, _)| key.clone())
+        .collect();
+    assert_eq!(nodes, vec![3, 5], "nodes in prefix order");
+    assert_eq!(ids.len(), 3, "all identities present");
+    node.collect();
 }
 
 #[test]
@@ -6322,18 +6852,18 @@ const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
 /// segment commitment is in this set.
 const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
     // C_0 — comb-free canonical shape.
-    // blake2s 46e1bede03214805b7b6130286a3c878026dd523a50cc0f62658a5d662f2a5a7
+    // blake2s 25cc5823902e24a32a720b9621f0411f3535760991941bdd33e71cae9a5df833
     [
-        0x46, 0xe1, 0xbe, 0xde, 0x03, 0x21, 0x48, 0x05, 0xb7, 0xb6, 0x13, 0x02, 0x86, 0xa3, 0xc8,
-        0x78, 0x02, 0x6d, 0xd5, 0x23, 0xa5, 0x0c, 0xc0, 0xf6, 0x26, 0x58, 0xa5, 0xd6, 0x62, 0xf2,
-        0xa5, 0xa7,
+        0x25, 0xcc, 0x58, 0x23, 0x90, 0x2e, 0x24, 0xa3, 0x2a, 0x72, 0x0b, 0x96, 0x21, 0xf0, 0x41,
+        0x1f, 0x35, 0x35, 0x76, 0x09, 0x91, 0x94, 0x1b, 0xdd, 0x33, 0xe7, 0x1c, 0xae, 0x9a, 0x5d,
+        0xf8, 0x33,
     ],
     // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
-    // blake2s f5dd7d50f536a474a31b092d93fb1d051abaa7f076dd32f542e5ccff769cd529
+    // blake2s 4805c03e1fd0cdfb2abac250352f1714939550cfac10f8900103d571b70d571f
     [
-        0xf5, 0xdd, 0x7d, 0x50, 0xf5, 0x36, 0xa4, 0x74, 0xa3, 0x1b, 0x09, 0x2d, 0x93, 0xfb, 0x1d,
-        0x05, 0x1a, 0xba, 0xa7, 0xf0, 0x76, 0xdd, 0x32, 0xf5, 0x42, 0xe5, 0xcc, 0xff, 0x76, 0x9c,
-        0xd5, 0x29,
+        0x48, 0x05, 0xc0, 0x3e, 0x1f, 0xd0, 0xcd, 0xfb, 0x2a, 0xba, 0xc2, 0x50, 0x35, 0x2f, 0x17,
+        0x14, 0x93, 0x95, 0x50, 0xcf, 0xac, 0x10, 0xf8, 0x90, 0x01, 0x03, 0xd5, 0x71, 0xb7, 0x0d,
+        0x57, 0x1f,
     ],
 ];
 
@@ -11034,6 +11564,20 @@ fn voucher_check_catalog_matches_pinned_constants() {
             vos::zk::witness_addr(&elf).expect("voucher-check ELF exports __VOS_WITNESS"),
             "catalog witness_addr drifted from the live ELF symbol"
         );
+        // The recorded unpatched image root must match the live blob too —
+        // trace-only (the unpatched guest early-exits on its all-zero
+        // witness), so this catches a guest-framework rebuild that moved
+        // the image without waiting for a prove-path failure.
+        let (blob, _) = voucher_check_pvm();
+        let measured = prover_extension::measure_catalog(&blob, &[], 0, 1, &[], VC_TRACE_GAS)
+            .expect("trace-only measure of the unpatched image root");
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            pin.unpatched_image_root,
+            hex(&measured[..32]),
+            "catalog unpatched_image_root drifted from the live blob — \
+             re-pin with `vosx zk pin` (or update catalog.toml)"
+        );
     }
 }
 
@@ -11126,4 +11670,336 @@ fn storage_map_outgrows_guest_heap() {
 
     node.shutdown();
     let _ = node.collect();
+}
+
+/// W4 capstone (docs/plans/actor-storage.md, Gate W4): a
+/// 10,000-account clerk-ledger. Every collection lives in committed
+/// storage, so the blob model's walls (256 KiB guest heap on decode,
+/// the 1 MiB halt cap on re-encode — fatal near 3k accounts) never
+/// come into play: account creation number 10,000 touches the same
+/// bounded row set as number 1, a transfer at 10k accounts commits in
+/// O(touched · log N) rows with its (root_before, root_after) anchors
+/// read in O(1) from the incremental sub-SMT roots, and the actor's
+/// state root equals a host-side from-scratch rebuild over the raw
+/// persisted rows — cipher-clerk's composite, byte for byte.
+#[test]
+fn clerk_ledger_capstone_ten_thousand_accounts() {
+    use cipher_clerk::conventions::{BankCode, Iso4217};
+    use cipher_clerk::crypto::{Amount, Keypair};
+    use cipher_clerk::ids::JournalId;
+    use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
+    use cipher_clerk::state_root::composite_root_from_subroots;
+    use cipher_clerk::types::Account;
+    use clerk_ledger::{ClerkLedgerRef, Status};
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::zk::state::{SmtParams, leaf_hash, root_of_sorted};
+
+    const ACCOUNTS: usize = 10_000;
+    const BATCH: usize = 8; // sized to the 4 KiB message cap
+
+    let path = format!(
+        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    );
+    let elf = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: clerk-ledger not built (run `just build-clerk-ledger`)");
+            return;
+        }
+    };
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile clerk-ledger");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_capstone_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut node = VosNode::with_prefix(0x00ad);
+    let ledger_id = node.register(
+        AgentConfig::new(blob)
+            .with_consistency(Consistency::Local)
+            .persist(&dir),
+    );
+    let ledger = ClerkLedgerRef::at(ledger_id);
+    let ts: u64 = 1_000_000;
+
+    let registrar = Keypair::generate();
+    let journal = JournalId::random();
+    let status = vos::block_on(ledger.bootstrap(
+        &mut &node,
+        journal.0,
+        registrar.public.0,
+        1,
+    ))
+    .expect("bootstrap");
+    assert_eq!(status, Status::Ok);
+
+    // ── Load 10k accounts, 8 signed creates per dispatch ────────
+    // One shared holder keypair: auth keys may repeat across
+    // accounts, and one key lets the transfer below sign cheaply.
+    let holder = Keypair::generate();
+    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(ACCOUNTS);
+    let started = std::time::Instant::now();
+    let mut pending_batch: Vec<CcCreateAccount> = Vec::with_capacity(BATCH);
+    for i in 0..ACCOUNTS {
+        let account = Account::asset(journal, holder.public, Iso4217::USD, BankCode::Checking);
+        ids.push(account.id.0);
+        pending_batch.push(CcCreateAccount::signed(account, &registrar.secret));
+        if pending_batch.len() == BATCH || i == ACCOUNTS - 1 {
+            let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&pending_batch)
+                .expect("rkyv encode batch")
+                .to_vec();
+            assert!(bytes.len() < 4096, "batch must fit the message cap");
+            let statuses = vos::block_on(ledger.create_accounts(&mut &node, bytes, ts))
+                .expect("create_accounts");
+            assert_eq!(statuses.len(), pending_batch.len(), "one status per item");
+            assert!(
+                statuses.iter().all(|&s| s == Status::Ok as u8),
+                "batch create failed at account ~{i}: {statuses:?}"
+            );
+            pending_batch.clear();
+        }
+    }
+    eprintln!(
+        "capstone: loaded {ACCOUNTS} accounts in {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        vos::block_on(ledger.account_count(&mut &node)).expect("account_count"),
+        ACCOUNTS as u32,
+    );
+
+    // Spot reads across the keyspace — point rows, no cache help.
+    for probe in [0, ACCOUNTS / 2, ACCOUNTS - 1] {
+        let acct = vos::block_on(ledger.account(&mut &node, ids[probe]))
+            .expect("account read")
+            .expect("account on file");
+        assert_eq!(acct.id.0, ids[probe]);
+    }
+
+    // ── A transfer at 10k accounts ──────────────────────────────
+    let debtor = vos::block_on(ledger.account(&mut &node, ids[17]))
+        .expect("read")
+        .expect("on file");
+    let creditor = vos::block_on(ledger.account(&mut &node, ids[ACCOUNTS - 3]))
+        .expect("read")
+        .expect("on file");
+    let blinding = cipher_clerk::crypto::Blinding([1u8; 32]);
+    let amt = Amount::commit(100, &blinding);
+    let transfer = cipher_clerk::types::Transfer::builder(journal)
+        .debit(&debtor, cipher_clerk::types::Layer::Settled, amt)
+        .credit(&creditor, cipher_clerk::types::Layer::Settled, amt)
+        .signed_with(&[(&debtor, &holder.secret)]);
+    let transfer_id = transfer.id.0;
+    let transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&transfer)
+        .expect("encode transfer")
+        .to_vec();
+    let openings = vec![clerk_ledger::Opening {
+        amount: amt,
+        value: 100,
+        blinding,
+    }];
+    let openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .expect("encode openings")
+        .to_vec();
+
+    let root_before = vos::block_on(ledger.state_root(&mut &node)).expect("state_root");
+    assert_eq!(root_before.len(), 32);
+    let transfer_started = std::time::Instant::now();
+    let status = vos::block_on(ledger.apply_transfer(
+        &mut &node,
+        transfer_bytes,
+        openings_bytes,
+        ts + 7,
+    ))
+    .expect("apply_transfer");
+    assert_eq!(status, Status::Ok, "transfer at 10k accounts must land");
+    eprintln!(
+        "capstone: transfer at {ACCOUNTS} accounts in {:?}",
+        transfer_started.elapsed()
+    );
+    let root_after = vos::block_on(ledger.state_root(&mut &node)).expect("state_root");
+    assert_ne!(root_after, root_before, "the transfer must move the root");
+    let anchors = vos::block_on(ledger.transfer_state_roots(&mut &node, transfer_id))
+        .expect("transfer_state_roots")
+        .expect("anchors recorded");
+    assert_eq!(anchors.0, root_before, "recorded root_before must match");
+    assert_eq!(anchors.1, root_after, "recorded root_after must match");
+
+    let final_root = root_after.clone();
+    node.shutdown();
+    let _ = node.collect();
+
+    // ── From-scratch rebuild over the raw persisted rows ────────
+    // The actor's incremental root must equal cipher-clerk's
+    // composite recomputed from nothing but the durable value rows.
+    let db = dir
+        .join("agents")
+        .join(format!("{:08x}.redb", ledger_id.0));
+    let rows = vos::commit::read_kv_rows_at(&db).expect("read persisted rows");
+    let cc = SmtParams {
+        leaf_domain: b"cipher-clerk/smt/leaf/v1",
+        node_domain: b"cipher-clerk/smt/node/v1",
+        width: 16,
+    };
+    // Collect one sub-SMT's sorted (key, leaf_hash) pairs from the
+    // value rows under `s/<field>/v`; leaf content = tag ‖ payload
+    // (cipher-clerk's canonical encodings; `id_in_leaf` re-derives
+    // the payload for the marker sets whose content embeds the key).
+    let sub_leaves = |field: &str, tag: u8, id_in_leaf: bool| -> Vec<(Vec<u8>, [u8; 32])> {
+        let prefix = format!("s/{field}/v").into_bytes();
+        let mut leaves: Vec<(Vec<u8>, [u8; 32])> = rows
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| {
+                let key = k[prefix.len()..].to_vec();
+                let mut content = vec![tag];
+                if id_in_leaf {
+                    content.extend_from_slice(&key);
+                    if field == "pending_statuses" {
+                        content.extend_from_slice(v);
+                    }
+                } else {
+                    content.extend_from_slice(v);
+                }
+                let hash = leaf_hash(&cc, &content);
+                (key, hash)
+            })
+            .collect();
+        leaves.sort_unstable();
+        leaves
+    };
+    let accounts_root = root_of_sorted(&cc, &sub_leaves("accounts", 0, false));
+    let transfers_root = root_of_sorted(&cc, &sub_leaves("transfers", 1, false));
+    let journal_root = root_of_sorted(&cc, &sub_leaves("journal", 2, false));
+    let eids_root = root_of_sorted(&cc, &sub_leaves("external_ids", 3, false));
+    let voided_root = root_of_sorted(&cc, &sub_leaves("voided_transfers", 4, true));
+    let pending_root = root_of_sorted(&cc, &sub_leaves("pending_statuses", 5, true));
+    let rebuilt = composite_root_from_subroots(
+        &accounts_root,
+        &transfers_root,
+        &journal_root,
+        &eids_root,
+        &voided_root,
+        &pending_root,
+    );
+    assert_eq!(
+        final_root,
+        rebuilt.to_vec(),
+        "the incremental state root must equal a from-scratch rebuild \
+         over the raw persisted rows",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `#[storage(committed)]` map anchors its work-results with
+/// `anchor_kind 0x02` composite roots (docs/plans/actor-storage.md W4.2):
+/// every accepted dispatch below IS the host verifying the chain — a
+/// mis-emitted anchor would AnchorMismatch, drop the reply, and fail
+/// the assert. The guest-maintained incremental root must equal a
+/// host-side full recompute over the known content, survive a cold
+/// process restart (the chain reseeds from the recorded composite
+/// row), and keep moving correctly through inserts and removes.
+#[test]
+fn committed_map_anchors_with_smt_roots() {
+    use committed_counter::CommittedCounterRef;
+    use vos::actors::codec::Encode;
+    use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::zk::state::{SmtParams, leaf_hash, root_of_sorted};
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let path = format!(
+        "{}/../examples/actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf",
+        workspace,
+    );
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: committed-counter actor not built — run `just build-pvm`");
+            return;
+        }
+    };
+    let blob = grey_transpiler::link_elf(&data).expect("transpile committed-counter");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "vos_committed_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Host-side reference: the fixture's map is CommittedMap<u64, u64>
+    // under vos domains — width 8, leaves hash the rkyv value bytes.
+    let p = SmtParams::vos(8);
+    let reference_root = |entries: &[(u64, u64)]| -> Vec<u8> {
+        let mut leaves: Vec<(Vec<u8>, [u8; 32])> = entries
+            .iter()
+            .map(|(k, v)| (k.to_be_bytes().to_vec(), leaf_hash(&p, &v.encode())))
+            .collect();
+        leaves.sort_unstable();
+        root_of_sorted(&p, &leaves).to_vec()
+    };
+
+    let spawn = |blob: Vec<u8>| -> (VosNode, vos::abi::service::ServiceId) {
+        let mut node = VosNode::with_prefix(0x00ac);
+        let id = node.register(
+            AgentConfig::new(blob)
+                .with_consistency(Consistency::Local)
+                .persist(&dir),
+        );
+        (node, id)
+    };
+
+    // ── Boot 1: genesis → 0x02 chain across dispatches ──────────
+    let (node, id) = spawn(blob.clone());
+    let counter = CommittedCounterRef::at(id);
+    for (k, v) in [(5u64, 50u64), (1, 10), (9, 90)] {
+        assert_eq!(vos::block_on(counter.put(&mut &node, k, v)).expect("put"), 1);
+    }
+    assert_eq!(vos::block_on(counter.get(&mut &node, 1)).expect("get"), 10);
+    assert_eq!(
+        vos::block_on(counter.root(&mut &node)).expect("root"),
+        reference_root(&[(5, 50), (1, 10), (9, 90)]),
+        "guest incremental root must equal the host full recompute",
+    );
+    node.shutdown();
+    let _ = node.collect();
+
+    // ── Boot 2: the anchor chain reseeds from the composite row ─
+    let (node, id) = spawn(blob);
+    let counter = CommittedCounterRef::at(id);
+    assert_eq!(
+        vos::block_on(counter.get(&mut &node, 9)).expect("get after restart"),
+        90,
+    );
+    assert_eq!(
+        vos::block_on(counter.root(&mut &node)).expect("root after restart"),
+        reference_root(&[(5, 50), (1, 10), (9, 90)]),
+        "the committed root must survive a cold restart",
+    );
+    // Mutations keep chaining: an overwrite, a fresh insert, a remove.
+    assert_eq!(vos::block_on(counter.put(&mut &node, 5, 55)).expect("put"), 0);
+    assert_eq!(vos::block_on(counter.put(&mut &node, 2, 20)).expect("put"), 1);
+    assert_eq!(vos::block_on(counter.del(&mut &node, 1)).expect("del"), 1);
+    assert_eq!(
+        vos::block_on(counter.root(&mut &node)).expect("root"),
+        reference_root(&[(5, 55), (9, 90), (2, 20)]),
+        "the root must track post-restart mutations",
+    );
+    let stats = vos::block_on(counter.stats(&mut &node)).expect("stats");
+    assert_eq!(u64::from_le_bytes(stats[..8].try_into().unwrap()), 3);
+    node.shutdown();
+    let _ = node.collect();
+    let _ = std::fs::remove_dir_all(&dir);
 }

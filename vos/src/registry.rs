@@ -155,6 +155,50 @@ pub struct ActorAclRow {
     pub grantor: Vec<u8>,
 }
 
+/// One page of [`RegistryRef::auth_grants`]. The registry keeps one grant
+/// row per peer and drops revoked/ineffective ones from `grants`, so a
+/// natural-key cursor over the returned rows would skip past scanned-but-
+/// dropped peers — `next` instead carries the last *scanned* `peer_id`
+/// (empty when the scan reached the end), which the caller round-trips as
+/// `after_peer` to continue.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct AuthGrantPage {
+    pub grants: Vec<AuthGrantRow>,
+    pub next: Vec<u8>,
+}
+
+/// One page of [`RegistryRef::actor_acls`]. Same filtered-cursor shape as
+/// [`AuthGrantPage`], but the actor-local key is `(peer_id, agent_name)`,
+/// so the continuation cursor is the last *scanned* pair (both empty when
+/// the scan reached the end).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct ActorAclPage {
+    pub acls: Vec<ActorAclRow>,
+    pub next_peer: Vec<u8>,
+    pub next_agent: String,
+}
+
+/// One page of [`RegistryRef::members`]. Members are two key spaces —
+/// nodes (by `prefix`) then identities (by hashed key) — stitched into
+/// one ordered stream. The cursor names the phase to resume (`next_kind`)
+/// and the resume-after key within it (`next_key`: a node's 2-byte prefix
+/// or an identity's hashed 32-byte map key; empty = that phase's start).
+/// The identity cursor is the *hashed* key, never the original
+/// `public_key`, so it can't be empty and can't collide with the
+/// phase-start sentinel. `more` is the terminator — `next_kind` alone
+/// can't be, since `MEMBER_KIND_NODE` is `0`. Round-trip the cursor
+/// opaquely. Use [`RegistryRef::members_all`] to drain the whole stream.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct MemberPage {
+    pub members: Vec<MemberRow>,
+    pub next_kind: u8,
+    pub next_key: Vec<u8>,
+    pub more: bool,
+}
+
 // ── Result codes ─────────────────────────────────────────────────
 
 /// Status returned by a mutation handler. `Ok` is always `0`.
@@ -602,8 +646,49 @@ impl RegistryRef {
         decode_bytes(self.call(inv, Msg::new("meta_for_instance").with("name", name)).await?)
     }
 
-    pub async fn members<I: Invoker>(&self, inv: &mut I) -> Result<Vec<MemberRow>, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("members")).await?)
+    /// One page of the member roster (nodes then identities). Prefer
+    /// [`members_all`](Self::members_all) unless you are paging by hand;
+    /// pass `(0, [])` to start and continue from the returned page's
+    /// `(next_kind, next_key)` while `more` is true. `budget` caps the page.
+    pub async fn members<I: Invoker>(
+        &self,
+        inv: &mut I,
+        after_kind: u8,
+        after_key: Vec<u8>,
+        budget: u32,
+    ) -> Result<MemberPage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("members")
+                    .with("after_kind", after_kind)
+                    .with("after_key", after_key)
+                    .with("budget", budget),
+            )
+            .await?,
+        )
+    }
+
+    /// Drain the whole member roster into one `Vec` (nodes then
+    /// identities). Callers that need the full set — voter-set
+    /// derivation, `space members`, catalog export — use this.
+    pub async fn members_all<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<MemberRow>, ClientError> {
+        let mut out = Vec::new();
+        let mut kind = 0u8;
+        let mut key: Vec<u8> = Vec::new();
+        loop {
+            let page = self.members(inv, kind, key, 0).await?;
+            out.extend(page.members);
+            if !page.more {
+                break;
+            }
+            kind = page.next_kind;
+            key = page.next_key;
+        }
+        Ok(out)
     }
 
     pub async fn root<I: Invoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
@@ -650,18 +735,47 @@ impl RegistryRef {
             .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
     }
 
+    /// One page of the effective space-level grants. Pass an empty
+    /// `after_peer` to start; continue from the returned [`AuthGrantPage::next`]
+    /// until it comes back empty. `budget` caps the page (0 = the
+    /// registry's max).
     pub async fn auth_grants<I: Invoker>(
         &self,
         inv: &mut I,
-    ) -> Result<Vec<AuthGrantRow>, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("auth_grants")).await?)
+        after_peer: Vec<u8>,
+        budget: u32,
+    ) -> Result<AuthGrantPage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("auth_grants")
+                    .with("after_peer", after_peer)
+                    .with("budget", budget),
+            )
+            .await?,
+        )
     }
 
+    /// One page of the effective actor-local ACLs. Continue from the
+    /// returned [`ActorAclPage::next_peer`]/`next_agent` until both come
+    /// back empty. `budget` caps the page (0 = the registry's max).
     pub async fn actor_acls<I: Invoker>(
         &self,
         inv: &mut I,
-    ) -> Result<Vec<ActorAclRow>, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("actor_acls")).await?)
+        after_peer: Vec<u8>,
+        after_agent: String,
+        budget: u32,
+    ) -> Result<ActorAclPage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("actor_acls")
+                    .with("after_peer", after_peer)
+                    .with("after_agent", after_agent)
+                    .with("budget", budget),
+            )
+            .await?,
+        )
     }
 
     // ── Genesis / catalog mutators ────────────────────────────────

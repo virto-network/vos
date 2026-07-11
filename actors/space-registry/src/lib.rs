@@ -52,7 +52,8 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
-    ActorAclRow, AgentRow, AuthGrantRow, MemberRow, ProgramRow, SPACE_ID_DOMAIN_TAG, Status,
+    ActorAclPage, ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, MemberPage, MemberRow,
+    ProgramRow, SPACE_ID_DOMAIN_TAG, Status,
     AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN,
     MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
     PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
@@ -95,47 +96,7 @@ pub struct ExtensionMetaRow {
     pub blob: Vec<u8>,
 }
 
-/// Raw PVM blob stored in the registry's per-space content-
-/// addressed object store. Hashed with the empty-domain blake2b
-/// that vosx's host-side `blob_store::BlobHash::of` uses, so a
-/// `ProgramRow.hash` looked up via `program(name, version)` is
-/// directly usable as a key into both the registry's blob table
-/// and the operator's `~/.cache/vosx/blobs/` cache.
-///
-/// Capacity caveat: blobs replicate via the registry's CRDT/Raft
-/// stream, so every peer in the space carries every blob's bytes.
-/// Fine for the program-distribution use case (small PVM ELFs at
-/// publish time) but unsuitable for bulk data — push that through
-/// a dedicated blob-distribution agent.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct BlobRow {
-    pub hash: [u8; 32],
-    pub bytes: Vec<u8>,
-}
-
 // ── Agents ────────────────────────────────────────────────────────
-
-/// Monotone-locality floor: the narrowest consistency tier (by
-/// shareability) an `instance_name` was ever installed at. Retained
-/// across `uninstall` — unlike the `AgentRow`, which is removed — so
-/// that reusing a name to *widen* it (e.g. re-installing a
-/// formerly-`Local` channel as `Crdt`) is refused. The load-bearing
-/// enforcement lives host-side in `vos::node` (the registry is
-/// replicated and not trusted); this catalog-level row keeps honest
-/// replicas from ever *recording* a widening.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct ConsistencyFloorRow {
-    pub instance_name: String,
-    /// `vos::node::Consistency` discriminant, same encoding as
-    /// `AgentRow.consistency`.
-    pub consistency: u8,
-}
 
 // ── Members ──────────────────────────────────────────────────────
 
@@ -202,33 +163,6 @@ impl vos::RoleByte for SpaceRegistryRole {
     }
 }
 
-/// Grow-only revoke high-water for a space-level grant. `revoke_role`
-/// raises (never lowers) the epoch for `peer_id`; a grant whose epoch
-/// is at or below this is dominated. Order-independent: the high-water
-/// is a max, so a revoke that merges in after the grants it dominates
-/// still voids them once [`SpaceRegistry::effective_role`] recomputes.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct RevokeEpochRow {
-    pub peer_id: Vec<u8>,
-    pub epoch: u64,
-}
-
-/// Grow-only revoke high-water for an actor-local `(peer_id,
-/// agent_name)` grant. Sibling of [`RevokeEpochRow`] for the
-/// `actor_acls` table.
-#[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
-)]
-#[rkyv(crate = vos::rkyv)]
-pub struct ActorRevokeEpochRow {
-    pub peer_id: Vec<u8>,
-    pub agent_name: String,
-    pub epoch: u64,
-}
-
 // ── Host mappings (hyperspace addressing) ───────────────────────
 //
 // In a space-local registry, every node hosts every agent so the
@@ -254,11 +188,26 @@ pub struct HostMapping {
     pub host_prefix: u16,
 }
 
+/// One page of [`SpaceRegistry::host_mappings`]. `more` is the explicit
+/// terminator: a page can come back short of the row cap because the
+/// byte budget truncated it, so "short page = done" would silently end
+/// a drain early — continue from the last row's `instance_name` while
+/// `more` is true.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct HostMappingPage {
+    pub mappings: Vec<HostMapping>,
+    pub more: bool,
+}
+
 // ── Result codes ─────────────────────────────────────────────────
 
 // ── Actor ─────────────────────────────────────────────────────────
 
 use vos::prelude::*;
+use vos::storage::{StorageMap, StorageSet, StorageValue, fill_page};
 
 /// Per-actor SpaceRole map (M7) — declared as a `pub const` so
 /// it survives the `#[actor(space_role_map = ...)]` expansion.
@@ -292,63 +241,81 @@ pub struct SpaceRegistry {
     programs: Vec<ProgramRow>,
     /// Sorted by `instance_name`.
     agents: Vec<AgentRow>,
-    /// Members; nodes sorted by `prefix` first, then identities
-    /// sorted by `key`.
-    members: Vec<MemberRow>,
+    /// Node members, one `#[storage]` row per node keyed by its `u16`
+    /// `prefix` (a fixed-width key, so iteration is prefix-ordered).
+    /// `node_role` point-gets; `members()` pages nodes before identities.
+    #[storage]
+    nodes: StorageMap<u16, MemberRow>,
+    /// Identity members, one `#[storage]` row per identity keyed by
+    /// `identity_key(public_key)` (variable-length key folded to fixed
+    /// width; the row keeps the plain key). The nodes/identities split
+    /// keeps each a single-key-type map — the old flat `Vec<MemberRow>`
+    /// mixed `u16` prefixes and variable pubkeys.
+    #[storage]
+    identities: StorageMap<[u8; 32], MemberRow>,
     /// Opaque metadata blobs keyed by program hash. Stored as raw
     /// `.vos_meta` section bytes so the registry stays agnostic
     /// about the schema format (lives in `vos::metadata` on the
-    /// consumer side).
-    metas: Vec<MetaRow>,
+    /// consumer side). A `#[storage]` map so each program's meta is
+    /// its own KV row — read by point `meta_for_program`, never
+    /// enumerated — instead of riding the state blob.
+    #[storage]
+    metas: StorageMap<[u8; 32], MetaRow>,
     /// Opaque metadata blobs for native `.so` extensions, keyed by
     /// the manifest `instance_name`. Service-mode extensions have
     /// no program-hash identity in this catalog (the host loads
     /// them off a filesystem path), so we key by the operator-
     /// visible name. `meta_for_instance` falls through here when
-    /// the name doesn't match an installed PVM agent.
-    extension_metas: Vec<ExtensionMetaRow>,
-    /// PVM blob bytes, keyed by their `BlobHash::of` hash. Sorted
-    /// by hash for binary search. Populated by
-    /// `upload_blob` — typically the dev extension's
-    /// `publish` flow uploads here before calling `publish` so
-    /// peers can resolve `ProgramRow.hash` without a separate
-    /// fetch dance.
-    blobs: Vec<BlobRow>,
-    /// Sprint 2 — per-PeerId auth grants. Sorted by `peer_id`
-    /// (lexicographic bytes) for binary lookup. Pre-Sprint-2
-    /// state archives don't have this field; the actor's
-    /// fall-back-to-fresh behaviour on archive decode failure
-    /// (see "Schema evolution" in this file's module doc) lets
-    /// upgrades resync from the DAG.
-    auth_grants: Vec<AuthGrantRow>,
-    /// M4 — per-(peer, agent) actor-local ACL overrides. Sorted
-    /// by `(peer_id, agent_name)` for binary lookup. Empty until
-    /// an operator calls `grant_actor_role`. Falls through to
-    /// `auth_grants` (space-level) when no actor-local grant
-    /// exists for `(peer, target_agent)`.
-    actor_acls: Vec<ActorAclRow>,
-    /// Grow-only revoke high-waters for space-level grants, sorted by
-    /// `peer_id`. A grant is dominated while its epoch is at or below
-    /// the peer's entry here (see [`AuthGrantRow::epoch`]). Retained
-    /// across re-grants so revocation can't be undone by replaying a
-    /// stale-epoch grant.
-    revoke_epochs: Vec<RevokeEpochRow>,
-    /// Grow-only revoke high-waters for actor-local grants, sorted by
-    /// `(peer_id, agent_name)`. Sibling of `revoke_epochs`.
-    actor_revoke_epochs: Vec<ActorRevokeEpochRow>,
-    /// Sorted by `instance_name`. Populated on the hyperspace
-    /// registry replica only — the local space-registry leaves
-    /// this empty so its `resolve` keeps the in-space behaviour
-    /// (caller_prefix == host).
-    host_mappings: Vec<HostMapping>,
-    /// Monotone-locality floors, sorted by `instance_name`. The
-    /// narrowest consistency tier each name was ever installed at;
-    /// retained across `uninstall` so `install` can refuse to widen
-    /// a reused name (see [`ConsistencyFloorRow`]). Pre-existing
-    /// state archives don't have this field; the actor's
-    /// fall-back-to-fresh behaviour on archive decode failure lets
-    /// upgrades resync from the DAG.
-    consistency_floors: Vec<ConsistencyFloorRow>,
+    /// the name doesn't match an installed PVM agent. A `#[storage]`
+    /// map keyed by `name_key(instance_name)` (the name folded to a
+    /// fixed-width key); the row keeps the plain name.
+    #[storage]
+    extension_metas: StorageMap<[u8; 32], ExtensionMetaRow>,
+    /// Sprint 2 — per-PeerId auth grants, one row per peer. A `#[storage]`
+    /// map keyed by `peer_key(peer_id)`: `effective_role`/`peer_epoch`
+    /// point-get, `auth_grants()` pages. Pre-Sprint-2 state archives don't
+    /// have this field; the actor's fall-back-to-fresh behaviour on archive
+    /// decode failure (see "Schema evolution" in this file's module doc)
+    /// lets upgrades resync from the DAG.
+    #[storage]
+    auth_grants: StorageMap<[u8; 32], AuthGrantRow>,
+    /// M4 — per-(peer, agent) actor-local ACL overrides, one row per pair.
+    /// A `#[storage]` map keyed by `acl_key(peer_id, agent_name)`. Empty
+    /// until an operator calls `grant_actor_role`. Falls through to
+    /// `auth_grants` (space-level) when no actor-local grant exists for
+    /// `(peer, target_agent)`.
+    #[storage]
+    actor_acls: StorageMap<[u8; 32], ActorAclRow>,
+    /// Grow-only revoke high-waters for space-level grants, one row per
+    /// peer. A `#[storage]` map keyed by `peer_key(peer_id)` so the
+    /// floors live beside the grant rows they dominate: a state-blob
+    /// drift fallback (`try_decode` failure → fresh struct) must reset
+    /// authority state *together* — floors in the blob with grants in
+    /// storage would resurrect every revoked grant. A grant is dominated
+    /// while its epoch is at or below the peer's entry here (see
+    /// [`AuthGrantRow::epoch`]). Retained across re-grants so revocation
+    /// can't be undone by replaying a stale-epoch grant.
+    #[storage]
+    revoke_epochs: StorageMap<[u8; 32], u64>,
+    /// Grow-only revoke high-waters for actor-local grants, keyed by
+    /// `acl_key(peer_id, agent_name)`. Sibling of `revoke_epochs`.
+    #[storage]
+    actor_revoke_epochs: StorageMap<[u8; 32], u64>,
+    /// Populated on the hyperspace registry replica only — the local
+    /// space-registry leaves this empty so its `resolve` keeps the
+    /// in-space behaviour (caller_prefix == host). A `#[storage]` map
+    /// keyed by `name_key(instance_name)`; `resolve`/`register_remote`
+    /// are point ops and `host_mappings()` pages in name order.
+    #[storage]
+    host_mappings: StorageMap<[u8; 32], HostMapping>,
+    /// Monotone-locality floors: the narrowest consistency tier each
+    /// `instance_name` was ever installed at (`vos::node::Consistency`
+    /// discriminant); retained across `uninstall` so `install` can
+    /// refuse to widen a reused name. A `#[storage]` map keyed by
+    /// `name_key(instance_name)` — a security floor, kept in storage
+    /// for the same drift-fallback reason as `revoke_epochs`.
+    #[storage]
+    consistency_floors: StorageMap<[u8; 32], u8>,
     /// Genesis root authority: the operator PeerId baked at
     /// `space new` via the first [`set_root`](SpaceRegistry::set_root)
     /// op. Empty until set. [`authorize_op`](SpaceRegistry::authorize_op)
@@ -356,16 +323,22 @@ pub struct SpaceRegistry {
     /// other admin's authority delegates from it through `auth_grants`.
     /// Pinned into `space_id` (it rides the genesis DAG), so a joiner
     /// verifies it via the same `space new`/`space verify` root recompute.
-    root: Vec<u8>,
+    /// A `#[storage]` value so the anchor every grant chain bottoms out
+    /// at resets (or survives) together with the grant rows and revoke
+    /// floors it governs — see `revoke_epochs`.
+    #[storage]
+    root: StorageValue<Vec<u8>>,
     /// Grow-only set of `replication_id`s any `install` has ever
-    /// consumed, sorted ascending. An install whose `replication_id`
-    /// is already here is refused, so a captured `install` op can't be
-    /// replayed to resurrect an uninstalled agent (the tombstone
-    /// outlives the `AgentRow`). A legitimate reinstall uses a fresh
+    /// consumed. An install whose `replication_id` is already here is
+    /// refused, so a captured `install` op can't be replayed to
+    /// resurrect an uninstalled agent (the tombstone outlives the
+    /// `AgentRow`). A legitimate reinstall uses a fresh
     /// `replication_id`. Order-independent: presence is a grow-only
     /// set, so the original install's id blocks the replay regardless
-    /// of merge order.
-    used_replication_ids: Vec<[u8; 32]>,
+    /// of merge order. A `#[storage]` set — only membership is ever
+    /// tested, so the burn/refuse pair is two point ops.
+    #[storage]
+    used_replication_ids: StorageSet<[u8; 32]>,
 }
 
 #[messages]
@@ -374,18 +347,18 @@ impl SpaceRegistry {
         Self {
             programs: Vec::new(),
             agents: Vec::new(),
-            members: Vec::new(),
-            metas: Vec::new(),
-            extension_metas: Vec::new(),
-            blobs: Vec::new(),
-            auth_grants: Vec::new(),
-            actor_acls: Vec::new(),
-            revoke_epochs: Vec::new(),
-            actor_revoke_epochs: Vec::new(),
-            host_mappings: Vec::new(),
-            consistency_floors: Vec::new(),
-            root: Vec::new(),
-            used_replication_ids: Vec::new(),
+            nodes: StorageMap::default(),
+            identities: StorageMap::default(),
+            metas: StorageMap::default(),
+            extension_metas: StorageMap::default(),
+            auth_grants: StorageMap::default(),
+            actor_acls: StorageMap::default(),
+            revoke_epochs: StorageMap::default(),
+            actor_revoke_epochs: StorageMap::default(),
+            host_mappings: StorageMap::default(),
+            consistency_floors: StorageMap::default(),
+            root: StorageValue::default(),
+            used_replication_ids: StorageSet::default(),
         }
     }
 
@@ -405,10 +378,10 @@ impl SpaceRegistry {
         if root.is_empty() {
             return Status::BadHash;
         }
-        if !self.root.is_empty() {
+        if !self.root_bytes().is_empty() {
             return Status::Forbidden;
         }
-        self.root = root;
+        self.root.set(&root);
         Status::Ok
     }
 
@@ -416,7 +389,7 @@ impl SpaceRegistry {
     /// for diagnostics and joiner verification.
     #[msg]
     async fn root(&self) -> Vec<u8> {
-        self.root.clone()
+        self.root_bytes()
     }
 
     // ── Programs catalog ────────────────────────────────────────
@@ -501,7 +474,11 @@ impl SpaceRegistry {
             .cloned()
     }
 
-    /// Snapshot the full catalog. Pagination can come later.
+    /// Snapshot the program catalog, sorted by `(name, version)`. Left
+    /// unpaginated: `programs` stays blob-backed (so the reply is
+    /// heap-bounded like the table itself) and PVM-actor consumers read it
+    /// arg-free — pagination would break those callers for no reply-cap
+    /// gain until the table actually moves to storage.
     #[msg]
     async fn programs(&self) -> Vec<ProgramRow> {
         self.programs.clone()
@@ -528,15 +505,8 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Status::BadHash;
         };
-        let mut idx = 0usize;
-        while idx < self.metas.len() {
-            if self.metas[idx].program_hash == program_hash {
-                self.metas[idx].blob = blob;
-                return Status::Ok;
-            }
-            idx += 1;
-        }
-        self.metas.push(MetaRow { program_hash, blob });
+        // Upsert: one point write, keyed by the program hash.
+        self.metas.insert(&program_hash, &MetaRow { program_hash, blob });
         Status::Ok
     }
 
@@ -549,11 +519,7 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Vec::new();
         };
-        self.metas
-            .iter()
-            .find(|m| m.program_hash == program_hash)
-            .map(|m| m.blob.clone())
-            .unwrap_or_default()
+        self.metas.get(&program_hash).map(|m| m.blob).unwrap_or_default()
     }
 
     /// Convenience join: find an installed agent by name, then
@@ -576,25 +542,15 @@ impl SpaceRegistry {
         while ai < self.agents.len() {
             if self.agents[ai].instance_name == name {
                 let hash = self.agents[ai].program_hash;
-                let mut mi = 0usize;
-                while mi < self.metas.len() {
-                    if self.metas[mi].program_hash == hash {
-                        return self.metas[mi].blob.clone();
-                    }
-                    mi += 1;
-                }
-                return Vec::new();
+                return self.metas.get(&hash).map(|m| m.blob).unwrap_or_default();
             }
             ai += 1;
         }
-        let mut ei = 0usize;
-        while ei < self.extension_metas.len() {
-            if self.extension_metas[ei].instance_name == name {
-                return self.extension_metas[ei].blob.clone();
-            }
-            ei += 1;
-        }
-        Vec::new()
+        // Fall through to the extension-meta table (keyed by name).
+        self.extension_metas
+            .get(&name_key(&name))
+            .map(|e| e.blob)
+            .unwrap_or_default()
     }
 
     /// Record (or replace) the metadata blob for a native
@@ -621,23 +577,19 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.extension_metas.len() {
-            if self.extension_metas[idx].instance_name == instance_name {
-                if blob.is_empty() {
-                    self.extension_metas.remove(idx);
-                } else {
-                    self.extension_metas[idx].blob = blob;
-                }
-                return Status::Ok;
-            }
-            idx += 1;
-        }
-        if !blob.is_empty() {
-            self.extension_metas.push(ExtensionMetaRow {
-                instance_name,
-                blob,
-            });
+        // An empty blob removes the row; otherwise upsert. Both are one
+        // point op, keyed by the instance name.
+        let key = name_key(&instance_name);
+        if blob.is_empty() {
+            self.extension_metas.remove(&key);
+        } else {
+            self.extension_metas.insert(
+                &key,
+                &ExtensionMetaRow {
+                    instance_name,
+                    blob,
+                },
+            );
         }
         Status::Ok
     }
@@ -723,11 +675,7 @@ impl SpaceRegistry {
         // consumed. Order-independent — the original install seeds the
         // id, so the replay is blocked regardless of merge order, and
         // the tombstone outlives the `AgentRow` that `uninstall` removes.
-        if self
-            .used_replication_ids
-            .binary_search(&replication_id)
-            .is_ok()
-        {
+        if self.used_replication_ids.contains(&replication_id) {
             return Status::ReplicationIdReused;
         }
 
@@ -738,16 +686,22 @@ impl SpaceRegistry {
         // is never folded into a now-shared DAG. The floor outlives the
         // row, so this fires on the uninstall→reinstall-wider path; a live
         // row already returned `Status::InstanceExists` above.
-        if let Some(floor) = consistency_floor(&self.consistency_floors, &instance_name) {
-            if !may_transition_to(floor, consistency) {
-                return Status::ConsistencyWidenDenied;
+        let floor_key = name_key(&instance_name);
+        match self.consistency_floors.get(&floor_key) {
+            Some(floor) => {
+                if !may_transition_to(floor, consistency) {
+                    return Status::ConsistencyWidenDenied;
+                }
+                // Narrow (never widen) the recorded floor; a lateral
+                // re-install leaves it unchanged.
+                if shareability(consistency) < shareability(floor) {
+                    self.consistency_floors.insert(&floor_key, &consistency);
+                }
+            }
+            None => {
+                self.consistency_floors.insert(&floor_key, &consistency);
             }
         }
-        record_consistency_floor(
-            &mut self.consistency_floors,
-            instance_name.clone(),
-            consistency,
-        );
 
         self.agents.insert(
             idx,
@@ -764,9 +718,7 @@ impl SpaceRegistry {
             },
         );
         // Burn the replication_id so it can never seed a second install.
-        if let Err(at) = self.used_replication_ids.binary_search(&replication_id) {
-            self.used_replication_ids.insert(at, replication_id);
-        }
+        self.used_replication_ids.insert(&replication_id);
         Status::Ok
     }
 
@@ -880,16 +832,22 @@ impl SpaceRegistry {
             .cloned()
     }
 
+    /// Snapshot the installed-agent roster, sorted by `instance_name`.
+    /// Unpaginated for the same reason as `programs` — blob-backed and read
+    /// arg-free by PVM actors (messenger, gateway).
     #[msg]
     async fn agents(&self) -> Vec<AgentRow> {
         self.agents.clone()
     }
 
-    /// Lightweight enumeration of installed agent names.
-    /// Returns `Vec<String>` so cross-actor callers without
-    /// `AgentRow` schema knowledge (e.g. the gateway rendering
-    /// `/__schema`) can pull the list without an rkyv dance.
-    /// Same ordering as `agents()` — sorted by `instance_name`.
+    /// Lightweight enumeration of installed agent names, sorted by
+    /// `instance_name`. Returns `Vec<String>` so cross-actor callers
+    /// without `AgentRow` schema knowledge (e.g. the gateway rendering
+    /// `/__schema`) can pull the list without an rkyv dance. Unpaginated on
+    /// purpose: it is names-only, its `agents` backing stays blob-backed
+    /// (so the reply is heap-bounded like `agents` itself), and the gateway
+    /// consumes it arg-free — pagination would break that caller for no
+    /// reply-size gain.
     #[msg]
     async fn agent_names(&self) -> Vec<String> {
         self.agents
@@ -930,7 +888,7 @@ impl SpaceRegistry {
             return instance_service_id(&name, caller_prefix as u16);
         }
         // 2. Hyperspace host mapping (agent hosted on a peer node).
-        if let Some(h) = self.host_mappings.iter().find(|h| h.instance_name == name) {
+        if let Some(h) = self.host_mappings.get(&name_key(&name)) {
             return instance_service_id(&name, h.host_prefix);
         }
         0
@@ -965,22 +923,18 @@ impl SpaceRegistry {
         if host_prefix > u16::MAX as u32 {
             return Status::BadPrefix;
         }
-        let host_prefix = host_prefix as u16;
-        let mut idx = 0usize;
-        while idx < self.host_mappings.len() {
-            let cur = &self.host_mappings[idx];
-            if cur.instance_name == instance_name {
-                self.host_mappings[idx].host_prefix = host_prefix;
-                return Status::Ok;
-            }
-            if cur.instance_name.as_str() > instance_name.as_str() {
-                break;
-            }
-            idx += 1;
+        // An empty name is not resolvable — and it is the
+        // host_mappings() pager's start-of-table sentinel, so a row
+        // carrying it would wedge every drain that follows the
+        // documented cursor protocol.
+        if instance_name.is_empty() {
+            return Status::BadHash;
         }
+        let host_prefix = host_prefix as u16;
+        // Idempotent upsert keyed by the instance name.
         self.host_mappings.insert(
-            idx,
-            HostMapping {
+            &name_key(&instance_name),
+            &HostMapping {
                 instance_name,
                 host_prefix,
             },
@@ -988,11 +942,24 @@ impl SpaceRegistry {
         Status::Ok
     }
 
-    /// Snapshot the host-mapping table. Diagnostic/test surface;
-    /// production callers use `resolve`.
+    /// Page the host-mapping table. Diagnostic/test surface; production
+    /// callers use `resolve`. Pass an empty `after_name` to start;
+    /// continue from the last returned row's `instance_name` while the
+    /// page's `more` flag is set (a short page alone doesn't mean done —
+    /// the byte budget can truncate one). `budget` caps the page rows
+    /// (0 = the handler's max). Rows come back in key (hashed-name)
+    /// order, not name order — the cursor round-trips regardless.
     #[msg]
-    async fn host_mappings(&self) -> Vec<HostMapping> {
-        self.host_mappings.clone()
+    async fn host_mappings(&self, after_name: String, budget: u32) -> HostMappingPage {
+        let skip = (!after_name.is_empty()).then(|| name_key(&after_name));
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut it = self
+            .host_mappings
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k))
+            .map(|(_, row)| row);
+        let (mappings, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
+        HostMappingPage { mappings, more }
     }
 
     // ── Members ────────────────────────────────────────────────
@@ -1009,26 +976,10 @@ impl SpaceRegistry {
             return Status::Forbidden;
         }
         let prefix = prefix as u16;
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_NODE && cur.prefix == prefix {
-                self.members[idx].key = peer_id;
-                self.members[idx].role = role;
-                return Status::Ok;
-            }
-            // Nodes sort before Identities; within Nodes by prefix.
-            if cur.kind == MEMBER_KIND_NODE && cur.prefix > prefix {
-                break;
-            }
-            if cur.kind == MEMBER_KIND_IDENTITY {
-                break;
-            }
-            idx += 1;
-        }
-        self.members.insert(
-            idx,
-            MemberRow {
+        // Idempotent upsert keyed by the node prefix.
+        self.nodes.insert(
+            &prefix,
+            &MemberRow {
                 kind: MEMBER_KIND_NODE,
                 key: peer_id,
                 prefix,
@@ -1048,17 +999,11 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let prefix = prefix as u16;
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_NODE && cur.prefix == prefix {
-                self.members.remove(idx);
-                return Status::Ok;
-            }
-            idx += 1;
+        if self.nodes.remove(&(prefix as u16)) {
+            Status::Ok
+        } else {
+            Status::NotFound
         }
-        Status::NotFound
     }
 
     /// Add an Identity member. The registry stores the `proof`
@@ -1083,24 +1028,15 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_IDENTITY {
-                if cur.key == public_key {
-                    self.members[idx].proof_kind = proof_kind;
-                    self.members[idx].proof_data = proof_data;
-                    return Status::Ok;
-                }
-                if compare_bytes(&cur.key, &public_key) > 0 {
-                    break;
-                }
-            }
-            idx += 1;
+        // An empty key is not an identity — and defense in depth for
+        // the members() pager, whose phase-start sentinel is empty.
+        if public_key.is_empty() {
+            return Status::BadHash;
         }
-        self.members.insert(
-            idx,
-            MemberRow {
+        // Idempotent upsert keyed by the identity public key.
+        self.identities.insert(
+            &identity_key(&public_key),
+            &MemberRow {
                 kind: MEMBER_KIND_IDENTITY,
                 key: public_key,
                 prefix: 0,
@@ -1120,21 +1056,77 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        let mut idx = 0usize;
-        while idx < self.members.len() {
-            let cur = &self.members[idx];
-            if cur.kind == MEMBER_KIND_IDENTITY && cur.key == public_key {
-                self.members.remove(idx);
-                return Status::Ok;
-            }
-            idx += 1;
+        if self.identities.remove(&identity_key(&public_key)) {
+            Status::Ok
+        } else {
+            Status::NotFound
         }
-        Status::NotFound
     }
 
+    /// One page of the member roster, nodes (by prefix) before identities
+    /// (by key) — the single ordered stream the old flat `Vec<MemberRow>`
+    /// presented, now stitched across the two `#[storage]` maps. Pass
+    /// `(0, [])` to start; continue from the returned page's
+    /// `(next_kind, next_key)` while `more` is true. `budget` caps the page.
     #[msg]
-    async fn members(&self) -> Vec<MemberRow> {
-        self.members.clone()
+    async fn members(&self, after_kind: u8, after_key: Vec<u8>, budget: u32) -> MemberPage {
+        let cap = page_rows(budget);
+        // Node phase: whenever the cursor isn't already in the identity
+        // phase (a fresh start, or resuming a node prefix).
+        if after_kind != MEMBER_KIND_IDENTITY {
+            let start: u16 = if after_key.len() == 2 {
+                u16::from_be_bytes([after_key[0], after_key[1]])
+            } else {
+                0
+            };
+            let skip = (after_key.len() == 2).then_some(start);
+            let mut it = self
+                .nodes
+                .iter_from(&start)
+                .filter(move |(k, _)| skip != Some(*k))
+                .map(|(_, m)| m);
+            let (page, more) = fill_page(&mut it, cap, PAGE_BYTE_BUDGET);
+            if !page.is_empty() {
+                return if more {
+                    let next_key = page.last().map(|m| m.prefix.to_be_bytes().to_vec()).unwrap_or_default();
+                    MemberPage { members: page, next_kind: MEMBER_KIND_NODE, next_key, more: true }
+                } else {
+                    // Nodes drained — the next page starts the identity phase.
+                    MemberPage { members: page, next_kind: MEMBER_KIND_IDENTITY, next_key: Vec::new(), more: true }
+                };
+            }
+            // No nodes in range: fall through into the identity phase now.
+        }
+        // Identity phase. The cursor carries the row's *hashed* 32-byte
+        // map key — never the original public key. A hashed cursor can't
+        // be empty, so it can't collide with the empty-`next_key`
+        // "start of the identity phase" sentinel the node phase hands
+        // out (an identity whose original key round-tripped as an empty
+        // cursor would restart the phase forever).
+        let skip: Option<[u8; 32]> = (after_kind == MEMBER_KIND_IDENTITY
+            && after_key.len() == 32)
+            .then(|| {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&after_key);
+                k
+            });
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut it = self
+            .identities
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k));
+        let (page, more) = fill_page(&mut it, cap, PAGE_BYTE_BUDGET);
+        let next_key = if more {
+            page.last().map(|(k, _)| k.to_vec()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let members = page.into_iter().map(|(_, m)| m).collect();
+        if more {
+            MemberPage { members, next_kind: MEMBER_KIND_IDENTITY, next_key, more: true }
+        } else {
+            MemberPage { members, next_kind: 0, next_key: Vec::new(), more: false }
+        }
     }
 
     /// Raft-join admission probe: the role of the NODE member enrolled at
@@ -1147,10 +1139,8 @@ impl SpaceRegistry {
     /// itself stays Admin-gated at [`add_node`](Self::add_node).
     #[msg]
     async fn node_role(&self, prefix: u64) -> u8 {
-        let prefix = prefix as u16;
-        self.members
-            .iter()
-            .find(|m| m.kind == MEMBER_KIND_NODE && m.prefix == prefix)
+        self.nodes
+            .get(&(prefix as u16))
             .map(|m| m.role.saturating_add(1))
             .unwrap_or(0)
     }
@@ -1180,35 +1170,28 @@ impl SpaceRegistry {
             return Status::Forbidden;
         };
         let grantor = grantor.to_vec();
-        match self
-            .auth_grants
-            .binary_search_by(|g| compare_bytes(&g.peer_id, &peer_id).cmp(&0))
-        {
-            Ok(idx) => {
-                // One row per peer: keep the dominant grant under
-                // `grant_supersedes` (root-signed grants are immutable to
-                // non-root displacement; otherwise highest epoch wins).
-                let cur = &self.auth_grants[idx];
-                if grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root) {
-                    self.auth_grants[idx].role = role;
-                    self.auth_grants[idx].epoch = epoch;
-                    self.auth_grants[idx].grantor = grantor;
-                }
-                Status::Ok
+        // One row per peer: keep the dominant grant under `grant_supersedes`
+        // (root-signed grants are immutable to non-root displacement;
+        // otherwise highest epoch wins). A fresh peer always supersedes.
+        let key = peer_key(&peer_id);
+        let supersedes = match self.auth_grants.get(&key) {
+            Some(cur) => {
+                grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root_bytes())
             }
-            Err(insert_at) => {
-                self.auth_grants.insert(
-                    insert_at,
-                    AuthGrantRow {
-                        peer_id,
-                        role,
-                        epoch,
-                        grantor,
-                    },
-                );
-                Status::Ok
-            }
+            None => true,
+        };
+        if supersedes {
+            self.auth_grants.insert(
+                &key,
+                &AuthGrantRow {
+                    peer_id,
+                    role,
+                    epoch,
+                    grantor,
+                },
+            );
         }
+        Status::Ok
     }
 
     /// Revoke `peer_id` at `epoch`. Raises the peer's grow-only revoke
@@ -1226,7 +1209,7 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        bump_revoke_high_water(&mut self.revoke_epochs, peer_id, epoch);
+        self.raise_revoke_floor(&peer_id, epoch);
         Status::Ok
     }
 
@@ -1248,27 +1231,48 @@ impl SpaceRegistry {
     /// metadata is non-secret).
     #[msg]
     async fn peer_epoch(&self, peer_id: Vec<u8>) -> u64 {
-        grant_high_water(&self.auth_grants, &peer_id)
-            .max(revoke_high_water(&self.revoke_epochs, &peer_id))
+        let grant_hw = self
+            .auth_grants
+            .get(&peer_key(&peer_id))
+            .map(|g| g.epoch)
+            .unwrap_or(0);
+        grant_hw.max(self.revoke_floor(&peer_id))
     }
 
-    /// Full grants list, resolved to *effective* roles — for
-    /// `vosx space role list`. A grant dominated by a revoke or a
-    /// revoked delegator is omitted.
+    /// One page of grants, resolved to *effective* roles — for
+    /// `vosx space role list`. A grant dominated by a revoke or a revoked
+    /// delegator is omitted from `grants`, but the returned
+    /// [`AuthGrantPage::next`] tracks the last *scanned* peer so the caller
+    /// pages the whole table without skipping. Empty `after_peer` starts;
+    /// continue until `next` is empty. `budget` caps the page.
     #[msg]
-    async fn auth_grants(&self) -> Vec<AuthGrantRow> {
-        self.auth_grants
-            .iter()
+    async fn auth_grants(&self, after_peer: Vec<u8>, budget: u32) -> AuthGrantPage {
+        let skip = (!after_peer.is_empty()).then(|| peer_key(&after_peer));
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut raw = self
+            .auth_grants
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k))
+            .map(|(_, g)| g);
+        let (page, more) = fill_page(&mut raw, page_rows(budget).min(ROLE_PAGE_MAX_ROWS), PAGE_BYTE_BUDGET);
+        let next = if more {
+            page.last().map(|g| g.peer_id.clone()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let grants = page
+            .into_iter()
             .filter_map(|g| {
                 let role = self.effective_role(&g.peer_id);
-                (role != AUTH_ROLE_NONE).then(|| AuthGrantRow {
-                    peer_id: g.peer_id.clone(),
+                (role != AUTH_ROLE_NONE).then_some(AuthGrantRow {
+                    peer_id: g.peer_id,
                     role,
                     epoch: g.epoch,
-                    grantor: g.grantor.clone(),
+                    grantor: g.grantor,
                 })
             })
-            .collect()
+            .collect();
+        AuthGrantPage { grants, next }
     }
 
     // ── Actor-local ACLs (M4) ──────────────────────────────────
@@ -1309,35 +1313,29 @@ impl SpaceRegistry {
             return Status::Forbidden;
         };
         let grantor = grantor.to_vec();
-        match self
-            .actor_acls
-            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
-        {
-            Ok(idx) => {
-                // One row per (peer, agent): same root-dominates ordering
-                // as the space-level grants (see `grant_supersedes`).
-                let cur = &self.actor_acls[idx];
-                if grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root) {
-                    self.actor_acls[idx].role = role;
-                    self.actor_acls[idx].epoch = epoch;
-                    self.actor_acls[idx].grantor = grantor;
-                }
-                Status::Ok
+        // One row per (peer, agent): same root-dominates ordering as the
+        // space-level grants (see `grant_supersedes`). A fresh pair always
+        // supersedes.
+        let key = acl_key(&peer_id, &agent_name);
+        let supersedes = match self.actor_acls.get(&key) {
+            Some(cur) => {
+                grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root_bytes())
             }
-            Err(insert_at) => {
-                self.actor_acls.insert(
-                    insert_at,
-                    ActorAclRow {
-                        peer_id,
-                        agent_name,
-                        role,
-                        epoch,
-                        grantor,
-                    },
-                );
-                Status::Ok
-            }
+            None => true,
+        };
+        if supersedes {
+            self.actor_acls.insert(
+                &key,
+                &ActorAclRow {
+                    peer_id,
+                    agent_name,
+                    role,
+                    epoch,
+                    grantor,
+                },
+            );
         }
+        Status::Ok
     }
 
     /// Revoke the actor-local grant for `(peer_id, agent_name)` at
@@ -1361,7 +1359,7 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
-        bump_actor_revoke_high_water(&mut self.actor_revoke_epochs, peer_id, agent_name, epoch);
+        self.raise_actor_revoke_floor(&peer_id, &agent_name, epoch);
         Status::Ok
     }
 
@@ -1373,14 +1371,10 @@ impl SpaceRegistry {
     async fn actor_epoch(&self, peer_id: Vec<u8>, agent_name: String) -> u64 {
         let grant = self
             .actor_acls
-            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, &peer_id, &agent_name))
-            .map(|idx| self.actor_acls[idx].epoch)
+            .get(&acl_key(&peer_id, &agent_name))
+            .map(|a| a.epoch)
             .unwrap_or(0);
-        grant.max(actor_revoke_high_water(
-            &self.actor_revoke_epochs,
-            &peer_id,
-            &agent_name,
-        ))
+        grant.max(self.actor_revoke_floor(&peer_id, &agent_name))
     }
 
     /// Look up the actor-local role byte granted to `peer_id`
@@ -1401,58 +1395,53 @@ impl SpaceRegistry {
             .unwrap_or(AUTH_ROLE_NONE)
     }
 
-    /// Full actor-local ACL list, resolved to *effective* roles — for
-    /// `vosx space role list --in <actor>` and operator audit. A grant
-    /// dominated by a revoke or a revoked delegator is omitted.
+    /// One page of actor-local ACLs, resolved to *effective* roles — for
+    /// `vosx space role list --in <actor>` and operator audit. Rows with no
+    /// effective grant (revoked or revoked-delegator) are omitted from
+    /// `acls`; the returned [`ActorAclPage`] cursor tracks the last
+    /// *scanned* `(peer, agent)` so the caller pages the whole table.
+    /// Empty `after_peer`/`after_agent` starts; continue until both are
+    /// empty. `budget` caps the page.
     #[msg]
-    async fn actor_acls(&self) -> Vec<ActorAclRow> {
-        self.actor_acls
-            .iter()
+    async fn actor_acls(
+        &self,
+        after_peer: Vec<u8>,
+        after_agent: String,
+        budget: u32,
+    ) -> ActorAclPage {
+        let skip = (!after_peer.is_empty() || !after_agent.is_empty())
+            .then(|| acl_key(&after_peer, &after_agent));
+        let start = skip.unwrap_or([0u8; 32]);
+        let mut raw = self
+            .actor_acls
+            .iter_from(&start)
+            .filter(move |(k, _)| skip != Some(*k))
+            .map(|(_, a)| a);
+        let (page, more) = fill_page(&mut raw, page_rows(budget).min(ROLE_PAGE_MAX_ROWS), PAGE_BYTE_BUDGET);
+        let (next_peer, next_agent) = if more {
+            page.last()
+                .map(|a| (a.peer_id.clone(), a.agent_name.clone()))
+                .unwrap_or_default()
+        } else {
+            (Vec::new(), String::new())
+        };
+        let acls = page
+            .into_iter()
             .filter_map(|a| {
                 self.effective_actor_role(&a.peer_id, &a.agent_name)
                     .map(|role| ActorAclRow {
-                        peer_id: a.peer_id.clone(),
-                        agent_name: a.agent_name.clone(),
+                        peer_id: a.peer_id,
+                        agent_name: a.agent_name,
                         role,
                         epoch: a.epoch,
-                        grantor: a.grantor.clone(),
+                        grantor: a.grantor,
                     })
             })
-            .collect()
-    }
-
-    // ── Blob bytes ─────────────────────────────────────────────
-
-    /// Insert raw bytes into the registry's blob store, keyed by
-    /// the same empty-domain blake2b hash that vosx's
-    /// `BlobHash::of` (and therefore `ProgramRow.hash`) uses.
-    /// Returns the hash so callers can chain to `publish`
-    /// without a separate `BlobHash::of` step on the actor side.
-    /// Idempotent: re-uploading identical bytes is a no-op.
-    #[msg(role = SpaceRegistryRole::Admin)]
-    async fn upload_blob(&mut self, bytes: Vec<u8>) -> Vec<u8> {
-        let hash: [u8; 32] = vos::crypto::blake2b_hash(&[], &[&bytes]);
-        let pos = match self.blobs.binary_search_by(|b| b.hash.cmp(&hash)) {
-            Ok(_) => return hash.to_vec(),
-            Err(p) => p,
-        };
-        self.blobs.insert(pos, BlobRow { hash, bytes });
-        hash.to_vec()
-    }
-
-    /// Fetch raw bytes from the registry's blob store. Returns
-    /// an empty vector when the hash isn't present — callers
-    /// distinguish "blob absent" from "blob empty" by tracking
-    /// whether they uploaded zero-length data (almost certainly
-    /// a bug; the dev extension never does).
-    #[msg]
-    async fn fetch_blob(&self, hash: Vec<u8>) -> Vec<u8> {
-        let Some(h) = bytes_to_32(&hash) else {
-            return Vec::new();
-        };
-        match self.blobs.binary_search_by(|b| b.hash.cmp(&h)) {
-            Ok(i) => self.blobs[i].bytes.clone(),
-            Err(_) => Vec::new(),
+            .collect();
+        ActorAclPage {
+            acls,
+            next_peer,
+            next_agent,
         }
     }
 }
@@ -1492,12 +1481,49 @@ impl SpaceRegistry {
         self.is_effective_admin(signer)
     }
 
+    /// The anchored genesis root PeerId, or empty before genesis.
+    /// A point read; the dispatch read-cache makes repeated calls
+    /// (one per delegation-chain hop) cost a single row.
+    fn root_bytes(&self) -> Vec<u8> {
+        self.root.get().unwrap_or_default()
+    }
+
+    /// Grow-only revoke high-water for `peer_id`, or 0 if never revoked.
+    fn revoke_floor(&self, peer_id: &[u8]) -> u64 {
+        self.revoke_epochs.get(&peer_key(peer_id)).unwrap_or(0)
+    }
+
+    /// Raise (never lower) the revoke high-water for `peer_id`.
+    fn raise_revoke_floor(&mut self, peer_id: &[u8], epoch: u64) {
+        if epoch > self.revoke_floor(peer_id) {
+            self.revoke_epochs.insert(&peer_key(peer_id), &epoch);
+        }
+    }
+
+    /// Grow-only revoke high-water for an actor-local `(peer_id,
+    /// agent_name)` grant, or 0 if never revoked.
+    fn actor_revoke_floor(&self, peer_id: &[u8], agent_name: &str) -> u64 {
+        self.actor_revoke_epochs
+            .get(&acl_key(peer_id, agent_name))
+            .unwrap_or(0)
+    }
+
+    /// Raise (never lower) the actor revoke high-water for `(peer_id,
+    /// agent_name)`.
+    fn raise_actor_revoke_floor(&mut self, peer_id: &[u8], agent_name: &str, epoch: u64) {
+        if epoch > self.actor_revoke_floor(peer_id, agent_name) {
+            self.actor_revoke_epochs
+                .insert(&acl_key(peer_id, agent_name), &epoch);
+        }
+    }
+
     /// True when `signer` is the genesis root or a transitively
     /// effective ADMIN. The root is the supreme signer — before genesis
     /// sets one, `self.root` is empty and every signed mutator fails
     /// closed (only the unsigned `set_root` anchor is accepted).
     fn is_effective_admin(&self, signer: &[u8]) -> bool {
-        if !self.root.is_empty() && self.root.as_slice() == signer {
+        let root = self.root_bytes();
+        if !root.is_empty() && root.as_slice() == signer {
             return true;
         }
         self.effective_role(signer) == AUTH_ROLE_ADMIN
@@ -1513,34 +1539,45 @@ impl SpaceRegistry {
     /// before its own revoke during replay) retroactively voids the
     /// whole delegation subtree.
     fn effective_role(&self, peer_id: &[u8]) -> u8 {
-        self.effective_role_depth(peer_id, 0)
-    }
-
-    fn effective_role_depth(&self, peer_id: &[u8], depth: usize) -> u8 {
-        // A grant chain longer than the number of grants must contain a
-        // cycle, which can never bottom out at the root — refuse it.
-        if depth > self.auth_grants.len() {
-            return AUTH_ROLE_NONE;
-        }
-        let Ok(idx) = self
-            .auth_grants
-            .binary_search_by(|g| compare_bytes(&g.peer_id, peer_id).cmp(&0))
-        else {
+        // The peer's own grant carries the candidate result; the walk
+        // below decides whether it counts.
+        let Some(first) = self.auth_grants.get(&peer_key(peer_id)) else {
             return AUTH_ROLE_NONE;
         };
-        let row = &self.auth_grants[idx];
-        if row.epoch <= revoke_high_water(&self.revoke_epochs, peer_id) {
+        if first.epoch <= self.revoke_floor(peer_id) {
             return AUTH_ROLE_NONE;
         }
-        // The grantor must itself be effective. The genesis root is the
-        // base case (always admin, never revocable).
-        if !self.root.is_empty() && self.root.as_slice() == row.grantor.as_slice() {
-            return row.role;
+        let role = first.role;
+        let root = self.root_bytes();
+        // Walk the grantor chain iteratively, holding ONE decoded row
+        // at a time — a recursive walk pins every row on the guest
+        // arena simultaneously, so a crafted grantor cycle (e.g. an
+        // admin re-granting themselves) OOMs the dispatch once the
+        // table is large. Each intermediate grantor must itself be an
+        // undominated ADMIN, and the chain must bottom out at the
+        // genesis root (always admin, never revocable, needs no row).
+        // A chain with more hops than the table has rows must contain
+        // a cycle, which can never bottom out — refuse it. The map's
+        // count comes from its meta row (cached for the dispatch).
+        let mut grantor = first.grantor;
+        let mut hops = 0u64;
+        let limit = self.auth_grants.len();
+        loop {
+            if !root.is_empty() && root.as_slice() == grantor.as_slice() {
+                return role;
+            }
+            if hops >= limit {
+                return AUTH_ROLE_NONE;
+            }
+            let Some(row) = self.auth_grants.get(&peer_key(&grantor)) else {
+                return AUTH_ROLE_NONE;
+            };
+            if row.epoch <= self.revoke_floor(&grantor) || row.role != AUTH_ROLE_ADMIN {
+                return AUTH_ROLE_NONE;
+            }
+            grantor = row.grantor;
+            hops += 1;
         }
-        if self.effective_role_depth(&row.grantor, depth + 1) == AUTH_ROLE_ADMIN {
-            return row.role;
-        }
-        AUTH_ROLE_NONE
     }
 
     /// Effective actor-local role of `(peer_id, agent_name)`. Like
@@ -1550,12 +1587,8 @@ impl SpaceRegistry {
     /// when there is no row at all so the dispatch path can tell "no
     /// grant" from "role 0".
     fn effective_actor_role(&self, peer_id: &[u8], agent_name: &str) -> Option<u8> {
-        let idx = self
-            .actor_acls
-            .binary_search_by(|a| actor_acl_key(&a.peer_id, &a.agent_name, peer_id, agent_name))
-            .ok()?;
-        let row = &self.actor_acls[idx];
-        if row.epoch <= actor_revoke_high_water(&self.actor_revoke_epochs, peer_id, agent_name) {
+        let row = self.actor_acls.get(&acl_key(peer_id, agent_name))?;
+        if row.epoch <= self.actor_revoke_floor(peer_id, agent_name) {
             return None;
         }
         if self.is_effective_admin(&row.grantor) {
@@ -1567,61 +1600,6 @@ impl SpaceRegistry {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-/// Grow-only revoke high-water for `peer_id`, or 0 if never revoked.
-fn revoke_high_water(table: &[RevokeEpochRow], peer_id: &[u8]) -> u64 {
-    match table.binary_search_by(|r| compare_bytes(&r.peer_id, peer_id).cmp(&0)) {
-        Ok(idx) => table[idx].epoch,
-        Err(_) => 0,
-    }
-}
-
-/// Raise (never lower) the revoke high-water for `peer_id` to `epoch`.
-fn bump_revoke_high_water(table: &mut Vec<RevokeEpochRow>, peer_id: Vec<u8>, epoch: u64) {
-    match table.binary_search_by(|r| compare_bytes(&r.peer_id, &peer_id).cmp(&0)) {
-        Ok(idx) => {
-            if epoch > table[idx].epoch {
-                table[idx].epoch = epoch;
-            }
-        }
-        Err(at) => table.insert(at, RevokeEpochRow { peer_id, epoch }),
-    }
-}
-
-/// Grow-only revoke high-water for an actor-local `(peer_id,
-/// agent_name)` grant, or 0 if never revoked.
-fn actor_revoke_high_water(table: &[ActorRevokeEpochRow], peer_id: &[u8], agent_name: &str) -> u64 {
-    match table.binary_search_by(|r| actor_acl_key(&r.peer_id, &r.agent_name, peer_id, agent_name)) {
-        Ok(idx) => table[idx].epoch,
-        Err(_) => 0,
-    }
-}
-
-/// Raise (never lower) the actor revoke high-water for `(peer_id,
-/// agent_name)` to `epoch`.
-fn bump_actor_revoke_high_water(
-    table: &mut Vec<ActorRevokeEpochRow>,
-    peer_id: Vec<u8>,
-    agent_name: String,
-    epoch: u64,
-) {
-    match table.binary_search_by(|r| actor_acl_key(&r.peer_id, &r.agent_name, &peer_id, &agent_name))
-    {
-        Ok(idx) => {
-            if epoch > table[idx].epoch {
-                table[idx].epoch = epoch;
-            }
-        }
-        Err(at) => table.insert(
-            at,
-            ActorRevokeEpochRow {
-                peer_id,
-                agent_name,
-                epoch,
-            },
-        ),
-    }
-}
 
 /// Decide whether an incoming grant should replace the stored grant for
 /// the same target (one row per target). The ordering is a max over a
@@ -1653,14 +1631,6 @@ fn grant_supersedes(
     compare_bytes(new_grantor, cur_grantor) < 0
 }
 
-/// Highest grant epoch recorded for `peer_id`, or 0 if no grant row.
-fn grant_high_water(grants: &[AuthGrantRow], peer_id: &[u8]) -> u64 {
-    match grants.binary_search_by(|g| compare_bytes(&g.peer_id, peer_id).cmp(&0)) {
-        Ok(idx) => grants[idx].epoch,
-        Err(_) => 0,
-    }
-}
-
 fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     if b.len() != 32 {
         return None;
@@ -1668,6 +1638,72 @@ fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(b);
     Some(out)
+}
+
+/// Row cap for one page of a list handler. Kept well under the
+/// per-dispatch touched-row ceiling: a page reads one value row per
+/// entry plus a couple of index pages, so the dispatch stays O(page).
+const PAGE_MAX_ROWS: usize = 128;
+
+/// Encoded-byte budget for one page. The binding constraint is the
+/// 256 KiB guest heap, not the 1 MiB halt-output cap: while a page is
+/// being built, each row is resident ~3× (the dispatch read-cache's
+/// raw bytes, the decoded row, and `fill_page`'s transient encode), so
+/// the budget must leave the arena headroom for all three plus the
+/// final reply encode. 48 KiB bounds the page's peak footprint around
+/// ~150 KiB worst-case — large rows page earlier, they don't trap the
+/// guest allocator.
+const PAGE_BYTE_BUDGET: usize = 48 * 1024;
+
+/// Tighter page cap for the two role-list handlers: each row resolves an
+/// `effective_role`, an O(chain-depth) point-read walk, so the touched-row
+/// count is `page × depth` rather than `page`. Kept low enough that even a
+/// worst-case delegation chain stays under the per-dispatch row ceiling.
+const ROLE_PAGE_MAX_ROWS: usize = 48;
+
+/// Clamp a caller-supplied page budget to `[1, PAGE_MAX_ROWS]`. A `0`
+/// budget (caller didn't care) takes the max.
+fn page_rows(budget: u32) -> usize {
+    if budget == 0 {
+        PAGE_MAX_ROWS
+    } else {
+        (budget as usize).min(PAGE_MAX_ROWS)
+    }
+}
+
+/// Fixed-width `StorageMap` key for a variable-length instance name.
+/// The storage handles need `[u8; 32]` keys, and instance names are
+/// operator-chosen `String`s; fold them with a domain-separated blake2b.
+/// The stored row still carries the plain name, so a listing recovers it —
+/// only the ordered-by-name iteration is forfeit, and no consumer depends
+/// on it (`resolve`/`meta_for_instance` are exact-name point lookups).
+fn name_key(name: &str) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"space-registry/name-key/v1", &[name.as_bytes()])
+}
+
+/// Fixed-width `StorageMap` key for a variable-length peer id. One grant
+/// row per peer, so this is the whole key. Ordered iteration is by hashed
+/// key, not peer id — no consumer depends on peer order (grants are point
+/// looked-up in `effective_role`; the list handler pages).
+fn peer_key(peer_id: &[u8]) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"space-registry/peer-key/v1", &[peer_id])
+}
+
+/// Fixed-width `StorageMap` key for an actor-local `(peer_id, agent_name)`
+/// grant. Length-prefix the peer id so `(p‖q, name)` and `(p, q‖name)`
+/// can't collide into the same key.
+fn acl_key(peer_id: &[u8], agent_name: &str) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(
+        b"space-registry/acl-key/v1",
+        &[&(peer_id.len() as u32).to_be_bytes(), peer_id, agent_name.as_bytes()],
+    )
+}
+
+/// Fixed-width `StorageMap` key for an Identity member's variable-length
+/// public key. Nodes key directly by their `u16` prefix (order-preserving);
+/// only identities need folding.
+fn identity_key(public_key: &[u8]) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"space-registry/identity-key/v1", &[public_key])
 }
 
 /// Position of an `AgentRow.consistency` byte on the monotone
@@ -1695,49 +1731,6 @@ fn may_transition_to(floor: u8, requested: u8) -> bool {
 /// Current monotone-locality floor for `instance_name`, if one was ever
 /// recorded. `None` means the name has never been installed (any tier is
 /// allowed).
-fn consistency_floor(floors: &[ConsistencyFloorRow], instance_name: &str) -> Option<u8> {
-    let mut i = 0usize;
-    while i < floors.len() {
-        if floors[i].instance_name == instance_name {
-            return Some(floors[i].consistency);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Record — or *narrow* — the floor for an instance name, keeping the
-/// table sorted by `instance_name`. The floor only ever moves to a lower
-/// shareability; a genuine widening never reaches here (it's rejected in
-/// `install`). Re-installing at the same shareability (including a
-/// `Crdt`↔`Raft` lateral) leaves the recorded tier unchanged.
-fn record_consistency_floor(
-    floors: &mut Vec<ConsistencyFloorRow>,
-    instance_name: String,
-    consistency: u8,
-) {
-    let mut idx = 0usize;
-    while idx < floors.len() {
-        if floors[idx].instance_name == instance_name {
-            if shareability(consistency) < shareability(floors[idx].consistency) {
-                floors[idx].consistency = consistency;
-            }
-            return;
-        }
-        if floors[idx].instance_name.as_str() > instance_name.as_str() {
-            break;
-        }
-        idx += 1;
-    }
-    floors.insert(
-        idx,
-        ConsistencyFloorRow {
-            instance_name,
-            consistency,
-        },
-    );
-}
-
 fn compare_program(a_name: &str, a_version: &str, b_name: &str, b_version: &str) -> i8 {
     if a_name < b_name {
         return -1;
@@ -1752,18 +1745,6 @@ fn compare_program(a_name: &str, a_version: &str, b_name: &str, b_version: &str)
         return 1;
     }
     0
-}
-
-/// Total order on `(peer_id, agent_name)` rows in the
-/// `actor_acls` table. Primary key is `peer_id` bytes
-/// (lexicographic); secondary key is `agent_name`. Returns
-/// `Ordering` directly so it can be plugged into
-/// `binary_search_by`.
-fn actor_acl_key(a_peer: &[u8], a_name: &str, b_peer: &[u8], b_name: &str) -> core::cmp::Ordering {
-    match compare_bytes(a_peer, b_peer).cmp(&0) {
-        core::cmp::Ordering::Equal => a_name.cmp(b_name),
-        other => other,
-    }
 }
 
 fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
@@ -1858,7 +1839,14 @@ mod tests {
     use vos::actors::context::ServiceId;
 
     fn registry() -> SpaceRegistry {
+        // The mock keyspace and the dispatch overlay are thread-local,
+        // and the test pool reuses threads — every registry starts from
+        // the clean slate a fresh agent keyspace presents.
+        vos::storage::mock::reset();
         let mut r = SpaceRegistry::new();
+        // What the framework's load_or_create does after create():
+        // point each #[storage] handle at its key prefix.
+        vos::actors::Actor::__init_storage(&mut r);
         // Establish the genesis root so signed mutators authorize
         // against it (tests sign every op as the root via `root_auth`).
         let status = dispatch(
@@ -1869,6 +1857,30 @@ mod tests {
         );
         assert_eq!(status, Status::Ok, "set_root on a fresh registry");
         r
+    }
+
+    /// Drain the paginated `actor_acls` handler — tests assert over the
+    /// whole table.
+    fn actor_acls_all(r: &mut SpaceRegistry) -> Vec<ActorAclRow> {
+        let mut out = Vec::new();
+        let mut after_peer = Vec::new();
+        let mut after_agent = String::new();
+        loop {
+            let page = dispatch(
+                r,
+                ActorAcls {
+                    after_peer,
+                    after_agent,
+                    budget: 0,
+                },
+            );
+            out.extend(page.acls);
+            if page.next_peer.is_empty() && page.next_agent.is_empty() {
+                return out;
+            }
+            after_peer = page.next_peer;
+            after_agent = page.next_agent;
+        }
     }
 
     fn run<F: core::future::Future>(fut: F) -> F::Output {
@@ -1886,22 +1898,6 @@ mod tests {
     {
         let mut ctx: vos::Context<SpaceRegistry> = vos::Context::new(ServiceId(0));
         run(<SpaceRegistry as Message<M>>::handle(r, msg, &mut ctx))
-    }
-
-    // ── actor_acl_key — total order ─────────────────────────────
-
-    #[test]
-    fn actor_acl_key_orders_by_peer_then_name() {
-        // peer_id is the primary key; agent_name disambiguates
-        // rows for the same peer. The dispatch path's binary
-        // search depends on this total order.
-        use core::cmp::Ordering;
-        assert_eq!(actor_acl_key(b"aaa", "x", b"aaa", "x"), Ordering::Equal);
-        assert_eq!(actor_acl_key(b"aaa", "x", b"aab", "x"), Ordering::Less);
-        assert_eq!(actor_acl_key(b"aab", "x", b"aaa", "x"), Ordering::Greater);
-        // Same peer, agent_name disambiguates.
-        assert_eq!(actor_acl_key(b"aaa", "x", b"aaa", "y"), Ordering::Less);
-        assert_eq!(actor_acl_key(b"aaa", "y", b"aaa", "x"), Ordering::Greater);
     }
 
     // ── grant_actor_role / actor_role round-trip ────────────────
@@ -1960,7 +1956,7 @@ mod tests {
             ),
             2,
         );
-        let all = dispatch(&mut r, ActorAcls);
+        let all = actor_acls_all(&mut r);
         assert_eq!(all.len(), 1);
     }
 
@@ -1984,7 +1980,7 @@ mod tests {
             ),
             3,
         );
-        assert_eq!(dispatch(&mut r, ActorAcls).len(), 1);
+        assert_eq!(actor_acls_all(&mut r).len(), 1);
     }
 
     #[test]
@@ -2019,7 +2015,7 @@ mod tests {
             ),
             AUTH_ROLE_NONE,
         );
-        assert!(dispatch(&mut r, ActorAcls).is_empty());
+        assert!(actor_acls_all(&mut r).is_empty());
     }
 
     #[test]
@@ -2065,29 +2061,7 @@ mod tests {
             ),
             3,
         );
-        assert_eq!(dispatch(&mut r, ActorAcls).len(), 2);
-    }
-
-    #[test]
-    fn rows_stay_sorted_under_arbitrary_insertion_order() {
-        // binary_search_by depends on a total order. Insert in
-        // reverse and confirm actor_acls() returns sorted order.
-        let mut r = registry();
-        for peer_byte in (1u8..=4).rev() {
-            grant_actor(&mut r, &[peer_byte], "z", 1);
-        }
-        let rows = dispatch(&mut r, ActorAcls);
-        for w in rows.windows(2) {
-            assert!(
-                actor_acl_key(
-                    &w[0].peer_id,
-                    &w[0].agent_name,
-                    &w[1].peer_id,
-                    &w[1].agent_name
-                ) == core::cmp::Ordering::Less,
-                "actor_acls rows must be in sorted order",
-            );
-        }
+        assert_eq!(actor_acls_all(&mut r).len(), 2);
     }
 
     #[test]
@@ -2433,6 +2407,104 @@ mod tests {
         )
     }
 
+    /// `grant_role` signed by an arbitrary key — delegation tests,
+    /// where an admin (not the root) authors the grant.
+    fn grant_space_signed(
+        r: &mut SpaceRegistry,
+        signer: &SigningKey,
+        peer: &[u8],
+        role: u8,
+    ) -> Status {
+        let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
+        let canonical = canonical_op_bytes("grant_role", &[peer, &[role], &epoch.to_le_bytes()]);
+        let auth = pack_auth(
+            &peer_id_for(&signer.verifying_key().to_bytes()),
+            &signer.sign(&canonical).to_bytes(),
+        );
+        dispatch(
+            r,
+            GrantRole {
+                peer_id: peer.to_vec(),
+                role,
+                epoch,
+                auth,
+            },
+        )
+    }
+
+    // ── delegation chains (the iterative effective_role walk) ────
+
+    #[test]
+    fn delegated_grant_resolves_through_admin_chain() {
+        // root → A (ADMIN) → B (DEVELOPER): B's role holds only while
+        // every hop up the chain is an undominated ADMIN, and revoking
+        // the delegator voids the whole subtree.
+        let mut r = registry();
+        let a_key = SigningKey::from_bytes(&[21u8; 32]);
+        let a_peer = peer_id_for(&a_key.verifying_key().to_bytes());
+        let b_peer = alloc::vec![0xbb; 4];
+        assert_eq!(grant_space(&mut r, &a_peer, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(
+            grant_space_signed(&mut r, &a_key, &b_peer, AUTH_ROLE_DEVELOPER),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_DEVELOPER,
+        );
+        assert_eq!(revoke_space(&mut r, &a_peer), Status::Ok);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_NONE,
+            "revoking the delegator voids the delegated grant",
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: a_peer }),
+            AUTH_ROLE_NONE,
+        );
+    }
+
+    #[test]
+    fn grantor_cycle_terminates_as_none() {
+        // An effective admin can re-grant themselves at a higher epoch
+        // (grant_supersedes has no self guard; an admin-signed row is
+        // not root-signed, so the higher epoch displaces it). The result
+        // is grantor == subject — a chain that never bottoms out at the
+        // root. This pins the semantics (a cycle resolves to NONE) and
+        // termination. The bounded-MEMORY property is the walk's
+        // iterative shape itself — one decoded row live at a time —
+        // which a host-side test can't observe; don't take this suite
+        // as license to revert the walk to recursion.
+        let mut r = registry();
+        let a_key = SigningKey::from_bytes(&[22u8; 32]);
+        let a_peer = peer_id_for(&a_key.verifying_key().to_bytes());
+        let b_key = SigningKey::from_bytes(&[23u8; 32]);
+        let b_peer = peer_id_for(&b_key.verifying_key().to_bytes());
+        assert_eq!(grant_space(&mut r, &a_peer, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(
+            grant_space_signed(&mut r, &a_key, &b_peer, AUTH_ROLE_ADMIN),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_ADMIN,
+        );
+        assert_eq!(
+            grant_space_signed(&mut r, &b_key, &b_peer, AUTH_ROLE_ADMIN),
+            Status::Ok,
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            AUTH_ROLE_NONE,
+            "a grantor cycle resolves to NONE instead of looping",
+        );
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: a_peer }),
+            AUTH_ROLE_ADMIN,
+            "the cycle is self-inflicted; the delegator is untouched",
+        );
+    }
+
     #[test]
     fn peer_id_pubkey_extraction_round_trips() {
         let pk = root_key().verifying_key().to_bytes();
@@ -2553,8 +2625,41 @@ mod tests {
     }
 
     #[test]
+    fn register_remote_rejects_the_empty_name() {
+        // The empty name is host_mappings()'s start-of-table sentinel;
+        // a stored row carrying it would wedge every cursor drain —
+        // and register_remote is unauthenticated, so the row would be
+        // remotely plantable.
+        let mut r = registry();
+        assert_eq!(
+            dispatch(
+                &mut r,
+                RegisterRemote {
+                    instance_name: String::new(),
+                    host_prefix: 7,
+                },
+            ),
+            Status::BadHash,
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                RegisterRemote {
+                    instance_name: String::from("alice"),
+                    host_prefix: 7,
+                },
+            ),
+            Status::Ok,
+        );
+    }
+
+    #[test]
     fn set_root_is_first_write_wins() {
+        // Pre-genesis registry: built by hand (the `registry()` helper
+        // anchors a root, which is what this test observes happening).
+        vos::storage::mock::reset();
         let mut r = SpaceRegistry::new();
+        vos::actors::Actor::__init_storage(&mut r);
         assert!(dispatch(&mut r, Root).is_empty(), "no root before genesis");
         assert_eq!(
             dispatch(&mut r, SetRoot { root: root_peer_id() }),

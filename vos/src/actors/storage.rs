@@ -52,6 +52,9 @@ use core::marker::PhantomData;
 
 use super::codec::{Decode, Encode};
 
+mod committed;
+pub use committed::{CommittedMap, CommittedMapIter};
+
 /// Hard per-value ceiling. A row past this belongs in the blob CAS by
 /// hash, not in the agent keyspace: the guest heap is 256 KiB and every
 /// oversized row rides the halt payload toward the 1 MiB cap.
@@ -101,6 +104,14 @@ fn with_state<R>(f: impl FnOnce(&mut DispatchState) -> R) -> R {
             const { core::cell::RefCell::new(DispatchState::new()) };
     }
     DISPATCH.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// Queue a framework-owned row write into the dispatch overlay — the
+/// halt path uses this for the committed-storage composite root, so
+/// the row rides the same drain as the handles' own mutations.
+#[cfg_attr(not(feature = "service"), allow(dead_code))]
+pub(crate) fn store_raw(key: Vec<u8>, value: Vec<u8>) {
+    overlay_store(key, Some(value));
 }
 
 /// Drain the dispatch's queued row mutations (key order, one per key)
@@ -260,9 +271,22 @@ pub mod mock {
         });
     }
 
-    /// Wipe the keyspace (test isolation).
+    /// Wipe the keyspace AND the dispatch overlay (test isolation —
+    /// both are thread-local, and the test pool reuses threads). Also
+    /// models the host `ServiceStorage::clear_service` a soft restart
+    /// runs before replay.
     pub fn reset() {
         ROWS.with(|r| r.borrow_mut().clear());
+        super::with_state(|s| {
+            s.cache.clear();
+            s.pending.clear();
+        });
+    }
+
+    /// Snapshot every row, for byte-identity comparisons across two
+    /// materializations of the same op sequence.
+    pub fn snapshot() -> BTreeMap<Vec<u8>, Vec<u8>> {
+        ROWS.with(|r| r.borrow().clone())
     }
 }
 
@@ -365,6 +389,7 @@ macro_rules! unit_archive {
         }
     };
 }
+pub(crate) use unit_archive;
 
 // ── StorageValue ─────────────────────────────────────────────────────
 
@@ -1092,6 +1117,56 @@ mod tests {
         assert_eq!(v.get(1), Some(2));
         assert_eq!(v.swap_remove(0), Some(1));
         assert_eq!(v.iter().collect::<Vec<_>>(), alloc::vec![3, 2]);
+    }
+
+    #[test]
+    fn vec_replay_needs_a_cleared_keyspace() {
+        // A CRDT soft restart rebuilds rows by re-executing the guest's
+        // op log from genesis. `StorageVec::push` is positional — it reads
+        // the stored length row — so replaying the same pushes onto the
+        // surviving pre-merge rows appends past the stale length instead of
+        // rebuilding from zero, doubling the vector. `ServiceStorage::
+        // clear_service` (modelled here by `mock::reset`) wipes the
+        // keyspace first so the rebuild matches a from-genesis replay
+        // byte-for-byte. This is the sharpest form of the divergence:
+        // unlike a `StorageMap` (whose count self-heals because inserts are
+        // membership-gated), the vector's final length is wrong.
+        fn replay() {
+            let mut v: StorageVec<u64> = StorageVec::default();
+            v.__init(b"s/log/");
+            v.push(&10);
+            v.push(&20);
+            mock::commit(end_dispatch());
+        }
+        fn stored_len() -> u64 {
+            let mut v: StorageVec<u64> = StorageVec::default();
+            v.__init(b"s/log/");
+            v.len()
+        }
+
+        // From-genesis: the true rebuild.
+        fresh();
+        replay();
+        let canonical = mock::snapshot();
+        assert_eq!(stored_len(), 2);
+
+        // Replay onto surviving rows (no clear): length doubles.
+        fresh();
+        replay(); // stale materialization: l = 2
+        replay(); // "soft-restart" replay onto the stale rows
+        assert_eq!(stored_len(), 4, "positional push appends past stale length");
+
+        // Clear the keyspace before replay: rebuild is byte-identical.
+        fresh();
+        replay(); // stale materialization
+        mock::reset(); // clear_service wipes the whole keyspace
+        replay(); // replay from empty
+        assert_eq!(stored_len(), 2, "clear-before-replay rebuilds the true length");
+        assert_eq!(
+            mock::snapshot(),
+            canonical,
+            "cleared rebuild is byte-identical to the from-genesis materialization",
+        );
     }
 
     #[test]

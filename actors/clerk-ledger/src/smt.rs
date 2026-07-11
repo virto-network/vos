@@ -1,14 +1,16 @@
-//! Composite SMT state-root.
+//! Composite SMT state-root — the from-scratch reference.
 //!
-//! The algorithm and the three leaf encoders that used to live here
-//! were extracted into `cipher_clerk::state_root` (ungated, no_std,
-//! alloc-free) so the canonical encoding lives next to the types it
-//! commits to. This module is now a thin re-export keeping the
-//! actor-local `crate::smt::compute_state_root` name stable for the
-//! call sites in `lib.rs` / `view.rs`.
+//! The algorithm and the leaf encoders live in
+//! `cipher_clerk::state_root` (ungated, no_std, alloc-free) so the
+//! canonical encoding lives next to the types it commits to. The
+//! actor itself no longer rebuilds the root — the committed maps
+//! maintain the six sub-SMT roots incrementally and `composite_root`
+//! folds them in O(1) — so the full rebuild survives only as the
+//! parity reference the unit tests compare the incremental root
+//! against, byte for byte.
 //!
 //! Byte-equality against `cipher_clerk::helpers::MemLedger::root` is
-//! pinned in cipher-clerk's `state_root_mem_ledger` integration test
-//! (the pin that used to live in this crate's `tests.rs`).
+//! pinned in cipher-clerk's `state_root_mem_ledger` integration test.
 
+#[cfg(test)]
 pub(crate) use cipher_clerk::state_root::composite_state_root as compute_state_root;

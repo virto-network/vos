@@ -45,3 +45,9 @@ ed25519-dalek = { version = "2", default-features = false, features = ["rand_cor
 opt-level = "s"
 lto = true
 panic = "abort"
+
+[dev-dependencies]
+# The unit tests dispatch handlers in-process: `std` provides
+# `vos::block_on` and the mock storage backend behind the `#[storage]`
+# handles. Dev-deps never reach the riscv64 actor build.
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "extension", "std", "storage", "network"] }

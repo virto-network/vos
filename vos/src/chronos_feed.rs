@@ -180,7 +180,7 @@ impl ChronosFeeder {
         // feeder isn't reading the registry every pass.
         if self.voters_ttl == 0 {
             let reg = RegistryRef::at(ServiceId::REGISTRY);
-            let Ok(members) = crate::block_on(reg.members(&mut &*node)) else {
+            let Ok(members) = crate::block_on(reg.members_all(&mut &*node)) else {
                 return; // registry unavailable — retry next pass
             };
             self.voters_cache = members

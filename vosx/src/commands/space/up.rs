@@ -1016,7 +1016,7 @@ fn raft_members_for_row(
     use vos::registry::{MEMBER_KIND_NODE, NODE_ROLE_VOTER, RegistryRef};
 
     let reg = RegistryRef::at(ServiceId::REGISTRY);
-    let rows = vos::block_on(reg.members(&mut &*node))
+    let rows = vos::block_on(reg.members_all(&mut &*node))
         .map_err(|e| anyhow::anyhow!("query members: {e}"))?;
     let mut voters: Vec<u16> = rows
         .iter()

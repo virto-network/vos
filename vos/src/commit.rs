@@ -196,6 +196,34 @@ pub trait CommitStrategy: Send {
         self.commit(&AgentDelta::state_only(&writes))
     }
 
+    /// Durably replace the whole persisted keyspace with the slate a
+    /// from-genesis replay rebuilt: `state` plus every non-STATE row.
+    ///
+    /// A replay recomputes every row from history, so rows earlier
+    /// deltas persisted that the replayed execution no longer produces
+    /// are stale — a plain delta commit would leave them behind. After
+    /// a CRDT merge that's guaranteed to matter: the merged
+    /// serialization interleaves remote dispatches, so shared
+    /// accumulator rows (index pages, directories) lay out differently
+    /// from the local-only history that first persisted them, and the
+    /// remote dispatches' own rows were never in this replica's
+    /// persisted table at all. Appends no log node: replay materializes
+    /// history, it doesn't create any.
+    ///
+    /// The default forwards to [`commit_state`](Self::commit_state),
+    /// which is correct only for strategies without a KV backend
+    /// (nothing persisted, so nothing stale). Every strategy whose
+    /// [`restore_writes`](Self::restore_writes) returns rows MUST
+    /// override this with an atomic state-write + whole-table swap.
+    fn commit_rebuilt(
+        &mut self,
+        state: &[u8],
+        rows: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<CommitReceipt, CommitError> {
+        let _ = rows;
+        self.commit_state(state)
+    }
+
     /// Convenience: commit a full-state blob alongside its effect log.
     /// The pre-delta `commit_with_log` call shape, kept for tests and
     /// simple embedders; the agent thread builds real deltas.
@@ -312,7 +340,10 @@ impl CommitStrategy for NoCommit {
 // ── redb-backed local strategy ──────────────────────────────────────
 
 #[cfg(feature = "storage")]
-pub use local::{KV_TABLE, LocalCommit, STATE_KEY, STATE_TABLE, read_kv_rows, split_delta};
+pub use local::{
+    KV_TABLE, LocalCommit, STATE_KEY, STATE_TABLE, read_kv_rows, read_kv_rows_at, split_delta,
+    swap_kv_rows,
+};
 
 #[cfg(feature = "storage")]
 pub use crdt::{Blake2b, CrdtCommit, DAG_TABLE, ROOTS_KEY, read_dag_node, read_roots};
@@ -376,6 +407,31 @@ mod local {
             rows.push((k.value().to_vec(), v.value().to_vec()));
         }
         Ok(rows)
+    }
+
+    /// Open the agent database at `path` and read every persisted
+    /// non-STATE row. Diagnostic entry point for comparing replicas'
+    /// persisted keyspaces without building a strategy; the database
+    /// must not be open elsewhere.
+    pub fn read_kv_rows_at(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
+        let db = redb::Database::open(path)?;
+        read_kv_rows(&db)
+    }
+
+    /// Replace [`KV_TABLE`]'s entire contents with `rows` inside `txn`.
+    /// Backs [`CommitStrategy::commit_rebuilt`] for the storage-backed
+    /// strategies: dropping the table (rather than upserting) is what
+    /// clears rows a replay no longer produces.
+    pub fn swap_kv_rows(
+        txn: &redb::WriteTransaction,
+        rows: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), CommitError> {
+        txn.delete_table(KV_TABLE)?;
+        let mut kv = txn.open_table(KV_TABLE)?;
+        for (key, value) in rows {
+            kv.insert(key.as_slice(), value.as_slice())?;
+        }
+        Ok(())
     }
 
     /// Persists the agent delta to a redb database, skipping the write
@@ -450,6 +506,24 @@ mod local {
             if let Some(state) = state {
                 self.last = state.to_vec();
             }
+            Ok(CommitReceipt {
+                node_appended: false,
+            })
+        }
+
+        fn commit_rebuilt(
+            &mut self,
+            state: &[u8],
+            rows: &[(Vec<u8>, Vec<u8>)],
+        ) -> Result<CommitReceipt, CommitError> {
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(STATE_TABLE)?;
+                table.insert(STATE_KEY, state)?;
+            }
+            swap_kv_rows(&txn, rows)?;
+            txn.commit()?;
+            self.last = state.to_vec();
             Ok(CommitReceipt {
                 node_appended: false,
             })
@@ -865,6 +939,31 @@ mod crdt {
             self.write_atomic(delta)
         }
 
+        fn commit_rebuilt(
+            &mut self,
+            state: &[u8],
+            rows: &[(Vec<u8>, Vec<u8>)],
+        ) -> Result<CommitReceipt, CommitError> {
+            // Serialize against the sync ticker like write_atomic does —
+            // it only inserts DAG nodes and ROOTS, never STATE or KV
+            // rows, but sharing the lock keeps every writer to this db
+            // on one discipline. Replay materializes history the DAG
+            // already carries, so ROOTS/NEXT_SEQ stay untouched and no
+            // node appends.
+            let _guard = self.commit_lock.lock().expect("commit_lock poisoned");
+            let txn = self.db.begin_write()?;
+            {
+                let mut table = txn.open_table(STATE_TABLE)?;
+                table.insert(STATE_KEY, state)?;
+            }
+            super::swap_kv_rows(&txn, rows)?;
+            txn.commit()?;
+            self.last_state = state.to_vec();
+            Ok(CommitReceipt {
+                node_appended: false,
+            })
+        }
+
         fn restore_writes(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CommitError> {
             super::read_kv_rows(&self.db)
         }
@@ -979,8 +1078,14 @@ mod crdt {
             // real history that replay must reproduce). v2 deltas
             // (`effect_bearing == false`) fall back to value
             // comparison, since those guests re-emit their full state
-            // on every halt.
-            let append_node = delta.log.is_some() && (state_changed || delta.effect_bearing);
+            // on every halt — but a v2 dispatch that wrote KV rows
+            // under an unchanged state blob still appends: every
+            // persisted row must be replay-derivable, or the next
+            // post-replay materialization (`commit_rebuilt`'s
+            // whole-table swap) destroys it. RaftCommit's guard
+            // already includes `rest`.
+            let append_node =
+                delta.log.is_some() && (state_changed || delta.effect_bearing || !rest.is_empty());
             if !state_changed && rest.is_empty() && !append_node {
                 return Ok(CommitReceipt {
                     node_appended: false,
@@ -1688,6 +1793,136 @@ mod tests {
         assert!(
             cc.restore_writes().unwrap().is_empty(),
             "deleted row must leave the KV table"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn crdt_row_writes_under_unchanged_state_append_history() {
+        // A v2-style dispatch (effect_bearing = false) that wrote KV
+        // rows while re-emitting a byte-identical state blob must
+        // append a DAG node: every persisted row has to be
+        // replay-derivable, or the next post-replay whole-table swap
+        // (commit_rebuilt) destroys it.
+        let path = temp_db_path("crdt_v2_rows");
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+        let log1 = crate::effect_log::EffectLog::for_msg(b"m1".to_vec());
+        let writes = [(
+            crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+            Some(b"s".to_vec()),
+        )];
+        cc.commit(&AgentDelta {
+            writes: &writes,
+            anchor: (0x01, [1u8; 32]),
+            log: Some(&log1),
+            effect_bearing: false,
+        })
+        .unwrap();
+        let log2 = crate::effect_log::EffectLog::for_msg(b"m2".to_vec());
+        let writes2 = [
+            (
+                crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                Some(b"s".to_vec()),
+            ),
+            (b"row".to_vec(), Some(b"1".to_vec())),
+        ];
+        let receipt = cc
+            .commit(&AgentDelta {
+                writes: &writes2,
+                anchor: (0x01, [2u8; 32]),
+                log: Some(&log2),
+                effect_bearing: false,
+            })
+            .unwrap();
+        assert!(
+            receipt.node_appended,
+            "a row-bearing v2 dispatch is real history"
+        );
+        assert_eq!(cc.replay_logs().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn commit_rebuilt_swaps_the_whole_kv_table() {
+        // A replay recomputes every row, so commit_rebuilt must clear
+        // rows the rebuilt slate no longer produces — an upserting
+        // delta commit would leave them behind.
+        let db_path = temp_db_path("local_rebuilt");
+        let dir = db_path.parent().unwrap().to_path_buf();
+        {
+            let mut lc = LocalCommit::open(&db_path).unwrap();
+            let writes = [
+                (b"stale".to_vec(), Some(b"old".to_vec())),
+                (b"shared".to_vec(), Some(b"old-layout".to_vec())),
+            ];
+            lc.commit(&AgentDelta::state_only(&writes)).unwrap();
+            lc.commit_rebuilt(
+                b"replayed-state",
+                &[
+                    (b"shared".to_vec(), b"new-layout".to_vec()),
+                    (b"fresh".to_vec(), b"from-merge".to_vec()),
+                ],
+            )
+            .unwrap();
+        }
+        {
+            let mut lc = LocalCommit::open(&db_path).unwrap();
+            assert_eq!(lc.restore().as_deref(), Some(&b"replayed-state"[..]));
+            let mut rows = lc.restore_writes().unwrap();
+            rows.sort();
+            assert_eq!(
+                rows,
+                vec![
+                    (b"fresh".to_vec(), b"from-merge".to_vec()),
+                    (b"shared".to_vec(), b"new-layout".to_vec()),
+                ],
+                "rows the replay no longer produces must not survive"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn crdt_commit_rebuilt_swaps_rows_without_appending_history() {
+        let path = temp_db_path("crdt_rebuilt");
+        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+        let log = crate::effect_log::EffectLog::for_msg(b"m1".to_vec());
+        let writes = [
+            (
+                crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                Some(b"s1".to_vec()),
+            ),
+            (b"stale".to_vec(), Some(b"old".to_vec())),
+        ];
+        cc.commit(&AgentDelta {
+            writes: &writes,
+            anchor: (0x01, [1u8; 32]),
+            log: Some(&log),
+            effect_bearing: true,
+        })
+        .unwrap();
+        let history = cc.replay_logs().unwrap().len();
+        let receipt = cc
+            .commit_rebuilt(b"s2", &[(b"fresh".to_vec(), b"1".to_vec())])
+            .unwrap();
+        assert!(!receipt.node_appended);
+        assert_eq!(
+            cc.replay_logs().unwrap().len(),
+            history,
+            "replay materializes history, it must not create any"
+        );
+        assert_eq!(
+            cc.restore_writes().unwrap(),
+            vec![(b"fresh".to_vec(), b"1".to_vec())],
+            "the pre-replay row must not survive the swap"
+        );
+        assert_eq!(
+            cc.restore().as_deref(),
+            Some(&b"s2"[..]),
+            "skip-on-unchanged must track the rebuilt state"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

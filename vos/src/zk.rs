@@ -73,6 +73,11 @@
 //! `public_io_hash` is `[0u8; 32]` and naturally fails the equality
 //! check.
 
+/// Sparse-Merkle state commitments (`anchor_kind 0x02` math): fixed-
+/// depth SMT roots, single-key proofs, and the [`state::BatchProof`]
+/// multiproof over any fixed key width.
+pub mod state;
+
 /// Domain separator + ABI version for the (outer) actor-IO hash.  Bumping
 /// the trailing version rotates the binding so old proofs and old
 /// verifiers cleanly fail the equality check rather than silently

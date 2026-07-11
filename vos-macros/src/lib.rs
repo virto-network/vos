@@ -220,14 +220,50 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let init_storage = if storage_fields.is_empty() {
         quote! {}
     } else {
-        let inits = storage_fields.iter().map(|(ident, prefix)| {
-            let lit = syn::LitByteStr::new(prefix, proc_macro2::Span::call_site());
-            quote! { self.#ident.__init(#lit); }
+        let inits = storage_fields.iter().map(|f| {
+            let ident = &f.ident;
+            let lit = syn::LitByteStr::new(&f.prefix, proc_macro2::Span::call_site());
+            match &f.domains {
+                Some((leaf, node)) => {
+                    let leaf =
+                        syn::LitByteStr::new(leaf.as_bytes(), proc_macro2::Span::call_site());
+                    let node =
+                        syn::LitByteStr::new(node.as_bytes(), proc_macro2::Span::call_site());
+                    quote! { self.#ident.__init_with_domains(#lit, #leaf, #node); }
+                }
+                None => quote! { self.#ident.__init(#lit); },
+            }
         });
         quote! {
             #[doc(hidden)]
             fn __init_storage(&mut self) {
                 #( #inits )*
+            }
+        }
+    };
+
+    // `#[storage(committed)]` fields: fold their SMT roots (declaration
+    // order — part of the upgrade contract) with the state-blob hash
+    // into the composite root `anchor_kind 0x02` anchors. Actors with
+    // no committed fields keep the trait default (`None` → 0x01).
+    let committed: Vec<&syn::Ident> = storage_fields
+        .iter()
+        .filter(|f| f.committed)
+        .map(|f| &f.ident)
+        .collect();
+    let committed_root = if committed.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            #[doc(hidden)]
+            const COMMITTED: bool = true;
+
+            #[doc(hidden)]
+            fn __committed_root(&self, state_hash: &[u8; 32]) -> Option<[u8; 32]> {
+                Some(vos::zk::state::composite_fold(
+                    state_hash,
+                    [ #( self.#committed.root() ),* ],
+                ))
             }
         }
     };
@@ -265,6 +301,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #init_storage
+
+            #committed_root
 
             async fn on_start(
                 &mut self,
@@ -1384,36 +1422,64 @@ struct ActorAttrs {
 /// The default prefix is `s/<field>/`; pass an explicit
 /// `prefix = "…"` to pin it across a field rename (the prefix names
 /// the rows — changing it orphans them).
-fn extract_storage_fields(input: &mut ItemStruct) -> Vec<(syn::Ident, Vec<u8>)> {
-    let mut out: Vec<(syn::Ident, Vec<u8>)> = Vec::new();
+/// One `#[storage]` field: its ident, key prefix, whether it is
+/// `committed` (folds into the `anchor_kind 0x02` composite root),
+/// and optional application-owned SMT hash domains (for trees whose
+/// roots are pinned outside vos — clerk-ledger ↔ cipher-clerk).
+struct StorageField {
+    ident: syn::Ident,
+    prefix: Vec<u8>,
+    committed: bool,
+    domains: Option<(String, String)>,
+}
+
+fn extract_storage_fields(input: &mut ItemStruct) -> Vec<StorageField> {
+    let mut out: Vec<StorageField> = Vec::new();
     let syn::Fields::Named(named) = &mut input.fields else {
         return out;
     };
     for field in named.named.iter_mut() {
-        let mut storage: Option<Option<String>> = None;
+        let mut storage: Option<(Option<String>, bool, Option<String>, Option<String>)> = None;
         field.attrs.retain(|attr| {
             if !attr.path().is_ident("storage") {
                 return true;
             }
             let mut custom = None;
+            let mut committed = false;
+            let mut leaf_domain = None;
+            let mut node_domain = None;
             if matches!(attr.meta, syn::Meta::List(_)) {
                 let parsed = attr.parse_nested_meta(|meta| {
                     if meta.path.is_ident("prefix") {
                         let lit: syn::LitStr = meta.value()?.parse()?;
                         custom = Some(lit.value());
                         Ok(())
+                    } else if meta.path.is_ident("committed") {
+                        committed = true;
+                        Ok(())
+                    } else if meta.path.is_ident("leaf_domain") {
+                        let lit: syn::LitStr = meta.value()?.parse()?;
+                        leaf_domain = Some(lit.value());
+                        Ok(())
+                    } else if meta.path.is_ident("node_domain") {
+                        let lit: syn::LitStr = meta.value()?.parse()?;
+                        node_domain = Some(lit.value());
+                        Ok(())
                     } else {
-                        Err(meta.error("expected `prefix = \"…\"`"))
+                        Err(meta.error(
+                            "expected `prefix = \"…\"`, `committed`, \
+                             `leaf_domain = \"…\"`, or `node_domain = \"…\"`",
+                        ))
                     }
                 });
                 if let Err(e) = parsed {
                     panic!("#[storage]: {e}");
                 }
             }
-            storage = Some(custom);
+            storage = Some((custom, committed, leaf_domain, node_domain));
             false
         });
-        if let Some(custom) = storage {
+        if let Some((custom, committed, leaf_domain, node_domain)) = storage {
             let ident = field.ident.clone().expect("named field");
             let prefix = custom.unwrap_or_else(|| format!("s/{ident}/"));
             assert!(
@@ -1421,10 +1487,28 @@ fn extract_storage_fields(input: &mut ItemStruct) -> Vec<(syn::Ident, Vec<u8>)> 
                 "#[storage] prefix {prefix:?} collides with the framework keyspace",
             );
             assert!(
-                out.iter().all(|(_, p)| p != prefix.as_bytes()),
+                out.iter().all(|f| f.prefix != prefix.as_bytes()),
                 "#[storage] prefix {prefix:?} is used by two fields",
             );
-            out.push((ident, prefix.into_bytes()));
+            let domains = match (leaf_domain, node_domain) {
+                (Some(l), Some(n)) => Some((l, n)),
+                (None, None) => None,
+                _ => panic!(
+                    "#[storage]: leaf_domain and node_domain must be given together \
+                     (field `{ident}`)"
+                ),
+            };
+            assert!(
+                domains.is_none() || committed,
+                "#[storage]: custom SMT domains only apply to `committed` fields \
+                 (field `{ident}`)"
+            );
+            out.push(StorageField {
+                ident,
+                prefix: prefix.into_bytes(),
+                committed,
+                domains,
+            });
         }
     }
     out

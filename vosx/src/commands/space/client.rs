@@ -386,7 +386,9 @@ impl DaemonClient {
     }
 
     pub fn members(&self) -> anyhow::Result<Vec<MemberRow>> {
-        vos::block_on(self.registry().members(&mut &self.node))
+        // The registry pages the roster (nodes then identities);
+        // `members_all` drains every page into one Vec.
+        vos::block_on(self.registry().members_all(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.members(): {e}"))
     }
 
@@ -591,8 +593,21 @@ impl DaemonClient {
     }
 
     pub fn auth_grants(&self) -> anyhow::Result<Vec<vos::registry::AuthGrantRow>> {
-        vos::block_on(self.registry().auth_grants(&mut &self.node))
-            .map_err(|e| anyhow::anyhow!("registry.auth_grants(): {e}"))
+        // The registry pages this list; drain every page into one Vec so
+        // callers keep the whole-catalog view. The cursor is the last
+        // scanned peer id; an empty `next` ends the walk.
+        let mut out = Vec::new();
+        let mut after: Vec<u8> = Vec::new();
+        loop {
+            let page = vos::block_on(self.registry().auth_grants(&mut &self.node, after, 0))
+                .map_err(|e| anyhow::anyhow!("registry.auth_grants(): {e}"))?;
+            out.extend(page.grants);
+            if page.next.is_empty() {
+                break;
+            }
+            after = page.next;
+        }
+        Ok(out)
     }
 
     // ── M4/M8 actor-local grants ────────────────────────────────
@@ -631,7 +646,26 @@ impl DaemonClient {
     }
 
     pub fn actor_acls(&self) -> anyhow::Result<Vec<vos::registry::ActorAclRow>> {
-        vos::block_on(self.registry().actor_acls(&mut &self.node))
-            .map_err(|e| anyhow::anyhow!("registry.actor_acls(): {e}"))
+        // Drain every page (cursor = last scanned (peer, agent); both empty
+        // ends the walk) so callers keep the whole-catalog view.
+        let mut out = Vec::new();
+        let mut after_peer: Vec<u8> = Vec::new();
+        let mut after_agent = String::new();
+        loop {
+            let page = vos::block_on(self.registry().actor_acls(
+                &mut &self.node,
+                after_peer,
+                after_agent,
+                0,
+            ))
+            .map_err(|e| anyhow::anyhow!("registry.actor_acls(): {e}"))?;
+            out.extend(page.acls);
+            if page.next_peer.is_empty() && page.next_agent.is_empty() {
+                break;
+            }
+            after_peer = page.next_peer;
+            after_agent = page.next_agent;
+        }
+        Ok(out)
     }
 }

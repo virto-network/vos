@@ -462,15 +462,23 @@ pub fn run_refine_service<A: super::Actor>() {
     // as `usize` because `A` differs per service; safe because PVM is
     // single-threaded.
     static mut ACTOR_HOLDER: usize = 0;
-    // The work-result anchor: `(anchor_kind, anchor)` committing to the
-    // state this refine runs against. Computed on cold start from the
-    // exact serialized bytes READ returned (before deserialization);
-    // carried forward across warm restarts in flat_mem, advancing to
-    // `blake2b(S)` whenever a work-result's final state was `S` — so
+    // The work-result anchor: `(anchor_kind, anchor, state_hash)`
+    // committing to the state this refine runs against. Computed on
+    // cold start from the exact serialized bytes READ returned (before
+    // deserialization) — plus, for committed actors, the recorded
+    // composite-root row; carried forward across warm restarts in
+    // flat_mem and advanced after every state-changing work-result, so
     // the up-to-64 work-results of one tick form the anchor chain the
-    // host verifies against its journal overlay.
-    static mut CURRENT_ANCHOR: (u8, [u8; 32]) =
-        (crate::refine_payload::ANCHOR_GENESIS, [0u8; 32]);
+    // host verifies against its journal overlay. `state_hash` tracks
+    // the blob alone: under a composite (0x02) anchor, "anchor moved"
+    // and "blob moved" are separate questions (a committed-field write
+    // moves the composite while the blob stands), and the final
+    // `Write{STATE_KEY}` is gated on the blob.
+    static mut CURRENT_ANCHOR: (u8, [u8; 32], [u8; 32]) = (
+        crate::refine_payload::ANCHOR_GENESIS,
+        [0u8; 32],
+        [0u8; 32],
+    );
     let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
     let anchor_ptr = addr_of_mut!(CURRENT_ANCHOR);
     let mut cold_start = false;
@@ -492,7 +500,18 @@ pub fn run_refine_service<A: super::Actor>() {
             // large state as missing and silently resurrect the actor
             // as default, persisting the wipe on the next save.
             let state = lifecycle::read_persisted_state_owned();
-            *anchor_ptr = crate::refine_payload::anchor_for(state.as_deref());
+            let (kind, anchor) = crate::refine_payload::anchor_for(state.as_deref());
+            let state_hash = match &state {
+                Some(bytes) if !bytes.is_empty() => crate::refine_payload::state_anchor(bytes),
+                _ => [0u8; 32],
+            };
+            // A committed actor whose first dispatch already completed
+            // resumes the 0x02 chain from the recorded composite row;
+            // before that (or for plain actors) the blob rules apply.
+            *anchor_ptr = match A::COMMITTED.then(lifecycle::read_committed_root).flatten() {
+                Some(root) => (crate::refine_payload::ANCHOR_SMT_ROOT, root, state_hash),
+                None => (kind, anchor, state_hash),
+            };
             let boxed = Box::new(lifecycle::load_or_create::<A>(state.as_deref()));
             *holder_ptr = Box::into_raw(boxed) as usize;
         }
@@ -555,11 +574,12 @@ pub fn run_refine_service<A: super::Actor>() {
         let new_state_bytes = super::codec::Encode::encode(&*actor_ref);
         let reply_bytes = ctx.take_reply_bytes();
         // Emit the post-dispatch state as the final Write{STATE_KEY}
-        // effect only when it changed from the anchored state. Genesis
-        // always emits: there is no prior blob to be equal to, and the
-        // first work-result is what materializes the actor's row.
+        // effect only when the blob changed from the anchored state.
+        // Genesis always emits: there is no prior blob to be equal to,
+        // and the first work-result is what materializes the actor's
+        // row.
         // SAFETY: single-threaded PVM, raw-pointer access as above.
-        let (anchor_kind, anchor) = unsafe { *anchor_ptr };
+        let (anchor_kind, anchor, prior_state_hash) = unsafe { *anchor_ptr };
         let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
         // Empty state is genesis, not a hash anchor — the host's overlay
         // computes `anchor_for(Some(empty)) == GENESIS`, so a fieldless
@@ -567,7 +587,29 @@ pub fn run_refine_service<A: super::Actor>() {
         // self-message iteration would AnchorMismatch and silently drop.
         let new_is_empty = new_state_bytes.is_empty();
         let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS
-            || new_hash != anchor;
+            || new_hash != prior_state_hash;
+
+        // Committed actors: recompute the composite AFTER the handler
+        // (the field root rows are current through the overlay) and
+        // record it as an ordinary framework row — the host's
+        // expected-anchor check reads it next dispatch. Written only
+        // when the composite moved, so a pure read stays effect-free
+        // (the durable-node rule). Must precede the drain: one drain
+        // carries the handles' rows AND this one.
+        let (next_kind, next_anchor) = match actor_ref.__committed_root(&new_hash) {
+            Some(root) => (crate::refine_payload::ANCHOR_SMT_ROOT, root),
+            None if new_is_empty => (crate::refine_payload::ANCHOR_GENESIS, [0u8; 32]),
+            None => (crate::refine_payload::ANCHOR_STATE_HASH, new_hash),
+        };
+        if next_kind == crate::refine_payload::ANCHOR_SMT_ROOT
+            && (next_kind, next_anchor) != (anchor_kind, anchor)
+        {
+            super::storage::store_raw(
+                lifecycle::COMMITTED_ROOT_KEY.to_vec(),
+                next_anchor.to_vec(),
+            );
+        }
+
         let payload = ctx.drain_into_refine_payload(
             anchor_kind,
             anchor,
@@ -575,15 +617,13 @@ pub fn run_refine_service<A: super::Actor>() {
             state_changed.then_some(new_state_bytes),
             reply_bytes,
         );
-        if state_changed {
-            // SAFETY: single-threaded PVM, raw-pointer access as above.
-            unsafe {
-                *anchor_ptr = if new_is_empty {
-                    (crate::refine_payload::ANCHOR_GENESIS, [0u8; 32])
-                } else {
-                    (crate::refine_payload::ANCHOR_STATE_HASH, new_hash)
-                };
-            }
+        // SAFETY: single-threaded PVM, raw-pointer access as above.
+        unsafe {
+            *anchor_ptr = (
+                next_kind,
+                next_anchor,
+                if new_is_empty { [0u8; 32] } else { new_hash },
+            );
         }
         drop(ctx);
         let encoded = payload.encode();
