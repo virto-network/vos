@@ -918,6 +918,24 @@ impl RegistryRef {
         decode_rkyv(self.call(inv, Msg::new("set_root").with("root", root)).await?)
     }
 
+    /// Anchor this space's `space_id` (first-write-wins). The daemon
+    /// calls this once at boot with the id it already validated against
+    /// the genesis; it lets `redeem_invite` bind the invite canonical to
+    /// THIS space so an invite can't be replayed at another space the
+    /// same operator runs (the genesis root alone can't distinguish them).
+    pub async fn set_space_id<I: Invoker>(
+        &self,
+        inv: &mut I,
+        space_id: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(self.call(inv, Msg::new("set_space_id").with("space_id", space_id)).await?)
+    }
+
+    /// This space's anchored `space_id`, or empty if never set.
+    pub async fn space_id<I: Invoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
+        decode_bytes(self.call(inv, Msg::new("space_id")).await?)
+    }
+
     pub async fn publish<I: Invoker>(
         &self,
         inv: &mut I,
@@ -1256,13 +1274,13 @@ impl RegistryRef {
     /// Redeem an invite token: grant `role` to `peer_id`. Deliberately
     /// unauthenticated — the carried signatures ARE the auth. The handler
     /// verifies `admin_sig` over the invite canonical (`invite`,
-    /// `[genesis_root, [role], expires_le, token_pub]`) under
-    /// `admin_peer_id` (a current-epoch effective admin), `redeem_sig`
-    /// (token possession) under `token_pub`, and `node_sig` (peer-id
-    /// control) under `peer_id` — both over (`redeem_invite`,
-    /// `[token_pub, peer_id]`). The invite canonical binds the actor's
-    /// own genesis root, not a caller-supplied space id. No expiry check
-    /// happens here (checked host-side at admission).
+    /// `[space_id, [role], expires_le, token_pub]`) under `admin_peer_id`
+    /// (a current-epoch effective admin), `redeem_sig` (token possession)
+    /// under `token_pub`, and `node_sig` (peer-id control) under
+    /// `peer_id` — both over (`redeem_invite`, `[token_pub, peer_id]`).
+    /// The invite canonical binds the actor's own anchored `space_id`
+    /// (set via `set_space_id`), not a caller-supplied value. No expiry
+    /// check happens here (checked host-side at admission).
     #[allow(clippy::too_many_arguments)]
     pub async fn redeem_invite<I: Invoker>(
         &self,

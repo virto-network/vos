@@ -94,16 +94,14 @@ pub struct InvitePayload {
 /// the token string. `expires_at` is an absolute unix-seconds deadline
 /// (the caller resolves `--expires` against its wall clock).
 ///
-/// `root_peer_id` is the space's genesis root peer-id (from
-/// `RegistryRef::root`). The invite canonical binds the ROOT, not the
-/// `space_id`, because the redeeming registry rebuilds the canonical from
-/// its own authoritative `root` — that is what makes an invite
-/// non-replayable at a different space (each space's root differs) even
-/// when the minting admin is an admin of both. `space_id` still rides the
-/// payload as the joiner's client-side "which space" pointer.
+/// The invite canonical binds `space_id`: the redeeming registry rebuilds
+/// it from its OWN anchored `space_id`, so an invite is non-replayable at
+/// a different space even when the minting operator is an admin of both.
+/// (The genesis root can't distinguish two spaces one operator runs — it
+/// is the shared operator identity — but each space's `space_id` differs,
+/// since it derives from a fresh per-space genesis origin.)
 pub fn mint(
     operator: &Keypair,
-    root_peer_id: &[u8],
     space_id: [u8; 32],
     name: String,
     bootnodes: Vec<String>,
@@ -119,10 +117,10 @@ pub fn mint(
     let token_pub = raw_ed25519_pubkey(&token_kp)?;
 
     // The operator (an admin) signs the invite canonical — byte-for-byte
-    // what `redeem_invite` rebuilds to verify, binding the genesis root.
+    // what `redeem_invite` rebuilds to verify, binding the space_id.
     let invite_canon = canonical_op_bytes(
         "invite",
-        &[root_peer_id, &[role], &expires_at.to_le_bytes(), &token_pub],
+        &[&space_id, &[role], &expires_at.to_le_bytes(), &token_pub],
     );
     let admin_sig = sig64(
         &operator
@@ -253,16 +251,11 @@ mod tests {
         [0x5a; 32]
     }
 
-    fn op_root(op: &Keypair) -> Vec<u8> {
-        libp2p::PeerId::from(op.public()).to_bytes()
-    }
-
     #[test]
     fn round_trips_through_parse() {
         let op = Keypair::generate_ed25519();
         let token = mint(
             &op,
-            &op_root(&op),
             sample_space_id(),
             "demo".into(),
             vec!["/ip4/1.2.3.4/tcp/9000".into()],
@@ -283,7 +276,7 @@ mod tests {
     #[test]
     fn checksum_corruption_is_rejected() {
         let op = Keypair::generate_ed25519();
-        let token = mint(&op, &op_root(&op), sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
         // Flip a character in the middle of the base58 body.
         let mut chars: Vec<char> = token.chars().collect();
         let mid = chars.len() / 2;
@@ -295,7 +288,7 @@ mod tests {
     #[test]
     fn wrong_version_byte_is_rejected() {
         let op = Keypair::generate_ed25519();
-        let token = mint(&op, &op_root(&op), sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
         // Decode, bump the version byte, re-checksum, re-encode.
         let body58 = token.strip_prefix(TOKEN_HRP).unwrap();
         let blob = bs58::decode(body58).into_vec().unwrap();
@@ -319,32 +312,32 @@ mod tests {
     fn minted_token_verifies_under_the_registry() {
         // The interop: a token minted here must pass every signature the
         // actor's `redeem_invite` checks, byte-for-byte — admin_sig over
-        // the ROOT-bound invite canonical under admin_peer_id, and both
-        // redeem_sig (token) and node_sig (node) over the redeem canonical.
+        // the space_id-bound invite canonical under admin_peer_id, and
+        // both redeem_sig (token) and node_sig (node) over the redeem
+        // canonical.
         let op = Keypair::generate_ed25519();
-        let root = op_root(&op); // the operator is the genesis root here
         let space_id = sample_space_id();
         let role = AUTH_ROLE_READONLY;
         let expires_at = 2_000_000_000u64;
-        let token = mint(&op, &root, space_id, "demo".into(), vec![], role, expires_at).unwrap();
+        let token = mint(&op, space_id, "demo".into(), vec![], role, expires_at).unwrap();
         let p = parse(&token).unwrap();
 
-        // admin_sig over the invite canonical (bound to the ROOT, not the
-        // space id) verifies under admin_peer_id.
+        // admin_sig over the invite canonical (bound to space_id) verifies
+        // under admin_peer_id.
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&root, &[role], &expires_at.to_le_bytes(), &p.token_pub],
+            &[&space_id, &[role], &expires_at.to_le_bytes(), &p.token_pub],
         );
         assert!(
             verify_op_sig(&p.admin_peer_id, &invite_canon, &p.admin_sig),
             "admin_sig must verify under the operator's peer-id",
         );
-        // Binding the root defeats cross-space replay: a different root
-        // makes the rebuilt canonical (and thus the signature) mismatch.
-        let other_root = op_root(&Keypair::generate_ed25519());
+        // Binding space_id defeats cross-space replay: a sibling space's
+        // id makes the rebuilt canonical (and signature) mismatch.
+        let other_space: [u8; 32] = [0x11; 32];
         let wrong_canon = canonical_op_bytes(
             "invite",
-            &[&other_root, &[role], &expires_at.to_le_bytes(), &p.token_pub],
+            &[&other_space, &[role], &expires_at.to_le_bytes(), &p.token_pub],
         );
         assert!(!verify_op_sig(&p.admin_peer_id, &wrong_canon, &p.admin_sig));
 

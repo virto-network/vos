@@ -217,6 +217,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
+    // Anchor this space's space_id into the registry (first-write-wins;
+    // idempotent on later boots). `redeem_invite` binds it so an invite
+    // minted here can't be replayed at a sibling space the same operator
+    // runs — the genesis root is the shared operator identity and can't
+    // tell them apart. Without this the invite canonical would bind an
+    // empty id and every redemption would fail. Best-effort: a warn, not
+    // a boot-wedging error, on the unusual failure paths.
+    {
+        let reg = vos::registry::RegistryRef::at(ServiceId::REGISTRY);
+        match vos::block_on(reg.set_space_id(&mut &node, space_id.to_vec())) {
+            Ok(vos::registry::Status::Ok) => tracing::info!("anchored space_id into the registry"),
+            Ok(_) => {} // already anchored — idempotent
+            Err(e) => tracing::warn!("could not anchor space_id into the registry: {e}"),
+        }
+    }
+
     // Spawn the hyperspace registry replica if this space declares
     // membership in one. Same blob as the local registry; distinct
     // ServiceId slot (HYPERSPACE_REGISTRY = svc_id 1) and a

@@ -328,6 +328,16 @@ pub struct SpaceRegistry {
     /// floors it governs — see `revoke_epochs`.
     #[storage]
     root: StorageValue<Vec<u8>>,
+    /// This space's `space_id` (blake2b of the genesis DAG root),
+    /// anchored once at boot (first-write-wins). Unlike `root` — the
+    /// operator's CLI identity, which is SHARED across every space that
+    /// operator runs — `space_id` is distinct per space (the genesis
+    /// commit's `origin` is a fresh per-space key), so `redeem_invite`
+    /// binds it to make an invite non-replayable at a sibling space. A
+    /// `#[storage]` value so it resets/survives together with the
+    /// authority state it scopes, per the `revoke_epochs` discipline.
+    #[storage]
+    space_id: StorageValue<Vec<u8>>,
     /// Grow-only set of `replication_id`s any `install` has ever
     /// consumed. An install whose `replication_id` is already here is
     /// refused, so a captured `install` op can't be replayed to
@@ -367,6 +377,7 @@ impl SpaceRegistry {
             host_mappings: StorageMap::default(),
             consistency_floors: StorageMap::default(),
             root: StorageValue::default(),
+            space_id: StorageValue::default(),
             used_replication_ids: StorageSet::default(),
             invites: StorageMap::default(),
         }
@@ -400,6 +411,32 @@ impl SpaceRegistry {
     #[msg]
     async fn root(&self) -> Vec<u8> {
         self.root_bytes()
+    }
+
+    /// Anchor this space's `space_id` (first-write-wins). The daemon
+    /// calls this at boot with the id it validated against the genesis;
+    /// `redeem_invite` binds it so an invite minted for this space cannot
+    /// be replayed at a sibling space the same operator runs (whose
+    /// genesis root — the operator identity — is identical). Unsigned,
+    /// like `set_root`: the value is public and verifiable from the
+    /// genesis, and first-write-wins pins the earliest (the operator's
+    /// own boot, before any peer is invited).
+    #[msg]
+    async fn set_space_id(&mut self, space_id: Vec<u8>) -> Status {
+        if space_id.is_empty() {
+            return Status::BadHash;
+        }
+        if !self.space_id_bytes().is_empty() {
+            return Status::Forbidden;
+        }
+        self.space_id.set(&space_id);
+        Status::Ok
+    }
+
+    /// This space's anchored `space_id`, or empty if never set.
+    #[msg]
+    async fn space_id(&self) -> Vec<u8> {
+        self.space_id_bytes()
     }
 
     // ── Programs catalog ────────────────────────────────────────
@@ -1375,16 +1412,18 @@ impl SpaceRegistry {
         }
         // (3) Admin minting: admin_sig over the invite canonical under a
         // current-epoch effective admin. The canonical binds THIS space's
-        // genesis root — held authoritatively by the actor
-        // (`self.root_bytes()`), never a caller-supplied space id — so an
+        // `space_id` — anchored authoritatively in the actor
+        // (`self.space_id_bytes()`), never a caller-supplied value — so an
         // invite minted for another space cannot be replayed here even
-        // when its minter is an effective admin of both spaces: each
-        // space's distinct root makes the rebuilt canonical (and thus the
-        // signature) mismatch.
-        let root = self.root_bytes();
+        // when its minter is an effective admin of both. The genesis root
+        // alone can't distinguish two spaces one operator runs (it is the
+        // shared operator identity); `space_id` (a fresh per-space genesis
+        // origin) can, so a mismatched space rebuilds a different canonical
+        // and the signature fails.
+        let space_id = self.space_id_bytes();
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&root, &[role], &expires_at.to_le_bytes(), &token_pub],
+            &[&space_id, &[role], &expires_at.to_le_bytes(), &token_pub],
         );
         if !verify_op_sig(&admin_peer_id, &invite_canon, &admin_sig)
             || !self.is_effective_admin(&admin_peer_id)
@@ -1696,6 +1735,11 @@ impl SpaceRegistry {
     /// (one per delegation-chain hop) cost a single row.
     fn root_bytes(&self) -> Vec<u8> {
         self.root.get().unwrap_or_default()
+    }
+
+    /// This space's anchored `space_id`, or empty before it is set.
+    fn space_id_bytes(&self) -> Vec<u8> {
+        self.space_id.get().unwrap_or_default()
     }
 
     /// Grow-only revoke high-water for `peer_id`, or 0 if never revoked.
@@ -2066,6 +2110,11 @@ mod tests {
     use vos::Message;
     use vos::actors::context::ServiceId;
 
+    /// The test space's anchored `space_id` — bound into invite
+    /// canonicals so `redeem_invite`'s cross-space check has a concrete
+    /// local id to reject mismatches against.
+    const TEST_SPACE_ID: [u8; 32] = [0x5a; 32];
+
     fn registry() -> SpaceRegistry {
         // The mock keyspace and the dispatch overlay are thread-local,
         // and the test pool reuses threads — every registry starts from
@@ -2084,6 +2133,15 @@ mod tests {
             },
         );
         assert_eq!(status, Status::Ok, "set_root on a fresh registry");
+        // Anchor the space_id (the daemon does this at boot) so
+        // redeem_invite binds a concrete local space.
+        let status = dispatch(
+            &mut r,
+            SetSpaceId {
+                space_id: TEST_SPACE_ID.to_vec(),
+            },
+        );
+        assert_eq!(status, Status::Ok, "set_space_id on a fresh registry");
         r
     }
 
@@ -2970,6 +3028,28 @@ mod tests {
     }
 
     #[test]
+    fn set_space_id_is_first_write_wins() {
+        // Pre-anchor registry built by hand (the `registry()` helper
+        // anchors a space_id, which is what this test observes happening).
+        vos::storage::mock::reset();
+        let mut r = SpaceRegistry::new();
+        vos::actors::Actor::__init_storage(&mut r);
+        assert!(dispatch(&mut r, SpaceId).is_empty(), "no space_id before anchor");
+        assert_eq!(
+            dispatch(&mut r, SetSpaceId { space_id: TEST_SPACE_ID.to_vec() }),
+            Status::Ok,
+        );
+        assert_eq!(dispatch(&mut r, SpaceId), TEST_SPACE_ID.to_vec());
+        // A second set_space_id — e.g. a forged one merged via CRDT — is
+        // refused; the anchored id is immutable.
+        assert_eq!(
+            dispatch(&mut r, SetSpaceId { space_id: alloc::vec![0x11u8; 32] }),
+            Status::Forbidden,
+        );
+        assert_eq!(dispatch(&mut r, SpaceId), TEST_SPACE_ID.to_vec());
+    }
+
+    #[test]
     fn unsigned_grant_is_rejected() {
         // The exact forge vector: a peer authors a grant_role op with
         // no valid signature. authorize_op fails closed.
@@ -3655,7 +3735,7 @@ mod tests {
         let peer_id = node_peer_of(node);
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&root_peer_id(), &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+            &[&TEST_SPACE_ID, &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
         );
         let admin_sig = admin_key.sign(&invite_canon).to_bytes();
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer_id]);
@@ -3814,20 +3894,21 @@ mod tests {
 
     #[test]
     fn redeem_invite_cross_space_replay_rejected() {
-        // An invite minted for ANOTHER space binds that space's root. The
-        // actor rebuilds the invite canonical with its OWN root, so
-        // admin_sig fails to verify — even though root_key IS this space's
-        // admin. This is the cross-space replay the untrusted space_id arg
-        // could not stop.
+        // An invite minted for ANOTHER space binds that space's space_id.
+        // This registry rebuilds the invite canonical with its OWN
+        // space_id (TEST_SPACE_ID), so admin_sig fails — even though
+        // root_key IS an effective admin here (the shared operator
+        // identity is admin of both spaces). This is the replay that
+        // binding the operator root alone could not stop.
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
         let token_pub = token.verifying_key().to_bytes();
         let node = node_key(66);
         let peer = node_peer_of(&node);
-        let other_root = peer_id_for(&SigningKey::from_bytes(&[123u8; 32]).verifying_key().to_bytes());
+        let other_space: [u8; 32] = [0x11; 32]; // a sibling space's id
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&other_root, &[AUTH_ROLE_READONLY], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+            &[&other_space, &[AUTH_ROLE_READONLY], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
         );
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer]);
         let msg = RedeemInvite {
@@ -3871,7 +3952,7 @@ mod tests {
         let forge = |role: u8| -> RedeemInvite {
             let invite_canon = canonical_op_bytes(
                 "invite",
-                &[&root_peer_id(), &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+                &[&TEST_SPACE_ID, &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
             );
             let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &victim_peer]);
             RedeemInvite {
