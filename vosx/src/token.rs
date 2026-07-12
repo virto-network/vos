@@ -93,8 +93,17 @@ pub struct InvitePayload {
 /// `operator` sign the invite canonical, and encode the payload. Returns
 /// the token string. `expires_at` is an absolute unix-seconds deadline
 /// (the caller resolves `--expires` against its wall clock).
+///
+/// `root_peer_id` is the space's genesis root peer-id (from
+/// `RegistryRef::root`). The invite canonical binds the ROOT, not the
+/// `space_id`, because the redeeming registry rebuilds the canonical from
+/// its own authoritative `root` — that is what makes an invite
+/// non-replayable at a different space (each space's root differs) even
+/// when the minting admin is an admin of both. `space_id` still rides the
+/// payload as the joiner's client-side "which space" pointer.
 pub fn mint(
     operator: &Keypair,
+    root_peer_id: &[u8],
     space_id: [u8; 32],
     name: String,
     bootnodes: Vec<String>,
@@ -110,10 +119,10 @@ pub fn mint(
     let token_pub = raw_ed25519_pubkey(&token_kp)?;
 
     // The operator (an admin) signs the invite canonical — byte-for-byte
-    // what `redeem_invite` rebuilds to verify.
+    // what `redeem_invite` rebuilds to verify, binding the genesis root.
     let invite_canon = canonical_op_bytes(
         "invite",
-        &[&space_id, &[role], &expires_at.to_le_bytes(), &token_pub],
+        &[root_peer_id, &[role], &expires_at.to_le_bytes(), &token_pub],
     );
     let admin_sig = sig64(
         &operator
@@ -244,11 +253,16 @@ mod tests {
         [0x5a; 32]
     }
 
+    fn op_root(op: &Keypair) -> Vec<u8> {
+        libp2p::PeerId::from(op.public()).to_bytes()
+    }
+
     #[test]
     fn round_trips_through_parse() {
         let op = Keypair::generate_ed25519();
         let token = mint(
             &op,
+            &op_root(&op),
             sample_space_id(),
             "demo".into(),
             vec!["/ip4/1.2.3.4/tcp/9000".into()],
@@ -269,7 +283,7 @@ mod tests {
     #[test]
     fn checksum_corruption_is_rejected() {
         let op = Keypair::generate_ed25519();
-        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let token = mint(&op, &op_root(&op), sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
         // Flip a character in the middle of the base58 body.
         let mut chars: Vec<char> = token.chars().collect();
         let mid = chars.len() / 2;
@@ -281,7 +295,7 @@ mod tests {
     #[test]
     fn wrong_version_byte_is_rejected() {
         let op = Keypair::generate_ed25519();
-        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let token = mint(&op, &op_root(&op), sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
         // Decode, bump the version byte, re-checksum, re-encode.
         let body58 = token.strip_prefix(TOKEN_HRP).unwrap();
         let blob = bs58::decode(body58).into_vec().unwrap();
@@ -303,39 +317,76 @@ mod tests {
 
     #[test]
     fn minted_token_verifies_under_the_registry() {
-        // The interop: a token minted here must pass BOTH signatures the
-        // actor's `redeem_invite` checks — admin_sig under admin_peer_id,
-        // and redeem_sig under token_pub — byte-for-byte.
+        // The interop: a token minted here must pass every signature the
+        // actor's `redeem_invite` checks, byte-for-byte — admin_sig over
+        // the ROOT-bound invite canonical under admin_peer_id, and both
+        // redeem_sig (token) and node_sig (node) over the redeem canonical.
         let op = Keypair::generate_ed25519();
+        let root = op_root(&op); // the operator is the genesis root here
         let space_id = sample_space_id();
         let role = AUTH_ROLE_READONLY;
         let expires_at = 2_000_000_000u64;
-        let token = mint(&op, space_id, "demo".into(), vec![], role, expires_at).unwrap();
+        let token = mint(&op, &root, space_id, "demo".into(), vec![], role, expires_at).unwrap();
         let p = parse(&token).unwrap();
 
-        // admin_sig over the invite canonical verifies under admin_peer_id.
+        // admin_sig over the invite canonical (bound to the ROOT, not the
+        // space id) verifies under admin_peer_id.
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&space_id, &[role], &expires_at.to_le_bytes(), &p.token_pub],
+            &[&root, &[role], &expires_at.to_le_bytes(), &p.token_pub],
         );
         assert!(
             verify_op_sig(&p.admin_peer_id, &invite_canon, &p.admin_sig),
             "admin_sig must verify under the operator's peer-id",
         );
+        // Binding the root defeats cross-space replay: a different root
+        // makes the rebuilt canonical (and thus the signature) mismatch.
+        let other_root = op_root(&Keypair::generate_ed25519());
+        let wrong_canon = canonical_op_bytes(
+            "invite",
+            &[&other_root, &[role], &expires_at.to_le_bytes(), &p.token_pub],
+        );
+        assert!(!verify_op_sig(&p.admin_peer_id, &wrong_canon, &p.admin_sig));
 
-        // redeem_sig over the redeem canonical verifies under token_pub.
-        let node = libp2p::PeerId::from(Keypair::generate_ed25519().public()).to_bytes();
-        let rsig = redeem_sig(&p, &node).unwrap();
+        // The joining node signs the redeem canonical with BOTH the token
+        // secret (redeem_sig, under token_pub) and its own node key
+        // (node_sig, under the node peer-id).
+        let node_kp = Keypair::generate_ed25519();
+        let node = libp2p::PeerId::from(node_kp.public()).to_bytes();
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&p.token_pub, &node]);
+
+        let rsig = redeem_sig(&p, &node).unwrap();
         assert!(
             verify_raw_sig(&p.token_pub, &redeem_canon, &rsig),
             "redeem_sig must verify under the token public key",
+        );
+
+        let node_sig: [u8; 64] = node_kp
+            .sign(&redeem_canon)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        assert!(
+            verify_op_sig(&node, &redeem_canon, &node_sig),
+            "node_sig must verify under the joining node's peer-id",
         );
 
         // A redeem_sig for one node must not verify for another.
         let other = libp2p::PeerId::from(Keypair::generate_ed25519().public()).to_bytes();
         let other_canon = canonical_op_bytes("redeem_invite", &[&p.token_pub, &other]);
         assert!(!verify_raw_sig(&p.token_pub, &other_canon, &rsig));
+        // …and a node_sig made by a DIFFERENT key must not verify under
+        // this node's peer-id (peer-id control is unforgeable).
+        assert!(!verify_op_sig(&node, &redeem_canon, &{
+            let s: [u8; 64] = Keypair::generate_ed25519()
+                .sign(&redeem_canon)
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap();
+            s
+        }));
     }
 
     #[test]

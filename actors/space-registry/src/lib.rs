@@ -1327,7 +1327,6 @@ impl SpaceRegistry {
     #[msg]
     async fn redeem_invite(
         &mut self,
-        space_id: Vec<u8>,
         token_pub: Vec<u8>,
         role: u8,
         expires_at: u64,
@@ -1335,6 +1334,7 @@ impl SpaceRegistry {
         admin_sig: Vec<u8>,
         peer_id: Vec<u8>,
         redeem_sig: Vec<u8>,
+        node_sig: Vec<u8>,
     ) -> Status {
         let Some(token_pub_key) = bytes_to_32(&token_pub) else {
             return Status::BadHash;
@@ -1348,21 +1348,43 @@ impl SpaceRegistry {
         let Some(redeem_sig) = bytes_to_64(&redeem_sig) else {
             return Status::BadHash;
         };
+        let Some(node_sig) = bytes_to_64(&node_sig) else {
+            return Status::BadHash;
+        };
         // Offline tiers only. `admin`/voter enrollment need the serving
         // daemon to countersign online (decision 5); refuse them here.
         if role != AUTH_ROLE_READONLY && role != AUTH_ROLE_DEVELOPER {
             return Status::Forbidden;
         }
-        // (2) Token possession.
+        // (2) Token possession AND peer-id control: the redeem canonical
+        // is signed BOTH by the token secret (`redeem_sig`, under
+        // `token_pub`) and by the joining node's own key (`node_sig`,
+        // under `peer_id`). The node_sig is load-bearing: without it a
+        // token holder could redeem for an arbitrary victim's `peer_id`,
+        // and because the grant epoch is the large `expires_at`, that
+        // grant would supersede — silently downgrade — the victim's
+        // legitimately-granted role (and cascade-void its delegation
+        // subtree). Requiring a signature under `peer_id` binds the grant
+        // to a node the redeemer actually controls. Both checks are
+        // deterministic, so they re-verify identically on CRDT replay.
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer_id]);
-        if !verify_raw_sig(&token_pub_key, &redeem_canon, &redeem_sig) {
+        if !verify_raw_sig(&token_pub_key, &redeem_canon, &redeem_sig)
+            || !verify_op_sig(&peer_id, &redeem_canon, &node_sig)
+        {
             return Status::Forbidden;
         }
         // (3) Admin minting: admin_sig over the invite canonical under a
-        // current-epoch effective admin.
+        // current-epoch effective admin. The canonical binds THIS space's
+        // genesis root — held authoritatively by the actor
+        // (`self.root_bytes()`), never a caller-supplied space id — so an
+        // invite minted for another space cannot be replayed here even
+        // when its minter is an effective admin of both spaces: each
+        // space's distinct root makes the rebuilt canonical (and thus the
+        // signature) mismatch.
+        let root = self.root_bytes();
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&space_id, &[role], &expires_at.to_le_bytes(), &token_pub],
+            &[&root, &[role], &expires_at.to_le_bytes(), &token_pub],
         );
         if !verify_op_sig(&admin_peer_id, &invite_canon, &admin_sig)
             || !self.is_effective_admin(&admin_peer_id)
@@ -3604,42 +3626,50 @@ mod tests {
 
     // ── Invites (redeem_invite / revoke_invite) ─────────────────
 
-    const INVITE_SPACE_ID: [u8; 32] = [0x5a; 32];
     const INVITE_EXPIRES: u64 = 2_000_000_000;
 
-    /// A deterministic node peer-id for a fixed seed byte.
-    fn node_peer(seed: u8) -> Vec<u8> {
-        peer_id_for(&SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes())
+    /// A deterministic node signing key for a fixed seed byte — stands in
+    /// for a joining node's own key (used to produce `node_sig`).
+    fn node_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// The libp2p node peer-id for a node key.
+    fn node_peer_of(k: &SigningKey) -> Vec<u8> {
+        peer_id_for(&k.verifying_key().to_bytes())
     }
 
     /// Build a `RedeemInvite` message: `admin_key` mints an invite for
-    /// `token_key`, redeemed by node `peer_id`. Deterministic (fixed
-    /// keys → identical bytes), so rebuilding it models a CRDT replay of
-    /// the same op. Tamper one returned field to exercise a negative
-    /// path.
+    /// `token_key`, redeemed by node `node`. The invite canonical binds
+    /// the genesis root (`root_peer_id()`, set by `registry()`), exactly
+    /// as the actor rebuilds it. Deterministic (fixed keys → identical
+    /// bytes), so rebuilding it models a CRDT replay of the same op.
+    /// Tamper one returned field to exercise a negative path.
     fn redeem_msg(
         admin_key: &SigningKey,
         token_key: &SigningKey,
         role: u8,
-        peer_id: &[u8],
+        node: &SigningKey,
     ) -> RedeemInvite {
         let token_pub = token_key.verifying_key().to_bytes();
+        let peer_id = node_peer_of(node);
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&INVITE_SPACE_ID, &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+            &[&root_peer_id(), &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
         );
         let admin_sig = admin_key.sign(&invite_canon).to_bytes();
-        let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, peer_id]);
+        let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer_id]);
         let redeem_sig = token_key.sign(&redeem_canon).to_bytes();
+        let node_sig = node.sign(&redeem_canon).to_bytes();
         RedeemInvite {
-            space_id: INVITE_SPACE_ID.to_vec(),
             token_pub: token_pub.to_vec(),
             role,
             expires_at: INVITE_EXPIRES,
             admin_peer_id: peer_id_for(&admin_key.verifying_key().to_bytes()),
             admin_sig: admin_sig.to_vec(),
-            peer_id: peer_id.to_vec(),
+            peer_id,
             redeem_sig: redeem_sig.to_vec(),
+            node_sig: node_sig.to_vec(),
         }
     }
 
@@ -3672,20 +3702,21 @@ mod tests {
     fn redeem_invite_happy_chain() {
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
+        let peer = node_peer_of(&node);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
             Status::Ok,
             "root-minted invite redeems",
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: node.clone() }),
+            dispatch(&mut r, PeerRole { peer_id: peer.clone() }),
             AUTH_ROLE_READONLY,
             "redemption grants the token's role to the joining node",
         );
         let rows = invites_all(&mut r);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].redeemed_by, alloc::vec![node]);
+        assert_eq!(rows[0].redeemed_by, alloc::vec![peer]);
         assert!(!rows[0].revoked);
     }
 
@@ -3693,12 +3724,12 @@ mod tests {
     fn redeem_invite_developer_tier_ok() {
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_DEVELOPER, &node)),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_DEVELOPER);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_DEVELOPER);
     }
 
     #[test]
@@ -3707,50 +3738,63 @@ mod tests {
         // redeem carrying role=ADMIN is refused outright (decision 5).
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_ADMIN, &node)),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
     }
 
     #[test]
     fn redeem_invite_tampered_admin_sig_rejected() {
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
         let mut msg = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
         msg.admin_sig[0] ^= 0xff;
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
     }
 
     #[test]
     fn redeem_invite_tampered_redeem_sig_rejected() {
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
         let mut msg = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
         msg.redeem_sig[0] ^= 0xff;
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+    }
+
+    #[test]
+    fn redeem_invite_tampered_node_sig_rejected() {
+        // node_sig must verify under peer_id — a corrupted one is refused,
+        // proving the peer-id-control gate is live.
+        let mut r = registry();
+        let token = SigningKey::from_bytes(&[55u8; 32]);
+        let node = node_key(66);
+        let mut msg = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
+        msg.node_sig[0] ^= 0xff;
+        assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
     }
 
     #[test]
     fn redeem_invite_non_admin_minter_rejected() {
         // A validly-signed invite whose minter is not an effective admin
-        // (a stranger) is refused: both signatures verify, but
+        // (a stranger) is refused: the signatures verify, but
         // is_effective_admin(admin_peer_id) fails.
         let mut r = registry();
         let attacker = SigningKey::from_bytes(&[42u8; 32]);
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&attacker, &token, AUTH_ROLE_READONLY, &node)),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
     }
 
     #[test]
@@ -3761,25 +3805,93 @@ mod tests {
         let mut r = registry();
         let attacker = SigningKey::from_bytes(&[42u8; 32]);
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
         let mut msg = redeem_msg(&attacker, &token, AUTH_ROLE_READONLY, &node);
         msg.admin_peer_id = root_peer_id();
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
     }
 
     #[test]
-    fn redeem_invite_wrong_space_id_rejected() {
-        // The invite canonical binds space_id, so redeeming with a
-        // mismatched space_id breaks admin_sig verification — an invite
-        // minted for one space can't be replayed at another.
+    fn redeem_invite_cross_space_replay_rejected() {
+        // An invite minted for ANOTHER space binds that space's root. The
+        // actor rebuilds the invite canonical with its OWN root, so
+        // admin_sig fails to verify — even though root_key IS this space's
+        // admin. This is the cross-space replay the untrusted space_id arg
+        // could not stop.
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
-        let mut msg = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
-        msg.space_id = alloc::vec![0x11; 32];
+        let token_pub = token.verifying_key().to_bytes();
+        let node = node_key(66);
+        let peer = node_peer_of(&node);
+        let other_root = peer_id_for(&SigningKey::from_bytes(&[123u8; 32]).verifying_key().to_bytes());
+        let invite_canon = canonical_op_bytes(
+            "invite",
+            &[&other_root, &[AUTH_ROLE_READONLY], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+        );
+        let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer]);
+        let msg = RedeemInvite {
+            token_pub: token_pub.to_vec(),
+            role: AUTH_ROLE_READONLY,
+            expires_at: INVITE_EXPIRES,
+            admin_peer_id: root_peer_id(),
+            admin_sig: root_key().sign(&invite_canon).to_bytes().to_vec(),
+            peer_id: peer.clone(),
+            redeem_sig: token.sign(&redeem_canon).to_bytes().to_vec(),
+            node_sig: node.sign(&redeem_canon).to_bytes().to_vec(),
+        };
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer }), AUTH_ROLE_NONE);
+    }
+
+    #[test]
+    fn redeem_invite_cannot_target_an_uncontrolled_peer() {
+        // The Finding-1 downgrade attack: an attacker holding a VALID
+        // member token tries to redeem it for a VICTIM's peer_id to
+        // supersede the victim's (delegated) admin grant. Without a
+        // node_sig under the victim's key the redeem is refused — on both
+        // the direct and the CRDT-replay (System) path — so the victim
+        // keeps admin.
+        let mut r = registry();
+        // Victim holds a delegated (non-root) admin grant — the case root
+        // protection alone does not cover.
+        let a2 = SigningKey::from_bytes(&[13u8; 32]);
+        let a2_peer = peer_id_for(&a2.verifying_key().to_bytes());
+        assert_eq!(grant_space(&mut r, &a2_peer, AUTH_ROLE_ADMIN), Status::Ok);
+        let victim = node_key(90);
+        let victim_peer = node_peer_of(&victim);
+        assert_eq!(grant_space_signed(&mut r, &a2, &victim_peer, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim_peer.clone() }), AUTH_ROLE_ADMIN);
+
+        // Attacker's forged redeem: valid token, target = victim_peer,
+        // node_sig by the ATTACKER's key (not the victim's).
+        let token = SigningKey::from_bytes(&[55u8; 32]);
+        let token_pub = token.verifying_key().to_bytes();
+        let attacker = node_key(66);
+        let forge = |role: u8| -> RedeemInvite {
+            let invite_canon = canonical_op_bytes(
+                "invite",
+                &[&root_peer_id(), &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+            );
+            let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &victim_peer]);
+            RedeemInvite {
+                token_pub: token_pub.to_vec(),
+                role,
+                expires_at: INVITE_EXPIRES,
+                admin_peer_id: root_peer_id(),
+                admin_sig: root_key().sign(&invite_canon).to_bytes().to_vec(),
+                peer_id: victim_peer.clone(),
+                redeem_sig: token.sign(&redeem_canon).to_bytes().to_vec(),
+                node_sig: attacker.sign(&redeem_canon).to_bytes().to_vec(),
+            }
+        };
+        assert_eq!(dispatch(&mut r, forge(AUTH_ROLE_READONLY)), Status::Forbidden);
+        assert_eq!(dispatch_as_system(&mut r, forge(AUTH_ROLE_READONLY)), Status::Forbidden);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: victim_peer }),
+            AUTH_ROLE_ADMIN,
+            "victim's admin grant is untouched — no downgrade",
+        );
     }
 
     #[test]
@@ -3792,15 +3904,16 @@ mod tests {
         let bob_peer = peer_id_for(&bob.verifying_key().to_bytes());
         assert_eq!(grant_space(&mut r, &bob_peer, AUTH_ROLE_ADMIN), Status::Ok);
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
+        let peer = node_peer_of(&node);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&bob, &token, AUTH_ROLE_READONLY, &node)),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node.clone() }), AUTH_ROLE_READONLY);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer.clone() }), AUTH_ROLE_READONLY);
         assert_eq!(revoke_space(&mut r, &bob_peer), Status::Ok);
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: node }),
+            dispatch(&mut r, PeerRole { peer_id: peer }),
             AUTH_ROLE_NONE,
             "revoking the minting admin voids the redeemed grant",
         );
@@ -3813,13 +3926,13 @@ mod tests {
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
         let token_pub = token.verifying_key().to_bytes();
-        let node = node_peer(66);
+        let node = node_key(66);
         assert_eq!(revoke_invite(&mut r, &token_pub), Status::Ok);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
     }
 
     #[test]
@@ -3859,8 +3972,10 @@ mod tests {
         // (sorted) — detection, not prevention.
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node_a = node_peer(66);
-        let node_b = node_peer(77);
+        let node_a = node_key(66);
+        let node_b = node_key(77);
+        let peer_a = node_peer_of(&node_a);
+        let peer_b = node_peer_of(&node_b);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node_a)),
             Status::Ok,
@@ -3869,11 +3984,11 @@ mod tests {
             dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node_b)),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_a.clone() }), AUTH_ROLE_READONLY);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_b.clone() }), AUTH_ROLE_READONLY);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer_a.clone() }), AUTH_ROLE_READONLY);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer_b.clone() }), AUTH_ROLE_READONLY);
         let rows = invites_all(&mut r);
         assert_eq!(rows.len(), 1);
-        let mut expected = alloc::vec![node_a, node_b];
+        let mut expected = alloc::vec![peer_a, peer_b];
         expected.sort();
         assert_eq!(rows[0].redeemed_by, expected, "both redeemers recorded, sorted");
     }
@@ -3885,7 +4000,8 @@ mod tests {
         // redeemed_by set both converge, so the state is unchanged.
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
-        let node = node_peer(66);
+        let node = node_key(66);
+        let peer = node_peer_of(&node);
         assert_eq!(
             dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
             Status::Ok,
@@ -3894,10 +4010,10 @@ mod tests {
             dispatch_as_system(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node.clone() }), AUTH_ROLE_READONLY);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer.clone() }), AUTH_ROLE_READONLY);
         let rows = invites_all(&mut r);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].redeemed_by, alloc::vec![node], "replay doesn't duplicate the peer");
+        assert_eq!(rows[0].redeemed_by, alloc::vec![peer], "replay doesn't duplicate the peer");
     }
 
     #[test]
@@ -3908,10 +4024,10 @@ mod tests {
         let mut r = registry();
         let token = SigningKey::from_bytes(&[55u8; 32]);
         let token_pub = token.verifying_key().to_bytes();
-        let node = node_peer(66);
+        let node = node_key(66);
         let captured = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
         assert_eq!(revoke_invite(&mut r, &token_pub), Status::Ok);
         assert_eq!(dispatch_as_system(&mut r, captured), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node }), AUTH_ROLE_NONE);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
     }
 }

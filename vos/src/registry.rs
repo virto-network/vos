@@ -1254,18 +1254,19 @@ impl RegistryRef {
     // ── Invites ───────────────────────────────────────────────────
 
     /// Redeem an invite token: grant `role` to `peer_id`. Deliberately
-    /// unauthenticated — the two carried signatures ARE the auth. The
-    /// handler verifies `admin_sig` over the invite canonical
-    /// (`invite`, `[space_id, [role], expires_le, token_pub]`) under
-    /// `admin_peer_id` (which must be a current-epoch effective admin),
-    /// and `redeem_sig` over (`redeem_invite`, `[token_pub, peer_id]`)
-    /// under `token_pub`. No expiry check happens here (checked
-    /// host-side at admission).
+    /// unauthenticated — the carried signatures ARE the auth. The handler
+    /// verifies `admin_sig` over the invite canonical (`invite`,
+    /// `[genesis_root, [role], expires_le, token_pub]`) under
+    /// `admin_peer_id` (a current-epoch effective admin), `redeem_sig`
+    /// (token possession) under `token_pub`, and `node_sig` (peer-id
+    /// control) under `peer_id` — both over (`redeem_invite`,
+    /// `[token_pub, peer_id]`). The invite canonical binds the actor's
+    /// own genesis root, not a caller-supplied space id. No expiry check
+    /// happens here (checked host-side at admission).
     #[allow(clippy::too_many_arguments)]
     pub async fn redeem_invite<I: Invoker>(
         &self,
         inv: &mut I,
-        space_id: Vec<u8>,
         token_pub: Vec<u8>,
         role: u8,
         expires_at: u64,
@@ -1273,19 +1274,20 @@ impl RegistryRef {
         admin_sig: Vec<u8>,
         peer_id: Vec<u8>,
         redeem_sig: Vec<u8>,
+        node_sig: Vec<u8>,
     ) -> Result<Status, ClientError> {
         decode_rkyv(
             self.call(
                 inv,
                 Msg::new("redeem_invite")
-                    .with("space_id", space_id)
                     .with("token_pub", token_pub)
                     .with("role", role)
                     .with("expires_at", expires_at)
                     .with("admin_peer_id", admin_peer_id)
                     .with("admin_sig", admin_sig)
                     .with("peer_id", peer_id)
-                    .with("redeem_sig", redeem_sig),
+                    .with("redeem_sig", redeem_sig)
+                    .with("node_sig", node_sig),
             )
             .await?,
         )
