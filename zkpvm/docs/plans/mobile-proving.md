@@ -69,10 +69,10 @@ count (965 windows ≈ 4 h vs 78 ≈ 32 min). The knob and its tooling
 remain right (every production FRI zkVM shards; the verifier is
 seg-size-agnostic; `MAX_CHAIN_SEGMENTS = 65 536`; the turnkey
 re-pin below), but for THIS transition the lever is spent at 100k —
-the RAM path runs through Wave 5.1 (content-aware windowing — the
-sizing spike pinned the wall on BLAKE2B_BOUNDARY's 2502 columns at the
-chain-max floor, which STEP-windowing can't cut but cost-budget
-windowing can), with Wave 4 as the multiplier after.
+the RAM path runs through Wave 5.2 (the BLAKE2B_BOUNDARY per-page-cost
+diet — measurement showed ~10k boundary rows per touched page with
+pages-per-window small and flat, so NO windowing strategy, uniform or
+budgeted, moves the wall), with Wave 4 as the multiplier after.
 **The tooling gap (floor derivation) is closed:** `vosx zk pin
 --seg-steps N` without `--profile` derives the floors, measures the
 allowlist under them, and records both; then update the three frozen
@@ -151,11 +151,12 @@ lowers to NEON; zkpvm itself has no intrinsics. Setup-level items:
 
 ## Honest wall-clock picture
 
-Chain proving on phones is a Wave-5 outcome (content-aware windowing;
-Wave 4 adds margin): Wave 1.3 measured ~10–11 GiB per window at ANY
-uniform seg_steps with time ∝ window count, and the sizing spike
-showed both symptoms share one cause — canonical padding to
-BLAKE2B_BOUNDARY's burst maximum. Even once RAM fits, 7.6M steps at phone
+Chain proving on phones is a Wave-5.2 outcome (the boundary chip's
+per-page cost; Wave 4 adds margin): Wave 1.3 measured ~10–11 GiB per
+window at ANY uniform seg_steps, and the 5.1 validation showed the
+cause is not window placement at all — every window touches a
+handful of pages and each page costs ~10k rows on the 2502-column
+boundary chip. Even once RAM fits, 7.6M steps at phone
 throughput is an hour-plus of background work (x86 desktop: ~32 min at
 100k windows). That is the intended shape — the roadmap already treats
 chain proving as an async job per settlement window, off the hot path.
@@ -211,8 +212,10 @@ settlement windows and, eventually, succinct-witness step reduction.
      (hashing concentrates in short step ranges, so step-windowing
      can't cut its per-window max). PROGRAM_MEMORY, despite L=18, is
      31+1 columns = **1.4%**. Because the dominant chip is
-     content-scaling, content-aware windowing (Wave 5) removes the
-     wall — no stwo fork or AIR change required for the first ~4×.
+     content-scaling, windowing looked like the fix — but the 5.1
+     validation then showed the per-window page count is already
+     minimal (~26), so the wall is the boundary chip's per-page
+     cost (Wave 5.2), not window placement.
   2. **Chain-prove time ∝ window count under canonical padding.**
      Per-window cost is pinned by the padded floors (~15–25 s here),
      so 965 windows ≈ 4 h vs 78 windows ≈ 32 min for the same trace.
@@ -233,13 +236,13 @@ settlement windows and, eventually, succinct-witness step reduction.
      Wave-2.1 streaming driver is what fixes it.
 - **1.4 Flip the pin — NOT NOW.** Per finding 2, stay at
   seg_steps = 100k; the flip becomes interesting only after the
-  Wave-5.1 budgeted windowing moves the RAM walls. (The
+  Wave-5.2 boundary diet moves the RAM walls. (The
   actor-storage re-pin has merged; catalogs are current.)
 
 Exit (revised): one-command re-pin at any `seg_steps` ✓; measured
-floor/RAM/time table ✓; the ≤3 GB path now runs through Wave 5.1
-(content-aware windowing), with Wave 4 as margin — not through
-uniform segment shrink.
+floor/RAM/time table ✓; the ≤3 GB path now runs through Wave 5.2
+(boundary per-page-cost diet), with Wave 4 as margin — not through
+segmentation of any kind.
 
 ### Wave 2 — chain-driver memory (SideNote diet)
 
@@ -273,8 +276,8 @@ Fork `prover/pcs/` (`CommitmentTreeProver`, `prove_values`,
 root, recompute per-column LDEs from retained coefficients for FRI
 quotients + decommit. Consider bumping stwo 2.2.0→2.3.0 first so the
 fork tracks upstream. Exit: ~2–3× off the per-segment LDE term.
-Multiplies with Wave 5.1 (2.5–3 GiB → ~1–1.5 GiB windows — headroom
-for low-end phones) and benefits tap-to-pay equally.
+Multiplies with Wave 5.2 (post-diet windows × another 2–3×) and
+benefits tap-to-pay equally.
 
 ### Wave 5 — content-aware windowing (sizing spike DONE 2026-07-10)
 
@@ -297,37 +300,46 @@ per-window max doesn't fall with seg_steps). Both original Wave-5
 hypotheses are dead: the program-memory diet is pointless (1.4%), and
 the wall is NOT windowing-proof — it's step-windowing-proof.
 
-- **5.1 Content-aware windowing.** Replace `segment_bounds(total,
-  seg_steps)` with a deterministic cost-budget cut: walk the trace
-  accumulating per-chip row counts (blake2b-boundary ops above all)
-  and close a window when any budgeted chip would exceed its cap
-  (e.g. 2^14 boundary rows). Hash-dense stretches get short windows,
-  plain-CPU stretches get long ones — window count stays moderate
-  while EVERY window's floors land near the budget. Projected:
-  boundary 10 GiB → ~1.3 GiB at 2^14; whole window ~2.5–3 GiB. Time
-  improves too — canonical padding waste (every window paying the
-  burst's 2^17/2^18) is what made both uniform-8k (~4 h) and
-  uniform-100k (78 × 2^18-padded windows) expensive; with budgeted
-  floors, total work ≈ actual content rows. Local change:
-  `segment.rs` + `canonical_profile_for` + `prove_chain_segments` +
-  the measure paths; the verifier is untouched (seg-size-agnostic,
-  allowlist still collapses — budgeted floors are uniform across
-  windows by construction). ABI note: window boundaries become
-  trace-determined, so the caller-supplied `seg_steps` becomes the
-  cap/budget knob and the catalog pins the budget alongside the
-  profile — prover and re-measurement must cut identically (a
-  deterministic function of trace + budget). Cost signal: either an
-  O(steps) per-chip row model for the budgeted chips, or greedy
-  window growth probed via `natural_log_sizes_for` on candidate
-  slices (indices subset — just the budgeted chips); the probe
-  route is simpler and exact but leans on the Wave-2.1 streaming
-  driver to avoid the slice-replay cost.
-- **5.2 BLAKE2B_BOUNDARY width diet (AIR investigation).** 2502 main
-  columns for a boundary/binding chip is the widest surface in the
-  AIR (the BLAKE2B core has the same width but sits at L=13). If the
-  boundary rows carry full hash state per row, a narrower binding
-  (or moving rows into the cheaper core chip) multiplies with every
-  other lever. Soundness-sensitive — investigate before touching.
+- **5.1 Content-aware windowing — BUILT, AND ITS RAM HYPOTHESIS IS
+  FALSIFIED (measured 2026-07-12).** `segment_bounds_budgeted(full,
+  max_steps, max_pages)` landed in `segment.rs` (deterministic dual
+  budget, page accounting mirrors `page_merkle::touched_pages`, unit
+  tests) with `canonical_profile_for_bounds` for floors over any
+  explicit cut. The validation sweep (real transition, 7.84M steps,
+  steps ≤ 32k, page budgets {48, 96, 192}) showed the page budget
+  NEVER binds: **the worst window touches only 26 distinct pages**,
+  at every budget, with all precompile streams counted — yet
+  BLAKE2B_BOUNDARY still floors at 2^18. Pages-per-window is small
+  and flat; the cost is **~10k boundary rows PER TOUCHED PAGE**
+  (2^18/26 ≈ 10k; the 8k-uniform floors fit the same constant), and
+  every window touches a handful of pages no matter how it's cut. No
+  segmentation strategy — uniform or budgeted — can push the
+  boundary chip below ~2^17. The machinery is kept (deterministic
+  budgeted cuts, floors-over-bounds, commitments still collapse to
+  2): it becomes the binding knob once 5.2 shrinks the per-page
+  constant. Plumbing (`seg_steps`→budget in the pin ABI) is deferred
+  until then.
+- **5.2 BLAKE2B_BOUNDARY per-page-cost diet — THE ≤3 GiB path (AIR
+  work).** Mechanism, confirmed in code: the boundary chip proves
+  the page-Merkle multiproof's compressions on a **96-row schedule
+  per compression** (12 rounds × 8 G-steps, `fill_schedule_
+  preprocessed`), and a touched page costs 32 blocks × 2 images
+  × 96 rows + path-node compressions **× per-consumption duplicates
+  (design §4 keeps them)** ≈ 10k rows on a 2502-column layout shared
+  with the core chip. Levers, cheapest first:
+  1. **Dedup consumptions** — hash each page image / node once
+     instead of per consumption; pure trace+AIR bookkeeping, no
+     format change. Sizing spike: count duplicate factor first.
+  2. **Smaller Merkle leaf unit** — 4 KB pages cost 64 compressions
+     even for a one-byte touch; 256B–512B sub-page leaves cut sparse
+     touches ~8–16×. Page-Merkle format bump + re-pin.
+  3. **Swap the page-Merkle hash to Poseidon2-M31** — blake2b costs
+     96 rows per 128 hashed bytes in-circuit; the M31-native
+     Poseidon2 (already in-tree: `poseidon2/`, settlement-verifier)
+     is the principled fix for hashing megabytes of page images
+     in-AIR. Format bump + catalog/manifest re-pin + verifier
+     alignment — the deep option.
 
-Exit: chain windows ≤3 GiB on desktop via 5.1; a measured
-column-level answer on whether 5.2 is worth AIR surgery.
+Exit: a measured duplicate-factor + per-lever sizing table; then
+boundary rows/page small enough that 5.1's page budget becomes the
+binding knob and windows land ≤3 GiB.
