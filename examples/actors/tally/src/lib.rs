@@ -7,17 +7,38 @@
 //! both ways and asserts byte-identical images and work-results.
 
 use vos::prelude::*;
+use vos::storage::StorageMap;
 
 #[actor(task)]
 struct Tally {
     total: u64,
     steps: u32,
+    /// Witnessed-read fixture: a Task has no live storage, so gets on
+    /// this map are served from the rows the invoking parent named
+    /// (staged from ITS keyspace under this same `s/saved/` prefix) —
+    /// and panic as unproven for any key the parent didn't name.
+    #[storage(prefix = "s/saved/")]
+    saved: StorageMap<u64, u64>,
 }
 
 #[messages]
 impl Tally {
     fn new() -> Self {
-        Tally { total: 0, steps: 0 }
+        Tally {
+            total: 0,
+            steps: 0,
+            saved: Default::default(),
+        }
+    }
+
+    /// Fold the witnessed values at `a` and `b` into the total —
+    /// absent rows count zero (proven absence), unnamed rows panic
+    /// (unproven read). The witnessed-read e2e drives this.
+    #[msg]
+    async fn add_saved(&mut self, a: u64, b: u64) -> u64 {
+        self.total += self.saved.get(&a).unwrap_or(0);
+        self.total += self.saved.get(&b).unwrap_or(0);
+        self.total
     }
 
     /// One-shot: fold `n` into the running total and reply with it.

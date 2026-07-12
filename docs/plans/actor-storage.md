@@ -416,19 +416,33 @@ end-to-end; 0x01 actors byte-for-byte unaffected.
   ledger's provable path is app-level (voucher-check +
   `SuccinctTransitionWitness`), so the capstone needs the incremental
   roots, not the generic witnessed backend.
-- **4.3 (remaining)** — the generic witnessed-read backend for
-  provable Tasks over committed storage. Banked constraints: the
-  two-backend seam is `storage.rs::backend_read` (a Task's STORAGE_R
-  is an echo stub — the witnessed backend must panic on unproven
-  reads, never fall through); Task input staging lives only in
-  `build_task_kernel` and must stay byte-identical with
-  `task_initial_image` + the tracer patch path (live≡traced gate);
-  `__VOS_WITNESS` already carries two layouts (zk pub/sec, VOST task
-  input) and the host never checks buffer capacity; the `.vos_meta`
-  storage section appends after the mode section. A10 is fixed (see
-  open question 4): invoke effects ride the effect log and replay
-  re-absorbs them, so witnessed Tasks on replicated agents are
-  unblocked.
+- **4.3** — the witnessed-read backend, as built. The VOST task input
+  grew a trailing rows section (`n_rows = 0` encodes as four zero
+  bytes — identical to the `.bss` padding, so pre-rows images are
+  byte-stable and live≡traced holds through the shared
+  `encode_task_input_with_rows`). The touched-set oracle is the
+  plan's v1: **the caller names the keys** —
+  `Tasks::spawn_raw_with_rows` / `invoke_hash_with_rows` carry them
+  in the invoke input (flag bit in the state-length word; service
+  invokes untouched), and the host resolves each against the invoking
+  parent's EFFECTIVE keyspace: a Task reads the parent's rows and
+  folds effects back into the parent, so the parent decides what the
+  child sees. Named-but-absent keys stage as proven-absent; the
+  guest's dispatch overlay carries the witness and any read of an
+  unnamed key panics as unproven (a Task's STORAGE_R is an echo stub
+  — the backend never falls through to it). `register_task_blob` now
+  records the witness buffer's capacity (`vos::zk::witness_symbol`
+  reads the symbol size) and the host refuses over-capacity inputs as
+  TOO_BIG instead of overwriting adjacent `.bss`. Gates:
+  `task_storage_reads_come_from_the_witness` (present /
+  proven-absent / unproven-panic) + the live≡traced pair. A10 fixed
+  first (see open question 4), so witnessed Tasks run on replicated
+  agents. Deferred: the `.vos_meta` storage section (an auto-derived
+  message→keys oracle has no consumer yet — explicit keys are what
+  the clerk pattern needs); in-guest tree-consistency checks for
+  committed rows (soundness rides the anchor: a doctored witness
+  changes the emitted composite and fails the verifier's comparison —
+  the SparseLedger model).
 
 ## Open questions (resolve before the wave that needs them)
 

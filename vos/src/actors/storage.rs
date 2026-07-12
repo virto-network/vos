@@ -76,6 +76,12 @@ struct DispatchState {
     /// rewrite rows between dispatches, so nothing cached outlives the
     /// dispatch that read it.
     cache: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// The witnessed rows a Task invocation was staged with (`None`
+    /// value = proven absent). `Some` switches every backend read to
+    /// the witness — a Task has no live storage (its `STORAGE_R` is an
+    /// echo stub), so a read of a key the witness doesn't carry panics
+    /// as unproven instead of misreading the stub.
+    witness: Option<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
 }
 
 impl DispatchState {
@@ -83,6 +89,7 @@ impl DispatchState {
         Self {
             pending: BTreeMap::new(),
             cache: BTreeMap::new(),
+            witness: None,
         }
     }
 }
@@ -114,16 +121,27 @@ pub(crate) fn store_raw(key: Vec<u8>, value: Vec<u8>) {
     overlay_store(key, Some(value));
 }
 
+/// Switch this dispatch's backend reads to the witnessed rows a Task
+/// invocation was staged with — see [`DispatchState::witness`]. The
+/// Task entry seeds this before dispatching (always, even empty: an
+/// unwitnessed read in a Task must fail loudly, not misread the
+/// `STORAGE_R` echo stub).
+#[cfg_attr(not(feature = "service"), allow(dead_code))]
+pub(crate) fn seed_witness_rows(rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
+    with_state(|s| s.witness = Some(rows));
+}
+
 /// Drain the dispatch's queued row mutations (key order, one per key)
-/// and drop the read cache. Called by the framework when packing the
-/// refine payload; the drained rows become `Write`/`Delete` effects
-/// ahead of the final state write.
+/// and drop the read cache + any witnessed rows. Called by the
+/// framework when packing the refine payload; the drained rows become
+/// `Write`/`Delete` effects ahead of the final state write.
 // Only the service message loop drains; other build flavors compile the
 // storage types for their rlib surface without a dispatch cycle.
 #[cfg_attr(not(feature = "service"), allow(dead_code))]
 pub(crate) fn end_dispatch() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     with_state(|s| {
         s.cache.clear();
+        s.witness = None;
         core::mem::take(&mut s.pending).into_iter().collect()
     })
 }
@@ -141,10 +159,36 @@ fn overlay_load(key: &[u8]) -> Option<Vec<u8>> {
         Err(())
     })
     .unwrap_or_else(|()| {
-        let value = backend_read(key);
+        let value = read_row(key);
         with_state(|s| s.cache.insert(key.to_vec(), value.clone()));
         value
     })
+}
+
+/// The dispatch's authoritative row source: the witnessed rows when a
+/// Task seeded them (a miss panics — an unproven read), the host
+/// backend otherwise.
+fn read_row(key: &[u8]) -> Option<Vec<u8>> {
+    enum Witnessed {
+        Hit(Option<Vec<u8>>),
+        Unproven,
+        NotWitnessed,
+    }
+    let witnessed = with_state(|s| match &s.witness {
+        Some(rows) => match rows.get(key) {
+            Some(value) => Witnessed::Hit(value.clone()),
+            None => Witnessed::Unproven,
+        },
+        None => Witnessed::NotWitnessed,
+    });
+    match witnessed {
+        Witnessed::Hit(value) => value,
+        Witnessed::Unproven => panic!(
+            "unproven storage read — the task witness does not carry this \
+             key; the invoker must name every row the handler touches",
+        ),
+        Witnessed::NotWitnessed => backend_read(key),
+    }
 }
 
 /// Mutate a row's pending value in place, seeding it from the cache or
@@ -164,7 +208,7 @@ fn overlay_mutate<R>(key: &[u8], f: impl FnOnce(&mut Option<Vec<u8>>) -> R) -> R
         false
     });
     if !seeded {
-        let value = backend_read(key);
+        let value = read_row(key);
         with_state(|s| s.pending.insert(key.to_vec(), value));
     }
     with_state(|s| {
@@ -280,6 +324,7 @@ pub mod mock {
         super::with_state(|s| {
             s.cache.clear();
             s.pending.clear();
+            s.witness = None;
         });
     }
 
