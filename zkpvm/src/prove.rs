@@ -634,13 +634,25 @@ pub fn canonical_profile_for(full: &SideNote, seg_steps: usize) -> Option<Vec<u3
     if seg_steps == 0 {
         return None;
     }
-    let bounds = crate::segment::segment_bounds(full.steps.len(), seg_steps);
+    canonical_profile_for_bounds(
+        full,
+        &crate::segment::segment_bounds(full.steps.len(), seg_steps),
+    )
+}
+
+/// [`canonical_profile_for`] over explicit window bounds — the floors for a
+/// content-budgeted cut ([`crate::segment::segment_bounds_budgeted`]), or
+/// any other deterministic segmentation. Same guarantees and refusals.
+pub fn canonical_profile_for_bounds(
+    full: &SideNote,
+    bounds: &[(usize, usize)],
+) -> Option<Vec<u32>> {
     if bounds.is_empty() {
         return None;
     }
     let indices: Vec<usize> = (0..super::chip_idx::COUNT).collect();
     let mut floors = vec![0u32; indices.len()];
-    for &(a, b) in &bounds {
+    for &(a, b) in bounds {
         let mut sn = crate::segment::segment_side_note(full, a, b);
         for (floor, natural) in floors.iter_mut().zip(natural_log_sizes_for(&mut sn, &indices)) {
             *floor = (*floor).max(natural);

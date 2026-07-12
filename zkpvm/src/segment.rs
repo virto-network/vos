@@ -55,7 +55,123 @@ pub fn segment_bounds(total: usize, max_steps: usize) -> alloc::vec::Vec<(usize,
 #[cfg(feature = "prover")]
 mod prover {
     use crate::side_note::SideNote;
+    use alloc::collections::BTreeSet;
     use alloc::vec::Vec;
+
+    /// Content-budgeted segmentation: split the trace into maximal windows
+    /// holding BOTH budgets — at most `max_steps` steps AND at most
+    /// `max_pages` distinct touched memory pages. Distinct pages size the
+    /// entering/exiting page-Merkle multiproof and with it
+    /// `Blake2bBoundaryChip`'s row count — the widest chip in the AIR — so
+    /// step-only windowing leaves every window padded to the chain's worst
+    /// window (canonical forcing) no matter how small `max_steps` gets.
+    /// Budgeted cuts give memory-dense stretches short windows and
+    /// plain-CPU stretches long ones, landing every window's canonical
+    /// floors near the budget.
+    ///
+    /// Deterministic in `(trace, budgets)` — the prover and the catalog
+    /// measurement MUST cut identically or the pinned allowlist misses the
+    /// live shapes. Page counting mirrors
+    /// [`crate::page_merkle::touched_pages`] (same streams, same
+    /// `add_range` granularity), so a window's budget holds by the
+    /// multiproof's own definition. A single step may exceed `max_pages`
+    /// on its own and still forms a one-step window — the budget is a
+    /// cost target, not a soundness bound (floors are measured over the
+    /// actual windows).
+    ///
+    /// Panics if either budget is zero.
+    pub fn segment_bounds_budgeted(
+        full: &SideNote,
+        max_steps: usize,
+        max_pages: usize,
+    ) -> Vec<(usize, usize)> {
+        assert!(max_steps > 0, "max_steps must be non-zero");
+        assert!(max_pages > 0, "max_pages must be non-zero");
+        let total = full.steps.len();
+        let mut bounds = Vec::new();
+        if total == 0 {
+            return bounds;
+        }
+
+        /// Advance `cursor` past every op with `ts_of(op) <= ts`, handing
+        /// the ones AT `ts` to `push`. Each stream is ts-sorted (the tracer
+        /// appends in step order), so one monotone cursor per stream visits
+        /// every op exactly once.
+        fn take_at<'a, T>(
+            ops: &'a [T],
+            cursor: &mut usize,
+            ts: u64,
+            ts_of: impl Fn(&T) -> u64,
+            mut push: impl FnMut(&'a T),
+        ) {
+            while *cursor < ops.len() && ts_of(&ops[*cursor]) <= ts {
+                if ts_of(&ops[*cursor]) == ts {
+                    push(&ops[*cursor]);
+                }
+                *cursor += 1;
+            }
+        }
+
+        let (mut cb, mut cr, mut ca, mut cw, mut cs) = (0, 0, 0, 0, 0);
+        let mut pages: BTreeSet<u32> = BTreeSet::new();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        let mut a = 0;
+        for i in 0..total {
+            let step = &full.steps[i];
+            let ts = step.timestamp;
+            ranges.clear();
+            if let Some(r) = &step.mem_read {
+                ranges.push((r.address, r.size as u32));
+            }
+            if let Some(w) = &step.mem_write {
+                ranges.push((w.address, w.size as u32));
+            }
+            take_at(&full.blake2b_mem_ops, &mut cb, ts, |o| o.ts, |o| {
+                ranges.push((o.h_ptr, o.h_bytes.len() as u32));
+                ranges.push((o.m_ptr, o.m_bytes.len() as u32));
+            });
+            take_at(&full.ristretto_mem_ops, &mut cr, ts, |o| o.ts, |o| {
+                ranges.push((o.scalar_ptr, o.scalar_bytes.len() as u32));
+                ranges.push((o.point_ptr, o.point_bytes.len() as u32));
+                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+            });
+            take_at(&full.ristretto_add_mem_ops, &mut ca, ts, |o| o.ts, |o| {
+                ranges.push((o.p_ptr, o.p_bytes.len() as u32));
+                ranges.push((o.q_ptr, o.q_bytes.len() as u32));
+                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+            });
+            take_at(&full.scalar_reduce_wide_mem_ops, &mut cw, ts, |o| o.ts, |o| {
+                ranges.push((o.wide_ptr, o.wide_bytes.len() as u32));
+                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+            });
+            take_at(&full.scalar_binop_mem_ops, &mut cs, ts, |o| o.ts, |o| {
+                ranges.push((o.a_ptr, o.a_bytes.len() as u32));
+                ranges.push((o.b_ptr, o.b_bytes.len() as u32));
+                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+            });
+
+            for &(addr, len) in &ranges {
+                crate::page_merkle::add_range(&mut pages, addr, len);
+            }
+            // Step i busts the page budget: close the window BEFORE it (the
+            // window keeps at least one step, so a lone oversize step still
+            // segments) and restart the page set from step i's own ranges.
+            if pages.len() > max_pages && i > a {
+                bounds.push((a, i));
+                a = i;
+                pages.clear();
+                for &(addr, len) in &ranges {
+                    crate::page_merkle::add_range(&mut pages, addr, len);
+                }
+            }
+            if i + 1 - a == max_steps || i + 1 == total {
+                bounds.push((a, i + 1));
+                a = i + 1;
+                pages.clear();
+            }
+        }
+        bounds
+    }
 
     /// Slice a fully-traced `SideNote` into the segment covering steps
     /// `[a, b)`. The returned `SideNote` proves independently (in memory
@@ -267,4 +383,92 @@ mod prover {
 #[cfg(feature = "prover")]
 pub(crate) use prover::replay_writes;
 #[cfg(feature = "prover")]
-pub use prover::segment_side_note;
+pub use prover::{segment_bounds_budgeted, segment_side_note};
+
+#[cfg(all(test, feature = "prover"))]
+mod tests {
+    use super::*;
+    use crate::core::step::{MemAccess, NUM_REGS, PvmStep};
+    use crate::page_merkle;
+    use crate::side_note::SideNote;
+    use javm::instruction::Opcode;
+
+    /// A synthetic step at `ts`, optionally writing `size` bytes at `addr`.
+    /// The budgeted walker and `touched_pages` read only
+    /// timestamp/mem_read/mem_write (+ the precompile streams), so the rest
+    /// is inert filler.
+    fn step(ts: u64, write: Option<(u32, u8)>) -> PvmStep {
+        PvmStep {
+            timestamp: ts,
+            pc: 0,
+            opcode: Opcode::Add64,
+            skip_len: 3,
+            regs_before: [0; NUM_REGS],
+            regs_after: [0; NUM_REGS],
+            reg_write: None,
+            reg_a: 0,
+            reg_b: 0,
+            reg_d: 0,
+            imm: 0,
+            imm_y: 0,
+            branch_target: 0,
+            branch_taken: false,
+            mem_read: None,
+            mem_write: write.map(|(address, size)| MemAccess { address, value: 0, size }),
+            gas_after: 0,
+            gas_charged: 0,
+            next_pc: 0,
+            exit: false,
+        }
+    }
+
+    /// 12 steps: 0-3 write page 0, 4-7 spray pages 10..14, 8-11 write page 1.
+    fn spray_trace() -> SideNote {
+        let mut steps = Vec::new();
+        for i in 0..12u64 {
+            let addr = match i {
+                0..=3 => 0x100,
+                4..=7 => ((10 + i as u32 - 4) << page_merkle::PAGE_BITS) + 8,
+                _ => (1 << page_merkle::PAGE_BITS) + 0x40,
+            };
+            steps.push(step(i + 1, Some((addr, 8))));
+        }
+        SideNote::new(steps, vec![Opcode::Trap as u8], vec![1]).with_memory(vec![0u8; 1 << 16])
+    }
+
+    #[test]
+    fn budgeted_bounds_partition_and_hold_budgets() {
+        let full = spray_trace();
+        // Step budget slack (12) isolates the page budget (2): only the
+        // page-spray region (steps 4..8, one fresh page each) forces cuts.
+        let bounds = segment_bounds_budgeted(&full, 12, 2);
+        // Partition: consecutive, gapless, covering [0, total).
+        assert_eq!(bounds.first().unwrap().0, 0);
+        assert_eq!(bounds.last().unwrap().1, full.steps.len());
+        for w in bounds.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "windows must be gapless");
+        }
+        // Budget holds by the multiproof's own page definition.
+        for &(a, b) in &bounds {
+            let slice = segment_side_note(&full, a, b);
+            let pages = page_merkle::touched_pages(&slice);
+            assert!(
+                pages.len() <= 2 || b - a == 1,
+                "page budget violated at [{a},{b}): {} pages",
+                pages.len()
+            );
+        }
+        // Content-awareness: the spray region splits what a pure step cut
+        // would keep whole.
+        assert!(bounds.len() > segment_bounds(full.steps.len(), 12).len());
+    }
+
+    #[test]
+    fn huge_page_budget_degenerates_to_step_cut() {
+        let full = spray_trace();
+        assert_eq!(
+            segment_bounds_budgeted(&full, 5, usize::MAX >> 1),
+            segment_bounds(full.steps.len(), 5),
+        );
+    }
+}

@@ -396,7 +396,7 @@ pub fn build_multiproof_from_leaves(
 
 /// Insert every page overlapped by the byte range `[ptr, ptr + len)`.
 #[cfg(feature = "prover")]
-fn add_range(set: &mut BTreeSet<u32>, ptr: u32, len: u32) {
+pub(crate) fn add_range(set: &mut BTreeSet<u32>, ptr: u32, len: u32) {
     if len == 0 {
         return;
     }
