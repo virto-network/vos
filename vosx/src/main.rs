@@ -27,6 +27,7 @@ mod output;
 mod paths;
 mod shutdown;
 mod spaces_index;
+mod token;
 
 use output::Format;
 use spaces_index::IndexError;

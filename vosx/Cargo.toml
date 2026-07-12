@@ -38,6 +38,10 @@ grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ba1276acff
 # and `Hash` sources, only `Cid` and `Url` resolution touch
 # external services.
 hex = "0.4"
+# base58 (Bitcoin alphabet) for the `vos1…` invite token string —
+# compact, unambiguous, double-click-selectable. Only used by
+# `token.rs`.
+bs58 = "0.5"
 # anyhow is the existing project's only convenience-error crate;
 # the new `space *` commands return Result for clean error
 # bubbling through the clap dispatcher.
