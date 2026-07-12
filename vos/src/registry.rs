@@ -280,6 +280,51 @@ pub struct MemberPage {
     pub more: bool,
 }
 
+// ── Invites ───────────────────────────────────────────────────────
+//
+// An invite is a delegated-grant credential: an admin signs the invite
+// canonical (`space_id, role, expires, token_pub`) with its operator
+// key; a joiner's daemon proves possession of the token secret by
+// signing its own node peer-id, then remotely invokes `redeem_invite`.
+// The registry verifies admin→token→node offline and records the grant.
+// One row per `token_pub`; `redeemed_by` accumulates (sorted, deduped)
+// every peer that redeemed the token so a double-redemption is
+// *detected* (not silently prevented), and `revoked` is a grow-only
+// flag mirroring the `revoke_epochs` monotonicity discipline.
+
+/// One row in the invites table, keyed by `token_pub`.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct InviteRow {
+    /// The invite token's ed25519 public key (raw 32 bytes) — the row's
+    /// identity and the key `redeem_sig` verifies under.
+    pub token_pub: [u8; 32],
+    /// `AUTH_ROLE_*` the token grants. Only offline tiers
+    /// (`READONLY`/`DEVELOPER`) are redeemable; `admin` is refused.
+    pub role: u8,
+    /// Admin-committed expiry (unix seconds). Bound into the signed
+    /// invite canonical, but never compared to a clock in the handler
+    /// (expiry is checked once, host-side, at admission).
+    pub expires_at: u64,
+    /// Every node peer-id that has redeemed this token, sorted +
+    /// deduped so the set converges identically on every replica. More
+    /// than one entry flags a double-redemption for `space members`.
+    pub redeemed_by: Vec<Vec<u8>>,
+    /// Grow-only: once an admin `revoke_invite`s the token, no replayed
+    /// redeem may clear it.
+    pub revoked: bool,
+}
+
+/// One page of [`RegistryRef::invites`]. Cursor is the last-scanned
+/// `token_pub` (empty when the scan reached the end), round-tripped as
+/// `after`.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct InvitePage {
+    pub invites: Vec<InviteRow>,
+    pub next: Vec<u8>,
+}
+
 // ── Result codes ─────────────────────────────────────────────────
 
 /// Status returned by a mutation handler. `Ok` is always `0`.
@@ -1201,6 +1246,84 @@ impl RegistryRef {
                 Msg::new("register_remote")
                     .with("instance_name", instance_name)
                     .with("host_prefix", host_prefix),
+            )
+            .await?,
+        )
+    }
+
+    // ── Invites ───────────────────────────────────────────────────
+
+    /// Redeem an invite token: grant `role` to `peer_id`. Deliberately
+    /// unauthenticated — the two carried signatures ARE the auth. The
+    /// handler verifies `admin_sig` over the invite canonical
+    /// (`invite`, `[space_id, [role], expires_le, token_pub]`) under
+    /// `admin_peer_id` (which must be a current-epoch effective admin),
+    /// and `redeem_sig` over (`redeem_invite`, `[token_pub, peer_id]`)
+    /// under `token_pub`. No expiry check happens here (checked
+    /// host-side at admission).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn redeem_invite<I: Invoker>(
+        &self,
+        inv: &mut I,
+        space_id: Vec<u8>,
+        token_pub: Vec<u8>,
+        role: u8,
+        expires_at: u64,
+        admin_peer_id: Vec<u8>,
+        admin_sig: Vec<u8>,
+        peer_id: Vec<u8>,
+        redeem_sig: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("redeem_invite")
+                    .with("space_id", space_id)
+                    .with("token_pub", token_pub)
+                    .with("role", role)
+                    .with("expires_at", expires_at)
+                    .with("admin_peer_id", admin_peer_id)
+                    .with("admin_sig", admin_sig)
+                    .with("peer_id", peer_id)
+                    .with("redeem_sig", redeem_sig),
+            )
+            .await?,
+        )
+    }
+
+    /// Revoke an invite token (admin-signed). Grow-only: flips the
+    /// token's `revoked` flag so no future redemption succeeds and no
+    /// replayed redeem can clear it. Idempotent.
+    pub async fn revoke_invite<I: Invoker>(
+        &self,
+        inv: &mut I,
+        token_pub: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("revoke_invite")
+                    .with("token_pub", token_pub)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    /// One page of the invites table. Pass an empty `after` to start;
+    /// continue from the returned [`InvitePage::next`] until it comes
+    /// back empty. `budget` caps the page (0 = the registry's max).
+    pub async fn invites<I: Invoker>(
+        &self,
+        inv: &mut I,
+        after: Vec<u8>,
+        budget: u32,
+    ) -> Result<InvitePage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("invites").with("after", after).with("budget", budget),
             )
             .await?,
         )
