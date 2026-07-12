@@ -27,6 +27,18 @@ impl Tally {
         self.total
     }
 
+    /// Like `add`, but also persists an audit row. Task effects fold
+    /// into the invoking parent's keyspace (a Task has no rows of its
+    /// own) — the fixture the effect-log replay gate leans on: replay
+    /// never re-runs the task, so a rebuilt replica gets this row only
+    /// from the recorded invoke effects.
+    #[msg]
+    async fn add_recorded(&mut self, ctx: &mut Context<Self>, n: u64) -> u64 {
+        self.total += n;
+        ctx.store(b"tally/last_add", &n.to_le_bytes());
+        self.total
+    }
+
     /// Multi-step job: each invocation performs one step and yields
     /// until three steps are done — the suspended task is its
     /// TaskRecord, and the parent's drive passes deliver this same

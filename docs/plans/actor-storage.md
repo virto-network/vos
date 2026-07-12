@@ -151,7 +151,8 @@ is already proven at the application layer in cipher-clerk
    does not cover the rows. Provable actors therefore may not use
    storage types until `anchor_kind 0x02` lands (W4). The A10 bug
    (Task non-STATE effects dropped on replica rebuild) additionally
-   gates *Tasks* + storage rows on replicated agents.
+   gated *Tasks* + storage rows on replicated agents — FIXED: invoke
+   effects ride the effect log and replay re-absorbs them.
 8. **Per-value soft cap 4 KiB** (fits `BUF_SIZE`, one `STORAGE_R`
    round-trip). Values past the cap read via the grow-to-exact heap
    path with a hard guest-side error at 64 KiB — a quarter of the heap;
@@ -424,10 +425,10 @@ end-to-end; 0x01 actors byte-for-byte unaffected.
   `task_initial_image` + the tracer patch path (live≡traced gate);
   `__VOS_WITNESS` already carries two layouts (zk pub/sec, VOST task
   input) and the host never checks buffer capacity; the `.vos_meta`
-  storage section appends after the mode section. A10 (Task effects
-  dropped on replica rebuild — and `commit_rebuilt` now actively
-  swaps them away) gates witnessed Tasks on replicated agents: fix
-  A10 first or keep such actors Local.
+  storage section appends after the mode section. A10 is fixed (see
+  open question 4): invoke effects ride the effect log and replay
+  re-absorbs them, so witnessed Tasks on replicated agents are
+  unblocked.
 
 ## Open questions (resolve before the wave that needs them)
 
@@ -491,6 +492,11 @@ end-to-end; 0x01 actors byte-for-byte unaffected.
    The composite is a linear fold (state hash, then field roots in
    declaration order) rather than a balanced tree — field counts are
    tiny and the fold is what the macro can emit cheaply.
-4. **A10 fix ordering** (4.3): witnessed Tasks on replicated agents
-   need the Task-effects-on-rebuild fix; sequence it before 4.4 if the
-   ledger stays Raft/CRDT-replicated in the showcase.
+4. **A10 fix ordering** (4.3): RESOLVED — the effect log now records
+   each depth-1 invoke's absorbed effects (`InvokeEffects`, a trailing
+   wire extension keyed to the reply index) and the replay
+   short-circuit re-absorbs them into the recorded scope, so a rebuilt
+   replica's journal reproduces what the live children did without
+   re-running them. Gate: `replay_reabsorbs_task_effects` (fails with
+   the re-absorb disabled). Witnessed Tasks on replicated agents are
+   unblocked.

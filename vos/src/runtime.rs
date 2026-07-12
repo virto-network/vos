@@ -1896,8 +1896,19 @@ fn run_task_invoke(
 
     // Child state to the parent envelope (echo the input when
     // unchanged); every remaining effect folds into the PARENT's
-    // keyspace — a Task has no rows of its own.
+    // keyspace — a Task has no rows of its own. Under a recording
+    // session, log the effects alongside the invoke output: replay
+    // short-circuits the child, so re-absorbing the recorded effects
+    // is the only way a rebuilt replica gets them.
     let child_state = payload.take_state_write().unwrap_or_else(|| state.to_vec());
+    if !payload.effects.is_empty()
+        && let crate::effect_log::EffectMode::Recording(s) = &mut *mode
+    {
+        s.record_invoke_effects(
+            parent_svc_id,
+            crate::refine_payload::encode_effects(&payload.effects),
+        );
+    }
     journal.absorb_effects(core::mem::take(&mut payload.effects), parent_svc_id);
 
     let status = if payload.continue_next {
@@ -1950,17 +1961,43 @@ fn handle_invoke(
 
     // Replay fast path: at the top-level invoke under a replay
     // session, return the next recorded output instead of running
-    // the child. If the log is exhausted we surface STATUS_PANICKED
-    // — the handler has become non-deterministic (asking more than
-    // we recorded), and the caller should treat the whole rebuild
-    // as a failure.
+    // the child — and re-absorb the side effects the live child
+    // folded into the journal (recorded alongside the output; the
+    // short-circuit skips the child, but its effects are as much
+    // recorded history as the output bytes — without this, every
+    // replica rebuild silently dropped the rows/transfers a Task
+    // produced). If the log is exhausted, or an effects record is
+    // corrupt, surface STATUS_PANICKED — the rebuild has diverged.
     if depth == 1
         && let crate::effect_log::EffectMode::Replaying(replay) = mode
     {
-        let out: alloc::vec::Vec<u8> = match replay.next_reply() {
-            Some(bytes) => bytes.to_vec(),
-            None => alloc::vec![STATUS_PANICKED],
-        };
+        let (out, absorbed): (alloc::vec::Vec<u8>, alloc::vec::Vec<(u32, Vec<Effect>)>) =
+            match replay.next_reply() {
+                Some(bytes) => {
+                    let bytes = bytes.to_vec();
+                    let idx = replay.position() - 1;
+                    let mut absorbed = alloc::vec::Vec::new();
+                    let mut corrupt = false;
+                    for rec in replay.effects_for(idx) {
+                        match crate::refine_payload::decode_effects(&rec.effects) {
+                            Some(effects) => absorbed.push((rec.svc_id, effects)),
+                            None => {
+                                corrupt = true;
+                                break;
+                            }
+                        }
+                    }
+                    if corrupt {
+                        (alloc::vec![STATUS_PANICKED], alloc::vec::Vec::new())
+                    } else {
+                        (bytes, absorbed)
+                    }
+                }
+                None => (alloc::vec![STATUS_PANICKED], alloc::vec::Vec::new()),
+            };
+        for (svc, effects) in absorbed {
+            journal.absorb_effects(effects, svc);
+        }
         kwrite(caller, output_ptr, &out);
         return out.len() as u64;
     }
@@ -2306,10 +2343,21 @@ fn handle_invoke(
 
         // When the child emitted no state write (state unchanged), echo
         // the state the host delivered so scheduler-style TaskRecords
-        // are never silently emptied.
+        // are never silently emptied. Under a recording session, log
+        // the child's effects alongside the invoke output — replay
+        // short-circuits the child, so re-absorbing the record is the
+        // only way a rebuilt replica's journal sees them.
         let child_state = payload
             .take_state_write()
             .unwrap_or_else(|| child_prior_state.clone());
+        if !payload.effects.is_empty()
+            && let crate::effect_log::EffectMode::Recording(s) = &mut *mode
+        {
+            s.record_invoke_effects(
+                target_svc_id.0,
+                crate::refine_payload::encode_effects(&payload.effects),
+            );
+        }
         journal.absorb_effects(core::mem::take(&mut payload.effects), target_svc_id.0);
 
         let status = if payload.continue_next {

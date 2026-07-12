@@ -11212,6 +11212,101 @@ fn task_gate_ask(
     vos::Decode::decode(&bytes)
 }
 
+/// A replayed dispatch must reproduce the side effects its invoked
+/// children folded into the journal. Replay short-circuits every
+/// depth-1 invoke to its recorded output — the child never re-runs —
+/// so the child's effects ride the effect log as invoke-effects
+/// records and re-absorb when the output is popped. Before that, a
+/// replica rebuild silently dropped every row a Task produced (and
+/// the post-replay whole-table persistence made the loss durable);
+/// this is the A10 regression gate.
+#[test]
+fn replay_reabsorbs_task_effects() {
+    use vos::value::Msg;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let witness_addr =
+        vos::zk::witness_addr(&tally_elf).expect("tally must export __VOS_WITNESS") as u32;
+    let tally_blob = transpile_actor(&tally_elf);
+    let sched_blob = transpile_actor(&sched_elf);
+
+    let init_args =
+        vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let init_encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&init_args).unwrap();
+
+    // ── Record: the scheduler drives tally's add_recorded, whose
+    // Write effect folds into the scheduler's keyspace. ─────────
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, sched_blob.clone());
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &init_encoded);
+    let task_hash = rt.register_task_blob(tally_blob.clone(), witness_addr);
+
+    let task_msg = task_gate_dyn_msg(&Msg::new("add_recorded").with("n", 42u64));
+    let dispatch = task_gate_dyn_msg(
+        &Msg::new("run_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", task_msg),
+    );
+    rt.begin_recording(dispatch.clone());
+    rt.send_to(sched_id, dispatch.clone());
+    rt.run_blocking();
+    let log = rt.finish_recording().expect("recording was active");
+    assert_eq!(rt.panics, 0);
+    assert_eq!(
+        rt.storage.read(sched_id, b"tally/last_add"),
+        Some(&42u64.to_le_bytes()[..]),
+        "live: the task's row lands in the parent keyspace",
+    );
+    assert!(
+        !log.invoke_effects.is_empty(),
+        "the recorded log must carry the task's effects",
+    );
+
+    // ── Replay into a fresh runtime: the recorded effects must
+    // materialize without the task ever re-running. ─────────────
+    let mut rt2 = VosRuntime::new();
+    let sched2 = register_svc(&mut rt2, sched_blob);
+    rt2.storage
+        .write(sched2, vos::lifecycle::INIT_KEY, &init_encoded);
+    // Deliberately NO register_task_blob: if replay tried to re-run
+    // the child it would fail loudly instead of silently passing.
+    rt2.begin_replay(log);
+    rt2.send_to(sched2, dispatch);
+    rt2.run_blocking();
+    let replay = rt2.finish_replay().expect("replay was active");
+    assert!(
+        replay.is_complete(),
+        "replay must consume the recorded invoke exactly",
+    );
+    assert_eq!(rt2.panics, 0);
+    assert_eq!(
+        rt2.storage.read(sched2, b"tally/last_add"),
+        Some(&42u64.to_le_bytes()[..]),
+        "replay: the task's recorded effects must re-absorb into the \
+         parent keyspace — the child never re-runs",
+    );
+    // And the rebuilt states agree (the scheduler's own TaskRecord
+    // travels through its state blob either way).
+    assert_eq!(
+        rt.storage.read(sched_id, vos::lifecycle::STATE_KEY_BYTES),
+        rt2.storage.read(sched2, vos::lifecycle::STATE_KEY_BYTES),
+        "replayed scheduler state must match the recorded run",
+    );
+}
+
 #[test]
 fn task_invoke_live_equals_traced() {
     use vos::refine_payload::{ANCHOR_GENESIS, RefinePayload};
