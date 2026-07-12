@@ -164,6 +164,17 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   space-registry + clerk-bridge adoption; W4 `anchor_kind 0x02`
   committed storage (B6 / `vos::zk::state`) + clerk-ledger at 10k
   accounts.
+- **`#[provable]` actor transitions** → `docs/plans/provable.md`:
+  promote the cipher-clerk/voucher-check proof pattern into the
+  framework. A provable Task is a pure VERIFIER — it checks witnessed
+  inputs against an app-named `root_before` via a `vos::zk::state::
+  BatchProof` (inclusion + non-inclusion in-circuit), computes
+  `root_after`, and binds `(root_before, root_after, app-public)` via
+  `bind_public`; the parent applies the mutation live against the
+  attested roots. Plus the durable/split `ProvableRecord` (B4 verify
+  half), a witness-free `verify_record`, and an append-versioned
+  catalog. Design settled after a 4-lens review killed the first draft's
+  `0x02`-in-Task anchor approach (unsound + unbuildable).
 - A11 `vos::task` step-machine combinators; A12 determinism tiers (record
   NOW_MS / deny BOOT_CONTEXT under Crdt/Raft; hostcall-tier marker in
   `.vos_meta`); A13 DAG checkpointing (bounded replay); A15 guest
