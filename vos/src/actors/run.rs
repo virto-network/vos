@@ -684,6 +684,14 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     // `witness_cap` readable bytes.
     let (state, msg) = unsafe { crate::task_abi::read_task_input(witness_ptr, witness_cap) }
         .expect("task input not patched — Task blobs run only under a witness-delivering invoker");
+    // SAFETY: same buffer, same bounds.
+    let rows = unsafe { crate::task_abi::read_task_rows(witness_ptr, witness_cap) }
+        .expect("task witness rows section malformed");
+    // Always seed — even empty. A Task has no live storage (STORAGE_R
+    // is an echo stub under the task hostcall table), so an
+    // unwitnessed handle read must panic as unproven, never misread
+    // the stub.
+    super::storage::seed_witness_rows(rows.into_iter().collect());
 
     let (anchor_kind, anchor) = crate::refine_payload::anchor_for(Some(&state));
     let mut actor = lifecycle::load_or_create::<A>(Some(&state));

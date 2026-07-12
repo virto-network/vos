@@ -6852,18 +6852,18 @@ const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
 /// segment commitment is in this set.
 const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
     // C_0 — comb-free canonical shape.
-    // blake2s 25cc5823902e24a32a720b9621f0411f3535760991941bdd33e71cae9a5df833
+    // blake2s 4e8f886921b2d4751c1ca7699e033b637bd1dc16eaf46faa50d120c12d3065bf
     [
-        0x25, 0xcc, 0x58, 0x23, 0x90, 0x2e, 0x24, 0xa3, 0x2a, 0x72, 0x0b, 0x96, 0x21, 0xf0, 0x41,
-        0x1f, 0x35, 0x35, 0x76, 0x09, 0x91, 0x94, 0x1b, 0xdd, 0x33, 0xe7, 0x1c, 0xae, 0x9a, 0x5d,
-        0xf8, 0x33,
+        0x4e, 0x8f, 0x88, 0x69, 0x21, 0xb2, 0xd4, 0x75, 0x1c, 0x1c, 0xa7, 0x69, 0x9e, 0x03, 0x3b,
+        0x63, 0x7b, 0xd1, 0xdc, 0x16, 0xea, 0xf4, 0x6f, 0xaa, 0x50, 0xd1, 0x20, 0xc1, 0x2d, 0x30,
+        0x65, 0xbf,
     ],
     // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
-    // blake2s 4805c03e1fd0cdfb2abac250352f1714939550cfac10f8900103d571b70d571f
+    // blake2s fc90359b175185680d4df482cabfe5895f01454a0e77c53c7488593a3dfd9354
     [
-        0x48, 0x05, 0xc0, 0x3e, 0x1f, 0xd0, 0xcd, 0xfb, 0x2a, 0xba, 0xc2, 0x50, 0x35, 0x2f, 0x17,
-        0x14, 0x93, 0x95, 0x50, 0xcf, 0xac, 0x10, 0xf8, 0x90, 0x01, 0x03, 0xd5, 0x71, 0xb7, 0x0d,
-        0x57, 0x1f,
+        0xfc, 0x90, 0x35, 0x9b, 0x17, 0x51, 0x85, 0x68, 0x0d, 0x4d, 0xf4, 0x82, 0xca, 0xbf, 0xe5,
+        0x89, 0x5f, 0x01, 0x45, 0x4a, 0x0e, 0x77, 0xc5, 0x3c, 0x74, 0x88, 0x59, 0x3a, 0x3d, 0xfd,
+        0x93, 0x54,
     ],
 ];
 
@@ -11212,6 +11212,205 @@ fn task_gate_ask(
     vos::Decode::decode(&bytes)
 }
 
+/// A replayed dispatch must reproduce the side effects its invoked
+/// children folded into the journal. Replay short-circuits every
+/// depth-1 invoke to its recorded output — the child never re-runs —
+/// so the child's effects ride the effect log as invoke-effects
+/// records and re-absorb when the output is popped. Before that, a
+/// replica rebuild silently dropped every row a Task produced (and
+/// the post-replay whole-table persistence made the loss durable);
+/// this is the A10 regression gate.
+#[test]
+fn replay_reabsorbs_task_effects() {
+    use vos::value::Msg;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let (witness_addr, witness_cap) =
+        vos::zk::witness_symbol(&tally_elf).expect("tally must export __VOS_WITNESS");
+    let tally_blob = transpile_actor(&tally_elf);
+    let sched_blob = transpile_actor(&sched_elf);
+
+    let init_args =
+        vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let init_encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&init_args).unwrap();
+
+    // ── Record: the scheduler drives tally's add_recorded, whose
+    // Write effect folds into the scheduler's keyspace. ─────────
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, sched_blob.clone());
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &init_encoded);
+    let task_hash =
+        rt.register_task_blob(tally_blob.clone(), witness_addr as u32, witness_cap as u32);
+
+    let task_msg = task_gate_dyn_msg(&Msg::new("add_recorded").with("n", 42u64));
+    let dispatch = task_gate_dyn_msg(
+        &Msg::new("run_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", task_msg),
+    );
+    rt.begin_recording(dispatch.clone());
+    rt.send_to(sched_id, dispatch.clone());
+    rt.run_blocking();
+    let log = rt.finish_recording().expect("recording was active");
+    assert_eq!(rt.panics, 0);
+    assert_eq!(
+        rt.storage.read(sched_id, b"tally/last_add"),
+        Some(&42u64.to_le_bytes()[..]),
+        "live: the task's row lands in the parent keyspace",
+    );
+    assert!(
+        !log.invoke_effects.is_empty(),
+        "the recorded log must carry the task's effects",
+    );
+
+    // ── Replay into a fresh runtime: the recorded effects must
+    // materialize without the task ever re-running. ─────────────
+    let mut rt2 = VosRuntime::new();
+    let sched2 = register_svc(&mut rt2, sched_blob);
+    rt2.storage
+        .write(sched2, vos::lifecycle::INIT_KEY, &init_encoded);
+    // Deliberately NO register_task_blob: if replay tried to re-run
+    // the child it would fail loudly instead of silently passing.
+    rt2.begin_replay(log);
+    rt2.send_to(sched2, dispatch);
+    rt2.run_blocking();
+    let replay = rt2.finish_replay().expect("replay was active");
+    assert!(
+        replay.is_complete(),
+        "replay must consume the recorded invoke exactly",
+    );
+    assert_eq!(rt2.panics, 0);
+    assert_eq!(
+        rt2.storage.read(sched2, b"tally/last_add"),
+        Some(&42u64.to_le_bytes()[..]),
+        "replay: the task's recorded effects must re-absorb into the \
+         parent keyspace — the child never re-runs",
+    );
+    // And the rebuilt states agree (the scheduler's own TaskRecord
+    // travels through its state blob either way).
+    assert_eq!(
+        rt.storage.read(sched_id, vos::lifecycle::STATE_KEY_BYTES),
+        rt2.storage.read(sched2, vos::lifecycle::STATE_KEY_BYTES),
+        "replayed scheduler state must match the recorded run",
+    );
+}
+
+/// The witnessed-read backend (docs/plans/actor-storage.md W4.3):
+/// a Task has no live storage — its `STORAGE_R` is an echo stub — so
+/// its storage-handle reads are served from rows the invoking parent
+/// NAMED, which the host resolves against the parent's effective
+/// keyspace and stages into the child's witness buffer. Present rows
+/// read through; named-but-absent rows read as proven-absent; a key
+/// the parent never named panics the child as an unproven read.
+#[test]
+fn task_storage_reads_come_from_the_witness() {
+    use vos::value::Msg;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let (witness_addr, witness_cap) =
+        vos::zk::witness_symbol(&tally_elf).expect("tally must export __VOS_WITNESS");
+    let tally_blob = transpile_actor(&tally_elf);
+
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    let task_hash = rt.register_task_blob(tally_blob, witness_addr as u32, witness_cap as u32);
+
+    // Tally's map rows live under `s/saved/v<key BE>` — write two into
+    // the PARENT's keyspace (the task reads the parent's rows).
+    let row_key = |k: u64| -> Vec<u8> {
+        let mut key = b"s/saved/v".to_vec();
+        key.extend_from_slice(&k.to_be_bytes());
+        key
+    };
+    rt.storage.write(sched_id, &row_key(7), &vos::Encode::encode(&100u64));
+    rt.storage.write(sched_id, &row_key(9), &vos::Encode::encode(&11u64));
+
+    let run_with_keys = |rt: &mut VosRuntime, a: u64, b: u64, named: &[u64]| -> u64 {
+        let task_msg = task_gate_dyn_msg(&Msg::new("add_saved").with("a", a).with("b", b));
+        let keys: Vec<Vec<u8>> = named.iter().map(|&k| row_key(k)).collect();
+        let keys_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&keys)
+            .expect("encode row keys")
+            .to_vec();
+        task_gate_ask(
+            rt,
+            sched_id,
+            &Msg::new("run_task_rows")
+                .with("code_hash", task_hash.to_vec())
+                .with("task_msg", task_msg)
+                .with("row_keys", keys_bytes),
+        )
+        .as_u64()
+        .expect("run_task_rows replies the task id")
+    };
+
+    // Present + present: both witnessed values fold in.
+    let id = run_with_keys(&mut rt, 7, 9, &[7, 9]);
+    let reply = task_gate_ask(&mut rt, sched_id, &Msg::new("task_reply").with("id", id))
+        .as_bytes()
+        .expect("task_reply bytes")
+        .to_vec();
+    let value: vos::value::Value = vos::Decode::decode(&reply);
+    assert_eq!(
+        value,
+        vos::value::Value::U64(111),
+        "witnessed rows must serve the task's storage reads"
+    );
+    assert_eq!(rt.panics, 0);
+
+    // Present + named-but-absent: the absent row is proven absent and
+    // counts zero — no panic.
+    let id = run_with_keys(&mut rt, 7, 1234, &[7, 1234]);
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", id));
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Done as u32),
+        "a named-but-absent row is proven absent, not a failure"
+    );
+    assert_eq!(rt.panics, 0);
+
+    // Unnamed key: the task's read is unproven — the child panics
+    // (surfacing as Panicked, or OutOfGas where the guest's abort
+    // handler spins the meter down) and the record keeps the failure;
+    // the parent is unharmed.
+    let id = run_with_keys(&mut rt, 7, 9, &[7]);
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", id))
+        .as_u32()
+        .expect("task_status replies");
+    assert!(
+        status == vos::agent::TaskStatus::Panicked as u32
+            || status == vos::agent::TaskStatus::OutOfGas as u32,
+        "an unproven read must fail the task loudly (got status {status})"
+    );
+}
+
 #[test]
 fn task_invoke_live_equals_traced() {
     use vos::refine_payload::{ANCHOR_GENESIS, RefinePayload};
@@ -11230,8 +11429,8 @@ fn task_invoke_live_equals_traced() {
         }
     };
     let tally_elf = example_elf("tally");
-    let witness_addr =
-        vos::zk::witness_addr(&tally_elf).expect("tally must export __VOS_WITNESS") as u32;
+    let (witness_addr, witness_cap) =
+        vos::zk::witness_symbol(&tally_elf).expect("tally must export __VOS_WITNESS");
     let tally_blob = transpile_actor(&tally_elf);
 
     let mut rt = VosRuntime::new();
@@ -11239,7 +11438,8 @@ fn task_invoke_live_equals_traced() {
     let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
-    let task_hash = rt.register_task_blob(tally_blob.clone(), witness_addr);
+    let task_hash =
+        rt.register_task_blob(tally_blob.clone(), witness_addr as u32, witness_cap as u32);
 
     // ── Live: the scheduler spawns Child::Task(tally) with add(5) and
     // drives it to Done inside one dispatch. ─────────────────────────
@@ -11282,7 +11482,7 @@ fn task_invoke_live_equals_traced() {
     // prover-patched image byte for byte over the blob-declared pages
     // (the live arena may map extra heap beyond them).
     let live_img = rt
-        .task_initial_image(&task_hash, &[], &add_msg)
+        .task_initial_image(&task_hash, &[], &add_msg, &[])
         .expect("live task image");
     let (mut interp, mut traced_img) =
         zkpvm::actor::interpreter_from_blob(&tally_blob, 100_000_000).expect("parse tally blob");
@@ -11378,8 +11578,8 @@ fn task_suspension_resumes_through_task_record() {
         }
     };
     let tally_elf = example_elf("tally");
-    let witness_addr =
-        vos::zk::witness_addr(&tally_elf).expect("tally must export __VOS_WITNESS") as u32;
+    let (witness_addr, witness_cap) =
+        vos::zk::witness_symbol(&tally_elf).expect("tally must export __VOS_WITNESS");
     let tally_blob = transpile_actor(&tally_elf);
 
     let mut rt = VosRuntime::new();
@@ -11387,7 +11587,7 @@ fn task_suspension_resumes_through_task_record() {
     let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
-    let task_hash = rt.register_task_blob(tally_blob, witness_addr);
+    let task_hash = rt.register_task_blob(tally_blob, witness_addr as u32, witness_cap as u32);
 
     let work_msg = task_gate_dyn_msg(&Msg::new("work"));
     // The job yields, so run_task's dispatch chains into self-tick

@@ -307,11 +307,59 @@ pub fn invoke_raw(service_id: u32, message: &[u8], state: &[u8]) -> InvokeResult
 /// Same input packing and output envelope as [`invoke_raw`].
 #[cfg(feature = "pvm")]
 pub fn invoke_hash(code_hash: &[u8; 32], message: &[u8], state: &[u8]) -> InvokeResult {
-    let total = 4 + state.len() + message.len();
-    let mut input = alloc::vec![0u8; total];
-    input[0..4].copy_from_slice(&(state.len() as u32).to_le_bytes());
-    input[4..4 + state.len()].copy_from_slice(state);
-    input[4 + state.len()..].copy_from_slice(message);
+    invoke_hash_with_rows(code_hash, message, state, &[])
+}
+
+/// Flag bit in the invoke input's leading `state_len` word marking the
+/// extended layout that carries witnessed-row keys. State blobs are
+/// nowhere near 2 GiB, so the bit is otherwise dead; legacy inputs
+/// (and every service invoke) keep the flag clear and parse as
+/// `[state_len:4][state][msg]`.
+pub const INVOKE_INPUT_HAS_ROWS: u32 = 0x8000_0000;
+
+/// [`invoke_hash`] plus the storage row keys the Task's witnessed
+/// reads need. The host resolves each key against the invoking
+/// parent's effective keyspace and stages the present rows into the
+/// child's witness buffer — a Task reads the parent's rows and folds
+/// its effects back into the parent, so the parent names what the
+/// child may see. Named-but-absent keys stage as proven-absent, so
+/// the child's reads of them return absent; a key the caller never
+/// named panics the child's witnessed backend (an unproven read),
+/// the fail-loud the refine-pure contract wants.
+///
+/// Extended input layout (flagged by [`INVOKE_INPUT_HAS_ROWS`]):
+/// ```text
+/// [state_len|FLAG: u32][state][n_keys: u32]([key_len: u16][key])*[msg]
+/// ```
+#[cfg(feature = "pvm")]
+pub fn invoke_hash_with_rows(
+    code_hash: &[u8; 32],
+    message: &[u8],
+    state: &[u8],
+    row_keys: &[&[u8]],
+) -> InvokeResult {
+    let keys_len: usize = if row_keys.is_empty() {
+        0
+    } else {
+        4 + row_keys.iter().map(|k| 2 + k.len()).sum::<usize>()
+    };
+    let total = 4 + state.len() + keys_len + message.len();
+    let mut input = Vec::with_capacity(total);
+    let len_word = if row_keys.is_empty() {
+        state.len() as u32
+    } else {
+        state.len() as u32 | INVOKE_INPUT_HAS_ROWS
+    };
+    input.extend_from_slice(&len_word.to_le_bytes());
+    input.extend_from_slice(state);
+    if !row_keys.is_empty() {
+        input.extend_from_slice(&(row_keys.len() as u32).to_le_bytes());
+        for key in row_keys {
+            input.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            input.extend_from_slice(key);
+        }
+    }
+    input.extend_from_slice(message);
 
     let hash = *code_hash;
     // Reply buffer. Kept on the stack at BUF_SIZE: heap-allocating a

@@ -213,13 +213,22 @@ pub unsafe fn read_witness_buffer(ptr: *const u8, cap: usize) -> Option<Witness>
 /// then hands both to the (ELF-agnostic) prover.
 #[cfg(feature = "std")]
 pub fn witness_addr(elf: &[u8]) -> Option<u64> {
+    witness_symbol(elf).map(|(addr, _)| addr)
+}
+
+/// `(address, size)` of the `__VOS_WITNESS` buffer. The size is the
+/// buffer's declared capacity — the host must refuse to patch an input
+/// past it (a fixed static in the guest image; an over-capacity write
+/// would silently overwrite adjacent `.bss`).
+#[cfg(feature = "std")]
+pub fn witness_symbol(elf: &[u8]) -> Option<(u64, u64)> {
     use object::{Object, ObjectSymbol};
     let obj = object::File::parse(elf).ok()?;
     for sym in obj.symbols() {
         if sym.name().ok() == Some("__VOS_WITNESS") {
             let addr = sym.address();
             if addr != 0 {
-                return Some(addr);
+                return Some((addr, sym.size()));
             }
         }
     }

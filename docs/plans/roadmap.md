@@ -148,9 +148,10 @@ stands in for the on-chain settlement venue Wave 2 makes real.
 - Always-run regression fixtures for guest-side money-path behaviors
   (fieldless-self-tell anchor, mid-chain panic reply-drop, child-invoke
   rollback) — currently ELF-gated.
-- **A10 pre-req**: a Task's non-STATE effects are dropped on replica
-  rebuild (DAG replay short-circuits depth-1 invokes) — fix before wiring
-  Tasks into replicated agents.
+- **A10 pre-req**: FIXED — the effect log records each depth-1
+  invoke's absorbed effects alongside its output, and the replay
+  short-circuit re-absorbs them (`replay_reabsorbs_task_effects` is
+  the gate). Tasks can now run on replicated agents.
 
 **VOS-core continuation**
 - **Actor storage scale-out** → `docs/plans/actor-storage.md`: typed

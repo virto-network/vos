@@ -50,6 +50,26 @@ pub const CALLER_SYSTEM: CallerPrefix = [1, 0, 0, 0, 0];
 /// payloads. Configurable per-node and per-worker.
 pub const DEFAULT_REPLY_CAP: usize = 16 * 1024;
 
+/// Side effects an invoked child folded into the journal while the
+/// enclosing depth-1 invoke ran — a Task child's rows/transfers fold
+/// into the invoking parent's keyspace, a peer child's into its own.
+/// Replay short-circuits the child to its recorded output, so these
+/// must be re-absorbed when that output is popped: without them a
+/// replica rebuild silently drops every effect a child produced, and
+/// the post-replay whole-table persistence then makes the loss
+/// durable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvokeEffects {
+    /// Index into [`EffectLog::replies`] of the depth-1 invoke output
+    /// these effects accompanied.
+    pub reply_idx: u64,
+    /// The service scope the live run absorbed them into.
+    pub svc_id: u32,
+    /// The effects, in the `RefinePayload` effect wire encoding
+    /// (`refine_payload::encode_effects`).
+    pub effects: Vec<u8>,
+}
+
 /// Ordered log of reply bytes captured during one dispatch.
 ///
 /// Stored inside a CRDT actor's DAG node together with the incoming
@@ -76,6 +96,10 @@ pub struct EffectLog {
     /// the message with exactly these so gate decisions reproduce
     /// (see [`CallerPrefix`]). [`CALLER_SYSTEM`] for legacy logs.
     pub caller_prefix: CallerPrefix,
+    /// Side effects invoked children absorbed into the journal, keyed
+    /// to the reply they rode with. Empty for dispatches whose invokes
+    /// produced no effects (and for every ask reply).
+    pub invoke_effects: Vec<InvokeEffects>,
 }
 
 impl EffectLog {
@@ -87,6 +111,7 @@ impl EffectLog {
             anchor_kind: ANCHOR_UNRECORDED,
             anchor: [0u8; 32],
             caller_prefix: CALLER_SYSTEM,
+            invoke_effects: Vec::new(),
         }
     }
 
@@ -135,7 +160,14 @@ impl EffectLog {
     /// [msg_len:u64 LE][msg][n_replies:u64 LE]
     /// ( [reply_len:u64 LE][reply] )*
     /// [anchor_kind:u8][anchor:32B][caller_prefix:5B]
+    /// [n_invoke_effects:u64 LE]
+    /// ( [reply_idx:u64 LE][svc_id:u32 LE][len:u64 LE][effects] )*
     /// ```
+    ///
+    /// The invoke-effects section is a trailing extension: it is
+    /// omitted entirely when empty, and decoders treat its absence as
+    /// empty — logs recorded before the section existed keep their
+    /// CIDs and replay with their historical semantics.
     ///
     /// The encoding is deterministic and unambiguous, so two
     /// replicas observing the same dispatch produce the same bytes
@@ -154,6 +186,15 @@ impl EffectLog {
         buf.push(self.anchor_kind);
         buf.extend_from_slice(&self.anchor);
         buf.extend_from_slice(&self.caller_prefix);
+        if !self.invoke_effects.is_empty() {
+            buf.extend_from_slice(&(self.invoke_effects.len() as u64).to_le_bytes());
+            for rec in &self.invoke_effects {
+                buf.extend_from_slice(&rec.reply_idx.to_le_bytes());
+                buf.extend_from_slice(&rec.svc_id.to_le_bytes());
+                buf.extend_from_slice(&(rec.effects.len() as u64).to_le_bytes());
+                buf.extend_from_slice(&rec.effects);
+            }
+        }
         buf
     }
 
@@ -176,8 +217,8 @@ impl EffectLog {
             replies.push(take(bytes, &mut pos, len)?.to_vec());
         }
 
-        let (anchor_kind, anchor, caller_prefix) = if pos == bytes.len() {
-            (ANCHOR_UNRECORDED, [0u8; 32], CALLER_SYSTEM)
+        let (anchor_kind, anchor, caller_prefix, invoke_effects) = if pos == bytes.len() {
+            (ANCHOR_UNRECORDED, [0u8; 32], CALLER_SYSTEM, Vec::new())
         } else {
             let kind = *bytes.get(pos)?;
             pos += 1;
@@ -185,10 +226,31 @@ impl EffectLog {
             anchor.copy_from_slice(take(bytes, &mut pos, 32)?);
             let mut prefix = [0u8; 5];
             prefix.copy_from_slice(take(bytes, &mut pos, 5)?);
-            if pos != bytes.len() {
-                return None;
-            }
-            (kind, anchor, prefix)
+            // Trailing invoke-effects section; absent = empty (logs
+            // recorded before the section existed keep their CIDs).
+            let effects = if pos == bytes.len() {
+                Vec::new()
+            } else {
+                let n = read_u64(bytes, &mut pos)? as usize;
+                let mut records = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let reply_idx = read_u64(bytes, &mut pos)?;
+                    let svc_bytes = take(bytes, &mut pos, 4)?;
+                    let svc_id = u32::from_le_bytes(svc_bytes.try_into().ok()?);
+                    let len = read_u64(bytes, &mut pos)? as usize;
+                    let effects = take(bytes, &mut pos, len)?.to_vec();
+                    records.push(InvokeEffects {
+                        reply_idx,
+                        svc_id,
+                        effects,
+                    });
+                }
+                if pos != bytes.len() {
+                    return None;
+                }
+                records
+            };
+            (kind, anchor, prefix, effects)
         };
         Some(Self {
             msg,
@@ -196,6 +258,7 @@ impl EffectLog {
             anchor_kind,
             anchor,
             caller_prefix,
+            invoke_effects,
         })
     }
 }
@@ -367,6 +430,20 @@ impl EffectSession {
         self.log.record_reply(reply);
     }
 
+    /// Record side effects an invoked child absorbed into the journal
+    /// under `svc_id` (`effects` in the `RefinePayload` wire encoding).
+    /// Attaches to the NEXT reply to be recorded — the absorb sites
+    /// run before the invoke's output envelope is appended, including
+    /// nested absorbs inside a still-running depth-1 child.
+    pub fn record_invoke_effects(&mut self, svc_id: u32, effects: Vec<u8>) {
+        let reply_idx = self.log.replies.len() as u64;
+        self.log.invoke_effects.push(InvokeEffects {
+            reply_idx,
+            svc_id,
+            effects,
+        });
+    }
+
     /// Number of replies recorded so far.
     pub fn reply_count(&self) -> usize {
         self.log.reply_count()
@@ -422,6 +499,18 @@ impl EffectReplay {
     /// Number of replies already consumed.
     pub fn position(&self) -> usize {
         self.pos
+    }
+
+    /// The invoke-effects records attached to the reply at `idx`
+    /// (the reply [`next_reply`](Self::next_reply) just returned is
+    /// index `position() - 1`). The replaying invoke short-circuit
+    /// re-absorbs these — the child never re-runs, but its journal
+    /// effects are recorded history.
+    pub fn effects_for(&self, idx: usize) -> impl Iterator<Item = &InvokeEffects> {
+        self.log
+            .invoke_effects
+            .iter()
+            .filter(move |rec| rec.reply_idx as usize == idx)
     }
 
     /// Did the replay consume every recorded reply?
@@ -549,6 +638,56 @@ mod tests {
         let mut bytes = log.to_bytes();
         bytes.push(0xff);
         assert!(EffectLog::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn invoke_effects_roundtrip_and_replay_lookup() {
+        // A session recording two invokes: the first absorbed effects
+        // into two scopes (a nested absorb plus the depth-1 child's),
+        // the second none, and a plain ask reply in between.
+        let mut s = EffectSession::new(b"dispatch".to_vec());
+        s.record_invoke_effects(7, b"fx-a".to_vec());
+        s.record_invoke_effects(9, b"fx-b".to_vec());
+        s.record(b"task-output".to_vec()); // reply 0 — both records attach here
+        s.record(b"ask-reply".to_vec()); // reply 1 — no effects
+        s.record(b"invoke-2".to_vec()); // reply 2 — no effects
+        let log = s.into_log();
+
+        let bytes = log.to_bytes();
+        let decoded = EffectLog::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, log);
+
+        let mut replay = EffectReplay::new(decoded);
+        assert_eq!(replay.next_reply(), Some(&b"task-output"[..]));
+        let recs: Vec<(u32, &[u8])> = replay
+            .effects_for(replay.position() - 1)
+            .map(|r| (r.svc_id, r.effects.as_slice()))
+            .collect();
+        assert_eq!(recs, vec![(7, &b"fx-a"[..]), (9, &b"fx-b"[..])]);
+        assert_eq!(replay.next_reply(), Some(&b"ask-reply"[..]));
+        assert_eq!(replay.effects_for(replay.position() - 1).count(), 0);
+        assert_eq!(replay.next_reply(), Some(&b"invoke-2"[..]));
+        assert_eq!(replay.effects_for(replay.position() - 1).count(), 0);
+        assert!(replay.is_complete());
+    }
+
+    #[test]
+    fn invoke_effects_section_is_a_trailing_extension() {
+        // A log without invoke effects encodes WITHOUT the section —
+        // byte-identical to the pre-section encoding, so existing DAG
+        // CIDs stand. A truncated section rejects.
+        let mut log = EffectLog::for_msg(b"m".to_vec());
+        log.record_reply(b"r".to_vec());
+        let plain = log.to_bytes();
+        log.invoke_effects.push(InvokeEffects {
+            reply_idx: 0,
+            svc_id: 3,
+            effects: b"fx".to_vec(),
+        });
+        let extended = log.to_bytes();
+        assert_eq!(&extended[..plain.len()], &plain[..], "prefix-stable");
+        assert!(extended.len() > plain.len());
+        assert!(EffectLog::from_bytes(&extended[..extended.len() - 1]).is_none());
     }
 
     #[test]

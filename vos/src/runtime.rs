@@ -615,7 +615,7 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// makes a full-hash INVOKE run in Task mode: `(state, msg)`
     /// patched into the initial image, tracer-parity hostcalls, no
     /// child rows, effects folded into the parent's keyspace.
-    task_witness: HashMap<[u8; 32], u32>,
+    task_witness: HashMap<[u8; 32], (u32, u32)>,
     services: HashMap<u32, ServiceInfo>,
     next_id: u32,
     pub storage: ServiceStorage,
@@ -872,10 +872,15 @@ impl<D: DataLayer> VosRuntime<D> {
     /// layout). Returns the content hash parents invoke by. Tasks get no
     /// ServiceId and no storage row; a full-hash INVOKE of this hash
     /// runs witness-delivered.
-    pub fn register_task_blob(&mut self, blob: Vec<u8>, witness_addr: u32) -> [u8; 32] {
+    pub fn register_task_blob(
+        &mut self,
+        blob: Vec<u8>,
+        witness_addr: u32,
+        witness_cap: u32,
+    ) -> [u8; 32] {
         let hash = blob_hash(&blob);
         self.register_blob(blob);
-        self.task_witness.insert(hash, witness_addr);
+        self.task_witness.insert(hash, (witness_addr, witness_cap));
         hash
     }
 
@@ -890,11 +895,15 @@ impl<D: DataLayer> VosRuntime<D> {
         code_hash: &[u8; 32],
         state: &[u8],
         msg: &[u8],
+        rows: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Option<Vec<u8>> {
-        let &witness_addr = self.task_witness.get(code_hash)?;
+        let &(witness_addr, witness_cap) = self.task_witness.get(code_hash)?;
         let &blob_idx = self.blob_by_hash.get(code_hash)?;
         let blob = self.blobs.get(blob_idx)?;
-        let input = crate::task_abi::encode_task_input(state, msg);
+        let input = crate::task_abi::encode_task_input_with_rows(state, msg, rows);
+        if input.len() > witness_cap as usize {
+            return None;
+        }
         let kernel = build_task_kernel(
             blob,
             witness_addr,
@@ -1345,7 +1354,7 @@ fn run_refine_kernel(
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
-    task_witness: &HashMap<[u8; 32], u32>,
+    task_witness: &HashMap<[u8; 32], (u32, u32)>,
     services: &HashMap<u32, ServiceInfo>,
     mode: &mut crate::effect_log::EffectMode,
     code_cache: &mut javm::CodeCache,
@@ -1414,7 +1423,7 @@ fn handle_refine_hostcall(
     preimages: &HashMap<[u8; 32], Vec<u8>>,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
-    task_witness: &HashMap<[u8; 32], u32>,
+    task_witness: &HashMap<[u8; 32], (u32, u32)>,
     services: &HashMap<u32, ServiceInfo>,
     code_cache: &mut javm::CodeCache,
     depth: usize,
@@ -1682,17 +1691,49 @@ fn record_and_write_invoke(
     output.len() as u64
 }
 
-/// Split an invoke input `[state_len: u32 LE][state][msg]` into its
-/// halves. Inputs shorter than the length prefix are all message
-/// (legacy raw invokes).
-fn split_invoke_input(input: &[u8]) -> (&[u8], &[u8]) {
-    if input.len() >= 4 {
-        let state_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
-        let state_end = (4 + state_len).min(input.len());
-        (&input[4..state_end], &input[state_end..])
-    } else {
-        (&[], input)
+/// Split an invoke input into `(state, witnessed-row keys, msg)`.
+/// The base layout is `[state_len: u32 LE][state][msg]`; the extended
+/// layout (flag bit in the length word — see
+/// `lifecycle::invoke_hash_with_rows`) carries the row keys the caller
+/// named between the state and the message. Inputs shorter than the
+/// length prefix are all message (legacy raw invokes). A malformed
+/// keys section degrades to "no keys, rest is message": the child then
+/// panics on its first unproven read instead of the host guessing.
+fn split_invoke_input(input: &[u8]) -> (&[u8], alloc::vec::Vec<&[u8]>, &[u8]) {
+    if input.len() < 4 {
+        return (&[], alloc::vec::Vec::new(), input);
     }
+    let len_word = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+    let state_len = (len_word & !crate::lifecycle::INVOKE_INPUT_HAS_ROWS) as usize;
+    let state_end = (4 + state_len).min(input.len());
+    let state = &input[4..state_end];
+    let mut rest = &input[state_end..];
+    let mut row_keys = alloc::vec::Vec::new();
+    if len_word & crate::lifecycle::INVOKE_INPUT_HAS_ROWS != 0 && rest.len() >= 4 {
+        let n = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let mut at = 4;
+        let mut keys = alloc::vec::Vec::with_capacity(n);
+        let mut ok = true;
+        for _ in 0..n {
+            if at + 2 > rest.len() {
+                ok = false;
+                break;
+            }
+            let klen = u16::from_le_bytes([rest[at], rest[at + 1]]) as usize;
+            at += 2;
+            if at + klen > rest.len() {
+                ok = false;
+                break;
+            }
+            keys.push(&rest[at..at + klen]);
+            at += klen;
+        }
+        if ok {
+            row_keys = keys;
+            rest = &rest[at..];
+        }
+    }
+    (state, row_keys, rest)
 }
 
 /// Build a Task child's kernel: fresh instance from the blob, VOS
@@ -1786,9 +1827,11 @@ fn run_task_invoke(
     caller: &mut InvocationKernel,
     blob: &[u8],
     witness_addr: u32,
+    witness_cap: u32,
     parent_svc_id: u32,
     state: &[u8],
     msg: &[u8],
+    rows: &[(Vec<u8>, Option<Vec<u8>>)],
     gas: Gas,
     journal: &mut RefineJournal,
     code_cache: &mut javm::CodeCache,
@@ -1797,9 +1840,24 @@ fn run_task_invoke(
     depth: usize,
     mode: &mut crate::effect_log::EffectMode,
 ) -> u64 {
-    use crate::actors::run::{STATUS_DONE, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED};
+    use crate::actors::run::{
+        STATUS_DONE, STATUS_OOG, STATUS_PANICKED, STATUS_TOO_BIG, STATUS_YIELDED,
+    };
 
-    let input = crate::task_abi::encode_task_input(state, msg);
+    let input = crate::task_abi::encode_task_input_with_rows(state, msg, rows);
+    // The witness buffer is a fixed static in the child's image — an
+    // over-capacity input would silently overwrite adjacent .bss.
+    // Refuse host-side with the status the guest already understands.
+    if input.len() > witness_cap as usize {
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_TOO_BIG],
+            depth,
+            mode,
+        );
+    }
     let Some(mut child) = build_task_kernel(blob, witness_addr, &input, gas, code_cache) else {
         return record_and_write_invoke(
             caller,
@@ -1896,8 +1954,19 @@ fn run_task_invoke(
 
     // Child state to the parent envelope (echo the input when
     // unchanged); every remaining effect folds into the PARENT's
-    // keyspace — a Task has no rows of its own.
+    // keyspace — a Task has no rows of its own. Under a recording
+    // session, log the effects alongside the invoke output: replay
+    // short-circuits the child, so re-absorbing the recorded effects
+    // is the only way a rebuilt replica gets them.
     let child_state = payload.take_state_write().unwrap_or_else(|| state.to_vec());
+    if !payload.effects.is_empty()
+        && let crate::effect_log::EffectMode::Recording(s) = &mut *mode
+    {
+        s.record_invoke_effects(
+            parent_svc_id,
+            crate::refine_payload::encode_effects(&payload.effects),
+        );
+    }
     journal.absorb_effects(core::mem::take(&mut payload.effects), parent_svc_id);
 
     let status = if payload.continue_next {
@@ -1922,7 +1991,7 @@ fn handle_invoke(
     parent_svc_id: u32,
     blobs: &[Vec<u8>],
     blob_by_hash: &HashMap<[u8; 32], usize>,
-    task_witness: &HashMap<[u8; 32], u32>,
+    task_witness: &HashMap<[u8; 32], (u32, u32)>,
     services: &HashMap<u32, ServiceInfo>,
     storage: &mut ServiceStorage,
     preimages: &HashMap<[u8; 32], Vec<u8>>,
@@ -1950,17 +2019,43 @@ fn handle_invoke(
 
     // Replay fast path: at the top-level invoke under a replay
     // session, return the next recorded output instead of running
-    // the child. If the log is exhausted we surface STATUS_PANICKED
-    // — the handler has become non-deterministic (asking more than
-    // we recorded), and the caller should treat the whole rebuild
-    // as a failure.
+    // the child — and re-absorb the side effects the live child
+    // folded into the journal (recorded alongside the output; the
+    // short-circuit skips the child, but its effects are as much
+    // recorded history as the output bytes — without this, every
+    // replica rebuild silently dropped the rows/transfers a Task
+    // produced). If the log is exhausted, or an effects record is
+    // corrupt, surface STATUS_PANICKED — the rebuild has diverged.
     if depth == 1
         && let crate::effect_log::EffectMode::Replaying(replay) = mode
     {
-        let out: alloc::vec::Vec<u8> = match replay.next_reply() {
-            Some(bytes) => bytes.to_vec(),
-            None => alloc::vec![STATUS_PANICKED],
-        };
+        let (out, absorbed): (alloc::vec::Vec<u8>, alloc::vec::Vec<(u32, Vec<Effect>)>) =
+            match replay.next_reply() {
+                Some(bytes) => {
+                    let bytes = bytes.to_vec();
+                    let idx = replay.position() - 1;
+                    let mut absorbed = alloc::vec::Vec::new();
+                    let mut corrupt = false;
+                    for rec in replay.effects_for(idx) {
+                        match crate::refine_payload::decode_effects(&rec.effects) {
+                            Some(effects) => absorbed.push((rec.svc_id, effects)),
+                            None => {
+                                corrupt = true;
+                                break;
+                            }
+                        }
+                    }
+                    if corrupt {
+                        (alloc::vec![STATUS_PANICKED], alloc::vec::Vec::new())
+                    } else {
+                        (bytes, absorbed)
+                    }
+                }
+                None => (alloc::vec![STATUS_PANICKED], alloc::vec::Vec::new()),
+            };
+        for (svc, effects) in absorbed {
+            journal.absorb_effects(effects, svc);
+        }
         kwrite(caller, output_ptr, &out);
         return out.len() as u64;
     }
@@ -1982,12 +2077,28 @@ fn handle_invoke(
     // witness-delivered — `(state, msg)` patched into the initial
     // image, no ServiceId, no storage row, effects folded into the
     // invoking parent's keyspace.
-    if let Some(&witness_addr) = task_witness.get(&code_hash)
+    if let Some(&(witness_addr, witness_cap)) = task_witness.get(&code_hash)
         && let Some(&blob_idx) = blob_by_hash.get(&code_hash)
         && let Some(blob) = blobs.get(blob_idx)
     {
         let input = kread(caller, input_ptr, input_len);
-        let (state, msg) = split_invoke_input(&input);
+        let (state, row_keys, msg) = split_invoke_input(&input);
+        // Resolve the caller-named row keys against the invoking
+        // parent's EFFECTIVE keyspace (the same overlay its own reads
+        // see) — a Task reads the parent's rows and folds its effects
+        // back into the parent, so the parent names what the child may
+        // see. Named-but-absent keys stage as proven-absent (the
+        // witnessed read returns absent); only a key the caller never
+        // named panics as unproven.
+        let rows: alloc::vec::Vec<(Vec<u8>, Option<Vec<u8>>)> = row_keys
+            .iter()
+            .map(|key| {
+                let value = journal
+                    .effective_read(storage, parent_svc_id, key)
+                    .map(|value| value.to_vec());
+                (key.to_vec(), value)
+            })
+            .collect();
         let gas = if gas_limit == 0 {
             DEFAULT_GAS
         } else {
@@ -1997,9 +2108,11 @@ fn handle_invoke(
             caller,
             blob,
             witness_addr,
+            witness_cap,
             parent_svc_id,
             state,
             msg,
+            &rows,
             gas,
             journal,
             code_cache,
@@ -2306,10 +2419,21 @@ fn handle_invoke(
 
         // When the child emitted no state write (state unchanged), echo
         // the state the host delivered so scheduler-style TaskRecords
-        // are never silently emptied.
+        // are never silently emptied. Under a recording session, log
+        // the child's effects alongside the invoke output — replay
+        // short-circuits the child, so re-absorbing the record is the
+        // only way a rebuilt replica's journal sees them.
         let child_state = payload
             .take_state_write()
             .unwrap_or_else(|| child_prior_state.clone());
+        if !payload.effects.is_empty()
+            && let crate::effect_log::EffectMode::Recording(s) = &mut *mode
+        {
+            s.record_invoke_effects(
+                target_svc_id.0,
+                crate::refine_payload::encode_effects(&payload.effects),
+            );
+        }
         journal.absorb_effects(core::mem::take(&mut payload.effects), target_svc_id.0);
 
         let status = if payload.continue_next {

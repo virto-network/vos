@@ -418,6 +418,35 @@ pub fn encode_v2(
     out
 }
 
+/// Encode a standalone effect list — `[count:u16 LE]` then each effect
+/// in the payload wire encoding. The effect log's invoke records carry
+/// these so a replayed depth-1 invoke can re-absorb the side effects
+/// its child folded into the journal (replay short-circuits the child,
+/// but the effects are as much recorded history as the output bytes).
+pub(crate) fn encode_effects(effects: &[Effect]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u16(&mut out, effects.len() as u16);
+    for eff in effects {
+        encode_effect(&mut out, eff);
+    }
+    out
+}
+
+/// Decode a list produced by [`encode_effects`]. Strict canonical:
+/// payload slack or trailing bytes reject the whole list.
+pub(crate) fn decode_effects(bytes: &[u8]) -> Option<Vec<Effect>> {
+    let mut c = Cursor::new(bytes);
+    let count = c.read_u16()? as usize;
+    let mut effects = Vec::with_capacity(count);
+    for _ in 0..count {
+        effects.push(decode_effect(&mut c, true)?);
+    }
+    if !c.is_exhausted() {
+        return None;
+    }
+    Some(effects)
+}
+
 fn encode_effect(out: &mut Vec<u8>, eff: &Effect) {
     match eff {
         Effect::Write { key, value } => {

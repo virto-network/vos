@@ -56,6 +56,29 @@ impl Agent {
         id
     }
 
+    /// Like `run_task`, additionally naming the storage row keys the
+    /// task's witnessed reads need — the host stages those rows from
+    /// THIS agent's keyspace into the child's witness buffer.
+    /// `row_keys` is an rkyv-encoded `Vec<Vec<u8>>` (the dynamic value
+    /// vocabulary has no list-of-bytes).
+    #[msg]
+    async fn run_task_rows(
+        &mut self,
+        code_hash: [u8; 32],
+        task_msg: Vec<u8>,
+        row_keys: Vec<u8>,
+        ctx: &mut Context<Self>,
+    ) -> u64 {
+        let keys: Vec<Vec<u8>> =
+            vos::rkyv::from_bytes::<Vec<Vec<u8>>, vos::rkyv::rancor::Error>(&row_keys)
+                .unwrap_or_default();
+        let id = self
+            .tasks
+            .spawn_raw_with_rows(Child::Task(code_hash), task_msg, keys);
+        self.drive_round(ctx);
+        id
+    }
+
     /// Drive all configured peers with a dynamic `start` message.
     /// Actors without a `start` handler silently skip it.
     #[msg]

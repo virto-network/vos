@@ -93,6 +93,12 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     /// Reply bytes from the child's most recent work-result.
     pub reply: Vec<u8>,
+    /// Storage row keys the child's witnessed reads need — resolved by
+    /// the host against THIS parent's effective keyspace on every
+    /// drive pass and staged into the child's witness buffer (see
+    /// `lifecycle::invoke_hash_with_rows`). Empty for children that
+    /// read no storage.
+    pub row_keys: Vec<Vec<u8>>,
 }
 
 impl TaskRecord {
@@ -100,14 +106,15 @@ impl TaskRecord {
     /// saved `(state, msg)` and fold the outcome back in.
     #[cfg(feature = "pvm")]
     fn apply_drive_outcome(&mut self) {
-        use super::lifecycle::{InvokeResult, invoke_hash};
+        use super::lifecycle::{InvokeResult, invoke_hash_with_rows};
         use super::run::service_code_hash;
 
         let code_hash = match self.child {
             Child::Task(hash) => hash,
             Child::Peer(service_id) => service_code_hash(service_id),
         };
-        match invoke_hash(&code_hash, &self.msg, &self.state) {
+        let keys: Vec<&[u8]> = self.row_keys.iter().map(|k| k.as_slice()).collect();
+        match invoke_hash_with_rows(&code_hash, &self.msg, &self.state, &keys) {
             InvokeResult::Done { state, reply } => {
                 // An empty state envelope means the child ran with no
                 // state delivery path at all (short error-shape
@@ -171,6 +178,18 @@ impl Tasks {
 
     /// Queue a child with pre-encoded message bytes.
     pub fn spawn_raw(&mut self, child: Child, msg: Vec<u8>) -> TaskId {
+        self.spawn_raw_with_rows(child, msg, Vec::new())
+    }
+
+    /// Queue a child that additionally names the storage row keys its
+    /// witnessed reads need — the parent decides what the child may
+    /// see of its keyspace.
+    pub fn spawn_raw_with_rows(
+        &mut self,
+        child: Child,
+        msg: Vec<u8>,
+        row_keys: Vec<Vec<u8>>,
+    ) -> TaskId {
         let id = self.next_id;
         self.next_id += 1;
         self.records.push((
@@ -181,6 +200,7 @@ impl Tasks {
                 msg,
                 status: TaskStatus::Idle,
                 reply: Vec::new(),
+                row_keys,
             },
         ));
         id
