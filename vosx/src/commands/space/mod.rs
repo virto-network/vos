@@ -204,6 +204,9 @@ pub enum SpaceCommand {
         /// 0 || program_hash).
         #[arg(long, value_name = "HEX")]
         replication_id: Option<String>,
+        /// Serving-side sync floor: public | member | private.
+        #[arg(long, default_value = "member")]
+        sync: String,
     },
     /// Tombstone an installed agent.
     Uninstall { space: String, instance: String },
@@ -377,6 +380,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             init,
             consistency,
             replication_id,
+            sync,
         } => install::run(install::Args {
             space,
             program_ref,
@@ -384,6 +388,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             init,
             consistency,
             replication_id,
+            sync,
         }),
         SpaceCommand::Uninstall { space, instance } => uninstall::run(&space, &instance),
         SpaceCommand::Upgrade {

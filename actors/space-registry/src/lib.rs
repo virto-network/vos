@@ -53,7 +53,7 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
     ActorAclPage, ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, MemberPage, MemberRow,
-    ProgramRow, SPACE_ID_DOMAIN_TAG, Status,
+    ProgramRow, SPACE_ID_DOMAIN_TAG, Status, SyncFloor,
     AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN,
     MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
     PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
@@ -614,6 +614,7 @@ impl SpaceRegistry {
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
         network_reachable: bool,
+        sync_role: u8,
         auth: Vec<u8>,
     ) -> Status {
         if !self.authorize_op(
@@ -629,6 +630,7 @@ impl SpaceRegistry {
                     &install_args,
                     &install_payloads,
                     &[network_reachable as u8],
+                    &[sync_role],
                 ],
             ),
             &auth,
@@ -713,6 +715,7 @@ impl SpaceRegistry {
                 replication_id,
                 consistency,
                 network_reachable,
+                sync_role: SyncFloor::from_u8(sync_role).unwrap_or_default(),
                 install_args,
                 install_payloads,
             },
@@ -2137,6 +2140,7 @@ mod tests {
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
                 network_reachable: false,
+                sync_role: SyncFloor::Member as u8,
                 auth: root_auth(
                     "install",
                     &[
@@ -2149,6 +2153,7 @@ mod tests {
                         &[],
                         &[],
                         &[0u8],
+                        &[SyncFloor::Member as u8],
                     ],
                 ),
             },
@@ -2217,9 +2222,13 @@ mod tests {
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
                 network_reachable: true,
+                sync_role: SyncFloor::Member as u8,
                 auth: root_auth(
                     "install",
-                    &[b"bridge", b"p", b"1", &hash, &rep, &[0u8], &[], &[], &[1u8]],
+                    &[
+                        b"bridge", b"p", b"1", &hash, &rep, &[0u8], &[], &[], &[1u8],
+                        &[SyncFloor::Member as u8],
+                    ],
                 ),
             },
         );
@@ -2233,6 +2242,61 @@ mod tests {
         assert_eq!(install_at(&mut r, "counter", 2 /* Crdt */), Status::Ok);
         let c = r.agents.iter().find(|a| a.instance_name == "counter").unwrap();
         assert!(!c.network_reachable, "default install is confined");
+    }
+
+    #[test]
+    fn install_persists_sync_floor() {
+        // The `sync_role` floor rides the AgentRow: a `private` install
+        // round-trips as `SyncFloor::Private`, and the default install
+        // path (via `install_at`) records `Member`.
+        let mut r = registry();
+        let hash = alloc::vec![7u8; 32];
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Publish {
+                    name: String::from("p"),
+                    version: String::from("1"),
+                    hash: hash.clone(),
+                    auth: root_auth("publish", &[b"p", b"1", &hash]),
+                },
+            ),
+            Status::Ok
+        );
+        let rep = fresh_rep_id();
+        let st = dispatch(
+            &mut r,
+            Install {
+                instance_name: String::from("secret"),
+                program_name: String::from("p"),
+                program_version: String::from("1"),
+                program_hash: hash.clone(),
+                replication_id: rep.clone(),
+                consistency: 2, // Crdt
+                install_args: Vec::new(),
+                install_payloads: Vec::new(),
+                network_reachable: false,
+                sync_role: SyncFloor::Private as u8,
+                auth: root_auth(
+                    "install",
+                    &[
+                        b"secret", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                        &[SyncFloor::Private as u8],
+                    ],
+                ),
+            },
+        );
+        assert_eq!(st, Status::Ok);
+        let row = r.agents.iter().find(|a| a.instance_name == "secret").unwrap();
+        assert_eq!(
+            row.sync_role,
+            SyncFloor::Private,
+            "install must persist the sync floor onto the AgentRow"
+        );
+        // The default install path (install_at) records Member.
+        assert_eq!(install_at(&mut r, "open", 2 /* Crdt */), Status::Ok);
+        let o = r.agents.iter().find(|a| a.instance_name == "open").unwrap();
+        assert_eq!(o.sync_role, SyncFloor::Member, "default install floor is Member");
     }
 
     #[test]
@@ -2789,7 +2853,10 @@ mod tests {
         let forged = auth_as(
             &attacker_key,
             "install",
-            &[b"evil", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8]],
+            &[
+                b"evil", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                &[SyncFloor::Member as u8],
+            ],
         );
         let status = dispatch_as_system(
             &mut r,
@@ -2803,6 +2870,7 @@ mod tests {
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
                 network_reachable: false,
+                sync_role: SyncFloor::Member as u8,
                 auth: forged,
             },
         );
@@ -2870,6 +2938,7 @@ mod tests {
                 install_args: Vec::new(),
                 install_payloads: Vec::new(),
                 network_reachable: false,
+                sync_role: SyncFloor::Member as u8,
                 auth: Vec::new(),
             },
         );
@@ -3170,7 +3239,10 @@ mod tests {
         let rep = alloc::vec![5u8; 32];
         let install_auth = root_auth(
             "install",
-            &[b"res", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8]],
+            &[
+                b"res", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                &[SyncFloor::Member as u8],
+            ],
         );
         let install = |r: &mut SpaceRegistry| {
             dispatch(
@@ -3185,6 +3257,7 @@ mod tests {
                     install_args: Vec::new(),
                     install_payloads: Vec::new(),
                     network_reachable: false,
+                    sync_role: SyncFloor::Member as u8,
                     auth: install_auth.clone(),
                 },
             )
@@ -3219,9 +3292,13 @@ mod tests {
                     install_args: Vec::new(),
                     install_payloads: Vec::new(),
                     network_reachable: false,
+                    sync_role: SyncFloor::Member as u8,
                     auth: root_auth(
                         "install",
-                        &[b"res", b"p", b"1", &hash, &rep2, &[2u8], &[], &[], &[0u8]],
+                        &[
+                            b"res", b"p", b"1", &hash, &rep2, &[2u8], &[], &[], &[0u8],
+                            &[SyncFloor::Member as u8],
+                        ],
                     ),
                 },
             ),
@@ -3263,9 +3340,13 @@ mod tests {
                     install_args: Vec::new(),
                     install_payloads: Vec::new(),
                     network_reachable: false,
+                    sync_role: SyncFloor::Member as u8,
                     auth: root_auth(
                         "install",
-                        &[b"app", b"p", b"1", &h1, &rep, &[2u8], &[], &[], &[0u8]],
+                        &[
+                            b"app", b"p", b"1", &h1, &rep, &[2u8], &[], &[], &[0u8],
+                            &[SyncFloor::Member as u8],
+                        ],
                     ),
                 },
             ),

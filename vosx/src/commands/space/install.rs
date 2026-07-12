@@ -37,6 +37,9 @@ pub struct Args {
     /// Optional explicit replication id (64 hex). Defaults to
     /// auto-derived from instance_name + program_hash.
     pub replication_id: Option<String>,
+    /// Serving-side sync floor: `public` | `member` | `private`.
+    /// Defaults to `member`.
+    pub sync: String,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -47,6 +50,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         anyhow::anyhow!(
             "unknown consistency '{}', expected ephemeral|local|crdt|raft",
             args.consistency,
+        )
+    })?;
+
+    let sync_role = vos::registry::SyncFloor::parse(&args.sync).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown sync floor '{}', expected public|member|private",
+            args.sync,
         )
     })?;
 
@@ -85,6 +95,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             consistency,
             install_args,
             Vec::new(), // install_payloads — CLI install has no on_start
+            sync_role,
         )?;
 
         match status {

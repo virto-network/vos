@@ -439,6 +439,7 @@ impl DaemonClient {
         consistency: u8,
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
+        sync_role: vos::registry::SyncFloor,
     ) -> anyhow::Result<Status> {
         vos::block_on(self.registry().install(
             &mut &self.node,
@@ -451,6 +452,7 @@ impl DaemonClient {
             install_args,
             install_payloads,
             false, // network_reachable: CLI/dev installs stay confined by default
+            sync_role,
             Vec::new(),
         ))
         .map_err(|e| anyhow::anyhow!("registry.install(): {e}"))

@@ -6979,6 +6979,7 @@ mod tests {
                     .with("install_args", Vec::<u8>::new())
                     .with("install_payloads", Vec::<u8>::new())
                     .with("network_reachable", false)
+                    .with("sync_role", crate::registry::SyncFloor::Member as u64)
                     .with(
                         "auth",
                         auth_as(
@@ -6995,6 +6996,7 @@ mod tests {
                                 &[],
                                 &[],
                                 &[0u8], // network_reachable = false
+                                &[crate::registry::SyncFloor::Member as u8], // sync_role
                             ],
                         ),
                     ),

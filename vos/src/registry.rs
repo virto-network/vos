@@ -54,6 +54,13 @@ pub struct AgentRow {
     /// confined and ignore it. See
     /// [`vos::node::AgentConfig::network_reachable`].
     pub network_reachable: bool,
+    /// Serving-side sync floor: who this replica's state (`FetchHeads`/
+    /// `FetchNode`) is served to, and the default spawn set a node
+    /// derives from its own role. `Public` serves any connected peer,
+    /// `Member` requires a space read grant, `Private` requires a
+    /// per-actor grant (the generalized `msg-*` private semantics). See
+    /// [`SyncFloor`].
+    pub sync_role: SyncFloor,
     /// rkyv-encoded `vos::init::InitArgs` captured at install
     /// time. New replicas use this to bootstrap their copy of
     /// the agent before its first message arrives. Empty when
@@ -65,6 +72,80 @@ pub struct AgentRow {
     /// payload. Reconciled from the manifest's `on_start = [{msg=…}]`
     /// list. Empty when the agent has no on_start.
     pub install_payloads: Vec<u8>,
+}
+
+/// Serving-side sync floor for a replica — who its state (`FetchHeads`/
+/// `FetchNode`) is served to, and the default spawn set a node derives
+/// from its own role. Three user-facing levels (`sync = "public" |
+/// "member" | "private"` in manifests/`install`), ordered from most
+/// open to most restricted, so `<` means "more open".
+#[derive(
+    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+    PartialOrd, Ord, Hash,
+)]
+#[rkyv(crate = rkyv)]
+#[repr(u8)]
+pub enum SyncFloor {
+    /// Served to any connected peer; every node spawns it.
+    Public = 0,
+    /// Served to a caller holding a space read grant
+    /// (`>= AUTH_ROLE_READONLY`); the default for new installs.
+    Member = 1,
+    /// Served only to a caller holding a per-actor grant on this replica
+    /// (`>= AUTH_ROLE_READONLY`) — the generalized `msg-*` semantics.
+    Private = 2,
+}
+
+impl SyncFloor {
+    /// Decode a floor byte (the wire/rkyv discriminant). `None` for an
+    /// unknown byte.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Public),
+            1 => Some(Self::Member),
+            2 => Some(Self::Private),
+            _ => None,
+        }
+    }
+
+    /// The user-facing manifest/CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Member => "member",
+            Self::Private => "private",
+        }
+    }
+
+    /// Parse the user-facing spelling (`public` / `member` / `private`),
+    /// case-insensitively. `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("public") {
+            Some(Self::Public)
+        } else if s.eq_ignore_ascii_case("member") {
+            Some(Self::Member)
+        } else if s.eq_ignore_ascii_case("private") {
+            Some(Self::Private)
+        } else {
+            None
+        }
+    }
+}
+
+/// New installs default to `Member` — served to space members, not the
+/// world. The pre-onboarding behaviour (everything served publicly) is
+/// now an explicit `Public` opt-in.
+impl Default for SyncFloor {
+    fn default() -> Self {
+        Self::Member
+    }
+}
+
+impl core::fmt::Display for SyncFloor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // ── Members ──────────────────────────────────────────────────────
@@ -451,6 +532,9 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
             // Absent field (e.g. an older client) defaults to false (confined),
             // matching the mutator's decode of a missing bool param.
             let network_reachable = a.get_bool("network_reachable").unwrap_or(false);
+            // Absent floor defaults to `Member`, matching the mutator's
+            // `SyncFloor::from_u8(...).unwrap_or_default()` decode.
+            let sync_role = a.get_u8("sync_role").unwrap_or(SyncFloor::Member as u8);
             canonical_op_bytes(
                 "install",
                 &[
@@ -463,6 +547,7 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
                     &install_args,
                     &install_payloads,
                     &[network_reachable as u8],
+                    &[sync_role],
                 ],
             )
         }
@@ -879,6 +964,7 @@ impl RegistryRef {
         install_args: Vec<u8>,
         install_payloads: Vec<u8>,
         network_reachable: bool,
+        sync_role: SyncFloor,
         auth: Vec<u8>,
     ) -> Result<Status, ClientError> {
         decode_rkyv(
@@ -894,6 +980,7 @@ impl RegistryRef {
                     .with("install_args", install_args)
                     .with("install_payloads", install_payloads)
                     .with("network_reachable", network_reachable)
+                    .with("sync_role", sync_role as u8)
                     .with("auth", auth),
             )
             .await?,
@@ -1140,7 +1227,8 @@ mod tests {
             .with("consistency", 2u64)
             .with("install_args", alloc::vec![1u8, 2, 3])
             .with("install_payloads", Vec::<u8>::new())
-            .with("network_reachable", true);
+            .with("network_reachable", true)
+            .with("sync_role", SyncFloor::Private as u64);
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
             canonical_op_bytes(
@@ -1155,6 +1243,7 @@ mod tests {
                     &[1u8, 2, 3],
                     &[],
                     &[1u8],
+                    &[2u8],
                 ],
             ),
         );

@@ -131,6 +131,11 @@ pub struct AgentDef {
     /// confined and ignore it.
     #[serde(default)]
     pub network_reachable: bool,
+    /// Serving-side sync floor: `public` | `member` | `private`.
+    /// Omitted → `member` (served to space members). Drives who this
+    /// replica's state is served to and the default spawn set.
+    #[serde(default)]
+    pub sync: Option<String>,
     /// Constructor args. Values are resolved against the
     /// actor's `.vos_meta` so e.g. `Vec<u32>` typed args
     /// automatically map a list of agent names to their
@@ -848,6 +853,17 @@ fn reconcile_one(
         }
     };
 
+    let sync_role = match agent.sync.as_deref() {
+        Some(s) => vos::registry::SyncFloor::parse(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent '{}': unknown sync floor '{}', expected public|member|private",
+                agent.name,
+                s,
+            )
+        })?,
+        None => vos::registry::SyncFloor::Member,
+    };
+
     let install_args = encode_init_args(&agent.name, &elf_bytes, &agent.init, name_ids)?;
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
@@ -866,6 +882,7 @@ fn reconcile_one(
         install_args,
         install_payloads,
         agent.network_reachable,
+        sync_role,
         Vec::new(),
     ))
     .map_err(|e| anyhow::anyhow!("registry.install('{}'): {e}", agent.name))?;
