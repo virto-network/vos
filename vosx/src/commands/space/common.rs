@@ -88,9 +88,10 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
 }
 
 /// A [`NodeValidator`](vos::commit::NodeValidator) that binds the
-/// registry's genesis to `space_id`: it rejects any peer-merged
-/// `set_root` DAG node whose CID doesn't derive `space_id`, and passes
-/// every other node through.
+/// registry's two genesis anchors to `space_id`: it rejects any
+/// peer-merged `set_root` DAG node whose CID doesn't derive `space_id`,
+/// rejects any `set_space_id` node carrying a value other than
+/// `space_id`, and passes every other node through.
 ///
 /// `insert_node` only checks `CID == hash(bytes)`, and replay orders
 /// concurrent origin nodes by ascending CID — so without this gate a
@@ -102,6 +103,15 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
 /// *specific* `space_id` is a second-preimage attack on blake2b, so the
 /// genuine genesis (whose CID derives `space_id` by construction) is the
 /// only `set_root` this accepts.
+///
+/// `set_space_id` has the identical exposure — unsigned, first-write-wins,
+/// re-derived from the DAG on every `soft_restart_crdt` replay — and
+/// `redeem_invite` binds the anchored value, so a forged concurrent
+/// `set_space_id` that sorts first would permanently poison the anchor
+/// (invite-redemption DoS, or a cross-space redeem when the forged value
+/// is a sibling space's id). The value is public and known here, so the
+/// gate is exact: only this space's own id may anchor, and a wrong-valued
+/// node never enters the DAG regardless of replay ordering.
 pub fn genesis_node_validator(space_id: [u8; 32]) -> vos::commit::NodeValidator {
     std::sync::Arc::new(move |cid: &[u8; 32], node_bytes: &[u8]| -> bool {
         // DagNode wire: [payload_len:u64 LE][payload(CrdtEvent)][children…].
@@ -122,7 +132,12 @@ pub fn genesis_node_validator(space_id: [u8; 32]) -> vos::commit::NodeValidator 
         let Some(decoded) = <vos::value::Msg as vos::Decode>::try_decode(&msg[1..]) else {
             return true;
         };
-        // Only `set_root` is genesis-bound; every other op flows through.
+        // `set_space_id` anchors the value `redeem_invite` binds: accept
+        // only this space's own id, so no forged value can enter the DAG.
+        if decoded.name == "set_space_id" {
+            return decoded.args.get_bytes("space_id").as_deref() == Some(space_id.as_slice());
+        }
+        // `set_root` is genesis-bound by CID; every other op flows through.
         if decoded.name != "set_root" {
             return true;
         }
@@ -272,6 +287,39 @@ mod tests {
         assert!(
             v(&[9u8; 32], &node_for("grant_role")),
             "non-set_root op is not genesis-gated",
+        );
+    }
+
+    #[test]
+    fn genesis_validator_binds_set_space_id_to_the_known_value() {
+        use vos::Encode;
+        fn set_space_id_node(value: &[u8]) -> Vec<u8> {
+            let m = vos::value::Msg::new("set_space_id").with("space_id", value.to_vec());
+            let mut msg = vec![vos::value::TAG_DYNAMIC];
+            msg.extend_from_slice(&m.encode());
+            let event =
+                vos::effect_log::CrdtEvent::new([0u8; 32], 0, vos::effect_log::EffectLog::for_msg(msg));
+            let payload = event.to_bytes();
+            let mut node = (payload.len() as u64).to_le_bytes().to_vec();
+            node.extend_from_slice(&payload);
+            node.extend_from_slice(&0u64.to_le_bytes());
+            node
+        }
+
+        let space_id = [0x5au8; 32];
+        let v = genesis_node_validator(space_id);
+        // The genuine anchor (this space's id) is accepted — CID irrelevant.
+        assert!(v(&[1u8; 32], &set_space_id_node(&space_id)), "genuine space_id accepted");
+        // A forged set_space_id carrying a sibling space's id (or a bogus
+        // one) is rejected at ingest — so a member can't grind a concurrent
+        // node that sorts first on replay and poisons the anchor.
+        assert!(
+            !v(&[0u8; 32], &set_space_id_node(&[0x11u8; 32])),
+            "forged set_space_id(sibling id) rejected regardless of CID",
+        );
+        assert!(
+            !v(&[0u8; 32], &set_space_id_node(&[0xFFu8; 32])),
+            "forged set_space_id(bogus id) rejected — closes the invite-DoS vector",
         );
     }
 
