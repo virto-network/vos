@@ -324,8 +324,9 @@ pub enum Column {
     HWrAddrB2,
     #[size = 64]
     HWrAddrB3,
-    // Row type.  mask_next_row so Blake2bBoundaryChip's IsReal-continuity
-    // anchor can read the next row; Blake2bChip leaves the next value unused.
+    // Row type.  mask_next_row mirrors `BoundaryColumn::IsReal` (whose
+    // IsReal-continuity anchor reads the next row); Blake2bChip leaves the
+    // next value unused.
     #[size = 1]
     #[mask_next_row]
     IsReal,
@@ -343,15 +344,11 @@ pub enum Column {
     InitGateH,
     #[size = 1]
     OutputGateH,
-    // Blake2bBoundaryChip: logup multiplicity of the row-95 compression
-    // production — how many in-circuit consumers read this UNIQUE
-    // (h, m, t, f) compression (the page/merge chips emit −1 each, so one
-    // production carrying the count balances exactly as the
-    // one-row-block-per-consumption scheme did, at a fraction of the
-    // rows).  Constrained to 0 off real row-95s
-    // ((1 − OutputGateH) · EmitMult = 0); the VALUE is free — the logup
-    // balance alone pins it, the RangeMultiplicity256 pattern.  Dead
-    // (all-zero) in Blake2bChip, whose producer gate stays OutputGateH.
+    // Logup multiplicity of the row-95 compression production.  Live only
+    // in `BoundaryColumn::EmitMult` (see boundary.rs for the gating and the
+    // RangeMultiplicity256-style value-freedom argument); dead (all-zero)
+    // here — Blake2bChip's producer gate stays OutputGateH — and retained
+    // solely to keep the main chip's committed layout unchanged.
     #[size = 1]
     EmitMult,
     // Carry-bound helpers — flatten the degree-3 / -4
@@ -567,4 +564,224 @@ pub enum PreprocessedColumn {
     IsMySlot14,
     #[size = 1]
     IsMySlot15,
+}
+
+/// The main-column handles the shared blake2b compression core reads and
+/// writes (`add_compression_core`, `add_compression_interaction_core`,
+/// `fill_compression_trace`).  `Column` implements it over the full
+/// ECALL-binding layout; the boundary chip's `BoundaryColumn` implements it
+/// without the 1040 ECALL-binding limbs (`HPtr`/`MPtr`/`CallTs` and the
+/// per-byte address columns) that only `Blake2bChip`'s memory-ledger /
+/// CPU-call bindings reference.
+///
+/// Limb counts are fixed by the core's constraint shapes and must match the
+/// sizes documented on `Column`'s variants (the `column_eval` /
+/// `fill_columns_bytes` size asserts check every access at runtime).  The
+/// `M` / `H` / `T` / `F` / `V` / `IS_REAL` handles must be
+/// `mask_next_row`-capable: the core reads their next-row values for the
+/// inter-row equality and V-chain constraints.
+pub(super) trait CompressionColumns: AirColumn {
+    const IS_REAL: Self;
+    const GATE_H: Self;
+    const INIT_GATE_H: Self;
+    const OUTPUT_GATE_H: Self;
+    const A_IN: Self;
+    const B_IN: Self;
+    const C_IN: Self;
+    const D_IN: Self;
+    const MX: Self;
+    const MY: Self;
+    const A1: Self;
+    const CARRY1: Self;
+    const AND1: Self;
+    const C1: Self;
+    const CARRY2: Self;
+    const AND2: Self;
+    const A_OUT: Self;
+    const CARRY3: Self;
+    const AND3: Self;
+    const C_OUT: Self;
+    const CARRY4: Self;
+    const AND4: Self;
+    const B_OUT: Self;
+    const ROT63_CARRY: Self;
+    const AND1_A_HI: Self;
+    const AND1_B_HI: Self;
+    const AND1_RES_HI: Self;
+    const AND2_A_HI: Self;
+    const AND2_B_HI: Self;
+    const AND2_RES_HI: Self;
+    const AND3_A_HI: Self;
+    const AND3_B_HI: Self;
+    const AND3_RES_HI: Self;
+    const AND4_A_HI: Self;
+    const AND4_B_HI: Self;
+    const AND4_RES_HI: Self;
+    const D_OUT: Self;
+    const M: [Self; 16];
+    const H: [Self; 8];
+    const T: Self;
+    const F: Self;
+    const T_HI: Self;
+    const AND_T_LO: Self;
+    const AND_T_HI: Self;
+    const AND_T_LO_HI: Self;
+    const AND_T_HI_HI: Self;
+    const V: [Self; 16];
+    const OUTPUT: Self;
+    const H_HI: Self;
+    const V_AFTER_HI: Self;
+    const OUT_AND1: Self;
+    const OUT_AND1_HI: Self;
+    const OUT_XOR1_HI: Self;
+    const OUT_AND2: Self;
+    const OUT_AND2_HI: Self;
+    const CARRY1_XCM1: Self;
+    const CARRY1_FULL: Self;
+    const CARRY3_XCM1: Self;
+    const CARRY3_FULL: Self;
+    const CARRY2_XCM1: Self;
+    const CARRY4_XCM1: Self;
+    const ROT63_XCM1: Self;
+    const F_BOUND_H: Self;
+    const IN_MATCH_A: Self;
+    const IN_MATCH_B: Self;
+    const IN_MATCH_C: Self;
+    const IN_MATCH_D: Self;
+    const MX_SLOT_SUM: Self;
+    const MY_SLOT_SUM: Self;
+    const V_NEXT_SUM: [Self; 16];
+}
+
+impl CompressionColumns for Column {
+    const IS_REAL: Self = Column::IsReal;
+    const GATE_H: Self = Column::GateH;
+    const INIT_GATE_H: Self = Column::InitGateH;
+    const OUTPUT_GATE_H: Self = Column::OutputGateH;
+    const A_IN: Self = Column::AIn;
+    const B_IN: Self = Column::BIn;
+    const C_IN: Self = Column::CIn;
+    const D_IN: Self = Column::DIn;
+    const MX: Self = Column::Mx;
+    const MY: Self = Column::My;
+    const A1: Self = Column::A1;
+    const CARRY1: Self = Column::Carry1;
+    const AND1: Self = Column::And1;
+    const C1: Self = Column::C1;
+    const CARRY2: Self = Column::Carry2;
+    const AND2: Self = Column::And2;
+    const A_OUT: Self = Column::AOut;
+    const CARRY3: Self = Column::Carry3;
+    const AND3: Self = Column::And3;
+    const C_OUT: Self = Column::COut;
+    const CARRY4: Self = Column::Carry4;
+    const AND4: Self = Column::And4;
+    const B_OUT: Self = Column::BOut;
+    const ROT63_CARRY: Self = Column::Rot63Carry;
+    const AND1_A_HI: Self = Column::And1AHi;
+    const AND1_B_HI: Self = Column::And1BHi;
+    const AND1_RES_HI: Self = Column::And1ResHi;
+    const AND2_A_HI: Self = Column::And2AHi;
+    const AND2_B_HI: Self = Column::And2BHi;
+    const AND2_RES_HI: Self = Column::And2ResHi;
+    const AND3_A_HI: Self = Column::And3AHi;
+    const AND3_B_HI: Self = Column::And3BHi;
+    const AND3_RES_HI: Self = Column::And3ResHi;
+    const AND4_A_HI: Self = Column::And4AHi;
+    const AND4_B_HI: Self = Column::And4BHi;
+    const AND4_RES_HI: Self = Column::And4ResHi;
+    const D_OUT: Self = Column::DOut;
+    const T: Self = Column::T;
+    const F: Self = Column::F;
+    const T_HI: Self = Column::THi;
+    const AND_T_LO: Self = Column::AndTLo;
+    const AND_T_HI: Self = Column::AndTHi;
+    const AND_T_LO_HI: Self = Column::AndTLoHi;
+    const AND_T_HI_HI: Self = Column::AndTHiHi;
+    const OUTPUT: Self = Column::Output;
+    const H_HI: Self = Column::HHi;
+    const V_AFTER_HI: Self = Column::VAfterHi;
+    const OUT_AND1: Self = Column::OutAnd1;
+    const OUT_AND1_HI: Self = Column::OutAnd1Hi;
+    const OUT_XOR1_HI: Self = Column::OutXor1Hi;
+    const OUT_AND2: Self = Column::OutAnd2;
+    const OUT_AND2_HI: Self = Column::OutAnd2Hi;
+    const CARRY1_XCM1: Self = Column::Carry1XcM1;
+    const CARRY1_FULL: Self = Column::Carry1Full;
+    const CARRY3_XCM1: Self = Column::Carry3XcM1;
+    const CARRY3_FULL: Self = Column::Carry3Full;
+    const CARRY2_XCM1: Self = Column::Carry2XcM1;
+    const CARRY4_XCM1: Self = Column::Carry4XcM1;
+    const ROT63_XCM1: Self = Column::Rot63XcM1;
+    const F_BOUND_H: Self = Column::FBoundH;
+    const IN_MATCH_A: Self = Column::InMatchA;
+    const IN_MATCH_B: Self = Column::InMatchB;
+    const IN_MATCH_C: Self = Column::InMatchC;
+    const IN_MATCH_D: Self = Column::InMatchD;
+    const MX_SLOT_SUM: Self = Column::MxSlotSum;
+    const MY_SLOT_SUM: Self = Column::MySlotSum;
+    const M: [Self; 16] = [
+        Column::M0,
+        Column::M1,
+        Column::M2,
+        Column::M3,
+        Column::M4,
+        Column::M5,
+        Column::M6,
+        Column::M7,
+        Column::M8,
+        Column::M9,
+        Column::M10,
+        Column::M11,
+        Column::M12,
+        Column::M13,
+        Column::M14,
+        Column::M15,
+    ];
+    const H: [Self; 8] = [
+        Column::H0,
+        Column::H1,
+        Column::H2,
+        Column::H3,
+        Column::H4,
+        Column::H5,
+        Column::H6,
+        Column::H7,
+    ];
+    const V: [Self; 16] = [
+        Column::V0,
+        Column::V1,
+        Column::V2,
+        Column::V3,
+        Column::V4,
+        Column::V5,
+        Column::V6,
+        Column::V7,
+        Column::V8,
+        Column::V9,
+        Column::V10,
+        Column::V11,
+        Column::V12,
+        Column::V13,
+        Column::V14,
+        Column::V15,
+    ];
+    const V_NEXT_SUM: [Self; 16] = [
+        Column::VNextSum0,
+        Column::VNextSum1,
+        Column::VNextSum2,
+        Column::VNextSum3,
+        Column::VNextSum4,
+        Column::VNextSum5,
+        Column::VNextSum6,
+        Column::VNextSum7,
+        Column::VNextSum8,
+        Column::VNextSum9,
+        Column::VNextSum10,
+        Column::VNextSum11,
+        Column::VNextSum12,
+        Column::VNextSum13,
+        Column::VNextSum14,
+        Column::VNextSum15,
+    ];
 }

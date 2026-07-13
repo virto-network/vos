@@ -26,7 +26,7 @@ use stwo::{
 };
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
-use crate::air_column::PreprocessedAirColumn;
+use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
 use crate::trace::{
@@ -55,11 +55,11 @@ mod consts;
 mod sw;
 mod trace;
 
-pub use boundary::Blake2bBoundaryChip;
+pub use boundary::{Blake2bBoundaryChip, BoundaryColumn};
 pub use call::Blake2bCall;
 pub use sw::blake2b_compress;
 
-use columns::PreprocessedColumn;
+use columns::{CompressionColumns, PreprocessedColumn};
 // Re-exported (gate tests reach `Column::IsReal`/`Output` offsets to tamper).
 pub use columns::Column;
 use consts::{G_INDICES, IV, SIGMA};
@@ -146,8 +146,8 @@ impl ScheduleColumns for PreprocessedColumn {
 }
 
 /// Read the compression schedule selectors from a chip's preprocessed trace.
-pub(super) fn read_schedule<P: ScheduleColumns, E: EvalAtRow>(
-    trace_eval: &TraceEval<P, Column, E>,
+pub(super) fn read_schedule<P: ScheduleColumns, C: AirColumn, E: EvalAtRow>(
+    trace_eval: &TraceEval<P, C, E>,
 ) -> Blake2bSchedule<E::F> {
     Blake2bSchedule {
         is_first: trace_eval.preprocessed_column_eval::<1>(P::IS_FIRST),
@@ -171,14 +171,18 @@ pub(super) fn read_schedule<P: ScheduleColumns, E: EvalAtRow>(
 /// memory-ledger + CPU-call bindings) and `Blake2bBoundaryChip` (which adds
 /// its own IsReal anchor + Blake2bCompression producer instead).  Re-reads
 /// every column it needs from `trace_eval`; does NOT finalize the logup.
-pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
+pub(in crate::chips::blake2b) fn add_compression_core<
+    P: PreprocessedAirColumn,
+    C: CompressionColumns,
+    E: EvalAtRow,
+>(
     eval: &mut E,
-    trace_eval: &TraceEval<P, Column, E>,
+    trace_eval: &TraceEval<P, C, E>,
     sched: &Blake2bSchedule<E::F>,
     range256_lookup: &Range256LookupElements,
     bitwise_lookup: &BitwiseAndLookupElements,
 ) {
-    let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+    let is_real = trace_eval.column_eval::<1>(C::IS_REAL);
     // Gate helpers — Stwo v2.x lifted-protocol degree
     // flatten.  Pull in `IsFirstOfCompression` / `IsLastOfCompression`
     // (from `sched`) and the 3 main-column helpers; tie them together
@@ -187,35 +191,35 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     // contribution to algebraic degree drops from 2 to 1.
     let is_first = &sched.is_first;
     let is_last = &sched.is_last;
-    let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
-    let init_gate_h = crate::trace::trace_eval!(trace_eval, Column::InitGateH);
-    let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
+    let gate_h = trace_eval.column_eval::<1>(C::GATE_H);
+    let init_gate_h = trace_eval.column_eval::<1>(C::INIT_GATE_H);
+    let output_gate_h = trace_eval.column_eval::<1>(C::OUTPUT_GATE_H);
     let f1_top = E::F::one();
     eval.add_constraint(
         gate_h[0].clone() - is_real[0].clone() * (f1_top.clone() - is_last[0].clone()),
     );
     eval.add_constraint(init_gate_h[0].clone() - is_real[0].clone() * is_first[0].clone());
     eval.add_constraint(output_gate_h[0].clone() - is_real[0].clone() * is_last[0].clone());
-    let a_in = crate::trace::trace_eval!(trace_eval, Column::AIn);
-    let b_in = crate::trace::trace_eval!(trace_eval, Column::BIn);
-    let c_in = crate::trace::trace_eval!(trace_eval, Column::CIn);
-    let d_in = crate::trace::trace_eval!(trace_eval, Column::DIn);
-    let mx = crate::trace::trace_eval!(trace_eval, Column::Mx);
-    let my = crate::trace::trace_eval!(trace_eval, Column::My);
-    let a1 = crate::trace::trace_eval!(trace_eval, Column::A1);
-    let carry1 = crate::trace::trace_eval!(trace_eval, Column::Carry1);
-    let and1 = crate::trace::trace_eval!(trace_eval, Column::And1);
-    let c1 = crate::trace::trace_eval!(trace_eval, Column::C1);
-    let carry2 = crate::trace::trace_eval!(trace_eval, Column::Carry2);
-    let and2 = crate::trace::trace_eval!(trace_eval, Column::And2);
-    let a_out = crate::trace::trace_eval!(trace_eval, Column::AOut);
-    let carry3 = crate::trace::trace_eval!(trace_eval, Column::Carry3);
-    let and3 = crate::trace::trace_eval!(trace_eval, Column::And3);
-    let c_out = crate::trace::trace_eval!(trace_eval, Column::COut);
-    let carry4 = crate::trace::trace_eval!(trace_eval, Column::Carry4);
-    let and4 = crate::trace::trace_eval!(trace_eval, Column::And4);
-    let b_out = crate::trace::trace_eval!(trace_eval, Column::BOut);
-    let rot63_carry = crate::trace::trace_eval!(trace_eval, Column::Rot63Carry);
+    let a_in = trace_eval.column_eval::<8>(C::A_IN);
+    let b_in = trace_eval.column_eval::<8>(C::B_IN);
+    let c_in = trace_eval.column_eval::<8>(C::C_IN);
+    let d_in = trace_eval.column_eval::<8>(C::D_IN);
+    let mx = trace_eval.column_eval::<8>(C::MX);
+    let my = trace_eval.column_eval::<8>(C::MY);
+    let a1 = trace_eval.column_eval::<8>(C::A1);
+    let carry1 = trace_eval.column_eval::<8>(C::CARRY1);
+    let and1 = trace_eval.column_eval::<8>(C::AND1);
+    let c1 = trace_eval.column_eval::<8>(C::C1);
+    let carry2 = trace_eval.column_eval::<8>(C::CARRY2);
+    let and2 = trace_eval.column_eval::<8>(C::AND2);
+    let a_out = trace_eval.column_eval::<8>(C::A_OUT);
+    let carry3 = trace_eval.column_eval::<8>(C::CARRY3);
+    let and3 = trace_eval.column_eval::<8>(C::AND3);
+    let c_out = trace_eval.column_eval::<8>(C::C_OUT);
+    let carry4 = trace_eval.column_eval::<8>(C::CARRY4);
+    let and4 = trace_eval.column_eval::<8>(C::AND4);
+    let b_out = trace_eval.column_eval::<8>(C::B_OUT);
+    let rot63_carry = trace_eval.column_eval::<8>(C::ROT63_CARRY);
 
     let f256 = E::F::from(BaseField::from(256u32));
     let f2 = E::F::from(BaseField::from(2u32));
@@ -337,18 +341,18 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     // lo, And4 hi, And4 lo).  finalize_logup_in_pairs combines (hi, lo) per
     // AND into a single fraction, so ordering MUST match the prover side.
     let f16 = E::F::from(BaseField::from(16u32));
-    let and1_a_hi = crate::trace::trace_eval!(trace_eval, Column::And1AHi);
-    let and1_b_hi = crate::trace::trace_eval!(trace_eval, Column::And1BHi);
-    let and1_res_hi = crate::trace::trace_eval!(trace_eval, Column::And1ResHi);
-    let and2_a_hi = crate::trace::trace_eval!(trace_eval, Column::And2AHi);
-    let and2_b_hi = crate::trace::trace_eval!(trace_eval, Column::And2BHi);
-    let and2_res_hi = crate::trace::trace_eval!(trace_eval, Column::And2ResHi);
-    let and3_a_hi = crate::trace::trace_eval!(trace_eval, Column::And3AHi);
-    let and3_b_hi = crate::trace::trace_eval!(trace_eval, Column::And3BHi);
-    let and3_res_hi = crate::trace::trace_eval!(trace_eval, Column::And3ResHi);
-    let and4_a_hi = crate::trace::trace_eval!(trace_eval, Column::And4AHi);
-    let and4_b_hi = crate::trace::trace_eval!(trace_eval, Column::And4BHi);
-    let and4_res_hi = crate::trace::trace_eval!(trace_eval, Column::And4ResHi);
+    let and1_a_hi = trace_eval.column_eval::<8>(C::AND1_A_HI);
+    let and1_b_hi = trace_eval.column_eval::<8>(C::AND1_B_HI);
+    let and1_res_hi = trace_eval.column_eval::<8>(C::AND1_RES_HI);
+    let and2_a_hi = trace_eval.column_eval::<8>(C::AND2_A_HI);
+    let and2_b_hi = trace_eval.column_eval::<8>(C::AND2_B_HI);
+    let and2_res_hi = trace_eval.column_eval::<8>(C::AND2_RES_HI);
+    let and3_a_hi = trace_eval.column_eval::<8>(C::AND3_A_HI);
+    let and3_b_hi = trace_eval.column_eval::<8>(C::AND3_B_HI);
+    let and3_res_hi = trace_eval.column_eval::<8>(C::AND3_RES_HI);
+    let and4_a_hi = trace_eval.column_eval::<8>(C::AND4_A_HI);
+    let and4_b_hi = trace_eval.column_eval::<8>(C::AND4_B_HI);
+    let and4_res_hi = trace_eval.column_eval::<8>(C::AND4_RES_HI);
 
     for i in 0..8 {
         // And1 hi
@@ -440,12 +444,12 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
         ));
 
         // ── AndTLo = IV[4] & T[i] ──
-        let t_hi_e = crate::trace::trace_eval!(trace_eval, Column::THi);
-        let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
-        let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
-        let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
-        let and_t_lo_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTLoHi);
-        let and_t_hi_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHiHi);
+        let t_hi_e = trace_eval.column_eval::<16>(C::T_HI);
+        let t_e = trace_eval.column_eval::<16>(C::T);
+        let and_t_lo_e = trace_eval.column_eval::<8>(C::AND_T_LO);
+        let and_t_hi_e = trace_eval.column_eval::<8>(C::AND_T_HI);
+        let and_t_lo_hi_e = trace_eval.column_eval::<8>(C::AND_T_LO_HI);
+        let and_t_hi_hi_e = trace_eval.column_eval::<8>(C::AND_T_HI_HI);
         let iv4_byte = IV[4].to_le_bytes()[i];
         let iv4_hi_f = E::F::from(BaseField::from((iv4_byte >> 4) as u32));
         let iv4_lo_f = E::F::from(BaseField::from((iv4_byte & 0x0F) as u32));
@@ -494,11 +498,11 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
 
     // ── Range256 for non-AND-covered byte columns ──
     // Must match the prover-side order from generate_interaction_trace.
-    let a_in_e = crate::trace::trace_eval!(trace_eval, Column::AIn);
-    let c_in_e = crate::trace::trace_eval!(trace_eval, Column::CIn);
-    let mx_e = crate::trace::trace_eval!(trace_eval, Column::Mx);
-    let my_e = crate::trace::trace_eval!(trace_eval, Column::My);
-    let b_out_e = crate::trace::trace_eval!(trace_eval, Column::BOut);
+    let a_in_e = trace_eval.column_eval::<8>(C::A_IN);
+    let c_in_e = trace_eval.column_eval::<8>(C::C_IN);
+    let mx_e = trace_eval.column_eval::<8>(C::MX);
+    let my_e = trace_eval.column_eval::<8>(C::MY);
+    let b_out_e = trace_eval.column_eval::<8>(C::B_OUT);
     for col in [&a_in_e, &c_in_e, &mx_e, &my_e, &b_out_e] {
         for i in 0..8 {
             eval.add_to_relation(RelationEntry::new(
@@ -521,13 +525,13 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     // `is_real · c · (c-1)` (deg 3) flattened via XcM1 / Full helper
     // columns (`Column::Carry{1,2,3,4}XcM1`, `Carry{1,3}Full`, `Rot63XcM1`).
     let f1 = E::F::one();
-    let carry1_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry1XcM1);
-    let carry1_full = crate::trace::trace_eval!(trace_eval, Column::Carry1Full);
-    let carry3_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry3XcM1);
-    let carry3_full = crate::trace::trace_eval!(trace_eval, Column::Carry3Full);
-    let carry2_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry2XcM1);
-    let carry4_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Carry4XcM1);
-    let rot63_xcm1 = crate::trace::trace_eval!(trace_eval, Column::Rot63XcM1);
+    let carry1_xcm1 = trace_eval.column_eval::<8>(C::CARRY1_XCM1);
+    let carry1_full = trace_eval.column_eval::<8>(C::CARRY1_FULL);
+    let carry3_xcm1 = trace_eval.column_eval::<8>(C::CARRY3_XCM1);
+    let carry3_full = trace_eval.column_eval::<8>(C::CARRY3_FULL);
+    let carry2_xcm1 = trace_eval.column_eval::<8>(C::CARRY2_XCM1);
+    let carry4_xcm1 = trace_eval.column_eval::<8>(C::CARRY4_XCM1);
+    let rot63_xcm1 = trace_eval.column_eval::<8>(C::ROT63_XCM1);
     for i in 0..8 {
         // Carry1: degree-4 → degree-2 via 2 helpers.
         let c1_v = carry1[i].clone();
@@ -561,7 +565,7 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     // d_out[i] = xor3[(i+2)%8] where xor3[k] = d1[k] + a_out[k] - 2·and3[k]
     // and d1[k] = d_in[(k+4)%8] + a1[(k+4)%8] - 2·and1[(k+4)%8].
     // Reify so it can flow into V_next[di] via the row-chain update.
-    let d_out = crate::trace::trace_eval!(trace_eval, Column::DOut);
+    let d_out = trace_eval.column_eval::<8>(C::D_OUT);
     for i in 0..8 {
         let k = (i + 2) % 8;
         let j = (k + 4) % 8;
@@ -577,50 +581,50 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     let is_gidx = &sched.is_gidx;
 
     let v_cols: [_; 16] = [
-        crate::trace::trace_eval!(trace_eval, Column::V0),
-        crate::trace::trace_eval!(trace_eval, Column::V1),
-        crate::trace::trace_eval!(trace_eval, Column::V2),
-        crate::trace::trace_eval!(trace_eval, Column::V3),
-        crate::trace::trace_eval!(trace_eval, Column::V4),
-        crate::trace::trace_eval!(trace_eval, Column::V5),
-        crate::trace::trace_eval!(trace_eval, Column::V6),
-        crate::trace::trace_eval!(trace_eval, Column::V7),
-        crate::trace::trace_eval!(trace_eval, Column::V8),
-        crate::trace::trace_eval!(trace_eval, Column::V9),
-        crate::trace::trace_eval!(trace_eval, Column::V10),
-        crate::trace::trace_eval!(trace_eval, Column::V11),
-        crate::trace::trace_eval!(trace_eval, Column::V12),
-        crate::trace::trace_eval!(trace_eval, Column::V13),
-        crate::trace::trace_eval!(trace_eval, Column::V14),
-        crate::trace::trace_eval!(trace_eval, Column::V15),
+        trace_eval.column_eval::<8>(C::V[0]),
+        trace_eval.column_eval::<8>(C::V[1]),
+        trace_eval.column_eval::<8>(C::V[2]),
+        trace_eval.column_eval::<8>(C::V[3]),
+        trace_eval.column_eval::<8>(C::V[4]),
+        trace_eval.column_eval::<8>(C::V[5]),
+        trace_eval.column_eval::<8>(C::V[6]),
+        trace_eval.column_eval::<8>(C::V[7]),
+        trace_eval.column_eval::<8>(C::V[8]),
+        trace_eval.column_eval::<8>(C::V[9]),
+        trace_eval.column_eval::<8>(C::V[10]),
+        trace_eval.column_eval::<8>(C::V[11]),
+        trace_eval.column_eval::<8>(C::V[12]),
+        trace_eval.column_eval::<8>(C::V[13]),
+        trace_eval.column_eval::<8>(C::V[14]),
+        trace_eval.column_eval::<8>(C::V[15]),
     ];
     let v_cols_next: [_; 16] = [
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V0),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V1),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V2),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V3),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V4),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V5),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V6),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V7),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V8),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V9),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V10),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V11),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V12),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V13),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V14),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::V15),
+        trace_eval.column_eval_next_row::<8>(C::V[0]),
+        trace_eval.column_eval_next_row::<8>(C::V[1]),
+        trace_eval.column_eval_next_row::<8>(C::V[2]),
+        trace_eval.column_eval_next_row::<8>(C::V[3]),
+        trace_eval.column_eval_next_row::<8>(C::V[4]),
+        trace_eval.column_eval_next_row::<8>(C::V[5]),
+        trace_eval.column_eval_next_row::<8>(C::V[6]),
+        trace_eval.column_eval_next_row::<8>(C::V[7]),
+        trace_eval.column_eval_next_row::<8>(C::V[8]),
+        trace_eval.column_eval_next_row::<8>(C::V[9]),
+        trace_eval.column_eval_next_row::<8>(C::V[10]),
+        trace_eval.column_eval_next_row::<8>(C::V[11]),
+        trace_eval.column_eval_next_row::<8>(C::V[12]),
+        trace_eval.column_eval_next_row::<8>(C::V[13]),
+        trace_eval.column_eval_next_row::<8>(C::V[14]),
+        trace_eval.column_eval_next_row::<8>(C::V[15]),
     ];
 
     // Input match (helper-flattened): a_in[i] = V[G_INDICES[j][0]][i]
     // when IsGIdx[j]=1, etc.  Written as a_in[i] = Σ_j IsGIdx[j] · V[G_INDICES[j][0]][i]
     // and routed through `InMatch{A,B,C,D}` sum helpers so the gate × sum product
     // sits at degree 2 instead of 3.
-    let in_match_a = crate::trace::trace_eval!(trace_eval, Column::InMatchA);
-    let in_match_b = crate::trace::trace_eval!(trace_eval, Column::InMatchB);
-    let in_match_c = crate::trace::trace_eval!(trace_eval, Column::InMatchC);
-    let in_match_d = crate::trace::trace_eval!(trace_eval, Column::InMatchD);
+    let in_match_a = trace_eval.column_eval::<8>(C::IN_MATCH_A);
+    let in_match_b = trace_eval.column_eval::<8>(C::IN_MATCH_B);
+    let in_match_c = trace_eval.column_eval::<8>(C::IN_MATCH_C);
+    let in_match_d = trace_eval.column_eval::<8>(C::IN_MATCH_D);
     for i in 0..8 {
         let mut exp_a = E::F::zero();
         let mut exp_b = E::F::zero();
@@ -653,22 +657,22 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     // Gate substitution: gate ← GateH.
     let gate = gate_h[0].clone();
     let v_next_sum: [_; 16] = [
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum0),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum1),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum2),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum3),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum4),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum5),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum6),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum7),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum8),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum9),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum10),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum11),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum12),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum13),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum14),
-        crate::trace::trace_eval!(trace_eval, Column::VNextSum15),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[0]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[1]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[2]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[3]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[4]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[5]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[6]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[7]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[8]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[9]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[10]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[11]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[12]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[13]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[14]),
+        trace_eval.column_eval::<8>(C::V_NEXT_SUM[15]),
     ];
     for k in 0..16 {
         for i in 0..8 {
@@ -704,50 +708,50 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     // selectors.  Inter-row M_k_next = M_k keeps the message constant
     // across the 96 rows of a single compression.
     let m_cols: [_; 16] = [
-        crate::trace::trace_eval!(trace_eval, Column::M0),
-        crate::trace::trace_eval!(trace_eval, Column::M1),
-        crate::trace::trace_eval!(trace_eval, Column::M2),
-        crate::trace::trace_eval!(trace_eval, Column::M3),
-        crate::trace::trace_eval!(trace_eval, Column::M4),
-        crate::trace::trace_eval!(trace_eval, Column::M5),
-        crate::trace::trace_eval!(trace_eval, Column::M6),
-        crate::trace::trace_eval!(trace_eval, Column::M7),
-        crate::trace::trace_eval!(trace_eval, Column::M8),
-        crate::trace::trace_eval!(trace_eval, Column::M9),
-        crate::trace::trace_eval!(trace_eval, Column::M10),
-        crate::trace::trace_eval!(trace_eval, Column::M11),
-        crate::trace::trace_eval!(trace_eval, Column::M12),
-        crate::trace::trace_eval!(trace_eval, Column::M13),
-        crate::trace::trace_eval!(trace_eval, Column::M14),
-        crate::trace::trace_eval!(trace_eval, Column::M15),
+        trace_eval.column_eval::<8>(C::M[0]),
+        trace_eval.column_eval::<8>(C::M[1]),
+        trace_eval.column_eval::<8>(C::M[2]),
+        trace_eval.column_eval::<8>(C::M[3]),
+        trace_eval.column_eval::<8>(C::M[4]),
+        trace_eval.column_eval::<8>(C::M[5]),
+        trace_eval.column_eval::<8>(C::M[6]),
+        trace_eval.column_eval::<8>(C::M[7]),
+        trace_eval.column_eval::<8>(C::M[8]),
+        trace_eval.column_eval::<8>(C::M[9]),
+        trace_eval.column_eval::<8>(C::M[10]),
+        trace_eval.column_eval::<8>(C::M[11]),
+        trace_eval.column_eval::<8>(C::M[12]),
+        trace_eval.column_eval::<8>(C::M[13]),
+        trace_eval.column_eval::<8>(C::M[14]),
+        trace_eval.column_eval::<8>(C::M[15]),
     ];
     let m_cols_next: [_; 16] = [
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M0),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M1),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M2),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M3),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M4),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M5),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M6),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M7),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M8),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M9),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M10),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M11),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M12),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M13),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M14),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::M15),
+        trace_eval.column_eval_next_row::<8>(C::M[0]),
+        trace_eval.column_eval_next_row::<8>(C::M[1]),
+        trace_eval.column_eval_next_row::<8>(C::M[2]),
+        trace_eval.column_eval_next_row::<8>(C::M[3]),
+        trace_eval.column_eval_next_row::<8>(C::M[4]),
+        trace_eval.column_eval_next_row::<8>(C::M[5]),
+        trace_eval.column_eval_next_row::<8>(C::M[6]),
+        trace_eval.column_eval_next_row::<8>(C::M[7]),
+        trace_eval.column_eval_next_row::<8>(C::M[8]),
+        trace_eval.column_eval_next_row::<8>(C::M[9]),
+        trace_eval.column_eval_next_row::<8>(C::M[10]),
+        trace_eval.column_eval_next_row::<8>(C::M[11]),
+        trace_eval.column_eval_next_row::<8>(C::M[12]),
+        trace_eval.column_eval_next_row::<8>(C::M[13]),
+        trace_eval.column_eval_next_row::<8>(C::M[14]),
+        trace_eval.column_eval_next_row::<8>(C::M[15]),
     ];
     let is_mx_slot = &sched.is_mx_slot;
     let is_my_slot = &sched.is_my_slot;
 
     // Mx / My selection from M by preprocessed selector
     // (helper-flattened).
-    let mx = crate::trace::trace_eval!(trace_eval, Column::Mx);
-    let my = crate::trace::trace_eval!(trace_eval, Column::My);
-    let mx_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MxSlotSum);
-    let my_slot_sum = crate::trace::trace_eval!(trace_eval, Column::MySlotSum);
+    let mx = trace_eval.column_eval::<8>(C::MX);
+    let my = trace_eval.column_eval::<8>(C::MY);
+    let mx_slot_sum = trace_eval.column_eval::<8>(C::MX_SLOT_SUM);
+    let my_slot_sum = trace_eval.column_eval::<8>(C::MY_SLOT_SUM);
     for i in 0..8 {
         let mut exp_mx = E::F::zero();
         let mut exp_my = E::F::zero();
@@ -785,22 +789,22 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     //                 = IV[6][i] + F·(255 - 2·IV[6][i])
     //   V[15][i]    = IV[7][i]
     let h_cols: [_; 8] = [
-        crate::trace::trace_eval!(trace_eval, Column::H0),
-        crate::trace::trace_eval!(trace_eval, Column::H1),
-        crate::trace::trace_eval!(trace_eval, Column::H2),
-        crate::trace::trace_eval!(trace_eval, Column::H3),
-        crate::trace::trace_eval!(trace_eval, Column::H4),
-        crate::trace::trace_eval!(trace_eval, Column::H5),
-        crate::trace::trace_eval!(trace_eval, Column::H6),
-        crate::trace::trace_eval!(trace_eval, Column::H7),
+        trace_eval.column_eval::<8>(C::H[0]),
+        trace_eval.column_eval::<8>(C::H[1]),
+        trace_eval.column_eval::<8>(C::H[2]),
+        trace_eval.column_eval::<8>(C::H[3]),
+        trace_eval.column_eval::<8>(C::H[4]),
+        trace_eval.column_eval::<8>(C::H[5]),
+        trace_eval.column_eval::<8>(C::H[6]),
+        trace_eval.column_eval::<8>(C::H[7]),
     ];
-    let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
-    let f_e = crate::trace::trace_eval!(trace_eval, Column::F);
-    let and_t_lo_e = crate::trace::trace_eval!(trace_eval, Column::AndTLo);
-    let and_t_hi_e = crate::trace::trace_eval!(trace_eval, Column::AndTHi);
+    let t_e = trace_eval.column_eval::<16>(C::T);
+    let f_e = trace_eval.column_eval::<1>(C::F);
+    let and_t_lo_e = trace_eval.column_eval::<8>(C::AND_T_LO);
+    let and_t_hi_e = trace_eval.column_eval::<8>(C::AND_T_HI);
 
     // F ∈ {0,1} (helper-flattened).
-    let f_bound_h = crate::trace::trace_eval!(trace_eval, Column::FBoundH);
+    let f_bound_h = trace_eval.column_eval::<1>(C::F_BOUND_H);
     eval.add_constraint(f_bound_h[0].clone() - f_e[0].clone() * (f_e[0].clone() - f1.clone()));
     eval.add_constraint(is_real[0].clone() * f_bound_h[0].clone());
 
@@ -843,17 +847,17 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
 
     // ── Inter-row: H, T, F stay constant within a compression ──
     let h_cols_next: [_; 8] = [
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H0),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H1),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H2),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H3),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H4),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H5),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H6),
-        crate::trace::trace_eval_next_row!(trace_eval, Column::H7),
+        trace_eval.column_eval_next_row::<8>(C::H[0]),
+        trace_eval.column_eval_next_row::<8>(C::H[1]),
+        trace_eval.column_eval_next_row::<8>(C::H[2]),
+        trace_eval.column_eval_next_row::<8>(C::H[3]),
+        trace_eval.column_eval_next_row::<8>(C::H[4]),
+        trace_eval.column_eval_next_row::<8>(C::H[5]),
+        trace_eval.column_eval_next_row::<8>(C::H[6]),
+        trace_eval.column_eval_next_row::<8>(C::H[7]),
     ];
-    let t_e_next = crate::trace::trace_eval_next_row!(trace_eval, Column::T);
-    let f_e_next = crate::trace::trace_eval_next_row!(trace_eval, Column::F);
+    let t_e_next = trace_eval.column_eval_next_row::<16>(C::T);
+    let f_e_next = trace_eval.column_eval_next_row::<1>(C::F);
     for k in 0..8 {
         for i in 0..8 {
             eval.add_constraint(gate.clone() * (h_cols_next[k][i].clone() - h_cols[k][i].clone()));
@@ -871,14 +875,14 @@ pub(super) fn add_compression_core<P: PreprocessedAirColumn, E: EvalAtRow>(
     // V_after[k][j] is an expression: at row 95 IsGIdx_7=1, so
     //   V_after[3] ← a_out, V_after[4] ← b_out,
     //   V_after[9] ← c_out, V_after[14] ← d_out,  else V[k].
-    let output_e = crate::trace::trace_eval!(trace_eval, Column::Output);
-    let h_hi_e = crate::trace::trace_eval!(trace_eval, Column::HHi);
-    let v_after_hi_e = crate::trace::trace_eval!(trace_eval, Column::VAfterHi);
-    let out_and1_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd1);
-    let out_and1_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd1Hi);
-    let out_xor1_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutXor1Hi);
-    let out_and2_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2);
-    let out_and2_hi_e = crate::trace::trace_eval!(trace_eval, Column::OutAnd2Hi);
+    let output_e = trace_eval.column_eval::<64>(C::OUTPUT);
+    let h_hi_e = trace_eval.column_eval::<64>(C::H_HI);
+    let v_after_hi_e = trace_eval.column_eval::<128>(C::V_AFTER_HI);
+    let out_and1_e = trace_eval.column_eval::<64>(C::OUT_AND1);
+    let out_and1_hi_e = trace_eval.column_eval::<64>(C::OUT_AND1_HI);
+    let out_xor1_hi_e = trace_eval.column_eval::<64>(C::OUT_XOR1_HI);
+    let out_and2_e = trace_eval.column_eval::<64>(C::OUT_AND2);
+    let out_and2_hi_e = trace_eval.column_eval::<64>(C::OUT_AND2_HI);
     // Gate substitution: output_gate ← OutputGateH.
     let output_gate = output_gate_h[0].clone();
 
@@ -1224,41 +1228,44 @@ impl BuiltInComponent for Blake2bChip {
 }
 
 #[cfg(feature = "prover")]
-pub(super) fn add_compression_interaction_core<P: ScheduleColumns>(
+pub(in crate::chips::blake2b) fn add_compression_interaction_core<
+    P: ScheduleColumns,
+    C: CompressionColumns,
+>(
     logup: &mut LogupTraceBuilder,
     component_trace: &ComponentTrace,
     range256: &Range256LookupElements,
     bitwise: &BitwiseAndLookupElements,
 ) {
-    let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
-    let a_in = crate::trace::original_base_column!(component_trace, Column::AIn);
-    let c_in = crate::trace::original_base_column!(component_trace, Column::CIn);
-    let mx = crate::trace::original_base_column!(component_trace, Column::Mx);
-    let my = crate::trace::original_base_column!(component_trace, Column::My);
-    let b_out = crate::trace::original_base_column!(component_trace, Column::BOut);
-    let d_in = crate::trace::original_base_column!(component_trace, Column::DIn);
-    let a1 = crate::trace::original_base_column!(component_trace, Column::A1);
-    let and1 = crate::trace::original_base_column!(component_trace, Column::And1);
-    let b_in = crate::trace::original_base_column!(component_trace, Column::BIn);
-    let c1 = crate::trace::original_base_column!(component_trace, Column::C1);
-    let and2 = crate::trace::original_base_column!(component_trace, Column::And2);
-    let a_out = crate::trace::original_base_column!(component_trace, Column::AOut);
-    let and3 = crate::trace::original_base_column!(component_trace, Column::And3);
-    let c_out = crate::trace::original_base_column!(component_trace, Column::COut);
-    let d_out = crate::trace::original_base_column!(component_trace, Column::DOut);
-    let and4 = crate::trace::original_base_column!(component_trace, Column::And4);
-    let and1_a_hi = crate::trace::original_base_column!(component_trace, Column::And1AHi);
-    let and1_b_hi = crate::trace::original_base_column!(component_trace, Column::And1BHi);
-    let and1_res_hi = crate::trace::original_base_column!(component_trace, Column::And1ResHi);
-    let and2_a_hi = crate::trace::original_base_column!(component_trace, Column::And2AHi);
-    let and2_b_hi = crate::trace::original_base_column!(component_trace, Column::And2BHi);
-    let and2_res_hi = crate::trace::original_base_column!(component_trace, Column::And2ResHi);
-    let and3_a_hi = crate::trace::original_base_column!(component_trace, Column::And3AHi);
-    let and3_b_hi = crate::trace::original_base_column!(component_trace, Column::And3BHi);
-    let and3_res_hi = crate::trace::original_base_column!(component_trace, Column::And3ResHi);
-    let and4_a_hi = crate::trace::original_base_column!(component_trace, Column::And4AHi);
-    let and4_b_hi = crate::trace::original_base_column!(component_trace, Column::And4BHi);
-    let and4_res_hi = crate::trace::original_base_column!(component_trace, Column::And4ResHi);
+    let is_real = component_trace.original_base_column::<1, _>(C::IS_REAL);
+    let a_in = component_trace.original_base_column::<8, _>(C::A_IN);
+    let c_in = component_trace.original_base_column::<8, _>(C::C_IN);
+    let mx = component_trace.original_base_column::<8, _>(C::MX);
+    let my = component_trace.original_base_column::<8, _>(C::MY);
+    let b_out = component_trace.original_base_column::<8, _>(C::B_OUT);
+    let d_in = component_trace.original_base_column::<8, _>(C::D_IN);
+    let a1 = component_trace.original_base_column::<8, _>(C::A1);
+    let and1 = component_trace.original_base_column::<8, _>(C::AND1);
+    let b_in = component_trace.original_base_column::<8, _>(C::B_IN);
+    let c1 = component_trace.original_base_column::<8, _>(C::C1);
+    let and2 = component_trace.original_base_column::<8, _>(C::AND2);
+    let a_out = component_trace.original_base_column::<8, _>(C::A_OUT);
+    let and3 = component_trace.original_base_column::<8, _>(C::AND3);
+    let c_out = component_trace.original_base_column::<8, _>(C::C_OUT);
+    let d_out = component_trace.original_base_column::<8, _>(C::D_OUT);
+    let and4 = component_trace.original_base_column::<8, _>(C::AND4);
+    let and1_a_hi = component_trace.original_base_column::<8, _>(C::AND1_A_HI);
+    let and1_b_hi = component_trace.original_base_column::<8, _>(C::AND1_B_HI);
+    let and1_res_hi = component_trace.original_base_column::<8, _>(C::AND1_RES_HI);
+    let and2_a_hi = component_trace.original_base_column::<8, _>(C::AND2_A_HI);
+    let and2_b_hi = component_trace.original_base_column::<8, _>(C::AND2_B_HI);
+    let and2_res_hi = component_trace.original_base_column::<8, _>(C::AND2_RES_HI);
+    let and3_a_hi = component_trace.original_base_column::<8, _>(C::AND3_A_HI);
+    let and3_b_hi = component_trace.original_base_column::<8, _>(C::AND3_B_HI);
+    let and3_res_hi = component_trace.original_base_column::<8, _>(C::AND3_RES_HI);
+    let and4_a_hi = component_trace.original_base_column::<8, _>(C::AND4_A_HI);
+    let and4_b_hi = component_trace.original_base_column::<8, _>(C::AND4_B_HI);
+    let and4_res_hi = component_trace.original_base_column::<8, _>(C::AND4_RES_HI);
 
     let sixteen = PackedBaseField::broadcast(BaseField::from(16));
     let two = PackedBaseField::broadcast(BaseField::from(2));
@@ -1401,14 +1408,12 @@ pub(super) fn add_compression_interaction_core<P: ScheduleColumns>(
         let iv4_byte = IV[4].to_le_bytes()[i];
         let iv4_hi = PackedBaseField::broadcast(BaseField::from((iv4_byte >> 4) as u32));
         let iv4_lo = PackedBaseField::broadcast(BaseField::from((iv4_byte & 0x0F) as u32));
-        let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
-        let t_hi_cols = crate::trace::original_base_column!(component_trace, Column::THi);
-        let and_t_lo_cols = crate::trace::original_base_column!(component_trace, Column::AndTLo);
-        let and_t_hi_cols = crate::trace::original_base_column!(component_trace, Column::AndTHi);
-        let and_t_lo_hi_cols =
-            crate::trace::original_base_column!(component_trace, Column::AndTLoHi);
-        let and_t_hi_hi_cols =
-            crate::trace::original_base_column!(component_trace, Column::AndTHiHi);
+        let t_cols = component_trace.original_base_column::<16, _>(C::T);
+        let t_hi_cols = component_trace.original_base_column::<16, _>(C::T_HI);
+        let and_t_lo_cols = component_trace.original_base_column::<8, _>(C::AND_T_LO);
+        let and_t_hi_cols = component_trace.original_base_column::<8, _>(C::AND_T_HI);
+        let and_t_lo_hi_cols = component_trace.original_base_column::<8, _>(C::AND_T_LO_HI);
+        let and_t_hi_hi_cols = component_trace.original_base_column::<8, _>(C::AND_T_HI_HI);
         let iv4_hi_bcast_tuple = iv4_hi;
         logup.add_to_relation_computed(bitwise, [is_real[0].clone()], |[r]| r.into(), 3, {
             let t_hi_i = t_hi_cols[i].clone();
@@ -1493,40 +1498,40 @@ pub(super) fn add_compression_interaction_core<P: ScheduleColumns>(
     // numeric index below because the column-fetch macro requires a
     // literal path.
     let is_last_pp = component_trace.preprocessed_base_column::<1, P>(P::IS_LAST);
-    let h_hi_cols = crate::trace::original_base_column!(component_trace, Column::HHi);
-    let v_after_hi_cols = crate::trace::original_base_column!(component_trace, Column::VAfterHi);
-    let out_and1_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1);
-    let out_and1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd1Hi);
-    let out_xor1_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutXor1Hi);
-    let out_and2_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2);
-    let out_and2_hi_cols = crate::trace::original_base_column!(component_trace, Column::OutAnd2Hi);
+    let h_hi_cols = component_trace.original_base_column::<64, _>(C::H_HI);
+    let v_after_hi_cols = component_trace.original_base_column::<128, _>(C::V_AFTER_HI);
+    let out_and1_cols = component_trace.original_base_column::<64, _>(C::OUT_AND1);
+    let out_and1_hi_cols = component_trace.original_base_column::<64, _>(C::OUT_AND1_HI);
+    let out_xor1_hi_cols = component_trace.original_base_column::<64, _>(C::OUT_XOR1_HI);
+    let out_and2_cols = component_trace.original_base_column::<64, _>(C::OUT_AND2);
+    let out_and2_hi_cols = component_trace.original_base_column::<64, _>(C::OUT_AND2_HI);
     let h_by_word: [_; 8] = [
-        crate::trace::original_base_column!(component_trace, Column::H0),
-        crate::trace::original_base_column!(component_trace, Column::H1),
-        crate::trace::original_base_column!(component_trace, Column::H2),
-        crate::trace::original_base_column!(component_trace, Column::H3),
-        crate::trace::original_base_column!(component_trace, Column::H4),
-        crate::trace::original_base_column!(component_trace, Column::H5),
-        crate::trace::original_base_column!(component_trace, Column::H6),
-        crate::trace::original_base_column!(component_trace, Column::H7),
+        component_trace.original_base_column::<8, _>(C::H[0]),
+        component_trace.original_base_column::<8, _>(C::H[1]),
+        component_trace.original_base_column::<8, _>(C::H[2]),
+        component_trace.original_base_column::<8, _>(C::H[3]),
+        component_trace.original_base_column::<8, _>(C::H[4]),
+        component_trace.original_base_column::<8, _>(C::H[5]),
+        component_trace.original_base_column::<8, _>(C::H[6]),
+        component_trace.original_base_column::<8, _>(C::H[7]),
     ];
     let v_by_slot: [_; 16] = [
-        crate::trace::original_base_column!(component_trace, Column::V0),
-        crate::trace::original_base_column!(component_trace, Column::V1),
-        crate::trace::original_base_column!(component_trace, Column::V2),
-        crate::trace::original_base_column!(component_trace, Column::V3),
-        crate::trace::original_base_column!(component_trace, Column::V4),
-        crate::trace::original_base_column!(component_trace, Column::V5),
-        crate::trace::original_base_column!(component_trace, Column::V6),
-        crate::trace::original_base_column!(component_trace, Column::V7),
-        crate::trace::original_base_column!(component_trace, Column::V8),
-        crate::trace::original_base_column!(component_trace, Column::V9),
-        crate::trace::original_base_column!(component_trace, Column::V10),
-        crate::trace::original_base_column!(component_trace, Column::V11),
-        crate::trace::original_base_column!(component_trace, Column::V12),
-        crate::trace::original_base_column!(component_trace, Column::V13),
-        crate::trace::original_base_column!(component_trace, Column::V14),
-        crate::trace::original_base_column!(component_trace, Column::V15),
+        component_trace.original_base_column::<8, _>(C::V[0]),
+        component_trace.original_base_column::<8, _>(C::V[1]),
+        component_trace.original_base_column::<8, _>(C::V[2]),
+        component_trace.original_base_column::<8, _>(C::V[3]),
+        component_trace.original_base_column::<8, _>(C::V[4]),
+        component_trace.original_base_column::<8, _>(C::V[5]),
+        component_trace.original_base_column::<8, _>(C::V[6]),
+        component_trace.original_base_column::<8, _>(C::V[7]),
+        component_trace.original_base_column::<8, _>(C::V[8]),
+        component_trace.original_base_column::<8, _>(C::V[9]),
+        component_trace.original_base_column::<8, _>(C::V[10]),
+        component_trace.original_base_column::<8, _>(C::V[11]),
+        component_trace.original_base_column::<8, _>(C::V[12]),
+        component_trace.original_base_column::<8, _>(C::V[13]),
+        component_trace.original_base_column::<8, _>(C::V[14]),
+        component_trace.original_base_column::<8, _>(C::V[15]),
     ];
 
     // G_INDICES[7] = [3, 4, 9, 14] — at row 95 (g_idx=7, always true at
@@ -1736,175 +1741,76 @@ pub(in crate::chips::blake2b) fn build_compression_rows(
 }
 
 #[cfg(feature = "prover")]
-pub(in crate::chips::blake2b) fn fill_compression_trace(
-    trace: &mut TraceBuilder<Column>,
+pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
+    trace: &mut TraceBuilder<C>,
     side_note: &mut SideNote,
     rows: &[GRow],
 ) {
     for (row_idx, r) in rows.iter().enumerate() {
-        trace.fill_columns_bytes(row_idx, &r.a_in, Column::AIn);
-        trace.fill_columns_bytes(row_idx, &r.b_in, Column::BIn);
-        trace.fill_columns_bytes(row_idx, &r.c_in, Column::CIn);
-        trace.fill_columns_bytes(row_idx, &r.d_in, Column::DIn);
-        trace.fill_columns_bytes(row_idx, &r.mx, Column::Mx);
-        trace.fill_columns_bytes(row_idx, &r.my, Column::My);
-        trace.fill_columns_bytes(row_idx, &r.a1, Column::A1);
-        trace.fill_columns_bytes(row_idx, &r.carry1, Column::Carry1);
-        trace.fill_columns_bytes(row_idx, &r.and1, Column::And1);
-        trace.fill_columns_bytes(row_idx, &r.c1, Column::C1);
-        trace.fill_columns_bytes(row_idx, &r.carry2, Column::Carry2);
-        trace.fill_columns_bytes(row_idx, &r.and2, Column::And2);
-        trace.fill_columns_bytes(row_idx, &r.a_out, Column::AOut);
-        trace.fill_columns_bytes(row_idx, &r.carry3, Column::Carry3);
-        trace.fill_columns_bytes(row_idx, &r.and3, Column::And3);
-        trace.fill_columns_bytes(row_idx, &r.c_out, Column::COut);
-        trace.fill_columns_bytes(row_idx, &r.carry4, Column::Carry4);
-        trace.fill_columns_bytes(row_idx, &r.and4, Column::And4);
-        trace.fill_columns_bytes(row_idx, &r.b_out, Column::BOut);
-        trace.fill_columns_bytes(row_idx, &r.rot63_carry, Column::Rot63Carry);
-        trace.fill_columns_bytes(row_idx, &r.and1_a_hi, Column::And1AHi);
-        trace.fill_columns_bytes(row_idx, &r.and1_b_hi, Column::And1BHi);
-        trace.fill_columns_bytes(row_idx, &r.and1_res_hi, Column::And1ResHi);
-        trace.fill_columns_bytes(row_idx, &r.and2_a_hi, Column::And2AHi);
-        trace.fill_columns_bytes(row_idx, &r.and2_b_hi, Column::And2BHi);
-        trace.fill_columns_bytes(row_idx, &r.and2_res_hi, Column::And2ResHi);
-        trace.fill_columns_bytes(row_idx, &r.and3_a_hi, Column::And3AHi);
-        trace.fill_columns_bytes(row_idx, &r.and3_b_hi, Column::And3BHi);
-        trace.fill_columns_bytes(row_idx, &r.and3_res_hi, Column::And3ResHi);
-        trace.fill_columns_bytes(row_idx, &r.and4_a_hi, Column::And4AHi);
-        trace.fill_columns_bytes(row_idx, &r.and4_b_hi, Column::And4BHi);
-        trace.fill_columns_bytes(row_idx, &r.and4_res_hi, Column::And4ResHi);
-        trace.fill_columns_bytes(row_idx, &r.d_out, Column::DOut);
-        const V_COLS: [Column; 16] = [
-            Column::V0,
-            Column::V1,
-            Column::V2,
-            Column::V3,
-            Column::V4,
-            Column::V5,
-            Column::V6,
-            Column::V7,
-            Column::V8,
-            Column::V9,
-            Column::V10,
-            Column::V11,
-            Column::V12,
-            Column::V13,
-            Column::V14,
-            Column::V15,
-        ];
+        trace.fill_columns_bytes(row_idx, &r.a_in, C::A_IN);
+        trace.fill_columns_bytes(row_idx, &r.b_in, C::B_IN);
+        trace.fill_columns_bytes(row_idx, &r.c_in, C::C_IN);
+        trace.fill_columns_bytes(row_idx, &r.d_in, C::D_IN);
+        trace.fill_columns_bytes(row_idx, &r.mx, C::MX);
+        trace.fill_columns_bytes(row_idx, &r.my, C::MY);
+        trace.fill_columns_bytes(row_idx, &r.a1, C::A1);
+        trace.fill_columns_bytes(row_idx, &r.carry1, C::CARRY1);
+        trace.fill_columns_bytes(row_idx, &r.and1, C::AND1);
+        trace.fill_columns_bytes(row_idx, &r.c1, C::C1);
+        trace.fill_columns_bytes(row_idx, &r.carry2, C::CARRY2);
+        trace.fill_columns_bytes(row_idx, &r.and2, C::AND2);
+        trace.fill_columns_bytes(row_idx, &r.a_out, C::A_OUT);
+        trace.fill_columns_bytes(row_idx, &r.carry3, C::CARRY3);
+        trace.fill_columns_bytes(row_idx, &r.and3, C::AND3);
+        trace.fill_columns_bytes(row_idx, &r.c_out, C::C_OUT);
+        trace.fill_columns_bytes(row_idx, &r.carry4, C::CARRY4);
+        trace.fill_columns_bytes(row_idx, &r.and4, C::AND4);
+        trace.fill_columns_bytes(row_idx, &r.b_out, C::B_OUT);
+        trace.fill_columns_bytes(row_idx, &r.rot63_carry, C::ROT63_CARRY);
+        trace.fill_columns_bytes(row_idx, &r.and1_a_hi, C::AND1_A_HI);
+        trace.fill_columns_bytes(row_idx, &r.and1_b_hi, C::AND1_B_HI);
+        trace.fill_columns_bytes(row_idx, &r.and1_res_hi, C::AND1_RES_HI);
+        trace.fill_columns_bytes(row_idx, &r.and2_a_hi, C::AND2_A_HI);
+        trace.fill_columns_bytes(row_idx, &r.and2_b_hi, C::AND2_B_HI);
+        trace.fill_columns_bytes(row_idx, &r.and2_res_hi, C::AND2_RES_HI);
+        trace.fill_columns_bytes(row_idx, &r.and3_a_hi, C::AND3_A_HI);
+        trace.fill_columns_bytes(row_idx, &r.and3_b_hi, C::AND3_B_HI);
+        trace.fill_columns_bytes(row_idx, &r.and3_res_hi, C::AND3_RES_HI);
+        trace.fill_columns_bytes(row_idx, &r.and4_a_hi, C::AND4_A_HI);
+        trace.fill_columns_bytes(row_idx, &r.and4_b_hi, C::AND4_B_HI);
+        trace.fill_columns_bytes(row_idx, &r.and4_res_hi, C::AND4_RES_HI);
+        trace.fill_columns_bytes(row_idx, &r.d_out, C::D_OUT);
         for k in 0..16 {
-            trace.fill_columns_bytes(row_idx, &r.v[k], V_COLS[k]);
+            trace.fill_columns_bytes(row_idx, &r.v[k], C::V[k]);
         }
-        const M_COLS: [Column; 16] = [
-            Column::M0,
-            Column::M1,
-            Column::M2,
-            Column::M3,
-            Column::M4,
-            Column::M5,
-            Column::M6,
-            Column::M7,
-            Column::M8,
-            Column::M9,
-            Column::M10,
-            Column::M11,
-            Column::M12,
-            Column::M13,
-            Column::M14,
-            Column::M15,
-        ];
         for k in 0..16 {
-            trace.fill_columns_bytes(row_idx, &r.m[k], M_COLS[k]);
+            trace.fill_columns_bytes(row_idx, &r.m[k], C::M[k]);
         }
         // Compression-level inputs.
-        const H_COLS: [Column; 8] = [
-            Column::H0,
-            Column::H1,
-            Column::H2,
-            Column::H3,
-            Column::H4,
-            Column::H5,
-            Column::H6,
-            Column::H7,
-        ];
         for k in 0..8 {
-            trace.fill_columns_bytes(row_idx, &r.h[k], H_COLS[k]);
+            trace.fill_columns_bytes(row_idx, &r.h[k], C::H[k]);
         }
-        trace.fill_columns_bytes(row_idx, &r.t, Column::T);
-        trace.fill_columns(row_idx, r.f, Column::F);
-        trace.fill_columns_bytes(row_idx, &r.t_hi, Column::THi);
-        trace.fill_columns_bytes(row_idx, &r.and_t_lo, Column::AndTLo);
-        trace.fill_columns_bytes(row_idx, &r.and_t_hi, Column::AndTHi);
-        trace.fill_columns_bytes(row_idx, &r.and_t_lo_hi, Column::AndTLoHi);
-        trace.fill_columns_bytes(row_idx, &r.and_t_hi_hi, Column::AndTHiHi);
+        trace.fill_columns_bytes(row_idx, &r.t, C::T);
+        trace.fill_columns(row_idx, r.f, C::F);
+        trace.fill_columns_bytes(row_idx, &r.t_hi, C::T_HI);
+        trace.fill_columns_bytes(row_idx, &r.and_t_lo, C::AND_T_LO);
+        trace.fill_columns_bytes(row_idx, &r.and_t_hi, C::AND_T_HI);
+        trace.fill_columns_bytes(row_idx, &r.and_t_lo_hi, C::AND_T_LO_HI);
+        trace.fill_columns_bytes(row_idx, &r.and_t_hi_hi, C::AND_T_HI_HI);
         // Output-derivation witnesses (0 on non-last rows).
-        trace.fill_columns_bytes(row_idx, &r.output, Column::Output);
-        trace.fill_columns_bytes(row_idx, &r.h_hi, Column::HHi);
-        trace.fill_columns_bytes(row_idx, &r.v_after_hi, Column::VAfterHi);
-        trace.fill_columns_bytes(row_idx, &r.out_and1, Column::OutAnd1);
-        trace.fill_columns_bytes(row_idx, &r.out_and1_hi, Column::OutAnd1Hi);
-        trace.fill_columns_bytes(row_idx, &r.out_xor1_hi, Column::OutXor1Hi);
-        trace.fill_columns_bytes(row_idx, &r.out_and2, Column::OutAnd2);
-        trace.fill_columns_bytes(row_idx, &r.out_and2_hi, Column::OutAnd2Hi);
-        // ECALL-binding witnesses.
-        trace.fill_columns_bytes(row_idx, &r.h_ptr, Column::HPtr);
-        trace.fill_columns_bytes(row_idx, &r.m_ptr, Column::MPtr);
-        trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
-        // Split 4-byte-wide address arrays into per-byte slices.
-        {
-            let mut b0 = [0u8; 64];
-            let mut b1 = [0u8; 64];
-            let mut b2 = [0u8; 64];
-            let mut b3 = [0u8; 64];
-            for i in 0..64 {
-                b0[i] = r.h_rd_addr[i * 4];
-                b1[i] = r.h_rd_addr[i * 4 + 1];
-                b2[i] = r.h_rd_addr[i * 4 + 2];
-                b3[i] = r.h_rd_addr[i * 4 + 3];
-            }
-            trace.fill_columns_bytes(row_idx, &b0, Column::HRdAddrB0);
-            trace.fill_columns_bytes(row_idx, &b1, Column::HRdAddrB1);
-            trace.fill_columns_bytes(row_idx, &b2, Column::HRdAddrB2);
-            trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
-        }
-        {
-            let mut b0 = [0u8; 128];
-            let mut b1 = [0u8; 128];
-            let mut b2 = [0u8; 128];
-            let mut b3 = [0u8; 128];
-            for k in 0..128 {
-                b0[k] = r.m_rd_addr[k * 4];
-                b1[k] = r.m_rd_addr[k * 4 + 1];
-                b2[k] = r.m_rd_addr[k * 4 + 2];
-                b3[k] = r.m_rd_addr[k * 4 + 3];
-            }
-            trace.fill_columns_bytes(row_idx, &b0, Column::MRdAddrB0);
-            trace.fill_columns_bytes(row_idx, &b1, Column::MRdAddrB1);
-            trace.fill_columns_bytes(row_idx, &b2, Column::MRdAddrB2);
-            trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
-        }
-        {
-            let mut b0 = [0u8; 64];
-            let mut b1 = [0u8; 64];
-            let mut b2 = [0u8; 64];
-            let mut b3 = [0u8; 64];
-            for i in 0..64 {
-                b0[i] = r.h_wr_addr[i * 4];
-                b1[i] = r.h_wr_addr[i * 4 + 1];
-                b2[i] = r.h_wr_addr[i * 4 + 2];
-                b3[i] = r.h_wr_addr[i * 4 + 3];
-            }
-            trace.fill_columns_bytes(row_idx, &b0, Column::HWrAddrB0);
-            trace.fill_columns_bytes(row_idx, &b1, Column::HWrAddrB1);
-            trace.fill_columns_bytes(row_idx, &b2, Column::HWrAddrB2);
-            trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
-        }
-        trace.fill_columns(row_idx, true, Column::IsReal);
+        trace.fill_columns_bytes(row_idx, &r.output, C::OUTPUT);
+        trace.fill_columns_bytes(row_idx, &r.h_hi, C::H_HI);
+        trace.fill_columns_bytes(row_idx, &r.v_after_hi, C::V_AFTER_HI);
+        trace.fill_columns_bytes(row_idx, &r.out_and1, C::OUT_AND1);
+        trace.fill_columns_bytes(row_idx, &r.out_and1_hi, C::OUT_AND1_HI);
+        trace.fill_columns_bytes(row_idx, &r.out_xor1_hi, C::OUT_XOR1_HI);
+        trace.fill_columns_bytes(row_idx, &r.out_and2, C::OUT_AND2);
+        trace.fill_columns_bytes(row_idx, &r.out_and2_hi, C::OUT_AND2_HI);
+        trace.fill_columns(row_idx, true, C::IS_REAL);
 
         // Carry-bound helpers.  Carries c ∈ {0,1,2}
         // for Carry1/3 and ∈ {0,1} for Carry2/4/Rot63 — see DESIGN
-        // notes on `Column::Carry1XcM1` etc.  XcM1 = c·(c-1) is 0 for
+        // notes on `C::CARRY1_XCM1` etc.  XcM1 = c·(c-1) is 0 for
         // c ∈ {0,1} and 2 for c=2.  Full = XcM1·(c-2) is 0 for any
         // valid c (so the runtime values are always 0; the helpers
         // exist purely to flatten the constraint degree).  All math
@@ -1933,30 +1839,30 @@ pub(in crate::chips::blake2b) fn fill_compression_trace(
             c4_xcm1[i] = xcm1(r.carry4[i]);
             rot_xcm1[i] = xcm1(r.rot63_carry[i]);
         }
-        trace.fill_columns_bytes(row_idx, &c1_xcm1, Column::Carry1XcM1);
-        trace.fill_columns_bytes(row_idx, &c1_full, Column::Carry1Full);
-        trace.fill_columns_bytes(row_idx, &c3_xcm1, Column::Carry3XcM1);
-        trace.fill_columns_bytes(row_idx, &c3_full, Column::Carry3Full);
-        trace.fill_columns_bytes(row_idx, &c2_xcm1, Column::Carry2XcM1);
-        trace.fill_columns_bytes(row_idx, &c4_xcm1, Column::Carry4XcM1);
-        trace.fill_columns_bytes(row_idx, &rot_xcm1, Column::Rot63XcM1);
+        trace.fill_columns_bytes(row_idx, &c1_xcm1, C::CARRY1_XCM1);
+        trace.fill_columns_bytes(row_idx, &c1_full, C::CARRY1_FULL);
+        trace.fill_columns_bytes(row_idx, &c3_xcm1, C::CARRY3_XCM1);
+        trace.fill_columns_bytes(row_idx, &c3_full, C::CARRY3_FULL);
+        trace.fill_columns_bytes(row_idx, &c2_xcm1, C::CARRY2_XCM1);
+        trace.fill_columns_bytes(row_idx, &c4_xcm1, C::CARRY4_XCM1);
+        trace.fill_columns_bytes(row_idx, &rot_xcm1, C::ROT63_XCM1);
 
         // F-bound helper.  F ∈ {0,1} ⇒ F·(F-1) = 0.
-        trace.fill_columns(row_idx, false, Column::FBoundH);
+        trace.fill_columns(row_idx, false, C::F_BOUND_H);
 
         // Input-match sum helpers.  Exactly one
         // `IsGIdx[j_active] = 1` per row, so the sum equals the active
         // V slot's byte — which is what `r.{a,b,c,d}_in` already hold.
-        trace.fill_columns_bytes(row_idx, &r.a_in, Column::InMatchA);
-        trace.fill_columns_bytes(row_idx, &r.b_in, Column::InMatchB);
-        trace.fill_columns_bytes(row_idx, &r.c_in, Column::InMatchC);
-        trace.fill_columns_bytes(row_idx, &r.d_in, Column::InMatchD);
+        trace.fill_columns_bytes(row_idx, &r.a_in, C::IN_MATCH_A);
+        trace.fill_columns_bytes(row_idx, &r.b_in, C::IN_MATCH_B);
+        trace.fill_columns_bytes(row_idx, &r.c_in, C::IN_MATCH_C);
+        trace.fill_columns_bytes(row_idx, &r.d_in, C::IN_MATCH_D);
 
         // Mx / My slot-selection helpers.  Exactly
         // one IsMxSlot[k_mx] = 1 per row (k_mx = SIGMA[round][2·g_idx]),
         // so MxSlotSum[i] = M[k_mx][i] = mx[i].  Same shape for My.
-        trace.fill_columns_bytes(row_idx, &r.mx, Column::MxSlotSum);
-        trace.fill_columns_bytes(row_idx, &r.my, Column::MySlotSum);
+        trace.fill_columns_bytes(row_idx, &r.mx, C::MX_SLOT_SUM);
+        trace.fill_columns_bytes(row_idx, &r.my, C::MY_SLOT_SUM);
 
         // V_next sum helpers.  At row r with
         // j_active = row_idx % 8, the sum collapses to v_after[k][i]
@@ -1969,26 +1875,8 @@ pub(in crate::chips::blake2b) fn fill_compression_trace(
         v_after_bytes[bi_v] = r.b_out;
         v_after_bytes[ci_v] = r.c_out;
         v_after_bytes[di_v] = r.d_out;
-        const V_NEXT_SUM_COLS: [Column; 16] = [
-            Column::VNextSum0,
-            Column::VNextSum1,
-            Column::VNextSum2,
-            Column::VNextSum3,
-            Column::VNextSum4,
-            Column::VNextSum5,
-            Column::VNextSum6,
-            Column::VNextSum7,
-            Column::VNextSum8,
-            Column::VNextSum9,
-            Column::VNextSum10,
-            Column::VNextSum11,
-            Column::VNextSum12,
-            Column::VNextSum13,
-            Column::VNextSum14,
-            Column::VNextSum15,
-        ];
         for k in 0..16 {
-            trace.fill_columns_bytes(row_idx, &v_after_bytes[k], V_NEXT_SUM_COLS[k]);
+            trace.fill_columns_bytes(row_idx, &v_after_bytes[k], C::V_NEXT_SUM[k]);
         }
 
         // Gate helpers.  Each row, IsReal=1 here, so
@@ -2002,9 +1890,9 @@ pub(in crate::chips::blake2b) fn fill_compression_trace(
         let pos = row_idx % 96;
         let is_first = pos == 0;
         let is_last = pos == 95;
-        trace.fill_columns(row_idx, !is_last, Column::GateH);
-        trace.fill_columns(row_idx, is_first, Column::InitGateH);
-        trace.fill_columns(row_idx, is_last, Column::OutputGateH);
+        trace.fill_columns(row_idx, !is_last, C::GATE_H);
+        trace.fill_columns(row_idx, is_first, C::INIT_GATE_H);
+        trace.fill_columns(row_idx, is_last, C::OUTPUT_GATE_H);
 
         // Emit per-byte nibble counts.  add_bitwise_and increments both the
         // hi-nibble and lo-nibble (a, b) cell in the 16×16 BitwiseLookup
@@ -2065,6 +1953,69 @@ pub(in crate::chips::blake2b) fn fill_compression_trace(
     }
 }
 
+/// Fill the ECALL memory-binding columns — `Blake2bChip`'s exclusive width
+/// (`HPtr`/`MPtr`/`CallTs` + the per-byte read/write address columns).
+/// Split from `fill_compression_trace` because the boundary chip's
+/// `BoundaryColumn` layout omits these columns entirely.
+#[cfg(feature = "prover")]
+fn fill_ecall_binding_trace(trace: &mut TraceBuilder<Column>, rows: &[GRow]) {
+    for (row_idx, r) in rows.iter().enumerate() {
+        // ECALL-binding witnesses.
+        trace.fill_columns_bytes(row_idx, &r.h_ptr, Column::HPtr);
+        trace.fill_columns_bytes(row_idx, &r.m_ptr, Column::MPtr);
+        trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
+        // Split 4-byte-wide address arrays into per-byte slices.
+        {
+            let mut b0 = [0u8; 64];
+            let mut b1 = [0u8; 64];
+            let mut b2 = [0u8; 64];
+            let mut b3 = [0u8; 64];
+            for i in 0..64 {
+                b0[i] = r.h_rd_addr[i * 4];
+                b1[i] = r.h_rd_addr[i * 4 + 1];
+                b2[i] = r.h_rd_addr[i * 4 + 2];
+                b3[i] = r.h_rd_addr[i * 4 + 3];
+            }
+            trace.fill_columns_bytes(row_idx, &b0, Column::HRdAddrB0);
+            trace.fill_columns_bytes(row_idx, &b1, Column::HRdAddrB1);
+            trace.fill_columns_bytes(row_idx, &b2, Column::HRdAddrB2);
+            trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
+        }
+        {
+            let mut b0 = [0u8; 128];
+            let mut b1 = [0u8; 128];
+            let mut b2 = [0u8; 128];
+            let mut b3 = [0u8; 128];
+            for k in 0..128 {
+                b0[k] = r.m_rd_addr[k * 4];
+                b1[k] = r.m_rd_addr[k * 4 + 1];
+                b2[k] = r.m_rd_addr[k * 4 + 2];
+                b3[k] = r.m_rd_addr[k * 4 + 3];
+            }
+            trace.fill_columns_bytes(row_idx, &b0, Column::MRdAddrB0);
+            trace.fill_columns_bytes(row_idx, &b1, Column::MRdAddrB1);
+            trace.fill_columns_bytes(row_idx, &b2, Column::MRdAddrB2);
+            trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
+        }
+        {
+            let mut b0 = [0u8; 64];
+            let mut b1 = [0u8; 64];
+            let mut b2 = [0u8; 64];
+            let mut b3 = [0u8; 64];
+            for i in 0..64 {
+                b0[i] = r.h_wr_addr[i * 4];
+                b1[i] = r.h_wr_addr[i * 4 + 1];
+                b2[i] = r.h_wr_addr[i * 4 + 2];
+                b3[i] = r.h_wr_addr[i * 4 + 3];
+            }
+            trace.fill_columns_bytes(row_idx, &b0, Column::HWrAddrB0);
+            trace.fill_columns_bytes(row_idx, &b1, Column::HWrAddrB1);
+            trace.fill_columns_bytes(row_idx, &b2, Column::HWrAddrB2);
+            trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
+        }
+    }
+}
+
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for Blake2bChip {
     fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
@@ -2093,6 +2044,7 @@ impl BuiltInProverComponent for Blake2bChip {
         let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         fill_compression_trace(&mut trace, side_note, &rows);
+        fill_ecall_binding_trace(&mut trace, &rows);
         trace.finalize_bit_reversed()
     }
 
@@ -2112,7 +2064,7 @@ impl BuiltInProverComponent for Blake2bChip {
         let bitwise: &BitwiseAndLookupElements = lookup_elements.as_ref();
         // Arithmetic-core lookups (BitwiseAnd / Range256 nibble lookups +
         // output-AND lookups) — shared with Blake2bBoundaryChip.
-        add_compression_interaction_core::<PreprocessedColumn>(
+        add_compression_interaction_core::<PreprocessedColumn, Column>(
             &mut logup,
             &component_trace,
             range256,

@@ -24,7 +24,7 @@ use zkpvm::AirColumn;
 use zkpvm::SideNote;
 use zkpvm::chips::Blake2bBoundaryChip;
 use zkpvm::chips::Blake2bCall;
-use zkpvm::chips::blake2b::Column;
+use zkpvm::chips::blake2b::BoundaryColumn;
 use zkpvm::framework_access::AllLookupElements;
 use zkpvm::harness::MachineProverComponent;
 use zkpvm::trace::component::ComponentTrace;
@@ -91,8 +91,8 @@ fn boundary_isreal_anchor_rejects_lit_only_at_row95() {
     let chip = Blake2bBoundaryChip;
     let mut trace = chip.generate_component_trace(&mut side_note);
 
-    let is_real = Column::IsReal.offset();
-    let output_gate_h = Column::OutputGateH.offset();
+    let is_real = BoundaryColumn::IsReal.offset();
+    let output_gate_h = BoundaryColumn::OutputGateH.offset();
 
     // Control: the honest trace satisfies every constraint.
     assert_chip(&chip, &trace, &side_note)
