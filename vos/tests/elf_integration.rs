@@ -6785,7 +6785,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
 // ── voucher-check canonical proving provenance ───────────────────────
 //
 // The `voucher-check` program's canonical profile + commitment allowlist
-// + segment-step bound. The prover is program-agnostic (it takes a
+// + budgeted-cut bounds. The prover is program-agnostic (it takes a
 // transpiled PVM blob + these caller-supplied parameters), so this
 // provenance lives with the verification system that uses it — here, the
 // issuing-bank stand-in that drives the federation e2e below. In
@@ -6794,11 +6794,20 @@ fn clerk_ledger_bootstrap_and_create_account() {
 // published voucher-check build. `voucher_check_commitment_drift_guard`
 // re-derives + guards these values.
 
-/// Per-segment step bound for canonical chain proving. The canonical
-/// profile + commitment allowlist were measured/pinned against this bound;
-/// a different segment size reshapes the segments and lands the chain on
-/// commitments outside the allowlist.
-const CHAIN_SEG_STEPS: usize = 100_000;
+/// Per-segment step budget for canonical chain proving. Together with
+/// [`VOUCHER_CHECK_PAGE_BUDGET`] it fixes the content-budgeted cut
+/// (`zkpvm::segment::segment_bounds_budgeted`) the canonical profile +
+/// commitment allowlist were measured against; a different cut reshapes
+/// the windows and lands the chain on commitments outside the allowlist.
+const CHAIN_SEG_STEPS: usize = 32_000;
+
+/// Per-segment touched-page budget — the second axis of the budgeted cut.
+/// Distinct touched pages size the entering/exiting page-Merkle multiproof
+/// and with it the boundary chip (the widest chip in the AIR), so the page
+/// budget, not the step budget, bounds a window's committed cells: at
+/// (32k, 8) every window proves at roughly a third of the uniform-100k
+/// cut's RAM (see zkpvm/docs/plans/mobile-proving.md Wave 5.1).
+const VOUCHER_CHECK_PAGE_BUDGET: usize = 8;
 
 /// Gas bound for tracing the voucher-check transition (matches the prover's
 /// generous trace budget).
@@ -6806,64 +6815,60 @@ const VC_TRACE_GAS: u64 = 100_000_000;
 
 /// Canonical-shape forcing profile for `voucher-check`, indexed by
 /// `zkpvm::chip_idx`. `zkpvm::prove_canonical` pads each forcing-set chip's
-/// main trace up to `PROFILE[chip_idx]` so every segment's
+/// main trace up to `PROFILE[chip_idx]` so every window's
 /// preprocessed-bearing chips share one `log_size`; `0` = not forced.
-/// Forcing set: BLAKE2B(1), BLAKE2B_BOUNDARY(2), MEMORY_PAGE(4),
-/// RISTRETTO(23), RIST_ECALL(24), FIXED_BASE_CONSUMER(26), COMB_ANCHOR(27),
-/// COMB_SCALAR_BOUNDARY(28), COMB_COMPRESS(29), COMB_COMPRESS_OUTPUT(30).
 ///
-/// BLAKE2B_BOUNDARY and MEMORY_PAGE floors are 18/11 — the size a FULL
-/// (`seg_steps`) segment reaches — so the short trailing segment, whose natural
-/// sizes are smaller, is forced up to the same shape and collapses to C_0
-/// rather than a third commitment. The earlier 17/10 floors sat BELOW the
-/// full-segment natural, leaving full segments unforced (they used 18/11) while
-/// the short segment sat on the floor (17/10) — a mismatch that landed the
-/// chain's tail outside the allowlist.
+/// These are the DERIVED floors (`zkpvm::canonical_profile_for_bounds`)
+/// over the budgeted cut: the per-chip elementwise MAX of every window's
+/// natural main-trace `log_size` — dense, unlike the retired hand-tuned
+/// profile, which forced only the content-scaling chips. Chips whose size
+/// is already uniform across windows get their own size back (forcing is a
+/// no-op there); varying chips get the chain-wide max, so every window
+/// collapses onto the allowlist below. Forcing chips the hand profile left
+/// at 0 SHIFTS the program commitment — a dense re-derivation is always a
+/// full re-pin (profile + allowlist + catalog together), never a drop-in.
 ///
-/// These chips size on the NUMBER of blake2b / memory-page / ristretto
-/// OPERATIONS in a segment (content), not on its step count — so padding the
-/// tail with no-op steps would NOT canonicalize them; forcing the floor is
-/// the only lever. The floors are the observed per-segment MAXIMA for this
-/// transition, measured over EVERY segment by the trace-only
-/// `voucher_check_profile_floors_cover_natural_sizes` guard: the federation
-/// e2e verifies all segments against {C_0, C_1}, which can only hold if no
-/// segment's natural size exceeds a floor. Because the succinct witness fixes
-/// per-operation cost (constant-depth SMT paths regardless of ledger size),
-/// per-segment operation DENSITY is bounded (it does not grow with the
-/// ledger), so the fixed-profile approach stays sound across batch sizes —
-/// but the floors are measured maxima for this transition's operation
-/// pattern, not a proven bound; guest-framework or kernel code-size changes
-/// slide operation bursts across segment boundaries and can outgrow them
-/// (BLAKE2B went 14→16 and RISTRETTO_ECALL 7→8 that way). The floor guard
-/// catches it cheaply; `voucher_check_commitment_drift_guard` +
+/// The content-scaling chips size on the NUMBER of blake2b / memory-page /
+/// ristretto OPERATIONS in a window (content), not on its step count — so
+/// padding with no-op steps would NOT canonicalize them; forcing the floor
+/// is the only lever. The floors are observed per-window MAXIMA for this
+/// transition, not a proven bound: guest-framework or kernel code-size
+/// changes slide operation bursts across window boundaries and can outgrow
+/// them. The trace-only `voucher_check_profile_floors_cover_natural_sizes`
+/// guard catches that cheaply; `voucher_check_commitment_drift_guard` +
 /// `voucher_check_allowlist_coverage` are the proving-grade confirmation.
-/// Collapsing any-length chain to ONE commitment (so no floor tuning is ever
-/// needed) is the recursive-aggregation work in docs/plans/proving-time.md §6.
+/// Because the succinct witness fixes per-operation cost (constant-depth
+/// SMT paths regardless of ledger size), per-window operation DENSITY is
+/// bounded (it does not grow with the ledger), so the fixed-profile
+/// approach stays sound across batch sizes. Collapsing any-length chain to
+/// ONE commitment (so no floor tuning is ever needed) is the
+/// recursive-aggregation work in docs/plans/proving-time.md §6.
 const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 31] = [
-    0, 16, 18, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 8, 0, 11, 6, 5, 6, 5,
+    15, 15, 16, 18, 9, 6, 4, 17, 4, 4, 4, 18, 11, 8, 8, 6, 8, 8, 8, 14, 12, 13, 12, 4, 7, 10, 11,
+    6, 5, 6, 5,
 ];
 
 /// Published canonical-shape program-commitment ALLOWLIST for
 /// `voucher-check` (production Blake2s channel). The commitment is the
-/// preprocessed-trace Merkle root; under canonical proving every segment of
+/// preprocessed-trace Merkle root; under canonical proving every window of
 /// the conservation transition collapses to one of these — `[0]` = a
-/// comb-free segment (the vast majority), `[1]` = a segment carrying one
-/// fixed-base scalar mult. `verify_chain` accepts a chain whose every
-/// segment commitment is in this set.
+/// comb-free window (the vast majority, short tail included), `[1]` = a
+/// window carrying one fixed-base scalar mult. `verify_chain` accepts a
+/// chain whose every segment commitment is in this set.
 const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
     // C_0 — comb-free canonical shape.
-    // blake2s 4e8f886921b2d4751c1ca7699e033b637bd1dc16eaf46faa50d120c12d3065bf
+    // blake2s 1373d0f4968e0b2d46a0e23c758753f41664591a5dd22f331044174a40c8e980
     [
-        0x4e, 0x8f, 0x88, 0x69, 0x21, 0xb2, 0xd4, 0x75, 0x1c, 0x1c, 0xa7, 0x69, 0x9e, 0x03, 0x3b,
-        0x63, 0x7b, 0xd1, 0xdc, 0x16, 0xea, 0xf4, 0x6f, 0xaa, 0x50, 0xd1, 0x20, 0xc1, 0x2d, 0x30,
-        0x65, 0xbf,
+        0x13, 0x73, 0xd0, 0xf4, 0x96, 0x8e, 0x0b, 0x2d, 0x46, 0xa0, 0xe2, 0x3c, 0x75, 0x87, 0x53,
+        0xf4, 0x16, 0x64, 0x59, 0x1a, 0x5d, 0xd2, 0x2f, 0x33, 0x10, 0x44, 0x17, 0x4a, 0x40, 0xc8,
+        0xe9, 0x80,
     ],
-    // C_1 — one-comb-call canonical shape (the fixed-base scalar mult segment).
-    // blake2s fc90359b175185680d4df482cabfe5895f01454a0e77c53c7488593a3dfd9354
+    // C_1 — one-comb-call canonical shape (the fixed-base scalar mult window).
+    // blake2s 3667db4fa250fe91ddc578227da1d8ea4b2ca9cc002d738c69b558d1a33a4ff0
     [
-        0xfc, 0x90, 0x35, 0x9b, 0x17, 0x51, 0x85, 0x68, 0x0d, 0x4d, 0xf4, 0x82, 0xca, 0xbf, 0xe5,
-        0x89, 0x5f, 0x01, 0x45, 0x4a, 0x0e, 0x77, 0xc5, 0x3c, 0x74, 0x88, 0x59, 0x3a, 0x3d, 0xfd,
-        0x93, 0x54,
+        0x36, 0x67, 0xdb, 0x4f, 0xa2, 0x50, 0xfe, 0x91, 0xdd, 0xc5, 0x78, 0x22, 0x7d, 0xa1, 0xd8,
+        0xea, 0x4b, 0x2c, 0xa9, 0xcc, 0x00, 0x2d, 0x73, 0x8c, 0x69, 0xb5, 0x58, 0xd1, 0xa3, 0x3a,
+        0x4f, 0xf0,
     ],
 ];
 
@@ -6915,7 +6920,8 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
     let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
     let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
         .expect("trace the voucher-check conservation transition");
-    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), CHAIN_SEG_STEPS);
+    let bounds =
+        zkpvm::segment::segment_bounds_budgeted(&full, CHAIN_SEG_STEPS, VOUCHER_CHECK_PAGE_BUDGET);
 
     let forced: Vec<usize> = VOUCHER_CHECK_CANONICAL_PROFILE
         .iter()
@@ -6963,7 +6969,7 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
 /// re-derive C_0 (a comb-free segment) and C_1 (the comb segment) by
 /// canonical proving over the CURRENT `voucher-check.elf` transpiled with
 /// vos's grey-transpiler, and assert they equal the baked values. Fails
-/// loudly if the AIR, the canonical profile, the segment-step bound, the
+/// loudly if the AIR, the canonical profile, the budgeted cut, the
 /// voucher-check ELF, or the transpiler shifts the program commitment —
 /// re-run and re-pin `VOUCHER_CHECK_COMMITMENTS` from the printed values
 /// (and re-pin the `allowlist` any verification system configured with
@@ -6992,14 +6998,16 @@ fn voucher_check_commitment_drift_guard() {
         total > 1_000_000,
         "trace is only {total} steps — guest early-exited (stale voucher-check ELF?)"
     );
-    let bounds = zkpvm::segment::segment_bounds(total, CHAIN_SEG_STEPS);
+    let bounds =
+        zkpvm::segment::segment_bounds_budgeted(&full, CHAIN_SEG_STEPS, VOUCHER_CHECK_PAGE_BUDGET);
     let n = bounds.len();
+    // One forward cursor pass finds the first comb-bearing window — O(N)
+    // slicing instead of segment_side_note's per-window prefix replay.
+    let mut scan = zkpvm::segment::SegmentCursor::new(&full);
     let comb_seg = (0..n)
         .find(|&i| {
             let (a, b) = bounds[i];
-            !zkpvm::segment::segment_side_note(&full, a, b)
-                .ristretto_comb_calls
-                .is_empty()
+            !scan.side_note(a, b).ristretto_comb_calls.is_empty()
         })
         .expect("the conservation transition must contain a fixed-base scalar mult (comb) segment");
 
@@ -7034,7 +7042,7 @@ fn voucher_check_commitment_drift_guard() {
 /// segment, asserting each commitment is in the allowlist. Catches an
 /// incomplete allowlist — e.g. the short trailing segment landing on a third
 /// commitment when a canonical-profile floor under-forces it (the 2026-07
-/// `verify_chain` ProofInvalid) — without proving all ~76 segments. Run:
+/// `verify_chain` ProofInvalid) — without proving every window. Run:
 ///   RUST_MIN_STACK=268435456 cargo test -p vos --release --test elf_integration \
 ///     voucher_check_allowlist_coverage -- --ignored --nocapture
 #[test]
@@ -7048,14 +7056,19 @@ fn voucher_check_allowlist_coverage() {
     let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
         .expect("trace the conservation transition");
     let total = full.steps.len();
-    let bounds = zkpvm::segment::segment_bounds(total, CHAIN_SEG_STEPS);
+    let bounds =
+        zkpvm::segment::segment_bounds_budgeted(&full, CHAIN_SEG_STEPS, VOUCHER_CHECK_PAGE_BUDGET);
     let n = bounds.len();
-    eprintln!("total steps = {total}, segments = {n}, seg_steps = {CHAIN_SEG_STEPS}");
+    eprintln!(
+        "total steps = {total}, windows = {n}, cut = ({CHAIN_SEG_STEPS}, {VOUCHER_CHECK_PAGE_BUDGET})"
+    );
 
-    // Comb-count per segment (trace-only — no proving).
+    // Comb-count per window (trace-only — no proving), via one forward
+    // cursor pass — O(N) slicing instead of the per-window prefix replay.
+    let mut scan = zkpvm::segment::SegmentCursor::new(&full);
     let counts: Vec<usize> = bounds
         .iter()
-        .map(|&(a, b)| zkpvm::segment::segment_side_note(&full, a, b).ristretto_comb_calls.len())
+        .map(|&(a, b)| scan.side_note(a, b).ristretto_comb_calls.len())
         .collect();
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for &c in &counts {
@@ -7076,9 +7089,12 @@ fn voucher_check_allowlist_coverage() {
     let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     eprintln!("proving {} representative segments: {probe:?}", probe.len());
     let mut commit_of: std::collections::BTreeMap<usize, [u8; 32]> = Default::default();
+    // Fresh cursor for the probe pass (the scan cursor can't rewind); the
+    // probe set is ascending, and skipped windows advance the image cheaply.
+    let mut cursor = zkpvm::segment::SegmentCursor::new(&full);
     for i in probe {
         let (a, b) = bounds[i];
-        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let mut sn = cursor.side_note(a, b);
         let proof = zkpvm::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
             .unwrap_or_else(|e| panic!("prove_canonical seg {i} [{a},{b}): {e:?}"));
         let c =
@@ -11761,6 +11777,11 @@ fn voucher_check_catalog_matches_pinned_constants() {
         CHAIN_SEG_STEPS as u64,
         "catalog seg_steps drifted from CHAIN_SEG_STEPS"
     );
+    assert_eq!(
+        pin.page_budget,
+        VOUCHER_CHECK_PAGE_BUDGET as u64,
+        "catalog page_budget drifted from VOUCHER_CHECK_PAGE_BUDGET"
+    );
     // The pinned witness address must match the live ELF symbol — cheap (symbol
     // table read only), so gate it on the ELF being built.
     if voucher_check_elf_path().exists() {
@@ -12229,9 +12250,13 @@ fn leaf_size_sizing() {
     let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
     let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
         .expect("trace");
-    let bounds = zkpvm::segment::segment_bounds_budgeted(&full, 32_000, 8);
+    let bounds =
+        zkpvm::segment::segment_bounds_budgeted(&full, CHAIN_SEG_STEPS, VOUCHER_CHECK_PAGE_BUDGET);
     let n = bounds.len();
-    eprintln!("{} steps, {n} windows at (32k, 8)", full.steps.len());
+    eprintln!(
+        "{} steps, {n} windows at ({CHAIN_SEG_STEPS}, {VOUCHER_CHECK_PAGE_BUDGET})",
+        full.steps.len()
+    );
 
     // Sample: first, last, and 8 spread windows; track the worst per size.
     let mut sample: Vec<usize> = (0..8).map(|k| k * n / 8).collect();

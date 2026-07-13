@@ -246,10 +246,18 @@ settlement windows and, eventually, succinct-witness step reduction.
   5. **Floors derivation costs minutes** (968 s at 8k) — the
      documented O(N²) slice-replay plus per-window trace-gen; the
      Wave-2.1 streaming driver is what fixes it.
-- **1.4 Flip the pin — NOT NOW.** Per finding 2, stay at
-  seg_steps = 100k; the flip becomes interesting only after the
-  Wave-5.2 boundary diet moves the RAM walls. (The
-  actor-storage re-pin has merged; catalogs are current.)
+- **1.4 Flip the pin — DONE (2026-07-13).** Once the Wave-5.2 dedup +
+  width diet moved the walls, the deployment flipped to the budgeted
+  (32k, 8) cut with dense derived floors: ~293 windows over the
+  7.84M-step transition (the count wobbles by a couple of windows with
+  the freshly keyed witness; the commitments do not), boundary floor
+  2^16, representative probes ~6.1–6.5 s at
+  ~10.2–11.4 GiB VmHWM (process carries the full-chain SideNote; the
+  fresh-process window peak is the 9.54 GiB in §5.2-2b). Allowlist
+  re-measured (still exactly {comb-free, one-comb}): C_0 `1373d0f4…`,
+  C_1 `3667db4f…` — pinned in `vos/tests/elf_integration.rs`
+  (`CHAIN_SEG_STEPS`/`VOUCHER_CHECK_PAGE_BUDGET`/profile/allowlist) and
+  the voucher-check catalog.
 
 Exit (revised): one-command re-pin at any `seg_steps` ✓; measured
 floor/RAM/time table ✓; the ≤3 GB path now runs through Wave 5.2
@@ -449,11 +457,14 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
      commitment-clean (bit-identical window commitment).
      SEPARATE FINDING: the drift guard is red on clean master too —
      a freshly built voucher-check ELF yields C_0 `ae749763…` /
-     C_1 `38e3912d…` vs the pinned `4e8f8869…` lineage (the guard's
-     documented ELF-shift mode; parallel sessions saw the same at
-     c3e88a5a). Master needs ONE deliberate re-pin drill — natural
-     to bundle with the deployment flip to (32k, 8) + derived
-     floors, which re-pins anyway.
+     C_1 `38e3912d…` vs the pinned `4e8f8869…` lineage (parallel
+     sessions saw the same at c3e88a5a). RESOLVED by the Wave-1.4
+     re-pin drill (see there): pins flipped to (32k, 8) + dense
+     derived floors, C_0 `1373d0f4…` / C_1 `3667db4f…`. The drill
+     also showed the drift was NOT the guard's ELF-shift mode —
+     `witness_addr` and the unpatched image root were UNCHANGED
+     across the rebuild, so the `4e8f8869…` lineage shifted on the
+     AIR side at some point after that pin, not in the guest image.
   3. **Poseidon2-M31 page hash (deep reserve).** 96 rows per 128
      hashed bytes is the constant both above levers dance around; an
      M31-native page hash cuts it ~10×+ but needs a new chip +
