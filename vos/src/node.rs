@@ -1200,7 +1200,23 @@ struct NodeService {
     /// sole caller [`Self::dispatch_invoke`] admits to a node-confined
     /// target. `None` denies every caller (fail closed).
     operator_peer: Option<Vec<u8>>,
+    /// Per-instance-name `SyncFloor` cache for the sync-serve gate. The
+    /// floor is a static install-time property, but resolving it hits the
+    /// registry with a blocking probe (up to ~5 s); caching keeps
+    /// `FetchHeads`/`FetchNode` cheap under a chatty mesh. Entries expire
+    /// after [`SYNC_FLOOR_TTL`] so an `install` that sets a floor is
+    /// picked up without a restart.
+    #[cfg(feature = "storage")]
+    sync_floor_cache: SyncFloorCache,
 }
+
+/// Cache of resolved sync floors, keyed by replica instance name.
+#[cfg(feature = "storage")]
+type SyncFloorCache = Arc<RwLock<HashMap<String, (crate::registry::SyncFloor, Instant)>>>;
+
+/// How long a cached `SyncFloor` stays fresh before it's re-probed.
+#[cfg(feature = "storage")]
+const SYNC_FLOOR_TTL: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "network")]
 impl NodeService {
@@ -1281,27 +1297,117 @@ impl NodeService {
         self.probe_registry_for_u8(payload).unwrap_or(0)
     }
 
-    /// Membership gate for serving a replica's sync data (heads /
-    /// nodes). A replica whose instance name begins with [`MSG_PREFIX`]
-    /// is *private*: it ships E2EE ciphertext, so we serve it only to a
-    /// peer holding at least a read grant on the channel agent (its
-    /// actor-local `actor_acls` row) or on the space (`auth_grants`).
-    /// Every other replica (the space-registry a joiner needs *before*
-    /// it has any grant, app CRDTs) serves openly — gating those would
-    /// wedge bootstrap. `caller == None` (no libp2p identity) denies a
-    /// private group.
+    /// Membership gate for serving a replica's sync data (heads / nodes),
+    /// keyed on the replica's [`SyncFloor`](crate::registry::SyncFloor):
+    /// `Public` serves any connected peer; `Member` requires a space read
+    /// grant (`>= READONLY`); `Private` requires that OR a per-actor read
+    /// grant — the generalized `msg-*` semantics (an E2EE channel ships
+    /// ciphertext, safe to sync to any member, plus non-member channel
+    /// grantees). `caller == None` (no libp2p identity) is refused for any
+    /// non-`Public` floor.
     #[cfg(feature = "storage")]
     fn sync_serve_allowed(&self, caller_peer_id: Option<&libp2p::PeerId>, name: &str) -> bool {
-        if !name.starts_with(MSG_PREFIX) {
-            return true;
+        use crate::registry::SyncFloor;
+        match self.resolve_sync_floor(name) {
+            SyncFloor::Public => true,
+            SyncFloor::Member => {
+                let Some(peer) = caller_peer_id else {
+                    return false;
+                };
+                self.lookup_caller_role(Some(peer)) >= AUTH_ROLE_READONLY
+                    || self.caller_is_enrolled_node(peer)
+            }
+            SyncFloor::Private => {
+                let Some(peer) = caller_peer_id else {
+                    return false;
+                };
+                self.lookup_caller_role(Some(peer)) >= AUTH_ROLE_READONLY
+                    || self.lookup_caller_actor_role(Some(peer), name) >= AUTH_ROLE_READONLY
+            }
         }
-        let Some(peer) = caller_peer_id else {
-            return false;
-        };
-        if self.lookup_caller_role(Some(peer)) >= AUTH_ROLE_READONLY {
-            return true;
+    }
+
+    /// A node enrolled in the space (voter/observer) IS a space member —
+    /// admin-gated `add_node` put it there — so it may sync `Member`-floor
+    /// state (the registry it bootstraps from, app CRDTs) even before it
+    /// holds a separate READONLY grant. This unwedges the join → sync →
+    /// grant order: a joiner enrolled as a voter can pull the registry to
+    /// learn the space before an operator grants it a role. `Private`
+    /// (`msg-*`) deliberately does NOT accept enrollment here — a voter
+    /// isn't automatically a channel reader; that stays grant-based.
+    #[cfg(feature = "network")]
+    fn caller_is_enrolled_node(&self, peer: &libp2p::PeerId) -> bool {
+        self.lookup_node_role(crate::network::derive_node_prefix(peer)) > 0
+    }
+
+    /// No-network build: enrollment can't be probed, so fall back to the
+    /// grant-only membership test.
+    #[cfg(not(feature = "network"))]
+    fn caller_is_enrolled_node(&self, _peer: &libp2p::PeerId) -> bool {
+        false
+    }
+
+    /// Resolve a replica's serving floor from its instance name. The two
+    /// registries are hardcoded (decision 9): the space registry serves at
+    /// `Member` — a joiner redeems by remote invoke (ungated) BEFORE it can
+    /// sync, so it holds a grant by the time its `FetchHeads` runs — and
+    /// the hyperspace registry at `Public` (the federation surface).
+    /// Anonymous / test replicas (empty name) serve openly. Every other
+    /// replica's floor is its `AgentRow.sync_role`, probed once and cached
+    /// with a short TTL; a probe miss defaults to `Member` — fail toward
+    /// gated, never open.
+    #[cfg(feature = "storage")]
+    fn resolve_sync_floor(&self, name: &str) -> crate::registry::SyncFloor {
+        use crate::registry::SyncFloor;
+        match name {
+            "" => return SyncFloor::Public,
+            REGISTRY_AGENT_NAME => return SyncFloor::Member,
+            HYPERSPACE_REGISTRY_AGENT_NAME => return SyncFloor::Public,
+            _ => {}
         }
-        self.lookup_caller_actor_role(Some(peer), name) >= AUTH_ROLE_READONLY
+        if let Ok(cache) = self.sync_floor_cache.read() {
+            if let Some((floor, at)) = cache.get(name) {
+                if at.elapsed() < SYNC_FLOOR_TTL {
+                    return *floor;
+                }
+            }
+        }
+        let floor = self.probe_agent_floor(name).unwrap_or(SyncFloor::Member);
+        if let Ok(mut cache) = self.sync_floor_cache.write() {
+            cache.insert(name.to_string(), (floor, Instant::now()));
+        }
+        floor
+    }
+
+    /// Probe the registry's `agent(name)` handler and read the row's
+    /// `sync_role`. `None` when the registry is unreachable, the agent
+    /// isn't installed, or the reply doesn't decode.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    fn probe_agent_floor(&self, name: &str) -> Option<crate::registry::SyncFloor> {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+        let msg = Msg::new("agent").with("instance_name", name);
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+        let reply = registry_probe_reply(&self.invoke_routes, payload)?;
+        // `agent` replies `Value::Bytes(rkyv AgentRow)` (installed) or
+        // `Value::Unit` (not installed).
+        match <Value as Decode>::try_decode(&reply)? {
+            Value::Bytes(b) => {
+                let row = <crate::registry::AgentRow as Decode>::try_decode(&b)?;
+                Some(row.sync_role)
+            }
+            _ => None,
+        }
+    }
+
+    /// Storage-only build (no network): the floor probe is unavailable, so
+    /// gate every non-registry replica at `Member` — the same restrictive
+    /// default a probe miss falls back to.
+    #[cfg(all(feature = "storage", not(feature = "network")))]
+    fn probe_agent_floor(&self, _name: &str) -> Option<crate::registry::SyncFloor> {
+        None
     }
 
     /// Shared probe helper for both auth lookups — sends an
@@ -1468,7 +1574,7 @@ impl NodeService {
 /// handler. Returns `None` if the registry is unreachable, the reply
 /// times out, or the payload doesn't decode.
 #[cfg(feature = "network")]
-fn registry_probe_u8(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<u8> {
+fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u8>> {
     let registry_id = crate::abi::service::ServiceId::REGISTRY.local_id() as u32;
     let tx = routes.lock().ok()?.get(&registry_id).cloned()?;
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -1486,8 +1592,12 @@ fn registry_probe_u8(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<u8> {
         return None;
     }
     let envelope = reply_rx.recv_timeout(Duration::from_secs(5)).ok()?;
-    let reply_bytes = unwrap_invoke_envelope(&envelope)?;
-    decode_u8_reply(&reply_bytes)
+    unwrap_invoke_envelope(&envelope)
+}
+
+#[cfg(feature = "network")]
+fn registry_probe_u8(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<u8> {
+    decode_u8_reply(&registry_probe_reply(routes, payload)?)
 }
 
 /// Pull a `u8` out of the actor-framework reply bytes. Handles
@@ -1648,25 +1758,29 @@ impl crate::network::NetworkService for NodeService {
             _ => (None, None),
         };
 
-        // Private-replica read gate. The `msg-*` channel actors
-        // (`msg-log` / `msg-ctl` / `msg-directory`) hold the E2EE channel's
-        // ciphertext + metadata, and their READ handlers are bare `#[msg]`
-        // (no role gate). The local messenger reads its OWN replica through
-        // the same-node invoke route and never reaches `dispatch_invoke`, so a
+        // Private-replica read gate. A `Private`-floor replica (the
+        // messenger's `msg-*` channel actors, or any app agent installed
+        // `sync = "private"`) holds state the sync gate serves only to
+        // members/grantees, and its READ handlers are bare `#[msg]` (no
+        // role gate). The local owner reads its OWN replica through the
+        // same-node invoke route and never reaches `dispatch_invoke`, so a
         // read arriving HERE is always a remote peer. Gate it by the same
-        // membership floor the sync path uses ([`sync_serve_allowed`]): a space
-        // member (or an actor-local read grant) may read; a non-member is
-        // refused as if the method did not exist (empty reply — no existence
-        // oracle, matching the unknown-target path). A member learns nothing
-        // new — its own membership-gated sync replica already holds this
-        // ciphertext — so this only closes the invoke backdoor that bypassed
-        // the sync gate. WRITE handlers (raft leader-forward of `post` /
-        // `commit` / `publish_kp` / …) are NOT gated here: they carry the
-        // actor's own `#[msg(role = …)]` check and legitimately arrive over the
-        // network. Reuses the role bytes already probed above.
-        if self
+        // membership floor the sync path uses ([`sync_serve_allowed`]): a
+        // space member (or an actor-local read grant) may read; a
+        // non-member is refused as if the method did not exist (empty
+        // reply — no existence oracle). This only closes the invoke
+        // backdoor that bypassed the sync gate. WRITE handlers (raft
+        // leader-forward of `post` / `commit` / `publish_kp` / …) are NOT
+        // gated here — they carry the actor's own `#[msg(role = …)]` check
+        // and legitimately arrive over the network. Reuses the role bytes
+        // already probed above; the floor lookup is cached.
+        #[cfg(feature = "storage")]
+        let target_is_private = self
             .agent_name_for(to_unscoped)
-            .is_some_and(|name| name.starts_with(MSG_PREFIX))
+            .is_some_and(|name| self.resolve_sync_floor(&name) == crate::registry::SyncFloor::Private);
+        #[cfg(not(feature = "storage"))]
+        let target_is_private = false;
+        if target_is_private
             && intercepted_method_name(&msg).is_some_and(|m| is_private_read_method(&m))
         {
             let is_member = space_role.is_some_and(|r| r >= AUTH_ROLE_READONLY)
@@ -1675,7 +1789,7 @@ impl crate::network::NetworkService for NodeService {
                 warn!(
                     target = to,
                     peer = ?caller_peer_id,
-                    "invoke refused: private msg- replica read requires space membership",
+                    "invoke refused: private replica read requires space membership",
                 );
                 return Vec::new();
             }
@@ -2396,6 +2510,8 @@ impl VosNode {
             proof_blobs: self.proof_blobs.clone(),
             proof_blobs_dir: self.proof_blobs_dir.clone(),
             operator_peer: self.operator_peer.clone(),
+            #[cfg(feature = "storage")]
+            sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
         });
         network.set_service(service);
 
@@ -4114,15 +4230,6 @@ pub(crate) const AUTH_ROLE_READONLY: u8 = 1;
 #[cfg(feature = "network")]
 pub(crate) const NODE_ROLE_REPLY_VOTER: u8 = 1;
 
-/// Instance-name prefix marking a replica as *private* (a messaging
-/// channel agent — `msg-<chan>-log`, `msg-<chan>-ctl`, `msg-directory`).
-/// The sync-serve path membership-gates these; every other replica
-/// (space-registry, app CRDTs) serves openly. Matches the `msg-*`
-/// intra-cap convention so dynamically-installed channels are gated
-/// without any registry-schema flag.
-#[cfg(feature = "network")]
-pub(crate) const MSG_PREFIX: &str = "msg-";
-
 /// The bare (un-role-gated) READ handlers on the private `msg-*` channel
 /// replicas — `msg-log` (`history` / `stats`), `msg-ctl` (`commits` /
 /// `commit_at` / `head`), `msg-directory` (`kp_count` / `channels`).
@@ -4970,7 +5077,14 @@ fn current_relay_caller() -> Option<PropagatedCaller> {
 /// registered from a bare `AgentConfig`, so the registry resolves
 /// name-from-id through the same map as every other installed agent
 /// rather than via a special case.
-const REGISTRY_AGENT_NAME: &str = "space-registry";
+pub const REGISTRY_AGENT_NAME: &str = "space-registry";
+
+/// Well-known instance name of the hyperspace (federation) registry
+/// replica. The sync-serve gate hardcodes it to `Public` — the hyperspace
+/// registry is the deliberately-ungated federation surface. Set on the
+/// replica's `AgentConfig` at [`VosNode::attach_network`] so `slot.name`
+/// carries it (a bare `AgentConfig` would leave the name empty).
+pub const HYPERSPACE_REGISTRY_AGENT_NAME: &str = "hyperspace-registry";
 
 /// R4 — the propagated peer's actor-local grant on the relay's final
 /// target, to be carried on the relayed call so an explicit per-actor
@@ -9033,6 +9147,8 @@ mod tests {
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
             operator_peer: None,
+            #[cfg(feature = "storage")]
+            sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let peer = libp2p::PeerId::random();
@@ -9178,15 +9294,16 @@ mod tests {
         );
     }
 
-    /// Private-replica read gate. A bare-`#[msg]` READ on a `msg-*`
+    /// Private-replica read gate. A bare-`#[msg]` READ on a `Private`-floor
     /// replica is served over the network only to a space member; a WRITE,
     /// and any method on a non-private agent, is left to the normal path.
     #[test]
-    #[cfg(feature = "network")]
+    #[cfg(all(feature = "network", feature = "storage"))]
     fn dispatch_invoke_gates_private_replica_reads_to_members() {
         use crate::actors::codec::Encode;
         use crate::actors::run::STATUS_DONE;
         use crate::network::NetworkService;
+        use crate::registry::SyncFloor;
         use crate::value::{Msg, TAG_DYNAMIC, Value};
 
         let target = ServiceId::new(0x00ab, 0x0150);
@@ -9218,6 +9335,18 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(HashMap::new())),
             );
             svc.agent_names = names;
+            // Seed the floor directly (the stub registry only answers the
+            // peer_role probe, not agent()): `msg-*` names are Private, others
+            // Public — exercising the gate itself, not floor resolution.
+            let floor = if agent_name.starts_with("msg-") {
+                SyncFloor::Private
+            } else {
+                SyncFloor::Public
+            };
+            svc.sync_floor_cache
+                .write()
+                .unwrap()
+                .insert(agent_name.to_string(), (floor, Instant::now()));
             let peer = libp2p::PeerId::random();
             let mut payload = vec![TAG_DYNAMIC];
             payload.extend_from_slice(&Msg::new(method).encode());
@@ -9302,6 +9431,80 @@ mod tests {
         (routes, handle)
     }
 
+    /// A stub registry that answers `peer_role` and `node_role` with
+    /// DIFFERENT bytes — so a test can model a peer that is enrolled as a
+    /// node but holds no auth grant (or vice versa).
+    #[cfg(feature = "network")]
+    fn spawn_stub_role_registry(
+        peer_role: u8,
+        node_role: u8,
+    ) -> (InvokeRoutes, thread::JoinHandle<()>) {
+        use crate::actors::codec::Encode;
+        use crate::value::Value;
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let handle = thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                let byte = match intercepted_method_name(&req.msg).as_deref() {
+                    Some("node_role") => node_role,
+                    _ => peer_role,
+                };
+                let reply = encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE,
+                    &[],
+                    &Value::U8(byte).encode(),
+                );
+                let _ = req.reply.send(reply);
+            }
+        });
+        (routes, handle)
+    }
+
+    /// The `Member` sync floor admits a peer that holds a space read grant
+    /// OR is an enrolled node (a voter/observer is a space member) — the
+    /// latter unwedges the join→sync→grant bootstrap order. A stranger
+    /// (no grant, not enrolled) and an anonymous caller are refused.
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn sync_serve_allowed_member_admits_grants_and_enrolled_nodes() {
+        use crate::registry::SyncFloor;
+        let peer = libp2p::PeerId::random();
+        let check = |peer_role: u8, node_role: u8| -> bool {
+            let (routes, _reg) = spawn_stub_role_registry(peer_role, node_role);
+            let svc = lifecycle_service(
+                routes,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+            );
+            // Seed the floor so resolve_sync_floor returns Member for the
+            // app agent without an `agent()` probe against the stub.
+            svc.sync_floor_cache
+                .write()
+                .unwrap()
+                .insert("counter".to_string(), (SyncFloor::Member, Instant::now()));
+            svc.sync_serve_allowed(Some(&peer), "counter")
+        };
+        assert!(!check(AUTH_ROLE_NONE, 0), "a stranger is refused a Member replica");
+        assert!(check(AUTH_ROLE_READONLY, 0), "a granted member is served");
+        assert!(
+            check(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER),
+            "an enrolled voter is served before a grant lands",
+        );
+        // Anonymous (no peer id) is refused for a non-Public floor.
+        let (routes, _reg) = spawn_stub_role_registry(AUTH_ROLE_READONLY, NODE_ROLE_REPLY_VOTER);
+        let svc = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+        svc.sync_floor_cache
+            .write()
+            .unwrap()
+            .insert("counter".to_string(), (SyncFloor::Member, Instant::now()));
+        assert!(!svc.sync_serve_allowed(None, "counter"), "anonymous is refused Member");
+    }
+
     #[cfg(feature = "network")]
     fn lifecycle_service(
         routes: InvokeRoutes,
@@ -9319,6 +9522,8 @@ mod tests {
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
             operator_peer: None,
+            #[cfg(feature = "storage")]
+            sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

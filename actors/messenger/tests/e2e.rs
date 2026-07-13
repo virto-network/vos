@@ -179,16 +179,19 @@ version = "0.1.0"
 name = "msg-general-log"
 path = "{log_elf}"
 consistency = "crdt"
+sync = "private"
 
 [[agent]]
 name = "msg-general-ctl"
 path = "{ctl_elf}"
 consistency = "raft"
+sync = "private"
 
 [[agent]]
 name = "msg-directory"
 path = "{dir_elf}"
 consistency = "raft"
+sync = "private"
 
 [[agent]]
 name = "messenger"

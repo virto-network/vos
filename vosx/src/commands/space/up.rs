@@ -211,6 +211,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // (the hyperspace registry is the separate-trust federation surface
     // and is left ungated). See `genesis_node_validator`.
     let cfg = AgentConfig::new(blob.clone())
+        .with_name(vos::node::REGISTRY_AGENT_NAME)
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
         .with_node_validator(crate::commands::space::common::genesis_node_validator(space_id))
@@ -242,6 +243,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if let Some(name) = &hyperspace {
         let hs_rep = derive_hyperspace_id(name);
         let hs_cfg = AgentConfig::new(blob)
+            .with_name(vos::node::HYPERSPACE_REGISTRY_AGENT_NAME)
             .with_consistency(Consistency::Crdt)
             .with_replication_id(hs_rep)
             .persist(&data_dir);

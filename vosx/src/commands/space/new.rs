@@ -82,6 +82,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     //    replication_id will be used on subsequent `space up`.
     let mut node = VosNode::with_prefix(local_prefix);
     let cfg = AgentConfig::new(registry_blob)
+        .with_name(vos::node::REGISTRY_AGENT_NAME)
         .with_consistency(Consistency::Crdt)
         .with_replication_id([0u8; 32])
         .persist(&temp_dir);
