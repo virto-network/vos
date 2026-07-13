@@ -1,3 +1,12 @@
+# Codegen flags are scoped PER TARGET TRIPLE, never under `[build]`.
+# `[build] rustflags` leaks into every `--target` cross-build (cargo
+# applies rustflags to the *target* units), so `target-cpu=native` —
+# which rustc resolves to the host CPU's name — would poison aarch64
+# codegen ("is not a recognized processor for this target").  Scoping
+# under `[target.<triple>]` keeps the native win for host builds and
+# leaves cross-builds clean; cargo uses the matching target section
+# INSTEAD of `[build] rustflags`, not in addition to it.
+
 # Phase 61: target-cpu=native is a 20% prove-time win on the zkpvm
 # bench (log14 MOBILE: 1.90 s → 1.52 s on the reference Intel Core
 # Ultra 7 155H).  Stwo's SimdBackend benefits massively from AVX2 +
@@ -11,5 +20,29 @@
 # To opt out (for distributable builds):
 #   - Comment out the rustflags below, or
 #   - Override on the command line: RUSTFLAGS="" cargo build --release
-[build]
+[target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=native"]
+
+# ── aarch64 cross-compilation (mobile-proving plan, ARM bring-up) ──
+#
+# Only consulted when building `--target aarch64-unknown-linux-gnu`;
+# harmless otherwise.  The linker must be a cross-gcc (or clang with
+# `--target=`) because rust-lld is not the default for this triple.
+# blst (via javm → grey-crypto) compiles C: the `cc` crate finds the
+# conventional `aarch64-linux-gnu-gcc` on PATH automatically; to use
+# clang instead set
+#   CC_aarch64_unknown_linux_gnu=clang
+#   CFLAGS_aarch64_unknown_linux_gnu=--target=aarch64-unknown-linux-gnu
+#
+# No target-cpu pin here: NEON is baseline on aarch64 (stwo's SimdBackend
+# and the hand-written M31 NEON kernel need nothing extra), and per-device
+# tuning (`-C target-cpu=cortex-a76`, `apple-m1`, …) belongs in a local
+# override or an on-device build, not checked in.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Android: same story but the linker is the NDK's versioned clang
+# wrapper, whose path is machine-specific — uncomment and point at
+# your NDK (API 24+):
+# [target.aarch64-linux-android]
+# linker = "<NDK>/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
