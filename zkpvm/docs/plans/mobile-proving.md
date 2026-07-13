@@ -316,9 +316,24 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
   segmentation strategy — uniform or budgeted — can push the
   boundary chip below ~2^17. The machinery is kept (deterministic
   budgeted cuts, floors-over-bounds, commitments still collapse to
-  2): it becomes the binding knob once 5.2 shrinks the per-page
-  constant. Plumbing (`seg_steps`→budget in the pin ABI) is deferred
-  until then.
+  2): it became the binding knob once 5.2's dedup landed.
+  **Plumbing DONE (2026-07-13):** `page_budget` rides the chain ABI
+  (`prove_chain{,_job}`, `measure_catalog`, `measure_floors`),
+  `ProgramPin`/catalog pin it beside `seg_steps` (serde default 0 —
+  old catalogs load unchanged), `vosx zk pin --page-budget` records
+  it. **Tuning, post-dedup (measured):**
+
+  | budget (steps, pages) | windows | boundary floor | window peak |
+  |---|---|---|---|
+  | uniform 100k | 79 | 2^17 | ~20 GiB |
+  | 32k, 12 | 250 | 2^17 | ~13–16 GiB |
+  | **32k, 8** | **293** | **2^16** | **11.0 GiB abs (~8 GiB working set, fresh)** |
+  | 16k, 6 | 592 | 2^16 | ~similar, more windows |
+
+  (32k, 8) is the recommended deployment cut: ~8 s/window ⇒ ~40 min
+  chain, and boundary stalls at 2^16 below it (≥ ~5 distinct-content
+  pages per window at 4 KB leaves — 2^15 is lever 2's case). With
+  Wave 4's 2–3× on top: **~3–4 GiB**, the phone envelope's edge.
 - **5.2 BLAKE2B_BOUNDARY per-page-cost diet (decomposition spike
   DONE 2026-07-13).** Mechanism, confirmed in code: the boundary
   chip proves the page-Merkle multiproof's compressions on a
