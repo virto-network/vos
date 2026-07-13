@@ -445,6 +445,14 @@ pub struct ProgramPin {
     pub canonical_profile: alloc::vec::Vec<u32>,
     /// Per-segment step bound the profile + allowlist were measured against.
     pub seg_steps: u64,
+    /// Per-segment touched-page budget the chain was cut with (`0` = uniform
+    /// step cut). When non-zero, windows come from the content-budgeted cut
+    /// (`zkpvm::segment::segment_bounds_budgeted`) — the prover MUST cut with
+    /// the same `(seg_steps, page_budget)` this pin was measured against, or
+    /// the chain lands on commitments outside `commitments`. Defaults to `0`
+    /// so catalogs written before the field exist load unchanged.
+    #[serde(default)]
+    pub page_budget: u64,
     /// Flat-memory address of the program's `__VOS_WITNESS` buffer (its ELF
     /// symbol address); where the prover patches the witness before tracing.
     pub witness_addr: u64,
@@ -720,6 +728,7 @@ mod tests {
             commitments: vec![bytes_to_hex(&c0), bytes_to_hex(&c1)],
             canonical_profile: vec![0, 14, 18, 4],
             seg_steps: 100_000,
+            page_budget: 8,
             witness_addr: 0x1_2340,
             unpatched_image_root: bytes_to_hex(&root),
         };

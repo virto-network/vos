@@ -75,6 +75,12 @@ pub struct PinArgs {
     /// Per-segment step bound the canonical profile was tuned against.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
     seg_steps: u64,
+    /// Per-segment touched-page budget: cut windows by content (close a
+    /// window before it would exceed this many distinct touched memory
+    /// pages) instead of by steps alone. `0` (default) = uniform step cut.
+    /// Recorded in the pin — the prover must cut with the same value.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    page_budget: u64,
     /// File holding the canonical forcing profile: `zkpvm::chip_idx::COUNT`
     /// unsigned integers, whitespace/comma/newline separated (`0` = not
     /// forced). Omit to DERIVE the profile from the `--witness` run
@@ -176,6 +182,7 @@ fn pin(args: PinArgs) -> Result<()> {
                             .with("witness_bytes", witness.clone())
                             .with("witness_addr", waddr)
                             .with("seg_steps", args.seg_steps)
+                            .with("page_budget", args.page_budget)
                             .with("gas", args.gas),
                         MEASURE_TIMEOUT,
                     )?;
@@ -198,6 +205,7 @@ fn pin(args: PinArgs) -> Result<()> {
                 .with("witness_bytes", witness_to_send)
                 .with("witness_addr", waddr)
                 .with("seg_steps", args.seg_steps)
+                .with("page_budget", args.page_budget)
                 .with("profile", profile_to_send)
                 .with("gas", args.gas),
             MEASURE_TIMEOUT,
@@ -228,6 +236,7 @@ fn pin(args: PinArgs) -> Result<()> {
         commitments: commitments.iter().map(|c| bytes_to_hex(c)).collect(),
         canonical_profile: profile.clone(),
         seg_steps: args.seg_steps,
+        page_budget: args.page_budget,
         witness_addr: waddr,
         unpatched_image_root: bytes_to_hex(&image_root),
     };
@@ -251,6 +260,7 @@ fn pin(args: PinArgs) -> Result<()> {
     eprintln!("  witness_addr         = {waddr:#x}");
     eprintln!("  unpatched_image_root = {}", bytes_to_hex(&image_root));
     eprintln!("  seg_steps            = {}", args.seg_steps);
+    eprintln!("  page_budget          = {}", args.page_budget);
     if args.profile.is_none() {
         eprintln!("  profile (derived)    = {}", format_profile(&profile));
     }

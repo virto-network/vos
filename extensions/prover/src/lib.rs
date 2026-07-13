@@ -34,10 +34,12 @@
 //!   commitment (the tagless design — no actor/message tag in the hash).
 //!
 //! - `prove_chain(pvm_blob, witness_bytes, witness_addr, seg_steps,
-//!   profile) -> Vec<u8>` — the segment-chain analog of `prove` for traces
-//!   too large for a single proof. The caller also supplies `seg_steps`
-//!   (the per-segment step bound) and the canonical `profile` (the
-//!   `[u32; chip_idx::COUNT]` forcing profile). Returns `bincode(Vec<Vec<u8>>)`.
+//!   page_budget, profile) -> Vec<u8>` — the segment-chain analog of `prove`
+//!   for traces too large for a single proof. The caller also supplies
+//!   `seg_steps` (the per-segment step bound), `page_budget` (per-segment
+//!   touched-page budget; `0` = uniform step cut), and the canonical
+//!   `profile` (the `[u32; chip_idx::COUNT]` forcing profile). Returns
+//!   `bincode(Vec<Vec<u8>>)`.
 //!
 //! - `verify_chain(allowlist, proof_hash, public_bytes, return_bytes,
 //!   peer_prefix) -> u8` — the chain analog of `verify`. `allowlist` is the
@@ -49,7 +51,7 @@
 //!   carries the ENTERING-IMAGE root, which segment 0 is anchored to (the memory
 //!   analogue of the allowlist — closes the doctored-initial-image splice).
 //!
-//! - `measure_catalog(pvm_blob, witness_bytes, witness_addr, seg_steps,
+//! - `measure_catalog(pvm_blob, witness_bytes, witness_addr, seg_steps, page_budget,
 //!   profile, gas) -> Vec<u8>` — the heavy zkpvm measurement behind
 //!   `vosx zk pin`: the entering-image root over the UNPATCHED image and, when
 //!   a representative `witness_bytes` is supplied, the canonical commitment
@@ -164,6 +166,8 @@ struct PendingProve {
     witness_addr: u64,
     /// Per-segment step bound for canonical proving.
     seg_steps: u64,
+    /// Per-segment touched-page budget (0 = uniform step cut).
+    page_budget: u64,
     /// Canonical forcing profile.
     profile: Vec<u32>,
 }
@@ -258,6 +262,7 @@ impl Prover {
         witness_bytes: Vec<u8>,
         witness_addr: u64,
         seg_steps: u64,
+        page_budget: u64,
         profile: Vec<u32>,
     ) -> Vec<u8> {
         match prove_chain_segments(
@@ -265,6 +270,7 @@ impl Prover {
             &witness_bytes,
             witness_addr as usize,
             seg_steps as usize,
+            page_budget as usize,
             &profile,
         ) {
             Some(segments) => bincode::serialize(&segments).unwrap_or_default(),
@@ -379,6 +385,7 @@ impl Prover {
         witness_bytes: Vec<u8>,
         witness_addr: u64,
         seg_steps: u64,
+        page_budget: u64,
         profile: Vec<u32>,
         reply_to: u32,
         reply_msg: Vec<u8>,
@@ -392,6 +399,7 @@ impl Prover {
             witness_bytes,
             witness_addr,
             seg_steps,
+            page_budget,
             profile,
         });
         id
@@ -476,6 +484,7 @@ impl Prover {
         witness_bytes: Vec<u8>,
         witness_addr: u64,
         seg_steps: u64,
+        page_budget: u64,
         profile: Vec<u32>,
         gas: u64,
     ) -> Vec<u8> {
@@ -484,6 +493,7 @@ impl Prover {
             &witness_bytes,
             witness_addr as usize,
             seg_steps as usize,
+            page_budget as usize,
             &profile,
             gas,
         )
@@ -509,10 +519,18 @@ impl Prover {
         witness_bytes: Vec<u8>,
         witness_addr: u64,
         seg_steps: u64,
+        page_budget: u64,
         gas: u64,
     ) -> Vec<u32> {
-        measure_floors(&pvm_blob, &witness_bytes, witness_addr as usize, seg_steps as usize, gas)
-            .unwrap_or_default()
+        measure_floors(
+            &pvm_blob,
+            &witness_bytes,
+            witness_addr as usize,
+            seg_steps as usize,
+            page_budget as usize,
+            gas,
+        )
+        .unwrap_or_default()
     }
 }
 
@@ -529,6 +547,7 @@ pub fn measure_catalog(
     witness: &[u8],
     witness_addr: usize,
     seg_steps: usize,
+    page_budget: usize,
     profile: &[u32],
     gas: u64,
 ) -> Option<Vec<u8>> {
@@ -537,7 +556,15 @@ pub fn measure_catalog(
     let witness = witness.to_vec();
     let profile = profile.to_vec();
     run_on_large_stack(move || {
-        measure_catalog_inner(&pvm_blob, &witness, witness_addr, seg_steps, &profile, gas)
+        measure_catalog_inner(
+            &pvm_blob,
+            &witness,
+            witness_addr,
+            seg_steps,
+            page_budget,
+            &profile,
+            gas,
+        )
     })
 }
 
@@ -546,6 +573,7 @@ fn measure_catalog_inner(
     witness: &[u8],
     witness_addr: usize,
     seg_steps: usize,
+    page_budget: usize,
     profile: &[u32],
     gas: u64,
 ) -> Option<Vec<u8>> {
@@ -568,10 +596,11 @@ fn measure_catalog_inner(
     if !witness.is_empty() {
         let full =
             zkpvm::actor::trace_blob_with_patches(pvm_blob, gas, &[(witness_addr, witness)])?;
+        let bounds = chain_bounds(&full, seg_steps, page_budget);
         if floors.is_empty() {
-            floors = zkpvm::canonical_profile_for(&full, seg_steps)?;
+            floors = zkpvm::canonical_profile_for_bounds(&full, &bounds)?;
         }
-        commitments = measure_commitments(&full, seg_steps, &floors)?;
+        commitments = measure_commitments(&full, &bounds, &floors)?;
     }
     let mut out = Vec::with_capacity(32 + 4 + floors.len() * 4 + commitments.len() * 32);
     out.extend_from_slice(&image_root);
@@ -594,10 +623,9 @@ fn measure_catalog_inner(
 /// stack — reached via [`measure_catalog`]. `None` on any failure.
 fn measure_commitments(
     full: &zkpvm::SideNote,
-    seg_steps: usize,
+    bounds: &[(usize, usize)],
     profile: &[u32],
 ) -> Option<Vec<[u8; 32]>> {
-    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), seg_steps);
     let n = bounds.len();
     if n == 0 {
         return None;
@@ -644,8 +672,12 @@ pub fn measure_floors(
     witness: &[u8],
     witness_addr: usize,
     seg_steps: usize,
+    page_budget: usize,
     gas: u64,
 ) -> Option<Vec<u32>> {
+    if seg_steps == 0 {
+        return None;
+    }
     let pvm_blob = pvm_blob.to_vec();
     let witness = witness.to_vec();
     run_on_large_stack(move || {
@@ -658,7 +690,8 @@ pub fn measure_floors(
                 &[(witness_addr, witness.as_slice())],
             )?
         };
-        zkpvm::canonical_profile_for(&full, seg_steps)
+        let bounds = chain_bounds(&full, seg_steps, page_budget);
+        zkpvm::canonical_profile_for_bounds(&full, &bounds)
     })
 }
 
@@ -696,6 +729,7 @@ fn advance_one_job(pending: &mut Vec<PendingProve>, queue: &mut JobQueue) -> Opt
         &job.witness_bytes,
         job.witness_addr as usize,
         job.seg_steps as usize,
+        job.page_budget as usize,
         &job.profile,
     ) {
         Some((root, segments)) => {
@@ -737,14 +771,21 @@ fn run_prove_chain_job(
     witness_bytes: &[u8],
     witness_addr: usize,
     seg_steps: usize,
+    page_budget: usize,
     profile: &[u32],
 ) -> Option<([u8; 32], Vec<Vec<u8>>)> {
     let pvm_blob = pvm_blob.to_vec();
     let witness_bytes = witness_bytes.to_vec();
     let profile = profile.to_vec();
     run_on_large_stack(move || {
-        let segments =
-            prove_chain_segments(&pvm_blob, &witness_bytes, witness_addr, seg_steps, &profile)?;
+        let segments = prove_chain_segments(
+            &pvm_blob,
+            &witness_bytes,
+            witness_addr,
+            seg_steps,
+            page_budget,
+            &profile,
+        )?;
         let root = segment_initial_root(&segments)?;
         Some((root, segments))
     })
@@ -817,15 +858,16 @@ pub fn verify_proof_bytes(
 
 /// Prove `pvm_blob` over `witness_bytes` as a canonical-shape segment chain,
 /// returning the per-segment `bincode(Proof)` bytes — one `Vec<u8>` per segment,
-/// in chain order. Trace, segment at `seg_steps`, prove each segment with
+/// in chain order. Trace, cut windows ([`chain_bounds`]: uniform `seg_steps`,
+/// or content-budgeted when `page_budget > 0`), prove each segment with
 /// [`zkpvm::prove_canonical`] against the caller-supplied `profile`. `None`
 /// on any failure. Each segment's side note is dropped after its proof, so peak
 /// memory holds the full trace + one segment.
 ///
-/// `seg_steps` and `profile` MUST match the values the program's canonical
-/// commitment allowlist was measured/pinned against — a different segment size
-/// reshapes the segments and lands the chain on commitments outside the
-/// published allowlist.
+/// `seg_steps`, `page_budget`, and `profile` MUST match the values the
+/// program's canonical commitment allowlist was measured/pinned against — a
+/// different cut reshapes the segments and lands the chain on commitments
+/// outside the published allowlist.
 ///
 /// PER-SEGMENT DELIVERY: the caller content-addresses each segment SEPARATELY
 /// (`put_proof_blob`), assembles a [`ChainManifest`] of the resulting hashes,
@@ -842,13 +884,14 @@ pub fn prove_chain_segments(
     witness_bytes: &[u8],
     witness_addr: usize,
     seg_steps: usize,
+    page_budget: usize,
     profile: &[u32],
 ) -> Option<Vec<Vec<u8>>> {
     if seg_steps == 0 {
         return None;
     }
     let full = trace_blob(pvm_blob, witness_bytes, witness_addr)?;
-    let bounds = zkpvm::segment::segment_bounds(full.steps.len(), seg_steps);
+    let bounds = chain_bounds(&full, seg_steps, page_budget);
     let mut segments: Vec<Vec<u8>> = Vec::with_capacity(bounds.len());
     for (a, b) in bounds {
         let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
@@ -856,6 +899,23 @@ pub fn prove_chain_segments(
         segments.push(bincode::serialize(&proof).ok()?);
     }
     Some(segments)
+}
+
+/// The chain's window cut: uniform `seg_steps` windows, or the content-budgeted
+/// cut ([`zkpvm::segment::segment_bounds_budgeted`]) when `page_budget > 0`.
+/// Deterministic in `(trace, seg_steps, page_budget)` — producer, catalog
+/// measurement, and re-measurement must all cut identically, which is why the
+/// budget is pinned in the catalog beside `seg_steps` and the profile.
+fn chain_bounds(
+    full: &zkpvm::SideNote,
+    seg_steps: usize,
+    page_budget: usize,
+) -> Vec<(usize, usize)> {
+    if page_budget > 0 {
+        zkpvm::segment::segment_bounds_budgeted(full, seg_steps, page_budget)
+    } else {
+        zkpvm::segment::segment_bounds(full.steps.len(), seg_steps)
+    }
 }
 
 /// A chain delivered as per-segment proof CAS hashes (in chain order) plus the
@@ -1259,7 +1319,7 @@ mod floors_tests {
     #[test]
     fn floors_fail_soft_on_bad_inputs() {
         assert_eq!(
-            measure_floors(&[0xDE, 0xAD, 0xBE, 0xEF], &[], 0, 100, 1_000),
+            measure_floors(&[0xDE, 0xAD, 0xBE, 0xEF], &[], 0, 100, 0, 1_000),
             None,
             "an unparseable blob yields None, not a panic"
         );
@@ -1290,6 +1350,7 @@ mod job_tests {
             witness_bytes: Vec::new(),
             witness_addr: 0,
             seg_steps: 100,
+            page_budget: 0,
             profile: Vec::new(),
         }
     }
@@ -1371,7 +1432,7 @@ mod job_tests {
         // A non-PVM blob fails fast at trace (no STARK work), so this stays
         // cheap — the negative path `measure_catalog` returns on a bad blob.
         assert_eq!(
-            measure_catalog(&[0xDE, 0xAD, 0xBE, 0xEF], &[], 0, 100, &[], 1_000),
+            measure_catalog(&[0xDE, 0xAD, 0xBE, 0xEF], &[], 0, 100, 0, &[], 1_000),
             None,
             "an unparseable blob yields None, not a panic"
         );

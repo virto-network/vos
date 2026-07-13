@@ -7142,6 +7142,7 @@ fn voucher_check_chain_accept_path() {
         &witness_buf,
         addr,
         vc_pin.seg_steps as usize,
+        vc_pin.page_budget as usize,
         &vc_pin.canonical_profile,
     )
     .expect("prove_chain_segments over the conservation transition");
@@ -9200,6 +9201,7 @@ fn clerk_ledger_two_bank_federation() {
                 &witness_buf,
                 vc_witness_addr,
                 vc_pin.seg_steps as usize,
+                vc_pin.page_budget as usize,
                 &vc_pin.canonical_profile,
             )
             .expect(
@@ -11667,6 +11669,7 @@ fn voucher_check_chain_anchor_path() {
         &witness_buf,
         addr,
         seg_steps,
+        pin.page_budget as usize,
         &pin.canonical_profile,
     )
     .expect("prove_chain_segments over the conservation transition");
@@ -11769,7 +11772,7 @@ fn voucher_check_catalog_matches_pinned_constants() {
         // witness), so this catches a guest-framework rebuild that moved
         // the image without waiting for a prove-path failure.
         let (blob, _) = voucher_check_pvm();
-        let measured = prover_extension::measure_catalog(&blob, &[], 0, 1, &[], VC_TRACE_GAS)
+        let measured = prover_extension::measure_catalog(&blob, &[], 0, 1, 0, &[], VC_TRACE_GAS)
             .expect("trace-only measure of the unpatched image root");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         assert_eq!(
