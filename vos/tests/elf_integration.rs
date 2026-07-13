@@ -12209,3 +12209,168 @@ fn committed_map_anchors_with_smt_roots() {
     let _ = node.collect();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// SCRATCH (W5.2 lever-2 sizing, not for commit): projected boundary-chip
+/// cost at candidate Merkle leaf sizes {4096, 1024, 512, 256} bytes, over
+/// sampled (32k, 8-page) windows of the real transition. Counts only —
+/// distinct touched leaves, content-deduped leaf-image chains (before +
+/// after), leaf compressions (= unique chains × S/128), and a node upper
+/// bound (2 passes × leaves × remaining depth, pre-dedup) — no proving.
+/// Run: RUST_MIN_STACK=268435456 cargo test -p vos --release --test elf_integration \
+///   leaf_size_sizing -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn leaf_size_sizing() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use vos::Encode;
+    let (blob, addr) = voucher_check_pvm();
+    let registrar = cipher_clerk::crypto::Keypair::generate();
+    let (public, witness, _v, _b) = build_conservation_transition(&registrar);
+    let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
+    let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
+        .expect("trace");
+    let bounds = zkpvm::segment::segment_bounds_budgeted(&full, 32_000, 8);
+    let n = bounds.len();
+    eprintln!("{} steps, {n} windows at (32k, 8)", full.steps.len());
+
+    // Sample: first, last, and 8 spread windows; track the worst per size.
+    let mut sample: Vec<usize> = (0..8).map(|k| k * n / 8).collect();
+    sample.push(n - 1);
+    sample.dedup();
+
+    let log2c = |x: usize| (usize::BITS - x.max(1).leading_zeros()) as u32;
+    let mut worst: BTreeMap<u32, (usize, u32)> = BTreeMap::new(); // S -> (rows, log)
+    for &i in &sample {
+        let (a, b) = bounds[i];
+        let sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let entering = sn.initial_memory.clone();
+        let exiting = zkpvm::segment::segment_side_note(&full, a, b); // fresh slice for exit replay
+        let _ = exiting;
+        // Exit image = entering + this window's writes; reuse the multiproof
+        // payload the prover builds (segment-local, cheap).
+        let mut sn2 = zkpvm::segment::segment_side_note(&full, a, b);
+        sn2.ingest_memory_pages();
+        let payload = sn2.memory_pages.as_ref().expect("payload");
+        // Touched byte set at page granularity comes from the payload's
+        // pages; refine to sub-leaves via the touched ranges of the slice.
+        let mut touched_bytes: BTreeSet<u32> = BTreeSet::new();
+        for p in &payload.pages {
+            // Whole listed page is the binding unit today; the diff between
+            // before/after tells which bytes changed, but reads also touch —
+            // conservatively take the multiproof's whole page span for leaf
+            // counting, and the per-range touch set for sub-leaf counting.
+            let base = p.page_idx << 12;
+            for off in 0..4096u32 {
+                // Only count bytes in ranges the window actually touched:
+                // approximate with changed-or-any — use full page for S=4096
+                // and the touch ranges below for finer S.
+                let _ = base + off;
+            }
+        }
+        let _ = touched_bytes;
+        // Touch ranges from the slice's streams (same enumeration as
+        // touched_pages, at byte granularity).
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for s in &sn.steps {
+            if let Some(r) = &s.mem_read {
+                ranges.push((r.address, r.size as u32));
+            }
+            if let Some(w) = &s.mem_write {
+                ranges.push((w.address, w.size as u32));
+            }
+        }
+        for o in &sn.blake2b_mem_ops {
+            ranges.push((o.h_ptr, 64));
+            ranges.push((o.m_ptr, 128));
+        }
+        for o in &sn.ristretto_mem_ops {
+            ranges.push((o.scalar_ptr, 32));
+            ranges.push((o.point_ptr, 32));
+            ranges.push((o.output_ptr, 32));
+        }
+        for o in &sn.ristretto_add_mem_ops {
+            ranges.push((o.p_ptr, 32));
+            ranges.push((o.q_ptr, 32));
+            ranges.push((o.output_ptr, 32));
+        }
+        for o in &sn.scalar_reduce_wide_mem_ops {
+            ranges.push((o.wide_ptr, 64));
+            ranges.push((o.output_ptr, 32));
+        }
+        for o in &sn.scalar_binop_mem_ops {
+            ranges.push((o.a_ptr, 32));
+            ranges.push((o.b_ptr, 32));
+            ranges.push((o.output_ptr, 32));
+        }
+
+        let exit_img = {
+            // entering + window writes: payload.pages carry before/after per
+            // page; build a sparse map page->after.
+            let mut m: BTreeMap<u32, &Vec<u8>> = BTreeMap::new();
+            for p in &payload.pages {
+                m.insert(p.page_idx, &p.after);
+            }
+            m
+        };
+        let ent_img = {
+            let mut m: BTreeMap<u32, &Vec<u8>> = BTreeMap::new();
+            for p in &payload.pages {
+                m.insert(p.page_idx, &p.before);
+            }
+            m
+        };
+
+        eprintln!("\nwindow {i} [{a},{b}): {} listed pages", payload.pages.len());
+        for s_bits in [12u32, 10, 9, 8] {
+            let s_bytes = 1u32 << s_bits;
+            // Distinct touched sub-leaves (+ leaf 0 always-listed analog).
+            let mut leaves: BTreeSet<u32> = BTreeSet::new();
+            leaves.insert(0);
+            for &(addr, len) in &ranges {
+                if len == 0 {
+                    continue;
+                }
+                let first = addr >> s_bits;
+                let last = ((addr as u64 + len as u64 - 1) >> s_bits) as u32;
+                for l in first..=last {
+                    leaves.insert(l);
+                }
+            }
+            // Content-deduped chains: hash key = the S-byte slice before/after.
+            let slice_of = |img: &BTreeMap<u32, &Vec<u8>>, leaf: u32| -> Vec<u8> {
+                let page = leaf >> (12 - s_bits);
+                let off = ((leaf as usize) & ((1usize << (12 - s_bits)) - 1)) * s_bytes as usize;
+                img.get(&page)
+                    .map(|p| p[off..off + s_bytes as usize].to_vec())
+                    .unwrap_or_else(|| vec![0u8; s_bytes as usize])
+            };
+            let mut uniq: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for &l in &leaves {
+                uniq.insert(slice_of(&ent_img, l));
+                uniq.insert(slice_of(&exit_img, l));
+            }
+            let comps_per_chain = (s_bytes / 128).max(1) as usize;
+            let leaf_comps = uniq.len() * comps_per_chain;
+            let depth = 32 - s_bits; // leaf index bits over 4 GiB space
+            let node_ub = 2 * leaves.len() * depth as usize; // pre-dedup upper bound
+            let rows = (leaf_comps + node_ub) * 96;
+            let e = worst.entry(s_bits).or_insert((0, 0));
+            if rows > e.0 {
+                *e = (rows, log2c(rows));
+            }
+            eprintln!(
+                "  S={s_bytes:5}: leaves {:4}, uniq chains {:4}, leaf comps {:5}, node UB {:5} → rows ≤ {:6} (log₂⌈{}⌉)",
+                leaves.len(),
+                uniq.len(),
+                leaf_comps,
+                node_ub,
+                rows,
+                log2c(rows),
+            );
+        }
+    }
+    eprintln!("\nworst sampled window per leaf size (rows include node upper bound):");
+    for (s_bits, (rows, log)) in worst {
+        eprintln!("  S={:5}: rows ≤ {rows} → boundary log₂⌈{log}⌉", 1u32 << s_bits);
+    }
+}

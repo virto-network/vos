@@ -423,10 +423,22 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
      one-byte touch) is what stands between that and 2^14, which is
      lever 2's case. Prove-time deltas from this change are
      unbenchmarked (box was under parallel load).
-  2. **Smaller Merkle leaf unit (reserve).** 256B sub-leaf counts
-     measured (seg0 421, mid 14, comb 23, tail 81): helps sparse
-     windows ~3–5×, does NOT help dense ones alone (seg0 would stay
-     ~2^18 without dedup) — only worth it after 1, if at all.
+  2. **Smaller Merkle leaf unit — FALSIFIED (sizing spike
+     2026-07-13).** At the (32k, 8) cut, finer leaves shrink
+     leaf-image compressions but multiply Merkle PATHS (more leaves ×
+     deeper tree): sampled windows show S=1024/512/256 all at or
+     above the 4 KB rows even before node dedup. Post-dedup the
+     boundary floor is PATH-dominated (~20 levels × 96 rows × 2
+     passes per touched page), which leaf granularity cannot touch.
+     Dropped.
+  2b. **Boundary WIDTH diet — the live both-axes lever (measured
+     40.9% dead width).** The boundary chip rides the shared Blake2b
+     layout; its ECALL-binding columns (h/m pointers, CallTs,
+     h_rd/m_rd/h_wr address limbs) are zeroed and unconstrained
+     there — 1040 of 2545 main limbs. A boundary-own column set cuts
+     the dominant chip's cells ~41% ⇒ ~25–30% off BOTH window RAM
+     and prove time; main-column-only change, so C_0/C_1 should not
+     drift (same argument as the dedup). Implementation in flight.
   3. **Poseidon2-M31 page hash (deep reserve).** 96 rows per 128
      hashed bytes is the constant both above levers dance around; an
      M31-native page hash cuts it ~10×+ but needs a new chip +
