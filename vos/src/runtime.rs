@@ -1691,20 +1691,23 @@ fn record_and_write_invoke(
     output.len() as u64
 }
 
-/// Split an invoke input into `(state, witnessed-row keys, msg)`.
-/// The base layout is `[state_len: u32 LE][state][msg]`; the extended
-/// layout (flag bit in the length word — see
-/// `lifecycle::invoke_hash_with_rows`) carries the row keys the caller
-/// named between the state and the message. Inputs shorter than the
-/// length prefix are all message (legacy raw invokes). A malformed
-/// keys section degrades to "no keys, rest is message": the child then
-/// panics on its first unproven read instead of the host guessing.
-fn split_invoke_input(input: &[u8]) -> (&[u8], alloc::vec::Vec<&[u8]>, &[u8]) {
+/// Split an invoke input into `(state, witnessed-row keys, record tag,
+/// msg)`. The base layout is `[state_len: u32 LE][state][msg]`; the
+/// extended layout (flag bits in the length word — see
+/// `lifecycle::invoke_hash_full`) carries the row keys the caller named
+/// and/or a 32-byte record tag between the state and the message. Inputs
+/// shorter than the length prefix are all message (legacy raw invokes). A
+/// malformed keys/tag section degrades to "no keys, no tag, rest is
+/// message": the child then panics on its first unproven read instead of
+/// the host guessing.
+fn split_invoke_input(
+    input: &[u8],
+) -> (&[u8], alloc::vec::Vec<&[u8]>, Option<[u8; 32]>, &[u8]) {
     if input.len() < 4 {
-        return (&[], alloc::vec::Vec::new(), input);
+        return (&[], alloc::vec::Vec::new(), None, input);
     }
     let len_word = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
-    let state_len = (len_word & !crate::lifecycle::INVOKE_INPUT_HAS_ROWS) as usize;
+    let state_len = (len_word & !crate::lifecycle::INVOKE_INPUT_FLAG_MASK) as usize;
     let state_end = (4 + state_len).min(input.len());
     let state = &input[4..state_end];
     let mut rest = &input[state_end..];
@@ -1733,7 +1736,14 @@ fn split_invoke_input(input: &[u8]) -> (&[u8], alloc::vec::Vec<&[u8]>, &[u8]) {
             rest = &rest[at..];
         }
     }
-    (state, row_keys, rest)
+    let mut tag = None;
+    if len_word & crate::lifecycle::INVOKE_INPUT_RECORD != 0 && rest.len() >= 32 {
+        let mut t = [0u8; 32];
+        t.copy_from_slice(&rest[..32]);
+        tag = Some(t);
+        rest = &rest[32..];
+    }
+    (state, row_keys, tag, rest)
 }
 
 /// Build a Task child's kernel: fresh instance from the blob, VOS
@@ -1823,15 +1833,18 @@ fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
 /// to the parent's envelope and the remaining effects fold into the
 /// PARENT's keyspace.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_task_invoke(
     caller: &mut InvocationKernel,
     blob: &[u8],
+    task_hash: &[u8; 32],
     witness_addr: u32,
     witness_cap: u32,
     parent_svc_id: u32,
     state: &[u8],
     msg: &[u8],
     rows: &[(Vec<u8>, Option<Vec<u8>>)],
+    record_tag: Option<&[u8; 32]>,
     gas: Gas,
     journal: &mut RefineJournal,
     code_cache: &mut javm::CodeCache,
@@ -1950,6 +1963,38 @@ fn run_task_invoke(
             depth,
             mode,
         );
+    }
+
+    // Provable record capture: the caller named a tag, so persist what a
+    // proof of this transition needs later into the PARENT's keyspace as
+    // an ordinary `__vos_proofrec/<tag>` write — riding the same commit
+    // (and recording/replay) path as every other effect, so it survives
+    // restart and CRDT soft-restart. The transition digest is read here,
+    // BEFORE this write is appended and before `take_state_write`, so it
+    // is exactly the digest the guest folded into its bound io-hash.
+    if let Some(tag) = record_tag {
+        let mut io_hash = [0u8; 32];
+        for (i, r) in (9usize..13).enumerate() {
+            io_hash[i * 8..i * 8 + 8].copy_from_slice(&child.active_reg(r).to_le_bytes());
+        }
+        let entry = crate::provable::ProofRecordEntry {
+            input: crate::provable::ProvableInput {
+                task_hash: *task_hash,
+                witness_bytes: input.clone(),
+            },
+            record: crate::provable::ProvableRecord {
+                task_hash: *task_hash,
+                anchor_kind: payload.anchor_kind,
+                anchor: payload.anchor,
+                transition_digest: payload.transition_digest(),
+                reply: payload.reply.clone(),
+                io_hash,
+            },
+        };
+        payload.effects.push(crate::refine_payload::Effect::Write {
+            key: crate::provable::proofrec_key(tag),
+            value: entry.encode(),
+        });
     }
 
     // Child state to the parent envelope (echo the input when
@@ -2082,7 +2127,7 @@ fn handle_invoke(
         && let Some(blob) = blobs.get(blob_idx)
     {
         let input = kread(caller, input_ptr, input_len);
-        let (state, row_keys, msg) = split_invoke_input(&input);
+        let (state, row_keys, record_tag, msg) = split_invoke_input(&input);
         // Resolve the caller-named row keys against the invoking
         // parent's EFFECTIVE keyspace (the same overlay its own reads
         // see) — a Task reads the parent's rows and folds its effects
@@ -2107,12 +2152,14 @@ fn handle_invoke(
         return run_task_invoke(
             caller,
             blob,
+            &code_hash,
             witness_addr,
             witness_cap,
             parent_svc_id,
             state,
             msg,
             &rows,
+            record_tag.as_ref(),
             gas,
             journal,
             code_cache,
@@ -2556,6 +2603,70 @@ mod tests {
         let rt = VosRuntime::with_gas_config(g);
         let cfg = rt.gas_config();
         assert_eq!(cfg.refine_gas, 12_345);
+    }
+
+    #[test]
+    fn split_invoke_input_extracts_rows_and_record_tag() {
+        use crate::lifecycle::{INVOKE_INPUT_HAS_ROWS, INVOKE_INPUT_RECORD};
+
+        // Hand-build an invoke input the way `lifecycle::invoke_hash_full`
+        // would: [state_len|FLAGS][state]([n_keys][keys] if rows)([tag] if
+        // record)[msg].
+        let build = |state: &[u8], keys: &[&[u8]], tag: Option<[u8; 32]>, msg: &[u8]| -> Vec<u8> {
+            let mut w = state.len() as u32;
+            if !keys.is_empty() {
+                w |= INVOKE_INPUT_HAS_ROWS;
+            }
+            if tag.is_some() {
+                w |= INVOKE_INPUT_RECORD;
+            }
+            let mut v = w.to_le_bytes().to_vec();
+            v.extend_from_slice(state);
+            if !keys.is_empty() {
+                v.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+                for k in keys {
+                    v.extend_from_slice(&(k.len() as u16).to_le_bytes());
+                    v.extend_from_slice(k);
+                }
+            }
+            if let Some(t) = tag {
+                v.extend_from_slice(&t);
+            }
+            v.extend_from_slice(msg);
+            v
+        };
+
+        // Base: no flags.
+        let base = build(b"ST", &[], None, b"MSG");
+        let (s, k, t, m) = split_invoke_input(&base);
+        assert_eq!(s, b"ST");
+        assert!(k.is_empty());
+        assert_eq!(t, None);
+        assert_eq!(m, b"MSG");
+
+        // Record only: the tag rides between state and msg.
+        let tag = [7u8; 32];
+        let rec = build(b"ST", &[], Some(tag), b"MSG");
+        let (s, k, t, m) = split_invoke_input(&rec);
+        assert_eq!(s, b"ST");
+        assert!(k.is_empty());
+        assert_eq!(t, Some(tag));
+        assert_eq!(m, b"MSG");
+
+        // Rows AND record together, in order.
+        let both = build(b"ST", &[b"k1", b"key2"], Some(tag), b"MSG");
+        let (s, k, t, m) = split_invoke_input(&both);
+        assert_eq!(s, b"ST");
+        assert_eq!(k, vec![&b"k1"[..], &b"key2"[..]]);
+        assert_eq!(t, Some(tag));
+        assert_eq!(m, b"MSG");
+
+        // Reserved-bit safety: an OLD host masks only HAS_ROWS, so a
+        // record-flagged length word reads as a ~1 GiB state_len and
+        // consumes the whole input as state — the child gets garbage and
+        // traps, rather than the tag being misread as state bytes.
+        let record_word = 2u32 | INVOKE_INPUT_RECORD;
+        assert!((record_word & !INVOKE_INPUT_HAS_ROWS) as usize > 0x1000_0000);
     }
 
     #[test]

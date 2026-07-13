@@ -109,6 +109,7 @@ pub mod registry;
 pub mod chronos;
 pub mod refine_payload;
 pub mod task_abi;
+pub mod provable;
 
 pub mod effect_log;
 pub mod effects;

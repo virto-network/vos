@@ -325,6 +325,21 @@ pub fn invoke_hash(code_hash: &[u8; 32], message: &[u8], state: &[u8]) -> Invoke
 /// `[state_len:4][state][msg]`.
 pub const INVOKE_INPUT_HAS_ROWS: u32 = 0x8000_0000;
 
+/// Flag bit marking a record-capturing provable invoke: the input carries
+/// a caller-supplied 32-byte tag (between the row keys, if any, and the
+/// message) under which the host persists a durable proof record. Bit 30,
+/// beside [`INVOKE_INPUT_HAS_ROWS`] (bit 31). The remaining high bits are
+/// reserved-must-be-zero: an older host masks only bit 31, so a
+/// record-flagged input parses with a huge `state_len` and fails cleanly
+/// (the child gets garbage and traps) rather than silently misreading the
+/// tag as state.
+pub const INVOKE_INPUT_RECORD: u32 = 0x4000_0000;
+
+/// The high bits of the leading length word reserved for invoke-input
+/// flags; the low bits are the true `state_len`. A new host masks all of
+/// these off to recover the length.
+pub const INVOKE_INPUT_FLAG_MASK: u32 = INVOKE_INPUT_HAS_ROWS | INVOKE_INPUT_RECORD;
+
 /// [`invoke_hash`] plus the storage row keys the Task's witnessed
 /// reads need. The host resolves each key against the invoking
 /// parent's effective keyspace and stages the present rows into the
@@ -346,18 +361,56 @@ pub fn invoke_hash_with_rows(
     state: &[u8],
     row_keys: &[&[u8]],
 ) -> InvokeResult {
+    invoke_hash_full(code_hash, message, state, row_keys, None)
+}
+
+/// [`invoke_hash_with_rows`] plus a record tag: the host captures a
+/// durable [`ProvableRecord`](crate::provable) under `__vos_proofrec/<tag>`
+/// in this parent's keyspace. Flagged by [`INVOKE_INPUT_RECORD`]; the tag
+/// rides the input between the row keys and the message and never reaches
+/// the child (it is host metadata).
+///
+/// Full extended layout (either flag independent):
+/// ```text
+/// [state_len|FLAGS: u32][state]
+///   ([n_keys: u32]([key_len: u16][key])*  if HAS_ROWS)
+///   ([tag: 32]                            if RECORD)
+///   [msg]
+/// ```
+#[cfg(feature = "pvm")]
+pub fn invoke_hash_with_record(
+    code_hash: &[u8; 32],
+    message: &[u8],
+    state: &[u8],
+    row_keys: &[&[u8]],
+    tag: &[u8; 32],
+) -> InvokeResult {
+    invoke_hash_full(code_hash, message, state, row_keys, Some(tag))
+}
+
+#[cfg(feature = "pvm")]
+fn invoke_hash_full(
+    code_hash: &[u8; 32],
+    message: &[u8],
+    state: &[u8],
+    row_keys: &[&[u8]],
+    tag: Option<&[u8; 32]>,
+) -> InvokeResult {
     let keys_len: usize = if row_keys.is_empty() {
         0
     } else {
         4 + row_keys.iter().map(|k| 2 + k.len()).sum::<usize>()
     };
-    let total = 4 + state.len() + keys_len + message.len();
+    let tag_len = if tag.is_some() { 32 } else { 0 };
+    let total = 4 + state.len() + keys_len + tag_len + message.len();
     let mut input = Vec::with_capacity(total);
-    let len_word = if row_keys.is_empty() {
-        state.len() as u32
-    } else {
-        state.len() as u32 | INVOKE_INPUT_HAS_ROWS
-    };
+    let mut len_word = state.len() as u32;
+    if !row_keys.is_empty() {
+        len_word |= INVOKE_INPUT_HAS_ROWS;
+    }
+    if tag.is_some() {
+        len_word |= INVOKE_INPUT_RECORD;
+    }
     input.extend_from_slice(&len_word.to_le_bytes());
     input.extend_from_slice(state);
     if !row_keys.is_empty() {
@@ -366,6 +419,9 @@ pub fn invoke_hash_with_rows(
             input.extend_from_slice(&(key.len() as u16).to_le_bytes());
             input.extend_from_slice(key);
         }
+    }
+    if let Some(tag) = tag {
+        input.extend_from_slice(tag);
     }
     input.extend_from_slice(message);
 

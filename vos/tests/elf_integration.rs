@@ -11742,6 +11742,115 @@ fn task_storage_reads_come_from_the_witness() {
     );
 }
 
+/// docs/plans/provable.md W2 — durable, split record capture. A parent
+/// invokes a provable Task with a business tag; the host captures the
+/// split `(ProvableInput, ProvableRecord)` under `__vos_proofrec/<tag>`
+/// in the parent's COMMITTED keyspace. The record's bound io-hash
+/// (φ[9..12]) re-traces from its own stored witness bytes, and the row is
+/// ordinary committed parent state — so it survives restart and CRDT
+/// replay (the property A10 makes non-optional: replay short-circuits the
+/// child, so a record can't "regenerate" and must be persisted).
+#[test]
+fn provable_task_captures_a_durable_re_traceable_record() {
+    use vos::provable::{ProofRecordEntry, proofrec_key};
+    use vos::value::Msg;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let (witness_addr, witness_cap) =
+        vos::zk::witness_symbol(&tally_elf).expect("tally must export __VOS_WITNESS");
+    let tally_blob = transpile_actor(&tally_elf);
+
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    let task_hash =
+        rt.register_task_blob(tally_blob.clone(), witness_addr as u32, witness_cap as u32);
+
+    // Spawn a provable `add(5)` task under a caller business tag.
+    let tag = [0xABu8; 32];
+    let task_msg = task_gate_dyn_msg(&Msg::new("add").with("n", 5u64));
+    let no_keys = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
+        .expect("encode empty row keys")
+        .to_vec();
+    let id = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_provable_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", task_msg)
+            .with("row_keys", no_keys)
+            .with("tag", tag.to_vec()),
+    )
+    .as_u64()
+    .expect("run_provable_task replies the task id");
+
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", id));
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Done as u32),
+        "the provable task must complete"
+    );
+    assert_eq!(rt.panics, 0);
+
+    // The record is a committed row in the parent's keyspace — durable
+    // state (the same store the disk-restart suite persists and reloads),
+    // not a transient.
+    let row = rt
+        .storage
+        .read(sched_id, &proofrec_key(&tag))
+        .expect("a record must be captured under __vos_proofrec/<tag>")
+        .to_vec();
+    let entry = ProofRecordEntry::decode(&row).expect("the record row decodes");
+    assert_eq!(entry.input.task_hash, task_hash, "input names the task");
+    assert_eq!(entry.record.task_hash, task_hash, "record names the task");
+    assert!(
+        !entry.record.reply.is_empty(),
+        "the record carries the task reply"
+    );
+
+    // The stored witness bytes re-trace to the record's bound io-hash —
+    // the producer can later prove exactly this transition, offline.
+    let (mut interp, mut img) = zkpvm::actor::interpreter_from_blob(&tally_blob, 100_000_000)
+        .expect("parse tally blob");
+    let w = &entry.input.witness_bytes;
+    let (start, end) = (witness_addr as usize, witness_addr as usize + w.len());
+    img[start..end].copy_from_slice(w);
+    interp.flat_mem = img;
+    let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
+    let exit = format!("{:?}", tracing.run_with_vos_stubs());
+    assert!(
+        exit == "HostCall(0)" || exit == "Ecall",
+        "the re-trace must halt cleanly, got {exit}"
+    );
+    let mut io = [0u8; 32];
+    for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
+        io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    assert_eq!(
+        io, entry.record.io_hash,
+        "the stored witness must re-trace to the record's bound io-hash"
+    );
+    assert_ne!(
+        entry.record.io_hash,
+        vos::zk::compute_io_hash(&[], &[]),
+        "the io-hash must commit to the transition, not the empty placeholder"
+    );
+}
+
 #[test]
 fn task_invoke_live_equals_traced() {
     use vos::refine_payload::{ANCHOR_GENESIS, RefinePayload};

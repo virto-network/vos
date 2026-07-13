@@ -99,6 +99,11 @@ pub struct TaskRecord {
     /// `lifecycle::invoke_hash_with_rows`). Empty for children that
     /// read no storage.
     pub row_keys: Vec<Vec<u8>>,
+    /// When set, drive this task as a provable invoke: the host captures
+    /// a durable proof record under `__vos_proofrec/<tag>` in the
+    /// parent's keyspace on every drive pass (see
+    /// `lifecycle::invoke_hash_with_record`). `None` = ordinary drive.
+    pub record_tag: Option<[u8; 32]>,
 }
 
 impl TaskRecord {
@@ -106,7 +111,7 @@ impl TaskRecord {
     /// saved `(state, msg)` and fold the outcome back in.
     #[cfg(feature = "pvm")]
     fn apply_drive_outcome(&mut self) {
-        use super::lifecycle::{InvokeResult, invoke_hash_with_rows};
+        use super::lifecycle::{InvokeResult, invoke_hash_with_record, invoke_hash_with_rows};
         use super::run::service_code_hash;
 
         let code_hash = match self.child {
@@ -114,7 +119,11 @@ impl TaskRecord {
             Child::Peer(service_id) => service_code_hash(service_id),
         };
         let keys: Vec<&[u8]> = self.row_keys.iter().map(|k| k.as_slice()).collect();
-        match invoke_hash_with_rows(&code_hash, &self.msg, &self.state, &keys) {
+        let outcome = match &self.record_tag {
+            Some(tag) => invoke_hash_with_record(&code_hash, &self.msg, &self.state, &keys, tag),
+            None => invoke_hash_with_rows(&code_hash, &self.msg, &self.state, &keys),
+        };
+        match outcome {
             InvokeResult::Done { state, reply } => {
                 // An empty state envelope means the child ran with no
                 // state delivery path at all (short error-shape
@@ -190,6 +199,48 @@ impl Tasks {
         msg: Vec<u8>,
         row_keys: Vec<Vec<u8>>,
     ) -> TaskId {
+        self.push(child, msg, row_keys, None)
+    }
+
+    /// Queue a provable child: driven with a record tag so the host
+    /// captures a durable proof record (`__vos_proofrec/<tag>`) of the
+    /// transition into THIS parent's keyspace. The tag is a
+    /// caller-chosen business id (e.g. a transfer id) that keys the
+    /// record for later `prove`/`prune`. Dynamic-message framing, as
+    /// [`spawn`](Self::spawn).
+    pub fn spawn_provable(
+        &mut self,
+        child: Child,
+        msg: &super::value::Msg,
+        tag: [u8; 32],
+    ) -> TaskId {
+        let encoded = super::codec::Encode::encode(msg);
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(super::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        self.push(child, payload, Vec::new(), Some(tag))
+    }
+
+    /// [`spawn_provable`](Self::spawn_provable) with pre-encoded message
+    /// bytes and named witnessed-row keys — the provable counterpart of
+    /// [`spawn_raw_with_rows`](Self::spawn_raw_with_rows).
+    pub fn spawn_raw_provable_with_rows(
+        &mut self,
+        child: Child,
+        msg: Vec<u8>,
+        row_keys: Vec<Vec<u8>>,
+        tag: [u8; 32],
+    ) -> TaskId {
+        self.push(child, msg, row_keys, Some(tag))
+    }
+
+    fn push(
+        &mut self,
+        child: Child,
+        msg: Vec<u8>,
+        row_keys: Vec<Vec<u8>>,
+        record_tag: Option<[u8; 32]>,
+    ) -> TaskId {
         let id = self.next_id;
         self.next_id += 1;
         self.records.push((
@@ -201,6 +252,7 @@ impl Tasks {
                 status: TaskStatus::Idle,
                 reply: Vec::new(),
                 row_keys,
+                record_tag,
             },
         ));
         id
