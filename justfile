@@ -48,7 +48,7 @@ build-settle:
 # surfaces as `register_remote Unreachable` and a stale voucher-check /
 # prover .so as a `ProofInvalid`. (Run `just build-actors` by hand if you invoke
 # `cargo test` directly instead of through `just test-pvm`.)
-build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge build-clerk-settle build-voucher-check
+build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge build-clerk-settle build-voucher-check build-witnessed-transfer
     cargo build -p prover-extension
     cargo build -p prover-extension --release
 
@@ -168,6 +168,17 @@ build-clerk-settle:
 # replication, no Ref API consumers.
 build-voucher-check:
     cd examples/actors/voucher-check; cargo +nightly build --release
+
+
+# Build the witnessed-transfer PVM guest — the `#[provable]` W1 fixture
+# whose traced execution proves a committed-map state transition through
+# `vos::zk::state::WitnessedLedger`. A pure verifier: reads touched leaves
+# + a BatchProof from `__VOS_WITNESS`, checks them against an app-named
+# `root_before`, applies transfers, and binds the roots. The e2e in
+# `vos/tests/elf_integration.rs` traces it clean (asserting the io-hash)
+# and rejects doctored witnesses.
+build-witnessed-transfer:
+    cd examples/actors/witnessed-transfer; cargo +nightly build --release
 
 
 # Build the per-channel messaging actors — msg-log (crdt-mode

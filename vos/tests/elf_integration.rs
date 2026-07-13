@@ -7350,6 +7350,265 @@ fn encode_witness_payload(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
     v
 }
 
+// ── W1 provable-verifier fixture (witnessed-transfer) ────────────────
+//
+// The `#[provable]` primitive `vos::zk::state::WitnessedLedger`, exercised
+// end-to-end in a real traced guest: the fixture reads touched leaves + a
+// `BatchProof` from `__VOS_WITNESS`, verifies them against an app-named
+// `root_before`, applies a batch of transfers, computes `root_after`, and
+// binds `(root_before, root_after, batch_digest)` into φ[9..12]. The gate
+// asserts the clean transition binds the io-hash a verifier would recompute,
+// and that each doctored witness (swapped value, lying-absent, wrong root,
+// unproven read) fails to complete a clean trace. Trace-only — no proving.
+
+const WT_TRACE_GAS: u64 = 100_000_000;
+
+fn witnessed_transfer_elf_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("WITNESSED_TRANSFER_ELF") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from(format!(
+        "{}/../examples/actors/witnessed-transfer/target/riscv64em-javm/release/witnessed-transfer.elf",
+        env!("CARGO_MANIFEST_DIR"),
+    ))
+}
+
+/// Read + transpile `witnessed-transfer.elf` and locate `__VOS_WITNESS`.
+fn witnessed_transfer_pvm() -> (Vec<u8>, usize) {
+    let elf = std::fs::read(witnessed_transfer_elf_path())
+        .expect("witnessed-transfer.elf not built — run `just build-witnessed-transfer`");
+    let blob = grey_transpiler::link_elf(&elf).expect("transpile witnessed-transfer");
+    let addr =
+        vos::zk::witness_addr(&elf).expect("witnessed-transfer.elf must export __VOS_WITNESS");
+    (blob, addr as usize)
+}
+
+/// The fixture's account-tree shape: default vos domains, 8-byte
+/// (`u64` big-endian) keys → a depth-64 SMT. Must match the guest's
+/// `SmtParams::vos(KEY_WIDTH)`.
+fn wt_params() -> vos::zk::state::SmtParams {
+    vos::zk::state::SmtParams::vos(8)
+}
+
+fn wt_leaf(balance: u64) -> [u8; 32] {
+    vos::zk::state::leaf_hash(&wt_params(), &balance.to_le_bytes())
+}
+
+/// Sorted `(key, leaf_hash)` leaves for an account→balance map.
+fn wt_leaves(accounts: &[(u64, u64)]) -> Vec<([u8; 8], [u8; 32])> {
+    let mut l: Vec<([u8; 8], [u8; 32])> = accounts
+        .iter()
+        .map(|&(a, b)| (a.to_be_bytes(), wt_leaf(b)))
+        .collect();
+    l.sort_unstable_by_key(|(k, _)| *k);
+    l
+}
+
+/// Encode the public half: `[u32 count][ (from,to,amount) × count ]` LE.
+fn wt_encode_transfers(transfers: &[(u64, u64, u64)]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + transfers.len() * 24);
+    v.extend_from_slice(&(transfers.len() as u32).to_le_bytes());
+    for &(from, to, amount) in transfers {
+        v.extend_from_slice(&from.to_le_bytes());
+        v.extend_from_slice(&to.to_le_bytes());
+        v.extend_from_slice(&amount.to_le_bytes());
+    }
+    v
+}
+
+/// Build the `LedgerWitness` (root_before + BatchProof + touched leaves)
+/// for `touched_accounts` against the tree `accounts`. Present accounts
+/// carry `Some(balance)` content; keys absent from `accounts` carry
+/// `None` (proven-absent).
+fn wt_ledger_witness(
+    accounts: &[(u64, u64)],
+    touched_accounts: &[u64],
+) -> vos::zk::state::LedgerWitness {
+    let params = wt_params();
+    let leaves = wt_leaves(accounts);
+    let root_before = vos::zk::state::root_of_sorted(&params, &leaves);
+    let mut keys: Vec<[u8; 8]> = touched_accounts.iter().map(|a| a.to_be_bytes()).collect();
+    keys.sort_unstable();
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let proof = vos::zk::state::BatchProof::build(&params, &leaves, &refs);
+    let touched = keys
+        .iter()
+        .map(|k| {
+            let account = u64::from_be_bytes(*k);
+            let content = accounts
+                .iter()
+                .find(|(a, _)| *a == account)
+                .map(|(_, b)| b.to_le_bytes().to_vec());
+            (k.to_vec(), content)
+        })
+        .collect();
+    vos::zk::state::LedgerWitness {
+        root_before,
+        proof,
+        touched,
+    }
+}
+
+/// Apply a batch of transfers to an account→balance model (same order and
+/// zero-for-absent semantics as the guest) and return the resulting root.
+fn wt_apply_root(accounts: &[(u64, u64)], transfers: &[(u64, u64, u64)]) -> [u8; 32] {
+    let mut model: std::collections::BTreeMap<u64, u64> = accounts.iter().copied().collect();
+    for &(from, to, amount) in transfers {
+        let fb = *model.get(&from).unwrap_or(&0);
+        assert!(fb >= amount, "test scenario overdraft");
+        model.insert(from, fb - amount);
+        let tb = *model.get(&to).unwrap_or(&0);
+        model.insert(to, tb + amount);
+    }
+    let accts: Vec<(u64, u64)> = model.into_iter().collect();
+    vos::zk::state::root_of_sorted(&wt_params(), &wt_leaves(&accts))
+}
+
+/// Trace the fixture over a patched witness. Returns `(exit_reason,
+/// step_count, bound_io_hash)`; the io-hash (φ[9..12]) is only meaningful
+/// on a clean halt.
+fn wt_trace(blob: &[u8], addr: usize, gas: u64, witness_buf: &[u8]) -> (String, usize, [u8; 32]) {
+    let (mut interp, mut img) =
+        zkpvm::actor::interpreter_from_blob(blob, gas).expect("parse witnessed-transfer blob");
+    let end = addr + witness_buf.len();
+    assert!(end <= img.len(), "witness buffer overruns the guest image");
+    img[addr..end].copy_from_slice(witness_buf);
+    interp.flat_mem = img;
+    let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
+    let exit = format!("{:?}", tracing.run_with_vos_stubs());
+    let steps = tracing.steps.len();
+    let mut io = [0u8; 32];
+    for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
+        io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    (exit, steps, io)
+}
+
+fn wt_is_clean_halt(exit: &str) -> bool {
+    exit == "HostCall(0)" || exit == "Ecall"
+}
+
+/// The W1 gate. A real committed-map transition proves through
+/// `WitnessedLedger`: the clean witness binds the io-hash a verifier
+/// independently recomputes; every doctored witness traps.
+#[test]
+fn witnessed_transfer_verifies_and_rejects_doctored_witnesses() {
+    if !witnessed_transfer_elf_path().exists() {
+        eprintln!("SKIP: witnessed-transfer ELF not built — run `just build-witnessed-transfer`");
+        return;
+    }
+    let (blob, addr) = witnessed_transfer_pvm();
+
+    // A committed field of account→balance. Transfers touch 1,2,3,5 and
+    // pay a fresh account (99, absent) — exercising present reads, a
+    // proven-absent read, and updates. The `(2, 2, 5)` self-transfer must
+    // net to a no-op (not mint): the guest debits before reading the
+    // recipient, so its root_after matches the host recompute — and the
+    // io-hash check below is the regression that a self-transfer can't
+    // create value.
+    let accounts = [(1u64, 100u64), (2, 50), (3, 200), (5, 30)];
+    let transfers = [(1u64, 2u64, 10u64), (2, 2, 5), (3, 5, 5), (1, 99, 3)];
+    let touched: Vec<u64> = [1u64, 2, 3, 5, 99].to_vec();
+
+    let witness = wt_ledger_witness(&accounts, &touched);
+    let root_before = witness.root_before;
+    let public = wt_encode_transfers(&transfers);
+    let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&witness)
+        .expect("encode LedgerWitness")
+        .to_vec();
+    let witness_buf = encode_witness_payload(&public, &secret);
+
+    // Independently derive the io-hash the guest must bind.
+    let root_after = wt_apply_root(&accounts, &transfers);
+    let batch_digest =
+        vos::crypto::blake2b_hash::<32>(b"witnessed-transfer/batch/v1", &[&public]);
+    let mut public_bytes = Vec::with_capacity(96);
+    public_bytes.extend_from_slice(&root_before);
+    public_bytes.extend_from_slice(&root_after);
+    public_bytes.extend_from_slice(&batch_digest);
+    let expected_io = vos::zk::compute_io_hash(&public_bytes, &[1u8]);
+
+    // Clean run: completes and binds the expected transition io-hash.
+    let (exit, clean_steps, io) = wt_trace(&blob, addr, WT_TRACE_GAS, &witness_buf);
+    assert!(
+        wt_is_clean_halt(&exit),
+        "clean witnessed transition must halt cleanly, got {exit} after {clean_steps} steps"
+    );
+    assert_eq!(
+        io, expected_io,
+        "the guest must bind io_hash(root_before ‖ root_after ‖ batch_digest, [1]) \
+         a verifier can recompute"
+    );
+    assert_ne!(root_after, root_before, "the transition must move the root");
+    eprintln!("clean transition: {exit} in {clean_steps} steps, io-hash bound OK");
+
+    // Bound the doctored runs: their panic fires early (root check at
+    // build, or the unproven read mid-apply); an aborting guest spins gas,
+    // so cap it a small multiple above the clean cost.
+    let doctored_gas = (clean_steps as u64).saturating_mul(8).max(1_000_000);
+
+    // Doctor 1 — a swapped witnessed value shifts root_before.
+    {
+        let mut w = witness.clone();
+        for (k, v) in w.touched.iter_mut() {
+            if *k == 1u64.to_be_bytes().to_vec() {
+                *v = Some(999u64.to_le_bytes().to_vec());
+            }
+        }
+        let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&w).unwrap().to_vec();
+        let buf = encode_witness_payload(&public, &secret);
+        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        assert!(
+            !wt_is_clean_halt(&exit),
+            "a swapped witnessed value must trap, got clean halt {exit} in {steps} steps"
+        );
+    }
+
+    // Doctor 2 — a present account handed as proven-absent.
+    {
+        let mut w = witness.clone();
+        for (k, v) in w.touched.iter_mut() {
+            if *k == 2u64.to_be_bytes().to_vec() {
+                *v = None;
+            }
+        }
+        let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&w).unwrap().to_vec();
+        let buf = encode_witness_payload(&public, &secret);
+        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        assert!(
+            !wt_is_clean_halt(&exit),
+            "a lying-absent leaf must trap, got clean halt {exit} in {steps} steps"
+        );
+    }
+
+    // Doctor 3 — a root_before that isn't the tree's.
+    {
+        let mut w = witness.clone();
+        w.root_before[0] ^= 1;
+        let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&w).unwrap().to_vec();
+        let buf = encode_witness_payload(&public, &secret);
+        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        assert!(
+            !wt_is_clean_halt(&exit),
+            "a wrong root_before must trap, got clean halt {exit} in {steps} steps"
+        );
+    }
+
+    // Doctor 4 — a transfer over an account the parent never witnessed
+    // (unproven read). The honest witness stands; only the batch names a
+    // stranger (account 7), so `ledger.get` traps.
+    {
+        let bad_transfers = [(1u64, 2u64, 10u64), (7, 5, 5)];
+        let public_bad = wt_encode_transfers(&bad_transfers);
+        let buf = encode_witness_payload(&public_bad, &secret);
+        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        assert!(
+            !wt_is_clean_halt(&exit),
+            "an unproven read must trap, got clean halt {exit} in {steps} steps"
+        );
+    }
+}
+
 #[test]
 fn clerk_ledger_two_bank_federation() {
     // Serialize network e2e tests (see net_serial).

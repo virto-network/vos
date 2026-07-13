@@ -32,6 +32,7 @@
 //!   no length prefixes (`vos::crypto::blake2b_hash`, which routes
 //!   through the blake2b precompile ecall on riscv64).
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::crypto::blake2b_hash;
@@ -371,6 +372,178 @@ fn build_frontier_rec<K: AsRef<[u8]>>(
     build_frontier_rec(p, t_right, f_right, prefix_r, level + 1, chain, out);
 }
 
+/// A witness-verified view of a committed field's touched leaves — the
+/// pure-verifier workhorse a provable Task builds to prove a state
+/// transition without ever touching live storage.
+///
+/// A Task holds no committed rows of its own; instead the invoking
+/// parent ships, in the Task's witness, the touched leaf *contents* plus
+/// a [`BatchProof`] over their keys. `WitnessedLedger` verifies those
+/// against the app-named `root_before` at construction — **this is where
+/// every input, present or absent, is bound**: [`BatchProof::root`]
+/// folds an absent key as [`EMPTY_LEAF`], so a swapped value, a lying
+/// "absent" over an occupied slot, or a wrong `root_before` each shift
+/// the reconstructed root and panic. The handler then `get`/`insert`/
+/// `remove`s the touched leaves and reads back `root_after` via
+/// [`root`](Self::root), reusing the same frontier (untouched branches
+/// don't move). It writes no live storage; the parent applies the
+/// mutation itself against the roots the Task attested.
+///
+/// This generalizes cipher-clerk's `SparseLedger`: byte-oriented leaves
+/// over any [`SmtParams`] shape, rather than six hardcoded typed
+/// sub-trees. The app owns value↔leaf-content encoding, matching
+/// [`CommittedMap::insert_with_leaf`](crate::storage::CommittedMap) — the
+/// content bytes handed here are hashed with [`leaf_hash`] exactly as the
+/// live tree hashed them, so a witnessed leaf reproduces its live leaf.
+/// An app with several committed fields builds one `WitnessedLedger` per
+/// field and folds their roots the way it composes them live.
+///
+/// ## Soundness backstop
+///
+/// Every access is against the *witnessed* key set. A `get`, `insert`,
+/// or `remove` of a key that was not in `touched` **panics** — an
+/// unproven read is an incomplete witness, not proven absence, and a
+/// silent zero there would let a courier omit an occupied leaf and mint
+/// value. The panic names the offending key so the common migration
+/// mistake (a key the parent forgot to witness) is diagnosable rather
+/// than a bare gas-burn.
+pub struct WitnessedLedger {
+    params: SmtParams,
+    proof: BatchProof,
+    /// Touched key → current leaf content; `None` = proven-absent (the
+    /// empty leaf). A key absent from this map was never witnessed and
+    /// panics on any access.
+    leaves: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl WitnessedLedger {
+    /// Build over `touched` — every key the transition will read or write,
+    /// each with its witnessed content `Some(bytes)` or proven-absent
+    /// `None` — and verify the reconstruction equals `root_before`.
+    ///
+    /// Panics if any touched key is not `params.width` bytes, or if the
+    /// reconstructed root != `root_before` (the one check that binds every
+    /// witnessed input, present or absent).
+    pub fn new(
+        params: SmtParams,
+        proof: BatchProof,
+        touched: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
+        root_before: [u8; 32],
+    ) -> Self {
+        let leaves: BTreeMap<Vec<u8>, Option<Vec<u8>>> = touched.into_iter().collect();
+        for k in leaves.keys() {
+            assert!(
+                k.len() == params.width,
+                "witnessed-ledger: touched key {:x?} is {} bytes, tree width is {}",
+                k,
+                k.len(),
+                params.width,
+            );
+        }
+        let me = Self {
+            params,
+            proof,
+            leaves,
+        };
+        let recomputed = me.root();
+        assert!(
+            recomputed == root_before,
+            "witnessed-ledger: reconstructed root {:x?} != root_before {:x?} \
+             — inconsistent witness (swapped value, lying-absent, or wrong root)",
+            recomputed,
+            root_before,
+        );
+        me
+    }
+
+    /// Read the witnessed content at `key`: `Some` = its present leaf
+    /// content bytes, `None` = proven-absent. Panics (naming `key`) if
+    /// `key` was not witnessed — an unproven read, distinct from proven
+    /// absence.
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        match self.leaves.get(key) {
+            Some(slot) => slot.as_deref(),
+            None => panic!(
+                "witnessed-ledger: unproven read of key {:x?} — not in the witness \
+                 (incomplete witness, not proven absence)",
+                key,
+            ),
+        }
+    }
+
+    /// Whether `key` was witnessed present. Panics for an unwitnessed key,
+    /// same rule as [`get`](Self::get).
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Set `key`'s leaf content. Panics (naming `key`) if `key` was not
+    /// witnessed — an unproven write can't fold into a sound root.
+    pub fn insert(&mut self, key: &[u8], content: Vec<u8>) {
+        match self.leaves.get_mut(key) {
+            Some(slot) => *slot = Some(content),
+            None => panic!(
+                "witnessed-ledger: unproven write to key {:x?} — not in the witness",
+                key,
+            ),
+        }
+    }
+
+    /// Clear `key` (make it proven-absent). Panics (naming `key`) if `key`
+    /// was not witnessed.
+    pub fn remove(&mut self, key: &[u8]) {
+        match self.leaves.get_mut(key) {
+            Some(slot) => *slot = None,
+            None => panic!(
+                "witnessed-ledger: unproven remove of key {:x?} — not in the witness",
+                key,
+            ),
+        }
+    }
+
+    /// The root over the current (post-mutation) leaf set reusing the
+    /// proof frontier — `root_after`. Before any mutation this returns
+    /// the `root_before` [`new`](Self::new) checked.
+    pub fn root(&self) -> [u8; 32] {
+        let touched: Vec<(&[u8], [u8; 32])> = self
+            .leaves
+            .iter()
+            .map(|(k, v)| {
+                let h = match v {
+                    Some(content) => leaf_hash(&self.params, content),
+                    None => EMPTY_LEAF,
+                };
+                (k.as_slice(), h)
+            })
+            .collect();
+        self.proof.root(&self.params, &touched)
+    }
+}
+
+/// The wire envelope a provable Task's witness carries for one committed
+/// field: the app-named `root_before`, a [`BatchProof`] over the touched
+/// keys, and the touched leaves themselves (`Some` = present content,
+/// `None` = proven-absent). The invoking parent builds this from the live
+/// field it walks; [`into_ledger`](Self::into_ledger) hands the Task a
+/// verified [`WitnessedLedger`]. An app with several committed fields
+/// ships one envelope per field.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct LedgerWitness {
+    pub root_before: [u8; 32],
+    pub proof: BatchProof,
+    pub touched: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl LedgerWitness {
+    /// Verify the envelope against its `root_before` and return the
+    /// ledger. Panics on an inconsistent witness — see
+    /// [`WitnessedLedger::new`].
+    pub fn into_ledger(self, params: SmtParams) -> WitnessedLedger {
+        WitnessedLedger::new(params, self.proof, self.touched, self.root_before)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,5 +769,166 @@ mod tests {
         proof.frontier[0].hash[0] ^= 1;
         let t = [(leaves[0].0, leaves[0].1)];
         assert_ne!(proof.root(&CC, &t), root);
+    }
+
+    // ── WitnessedLedger — the pure-verifier primitive ────────────────
+
+    /// `n` accounts keyed `key16(i)` with leaf content `(i·10)` little-
+    /// endian, sorted ascending by key.
+    fn accounts(n: u64) -> Vec<([u8; 16], Vec<u8>)> {
+        let mut v: Vec<([u8; 16], Vec<u8>)> = (0..n)
+            .map(|i| (key16(i), (i * 10).to_le_bytes().to_vec()))
+            .collect();
+        v.sort_unstable_by_key(|(k, _)| *k);
+        v
+    }
+
+    fn leaves_of(accts: &[([u8; 16], Vec<u8>)]) -> Vec<([u8; 16], [u8; 32])> {
+        let mut l: Vec<([u8; 16], [u8; 32])> =
+            accts.iter().map(|(k, c)| (*k, leaf_hash(&CC, c))).collect();
+        l.sort_unstable_by_key(|(k, _)| *k);
+        l
+    }
+
+    fn content_of(accts: &[([u8; 16], Vec<u8>)], k: &[u8; 16]) -> Option<Vec<u8>> {
+        accts.iter().find(|(ak, _)| ak == k).map(|(_, c)| c.clone())
+    }
+
+    /// Build a `BatchProof` + `touched` list for the given keys against
+    /// `accts` (present keys carry their content, absent carry `None`).
+    fn witness_for(
+        accts: &[([u8; 16], Vec<u8>)],
+        touched_keys: &[[u8; 16]],
+    ) -> (BatchProof, Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        let leaves = leaves_of(accts);
+        let mut tk = touched_keys.to_vec();
+        tk.sort_unstable();
+        let refs: Vec<&[u8]> = tk.iter().map(|k| k.as_slice()).collect();
+        let proof = BatchProof::build(&CC, &leaves, &refs);
+        let touched = tk
+            .iter()
+            .map(|k| (k.to_vec(), content_of(accts, k)))
+            .collect();
+        (proof, touched)
+    }
+
+    /// A ledger built from a real tree's proof reconstructs the bound
+    /// root, serves proven reads (present and absent), tracks mutations,
+    /// and yields the full-recompute `root_after`.
+    #[test]
+    fn witnessed_ledger_verifies_and_applies_a_transition() {
+        let accts = accounts(64);
+        let root_before = root_of_sorted(&CC, &leaves_of(&accts));
+        let a = key16(3);
+        let b = key16(40);
+        let fresh = key16(1_000); // absent from the tree
+        let (proof, touched) = witness_for(&accts, &[a, b, fresh]);
+
+        let mut ledger = WitnessedLedger::new(CC, proof, touched, root_before);
+        assert_eq!(ledger.root(), root_before, "pre-mutation root is root_before");
+
+        // Proven reads: a present account and a proven-absent one.
+        assert_eq!(ledger.get(&a), content_of(&accts, &a).as_deref());
+        assert_eq!(ledger.get(&fresh), None);
+        assert!(ledger.contains(&b) && !ledger.contains(&fresh));
+
+        // Transfer 10 from a to b, and open the fresh account with 5.
+        let a_val = u64::from_le_bytes(ledger.get(&a).unwrap().try_into().unwrap());
+        let b_val = u64::from_le_bytes(ledger.get(&b).unwrap().try_into().unwrap());
+        ledger.insert(&a, (a_val - 10).to_le_bytes().to_vec());
+        ledger.insert(&b, (b_val + 10).to_le_bytes().to_vec());
+        ledger.insert(&fresh, 5u64.to_le_bytes().to_vec());
+        let root_after = ledger.root();
+
+        // Same mutation, recomputed from scratch over the full key set.
+        let mut model = accts.clone();
+        for (k, c) in model.iter_mut() {
+            if *k == a {
+                *c = (a_val - 10).to_le_bytes().to_vec();
+            } else if *k == b {
+                *c = (b_val + 10).to_le_bytes().to_vec();
+            }
+        }
+        model.push((fresh, 5u64.to_le_bytes().to_vec()));
+        assert_eq!(root_after, root_of_sorted(&CC, &leaves_of(&model)));
+        assert_ne!(root_after, root_before);
+
+        // Removing the fresh account again returns to the same root a
+        // never-inserted witness would produce.
+        ledger.remove(&fresh);
+        let mut without = model.clone();
+        without.retain(|(k, _)| *k != fresh);
+        assert_eq!(ledger.root(), root_of_sorted(&CC, &leaves_of(&without)));
+    }
+
+    /// A swapped witnessed value shifts the reconstructed root — the
+    /// build rejects it before any logic runs.
+    #[test]
+    #[should_panic(expected = "reconstructed root")]
+    fn witnessed_ledger_rejects_a_swapped_value() {
+        let accts = accounts(64);
+        let root_before = root_of_sorted(&CC, &leaves_of(&accts));
+        let a = key16(3);
+        let (proof, mut touched) = witness_for(&accts, &[a, key16(40)]);
+        // Hand `a` a value the tree does not hold.
+        for (k, v) in touched.iter_mut() {
+            if k.as_slice() == a.as_slice() {
+                *v = Some(999u64.to_le_bytes().to_vec());
+            }
+        }
+        WitnessedLedger::new(CC, proof, touched, root_before);
+    }
+
+    /// A courier hiding an occupied slot (present key handed as absent)
+    /// shifts the reconstructed root and is rejected — non-inclusion is
+    /// proven, not asserted.
+    #[test]
+    #[should_panic(expected = "reconstructed root")]
+    fn witnessed_ledger_rejects_a_lying_absent() {
+        let accts = accounts(64);
+        let root_before = root_of_sorted(&CC, &leaves_of(&accts));
+        let b = key16(40);
+        let (proof, mut touched) = witness_for(&accts, &[key16(3), b]);
+        for (k, v) in touched.iter_mut() {
+            if k.as_slice() == b.as_slice() {
+                *v = None; // b is really present
+            }
+        }
+        WitnessedLedger::new(CC, proof, touched, root_before);
+    }
+
+    /// A `root_before` that isn't the tree's is rejected outright.
+    #[test]
+    #[should_panic(expected = "reconstructed root")]
+    fn witnessed_ledger_rejects_a_wrong_root_before() {
+        let accts = accounts(64);
+        let mut wrong = root_of_sorted(&CC, &leaves_of(&accts));
+        wrong[0] ^= 1;
+        let (proof, touched) = witness_for(&accts, &[key16(3), key16(40)]);
+        WitnessedLedger::new(CC, proof, touched, wrong);
+    }
+
+    /// Reading a key the parent never witnessed names the key and traps —
+    /// the diagnosis surface for the common migration mistake.
+    #[test]
+    #[should_panic(expected = "unproven read")]
+    fn witnessed_ledger_panics_on_unproven_read() {
+        let accts = accounts(64);
+        let root_before = root_of_sorted(&CC, &leaves_of(&accts));
+        let (proof, touched) = witness_for(&accts, &[key16(3), key16(40)]);
+        let ledger = WitnessedLedger::new(CC, proof, touched, root_before);
+        let _ = ledger.get(&key16(7)); // never witnessed
+    }
+
+    /// Writing an unwitnessed key traps rather than folding an unbound
+    /// leaf into the root.
+    #[test]
+    #[should_panic(expected = "unproven write")]
+    fn witnessed_ledger_panics_on_unproven_write() {
+        let accts = accounts(64);
+        let root_before = root_of_sorted(&CC, &leaves_of(&accts));
+        let (proof, touched) = witness_for(&accts, &[key16(3), key16(40)]);
+        let mut ledger = WitnessedLedger::new(CC, proof, touched, root_before);
+        ledger.insert(&key16(7), 1u64.to_le_bytes().to_vec());
     }
 }

@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "witnessed-transfer"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `bin` gates the PVM entry-point block (`_start` + `accumulate`)
+# emitted by `#[actor]`. Default-on so a plain `cargo build` for the
+# riscv64em-javm target produces a non-empty ELF.
+default = ["bin"]
+bin = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+# The W1 `#[provable]` fixture: a pure-verifier PVM guest whose traced
+# execution proves a committed-map state transition through
+# `vos::zk::state::WitnessedLedger`. It reads touched leaves + a
+# `BatchProof` from `__VOS_WITNESS`, verifies them against an app-named
+# `root_before`, applies a batch of transfers, computes `root_after`, and
+# binds `(root_before, root_after, batch_digest)` — the generalized shape
+# voucher-check will collapse onto in W4. Built via `cargo +nightly build
+# --release` (see `just build-witnessed-transfer`).
+[dependencies]
+vos = { path = "../../../vos", default-features = false, features = ["macros", "service"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
