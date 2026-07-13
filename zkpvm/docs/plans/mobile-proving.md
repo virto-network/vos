@@ -132,6 +132,31 @@ column blowup multiplies transient buffers; bump stwo 2.2.0→2.3.0
 latter is the Solidity-friendly Fiat–Shamir if direct EVM verification
 ever matters) and measure its peak-RAM effect.
 
+## Interaction-trace diet (sizing spike DONE 2026-07-13)
+
+Correction to the Wave-4 note: at production floors the interaction
+tree models at 1.95 GiB vs main's 4.22 GiB — second tree, not first.
+The two blake2b chips are ~90% of it, and the waste is ~1.17 GiB of
+FULL-HEIGHT columns carrying fractions gated to 1-in-96 rows (a gate
+multiplies the numerator; the column still spans 2^L). Logup pairing
+itself is fine (two lone tails, ~7.5 MiB). Candidates, both-axes:
+- **C2 (GO, first): byte-wide AND table** (2^16-row (a,b,a&b) chip,
+  RangeMultiplicity pattern) halves every AND lookup in both blake2b
+  chips: −660 MiB interaction, ~−480 MiB main, interaction-gen time
+  DOWN ~40% on the two heaviest chips. Component-set change ⇒ re-pin.
+- **C1 (GO, after C2): per-compression sub-chip** hoisting the
+  row-0/row-95 payloads (output-derivation AND-nibbles, h/m read
+  binding, producers) onto one-row-per-compression siblings
+  (L16→~L10): ~−2.5 GiB committed cells ⇒ window ~9.5→~7 GiB, time
+  down. Biggest engineering + re-pin; land after C2, one drill.
+- **C3 (NO-GO for now): batch-4 logup** — −46% of the tree with no
+  re-pin, but doubles quotient-eval domain for the heaviest
+  constraint sets (both-axes violation risk); revisit only if short
+  after C1+C2, batch-3 fallback.
+- **Free time lever (no re-pin, bit-identical): LogupTraceBuilder
+  skips relation.combine() on zero-numerator rows** — the ~1.5k gated
+  entries pay 265-wide combines on 95/96 dead rows today.
+
 ## ARM bring-up (orthogonal to RAM)
 
 No source-level blocker: stwo's SimdBackend is portable `std::simd`
