@@ -6924,8 +6924,11 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
         .map(|(i, _)| i)
         .collect();
     let mut max_natural = vec![0u32; forced.len()];
+    // One forward cursor pass — O(N) slicing across the windows instead of
+    // segment_side_note's per-window prefix replay (O(N²) over the chain).
+    let mut cursor = zkpvm::segment::SegmentCursor::new(&full);
     for &(a, b) in &bounds {
-        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let mut sn = cursor.side_note(a, b);
         let naturals = zkpvm::natural_log_sizes_for(&mut sn, &forced);
         for (m, n) in max_natural.iter_mut().zip(naturals) {
             *m = (*m).max(n);

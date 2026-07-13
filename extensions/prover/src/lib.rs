@@ -630,9 +630,14 @@ fn measure_commitments(
     if n == 0 {
         return None;
     }
+    // Both passes ride a forward SegmentCursor — O(N) total slicing instead
+    // of the per-window prefix replay's O(N²): the comb scan walks every
+    // window in order; the probe pass (a fresh cursor — the image can't
+    // rewind) skips straight between the sparse probe windows.
+    let mut scan = zkpvm::segment::SegmentCursor::new(full);
     let comb_counts: Vec<usize> = bounds
         .iter()
-        .map(|&(a, b)| zkpvm::segment::segment_side_note(full, a, b).ristretto_comb_calls.len())
+        .map(|&(a, b)| scan.side_note(a, b).ristretto_comb_calls.len())
         .collect();
 
     // Probe seg 0, the last (possibly short) segment, and the first segment of
@@ -648,9 +653,10 @@ fn measure_commitments(
 
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
+    let mut cursor = zkpvm::segment::SegmentCursor::new(full);
     for i in probe {
         let (a, b) = bounds[i];
-        let mut sn = zkpvm::segment::segment_side_note(full, a, b);
+        let mut sn = cursor.side_note(a, b);
         let proof = prove_canonical(&mut sn, profile).ok()?;
         let c = zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
         if seen.insert(c) {
@@ -893,8 +899,12 @@ pub fn prove_chain_segments(
     let full = trace_blob(pvm_blob, witness_bytes, witness_addr)?;
     let bounds = chain_bounds(&full, seg_steps, page_budget);
     let mut segments: Vec<Vec<u8>> = Vec::with_capacity(bounds.len());
+    // One forward cursor pass threads the entering memory image across the
+    // windows — O(N) total slicing instead of the per-window prefix
+    // replay's O(N²) (see zkpvm::segment::SegmentCursor).
+    let mut cursor = zkpvm::segment::SegmentCursor::new(&full);
     for (a, b) in bounds {
-        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+        let mut sn = cursor.side_note(a, b);
         let proof = prove_canonical(&mut sn, profile).ok()?;
         segments.push(bincode::serialize(&proof).ok()?);
     }

@@ -322,7 +322,7 @@ pub struct MulEntry {
 /// `(output_ptr + i, byte, ts, is_write=1)`.  `output_ptr` and
 /// `ts` come straight from the actor's ECALL-step register
 /// snapshot via `ingest_ristretto_boundary`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RistrettoCombCall {
     /// 32 LE bytes; the scalar `k` to multiply against the fixed
     /// basepoint G.  Decomposes into 64 4-bit windows that drive the

@@ -246,11 +246,22 @@ segmentation of any kind.
 
 ### Wave 2 — chain-driver memory (SideNote diet)
 
-- **2.1 Streamed per-segment tracing.** Drive `prove_chain_segments`
-  with a forward tracer that threads the memory image + register file
-  across windows instead of holding the full-chain SideNote and
-  re-replaying writes per slice (`segment.rs` documents the O(N²)).
-  Removes the 2.6 GB full-trace residency floor.
+- **2.1 Streamed per-segment tracing — O(N²) replay ELIMINATED
+  (`SegmentCursor`).** `zkpvm::segment::SegmentCursor` walks a chain's
+  windows in ascending order, threading the entering memory image
+  forward and applying each write exactly once; skipped windows advance
+  the image without building a `SideNote`, so sparse probe sets stay
+  cheap. Segment assembly is the same code path `segment_side_note`
+  runs (equivalence unit-pinned field-by-field over a fixture with
+  precompile writes threaded across window boundaries). All sequential
+  full passes ride it: `prove_chain_segments`, `measure_commitments`'s
+  comb scan + probes, `canonical_profile_for_bounds` — so the
+  minutes-long floors derivation (Wave-1.3 finding 5) collapses with
+  it, and the per-pass replay cost no longer grows with window count
+  (the 8k sweep's 968 s derive was the O(N²) at 965 windows).
+  Remaining for 2.1: the full-chain SideNote is still resident during
+  the loop — removing the ~2.6 GB floor needs the tracer itself to
+  stream (pair with 2.2's `PvmStep` shrink).
 - **2.2 `PvmStep` shrink.** Drop the two full register-file snapshots
   (~208 of ~350 B/step); keep the written register + value,
   reconstruct at trace-gen.

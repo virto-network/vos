@@ -643,6 +643,10 @@ pub fn canonical_profile_for(full: &SideNote, seg_steps: usize) -> Option<Vec<u3
 /// [`canonical_profile_for`] over explicit window bounds — the floors for a
 /// content-budgeted cut ([`crate::segment::segment_bounds_budgeted`]), or
 /// any other deterministic segmentation. Same guarantees and refusals.
+/// `bounds` must be in ascending step order (every segmentation here
+/// produces them so): the windows are sliced by one forward
+/// [`crate::segment::SegmentCursor`] pass, O(N) in the trace length
+/// instead of the per-window prefix replay's O(N²).
 pub fn canonical_profile_for_bounds(
     full: &SideNote,
     bounds: &[(usize, usize)],
@@ -652,8 +656,9 @@ pub fn canonical_profile_for_bounds(
     }
     let indices: Vec<usize> = (0..super::chip_idx::COUNT).collect();
     let mut floors = vec![0u32; indices.len()];
+    let mut cursor = crate::segment::SegmentCursor::new(full);
     for &(a, b) in bounds {
-        let mut sn = crate::segment::segment_side_note(full, a, b);
+        let mut sn = cursor.side_note(a, b);
         for (floor, natural) in floors.iter_mut().zip(natural_log_sizes_for(&mut sn, &indices)) {
             *floor = (*floor).max(natural);
         }

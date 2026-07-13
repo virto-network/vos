@@ -7,7 +7,7 @@ pub const NUM_REGS: usize = PVM_REGISTER_COUNT;
 pub const WORD_SIZE: usize = 8;
 
 /// A single PVM execution step witness, capturing the full state transition.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PvmStep {
     /// Monotonic timestamp (step index).
     pub timestamp: u64,
@@ -53,7 +53,7 @@ pub struct PvmStep {
 }
 
 /// A memory access record.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MemAccess {
     pub address: u32,
     pub value: u64,

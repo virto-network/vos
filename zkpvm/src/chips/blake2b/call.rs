@@ -4,7 +4,7 @@
 //! `SideNote.blake2b_calls`.
 
 /// A single blake2b compression call to be proven.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Blake2bCall {
     pub h: [u64; 8],
     pub m: [u64; 16],

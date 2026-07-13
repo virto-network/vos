@@ -25,7 +25,7 @@ pub struct Blake2bRecord {
 /// overwrites h) that happened atomically inside the precompile.  All
 /// entries share a single `ts` matching the ECALL step's timestamp; the
 /// MemoryChip insertion order keeps reads before writes at tie-break.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Blake2bMemOp {
     /// Pointer register φ[10] — base of h and also base of the output write.
     pub h_ptr: u32,
@@ -43,7 +43,7 @@ pub struct Blake2bMemOp {
 
 /// A recorded scalar mul/add mod ℓ call for chip integration.
 /// Both ECALL types share the same shape: 32B + 32B → 32B.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScalarBinopRecord {
     pub op_id: u32, // ECALL_SCALAR_MUL_MOD_L or _ADD_MOD_L
     pub a: [u8; 32],
@@ -51,7 +51,7 @@ pub struct ScalarBinopRecord {
     pub output: [u8; 32],
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScalarBinopMemOp {
     /// ECALL id (113 = SCALAR_MUL_MOD_L, 114 = SCALAR_ADD_MOD_L).  Carried so
     /// RistrettoEcallChip can emit the matching RELATION-A `id` limb (the two
@@ -67,7 +67,7 @@ pub struct ScalarBinopMemOp {
 }
 
 /// A recorded wide-scalar reduction call for chip integration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScalarReduceWideRecord {
     pub wide: [u8; 64],
     pub output: [u8; 32],
@@ -75,7 +75,7 @@ pub struct ScalarReduceWideRecord {
 
 /// Per-byte memory operations for a single
 /// scalar_from_bytes_mod_order_wide ECALL: 64 reads + 32 writes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScalarReduceWideMemOp {
     pub wide_ptr: u32,
     pub output_ptr: u32,
@@ -87,7 +87,7 @@ pub struct ScalarReduceWideMemOp {
 /// A recorded Ristretto255 point-add call for the (in-progress) chip
 /// integration.  Captures both compressed inputs + the compressed
 /// output — the bytes the chip's boundary lookup will commit to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RistrettoPointAddRecord {
     pub p: [u8; 32],
     pub q: [u8; 32],
@@ -98,7 +98,7 @@ pub struct RistrettoPointAddRecord {
 /// 32 P-bytes + 32 Q-bytes read at the call's timestamp + 32 output
 /// bytes written.  Insertion order in the MemoryChip ledger keeps
 /// reads before writes at tie-break.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RistrettoPointAddMemOp {
     pub p_ptr: u32,
     pub q_ptr: u32,
@@ -148,7 +148,7 @@ pub fn detect_scalar_mult_kind(point_bytes: &[u8; 32]) -> ScalarMultKind {
 /// Captures the canonical 32-byte scalar, 32-byte compressed input
 /// point, and 32-byte compressed output point — exactly the bytes the
 /// chip's boundary lookup will commit to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RistrettoRecord {
     pub scalar: [u8; 32],
     pub point: [u8; 32],
@@ -162,7 +162,7 @@ pub struct RistrettoRecord {
 /// 32 scalar reads + 32 point reads + 32 output writes, all sharing the
 /// ECALL step's timestamp.  Insertion order in the MemoryChip ledger
 /// keeps reads before writes at tie-break.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RistrettoMemOp {
     /// Pointer register φ[10] — base of the 32-byte scalar buffer.
     pub scalar_ptr: u32,
