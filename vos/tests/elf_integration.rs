@@ -6918,10 +6918,6 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
     let registrar = cipher_clerk::crypto::Keypair::generate();
     let (public, witness, _value, _blinding) = build_conservation_transition(&registrar);
     let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
-    let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
-        .expect("trace the voucher-check conservation transition");
-    let bounds =
-        zkpvm::segment::segment_bounds_budgeted(&full, CHAIN_SEG_STEPS, VOUCHER_CHECK_PAGE_BUDGET);
 
     let forced: Vec<usize> = VOUCHER_CHECK_CANONICAL_PROFILE
         .iter()
@@ -6930,17 +6926,27 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
         .map(|(i, _)| i)
         .collect();
     let mut max_natural = vec![0u32; forced.len()];
-    // One forward cursor pass — O(N) slicing across the windows instead of
-    // segment_side_note's per-window prefix replay (O(N²) over the chain).
-    let mut cursor = zkpvm::segment::SegmentCursor::new(&full);
-    for &(a, b) in &bounds {
-        let mut sn = cursor.side_note(a, b);
+    // One streaming pass (trace interleaved with the window walk, online
+    // budgeted cut — bit-identical to offline `segment_bounds_budgeted`):
+    // the transition's trace is never resident.
+    let mut stream = zkpvm::actor::trace_stream_with_patches(
+        &blob,
+        VC_TRACE_GAS,
+        &[(addr, &witness_buf)],
+        CHAIN_SEG_STEPS,
+        VOUCHER_CHECK_PAGE_BUDGET,
+    )
+    .expect("trace the voucher-check conservation transition");
+    let mut windows = 0usize;
+    while stream.next_window().is_some() {
+        windows += 1;
+        let mut sn = stream.side_note();
         let naturals = zkpvm::natural_log_sizes_for(&mut sn, &forced);
         for (m, n) in max_natural.iter_mut().zip(naturals) {
             *m = (*m).max(n);
         }
     }
-    eprintln!("forced-chip natural maxima over {} segments:", bounds.len());
+    eprintln!("forced-chip natural maxima over {windows} segments:");
     for (&idx, &max) in forced.iter().zip(&max_natural) {
         eprintln!(
             "  chip {idx:2}: floor {:2}, natural max {max}",
@@ -6975,6 +6981,11 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
 /// (and re-pin the `allowlist` any verification system configured with
 /// `set_prover`).
 ///
+/// Rides the STREAMING chain driver (`zkpvm::actor::trace_stream_with_
+/// patches`) end to end — a metadata pass then a probe-prove pass, the
+/// production `prove_chain` shape — so reproducing the pinned values here
+/// also certifies the streaming path emits the deployed commitments.
+///
 /// Heavy (canonical prove of 2 segments, minutes); `#[ignore]`. Run:
 ///   cargo test -p vos --release --test elf_integration \
 ///     voucher_check_commitment_drift_guard -- --ignored --nocapture
@@ -6991,36 +7002,71 @@ fn voucher_check_commitment_drift_guard() {
     let (public, witness, _value, _blinding) = build_conservation_transition(&registrar);
     let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
 
-    let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
-        .expect("trace the voucher-check conservation transition");
-    let total = full.steps.len();
+    // Streaming pass 1 (metadata only, no window assembly): the online
+    // budgeted cut — bit-identical to offline `segment_bounds_budgeted` —
+    // plus each window's comb-call count; the trace is never resident.
+    let stream = || {
+        zkpvm::actor::trace_stream_with_patches(
+            &blob,
+            VC_TRACE_GAS,
+            &[(addr, &witness_buf)],
+            CHAIN_SEG_STEPS,
+            VOUCHER_CHECK_PAGE_BUDGET,
+        )
+        .expect("trace the voucher-check conservation transition")
+    };
+    let mut scan = stream();
+    let mut bounds = Vec::new();
+    let mut comb_seg = None;
+    while let Some(b) = scan.next_window() {
+        if comb_seg.is_none() && scan.fixed_base_calls() > 0 {
+            comb_seg = Some(bounds.len());
+        }
+        bounds.push(b);
+    }
+    let total = scan.steps_seen();
     assert!(
         total > 1_000_000,
         "trace is only {total} steps — guest early-exited (stale voucher-check ELF?)"
     );
-    let bounds =
-        zkpvm::segment::segment_bounds_budgeted(&full, CHAIN_SEG_STEPS, VOUCHER_CHECK_PAGE_BUDGET);
-    let n = bounds.len();
-    // One forward cursor pass finds the first comb-bearing window — O(N)
-    // slicing instead of segment_side_note's per-window prefix replay.
-    let mut scan = zkpvm::segment::SegmentCursor::new(&full);
-    let comb_seg = (0..n)
-        .find(|&i| {
-            let (a, b) = bounds[i];
-            !scan.side_note(a, b).ristretto_comb_calls.is_empty()
-        })
+    let comb_seg = comb_seg
         .expect("the conservation transition must contain a fixed-base scalar mult (comb) segment");
 
-    let prove_seg = |i: usize| -> [u8; 32] {
-        let (a, b) = bounds[i];
-        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+    // Streaming pass 2: re-trace (deterministic — pinned by the bounds
+    // check below) and prove ONLY the two probe windows, skip-advancing
+    // through the rest.
+    let mut prover = stream();
+    let mut commitments: Vec<(usize, [u8; 32])> = Vec::new();
+    for (i, &expected) in bounds.iter().enumerate() {
+        let b = prover
+            .next_window()
+            .expect("re-trace must yield the same window count");
+        assert_eq!(b, expected, "re-trace cut diverged at window {i}");
+        if i != 0 && i != comb_seg {
+            continue;
+        }
+        let mut sn = prover.side_note();
         let proof = zkpvm::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
-            .unwrap_or_else(|e| panic!("prove_canonical seg {i} [{a},{b}): {e:?}"));
+            .unwrap_or_else(|e| panic!("prove_canonical seg {i} {expected:?}: {e:?}"));
         // Channel-agnostic 32-byte form ([u8; 32] under Blake2s).
-        zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof))
+        commitments.push((
+            i,
+            zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof)),
+        ));
+    }
+    assert!(
+        prover.next_window().is_none(),
+        "re-trace must yield the same window count"
+    );
+    let commitment_of = |seg: usize| {
+        commitments
+            .iter()
+            .find(|(i, _)| *i == seg)
+            .expect("probe segment was proven")
+            .1
     };
-    let c0 = prove_seg(0);
-    let c1 = prove_seg(comb_seg);
+    let c0 = commitment_of(0);
+    let c1 = commitment_of(comb_seg);
     let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     eprintln!("C_0 (comb-free) = {}", hex(&c0));
     eprintln!("C_1 (one comb)  = {}", hex(&c1));

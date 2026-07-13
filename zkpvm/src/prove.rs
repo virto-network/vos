@@ -675,21 +675,60 @@ fn canonical_profile_over(
     bounds: &[(usize, usize)],
     mut window: impl FnMut(usize, usize) -> SideNote,
 ) -> Option<Vec<u32>> {
-    if bounds.is_empty() {
-        return None;
-    }
-    let indices: Vec<usize> = (0..super::chip_idx::COUNT).collect();
-    let mut floors = vec![0u32; indices.len()];
+    let mut floors = NaturalFloors::new();
     for &(a, b) in bounds {
-        let mut sn = window(a, b);
-        for (floor, natural) in floors.iter_mut().zip(natural_log_sizes_for(&mut sn, &indices)) {
+        floors.observe(&mut window(a, b));
+    }
+    floors.finish()
+}
+
+/// The canonical-floors accumulator behind [`canonical_profile_for_bounds`]
+/// and the streaming derivations: feed every window's `SideNote` in any
+/// order via [`Self::observe`], then [`Self::finish`] yields the per-chip
+/// elementwise MAX of the observed natural `log_size`s — the canonical
+/// forcing profile. `finish` refuses (`None`) when nothing was observed
+/// (an empty chain has no floors) or any floor exceeds
+/// [`DEFAULT_MAX_LOG_SIZE`](crate::DEFAULT_MAX_LOG_SIZE) (such a profile
+/// could only ever produce verifier-rejected proofs) — the same contract
+/// [`canonical_profile_for`] documents. Exists so a
+/// [`crate::segment::TraceStream`] pass can derive floors without ever
+/// holding the chain's trace.
+pub struct NaturalFloors {
+    indices: Vec<usize>,
+    floors: Vec<u32>,
+    observed: bool,
+}
+
+impl NaturalFloors {
+    pub fn new() -> Self {
+        let indices: Vec<usize> = (0..super::chip_idx::COUNT).collect();
+        Self {
+            floors: vec![0u32; indices.len()],
+            indices,
+            observed: false,
+        }
+    }
+
+    /// Fold one window's natural sizes into the floors.
+    pub fn observe(&mut self, sn: &mut SideNote) {
+        self.observed = true;
+        for (floor, natural) in self
+            .floors
+            .iter_mut()
+            .zip(natural_log_sizes_for(sn, &self.indices))
+        {
             *floor = (*floor).max(natural);
         }
     }
-    floors
-        .iter()
-        .all(|&f| f <= crate::DEFAULT_MAX_LOG_SIZE)
-        .then_some(floors)
+
+    pub fn finish(self) -> Option<Vec<u32>> {
+        (self.observed
+            && self
+                .floors
+                .iter()
+                .all(|&f| f <= crate::DEFAULT_MAX_LOG_SIZE))
+        .then_some(self.floors)
+    }
 }
 
 fn prove_impl_with_components(

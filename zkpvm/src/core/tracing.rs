@@ -402,49 +402,68 @@ impl TracingPvm {
     /// executed natively.  Unknown hostcall IDs propagate as-is.
     pub fn run_with_vos_stubs(&mut self) -> ExitReason {
         loop {
-            if let Some(exit) = self.step() {
-                match exit {
-                    ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
-                        self.handle_blake2b_ecall();
-                    }
-                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_SCALAR_MULT => {
-                        self.handle_ristretto_scalar_mult_ecall();
-                    }
-                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_POINT_ADD => {
-                        self.handle_ristretto_point_add_ecall();
-                    }
-                    ExitReason::HostCall(id) if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE => {
-                        self.handle_scalar_reduce_wide_ecall();
-                    }
-                    ExitReason::HostCall(id) if id == ECALL_SCALAR_MUL_MOD_L => {
-                        self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
-                    }
-                    ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
-                        self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
-                    }
-                    ExitReason::HostCall(id) => match id {
-                        // imm=0 is the IPC/REPLY slot — `halt_with_output`
-                        // emits `ecalli 0` with `t0=0`, the clean-termination
-                        // sentinel.  Treat as halt.
-                        0 => return ExitReason::HostCall(0),
-                        // GAS, FETCH, STORAGE_R, STORAGE_W, INFO,
-                        // DEBUG_WRITE, OUTPUT — leave registers
-                        // untouched so the RegisterMemoryChip ledger
-                        // stays balanced.  The actor reads whatever is
-                        // already in φ[7], which for these "lucky"
-                        // hostcalls (zeroed at PVM cold start) means
-                        // it sees 0 — i.e. no service_id, no persisted
-                        // state, no fetched message.  Same effect as a
-                        // proper stub but without disturbing the
-                        // register ledger.
-                        1 | 2 | 4 | 5 | 6 | 11 | 26 => {}
-                        _ => return ExitReason::HostCall(id),
-                    },
-                    // Plain Ecall (no immediate) is also a halt sentinel.
-                    ExitReason::Ecall => return ExitReason::Ecall,
-                    other => return other,
-                }
+            if let Some(exit) = self.step_with_vos_stubs() {
+                return exit;
             }
+        }
+    }
+
+    /// One iteration of [`Self::run_with_vos_stubs`]: execute exactly one
+    /// recorded step, intercept + natively execute the precompile ECALLs,
+    /// swallow the stubbed lifecycle hostcalls, and return `Some(exit)`
+    /// only when the run TERMINATES (with exactly the `ExitReason`
+    /// `run_with_vos_stubs` would return). Lets a streaming driver
+    /// ([`crate::segment::TracingSource`]) pump the tracer step by step —
+    /// draining each recorded step as it lands — while the run-to-
+    /// completion path stays a loop over this, so the two cannot diverge.
+    pub fn step_with_vos_stubs(&mut self) -> Option<ExitReason> {
+        let exit = self.step()?;
+        match exit {
+            ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
+                self.handle_blake2b_ecall();
+                None
+            }
+            ExitReason::HostCall(id) if id == ECALL_RISTRETTO_SCALAR_MULT => {
+                self.handle_ristretto_scalar_mult_ecall();
+                None
+            }
+            ExitReason::HostCall(id) if id == ECALL_RISTRETTO_POINT_ADD => {
+                self.handle_ristretto_point_add_ecall();
+                None
+            }
+            ExitReason::HostCall(id) if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE => {
+                self.handle_scalar_reduce_wide_ecall();
+                None
+            }
+            ExitReason::HostCall(id) if id == ECALL_SCALAR_MUL_MOD_L => {
+                self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
+                None
+            }
+            ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
+                self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
+                None
+            }
+            ExitReason::HostCall(id) => match id {
+                // imm=0 is the IPC/REPLY slot — `halt_with_output`
+                // emits `ecalli 0` with `t0=0`, the clean-termination
+                // sentinel.  Treat as halt.
+                0 => Some(ExitReason::HostCall(0)),
+                // GAS, FETCH, STORAGE_R, STORAGE_W, INFO,
+                // DEBUG_WRITE, OUTPUT — leave registers
+                // untouched so the RegisterMemoryChip ledger
+                // stays balanced.  The actor reads whatever is
+                // already in φ[7], which for these "lucky"
+                // hostcalls (zeroed at PVM cold start) means
+                // it sees 0 — i.e. no service_id, no persisted
+                // state, no fetched message.  Same effect as a
+                // proper stub but without disturbing the
+                // register ledger.
+                1 | 2 | 4 | 5 | 6 | 11 | 26 => None,
+                _ => Some(ExitReason::HostCall(id)),
+            },
+            // Plain Ecall (no immediate) is also a halt sentinel.
+            ExitReason::Ecall => Some(ExitReason::Ecall),
+            other => Some(other),
         }
     }
 
@@ -731,6 +750,21 @@ impl TracingPvm {
     /// Number of steps recorded so far.
     pub fn num_steps(&self) -> usize {
         self.steps.len()
+    }
+
+    /// Drain the OLDEST retained recorded step — the streaming drivers'
+    /// keep-the-tracer-empty primitive: a driver that pumps
+    /// [`Self::step_with_vos_stubs`] takes each step out as it lands, so
+    /// the tracer never accumulates the trace it is producing. Draining
+    /// removes the step from [`Self::trace`]/[`Self::into_trace`]'s view;
+    /// mixing drained and run-to-completion consumption of one tracer is
+    /// a caller bug. Register continuity ([`Self::step`]'s asserts) is
+    /// tracked independently, so stepping stays sound after a drain.
+    pub fn take_step(&mut self) -> Option<CompactStep> {
+        if self.steps.is_empty() {
+            return None;
+        }
+        Some(self.steps.remove(0))
     }
 
     /// The register file entering the first recorded step (the file the

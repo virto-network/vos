@@ -54,7 +54,13 @@ pub fn segment_bounds(total: usize, max_steps: usize) -> alloc::vec::Vec<(usize,
 
 #[cfg(feature = "prover")]
 mod prover {
+    use crate::chips::blake2b::Blake2bCall;
     use crate::core::step::{CompactStep, MemAccess, NUM_REGS, PvmStep, expand_steps};
+    use crate::core::tracing::{
+        Blake2bMemOp, RistrettoMemOp, RistrettoPointAddMemOp, RistrettoPointAddRecord,
+        RistrettoRecord, ScalarBinopMemOp, ScalarBinopRecord, ScalarMultKind,
+        ScalarReduceWideMemOp, ScalarReduceWideRecord, TracingPvm,
+    };
     use crate::side_note::{CompactTrace, SideNote};
     use alloc::collections::BTreeSet;
     use alloc::vec::Vec;
@@ -203,14 +209,6 @@ mod prover {
         max_steps: usize,
         max_pages: usize,
     ) -> Vec<(usize, usize)> {
-        assert!(max_steps > 0, "max_steps must be non-zero");
-        assert!(max_pages > 0, "max_pages must be non-zero");
-        let total = steps.len();
-        let mut bounds = Vec::new();
-        if total == 0 {
-            return bounds;
-        }
-
         /// Advance `cursor` past every op with `ts_of(op) <= ts`, handing
         /// the ones AT `ts` to `push`. Each stream is ts-sorted (the tracer
         /// appends in step order), so one monotone cursor per stream visits
@@ -230,64 +228,150 @@ mod prover {
             }
         }
 
+        let mut cutter = BudgetedCutter::new(max_steps, max_pages);
+        let mut bounds = Vec::new();
         let (mut cb, mut cr, mut ca, mut cw, mut cs) = (0, 0, 0, 0, 0);
-        let mut pages: BTreeSet<u32> = BTreeSet::new();
         let mut ranges: Vec<(u32, u32)> = Vec::new();
-        let mut a = 0;
-        for (i, step) in steps.iter().enumerate() {
+        for step in steps {
             let ts = step.ts();
             ranges.clear();
-            if let Some(r) = step.read_access() {
-                ranges.push((r.address, r.size as u32));
-            }
-            if let Some(w) = step.write_access() {
-                ranges.push((w.address, w.size as u32));
-            }
+            step_ranges(step, &mut ranges);
             take_at(parts.blake2b_mem_ops, &mut cb, ts, |o| o.ts, |o| {
-                ranges.push((o.h_ptr, o.h_bytes.len() as u32));
-                ranges.push((o.m_ptr, o.m_bytes.len() as u32));
+                blake2b_op_ranges(o, &mut ranges)
             });
             take_at(parts.ristretto_mem_ops, &mut cr, ts, |o| o.ts, |o| {
-                ranges.push((o.scalar_ptr, o.scalar_bytes.len() as u32));
-                ranges.push((o.point_ptr, o.point_bytes.len() as u32));
-                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+                ristretto_op_ranges(o, &mut ranges)
             });
             take_at(parts.ristretto_add_mem_ops, &mut ca, ts, |o| o.ts, |o| {
-                ranges.push((o.p_ptr, o.p_bytes.len() as u32));
-                ranges.push((o.q_ptr, o.q_bytes.len() as u32));
-                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+                ristretto_add_op_ranges(o, &mut ranges)
             });
             take_at(parts.scalar_reduce_wide_mem_ops, &mut cw, ts, |o| o.ts, |o| {
-                ranges.push((o.wide_ptr, o.wide_bytes.len() as u32));
-                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+                scalar_reduce_wide_op_ranges(o, &mut ranges)
             });
             take_at(parts.scalar_binop_mem_ops, &mut cs, ts, |o| o.ts, |o| {
-                ranges.push((o.a_ptr, o.a_bytes.len() as u32));
-                ranges.push((o.b_ptr, o.b_bytes.len() as u32));
-                ranges.push((o.output_ptr, o.out_bytes.len() as u32));
+                scalar_binop_op_ranges(o, &mut ranges)
             });
 
-            for &(addr, len) in &ranges {
-                crate::page_merkle::add_range(&mut pages, addr, len);
-            }
-            // Step i busts the page budget: close the window BEFORE it (the
-            // window keeps at least one step, so a lone oversize step still
-            // segments) and restart the page set from step i's own ranges.
-            if pages.len() > max_pages && i > a {
-                bounds.push((a, i));
-                a = i;
-                pages.clear();
-                for &(addr, len) in &ranges {
-                    crate::page_merkle::add_range(&mut pages, addr, len);
-                }
-            }
-            if i + 1 - a == max_steps || i + 1 == total {
-                bounds.push((a, i + 1));
-                a = i + 1;
-                pages.clear();
+            let (before, after) = cutter.feed(&ranges);
+            bounds.extend(before);
+            bounds.extend(after);
+        }
+        bounds.extend(cutter.finish());
+        bounds
+    }
+
+    /// The step's own touched ranges: its optional memory read + write.
+    fn step_ranges<S: StepView>(s: &S, out: &mut Vec<(u32, u32)>) {
+        if let Some(r) = s.read_access() {
+            out.push((r.address, r.size as u32));
+        }
+        if let Some(w) = s.write_access() {
+            out.push((w.address, w.size as u32));
+        }
+    }
+
+    // Per-stream touched ranges of one precompile op — the page-accounting
+    // knowledge shared by the offline walker above and the online
+    // [`TraceStream`] windower, so the two count identical pages for the
+    // same op by construction.
+    fn blake2b_op_ranges(o: &Blake2bMemOp, out: &mut Vec<(u32, u32)>) {
+        out.push((o.h_ptr, o.h_bytes.len() as u32));
+        out.push((o.m_ptr, o.m_bytes.len() as u32));
+    }
+    fn ristretto_op_ranges(o: &RistrettoMemOp, out: &mut Vec<(u32, u32)>) {
+        out.push((o.scalar_ptr, o.scalar_bytes.len() as u32));
+        out.push((o.point_ptr, o.point_bytes.len() as u32));
+        out.push((o.output_ptr, o.out_bytes.len() as u32));
+    }
+    fn ristretto_add_op_ranges(o: &RistrettoPointAddMemOp, out: &mut Vec<(u32, u32)>) {
+        out.push((o.p_ptr, o.p_bytes.len() as u32));
+        out.push((o.q_ptr, o.q_bytes.len() as u32));
+        out.push((o.output_ptr, o.out_bytes.len() as u32));
+    }
+    fn scalar_reduce_wide_op_ranges(o: &ScalarReduceWideMemOp, out: &mut Vec<(u32, u32)>) {
+        out.push((o.wide_ptr, o.wide_bytes.len() as u32));
+        out.push((o.output_ptr, o.out_bytes.len() as u32));
+    }
+    fn scalar_binop_op_ranges(o: &ScalarBinopMemOp, out: &mut Vec<(u32, u32)>) {
+        out.push((o.a_ptr, o.a_bytes.len() as u32));
+        out.push((o.b_ptr, o.b_bytes.len() as u32));
+        out.push((o.output_ptr, o.out_bytes.len() as u32));
+    }
+
+    /// The incremental budgeted-cut decision — ONE code path behind the
+    /// offline [`segment_bounds_budgeted`] walk and the online
+    /// [`TraceStream`] windower, so an online cut is bit-identical to the
+    /// offline cut of the same trace by construction. Feed each step's
+    /// touched ranges in order; the cutter reports the window(s) the step
+    /// closed. Page accounting mirrors
+    /// [`crate::page_merkle::touched_pages`] (same `add_range`
+    /// granularity), exactly as the offline walker always did.
+    struct BudgetedCutter {
+        max_steps: usize,
+        max_pages: usize,
+        pages: BTreeSet<u32>,
+        /// Start of the currently accumulating window.
+        a: usize,
+        /// Index the next fed step will occupy.
+        next: usize,
+    }
+
+    impl BudgetedCutter {
+        /// Panics if either budget is zero (the historical
+        /// `segment_bounds_budgeted` contract).
+        fn new(max_steps: usize, max_pages: usize) -> Self {
+            assert!(max_steps > 0, "max_steps must be non-zero");
+            assert!(max_pages > 0, "max_pages must be non-zero");
+            Self {
+                max_steps,
+                max_pages,
+                pages: BTreeSet::new(),
+                a: 0,
+                next: 0,
             }
         }
-        bounds
+
+        /// Feed the next step's touched ranges. Returns the bounds of the
+        /// window closed BEFORE this step (its page ranges bust the page
+        /// budget, so the step opens a fresh window — the window keeps at
+        /// least one step, so a lone oversize step still segments) and the
+        /// window closed AFTER it (the step budget filled), either or both
+        /// `None`.
+        fn feed(
+            &mut self,
+            ranges: &[(u32, u32)],
+        ) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+            let i = self.next;
+            for &(addr, len) in ranges {
+                crate::page_merkle::add_range(&mut self.pages, addr, len);
+            }
+            let mut before = None;
+            if self.pages.len() > self.max_pages && i > self.a {
+                before = Some((self.a, i));
+                self.a = i;
+                self.pages.clear();
+                for &(addr, len) in ranges {
+                    crate::page_merkle::add_range(&mut self.pages, addr, len);
+                }
+            }
+            self.next = i + 1;
+            let mut after = None;
+            if self.next - self.a == self.max_steps {
+                after = Some((self.a, self.next));
+                self.a = self.next;
+                self.pages.clear();
+            }
+            (before, after)
+        }
+
+        /// End of trace: the final partial window, if any steps remain
+        /// open. Consumes it — a second call returns `None`.
+        fn finish(&mut self) -> Option<(usize, usize)> {
+            let bounds = (self.next > self.a).then_some((self.a, self.next));
+            self.a = self.next;
+            self.pages.clear();
+            bounds
+        }
     }
 
     /// Slice a fully-traced `SideNote` into the segment covering steps
@@ -808,6 +892,499 @@ mod prover {
         }
     }
 
+    /// One traced step plus the precompile call/mem-op pair its ECALL
+    /// recorded — at most one pair, on at most one stream (a step is at
+    /// most one ECALL; the invariant the ts-sorted streams rest on). The
+    /// unit a [`StepSource`] hands the [`TraceStream`] windower.
+    pub struct StepArrival {
+        pub(crate) step: CompactStep,
+        pub(crate) blake2b: Option<(Blake2bCall, Blake2bMemOp)>,
+        pub(crate) ristretto: Option<(RistrettoRecord, RistrettoMemOp)>,
+        pub(crate) ristretto_add: Option<(RistrettoPointAddRecord, RistrettoPointAddMemOp)>,
+        pub(crate) scalar_reduce_wide: Option<(ScalarReduceWideRecord, ScalarReduceWideMemOp)>,
+        pub(crate) scalar_binop: Option<(ScalarBinopRecord, ScalarBinopMemOp)>,
+    }
+
+    impl StepArrival {
+        /// The step's touched ranges — its own read/write plus its
+        /// precompile op's buffers, via the same per-stream helpers the
+        /// offline budgeted walk uses, so online page accounting counts
+        /// exactly what [`segment_bounds_budgeted`] counts.
+        fn ranges(&self, out: &mut Vec<(u32, u32)>) {
+            out.clear();
+            step_ranges(&self.step, out);
+            if let Some((_, o)) = &self.blake2b {
+                blake2b_op_ranges(o, out);
+            }
+            if let Some((_, o)) = &self.ristretto {
+                ristretto_op_ranges(o, out);
+            }
+            if let Some((_, o)) = &self.ristretto_add {
+                ristretto_add_op_ranges(o, out);
+            }
+            if let Some((_, o)) = &self.scalar_reduce_wide {
+                scalar_reduce_wide_op_ranges(o, out);
+            }
+            if let Some((_, o)) = &self.scalar_binop {
+                scalar_binop_op_ranges(o, out);
+            }
+        }
+
+        /// Every attached op must carry the step's own timestamp — the
+        /// binding that makes online "ops at this step" equal the offline
+        /// walk's ts-filtered `take_at`.
+        fn assert_ts_consistent(&self) {
+            let ts = self.step.timestamp;
+            debug_assert!(self.blake2b.as_ref().is_none_or(|(_, o)| o.ts == ts));
+            debug_assert!(self.ristretto.as_ref().is_none_or(|(_, o)| o.ts == ts));
+            debug_assert!(self.ristretto_add.as_ref().is_none_or(|(_, o)| o.ts == ts));
+            debug_assert!(
+                self.scalar_reduce_wide
+                    .as_ref()
+                    .is_none_or(|(_, o)| o.ts == ts)
+            );
+            debug_assert!(self.scalar_binop.as_ref().is_none_or(|(_, o)| o.ts == ts));
+        }
+    }
+
+    /// A producer of traced steps for [`TraceStream`] — the seam that lets
+    /// the windower run over a live [`TracingPvm`] ([`TracingSource`]) in
+    /// production and over hand-built fixtures in the equivalence tests.
+    pub trait StepSource {
+        /// The next traced step with its ECALL records, or `None` once the
+        /// run terminated.
+        fn next_arrival(&mut self) -> Option<StepArrival>;
+        /// Register file entering the first produced step; meaningful once
+        /// at least one arrival was produced.
+        fn initial_regs(&self) -> [u64; NUM_REGS];
+    }
+
+    /// The live [`StepSource`]: pumps a [`TracingPvm`] one
+    /// [`TracingPvm::step_with_vos_stubs`] iteration per arrival —
+    /// identical execution to `run_with_vos_stubs` (the loop over the same
+    /// method) — draining the recorded step and its precompile records out
+    /// of the tracer as they land, so the tracer holds no trace at all:
+    /// the windower's current window is the only step storage anywhere.
+    pub struct TracingSource {
+        tracer: TracingPvm,
+        done: bool,
+    }
+
+    impl TracingSource {
+        pub fn new(tracer: TracingPvm) -> Self {
+            Self {
+                tracer,
+                done: false,
+            }
+        }
+    }
+
+    /// Take the (at most one) freshly recorded `(call, mem_op)` pair off a
+    /// tracer stream. The source drains after every step, so a stream
+    /// holds 0 or 1 pairs here.
+    fn pop_pair<C, M>(calls: &mut Vec<C>, ops: &mut Vec<M>) -> Option<(C, M)> {
+        debug_assert_eq!(calls.len(), ops.len());
+        debug_assert!(calls.len() <= 1);
+        Some((calls.pop()?, ops.pop()?))
+    }
+
+    impl StepSource for TracingSource {
+        fn next_arrival(&mut self) -> Option<StepArrival> {
+            if self.done {
+                return None;
+            }
+            if self.tracer.step_with_vos_stubs().is_some() {
+                self.done = true;
+            }
+            let step = self
+                .tracer
+                .take_step()
+                .expect("every pumped iteration records exactly one step");
+            debug_assert_eq!(self.tracer.num_steps(), 0);
+            let t = &mut self.tracer;
+            Some(StepArrival {
+                step,
+                blake2b: pop_pair(&mut t.blake2b_records, &mut t.blake2b_mem_ops).map(
+                    |(r, m)| {
+                        (
+                            Blake2bCall {
+                                h: r.h,
+                                m: r.m,
+                                t: r.t,
+                                f: r.f,
+                            },
+                            m,
+                        )
+                    },
+                ),
+                ristretto: pop_pair(&mut t.ristretto_records, &mut t.ristretto_mem_ops),
+                ristretto_add: pop_pair(&mut t.ristretto_add_records, &mut t.ristretto_add_mem_ops),
+                scalar_reduce_wide: pop_pair(
+                    &mut t.scalar_reduce_wide_records,
+                    &mut t.scalar_reduce_wide_mem_ops,
+                ),
+                scalar_binop: pop_pair(&mut t.scalar_binop_records, &mut t.scalar_binop_mem_ops),
+            })
+        }
+
+        fn initial_regs(&self) -> [u64; NUM_REGS] {
+            self.tracer.initial_regs()
+        }
+    }
+
+    /// One window's accumulating storage: its compact steps plus its
+    /// precompile call/mem-op stream slices, exactly the per-window share
+    /// of what a [`CompactTrace`] holds chain-wide.
+    #[derive(Default)]
+    struct WindowBuf {
+        steps: Vec<CompactStep>,
+        blake2b_calls: Vec<Blake2bCall>,
+        blake2b_mem_ops: Vec<Blake2bMemOp>,
+        ristretto_calls: Vec<RistrettoRecord>,
+        ristretto_mem_ops: Vec<RistrettoMemOp>,
+        ristretto_add_calls: Vec<RistrettoPointAddRecord>,
+        ristretto_add_mem_ops: Vec<RistrettoPointAddMemOp>,
+        scalar_reduce_wide_calls: Vec<ScalarReduceWideRecord>,
+        scalar_reduce_wide_mem_ops: Vec<ScalarReduceWideMemOp>,
+        scalar_binop_calls: Vec<ScalarBinopRecord>,
+        scalar_binop_mem_ops: Vec<ScalarBinopMemOp>,
+    }
+
+    impl WindowBuf {
+        fn push(&mut self, arr: StepArrival) {
+            self.steps.push(arr.step);
+            if let Some((c, m)) = arr.blake2b {
+                self.blake2b_calls.push(c);
+                self.blake2b_mem_ops.push(m);
+            }
+            if let Some((c, m)) = arr.ristretto {
+                self.ristretto_calls.push(c);
+                self.ristretto_mem_ops.push(m);
+            }
+            if let Some((c, m)) = arr.ristretto_add {
+                self.ristretto_add_calls.push(c);
+                self.ristretto_add_mem_ops.push(m);
+            }
+            if let Some((c, m)) = arr.scalar_reduce_wide {
+                self.scalar_reduce_wide_calls.push(c);
+                self.scalar_reduce_wide_mem_ops.push(m);
+            }
+            if let Some((c, m)) = arr.scalar_binop {
+                self.scalar_binop_calls.push(c);
+                self.scalar_binop_mem_ops.push(m);
+            }
+        }
+
+        /// The window's stream slices as a [`ChainParts`] view. Handing
+        /// pre-sliced streams through [`assemble_segment`] yields exactly
+        /// what filtering the full streams yields: every op here has its
+        /// ts inside the window, so the assembly's `in_window` filter
+        /// passes each one, in the same (step) order.
+        fn parts<'a>(
+            &'a self,
+            code: &'a [u8],
+            bitmask: &'a [u8],
+            jump_table: &'a [u32],
+        ) -> ChainParts<'a> {
+            ChainParts {
+                code,
+                bitmask,
+                jump_table,
+                blake2b_calls: &self.blake2b_calls,
+                blake2b_mem_ops: &self.blake2b_mem_ops,
+                ristretto_calls: &self.ristretto_calls,
+                ristretto_mem_ops: &self.ristretto_mem_ops,
+                ristretto_add_calls: &self.ristretto_add_calls,
+                ristretto_add_mem_ops: &self.ristretto_add_mem_ops,
+                scalar_reduce_wide_calls: &self.scalar_reduce_wide_calls,
+                scalar_reduce_wide_mem_ops: &self.scalar_reduce_wide_mem_ops,
+                scalar_binop_calls: &self.scalar_binop_calls,
+                scalar_binop_mem_ops: &self.scalar_binop_mem_ops,
+            }
+        }
+
+        /// The window's precompile OUTPUT writes as pending writes — the
+        /// same per-stream mapping [`StreamCursors::drain_below`] applies
+        /// when a cursor advances past these ops.
+        fn pending_writes(&self, out: &mut Vec<PendingWrite>) {
+            for m in &self.blake2b_mem_ops {
+                out.push(write_of_bytes(m.ts, m.h_ptr, &m.out_bytes));
+            }
+            for m in &self.ristretto_mem_ops {
+                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
+            }
+            for m in &self.ristretto_add_mem_ops {
+                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
+            }
+            for m in &self.scalar_reduce_wide_mem_ops {
+                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
+            }
+            for m in &self.scalar_binop_mem_ops {
+                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
+            }
+        }
+    }
+
+    /// A closed window: its step bounds, the exclusive timestamp bound of
+    /// the next window (`None` until the successor step's ts is known;
+    /// `u64::MAX` for the chain's last window — exactly the offline
+    /// `full.steps.get(b).map(ts).unwrap_or(MAX)`), and its buffered
+    /// content.
+    struct ClosedWindow {
+        bounds: (usize, usize),
+        ts_hi: Option<u64>,
+        buf: WindowBuf,
+    }
+
+    /// The streaming chain driver: runs a [`StepSource`] (production: a
+    /// live [`TracingPvm`] via [`TracingSource`]) and cuts windows ONLINE
+    /// with the same [`BudgetedCutter`] decisions the offline
+    /// [`segment_bounds_budgeted`] walk makes, yielding each window's
+    /// `SideNote` as the tracer completes it and dropping it before the
+    /// next — so a multi-million-step chain is NEVER resident: peak step
+    /// storage is one window's compact steps (plus the window-local
+    /// expansion during [`Self::side_note`]), instead of the whole
+    /// [`CompactTrace`] (~1 GiB at 7.8M steps).
+    ///
+    /// Equivalence: the cut shares the offline cutter's decision path
+    /// (bit-identical bounds); the entering memory image and register
+    /// file are threaded forward with the same write enumeration
+    /// [`CompactSegmentCursor::advance_to`] performs (batched per window);
+    /// and the assembly is [`assemble_segment`] — so every yielded window
+    /// is field-identical to the compact cursor's over the same traced
+    /// run (unit-pinned by the `trace_stream_*` equivalence tests).
+    ///
+    /// Contract: call [`Self::next_window`] repeatedly; after each
+    /// `Some(bounds)`, optionally call [`Self::side_note`] (or
+    /// [`Self::fixed_base_calls`] for the metadata passes) before the next
+    /// `next_window` call retires the window — skipped windows advance the
+    /// carried state without expansion, the cursor pattern's sparse-probe
+    /// economy.
+    pub struct TraceStream<S: StepSource> {
+        source: S,
+        code: Vec<u8>,
+        bitmask: Vec<u8>,
+        jump_table: Vec<u32>,
+        cutter: BudgetedCutter,
+        /// The carried image: the initial memory with every retired
+        /// window's writes applied — the image ENTERING the current
+        /// window, as [`CompactSegmentCursor`] carries it.
+        mem: Vec<u8>,
+        /// The carried register file entering the current window.
+        regs: [u64; NUM_REGS],
+        regs_seeded: bool,
+        /// The window currently accumulating arrivals.
+        acc: WindowBuf,
+        /// A step-budget-closed window awaiting its successor's ts.
+        pending: Option<ClosedWindow>,
+        /// A fully resolved window not yet handed to the caller.
+        ready: Option<ClosedWindow>,
+        /// The window handed out by the last `next_window`, retired (its
+        /// writes applied to the carried state) on the next call.
+        current: Option<ClosedWindow>,
+        exhausted: bool,
+        ranges_scratch: Vec<(u32, u32)>,
+        steps_seen: usize,
+    }
+
+    impl<S: StepSource> TraceStream<S> {
+        /// Windower over `source` with the `(seg_steps, page_budget)` cut;
+        /// `page_budget == 0` means the uniform step cut ([`super::
+        /// segment_bounds`]), realized as an unbounded page budget — the
+        /// budgeted walk degenerates to exactly the uniform bounds.
+        /// `initial_memory` is the image the trace starts from (the
+        /// pre-run flat_mem); `code`/`bitmask`/`jump_table` the
+        /// program-static fields every window shares.
+        pub fn new(
+            source: S,
+            code: Vec<u8>,
+            bitmask: Vec<u8>,
+            jump_table: Vec<u32>,
+            initial_memory: Vec<u8>,
+            seg_steps: usize,
+            page_budget: usize,
+        ) -> Self {
+            let max_pages = if page_budget == 0 {
+                usize::MAX
+            } else {
+                page_budget
+            };
+            Self {
+                source,
+                code,
+                bitmask,
+                jump_table,
+                cutter: BudgetedCutter::new(seg_steps, max_pages),
+                mem: initial_memory,
+                regs: [0u64; NUM_REGS],
+                regs_seeded: false,
+                acc: WindowBuf::default(),
+                pending: None,
+                ready: None,
+                current: None,
+                exhausted: false,
+                ranges_scratch: Vec::new(),
+                steps_seen: 0,
+            }
+        }
+
+        /// Advance to the next window: retire the previous one (apply its
+        /// writes to the carried image + register file) and run the
+        /// source until a window completes. Returns its step bounds, or
+        /// `None` when the trace is exhausted.
+        pub fn next_window(&mut self) -> Option<(usize, usize)> {
+            if let Some(w) = self.current.take() {
+                self.retire(w);
+            }
+            loop {
+                if let Some(w) = self.ready.take() {
+                    let bounds = w.bounds;
+                    self.current = Some(w);
+                    return Some(bounds);
+                }
+                if self.exhausted {
+                    // Flush: a step-budget-closed window awaiting a
+                    // successor that never came (its exclusive ts bound is
+                    // MAX), else the final partial window the cutter still
+                    // holds open.
+                    if let Some(mut p) = self.pending.take() {
+                        p.ts_hi = Some(u64::MAX);
+                        self.ready = Some(p);
+                        continue;
+                    }
+                    if let Some(bounds) = self.cutter.finish() {
+                        debug_assert_eq!(bounds.1 - bounds.0, self.acc.steps.len());
+                        self.ready = Some(ClosedWindow {
+                            bounds,
+                            ts_hi: Some(u64::MAX),
+                            buf: core::mem::take(&mut self.acc),
+                        });
+                        continue;
+                    }
+                    return None;
+                }
+                match self.source.next_arrival() {
+                    Some(arr) => self.on_arrival(arr),
+                    None => self.exhausted = true,
+                }
+            }
+        }
+
+        /// The current window's step bounds (the last `next_window`
+        /// return). Panics with no current window.
+        pub fn bounds(&self) -> (usize, usize) {
+            self.current
+                .as_ref()
+                .expect("no current window: call next_window first")
+                .bounds
+        }
+
+        /// Assemble the current window's `SideNote` — field-identical to
+        /// [`CompactSegmentCursor::side_note`] over the same traced run
+        /// (same entering state threading, same [`assemble_segment`]).
+        /// The expansion is window-local and dropped with the returned
+        /// `SideNote`. Panics with no current window.
+        pub fn side_note(&mut self) -> SideNote {
+            let w = self
+                .current
+                .as_ref()
+                .expect("no current window: call next_window first");
+            let steps = expand_steps(&w.buf.steps, self.regs);
+            assemble_segment(
+                &w.buf.parts(&self.code, &self.bitmask, &self.jump_table),
+                steps,
+                self.regs,
+                self.mem.clone(),
+                w.ts_hi.expect("a current window's ts bound is resolved"),
+            )
+        }
+
+        /// The current window's fixed-base scalar-mult (comb) call count —
+        /// what `ristretto_comb_calls.len()` would be on its assembled
+        /// `SideNote` (`ingest_ristretto_boundary` routes exactly the
+        /// `FixedBasepoint`-kind records onto the comb path), without
+        /// assembling it. The metadata passes' probe-selection key.
+        pub fn fixed_base_calls(&self) -> usize {
+            self.current
+                .as_ref()
+                .expect("no current window: call next_window first")
+                .buf
+                .ristretto_calls
+                .iter()
+                .filter(|r| r.kind == ScalarMultKind::FixedBasepoint)
+                .count()
+        }
+
+        /// Steps consumed so far; the trace's total length once
+        /// `next_window` has returned `None`.
+        pub fn steps_seen(&self) -> usize {
+            self.steps_seen
+        }
+
+        fn on_arrival(&mut self, arr: StepArrival) {
+            if !self.regs_seeded {
+                self.regs = self.source.initial_regs();
+                self.regs_seeded = true;
+            }
+            arr.assert_ts_consistent();
+            let ts = arr.step.timestamp;
+            // A step-budget-closed window's exclusive ts bound is this
+            // step's ts (offline: `full.steps[b].timestamp`).
+            if let Some(mut p) = self.pending.take() {
+                p.ts_hi = Some(ts);
+                debug_assert!(self.ready.is_none());
+                self.ready = Some(p);
+            }
+            let mut ranges = core::mem::take(&mut self.ranges_scratch);
+            arr.ranges(&mut ranges);
+            let (before, after) = self.cutter.feed(&ranges);
+            self.ranges_scratch = ranges;
+            if let Some(bounds) = before {
+                // Page-budget close: the accumulated steps end BEFORE this
+                // step, so its ts is the closed window's exclusive bound.
+                // Can't collide with a pending resolution above: a pending
+                // window empties the accumulator, and the page close
+                // requires an accumulated step.
+                debug_assert!(self.ready.is_none());
+                debug_assert_eq!(bounds.1 - bounds.0, self.acc.steps.len());
+                self.ready = Some(ClosedWindow {
+                    bounds,
+                    ts_hi: Some(ts),
+                    buf: core::mem::take(&mut self.acc),
+                });
+            }
+            self.acc.push(arr);
+            self.steps_seen += 1;
+            if let Some(bounds) = after {
+                debug_assert!(self.pending.is_none());
+                debug_assert_eq!(bounds.1 - bounds.0, self.acc.steps.len());
+                self.pending = Some(ClosedWindow {
+                    bounds,
+                    ts_hi: None,
+                    buf: core::mem::take(&mut self.acc),
+                });
+            }
+        }
+
+        /// Apply a retired window's writes to the carried state — the
+        /// same enumeration [`CompactSegmentCursor::advance_to`] performs
+        /// (step stores + register writes in one walk, then the
+        /// precompile output streams), batched per window.
+        fn retire(&mut self, w: ClosedWindow) {
+            let mut writes: Vec<PendingWrite> = Vec::new();
+            for s in &w.buf.steps {
+                if let Some(pw) = write_of_step(s) {
+                    writes.push(pw);
+                }
+                if let Some(rw) = s.reg_write {
+                    self.regs[rw.index as usize] = rw.value;
+                }
+            }
+            w.buf.pending_writes(&mut writes);
+            apply_writes(&mut self.mem, writes);
+        }
+    }
+
     /// Keep the i-th `(call, mem_op)` pair iff `pred(mem_op)`. The inputs
     /// are parallel (1:1, same order — the tracer pushes the pair together).
     fn filter_pair<C: Clone, M: Clone>(
@@ -836,8 +1413,8 @@ mod prover {
 pub(crate) use prover::replay_writes;
 #[cfg(feature = "prover")]
 pub use prover::{
-    CompactSegmentCursor, SegmentCursor, segment_bounds_budgeted,
-    segment_bounds_budgeted_compact, segment_side_note,
+    CompactSegmentCursor, SegmentCursor, StepArrival, StepSource, TraceStream, TracingSource,
+    segment_bounds_budgeted, segment_bounds_budgeted_compact, segment_side_note,
 };
 
 #[cfg(all(test, feature = "prover"))]
@@ -1261,6 +1838,312 @@ mod tests {
                     "cut diverged at budgets ({max_steps}, {max_pages})"
                 );
             }
+        }
+    }
+
+    /// Test-only [`StepSource`]: replays a hand-built full-trace fixture
+    /// as arrivals — each step with the precompile pair recorded at its
+    /// ts — so the ONLINE windower can be driven over the same synthetic
+    /// fixtures the offline paths are pinned on (all five streams,
+    /// records crossing window boundaries, resize growth).
+    struct ReplaySource {
+        arrivals: std::collections::VecDeque<crate::segment::StepArrival>,
+        initial_regs: [u64; NUM_REGS],
+    }
+
+    impl ReplaySource {
+        fn from_side_note(full: &SideNote) -> Self {
+            fn pair_at<C: Clone, M: Clone>(
+                calls: &[C],
+                ops: &[M],
+                ts: u64,
+                ts_of: impl Fn(&M) -> u64,
+            ) -> Option<(C, M)> {
+                ops.iter()
+                    .position(|m| ts_of(m) == ts)
+                    .map(|i| (calls[i].clone(), ops[i].clone()))
+            }
+            let arrivals = full
+                .steps
+                .iter()
+                .map(|s| {
+                    let ts = s.timestamp;
+                    crate::segment::StepArrival {
+                        step: s.to_compact(),
+                        blake2b: pair_at(&full.blake2b_calls, &full.blake2b_mem_ops, ts, |m| {
+                            m.ts
+                        }),
+                        ristretto: pair_at(
+                            &full.ristretto_calls,
+                            &full.ristretto_mem_ops,
+                            ts,
+                            |m| m.ts,
+                        ),
+                        ristretto_add: pair_at(
+                            &full.ristretto_add_calls,
+                            &full.ristretto_add_mem_ops,
+                            ts,
+                            |m| m.ts,
+                        ),
+                        scalar_reduce_wide: pair_at(
+                            &full.scalar_reduce_wide_calls,
+                            &full.scalar_reduce_wide_mem_ops,
+                            ts,
+                            |m| m.ts,
+                        ),
+                        scalar_binop: pair_at(
+                            &full.scalar_binop_calls,
+                            &full.scalar_binop_mem_ops,
+                            ts,
+                            |m| m.ts,
+                        ),
+                    }
+                })
+                .collect();
+            Self {
+                arrivals,
+                initial_regs: full.steps[0].regs_before,
+            }
+        }
+    }
+
+    impl crate::segment::StepSource for ReplaySource {
+        fn next_arrival(&mut self) -> Option<crate::segment::StepArrival> {
+            self.arrivals.pop_front()
+        }
+        fn initial_regs(&self) -> [u64; NUM_REGS] {
+            self.initial_regs
+        }
+    }
+
+    /// A [`TraceStream`] over `full` replayed with the given cut.
+    fn stream_of(
+        full: &SideNote,
+        seg_steps: usize,
+        page_budget: usize,
+    ) -> crate::segment::TraceStream<ReplaySource> {
+        crate::segment::TraceStream::new(
+            ReplaySource::from_side_note(full),
+            full.code.clone(),
+            full.bitmask.clone(),
+            full.jump_table.clone(),
+            full.initial_memory.clone(),
+            seg_steps,
+            page_budget,
+        )
+    }
+
+    /// The W2(a) equivalence bar, synthetic side: over the all-streams
+    /// fixture (precompile records crossing both boundaries, resize
+    /// growth past the image, comb routing) the ONLINE windower's cut
+    /// and windows must equal the offline path — the uniform cut
+    /// (`page_budget = 0`) checked window-by-window against
+    /// `segment_side_note`, field for field.
+    #[test]
+    fn trace_stream_matches_offline_windows_on_uniform_cut() {
+        let full = threaded_trace();
+        let bounds = segment_bounds(full.steps.len(), 4);
+        assert_eq!(bounds.len(), 3);
+        let mut stream = stream_of(&full, 4, 0);
+        let mut streamed_bounds = Vec::new();
+        while let Some((a, b)) = stream.next_window() {
+            streamed_bounds.push((a, b));
+            assert_windows_equal(&stream.side_note(), &segment_side_note(&full, a, b));
+        }
+        assert_eq!(streamed_bounds, bounds, "online uniform cut diverged");
+        assert_eq!(stream.steps_seen(), full.steps.len());
+    }
+
+    /// The synthetic budgeted side: online cut bit-identical to
+    /// `segment_bounds_budgeted` AND every window field-identical, on
+    /// both fixtures across page budgets that trigger page closes,
+    /// step closes, and the degenerate huge budget.
+    #[test]
+    fn trace_stream_budgeted_cut_and_windows_match_offline() {
+        for full in [spray_trace(), threaded_trace()] {
+            for (max_steps, max_pages) in [(12, 2), (5, usize::MAX >> 1), (4, 1), (1, 3)] {
+                let offline = segment_bounds_budgeted(&full, max_steps, max_pages);
+                let mut cursor = crate::segment::SegmentCursor::new(&full);
+                let mut stream = stream_of(&full, max_steps, max_pages);
+                let mut online = Vec::new();
+                while let Some((a, b)) = stream.next_window() {
+                    online.push((a, b));
+                    assert_windows_equal(&stream.side_note(), &cursor.side_note(a, b));
+                }
+                assert_eq!(
+                    online, offline,
+                    "cut diverged at budgets ({max_steps}, {max_pages})"
+                );
+            }
+        }
+    }
+
+    /// Skipped windows must advance the carried state exactly like the
+    /// cursor's skip-advance: assembling only the LAST window after
+    /// skipping the rest yields the same window a full offline slice
+    /// does — the sparse-probe pattern the measurement passes rely on.
+    #[test]
+    fn trace_stream_skips_windows_without_building_them() {
+        let full = threaded_trace();
+        let bounds = segment_bounds(full.steps.len(), 4);
+        let (a, b) = bounds[2];
+        let mut stream = stream_of(&full, 4, 0);
+        while let Some(w) = stream.next_window() {
+            if w == (a, b) {
+                assert_windows_equal(&stream.side_note(), &segment_side_note(&full, a, b));
+                return;
+            }
+        }
+        panic!("stream never reached the probe window");
+    }
+
+    /// The comb-count metadata a probe pass keys on must equal what the
+    /// assembled window derives — `fixed_base_calls()` is the no-assembly
+    /// count of `ristretto_comb_calls` (the fixture routes one
+    /// FixedBasepoint and one Variable record through window 1's slice
+    /// group, so the count discriminates kinds, not records).
+    #[test]
+    fn trace_stream_fixed_base_calls_match_assembled_comb_calls() {
+        let full = threaded_trace();
+        let mut stream = stream_of(&full, 4, 0);
+        let mut saw_comb_window = false;
+        while stream.next_window().is_some() {
+            let counted = stream.fixed_base_calls();
+            let assembled = stream.side_note().ristretto_comb_calls.len();
+            assert_eq!(counted, assembled);
+            saw_comb_window |= counted > 0;
+        }
+        assert!(saw_comb_window, "fixture must contain a comb window");
+    }
+
+    /// The W2(a) equivalence bar, LIVE side: a real multi-window program
+    /// (blake2b ECALLs at page-striding pointers, register-moving Add64s)
+    /// pumped through [`TracingSource`] must cut and assemble exactly
+    /// what the run-to-completion compact holder + cursor produce over an
+    /// identical interpreter — pinning the live arrival plumbing (the
+    /// step→ECALL-record association) the replay tests can't see.
+    #[test]
+    fn trace_stream_live_tracer_matches_offline_compact_path() {
+        use crate::core::tracing::TracingPvm;
+        use javm::instruction::Opcode;
+        use javm::interpreter::Interpreter;
+
+        let ecall_id = crate::core::tracing::ECALL_BLAKE2B_COMPRESS as u8;
+        // Ecalli 100; (φ7 += φ11); Ecalli; add; Ecalli; Trap — h_ptr
+        // strides one page per call so a small page budget cuts between
+        // the calls, and each output lands where a later window's
+        // entering image must carry it.
+        let code = vec![
+            Opcode::Ecalli as u8,
+            ecall_id,
+            Opcode::Add64 as u8,
+            0x07 | (11 << 4),
+            7,
+            Opcode::Ecalli as u8,
+            ecall_id,
+            Opcode::Add64 as u8,
+            0x07 | (11 << 4),
+            7,
+            Opcode::Ecalli as u8,
+            ecall_id,
+            Opcode::Trap as u8,
+        ];
+        let bitmask = vec![1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1];
+        let mut regs = [0u64; NUM_REGS];
+        regs[7] = 0x1000; // h_ptr — strides by φ[11] per Add64
+        regs[8] = 0x100; // m_ptr — fixed
+        regs[9] = 0; // t_low
+        regs[10] = 1; // f flag
+        regs[11] = 0x1000; // page stride
+        let flat_mem = vec![0u8; 0x8000];
+        let interp = || {
+            Interpreter::new(
+                code.clone(),
+                bitmask.clone(),
+                vec![],
+                regs,
+                flat_mem.clone(),
+                10_000,
+                25,
+            )
+        };
+
+        // Offline: run to completion, hold the compact chain form.
+        let mut tracing = TracingPvm::new(interp());
+        let _ = tracing.run_with_vos_stubs();
+        let blake2b_calls = tracing
+            .blake2b_calls()
+            .iter()
+            .map(|c| crate::chips::blake2b::Blake2bCall {
+                h: c.h,
+                m: c.m,
+                t: c.t,
+                f: c.f,
+            })
+            .collect();
+        let blake2b_mem_ops = std::mem::take(&mut tracing.blake2b_mem_ops);
+        let (steps, initial_regs) = tracing.into_compact();
+        assert_eq!(steps.len(), 6, "fixture shape drifted");
+        let compact = crate::side_note::CompactTrace {
+            steps,
+            initial_regs,
+            code: code.clone(),
+            bitmask: bitmask.clone(),
+            initial_memory: flat_mem.clone(),
+            jump_table: vec![],
+            blake2b_calls,
+            blake2b_mem_ops,
+            ristretto_calls: vec![],
+            ristretto_mem_ops: vec![],
+            ristretto_add_calls: vec![],
+            ristretto_add_mem_ops: vec![],
+            scalar_reduce_wide_calls: vec![],
+            scalar_reduce_wide_mem_ops: vec![],
+            scalar_binop_calls: vec![],
+            scalar_binop_mem_ops: vec![],
+        };
+
+        for (seg_steps, page_budget) in [(2usize, 0usize), (6, 2), (4, 2)] {
+            let offline = if page_budget == 0 {
+                segment_bounds(compact.steps.len(), seg_steps)
+            } else {
+                segment_bounds_budgeted_compact(&compact, seg_steps, page_budget)
+            };
+            let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
+            let mut stream = crate::segment::TraceStream::new(
+                crate::segment::TracingSource::new(TracingPvm::new(interp())),
+                code.clone(),
+                bitmask.clone(),
+                vec![],
+                flat_mem.clone(),
+                seg_steps,
+                page_budget,
+            );
+            let mut online = Vec::new();
+            let mut windows = Vec::new();
+            while let Some((a, b)) = stream.next_window() {
+                online.push((a, b));
+                let via_stream = stream.side_note();
+                assert_windows_equal(&via_stream, &cursor.side_note(a, b));
+                windows.push(via_stream);
+            }
+            assert_eq!(
+                online, offline,
+                "live cut diverged at budgets ({seg_steps}, {page_budget})"
+            );
+            // Non-vacuity: a real multi-window chain whose later windows'
+            // entering images carry the earlier blake2b outputs.
+            assert!(windows.len() >= 2, "fixture must cut into a real chain");
+            assert!(
+                windows[0].blake2b_calls.len() == 1,
+                "window 0 must hold the first blake2b call"
+            );
+            let out0 = windows[0].blake2b_mem_ops[0].out_bytes;
+            assert_eq!(
+                windows.last().unwrap().initial_memory[0x1000..0x1040],
+                out0,
+                "a later window's entering image must carry window 0's blake2b output"
+            );
         }
     }
 }

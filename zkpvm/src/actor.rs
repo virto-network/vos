@@ -23,6 +23,7 @@ use javm::{
 
 use crate::SideNote;
 use crate::core::tracing::TracingPvm;
+use crate::segment::{TraceStream, TracingSource};
 use crate::side_note::CompactTrace;
 
 /// Build a fresh `Interpreter` from a parsed PVM blob's CODE + DATA
@@ -112,13 +113,14 @@ pub fn trace_blob(blob: &[u8], gas: u64) -> Option<SideNote> {
     trace_blob_with_patches(blob, gas, &[])
 }
 
-/// [`trace_blob`] in chain form: the same traced run held as a
-/// [`CompactTrace`] — steps without register snapshots — for the chain
-/// drivers that keep the whole multi-million-step trace resident across a
-/// segment loop and expand it window by window
-/// ([`crate::segment::CompactSegmentCursor`]). ~2.6× smaller residency
-/// than the full `SideNote`; the full snapshots are never materialized
-/// chain-wide.
+/// [`trace_blob`] in chain-holder form: the same traced run held as a
+/// [`CompactTrace`] — steps without register snapshots, ~2.6× smaller
+/// residency than the full `SideNote`, expandable window by window via
+/// [`crate::segment::CompactSegmentCursor`]. The single-proof paths
+/// assemble through it, and callers that need the whole run in hand
+/// (offline cutting, equivalence tests) hold it; the chain drivers
+/// themselves stream instead ([`trace_stream`]) and never hold any trace
+/// form at all.
 pub fn trace_blob_compact(blob: &[u8], gas: u64) -> Option<CompactTrace> {
     trace_blob_compact_with_patches(blob, gas, &[])
 }
@@ -152,33 +154,8 @@ pub fn trace_blob_compact_with_patches(
     gas: u64,
     patches: &[(usize, &[u8])],
 ) -> Option<CompactTrace> {
-    let parsed = program::parse_blob(blob)?;
-    let mut code_data = None;
-    for entry in &parsed.caps {
-        if entry.cap_type == CapEntryType::Code {
-            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
-            break;
-        }
-    }
-    let code_blob = program::parse_code_blob(&code_data?)?;
-    let (mut interp, mut flat_mem) = interpreter_from_blob(blob, gas)?;
-
-    // Inject the witness into the initial image. `interpreter_from_blob`
-    // handed back a clone of the interpreter's flat_mem, so patch the
-    // clone and sync it back into the interpreter — otherwise the trace
-    // would execute over the unpatched original.
-    if !patches.is_empty() {
-        for (offset, bytes) in patches {
-            let end = offset.checked_add(bytes.len())?;
-            if end > flat_mem.len() {
-                return None;
-            }
-            flat_mem[*offset..end].copy_from_slice(bytes);
-        }
-        interp.flat_mem = flat_mem.clone();
-    }
-
-    let mut tracing = TracingPvm::new(interp);
+    let setup = trace_setup(blob, gas, patches)?;
+    let mut tracing = setup.tracing;
     let _ = tracing.run_with_vos_stubs();
 
     let blake2b_calls = tracing
@@ -205,10 +182,10 @@ pub fn trace_blob_compact_with_patches(
     Some(CompactTrace {
         steps,
         initial_regs,
-        code: code_blob.code.to_vec(),
-        bitmask: code_blob.bitmask.to_vec(),
-        initial_memory: flat_mem,
-        jump_table: code_blob.jump_table.to_vec(),
+        code: setup.code,
+        bitmask: setup.bitmask,
+        initial_memory: setup.initial_memory,
+        jump_table: setup.jump_table,
         blake2b_calls,
         blake2b_mem_ops,
         ristretto_calls,
@@ -219,5 +196,92 @@ pub fn trace_blob_compact_with_patches(
         scalar_reduce_wide_mem_ops,
         scalar_binop_calls,
         scalar_binop_mem_ops,
+    })
+}
+
+/// The chain drivers' STREAMING entry point: trace `blob` incrementally,
+/// cutting `(seg_steps, page_budget)` windows online (`page_budget == 0` =
+/// uniform step cut) and yielding each window's `SideNote` as the run
+/// reaches it — the whole trace is NEVER resident (peak step storage is
+/// one window), unlike [`trace_blob_compact`] whose `CompactTrace` holds
+/// every step until the segment loop ends. Same execution
+/// (`run_with_vos_stubs` semantics), same cut, field-identical windows —
+/// see [`TraceStream`]. `None` if the blob isn't parseable.
+pub fn trace_stream(
+    blob: &[u8],
+    gas: u64,
+    seg_steps: usize,
+    page_budget: usize,
+) -> Option<TraceStream<TracingSource>> {
+    trace_stream_with_patches(blob, gas, &[], seg_steps, page_budget)
+}
+
+/// [`trace_stream`] with initial-image patches — the streaming twin of
+/// [`trace_blob_compact_with_patches`] (same patch semantics and `None`
+/// cases).
+pub fn trace_stream_with_patches(
+    blob: &[u8],
+    gas: u64,
+    patches: &[(usize, &[u8])],
+    seg_steps: usize,
+    page_budget: usize,
+) -> Option<TraceStream<TracingSource>> {
+    let setup = trace_setup(blob, gas, patches)?;
+    Some(TraceStream::new(
+        TracingSource::new(setup.tracing),
+        setup.code,
+        setup.bitmask,
+        setup.jump_table,
+        setup.initial_memory,
+        seg_steps,
+        page_budget,
+    ))
+}
+
+/// A blob parsed + patched up to the brink of tracing: the tracer over the
+/// (possibly patched) image, the pre-run image clone, and the
+/// program-static fields. One setup path behind the run-to-completion
+/// holders and the streaming driver, so the two trace identical runs.
+struct TraceSetup {
+    tracing: TracingPvm,
+    initial_memory: Vec<u8>,
+    code: Vec<u8>,
+    bitmask: Vec<u8>,
+    jump_table: Vec<u32>,
+}
+
+fn trace_setup(blob: &[u8], gas: u64, patches: &[(usize, &[u8])]) -> Option<TraceSetup> {
+    let parsed = program::parse_blob(blob)?;
+    let mut code_data = None;
+    for entry in &parsed.caps {
+        if entry.cap_type == CapEntryType::Code {
+            code_data = Some(program::cap_data(entry, parsed.data_section).to_vec());
+            break;
+        }
+    }
+    let code_blob = program::parse_code_blob(&code_data?)?;
+    let (mut interp, mut flat_mem) = interpreter_from_blob(blob, gas)?;
+
+    // Inject the witness into the initial image. `interpreter_from_blob`
+    // handed back a clone of the interpreter's flat_mem, so patch the
+    // clone and sync it back into the interpreter — otherwise the trace
+    // would execute over the unpatched original.
+    if !patches.is_empty() {
+        for (offset, bytes) in patches {
+            let end = offset.checked_add(bytes.len())?;
+            if end > flat_mem.len() {
+                return None;
+            }
+            flat_mem[*offset..end].copy_from_slice(bytes);
+        }
+        interp.flat_mem = flat_mem.clone();
+    }
+
+    Some(TraceSetup {
+        tracing: TracingPvm::new(interp),
+        initial_memory: flat_mem,
+        code: code_blob.code.to_vec(),
+        bitmask: code_blob.bitmask.to_vec(),
+        jump_table: code_blob.jump_table.to_vec(),
     })
 }

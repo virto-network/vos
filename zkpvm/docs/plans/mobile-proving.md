@@ -58,12 +58,13 @@ Two structural facts drive the seams below:
 
 The chain driver adds two O(N) hazards of its own: the full-chain
 trace resident for the whole loop (WAS 2.6 GB of `PvmStep`s with an
-O(N²) memory-replay per slice; the replay fell to Wave 2.1's cursor
-and the residency to Wave 2.2's compact holder — now ~1.0 GB), and
-`prove_chain`/the async job USED to materialize **all** segment proofs
-in one buffer (~3 MiB each) — gone with Wave 2.3's streaming publish
-(each proof goes to the host CAS as it is proven; only 32-byte hashes
-are retained).
+O(N²) memory-replay per slice; the replay fell to Wave 2.1's cursor,
+the residency to Wave 2.2's compact holder (~1.0 GB) and then to Wave
+2(a)'s streaming tracer — the chain's trace is no longer resident at
+all), and `prove_chain`/the async job USED to materialize **all**
+segment proofs in one buffer (~3 MiB each) — gone with Wave 2.3's
+streaming publish (each proof goes to the host CAS as it is proven;
+only 32-byte hashes are retained).
 
 ## Levers, ranked
 
@@ -94,11 +95,13 @@ constants in `vos/tests/elf_integration.rs`, re-run the two
 
 **2. SideNote diet + chain-driver streaming (local).**
 (a) Stop holding the full-chain trace: drive segments with a forward
-tracer (or spill steps to disk and stream slices) — removes the 2.6 GB
-constant *and* the O(N²) replay; per-segment step storage is ~35 MB.
-(The replay went to Wave 2.1's `SegmentCursor`; the residency largely
-went to (b) — the compact holder is ~1.0 GB, and full streaming-to-disk
-remains available if the last GB ever matters.)
+tracer — LANDED + MEASURED (see Wave 2, item 2(a) below): the chain's
+trace is never resident (post-trace residency 1,057 → 15 MB; peak
+across a 10-window prove pass 9.34 → 8.42 GiB); per-segment step
+storage is one window's `CompactStep`s.
+(The replay went to Wave 2.1's `SegmentCursor`, the residency's first
+1.6 GB to (b)'s compact holder, the remaining ~1.0 GB to the online
+tracer.)
 (b) Shrink `PvmStep` — DONE (Wave 2.2): the chain holds `CompactStep`s
 (no register snapshots; 360 → 136 B/step), windows expand locally.
 (c) CAS-publish each segment proof as produced instead of returning
@@ -413,11 +416,52 @@ segmentation of any kind.
   pass — the prove transient dominates both). Commitments do NOT move
   (drift guard green): pure buffer-retention removal, time-neutral
   under the both-axes constraint.
+- **2(a) Streaming chain tracer — LANDED + MEASURED (2026-07-14).**
+  The chain drivers never hold ANY trace form: `TraceStream`
+  (`zkpvm::segment`) pumps a live `TracingPvm` one
+  `step_with_vos_stubs` iteration at a time (the run-to-completion
+  path is a loop over the same method, so the two executions cannot
+  diverge), drains each recorded step out of the tracer as it lands
+  (`take_step` — the tracer stays empty), cuts windows ONLINE with
+  the same `BudgetedCutter` decision path the offline
+  `segment_bounds_budgeted` walk now runs (one code path ⇒
+  bit-identical bounds by construction; `page_budget = 0` degenerates
+  to the uniform step cut), and yields each window's `SideNote` via
+  the same `assemble_segment` + entering-state threading
+  `CompactSegmentCursor` performs, batched per retired window.
+  Entry points: `zkpvm::actor::trace_stream{,_with_patches}`
+  (streaming twins of `trace_blob_compact{,_with_patches}`, one
+  shared `trace_setup`). Rewired to single streaming passes:
+  `prove_chain_segments_with` (trace interleaved with proving),
+  `measure_floors` (`NaturalFloors` accumulator), the floors gate;
+  the catalog measurement (`measure_catalog`) runs a metadata scan
+  (bounds + per-window comb counts read off the window buffer without
+  assembly) then RE-TRACES for the sparse probe proves — the
+  deterministic second pass is checked window-by-window against the
+  scan's bounds and fails soft on any divergence, and the drift guard
+  rides the same two-pass shape with hard asserts. Whole-trace entry
+  points stay for single-proof paths and offline cutting. Equivalence
+  pinned at three levels: `trace_stream_*` unit tests (online cut ==
+  offline cut bit-identical incl. `page_budget = 0`; every streamed
+  window field-identical to the cursor's, over synthetic all-stream
+  fixtures AND a live multi-window tracer whose blake2b outputs cross
+  window images), `streaming_pass_matches_the_compact_holder_pipeline`
+  (byte-identical segment proofs vs the retired holder pipeline), and
+  `measure_catalog_two_passes_agree_with_the_holder_derivation`
+  (two-pass floors + probe commitments == holder derivation).
+  Measured (7.84M-step transition, (32k, 8) cut, release): post-trace
+  residency **1,057 MB → 15 MB** (the compact holder is gone; the
+  tracer holds no steps); peak across a 10-window prove pass
+  **VmHWM 9.34 → 8.42 GiB** (−0.96 GiB); per-window prove 3.5–4.9 s
+  vs 4.0–6.5 s compact (time-neutral within noise — the prove
+  transient dominates). Commitments do NOT move: drift guard
+  reproduces C_0 1373d0f4… / C_1 3667db4f… through the streaming
+  two-pass path.
 
-Exit: chain-prove peak = one segment's prove cost + the compact chain
-holder; the O(N) proof-buffer axis is closed (2.3) and the floors
-derivation collapsed with 2.1. The remaining O(N) driver state is the
-~1.0 GB compact trace — item 2(a)'s spill-to-disk, still open.
+Exit: chain-prove peak = one segment's prove cost — every O(N) driver
+axis is closed: the proof buffer (2.3), the floors derivation (2.1),
+and the resident chain trace (2(a)); the remaining chain-length state
+is O(windows) metadata (bounds + comb counts).
 
 ### Wave 3 — aarch64 bring-up
 
