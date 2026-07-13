@@ -142,14 +142,60 @@ lowers to NEON; zkpvm itself has no intrinsics. Setup-level items:
 - Nightly toolchain per `rust-toolchain.toml` (portable_simd) for the
   aarch64 target; NDK/iOS clang for `blst` (unavoidable via javm →
   grey-crypto, ships aarch64 asm).
-- `.cargo/config` sets `[build] rustflags = target-cpu=native` — wrong
-  under cross-compilation; needs a `[target.aarch64-*]` override. PGO
+- `.cargo/config.toml` scopes `target-cpu=native` to the host triple
+  (`[target.x86_64-unknown-linux-gnu]`) so cross-builds see clean
+  flags, and pre-wires the `aarch64-unknown-linux-gnu` linker; the
+  Android section is commented (NDK paths are machine-specific). PGO
   profile is x86-trained; retrain on-device.
 - MOBILE PcsPolicy is doubly right on ARM (4× smaller committed domain
   = compute *and* LPDDR-bandwidth relief); STANDARD and MOBILE are the
   same 96 conjectured bits (20 PoW + blowup·queries = 76).
 - Expect Blake2s/Merkle's share of prove time to rise vs x86 (portable
   SIMD pays the 128-bit width tax; the M31 mul degrades less).
+
+### Cross-compile recipe (x86_64 Linux host → aarch64-unknown-linux-gnu)
+
+The no-device half is landed and verified: `zkpvm --features prover`
+and `prover-extension` cross-`check` clean, and `mobile_bench` (the
+on-device artifact, `zkpvm/src/bin/mobile_bench.rs`) links and runs
+under qemu-user with the proof *verifying* — an end-to-end correctness
+gate for the portable-SIMD/NEON prover path on ARM.
+
+Host prerequisites (Arch/Manjaro package names):
+
+- `aarch64-linux-gnu-gcc` — the linker (`.cargo/config.toml` names it)
+  and the C compiler the `cc` crate auto-finds on PATH for blst's
+  aarch64 asm/C. Alternative without cross-gcc: clang via
+  `CC_aarch64_unknown_linux_gnu=clang`
+  `CFLAGS_aarch64_unknown_linux_gnu=--target=aarch64-unknown-linux-gnu`.
+- `qemu-user` (optional) — `qemu-aarch64` for an emulated smoke run;
+  the cross-gcc package ships the `/usr/aarch64-linux-gnu` sysroot.
+
+From a clean checkout (rust-toolchain.toml pins the nightly; rustup
+installs the target into it):
+
+    rustup target add aarch64-unknown-linux-gnu
+    cargo check -p zkpvm --features prover --target aarch64-unknown-linux-gnu
+    cargo check -p prover-extension --target aarch64-unknown-linux-gnu
+    cargo build --release -p zkpvm --bin mobile_bench \
+        --target aarch64-unknown-linux-gnu
+
+Emulated smoke (correctness only — qemu timings are meaningless):
+
+    qemu-aarch64 -L /usr/aarch64-linux-gnu \
+        target/aarch64-unknown-linux-gnu/release/mobile_bench 8
+
+On the device: push
+`target/aarch64-unknown-linux-gnu/release/mobile_bench` and run
+`./mobile_bench 14` (arg = log₂ steps). It traces, proves under the
+MOBILE config, verifies, and prints per-stage wall-clock plus peak RSS
+(`VmHWM`). Reference x86 point to beat (Core Ultra 7 155H,
+target-cpu=native, idle box): log14 prove ≈ 1.7 s, peak RSS 1.3 GiB —
+and note the number is badly load-sensitive (~10× under a saturated
+box), so bench on an idle, cooled phone. The glibc binary runs on
+linux-gnu userlands (Termux glibc / proot included); stock Android
+needs `--target aarch64-linux-android` with the NDK clang linker (see
+the commented section in `.cargo/config.toml`).
 
 ## What NOT to pursue
 
