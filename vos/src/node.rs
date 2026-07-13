@@ -1361,7 +1361,20 @@ impl NodeService {
         use crate::registry::SyncFloor;
         match name {
             "" => return SyncFloor::Public,
-            REGISTRY_AGENT_NAME => return SyncFloor::Member,
+            // The space registry stays PUBLIC until the redeem flow lands
+            // (wave 3). A `Member` registry deadlocks bootstrap: a joiner
+            // must sync the registry to LEARN its own grant, but a `Member`
+            // gate would refuse it until it is already a member. The
+            // ordering note in the plan resolves this by having the joiner
+            // redeem (an ungated remote invoke) FIRST — which grants its
+            // NODE key (the sync identity) — before it syncs. Until
+            // `redeem_invite` is wired into `space up`, the old join flow
+            // grants the OPERATOR (not the node) and enrolls the node only
+            // later, so flipping the registry to `Member` now breaks the
+            // join → sync → learn-grant order. Registry metadata is
+            // non-secret, so `Public` is safe in the interim; the flip
+            // rides with wave 3.
+            REGISTRY_AGENT_NAME => return SyncFloor::Public,
             HYPERSPACE_REGISTRY_AGENT_NAME => return SyncFloor::Public,
             _ => {}
         }
