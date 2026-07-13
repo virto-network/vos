@@ -72,7 +72,8 @@ re-pin below), but for THIS transition the lever is spent at 100k —
 the RAM path runs through Wave 5.2 (the BLAKE2B_BOUNDARY per-page-cost
 diet — measurement showed ~10k boundary rows per touched page with
 pages-per-window small and flat, so NO windowing strategy, uniform or
-budgeted, moves the wall), with Wave 4 as the multiplier after.
+budgeted, moves the wall), with the Wave-4 line (measured −9.6% as
+built; row-chunked commit is the real increment) after.
 **The tooling gap (floor derivation) is closed:** `vosx zk pin
 --seg-steps N` without `--profile` derives the floors, measures the
 allowlist under them, and records both; then update the three frozen
@@ -95,8 +96,9 @@ stwo fork).** After each tree's Merkle root is computed, drop
 `Poly.evals` and recompute per-column LDEs from the retained
 coefficients when FRI quotients and decommit need them
 (`get_evaluation_on_domain` already exists). Removes "all 4 trees' LDE
-resident simultaneously" — est. **2–3× off the dominant term** for one
-extra FFT pass per column. Fork surface: `prover/pcs/`
+resident simultaneously" — originally estimated 2–3× off the dominant
+term; MEASURED at −9.6% (see Wave 4: whole-tree commit residency +
+the non-LDE plateau bound the win). Fork surface: `prover/pcs/`
 (`CommitmentTreeProver`, `prove_values`, `compute_fri_quotients`).
 Upstream is drifting this way (configurable quotient chunks, leaf
 packing in 2.3.0-dev), so this is plausibly upstreamable. True
@@ -152,7 +154,8 @@ lowers to NEON; zkpvm itself has no intrinsics. Setup-level items:
 ## Honest wall-clock picture
 
 Chain proving on phones is a Wave-5.2 outcome (the boundary chip's
-per-page cost; Wave 4 adds margin): Wave 1.3 measured ~10–11 GiB per
+per-page cost; Wave 4's row-chunked-commit increment adds margin —
+its first increment measured only −9.6%): Wave 1.3 measured ~10–11 GiB per
 window at ANY uniform seg_steps, and the 5.1 validation showed the
 cause is not window placement at all — every window touches a
 handful of pages and each page costs ~10k rows on the 2502-column
@@ -280,15 +283,36 @@ Cross-build for aarch64 (nightly rust-std, NDK/iOS clang for blst,
 tap-to-pay + one small segment on a real phone; retrain PGO on-device.
 Exit: measured phone numbers replacing the 3.5–7 s estimate.
 
-### Wave 4 — stwo fork: recompute-LDE-from-coeffs
+### Wave 4 — stwo fork: recompute-LDE-from-coeffs (BUILT + MEASURED
+2026-07-13 — projection largely falsified; kept as groundwork)
 
-Fork `prover/pcs/` (`CommitmentTreeProver`, `prove_values`,
-`compute_fri_quotients`): drop `Poly.evals` after each tree's Merkle
-root, recompute per-column LDEs from retained coefficients for FRI
-quotients + decommit. Consider bumping stwo 2.2.0→2.3.0 first so the
-fork tracks upstream. Exit: ~2–3× off the per-segment LDE term.
-Multiplies with Wave 5.2 (post-diet windows × another 2–3×) and
-benefits tap-to-pay equally.
+Built on the `olanod/stwo` clone, branch `lde-recompute` (one commit
+`0b4377a` over upstream `e1286720`; local, unpushed; NOT wired into
+master): opt-in `set_stream_lde()` — `Poly.evals` becomes
+resident/released, each tree's buffers return to the pool right after
+its Merkle root, FRI quotients recompute from coeffs in 64-column
+chunks, decommit recomputes per column, composition falls back to
+`ExtendToEvalDomain` for released columns. **Proof bytes are identical
+streaming vs not** (PCS-level and full-pipeline tests), and every fork
++ zkpvm gate is green.
+
+Measured (seg 0, uniform-100k, PINNED canonical profile, 62 GiB box):
+**32.5 → 29.4 GiB (−9.6%) at +64–86% prove time.** Two premises were
+wrong: (a) lifted-Merkle commit needs a WHOLE tree's columns resident
+at once, so post-commit release converts sum-of-trees to max-tree —
+and under canonical forcing the largest (interaction) tree is a hard
+floor; (b) a ~26 GiB plateau (side-note, interaction-gen inputs,
+coeffs, in-flight tree) sits under the LDE term. Note the baseline
+nuance: 32.5 GiB is at the pinned 18/11 floors; the 20 GiB figure
+earlier in this doc is at the (unpinned) derived-17 floors.
+
+Verdict: not worth flag-on as shipped (−10% RAM for ~+75% time). The
+release machinery is the right substrate for the real Wave-4 win:
+**row-chunked lifted-Merkle leaf hashing** (stream a tree's leaf layer
+across column chunks with per-row hash states — kills the max-tree
+floor and most of the tree share of the plateau). That is the next
+fork increment; until then the flag stays off and the fork stays
+unwired.
 
 ### Wave 5 — content-aware windowing (sizing spike DONE 2026-07-10)
 
@@ -344,7 +368,10 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
   (32k, 8) is the recommended deployment cut: ~8 s/window ⇒ ~40 min
   chain, and boundary stalls at 2^16 below it (≥ ~5 distinct-content
   pages per window at 4 KB leaves — 2^15 is lever 2's case). With
-  Wave 4's 2–3× on top: **~3–4 GiB**, the phone envelope's edge.
+  the remaining RAM line to the phone envelope running through
+  W2.2 (SideNote diet, −2.6 GiB), the Wave-4 row-chunked-commit
+  increment, and lever 2 if still short (Wave 4's first increment
+  measured only −9.6% — see its section).
 - **5.2 BLAKE2B_BOUNDARY per-page-cost diet (decomposition spike
   DONE 2026-07-13).** Mechanism, confirmed in code: the boundary
   chip proves the page-Merkle multiproof's compressions on a
