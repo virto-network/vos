@@ -55,8 +55,15 @@ pub struct SideNote {
     /// boundary multiproof, proven by `Blake2bBoundaryChip`.  Unlike
     /// `blake2b_calls` these hash page images (leaves) and node pairs, with
     /// no memory-ledger binding.  Built on the prove path from
-    /// `page_merkle::boundary_blake2b_calls`.
+    /// `page_merkle::boundary_blake2b_calls`, DEDUPLICATED — each unique
+    /// compression appears once, with its in-circuit consumption count in
+    /// the parallel `merkle_blake2b_mults`.
     pub merkle_blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
+    /// Logup multiplicity per entry of `merkle_blake2b_calls` (parallel,
+    /// 1:1) — the `EmitMult` value the boundary chip fills at that
+    /// compression's row 95.  A missing entry (hand-built side notes)
+    /// defaults to 1.
+    pub merkle_blake2b_mults: Vec<u32>,
     /// R1f: Ristretto255 scalar-mult ECALL records (scalar / input
     /// point / output point as 32 LE bytes each).  Populated by the
     /// trace driver after `TracingPvm::run_with_precompiles`; consumed
@@ -354,6 +361,7 @@ impl SideNote {
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
             merkle_blake2b_calls: Vec::new(),
+            merkle_blake2b_mults: Vec::new(),
             ristretto_calls: Vec::new(),
             ristretto_mem_ops: Vec::new(),
             ristretto_add_calls: Vec::new(),
@@ -394,9 +402,14 @@ impl SideNote {
         touched.insert(0); // never-empty page set (design §0)
         let exiting = crate::segment::replay_writes(self, None);
         let mp = page_merkle::build_multiproof(&self.initial_memory, &exiting, &touched);
-        // One call per consumption, duplicates included (design §4).
-        self.merkle_blake2b_calls =
+        // Unique compressions with per-consumption multiplicities: the
+        // page/merge chips emit −1 per consumption, the boundary chip
+        // produces +EmitMult per unique compression — same balance design
+        // §4's one-block-per-consumption scheme held, at far fewer rows.
+        let (calls, mults) =
             page_merkle::boundary_blake2b_calls(&mp, &self.initial_memory, &exiting);
+        self.merkle_blake2b_calls = calls;
+        self.merkle_blake2b_mults = mults;
         let pages = touched
             .iter()
             .map(|&p| MemoryPageImage {

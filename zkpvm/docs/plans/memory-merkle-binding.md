@@ -282,10 +282,15 @@ All four are **unconditionally active** (the page set is never empty, §0).
 - Side note: `ingest_memory_pages(&mut SideNote)` builds the **idempotent**
   per-segment payload (listed page set via the shared enumeration, entering/
   exit page images, frontier, the merge schedule, and
-  `merkle_blake2b_calls` — **one call per consumption, duplicates included**:
-  identical compressions are common, e.g. two all-zero pages, or a read-only
-  page whose before/after passes coincide; any dedup under-produces and
-  rejects honest proofs). Called on the **prove path only** (prove_impl +
+  `merkle_blake2b_calls` — **one call per UNIQUE compression, with its
+  consumption count in the parallel `merkle_blake2b_mults`**: identical
+  compressions are common, e.g. two all-zero pages, or a read-only page
+  whose before/after passes coincide. The boundary chip produces each
+  unique compression once with the count as its logup multiplicity
+  (`EmitMult`), which balances the consumers' −1-per-consumption exactly
+  as the earlier one-block-per-consumption scheme did — a bare dedup
+  without the multiplicity would under-produce and reject honest proofs).
+  Called on the **prove path only** (prove_impl +
   segment driver), rebuild-from-scratch each time. The verify paths never
   need the payload: the FS mix reads proof fields, preprocessed regeneration
   is row-index-pure, and the component set is constant (all new chips

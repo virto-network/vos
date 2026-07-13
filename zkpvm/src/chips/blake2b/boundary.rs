@@ -255,6 +255,16 @@ impl BuiltInComponent for Blake2bBoundaryChip {
         eval.add_constraint(
             continuity_gate[0].clone() * (is_real_next[0].clone() - is_real[0].clone()),
         );
+        // EmitMult may light up only on a real row 95 (the production row);
+        // its VALUE there is free — the logup balance alone pins it to the
+        // compression's true consumption count.  OutputGateH is itself
+        // pinned to IsReal·IsLast by its definition constraint in the
+        // shared core.
+        let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
+        let emit_mult = crate::trace::trace_eval!(trace_eval, Column::EmitMult);
+        eval.add_constraint(
+            (f1.clone() - output_gate_h[0].clone()) * emit_mult[0].clone(),
+        );
         // T[8..16] = 0 — domain constraint (pins V[13]'s init); retained since
         // the tuple only carries t[0..8].
         for i in 8..16 {
@@ -268,7 +278,6 @@ impl BuiltInComponent for Blake2bBoundaryChip {
         let sched = read_schedule(&trace_eval);
         add_compression_core(eval, &trace_eval, &sched, range256_lookup, bitwise_lookup);
 
-        let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
         let f_e = crate::trace::trace_eval!(trace_eval, Column::F);
         let output_e = crate::trace::trace_eval!(trace_eval, Column::Output);
         let h_cols: [_; 8] = [
@@ -301,8 +310,11 @@ impl BuiltInComponent for Blake2bBoundaryChip {
         ];
 
         // ── Blake2bCompression producer ─────────────────────────
-        // (h_in[64], m[128], t[8], f[1], h_out[64]); +output_gate at row 95.
-        let output_gate = output_gate_h[0].clone();
+        // (h_in[64], m[128], t[8], f[1], h_out[64]); +EmitMult at row 95 —
+        // each unique compression produced once with its consumption count
+        // (the page/merge chips emit −1 per consumption; the
+        // RangeMultiplicity256 pattern, producer-side).  The gate pinning
+        // EmitMult to real row-95s is emitted with the IsReal anchor above.
         let mut tuple: Vec<E::F> = Vec::with_capacity(265);
         for w in 0..8 {
             for b in 0..8 {
@@ -323,7 +335,7 @@ impl BuiltInComponent for Blake2bBoundaryChip {
         }
         eval.add_to_relation(RelationEntry::new(
             compression_lookup,
-            output_gate.into(),
+            emit_mult[0].clone().into(),
             &tuple,
         ));
 
@@ -368,6 +380,13 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
         let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         fill_compression_trace(&mut trace, side_note, &rows);
+        // Production multiplicity at each compression's row 95: the unique
+        // compression's in-circuit consumption count (a hand-built side note
+        // without mults defaults to one consumer per call).
+        for k in 0..side_note.merkle_blake2b_calls.len() {
+            let mult = side_note.merkle_blake2b_mults.get(k).copied().unwrap_or(1);
+            trace.fill_columns(k * 96 + 95, BaseField::from(mult), Column::EmitMult);
+        }
         trace.finalize_bit_reversed()
     }
 
@@ -394,10 +413,7 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
 
         // ── Blake2bCompression producer (mirror of add_constraints) ──
         let compression: &Blake2bCompressionLookupElements = lookup_elements.as_ref();
-        let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
-        let is_last_pp = component_trace.preprocessed_base_column::<1, PreprocessedColumn>(
-            PreprocessedColumn::IsLastOfCompression,
-        );
+        let emit_mult = crate::trace::original_base_column!(component_trace, Column::EmitMult);
         let h_word_cols: [_; 8] = [
             crate::trace::original_base_column!(component_trace, Column::H0),
             crate::trace::original_base_column!(component_trace, Column::H1),
@@ -432,8 +448,8 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
 
         logup.add_to_relation_computed(
             compression,
-            [is_real[0].clone(), is_last_pp[0].clone()],
-            |[r, l]| (r * l).into(),
+            [emit_mult[0].clone()],
+            |[m]| m.into(),
             265,
             move |v| {
                 let mut t = Vec::with_capacity(265);

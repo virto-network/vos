@@ -343,6 +343,17 @@ pub enum Column {
     InitGateH,
     #[size = 1]
     OutputGateH,
+    // Blake2bBoundaryChip: logup multiplicity of the row-95 compression
+    // production — how many in-circuit consumers read this UNIQUE
+    // (h, m, t, f) compression (the page/merge chips emit −1 each, so one
+    // production carrying the count balances exactly as the
+    // one-row-block-per-consumption scheme did, at a fraction of the
+    // rows).  Constrained to 0 off real row-95s
+    // ((1 − OutputGateH) · EmitMult = 0); the VALUE is free — the logup
+    // balance alone pins it, the RangeMultiplicity256 pattern.  Dead
+    // (all-zero) in Blake2bChip, whose producer gate stays OutputGateH.
+    #[size = 1]
+    EmitMult,
     // Carry-bound helpers — flatten the degree-3 / -4
     // carry-domain constraints to degree 2.
     //

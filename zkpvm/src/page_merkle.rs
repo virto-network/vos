@@ -573,17 +573,24 @@ fn node_call(left: &[u8; 32], right: &[u8; 32]) -> crate::chips::Blake2bCall {
     }
 }
 
-/// Every blake2b compression the Blake2bBoundaryChip must prove for a segment:
-/// for each touched leaf, the 32-block chain over the entering page then the
-/// exit page; for each merge node, the before-pass then the after-pass node
-/// compression.  Duplicates are kept (one call per in-circuit consumption —
-/// identical compressions, e.g. two all-zero pages or an unchanged page whose
-/// passes coincide, each need their own producer block for logup balance).
+/// Every blake2b compression the Blake2bBoundaryChip must prove for a
+/// segment, DEDUPLICATED, with each unique compression's in-circuit
+/// consumption count: for each touched leaf, the 32-block chain over the
+/// entering page then the exit page; for each merge node, the before-pass
+/// then the after-pass node compression.  Identical compressions are
+/// common — two all-zero pages, a read-only page whose passes coincide,
+/// same-level default-subtree merges — and each consumer (page / merge
+/// chip row) emits −1 into the compression relation, so the boundary chip
+/// produces each unique compression ONCE with the count as its logup
+/// multiplicity (`EmitMult`): the balance the one-block-per-consumption
+/// scheme held, at a fraction of the rows.  Order is first occurrence —
+/// deterministic in the multiproof, which prover and re-measurement both
+/// derive from the trace.
 pub fn boundary_blake2b_calls(
     mp: &MerkleMultiproof,
     entering: &[u8],
     exiting: &[u8],
-) -> Vec<crate::chips::Blake2bCall> {
+) -> (Vec<crate::chips::Blake2bCall>, Vec<u32>) {
     let mut calls = Vec::new();
     for &(p, _, _) in &mp.leaves {
         push_leaf_calls(&page_bytes(entering, p), &mut calls); // before pass
@@ -593,7 +600,33 @@ pub fn boundary_blake2b_calls(
         calls.push(node_call(&node.child_before[0], &node.child_before[1]));
         calls.push(node_call(&node.child_after[0], &node.child_after[1]));
     }
-    calls
+
+    let key = |c: &crate::chips::Blake2bCall| {
+        let mut k = [0u8; 8 * 8 + 16 * 8 + 16 + 1];
+        for (i, w) in c.h.iter().enumerate() {
+            k[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        for (i, w) in c.m.iter().enumerate() {
+            k[64 + i * 8..64 + i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        k[192..208].copy_from_slice(&c.t.to_le_bytes());
+        k[208] = c.f as u8;
+        k
+    };
+    let mut index: alloc::collections::BTreeMap<[u8; 209], usize> = alloc::collections::BTreeMap::new();
+    let mut unique = Vec::new();
+    let mut mults: Vec<u32> = Vec::new();
+    for c in calls {
+        match index.entry(key(&c)) {
+            alloc::collections::btree_map::Entry::Occupied(e) => mults[*e.get()] += 1,
+            alloc::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(unique.len());
+                unique.push(c);
+                mults.push(1);
+            }
+        }
+    }
+    (unique, mults)
 }
 
 /// Build the boundary multiproof for a segment from its side note: enumerate
@@ -895,20 +928,27 @@ mod tests {
             );
         }
 
-        // The full call list: one block-chain per leaf-pass + one call per
-        // node-pass.  Count and replay-consistency.
-        let calls = boundary_blake2b_calls(&mp, &entering, &exiting);
-        let expected = mp.leaves.len() * 2 * 32 + mp.merges.len() * 2;
-        assert_eq!(calls.len(), expected);
+        // Rebuild the raw one-call-per-consumption list: one block-chain per
+        // leaf-pass + one call per node-pass. Replay-consistency holds on it.
+        let mut raw = Vec::new();
+        for &(p, _, _) in &mp.leaves {
+            push_leaf_calls(&page_bytes(&entering, p), &mut raw);
+            push_leaf_calls(&page_bytes(&exiting, p), &mut raw);
+        }
+        for node in &mp.merges {
+            raw.push(node_call(&node.child_before[0], &node.child_before[1]));
+            raw.push(node_call(&node.child_after[0], &node.child_after[1]));
+        }
+        assert_eq!(raw.len(), mp.leaves.len() * 2 * 32 + mp.merges.len() * 2);
 
         // Leaf chains replay to the leaf digests recorded in the multiproof.
         let mut idx = 0;
         for &(_, before_leaf, after_leaf) in &mp.leaves {
             for want in [before_leaf, after_leaf] {
-                let mut h = calls[idx].h;
+                let mut h = raw[idx].h;
                 for _ in 0..32 {
-                    assert_eq!(calls[idx].h, h);
-                    h = replay(&calls[idx]);
+                    assert_eq!(raw[idx].h, h);
+                    h = replay(&raw[idx]);
                     idx += 1;
                 }
                 assert_eq!(trunc32(&h), want);
@@ -916,12 +956,109 @@ mod tests {
         }
         // Node calls replay to the node digests.
         for node in &mp.merges {
-            assert_eq!(trunc32(&replay(&calls[idx])), node.hash_before);
+            assert_eq!(trunc32(&replay(&raw[idx])), node.hash_before);
             idx += 1;
-            assert_eq!(trunc32(&replay(&calls[idx])), node.hash_after);
+            assert_eq!(trunc32(&replay(&raw[idx])), node.hash_after);
             idx += 1;
         }
-        assert_eq!(idx, calls.len());
+        assert_eq!(idx, raw.len());
+
+        // The produced list DEDUPLICATES the raw consumptions: unique calls,
+        // multiplicities aggregating every raw occurrence, nothing dropped.
+        let (calls, mults) = boundary_blake2b_calls(&mp, &entering, &exiting);
+        let key = |c: &crate::chips::Blake2bCall| (c.h, c.m, c.t, c.f);
+        assert_eq!(calls.len(), mults.len());
+        assert_eq!(mults.iter().map(|&m| m as usize).sum::<usize>(), raw.len());
+        let uniq: BTreeSet<_> = calls.iter().map(key).collect();
+        assert_eq!(uniq.len(), calls.len(), "deduped list must be unique");
+        let mut counts: alloc::collections::BTreeMap<_, u32> = Default::default();
+        for c in &raw {
+            *counts.entry(key(c)).or_default() += 1;
+        }
+        assert_eq!(counts.len(), calls.len(), "every distinct raw call survives");
+        for (c, &m) in calls.iter().zip(&mults) {
+            assert_eq!(counts.get(&key(c)), Some(&m), "multiplicity mismatch");
+        }
+    }
+
+    /// The dedup soundness story, in fraction space: the boundary chip
+    /// produces Σ mult/denom(unique compression) and the page/merge chips
+    /// consume Σ 1/denom(consumption) — these must cancel, and a single
+    /// off-by-one multiplicity must imbalance them.  `EmitMult`'s value is
+    /// deliberately unconstrained in the chip (the RangeMultiplicity256
+    /// pattern); this cross-side sum is exactly what pins it in a proof.
+    #[test]
+    #[cfg(feature = "prover")]
+    fn dedup_multiplicities_balance_in_fraction_space() {
+        use crate::chips::Blake2bBoundaryChip;
+        use crate::harness::MachineComponent;
+        use crate::lookups::{AllLookupElements, Blake2bCompressionLookupElements};
+        use stwo::core::channel::Blake2sChannel;
+        use stwo::core::fields::FieldExpOps;
+        use stwo::core::fields::m31::BaseField;
+        use stwo::core::fields::qm31::SecureField;
+        use stwo_constraint_framework::Relation;
+
+        let entering = make_image(&[(1, 0xAA), (2, 0xBB), (1000, 0xCC)]);
+        let mut exiting = entering.clone();
+        for b in &mut exiting[2 * PAGE_SIZE..3 * PAGE_SIZE] {
+            *b = 0xDD;
+        }
+        let touched: BTreeSet<u32> = [2u32, 5].into_iter().collect();
+        let mp = build_multiproof(&entering, &exiting, &touched);
+        let (calls, mults) = boundary_blake2b_calls(&mp, &entering, &exiting);
+        let mut raw = Vec::new();
+        for &(p, _, _) in &mp.leaves {
+            push_leaf_calls(&page_bytes(&entering, p), &mut raw);
+            push_leaf_calls(&page_bytes(&exiting, p), &mut raw);
+        }
+        for node in &mp.merges {
+            raw.push(node_call(&node.child_before[0], &node.child_before[1]));
+            raw.push(node_call(&node.child_after[0], &node.child_after[1]));
+        }
+        assert!(calls.len() < raw.len(), "the fixture must actually dedup");
+
+        let mut all = AllLookupElements::default();
+        let channel = &mut Blake2sChannel::default();
+        Blake2bBoundaryChip.draw_lookup_elements(&mut all, channel);
+        let el: &Blake2bCompressionLookupElements = all.as_ref();
+        // (h_in[64] ‖ m[128] ‖ t[8] ‖ f[1] ‖ h_out[64]) as byte limbs — the
+        // tuple shape both producer and consumers emit.
+        let inv_denom = |c: &crate::chips::Blake2bCall| -> SecureField {
+            let mut v: Vec<BaseField> = Vec::with_capacity(265);
+            for w in c.h {
+                v.extend(w.to_le_bytes().map(|b| BaseField::from(b as u32)));
+            }
+            for w in c.m {
+                v.extend(w.to_le_bytes().map(|b| BaseField::from(b as u32)));
+            }
+            v.extend(c.t.to_le_bytes()[..8].iter().map(|&b| BaseField::from(b as u32)));
+            v.push(BaseField::from(c.f as u32));
+            v.extend(replay(c).map(|b| BaseField::from(b as u32)));
+            <Blake2bCompressionLookupElements as Relation<BaseField, SecureField>>::combine(
+                el,
+                v.as_slice(),
+            )
+            .inverse()
+        };
+        let consumed = raw.iter().map(&inv_denom).fold(SecureField::default(), |a, f| a + f);
+        let produced = calls
+            .iter()
+            .zip(&mults)
+            .map(|(c, &m)| inv_denom(c) * BaseField::from(m))
+            .fold(SecureField::default(), |a, f| a + f);
+        assert_eq!(produced, consumed, "deduped productions must cancel the consumptions");
+
+        let forged = calls
+            .iter()
+            .zip(&mults)
+            .enumerate()
+            .map(|(i, (c, &m))| inv_denom(c) * BaseField::from(m + u32::from(i == 0)))
+            .fold(SecureField::default(), |a, f| a + f);
+        assert_ne!(
+            forged, consumed,
+            "an off-by-one multiplicity must imbalance the compression relation"
+        );
     }
 
     #[test]

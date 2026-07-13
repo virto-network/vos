@@ -334,9 +334,11 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
   | comb | 6 (4) | 456 → 283 | ×1.6 | 2^16 → 2^15 |
   | tail | 16 (6) | 1134 → 687 | ×1.7 | 2^17 → 2^17 |
 
-  **Every compression is a leaf-image chain** (zero in-circuit node
-  hashes); duplicates come from read-only pages (exiting chain ==
-  entering chain) and identical-content pages (fresh zero pages).
+  Leaf-image chains dominate (~90–95%; the remainder are t=192
+  domain-tagged node merges — the spike's t=64 node classifier was
+  wrong, totals/uniques stand); duplicates come from read-only pages
+  (exiting chain == entering chain) and identical-content pages
+  (fresh zero pages).
   1. **Dedup via a multiplicity column (THE next implementation).**
      Produce each unique compression once with its consumption count
      as logup multiplicity (the pattern RANGE_MULT_256 already uses)
