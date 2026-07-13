@@ -438,7 +438,22 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
      there — 1040 of 2545 main limbs. A boundary-own column set cuts
      the dominant chip's cells ~41% ⇒ ~25–30% off BOTH window RAM
      and prove time; main-column-only change, so C_0/C_1 should not
-     drift (same argument as the dedup). Implementation in flight.
+     drift (same argument as the dedup). LANDED + MEASURED
+     2026-07-13: `BoundaryColumn` (1463 limbs; 1040 ECALL limbs
+     removed: HPtr/MPtr/CallTs/HRdAddr/MRdAddr/HWrAddr) over a
+     `CompressionColumns` trait generifying the shared core;
+     Blake2bChip byte-identical. Window at the (32k, 8) cut:
+     **11.05 → 9.54 GiB (−13.7%), 5.67 → 5.04 s (−11.1%)** — the
+     boundary's 41.6% committed-cell cut dilutes at process level
+     against the held trace + the other 30 chips. The diet itself is
+     commitment-clean (bit-identical window commitment).
+     SEPARATE FINDING: the drift guard is red on clean master too —
+     a freshly built voucher-check ELF yields C_0 `ae749763…` /
+     C_1 `38e3912d…` vs the pinned `4e8f8869…` lineage (the guard's
+     documented ELF-shift mode; parallel sessions saw the same at
+     c3e88a5a). Master needs ONE deliberate re-pin drill — natural
+     to bundle with the deployment flip to (32k, 8) + derived
+     floors, which re-pins anyway.
   3. **Poseidon2-M31 page hash (deep reserve).** 96 rows per 128
      hashed bytes is the constant both above levers dance around; an
      M31-native page hash cuts it ~10×+ but needs a new chip +
