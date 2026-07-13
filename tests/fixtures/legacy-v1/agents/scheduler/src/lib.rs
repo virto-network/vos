@@ -79,6 +79,33 @@ impl Agent {
         id
     }
 
+    /// Like `run_task_rows`, but provable: the host captures a durable
+    /// proof record under `__vos_proofrec/<tag>` in THIS agent's
+    /// keyspace on every drive pass (see
+    /// `lifecycle::invoke_hash_with_record`), keyed by the caller's
+    /// 32-byte business tag.
+    #[msg]
+    async fn run_provable_task(
+        &mut self,
+        code_hash: [u8; 32],
+        task_msg: Vec<u8>,
+        row_keys: Vec<u8>,
+        tag: [u8; 32],
+        ctx: &mut Context<Self>,
+    ) -> u64 {
+        let keys: Vec<Vec<u8>> =
+            vos::rkyv::from_bytes::<Vec<Vec<u8>>, vos::rkyv::rancor::Error>(&row_keys)
+                .unwrap_or_default();
+        let id = self.tasks.spawn_raw_provable_with_rows(
+            Child::Task(code_hash),
+            task_msg,
+            keys,
+            tag,
+        );
+        self.drive_round(ctx);
+        id
+    }
+
     /// Drive all configured peers with a dynamic `start` message.
     /// Actors without a `start` handler silently skip it.
     #[msg]
