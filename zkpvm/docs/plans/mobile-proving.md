@@ -319,27 +319,42 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
   2): it becomes the binding knob once 5.2 shrinks the per-page
   constant. Plumbing (`seg_steps`→budget in the pin ABI) is deferred
   until then.
-- **5.2 BLAKE2B_BOUNDARY per-page-cost diet — THE ≤3 GiB path (AIR
-  work).** Mechanism, confirmed in code: the boundary chip proves
-  the page-Merkle multiproof's compressions on a **96-row schedule
-  per compression** (12 rounds × 8 G-steps, `fill_schedule_
-  preprocessed`), and a touched page costs 32 blocks × 2 images
-  × 96 rows + path-node compressions **× per-consumption duplicates
-  (design §4 keeps them)** ≈ 10k rows on a 2502-column layout shared
-  with the core chip. Levers, cheapest first:
-  1. **Dedup consumptions** — hash each page image / node once
-     instead of per consumption; pure trace+AIR bookkeeping, no
-     format change. Sizing spike: count duplicate factor first.
-  2. **Smaller Merkle leaf unit** — 4 KB pages cost 64 compressions
-     even for a one-byte touch; 256B–512B sub-page leaves cut sparse
-     touches ~8–16×. Page-Merkle format bump + re-pin.
-  3. **Swap the page-Merkle hash to Poseidon2-M31** — blake2b costs
-     96 rows per 128 hashed bytes in-circuit; the M31-native
-     Poseidon2 (already in-tree: `poseidon2/`, settlement-verifier)
-     is the principled fix for hashing megabytes of page images
-     in-AIR. Format bump + catalog/manifest re-pin + verifier
-     alignment — the deep option.
+- **5.2 BLAKE2B_BOUNDARY per-page-cost diet (decomposition spike
+  DONE 2026-07-13).** Mechanism, confirmed in code: the boundary
+  chip proves the page-Merkle multiproof's compressions on a
+  **96-row schedule per compression** (12 rounds × 8 G-steps), one
+  row-block **per consumption, duplicates kept** (design §4: naive
+  dedup under-produces the lookup balance). Decomposition of real
+  uniform-100k windows:
 
-Exit: a measured duplicate-factor + per-lever sizing table; then
-boundary rows/page small enough that 5.1's page budget becomes the
-binding knob and windows land ≤3 GiB.
+  | window | pages (read-only) | compressions total→unique | dup | rows now→dedup |
+  |---|---|---|---|---|
+  | seg 0 | 33 (27) | 2248 → 262 | ×8.6 | 2^18 → 2^15 |
+  | mid | 4 (2) | 310 → 207 | ×1.5 | 2^15 → 2^15 |
+  | comb | 6 (4) | 456 → 283 | ×1.6 | 2^16 → 2^15 |
+  | tail | 16 (6) | 1134 → 687 | ×1.7 | 2^17 → 2^17 |
+
+  **Every compression is a leaf-image chain** (zero in-circuit node
+  hashes); duplicates come from read-only pages (exiting chain ==
+  entering chain) and identical-content pages (fresh zero pages).
+  1. **Dedup via a multiplicity column (THE next implementation).**
+     Produce each unique compression once with its consumption count
+     as logup multiplicity (the pattern RANGE_MULT_256 already uses)
+     — balance preserved, design §4's under-production objection
+     answered. Main-layout +1 column ⇒ commitment shift ⇒ routine
+     re-pin. Post-dedup, boundary rows are CONTENT-proportional
+     (unique page images per window) — which is exactly what the
+     5.1 page budget can cut: splitting the tail's 16-distinct-page
+     window lands every window ≤ ~2^15. Projected chain: boundary
+     term ~1.3 GiB, whole window ~2.5–3 GiB; Wave 4 then → ~1–1.5.
+  2. **Smaller Merkle leaf unit (reserve).** 256B sub-leaf counts
+     measured (seg0 421, mid 14, comb 23, tail 81): helps sparse
+     windows ~3–5×, does NOT help dense ones alone (seg0 would stay
+     ~2^18 without dedup) — only worth it after 1, if at all.
+  3. **Poseidon2-M31 page hash (deep reserve).** 96 rows per 128
+     hashed bytes is the constant both above levers dance around; an
+     M31-native page hash cuts it ~10×+ but needs a new chip +
+     format/verifier re-pin across the stack.
+
+Exit: lever 1 implemented (multiplicity dedup) + 5.1 budget plumbed
+⇒ every window ≤ ~2^15 boundary rows, windows ≤3 GiB on desktop.
