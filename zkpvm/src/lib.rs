@@ -527,10 +527,11 @@ pub use proof::{
 pub use prove::prove_with_boundary_override;
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, canonical_profile_for, canonical_profile_for_bounds, install_thread_pool,
-    natural_log_sizes_for, prepare_side_note_for_verification, production_pcs_config,
-    production_pcs_config_mobile, prove, prove_canonical, prove_mobile, prove_profiled,
-    prove_profiled_with_config, prove_with_config, prove_with_explicit_components,
+    ProveProfile, canonical_profile_for, canonical_profile_for_bounds,
+    canonical_profile_for_bounds_compact, install_thread_pool, natural_log_sizes_for,
+    prepare_side_note_for_verification, production_pcs_config, production_pcs_config_mobile,
+    prove, prove_canonical, prove_mobile, prove_profiled, prove_profiled_with_config,
+    prove_with_config, prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{
@@ -538,7 +539,7 @@ pub use prove::{
     debug_claimed_sums_streaming,
 };
 #[cfg(feature = "prover")]
-pub use side_note::SideNote;
+pub use side_note::{CompactTrace, SideNote};
 pub use stwo::core::fri::FriConfig;
 pub use stwo::core::pcs::PcsConfig;
 #[cfg(feature = "prover")]

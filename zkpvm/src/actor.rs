@@ -23,6 +23,7 @@ use javm::{
 
 use crate::SideNote;
 use crate::core::tracing::TracingPvm;
+use crate::side_note::CompactTrace;
 
 /// Build a fresh `Interpreter` from a parsed PVM blob's CODE + DATA
 /// capabilities. Returns `(interp, flat_mem)` — the second tuple
@@ -111,6 +112,17 @@ pub fn trace_blob(blob: &[u8], gas: u64) -> Option<SideNote> {
     trace_blob_with_patches(blob, gas, &[])
 }
 
+/// [`trace_blob`] in chain form: the same traced run held as a
+/// [`CompactTrace`] — steps without register snapshots — for the chain
+/// drivers that keep the whole multi-million-step trace resident across a
+/// segment loop and expand it window by window
+/// ([`crate::segment::CompactSegmentCursor`]). ~2.6× smaller residency
+/// than the full `SideNote`; the full snapshots are never materialized
+/// chain-wide.
+pub fn trace_blob_compact(blob: &[u8], gas: u64) -> Option<CompactTrace> {
+    trace_blob_compact_with_patches(blob, gas, &[])
+}
+
 /// Like [`trace_blob`], but writes each `(offset, bytes)` patch into the
 /// initial flat_mem (at `flat_mem[offset..offset + bytes.len()]`) before
 /// tracing — both the interpreter's execution image and the `SideNote`'s
@@ -127,6 +139,19 @@ pub fn trace_blob_with_patches(
     gas: u64,
     patches: &[(usize, &[u8])],
 ) -> Option<SideNote> {
+    // One assembly path: trace compactly, then expand — identical output
+    // to assembling from full-step recording, at a transient cost of the
+    // compact form alongside the expanded steps.
+    Some(trace_blob_compact_with_patches(blob, gas, patches)?.into_side_note())
+}
+
+/// [`trace_blob_compact`] with initial-image patches — the compact twin of
+/// [`trace_blob_with_patches`] (same patch semantics and `None` cases).
+pub fn trace_blob_compact_with_patches(
+    blob: &[u8],
+    gas: u64,
+    patches: &[(usize, &[u8])],
+) -> Option<CompactTrace> {
     let parsed = program::parse_blob(blob)?;
     let mut code_data = None;
     for entry in &parsed.caps {
@@ -156,42 +181,43 @@ pub fn trace_blob_with_patches(
     let mut tracing = TracingPvm::new(interp);
     let _ = tracing.run_with_vos_stubs();
 
-    let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
-    let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-    let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
-    let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
-    let ristretto_add_records = tracing.ristretto_add_records.clone();
-    let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
-    let scalar_reduce_records = tracing.scalar_reduce_wide_records.clone();
-    let scalar_reduce_mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
-    let scalar_binop_records = tracing.scalar_binop_records.clone();
-    let scalar_binop_mem_ops = tracing.scalar_binop_mem_ops.clone();
-    let steps = tracing.into_trace();
+    let blake2b_calls = tracing
+        .blake2b_calls()
+        .iter()
+        .map(|c| crate::chips::blake2b::Blake2bCall {
+            h: c.h,
+            m: c.m,
+            t: c.t,
+            f: c.f,
+        })
+        .collect();
+    let blake2b_mem_ops = std::mem::take(&mut tracing.blake2b_mem_ops);
+    let ristretto_calls = std::mem::take(&mut tracing.ristretto_records);
+    let ristretto_mem_ops = std::mem::take(&mut tracing.ristretto_mem_ops);
+    let ristretto_add_calls = std::mem::take(&mut tracing.ristretto_add_records);
+    let ristretto_add_mem_ops = std::mem::take(&mut tracing.ristretto_add_mem_ops);
+    let scalar_reduce_wide_calls = std::mem::take(&mut tracing.scalar_reduce_wide_records);
+    let scalar_reduce_wide_mem_ops = std::mem::take(&mut tracing.scalar_reduce_wide_mem_ops);
+    let scalar_binop_calls = std::mem::take(&mut tracing.scalar_binop_records);
+    let scalar_binop_mem_ops = std::mem::take(&mut tracing.scalar_binop_mem_ops);
+    let (steps, initial_regs) = tracing.into_compact();
 
-    let mut side_note = SideNote::new(steps, code_blob.code.to_vec(), code_blob.bitmask.to_vec())
-        .with_memory(flat_mem)
-        .with_jump_table(code_blob.jump_table.to_vec());
-
-    for c in &blake2b_calls {
-        side_note
-            .blake2b_calls
-            .push(crate::chips::blake2b::Blake2bCall {
-                h: c.h,
-                m: c.m,
-                t: c.t,
-                f: c.f,
-            });
-    }
-    side_note.blake2b_mem_ops = blake2b_mem_ops;
-    side_note.ristretto_calls = ristretto_calls;
-    side_note.ristretto_mem_ops = ristretto_mem_ops;
-    side_note.ristretto_add_calls = ristretto_add_records;
-    side_note.ristretto_add_mem_ops = ristretto_add_mem_ops;
-    side_note.scalar_reduce_wide_calls = scalar_reduce_records;
-    side_note.scalar_reduce_wide_mem_ops = scalar_reduce_mem_ops;
-    side_note.scalar_binop_calls = scalar_binop_records;
-    side_note.scalar_binop_mem_ops = scalar_binop_mem_ops;
-    side_note.ingest_ristretto_boundary();
-
-    Some(side_note)
+    Some(CompactTrace {
+        steps,
+        initial_regs,
+        code: code_blob.code.to_vec(),
+        bitmask: code_blob.bitmask.to_vec(),
+        initial_memory: flat_mem,
+        jump_table: code_blob.jump_table.to_vec(),
+        blake2b_calls,
+        blake2b_mem_ops,
+        ristretto_calls,
+        ristretto_mem_ops,
+        ristretto_add_calls,
+        ristretto_add_mem_ops,
+        scalar_reduce_wide_calls,
+        scalar_reduce_wide_mem_ops,
+        scalar_binop_calls,
+        scalar_binop_mem_ops,
+    })
 }

@@ -57,10 +57,11 @@ Two structural facts drive the seams below:
    ~76 queries and sits at the soundness margin.
 
 The chain driver adds two O(N) hazards of its own: the full-chain
-SideNote (2.6 GB, ~350 B/step of which ~208 B are redundant full
-register-file snapshots) is resident for the whole loop with an O(N²)
-memory-replay per segment slice, and `prove_chain`/the async job
-materialize **all** segment proofs in one buffer (~3 MiB each).
+trace resident for the whole loop (WAS 2.6 GB of `PvmStep`s with an
+O(N²) memory-replay per slice; the replay fell to Wave 2.1's cursor
+and the residency to Wave 2.2's compact holder — now ~1.0 GB), and
+`prove_chain`/the async job materialize **all** segment proofs in one
+buffer (~3 MiB each — Wave 2.3, still open).
 
 ## Levers, ranked
 
@@ -93,8 +94,11 @@ constants in `vos/tests/elf_integration.rs`, re-run the two
 (a) Stop holding the full-chain trace: drive segments with a forward
 tracer (or spill steps to disk and stream slices) — removes the 2.6 GB
 constant *and* the O(N²) replay; per-segment step storage is ~35 MB.
-(b) Shrink `PvmStep`: drop the two full register-file snapshots, keep
-the written register + value, reconstruct at trace-gen (~2–3× smaller).
+(The replay went to Wave 2.1's `SegmentCursor`; the residency largely
+went to (b) — the compact holder is ~1.0 GB, and full streaming-to-disk
+remains available if the last GB ever matters.)
+(b) Shrink `PvmStep` — DONE (Wave 2.2): the chain holds `CompactStep`s
+(no register snapshots; 360 → 136 B/step), windows expand locally.
 (c) CAS-publish each segment proof as produced instead of returning
 `Vec<Vec<u8>>` (at 600 segments the current return is ~1.8 GB). Without
 this item, small segments alone still carry a ~2.6 GB floor that blows
@@ -279,12 +283,35 @@ segmentation of any kind.
   minutes-long floors derivation (Wave-1.3 finding 5) collapses with
   it, and the per-pass replay cost no longer grows with window count
   (the 8k sweep's 968 s derive was the O(N²) at 965 windows).
-  Remaining for 2.1: the full-chain SideNote is still resident during
-  the loop — removing the ~2.6 GB floor needs the tracer itself to
-  stream (pair with 2.2's `PvmStep` shrink).
-- **2.2 `PvmStep` shrink.** Drop the two full register-file snapshots
-  (~208 of ~350 B/step); keep the written register + value,
-  reconstruct at trace-gen.
+  The 2.1 leftover — the full-chain SideNote resident during the
+  loop — is closed by 2.2's compact chain holder.
+- **2.2 `PvmStep` shrink — LANDED + MEASURED (2026-07-13).** The
+  tracer records `CompactStep`s: everything `PvmStep` carries except
+  the two register-file snapshots, whose whole delta is
+  `reg_write: (index, value)`. That sufficiency is VERIFIED, not
+  assumed — every javm interpreter opcode arm writes at most one
+  register (Sbrk panics; audited at rev 6db1168) and the tracer
+  panics on a second changed index; nothing mutates the file between
+  steps (precompile handlers touch memory only) and the tracer
+  asserts inter-step continuity too. Chain paths hold a
+  `CompactTrace` (`trace_blob_compact{,_with_patches}`);
+  `CompactSegmentCursor` threads the memory image AND the register
+  file forward and expands each window's full `PvmStep`s
+  window-locally (~32k × 360 B ≈ 11 MiB, dropped with the window), so
+  the CHIPS ARE UNTOUCHED. Window `SideNote`s are field-identical to
+  the full-trace slice (unit-pinned incl. every `PvmStep` field) and
+  the budgeted cut is bit-identical
+  (`segment_bounds_budgeted_compact` shares the walker via a step
+  view). Rewired: `prove_chain_segments`, `measure_commitments`,
+  `measure_floors` → `canonical_profile_for_bounds_compact`,
+  `chain_bounds`; single-proof paths keep the full `SideNote` (now
+  assembled by expanding the compact record — one assembly path, so
+  the forms cannot drift). Measured (7.84M-step transition, (32k, 8)
+  cut, first 10 windows): **360 → 136 B/step (2.65×)**, chain holder
+  **2.63 → 0.99 GiB**, probe-pass peak RSS **11.15 → 9.61 GiB**
+  (−1.5 GiB), per-window prove 6.11–6.86 s → 5.73–7.06 s (mean
+  6.46 → 6.19 s — unchanged within noise). Commitments do NOT move
+  (drift guard green): prover-side representation only.
 - **2.3 Producer-side proof streaming.** `prove_chain`/the async job
   materialize `bincode(Vec<Vec<u8>>)` — ~1.8 GB at 600 segments.
   Spill per-segment proofs (host CAS or extension-local disk) and

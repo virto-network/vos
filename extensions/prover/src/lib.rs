@@ -584,8 +584,9 @@ fn measure_catalog_inner(
     // trace with no patches and page-Merkle its initial memory. DIAGNOSTIC —
     // NOT the verifier's entering-image pin (a witness-injecting program's live
     // segment-0 root is the PATCHED root); see `ChainManifest::initial_root`.
-    let unpatched = zkpvm::actor::trace_blob(pvm_blob, gas)?;
+    let unpatched = zkpvm::actor::trace_blob_compact(pvm_blob, gas)?;
     let image_root = zkpvm::page_merkle::image_root(&unpatched.initial_memory);
+    drop(unpatched);
     // Measure the commitment allowlist only when a representative witness is
     // supplied; the `--allowlist` re-pin path passes an empty witness and
     // records its own already-trusted allowlist. An empty profile means
@@ -594,11 +595,10 @@ fn measure_catalog_inner(
     let mut floors = profile.to_vec();
     let mut commitments = Vec::new();
     if !witness.is_empty() {
-        let full =
-            zkpvm::actor::trace_blob_with_patches(pvm_blob, gas, &[(witness_addr, witness)])?;
+        let full = trace_blob_compact(pvm_blob, witness, witness_addr, gas)?;
         let bounds = chain_bounds(&full, seg_steps, page_budget);
         if floors.is_empty() {
-            floors = zkpvm::canonical_profile_for_bounds(&full, &bounds)?;
+            floors = zkpvm::canonical_profile_for_bounds_compact(&full, &bounds)?;
         }
         commitments = measure_commitments(&full, &bounds, &floors)?;
     }
@@ -622,7 +622,7 @@ fn measure_catalog_inner(
 /// allowlist is complete without proving all ~N segments. MUST run on a large
 /// stack — reached via [`measure_catalog`]. `None` on any failure.
 fn measure_commitments(
-    full: &zkpvm::SideNote,
+    full: &zkpvm::CompactTrace,
     bounds: &[(usize, usize)],
     profile: &[u32],
 ) -> Option<Vec<[u8; 32]>> {
@@ -630,11 +630,12 @@ fn measure_commitments(
     if n == 0 {
         return None;
     }
-    // Both passes ride a forward SegmentCursor — O(N) total slicing instead
-    // of the per-window prefix replay's O(N²): the comb scan walks every
-    // window in order; the probe pass (a fresh cursor — the image can't
-    // rewind) skips straight between the sparse probe windows.
-    let mut scan = zkpvm::segment::SegmentCursor::new(full);
+    // Both passes ride a forward cursor over the compact holder — O(N)
+    // total slicing instead of the per-window prefix replay's O(N²): the
+    // comb scan walks every window in order; the probe pass (a fresh
+    // cursor — the image can't rewind) skips straight between the sparse
+    // probe windows.
+    let mut scan = zkpvm::segment::CompactSegmentCursor::new(full);
     let comb_counts: Vec<usize> = bounds
         .iter()
         .map(|&(a, b)| scan.side_note(a, b).ristretto_comb_calls.len())
@@ -653,7 +654,7 @@ fn measure_commitments(
 
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    let mut cursor = zkpvm::segment::SegmentCursor::new(full);
+    let mut cursor = zkpvm::segment::CompactSegmentCursor::new(full);
     for i in probe {
         let (a, b) = bounds[i];
         let mut sn = cursor.side_note(a, b);
@@ -687,17 +688,9 @@ pub fn measure_floors(
     let pvm_blob = pvm_blob.to_vec();
     let witness = witness.to_vec();
     run_on_large_stack(move || {
-        let full = if witness.is_empty() {
-            zkpvm::actor::trace_blob(&pvm_blob, gas)?
-        } else {
-            zkpvm::actor::trace_blob_with_patches(
-                &pvm_blob,
-                gas,
-                &[(witness_addr, witness.as_slice())],
-            )?
-        };
+        let full = trace_blob_compact(&pvm_blob, &witness, witness_addr, gas)?;
         let bounds = chain_bounds(&full, seg_steps, page_budget);
-        zkpvm::canonical_profile_for_bounds(&full, &bounds)
+        zkpvm::canonical_profile_for_bounds_compact(&full, &bounds)
     })
 }
 
@@ -825,6 +818,28 @@ fn trace_blob(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -> Opt
     }
 }
 
+/// [`trace_blob`] in chain form: the traced run as a [`zkpvm::CompactTrace`]
+/// (steps without register snapshots, ~2.6× smaller resident) — what every
+/// CHAIN path here holds across its segment loop, expanding one window at a
+/// time via [`zkpvm::segment::CompactSegmentCursor`]. Single-proof paths
+/// keep the full `SideNote`.
+fn trace_blob_compact(
+    pvm_blob: &[u8],
+    witness_bytes: &[u8],
+    witness_addr: usize,
+    gas: u64,
+) -> Option<zkpvm::CompactTrace> {
+    if witness_bytes.is_empty() {
+        zkpvm::actor::trace_blob_compact(pvm_blob, gas)
+    } else {
+        zkpvm::actor::trace_blob_compact_with_patches(
+            pvm_blob,
+            gas,
+            &[(witness_addr, witness_bytes)],
+        )
+    }
+}
+
 fn prove_to_proof(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -> Option<Proof> {
     let mut side_note = trace_blob(pvm_blob, witness_bytes, witness_addr)?;
     prove_mobile(&mut side_note).ok()
@@ -896,13 +911,17 @@ pub fn prove_chain_segments(
     if seg_steps == 0 {
         return None;
     }
-    let full = trace_blob(pvm_blob, witness_bytes, witness_addr)?;
+    // The chain holder is the COMPACT trace — full register snapshots are
+    // materialized only window-locally by the cursor, so the resident
+    // floor under every segment prove is ~2.6× smaller than a full
+    // `SideNote`'s.
+    let full = trace_blob_compact(pvm_blob, witness_bytes, witness_addr, TRACE_GAS)?;
     let bounds = chain_bounds(&full, seg_steps, page_budget);
     let mut segments: Vec<Vec<u8>> = Vec::with_capacity(bounds.len());
-    // One forward cursor pass threads the entering memory image across the
-    // windows — O(N) total slicing instead of the per-window prefix
-    // replay's O(N²) (see zkpvm::segment::SegmentCursor).
-    let mut cursor = zkpvm::segment::SegmentCursor::new(&full);
+    // One forward cursor pass threads the entering memory image + register
+    // file across the windows — O(N) total slicing instead of the
+    // per-window prefix replay's O(N²).
+    let mut cursor = zkpvm::segment::CompactSegmentCursor::new(&full);
     for (a, b) in bounds {
         let mut sn = cursor.side_note(a, b);
         let proof = prove_canonical(&mut sn, profile).ok()?;
@@ -912,19 +931,21 @@ pub fn prove_chain_segments(
 }
 
 /// The chain's window cut: uniform `seg_steps` windows, or the content-budgeted
-/// cut ([`zkpvm::segment::segment_bounds_budgeted`]) when `page_budget > 0`.
-/// Deterministic in `(trace, seg_steps, page_budget)` — producer, catalog
-/// measurement, and re-measurement must all cut identically, which is why the
-/// budget is pinned in the catalog beside `seg_steps` and the profile.
+/// cut ([`zkpvm::segment::segment_bounds_budgeted_compact`]) when
+/// `page_budget > 0`. Deterministic in `(trace, seg_steps, page_budget)` —
+/// producer, catalog measurement, and re-measurement must all cut identically,
+/// which is why the budget is pinned in the catalog beside `seg_steps` and the
+/// profile (and why the budgeted walk is one code path across the full and
+/// compact holders).
 fn chain_bounds(
-    full: &zkpvm::SideNote,
+    full: &zkpvm::CompactTrace,
     seg_steps: usize,
     page_budget: usize,
 ) -> Vec<(usize, usize)> {
     if page_budget > 0 {
-        zkpvm::segment::segment_bounds_budgeted(full, seg_steps, page_budget)
+        zkpvm::segment::segment_bounds_budgeted_compact(full, seg_steps, page_budget)
     } else {
-        zkpvm::segment::segment_bounds(full.steps.len(), seg_steps)
+        zkpvm::segment::segment_bounds(full.num_steps(), seg_steps)
     }
 }
 

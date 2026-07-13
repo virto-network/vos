@@ -54,10 +54,106 @@ pub fn segment_bounds(total: usize, max_steps: usize) -> alloc::vec::Vec<(usize,
 
 #[cfg(feature = "prover")]
 mod prover {
-    use crate::core::step::PvmStep;
-    use crate::side_note::SideNote;
+    use crate::core::step::{CompactStep, MemAccess, NUM_REGS, PvmStep, expand_steps};
+    use crate::side_note::{CompactTrace, SideNote};
     use alloc::collections::BTreeSet;
     use alloc::vec::Vec;
+
+    /// The per-step fields the chain-side walkers read — timestamp plus
+    /// the two optional memory accesses — implemented by both step forms,
+    /// so the budgeted cutter and the write replay are ONE code path each
+    /// and the full and compact chain representations cut and thread
+    /// identically by construction.
+    trait StepView {
+        fn ts(&self) -> u64;
+        fn read_access(&self) -> Option<&MemAccess>;
+        fn write_access(&self) -> Option<&MemAccess>;
+    }
+
+    impl StepView for PvmStep {
+        fn ts(&self) -> u64 {
+            self.timestamp
+        }
+        fn read_access(&self) -> Option<&MemAccess> {
+            self.mem_read.as_ref()
+        }
+        fn write_access(&self) -> Option<&MemAccess> {
+            self.mem_write.as_ref()
+        }
+    }
+
+    impl StepView for CompactStep {
+        fn ts(&self) -> u64 {
+            self.timestamp
+        }
+        fn read_access(&self) -> Option<&MemAccess> {
+            self.mem_read.as_ref()
+        }
+        fn write_access(&self) -> Option<&MemAccess> {
+            self.mem_write.as_ref()
+        }
+    }
+
+    /// Borrowed chain-wide fields common to the two chain holders
+    /// ([`SideNote`] and [`CompactTrace`]): the program-static parts and
+    /// the five precompile call/mem-op stream pairs. Both cursors, both
+    /// budgeted cutters, and the segment assembly take this view, so a
+    /// window built from either holder flows through identical code.
+    struct ChainParts<'a> {
+        code: &'a [u8],
+        bitmask: &'a [u8],
+        jump_table: &'a [u32],
+        blake2b_calls: &'a [crate::chips::blake2b::Blake2bCall],
+        blake2b_mem_ops: &'a [crate::core::tracing::Blake2bMemOp],
+        ristretto_calls: &'a [crate::core::tracing::RistrettoRecord],
+        ristretto_mem_ops: &'a [crate::core::tracing::RistrettoMemOp],
+        ristretto_add_calls: &'a [crate::core::tracing::RistrettoPointAddRecord],
+        ristretto_add_mem_ops: &'a [crate::core::tracing::RistrettoPointAddMemOp],
+        scalar_reduce_wide_calls: &'a [crate::core::tracing::ScalarReduceWideRecord],
+        scalar_reduce_wide_mem_ops: &'a [crate::core::tracing::ScalarReduceWideMemOp],
+        scalar_binop_calls: &'a [crate::core::tracing::ScalarBinopRecord],
+        scalar_binop_mem_ops: &'a [crate::core::tracing::ScalarBinopMemOp],
+    }
+
+    impl<'a> From<&'a SideNote> for ChainParts<'a> {
+        fn from(full: &'a SideNote) -> Self {
+            Self {
+                code: &full.code,
+                bitmask: &full.bitmask,
+                jump_table: &full.jump_table,
+                blake2b_calls: &full.blake2b_calls,
+                blake2b_mem_ops: &full.blake2b_mem_ops,
+                ristretto_calls: &full.ristretto_calls,
+                ristretto_mem_ops: &full.ristretto_mem_ops,
+                ristretto_add_calls: &full.ristretto_add_calls,
+                ristretto_add_mem_ops: &full.ristretto_add_mem_ops,
+                scalar_reduce_wide_calls: &full.scalar_reduce_wide_calls,
+                scalar_reduce_wide_mem_ops: &full.scalar_reduce_wide_mem_ops,
+                scalar_binop_calls: &full.scalar_binop_calls,
+                scalar_binop_mem_ops: &full.scalar_binop_mem_ops,
+            }
+        }
+    }
+
+    impl<'a> From<&'a CompactTrace> for ChainParts<'a> {
+        fn from(full: &'a CompactTrace) -> Self {
+            Self {
+                code: &full.code,
+                bitmask: &full.bitmask,
+                jump_table: &full.jump_table,
+                blake2b_calls: &full.blake2b_calls,
+                blake2b_mem_ops: &full.blake2b_mem_ops,
+                ristretto_calls: &full.ristretto_calls,
+                ristretto_mem_ops: &full.ristretto_mem_ops,
+                ristretto_add_calls: &full.ristretto_add_calls,
+                ristretto_add_mem_ops: &full.ristretto_add_mem_ops,
+                scalar_reduce_wide_calls: &full.scalar_reduce_wide_calls,
+                scalar_reduce_wide_mem_ops: &full.scalar_reduce_wide_mem_ops,
+                scalar_binop_calls: &full.scalar_binop_calls,
+                scalar_binop_mem_ops: &full.scalar_binop_mem_ops,
+            }
+        }
+    }
 
     /// Content-budgeted segmentation: split the trace into maximal windows
     /// holding BOTH budgets — at most `max_steps` steps AND at most
@@ -86,9 +182,30 @@ mod prover {
         max_steps: usize,
         max_pages: usize,
     ) -> Vec<(usize, usize)> {
+        segment_bounds_budgeted_impl(&full.steps, &ChainParts::from(full), max_steps, max_pages)
+    }
+
+    /// [`segment_bounds_budgeted`] over a [`CompactTrace`] — the same walk
+    /// over the same fields (a compact step carries the identical
+    /// timestamp + memory accesses), so the cut is bit-identical to the
+    /// full holder's for the same traced run.
+    pub fn segment_bounds_budgeted_compact(
+        full: &CompactTrace,
+        max_steps: usize,
+        max_pages: usize,
+    ) -> Vec<(usize, usize)> {
+        segment_bounds_budgeted_impl(&full.steps, &ChainParts::from(full), max_steps, max_pages)
+    }
+
+    fn segment_bounds_budgeted_impl<S: StepView>(
+        steps: &[S],
+        parts: &ChainParts<'_>,
+        max_steps: usize,
+        max_pages: usize,
+    ) -> Vec<(usize, usize)> {
         assert!(max_steps > 0, "max_steps must be non-zero");
         assert!(max_pages > 0, "max_pages must be non-zero");
-        let total = full.steps.len();
+        let total = steps.len();
         let mut bounds = Vec::new();
         if total == 0 {
             return bounds;
@@ -117,35 +234,34 @@ mod prover {
         let mut pages: BTreeSet<u32> = BTreeSet::new();
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         let mut a = 0;
-        for i in 0..total {
-            let step = &full.steps[i];
-            let ts = step.timestamp;
+        for (i, step) in steps.iter().enumerate() {
+            let ts = step.ts();
             ranges.clear();
-            if let Some(r) = &step.mem_read {
+            if let Some(r) = step.read_access() {
                 ranges.push((r.address, r.size as u32));
             }
-            if let Some(w) = &step.mem_write {
+            if let Some(w) = step.write_access() {
                 ranges.push((w.address, w.size as u32));
             }
-            take_at(&full.blake2b_mem_ops, &mut cb, ts, |o| o.ts, |o| {
+            take_at(parts.blake2b_mem_ops, &mut cb, ts, |o| o.ts, |o| {
                 ranges.push((o.h_ptr, o.h_bytes.len() as u32));
                 ranges.push((o.m_ptr, o.m_bytes.len() as u32));
             });
-            take_at(&full.ristretto_mem_ops, &mut cr, ts, |o| o.ts, |o| {
+            take_at(parts.ristretto_mem_ops, &mut cr, ts, |o| o.ts, |o| {
                 ranges.push((o.scalar_ptr, o.scalar_bytes.len() as u32));
                 ranges.push((o.point_ptr, o.point_bytes.len() as u32));
                 ranges.push((o.output_ptr, o.out_bytes.len() as u32));
             });
-            take_at(&full.ristretto_add_mem_ops, &mut ca, ts, |o| o.ts, |o| {
+            take_at(parts.ristretto_add_mem_ops, &mut ca, ts, |o| o.ts, |o| {
                 ranges.push((o.p_ptr, o.p_bytes.len() as u32));
                 ranges.push((o.q_ptr, o.q_bytes.len() as u32));
                 ranges.push((o.output_ptr, o.out_bytes.len() as u32));
             });
-            take_at(&full.scalar_reduce_wide_mem_ops, &mut cw, ts, |o| o.ts, |o| {
+            take_at(parts.scalar_reduce_wide_mem_ops, &mut cw, ts, |o| o.ts, |o| {
                 ranges.push((o.wide_ptr, o.wide_bytes.len() as u32));
                 ranges.push((o.output_ptr, o.out_bytes.len() as u32));
             });
-            take_at(&full.scalar_binop_mem_ops, &mut cs, ts, |o| o.ts, |o| {
+            take_at(parts.scalar_binop_mem_ops, &mut cs, ts, |o| o.ts, |o| {
                 ranges.push((o.a_ptr, o.a_bytes.len() as u32));
                 ranges.push((o.b_ptr, o.b_bytes.len() as u32));
                 ranges.push((o.output_ptr, o.out_bytes.len() as u32));
@@ -230,48 +346,68 @@ mod prover {
     /// (threaded image), so the two produce identical segments by
     /// construction — only the provenance of `mem` differs.
     fn build_segment(full: &SideNote, a: usize, b: usize, mem: Vec<u8>) -> SideNote {
-        let ts_lo = full.steps[a].timestamp;
         let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
+        assemble_segment(
+            &ChainParts::from(full),
+            full.steps[a..b].to_vec(),
+            full.steps[a].regs_before,
+            mem,
+            ts_hi,
+        )
+    }
+
+    /// Assemble a window's `SideNote` from its already-materialized full
+    /// steps, its entering register file, its entering memory image, and
+    /// the exclusive timestamp bound of the next window. The single
+    /// assembly path behind [`build_segment`] (full holder) and
+    /// [`CompactSegmentCursor::side_note`] (compact holder): whatever
+    /// produced the inputs, the window flows through identical filtering
+    /// and ingestion, so the two chain representations yield equal
+    /// segments by construction.
+    fn assemble_segment(
+        parts: &ChainParts<'_>,
+        steps: Vec<PvmStep>,
+        initial_regs: [u64; NUM_REGS],
+        mem: Vec<u8>,
+        ts_hi: u64,
+    ) -> SideNote {
+        let ts_lo = steps[0].timestamp;
         let in_window = move |ts: u64| ts >= ts_lo && ts < ts_hi;
 
-        let mut sn = SideNote::new(
-            full.steps[a..b].to_vec(),
-            full.code.clone(),
-            full.bitmask.clone(),
-        )
-        .with_memory(mem)
-        .with_jump_table(full.jump_table.clone())
-        .with_initial_regs(full.steps[a].regs_before);
+        let mut sn = SideNote::new(steps, parts.code.to_vec(), parts.bitmask.to_vec())
+            .with_memory(mem)
+            .with_jump_table(parts.jump_table.to_vec())
+            .with_initial_regs(initial_regs);
 
-        let (bc, bm) = filter_pair(&full.blake2b_calls, &full.blake2b_mem_ops, |m| {
+        let (bc, bm) = filter_pair(parts.blake2b_calls, parts.blake2b_mem_ops, |m| {
             in_window(m.ts)
         });
         sn.blake2b_calls = bc;
         sn.blake2b_mem_ops = bm;
 
-        let (rc, rm) = filter_pair(&full.ristretto_calls, &full.ristretto_mem_ops, |m| {
+        let (rc, rm) = filter_pair(parts.ristretto_calls, parts.ristretto_mem_ops, |m| {
             in_window(m.ts)
         });
         sn.ristretto_calls = rc;
         sn.ristretto_mem_ops = rm;
 
         let (ac, am) = filter_pair(
-            &full.ristretto_add_calls,
-            &full.ristretto_add_mem_ops,
+            parts.ristretto_add_calls,
+            parts.ristretto_add_mem_ops,
             |m| in_window(m.ts),
         );
         sn.ristretto_add_calls = ac;
         sn.ristretto_add_mem_ops = am;
 
         let (sc, sm) = filter_pair(
-            &full.scalar_reduce_wide_calls,
-            &full.scalar_reduce_wide_mem_ops,
+            parts.scalar_reduce_wide_calls,
+            parts.scalar_reduce_wide_mem_ops,
             |m| in_window(m.ts),
         );
         sn.scalar_reduce_wide_calls = sc;
         sn.scalar_reduce_wide_mem_ops = sm;
 
-        let (bc2, bm2) = filter_pair(&full.scalar_binop_calls, &full.scalar_binop_mem_ops, |m| {
+        let (bc2, bm2) = filter_pair(parts.scalar_binop_calls, parts.scalar_binop_mem_ops, |m| {
             in_window(m.ts)
         });
         sn.scalar_binop_calls = bc2;
@@ -343,12 +479,14 @@ mod prover {
     type PendingWrite = (u64, u32, [u8; 64], u8);
 
     /// The step's regular store as a pending write, if it made one.
-    fn write_of_step(s: &PvmStep) -> Option<PendingWrite> {
-        s.mem_write.as_ref().map(|w| {
+    /// Generic over the step form ([`StepView`]) so the full and compact
+    /// replay paths enumerate identical writes.
+    fn write_of_step<S: StepView>(s: &S) -> Option<PendingWrite> {
+        s.write_access().map(|w| {
             let sz = w.size as usize;
             let mut buf = [0u8; 64];
             buf[..sz].copy_from_slice(&w.value.to_le_bytes()[..sz]);
-            (s.timestamp, w.address, buf, sz as u8)
+            (s.ts(), w.address, buf, sz as u8)
         })
     }
 
@@ -411,13 +549,11 @@ mod prover {
         mem: Vec<u8>,
         /// Exclusive timestamp bound of the writes already applied.
         applied_upto: u64,
-        /// Per-stream index of the first entry not yet applied to `mem`.
+        /// Index of the first step not yet applied to `mem`.
         steps_at: usize,
-        blake2b_at: usize,
-        ristretto_at: usize,
-        ristretto_add_at: usize,
-        scalar_reduce_wide_at: usize,
-        scalar_binop_at: usize,
+        /// Per-stream indices of the first precompile output write not yet
+        /// applied to `mem`.
+        streams: StreamCursors,
     }
 
     impl<'a> SegmentCursor<'a> {
@@ -428,11 +564,7 @@ mod prover {
                 mem: full.initial_memory.clone(),
                 applied_upto: 0,
                 steps_at: 0,
-                blake2b_at: 0,
-                ristretto_at: 0,
-                ristretto_add_at: 0,
-                scalar_reduce_wide_at: 0,
-                scalar_binop_at: 0,
+                streams: StreamCursors::default(),
             }
         }
 
@@ -472,46 +604,188 @@ mod prover {
                 }
                 self.steps_at += 1;
             }
+            self.streams
+                .drain_below(&ChainParts::from(full), ts_lo, &mut writes);
+            apply_writes(&mut self.mem, writes);
+            self.applied_upto = ts_lo;
+        }
+    }
+
+    /// Per-stream indices of the first precompile output write not yet
+    /// applied to a cursor's carried image, with the drain that advances
+    /// them. Shared by [`SegmentCursor`] and [`CompactSegmentCursor`], so
+    /// the two thread identical precompile writes.
+    #[derive(Default)]
+    struct StreamCursors {
+        blake2b: usize,
+        ristretto: usize,
+        ristretto_add: usize,
+        scalar_reduce_wide: usize,
+        scalar_binop: usize,
+    }
+
+    impl StreamCursors {
+        /// Push every not-yet-applied precompile output write with
+        /// `ts < ts_lo`. Enumeration order mirrors [`replay_writes`]'s
+        /// stream order (blake2b, ristretto, point-add, wide-reduce,
+        /// scalar-binop); [`apply_writes`] sorts the batch by ts anyway.
+        fn drain_below(
+            &mut self,
+            parts: &ChainParts<'_>,
+            ts_lo: u64,
+            out: &mut Vec<PendingWrite>,
+        ) {
             drain_stream(
-                &full.blake2b_mem_ops,
-                &mut self.blake2b_at,
+                parts.blake2b_mem_ops,
+                &mut self.blake2b,
                 ts_lo,
                 |m| write_of_bytes(m.ts, m.h_ptr, &m.out_bytes),
                 |m| m.ts,
-                &mut writes,
+                out,
             );
             drain_stream(
-                &full.ristretto_mem_ops,
-                &mut self.ristretto_at,
+                parts.ristretto_mem_ops,
+                &mut self.ristretto,
                 ts_lo,
                 |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
                 |m| m.ts,
-                &mut writes,
+                out,
             );
             drain_stream(
-                &full.ristretto_add_mem_ops,
-                &mut self.ristretto_add_at,
+                parts.ristretto_add_mem_ops,
+                &mut self.ristretto_add,
                 ts_lo,
                 |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
                 |m| m.ts,
-                &mut writes,
+                out,
             );
             drain_stream(
-                &full.scalar_reduce_wide_mem_ops,
-                &mut self.scalar_reduce_wide_at,
+                parts.scalar_reduce_wide_mem_ops,
+                &mut self.scalar_reduce_wide,
                 ts_lo,
                 |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
                 |m| m.ts,
-                &mut writes,
+                out,
             );
             drain_stream(
-                &full.scalar_binop_mem_ops,
-                &mut self.scalar_binop_at,
+                parts.scalar_binop_mem_ops,
+                &mut self.scalar_binop,
                 ts_lo,
                 |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
                 |m| m.ts,
-                &mut writes,
+                out,
             );
+        }
+    }
+
+    /// [`SegmentCursor`] over a [`CompactTrace`]: threads BOTH the memory
+    /// image and the REGISTER FILE forward across a chain's windows, and
+    /// materializes each requested window's full steps
+    /// ([`expand_steps`] — window-local, dropped with the window's
+    /// `SideNote`), so the chips consume ordinary [`PvmStep`]s while the
+    /// chain-wide holder stays compact.
+    ///
+    /// Equivalence: the yielded `SideNote` equals
+    /// `segment_side_note(&full_side_note, a, b)` field for field (unit-
+    /// pinned by `compact_cursor_matches_segment_side_note`) — the memory
+    /// threading is [`StreamCursors`] + the same step-write enumeration
+    /// (both step forms carry identical `mem_write`s), the register file
+    /// is exact because a step's whole register delta is its
+    /// [`crate::core::step::RegWrite`] (tracer-verified), and the assembly
+    /// is [`assemble_segment`], the same path the full holder runs.
+    ///
+    /// Same visiting contract as [`SegmentCursor`]: ascending window
+    /// starts, skipped windows advance the state without building them.
+    pub struct CompactSegmentCursor<'a> {
+        full: &'a CompactTrace,
+        /// The carried image: `full.initial_memory` with every write at
+        /// `ts < applied_upto` applied.
+        mem: Vec<u8>,
+        /// The carried register file: `full.initial_regs` with every step
+        /// reg-write at `ts < applied_upto` applied — the file ENTERING
+        /// the first unapplied step.
+        regs: [u64; NUM_REGS],
+        /// Exclusive timestamp bound of the writes already applied.
+        applied_upto: u64,
+        /// Index of the first step not yet applied to `mem`/`regs`.
+        steps_at: usize,
+        /// Per-stream indices of the first precompile output write not yet
+        /// applied to `mem`.
+        streams: StreamCursors,
+    }
+
+    impl<'a> CompactSegmentCursor<'a> {
+        /// Start a pass over `full`'s windows from its initial memory and
+        /// initial register file.
+        pub fn new(full: &'a CompactTrace) -> Self {
+            Self {
+                full,
+                mem: full.initial_memory.clone(),
+                regs: full.initial_regs,
+                applied_upto: 0,
+                steps_at: 0,
+                streams: StreamCursors::default(),
+            }
+        }
+
+        /// The segment `SideNote` for `[a, b)` — field-identical to
+        /// slicing the expanded full trace. Panics on an invalid range or
+        /// a window starting before one already yielded.
+        pub fn side_note(&mut self, a: usize, b: usize) -> SideNote {
+            assert!(
+                a < b && b <= self.full.steps.len(),
+                "invalid segment range [{a}, {b}) over {} steps",
+                self.full.steps.len()
+            );
+            let ts_lo = self.full.steps[a].timestamp;
+            assert!(
+                ts_lo >= self.applied_upto,
+                "windows must be visited in ascending order: window start ts {ts_lo} \
+                 precedes the image already advanced to ts {}",
+                self.applied_upto
+            );
+            self.advance_to(ts_lo);
+            let ts_hi = self
+                .full
+                .steps
+                .get(b)
+                .map(|s| s.timestamp)
+                .unwrap_or(u64::MAX);
+            // The carried file IS the file entering step `a`: timestamps
+            // are strictly increasing, so exactly the steps before `a`
+            // have ts < ts_lo and their reg writes are already applied.
+            let steps = expand_steps(&self.full.steps[a..b], self.regs);
+            assemble_segment(
+                &ChainParts::from(self.full),
+                steps,
+                self.regs,
+                self.mem.clone(),
+                ts_hi,
+            )
+        }
+
+        /// Apply every not-yet-applied write with `ts < ts_lo`: step
+        /// memory writes + register writes in one walk (each step applied
+        /// exactly once), then the precompile output streams — the same
+        /// enumeration [`SegmentCursor::advance_to`] performs, plus the
+        /// register threading the compact form requires.
+        fn advance_to(&mut self, ts_lo: u64) {
+            let full = self.full;
+            let mut writes: Vec<PendingWrite> = Vec::new();
+            while let Some(s) = full.steps.get(self.steps_at) {
+                if s.timestamp >= ts_lo {
+                    break;
+                }
+                if let Some(w) = write_of_step(s) {
+                    writes.push(w);
+                }
+                if let Some(rw) = s.reg_write {
+                    self.regs[rw.index as usize] = rw.value;
+                }
+                self.steps_at += 1;
+            }
+            self.streams
+                .drain_below(&ChainParts::from(full), ts_lo, &mut writes);
             apply_writes(&mut self.mem, writes);
             self.applied_upto = ts_lo;
         }
@@ -561,7 +835,10 @@ mod prover {
 #[cfg(feature = "prover")]
 pub(crate) use prover::replay_writes;
 #[cfg(feature = "prover")]
-pub use prover::{SegmentCursor, segment_bounds_budgeted, segment_side_note};
+pub use prover::{
+    CompactSegmentCursor, SegmentCursor, segment_bounds_budgeted,
+    segment_bounds_budgeted_compact, segment_side_note,
+};
 
 #[cfg(all(test, feature = "prover"))]
 mod tests {
@@ -660,9 +937,13 @@ mod tests {
     ///     comb routing), a point-add at ts 6, a wide reduce at ts 7;
     ///   - window 2: a scalar binop at ts 9 (slice-only — no later window
     ///     observes its write).
-    /// Regular stores carry distinct non-zero values and each step a
-    /// distinct register file, so a missed or misplaced write/slice can't
-    /// vanish into an all-zero image.
+    /// Regular stores carry distinct non-zero values, so a missed or
+    /// misplaced write/slice can't vanish into an all-zero image. The
+    /// register history is CONSISTENT (a non-zero seeded file threaded
+    /// through per-step `reg_write`s that rotate across indices, with one
+    /// no-write step and one taken branch), so every step has a distinct
+    /// file AND the trace converts to compact form — the compact-cursor
+    /// equivalence tests reuse this fixture.
     fn threaded_trace() -> SideNote {
         use crate::chips::blake2b::Blake2bCall;
         use crate::core::tracing::{
@@ -672,6 +953,8 @@ mod tests {
         };
 
         let mut steps = Vec::new();
+        let mut regs = [0u64; NUM_REGS];
+        regs[1] = 100; // seeded stack pointer — non-zero entering file
         for i in 0..12u64 {
             let ts = i + 1;
             let write = match ts {
@@ -687,7 +970,20 @@ mod tests {
             if let Some(w) = s.mem_write.as_mut() {
                 w.value = 0xB000 + ts;
             }
-            s.regs_before[1] = 100 + ts;
+            s.regs_before = regs;
+            // ts 6 leaves the file unchanged; every other step writes one
+            // register, the index rotating so window boundaries land
+            // between writes to different indices.
+            if ts != 6 {
+                let idx = (ts as usize) % NUM_REGS;
+                regs[idx] = 0xC00 + ts;
+                s.reg_write = Some(idx);
+            }
+            s.regs_after = regs;
+            if ts == 4 {
+                s.branch_taken = true;
+                s.branch_target = 0x30;
+            }
             steps.push(s);
         }
         let mut sn = SideNote::new(steps, vec![Opcode::Trap as u8], vec![1])
@@ -867,5 +1163,104 @@ mod tests {
         let mut cursor = crate::segment::SegmentCursor::new(&full);
         cursor.side_note(4, 8);
         cursor.side_note(0, 4);
+    }
+
+    /// The compact holder for a full fixture: steps converted one-to-one
+    /// (`to_compact` panics if the fixture's register history were not
+    /// step-consistent), streams and program-static fields carried over.
+    fn compact_of(full: &SideNote) -> crate::side_note::CompactTrace {
+        crate::side_note::CompactTrace {
+            steps: full.steps.iter().map(|s| s.to_compact()).collect(),
+            initial_regs: full.steps[0].regs_before,
+            code: full.code.clone(),
+            bitmask: full.bitmask.clone(),
+            initial_memory: full.initial_memory.clone(),
+            jump_table: full.jump_table.clone(),
+            blake2b_calls: full.blake2b_calls.clone(),
+            blake2b_mem_ops: full.blake2b_mem_ops.clone(),
+            ristretto_calls: full.ristretto_calls.clone(),
+            ristretto_mem_ops: full.ristretto_mem_ops.clone(),
+            ristretto_add_calls: full.ristretto_add_calls.clone(),
+            ristretto_add_mem_ops: full.ristretto_add_mem_ops.clone(),
+            scalar_reduce_wide_calls: full.scalar_reduce_wide_calls.clone(),
+            scalar_reduce_wide_mem_ops: full.scalar_reduce_wide_mem_ops.clone(),
+            scalar_binop_calls: full.scalar_binop_calls.clone(),
+            scalar_binop_mem_ops: full.scalar_binop_mem_ops.clone(),
+        }
+    }
+
+    /// The W2.2 soundness bar: every window a [`CompactSegmentCursor`]
+    /// yields equals the full-trace slice field for field — including
+    /// every `PvmStep` field (snapshots rebuilt from the threaded register
+    /// file; `assert_windows_equal`'s steps equality is `PvmStep`'s derived
+    /// `PartialEq`), the entering image (with `replay_writes`' resize
+    /// growth), the entering registers, and everything
+    /// `ingest_ristretto_boundary` derives. The fixture crosses register
+    /// writes, a branch, and all five precompile streams over the window
+    /// boundaries.
+    #[test]
+    fn compact_cursor_matches_segment_side_note() {
+        let full = threaded_trace();
+        let compact = compact_of(&full);
+        let bounds = segment_bounds(full.steps.len(), 4);
+        assert_eq!(bounds.len(), 3);
+        let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
+        let mut windows = Vec::new();
+        for &(a, b) in &bounds {
+            let via_compact = cursor.side_note(a, b);
+            assert_windows_equal(&via_compact, &segment_side_note(&full, a, b));
+            windows.push(via_compact);
+        }
+        // Non-vacuity: the register threading is actually exercised — the
+        // windows enter with three DISTINCT non-zero files, and in-window
+        // steps carry register writes the expansion must apply.
+        assert_ne!(windows[0].initial_regs, windows[1].initial_regs);
+        assert_ne!(windows[1].initial_regs, windows[2].initial_regs);
+        assert!(windows.iter().all(|w| w.initial_regs[1] != 0));
+        assert!(
+            windows[1].steps.iter().any(|s| s.reg_write.is_some()),
+            "fixture must place register writes inside the windows"
+        );
+    }
+
+    /// Skipping windows must thread BOTH carried states across the gap:
+    /// jumping straight to the last window applies the gap's register
+    /// writes and memory writes (step stores + precompile outputs) without
+    /// materializing the intervening windows.
+    #[test]
+    fn compact_cursor_skips_windows_without_building_them() {
+        let full = threaded_trace();
+        let compact = compact_of(&full);
+        let bounds = segment_bounds(full.steps.len(), 4);
+        let (a, b) = bounds[2];
+        let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
+        assert_windows_equal(&cursor.side_note(a, b), &segment_side_note(&full, a, b));
+    }
+
+    #[test]
+    #[should_panic(expected = "ascending order")]
+    fn compact_cursor_rejects_backward_windows() {
+        let full = threaded_trace();
+        let compact = compact_of(&full);
+        let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
+        cursor.side_note(4, 8);
+        cursor.side_note(0, 4);
+    }
+
+    /// The budgeted cut must be bit-identical over the two holder forms —
+    /// the pinned allowlist assumes producer and measurement cut the same
+    /// windows regardless of which representation they walked.
+    #[test]
+    fn compact_budgeted_bounds_match_full() {
+        for full in [spray_trace(), threaded_trace()] {
+            let compact = compact_of(&full);
+            for (max_steps, max_pages) in [(12, 2), (5, usize::MAX >> 1), (4, 1)] {
+                assert_eq!(
+                    segment_bounds_budgeted_compact(&compact, max_steps, max_pages),
+                    segment_bounds_budgeted(&full, max_steps, max_pages),
+                    "cut diverged at budgets ({max_steps}, {max_pages})"
+                );
+            }
+        }
     }
 }

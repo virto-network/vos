@@ -4,7 +4,7 @@ use javm::args;
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
 
-use crate::core::step::{MemAccess, PvmStep};
+use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, expand_steps};
 
 pub use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
@@ -190,7 +190,22 @@ pub struct RistrettoMemOp {
 
 pub struct TracingPvm {
     pub pvm: Interpreter,
-    pub steps: Vec<PvmStep>,
+    /// Recorded steps in compact form — the register-file snapshots are
+    /// reconstructible from `initial_regs` + the per-step [`RegWrite`]s
+    /// (see [`CompactStep`]), so a multi-million-step trace holds ~2.6×
+    /// less than full [`PvmStep`]s. [`Self::trace`] / [`Self::into_trace`]
+    /// expand back to full steps for consumers that want snapshots.
+    steps: Vec<CompactStep>,
+    /// Register file entering the first recorded step, captured at that
+    /// step (not at construction, so pre-run register seeding is honored).
+    /// `None` until a step is recorded.
+    initial_regs: Option<[u64; PVM_REGISTER_COUNT]>,
+    /// `regs_after` of the last recorded step. Compact reconstruction
+    /// leans on register continuity across steps, so [`Self::step`]
+    /// asserts the interpreter's file still matches this before stepping —
+    /// out-of-band register mutation between steps would otherwise be
+    /// silently lost in expansion.
+    last_regs: [u64; PVM_REGISTER_COUNT],
     pub blake2b_records: Vec<Blake2bRecord>,
     pub blake2b_mem_ops: Vec<Blake2bMemOp>,
     pub ristretto_records: Vec<RistrettoRecord>,
@@ -209,6 +224,8 @@ impl TracingPvm {
         Self {
             pvm,
             steps: Vec::new(),
+            initial_regs: None,
+            last_regs: [0u64; PVM_REGISTER_COUNT],
             blake2b_records: Vec::new(),
             blake2b_mem_ops: Vec::new(),
             ristretto_records: Vec::new(),
@@ -229,6 +246,22 @@ impl TracingPvm {
         let regs_before = self.pvm.registers;
         let gas_before = self.pvm.gas;
         let need_gas_charge = self.pvm.need_gas_charge;
+
+        // Compact recording drops the per-step register snapshots, so the
+        // trace is only faithful if the file really is continuous across
+        // steps. Nothing in this crate mutates registers between steps
+        // (precompile handlers and the vos stubs touch memory only), but a
+        // silent violation would corrupt every later reconstructed
+        // snapshot — fail loudly instead.
+        match self.initial_regs {
+            Some(_) => assert!(
+                regs_before == self.last_regs,
+                "registers mutated between traced steps (ts {}): the compact \
+                 trace cannot represent out-of-band register changes",
+                self.timestamp,
+            ),
+            None => self.initial_regs = Some(regs_before),
+        }
 
         // Decode opcode and args BEFORE stepping
         let opcode_byte = if (pc_before as usize) < self.pvm.code.len() {
@@ -262,6 +295,21 @@ impl TracingPvm {
         let next_pc = self.pvm.pc;
 
         let reg_write = (0..PVM_REGISTER_COUNT).find(|&i| regs_before[i] != regs_after[i]);
+        // One interpreter step writes at most one register (every opcode
+        // arm is a single assignment; Sbrk panics) — the invariant that
+        // makes `RegWrite` the whole register-file delta. Verify rather
+        // than assume: a second changed index would be silently lost.
+        if let Some(i) = reg_write {
+            if let Some(j) = ((i + 1)..PVM_REGISTER_COUNT).find(|&j| regs_before[j] != regs_after[j])
+            {
+                panic!(
+                    "step at ts {} changed registers {i} and {j}: a compact \
+                     step records exactly one register write",
+                    self.timestamp,
+                );
+            }
+        }
+        self.last_regs = regs_after;
 
         let gas_charged = if need_gas_charge {
             gas_before - gas_after
@@ -276,17 +324,18 @@ impl TracingPvm {
         let (mem_read, mem_write) =
             decode_mem_access(opcode, &decoded_args, &regs_before, &regs_after);
 
-        self.steps.push(PvmStep {
+        self.steps.push(CompactStep {
             timestamp: self.timestamp,
             pc: pc_before,
             opcode,
             skip_len,
-            regs_before,
-            regs_after,
-            reg_write,
-            reg_a,
-            reg_b,
-            reg_d,
+            reg_write: reg_write.map(|i| RegWrite {
+                index: i as u8,
+                value: regs_after[i],
+            }),
+            reg_a: reg_a as u8,
+            reg_b: reg_b as u8,
+            reg_d: reg_d as u8,
             imm,
             imm_y,
             branch_target,
@@ -679,9 +728,36 @@ impl TracingPvm {
         });
     }
 
-    /// Consume and return the recorded trace.
+    /// Number of steps recorded so far.
+    pub fn num_steps(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// The register file entering the first recorded step (the file the
+    /// interpreter was seeded with); current registers if nothing was
+    /// recorded yet.
+    pub fn initial_regs(&self) -> [u64; PVM_REGISTER_COUNT] {
+        self.initial_regs.unwrap_or(self.pvm.registers)
+    }
+
+    /// The recorded trace expanded to full steps (snapshots rebuilt by
+    /// threading the register file from [`Self::initial_regs`]).
+    pub fn trace(&self) -> Vec<PvmStep> {
+        expand_steps(&self.steps, self.initial_regs())
+    }
+
+    /// Consume and return the recorded trace as full steps.
     pub fn into_trace(self) -> Vec<PvmStep> {
-        self.steps
+        let regs = self.initial_regs();
+        expand_steps(&self.steps, regs)
+    }
+
+    /// Consume and return the compact trace: the recorded steps plus the
+    /// register file entering the first one — the chain-side form that
+    /// [`crate::segment::CompactSegmentCursor`] expands window by window.
+    pub fn into_compact(self) -> (Vec<CompactStep>, [u64; PVM_REGISTER_COUNT]) {
+        let regs = self.initial_regs();
+        (self.steps, regs)
     }
 
     /// Return recorded blake2b calls for the precompile chip.

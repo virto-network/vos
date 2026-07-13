@@ -651,14 +651,37 @@ pub fn canonical_profile_for_bounds(
     full: &SideNote,
     bounds: &[(usize, usize)],
 ) -> Option<Vec<u32>> {
+    let mut cursor = crate::segment::SegmentCursor::new(full);
+    canonical_profile_over(bounds, move |a, b| cursor.side_note(a, b))
+}
+
+/// [`canonical_profile_for_bounds`] over a [`crate::CompactTrace`] — the
+/// chain-holder form the streaming drivers keep resident. The windows come
+/// from one forward [`crate::segment::CompactSegmentCursor`] pass, which
+/// yields `SideNote`s field-identical to slicing the expanded full trace,
+/// so the derived floors are the same numbers.
+pub fn canonical_profile_for_bounds_compact(
+    full: &crate::CompactTrace,
+    bounds: &[(usize, usize)],
+) -> Option<Vec<u32>> {
+    let mut cursor = crate::segment::CompactSegmentCursor::new(full);
+    canonical_profile_over(bounds, move |a, b| cursor.side_note(a, b))
+}
+
+/// The per-chip elementwise-max walk shared by the two holder forms:
+/// `window` materializes the `SideNote` for each `[a, b)` in `bounds`
+/// (ascending — both callers hand a forward cursor).
+fn canonical_profile_over(
+    bounds: &[(usize, usize)],
+    mut window: impl FnMut(usize, usize) -> SideNote,
+) -> Option<Vec<u32>> {
     if bounds.is_empty() {
         return None;
     }
     let indices: Vec<usize> = (0..super::chip_idx::COUNT).collect();
     let mut floors = vec![0u32; indices.len()];
-    let mut cursor = crate::segment::SegmentCursor::new(full);
     for &(a, b) in bounds {
-        let mut sn = cursor.side_note(a, b);
+        let mut sn = window(a, b);
         for (floor, natural) in floors.iter_mut().zip(natural_log_sizes_for(&mut sn, &indices)) {
             *floor = (*floor).max(natural);
         }

@@ -676,7 +676,7 @@ fn prove_blake2b_precompile() {
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run_with_precompiles();
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let blake2b_records = tracing.blake2b_records.clone();
     let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
 
@@ -1343,7 +1343,7 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
     let exit = tracing.run_with_precompiles();
     eprintln!(
         "Exit: {exit:?}, steps: {}, ristretto_calls: {}",
-        tracing.steps.len(),
+        tracing.num_steps(),
         tracing.ristretto_records.len()
     );
 
@@ -1453,7 +1453,7 @@ fn prove_blake2b_via_ecall() {
     let exit = tracing.run_with_precompiles();
     eprintln!(
         "Exit: {exit:?}, steps: {}, blake2b_calls: {}",
-        tracing.steps.len(),
+        tracing.num_steps(),
         tracing.blake2b_records.len()
     );
 
@@ -1463,7 +1463,7 @@ fn prove_blake2b_via_ecall() {
         "should have 1 blake2b call"
     );
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let blake2b_records = tracing.blake2b_records.clone();
     let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
 
@@ -1555,7 +1555,7 @@ fn prove_ristretto_via_ecall_boundary() {
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let r_records = tracing.ristretto_records.clone();
     let r_mem_ops = tracing.ristretto_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
@@ -1641,7 +1641,7 @@ fn prove_ristretto_identity_via_ecall_comb() {
         "0·G must trace to the all-zero Ristretto identity encoding"
     );
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let r_records = tracing.ristretto_records.clone();
     let r_mem_ops = tracing.ristretto_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
@@ -1716,7 +1716,7 @@ fn prove_ristretto_point_add_via_ecall_boundary() {
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_add_records.len(), 1);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let records = tracing.ristretto_add_records.clone();
     let mem_ops = tracing.ristretto_add_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
@@ -1779,7 +1779,7 @@ fn prove_scalar_reduce_wide_via_ecall_boundary() {
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_reduce_wide_records.len(), 1);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let records = tracing.scalar_reduce_wide_records.clone();
     let mem_ops = tracing.scalar_reduce_wide_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
@@ -1848,7 +1848,7 @@ fn prove_scalar_mul_mod_l_via_ecall() {
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_binop_records.len(), 1);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let records = tracing.scalar_binop_records.clone();
     let mem_ops = tracing.scalar_binop_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
@@ -1923,7 +1923,7 @@ fn prove_scalar_mul_then_add_mod_l() {
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_binop_records.len(), 2);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let records = tracing.scalar_binop_records.clone();
     let mem_ops = tracing.scalar_binop_mem_ops.clone();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
@@ -1999,7 +1999,7 @@ fn prove_scalar_mult_then_point_add() {
     assert_eq!(tracing.ristretto_records.len(), 1);
     assert_eq!(tracing.ristretto_add_records.len(), 1);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
         .with_memory(flat_mem)
         .with_initial_regs(regs);
@@ -2071,7 +2071,7 @@ fn prove_two_ristretto_scalar_mult_ecalls() {
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 2);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
         .with_memory(flat_mem)
         .with_initial_regs(regs);
@@ -2142,7 +2142,7 @@ fn prove_scalar_mul_chained_add() {
     let _ = tracing.run_with_precompiles();
     assert_eq!(tracing.scalar_binop_records.len(), 2);
 
-    let steps = tracing.steps.clone();
+    let steps = tracing.trace();
     let mut side_note = zkpvm::SideNote::new(steps, code.clone(), bitmask.clone())
         .with_memory(flat_mem)
         .with_initial_regs(regs);
