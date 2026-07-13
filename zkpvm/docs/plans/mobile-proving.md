@@ -12,6 +12,15 @@ different gaps:
   segments): **~26–29 GB peak per segment** today. This is the wall, and
   it is fixable with mostly-local work.
 
+**Both-axes constraint (2026-07-13, project decision):** a RAM
+reduction that costs considerable prove time is NOT acceptable — mobile
+viability means fitting the RAM envelope AND staying practical on the
+clock. Prefer levers that shrink committed cells (helping both axes);
+schedule-only levers (recompute/streaming trades) must stay under
+~10-15% time cost or ship as opt-in for RAM-desperate deployments only.
+This deprioritizes the Wave-4 fork line (its recompute tax measured
++64-86%) in favor of the boundary-diet levers.
+
 The external envelope is proven: FibRace (KKRT/Hyli, 2.2M proofs on 1,420
 device models, arXiv 2510.14693) showed M31+stwo proving of ~100k-cycle
 workloads at the same 96-bit security on ordinary phones — median 6.4 s,
