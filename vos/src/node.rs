@@ -5282,7 +5282,7 @@ enum AskOutcome {
 /// channels + blob store + byte-stream reactor a `TASK_PENDING` is fulfilled
 /// against.
 ///
-/// Request-reply effects (EFFECT_ASK / FETCH / BLOB_GET) stay on the
+/// Request-reply effects (EFFECT_ASK / FETCH / BLOB_GET / BLOB_PUT) stay on the
 /// synchronous [`handle_effect`] transport (EFFECT_ASK rides the envelope path —
 /// `outbox.send` + `wait_for_reply` — preserving the deferred-queue semantics
 /// `extension_to_extension_ask` depends on). Calling it inline is
@@ -5397,8 +5397,8 @@ impl Fulfiller<'_> {
                     None => bs::resp_err(""),
                 }
             }
-            // Other request-reply effects (EFFECT_ASK / FETCH / BLOB_GET) keep
-            // the synchronous envelope transport.
+            // Other request-reply effects (EFFECT_ASK / FETCH / BLOB_GET /
+            // BLOB_PUT) keep the synchronous envelope transport.
             _ => handle_effect(
                 effect,
                 self.inbox,
@@ -5546,8 +5546,8 @@ impl Fulfiller<'_> {
 /// caller). The remaining effects are still rejected in v1:
 ///   - `EFFECT_LISTEN`/`ACCEPT` — the host owns the accept loop; a connection
 ///     task cannot bind or accept.
-///   - `EFFECT_FETCH`/`BLOB_GET` — synchronous/blocking on the executor thread;
-///     not supported from a connection task.
+///   - `EFFECT_FETCH`/`BLOB_GET`/`BLOB_PUT` — synchronous/blocking on the
+///     executor thread; not supported from a connection task.
 struct ConnFulfiller {
     /// The owned connection. `None` after an explicit `close` of the matching
     /// `cid`; a byte op against a closed conn returns an error (handler sees
@@ -5649,8 +5649,8 @@ impl ConnFulfiller {
                 )
             }
             other => {
-                // EFFECT_FETCH / BLOB_GET (and anything else) stay rejected in
-                // v1: they take the synchronous `handle_effect` transport and
+                // EFFECT_FETCH / BLOB_GET / BLOB_PUT (and anything else) stay
+                // rejected in v1: they take the synchronous `handle_effect` transport and
                 // would block the single executor thread. (ASK is handled above
                 // via the async invoke route.) Returning empty bytes makes the
                 // handler's fetch/blob decode yield `None`/default, not hang.
@@ -6421,7 +6421,7 @@ fn handle_effect(
     deferred: &mut std::collections::VecDeque<Envelope>,
     blob_fetch: &BlobFetchCtx<'_>,
 ) -> Vec<u8> {
-    use crate::effects::{EFFECT_ASK, EFFECT_BLOB_GET, EFFECT_FETCH};
+    use crate::effects::{EFFECT_ASK, EFFECT_BLOB_GET, EFFECT_BLOB_PUT, EFFECT_FETCH};
 
     if effect.is_empty() {
         return Vec::new();
@@ -6459,6 +6459,7 @@ fn handle_effect(
             }
         }
         EFFECT_BLOB_GET => handle_blob_get(rest, blob_fetch),
+        EFFECT_BLOB_PUT => handle_blob_put(rest, blob_fetch),
         other => {
             error!(%extension_id, tag = format!("{other:#04x}"), "extension: unknown effect tag");
             Vec::new()
@@ -6586,6 +6587,21 @@ fn handle_blob_get(rest: &[u8], blob_fetch: &BlobFetchCtx<'_>) -> Vec<u8> {
     let _ = hint_prefix;
 
     Vec::new()
+}
+
+/// Serve `EFFECT_BLOB_PUT`. Payload = the raw blob bytes. Stores
+/// them into the same proof-blob CAS `EFFECT_BLOB_GET` reads —
+/// hot cache plus write-through disk when configured, the exact
+/// tiers `VosNode::put_proof_blob` writes and under the same
+/// content addressing (`proof_blob_hash`) — and returns the
+/// 32-byte hash. The put is node-local; peers obtain the blob on
+/// demand via the existing `handle_blob_get` fan-out (no push).
+/// Store failures degrade the same way `put_proof_blob`'s do: the
+/// hash is still returned and only the missing tier is lost.
+fn handle_blob_put(rest: &[u8], blob_fetch: &BlobFetchCtx<'_>) -> Vec<u8> {
+    let hash = proof_blob_hash(rest);
+    cache_blob(&hash, rest, blob_fetch);
+    hash.to_vec()
 }
 
 /// Populate hot cache + (when configured) write-through disk on
@@ -6771,6 +6787,39 @@ mod tests {
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    /// The extension-facing proof-blob CAS round trip: `EFFECT_BLOB_PUT`
+    /// (`handle_blob_put`) stores under the store's own addressing
+    /// (`proof_blob_hash`, i.e. `put_proof_blob` parity) and
+    /// `EFFECT_BLOB_GET` (`handle_blob_get`) returns the same bytes for
+    /// the returned hash.
+    #[test]
+    fn blob_put_round_trips_through_blob_get() {
+        let store: ProofBlobStore = Arc::new(RwLock::new(HashMap::new()));
+        #[cfg(feature = "network")]
+        let net: SharedNetwork = Arc::new(Mutex::new(None));
+        let blob_fetch = BlobFetchCtx {
+            proof_blobs: &store,
+            proof_blobs_dir: None,
+            #[cfg(feature = "network")]
+            shared_network: &net,
+        };
+        let bytes = b"per-segment proof bytes".to_vec();
+        let reply = handle_blob_put(&bytes, &blob_fetch);
+        assert_eq!(
+            reply,
+            proof_blob_hash(&bytes).to_vec(),
+            "the put reply is the 32-byte content hash under the store's addressing"
+        );
+        // The get payload is `[hash:32][hint_prefix:u16 LE]`.
+        let mut req = reply.clone();
+        req.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            handle_blob_get(&req, &blob_fetch),
+            bytes,
+            "blob_get serves the bytes blob_put stored"
+        );
     }
 
     #[cfg(feature = "storage")]

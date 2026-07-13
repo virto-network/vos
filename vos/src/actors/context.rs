@@ -887,6 +887,20 @@ pub trait ExtensionCtx<A: Actor> {
         hash: [u8; 32],
         hint_prefix: u16,
     ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<Vec<u8>>> + '_>>;
+
+    /// Store `bytes` into the host's content-addressed proof-blob
+    /// store — the same store [`Self::blob_get`] reads — and return
+    /// the 32-byte content hash (the node's `put_proof_blob`
+    /// addressing). Lets a producer extension publish large payloads
+    /// (per-segment STARK proofs, say) as they are produced instead of
+    /// buffering them for a host-side requester to publish. The put is
+    /// node-local; peers obtain the blob on demand through the
+    /// existing cross-node fetch fan-out. Returns `None` when the host
+    /// doesn't serve the effect or the store rejected the bytes.
+    fn blob_put(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<[u8; 32]>> + '_>>;
 }
 
 impl<A: Extension> ExtensionCtx<A> for Context<A> {
@@ -926,6 +940,26 @@ impl<A: Extension> ExtensionCtx<A> for Context<A> {
         alloc::boxed::Box::pin(async move {
             let bytes = io.await;
             if bytes.is_empty() { None } else { Some(bytes) }
+        })
+    }
+
+    fn blob_put(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<[u8; 32]>> + '_>>
+    {
+        // Wire format: `[EFFECT_BLOB_PUT][bytes…]`. The host stores the
+        // bytes into the proof-blob CAS and replies with the 32-byte
+        // content hash; anything else (an older host, a store failure)
+        // decodes to `None`.
+        let mut request = Vec::with_capacity(1 + bytes.len());
+        request.push(crate::effects::EFFECT_BLOB_PUT);
+        request.extend_from_slice(&bytes);
+        let io = self.host_call(request);
+        alloc::boxed::Box::pin(async move {
+            let resp = io.await;
+            let hash: [u8; 32] = resp.as_slice().try_into().ok()?;
+            Some(hash)
         })
     }
 }

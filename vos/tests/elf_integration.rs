@@ -9211,43 +9211,44 @@ fn clerk_ledger_two_bank_federation() {
             // the blob + address + the
             // caller-held seg_steps + canonical profile to the prover.
             let (vc_blob, vc_witness_addr) = voucher_check_pvm();
-            // Offline: prove the canonical segment chain (minutes), as
-            // per-segment proof bytes.
+            // Offline: prove the canonical segment chain (minutes), STREAMING
+            // each segment proof into bank A's (the SENDER's) CAS as it lands —
+            // the sink CASes and drops each ~3 MiB proof, so the producer never
+            // holds the whole chain (~N×3 MiB), only the 32-byte hashes.
             // Producer reads seg-steps + canonical profile from the catalog too,
             // so the whole federation path is catalog-driven (not the constants).
-            let segments = prover_extension::prove_chain_segments(
+            //
+            // Delivery: each canonical segment proof (~3 MiB) is under the 8 MiB
+            // single-shot cross-node frame cap (MAX_FRAME_BYTES), so bank B's
+            // verifier fetches them ON DEMAND across the wire via the existing
+            // proof-blob CAS fan-out (the `bank-a` peer_prefix hint registered
+            // with register_peer) — a REAL cross-node delivery, not a
+            // receiver-side pre-seed. The single concatenated chain blob
+            // (~N×3 MiB ≈ hundreds of MiB) could not cross one frame; the
+            // per-segment manifest is the delivery fix. The voucher's
+            // `proof.bytes` carries the single 32-byte hash of the manifest blob
+            // (unchanged wire shape — one hash). Ship an ANCHORED manifest: bind
+            // segment 0 to its entering-image root (returned by the streaming
+            // prove) so bank B's verify_chain enforces the entering-image anchor
+            // on the real money path (a chain spliced onto a doctored initial
+            // image is rejected).
+            let mut seg_hashes: Vec<[u8; 32]> = Vec::new();
+            let entering_root = prover_extension::prove_chain_segments_with(
                 &vc_blob,
                 &witness_buf,
                 vc_witness_addr,
                 vc_pin.seg_steps as usize,
                 vc_pin.page_budget as usize,
                 &vc_pin.canonical_profile,
+                |seg| {
+                    seg_hashes.push(node_a.put_proof_blob(seg));
+                    Some(())
+                },
             )
             .expect(
-                "prove_chain_segments over the conservation transition \
+                "prove_chain_segments_with over the conservation transition \
                  (stale voucher-check ELF? run `just build-voucher-check`)",
             );
-            // Seed each segment proof on bank A (the SENDER) and ship a MANIFEST.
-            // Each canonical segment proof (~3 MiB) is under the 8 MiB single-shot
-            // cross-node frame cap (MAX_FRAME_BYTES), so bank B's verifier fetches
-            // them ON DEMAND across the wire via the existing proof-blob CAS
-            // fan-out (the `bank-a` peer_prefix hint registered with
-            // register_peer) — a REAL cross-node delivery, not a receiver-side
-            // pre-seed. The single concatenated chain blob (~N×3 MiB ≈ hundreds
-            // of MiB) could not cross one frame; the per-segment manifest is the
-            // delivery fix. The voucher's `proof.bytes` carries the single 32-byte
-            // hash of the manifest blob (unchanged wire shape — one hash).
-            // Ship an ANCHORED manifest: bind segment 0 to its entering-image
-            // root so bank B's verify_chain enforces the entering-image anchor on
-            // the real money path (a chain spliced onto a doctored initial image
-            // is rejected). The root is segment 0's proved initial_state.
-            // memory_root, read via the prover's helper.
-            let entering_root = prover_extension::segment_initial_root(&segments)
-                .expect("proved chain has an entering-image root");
-            let seg_hashes: Vec<[u8; 32]> = segments
-                .into_iter()
-                .map(|s| node_a.put_proof_blob(s))
-                .collect();
             let manifest_bytes =
                 prover_extension::encode_chain_manifest_anchored(entering_root, &seg_hashes);
             let manifest_hash = node_a.put_proof_blob(manifest_bytes);

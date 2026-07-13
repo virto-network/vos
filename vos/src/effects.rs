@@ -42,6 +42,15 @@ pub const EFFECT_FETCH: u8 = 0x02;
 /// Result: blob bytes when found, empty bytes when missing.
 pub const EFFECT_BLOB_GET: u8 = 0x03;
 
+/// Store a blob into the host's content-addressed proof-blob store —
+/// the same store [`EFFECT_BLOB_GET`] reads, so a producer extension
+/// can publish (e.g. a prover streaming out per-segment proofs) and
+/// any node can later fetch by hash.
+/// Payload: the raw blob bytes (no framing).
+/// Result: the 32-byte content hash on success, empty bytes on
+/// failure (including an older host that doesn't serve this effect).
+pub const EFFECT_BLOB_PUT: u8 = 0x05;
+
 // ── Byte-stream effects ──────────────────────────────────
 //
 // Raw TCP via the host reactor (`smol::Async` in `node.rs`). The host

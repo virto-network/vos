@@ -60,8 +60,10 @@ The chain driver adds two O(N) hazards of its own: the full-chain
 trace resident for the whole loop (WAS 2.6 GB of `PvmStep`s with an
 O(N²) memory-replay per slice; the replay fell to Wave 2.1's cursor
 and the residency to Wave 2.2's compact holder — now ~1.0 GB), and
-`prove_chain`/the async job materialize **all** segment proofs in one
-buffer (~3 MiB each — Wave 2.3, still open).
+`prove_chain`/the async job USED to materialize **all** segment proofs
+in one buffer (~3 MiB each) — gone with Wave 2.3's streaming publish
+(each proof goes to the host CAS as it is proven; only 32-byte hashes
+are retained).
 
 ## Levers, ranked
 
@@ -312,13 +314,39 @@ segmentation of any kind.
   (−1.5 GiB), per-window prove 6.11–6.86 s → 5.73–7.06 s (mean
   6.46 → 6.19 s — unchanged within noise). Commitments do NOT move
   (drift guard green): prover-side representation only.
-- **2.3 Producer-side proof streaming.** `prove_chain`/the async job
-  materialize `bincode(Vec<Vec<u8>>)` — ~1.8 GB at 600 segments.
-  Spill per-segment proofs (host CAS or extension-local disk) and
-  page `job_result` per segment.
+- **2.3 Producer-side proof streaming — LANDED + MEASURED
+  (2026-07-13).** The chain prover no longer materializes the proof
+  buffer (`bincode(Vec<Vec<u8>>)`, ~1.8 GB at 600 segments) anywhere.
+  Host side: extensions gained a CAS *put* — `EFFECT_BLOB_PUT` /
+  `ctx.blob_put(bytes) -> [u8; 32]` stores into the node's proof-blob
+  store (same tiers + addressing as `VosNode::put_proof_blob`; served
+  in `handle_effect`, native-extension surface only — no guest ABI
+  change). Prover side: `prove_chain_segments_with(…, sink)` streams
+  each segment's `bincode(Proof)` out as it is proven and returns the
+  entering-image root (the old collecting `prove_chain_segments` is a
+  thin adapter over it — public API unchanged, bytes identical,
+  unit-pinned); `prove_chain_publishing` pipelines the large-stack
+  prove thread against per-segment `blob_put` over a capacity-1
+  channel (a refused put aborts the remaining prove). Both the sync
+  `prove_chain` invoke and the async job (`tick`/`job_poll`) now
+  publish per segment, retain only hashes, and reply with the
+  anchored-manifest input (`encode_chain_manifest_anchored`,
+  32·(N+1) B) — the requester CASes just the manifest; the federation
+  producer streams `put_proof_blob` through the sink the same way.
+  Measured (7.84M-step transition, (32k, 8) cut, first 10 windows):
+  retained proof bytes **29.2 MB → 0** (10 × ~2.92 MiB; linear, so
+  ~0.86 GB never materializes at the full ~293-segment chain, and the
+  old job path parked those bytes in the JobQueue until
+  `job_release`); process peak + per-window prove time unchanged
+  within noise (VmHWM 9.96 vs 9.84 GiB, 58 vs 48 s per 10-window
+  pass — the prove transient dominates both). Commitments do NOT move
+  (drift guard green): pure buffer-retention removal, time-neutral
+  under the both-axes constraint.
 
-Exit: chain-prove peak = one segment's prove cost + O(1) driver state;
-also collapses the minutes-long floors derivation (Wave-1.3 finding 5).
+Exit: chain-prove peak = one segment's prove cost + the compact chain
+holder; the O(N) proof-buffer axis is closed (2.3) and the floors
+derivation collapsed with 2.1. The remaining O(N) driver state is the
+~1.0 GB compact trace — item 2(a)'s spill-to-disk, still open.
 
 ### Wave 3 — aarch64 bring-up
 

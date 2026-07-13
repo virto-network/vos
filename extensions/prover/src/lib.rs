@@ -15,10 +15,9 @@
 //! - `prove(pvm_blob, witness_bytes, witness_addr) -> Vec<u8>` — patch
 //!   `witness_bytes` at `witness_addr` (skipped when empty), trace,
 //!   `prove_mobile`, and return the bincode-serialized `zkpvm::Proof`.
-//!   Empty `Vec` on any failure. The caller content-addresses the bytes
-//!   into the host proof-blob store (`put_proof_blob`) and ships the
-//!   32-byte hash, because there is no extension-side CAS *put* (only
-//!   `ctx.blob_get`).
+//!   Empty `Vec` on any failure. A single proof is one deliverable
+//!   payload, so the caller content-addresses the bytes into the host
+//!   proof-blob store (`put_proof_blob`) and ships the 32-byte hash.
 //!
 //! - `verify(program_commitment, proof_hash, public_bytes, return_bytes,
 //!   peer_prefix) -> u8` — fetch the proof from the host CAS by
@@ -38,8 +37,14 @@
 //!   for traces too large for a single proof. The caller also supplies
 //!   `seg_steps` (the per-segment step bound), `page_budget` (per-segment
 //!   touched-page budget; `0` = uniform step cut), and the canonical
-//!   `profile` (the `[u32; chip_idx::COUNT]` forcing profile). Returns
-//!   `bincode(Vec<Vec<u8>>)`.
+//!   `profile` (the `[u32; chip_idx::COUNT]` forcing profile). STREAMS the
+//!   chain out as it proves: each segment's `bincode(Proof)` is published
+//!   into the host proof-blob CAS via `ctx.blob_put` the moment it is
+//!   proven and only its 32-byte hash is retained, so peak memory holds
+//!   ~one segment regardless of chain length. Returns the anchored
+//!   [`ChainManifest`] input (`[entering_root:32][seg_hash:32]…`, i.e.
+//!   [`encode_chain_manifest_anchored`]); the caller CASes that manifest
+//!   and ships its single hash. Empty `Vec` on any failure.
 //!
 //! - `verify_chain(allowlist, proof_hash, public_bytes, return_bytes,
 //!   peer_prefix) -> u8` — the chain analog of `verify`. `allowlist` is the
@@ -94,19 +99,28 @@ const TRACE_GAS: u64 = 100_000_000;
 /// batch.
 const MAX_CHAIN_SEGMENTS: usize = 65_536;
 
-/// Run `f` on a dedicated 512 MiB-stack thread and hand back its result. A
+/// Spawn `f` on a dedicated 512 MiB-stack thread WITHOUT joining it. A
 /// canonical prove/verify overflows the default ~2 MiB stack, so every heavy
-/// zkpvm entry point runs through here. `None` when the thread can't spawn
-/// or `f` panics — the fail-soft the callers' empty replies map to.
-fn run_on_large_stack<T: Send + 'static>(
+/// zkpvm entry point runs on such a thread. The streaming chain paths use
+/// this directly (the spawner drains segments while the thread proves);
+/// everything else goes through the join-immediately [`run_on_large_stack`].
+/// `None` when the thread can't spawn.
+fn spawn_on_large_stack<T: Send + 'static>(
     f: impl FnOnce() -> Option<T> + Send + 'static,
-) -> Option<T> {
+) -> Option<std::thread::JoinHandle<Option<T>>> {
     std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
         .spawn(f)
-        .ok()?
-        .join()
-        .ok()?
+        .ok()
+}
+
+/// Run `f` on a dedicated 512 MiB-stack thread and hand back its result.
+/// `None` when the thread can't spawn or `f` panics — the fail-soft the
+/// callers' empty replies map to.
+fn run_on_large_stack<T: Send + 'static>(
+    f: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    spawn_on_large_stack(f)?.join().ok()?
 }
 
 // ── Async prove jobs ────────────────────────────────────────────
@@ -115,25 +129,25 @@ fn run_on_large_stack<T: Send + 'static>(
 // blocks for the whole (minutes-long) canonical chain prove, which no real
 // actor dispatch can wait out. The async path decouples proving from the ask:
 // `prove_chain_job` (a `#[msg(job)]` begin) enqueues a job and returns a job id
-// IMMEDIATELY; a later host `tick()` advances one job (proving on a large-stack
-// thread), records the per-segment proof bytes + the entering-image root, and
-// TELLS the requester a callback carrying the job id. The requester then pulls
-// the result (`job_poll`) and content-addresses it into the host proof-blob
-// store.
+// IMMEDIATELY; a later host `tick()` advances one job and TELLS the requester a
+// callback carrying the job id. The requester then pulls the result
+// (`job_poll`).
 //
 // Job STATE (output bytes / done / error) lives in a `vos::jobs::JobQueue`,
 // driving the standard `job_poll` / `job_release` surface. The queue holds no
 // inputs, so a separate FIFO `pending` list carries each unproved job's inputs
 // (blob / witness / profile) + its callback target until `tick` proves it.
 //
-// PUBLISH SPLIT: the extension cannot itself CAS-`put` (the host exposes only
-// `blob_get` to extensions — a `put` effect is host-side, `node.rs`-owned). So
-// the worker PRODUCES the segment bytes + a ready-to-anchor manifest input
-// (segments + entering root) and the node-side requester PUBLISHES them via
-// `VosNode::put_proof_blob` + `encode_chain_manifest_anchored` — exactly the
-// steps the federation e2e already runs after a synchronous prove, now off the
-// ask path. When a host `blob_put` effect lands (Workstream A), `tick()` can
-// publish directly and callback the manifest hash instead.
+// STREAMING PUBLISH: both chain paths (the sync `prove_chain` invoke and the
+// job's `tick`) prove on a large-stack worker thread and PUBLISH each segment's
+// proof bytes into the host proof-blob CAS (`ctx.blob_put`) the moment it is
+// proven, retaining only the 32-byte hashes — peak memory holds ~one segment
+// (~3 MiB) instead of the whole chain (~N × 3 MiB, ~0.9 GB at 293 segments)
+// parked in the JobQueue until `job_release`. The job result / sync reply is
+// the tiny anchored-manifest input (`encode_chain_manifest_anchored(root,
+// hashes)`, 32·(N+1) bytes); the requester CASes that manifest and ships its
+// single hash — the per-segment `put_proof_blob` dance it used to run over the
+// full proof bytes is gone.
 
 /// Terminal outcome codes carried in the completion callback's `status` field
 /// (`1` = proved, `2` = failed). Wire-preserved from the retired `JobStatus`
@@ -145,8 +159,7 @@ const JOB_FAILED: u64 = 2;
 /// Inputs for one queued prove-chain job that `tick` hasn't proved yet. The
 /// job's output + terminal state live in the [`JobQueue`]; this record holds
 /// only what proving consumes — blob / witness / profile — plus the callback
-/// target, retained in a FIFO `pending` list and dropped once proved. It is
-/// `bincode((initial_root, segments))` the requester later pulls via `job_poll`.
+/// target, retained in a FIFO `pending` list and dropped once proved.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -243,21 +256,24 @@ impl Prover {
     /// CHAIN — for traces too large for a single proof (the conservation-of-
     /// value transition, say, is millions of steps). Segments at `seg_steps`,
     /// proves each with canonical-shape proving against the caller-supplied
-    /// `profile`, and returns `bincode(Vec<Vec<u8>>)` — the per-segment
-    /// `bincode(Proof)` bytes (one entry per segment, in chain order). Empty
-    /// `Vec` on any failure.
+    /// `profile`, and STREAMS the chain out: each segment's `bincode(Proof)`
+    /// is published into the host proof-blob CAS (`ctx.blob_put`) as it is
+    /// proven and dropped, so peak memory holds ~one segment (~3 MiB)
+    /// regardless of chain length. Returns the anchored [`ChainManifest`]
+    /// input — [`encode_chain_manifest_anchored`]`(entering_root,
+    /// segment_hashes)`, `32·(N+1)` bytes. Empty `Vec` on any failure
+    /// (including a failed publish, which aborts the remaining prove).
     ///
-    /// The caller content-addresses each segment SEPARATELY (`put_proof_blob`),
-    /// assembles + CASes a [`ChainManifest`] of the hashes, and ships the
-    /// manifest's single 32-byte hash wherever its protocol carries a proof
-    /// reference (unchanged wire shape — one hash). Per-segment delivery keeps
-    /// every cross-node blob under the 8 MiB frame cap, which the single
-    /// concatenated chain blob cannot. Heavy + offline (the producer proves
-    /// before shipping).
+    /// The caller CASes the returned manifest bytes (`put_proof_blob`) and
+    /// ships the manifest's single 32-byte hash wherever its protocol carries
+    /// a proof reference (unchanged wire shape — one hash). Per-segment CAS
+    /// delivery keeps every cross-node blob under the 8 MiB frame cap, which
+    /// a single concatenated chain blob cannot. Heavy + offline (the producer
+    /// proves before shipping).
     #[msg]
     async fn prove_chain(
         &self,
-        _ctx: &mut Context<Self>,
+        ctx: &mut Context<Self>,
         pvm_blob: Vec<u8>,
         witness_bytes: Vec<u8>,
         witness_addr: u64,
@@ -265,15 +281,18 @@ impl Prover {
         page_budget: u64,
         profile: Vec<u32>,
     ) -> Vec<u8> {
-        match prove_chain_segments(
-            &pvm_blob,
-            &witness_bytes,
+        match prove_chain_publishing(
+            pvm_blob,
+            witness_bytes,
             witness_addr as usize,
             seg_steps as usize,
             page_budget as usize,
-            &profile,
-        ) {
-            Some(segments) => bincode::serialize(&segments).unwrap_or_default(),
+            profile,
+            async |seg| ctx.blob_put(seg).await,
+        )
+        .await
+        {
+            Some((root, hashes)) => encode_chain_manifest_anchored(root, &hashes),
             None => Vec::new(),
         }
     }
@@ -370,10 +389,11 @@ impl Prover {
     /// ASYNC analog of `prove_chain` (a `#[msg(job)]` begin): enqueue a
     /// canonical-chain prove job and return a job id IMMEDIATELY, without
     /// blocking the caller for the (minutes-long) prove. A later host `tick()`
-    /// proves the job and TELLS `reply_to` the dynamic message named `reply_msg`
-    /// carrying `{job_id, status, segments}` (skipped when `reply_to == 0`). The
-    /// requester then pulls the result with `job_poll` and content-addresses it
-    /// (see the module's async-jobs note on the publish split).
+    /// proves the job — publishing each segment to the host CAS as it lands
+    /// (see the module's async-jobs note) — and TELLS `reply_to` the dynamic
+    /// message named `reply_msg` carrying `{job_id, status, segments}`
+    /// (skipped when `reply_to == 0`). The requester then pulls the
+    /// anchored-manifest input with `job_poll`.
     ///
     /// `seg_steps` + `profile` MUST match the program's pinned catalog values,
     /// exactly as for the synchronous `prove_chain`. Returns the job id.
@@ -408,17 +428,22 @@ impl Prover {
     /// Host periodic tick: advance AT MOST ONE pending prove job
     /// and, on completion, `tell` the requester.
     ///
-    /// BLOCKING NOTE: proving runs SYNCHRONOUSLY here (a large-stack thread this
-    /// tick `join`s), so a tick that picks up a job blocks the extension for the
-    /// whole (minutes-long) prove — `verify_chain` / `job_*` are served only
-    /// BETWEEN jobs (an idle tick returns immediately), not during one. The async
-    /// win is that the requester's `prove_chain_job` returns a job id at once
-    /// instead of blocking on the prove; making the prove itself non-blocking (a
+    /// BLOCKING NOTE: proving runs SYNCHRONOUSLY here (a large-stack worker
+    /// thread this tick drains segment-by-segment and then `join`s), so a tick
+    /// that picks up a job blocks the extension for the whole (minutes-long)
+    /// prove — `verify_chain` / `job_*` are served only BETWEEN jobs (an idle
+    /// tick returns immediately), not during one. The async win is that the
+    /// requester's `prove_chain_job` returns a job id at once instead of
+    /// blocking on the prove; making the prove itself non-blocking (a
     /// background thread polled across ticks) is a further step a busy prover
     /// would want.
     #[msg]
     async fn tick(&mut self, ctx: &mut Context<Self>) {
-        let Some(cb) = advance_one_job(&mut self.pending, &mut self.queue) else {
+        // Publishing rides this task: the worker thread proves, and each
+        // segment crossing the channel is `blob_put` here before the next is
+        // accepted — so the job retains hashes, never proof bytes.
+        let put = async |seg| ctx.blob_put(seg).await;
+        let Some(cb) = advance_one_job(&mut self.pending, &mut self.queue, put).await else {
             return;
         };
         if cb.reply_to != 0 {
@@ -433,10 +458,11 @@ impl Prover {
 
     /// Drain an async prove job's output — the standard `job_poll` reply
     /// (`Args { data, done, error }`). For a completed job `data` is the
-    /// `bincode((initial_root: [u8; 32], segments: Vec<Vec<u8>>))` blob the
-    /// requester decodes, `put_proof_blob`s each segment, and anchors via
-    /// [`encode_chain_manifest_anchored`]. `done` flips at the terminal state;
-    /// `error` is non-empty on a failed prove.
+    /// anchored [`ChainManifest`] input ([`encode_chain_manifest_anchored`]
+    /// bytes, `32·(N+1)` — the per-segment proofs are already in the host CAS,
+    /// published by `tick` as they were proven); the requester CASes the
+    /// manifest and ships its hash. `done` flips at the terminal state;
+    /// `error` is non-empty on a failed prove or publish.
     #[msg]
     async fn job_poll(&mut self, _ctx: &mut Context<Self>, job_id: u64) -> Vec<u8> {
         self.queue.poll_reply(job_id).encode()
@@ -710,43 +736,45 @@ struct JobCallback {
     segments: u64,
 }
 
-/// Advance AT MOST ONE pending job: prove the FIFO-oldest job in `pending`,
-/// push its result (or failure) into `queue`, and return the callback intent
-/// (`None` when nothing is pending). Context-free so the prove→state→callback
-/// logic is unit-testable; the handler performs the actual `tell`. A failed
-/// prove (unparseable blob / patch out of range / prove error) resolves the job
-/// via `queue.fail(...)` with no result.
-fn advance_one_job(pending: &mut Vec<PendingProve>, queue: &mut JobQueue) -> Option<JobCallback> {
+/// Advance AT MOST ONE pending job: prove the FIFO-oldest job in `pending`
+/// STREAMING — each proved segment is handed to `put` (the host CAS publish)
+/// and only its 32-byte hash is retained — then push the job's result (the
+/// anchored-manifest input, [`encode_chain_manifest_anchored`]) or failure
+/// into `queue`, and return the callback intent (`None` when nothing is
+/// pending). Generic over the async `put` so the prove→publish→state→callback
+/// logic is unit-testable without a host `Context`; the tick handler passes
+/// `ctx.blob_put`. A failed prove (unparseable blob / patch out of range /
+/// prove error) or a failed publish resolves the job via `queue.fail(...)`
+/// with no result.
+async fn advance_one_job(
+    pending: &mut Vec<PendingProve>,
+    queue: &mut JobQueue,
+    put: impl AsyncFnMut(Vec<u8>) -> Option<[u8; 32]>,
+) -> Option<JobCallback> {
     if pending.is_empty() {
         return None;
     }
-    // FIFO: take the oldest queued job (and its large blob) out of `pending`.
+    // FIFO: take the oldest queued job (and its large blob) out of `pending`;
+    // its inputs move into the prove worker and drop when it finishes.
     let job = pending.remove(0);
-
-    let (status, segments) = match run_prove_chain_job(
-        &job.pvm_blob,
-        &job.witness_bytes,
+    let (status, segments) = match prove_chain_publishing(
+        job.pvm_blob,
+        job.witness_bytes,
         job.witness_addr as usize,
         job.seg_steps as usize,
         job.page_budget as usize,
-        &job.profile,
-    ) {
-        Some((root, segments)) => {
-            let n = segments.len() as u64;
-            match bincode::serialize(&(root, segments)) {
-                Ok(result) => {
-                    queue.push(job.id, &result);
-                    queue.finish(job.id);
-                    (JOB_DONE, n)
-                }
-                Err(_) => {
-                    queue.fail(job.id, "serialize prove result failed");
-                    (JOB_FAILED, 0)
-                }
-            }
+        job.profile,
+        put,
+    )
+    .await
+    {
+        Some((root, hashes)) => {
+            queue.push(job.id, &encode_chain_manifest_anchored(root, &hashes));
+            queue.finish(job.id);
+            (JOB_DONE, hashes.len() as u64)
         }
         None => {
-            queue.fail(job.id, "prove failed");
+            queue.fail(job.id, "prove or publish failed");
             (JOB_FAILED, 0)
         }
     };
@@ -759,42 +787,66 @@ fn advance_one_job(pending: &mut Vec<PendingProve>, queue: &mut JobQueue) -> Opt
     })
 }
 
-/// Prove a queued chain job on a large stack, returning `(entering_root,
-/// per-segment proof bytes)`. `None` on any failure. Mirrors the synchronous
-/// `prove_chain` path; the entering root is read back from segment 0's proof so
-/// the requester can anchor the manifest ([`encode_chain_manifest_anchored`]).
-/// A canonical prove overflows the default stack (same reason `verify` uses a
-/// large-stack thread), so it runs on its own 512 MiB thread.
-fn run_prove_chain_job(
-    pvm_blob: &[u8],
-    witness_bytes: &[u8],
+/// Prove a canonical chain STREAMING ITS PROOFS OUT: the prove runs on a
+/// large-stack worker thread ([`prove_chain_segments_with`]), each segment's
+/// `bincode(Proof)` crosses a bounded channel to this task, which hands it to
+/// `put` (the host CAS publish) and retains only the returned 32-byte hash.
+/// Peak retention is therefore ~one segment in flight (the channel holds one
+/// while the worker proves the next) instead of the whole chain. Returns
+/// `(entering_root, segment_hashes)` — exactly the
+/// [`encode_chain_manifest_anchored`] inputs; `None` on any failure. A failed
+/// `put` drops the receiver, which fails the worker's next send and so aborts
+/// the remaining prove instead of letting it run unobserved.
+async fn prove_chain_publishing(
+    pvm_blob: Vec<u8>,
+    witness_bytes: Vec<u8>,
     witness_addr: usize,
     seg_steps: usize,
     page_budget: usize,
-    profile: &[u32],
-) -> Option<([u8; 32], Vec<Vec<u8>>)> {
-    let pvm_blob = pvm_blob.to_vec();
-    let witness_bytes = witness_bytes.to_vec();
-    let profile = profile.to_vec();
-    run_on_large_stack(move || {
-        let segments = prove_chain_segments(
+    profile: Vec<u32>,
+    mut put: impl AsyncFnMut(Vec<u8>) -> Option<[u8; 32]>,
+) -> Option<([u8; 32], Vec<[u8; 32]>)> {
+    // Capacity 1 pipelines prove and publish without accumulation: the worker
+    // proves segment i+1 while this task publishes segment i, and blocks once
+    // the slot is full.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let worker = spawn_on_large_stack(move || {
+        prove_chain_segments_with(
             &pvm_blob,
             &witness_bytes,
             witness_addr,
             seg_steps,
             page_budget,
             &profile,
-        )?;
-        let root = segment_initial_root(&segments)?;
-        Some((root, segments))
-    })
+            |seg| tx.send(seg).ok(),
+        )
+    })?;
+    let mut hashes = Vec::new();
+    let mut publish_ok = true;
+    while let Ok(seg) = rx.recv() {
+        match put(seg).await {
+            Some(h) => hashes.push(h),
+            None => {
+                publish_ok = false;
+                break;
+            }
+        }
+    }
+    // Explicit for the failure path: dropping the receiver fails the worker's
+    // next send, aborting the rest of the chain before the join below.
+    drop(rx);
+    let root = worker.join().ok()??;
+    // The worker can finish (all segments sent) before a trailing publish
+    // fails, so a successful join alone doesn't mean every hash landed.
+    publish_ok.then_some((root, hashes))
 }
 
 /// The entering-image root of a proved chain: segment 0's
 /// `initial_state.memory_root`. `None` if the chain is empty or segment 0 won't
 /// decode. A producer feeds this to [`encode_chain_manifest_anchored`] so the
 /// shipped manifest anchors segment 0 — the value `verify_chain` checks it
-/// against.
+/// against. Serves producers holding already-proved segment bytes;
+/// [`prove_chain_segments_with`] returns the same root directly.
 pub fn segment_initial_root(segments: &[Vec<u8>]) -> Option<[u8; 32]> {
     let proof: Proof = bincode::deserialize(segments.first()?).ok()?;
     Some(proof.initial_state.memory_root)
@@ -878,36 +930,44 @@ pub fn verify_proof_bytes(
 }
 
 /// Prove `pvm_blob` over `witness_bytes` as a canonical-shape segment chain,
-/// returning the per-segment `bincode(Proof)` bytes — one `Vec<u8>` per segment,
-/// in chain order. Trace, cut windows ([`chain_bounds`]: uniform `seg_steps`,
-/// or content-budgeted when `page_budget > 0`), prove each segment with
-/// [`zkpvm::prove_canonical`] against the caller-supplied `profile`. `None`
-/// on any failure. Each segment's side note is dropped after its proof, so peak
-/// memory holds the full trace + one segment.
+/// STREAMING each segment's `bincode(Proof)` bytes into `sink` as it is
+/// proven (in chain order) and returning the chain's ENTERING-IMAGE root —
+/// segment 0's `initial_state.memory_root`, the
+/// [`encode_chain_manifest_anchored`] anchor. Trace, cut windows
+/// ([`chain_bounds`]: uniform `seg_steps`, or content-budgeted when
+/// `page_budget > 0`), prove each segment with [`zkpvm::prove_canonical`]
+/// against the caller-supplied `profile`. The sink owns each segment's bytes
+/// and decides their fate (publish to a CAS, collect, discard); returning
+/// `None` from it ABORTS the remaining chain. `None` on any failure —
+/// including a sink abort or an empty chain. Nothing is retained across
+/// segments beyond the compact trace, so peak memory holds the trace + the
+/// one segment in flight — the producer-side mirror of `verify_chain`'s
+/// fetch-verify-drop streaming.
 ///
 /// `seg_steps`, `page_budget`, and `profile` MUST match the values the
 /// program's canonical commitment allowlist was measured/pinned against — a
 /// different cut reshapes the segments and lands the chain on commitments
 /// outside the published allowlist.
 ///
-/// PER-SEGMENT DELIVERY: the caller content-addresses each segment SEPARATELY
-/// (`put_proof_blob`), assembles a [`ChainManifest`] of the resulting hashes,
-/// CASes the manifest, and ships the manifest's single 32-byte hash as its
-/// protocol's proof reference (unchanged wire shape — one hash). This keeps
-/// every cross-node blob under the 8 MiB frame cap (`MAX_FRAME_BYTES`): one
-/// canonical segment proof is
+/// PER-SEGMENT DELIVERY: a producer sink content-addresses each segment
+/// SEPARATELY (the host CAS — `put_proof_blob` / `ctx.blob_put`), then
+/// assembles + CASes a [`ChainManifest`] of the hashes and ships the
+/// manifest's single 32-byte hash as its protocol's proof reference
+/// (unchanged wire shape — one hash). This keeps every cross-node blob under
+/// the 8 MiB frame cap (`MAX_FRAME_BYTES`): one canonical segment proof is
 /// ~3 MiB, whereas the single concatenated `bincode(Vec<Proof>)` chain blob
-/// (~N × 3 MiB ≈ hundreds of MiB) is not deliverable in one frame. The verifier
-/// re-assembles the chain by fetching each segment via the manifest (see
-/// [`verify_chain_segments`]).
-pub fn prove_chain_segments(
+/// (~N × 3 MiB ≈ hundreds of MiB) is not deliverable in one frame. The
+/// verifier re-assembles the chain by fetching each segment via the manifest
+/// (see [`verify_chain_segments`]).
+pub fn prove_chain_segments_with(
     pvm_blob: &[u8],
     witness_bytes: &[u8],
     witness_addr: usize,
     seg_steps: usize,
     page_budget: usize,
     profile: &[u32],
-) -> Option<Vec<Vec<u8>>> {
+    mut sink: impl FnMut(Vec<u8>) -> Option<()>,
+) -> Option<[u8; 32]> {
     if seg_steps == 0 {
         return None;
     }
@@ -917,7 +977,7 @@ pub fn prove_chain_segments(
     // `SideNote`'s.
     let full = trace_blob_compact(pvm_blob, witness_bytes, witness_addr, TRACE_GAS)?;
     let bounds = chain_bounds(&full, seg_steps, page_budget);
-    let mut segments: Vec<Vec<u8>> = Vec::with_capacity(bounds.len());
+    let mut entering_root: Option<[u8; 32]> = None;
     // One forward cursor pass threads the entering memory image + register
     // file across the windows — O(N) total slicing instead of the
     // per-window prefix replay's O(N²).
@@ -925,8 +985,39 @@ pub fn prove_chain_segments(
     for (a, b) in bounds {
         let mut sn = cursor.side_note(a, b);
         let proof = prove_canonical(&mut sn, profile).ok()?;
-        segments.push(bincode::serialize(&proof).ok()?);
+        entering_root.get_or_insert(proof.initial_state.memory_root);
+        sink(bincode::serialize(&proof).ok()?)?;
     }
+    entering_root
+}
+
+/// [`prove_chain_segments_with`] with a collecting sink: returns the
+/// per-segment `bincode(Proof)` bytes — one `Vec<u8>` per segment, in chain
+/// order. Retains the WHOLE chain (~N × 3 MiB), so callers that publish or
+/// verify per segment should prefer the sink form; this shape suits offline
+/// verification over in-memory segments ([`verify_chain_segments`]). All
+/// parameter contracts are the sink form's.
+pub fn prove_chain_segments(
+    pvm_blob: &[u8],
+    witness_bytes: &[u8],
+    witness_addr: usize,
+    seg_steps: usize,
+    page_budget: usize,
+    profile: &[u32],
+) -> Option<Vec<Vec<u8>>> {
+    let mut segments: Vec<Vec<u8>> = Vec::new();
+    prove_chain_segments_with(
+        pvm_blob,
+        witness_bytes,
+        witness_addr,
+        seg_steps,
+        page_budget,
+        profile,
+        |seg| {
+            segments.push(seg);
+            Some(())
+        },
+    )?;
     Some(segments)
 }
 
@@ -1261,15 +1352,17 @@ mod anchor_tests {
 #[cfg(test)]
 mod test_trace {
     //! Shared tiny-trace fixture: a straight-line `Add64` program traced
-    //! into a [`SideNote`], small enough to prove in-test.
+    //! into a [`SideNote`] (or packaged as a JAR blob), small enough to
+    //! prove in-test.
     use javm::PVM_REGISTER_COUNT;
     use javm::instruction::Opcode;
     use javm::interpreter::Interpreter;
     use zkpvm::SideNote;
     use zkpvm::core::tracing::TracingPvm;
 
-    /// Trace `n_adds` `Add64` ops followed by `Trap` into a `SideNote`.
-    pub fn straight_line_side_note(n_adds: u8) -> SideNote {
+    /// The straight-line program bytes: `n_adds` `Add64` ops followed by
+    /// `Trap`, plus the instruction-start bitmask.
+    fn straight_line_code(n_adds: u8) -> (Vec<u8>, Vec<u8>) {
         let mut code = Vec::new();
         for imm in 1..=n_adds {
             code.extend_from_slice(&[Opcode::Add64 as u8, 0x10, imm]);
@@ -1279,6 +1372,12 @@ mod test_trace {
         for i in (0..code.len()).step_by(3) {
             bitmask[i] = 1;
         }
+        (code, bitmask)
+    }
+
+    /// Trace `n_adds` `Add64` ops followed by `Trap` into a `SideNote`.
+    pub fn straight_line_side_note(n_adds: u8) -> SideNote {
+        let (code, bitmask) = straight_line_code(n_adds);
         let mut regs = [0u64; PVM_REGISTER_COUNT];
         regs[0] = 100;
         regs[1] = 1;
@@ -1288,6 +1387,15 @@ mod test_trace {
         let mut tracing = TracingPvm::new(pvm);
         assert_eq!(tracing.run(), javm::ExitReason::Trap);
         SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
+    }
+
+    /// The same straight-line program packaged as a JAR blob, so the
+    /// deployed blob→trace→cut→prove chain pipeline
+    /// (`prove_chain_segments_with` and the job path over it) runs
+    /// end-to-end on a REAL, cheap program.
+    pub fn straight_line_blob(n_adds: u8) -> Vec<u8> {
+        let (code, bitmask) = straight_line_code(n_adds);
+        javm::program::build_simple_blob(&code, &bitmask, &[])
     }
 }
 
@@ -1364,12 +1472,100 @@ mod floors_tests {
 }
 
 #[cfg(test)]
+mod chain_stream_tests {
+    //! Streaming chain prove ([`prove_chain_segments_with`]): the sink form
+    //! must stream exactly the bytes the collecting form returns (canonical
+    //! proving is deterministic), return segment 0's entering-image root,
+    //! and honor a sink abort. Proves a real (tiny) straight-line chain, so
+    //! it runs the deployed blob→trace→cut→prove pipeline end-to-end.
+    use super::*;
+    use test_trace::straight_line_blob;
+
+    /// The tiny chain's fixed cut: 6 adds + trap = 7 steps, seg_steps 4 →
+    /// two windows ([0,4), [4,7)) — enough for a root + a continuity edge.
+    pub const SEG_STEPS: usize = 4;
+
+    /// Derive the canonical floors for the tiny chain — the profile every
+    /// prove in these tests runs under.
+    pub fn tiny_floors(blob: &[u8]) -> Vec<u32> {
+        measure_floors(blob, &[], 0, SEG_STEPS, 0, 1_000_000).expect("derive tiny-chain floors")
+    }
+
+    #[test]
+    fn sink_streams_the_collected_chain_and_returns_segment_zeros_root() {
+        // Canonical proving needs a large stack, same as the deployed paths.
+        run_on_large_stack(move || {
+            let blob = straight_line_blob(6);
+            let floors = tiny_floors(&blob);
+
+            let segments = prove_chain_segments(&blob, &[], 0, SEG_STEPS, 0, &floors)
+                .expect("collecting chain prove");
+            assert!(segments.len() >= 2, "the fixture must cut into a real chain");
+
+            let mut streamed: Vec<Vec<u8>> = Vec::new();
+            let root =
+                prove_chain_segments_with(&blob, &[], 0, SEG_STEPS, 0, &floors, |seg| {
+                    streamed.push(seg);
+                    Some(())
+                })
+                .expect("streaming chain prove");
+
+            assert_eq!(
+                streamed, segments,
+                "the sink must receive exactly the bytes the collect adapter returns"
+            );
+            assert_eq!(
+                Some(root),
+                segment_initial_root(&segments),
+                "the returned entering root is segment 0's initial_state.memory_root"
+            );
+            Some(())
+        })
+        .expect("large-stack test body");
+    }
+
+    #[test]
+    fn aborting_sink_cancels_the_chain() {
+        run_on_large_stack(move || {
+            let blob = straight_line_blob(6);
+            let floors = tiny_floors(&blob);
+            let mut calls = 0usize;
+            let aborted = prove_chain_segments_with(&blob, &[], 0, SEG_STEPS, 0, &floors, |_seg| {
+                calls += 1;
+                None
+            });
+            assert_eq!(aborted, None, "a sink abort fails the whole chain prove");
+            assert_eq!(calls, 1, "the abort stops the chain after the aborting segment");
+            Some(())
+        })
+        .expect("large-stack test body");
+    }
+}
+
+#[cfg(test)]
 mod job_tests {
     //! Prover-specific async-job tests: `advance_one_job` drains the FIFO
-    //! `pending` list, proves one job, and writes its outcome into the
-    //! `JobQueue` (whose lifecycle is covered by `vos::jobs`). Bad-blob jobs
-    //! fail fast at trace, so these stay cheap (no real STARK work).
+    //! `pending` list, proves one job STREAMING its segments through the
+    //! caller's `put`, and writes its outcome into the `JobQueue` (whose
+    //! lifecycle is covered by `vos::jobs`). Bad-blob jobs fail fast at
+    //! trace, so those stay cheap (no real STARK work); the streaming
+    //! result-shape test proves a real tiny chain.
     use super::*;
+
+    /// Drive a future to completion on this thread. The `put` futures these
+    /// tests supply are immediately ready (and `prove_chain_publishing`'s
+    /// channel recv blocks synchronously inside the poll, exactly as it does
+    /// under the host tick), so a noop-waker poll loop suffices.
+    fn block_on<F: core::future::Future>(fut: F) -> F::Output {
+        use core::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = core::pin::pin!(fut);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
 
     fn pending_job(id: u64, reply_to: u32, reply_msg: &[u8]) -> PendingProve {
         PendingProve {
@@ -1394,10 +1590,16 @@ mod job_tests {
         let mut pending = vec![pending_job(id1, 0, b""), pending_job(id2, 0, b"")];
 
         // FIFO: the first-enqueued job is advanced first, and leaves `pending`.
-        let cb1 = advance_one_job(&mut pending, &mut queue).expect("first job advances");
+        let cb1 = block_on(advance_one_job(&mut pending, &mut queue, async |_seg| {
+            Some([0u8; 32])
+        }))
+        .expect("first job advances");
         assert_eq!(cb1.job_id, id1);
         assert_eq!(pending.len(), 1);
-        let cb2 = advance_one_job(&mut pending, &mut queue).expect("second job advances");
+        let cb2 = block_on(advance_one_job(&mut pending, &mut queue, async |_seg| {
+            Some([0u8; 32])
+        }))
+        .expect("second job advances");
         assert_eq!(cb2.job_id, id2);
         assert!(pending.is_empty());
     }
@@ -1406,7 +1608,12 @@ mod job_tests {
     fn empty_pending_advances_to_none() {
         let mut queue = JobQueue::new();
         let mut pending: Vec<PendingProve> = Vec::new();
-        assert!(advance_one_job(&mut pending, &mut queue).is_none());
+        assert!(
+            block_on(advance_one_job(&mut pending, &mut queue, async |_seg| {
+                Some([0u8; 32])
+            }))
+            .is_none()
+        );
     }
 
     #[test]
@@ -1419,7 +1626,12 @@ mod job_tests {
         let mut pending = vec![pending_job(id, 0, b"")];
         pending.retain(|p| p.id != id);
         assert!(queue.release(id));
-        assert!(advance_one_job(&mut pending, &mut queue).is_none());
+        assert!(
+            block_on(advance_one_job(&mut pending, &mut queue, async |_seg| {
+                Some([0u8; 32])
+            }))
+            .is_none()
+        );
         assert!(pending.is_empty());
     }
 
@@ -1427,18 +1639,24 @@ mod job_tests {
     fn bad_blob_job_fails_and_emits_callback() {
         // A job whose blob is not a valid PVM blob: proving fails fast at trace,
         // so this stays cheap (no real STARK work) — the negative path a tick
-        // takes when a prove can't complete.
+        // takes when a prove can't complete. The publish is never reached.
         let mut queue = JobQueue::new();
         let id = queue.begin();
         let mut pending = vec![pending_job(id, 42, b"proved")];
 
-        let cb = advance_one_job(&mut pending, &mut queue).expect("the pending job is advanced");
+        let mut puts = 0usize;
+        let cb = block_on(advance_one_job(&mut pending, &mut queue, async |_seg| {
+            puts += 1;
+            Some([0u8; 32])
+        }))
+        .expect("the pending job is advanced");
         // The callback the tick handler `tell`s to the requester.
         assert_eq!(cb.reply_to, 42);
         assert_eq!(cb.reply_msg, b"proved");
         assert_eq!(cb.job_id, id);
         assert_eq!(cb.status, JOB_FAILED);
         assert_eq!(cb.segments, 0);
+        assert_eq!(puts, 0, "a failed trace publishes nothing");
         assert!(pending.is_empty(), "the advanced job leaves `pending`");
 
         // The queue reports the failure via the standard job_poll surface.
@@ -1446,6 +1664,96 @@ mod job_tests {
         assert!(data.is_empty(), "a failed job has no result bytes");
         assert!(done);
         assert!(!error.is_empty(), "a failed job carries an error message");
+    }
+
+    #[test]
+    fn streamed_job_publishes_segments_and_results_in_manifest_input() {
+        // The success path over a REAL tiny chain: every proved segment goes
+        // through `put` (only its hash retained) and the job result is the
+        // anchored-manifest input over exactly those hashes.
+        let blob = super::test_trace::straight_line_blob(6);
+        let floors = super::chain_stream_tests::tiny_floors(&blob);
+        let seg_steps = super::chain_stream_tests::SEG_STEPS as u64;
+
+        let mut queue = JobQueue::new();
+        let id = queue.begin();
+        let mut pending = vec![PendingProve {
+            id,
+            reply_to: 7,
+            reply_msg: b"proved".to_vec(),
+            pvm_blob: blob,
+            witness_bytes: Vec::new(),
+            witness_addr: 0,
+            seg_steps,
+            page_budget: 0,
+            profile: floors,
+        }];
+
+        // Fake CAS: record each published segment, hand back hash [i+1; 32].
+        let mut published: Vec<Vec<u8>> = Vec::new();
+        let cb = block_on(advance_one_job(&mut pending, &mut queue, async |seg| {
+            let n = published.len() as u8;
+            published.push(seg);
+            Some([n + 1; 32])
+        }))
+        .expect("the pending job is advanced");
+
+        assert_eq!(cb.status, JOB_DONE);
+        assert!(published.len() >= 2, "the fixture must cut into a real chain");
+        assert_eq!(cb.segments as usize, published.len());
+
+        let (data, done, error) = queue.poll(id);
+        assert!(done);
+        assert!(error.is_empty());
+        let manifest =
+            decode_chain_manifest(&data).expect("the job result is an anchored-manifest input");
+        let expected_hashes: Vec<[u8; 32]> =
+            (1..=published.len() as u8).map(|i| [i; 32]).collect();
+        assert_eq!(
+            manifest.segments, expected_hashes,
+            "the manifest lists the published hashes in chain order"
+        );
+        assert_eq!(
+            Some(manifest.initial_root),
+            segment_initial_root(&published),
+            "the manifest anchor is segment 0's entering-image root"
+        );
+    }
+
+    #[test]
+    fn failed_publish_fails_the_job() {
+        // A `put` that refuses (host CAS unavailable) must fail the job — and
+        // abort the remaining prove — rather than report success with proofs
+        // nobody can fetch.
+        let blob = super::test_trace::straight_line_blob(6);
+        let floors = super::chain_stream_tests::tiny_floors(&blob);
+
+        let mut queue = JobQueue::new();
+        let id = queue.begin();
+        let mut pending = vec![PendingProve {
+            id,
+            reply_to: 0,
+            reply_msg: Vec::new(),
+            pvm_blob: blob,
+            witness_bytes: Vec::new(),
+            witness_addr: 0,
+            seg_steps: super::chain_stream_tests::SEG_STEPS as u64,
+            page_budget: 0,
+            profile: floors,
+        }];
+
+        let mut puts = 0usize;
+        let cb = block_on(advance_one_job(&mut pending, &mut queue, async |_seg| {
+            puts += 1;
+            None
+        }))
+        .expect("the pending job is advanced");
+        assert_eq!(cb.status, JOB_FAILED);
+        assert_eq!(cb.segments, 0);
+        assert_eq!(puts, 1, "the first refused publish aborts the chain");
+        let (_, done, error) = queue.poll(id);
+        assert!(done);
+        assert!(!error.is_empty(), "a failed publish reports through job_poll");
     }
 
     #[test]
