@@ -339,16 +339,28 @@ the wall is NOT windowing-proof — it's step-windowing-proof.
   wrong, totals/uniques stand); duplicates come from read-only pages
   (exiting chain == entering chain) and identical-content pages
   (fresh zero pages).
-  1. **Dedup via a multiplicity column (THE next implementation).**
-     Produce each unique compression once with its consumption count
-     as logup multiplicity (the pattern RANGE_MULT_256 already uses)
-     — balance preserved, design §4's under-production objection
-     answered. Main-layout +1 column ⇒ commitment shift ⇒ routine
-     re-pin. Post-dedup, boundary rows are CONTENT-proportional
-     (unique page images per window) — which is exactly what the
-     5.1 page budget can cut: splitting the tail's 16-distinct-page
-     window lands every window ≤ ~2^15. Projected chain: boundary
-     term ~1.3 GiB, whole window ~2.5–3 GiB; Wave 4 then → ~1–1.5.
+  1. **Dedup via a multiplicity column — LANDED + MEASURED
+     (2026-07-13).** `boundary_blake2b_calls` returns unique
+     compressions with consumption counts; the boundary chip fills
+     the count into the new `EmitMult` column at each compression's
+     row 95 and produces `+EmitMult` (consumers keep −1 each) —
+     balance preserved, design §4 updated. `EmitMult` is pinned to
+     real row-95s in the clean-unwind anchor block; its value is
+     free, the cross-chip sum pins it (fraction-space balance test
+     with an off-by-one negative). Measured on the real transition:
+     boundary floor 18 → **17** at uniform 100k, window peak
+     ~28.5 → **~20 GiB** (~30% off) — and **C_0/C_1 DO NOT DRIFT**
+     (drift guard green: the identity is the preprocessed root,
+     EmitMult is main-trace) so this is drop-in for deployed
+     verifiers, no re-pin. Remaining tuning: post-dedup boundary
+     rows ≈ 70–96 per distinct-content page (64 leaf comps + node
+     share, ×96 rows), so the 5.1 page budget binds only below ~26
+     pages/window — a budget of ~6–12 pages projects the floor to
+     2^15–2^16 (boundary term ~2.6–5 GiB) at the cost of more
+     windows; the 4 KB leaf granularity (64 comps even for a
+     one-byte touch) is what stands between that and 2^14, which is
+     lever 2's case. Prove-time deltas from this change are
+     unbenchmarked (box was under parallel load).
   2. **Smaller Merkle leaf unit (reserve).** 256B sub-leaf counts
      measured (seg0 421, mid 14, comb 23, tail 81): helps sparse
      windows ~3–5×, does NOT help dense ones alone (seg0 would stay
