@@ -184,8 +184,8 @@ fn read_row(key: &[u8]) -> Option<Vec<u8>> {
     match witnessed {
         Witnessed::Hit(value) => value,
         Witnessed::Unproven => panic!(
-            "unproven storage read — the task witness does not carry this \
-             key; the invoker must name every row the handler touches",
+            "unproven storage read of key {key:x?} — the task witness does not \
+             carry this key; the invoker must name every row the handler touches",
         ),
         Witnessed::NotWitnessed => backend_read(key),
     }

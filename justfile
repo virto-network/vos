@@ -64,7 +64,7 @@ build-actor name:
     cd actors/{{name}}; cargo +nightly actor
 
 # Build all generated artifacts consumed by the test suite.
-build-test-artifacts: build-extensions build-pvm build-v2-pvm-test-artifacts build-actors build-voucher-check
+build-test-artifacts: build-extensions build-pvm build-v2-pvm-test-artifacts build-actors build-voucher-check build-witnessed-transfer
     cargo build
 
 # Build all built-in actors used by host tests.
@@ -78,6 +78,10 @@ build-actors: (build-actor "space-registry") (build-actor "space-bridge") \
 # Build the voucher-check PVM guest used by Mode::External voucher proofs.
 build-voucher-check:
     cd tests/fixtures/legacy-v1/actors/voucher-check; cargo +nightly build --release
+
+# Build the pure-verifier Task used by the WitnessedLedger proof gate.
+build-witnessed-transfer:
+    cd tests/fixtures/legacy-v1/actors/witnessed-transfer; cargo +nightly build --release
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")
