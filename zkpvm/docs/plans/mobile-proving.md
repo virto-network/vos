@@ -143,10 +143,34 @@ The two blake2b chips are ~90% of it, and the waste is ~1.17 GiB of
 FULL-HEIGHT columns carrying fractions gated to 1-in-96 rows (a gate
 multiplies the numerator; the column still spans 2^L). Logup pairing
 itself is fine (two lone tails, ~7.5 MiB). Candidates, both-axes:
-- **C2 (GO, first): byte-wide AND table** (2^16-row (a,b,a&b) chip,
-  RangeMultiplicity pattern) halves every AND lookup in both blake2b
-  chips: −660 MiB interaction, ~−480 MiB main, interaction-gen time
-  DOWN ~40% on the two heaviest chips. Component-set change ⇒ re-pin.
+- **C2 — LANDED + MEASURED (2026-07-14): byte-wide AND table.** A new
+  2^16-row `BitwiseAndByteChip` (`(a, b, a&b)` preprocessed +
+  free-multiplicity column, RangeMultiplicity pattern, placed last in
+  BASE_COMPONENTS — a receiver generated after its two blake2b
+  consumers) replaces every paired nibble AND lookup in both blake2b
+  chips (shared `add_compression_core` / `add_compression_interaction_
+  core`, generic over `CompressionColumns`) with one byte lookup —
+  byte-ness of the operands comes free from table membership. **512 main
+  limbs/row die from BOTH `Column` and `BoundaryColumn`**:
+  And{1..4}{A,B,Res}Hi (96), THi (16), AndT{Lo,Hi}Hi (16), HHi (64),
+  VAfterHi (128), OutAnd1Hi (64), OutXor1Hi (64), OutAnd2Hi (64); the
+  AND *results* (And1..4, AndTLo/Hi, Output, OutAnd1/2) stay. The nibble
+  `BitwiseLookupChip` + its CpuChip / ALU BitwiseChip consumers are
+  untouched (out of scope). `bitwise_and_byte_counts` accumulates during
+  blake2b trace-gen (`add_bitwise_and_byte`, mirrors `range256_counts`).
+  Component-set + preprocessed-shape change ⇒ FULL re-pin at the (32k, 8)
+  cut: `chip_idx::COUNT` 31→32, profile `[u32; 32]` (chip 31 = 16, all
+  others UNCHANGED — floors still equal naturals over all 293 windows),
+  **C_0 `d76262877c32e2b6…`, C_1 `913f5cbf7cdd9d99…`**, catalog +
+  VOUCHER_CHECK_* re-pinned (`prove.rs` mask widened to dodge `1<<32`).
+  **Measured (release, same box, apples-to-apples): window-0 prove
+  6.41 → 4.01 s (−37%), peak RSS 6.90 → 5.17 GiB (−1.73 GiB, −25%);
+  interaction-gen BLAKE2B_BOUNDARY L16 617 → 352 ms (−43%), BLAKE2B L13
+  177 → 155 ms** (on top of the dead-row skip — the full diet from
+  master nibble+no-skip is 752 → 352 ms / 234 → 155 ms). Gates green:
+  chip_isolated / phase2_alu / memory / memory_negative /
+  blake2b_boundary_gate / memory_merkle_gate; floors-cover, drift guard,
+  allowlist coverage, catalog parity all reproduce the new pins.
 - **C1 (GO, after C2): per-compression sub-chip** hoisting the
   row-0/row-95 payloads (output-derivation AND-nibbles, h/m read
   binding, producers) onto one-row-per-compression siblings
