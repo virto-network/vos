@@ -76,7 +76,7 @@ let full = trace_blob(&pvm_blob, gas).expect("trace");
 
 // Content-budgeted windows: cap BOTH steps and distinct touched pages,
 // so hash-dense stretches get short windows and the boundary chip stays
-// bounded (see docs/plans/mobile-proving.md).
+// bounded (see docs/plans/roadmap.md).
 let bounds = segment_bounds_budgeted(&full, 32_000, 8);
 
 // One canonical forcing profile so every window shares ONE program
@@ -108,7 +108,7 @@ cargo build -p zkpvm --no-default-features   # verifier-only: no_std, ~50× smal
 ```
 
 Cross-compiling the prover for aarch64 (on-device proving) is a supported
-target — see `docs/plans/mobile-proving.md` § "Cross-compile recipe".
+target — see `docs/plans/roadmap.md` § "Cross-compile recipe".
 
 ## Soundness & security
 
@@ -116,7 +116,8 @@ target — see `docs/plans/mobile-proving.md` § "Cross-compile recipe".
 remain prover-trusted. **Before pointing real users at a deployed
 verifier, read [`SECURITY.md`](./SECURITY.md)** (trust boundary, what a
 verified proof does and does not guarantee, deployment checklist) and
-[`STATUS.md`](./STATUS.md) (per-opcode soundness coverage and open items).
+[`docs/status.md`](./docs/status.md) (per-opcode soundness coverage and
+open items).
 
 ## Examples
 
@@ -135,8 +136,10 @@ side-table chips answer its lookups (`ProgramMemory`, `RegisterMemory`,
 ristretto precompile chips, initial/final boundary chips). See
 [`src/chips/cpu/CONSTRAINTS.md`](./src/chips/cpu/CONSTRAINTS.md) for the
 constraint-authoring rules (logup pair-shape, multiplicity registration,
-regression checklist) and [`BENCHMARKS.md`](./BENCHMARKS.md) for
-throughput.
+regression checklist), the [`docs/design/`](./docs/design) records for
+individual chip designs, and
+[`docs/plans/roadmap.md`](./docs/plans/roadmap.md) for prover-performance
+state, forward work, and benchmark methodology.
 
 ## Fuzzing
 

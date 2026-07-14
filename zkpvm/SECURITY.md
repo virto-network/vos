@@ -1,8 +1,8 @@
 # zkpvm — security considerations
 
 A guide for deployers who want to use zkpvm in the wild.  Read this
-alongside [`STATUS.md`](./STATUS.md) (which proves *what* is bound)
-and [`README.md`](./README.md) (which says *how* to call the API).
+alongside [`docs/status.md`](./docs/status.md) (which proves *what* is
+bound) and [`README.md`](./README.md) (which says *how* to call the API).
 
 This document is descriptive: it spells out what a successful
 verification *proves* about a PVM execution, what it *does not*
@@ -64,7 +64,7 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 - **Per-step semantics**: each ALU / branch / load / store / shift
   / rotate / bitmanip / divrem / mul / compare / cmov / move /
   jump / ECALL / Trap / Sbrk row satisfies the AIR's per-opcode
-  constraints.  See `STATUS.md` for the per-opcode breakdown of
+  constraints.  See `docs/status.md` for the per-opcode breakdown of
   *which* semantic property is bound.
 
 - **Memory consistency**: every byte read at `(addr, ts)` matches

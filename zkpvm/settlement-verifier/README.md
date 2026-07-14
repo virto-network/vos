@@ -7,7 +7,7 @@ constraint re-evaluation at the OODS point. It carries only the VERIFY side (no
 `wasm32-unknown-unknown` and the JAM PVM (`riscv64em-javm`), and it executes and
 **ACCEPTS real proofs on the PVM**. This is the on-chain verify for a single
 light segment proof — the Track-A path in
-`zkpvm/docs/plans/recursion-decision.md`.
+`zkpvm/docs/design/recursion-decision.md`.
 
 ## Why a separate workspace
 

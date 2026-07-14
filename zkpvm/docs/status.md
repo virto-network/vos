@@ -190,7 +190,7 @@ as a write to skip the check.  This closes the previously-honest-only
 gap — in particular the closing read that pins `final_state.registers`
 / the voucher io-hash is now sound.  Gate:
 `tests/ledger_readconsistency_gate.rs`; see
-`docs/plans/ledger-read-consistency.md`.  `proof.memory_commitment`
+`docs/design/ledger-read-consistency.md`.  `proof.memory_commitment`
 remains separately unbound (computed outside the circuit — an
 in-circuit memory-image commitment is still future work).
 
