@@ -22,7 +22,7 @@ logarithmic.
 ## Prove and verify
 
 ```rust
-use zkpvm::{trace_blob, prove_mobile, program_commitment_of_proof, PcsPolicy};
+use zkpvm::{trace_blob, prove_mobile, program_commitment_of_proof};
 
 // `pvm_blob` is a transpiled PVM program; `gas` bounds tracing.
 let mut sn = trace_blob(&pvm_blob, gas).expect("trace");
@@ -32,18 +32,19 @@ let proof = prove_mobile(&mut sn).expect("prove");          // MOBILE = low late
 let commitment = program_commitment_of_proof(&proof);
 
 // Deployer-side: verify with only the proof + commitment (no trace).
-zkpvm_verifier::verify_standalone_with_pcs_policy(
-    proof, commitment, &PcsPolicy::MOBILE,
-).expect("verify");
+zkpvm_verifier::verify_standalone(proof, commitment).expect("verify");
 ```
 
 - **`prove` (STANDARD)** minimizes proof size (~4× smaller); **`prove_mobile`
-  (MOBILE)** is ~2.5× faster to prove for the same conjectured 96-bit
-  security, at a larger proof. Verify with the matching `PcsPolicy`.
-- **`verify` / `verify_with_pcs_policy(proof, &sn, policy)`** re-check a
-  proof against its `SideNote` (prover-side regression use). A *deployed*
-  verifier uses `zkpvm_verifier::verify_standalone*`, which needs only the
-  proof and the commitment.
+  (MOBILE)** is ~2.5× faster for the same conjectured 96-bit security, at a
+  larger proof.
+- **`verify` accepts any proof over the security floor** (`pow + queries·blowup
+  ≥ 96`), so STANDARD and MOBILE both verify with the *same* call — no policy
+  to match by hand. Pin an exact FRI shape with `verify_with_pcs_policy` /
+  `verify_standalone_with_pcs_policy` if a deployment wants it.
+- **`verify(proof, &sn)`** re-checks against the `SideNote` (prover-side
+  regression use); a *deployed* verifier uses `zkpvm_verifier::verify_standalone`,
+  which needs only the proof and commitment.
 - Proofs are `serde`-serializable (`bincode`, `postcard`, …) and versioned
   by `PROOF_FORMAT_VERSION` — a verifier compiled against version N rejects
   any other N.
@@ -65,12 +66,13 @@ verify(proof, &sn).expect("verify");
 ## Large executions: segment chains and streaming
 
 An execution too large for one proof is proved as a **chain** of
-equal-shape segments; `verify_chain` checks each segment plus boundary
-continuity (`segment[n].final_state == segment[n+1].initial_state`).
+equal-shape segments that all share ONE program commitment; the chain
+verifier checks each segment plus boundary continuity
+(`segment[n].final_state == segment[n+1].initial_state`).
 
 ```rust
-use zkpvm::{trace_blob, canonical_profile_for_bounds, prove_canonical, verify_chain};
-use zkpvm::segment::{segment_bounds_budgeted, segment_side_note};
+use zkpvm::{trace_blob, prove_chain, program_commitment_of_proof};
+use zkpvm::segment::segment_bounds_budgeted;
 
 let full = trace_blob(&pvm_blob, gas).expect("trace");
 
@@ -79,18 +81,20 @@ let full = trace_blob(&pvm_blob, gas).expect("trace");
 // bounded (see docs/plans/roadmap.md).
 let bounds = segment_bounds_budgeted(&full, 32_000, 8);
 
-// One canonical forcing profile so every window shares ONE program
-// commitment (what lets a single allowlist pin a heterogeneous chain).
-let profile = canonical_profile_for_bounds(&full, &bounds).expect("floors");
+// `prove_chain` derives the canonical forcing profile over `bounds` and
+// proves each window to that one shape, in memory.
+let (_profile, proofs) = prove_chain(&full, &bounds).expect("chain prove");
 
-let (mut proofs, mut sides) = (Vec::new(), Vec::new());
-for &(a, b) in &bounds {
-    let mut sn = segment_side_note(&full, a, b);
-    proofs.push(prove_canonical(&mut sn, &profile).expect("prove"));
-    sides.push(sn);
-}
-verify_chain(&proofs, &sides.iter().collect::<Vec<_>>()).expect("chain");
+// Every segment shares one commitment; verify the whole chain trustlessly.
+let commitment = program_commitment_of_proof(&proofs[0]);
+let entering_root = proofs[0].initial_state.memory_root;
+zkpvm_verifier::verify_chain_standalone(&proofs, commitment, entering_root)
+    .expect("chain verify");
 ```
+
+The building blocks under `prove_chain` — `segment::segment_bounds` /
+`segment_bounds_budgeted`, `canonical_profile_for_bounds`,
+`prove_canonical` — are public if you want to drive the cut yourself.
 
 **Streaming** (never hold the whole trace or all proofs in memory) is
 what the [`prover-extension`](../extensions/prover) crate wraps around

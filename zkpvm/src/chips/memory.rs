@@ -181,7 +181,7 @@ impl BuiltInComponent for MemoryChip {
         // The ledger is sorted by (Address, Timestamp).  These constraints pin
         // that ordering and bind each read to the immediately-preceding
         // same-address row (closing the read-consistency soundness gap).  All
-        // constraints stay ≤ degree 2.  See docs/plans/ledger-read-consistency.md.
+        // constraints stay ≤ degree 2.  See docs/design/ledger-read-consistency.md.
         let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
         let address_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Address);
         let timestamp_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Timestamp);

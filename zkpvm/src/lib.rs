@@ -7,8 +7,8 @@
 //! protocol.
 //!
 //! See the crate-level `README.md` for the architecture overview,
-//! `STATUS.md` for soundness coverage, `SECURITY.md` for the trust
-//! boundary, and `docs/plans/mobile-proving.md` for the chain-prove /
+//! `docs/status.md` for soundness coverage, `SECURITY.md` for the trust
+//! boundary, and `docs/plans/roadmap.md` for the chain-prove /
 //! low-RAM direction.
 //!
 //! ## Quick start
@@ -16,12 +16,12 @@
 //! Trace a PVM program, prove its execution, verify the proof:
 //!
 //! ```ignore
-//! use zkpvm::{trace_blob, prove_mobile, verify_with_pcs_policy, PcsPolicy};
+//! use zkpvm::{trace_blob, prove_mobile, verify};
 //!
 //! // `pvm_blob` is a transpiled PVM program; `gas` bounds tracing.
 //! let mut sn = trace_blob(&pvm_blob, gas).expect("trace");
 //! let proof = prove_mobile(&mut sn).expect("prove");   // MOBILE = low latency
-//! verify_with_pcs_policy(proof, &sn, &PcsPolicy::MOBILE).expect("verify");
+//! verify(proof, &sn).expect("verify");                 // accepts any ≥96-bit proof
 //! ```
 //!
 //! A *deployed* verifier sees only the proof + the program commitment

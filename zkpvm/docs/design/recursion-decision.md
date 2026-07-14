@@ -40,7 +40,7 @@ regardless.
 
 Note recursion was never the cross-node delivery mechanism: per-segment proofs
 verify independently, so a per-segment **manifest**
-(`docs/plans/federation-wire-through.md`) delivers a chain across nodes with no
+(`../plans/roadmap.md`) delivers a chain across nodes with no
 crypto change. Recursion's only exclusive payoff is succinctness (one proof for a
 single cheap on-chain check).
 

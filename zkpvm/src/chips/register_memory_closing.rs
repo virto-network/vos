@@ -58,7 +58,7 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 ///    `is_write = 0` is bound by the logup tuple, and the cross-row
 ///    `prev_value` binding forces its value to equal the previous (= last
 ///    real) row's value (see `RegisterMemoryChip` and
-///    `docs/plans/ledger-read-consistency.md`).
+///    `docs/design/ledger-read-consistency.md`).
 ///
 /// The FS-transcript mix of the field (see `prove.rs`) makes a finished proof
 /// tamper-evident and feeds the boundary states into the lookup-element draw

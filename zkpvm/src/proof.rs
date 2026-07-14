@@ -67,7 +67,7 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       enforced cross-row (a separate, pre-existing gap — a malicious
 ///       prover can still forge the closing read's value and hence the
 ///       io-hash; see `chips/register_memory_closing.rs` and
-///       `docs/plans/succinct-merkle-witness.md`). No AIR change — the
+///       `docs/plans/roadmap.md`). No AIR change — the
 ///       proof bytes an honest prover produces are unchanged apart from
 ///       this version field; the bump exists because older verifiers
 ///       ACCEPT metadata forgeries that v5 verifiers reject, and proofs

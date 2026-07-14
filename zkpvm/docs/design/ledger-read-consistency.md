@@ -199,7 +199,7 @@ The 4-slot emission machinery stays dormant (slots 1..3 emit 0-mult) so
 - Flip overstated caveats to "bound": `SECURITY.md` (Register/Memory consistency
   bullets), `docs/status.md` ("Open soundness gaps"),
   `register_memory_closing.rs` LIMITATION comment, `boundary_binding.rs` SCOPE
-  comment, `docs/plans/succinct-merkle-witness.md` "Soundness prerequisite #1"
+  comment, `roadmap.md` "Soundness prerequisite #1"
   register bullet, and the v5/v6 `proof.rs` history register note. Update the
   `tests/boundary_binding.rs` scope note.
 

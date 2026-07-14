@@ -7,7 +7,7 @@
 //! multiproof — recompute `initial_root` from the entering page images and
 //! `final_root` from the exit images, sharing the untouched-subtree witnesses
 //! — and binds both roots in-circuit (see
-//! `docs/plans/memory-merkle-binding.md`).
+//! `docs/design/memory-merkle-binding.md`).
 //!
 //! This module is the single host-side source of truth for that tree.  It is
 //! intentionally independent of any external blake2b crate: it hashes via the

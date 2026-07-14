@@ -27,12 +27,12 @@
 //!   - `memory_commitment` is a hash computed outside the circuit (not
 //!     even FS-mixed), so memory continuity trusts the prover. Closing
 //!     it needs an in-circuit memory-image commitment (couples with the
-//!     memory-continuity work in `docs/plans/proving-time.md`).
+//!     memory-continuity work in `docs/plans/roadmap.md`).
 //! Independently, `verify_chain` itself is a HOST-SIDE capability, not a
 //! trust-boundary check: it consumes prover-derived `SideNote`s and
 //! anchors no per-segment program commitment. Making it a trust boundary
 //! (a side-note-free `verify_chain_standalone`) is the
-//! chain-verification work in `docs/plans/succinct-merkle-witness.md`.
+//! chain-verification work in `docs/plans/roadmap.md`.
 //!
 //! This is program-agnostic: any actor whose trace is too large for one
 //! proof becomes provable as a chain.

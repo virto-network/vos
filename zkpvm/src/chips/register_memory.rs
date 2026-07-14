@@ -196,7 +196,7 @@ impl BuiltInComponent for RegisterMemoryChip {
         // The ledger is sorted by (RegAddr, Ts0).  These constraints pin that
         // ordering and bind each read to the immediately-preceding same-reg
         // row, closing the read-consistency soundness gap (see
-        // docs/plans/ledger-read-consistency.md).  All
+        // docs/design/ledger-read-consistency.md).  All
         // constraints stay ≤ degree 2 (this chip can't raise
         // LOG_CONSTRAINT_DEGREE_BOUND), via the BothRealH / OrderValH helpers.
         let is_pad_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
@@ -348,7 +348,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         // multiple timestamps would need per-slot monotonicity + an
         // overlap-forbidding constraint.  `merge_entries` and its property
         // tests stay (uncalled) as documentation of the merge optimisation.
-        // See docs/plans/ledger-read-consistency.md.
+        // See docs/design/ledger-read-consistency.md.
         let num_rows_real = entries.len();
         let mut log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real);
         // Guarantee ≥ 1 padding row so the cyclic last→row-0 wraparound is always
