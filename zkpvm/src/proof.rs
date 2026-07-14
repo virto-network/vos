@@ -337,3 +337,62 @@ pub fn check_pcs_policy(
     }
     Ok(())
 }
+
+/// Minimum conjectured FRI security (bits) the DEFAULT verify paths require.
+///
+/// Both named policies hit exactly this floor — STANDARD (20 + 19·4 = 96) and
+/// MOBILE (20 + 38·2 = 96) — so the default `verify` / `verify_standalone`
+/// accept EITHER shape without the caller naming a policy. The two policies
+/// are incomparable per-field (STANDARD high-blowup/low-queries, MOBILE
+/// low-blowup/high-queries), so a per-field policy floor can only ever accept
+/// one of them; this single conjectured-security floor accepts both while
+/// still rejecting degenerate FRI shapes. See SECURITY.md "Proof shape".
+pub const MIN_CONJECTURED_SECURITY_BITS: u32 = 96;
+
+/// Conjectured FRI soundness (bits) of a `PcsConfig`: `pow_bits +
+/// n_queries · log_blowup_factor`. This is the standard heuristic the named
+/// policies are tuned to (STANDARD and MOBILE both yield 96) — NOT a proven
+/// bound; it exists so the default verify paths can gate on a single number
+/// that both shapes satisfy.
+pub fn conjectured_security_bits(config: &stwo::core::pcs::PcsConfig) -> u32 {
+    config.pow_bits + (config.fri_config.n_queries as u32) * config.fri_config.log_blowup_factor
+}
+
+/// Validate `proof.pcs_config` against the conjectured-security floor the
+/// DEFAULT `verify` / `verify_standalone` paths enforce. Unlike
+/// [`check_pcs_policy`] (an exact per-field pin), this accepts ANY shape
+/// meeting the floor — so both STANDARD and MOBILE proofs verify by default —
+/// while still rejecting degenerate FRI shapes. Returns `Err` (mirroring
+/// `check_pcs_policy`'s style) if ANY of:
+///   - `pow_bits < MOBILE_MIN_POW_BITS` (the shared PoW floor),
+///   - `log_blowup_factor < MOBILE_MIN_FRI_LOG_BLOWUP` (rejects the
+///     degenerate rate-1 / blowup-1 shapes, whose per-query soundness is nil),
+///   - [`conjectured_security_bits`] `< MIN_CONJECTURED_SECURITY_BITS`.
+///
+/// STANDARD (20, 19, 4) and MOBILE (20, 38, 2) both pass (each is 96 bits);
+/// a blowup-1 or a 95-bit config fails.
+pub fn check_min_security(
+    config: &stwo::core::pcs::PcsConfig,
+) -> Result<(), alloc::string::String> {
+    use alloc::format;
+    if config.pow_bits < MOBILE_MIN_POW_BITS {
+        return Err(format!(
+            "pcs_config.pow_bits {} < security-floor minimum {}",
+            config.pow_bits, MOBILE_MIN_POW_BITS
+        ));
+    }
+    if config.fri_config.log_blowup_factor < MOBILE_MIN_FRI_LOG_BLOWUP {
+        return Err(format!(
+            "pcs_config.fri_config.log_blowup_factor {} < security-floor minimum {} \
+             (degenerate FRI rate)",
+            config.fri_config.log_blowup_factor, MOBILE_MIN_FRI_LOG_BLOWUP
+        ));
+    }
+    let bits = conjectured_security_bits(config);
+    if bits < MIN_CONJECTURED_SECURITY_BITS {
+        return Err(format!(
+            "pcs_config conjectured security {bits} bits < minimum {MIN_CONJECTURED_SECURITY_BITS}"
+        ));
+    }
+    Ok(())
+}

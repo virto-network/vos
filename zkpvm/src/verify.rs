@@ -74,47 +74,57 @@ pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
 /// re-derivation path only; `zkpvm_verifier::verify_standalone` needs no
 /// side note at all.)
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
-    verify_with_options(
-        proof,
-        side_note,
-        DEFAULT_MAX_LOG_SIZE,
-        &crate::proof::PcsPolicy::STANDARD,
-    )
+    // Default: the conjectured-security floor, which accepts any 96-bit-secure
+    // shape (STANDARD and MOBILE both). `None` selects that floor; the strict
+    // `verify_with_pcs_policy` path passes an exact `PcsPolicy` instead.
+    verify_with_shape(proof, side_note, DEFAULT_MAX_LOG_SIZE, None)
 }
 
 /// Caller-supplied per-component `log_size` cap variant of `verify`.
 /// See `verify` for the default and the `max_log_size` cap rationale.
+/// Shares `verify`'s default FRI-shape floor (the conjectured-security floor).
 pub fn verify_with_max_log_size(
     proof: Proof,
     side_note: &SideNote,
     max_log_size: u32,
 ) -> Result<(), VerificationError> {
-    verify_with_options(
-        proof,
-        side_note,
-        max_log_size,
-        &crate::proof::PcsPolicy::STANDARD,
-    )
+    verify_with_shape(proof, side_note, max_log_size, None)
 }
 
 /// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
-/// on `proof.pcs_config`.  Most deployers want `PcsPolicy::STANDARD`;
-/// override for stricter (more security) or looser (test harness)
-/// floors.  See SECURITY.md "Proof shape".
+/// on `proof.pcs_config`.  The default `verify` accepts any shape meeting the
+/// conjectured-security floor; reach for this to pin an EXACT shape (stricter
+/// deployments) or to accept a looser test-harness shape.  See SECURITY.md
+/// "Proof shape".
 pub fn verify_with_pcs_policy(
     proof: Proof,
     side_note: &SideNote,
     policy: &crate::proof::PcsPolicy,
 ) -> Result<(), VerificationError> {
-    verify_with_options(proof, side_note, DEFAULT_MAX_LOG_SIZE, policy)
+    verify_with_shape(proof, side_note, DEFAULT_MAX_LOG_SIZE, Some(policy))
 }
 
-/// Both knobs at once.
+/// Both knobs at once — the explicit-`PcsPolicy` funnel (strict per-field
+/// pin). The default `verify` / `verify_with_max_log_size` paths go through
+/// `verify_with_shape` with the conjectured-security floor instead.
 pub fn verify_with_options(
     proof: Proof,
     side_note: &SideNote,
     max_log_size: u32,
     policy: &crate::proof::PcsPolicy,
+) -> Result<(), VerificationError> {
+    verify_with_shape(proof, side_note, max_log_size, Some(policy))
+}
+
+/// Shared component-setup funnel for the SideNote verify paths. `policy`
+/// selects the FRI-shape floor: `None` = the conjectured-security floor (the
+/// default `verify` paths — accepts STANDARD and MOBILE), `Some(p)` = an exact
+/// `PcsPolicy` pin (the strict `*_with_pcs_policy` paths).
+fn verify_with_shape(
+    proof: Proof,
+    side_note: &SideNote,
+    max_log_size: u32,
+    policy: Option<&crate::proof::PcsPolicy>,
 ) -> Result<(), VerificationError> {
     // Select active components from side_note (same predicate
     // the prover used).  See `active_components_verifier` doc-comment.
@@ -168,7 +178,7 @@ pub fn verify_with_explicit_components(
         proof,
         side_note,
         DEFAULT_MAX_LOG_SIZE,
-        policy,
+        Some(policy),
         components,
         prover_components,
         None,
@@ -179,7 +189,7 @@ fn verify_with_options_explicit_components(
     proof: Proof,
     side_note: &SideNote,
     max_log_size: u32,
-    policy: &crate::proof::PcsPolicy,
+    policy: Option<&crate::proof::PcsPolicy>,
     components: &[&dyn crate::framework::MachineComponent],
     prover_components: &[&dyn crate::framework::MachineProverComponent],
     boundary_positions: Option<crate::boundary_binding::BoundaryChipPositions>,
@@ -202,10 +212,15 @@ fn verify_with_options_explicit_components(
             "proof log_size {offending} exceeds cap {max_log_size}"
         )));
     }
-    // Enforce the PcsPolicy floor — reject under-spec'd
-    // pcs_configs before any cryptographic work.  Default policy is
-    // PcsPolicy::STANDARD.
-    if let Err(msg) = crate::proof::check_pcs_policy(&proof.pcs_config, policy) {
+    // Enforce the FRI-shape floor — reject under-spec'd pcs_configs before any
+    // cryptographic work. `None` = the default conjectured-security floor
+    // (accepts any 96-bit-secure shape, STANDARD and MOBILE both); `Some(p)` =
+    // an exact `PcsPolicy` pin (the strict `*_with_pcs_policy` path).
+    let shape_check = match policy {
+        Some(p) => crate::proof::check_pcs_policy(&proof.pcs_config, p),
+        None => crate::proof::check_min_security(&proof.pcs_config),
+    };
+    if let Err(msg) = shape_check {
         return Err(VerificationError::InvalidStructure(msg));
     }
     let Proof {

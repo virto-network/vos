@@ -34,10 +34,15 @@ use zkpvm::recursion_pcs::{ProverChannel, ProverMerkleChannel};
 // `proof.format_version` themselves for early rejection at the network
 // boundary, or just rely on `verify_standalone`'s built-in check.
 pub use zkpvm::{PROOF_FORMAT_VERSION, Proof};
-// PcsPolicy floor — see SECURITY.md "Proof shape".
+// PcsPolicy floor — see SECURITY.md "Proof shape". `check_min_security` /
+// `conjectured_security_bits` / `MIN_CONJECTURED_SECURITY_BITS` are the
+// conjectured-security floor the DEFAULT `verify_standalone` path enforces
+// (accepts any 96-bit-secure shape, STANDARD and MOBILE both); the per-field
+// `PcsPolicy` + `check_pcs_policy` are the exact-pin path.
 pub use zkpvm::proof::{
-    PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
-    check_pcs_policy,
+    MIN_CONJECTURED_SECURITY_BITS, PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP,
+    STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS, check_min_security, check_pcs_policy,
+    conjectured_security_bits,
 };
 
 use zkpvm::framework_access::{
@@ -75,12 +80,11 @@ pub fn verify_standalone(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
 ) -> Result<(), VerificationError> {
-    verify_standalone_with_options(
-        proof,
-        preprocessed_commitment,
-        DEFAULT_MAX_LOG_SIZE,
-        &PcsPolicy::STANDARD,
-    )
+    // Default: the conjectured-security floor, which accepts any 96-bit-secure
+    // shape (STANDARD and MOBILE both) while rejecting degenerate FRI shapes.
+    // `None` selects that floor; the strict `verify_standalone_with_pcs_policy`
+    // path passes an exact `PcsPolicy`.
+    verify_standalone_shaped(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE, None)
 }
 
 /// Same as `verify_standalone` but with a caller-supplied per-component
@@ -98,32 +102,50 @@ pub fn verify_standalone_with_max_log_size(
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
 ) -> Result<(), VerificationError> {
-    verify_standalone_with_options(
-        proof,
-        preprocessed_commitment,
-        max_log_size,
-        &PcsPolicy::STANDARD,
-    )
+    // Shares `verify_standalone`'s default FRI-shape floor (conjectured
+    // security). Only the log_size cap differs.
+    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size, None)
 }
 
 /// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
-/// on `proof.pcs_config`.  Most deployers want `PcsPolicy::STANDARD`;
-/// override for stricter (more security) or looser (test harness)
-/// floors.  See SECURITY.md "Proof shape".
+/// on `proof.pcs_config`.  The default `verify_standalone` accepts any shape
+/// meeting the conjectured-security floor; reach for this to pin an EXACT
+/// shape (stricter deployments) or to accept a looser test-harness shape.
+/// See SECURITY.md "Proof shape".
 pub fn verify_standalone_with_pcs_policy(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
     policy: &PcsPolicy,
 ) -> Result<(), VerificationError> {
-    verify_standalone_with_options(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE, policy)
+    verify_standalone_shaped(
+        proof,
+        preprocessed_commitment,
+        DEFAULT_MAX_LOG_SIZE,
+        Some(policy),
+    )
 }
 
-/// Both knobs at once.
+/// Both knobs at once — the explicit-`PcsPolicy` funnel (strict per-field
+/// pin). The default `verify_standalone` / `verify_standalone_with_max_log_size`
+/// paths use the conjectured-security floor instead (via `verify_standalone_shaped`).
 pub fn verify_standalone_with_options(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
     policy: &PcsPolicy,
+) -> Result<(), VerificationError> {
+    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size, Some(policy))
+}
+
+/// Shared verify funnel. `policy` selects the FRI-shape floor: `None` = the
+/// conjectured-security floor (the default paths — accepts STANDARD and
+/// MOBILE), `Some(p)` = an exact `PcsPolicy` pin (the strict `*_with_pcs_policy`
+/// path). All four public `verify_standalone*` entry points funnel here.
+fn verify_standalone_shaped(
+    proof: Proof,
+    preprocessed_commitment: CommitmentHash,
+    max_log_size: u32,
+    policy: Option<&PcsPolicy>,
 ) -> Result<(), VerificationError> {
     // Reject proofs from a different AIR shape early, before
     // any cryptographic work.  Done first because every subsequent
@@ -166,12 +188,16 @@ pub fn verify_standalone_with_options(
              (set max_log_size higher or reject this proof)"
         )));
     }
-    // Enforce the PcsPolicy floor — reject under-spec'd
-    // pcs_configs (low pow_bits, low n_queries, low log_blowup_factor)
-    // before any cryptographic work.  Default policy is
-    // PcsPolicy::STANDARD; deployers needing more / less specify a
-    // custom one.
-    if let Err(msg) = check_pcs_policy(&proof.pcs_config, policy) {
+    // Enforce the FRI-shape floor — reject under-spec'd pcs_configs (low
+    // pow_bits, low n_queries, low log_blowup_factor) before any cryptographic
+    // work. `None` = the default conjectured-security floor (accepts any
+    // 96-bit-secure shape, STANDARD and MOBILE both); `Some(p)` = an exact
+    // `PcsPolicy` pin (the strict `*_with_pcs_policy` path).
+    let shape_check = match policy {
+        Some(p) => check_pcs_policy(&proof.pcs_config, p),
+        None => check_min_security(&proof.pcs_config),
+    };
+    if let Err(msg) = shape_check {
         return Err(VerificationError::InvalidStructure(msg));
     }
     let Proof {
@@ -393,21 +419,28 @@ pub fn verify_chain_standalone(
     preprocessed_commitment: CommitmentHash,
     expected_initial_root: [u8; 32],
 ) -> Result<[u8; 32], VerificationError> {
-    verify_chain_standalone_with_options(
+    // Default: the conjectured-security floor, so a canonical MOBILE chain
+    // (`zkpvm::prove_chain`) verifies without the caller naming
+    // `PcsPolicy::MOBILE`. `None` selects that floor; the explicit
+    // `verify_chain_standalone_with_options` path passes a `PcsPolicy`.
+    verify_chain_standalone_shaped(
         proofs,
         preprocessed_commitment,
         expected_initial_root,
         DEFAULT_MAX_LOG_SIZE,
-        &PcsPolicy::STANDARD,
+        None,
     )
 }
 
 /// [`verify_chain_standalone`] with explicit `max_log_size` cap + `PcsPolicy`.
 ///
-/// `expected_initial_root` is the page-Merkle root of the program's starting
-/// RAM image — the memory analogue of the program commitment — checked against
-/// `proofs[0].initial_state.memory_root`.  On success returns the chain's final
-/// root (`proofs.last().final_state.memory_root`) so the caller can pin the
+/// The strict-pin counterpart to `verify_chain_standalone` (which uses the
+/// conjectured-security floor): every segment is verified against the exact
+/// `policy` shape. `expected_initial_root` is the page-Merkle root of the
+/// program's starting RAM image — the memory analogue of the program
+/// commitment — checked against `proofs[0].initial_state.memory_root`.  On
+/// success returns the chain's final root
+/// (`proofs.last().final_state.memory_root`) so the caller can pin the
 /// post-state.  Callers compute `expected_initial_root` host-side via
 /// `zkpvm::page_merkle::image_root` over the input image.
 pub fn verify_chain_standalone_with_options(
@@ -416,6 +449,26 @@ pub fn verify_chain_standalone_with_options(
     expected_initial_root: [u8; 32],
     max_log_size: u32,
     policy: &PcsPolicy,
+) -> Result<[u8; 32], VerificationError> {
+    verify_chain_standalone_shaped(
+        proofs,
+        preprocessed_commitment,
+        expected_initial_root,
+        max_log_size,
+        Some(policy),
+    )
+}
+
+/// Shared chain-verify funnel. `policy`: `None` = the conjectured-security
+/// floor (the default `verify_chain_standalone` — accepts STANDARD and
+/// MOBILE), `Some(p)` = an exact `PcsPolicy` pin
+/// (`verify_chain_standalone_with_options`).
+fn verify_chain_standalone_shaped(
+    proofs: &[Proof],
+    preprocessed_commitment: CommitmentHash,
+    expected_initial_root: [u8; 32],
+    max_log_size: u32,
+    policy: Option<&PcsPolicy>,
 ) -> Result<[u8; 32], VerificationError> {
     if proofs.is_empty() {
         return Err(VerificationError::InvalidStructure(
@@ -445,7 +498,7 @@ pub fn verify_chain_standalone_with_options(
     // Each segment verifies standalone against the SAME program commitment:
     // no side note, and program identity is pinned across the whole chain.
     for proof in proofs {
-        verify_standalone_with_options(
+        verify_standalone_shaped(
             proof.clone(),
             preprocessed_commitment,
             max_log_size,

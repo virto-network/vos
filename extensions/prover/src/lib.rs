@@ -84,7 +84,7 @@
 use vos::jobs::JobQueue;
 use vos::prelude::*;
 use zkpvm::{Proof, SegmentState, prove_canonical, prove_mobile};
-use zkpvm_verifier::{CommitmentHash, PcsPolicy, verify_standalone_with_pcs_policy};
+use zkpvm_verifier::{CommitmentHash, verify_standalone};
 
 /// Gas bound for tracing a provable actor. Generous — an actor that
 /// exceeds it traces to `OutOfGas` and the prove fails (empty reply).
@@ -1011,9 +1011,10 @@ pub fn verify_proof_bytes(
         return false;
     };
     let commitment = CommitmentHash::from(commitment_bytes);
-    // 1. STARK validity against the program the caller trusts. `prove_mobile`
-    //    proofs verify only under the MOBILE policy — keep them paired.
-    if verify_standalone_with_pcs_policy(proof.clone(), commitment, &PcsPolicy::MOBILE).is_err() {
+    // 1. STARK validity against the program the caller trusts. The default
+    //    `verify_standalone` enforces the conjectured-security floor, which
+    //    accepts these MOBILE-shape (`prove_mobile`) proofs.
+    if verify_standalone(proof.clone(), commitment).is_err() {
         return false;
     }
     // 2. Tagless io-binding: the proof's STARK-bound public output must
@@ -1364,8 +1365,10 @@ fn verify_one_segment(
         return None;
     }
     let final_state = proof.final_state.clone();
-    // 2b. Per-segment STARK validity against its own commitment.
-    verify_standalone_with_pcs_policy(proof, commitment, &PcsPolicy::MOBILE).ok()?;
+    // 2b. Per-segment STARK validity against its own commitment. The default
+    // `verify_standalone` conjectured-security floor accepts these canonical
+    // MOBILE-shape segment proofs.
+    verify_standalone(proof, commitment).ok()?;
     Some(final_state)
 }
 
