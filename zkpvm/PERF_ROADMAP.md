@@ -4,6 +4,15 @@ State, design notes, and forward-looking items for prover performance.
 Implementation history lives in `git log` — this doc is the
 "design + decisions + open questions" survivor.
 
+> **Scope + freshness.** This doc covers the **single-proof latency**
+> path (tap-to-pay scale, ~24k steps). The numbers below are a
+> Session-3 (2026-05-08) snapshot and predate the 2026-07 chip changes
+> (boundary width diet, byte-wide AND table), so the single-proof
+> figures are now optimistic/stale — re-bench before quoting. For the
+> **chain-prove / mobile-RAM** work (the ~28→~5 GiB arc, budgeted
+> windowing, streaming trace, aarch64) see
+> `docs/plans/mobile-proving.md`, the live doc.
+
 ## Current state (post-Session-3, 2026-05-08)
 
 | Config   | Entry point      | Prove   | Proof   | Verify |

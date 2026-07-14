@@ -8,9 +8,11 @@ different gaps:
   question is ARM wall-clock. Estimated **~3.5–7 s on a flagship phone**
   (composed from SIMD-width/clock/bandwidth factors vs the 0.86 s x86
   MOBILE bench — needs an on-device measurement to confirm).
-- **Conservation-transition chain prove** (~7.6M steps, 76×100k-step
-  segments): **~26–29 GB peak per segment** today. This is the wall, and
-  it is fixable with mostly-local work.
+- **Conservation-transition chain prove** (~7.8M steps): was **~26–29 GB
+  peak per segment** — the original wall. As of 2026-07-14 the production
+  cut is content-budgeted (32k steps / 8 pages) and a window proves at
+  **~5.2 GiB / ~4 s** (see Status below); the chain's trace is no longer
+  resident and each segment proof streams to CAS as produced.
 
 **Both-axes constraint (2026-07-13, project decision):** a RAM
 reduction that costs considerable prove time is NOT acceptable — mobile
@@ -28,6 +30,57 @@ with a hard **≥3 GB available-RAM floor** and crashes driven by memory
 pressure, not CPU. Mopro measured the same ~3 GB OS app-memory cap on
 iPhone 15 Pro / Pixel 6 Pro. So the design constraint is **≤3 GB peak**,
 not 4 GB.
+
+## Status (2026-07-14) — what landed and what remains
+
+**Landed + pushed** (master, both remotes), under the both-axes
+constraint: turnkey re-pin tooling (Wave 1); content-budgeted windowing
++ `page_budget` ABI (Wave 5.1); the EmitMult boundary dedup; the
+boundary-chip width diet; the (32k, 8) production flip; the compact
+chain trace, streaming tracer, and streaming proof publish + native
+`blob_put` (Wave 2 / 2(a) / 2.3); the byte-wide AND table + zero-numerator
+logup skip (interaction diet C2); and aarch64 cross-compile plumbing +
+a qemu-verified `mobile_bench` (Wave 3, no-device half). Net: **chain
+window ~28.5 GiB / ~23 s → ~5.2 GiB / ~4 s**; trace no longer resident;
+job results 0.9 GB → 9 KB. The full real-STARK federation e2e
+(`clerk_ledger_two_bank_federation`, `VOS_FEDERATION_REAL_STARK=1`:
+canonical chain-prove → CAS → cross-node `verify_chain` accept +
+forged-root reject) passed on the new pins in ~17 min — a run that
+previously OOM'd on the same box at ~28 GiB/segment.
+
+**Falsified/NO-GO by measurement** (kept honest, not shipped): smaller
+Merkle leaves (path-dominated); recompute-LDE-from-coeffs stwo fork
+(−9.6% RAM / +64–86% time — violates both-axes; branch `lde-recompute`
+parked local at `~/src/gh/stwo`, unpushed); C1 per-compression sub-chips
+(payoff collapsed to ~0.45 GiB post-C2, gated cols entangled with
+per-row state).
+
+**Remaining, in priority order:**
+
+1. **aarch64 on-device bench (Wave 3, blocked on hardware).** The
+   turnkey artifact exists (`mobile_bench`, recipe below). qemu confirms
+   correctness only — it models no target timing. Needs a phone (or an
+   Apple-Silicon / cloud-ARM proxy) to answer the two live unknowns:
+   real tap-to-pay wall-clock, and whether ~5 GiB background chain
+   windows fit the ~3 GB device budget under memory pressure. **This is
+   the decision point for everything below** — chain proving is
+   async/off-hot-path, so ~5 GiB windows may already be acceptable.
+
+2. **Far-line RAM levers — DEFERRED, pursue only if the bench says
+   windows must go under ~3–5 GiB.** Both are large, soundness-touching
+   builds; neither is worth starting on speculation:
+   - **Row-chunked lifted-Merkle leaf hashing.** Stream a commitment
+     tree's leaf layer across column chunks with per-row running hash
+     states, so even the largest tree's LDE never fully materializes —
+     the real fix the parked `lde-recompute` fork's `Poly` release
+     machinery was substrate for (that fork's schedule-trade approach is
+     dead; this is a different, mostly-new change). Attacks the
+     single-tree commit residency that bounds the current window peak.
+   - **Poseidon2-M31 page-Merkle hash.** blake2b costs 96 in-circuit
+     rows per 128 hashed bytes; the in-tree M31-native Poseidon2
+     (`poseidon2/`, settlement-verifier) cuts the boundary chip's
+     per-page cost ~10×. Deepest option — new chip + format/verifier
+     re-pin across manifests, catalog, and the settlement verifier.
 
 ## Where the 28 GB actually goes
 
