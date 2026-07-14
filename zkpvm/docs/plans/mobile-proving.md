@@ -142,7 +142,10 @@ tree models at 1.95 GiB vs main's 4.22 GiB — second tree, not first.
 The two blake2b chips are ~90% of it, and the waste is ~1.17 GiB of
 FULL-HEIGHT columns carrying fractions gated to 1-in-96 rows (a gate
 multiplies the numerator; the column still spans 2^L). Logup pairing
-itself is fine (two lone tails, ~7.5 MiB). Candidates, both-axes:
+itself is fine (two lone tails, ~7.5 MiB). (These figures PREDATE C2:
+the byte-wide AND table since halved the AND-derived interaction
+fractions — post-C2 the two chips' gated interaction is ~0.65 GiB; see
+the C1 re-measurement below.) Candidates, both-axes:
 - **C2 — LANDED + MEASURED (2026-07-14): byte-wide AND table.** A new
   2^16-row `BitwiseAndByteChip` (`(a, b, a&b)` preprocessed +
   free-multiplicity column, RangeMultiplicity pattern, placed last in
@@ -171,11 +174,63 @@ itself is fine (two lone tails, ~7.5 MiB). Candidates, both-axes:
   chip_isolated / phase2_alu / memory / memory_negative /
   blake2b_boundary_gate / memory_merkle_gate; floors-cover, drift guard,
   allowlist coverage, catalog parity all reproduce the new pins.
-- **C1 (GO, after C2): per-compression sub-chip** hoisting the
-  row-0/row-95 payloads (output-derivation AND-nibbles, h/m read
-  binding, producers) onto one-row-per-compression siblings
-  (L16→~L10): ~−2.5 GiB committed cells ⇒ window ~9.5→~7 GiB, time
-  down. Biggest engineering + re-pin; land after C2, one drill.
+- **C1 (NO-GO after C2, RE-MEASURED 2026-07-14): per-compression
+  sub-chip.** C2 already captured most of C1's original target — it
+  halved the AND-derived interaction fractions (nibble→byte lookups)
+  and removed 512 main limbs/row — so the sub-chip's incremental payoff
+  collapsed from the ~2.5 GiB projection (pre-C2) to ~0.45 GiB (clean
+  part). Measured in-crate at the pinned floors (BLAKE2B_BOUNDARY L16,
+  BLAKE2B L15; LDE 2^(L+2); forced bare-run trace, `generate_component_
+  trace_min` + `generate_interaction_trace`, columns counted), the
+  row-0/row-95-gated payload a 1-row-per-compression sibling could hoist:
+
+  | chip | L | gated MAIN limbs | gated INTER M31 | committed |
+  |---|---|---|---|---|
+  | BLAKE2B_BOUNDARY | 16 | 193 / 951 (Output+OutAnd1+OutAnd2+EmitMult) | 260 / 436 = 65 of 109 QM31 (128 out-AND + producer) | 453 MiB |
+  | BLAKE2B (main) | 15 | 1232 / 1991 (192 out-deriv + 1040 ECALL) | 772 / 948 (81%) | 1002 MiB |
+
+  (Boundary interaction = 88 per-row fractions → 44 QM31, then 128
+  row-95 out-AND → 64 QM31 + 1 producer leftover → the 65 gated QM31
+  pair cleanly among themselves; measured total 436 M31 = 109 QM31
+  confirms the split. Main-chip `Column` = `BoundaryColumn` 951 + 1040
+  ECALL = 1991, confirmed.)
+
+  Why NO-GO — the gated columns are entangled with per-row state:
+  1. **The output derivation needs `V_after`, forcing a WIDE link.**
+     `Output = H ^ V_after[0..8] ^ V_after[8..16]`, and `V_after` is the
+     row-95 G-function final state (the V[0..16] snapshot with slots
+     {3,4,9,14} replaced by a/b/c/d_out) — not a stored column. A
+     sibling can only obtain it through a balance-registered linking
+     tuple `(H[64], V_after[128], m[128], t[8], f[1])` = 329 limbs.
+     Its *time* cost is small (one fire per compression, dead-row-skipped
+     on the boundary side), so the link does not eat the savings — but it
+     is a genuine new relation with soundness surface, plus the §4-style
+     balance requirement.
+  2. **Boundary-only clean hoist is marginal.** Removing 193 main + 256
+     interaction M31 from L16 and adding a ~530-limb L10 sibling nets
+     ~457 MiB committed (~0.55 GiB peak incl. coeffs) — ~5% of a ~9.5 GiB
+     window. Both-axes-neutral-to-positive, but small for: a new chip
+     (columns / constraints / trace-gen / interaction-gen), the 329-wide
+     relation, a split of the output-AND emission out of the SHARED
+     `add_compression_core` (the main chip still emits it inline), dead-
+     column removal, and a full re-pin (`chip_idx::COUNT` 32→33, profile
+     `[u32; 33]`, floors, C_0/C_1, catalog, drift guard) + the gate ladder.
+  3. **The main chip's larger share needs the ECALL hoist, which is
+     soundness-risky AND coupled.** Reaching the doc's ~7 GiB projection
+     requires hoisting the main chip's 1040-limb ECALL memory binding
+     (256 h-read + 128 m-read + 64 output-write lookups + the CpuChip
+     call consumer). Those 64 output-writes CONSUME `Output`, so the
+     output derivation and the memory-ledger binding cannot be split
+     apart without rebinding guest-RAM reads/writes through a sibling —
+     high surface, high risk, on a chip that is L15 (half the boundary's
+     height, so each hoisted column is worth half as much).
+
+  Verdict: C2 delivered the big interaction win drop-in (measured window
+  6.90→5.17 GiB, −25%); C1's residual is a marginal, wide-link, entangled
+  sub-chip. Not forced (both-axes / no-soundness-risk guidance). Smaller
+  alternative if a ~0.45 GiB clean lever is ever wanted: the
+  BOUNDARY-ONLY output-derivation sibling (leave the main chip untouched
+  — it dodges the ECALL coupling); re-measure before building.
 - **C3 (NO-GO for now): batch-4 logup** — −46% of the tree with no
   re-pin, but doubles quotient-eval domain for the heaviest
   constraint sets (both-axes violation risk); revisit only if short
