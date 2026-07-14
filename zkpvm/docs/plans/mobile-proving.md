@@ -156,9 +156,21 @@ itself is fine (two lone tails, ~7.5 MiB). Candidates, both-axes:
   re-pin, but doubles quotient-eval domain for the heaviest
   constraint sets (both-axes violation risk); revisit only if short
   after C1+C2, batch-3 fallback.
-- **Free time lever (no re-pin, bit-identical): LogupTraceBuilder
-  skips relation.combine() on zero-numerator rows** — the ~1.5k gated
-  entries pay 265-wide combines on 95/96 dead rows today.
+- **Free time lever — LANDED + MEASURED (2026-07-14, no re-pin,
+  bit-identical): `LogupTraceBuilder` skips `relation.combine()` on
+  zero-numerator rows.** When every batched numerator lane of a row is
+  zero the fraction contributes `0/denom = 0` regardless of the
+  denominator, so the builder stores the neutral `1` and skips the wide
+  combine (and the per-row tuple build).  `finalize_col` divides
+  `numerator/denominator`, so the dead emission's denominator cancels ⇒
+  the interaction columns are BIT-IDENTICAL to the always-combine path
+  (pinned by `dead_row_skip_is_bit_identical`, replaying dense + sparse
+  emissions through the builder skip-on vs skip-off on a real boundary
+  trace, across stash / combine / tail).  Measured interaction-gen
+  (release, synthetic shapes): BLAKE2B_BOUNDARY L16 **752 → 617 ms
+  (−18%)**, BLAKE2B L13 **234 → 177 ms (−24%)** — the projected ~40%
+  is shape-dependent (thinner, more-padded production shapes skip more).
+  Commitments do NOT move: prover-side representation only.
 
 ## ARM bring-up (orthogonal to RAM)
 
