@@ -558,8 +558,8 @@ pub use prove::prove_with_boundary_override;
 // forcing profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
-    canonical_profile_for, canonical_profile_for_bounds, prove, prove_canonical, prove_mobile,
-    prove_with_config,
+    canonical_profile_for, canonical_profile_for_bounds, prove, prove_canonical, prove_chain,
+    prove_mobile, prove_with_config,
 };
 // Advanced / internal prove surface: the compact-trace floor variant, the
 // profiling variants, the thread-pool installer, and the explicit-component

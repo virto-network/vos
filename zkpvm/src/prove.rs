@@ -592,6 +592,25 @@ pub fn prove_canonical(
     Ok(proof)
 }
 
+/// Prove a segment chain in memory: derive the canonical forcing profile over
+/// `bounds` (so every window shares ONE program commitment) and prove each
+/// window to that shape. Returns `(profile, per-segment proofs in order)`.
+/// `None` if profile derivation or any segment prove fails. `bounds` must be
+/// ascending, gapless, and cover the trace (e.g. from `segment::segment_bounds`
+/// or `segment::segment_bounds_budgeted`). For streaming / CAS deployment use
+/// the `prover-extension` crate instead.
+pub fn prove_chain(full: &SideNote, bounds: &[(usize, usize)]) -> Option<(Vec<u32>, Vec<Proof>)> {
+    // ONE profile over every window ⇒ one forced shape ⇒ one program
+    // commitment for the whole chain (what `verify_chain_standalone` pins).
+    let profile = canonical_profile_for_bounds(full, bounds)?;
+    let mut proofs = Vec::with_capacity(bounds.len());
+    for &(a, b) in bounds {
+        let mut sn = crate::segment::segment_side_note(full, a, b);
+        proofs.push(prove_canonical(&mut sn, &profile).ok()?);
+    }
+    Some((profile, proofs))
+}
+
 /// Canonical-shape profiling (federation wire-through W0): the NATURAL
 /// (unforced) main-trace `log_size` each of the given components would use for
 /// `side_note`. The per-segment max of these over a full trace is the
