@@ -6,26 +6,30 @@
 //! retargeted at PVM via the `javm` interpreter and ECALL host-call
 //! protocol.
 //!
-//! See the crate-level `README.md` for the full architecture
-//! overview and which opcodes are bound today; `STATUS.md` for
-//! soundness coverage; `PLAN.md` for the remaining phase plan.
+//! See the crate-level `README.md` for the architecture overview,
+//! `STATUS.md` for soundness coverage, `SECURITY.md` for the trust
+//! boundary, and `docs/plans/mobile-proving.md` for the chain-prove /
+//! low-RAM direction.
 //!
 //! ## Quick start
 //!
+//! Trace a PVM program, prove its execution, verify the proof:
+//!
 //! ```ignore
-//! use javm::{Interpreter, ExitReason};
-//! use zkpvm::{prove, verify, SideNote};
-//! use zkpvm::core::tracing::TracingPvm;
+//! use zkpvm::{trace_blob, prove_mobile, verify_with_pcs_policy, PcsPolicy};
 //!
-//! let pvm = Interpreter::new(code, bitmask, args, regs, memory, gas, max_steps);
-//! let mut tracing = TracingPvm::new(pvm);
-//! assert_eq!(tracing.run(), ExitReason::Trap);
-//! let steps = tracing.into_trace();
-//!
-//! let mut side_note = SideNote::new(steps, code, bitmask);
-//! let proof = prove(&mut side_note).expect("proving failed");
-//! verify(proof, &side_note).expect("verification failed");
+//! // `pvm_blob` is a transpiled PVM program; `gas` bounds tracing.
+//! let mut sn = trace_blob(&pvm_blob, gas).expect("trace");
+//! let proof = prove_mobile(&mut sn).expect("prove");   // MOBILE = low latency
+//! verify_with_pcs_policy(proof, &sn, &PcsPolicy::MOBILE).expect("verify");
 //! ```
+//!
+//! A *deployed* verifier sees only the proof + the program commitment
+//! (not the trace) and uses the side-note-free `verify_standalone` from
+//! the separate `no_std` `zkpvm-verifier` crate. Executions too large
+//! for one proof are proved as a chain — see [`verify_chain`], the
+//! [`segment`] cut helpers, and the `prover-extension` crate for the
+//! streaming / CAS deployment.
 //!
 //! ## Crate layout
 //!
@@ -59,25 +63,36 @@
 //! - `--no-default-features` — verifier-only, `no_std` compatible,
 //!   minimal dep tree.
 //!
-//! ## API stability
+//! ## API surface
 //!
-//! Items at this crate's root (`zkpvm::*`) are the **stable surface**:
-//! [`prove`], [`prove_with_config`], [`verify`],
-//! [`verify_with_max_log_size`], [`verify_chain`],
-//! [`Proof`], [`SegmentState`], [`SideNote`],
-//! [`PROOF_FORMAT_VERSION`], [`DEFAULT_MAX_LOG_SIZE`], [`PcsConfig`],
-//! [`FriConfig`], [`production_pcs_config`],
-//! [`program_commitment_of_proof`], [`program_commitment_hex`],
-//! [`ProgramCommitment`].  These are versioned by
-//! [`PROOF_FORMAT_VERSION`]: a verifier compiled against version N
-//! rejects proofs from any other N.
+//! The prover-side happy path lives at the crate root:
 //!
-//! Sub-modules ([`chips`], [`core`], [`framework_access`],
-//! [`air_column`], [`trace`], [`proof`]) are **internal — their
-//! shapes change without notice**.  They're public only because the
-//! companion `zkpvm-verifier` crate links against them and the AIR
-//! column derives need crate-root access.  External consumers should
-//! not rely on these.
+//! - **Trace** — [`trace_blob`] (whole trace) or [`SideNote::new`]
+//!   from a hand-built step trace; [`trace_blob_compact`] /
+//!   [`trace_stream`] for the chain / streaming paths.
+//! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
+//!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`].
+//! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
+//!   with the SideNote); [`verify_chain`] for a segment chain. The
+//!   side-note-free deployer verifier is `verify_standalone` in the
+//!   `zkpvm-verifier` crate.
+//! - **Identity** — [`program_commitment_of_proof`] /
+//!   [`program_commitment_hex`] extract the program commitment a
+//!   verifier pins.
+//! - **Large executions** — the [`segment`] cut helpers,
+//!   [`canonical_profile_for`], and [`prove_canonical`] produce a
+//!   chain of equal-shape segments; the `prover-extension` crate wraps
+//!   these with CAS publishing, allowlists, and async jobs.
+//!
+//! Core types: [`Proof`], [`SegmentState`], [`SideNote`],
+//! [`CompactTrace`], [`PcsPolicy`], [`PcsConfig`], [`FriConfig`].
+//!
+//! Proofs are versioned by [`PROOF_FORMAT_VERSION`]: a verifier
+//! compiled against version N rejects proofs from any other N. Items
+//! marked `#[doc(hidden)]`, and the sub-modules ([`chips`], [`core`],
+//! [`trace`], [`proof`], …), are **internal — their shapes change
+//! without notice**; they are public only for the verifier crate, the
+//! `prover-extension`, and the AIR-column derives.
 
 #![cfg_attr(not(feature = "prover"), no_std)]
 // In verifier-only builds (--no-default-features), prover-only modules are
@@ -152,6 +167,7 @@ pub use air_column::{AirColumn, PreprocessedAirColumn};
 /// Returns ALL chips, in declaration order. Test harnesses use this
 /// to bisect ConstraintsNotSatisfied failures — force a chip to be
 /// active even when its activity flag would normally drop it.
+#[doc(hidden)]
 #[cfg(feature = "prover")]
 pub fn all_components() -> &'static [&'static dyn framework::MachineProverComponent] {
     BASE_COMPONENTS
@@ -326,6 +342,7 @@ const _: () = {
 /// Index 1 in `BASE_COMPONENTS` is Blake2bChip — skipping that index is
 /// the current implementation.  When more chips become conditional,
 /// each gains a corresponding index check.
+#[doc(hidden)]
 #[cfg(feature = "prover")]
 pub fn active_components(
     side_note: &side_note::SideNote,
@@ -524,21 +541,45 @@ pub(crate) fn active_components_verifier(
         .collect()
 }
 
+pub use proof::{PROOF_FORMAT_VERSION, PcsPolicy, Proof, SegmentState};
+// The per-policy FRI floor constants + the policy checker: used by callers
+// that assemble a custom `PcsPolicy`; hidden from the top-level page.
+#[doc(hidden)]
 pub use proof::{
-    MOBILE_MIN_FRI_LOG_BLOWUP, MOBILE_MIN_FRI_QUERIES, MOBILE_MIN_POW_BITS, PROOF_FORMAT_VERSION,
-    PcsPolicy, Proof, STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS,
-    SegmentState, check_pcs_policy,
+    MOBILE_MIN_FRI_LOG_BLOWUP, MOBILE_MIN_FRI_QUERIES, MOBILE_MIN_POW_BITS,
+    STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS, check_pcs_policy,
 };
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::prove_with_boundary_override;
+// ── Prove: the stable surface ────────────────────────────────────────
+// Single proof: `prove` / `prove_mobile` / `prove_with_config`.
+// Segment chain: `canonical_profile_for` (or `_for_bounds`) derives the
+// forcing profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
-    NaturalFloors, ProveProfile, canonical_profile_for, canonical_profile_for_bounds,
-    canonical_profile_for_bounds_compact, install_thread_pool, natural_log_sizes_for,
-    prepare_side_note_for_verification, production_pcs_config, production_pcs_config_mobile,
-    prove, prove_canonical, prove_mobile, prove_profiled, prove_profiled_with_config,
-    prove_with_config, prove_with_explicit_components,
+    canonical_profile_for, canonical_profile_for_bounds, prove, prove_canonical, prove_mobile,
+    prove_with_config,
+};
+// Advanced / internal prove surface: the compact-trace floor variant, the
+// profiling variants, the thread-pool installer, and the explicit-component
+// harness entry.  Public for the prover extension + tests; hidden from docs
+// so the top-level page stays the happy path.
+#[doc(hidden)]
+#[cfg(feature = "prover")]
+pub use prove::{
+    NaturalFloors, ProveProfile, canonical_profile_for_bounds_compact, install_thread_pool,
+    natural_log_sizes_for, prepare_side_note_for_verification, production_pcs_config,
+    production_pcs_config_mobile, prove_profiled, prove_profiled_with_config,
+    prove_with_explicit_components,
+};
+// ── Trace a PVM blob into a SideNote / CompactTrace ───────────────────
+// The ergonomic entry points: `trace_blob` (whole trace, single proof),
+// `trace_blob_compact` / `trace_stream` (chain / streaming paths).
+#[cfg(feature = "prover")]
+pub use actor::{
+    interpreter_from_blob, trace_blob, trace_blob_compact, trace_blob_compact_with_patches,
+    trace_blob_with_patches, trace_stream, trace_stream_with_patches,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{
@@ -549,12 +590,22 @@ pub use prove::{
 pub use side_note::{CompactTrace, SideNote};
 pub use stwo::core::fri::FriConfig;
 pub use stwo::core::pcs::PcsConfig;
+// ── Verify (prover-side, with the SideNote): the stable surface ───────
+// The side-note-FREE deployer verifier lives in the `zkpvm-verifier` crate
+// (`verify_standalone`) — no_std, no prover deps.
 #[cfg(feature = "prover")]
 pub use verify::{
-    ComponentOodsMask, DEFAULT_MAX_LOG_SIZE, OodsReconstruction, reconstruct_oods_for_recursion,
-    verify, verify_chain, verify_with_explicit_components, verify_with_max_log_size,
-    verify_with_options, verify_with_pcs_policy,
+    DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_policy,
 };
+// Advanced verify surface (max-log-size / options / explicit components)
+// and the OODS reconstruction the recursion path consumes.
+#[doc(hidden)]
+#[cfg(feature = "prover")]
+pub use verify::{
+    ComponentOodsMask, OodsReconstruction, reconstruct_oods_for_recursion,
+    verify_with_explicit_components, verify_with_max_log_size, verify_with_options,
+};
+#[doc(hidden)]
 #[cfg(all(feature = "prover", feature = "poseidon2-channel"))]
 pub use verify::{
     DeepBatch, RecursionData, RecursionTranscript, extract_recursion_data,
@@ -568,6 +619,7 @@ pub use verify::{
 /// code should use `prove` / `verify`.  Callers build their own
 /// `&[&dyn MachineProverComponent]` slice from the chip structs in
 /// `crate::chips`.
+#[doc(hidden)]
 #[cfg(feature = "prover")]
 pub mod harness {
     pub use crate::framework::{MachineComponent, MachineProverComponent};

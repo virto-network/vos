@@ -2,215 +2,155 @@
 
 A zero-knowledge prover and verifier for **PVM** bytecode — the
 register-machine ISA shared by the Polkadot Virtual Machine and the
-Kunekt actor runtime.  Adapted from the Nexus zkVM (Stwo backend);
-re-targeted at PVM's instruction set, register file, and ECALL-based
-host-call protocol.
+Kunekt actor runtime. Built on [stwo](https://github.com/starkware-libs/stwo)
+(Circle-STARK over M31); adapted from the Nexus zkVM and re-targeted at
+PVM's instruction set, register file, and ECALL host-call protocol.
 
-A prover takes a traced PVM execution and produces a STARK proof.
-A verifier accepts the proof, the public program commitment, and the
-public input/output, and decides — without re-executing the program —
-whether the trace was valid.  The proving system uses
-[stwo](https://github.com/starkware-libs/stwo) (Circle-STARK over
-M31) so the prover scales linearly with trace length and the
-verifier is logarithmic.
+Given a traced PVM execution, the prover produces a STARK proof. A
+verifier accepts the proof, the program commitment, and the public I/O,
+and decides — **without re-executing** — whether the trace was valid.
+Prover work is quasi-linear in trace length; verification is
+logarithmic.
 
-## What can it prove today?
+**Two crates:**
 
-Every PVM opcode the [`javm`](../javm) interpreter supports is now
-traced and proven, with the following soundness coverage:
+| Crate | Role | `std`? |
+|---|---|---|
+| `zkpvm` (this crate) | trace + prove (+ prover-side verify) | yes, rayon |
+| `zkpvm-verifier` | side-note-free `verify_standalone` for deployed verifiers | `no_std`, tiny dep tree |
 
-| Opcode family            | Bound? | Notes                                                                |
-|---                       |---     |---                                                                   |
-| `Add` / `Sub` 32 / 64    | ✓      | Carry-chain identity (Phase 2); 32-bit sign-extension (Phase 19).   |
-| `Mul` 32 / 64            | ✓      | Schoolbook with 16-bit carry (Phase 7); MulUpper UU/SU/SS (12c).    |
-| `Div` / `Rem` 32 / 64 U  | ✓      | Schoolbook + DivU `r < d` uniqueness (Phase 21).                    |
-| `Div` / `Rem` 32 / 64 S  | ✓ \*   | Sign-correction at high bytes (Phases 16, 18).  See "open" below.   |
-| Bitwise (And/Or/Xor/…)   | ✓      | Algebraic identity + nibble-AND lookup (Phase 6).                   |
-| Shifts (ShloL/R, SharR)  | ✓      | Power-of-two lookup + mul / divrem schoolbook.                      |
-| Compare / SetLt / Min/Max| ✓      | Subtraction-carry chain + sign-bit multiplex (Phase 17).            |
-| Cmov                     | ✓ \*   | Pinned only on `val_d_is_zero=1`; converse direction open.          |
-| Branches                 | ✓      | Shared compare infra + branch-target binding (Phase 15-fix).        |
-| Jumps (direct + indirect)| ✓      | JumpTableChip lookup pins indirect targets (Phase 13d).             |
-| Loads / Stores           | ✓ \*   | MemSize / MemByteActive / MemValue (direct) / MemAddr all bound.    |
-| BitManip (Reverse, ZE16, SE8/16)| ✓| Phases 12a / 12b-1 / 12b-2.                                          |
-| BitManip (CountSetBits, LZ, TZ)| ✗ | Still prover-trusted.                                                |
-| Rotate (RotL/RotR 32/64) | ✗      | Still prover-trusted.                                                |
-| Trap                     | ✓      | Terminal-row constraint (Phase 13e-redux).                          |
-| Ecall / Ecalli           | ✓ \*   | Generic dispatch + Blake2b precompile (Phase 8).                    |
-
-\* See [`STATUS.md`](./STATUS.md) for the precise out-of-scope items
-each phase deferred (`is_load_indirect` MemValue, DivByZero, DivS
-`r<d`, …).
-
-## Architecture
-
-The AIR is split across multiple **chips** that share lookup
-relations.  Each chip contributes a few columns + constraints to the
-combined trace; lookups balance demand against producer chips
-(side tables) holding canonical (input, output) tuples.
-
-```
-┌─ CpuChip ────────────────────────────────────────────────────┐
-│  one row per traced PVM step                                 │
-│  ALU / branch / compare / load-store / ECALL / sign-bits     │
-│  consumes:  ProgramMemory, RegisterMemory, MemoryAccess,     │
-│             Range256, BitwiseAnd, PowerOfTwo, JumpTable,     │
-│             Blake2bCall, ProgramExecution                    │
-└─────────────────────────────────────────────────────────────┘
-        │
-        ├── ProgramMemoryChip       canonical bytecode → opcode + flags + imm
-        ├── RegisterMemoryChip      per-step register read/write ledger (Phase 9)
-        ├── MemoryChip              byte-level (addr, value, ts, write) lookup
-        ├── Blake2bChip + Boundary  precompile: 12-round compression (Phase 8)
-        ├── JumpTableChip           runtime jump-table targets (Phase 13d)
-        ├── BitwiseLookupChip       (a, b, a&b) for 4-bit nibble pairs
-        ├── PowerOfTwoChip          (n, 2^n) for n ∈ [0, 63]
-        ├── RangeMultiplicity256    every byte ∈ [0, 256)
-        ├── MemoryBoundaryChip      initial memory image binding
-        ├── RegisterMemoryBoundary  initial / final register state
-        └── ProgramBoundaryChip     program-counter sequencing entry/exit
-```
-
-The CpuChip alone has ~100 columns and ~150 constraints; about half
-of them encode the per-row "is this opcode of category X, and if so
-does it satisfy Y" structure.  See
-[`src/chips/cpu/CONSTRAINTS.md`](./src/chips/cpu/CONSTRAINTS.md) for
-the rules every constraint author must follow (logup pair-shape,
-multiplicity registration, regression-checklist).
-
-## API
+## Prove and verify
 
 ```rust
-use javm::{ExitReason, Interpreter, instruction::Opcode};
-use zkpvm::{prove, verify, SideNote};
+use zkpvm::{trace_blob, prove_mobile, program_commitment_of_proof, PcsPolicy};
+
+// `pvm_blob` is a transpiled PVM program; `gas` bounds tracing.
+let mut sn = trace_blob(&pvm_blob, gas).expect("trace");
+let proof = prove_mobile(&mut sn).expect("prove");          // MOBILE = low latency
+
+// The program commitment is the identity a verifier pins.
+let commitment = program_commitment_of_proof(&proof);
+
+// Deployer-side: verify with only the proof + commitment (no trace).
+zkpvm_verifier::verify_standalone_with_pcs_policy(
+    proof, commitment, &PcsPolicy::MOBILE,
+).expect("verify");
+```
+
+- **`prove` (STANDARD)** minimizes proof size (~4× smaller); **`prove_mobile`
+  (MOBILE)** is ~2.5× faster to prove for the same conjectured 96-bit
+  security, at a larger proof. Verify with the matching `PcsPolicy`.
+- **`verify` / `verify_with_pcs_policy(proof, &sn, policy)`** re-check a
+  proof against its `SideNote` (prover-side regression use). A *deployed*
+  verifier uses `zkpvm_verifier::verify_standalone*`, which needs only the
+  proof and the commitment.
+- Proofs are `serde`-serializable (`bincode`, `postcard`, …) and versioned
+  by `PROOF_FORMAT_VERSION` — a verifier compiled against version N rejects
+  any other N.
+
+Build a `SideNote` from a raw blob with `trace_blob` (above), or from a
+hand-driven trace:
+
+```rust
+use zkpvm::{SideNote, prove, verify};
 use zkpvm::core::tracing::TracingPvm;
 
-let pvm = Interpreter::new(code, bitmask, args, regs, memory, gas, max_steps);
-let mut tracing = TracingPvm::new(pvm);
-assert_eq!(tracing.run(), ExitReason::Trap);
-let steps = tracing.into_trace();
-
-let mut side_note = SideNote::new(steps, code, bitmask);
-let proof = prove(&mut side_note).expect("proving failed");
-verify(proof, &side_note).expect("verification failed");
+let mut tracing = TracingPvm::new(interpreter);
+tracing.run();
+let mut sn = SideNote::new(tracing.into_trace(), code, bitmask);
+let proof = prove(&mut sn).expect("prove");        // STANDARD
+verify(proof, &sn).expect("verify");
 ```
 
-For a verifier that only knows the program (not the steps), use
-[`verify_standalone`](./src/program_id.rs):
+## Large executions: segment chains and streaming
+
+An execution too large for one proof is proved as a **chain** of
+equal-shape segments; `verify_chain` checks each segment plus boundary
+continuity (`segment[n].final_state == segment[n+1].initial_state`).
 
 ```rust
-use zkpvm::{verify_standalone, program_id::commit_program};
+use zkpvm::{trace_blob, canonical_profile_for_bounds, prove_canonical, verify_chain};
+use zkpvm::segment::{segment_bounds_budgeted, segment_side_note};
 
-let program_hash = commit_program(&code, &bitmask);
-verify_standalone(&proof, &program_hash, &public_inputs)?;
+let full = trace_blob(&pvm_blob, gas).expect("trace");
+
+// Content-budgeted windows: cap BOTH steps and distinct touched pages,
+// so hash-dense stretches get short windows and the boundary chip stays
+// bounded (see docs/plans/mobile-proving.md).
+let bounds = segment_bounds_budgeted(&full, 32_000, 8);
+
+// One canonical forcing profile so every window shares ONE program
+// commitment (what lets a single allowlist pin a heterogeneous chain).
+let profile = canonical_profile_for_bounds(&full, &bounds).expect("floors");
+
+let (mut proofs, mut sides) = (Vec::new(), Vec::new());
+for &(a, b) in &bounds {
+    let mut sn = segment_side_note(&full, a, b);
+    proofs.push(prove_canonical(&mut sn, &profile).expect("prove"));
+    sides.push(sn);
+}
+verify_chain(&proofs, &sides.iter().collect::<Vec<_>>()).expect("chain");
 ```
+
+**Streaming** (never hold the whole trace or all proofs in memory) is
+what the [`prover-extension`](../extensions/prover) crate wraps around
+these primitives: `trace_stream` cuts windows online during tracing, each
+segment proof streams to a content-addressed store as it is proven, and
+`verify_chain` there fetches-verifies-drops one segment at a time against
+a published allowlist + manifest. Reach for the extension for a
+deployment; use the primitives here to embed proving in your own driver.
 
 ## Building
 
 ```sh
-# Default — prover (the prove_vos_actor benchmark fits in ~5min on
-# a modern x86 desktop; blake2b-heavy actors take ~15min).
-cargo build -p zkpvm
-
-# Verifier-only — no_std, no rayon, no blake3.  ~50× smaller dep tree.
-cargo build -p zkpvm --no-default-features
+cargo build -p zkpvm                     # prover (default): rayon + blake3
+cargo build -p zkpvm --no-default-features   # verifier-only: no_std, ~50× smaller deps
 ```
 
-## Tests
+Cross-compiling the prover for aarch64 (on-device proving) is a supported
+target — see `docs/plans/mobile-proving.md` § "Cross-compile recipe".
 
-| Suite                       | What it covers                                           | Runtime |
-|---                          |---                                                       |---      |
-| `add64_e2e`                 | end-to-end add64 (a smoke for the whole prover/verifier) |  ~10 s  |
-| `phase2_alu`                | every ALU op, positive smoke                             |  ~50 s  |
-| `alu_negative`              | every ALU op, forge-the-result rejection                 | ~6 min  |
-| `bitmanip`                  | every BitManip op + forge tests                          | ~2 min  |
-| `control_flow`              | branches + jumps                                         | ~2 min  |
-| `control_flow_negative`     | forge branch / jump targets                              | ~3 min  |
-| `memory`                    | StoreInd / LoadInd + multi-store ordering                | ~40 s   |
-| `memory_negative`           | forge address / value / dest-reg                         | ~70 s   |
-| `loads_signed`              | LoadI8 / I16 / I32 sign-extension (Phase 20)             | ~40 s   |
-| `program_identity`          | program-hash binding (Phase 13f)                         | ~50 s   |
-| `register_ledger_negative`  | forge register-memory ledger entries                     | ~30 s   |
-| `prove_vos_actor`           | real RISC-V actors (blake2b ECALL, fibonacci, hashes)    | ~5 min  |
+## Soundness & security
 
-Per [`src/chips/cpu/CONSTRAINTS.md`](./src/chips/cpu/CONSTRAINTS.md)
-rule 6, run the **minimum sweep** before committing a CpuChip
-constraint:
-
-```sh
-cargo test -p zkpvm \
-  --test add64_e2e --test memory --test control_flow --test bitmanip \
-  --test alu_negative --test control_flow_negative --test memory_negative \
-  --test program_identity --test loads_signed
-```
-
-…and `--test prove_vos_actor` if the change touches lookup pair
-shape (CONSTRAINTS.md rule 1).
-
-## Status & roadmap
-
-- [`STATUS.md`](./STATUS.md) — what's bound, what's open, which
-  phases delivered each piece.
-- [`PLAN.md`](./PLAN.md) — prioritized phase plan for the remaining
-  soundness gaps.
-- [`SECURITY.md`](./SECURITY.md) — trust boundary, what a
-  verified proof guarantees / does not guarantee, deployment
-  checklist.  **Read this before pointing real users at a
-  deployed verifier.**
-- [`BENCHMARKS.md`](./BENCHMARKS.md) — single-thread proving
-  throughput at log_size 10/12/14, per-stage breakdown,
-  apples-to-apples comparison against Nexus zkVM 2.x's
-  published Stwo numbers.
-- [`src/chips/cpu/CONSTRAINTS.md`](./src/chips/cpu/CONSTRAINTS.md)
-  — house rules for adding constraints to CpuChip.
+`zkpvm` binds PVM semantics in-circuit chip by chip; a handful of opcodes
+remain prover-trusted. **Before pointing real users at a deployed
+verifier, read [`SECURITY.md`](./SECURITY.md)** (trust boundary, what a
+verified proof does and does not guarantee, deployment checklist) and
+[`STATUS.md`](./STATUS.md) (per-opcode soundness coverage and open items).
 
 ## Examples
 
 ```sh
-cargo run -p zkpvm --example prove_and_verify --release
+cargo run -p zkpvm --example prove_and_verify --release   # trace → prove → standalone verify → serde roundtrip
+cargo run -p zkpvm --example multi_segment    --release   # slice a trace, prove segments, verify_chain (+ a forged-boundary reject)
 ```
 
-End-to-end: bytecode → trace → prove → standalone verify →
-serialize / deserialize round-trip.  Runs in a few seconds on a
-modern desktop and prints the proof size + per-stage timing.
+## Architecture
 
-```sh
-cargo run -p zkpvm --example multi_segment --release
-```
-
-Multi-segment proving: traces a 7-step program, slices the
-trace into two segments, proves each independently, and then
-runs `verify_chain` to check both per-segment validity AND
-boundary continuity (`segment_n.final_state ==
-segment_{n+1}.initial_state`).  Demonstrates the streaming-proof
-workflow for executions that exceed a single proof's log_size or
-that you want to prove across N parallel workers.  The example
-also forges segment 2's timestamp by one to show that
-`verify_chain` rejects mismatched boundaries.
+The AIR is split across **chips** that share lookup relations: `CpuChip`
+holds one row per PVM step (ALU / branch / compare / load-store / ECALL);
+side-table chips answer its lookups (`ProgramMemory`, `RegisterMemory`,
+`Memory`, `Range256`, `BitwiseAnd` nibble + `BitwiseAndByte` byte tables,
+`PowerOfTwo`, `JumpTable`, `Blake2b` + boundary/page-Merkle chips,
+ristretto precompile chips, initial/final boundary chips). See
+[`src/chips/cpu/CONSTRAINTS.md`](./src/chips/cpu/CONSTRAINTS.md) for the
+constraint-authoring rules (logup pair-shape, multiplicity registration,
+regression checklist) and [`BENCHMARKS.md`](./BENCHMARKS.md) for
+throughput.
 
 ## Fuzzing
 
-The `fuzz/` subcrate is a libFuzzer harness exercising the
-prove-then-verify roundtrip on random PVM bytecode.  Excluded
-from the workspace so the main `cargo build` doesn't pull in
-nightly-only deps; run it explicitly:
+The excluded `fuzz/` subcrate is a libFuzzer harness on the
+prove-then-verify roundtrip over random PVM bytecode:
 
 ```sh
-cargo install cargo-fuzz   # one-time
-cd crates/zkpvm
-cargo fuzz run prove_verify_roundtrip -- -max_total_time=300
+cargo install cargo-fuzz            # one-time
+cd zkpvm && cargo fuzz run prove_verify_roundtrip -- -max_total_time=300
 ```
-
-Findings (panics, `verify_standalone` failures on honest prove
-output) land in `fuzz/artifacts/`.  Reseed the corpus with
-`fuzz/corpus/prove_verify_roundtrip/` files between runs to
-build coverage incrementally.
 
 ## Adapted from
 
-- [Nexus zkVM](https://github.com/nexus-xyz/nexus-zkvm) — original
-  Stwo-backed RISC-V zkVM that this crate's chip / trace / lookup
-  scaffolding came from.  Re-targeted at PVM bytecode and the
-  `javm` interpreter.
+- [Nexus zkVM](https://github.com/nexus-xyz/nexus-zkvm) — the Stwo-backed
+  RISC-V zkVM whose chip / trace / lookup scaffolding this crate re-targets.
 - [stwo](https://github.com/starkware-libs/stwo) — the Circle-STARK
   prover/verifier underneath.
