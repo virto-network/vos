@@ -211,9 +211,14 @@ pub mod chip_idx {
     pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 28;
     pub const RISTRETTO_COMB_COMPRESS: usize = 29;
     pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 30;
+    /// 2^16-row byte-wide AND table.  Placed last: it is a receiver whose
+    /// multiplicity counts are accumulated by the two blake2b chips during
+    /// their trace-gen (idx 1/2), so it must be generated after all its
+    /// consumers (BASE_COMPONENTS ordering rule).
+    pub const BITWISE_AND_BYTE: usize = 31;
     /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
     /// assertion in `lib.rs` checks this against the actual array length.
-    pub const COUNT: usize = RISTRETTO_COMB_COMPRESS_OUTPUT + 1;
+    pub const COUNT: usize = BITWISE_AND_BYTE + 1;
 }
 
 #[cfg(feature = "prover")]
@@ -249,6 +254,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RistrettoCombScalarBoundaryChip, // OPTIONAL, gated by activity.ristretto_comb
     &chips::RistrettoCombCompressChip, // OPTIONAL, gated by activity.ristretto_comb
     &chips::RistrettoCombCompressOutputChip, // OPTIONAL, gated by activity.ristretto_comb
+    &chips::BitwiseAndByteChip, // byte-wide AND table — consumed by the two blake2b chips
 ];
 
 #[cfg(feature = "prover")]
@@ -293,6 +299,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::RistrettoCombScalarBoundaryChip,
     &chips::RistrettoCombCompressChip,
     &chips::RistrettoCombCompressOutputChip,
+    &chips::BitwiseAndByteChip,
 ];
 
 #[cfg(not(feature = "prover"))]

@@ -3,8 +3,8 @@ version = 1
 [[program]]
 name = "voucher-check"
 commitments = [
-    "1373d0f4968e0b2d46a0e23c758753f41664591a5dd22f331044174a40c8e980",
-    "3667db4fa250fe91ddc578227da1d8ea4b2ca9cc002d738c69b558d1a33a4ff0",
+    "d76262877c32e2b647e588958ff358be0fec60df024b319da21a204ee84fc5c9",
+    "913f5cbf7cdd9d997af1a38046270bbe6c0b24f0eff908f1a68f95cddf1cce8d",
 ]
 canonical_profile = [
     15,
@@ -38,6 +38,7 @@ canonical_profile = [
     5,
     6,
     5,
+    16,
 ]
 seg_steps = 32000
 page_budget = 8

@@ -12,8 +12,15 @@ pub struct SideNote {
     pub bitmask: Vec<u8>,
     /// Range check accumulator: counts of each byte value 0..255.
     pub range256_counts: Vec<u32>,
-    /// Bitwise AND lookup counts: (a, b) → multiplicity.
+    /// Bitwise AND nibble lookup counts: (a, b) → multiplicity, for the
+    /// 16×16 `BitwiseLookupChip` (CpuChip / ALU BitwiseChip consumers).
     pub bitwise_and_counts: HashMap<(u8, u8), u32>,
+    /// Byte-wide bitwise AND lookup counts for the 2^16-row
+    /// `BitwiseAndByteChip`, indexed `(a as usize) << 8 | b as usize`.  The two
+    /// blake2b chips consume this table (one byte lookup per AND) instead of
+    /// two nibble lookups; the byte-ness of `a`/`b` comes free from table
+    /// membership.
+    pub bitwise_and_byte_counts: Vec<u32>,
     /// Initial memory state (flat_mem from the PVM interpreter).
     /// The MemoryChip injects synthetic writes at timestamp 0 for addresses
     /// that are read without a prior write.
@@ -422,6 +429,7 @@ impl SideNote {
             bitmask,
             range256_counts: vec![0u32; 256],
             bitwise_and_counts: HashMap::new(),
+            bitwise_and_byte_counts: vec![0u32; 1 << 16],
             initial_memory: Vec::new(),
             num_initial_mem_entries: 0,
             power_of_two_counts: vec![0u32; 64],
@@ -740,5 +748,12 @@ impl SideNote {
         let b_hi = (b >> 4) & 0x0F;
         *self.bitwise_and_counts.entry((a_lo, b_lo)).or_insert(0) += 1;
         *self.bitwise_and_counts.entry((a_hi, b_hi)).or_insert(0) += 1;
+    }
+
+    /// One byte-wide AND lookup into the `BitwiseAndByteChip` table — used by
+    /// the blake2b chips (one emission per byte AND, vs the two nibble
+    /// emissions `add_bitwise_and` records).
+    pub fn add_bitwise_and_byte(&mut self, a: u8, b: u8) {
+        self.bitwise_and_byte_counts[((a as usize) << 8) | b as usize] += 1;
     }
 }

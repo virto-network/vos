@@ -98,9 +98,21 @@ stwo_constraint_framework::relation!(MemoryAccessLookupElements, REL_MEMORY_ACCE
 const REL_POWER_OF_TWO_LOOKUP_SIZE: usize = 1 + WORD_SIZE;
 stwo_constraint_framework::relation!(PowerOfTwoLookupElements, REL_POWER_OF_TWO_LOOKUP_SIZE);
 
-// (a, b, a_and_b) — per-byte bitwise AND lookup
+// (a, b, a_and_b) — per-nibble bitwise AND lookup (16×16 BitwiseLookupChip;
+// CpuChip + ALU BitwiseChip consumers).
 const REL_BITWISE_AND_LOOKUP_SIZE: usize = 3;
 stwo_constraint_framework::relation!(BitwiseAndLookupElements, REL_BITWISE_AND_LOOKUP_SIZE);
+
+// (a, b, a_and_b) — per-BYTE bitwise AND lookup against the 2^16-row
+// BitwiseAndByteChip.  Same tuple shape as the nibble relation but a distinct
+// type so the two tables don't collide: the blake2b chips consume this one
+// (one emission per byte AND, halving their AND lookup count), and byte-ness
+// of a/b comes free from table membership.
+const REL_BITWISE_AND_BYTE_LOOKUP_SIZE: usize = 3;
+stwo_constraint_framework::relation!(
+    BitwiseAndByteLookupElements,
+    REL_BITWISE_AND_BYTE_LOOKUP_SIZE
+);
 
 // (byte, popcount) — per-byte popcount lookup
 const REL_POPCOUNT_LOOKUP_SIZE: usize = 2;

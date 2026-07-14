@@ -65,35 +65,10 @@ pub enum Column {
     BOut,
     #[size = 8]
     Rot63Carry, // 1-bit carries for rotation
-    // ── Nibble witnesses for AND lookups (12 columns × 8 bytes = 96 limbs) ──
-    // And1 = DIn & A1
-    #[size = 8]
-    And1AHi, // hi nibble of DIn
-    #[size = 8]
-    And1BHi, // hi nibble of A1
-    #[size = 8]
-    And1ResHi, // hi nibble of And1
-    // And2 = BIn & C1
-    #[size = 8]
-    And2AHi, // hi nibble of BIn
-    #[size = 8]
-    And2BHi, // hi nibble of C1
-    #[size = 8]
-    And2ResHi, // hi nibble of And2
-    // And3 = D1 & AOut, where D1[k] = DIn[(k+4)%8] + A1[(k+4)%8] - 2·And1[(k+4)%8]
-    #[size = 8]
-    And3AHi, // hi nibble of derived D1[k]
-    #[size = 8]
-    And3BHi, // hi nibble of AOut
-    #[size = 8]
-    And3ResHi, // hi nibble of And3
-    // And4 = B1 & COut, where B1[k] = BIn[(k+3)%8] + C1[(k+3)%8] - 2·And2[(k+3)%8]
-    #[size = 8]
-    And4AHi, // hi nibble of derived B1[k]
-    #[size = 8]
-    And4BHi, // hi nibble of COut
-    #[size = 8]
-    And4ResHi, // hi nibble of And4
+    // The four G-function AND results (And1..And4) are proven by single
+    // byte-wide lookups into `BitwiseAndByteChip` (a, b, a&b), so the
+    // per-operand hi-nibble witness columns are gone — byte-ness of the
+    // operands comes free from table membership.
     // ── Row chaining: full state snapshot + d_out reification ──
     // D_out is not stored in the base trace; derive via XOR identity and
     // reify so the row-chaining constraint can propagate it into V_next.
@@ -189,19 +164,14 @@ pub enum Column {
     #[size = 1]
     #[mask_next_row]
     F,
-    /// Hi nibble of each T byte, for the AND-nibble lookup emitted below.
-    #[size = 16]
-    THi,
     /// and_t_lo[i] = IV[4][i] & T[i]; and_t_hi[i] = IV[5][i] & T[8+i].
     /// Together they let initial_v[12]/[13] be expressed via the XOR identity.
+    /// Proven by byte-wide AND lookups (a=IV const, b=T byte, a&b=result), so
+    /// their hi-nibble witnesses and the T hi-nibble are gone.
     #[size = 8]
     AndTLo,
     #[size = 8]
     AndTHi,
-    #[size = 8]
-    AndTLoHi,
-    #[size = 8]
-    AndTHiHi,
     // Snapshot of v[0..16] at the start of this row's G-call. Each V{k} is the
     // 8 LE bytes of v[k]. Marked mask_next_row so the state-update constraint
     // can reference row N+1's V for row N's inter-row constraint.
@@ -261,26 +231,15 @@ pub enum Column {
     /// Claimed output = H ^ V_after[0..8] ^ V_after[8..16].  8 words × 8 bytes.
     #[size = 64]
     Output,
-    /// Hi nibble of H (all 8 words × 8 bytes) for nibble-AND lookups on And1.
-    #[size = 64]
-    HHi,
-    /// Hi nibble of V_after[k] for k in 0..16, all 8 bytes each.  Validates
-    /// the implicit V_after expression as a byte via the AND nibble lookup.
-    #[size = 128]
-    VAfterHi,
-    /// OutAnd1[i][j] = H[i][j] & V_after[i][j].  8 words × 8 bytes.
+    /// OutAnd1[i][j] = H[i][j] & V_after[i][j].  8 words × 8 bytes.  Proven by
+    /// a byte-wide AND lookup (H byte, V_after byte, result), so the H /
+    /// V_after / result hi-nibble witnesses are gone.
     #[size = 64]
     OutAnd1,
-    #[size = 64]
-    OutAnd1Hi,
-    /// Hi nibble of OutXor1[i][j] = H[i][j] XOR V_after[i][j].
-    #[size = 64]
-    OutXor1Hi,
     /// OutAnd2[i][j] = OutXor1[i][j] & V_after[i+8][j].  8 words × 8 bytes.
+    /// Byte-wide AND lookup with OutXor1 = H ^ V_after computed inline.
     #[size = 64]
     OutAnd2,
-    #[size = 64]
-    OutAnd2Hi,
     // ── ECALL memory binding ──────────────────────────
     // HPtr / MPtr are the register values φ[10]/φ[11] at the ECALL step,
     // CallTs is its timestamp.  Inter-row equality keeps them constant
@@ -605,37 +564,17 @@ pub(super) trait CompressionColumns: AirColumn {
     const AND4: Self;
     const B_OUT: Self;
     const ROT63_CARRY: Self;
-    const AND1_A_HI: Self;
-    const AND1_B_HI: Self;
-    const AND1_RES_HI: Self;
-    const AND2_A_HI: Self;
-    const AND2_B_HI: Self;
-    const AND2_RES_HI: Self;
-    const AND3_A_HI: Self;
-    const AND3_B_HI: Self;
-    const AND3_RES_HI: Self;
-    const AND4_A_HI: Self;
-    const AND4_B_HI: Self;
-    const AND4_RES_HI: Self;
     const D_OUT: Self;
     const M: [Self; 16];
     const H: [Self; 8];
     const T: Self;
     const F: Self;
-    const T_HI: Self;
     const AND_T_LO: Self;
     const AND_T_HI: Self;
-    const AND_T_LO_HI: Self;
-    const AND_T_HI_HI: Self;
     const V: [Self; 16];
     const OUTPUT: Self;
-    const H_HI: Self;
-    const V_AFTER_HI: Self;
     const OUT_AND1: Self;
-    const OUT_AND1_HI: Self;
-    const OUT_XOR1_HI: Self;
     const OUT_AND2: Self;
-    const OUT_AND2_HI: Self;
     const CARRY1_XCM1: Self;
     const CARRY1_FULL: Self;
     const CARRY3_XCM1: Self;
@@ -678,34 +617,14 @@ impl CompressionColumns for Column {
     const AND4: Self = Column::And4;
     const B_OUT: Self = Column::BOut;
     const ROT63_CARRY: Self = Column::Rot63Carry;
-    const AND1_A_HI: Self = Column::And1AHi;
-    const AND1_B_HI: Self = Column::And1BHi;
-    const AND1_RES_HI: Self = Column::And1ResHi;
-    const AND2_A_HI: Self = Column::And2AHi;
-    const AND2_B_HI: Self = Column::And2BHi;
-    const AND2_RES_HI: Self = Column::And2ResHi;
-    const AND3_A_HI: Self = Column::And3AHi;
-    const AND3_B_HI: Self = Column::And3BHi;
-    const AND3_RES_HI: Self = Column::And3ResHi;
-    const AND4_A_HI: Self = Column::And4AHi;
-    const AND4_B_HI: Self = Column::And4BHi;
-    const AND4_RES_HI: Self = Column::And4ResHi;
     const D_OUT: Self = Column::DOut;
     const T: Self = Column::T;
     const F: Self = Column::F;
-    const T_HI: Self = Column::THi;
     const AND_T_LO: Self = Column::AndTLo;
     const AND_T_HI: Self = Column::AndTHi;
-    const AND_T_LO_HI: Self = Column::AndTLoHi;
-    const AND_T_HI_HI: Self = Column::AndTHiHi;
     const OUTPUT: Self = Column::Output;
-    const H_HI: Self = Column::HHi;
-    const V_AFTER_HI: Self = Column::VAfterHi;
     const OUT_AND1: Self = Column::OutAnd1;
-    const OUT_AND1_HI: Self = Column::OutAnd1Hi;
-    const OUT_XOR1_HI: Self = Column::OutXor1Hi;
     const OUT_AND2: Self = Column::OutAnd2;
-    const OUT_AND2_HI: Self = Column::OutAnd2Hi;
     const CARRY1_XCM1: Self = Column::Carry1XcM1;
     const CARRY1_FULL: Self = Column::Carry1Full;
     const CARRY3_XCM1: Self = Column::Carry3XcM1;

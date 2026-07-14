@@ -577,8 +577,9 @@ pub fn prove_canonical(
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
     let components = super::all_components();
-    // Full set present ⇒ constant mask = all 31 component bits set.
-    let component_mask = (1u32 << super::chip_idx::COUNT) - 1;
+    // Full set present ⇒ constant mask = all component bits set.  Built via
+    // a widening shift so COUNT == 32 (all u32 bits) doesn't overflow.
+    let component_mask = ((1u64 << super::chip_idx::COUNT) - 1) as u32;
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
         production_pcs_config_mobile(),

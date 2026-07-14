@@ -34,7 +34,7 @@ use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::framework::BuiltInComponent;
 use crate::lookups::{
-    BitwiseAndLookupElements, Blake2bCompressionLookupElements, Range256LookupElements,
+    BitwiseAndByteLookupElements, Blake2bCompressionLookupElements, Range256LookupElements,
 };
 use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
@@ -261,30 +261,6 @@ pub enum BoundaryColumn {
     #[size = 8]
     Rot63Carry,
     #[size = 8]
-    And1AHi,
-    #[size = 8]
-    And1BHi,
-    #[size = 8]
-    And1ResHi,
-    #[size = 8]
-    And2AHi,
-    #[size = 8]
-    And2BHi,
-    #[size = 8]
-    And2ResHi,
-    #[size = 8]
-    And3AHi,
-    #[size = 8]
-    And3BHi,
-    #[size = 8]
-    And3ResHi,
-    #[size = 8]
-    And4AHi,
-    #[size = 8]
-    And4BHi,
-    #[size = 8]
-    And4ResHi,
-    #[size = 8]
     DOut,
     #[size = 8]
     #[mask_next_row]
@@ -364,16 +340,10 @@ pub enum BoundaryColumn {
     #[size = 1]
     #[mask_next_row]
     F,
-    #[size = 16]
-    THi,
     #[size = 8]
     AndTLo,
     #[size = 8]
     AndTHi,
-    #[size = 8]
-    AndTLoHi,
-    #[size = 8]
-    AndTHiHi,
     #[size = 8]
     #[mask_next_row]
     V0,
@@ -425,19 +395,9 @@ pub enum BoundaryColumn {
     #[size = 64]
     Output,
     #[size = 64]
-    HHi,
-    #[size = 128]
-    VAfterHi,
-    #[size = 64]
     OutAnd1,
     #[size = 64]
-    OutAnd1Hi,
-    #[size = 64]
-    OutXor1Hi,
-    #[size = 64]
     OutAnd2,
-    #[size = 64]
-    OutAnd2Hi,
     #[size = 1]
     #[mask_next_row]
     IsReal,
@@ -536,34 +496,14 @@ impl CompressionColumns for BoundaryColumn {
     const AND4: Self = BoundaryColumn::And4;
     const B_OUT: Self = BoundaryColumn::BOut;
     const ROT63_CARRY: Self = BoundaryColumn::Rot63Carry;
-    const AND1_A_HI: Self = BoundaryColumn::And1AHi;
-    const AND1_B_HI: Self = BoundaryColumn::And1BHi;
-    const AND1_RES_HI: Self = BoundaryColumn::And1ResHi;
-    const AND2_A_HI: Self = BoundaryColumn::And2AHi;
-    const AND2_B_HI: Self = BoundaryColumn::And2BHi;
-    const AND2_RES_HI: Self = BoundaryColumn::And2ResHi;
-    const AND3_A_HI: Self = BoundaryColumn::And3AHi;
-    const AND3_B_HI: Self = BoundaryColumn::And3BHi;
-    const AND3_RES_HI: Self = BoundaryColumn::And3ResHi;
-    const AND4_A_HI: Self = BoundaryColumn::And4AHi;
-    const AND4_B_HI: Self = BoundaryColumn::And4BHi;
-    const AND4_RES_HI: Self = BoundaryColumn::And4ResHi;
     const D_OUT: Self = BoundaryColumn::DOut;
     const T: Self = BoundaryColumn::T;
     const F: Self = BoundaryColumn::F;
-    const T_HI: Self = BoundaryColumn::THi;
     const AND_T_LO: Self = BoundaryColumn::AndTLo;
     const AND_T_HI: Self = BoundaryColumn::AndTHi;
-    const AND_T_LO_HI: Self = BoundaryColumn::AndTLoHi;
-    const AND_T_HI_HI: Self = BoundaryColumn::AndTHiHi;
     const OUTPUT: Self = BoundaryColumn::Output;
-    const H_HI: Self = BoundaryColumn::HHi;
-    const V_AFTER_HI: Self = BoundaryColumn::VAfterHi;
     const OUT_AND1: Self = BoundaryColumn::OutAnd1;
-    const OUT_AND1_HI: Self = BoundaryColumn::OutAnd1Hi;
-    const OUT_XOR1_HI: Self = BoundaryColumn::OutXor1Hi;
     const OUT_AND2: Self = BoundaryColumn::OutAnd2;
-    const OUT_AND2_HI: Self = BoundaryColumn::OutAnd2Hi;
     const CARRY1_XCM1: Self = BoundaryColumn::Carry1XcM1;
     const CARRY1_FULL: Self = BoundaryColumn::Carry1Full;
     const CARRY3_XCM1: Self = BoundaryColumn::Carry3XcM1;
@@ -651,7 +591,7 @@ impl BuiltInComponent for Blake2bBoundaryChip {
     type MainColumn = BoundaryColumn;
     type LookupElements = (
         Range256LookupElements,
-        BitwiseAndLookupElements,
+        BitwiseAndByteLookupElements,
         Blake2bCompressionLookupElements,
     );
 
@@ -661,7 +601,7 @@ impl BuiltInComponent for Blake2bBoundaryChip {
         trace_eval: TraceEval<PreprocessedColumn, BoundaryColumn, E>,
         lookup_elements: &(
             Range256LookupElements,
-            BitwiseAndLookupElements,
+            BitwiseAndByteLookupElements,
             Blake2bCompressionLookupElements,
         ),
     ) {
@@ -839,7 +779,7 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let range256: &Range256LookupElements = lookup_elements.as_ref();
-        let bitwise: &BitwiseAndLookupElements = lookup_elements.as_ref();
+        let bitwise: &BitwiseAndByteLookupElements = lookup_elements.as_ref();
         add_compression_interaction_core::<PreprocessedColumn, BoundaryColumn>(
             &mut logup,
             &component_trace,

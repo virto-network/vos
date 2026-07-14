@@ -15,8 +15,9 @@ pub use self::relations::boundary_relation_challenges;
 pub use self::{
     range_check::Range256LookupElements,
     relations::{
-        BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
-        Blake2bCallLookupElements, Blake2bCompressionLookupElements, Blake2bStateLookupElements,
+        BitcountLookupElements, BitwiseAndByteLookupElements, BitwiseAndLookupElements,
+        BitwiseLookupElements, Blake2bCallLookupElements, Blake2bCompressionLookupElements,
+        Blake2bStateLookupElements,
         ByteToBitsLookupElements, CompareLookupElements, DivRemLookupElements,
         JumpTableLookupElements, MemoryAccessLookupElements, MerkleNodeLookupElements,
         MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
@@ -39,6 +40,7 @@ macros::register_relation! {
         Range256LookupElements,
         MemoryAccessLookupElements,
         BitwiseAndLookupElements,
+        BitwiseAndByteLookupElements,
         PowerOfTwoLookupElements,
         PopcountLookupElements,
         BitcountLookupElements,

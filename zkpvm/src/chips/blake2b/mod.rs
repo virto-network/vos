@@ -43,7 +43,7 @@ use crate::side_note::SideNote;
 use crate::{
     framework::BuiltInComponent,
     lookups::{
-        BitwiseAndLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements,
+        BitwiseAndByteLookupElements, Blake2bCallLookupElements, MemoryAccessLookupElements,
         Range256LookupElements,
     },
 };
@@ -180,7 +180,7 @@ pub(in crate::chips::blake2b) fn add_compression_core<
     trace_eval: &TraceEval<P, C, E>,
     sched: &Blake2bSchedule<E::F>,
     range256_lookup: &Range256LookupElements,
-    bitwise_lookup: &BitwiseAndLookupElements,
+    bitwise_lookup: &BitwiseAndByteLookupElements,
 ) {
     let is_real = trace_eval.column_eval::<1>(C::IS_REAL);
     // Gate helpers — Stwo v2.x lifted-protocol degree
@@ -335,164 +335,60 @@ pub(in crate::chips::blake2b) fn add_compression_core<
         );
     }
 
-    // ── Nibble AND lookups ───────────────────────────────────
-    // Mirror of generate_interaction_trace: for each byte i, emit 8 entries
-    // in the exact order (And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3
-    // lo, And4 hi, And4 lo).  finalize_logup_in_pairs combines (hi, lo) per
-    // AND into a single fraction, so ordering MUST match the prover side.
-    let f16 = E::F::from(BaseField::from(16u32));
-    let and1_a_hi = trace_eval.column_eval::<8>(C::AND1_A_HI);
-    let and1_b_hi = trace_eval.column_eval::<8>(C::AND1_B_HI);
-    let and1_res_hi = trace_eval.column_eval::<8>(C::AND1_RES_HI);
-    let and2_a_hi = trace_eval.column_eval::<8>(C::AND2_A_HI);
-    let and2_b_hi = trace_eval.column_eval::<8>(C::AND2_B_HI);
-    let and2_res_hi = trace_eval.column_eval::<8>(C::AND2_RES_HI);
-    let and3_a_hi = trace_eval.column_eval::<8>(C::AND3_A_HI);
-    let and3_b_hi = trace_eval.column_eval::<8>(C::AND3_B_HI);
-    let and3_res_hi = trace_eval.column_eval::<8>(C::AND3_RES_HI);
-    let and4_a_hi = trace_eval.column_eval::<8>(C::AND4_A_HI);
-    let and4_b_hi = trace_eval.column_eval::<8>(C::AND4_B_HI);
-    let and4_res_hi = trace_eval.column_eval::<8>(C::AND4_RES_HI);
-
+    // ── Byte-wide AND lookups ────────────────────────────────
+    // Mirror of generate_interaction_trace: for each byte i, emit 6 byte
+    // lookups in the exact order (And1, And2, And3, And4, AndTLo, AndTHi)
+    // into BitwiseAndByteChip.  The operands' byte-ness comes free from table
+    // membership; finalize_logup_in_pairs batches consecutive entries, so the
+    // ordering MUST match the prover side.
+    let t_e = trace_eval.column_eval::<16>(C::T);
+    let and_t_lo_e = trace_eval.column_eval::<8>(C::AND_T_LO);
+    let and_t_hi_e = trace_eval.column_eval::<8>(C::AND_T_HI);
     for i in 0..8 {
-        // And1 hi
+        // And1 = D_in & A1
         eval.add_to_relation(RelationEntry::new(
             bitwise_lookup,
             is_real[0].clone().into(),
-            &[
-                and1_a_hi[i].clone(),
-                and1_b_hi[i].clone(),
-                and1_res_hi[i].clone(),
-            ],
+            &[d_in[i].clone(), a1[i].clone(), and1[i].clone()],
         ));
-        // And1 lo — (d_in - hi·16, a1 - hi·16, and1 - hi·16)
+        // And2 = B_in & C1
         eval.add_to_relation(RelationEntry::new(
             bitwise_lookup,
             is_real[0].clone().into(),
-            &[
-                d_in[i].clone() - and1_a_hi[i].clone() * f16.clone(),
-                a1[i].clone() - and1_b_hi[i].clone() * f16.clone(),
-                and1[i].clone() - and1_res_hi[i].clone() * f16.clone(),
-            ],
+            &[b_in[i].clone(), c1[i].clone(), and2[i].clone()],
         ));
-
-        // And2 hi
-        eval.add_to_relation(RelationEntry::new(
-            bitwise_lookup,
-            is_real[0].clone().into(),
-            &[
-                and2_a_hi[i].clone(),
-                and2_b_hi[i].clone(),
-                and2_res_hi[i].clone(),
-            ],
-        ));
-        // And2 lo — (b_in - hi·16, c1 - hi·16, and2 - hi·16)
-        eval.add_to_relation(RelationEntry::new(
-            bitwise_lookup,
-            is_real[0].clone().into(),
-            &[
-                b_in[i].clone() - and2_a_hi[i].clone() * f16.clone(),
-                c1[i].clone() - and2_b_hi[i].clone() * f16.clone(),
-                and2[i].clone() - and2_res_hi[i].clone() * f16.clone(),
-            ],
-        ));
-
-        // And3 hi
-        eval.add_to_relation(RelationEntry::new(
-            bitwise_lookup,
-            is_real[0].clone().into(),
-            &[
-                and3_a_hi[i].clone(),
-                and3_b_hi[i].clone(),
-                and3_res_hi[i].clone(),
-            ],
-        ));
-        // And3 lo — A-side is derived D1[i] = D_in[j] + A1[j] - 2·And1[j], j=(i+4)%8
+        // And3 = D1 & A_out, D1[i] = D_in[j] + A1[j] - 2·And1[j], j=(i+4)%8
         let j3 = (i + 4) % 8;
         let d1_i = d_in[j3].clone() + a1[j3].clone() - f2.clone() * and1[j3].clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_lookup,
             is_real[0].clone().into(),
-            &[
-                d1_i - and3_a_hi[i].clone() * f16.clone(),
-                a_out[i].clone() - and3_b_hi[i].clone() * f16.clone(),
-                and3[i].clone() - and3_res_hi[i].clone() * f16.clone(),
-            ],
+            &[d1_i, a_out[i].clone(), and3[i].clone()],
         ));
-
-        // And4 hi
-        eval.add_to_relation(RelationEntry::new(
-            bitwise_lookup,
-            is_real[0].clone().into(),
-            &[
-                and4_a_hi[i].clone(),
-                and4_b_hi[i].clone(),
-                and4_res_hi[i].clone(),
-            ],
-        ));
-        // And4 lo — A-side is derived B1[i] = B_in[j] + C1[j] - 2·And2[j], j=(i+3)%8
+        // And4 = B1 & C_out, B1[i] = B_in[j] + C1[j] - 2·And2[j], j=(i+3)%8
         let j4 = (i + 3) % 8;
         let b1_i = b_in[j4].clone() + c1[j4].clone() - f2.clone() * and2[j4].clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_lookup,
             is_real[0].clone().into(),
-            &[
-                b1_i - and4_a_hi[i].clone() * f16.clone(),
-                c_out[i].clone() - and4_b_hi[i].clone() * f16.clone(),
-                and4[i].clone() - and4_res_hi[i].clone() * f16.clone(),
-            ],
+            &[b1_i, c_out[i].clone(), and4[i].clone()],
         ));
 
-        // ── AndTLo = IV[4] & T[i] ──
-        let t_hi_e = trace_eval.column_eval::<16>(C::T_HI);
-        let t_e = trace_eval.column_eval::<16>(C::T);
-        let and_t_lo_e = trace_eval.column_eval::<8>(C::AND_T_LO);
-        let and_t_hi_e = trace_eval.column_eval::<8>(C::AND_T_HI);
-        let and_t_lo_hi_e = trace_eval.column_eval::<8>(C::AND_T_LO_HI);
-        let and_t_hi_hi_e = trace_eval.column_eval::<8>(C::AND_T_HI_HI);
+        // ── AndTLo = IV[4] & T[i] (IV[4] const a-side) ──
         let iv4_byte = IV[4].to_le_bytes()[i];
-        let iv4_hi_f = E::F::from(BaseField::from((iv4_byte >> 4) as u32));
-        let iv4_lo_f = E::F::from(BaseField::from((iv4_byte & 0x0F) as u32));
+        let iv4_f = E::F::from(BaseField::from(iv4_byte as u32));
         eval.add_to_relation(RelationEntry::new(
             bitwise_lookup,
             is_real[0].clone().into(),
-            &[
-                iv4_hi_f.clone(),
-                t_hi_e[i].clone(),
-                and_t_lo_hi_e[i].clone(),
-            ],
+            &[iv4_f, t_e[i].clone(), and_t_lo_e[i].clone()],
         ));
-        eval.add_to_relation(RelationEntry::new(
-            bitwise_lookup,
-            is_real[0].clone().into(),
-            &[
-                iv4_lo_f.clone(),
-                t_e[i].clone() - t_hi_e[i].clone() * f16.clone(),
-                and_t_lo_e[i].clone() - and_t_lo_hi_e[i].clone() * f16.clone(),
-            ],
-        ));
-
         // ── AndTHi = IV[5] & T[8+i] ──
         let iv5_byte = IV[5].to_le_bytes()[i];
-        let iv5_hi_f = E::F::from(BaseField::from((iv5_byte >> 4) as u32));
-        let iv5_lo_f = E::F::from(BaseField::from((iv5_byte & 0x0F) as u32));
+        let iv5_f = E::F::from(BaseField::from(iv5_byte as u32));
         eval.add_to_relation(RelationEntry::new(
             bitwise_lookup,
             is_real[0].clone().into(),
-            &[
-                iv5_hi_f.clone(),
-                t_hi_e[8 + i].clone(),
-                and_t_hi_hi_e[i].clone(),
-            ],
-        ));
-        eval.add_to_relation(RelationEntry::new(
-            bitwise_lookup,
-            is_real[0].clone().into(),
-            &[
-                iv5_lo_f.clone(),
-                t_e[8 + i].clone() - t_hi_e[8 + i].clone() * f16.clone(),
-                and_t_hi_e[i].clone() - and_t_hi_hi_e[i].clone() * f16.clone(),
-            ],
+            &[iv5_f, t_e[8 + i].clone(), and_t_hi_e[i].clone()],
         ));
     }
 
@@ -876,13 +772,8 @@ pub(in crate::chips::blake2b) fn add_compression_core<
     //   V_after[3] ← a_out, V_after[4] ← b_out,
     //   V_after[9] ← c_out, V_after[14] ← d_out,  else V[k].
     let output_e = trace_eval.column_eval::<64>(C::OUTPUT);
-    let h_hi_e = trace_eval.column_eval::<64>(C::H_HI);
-    let v_after_hi_e = trace_eval.column_eval::<128>(C::V_AFTER_HI);
     let out_and1_e = trace_eval.column_eval::<64>(C::OUT_AND1);
-    let out_and1_hi_e = trace_eval.column_eval::<64>(C::OUT_AND1_HI);
-    let out_xor1_hi_e = trace_eval.column_eval::<64>(C::OUT_XOR1_HI);
     let out_and2_e = trace_eval.column_eval::<64>(C::OUT_AND2);
-    let out_and2_hi_e = trace_eval.column_eval::<64>(C::OUT_AND2_HI);
     // Gate substitution: output_gate ← OutputGateH.
     let output_gate = output_gate_h[0].clone();
 
@@ -911,46 +802,18 @@ pub(in crate::chips::blake2b) fn add_compression_core<
                 - f2.clone() * out_and2_e[slot].clone();
             eval.add_constraint(output_gate.clone() * (output_e[slot].clone() - expected_out));
 
-            // OutAnd1 hi
+            // OutAnd1 = H & V_after (byte lookup).
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 output_gate.clone().into(),
-                &[
-                    h_hi_e[slot].clone(),
-                    v_after_hi_e[word * 8 + byte].clone(),
-                    out_and1_hi_e[slot].clone(),
-                ],
+                &[h_b.clone(), v1.clone(), out_and1_e[slot].clone()],
             ));
-            // OutAnd1 lo
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                output_gate.clone().into(),
-                &[
-                    h_b.clone() - h_hi_e[slot].clone() * f16.clone(),
-                    v1.clone() - v_after_hi_e[word * 8 + byte].clone() * f16.clone(),
-                    out_and1_e[slot].clone() - out_and1_hi_e[slot].clone() * f16.clone(),
-                ],
-            ));
-            // OutAnd2 hi — operands are Xor1 (expression) and V_after[word+8]
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                output_gate.clone().into(),
-                &[
-                    out_xor1_hi_e[slot].clone(),
-                    v_after_hi_e[(word + 8) * 8 + byte].clone(),
-                    out_and2_hi_e[slot].clone(),
-                ],
-            ));
-            // OutAnd2 lo — xor1_expr = H + v1 - 2·OutAnd1
+            // OutAnd2 = Xor1 & V_after[word+8], Xor1 = H + v1 - 2·OutAnd1 (byte lookup).
             let xor1 = h_b.clone() + v1.clone() - f2.clone() * out_and1_e[slot].clone();
             eval.add_to_relation(RelationEntry::new(
                 bitwise_lookup,
                 output_gate.clone().into(),
-                &[
-                    xor1 - out_xor1_hi_e[slot].clone() * f16.clone(),
-                    v2.clone() - v_after_hi_e[(word + 8) * 8 + byte].clone() * f16.clone(),
-                    out_and2_e[slot].clone() - out_and2_hi_e[slot].clone() * f16.clone(),
-                ],
+                &[xor1, v2.clone(), out_and2_e[slot].clone()],
             ));
         }
     }
@@ -965,7 +828,7 @@ impl BuiltInComponent for Blake2bChip {
     type MainColumn = Column;
     type LookupElements = (
         Range256LookupElements,
-        BitwiseAndLookupElements,
+        BitwiseAndByteLookupElements,
         MemoryAccessLookupElements,
         Blake2bCallLookupElements,
     );
@@ -976,7 +839,7 @@ impl BuiltInComponent for Blake2bChip {
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         lookup_elements: &(
             Range256LookupElements,
-            BitwiseAndLookupElements,
+            BitwiseAndByteLookupElements,
             MemoryAccessLookupElements,
             Blake2bCallLookupElements,
         ),
@@ -1235,7 +1098,7 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
     logup: &mut LogupTraceBuilder,
     component_trace: &ComponentTrace,
     range256: &Range256LookupElements,
-    bitwise: &BitwiseAndLookupElements,
+    bitwise: &BitwiseAndByteLookupElements,
 ) {
     let is_real = component_trace.original_base_column::<1, _>(C::IS_REAL);
     let a_in = component_trace.original_base_column::<8, _>(C::A_IN);
@@ -1254,107 +1117,36 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
     let c_out = component_trace.original_base_column::<8, _>(C::C_OUT);
     let d_out = component_trace.original_base_column::<8, _>(C::D_OUT);
     let and4 = component_trace.original_base_column::<8, _>(C::AND4);
-    let and1_a_hi = component_trace.original_base_column::<8, _>(C::AND1_A_HI);
-    let and1_b_hi = component_trace.original_base_column::<8, _>(C::AND1_B_HI);
-    let and1_res_hi = component_trace.original_base_column::<8, _>(C::AND1_RES_HI);
-    let and2_a_hi = component_trace.original_base_column::<8, _>(C::AND2_A_HI);
-    let and2_b_hi = component_trace.original_base_column::<8, _>(C::AND2_B_HI);
-    let and2_res_hi = component_trace.original_base_column::<8, _>(C::AND2_RES_HI);
-    let and3_a_hi = component_trace.original_base_column::<8, _>(C::AND3_A_HI);
-    let and3_b_hi = component_trace.original_base_column::<8, _>(C::AND3_B_HI);
-    let and3_res_hi = component_trace.original_base_column::<8, _>(C::AND3_RES_HI);
-    let and4_a_hi = component_trace.original_base_column::<8, _>(C::AND4_A_HI);
-    let and4_b_hi = component_trace.original_base_column::<8, _>(C::AND4_B_HI);
-    let and4_res_hi = component_trace.original_base_column::<8, _>(C::AND4_RES_HI);
+    let t_cols = component_trace.original_base_column::<16, _>(C::T);
+    let and_t_lo_cols = component_trace.original_base_column::<8, _>(C::AND_T_LO);
+    let and_t_hi_cols = component_trace.original_base_column::<8, _>(C::AND_T_HI);
 
-    let sixteen = PackedBaseField::broadcast(BaseField::from(16));
     let two = PackedBaseField::broadcast(BaseField::from(2));
 
-    // For each byte i, emit 8 nibble lookups in order:
-    //   And1 hi, And1 lo, And2 hi, And2 lo, And3 hi, And3 lo, And4 hi, And4 lo
-    // The constraint-side emission MUST match this order exactly;
-    // finalize_logup_in_pairs will pair (hi, lo) per AND.
+    // For each byte i, emit 6 byte-wide AND lookups in order:
+    //   And1, And2, And3, And4, AndTLo, AndTHi
+    // The constraint-side emission MUST match this order exactly.
     for i in 0..8usize {
-        // ── And1 = D_in & A1, bytes at position i ──
+        // ── And1 = D_in & A1 ──
         logup.add_to_relation_with(
             bitwise,
             [is_real[0].clone()],
             |[r]| r.into(),
-            &[
-                and1_a_hi[i].clone(),
-                and1_b_hi[i].clone(),
-                and1_res_hi[i].clone(),
-            ],
-        );
-        let (d_in_i, a1_i, and1_i) = (d_in[i].clone(), a1[i].clone(), and1[i].clone());
-        let (and1_a_hi_i, and1_b_hi_i, and1_res_hi_i) = (
-            and1_a_hi[i].clone(),
-            and1_b_hi[i].clone(),
-            and1_res_hi[i].clone(),
-        );
-        logup.add_to_relation_computed(
-            bitwise,
-            [is_real[0].clone()],
-            |[r]| r.into(),
-            3,
-            move |v| {
-                let a_lo = d_in_i.at(v) - and1_a_hi_i.at(v) * sixteen;
-                let b_lo = a1_i.at(v) - and1_b_hi_i.at(v) * sixteen;
-                let r_lo = and1_i.at(v) - and1_res_hi_i.at(v) * sixteen;
-                vec![a_lo, b_lo, r_lo]
-            },
+            &[d_in[i].clone(), a1[i].clone(), and1[i].clone()],
         );
 
-        // ── And2 = B_in & C1, bytes at position i ──
+        // ── And2 = B_in & C1 ──
         logup.add_to_relation_with(
             bitwise,
             [is_real[0].clone()],
             |[r]| r.into(),
-            &[
-                and2_a_hi[i].clone(),
-                and2_b_hi[i].clone(),
-                and2_res_hi[i].clone(),
-            ],
-        );
-        let (b_in_i, c1_i, and2_i) = (b_in[i].clone(), c1[i].clone(), and2[i].clone());
-        let (and2_a_hi_i, and2_b_hi_i, and2_res_hi_i) = (
-            and2_a_hi[i].clone(),
-            and2_b_hi[i].clone(),
-            and2_res_hi[i].clone(),
-        );
-        logup.add_to_relation_computed(
-            bitwise,
-            [is_real[0].clone()],
-            |[r]| r.into(),
-            3,
-            move |v| {
-                let a_lo = b_in_i.at(v) - and2_a_hi_i.at(v) * sixteen;
-                let b_lo = c1_i.at(v) - and2_b_hi_i.at(v) * sixteen;
-                let r_lo = and2_i.at(v) - and2_res_hi_i.at(v) * sixteen;
-                vec![a_lo, b_lo, r_lo]
-            },
+            &[b_in[i].clone(), c1[i].clone(), and2[i].clone()],
         );
 
-        // ── And3 = D1 & A_out, bytes at position i ──
-        // D1[i] is derived: D1[i] = D_in[j] + A1[j] - 2·And1[j] where j=(i+4)%8.
-        logup.add_to_relation_with(
-            bitwise,
-            [is_real[0].clone()],
-            |[r]| r.into(),
-            &[
-                and3_a_hi[i].clone(),
-                and3_b_hi[i].clone(),
-                and3_res_hi[i].clone(),
-            ],
-        );
+        // ── And3 = D1 & A_out, D1[i] = D_in[j] + A1[j] - 2·And1[j], j=(i+4)%8 ──
         let j3 = (i + 4) % 8;
         let (d_in_j, a1_j, and1_j) = (d_in[j3].clone(), a1[j3].clone(), and1[j3].clone());
         let (a_out_i, and3_i) = (a_out[i].clone(), and3[i].clone());
-        let (and3_a_hi_i, and3_b_hi_i, and3_res_hi_i) = (
-            and3_a_hi[i].clone(),
-            and3_b_hi[i].clone(),
-            and3_res_hi[i].clone(),
-        );
         logup.add_to_relation_computed(
             bitwise,
             [is_real[0].clone()],
@@ -1362,33 +1154,14 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
             3,
             move |v| {
                 let d1_i = d_in_j.at(v) + a1_j.at(v) - two * and1_j.at(v);
-                let a_lo = d1_i - and3_a_hi_i.at(v) * sixteen;
-                let b_lo = a_out_i.at(v) - and3_b_hi_i.at(v) * sixteen;
-                let r_lo = and3_i.at(v) - and3_res_hi_i.at(v) * sixteen;
-                vec![a_lo, b_lo, r_lo]
+                vec![d1_i, a_out_i.at(v), and3_i.at(v)]
             },
         );
 
-        // ── And4 = B1 & C_out, bytes at position i ──
-        // B1[i] is derived: B1[i] = B_in[j] + C1[j] - 2·And2[j] where j=(i+3)%8.
-        logup.add_to_relation_with(
-            bitwise,
-            [is_real[0].clone()],
-            |[r]| r.into(),
-            &[
-                and4_a_hi[i].clone(),
-                and4_b_hi[i].clone(),
-                and4_res_hi[i].clone(),
-            ],
-        );
+        // ── And4 = B1 & C_out, B1[i] = B_in[j] + C1[j] - 2·And2[j], j=(i+3)%8 ──
         let j4 = (i + 3) % 8;
         let (b_in_j, c1_j, and2_j) = (b_in[j4].clone(), c1[j4].clone(), and2[j4].clone());
         let (c_out_i, and4_i) = (c_out[i].clone(), and4[i].clone());
-        let (and4_a_hi_i, and4_b_hi_i, and4_res_hi_i) = (
-            and4_a_hi[i].clone(),
-            and4_b_hi[i].clone(),
-            and4_res_hi[i].clone(),
-        );
         logup.add_to_relation_computed(
             bitwise,
             [is_real[0].clone()],
@@ -1396,81 +1169,35 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
             3,
             move |v| {
                 let b1_i = b_in_j.at(v) + c1_j.at(v) - two * and2_j.at(v);
-                let a_lo = b1_i - and4_a_hi_i.at(v) * sixteen;
-                let b_lo = c_out_i.at(v) - and4_b_hi_i.at(v) * sixteen;
-                let r_lo = and4_i.at(v) - and4_res_hi_i.at(v) * sixteen;
-                vec![a_lo, b_lo, r_lo]
+                vec![b1_i, c_out_i.at(v), and4_i.at(v)]
             },
         );
 
-        // ── AndTLo = IV[4] & T_lo at byte i ──
-        // IV[4] is constant, so a_hi / a_lo are inline.
-        let iv4_byte = IV[4].to_le_bytes()[i];
-        let iv4_hi = PackedBaseField::broadcast(BaseField::from((iv4_byte >> 4) as u32));
-        let iv4_lo = PackedBaseField::broadcast(BaseField::from((iv4_byte & 0x0F) as u32));
-        let t_cols = component_trace.original_base_column::<16, _>(C::T);
-        let t_hi_cols = component_trace.original_base_column::<16, _>(C::T_HI);
-        let and_t_lo_cols = component_trace.original_base_column::<8, _>(C::AND_T_LO);
-        let and_t_hi_cols = component_trace.original_base_column::<8, _>(C::AND_T_HI);
-        let and_t_lo_hi_cols = component_trace.original_base_column::<8, _>(C::AND_T_LO_HI);
-        let and_t_hi_hi_cols = component_trace.original_base_column::<8, _>(C::AND_T_HI_HI);
-        let iv4_hi_bcast_tuple = iv4_hi;
-        logup.add_to_relation_computed(bitwise, [is_real[0].clone()], |[r]| r.into(), 3, {
-            let t_hi_i = t_hi_cols[i].clone();
-            let and_hi_i = and_t_lo_hi_cols[i].clone();
-            move |v| vec![iv4_hi_bcast_tuple, t_hi_i.at(v), and_hi_i.at(v)]
-        });
+        // ── AndTLo = IV[4] & T[i] (IV[4] const a-side) ──
+        let iv4_bcast = PackedBaseField::broadcast(BaseField::from(IV[4].to_le_bytes()[i] as u32));
         {
-            let iv4_lo_const = iv4_lo;
             let t_i = t_cols[i].clone();
-            let t_hi_i = t_hi_cols[i].clone();
             let and_i = and_t_lo_cols[i].clone();
-            let and_hi_i = and_t_lo_hi_cols[i].clone();
             logup.add_to_relation_computed(
                 bitwise,
                 [is_real[0].clone()],
                 |[r]| r.into(),
                 3,
-                move |v| {
-                    let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
-                    let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
-                    vec![iv4_lo_const, b_lo, r_lo]
-                },
+                move |v| vec![iv4_bcast, t_i.at(v), and_i.at(v)],
             );
         }
 
-        // ── AndTHi = IV[5] & T_hi (bytes 8..16 of T) at byte i ──
-        let iv5_byte = IV[5].to_le_bytes()[i];
-        let iv5_hi = PackedBaseField::broadcast(BaseField::from((iv5_byte >> 4) as u32));
-        let iv5_lo = PackedBaseField::broadcast(BaseField::from((iv5_byte & 0x0F) as u32));
-        let iv5_hi_bcast = iv5_hi;
+        // ── AndTHi = IV[5] & T[8+i] ──
+        let iv5_bcast = PackedBaseField::broadcast(BaseField::from(IV[5].to_le_bytes()[i] as u32));
         {
-            let t_hi_i = t_hi_cols[8 + i].clone();
-            let and_hi_i = and_t_hi_hi_cols[i].clone();
-            logup.add_to_relation_computed(
-                bitwise,
-                [is_real[0].clone()],
-                |[r]| r.into(),
-                3,
-                move |v| vec![iv5_hi_bcast, t_hi_i.at(v), and_hi_i.at(v)],
-            );
-        }
-        {
-            let iv5_lo_const = iv5_lo;
             let t_i = t_cols[8 + i].clone();
-            let t_hi_i = t_hi_cols[8 + i].clone();
             let and_i = and_t_hi_cols[i].clone();
-            let and_hi_i = and_t_hi_hi_cols[i].clone();
             logup.add_to_relation_computed(
                 bitwise,
                 [is_real[0].clone()],
                 |[r]| r.into(),
                 3,
-                move |v| {
-                    let b_lo = t_i.at(v) - t_hi_i.at(v) * sixteen;
-                    let r_lo = and_i.at(v) - and_hi_i.at(v) * sixteen;
-                    vec![iv5_lo_const, b_lo, r_lo]
-                },
+                move |v| vec![iv5_bcast, t_i.at(v), and_i.at(v)],
             );
         }
     }
@@ -1489,22 +1216,17 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
         }
     }
 
-    // ── Output-derivation AND-nibble lookups ──────
-    // Fire only at IsLastOfCompression · IsReal.  128 AND bytes
-    // (And1 and And2 pairs) × 2 nibbles = 256 lookup entries per row
-    // (non-last rows have multiplicity 0).
+    // ── Output-derivation byte-wide AND lookups ──────
+    // Fire only at IsLastOfCompression · IsReal.  128 byte ANDs per row
+    // (OutAnd1 = H & V_after, OutAnd2 = Xor1 & V_after[+8]); non-last rows
+    // have multiplicity 0.
     //
     // Snapshot V[0..16] and H[0..8] columns upfront — we dispatch by
     // numeric index below because the column-fetch macro requires a
     // literal path.
     let is_last_pp = component_trace.preprocessed_base_column::<1, P>(P::IS_LAST);
-    let h_hi_cols = component_trace.original_base_column::<64, _>(C::H_HI);
-    let v_after_hi_cols = component_trace.original_base_column::<128, _>(C::V_AFTER_HI);
     let out_and1_cols = component_trace.original_base_column::<64, _>(C::OUT_AND1);
-    let out_and1_hi_cols = component_trace.original_base_column::<64, _>(C::OUT_AND1_HI);
-    let out_xor1_hi_cols = component_trace.original_base_column::<64, _>(C::OUT_XOR1_HI);
     let out_and2_cols = component_trace.original_base_column::<64, _>(C::OUT_AND2);
-    let out_and2_hi_cols = component_trace.original_base_column::<64, _>(C::OUT_AND2_HI);
     let h_by_word: [_; 8] = [
         component_trace.original_base_column::<8, _>(C::H[0]),
         component_trace.original_base_column::<8, _>(C::H[1]),
@@ -1549,6 +1271,7 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
         _ => v_by_slot[k][byte].clone(),
     };
 
+    let two = PackedBaseField::broadcast(BaseField::from(2));
     for word in 0..8 {
         for byte in 0..8 {
             let slot = word * 8 + byte;
@@ -1556,63 +1279,26 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
             let v2_src = v_after_byte(word + 8, byte);
             let h_b = h_by_word[word][byte].clone();
 
-            // And1 hi
-            {
-                let h_hi_s = h_hi_cols[slot].clone();
-                let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
-                let and1_hi_s = out_and1_hi_cols[slot].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone(), is_last_pp[0].clone()],
-                    |[r, l]| (r * l).into(),
-                    3,
-                    move |v| vec![h_hi_s.at(v), v_after_hi_s.at(v), and1_hi_s.at(v)],
-                );
-            }
-            // And1 lo
+            // OutAnd1 = H & V_after (byte lookup).
             {
                 let h_b2 = h_b.clone();
-                let h_hi_s = h_hi_cols[slot].clone();
                 let v1_src2 = v1_src.clone();
-                let v_after_hi_s = v_after_hi_cols[word * 8 + byte].clone();
                 let and1_s = out_and1_cols[slot].clone();
-                let and1_hi_s = out_and1_hi_cols[slot].clone();
                 logup.add_to_relation_computed(
                     bitwise,
                     [is_real[0].clone(), is_last_pp[0].clone()],
                     |[r, l]| (r * l).into(),
                     3,
-                    move |v| {
-                        let a_lo = h_b2.at(v) - h_hi_s.at(v) * sixteen;
-                        let b_lo = v1_src2.at(v) - v_after_hi_s.at(v) * sixteen;
-                        let r_lo = and1_s.at(v) - and1_hi_s.at(v) * sixteen;
-                        vec![a_lo, b_lo, r_lo]
-                    },
+                    move |v| vec![h_b2.at(v), v1_src2.at(v), and1_s.at(v)],
                 );
             }
-            // And2 hi
-            {
-                let xor1_hi_s = out_xor1_hi_cols[slot].clone();
-                let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
-                let and2_hi_s = out_and2_hi_cols[slot].clone();
-                logup.add_to_relation_computed(
-                    bitwise,
-                    [is_real[0].clone(), is_last_pp[0].clone()],
-                    |[r, l]| (r * l).into(),
-                    3,
-                    move |v| vec![xor1_hi_s.at(v), v_after_hi_s2.at(v), and2_hi_s.at(v)],
-                );
-            }
-            // And2 lo with xor1_expr = H + v1 - 2·And1
+            // OutAnd2 = Xor1 & V_after[+8], Xor1 = H + v1 - 2·OutAnd1 (byte lookup).
             {
                 let h_b2 = h_b.clone();
                 let v1_src2 = v1_src.clone();
                 let v2_src2 = v2_src.clone();
-                let xor1_hi_s = out_xor1_hi_cols[slot].clone();
-                let v_after_hi_s2 = v_after_hi_cols[(word + 8) * 8 + byte].clone();
                 let and1_s = out_and1_cols[slot].clone();
                 let and2_s = out_and2_cols[slot].clone();
-                let and2_hi_s = out_and2_hi_cols[slot].clone();
                 logup.add_to_relation_computed(
                     bitwise,
                     [is_real[0].clone(), is_last_pp[0].clone()],
@@ -1620,10 +1306,7 @@ pub(in crate::chips::blake2b) fn add_compression_interaction_core<
                     3,
                     move |v| {
                         let xor1_v = h_b2.at(v) + v1_src2.at(v) - two * and1_s.at(v);
-                        let a_lo = xor1_v - xor1_hi_s.at(v) * sixteen;
-                        let b_lo = v2_src2.at(v) - v_after_hi_s2.at(v) * sixteen;
-                        let r_lo = and2_s.at(v) - and2_hi_s.at(v) * sixteen;
-                        vec![a_lo, b_lo, r_lo]
+                        vec![xor1_v, v2_src2.at(v), and2_s.at(v)]
                     },
                 );
             }
@@ -1767,18 +1450,6 @@ pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
         trace.fill_columns_bytes(row_idx, &r.and4, C::AND4);
         trace.fill_columns_bytes(row_idx, &r.b_out, C::B_OUT);
         trace.fill_columns_bytes(row_idx, &r.rot63_carry, C::ROT63_CARRY);
-        trace.fill_columns_bytes(row_idx, &r.and1_a_hi, C::AND1_A_HI);
-        trace.fill_columns_bytes(row_idx, &r.and1_b_hi, C::AND1_B_HI);
-        trace.fill_columns_bytes(row_idx, &r.and1_res_hi, C::AND1_RES_HI);
-        trace.fill_columns_bytes(row_idx, &r.and2_a_hi, C::AND2_A_HI);
-        trace.fill_columns_bytes(row_idx, &r.and2_b_hi, C::AND2_B_HI);
-        trace.fill_columns_bytes(row_idx, &r.and2_res_hi, C::AND2_RES_HI);
-        trace.fill_columns_bytes(row_idx, &r.and3_a_hi, C::AND3_A_HI);
-        trace.fill_columns_bytes(row_idx, &r.and3_b_hi, C::AND3_B_HI);
-        trace.fill_columns_bytes(row_idx, &r.and3_res_hi, C::AND3_RES_HI);
-        trace.fill_columns_bytes(row_idx, &r.and4_a_hi, C::AND4_A_HI);
-        trace.fill_columns_bytes(row_idx, &r.and4_b_hi, C::AND4_B_HI);
-        trace.fill_columns_bytes(row_idx, &r.and4_res_hi, C::AND4_RES_HI);
         trace.fill_columns_bytes(row_idx, &r.d_out, C::D_OUT);
         for k in 0..16 {
             trace.fill_columns_bytes(row_idx, &r.v[k], C::V[k]);
@@ -1792,20 +1463,12 @@ pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
         }
         trace.fill_columns_bytes(row_idx, &r.t, C::T);
         trace.fill_columns(row_idx, r.f, C::F);
-        trace.fill_columns_bytes(row_idx, &r.t_hi, C::T_HI);
         trace.fill_columns_bytes(row_idx, &r.and_t_lo, C::AND_T_LO);
         trace.fill_columns_bytes(row_idx, &r.and_t_hi, C::AND_T_HI);
-        trace.fill_columns_bytes(row_idx, &r.and_t_lo_hi, C::AND_T_LO_HI);
-        trace.fill_columns_bytes(row_idx, &r.and_t_hi_hi, C::AND_T_HI_HI);
         // Output-derivation witnesses (0 on non-last rows).
         trace.fill_columns_bytes(row_idx, &r.output, C::OUTPUT);
-        trace.fill_columns_bytes(row_idx, &r.h_hi, C::H_HI);
-        trace.fill_columns_bytes(row_idx, &r.v_after_hi, C::V_AFTER_HI);
         trace.fill_columns_bytes(row_idx, &r.out_and1, C::OUT_AND1);
-        trace.fill_columns_bytes(row_idx, &r.out_and1_hi, C::OUT_AND1_HI);
-        trace.fill_columns_bytes(row_idx, &r.out_xor1_hi, C::OUT_XOR1_HI);
         trace.fill_columns_bytes(row_idx, &r.out_and2, C::OUT_AND2);
-        trace.fill_columns_bytes(row_idx, &r.out_and2_hi, C::OUT_AND2_HI);
         trace.fill_columns(row_idx, true, C::IS_REAL);
 
         // Carry-bound helpers.  Carries c ∈ {0,1,2}
@@ -1894,9 +1557,9 @@ pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
         trace.fill_columns(row_idx, is_first, C::INIT_GATE_H);
         trace.fill_columns(row_idx, is_last, C::OUTPUT_GATE_H);
 
-        // Emit per-byte nibble counts.  add_bitwise_and increments both the
-        // hi-nibble and lo-nibble (a, b) cell in the 16×16 BitwiseLookup
-        // multiplicity table.
+        // Emit per-byte AND counts into the BitwiseAndByteChip table — one
+        // increment per byte lookup (the constraint / interaction sides emit
+        // one byte lookup per AND).
         //
         // And3 A-side is d1[k] = (d^a1 rotated right 32) = xor byte at
         // position (k+4)%8.  We reconstruct the true byte value from the
@@ -1904,26 +1567,25 @@ pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
         // multiplicity table stays in sync with the constraint-side
         // derivation.  Same story for And4 A-side (b1).
         for i in 0..8 {
-            side_note.add_bitwise_and(r.d_in[i], r.a1[i]);
-            side_note.add_bitwise_and(r.b_in[i], r.c1[i]);
+            side_note.add_bitwise_and_byte(r.d_in[i], r.a1[i]);
+            side_note.add_bitwise_and_byte(r.b_in[i], r.c1[i]);
             let k3 = (i + 4) % 8;
             let d1_i = r.d_in[k3] ^ r.a1[k3];
-            side_note.add_bitwise_and(d1_i, r.a_out[i]);
+            side_note.add_bitwise_and_byte(d1_i, r.a_out[i]);
             let k4 = (i + 3) % 8;
             let b1_i = r.b_in[k4] ^ r.c1[k4];
-            side_note.add_bitwise_and(b1_i, r.c_out[i]);
-            // Initial-state XOR witnesses: IV[4]/IV[5] are constants, so the
-            // nibble multiplicity for their hi/lo nibbles is added here.
+            side_note.add_bitwise_and_byte(b1_i, r.c_out[i]);
+            // Initial-state XOR witnesses: IV[4]/IV[5] are constants.
             let iv4 = IV[4].to_le_bytes();
             let iv5 = IV[5].to_le_bytes();
-            side_note.add_bitwise_and(iv4[i], r.t[i]);
-            side_note.add_bitwise_and(iv5[i], r.t[8 + i]);
+            side_note.add_bitwise_and_byte(iv4[i], r.t[i]);
+            side_note.add_bitwise_and_byte(iv5[i], r.t[8 + i]);
         }
 
         // Range-check the inputs/outputs that are not covered by an AND
         // lookup.  D_in/B_in/A1/C1/A_out/C_out/And{1-4} and the derived
-        // D1/B1 are all nibble-and-lookup-constrained (hi+lo*16 = byte).
-        // The remaining bytes need an explicit Range256 consumer:
+        // D1/B1 are all byte-AND-lookup-constrained (byte-ness from table
+        // membership).  The remaining bytes need an explicit Range256 consumer:
         //   A_in, C_in, Mx, My — add-chain operands read by the prover
         //   B_out — rotation output derived from xor4
         for i in 0..8 {
@@ -1935,8 +1597,8 @@ pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
         }
 
         // Output-derivation AND counts — only at the last row of each compression.
-        // 64 And1 bytes (H & V_after[0..8]) + 64 And2 bytes (Xor1 &
-        // V_after[8..16]) = 128 nibble-AND multiplicity increments.
+        // 64 OutAnd1 bytes (H & V_after[0..8]) + 64 OutAnd2 bytes (Xor1 &
+        // V_after[8..16]) = 128 byte-AND multiplicity increments.
         if row_idx % 96 == 95 {
             let v_after = row_v_after(r);
             for word in 0..8 {
@@ -1945,8 +1607,8 @@ pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
                     let v1 = v_after[word][byte];
                     let v2 = v_after[word + 8][byte];
                     let xor1 = h_b ^ v1;
-                    side_note.add_bitwise_and(h_b, v1);
-                    side_note.add_bitwise_and(xor1, v2);
+                    side_note.add_bitwise_and_byte(h_b, v1);
+                    side_note.add_bitwise_and_byte(xor1, v2);
                 }
             }
         }
@@ -2061,8 +1723,8 @@ impl BuiltInProverComponent for Blake2bChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let range256: &Range256LookupElements = lookup_elements.as_ref();
-        let bitwise: &BitwiseAndLookupElements = lookup_elements.as_ref();
-        // Arithmetic-core lookups (BitwiseAnd / Range256 nibble lookups +
+        let bitwise: &BitwiseAndByteLookupElements = lookup_elements.as_ref();
+        // Arithmetic-core lookups (byte-wide AND / Range256 lookups +
         // output-AND lookups) — shared with Blake2bBoundaryChip.
         add_compression_interaction_core::<PreprocessedColumn, Column>(
             &mut logup,

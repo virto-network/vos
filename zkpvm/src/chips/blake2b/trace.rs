@@ -31,22 +31,6 @@ pub(super) struct GRow {
     /// d_out = (d1 ^ a_out) rotated right 16.  Materialised so the row-chain
     /// constraint can forward it into V_next[di].
     pub d_out: [u8; 8],
-    // Hi nibbles for AND lookups.  AxHi/BxHi are the hi nibbles of the two AND
-    // operands (in the byte ordering used by AndN); ResxHi is the hi nibble of
-    // the AND result byte.  For And3/And4 the A-side input is a derived byte
-    // (d1/b1), so AxHi is the hi nibble of that derived byte.
-    pub and1_a_hi: [u8; 8],
-    pub and1_b_hi: [u8; 8],
-    pub and1_res_hi: [u8; 8],
-    pub and2_a_hi: [u8; 8],
-    pub and2_b_hi: [u8; 8],
-    pub and2_res_hi: [u8; 8],
-    pub and3_a_hi: [u8; 8],
-    pub and3_b_hi: [u8; 8],
-    pub and3_res_hi: [u8; 8],
-    pub and4_a_hi: [u8; 8],
-    pub and4_b_hi: [u8; 8],
-    pub and4_res_hi: [u8; 8],
     /// Snapshot of v[0..16] as LE bytes at the START of this row's G-call.
     pub v: [[u8; 8]; 16],
     /// Full message m[0..16] (LE bytes) for the compression this row belongs
@@ -57,20 +41,12 @@ pub(super) struct GRow {
     pub h: [[u8; 8]; 8],
     pub t: [u8; 16],
     pub f: u8,
-    pub t_hi: [u8; 16],
     pub and_t_lo: [u8; 8],
     pub and_t_hi: [u8; 8],
-    pub and_t_lo_hi: [u8; 8],
-    pub and_t_hi_hi: [u8; 8],
     // ── Output derivation, only non-zero at the last row of a compression
     pub output: [u8; 64],
-    pub h_hi: [u8; 64],
-    pub v_after_hi: [u8; 128],
     pub out_and1: [u8; 64],
-    pub out_and1_hi: [u8; 64],
-    pub out_xor1_hi: [u8; 64],
     pub out_and2: [u8; 64],
-    pub out_and2_hi: [u8; 64],
     // ── ECALL memory-binding witnesses, constant across the 96 rows of a
     // compression; address columns only referenced at IsFirstOfCompression.
     pub h_ptr: [u8; 4],
@@ -152,20 +128,6 @@ pub(super) fn g_traced(
     let b_out = b_out_val.to_le_bytes();
     let rot63_carry = rot63_carries(&xor4_val.to_le_bytes());
 
-    // Hi nibbles for AND lookups.
-    let and1_a_hi = hi_nibbles(&d_in);
-    let and1_b_hi = hi_nibbles(&a1);
-    let and1_res_hi = hi_nibbles(&and1);
-    let and2_a_hi = hi_nibbles(&b_in);
-    let and2_b_hi = hi_nibbles(&c1);
-    let and2_res_hi = hi_nibbles(&and2);
-    let and3_a_hi = hi_nibbles(&d1_bytes); // derived: d1 = (d_in ^ a1) >>> 32
-    let and3_b_hi = hi_nibbles(&a_out);
-    let and3_res_hi = hi_nibbles(&and3);
-    let and4_a_hi = hi_nibbles(&b1_bytes); // derived: b1 = (b_in ^ c1) >>> 24
-    let and4_b_hi = hi_nibbles(&c_out);
-    let and4_res_hi = hi_nibbles(&and4);
-
     let d_out = d_out_val.to_le_bytes();
 
     let mut v_bytes = [[0u8; 8]; 16];
@@ -181,21 +143,11 @@ pub(super) fn g_traced(
         h_bytes[k] = call_h[k].to_le_bytes();
     }
     let t_bytes = call_t.to_le_bytes();
-    let mut t_hi_bytes = [0u8; 16];
-    for i in 0..16 {
-        t_hi_bytes[i] = t_bytes[i] >> 4;
-    }
     let mut and_t_lo = [0u8; 8];
     let mut and_t_hi = [0u8; 8];
     for i in 0..8 {
         and_t_lo[i] = IV[4].to_le_bytes()[i] & t_bytes[i];
         and_t_hi[i] = IV[5].to_le_bytes()[i] & t_bytes[8 + i];
-    }
-    let mut and_t_lo_hi = [0u8; 8];
-    let mut and_t_hi_hi = [0u8; 8];
-    for i in 0..8 {
-        and_t_lo_hi[i] = and_t_lo[i] >> 4;
-        and_t_hi_hi[i] = and_t_hi[i] >> 4;
     }
 
     GRow {
@@ -220,38 +172,18 @@ pub(super) fn g_traced(
         b_out,
         rot63_carry,
         d_out,
-        and1_a_hi,
-        and1_b_hi,
-        and1_res_hi,
-        and2_a_hi,
-        and2_b_hi,
-        and2_res_hi,
-        and3_a_hi,
-        and3_b_hi,
-        and3_res_hi,
-        and4_a_hi,
-        and4_b_hi,
-        and4_res_hi,
         v: v_bytes,
         m: m_bytes,
         h: h_bytes,
         t: t_bytes,
         f: call_f as u8,
-        t_hi: t_hi_bytes,
         and_t_lo,
         and_t_hi,
-        and_t_lo_hi,
-        and_t_hi_hi,
         // Output-derivation witnesses are zero by default; the trace-gen loop fills
         // them on the last row of each compression.
         output: [0u8; 64],
-        h_hi: [0u8; 64],
-        v_after_hi: [0u8; 128],
         out_and1: [0u8; 64],
-        out_and1_hi: [0u8; 64],
-        out_xor1_hi: [0u8; 64],
         out_and2: [0u8; 64],
-        out_and2_hi: [0u8; 64],
         // ECALL-binding witnesses — filled by the outer loop from
         // the matching blake2b_mem_op (or zero if none).  Address columns
         // are deterministic from HPtr/MPtr plus the byte offset.
@@ -294,28 +226,11 @@ pub(super) fn fill_output_witnesses(row: &mut GRow, v_after: &[u64; 16]) {
             let and2 = xor1 & v2;
             let out = xor1 ^ v2;
             let slot = i * 8 + j;
-            row.h_hi[slot] = h_b >> 4;
             row.out_and1[slot] = and1;
-            row.out_and1_hi[slot] = and1 >> 4;
-            row.out_xor1_hi[slot] = xor1 >> 4;
             row.out_and2[slot] = and2;
-            row.out_and2_hi[slot] = and2 >> 4;
             row.output[slot] = out;
         }
     }
-    for k in 0..16 {
-        for j in 0..8 {
-            row.v_after_hi[k * 8 + j] = v_after_bytes[k][j] >> 4;
-        }
-    }
-}
-
-fn hi_nibbles(bytes: &[u8; 8]) -> [u8; 8] {
-    let mut r = [0u8; 8];
-    for i in 0..8 {
-        r[i] = bytes[i] >> 4;
-    }
-    r
 }
 
 fn byte_and(a: &[u8; 8], b: &[u8; 8]) -> [u8; 8] {

@@ -197,7 +197,7 @@ mod tests {
     use crate::chips::blake2b::{Blake2bBoundaryChip, BoundaryColumn};
     use crate::framework::{MachineComponent, MachineProverComponent};
     use crate::lookups::{
-        AllLookupElements, BitwiseAndLookupElements, Blake2bCompressionLookupElements,
+        AllLookupElements, BitwiseAndByteLookupElements, Blake2bCompressionLookupElements,
         Range256LookupElements,
     };
     use crate::side_note::SideNote;
@@ -243,11 +243,11 @@ mod tests {
         SecureField,
     ) {
         let range256: &Range256LookupElements = lookups.as_ref();
-        let bitwise: &BitwiseAndLookupElements = lookups.as_ref();
+        let bitwise: &BitwiseAndByteLookupElements = lookups.as_ref();
         let is_real = crate::trace::original_base_column!(trace, BoundaryColumn::IsReal);
-        let a_hi = crate::trace::original_base_column!(trace, BoundaryColumn::And1AHi);
-        let b_hi = crate::trace::original_base_column!(trace, BoundaryColumn::And1BHi);
-        let r_hi = crate::trace::original_base_column!(trace, BoundaryColumn::And1ResHi);
+        let d_in = crate::trace::original_base_column!(trace, BoundaryColumn::DIn);
+        let a1 = crate::trace::original_base_column!(trace, BoundaryColumn::A1);
+        let and1 = crate::trace::original_base_column!(trace, BoundaryColumn::And1);
         let a_in = crate::trace::original_base_column!(trace, BoundaryColumn::AIn);
         let emit_mult = crate::trace::original_base_column!(trace, BoundaryColumn::EmitMult);
         let output_cols = crate::trace::original_base_column!(trace, BoundaryColumn::Output);
@@ -264,11 +264,13 @@ mod tests {
             );
         };
         let dense_and = |logup: &mut LogupTraceBuilder, i: usize| {
+            // A byte-wide AND lookup (And1 = D_in & A1) — a dense, IsReal-gated
+            // emission.
             logup.add_to_relation_with(
                 bitwise,
                 [is_real[0].clone()],
                 |[r]| r.into(),
-                &[a_hi[i].clone(), b_hi[i].clone(), r_hi[i].clone()],
+                &[d_in[i].clone(), a1[i].clone(), and1[i].clone()],
             );
         };
         let dense_range = |logup: &mut LogupTraceBuilder, i: usize| {
