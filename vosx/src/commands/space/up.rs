@@ -166,7 +166,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let network = build_network_for_daemon(entry, &data_dir, &args.listen, &args.connect)?;
     let local_prefix = network.local_prefix();
 
-    let mut node = VosNode::with_prefix(local_prefix);
+    // Serve program blobs (actor ELFs) to space members from the same
+    // content-addressed cache `blob_store` writes, so a joiner that installs
+    // an agent it never received in the manifest can fetch the ELF from us.
+    let mut node =
+        VosNode::with_prefix(local_prefix).with_program_blobs_dir(blob_store::cache_dir());
 
     // Record this daemon's operator — the CLI identity that ran `vosx space
     // up` (the same `vosx/identity.key` the operator later presents when
@@ -332,6 +336,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let has_hyperspace = hyperspace.is_some();
         let mut damped = std::collections::HashSet::new();
         let mut boot_grace = BootGrace::new();
+        // Program-blob fetches in flight, shared with the background fetch
+        // tasks the reconcile pass spawns for uncached rows.
+        let in_flight: InFlightBlobs = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        ));
         let mut query_warned = false;
         let mut last_pass = std::time::Instant::now();
         // chronos clock/randomness feed (`vos::chronos_feed::ChronosFeeder`): a
@@ -367,6 +376,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &local_cfg,
                 &mut damped,
                 &mut boot_grace,
+                &in_flight,
                 &agent_policies,
             ) {
                 Ok(()) => query_warned = false,
@@ -778,6 +788,89 @@ fn spawn_installed_agents(
 /// per row, so a low couple-of-seconds cadence keeps freshly
 /// installed agents snappy without measurable idle cost.
 const SPAWN_RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cap on program-blob fetches running concurrently across the daemon. A
+/// joiner that syncs a large registry can face many missing blobs at once;
+/// this bounds the fan-out (and the peer load) while the reconcile pass keeps
+/// retrying uncached rows every [`SPAWN_RECONCILE_EVERY`].
+const MAX_INFLIGHT_BLOB_FETCHES: usize = 4;
+
+/// Per-peer wait for a [`FetchProgramBlob`](vos::network) reply before rotating
+/// to the next connected peer. Generous — an ELF can be a few hundred KiB — but
+/// bounded so one unresponsive peer doesn't wedge a fetch task.
+const PROGRAM_BLOB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Hashes of program blobs currently being fetched from peers, shared between
+/// the reconcile pass (which starts fetches) and the background fetch tasks
+/// (which clear their entry when done). Dedups concurrent fetches of the same
+/// blob and caps total in-flight at [`MAX_INFLIGHT_BLOB_FETCHES`].
+type InFlightBlobs = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>;
+
+/// Kick off a best-effort background fetch of program blob `hash` from the
+/// node's connected peers, unless it's already in flight or the in-flight cap
+/// is reached. Returns immediately — the reconcile pass never blocks on the
+/// network. A spawned thread rotates through peers, verifies each reply's bytes
+/// against `hash` before caching (a peer can't poison the content-addressed
+/// cache), and clears the in-flight entry when done so a later pass can retry
+/// if no peer had the blob yet. The now-cached blob is picked up next pass.
+fn spawn_program_blob_fetch(node: &VosNode, hash: [u8; 32], in_flight: &InFlightBlobs) {
+    let Some(network) = node.network() else {
+        return; // no swarm attached (e.g. `--once`) — nothing to fetch from
+    };
+    {
+        let mut set = match in_flight.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if set.contains(&hash) || set.len() >= MAX_INFLIGHT_BLOB_FETCHES {
+            return;
+        }
+        set.insert(hash);
+    }
+    let peers = network.connected_peers();
+    if peers.is_empty() {
+        // Nobody to ask yet; free the slot so the next pass retries once a
+        // peer connects.
+        if let Ok(mut set) = in_flight.lock() {
+            set.remove(&hash);
+        }
+        return;
+    }
+    let in_flight = in_flight.clone();
+    std::thread::spawn(move || {
+        for peer in peers {
+            let rx = network.send_fetch_program_blob(peer, hash);
+            if let Ok(Some(bytes)) = rx.recv_timeout(PROGRAM_BLOB_FETCH_TIMEOUT) {
+                // A peer serves arbitrary bytes; trust them only if they hash to
+                // the requested content address.
+                if BlobHash::of(&bytes).0 != hash {
+                    tracing::warn!(
+                        "peer {peer} served the wrong bytes for program blob {} — ignoring",
+                        BlobHash(hash),
+                    );
+                    continue;
+                }
+                match blob_store::cache_put(&bytes) {
+                    Ok(_) => {
+                        tracing::info!(
+                            "fetched program blob {} from peer {peer} ({} bytes)",
+                            BlobHash(hash),
+                            bytes.len(),
+                        );
+                        break;
+                    }
+                    Err(e) => tracing::warn!(
+                        "caching fetched program blob {} failed: {e}",
+                        BlobHash(hash),
+                    ),
+                }
+            }
+        }
+        if let Ok(mut set) = in_flight.lock() {
+            set.remove(&hash);
+        }
+    });
+}
 
 /// How often the leader commits a chronos `advance`. This is a keepalive
 /// cadence, deliberately NOT the 250 ms slot rate: every state-changing advance
@@ -1260,6 +1353,7 @@ fn reconcile_installed_agents(
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
     damped: &mut RowDamping,
     boot_grace: &mut BootGrace,
+    in_flight: &InFlightBlobs,
     policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
     use vos::registry::{RegistryRef, Status};
@@ -1309,10 +1403,11 @@ fn reconcile_installed_agents(
         // spawn into would stall its quorum.
         let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
             if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
+                spawn_program_blob_fetch(node, a.program_hash, in_flight);
                 if damped.insert(key(RowNote::AwaitingBlob)) {
                     tracing::warn!(
-                        "agent '{}' pending — program blob {} not in the local cache \
-                         (no peer fetch exists yet); it spawns when the blob appears",
+                        "agent '{}' pending — program blob {} not in the local cache; \
+                         fetching from peers, it spawns when the blob appears",
                         a.instance_name,
                         BlobHash(a.program_hash),
                     );
@@ -1375,10 +1470,11 @@ fn reconcile_installed_agents(
                 }
             }
             Ok(RowConfig::MissingBlob) => {
+                spawn_program_blob_fetch(node, a.program_hash, in_flight);
                 if damped.insert(key(RowNote::AwaitingBlob)) {
                     tracing::warn!(
-                        "agent '{}' pending — program blob {} not in the local cache \
-                         (no peer fetch exists yet); it spawns when the blob appears",
+                        "agent '{}' pending — program blob {} not in the local cache; \
+                         fetching from peers, it spawns when the blob appears",
                         a.instance_name,
                         BlobHash(a.program_hash),
                     );

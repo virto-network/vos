@@ -953,6 +953,12 @@ pub struct VosNode {
     /// matches the legacy behaviour and is what tests use unless
     /// they explicitly opt in.
     pub(crate) proof_blobs_dir: Option<std::path::PathBuf>,
+    /// Directory the node serves *program* blobs (actor ELFs) from over
+    /// [`Frame::FetchProgramBlob`](crate::network::Frame::FetchProgramBlob),
+    /// content-addressed as `{dir}/{hex_hash}`. Set by the host (vosx points
+    /// it at its `blob_store` cache) so `vos` stays cache-agnostic — it only
+    /// reads files by hash, never owns the cache. `None` serves nothing.
+    pub(crate) program_blobs_dir: Option<std::path::PathBuf>,
 }
 
 /// Shared content-addressed proof-blob store. Cheap to clone; both
@@ -1195,6 +1201,9 @@ struct NodeService {
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     proof_blobs: ProofBlobStore,
     proof_blobs_dir: Option<std::path::PathBuf>,
+    /// Program-blob cache dir served over `FetchProgramBlob` — a clone of
+    /// [`VosNode::program_blobs_dir`]. `None` serves no program blobs.
+    program_blobs_dir: Option<std::path::PathBuf>,
     /// This daemon's operator PeerId bytes (a clone of
     /// [`VosNode::operator_peer`], set at [`VosNode::attach_network`]). The
     /// sole caller [`Self::dispatch_invoke`] admits to a node-confined
@@ -1903,6 +1912,37 @@ impl crate::network::NetworkService for NodeService {
         Some(bytes)
     }
 
+    fn get_program_blob(
+        &self,
+        peer: Option<libp2p::PeerId>,
+        hash: &[u8; 32],
+    ) -> Option<Vec<u8>> {
+        // A program blob is a space asset: serve it only to a caller who is a
+        // space member — a granted role at or above read-only, or an enrolled
+        // node (the `Member`-floor test, identical to `sync_serve_allowed`).
+        // A build without the registry can't gate, so it serves nothing.
+        #[cfg(not(feature = "storage"))]
+        {
+            let _ = (peer, hash);
+            None
+        }
+        #[cfg(feature = "storage")]
+        {
+            let peer = peer?;
+            let is_member = self.lookup_caller_role(Some(&peer)) >= AUTH_ROLE_READONLY
+                || self.caller_is_enrolled_node(&peer);
+            if !is_member {
+                return None;
+            }
+            // Read the ELF from the host's content-addressed cache dir
+            // (`{dir}/{hex_hash}`) — `proof_blob_filename` is just the shared
+            // hex-of-hash formatter. No rehash: the fetcher verifies bytes
+            // against the requested hash before trusting them.
+            let dir = self.program_blobs_dir.as_ref()?;
+            std::fs::read(dir.join(proof_blob_filename(hash))).ok()
+        }
+    }
+
     /// Admit a Raft joiner only if it is enrolled as a `NODE_ROLE_VOTER`
     /// in the local space-registry. Fails **closed** — an unreachable or
     /// empty registry reply (`lookup_node_role` → `0` = "not enrolled")
@@ -2371,6 +2411,7 @@ impl VosNode {
             sync_threads: Vec::new(),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
+            program_blobs_dir: None,
         }
     }
 
@@ -2387,6 +2428,16 @@ impl VosNode {
         let dir = dir.into();
         let _ = std::fs::create_dir_all(&dir);
         self.proof_blobs_dir = Some(dir);
+        self
+    }
+
+    /// Point the node at the host's program-blob cache directory so it can
+    /// serve actor ELFs to space members over `FetchProgramBlob`. The host
+    /// (vosx) passes its content-addressed `blob_store` cache dir, whose
+    /// `{dir}/{hex_hash}` layout the node reads by hash. Serving is
+    /// membership-gated; the directory itself is never written by `vos`.
+    pub fn with_program_blobs_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.program_blobs_dir = Some(dir.into());
         self
     }
 
@@ -2522,6 +2573,7 @@ impl VosNode {
             manifest: self.manifest.clone(),
             proof_blobs: self.proof_blobs.clone(),
             proof_blobs_dir: self.proof_blobs_dir.clone(),
+            program_blobs_dir: self.program_blobs_dir.clone(),
             operator_peer: self.operator_peer.clone(),
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -9159,6 +9211,7 @@ mod tests {
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
+            program_blobs_dir: None,
             operator_peer: None,
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -9518,6 +9571,76 @@ mod tests {
         assert!(!svc.sync_serve_allowed(None, "counter"), "anonymous is refused Member");
     }
 
+    /// `get_program_blob` is the serving side of the program-blob peer fetch:
+    /// a program blob is a space asset, so it is served only to a space member
+    /// (a read grant OR an enrolled node) and only for a hash actually present
+    /// in the host's cache dir. A stranger, an anonymous caller, and an
+    /// uncached hash all get nothing.
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn get_program_blob_serves_members_only() {
+        use crate::network::NetworkService;
+        let peer = libp2p::PeerId::random();
+        // A temp dir standing in for vosx's content-addressed blob cache,
+        // holding one ELF keyed by its hex hash (the layout the node reads).
+        let dir = std::env::temp_dir().join(format!(
+            "vos-progblob-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = b"\x7fELF fake actor body".to_vec();
+        let hash = crate::crypto::blake2b_hash::<32>(&[], &[&bytes]);
+        std::fs::write(dir.join(proof_blob_filename(&hash)), &bytes).unwrap();
+
+        let serve = |peer_role: u8, node_role: u8| -> Option<Vec<u8>> {
+            let (routes, _reg) = spawn_stub_role_registry(peer_role, node_role);
+            let mut svc = lifecycle_service(
+                routes,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+            );
+            svc.program_blobs_dir = Some(dir.clone());
+            svc.get_program_blob(Some(peer), &hash)
+        };
+
+        assert!(
+            serve(AUTH_ROLE_NONE, 0).is_none(),
+            "a stranger is refused the program blob",
+        );
+        assert_eq!(
+            serve(AUTH_ROLE_READONLY, 0).as_deref(),
+            Some(bytes.as_slice()),
+            "a granted member gets the program blob",
+        );
+        assert_eq!(
+            serve(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER).as_deref(),
+            Some(bytes.as_slice()),
+            "an enrolled voter gets the program blob before a grant lands",
+        );
+
+        // Anonymous and an uncached hash both yield nothing even though the
+        // caller would otherwise be a member.
+        let (routes, _reg) = spawn_stub_role_registry(AUTH_ROLE_READONLY, 0);
+        let mut svc = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+        svc.program_blobs_dir = Some(dir.clone());
+        assert!(
+            svc.get_program_blob(None, &hash).is_none(),
+            "anonymous is refused",
+        );
+        assert!(
+            svc.get_program_blob(Some(peer), &[0xEE; 32]).is_none(),
+            "an uncached hash yields nothing even for a member",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "network")]
     fn lifecycle_service(
         routes: InvokeRoutes,
@@ -9534,6 +9657,7 @@ mod tests {
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
+            program_blobs_dir: None,
             operator_peer: None,
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),

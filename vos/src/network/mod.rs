@@ -294,6 +294,18 @@ pub trait NetworkService: Send + Sync {
         None
     }
 
+    /// Inbound `Frame::FetchProgramBlob` from `peer` that needs a
+    /// content-addressed program blob (a compiled PVM actor ELF) this
+    /// node holds in its program-blob cache. Unlike proof blobs, this
+    /// is **membership-gated** — a program blob is a space asset, so
+    /// the concrete `vos::node` impl serves it only to a caller with a
+    /// space role at or above read-only (or an enrolled node). Default
+    /// returns `None` (nothing to serve) so the peer fans out to
+    /// another holder.
+    fn get_program_blob(&self, _peer: Option<PeerId>, _hash: &[u8; 32]) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Raft-join admission: may the node at `prefix` — already bound to
     /// its noise-verified PeerId by the dispatch layer — be enrolled as a
     /// voter? The concrete `vos::node` impl checks the registry's
@@ -503,6 +515,15 @@ pub(in crate::network) enum NetworkCmd {
         hash: [u8; 32],
         reply: std_mpsc::Sender<Option<Vec<u8>>>,
     },
+    /// Send a [`Frame::FetchProgramBlob`] to a peer that may hold the
+    /// content-addressed actor ELF. Reply yields `Some(bytes)` on hit,
+    /// `None` if the peer doesn't have it (or refused to serve a
+    /// non-member) — the caller fans out to the next peer.
+    SendFetchProgramBlob {
+        target_peer: PeerId,
+        hash: [u8; 32],
+        reply: std_mpsc::Sender<Option<Vec<u8>>>,
+    },
     /// Subscribe the local node to the gossipsub topic for a
     /// replication group. Idempotent — re-subscribing is a no-op.
     SubscribeRep {
@@ -596,6 +617,7 @@ enum OutboundReply {
     Manifest(std_mpsc::Sender<ManifestReply>),
     RaftStatus(std_mpsc::Sender<RaftStatusReply>),
     ProofBlob(std_mpsc::Sender<Option<Vec<u8>>>),
+    ProgramBlob(std_mpsc::Sender<Option<Vec<u8>>>),
 }
 
 impl Network {
@@ -854,6 +876,26 @@ impl Network {
     ) -> std_mpsc::Receiver<Option<Vec<u8>>> {
         let (tx, rx) = std_mpsc::channel();
         let _ = self.cmd_tx.send(NetworkCmd::SendFetchProofBlob {
+            target_peer,
+            hash,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Point-fetch a content-addressed program blob (an actor ELF)
+    /// from a peer. The receiver yields `Some(bytes)` if the peer
+    /// holds the blob and serves it (the peer gates on the caller's
+    /// space membership), `None` otherwise — the caller fans out to
+    /// the next peer. Reply timing is bounded by the
+    /// `request_response` per-request timeout.
+    pub fn send_fetch_program_blob(
+        &self,
+        target_peer: PeerId,
+        hash: [u8; 32],
+    ) -> std_mpsc::Receiver<Option<Vec<u8>>> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendFetchProgramBlob {
             target_peer,
             hash,
             reply: tx,
@@ -1183,6 +1225,17 @@ async fn network_main(
                             .send_request(&target_peer, frame);
                         outbound_replies.insert(req_id, OutboundReply::ProofBlob(reply));
                         debug!(%target_peer, "network: sent FetchProofBlob");
+                    }
+                    Some(NetworkCmd::SendFetchProgramBlob {
+                        target_peer, hash, reply,
+                    }) => {
+                        let frame = Frame::FetchProgramBlob { hash };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::ProgramBlob(reply));
+                        debug!(%target_peer, "network: sent FetchProgramBlob");
                     }
                     Some(NetworkCmd::SubscribeRep { replication_id }) => {
                         let topic = gossip_topic(&replication_id);
@@ -1668,6 +1721,24 @@ fn handle_req_resp(
                             .req_resp
                             .send_response(channel, Frame::ProofBlobReply { blob });
                     }
+                    Frame::FetchProgramBlob { hash } => {
+                        // Unlike proof blobs, this is membership-gated — the
+                        // gate runs the same blocking registry probe as the
+                        // sync path — and reads a possibly-large ELF off disk.
+                        // Serve off the swarm thread behind the per-peer flood
+                        // cap, exactly like FetchHeads/FetchNode.
+                        if !sync_rate.allow(peer) {
+                            return;
+                        }
+                        let svc = service.get().cloned();
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let blob =
+                                svc.and_then(|s| s.get_program_blob(Some(peer), &hash));
+                            let _ = response_tx
+                                .send((channel, Frame::ProgramBlobReply { blob }));
+                        });
+                    }
                     Frame::RaftAppendReq {
                         replication_id,
                         term,
@@ -1964,6 +2035,9 @@ fn handle_req_resp(
                         let _ = tx.send(node);
                     }
                     (Frame::ProofBlobReply { blob }, Some(OutboundReply::ProofBlob(tx))) => {
+                        let _ = tx.send(blob);
+                    }
+                    (Frame::ProgramBlobReply { blob }, Some(OutboundReply::ProgramBlob(tx))) => {
                         let _ = tx.send(blob);
                     }
                     (

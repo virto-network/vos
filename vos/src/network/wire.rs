@@ -76,6 +76,8 @@ const TAG_RAFT_STATUS_RESP: u8 = 0x45;
 // later cycle once production proofs start to push past it.
 const TAG_FETCH_PROOF_BLOB: u8 = 0x50;
 const TAG_PROOF_BLOB_REPLY: u8 = 0x51;
+const TAG_FETCH_PROGRAM_BLOB: u8 = 0x52;
+const TAG_PROGRAM_BLOB_REPLY: u8 = 0x53;
 
 /// CIDs are 32-byte blake2b hashes (matches `commit::Blake2b` in
 /// `vos`). A wider hasher would require a wire-format bump.
@@ -302,6 +304,24 @@ pub enum Frame {
     /// `MAX_FRAME_BYTES` (8 MiB) — production proofs exceeding
     /// that need the chunked transport reserved for a later cycle.
     ProofBlobReply {
+        blob: Option<Vec<u8>>,
+    },
+    /// Point-fetch a content-addressed *program* blob (a compiled
+    /// PVM actor ELF) by its 32-byte hash. Sent as a request; the
+    /// reply rides back as [`Frame::ProgramBlobReply`]. The hash is
+    /// the bare blake2b-256 of the blob bytes — the same digest the
+    /// space registry pins as `AgentRow.program_hash` and the host's
+    /// program-blob cache keys by. A joiner that installs an agent
+    /// whose blob it never received in the manifest (a channel
+    /// created after it joined, say) fetches the ELF this way.
+    FetchProgramBlob {
+        hash: [u8; 32],
+    },
+    /// Reply to [`Frame::FetchProgramBlob`]. `None` means the peer
+    /// doesn't hold (or won't serve) the blob — the requester tries
+    /// another peer. ELF bytes ride here, bounded by
+    /// `MAX_FRAME_BYTES` like every other length-prefixed payload.
+    ProgramBlobReply {
         blob: Option<Vec<u8>>,
     },
 }
@@ -659,6 +679,23 @@ impl Frame {
                     }
                 }
             }
+            Frame::FetchProgramBlob { hash } => {
+                out.push(TAG_FETCH_PROGRAM_BLOB);
+                out.extend_from_slice(hash);
+            }
+            Frame::ProgramBlobReply { blob } => {
+                out.push(TAG_PROGRAM_BLOB_REPLY);
+                match blob {
+                    Some(bytes) => {
+                        out.push(1);
+                        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        out.extend_from_slice(bytes);
+                    }
+                    None => {
+                        out.push(0);
+                    }
+                }
+            }
         }
         out
     }
@@ -930,6 +967,18 @@ impl Frame {
                 };
                 Frame::ProofBlobReply { blob }
             }
+            TAG_FETCH_PROGRAM_BLOB => Frame::FetchProgramBlob {
+                hash: r.fixed::<32>()?,
+            },
+            TAG_PROGRAM_BLOB_REPLY => {
+                let present = r.u8()?;
+                let blob = match present {
+                    0 => None,
+                    1 => Some(r.bytes_with_len_prefix()?),
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::ProgramBlobReply { blob }
+            }
             other => return Err(FrameError::UnknownTag(other)),
         };
         if !r.is_empty() {
@@ -1198,6 +1247,30 @@ mod tests {
     fn proof_blob_reply_bad_option_rejected() {
         let mut bad = Vec::new();
         bad.push(TAG_PROOF_BLOB_REPLY);
+        bad.push(2);
+        assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
+    }
+
+    #[test]
+    fn fetch_program_blob_roundtrip() {
+        roundtrip(Frame::FetchProgramBlob { hash: [0xCD; 32] });
+    }
+
+    #[test]
+    fn program_blob_reply_roundtrip() {
+        roundtrip(Frame::ProgramBlobReply { blob: None });
+        roundtrip(Frame::ProgramBlobReply {
+            blob: Some(b"\x7fELF actor body".to_vec()),
+        });
+        // A realistically-sized actor ELF — exercises the length prefix.
+        let big = vec![0x33u8; 600 * 1024];
+        roundtrip(Frame::ProgramBlobReply { blob: Some(big) });
+    }
+
+    #[test]
+    fn program_blob_reply_bad_option_rejected() {
+        let mut bad = Vec::new();
+        bad.push(TAG_PROGRAM_BLOB_REPLY);
         bad.push(2);
         assert!(matches!(Frame::decode(&bad), Err(FrameError::BadOption(2))));
     }
