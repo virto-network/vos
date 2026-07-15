@@ -14,12 +14,25 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clap::Subcommand;
 use serde::Serialize;
-use vos::registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_READONLY};
+use vos::registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_READONLY, Status};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
 use crate::token;
+
+#[derive(Subcommand, Debug)]
+pub enum InviteCommand {
+    /// Revoke an invite by a `token_pub` prefix (as shown in `space
+    /// members`). Grow-only + idempotent; does NOT claw back a role
+    /// already granted by a redemption — use `space role revoke` for
+    /// that.
+    Revoke {
+        /// Hex prefix of the invite's `token_pub`.
+        prefix: String,
+    },
+}
 
 pub struct Args {
     pub space: String,
@@ -30,6 +43,8 @@ pub struct Args {
     /// Bootnode multiaddr(s) to embed. Defaults to the running daemon's
     /// published listen addrs.
     pub bootnode: Vec<String>,
+    /// Optional subcommand — bare `space invite <space> …` mints.
+    pub command: Option<InviteCommand>,
 }
 
 #[derive(Serialize)]
@@ -54,6 +69,56 @@ fn role_from_name(s: &str) -> anyhow::Result<(u8, &'static str)> {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    if let Some(InviteCommand::Revoke { prefix }) = &args.command {
+        return revoke(&args.space, prefix);
+    }
+    mint(args)
+}
+
+/// `space invite <space> revoke <prefix>` — resolve the `token_pub`
+/// prefix against the invites table and flip its `revoked` flag.
+fn revoke(space: &str, prefix: &str) -> anyhow::Result<()> {
+    let prefix = prefix.to_ascii_lowercase();
+    DaemonClient::with_connect(space, |client| {
+        let invites = client.invites()?;
+        let matches: Vec<_> = invites
+            .iter()
+            .filter(|i| hex::encode(i.token_pub).starts_with(&prefix))
+            .collect();
+        let token_pub = match matches.as_slice() {
+            [] => anyhow::bail!(
+                "no invite token matches prefix '{prefix}' in space '{}' \
+                 (list them with `vosx space members {}`)",
+                client.entry.name,
+                client.entry.name,
+            ),
+            [one] => one.token_pub.to_vec(),
+            many => anyhow::bail!(
+                "prefix '{prefix}' matches {} invites — use a longer prefix",
+                many.len(),
+            ),
+        };
+        match client.revoke_invite(token_pub.clone())? {
+            Status::Ok => {
+                let short: String = hex::encode(&token_pub).chars().take(16).collect();
+                println!("revoked invite {short}… in space '{}'", client.entry.name);
+                println!(
+                    "note: this stops future redemptions; it does not claw back a role already \
+                     granted. Use `space role {} revoke <node-peer-id>` for that.",
+                    client.entry.name,
+                );
+                Ok(())
+            }
+            Status::Forbidden => anyhow::bail!(
+                "revoke refused — the operator key is not an admin of space '{}'.",
+                client.entry.name,
+            ),
+            other => anyhow::bail!("revoke_invite returned status {other}"),
+        }
+    })
+}
+
+fn mint(args: Args) -> anyhow::Result<()> {
     let (role, role_name) = role_from_name(&args.role)?;
     let ttl = token::parse_duration(&args.expires)?;
     let expires_at = SystemTime::now()

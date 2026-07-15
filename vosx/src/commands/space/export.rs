@@ -55,6 +55,9 @@ fn print_manifest(
         println!("program_hash   = {:?}", hex::encode(a.program_hash));
         println!("replication_id = {:?}", hex::encode(a.replication_id));
         println!("consistency    = {:?}", consistency_name(a.consistency));
+        // Serving-side sync floor — round-trips through `apply` so
+        // re-importing preserves who this replica's state is served to.
+        println!("sync           = {:?}", a.sync_role.as_str());
         // Only emitted when opted in — confined is the default, so a re-import
         // of an omitted field correctly defaults back to false.
         if a.network_reachable {

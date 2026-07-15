@@ -158,41 +158,64 @@ fn apply_one(
     upgrade: bool,
     report: &mut ApplyReport,
 ) -> anyhow::Result<()> {
-    // 1. Resolve + cache the blob; its bytes reach the daemon through
-    //    the shared cache dir.
-    let elf_path = recipe_dir.join(&agent.path);
-    let elf_bytes = std::fs::read(&elf_path).map_err(|e| {
-        anyhow::anyhow!("read {} for agent '{}': {e}", elf_path.display(), agent.name)
-    })?;
-    let hash = blob_store::cache_put(&elf_bytes)
-        .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
+    // 1. Resolve the blob hash + program identity from either a source
+    //    `path` (a hand-written recipe) or `program_hash` (a `space
+    //    export` output, which carries no path). Path-based also yields
+    //    the ELF bytes — needed to publish and to encode init args; the
+    //    hash-based form resolves against the already-published catalog,
+    //    which is what makes `export | apply --diff` all-skips.
+    let (program_name, program_version) = program_ref(agent);
+    let (hash, elf_bytes) = if !agent.path.is_empty() {
+        let elf_path = recipe_dir.join(&agent.path);
+        let bytes = std::fs::read(&elf_path).map_err(|e| {
+            anyhow::anyhow!("read {} for agent '{}': {e}", elf_path.display(), agent.name)
+        })?;
+        let h = blob_store::cache_put(&bytes)
+            .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
+        (h.0, Some(bytes))
+    } else if let Some(ph) = &agent.program_hash {
+        let h = blob_store::BlobHash::from_hex(ph)
+            .map_err(|_| anyhow::anyhow!("agent '{}': program_hash must be 64 hex", agent.name))?;
+        (h.0, None)
+    } else {
+        anyhow::bail!(
+            "agent '{}' has neither `path` (a source recipe) nor `program_hash` (an exported \
+             recipe) — nothing to resolve the blob from",
+            agent.name,
+        );
+    };
 
-    let program_name = agent.name.clone();
-
-    // 2. Ensure the program is published at the recipe's blob.
-    match client.program(&program_name, RECIPE_VERSION)? {
-        Some(p) if p.hash == hash.0 => {
-            // Already the recipe's blob — nothing to publish.
+    // 2. Ensure the program is published at this blob.
+    match client.program(&program_name, &program_version)? {
+        Some(p) if p.hash == hash => {
+            // Already the catalog's blob — nothing to publish.
         }
         Some(_) => {
             // The tag is pinned to a different blob. Never silently
             // overwrite (tags are immutable) — `--upgrade` re-points the
-            // instance below; the program tag itself is left alone and a
-            // fresh install would need a new version anyway.
+            // instance below; a fresh install would need a new version.
             report.upgrade_pending.push(agent.name.clone());
         }
         None => {
-            report.published.push(format!("{program_name}:{RECIPE_VERSION}"));
+            let Some(bytes) = &elf_bytes else {
+                anyhow::bail!(
+                    "agent '{}': program {program_name}:{program_version} (hash {}) is not in the \
+                     catalog and this recipe carries no `path` to publish it from",
+                    agent.name,
+                    hex::encode(hash),
+                );
+            };
+            report.published.push(format!("{program_name}:{program_version}"));
             if !diff {
-                match client.publish(program_name.clone(), RECIPE_VERSION.to_string(), hash.0.to_vec())? {
-                    Status::Ok => forward_meta(client, &hash, &elf_bytes),
+                match client.publish(program_name.clone(), program_version.clone(), hash.to_vec())? {
+                    Status::Ok => forward_meta(client, &blob_store::BlobHash(hash), bytes),
                     Status::Forbidden => anyhow::bail!(
                         "publish '{program_name}' refused (Status::Forbidden) — the operator key \
                          is not an admin of this space. `apply` is an admin op; grant the operator \
                          a role or apply from the admin node."
                     ),
                     Status::TagConflict => anyhow::bail!(
-                        "publish '{program_name}:{RECIPE_VERSION}' conflicts with an existing tag \
+                        "publish '{program_name}:{program_version}' conflicts with an existing tag \
                          at a different hash (race?). Retry."
                     ),
                     other => anyhow::bail!("publish '{program_name}' returned status {other}"),
@@ -204,7 +227,7 @@ fn apply_one(
     // 3. Ensure the instance is installed.
     let existing = client.agent(&agent.name)?;
     match existing {
-        Some(row) if row.program_hash == hash.0 => {
+        Some(row) if row.program_hash == hash => {
             report.skipped.push(agent.name.clone());
             return Ok(());
         }
@@ -216,8 +239,8 @@ fn apply_one(
                 match client.upgrade(
                     agent.name.clone(),
                     program_name.clone(),
-                    RECIPE_VERSION.to_string(),
-                    hash.0.to_vec(),
+                    program_version.clone(),
+                    hash.to_vec(),
                 )? {
                     Status::Ok => report.upgraded.push(agent.name.clone()),
                     other => anyhow::bail!("upgrade '{}' returned status {other}", agent.name),
@@ -238,7 +261,7 @@ fn apply_one(
             agent.consistency,
         )
     })?;
-    let replication_id = resolve_replication_id(agent, space_id, &hash.0)?;
+    let replication_id = resolve_replication_id(agent, space_id, &hash)?;
     let sync_role = match agent.sync.as_deref() {
         Some(s) => SyncFloor::parse(s).ok_or_else(|| {
             anyhow::anyhow!(
@@ -249,7 +272,17 @@ fn apply_one(
         })?,
         None => SyncFloor::Member,
     };
-    let install_args = encode_init_args(&agent.name, &elf_bytes, &agent.init, name_ids)?;
+    // Installing a new instance needs the ELF (to encode init args). The
+    // path-less `program_hash` form only supports the already-installed
+    // (skip) path — the round-trip case.
+    let Some(elf_bytes) = &elf_bytes else {
+        anyhow::bail!(
+            "agent '{}' is not installed and this recipe carries no `path` — the path-less \
+             (exported) form can only reconcile already-installed instances",
+            agent.name,
+        );
+    };
+    let install_args = encode_init_args(&agent.name, elf_bytes, &agent.init, name_ids)?;
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
     report.installed.push(agent.name.clone());
@@ -260,8 +293,8 @@ fn apply_one(
     let status = client.install(
         agent.name.clone(),
         program_name,
-        RECIPE_VERSION.to_string(),
-        hash.0.to_vec(),
+        program_version,
+        hash.to_vec(),
         replication_id.to_vec(),
         consistency,
         install_args,
@@ -290,6 +323,19 @@ fn apply_one(
         other => anyhow::bail!("install '{}' returned status {other}", agent.name),
     }
     Ok(())
+}
+
+/// The program `(name, version)` an agent installs from: an explicit
+/// `program = "name:version"` (as `space export` emits), else the agent
+/// name at the recipe version tag.
+fn program_ref(agent: &AgentDef) -> (String, String) {
+    match &agent.program {
+        Some(pv) => match pv.split_once(':') {
+            Some((n, v)) => (n.to_string(), v.to_string()),
+            None => (pv.clone(), RECIPE_VERSION.to_string()),
+        },
+        None => (agent.name.clone(), RECIPE_VERSION.to_string()),
+    }
 }
 
 /// Recipe replication-id → 32 bytes: `auto`/absent hashes
@@ -471,6 +517,34 @@ mod tests {
         assert_eq!(out.extensions[0].name, "gateway");
         // extension .so path resolved absolute against the recipe dir.
         assert_eq!(out.extensions[0].path, "/recipes/libgw.so");
+    }
+
+    #[test]
+    fn program_ref_from_program_field_or_defaults() {
+        // A hand-written recipe agent (no `program`) installs
+        // `<name>:manifest`; an exported agent carries an explicit
+        // `program = "name:version"`.
+        let bare = AgentDef {
+            name: "counter".into(),
+            ..Default::default()
+        };
+        assert_eq!(program_ref(&bare), ("counter".into(), RECIPE_VERSION.into()));
+
+        let exported = AgentDef {
+            name: "counter".into(),
+            program: Some("counter:manifest".into()),
+            ..Default::default()
+        };
+        assert_eq!(program_ref(&exported), ("counter".into(), "manifest".into()));
+
+        // A `program` with no `:` is treated as a bare name at the
+        // recipe version.
+        let noversion = AgentDef {
+            name: "x".into(),
+            program: Some("libcounter".into()),
+            ..Default::default()
+        };
+        assert_eq!(program_ref(&noversion), ("libcounter".into(), RECIPE_VERSION.into()));
     }
 
     #[test]

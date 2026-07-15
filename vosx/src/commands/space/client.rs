@@ -613,6 +613,38 @@ impl DaemonClient {
         Ok(out)
     }
 
+    // ── Invites ─────────────────────────────────────────────────
+
+    /// Drain every page of the invites table into one Vec. The cursor is
+    /// the last scanned `token_pub`; an empty `next` ends the walk (same
+    /// shape as `auth_grants`).
+    pub fn invites(&self) -> anyhow::Result<Vec<vos::registry::InviteRow>> {
+        let mut out = Vec::new();
+        let mut after: Vec<u8> = Vec::new();
+        loop {
+            let page = vos::block_on(self.registry().invites(&mut &self.node, after, 0))
+                .map_err(|e| anyhow::anyhow!("registry.invites(): {e}"))?;
+            out.extend(page.invites);
+            if page.next.is_empty() {
+                break;
+            }
+            after = page.next;
+        }
+        Ok(out)
+    }
+
+    /// Flip an invite's `revoked` flag (grow-only, idempotent). The
+    /// canonical is just `("revoke_invite", [token_pub])` — no epoch,
+    /// unlike grant/revoke_role.
+    pub fn revoke_invite(&self, token_pub: Vec<u8>) -> anyhow::Result<Status> {
+        let auth = op_auth(&self.signer, "revoke_invite", &[&token_pub])?;
+        vos::block_on(
+            self.registry()
+                .revoke_invite(&mut &self.node, token_pub, auth),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.revoke_invite(): {e}"))
+    }
+
     // ── M4/M8 actor-local grants ────────────────────────────────
 
     pub fn grant_actor_role(

@@ -35,9 +35,22 @@ struct IdentityView {
 }
 
 #[derive(Serialize)]
+struct InviteView {
+    token_pub: String,
+    role: &'static str,
+    expires_at: u64,
+    /// Node peer-ids that redeemed this token. More than one = a
+    /// double-redemption (detect, don't pretend to prevent — decision 6).
+    redeemed_by: usize,
+    revoked: bool,
+}
+
+#[derive(Serialize)]
 struct MembersView {
     nodes: Vec<NodeView>,
     identities: Vec<IdentityView>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    invites: Vec<InviteView>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,6 +124,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 fn list(space: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
         let members = client.members()?;
+        let invites = client.invites()?;
         let nodes: Vec<_> = members
             .iter()
             .filter(|m| m.kind == MEMBER_KIND_NODE)
@@ -137,6 +151,16 @@ fn list(space: &str) -> anyhow::Result<()> {
                         proof_kind: proof_kind_name(i.proof_kind),
                     })
                     .collect(),
+                invites: invites
+                    .iter()
+                    .map(|inv| InviteView {
+                        token_pub: hex::encode(inv.token_pub),
+                        role: auth_role_name(inv.role),
+                        expires_at: inv.expires_at,
+                        redeemed_by: inv.redeemed_by.len(),
+                        revoked: inv.revoked,
+                    })
+                    .collect(),
             };
             output::print_json(&view);
             return Ok(());
@@ -161,13 +185,55 @@ fn list(space: &str) -> anyhow::Result<()> {
                 println!("{:<10}  {short_pk}…", proof_kind_name(i.proof_kind));
             }
         }
-        if nodes.is_empty() && identities.is_empty() {
+        if !invites.is_empty() {
+            if !nodes.is_empty() || !identities.is_empty() {
+                println!();
+            }
+            println!("# invites");
+            println!(
+                "{:<18}  {:<10}  {:<12}  {:<8}  STATUS",
+                "TOKEN_PUB", "ROLE", "EXPIRES", "REDEEMED"
+            );
+            for inv in &invites {
+                let short: String = hex::encode(inv.token_pub).chars().take(16).collect();
+                let status = if inv.revoked { "revoked" } else { "active" };
+                let n = inv.redeemed_by.len();
+                let dup = if n > 1 { "  ⚠ double-redeemed" } else { "" };
+                println!(
+                    "{short}…  {:<10}  {:<12}  {:<8}  {status}{dup}",
+                    auth_role_name(inv.role),
+                    inv.expires_at,
+                    n,
+                );
+            }
+            // Surface the double-redemption warning loudly below the
+            // table too (decision 6 — detect, resolve with revoke).
+            for inv in invites.iter().filter(|i| i.redeemed_by.len() > 1 && !i.revoked) {
+                let short: String = hex::encode(inv.token_pub).chars().take(16).collect();
+                println!(
+                    "warning: token {short}… was redeemed by {} nodes — revoke it with \
+                     `vosx space invite {space} revoke {short}` and re-grant the intended node.",
+                    inv.redeemed_by.len(),
+                );
+            }
+        }
+        if nodes.is_empty() && identities.is_empty() && invites.is_empty() {
             println!(
                 "no members. add one with `vosx space members add-node …` or `add-identity …`."
             );
         }
         Ok(())
     })
+}
+
+/// Map an `AUTH_ROLE_*` code to its CLI name (invite roles).
+fn auth_role_name(role: u8) -> &'static str {
+    match role {
+        vos::registry::AUTH_ROLE_ADMIN => "admin",
+        vos::registry::AUTH_ROLE_DEVELOPER => "developer",
+        vos::registry::AUTH_ROLE_READONLY => "member",
+        _ => "none",
+    }
 }
 
 fn role_name(r: u8) -> &'static str {

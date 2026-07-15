@@ -104,6 +104,9 @@ pub enum SpaceCommand {
         /// running daemon's published listen addrs.
         #[arg(long, value_name = "MULTIADDR")]
         bootnode: Vec<String>,
+        /// `revoke <token_pub-prefix>` to revoke an invite; omit to mint.
+        #[command(subcommand)]
+        command: Option<invite::InviteCommand>,
     },
     /// Boot a space — THE onboarding command. The positional is
     /// trivalent: an existing `.toml` recipe path (create-if-missing +
@@ -349,11 +352,13 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             role,
             expires,
             bootnode,
+            command,
         } => invite::run(invite::Args {
             space,
             role,
             expires,
             bootnode,
+            command,
         }),
         SpaceCommand::Up {
             space,

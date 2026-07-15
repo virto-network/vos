@@ -117,8 +117,22 @@ pub struct ExtensionDef {
 pub struct AgentDef {
     pub name: String,
     /// Path to the actor ELF — relative to the manifest file's
-    /// directory.
+    /// directory. A hand-written recipe carries this; a `space export`
+    /// output does NOT (blobs are content-addressed, with no source
+    /// path on a running node) and instead carries `program_hash`, so
+    /// `apply` resolves the blob by hash. Empty when absent.
+    #[serde(default)]
     pub path: String,
+    /// `name:version` of the already-published program (emitted by
+    /// `space export`). When absent, the program name is the agent name
+    /// and the version is the recipe tag.
+    #[serde(default)]
+    pub program: Option<String>,
+    /// Hex blob hash of an already-published program (emitted by `space
+    /// export`). Lets `apply` resolve the blob without a source `path` —
+    /// the precondition for `export | apply --diff` being all-skips.
+    #[serde(default)]
+    pub program_hash: Option<String>,
     /// `ephemeral` / `local` / `crdt` / `raft`. Defaults to
     /// `crdt` for replicated actors; manifests that omit this
     /// for one-off services typically want `ephemeral`.
@@ -652,7 +666,16 @@ fn reconcile_one(
     node_is_admin: bool,
     space_id: &[u8; 32],
 ) -> anyhow::Result<()> {
-    // 1. Resolve and cache the agent's blob.
+    // 1. Resolve and cache the agent's blob. Genesis recipes carry a
+    //    `path`; the path-less `program_hash` form is `apply`-only.
+    if agent.path.is_empty() {
+        anyhow::bail!(
+            "recipe agent '{}' has no `path` — a genesis-applied recipe installs from source \
+             ELFs. (The path-less `program_hash` form is only for `space apply` against an \
+             already-published catalog.)",
+            agent.name,
+        );
+    }
     let elf_path = manifest_dir.join(&agent.path);
     let elf_bytes = std::fs::read(&elf_path).map_err(|e| {
         anyhow::anyhow!(
@@ -1135,6 +1158,46 @@ pub(crate) fn validate_manifest_names(manifest: &Manifest) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_output_parses_as_a_recipe() {
+        // `space export` emits path-less agents (blobs are content-
+        // addressed) carrying `program` + `program_hash`, plus
+        // `[[program]]` / `space_id` / `[members]` blocks the recipe
+        // parser doesn't model. All of it must parse cleanly so
+        // `export | apply --diff` can round-trip.
+        let s = r#"
+            space    = "e2e"
+            space_id = "aabb"
+
+            [[program]]
+            name    = "counter"
+            version = "manifest"
+            hash    = "deadbeef"
+
+            [[agent]]
+            name           = "counter"
+            program        = "counter:manifest"
+            program_hash   = "deadbeef"
+            replication_id = "0011"
+            consistency    = "crdt"
+            sync           = "member"
+            network_reachable = true
+
+            [members]
+            node = { prefix = 1, peer_id = "cc", role = 3 }
+        "#;
+        let m: Manifest = toml::from_str(s).expect("export output parses as a recipe");
+        assert_eq!(m.space.as_deref(), Some("e2e"));
+        assert_eq!(m.agents.len(), 1);
+        let a = &m.agents[0];
+        assert_eq!(a.name, "counter");
+        assert!(a.path.is_empty(), "exported agents carry no source path");
+        assert_eq!(a.program.as_deref(), Some("counter:manifest"));
+        assert_eq!(a.program_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(a.sync.as_deref(), Some("member"));
+        assert!(a.network_reachable);
+    }
 
     #[test]
     fn parses_minimal_manifest() {
