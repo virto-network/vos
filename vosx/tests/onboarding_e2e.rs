@@ -160,6 +160,31 @@ fn onboarding_via_token_redeems_and_syncs_member_gated_registry() {
     let _daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
     wait_for_endpoint(data_a.path(), &log_a, "A");
 
+    // ── host A: install a MEMBER-floor app agent (bundled dev-project) ─
+    // so B has something to spawn once it is a member. Its sync floor
+    // defaults to `member`, so a node judged non-member would narrow it
+    // out — this is what exercises node_is_member's node-key grant path.
+    let pubd = vosx(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "publish", space, "--bundled", "dev-project"],
+    );
+    assert!(
+        pubd.status.success(),
+        "space publish --bundled failed: {}",
+        String::from_utf8_lossy(&pubd.stderr),
+    );
+    let inst = vosx(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "install", space, "dev-project:0.1.0"],
+    );
+    assert!(
+        inst.status.success(),
+        "space install failed: {}",
+        String::from_utf8_lossy(&inst.stderr),
+    );
+
     // ── host A: mint a member invite (default bootnodes = A's addrs) ─
     let invite = vosx(
         data_a.path(),
@@ -222,4 +247,42 @@ fn onboarding_via_token_redeems_and_syncs_member_gated_registry() {
             )
         },
     );
+
+    // (3) B SPAWNS the Member-floor agent: node_is_member must recognize
+    //     B's redeemed node-key grant, else node_meets_floor narrows
+    //     dev-project out and B logs "not spawned … sync floor is above".
+    //     A spawned agent opens its own per-node redb, so a redb in B's
+    //     agents dir other than the registry's (00000000.redb) is the
+    //     spawn signal — sync alone (the row) would not create it.
+    let agents_dir = find_endpoint(data_b.path())
+        .and_then(|ep| ep.parent().map(|p| p.join("agents")))
+        .expect("B has a space data dir");
+    poll_until(
+        40,
+        || spawned_app_agent(&agents_dir),
+        || {
+            format!(
+                "B synced dev-project's row but never SPAWNED it — node_is_member likely still \
+                 ignores the redeemed node-key grant, so node_meets_floor narrowed the Member \
+                 agent out. B log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+            )
+        },
+    );
+}
+
+/// True once B's agents dir holds a per-agent redb other than the
+/// registry's `00000000.redb` — i.e. an app agent actually spawned.
+fn spawned_app_agent(agents_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(agents_dir) else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".redb") && name != "00000000.redb" {
+            return true;
+        }
+    }
+    false
 }
