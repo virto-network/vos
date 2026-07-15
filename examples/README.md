@@ -37,8 +37,8 @@ heap + statics survive without serialize/deserialize.
 ## Running
 
 `vosx space *` is the operator surface. The TOML manifests in
-this dir are reconciled into a space's registry on startup —
-they're devhelpers, not the runtime source of truth.
+this dir are genesis-applied into a space's registry on its first
+boot — they're devhelpers, not the runtime source of truth.
 
 ```bash
 # Build all the example actors (riscv64em-javm target)
@@ -47,9 +47,11 @@ just build
 # Single-actor smoke test, no manifest, no networking
 cargo run -p vosx -- run actors/greeter/target/riscv64em-javm/release/greeter.elf
 
-# Run the full example space (scheduler + greeter + counter + fizzbuzz)
-vosx space new --name demo
-vosx space up demo --manifest examples/space.toml &
+# Run the full example space (scheduler + greeter + counter + fizzbuzz).
+# The recipe is banked at `space new` and genesis-applied on first `up`;
+# `vosx space up examples/space.toml` is the one-shot path equivalent.
+vosx space new --name demo --manifest examples/space.toml
+vosx space up demo &
 
 # Then: list state, query agents, exercise handlers
 vosx space agents demo

@@ -64,6 +64,20 @@ Everything inside a space is data, and data is replicated by the mode each
 agent chooses. There is no leader and no global ordering across spaces —
 only in-space ordering, and only when the chosen mode requires it.
 
+Members onboard by redeeming an invite token: an admin mints a role-scoped
+`vos1…` token, and the joiner's daemon redeems it against the space's
+bootnode, which grants the joiner's node key a role. Agents are installed
+once by an admin — from a genesis recipe applied on the space's first boot,
+or a later reconcile against the running space — and replicate from the
+registry; a joiner syncs the catalog rather than booting its own manifest,
+and each agent reaches a member only if that member's role clears the
+agent's sync floor.
+
+Role-scoped sync is access control, not secrecy: every replica that holds
+state can leak it, and revocation never claws back already-synced data.
+Agents needing real confidentiality use the messenger's answer — an
+encrypted payload with gated keys.
+
 ## Replication modes
 
 State is replicated per agent, not globally. An agent picks the weakest

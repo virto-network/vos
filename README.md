@@ -28,14 +28,17 @@ the user's critical path.
 ```bash
 # Create a space. Generates per-space identity, runs the bundled
 # space-registry briefly to commit a genesis CrdtEvent, derives
-# space_id from the resulting DAG root.
-vosx space new --name demo
+# space_id from the resulting DAG root. A `--manifest` recipe is
+# banked for genesis-apply on the space's first boot.
+vosx space new --name demo --manifest examples/space-crdt-a.toml
 
 # Run the daemon. Owns the redb, listens on libp2p (auto-port
-# loopback by default; pass --listen for a routable addr).
-# `--manifest` reconciles a TOML into the registry on startup
-# (publishes blobs, installs agents, fires their `on_start`).
-vosx space up demo --manifest examples/space-crdt-a.toml &
+# loopback by default; pass --listen for a routable addr). The
+# first boot genesis-applies the banked recipe into the registry
+# (publishes blobs, installs agents, fires their `on_start`);
+# later boots resume the registry as-is. `space up` also accepts a
+# recipe path or a `vos1…` invite token in place of the name.
+vosx space up demo &
 
 # Talk to it. `space call` is the floor primitive — any agent,
 # any handler. `space publish/install/agents/etc.` are typed
@@ -85,22 +88,30 @@ cargo test --all -- --test-threads=1   # full integration suite
 
 ## Multi-node
 
-```bash
-# host A
-vosx space new --name a
-vosx space up a --manifest space-crdt-a.toml --listen /ip4/0.0.0.0/tcp/4811 &
-vosx space info a            # prints the bootnode hint:
-                             #   <space_id>@/ip4/.../tcp/4811/p2p/<peer-id>
+The admin node installs agents once; a joiner never boots its own
+manifest — it redeems an invite token and syncs the catalog from the
+registry.
 
-# host B (paste the bootnode hint)
-vosx space join "<bootnode-hint>" --name b
-vosx space up b --manifest space-crdt-b.toml --connect /ip4/.../tcp/4811/p2p/<peer-id> &
+```bash
+# host A — create with a genesis recipe, boot, then invite a member
+vosx space new --name a --manifest space-crdt-a.toml
+vosx space up a --listen /ip4/0.0.0.0/tcp/4811 &   # first boot genesis-applies the recipe
+vosx space info a            # prints the node's bootnode hint:
+                             #   /ip4/.../tcp/4811/p2p/<peer-id>
+vosx space invite a --role member --bootnode <bootnode-hint>
+                             # prints a vos1… token on its first stdout line
+
+# host B — redeem the token: join-if-needed + boot + auto-redeem
+vosx space up "<paste-the-vos1-token>" &
+                             # or  vosx space up -  to read the token from stdin
 ```
 
-The TOML manifest is a devhelper, not the runtime source of
-truth — the registry is. `space export` re-derives a manifest
-from the live registry; `space up --manifest` is idempotent
-reconciliation.
+The TOML recipe is a devhelper, not the runtime source of truth —
+the registry is. A recipe is consumed once at genesis (the space's
+first boot) to seed the registry; thereafter the registry is
+authoritative and joiners sync agents from it. `space export`
+re-derives a recipe from the live registry; `space apply`
+reconciles a recipe against a running space.
 
 ## Writing an actor
 

@@ -184,15 +184,19 @@ init = {
 }
 ```
 
-Then bring the daemon up with the manifest:
+Then create the space with the recipe and bring the daemon up:
 
 ```bash
-vosx space up <space> --manifest <path/to/space.toml>
+vosx space new --name <space> --manifest <path/to/space.toml>
+vosx space up <space>
 ```
 
-The manifest reconciler logs the load, registers the extension on
-the live `VosNode`, and the extension starts immediately — its message
-dispatch loop (Actor) or the host's accept loop (Transport).
+The recipe's node-local `[[extension]]` entries are written to the
+space's `local.toml` at genesis apply, and every boot registers them
+on the live `VosNode` — the host logs the load and the extension starts
+immediately, its message dispatch loop (Actor) or the host's accept
+loop (Transport). `vosx space up <path/to/space.toml>` is the one-shot
+equivalent (create-if-missing, genesis-apply, boot).
 
 ## Capabilities
 

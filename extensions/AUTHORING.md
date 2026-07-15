@@ -313,11 +313,15 @@ init = {
 
 Boot the daemon:
 ```bash
-vosx space up <space> --manifest <path/to/space.toml>
+vosx space new --name <space> --manifest <path/to/space.toml>
+vosx space up <space>
 ```
 
-The reconciler logs the load + caps, registers the extension on the
-live `VosNode`, and the extension starts.
+The recipe's node-local `[[extension]]` entries are written to the
+space's `local.toml` at genesis apply; every boot then registers them
+on the live `VosNode` — logging the load + caps — and the extension
+starts. (`vosx space up <path/to/space.toml>` is the one-shot path
+equivalent: create-if-missing, genesis-apply, boot.)
 
 ## Testing
 

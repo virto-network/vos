@@ -192,9 +192,10 @@ demo-crdt-sync: build-crdt-counter
     cargo test -p vos --features network --test elf_integration \
         crdt_counter_converges_across_nodes_live -- --nocapture
 
-# Two-process CRDT demo: two real `vosx space up` daemons (isolated XDG trees)
-# reconcile the same crdt-counter agent; one inc per replica gossips across and
-# both converge to count=2 (~6s). Daemons run as nu jobs, torn down via try/catch.
+# Two-process CRDT demo: host A installs the crdt-counter agent from a genesis
+# recipe and boots (isolated XDG trees); host B redeems an admin-minted invite
+# token, syncs the agent from A's registry, and the boot `inc` gossips across so
+# both replicas converge (~6s). Daemons run as nu jobs, torn down via try/catch.
 demo-crdt-procs: build-crdt-counter build-crates
     #!/usr/bin/env nu
     def vx [e, a: list] { with-env $e { ^./target/debug/vosx ...$a } }
@@ -209,14 +210,14 @@ demo-crdt-procs: build-crdt-counter build-crates
     rm -rf $A $B
     mkdir $"($A)/data" $"($A)/config" $"($A)/cache" $"($B)/data" $"($B)/config" $"($B)/cache"
 
-    print "→ host A: create space..."
-    vx $ea [space new --name demo] | ignore
+    print "→ host A: create space + bank genesis recipe..."
+    vx $ea [space new --name demo --manifest examples/space-crdt-a.toml] | ignore
     let space_id = (open --raw $"($A)/config/vosx/spaces.toml" | lines | where ($it | str starts-with "id = ") | first | str replace -r "^id = .(.*).$" "$1")
     print $"  space_id=($space_id)"
 
-    print "→ host A: starting daemon on :4811..."
+    print "→ host A: starting daemon on :4811 (genesis-applies the recipe)..."
     let job_a = (job spawn { with-env ($ea | merge { RUST_LOG: "info" }) {
-        ^./target/debug/vosx space up demo --manifest examples/space-crdt-a.toml --listen /ip4/127.0.0.1/tcp/4811 out+err> /tmp/vosx-a.log
+        ^./target/debug/vosx space up demo --listen /ip4/127.0.0.1/tcp/4811 out+err> /tmp/vosx-a.log
     } })
 
     let ep_a = $"($A)/data/vosx/($space_id)/.endpoint"
@@ -224,10 +225,12 @@ demo-crdt-procs: build-crdt-counter build-crates
     let bootnode = $"/ip4/127.0.0.1/tcp/4811/p2p/(peerid $ep_a)"
     print $"  bootnode=($bootnode)"
 
-    print "→ host B: join + start (dials A)..."
-    vx $eb [space join $"($space_id)@($bootnode)" --name demo] | ignore
+    print "→ host A: minting a member invite token..."
+    let token = (vx $ea [space invite demo --role member --bootnode $bootnode] | lines | where ($it | str starts-with "vos1") | first)
+
+    print "→ host B: redeem token + start (syncs A's registry, dials A)..."
     let job_b = (job spawn { with-env ($eb | merge { RUST_LOG: "info" }) {
-        ^./target/debug/vosx space up demo --manifest examples/space-crdt-b.toml --connect $bootnode out+err> /tmp/vosx-b.log
+        ^./target/debug/vosx space up $token --connect $bootnode out+err> /tmp/vosx-b.log
     } })
 
     sleep 6sec
@@ -258,22 +261,24 @@ demo-msg-procs: build-msg-actors build-chronos build-messenger-actor build-crate
     rm -rf $A $B
     mkdir $"($A)/data" $"($A)/config" $"($A)/cache" $"($B)/data" $"($B)/config" $"($B)/cache"
 
-    print "→ host A: create space..."
-    vx $ea [space new --name msg-demo] | ignore
+    print "→ host A: create space + bank genesis recipe..."
+    vx $ea [space new --name msg-demo --manifest examples/space-msg-a.toml] | ignore
     let space_id = (open --raw $"($A)/config/vosx/spaces.toml" | lines | where ($it | str starts-with "id = ") | first | str replace -r "^id = .(.*).$" "$1")
 
-    print "→ host A: starting daemon on :4821..."
+    print "→ host A: starting daemon on :4821 (genesis-applies the recipe)..."
     let job_a = (job spawn { with-env ($ea | merge { RUST_LOG: "info" }) {
-        ^./target/debug/vosx space up msg-demo --manifest examples/space-msg-a.toml --listen /ip4/127.0.0.1/tcp/4821 out+err> /tmp/vosx-msg-a.log
+        ^./target/debug/vosx space up msg-demo --listen /ip4/127.0.0.1/tcp/4821 out+err> /tmp/vosx-msg-a.log
     } })
     let ep_a = $"($A)/data/vosx/($space_id)/.endpoint"
     wait-bind $ep_a
     let bootnode = $"/ip4/127.0.0.1/tcp/4821/p2p/(peerid $ep_a)"
 
-    print "→ host B: join + start (dials A)..."
-    vx $eb [space join $"($space_id)@($bootnode)" --name msg-demo] | ignore
+    print "→ host A: minting a member invite token..."
+    let token = (vx $ea [space invite msg-demo --role member --bootnode $bootnode] | lines | where ($it | str starts-with "vos1") | first)
+
+    print "→ host B: redeem token + start (syncs A's registry, dials A)..."
     let job_b = (job spawn { with-env ($eb | merge { RUST_LOG: "info" }) {
-        ^./target/debug/vosx space up msg-demo --manifest examples/space-msg-b.toml --connect $bootnode out+err> /tmp/vosx-msg-b.log
+        ^./target/debug/vosx space up $token --connect $bootnode out+err> /tmp/vosx-msg-b.log
     } })
     sleep 3sec
 
