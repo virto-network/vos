@@ -20,6 +20,7 @@ use clap::Subcommand;
 use std::path::PathBuf;
 
 pub mod agents;
+pub mod apply;
 pub mod call;
 pub mod caps;
 pub mod client;
@@ -149,6 +150,25 @@ pub enum SpaceCommand {
     Export {
         /// Space id (full hex) or name.
         space: String,
+    },
+    /// Apply a recipe TOML to a running space: publish + install any
+    /// missing agents (the replicated half → the registry) and project
+    /// the recipe's node-local half (`tick_ms` / `intra_caps` /
+    /// `device_secret`, `cap_policy`, `[[extension]]`) into `local.toml`.
+    /// Idempotent — a re-apply of the same recipe is all-skips.
+    Apply {
+        /// Space id (full hex) or name.
+        space: String,
+        /// Recipe TOML path.
+        recipe: PathBuf,
+        /// Print the plan (create / skip / upgrade + local.toml
+        /// changes) and exit without mutating anything.
+        #[arg(long)]
+        diff: bool,
+        /// Re-point installed agents whose catalog blob differs from the
+        /// recipe. Without it, a differing blob is flagged, not applied.
+        #[arg(long)]
+        upgrade: bool,
     },
     /// Add a program (PVM blob) to the catalog with an
     /// immutable `(name, version)` tag.
@@ -358,6 +378,17 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             grace_secs: grace,
         }),
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
+        SpaceCommand::Apply {
+            space,
+            recipe,
+            diff,
+            upgrade,
+        } => apply::run(apply::Args {
+            space,
+            recipe,
+            diff,
+            upgrade,
+        }),
         SpaceCommand::Publish {
             space,
             program_ref,

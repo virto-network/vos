@@ -955,7 +955,7 @@ fn reconcile_one(
 /// whose target type is `Vec<u32>` get translated through
 /// `name_ids` so manifest-style `children = ["greeter", …]`
 /// resolves to actual ServiceIds.
-fn encode_init_args(
+pub(crate) fn encode_init_args(
     agent_name: &str,
     elf_bytes: &[u8],
     init: &BTreeMap<String, toml::Value>,
@@ -985,7 +985,7 @@ fn encode_init_args(
 /// `payload_codec::encode` so the registry can store it as a
 /// single `Vec<u8>` field on `AgentRow`. `spawn_installed_agents`
 /// reverses both layers on cold start.
-fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> {
     use vos::Encode;
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(on_start.len());
     for entry in on_start {
@@ -1119,7 +1119,7 @@ fn toml_to_init_value(val: &toml::Value, ty: &str, name_ids: &BTreeMap<String, u
 /// Returned in tree-iteration order (parents before children) so
 /// `reconcile` can process them sequentially while `name_ids` is
 /// still being built up.
-fn flatten(agents: &[AgentDef]) -> Vec<&AgentDef> {
+pub(crate) fn flatten(agents: &[AgentDef]) -> Vec<&AgentDef> {
     let mut out = Vec::new();
     for a in agents {
         out.push(a);
@@ -1149,7 +1149,7 @@ fn flat_count(agents: &[AgentDef]) -> usize {
 /// extensions and nothing about within-extension duplicates;
 /// catching the full set manifest-side gives the operator a
 /// single clear error before any side-effects land.
-fn validate_manifest_names(manifest: &Manifest) -> anyhow::Result<()> {
+pub(crate) fn validate_manifest_names(manifest: &Manifest) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
 
     // Preserve first-seen order so duplicates list the original

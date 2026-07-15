@@ -94,6 +94,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &LocalConfig {
                 subscriptions: Vec::new(),
                 listen: args.listen.clone(),
+                ..Default::default()
             },
         )?;
     }

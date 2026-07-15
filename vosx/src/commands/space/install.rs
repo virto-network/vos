@@ -95,6 +95,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             consistency,
             install_args,
             Vec::new(), // install_payloads — CLI install has no on_start
+            false,      // network_reachable — CLI installs stay confined by default
             sync_role,
         )?;
 

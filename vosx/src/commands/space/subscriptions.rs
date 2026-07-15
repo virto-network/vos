@@ -12,6 +12,7 @@
 //! `subscriptions = ["counter", "chat"]` at the top level.
 //! Other per-node overrides may join the same file later.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use clap::Subcommand;
@@ -46,7 +47,17 @@ pub fn run(space: &str, command: Option<SubsCommand>) -> anyhow::Result<()> {
 
 const LOCAL_FILE: &str = "local.toml";
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+/// A node's local half of a space's configuration — everything the
+/// registry does NOT replicate. Written by `space apply` / `space new
+/// --manifest` (the node-local projection of a recipe), read at every
+/// `space up`. The replicated half (which agents exist, their sync
+/// floor, consistency, init) lives in the registry; this file carries
+/// the per-node policy a recipe declares but that never leaves the node.
+///
+/// TOML ordering constraint: scalar/array fields must precede the
+/// table-valued ones (`agents`, `extensions`), or `toml` refuses to
+/// serialize.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct LocalConfig {
     /// Empty = sync all installed agents. Non-empty = sync
     /// only the listed instance names.
@@ -58,6 +69,64 @@ pub struct LocalConfig {
     /// `space up` overrides for one run.
     #[serde(default)]
     pub listen: Vec<String>,
+    /// Space-level default extension `cap_policy` (`"log"` / `"block"`
+    /// / `"kill"`); per-extension overrides live on each
+    /// [`ExtensionLocal`]. Node-local — a recipe declares it, `apply`
+    /// projects it here, boot reads it. `None` → host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_policy: Option<String>,
+    /// Per-agent node-local policy, keyed by instance name. Only agents
+    /// that declare at least one node-local field get an entry — a bare
+    /// agent isn't listed. Written by `apply`, applied at every boot so
+    /// a plain `space up` restart no longer drops `tick_ms`/`intra_caps`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentLocal>,
+    /// Native `.so` extensions to register at boot. Host-local — never
+    /// replicated (they're loaded in-process via `dlopen`, so a running
+    /// daemon can't register them remotely; they attach on the next
+    /// `space up`).
+    #[serde(default, rename = "extension", skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<ExtensionLocal>,
+}
+
+/// The node-local half of an `[[agent]]` recipe entry. Everything else
+/// on the entry (program, consistency, sync floor, init, on_start) is
+/// replicated through the registry `install`; these three fields never
+/// touch the `AgentRow`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct AgentLocal {
+    /// Periodic `tick` cadence in ms (0 / omitted → no ticking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_ms: Option<u64>,
+    /// `"actor:role"` intra-system caps bounding this agent's outbound
+    /// relays. Empty → legacy trusted relay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intra_caps: Vec<String>,
+    /// Mint + deliver a node-local device secret seed to this agent on
+    /// every spawn (the messenger's MLS root). Never leaves the node.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub device_secret: bool,
+}
+
+/// A native `.so` extension registration — the node-local mirror of a
+/// recipe `[[extension]]`. Serializable (unlike [`crate::commands::space::reconcile::ExtensionDef`],
+/// which is deserialize-only) so it can round-trip through `local.toml`.
+/// `init` is last because it serializes as a table and TOML requires
+/// scalar fields first.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct ExtensionLocal {
+    pub name: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay_unauthenticated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intra_caps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub init: BTreeMap<String, toml::Value>,
 }
 
 impl LocalConfig {
@@ -211,7 +280,7 @@ mod tests {
     fn non_empty_config_filters() {
         let cfg = LocalConfig {
             subscriptions: vec!["counter".into(), "chat".into()],
-            listen: vec![],
+            ..Default::default()
         };
         assert!(cfg.is_filtering());
         assert!(cfg.should_spawn("counter"));
@@ -233,11 +302,60 @@ mod tests {
         let cfg = LocalConfig {
             subscriptions: vec!["a".into(), "b".into()],
             listen: vec!["/ip4/0.0.0.0/tcp/4811".into()],
+            ..Default::default()
         };
         save(&tmp, &cfg).unwrap();
         let back = load(&tmp).unwrap();
         assert_eq!(back.subscriptions, cfg.subscriptions);
         assert_eq!(back.listen, cfg.listen);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_local_policy_roundtrips_through_toml() {
+        // The grown schema — per-agent tables, cap_policy, extensions —
+        // must survive a save/load so `apply`-written policy re-applies
+        // verbatim on the next boot. Also guards the TOML value-before-
+        // table ordering constraint (a bad field order panics on save).
+        let tmp = std::env::temp_dir().join(format!(
+            "vosx-local-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "messenger".to_string(),
+            AgentLocal {
+                tick_ms: Some(500),
+                intra_caps: vec!["space-registry:member".into()],
+                device_secret: true,
+            },
+        );
+        let mut init = BTreeMap::new();
+        init.insert("port".to_string(), toml::Value::Integer(8080));
+        let cfg = LocalConfig {
+            subscriptions: vec!["messenger".into()],
+            listen: vec![],
+            cap_policy: Some("block".into()),
+            agents,
+            extensions: vec![ExtensionLocal {
+                name: "gateway".into(),
+                path: "libgateway.so".into(),
+                cap_policy: Some("log".into()),
+                relay_unauthenticated: true,
+                intra_caps: vec![],
+                tick_ms: None,
+                init,
+            }],
+        };
+        save(&tmp, &cfg).unwrap();
+        let back = load(&tmp).unwrap();
+        assert_eq!(back, cfg);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
