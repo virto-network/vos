@@ -685,9 +685,22 @@ fn spawn_installed_agents(
     // spans reconcile passes); the throwaway map just satisfies the
     // protocol — the runtime reconciler owns the durable counters.
     let mut boot_grace = BootGrace::new();
+    // This node's own space role, probed once; rows whose sync floor is above it
+    // are narrowed out — the runtime reconciler re-evaluates them each pass, so
+    // one spawns if a grant lands later.
+    let own_role = probe_own_role(node, &reg);
     for a in agents {
         if !local_cfg.should_spawn(&a.instance_name) {
             tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
+            continue;
+        }
+        if !node_meets_floor(own_role, a.sync_role) {
+            tracing::info!(
+                "agent '{}' not spawned — its '{}' sync floor is above this \
+                 node's space role",
+                a.instance_name,
+                a.sync_role.as_str(),
+            );
             continue;
         }
         // Raft rows resolve their member seed first — see the
@@ -1319,6 +1332,30 @@ enum RowNote {
     /// (possibly different) reason at debug. Cleared on spawn so
     /// a later wedge re-warns.
     RaftWaiting,
+    /// Row whose `sync_role` floor is above this node's space role,
+    /// so the node can't sync it and doesn't spawn it. Logged once;
+    /// re-evaluated each pass, so it spawns if a grant later lands.
+    BelowFloor,
+}
+
+/// Does this node clear a row's sync floor? `own_role` is the node's own space
+/// role probed once per pass ([`probe_own_role`]); `None` means the probe
+/// failed, which fails OPEN — a transiently unreachable registry must not wedge
+/// spawning. A `Public` row always spawns; a `Member`/`Private` row spawns only
+/// with a read grant. Narrowing only: the sync gate is the real access
+/// boundary; this just keeps a node from spawning replicas it can't sync.
+fn node_meets_floor(own_role: Option<u8>, floor: vos::registry::SyncFloor) -> bool {
+    use vos::registry::{AUTH_ROLE_READONLY, SyncFloor};
+    floor == SyncFloor::Public || own_role.map_or(true, |r| r >= AUTH_ROLE_READONLY)
+}
+
+/// Probe this node's own space role once per reconcile pass — the grant on the
+/// operator that ran `space up` — for [`node_meets_floor`]. `None` on a probe
+/// failure (fail open). Pre-redeem the operator carries the node's grant; W3's
+/// redeem-grants-node will fold in the node-key grant + enrollment here.
+fn probe_own_role(node: &VosNode, reg: &vos::registry::RegistryRef) -> Option<u8> {
+    let operator = node.operator_peer()?.to_vec();
+    vos::block_on(reg.peer_role(&mut &*node, operator)).ok()
 }
 
 /// One runtime spawn-reconcile pass: query the registry for
@@ -1362,6 +1399,9 @@ fn reconcile_installed_agents(
     let agents =
         vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
+    // This node's own space role, probed once for the whole pass; rows whose
+    // sync floor is above it are narrowed out below.
+    let own_role = probe_own_role(node, &reg);
     let mut spawned_this_pass = 0usize;
     for a in agents {
         if spawned_this_pass >= MAX_SPAWNS_PER_PASS {
@@ -1372,6 +1412,17 @@ fn reconcile_installed_agents(
         }
         let key = |note: RowNote| (a.instance_name.clone(), a.program_hash, note);
         if damped.contains(&key(RowNote::Failed)) {
+            continue;
+        }
+        if !node_meets_floor(own_role, a.sync_role) {
+            if damped.insert(key(RowNote::BelowFloor)) {
+                tracing::info!(
+                    "agent '{}' not spawned here — its '{}' sync floor is above \
+                     this node's space role; it spawns if a grant lands",
+                    a.instance_name,
+                    a.sync_role.as_str(),
+                );
+            }
             continue;
         }
         let svc_id = instance_service_id(&a.instance_name, local_prefix);
@@ -1589,6 +1640,24 @@ mod tests {
     fn sole_voter_bootstraps_immediately() {
         let plan = decide_raft_spawn(0x0001, &[0x0001], false, &[], 0);
         assert_eq!(plan, RaftPlan::Bootstrap { contested: false });
+    }
+
+    #[test]
+    fn floor_filter_narrows_spawning_by_role() {
+        use vos::registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, SyncFloor};
+        // Public rows always spawn — any role, even a failed probe.
+        assert!(node_meets_floor(None, SyncFloor::Public));
+        assert!(node_meets_floor(Some(AUTH_ROLE_NONE), SyncFloor::Public));
+        // A non-member is narrowed out of Member/Private rows.
+        assert!(!node_meets_floor(Some(AUTH_ROLE_NONE), SyncFloor::Member));
+        assert!(!node_meets_floor(Some(AUTH_ROLE_NONE), SyncFloor::Private));
+        // A member (read grant or higher) spawns everything.
+        assert!(node_meets_floor(Some(AUTH_ROLE_READONLY), SyncFloor::Member));
+        assert!(node_meets_floor(Some(AUTH_ROLE_READONLY), SyncFloor::Private));
+        assert!(node_meets_floor(Some(AUTH_ROLE_ADMIN), SyncFloor::Private));
+        // A failed probe fails OPEN — an unreachable registry never narrows.
+        assert!(node_meets_floor(None, SyncFloor::Member));
+        assert!(node_meets_floor(None, SyncFloor::Private));
     }
 
     #[test]
