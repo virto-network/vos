@@ -66,30 +66,31 @@ fn print_manifest(
         println!();
     }
 
-    if !members.is_empty() {
-        println!("[members]");
-        for m in members {
-            match m.kind {
-                MEMBER_KIND_NODE => {
-                    println!(
-                        "node = {{ prefix = {}, peer_id = {:?}, role = {} }}",
-                        m.prefix,
-                        hex::encode(&m.key),
-                        m.role,
-                    );
-                }
-                MEMBER_KIND_IDENTITY => {
-                    println!(
-                        "identity = {{ public_key = {:?}, proof_kind = {} }}",
-                        hex::encode(&m.key),
-                        m.proof_kind,
-                    );
-                }
-                other => {
-                    println!("# unknown member kind {other}");
-                }
+    // Members are informational (the reconciler ignores them — nodes
+    // and identities are managed with `space members`). Emit them as an
+    // array-of-tables so the output stays valid TOML: a `[members]`
+    // table with two `node = …` keys is a duplicate-key parse error, so
+    // `export | apply` would fail on any space with ≥2 members.
+    for m in members {
+        match m.kind {
+            MEMBER_KIND_NODE => {
+                println!("[[member]]");
+                println!("kind    = \"node\"");
+                println!("prefix  = {}", m.prefix);
+                println!("peer_id = {:?}", hex::encode(&m.key));
+                println!("role    = {}", m.role);
+                println!();
+            }
+            MEMBER_KIND_IDENTITY => {
+                println!("[[member]]");
+                println!("kind       = \"identity\"");
+                println!("public_key = {:?}", hex::encode(&m.key));
+                println!("proof_kind = {}", m.proof_kind);
+                println!();
+            }
+            other => {
+                println!("# unknown member kind {other}");
             }
         }
-        println!();
     }
 }

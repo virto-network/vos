@@ -75,7 +75,11 @@ pub(crate) struct ApplyReport {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let (manifest, recipe_dir) = reconcile::parse_manifest_file(&args.recipe)?;
+    // Canonicalize so a relative recipe path still yields ABSOLUTE
+    // extension `.so` paths in local.toml — a later bare `space up` has
+    // no recipe dir to resolve a relative one against.
+    let recipe = std::fs::canonicalize(&args.recipe).unwrap_or(args.recipe);
+    let (manifest, recipe_dir) = reconcile::parse_manifest_file(&recipe)?;
     reconcile::validate_manifest_names(&manifest)?;
 
     DaemonClient::with_connect(&args.space, |client| {
@@ -362,23 +366,33 @@ fn resolve_replication_id(
     })
 }
 
-/// Build the local.toml the recipe implies, preserving `base`'s
-/// node-owned fields (subscriptions, listen). The recipe wholly owns
-/// `cap_policy`, per-agent policy, and extensions — so a re-apply is
-/// deterministic (equal recipe → equal output → no write). Extension
-/// `.so` paths are resolved absolute against `recipe_dir` so a later
-/// bare `space up` (with no recipe dir) still finds them.
+/// MERGE the recipe's node-local half onto `base`. Reconcile semantics
+/// (like the registry install): a recipe field that IS declared upserts;
+/// anything the recipe doesn't mention is preserved, never wiped. This
+/// is what keeps `export | apply` non-destructive — `space export`
+/// emits none of the node-local fields (they aren't in the registry),
+/// so merging an exported recipe changes nothing (all-skips), whereas a
+/// replace would delete the operator's cap_policy / intra_caps /
+/// extensions. Node-owned fields (subscriptions, listen) always survive.
+/// Deterministic → idempotent (re-applying the same recipe re-produces
+/// the same config). Extension `.so` paths are resolved absolute against
+/// `recipe_dir` so a later bare `space up` still finds them.
 pub(crate) fn project_node_local(
     base: &LocalConfig,
     manifest: &Manifest,
     recipe_dir: &Path,
 ) -> LocalConfig {
-    let mut agents: BTreeMap<String, AgentLocal> = BTreeMap::new();
+    let mut out = base.clone();
+    // cap_policy: the recipe overrides only if it declares one.
+    if manifest.cap_policy.is_some() {
+        out.cap_policy = manifest.cap_policy.clone();
+    }
+    // agents: upsert each recipe agent that carries node-local policy.
     for a in flatten(&manifest.agents) {
         if a.tick_ms.is_none() && a.intra_caps.is_empty() && !a.device_secret {
-            continue; // no node-local policy — don't emit an empty table
+            continue; // no node-local policy — leave any base entry intact
         }
-        agents.insert(
+        out.agents.insert(
             a.name.clone(),
             AgentLocal {
                 tick_ms: a.tick_ms,
@@ -387,10 +401,10 @@ pub(crate) fn project_node_local(
             },
         );
     }
-    let extensions = manifest
-        .extensions
-        .iter()
-        .map(|e| ExtensionLocal {
+    // extensions: upsert by name (recipe wins), preserving base
+    // extensions the recipe doesn't mention.
+    for e in &manifest.extensions {
+        let projected = ExtensionLocal {
             name: e.name.clone(),
             path: absolutize(recipe_dir, &e.path),
             cap_policy: e.cap_policy.clone(),
@@ -398,15 +412,13 @@ pub(crate) fn project_node_local(
             intra_caps: e.intra_caps.clone(),
             tick_ms: e.tick_ms,
             init: e.init.clone(),
-        })
-        .collect();
-    LocalConfig {
-        subscriptions: base.subscriptions.clone(),
-        listen: base.listen.clone(),
-        cap_policy: manifest.cap_policy.clone(),
-        agents,
-        extensions,
+        };
+        match out.extensions.iter_mut().find(|x| x.name == e.name) {
+            Some(slot) => *slot = projected,
+            None => out.extensions.push(projected),
+        }
     }
+    out
 }
 
 /// Resolve an extension `.so` path against the recipe dir. An absolute
@@ -545,6 +557,47 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(program_ref(&noversion), ("libcounter".into(), RECIPE_VERSION.into()));
+    }
+
+    #[test]
+    fn project_node_local_merges_preserving_existing_policy() {
+        // The `export | apply` non-destructiveness guarantee: an exported
+        // recipe declares NO node-local fields (they aren't in the
+        // registry), so merging it must leave an operator's existing
+        // cap_policy / per-agent policy / extensions untouched.
+        let mut existing_agents = BTreeMap::new();
+        existing_agents.insert(
+            "messenger".to_string(),
+            AgentLocal {
+                tick_ms: Some(500),
+                intra_caps: vec!["space-registry:member".into()],
+                device_secret: true,
+            },
+        );
+        let base = LocalConfig {
+            subscriptions: vec!["messenger".into()],
+            listen: vec![],
+            cap_policy: Some("block".into()),
+            agents: existing_agents,
+            extensions: vec![ExtensionLocal {
+                name: "gateway".into(),
+                path: "/abs/libgw.so".into(),
+                ..Default::default()
+            }],
+        };
+        // An export-shaped manifest: agents carry program_hash but no
+        // node-local fields, and there are no extensions / cap_policy.
+        let m = manifest_from(
+            r#"
+            space = "x"
+            [[agent]]
+            name = "messenger"
+            program = "messenger:manifest"
+            program_hash = "aa"
+        "#,
+        );
+        let out = project_node_local(&base, &m, Path::new("/recipes"));
+        assert_eq!(out, base, "an export recipe must not wipe existing node-local policy");
     }
 
     #[test]

@@ -282,6 +282,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     publish_endpoint(&node, &data_dir, local_prefix, extension_caps)?;
 
     if args.once {
+        // The redeem loop and spawn-reconcile live only in the
+        // run-forever tick, so `--once` (a smoke-test idle-exit) does not
+        // redeem a pending token. Warn rather than silently no-op.
+        if !entry.pending_token.is_empty() {
+            tracing::warn!(
+                "--once will NOT redeem the pending invite (redemption runs in the long-lived \
+                 tick). Re-run `space up {}` without --once to join.",
+                entry.name,
+            );
+        }
         tracing::info!("--once: exiting when registry goes idle");
         node.run();
     } else {
@@ -345,23 +355,37 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             }
             last_pass = std::time::Instant::now();
             if let Some(tok) = pending_token.clone() {
-                match try_redeem(n, &data_dir, &tok) {
-                    Ok(true) => {
-                        pending_token = None;
-                        if let Err(e) = clear_pending_token(&space_id_hex) {
-                            tracing::warn!("clearing pending token from the index: {e}");
+                // Honor `--expires` on the honest redeem path: an expired
+                // token is terminal, not a retry. (Robust enforcement
+                // against a modified redeemer rides the deferred
+                // online-admission hook; short expiry + `space invite
+                // revoke` are the backstop.)
+                if token_expired(&tok) {
+                    pending_token = None;
+                    let _ = clear_pending_token(&space_id_hex);
+                    tracing::warn!(
+                        "invite token expired — not redeeming; ask the admin for a fresh \
+                         `space invite`",
+                    );
+                } else {
+                    match try_redeem(n, &data_dir, &tok) {
+                        Ok(true) => {
+                            pending_token = None;
+                            if let Err(e) = clear_pending_token(&space_id_hex) {
+                                tracing::warn!("clearing pending token from the index: {e}");
+                            }
+                            tracing::info!(
+                                "invite redeemed — node key granted; the grant syncs back on the \
+                                 next FetchHeads",
+                            );
                         }
-                        tracing::info!(
-                            "invite redeemed — node key granted; the grant syncs back on the next \
-                             FetchHeads",
-                        );
+                        Ok(false) => {} // bootnode not reachable/ready yet — retry next pass
+                        Err(e) if !redeem_warned => {
+                            redeem_warned = true;
+                            tracing::warn!("redeem: {e}");
+                        }
+                        Err(e) => tracing::debug!("redeem: {e}"),
                     }
-                    Ok(false) => {} // bootnode not reachable/ready yet — retry next pass
-                    Err(e) if !redeem_warned => {
-                        redeem_warned = true;
-                        tracing::warn!("redeem: {e}");
-                    }
-                    Err(e) => tracing::debug!("redeem: {e}"),
                 }
             }
             match reconcile_installed_agents(
@@ -524,9 +548,10 @@ fn resolve_token(token_str: &str) -> anyhow::Result<String> {
             entry.bootnodes.push(b.clone());
         }
     }
-    let name = entry.name.clone();
     spaces_index::save(&index)?;
-    Ok(name)
+    // Return the space_id, not the name: the token's space is unambiguous
+    // by id, and a name can collide with another already-known space.
+    Ok(space_id_hex)
 }
 
 /// Lay out a joined space's local state from a parsed invite — mirrors
@@ -725,6 +750,22 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
         }
     }
     Ok(false)
+}
+
+/// True if the invite token's `expires_at` is in the past (host wall
+/// clock). A parse failure is treated as NOT expired — `try_redeem`
+/// reports the corrupt token with a clearer error. This honors
+/// `--expires` on the honest joiner path; the deferred online-admission
+/// hook adds serving-side enforcement against a modified redeemer.
+fn token_expired(token_str: &str) -> bool {
+    let Ok(payload) = crate::token::parse(token_str) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now > payload.expires_at
 }
 
 /// Clear the `pending_token` marker on the space's index entry (by id)
@@ -1701,26 +1742,39 @@ fn node_meets_floor(is_member: bool, floor: vos::registry::SyncFloor) -> bool {
 }
 
 /// Is this node a member of the space — may it sync `Member`/`Private` floors?
-/// Mirrors `sync_serve_allowed`'s disjunction: a read grant on the operator that
-/// ran `space up` (where a joiner's role lives pre-redeem) OR node enrollment (a
-/// voter/observer is a member even before a grant lands — the case that would
-/// otherwise be wrongly narrowed). Probed once per pass. Errs toward membership:
-/// a missing operator, an unreachable registry, or any probe error returns
-/// `true`, so a transient condition never narrows a legitimate member out of its
-/// replicas — only a node confidently non-member by every signal is narrowed.
-/// W3's redeem-grants-node will fold the node-key grant in here too.
+/// Mirrors `sync_serve_allowed`'s disjunction across every identity that can
+/// carry membership, in order: the DAEMON node key (where `space up <token>`
+/// redemption lands the grant — the primary post-redeem path); then the
+/// operator that ran `space up` (where a role lives pre-redeem, or on an
+/// operator-driven space that never redeemed); then node enrollment (a
+/// voter/observer is a member even before a grant lands).
+///
+/// Probed once per pass. Errs toward membership: a missing identity, an
+/// unreachable registry, or any probe error returns `true`, so a transient
+/// condition never narrows a legitimate member out of its replicas — only a
+/// node confidently non-member by EVERY signal is narrowed.
 fn node_is_member(node: &VosNode, reg: &vos::registry::RegistryRef, local_prefix: u16) -> bool {
     use vos::registry::AUTH_ROLE_READONLY;
-    let Some(operator) = node.operator_peer().map(<[u8]>::to_vec) else {
-        return true; // no operator recorded — can't judge, don't narrow
-    };
-    match vos::block_on(reg.peer_role(&mut &*node, operator)) {
-        Ok(r) if r >= AUTH_ROLE_READONLY => return true, // granted → member
-        Ok(_) => {}                                      // reachable, not granted
-        Err(_) => return true,                           // registry down → fail open
+    // (1) The node key `redeem_invite` grants. This is what a token joiner
+    // gets — the operator (2) is never granted on the redeem path.
+    if let Some(net) = node.network() {
+        let node_peer = net.peer_id().to_bytes();
+        match vos::block_on(reg.peer_role(&mut &*node, node_peer)) {
+            Ok(r) if r >= AUTH_ROLE_READONLY => return true, // node granted → member
+            Ok(_) => {}                                      // reachable, not granted
+            Err(_) => return true,                           // registry down → fail open
+        }
     }
-    // Not granted via the operator; an enrolled node (voter/observer) is a
-    // member too. `node_role` reads 0 when not enrolled, `role + 1` otherwise.
+    // (2) The operator that ran `space up`.
+    if let Some(operator) = node.operator_peer().map(<[u8]>::to_vec) {
+        match vos::block_on(reg.peer_role(&mut &*node, operator)) {
+            Ok(r) if r >= AUTH_ROLE_READONLY => return true, // granted → member
+            Ok(_) => {}                                      // reachable, not granted
+            Err(_) => return true,                           // registry down → fail open
+        }
+    }
+    // (3) An enrolled node (voter/observer) is a member too. `node_role` reads
+    // 0 when not enrolled, `role + 1` otherwise.
     match vos::block_on(reg.node_role(&mut &*node, local_prefix as u64)) {
         Ok(role) => role > 0,
         Err(_) => true, // probe failed → fail open
@@ -2019,7 +2073,14 @@ mod tests {
         // is not.
         assert!(!is_recipe_path("some-space-name"));
         assert!(!is_recipe_path("/does/not/exist.toml"));
-        let dir = std::env::temp_dir().join(format!("vosx-recipe-detect-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "vosx-recipe-detect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let recipe = dir.join("r.toml");
         std::fs::write(&recipe, "space = \"x\"\n").unwrap();

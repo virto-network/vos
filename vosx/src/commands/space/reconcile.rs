@@ -1184,8 +1184,17 @@ mod tests {
             sync           = "member"
             network_reachable = true
 
-            [members]
-            node = { prefix = 1, peer_id = "cc", role = 3 }
+            [[member]]
+            kind    = "node"
+            prefix  = 1
+            peer_id = "cc"
+            role    = 3
+
+            [[member]]
+            kind    = "node"
+            prefix  = 2
+            peer_id = "dd"
+            role    = 0
         "#;
         let m: Manifest = toml::from_str(s).expect("export output parses as a recipe");
         assert_eq!(m.space.as_deref(), Some("e2e"));
