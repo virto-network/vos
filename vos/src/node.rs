@@ -1912,43 +1912,18 @@ impl crate::network::NetworkService for NodeService {
         Some(bytes)
     }
 
-    fn get_program_blob(
-        &self,
-        peer: Option<libp2p::PeerId>,
-        hash: &[u8; 32],
-    ) -> Option<Vec<u8>> {
-        // A program blob is a space asset: serve it only to a caller who is a
-        // space member — a granted role at or above read-only, or an enrolled
-        // node (the `Member`-floor test, identical to `sync_serve_allowed`).
-        // A build without the registry can't gate, so it serves nothing.
-        //
-        // Known limitation: the gate is blanket-Member, but the floor is per
-        // agent and a bare hash doesn't reveal it. So a non-member can't fetch
-        // even a `Public` agent's ELF — a stranger that spawns a `Public` agent
-        // installed after it joined (its ELF was never in the manifest) can't
-        // obtain the code. Not a regression (before, no peer fetch existed at
-        // all), and manifest-shipped ELFs are unaffected; resolving hash→floor
-        // to serve `Public` code openly is a deliberate follow-up.
-        #[cfg(not(feature = "storage"))]
-        {
-            let _ = (peer, hash);
-            None
-        }
-        #[cfg(feature = "storage")]
-        {
-            let peer = peer?;
-            let is_member = self.lookup_caller_role(Some(&peer)) >= AUTH_ROLE_READONLY
-                || self.caller_is_enrolled_node(&peer);
-            if !is_member {
-                return None;
-            }
-            // Read the ELF from the host's content-addressed cache dir
-            // (`{dir}/{hex_hash}`) — `proof_blob_filename` is just the shared
-            // hex-of-hash formatter. No rehash: the fetcher verifies bytes
-            // against the requested hash before trusting them.
-            let dir = self.program_blobs_dir.as_ref()?;
-            std::fs::read(dir.join(proof_blob_filename(hash))).ok()
-        }
+    fn get_program_blob(&self, _peer: Option<libp2p::PeerId>, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        // Served to any connected peer. The 32-byte hash comes from a
+        // floor-gated registry row, so the registry floor is the real access
+        // boundary and the ELF follows the hash; the secret is the runtime
+        // DATA (protected by the sync gate + E2EE), never the code. The
+        // network layer caps per-peer volume (`allow_program_blob`) since each
+        // serve is a whole-ELF read. Read from the host's content-addressed
+        // cache dir (`{dir}/{hex_hash}`) — `proof_blob_filename` is the shared
+        // hex-of-hash formatter. No rehash: the fetcher verifies the bytes
+        // against the requested hash before trusting them.
+        let dir = self.program_blobs_dir.as_ref()?;
+        std::fs::read(dir.join(proof_blob_filename(hash))).ok()
     }
 
     /// Admit a Raft joiner only if it is enrolled as a `NODE_ROLE_VOTER`
@@ -9579,16 +9554,15 @@ mod tests {
         assert!(!svc.sync_serve_allowed(None, "counter"), "anonymous is refused Member");
     }
 
-    /// `get_program_blob` is the serving side of the program-blob peer fetch:
-    /// a program blob is a space asset, so it is served only to a space member
-    /// (a read grant OR an enrolled node) and only for a hash actually present
-    /// in the host's cache dir. A stranger, an anonymous caller, and an
-    /// uncached hash all get nothing.
+    /// `get_program_blob` is the serving side of the program-blob peer fetch.
+    /// It is ungated — the registry floor gating the hash is the real boundary,
+    /// and the code is not the secret — so it serves the cached ELF to any
+    /// caller, member or not, including an anonymous one. An uncached hash and a
+    /// node with no cache dir both yield nothing.
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn get_program_blob_serves_members_only() {
+    fn get_program_blob_serves_any_caller_from_the_cache_dir() {
         use crate::network::NetworkService;
-        let peer = libp2p::PeerId::random();
         // A temp dir standing in for vosx's content-addressed blob cache,
         // holding one ELF keyed by its hex hash (the layout the node reads).
         let dir = std::env::temp_dir().join(format!(
@@ -9602,48 +9576,38 @@ mod tests {
         let hash = crate::crypto::blake2b_hash::<32>(&[], &[&bytes]);
         std::fs::write(dir.join(proof_blob_filename(&hash)), &bytes).unwrap();
 
-        let serve = |peer_role: u8, node_role: u8| -> Option<Vec<u8>> {
-            let (routes, _reg) = spawn_stub_role_registry(peer_role, node_role);
-            let mut svc = lifecycle_service(
-                routes,
-                Arc::new(Mutex::new(HashMap::new())),
-                Arc::new(std::sync::RwLock::new(HashMap::new())),
-            );
-            svc.program_blobs_dir = Some(dir.clone());
-            svc.get_program_blob(Some(peer), &hash)
-        };
-
-        assert!(
-            serve(AUTH_ROLE_NONE, 0).is_none(),
-            "a stranger is refused the program blob",
-        );
-        assert_eq!(
-            serve(AUTH_ROLE_READONLY, 0).as_deref(),
-            Some(bytes.as_slice()),
-            "a granted member gets the program blob",
-        );
-        assert_eq!(
-            serve(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER).as_deref(),
-            Some(bytes.as_slice()),
-            "an enrolled voter gets the program blob before a grant lands",
-        );
-
-        // Anonymous and an uncached hash both yield nothing even though the
-        // caller would otherwise be a member.
-        let (routes, _reg) = spawn_stub_role_registry(AUTH_ROLE_READONLY, 0);
+        let (routes, _reg) = spawn_stub_role_registry(AUTH_ROLE_NONE, 0);
         let mut svc = lifecycle_service(
             routes,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(std::sync::RwLock::new(HashMap::new())),
         );
         svc.program_blobs_dir = Some(dir.clone());
+
+        // Served regardless of the caller — a random peer, and an anonymous
+        // caller with no peer id, both get the cached ELF.
+        assert_eq!(
+            svc.get_program_blob(Some(libp2p::PeerId::random()), &hash)
+                .as_deref(),
+            Some(bytes.as_slice()),
+            "any connected peer gets the cached ELF",
+        );
+        assert_eq!(
+            svc.get_program_blob(None, &hash).as_deref(),
+            Some(bytes.as_slice()),
+            "an anonymous caller gets it too",
+        );
+        // An uncached hash yields nothing.
+        assert!(
+            svc.get_program_blob(Some(libp2p::PeerId::random()), &[0xEE; 32])
+                .is_none(),
+            "an uncached hash yields nothing",
+        );
+        // No cache dir configured → nothing to serve.
+        svc.program_blobs_dir = None;
         assert!(
             svc.get_program_blob(None, &hash).is_none(),
-            "anonymous is refused",
-        );
-        assert!(
-            svc.get_program_blob(Some(peer), &[0xEE; 32]).is_none(),
-            "an uncached hash yields nothing even for a member",
+            "no cache dir → nothing served",
         );
 
         let _ = std::fs::remove_dir_all(&dir);

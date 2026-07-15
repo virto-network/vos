@@ -1722,12 +1722,11 @@ fn handle_req_resp(
                             .send_response(channel, Frame::ProofBlobReply { blob });
                     }
                     Frame::FetchProgramBlob { hash } => {
-                        // Unlike proof blobs, this is membership-gated — the
-                        // gate runs the same blocking registry probe as the
-                        // sync path — and reads a possibly-large ELF off disk.
-                        // Serve off the swarm thread behind the per-peer flood
-                        // cap, exactly like FetchHeads/FetchNode.
-                        if !sync_rate.allow(peer) {
+                        // Served to any peer (the registry floor gating the hash
+                        // is the access boundary), but each serve reads a whole
+                        // ELF off disk, so it rides its own tighter per-peer
+                        // budget. Off the swarm thread like FetchHeads/FetchNode.
+                        if !sync_rate.allow_program_blob(peer) {
                             return;
                         }
                         let svc = service.get().cloned();
@@ -2141,33 +2140,56 @@ fn handle_req_resp(
 /// (one `FetchNode` per CID), which arrives in a burst then quiesces.
 #[derive(Default)]
 struct SyncRateLimiter {
-    peers: HashMap<PeerId, (std::time::Instant, u32)>,
+    /// Per-peer window for cheap DAG-sync fetches (`FetchHeads`/`FetchNode`).
+    sync: HashMap<PeerId, (std::time::Instant, u32)>,
+    /// Separate, much tighter window for `FetchProgramBlob`: each serve is a
+    /// whole-ELF disk read (~150x a DAG node) and — unlike the membership-gated
+    /// sync path — it is served to any peer, so it gets its own small budget.
+    program_blob: HashMap<PeerId, (std::time::Instant, u32)>,
 }
 
 /// Window length for the per-peer sync fetch budget.
 const SYNC_RATE_WINDOW: Duration = Duration::from_secs(2);
 /// Max `FetchHeads`/`FetchNode` requests served per peer per window.
 const MAX_SYNC_FETCHES_PER_WINDOW: u32 = 1024;
+/// Max `FetchProgramBlob` requests served per peer per window — small, since a
+/// legitimate joiner fetches a bounded set of missing ELFs, not a stream.
+const MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW: u32 = 16;
 /// Map-size threshold that triggers a sweep of expired windows, so a
 /// churn of one-shot PeerIds can't grow the table without bound.
 const SYNC_RATE_PRUNE_LEN: usize = 1024;
 
 impl SyncRateLimiter {
-    /// Record a fetch from `peer` and report whether it stays within
-    /// budget. Resets the peer's counter when its window elapses.
+    /// Record a `FetchHeads`/`FetchNode` from `peer`; report whether it stays
+    /// within budget.
     fn allow(&mut self, peer: PeerId) -> bool {
+        Self::charge(&mut self.sync, peer, MAX_SYNC_FETCHES_PER_WINDOW)
+    }
+
+    /// Record a `FetchProgramBlob` from `peer` against its own tighter budget.
+    fn allow_program_blob(&mut self, peer: PeerId) -> bool {
+        Self::charge(&mut self.program_blob, peer, MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW)
+    }
+
+    /// Fixed-window charge against a per-peer counter map: reset a peer's count
+    /// when its window elapses, prune stale entries under churn, and report
+    /// whether the request stays within `cap`.
+    fn charge(
+        peers: &mut HashMap<PeerId, (std::time::Instant, u32)>,
+        peer: PeerId,
+        cap: u32,
+    ) -> bool {
         let now = std::time::Instant::now();
-        if self.peers.len() >= SYNC_RATE_PRUNE_LEN {
-            self.peers
-                .retain(|_, (start, _)| now.duration_since(*start) < SYNC_RATE_WINDOW);
+        if peers.len() >= SYNC_RATE_PRUNE_LEN {
+            peers.retain(|_, (start, _)| now.duration_since(*start) < SYNC_RATE_WINDOW);
         }
-        let entry = self.peers.entry(peer).or_insert((now, 0));
+        let entry = peers.entry(peer).or_insert((now, 0));
         if now.duration_since(entry.0) >= SYNC_RATE_WINDOW {
             *entry = (now, 0);
         }
         entry.1 += 1;
-        if entry.1 > MAX_SYNC_FETCHES_PER_WINDOW {
-            debug!(%peer, "network: peer over sync-fetch budget; dropping request");
+        if entry.1 > cap {
+            debug!(%peer, "network: peer over fetch budget; dropping request");
             false
         } else {
             true
