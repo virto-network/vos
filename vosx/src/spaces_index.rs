@@ -42,12 +42,24 @@ pub struct SpaceEntry {
     #[serde(default)]
     pub bootnodes: Vec<String>,
     /// Hyperspace (federation) name this space belongs to, if any.
-    /// Persisted at the first `space up --manifest` that declares
-    /// `hyperspace = "…"` so a later bare `space up` re-attaches the
-    /// space to the federation instead of silently detaching it. Empty
-    /// when the space is not a hyperspace member.
+    /// Persisted at the first recipe apply that declares `hyperspace =
+    /// "…"` so a later bare `space up` re-attaches the space to the
+    /// federation instead of silently detaching it. Empty when the space
+    /// is not a hyperspace member.
     #[serde(default)]
     pub hyperspace: String,
+    /// A `vos1…` invite token awaiting redemption. Set by `space up
+    /// <token>` (join-if-needed) and consumed by the redeem loop in the
+    /// boot tick: each pass re-parses it and invokes the bootnode's
+    /// `redeem_invite`, clearing it on success. Empty = nothing pending.
+    #[serde(default)]
+    pub pending_token: String,
+    /// An absolute recipe-TOML path awaiting a one-shot genesis apply.
+    /// Set by `space up <recipe>` / `space new --manifest`; consumed on
+    /// the next boot (agents → registry, node-local → local.toml) and
+    /// cleared. Empty = nothing pending.
+    #[serde(default)]
+    pub pending_manifest: String,
 }
 
 impl SpaceEntry {
@@ -165,6 +177,8 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
         registry_hash: String::new(),
         bootnodes: Vec::new(),
         hyperspace: String::new(),
+        pending_token: String::new(),
+        pending_manifest: String::new(),
     }
 }
 
@@ -215,6 +229,8 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: "bank-federation".into(),
+                pending_token: String::new(),
+                pending_manifest: String::new(),
             },
         );
         save_to(&idx, &p).unwrap();
@@ -258,6 +274,8 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
+                pending_token: String::new(),
+                pending_manifest: String::new(),
             },
         );
         upsert(
@@ -270,6 +288,8 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
+                pending_token: String::new(),
+                pending_manifest: String::new(),
             },
         );
         assert_eq!(idx.spaces.len(), 1);
@@ -290,6 +310,8 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
+                pending_token: String::new(),
+                pending_manifest: String::new(),
             },
         );
         assert_eq!(find(&idx, &id_a).unwrap().name, "alpha");

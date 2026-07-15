@@ -135,7 +135,7 @@ pub(crate) fn apply_manifest(
     // owned sections (cap_policy, per-agent policy, extensions) while
     // node-owned fields (subscriptions, listen) are preserved.
     let mut cfg = subscriptions::load(data_dir)?;
-    let next = project_node_local(&cfg, manifest);
+    let next = project_node_local(&cfg, manifest, recipe_dir);
     if next != cfg {
         report.local_changed = true;
         if !diff {
@@ -319,8 +319,14 @@ fn resolve_replication_id(
 /// Build the local.toml the recipe implies, preserving `base`'s
 /// node-owned fields (subscriptions, listen). The recipe wholly owns
 /// `cap_policy`, per-agent policy, and extensions — so a re-apply is
-/// deterministic (equal recipe → equal output → no write).
-fn project_node_local(base: &LocalConfig, manifest: &Manifest) -> LocalConfig {
+/// deterministic (equal recipe → equal output → no write). Extension
+/// `.so` paths are resolved absolute against `recipe_dir` so a later
+/// bare `space up` (with no recipe dir) still finds them.
+pub(crate) fn project_node_local(
+    base: &LocalConfig,
+    manifest: &Manifest,
+    recipe_dir: &Path,
+) -> LocalConfig {
     let mut agents: BTreeMap<String, AgentLocal> = BTreeMap::new();
     for a in flatten(&manifest.agents) {
         if a.tick_ms.is_none() && a.intra_caps.is_empty() && !a.device_secret {
@@ -340,7 +346,7 @@ fn project_node_local(base: &LocalConfig, manifest: &Manifest) -> LocalConfig {
         .iter()
         .map(|e| ExtensionLocal {
             name: e.name.clone(),
-            path: e.path.clone(),
+            path: absolutize(recipe_dir, &e.path),
             cap_policy: e.cap_policy.clone(),
             relay_unauthenticated: e.relay_unauthenticated,
             intra_caps: e.intra_caps.clone(),
@@ -354,6 +360,18 @@ fn project_node_local(base: &LocalConfig, manifest: &Manifest) -> LocalConfig {
         cap_policy: manifest.cap_policy.clone(),
         agents,
         extensions,
+    }
+}
+
+/// Resolve an extension `.so` path against the recipe dir. An absolute
+/// path is used as-is; a relative one is joined onto `recipe_dir` so a
+/// later bare `space up` (which has no recipe dir) still resolves it.
+fn absolutize(recipe_dir: &Path, path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        recipe_dir.join(p).to_string_lossy().to_string()
     }
 }
 
@@ -438,7 +456,7 @@ mod tests {
             listen: vec!["/ip4/0.0.0.0/tcp/1".into()],
             ..Default::default()
         };
-        let out = project_node_local(&base, &m);
+        let out = project_node_local(&base, &m, Path::new("/recipes"));
         // node-owned fields preserved
         assert_eq!(out.subscriptions, vec!["keep-me".to_string()]);
         assert_eq!(out.listen, vec!["/ip4/0.0.0.0/tcp/1".to_string()]);
@@ -451,6 +469,8 @@ mod tests {
         assert!(ticker.device_secret);
         assert_eq!(out.extensions.len(), 1);
         assert_eq!(out.extensions[0].name, "gateway");
+        // extension .so path resolved absolute against the recipe dir.
+        assert_eq!(out.extensions[0].path, "/recipes/libgw.so");
     }
 
     #[test]
@@ -466,8 +486,8 @@ mod tests {
             tick_ms = 100
         "#,
         );
-        let once = project_node_local(&LocalConfig::default(), &m);
-        let twice = project_node_local(&once, &m);
+        let once = project_node_local(&LocalConfig::default(), &m, Path::new("/recipes"));
+        let twice = project_node_local(&once, &m, Path::new("/recipes"));
         assert_eq!(once, twice);
     }
 }

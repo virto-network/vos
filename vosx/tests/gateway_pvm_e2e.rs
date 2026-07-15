@@ -174,17 +174,21 @@ fn boot_daemon(manifest_path: &Path, port: u16) -> Daemon {
         String::from_utf8_lossy(&new.stderr),
     );
 
-    // 2. `vosx space up <name> --manifest <path>`. Daemon stderr
-    //    goes to a file inside `data_home` so a failed boot is
-    //    still inspectable, while NOT going through a pipe — under
-    //    release-LTO the daemon's mDNS-discovery INFO logs can
-    //    exceed the default 64KB pipe buffer between test polls
-    //    and deadlock the dispatch thread on stderr write
-    //    (manifested as the test hanging on the first HTTP read).
+    // 2. `vosx space up <recipe.toml>` — the trivalent positional
+    //    detects the recipe path, finds the just-created `e2e` space
+    //    (the recipe's `space = "e2e"`), stamps it pending, and runs a
+    //    one-shot genesis apply at boot (agents → registry, gateway
+    //    extension → local.toml → registered). Daemon stderr goes to a
+    //    file inside `data_home` so a failed boot is still inspectable,
+    //    while NOT going through a pipe — under release-LTO the daemon's
+    //    mDNS-discovery INFO logs can exceed the default 64KB pipe
+    //    buffer between test polls and deadlock the dispatch thread on
+    //    stderr write (manifested as the test hanging on the first HTTP
+    //    read).
     let log_path = data_home.path().join("daemon.stderr");
     let log_file = std::fs::File::create(&log_path).expect("create daemon stderr log");
     let child = Command::new(vosx_bin())
-        .args(["space", "up", space_name, "--manifest"])
+        .args(["space", "up"])
         .arg(manifest_path)
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())

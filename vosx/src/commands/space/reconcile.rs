@@ -209,7 +209,7 @@ fn default_consistency() -> String {
 /// drive its dynamic clap surface. Double-loading the .so here is
 /// trivial: cdylibs are small and meta extraction doesn't run any
 /// extension code.
-fn register_extension(
+pub(crate) fn register_extension(
     node: &mut VosNode,
     reg: &RegistryRef,
     ext: &ExtensionDef,
@@ -567,81 +567,31 @@ pub fn parse_manifest_file(path: &Path) -> anyhow::Result<(Manifest, PathBuf)> {
     Ok((manifest, dir))
 }
 
-/// Walk the manifest and call `registry.publish` / `install`
-/// for every entry that's missing. `node` must already have
-/// the registry registered locally (so `&mut &node` can drive
-/// in-process Ref calls).
-pub fn reconcile(
+/// Install every manifest agent into the in-process registry (the
+/// *replicated* half of a recipe). Extensions are node-local and are
+/// handled separately from `local.toml` at boot, so this path is
+/// agent-only — the genesis apply `space up` runs when it consumes a
+/// pending recipe. `node` must already have the registry registered
+/// locally (so `&mut &node` drives in-process Ref calls).
+pub(crate) fn install_agents(
     node: &mut VosNode,
     manifest: &Manifest,
     manifest_dir: &Path,
     daemon_prefix: u16,
     space_id: &[u8; 32],
-) -> anyhow::Result<Vec<crate::commands::space::endpoint::ExtensionCaps>> {
-    use crate::commands::space::endpoint::ExtensionCaps;
+) -> anyhow::Result<()> {
     validate_manifest_names(manifest)?;
-
-    // Effective relay caps per extension, returned to the caller for
-    // the local endpoint descriptor (the `space describe` / `space
-    // caps` surface).
-    let mut ext_caps: Vec<ExtensionCaps> = Vec::new();
 
     let reg = RegistryRef::at(ServiceId::new(
         daemon_prefix,
         ServiceId::REGISTRY.local_id(),
     ));
 
-    // Every instance name this space installs — the roster a named
-    // intra_cap target is validated against (R3). Includes the built-in
-    // registry, which isn't a manifest entry but is always resolvable.
-    let known_names: std::collections::HashSet<String> = manifest
-        .agents
-        .iter()
-        .map(|a| a.name.clone())
-        .chain(manifest.extensions.iter().map(|e| e.name.clone()))
-        .chain(std::iter::once("space-registry".to_string()))
-        .collect();
-
-    // Extensions land first — they're host-local and don't need the
-    // registry to *boot*, but each one's meta blob does ride into
-    // the registry's `extension_metas` table so `meta_for_instance`
-    // (and Phase 4's `vosx <ext> <cmd>`) can find the CLI surface.
-    // Doing extensions up-front lets a service-mode extension
-    // (gateway, etc.) be ready by the time PVM agents start sending
-    // traffic at it.
-    if !manifest.extensions.is_empty() {
-        tracing::info!(
-            "reconciling manifest ({} extension definition(s))",
-            manifest.extensions.len(),
-        );
-        // Resolve the space-level default once; per-extension
-        // overrides are applied inside register_extension.
-        let space_cap_policy = match manifest.cap_policy.as_deref() {
-            Some(s) => vos::extension::CapPolicy::parse(s),
-            None => vos::extension::CapPolicy::default(),
-        };
-        for ext in &manifest.extensions {
-            let caps = register_extension(
-                node,
-                &reg,
-                ext,
-                manifest_dir,
-                daemon_prefix,
-                space_cap_policy,
-                &known_names,
-            )?;
-            ext_caps.push(ExtensionCaps {
-                name: ext.name.clone(),
-                caps,
-            });
-        }
-    }
-
     if manifest.agents.is_empty() {
-        return Ok(ext_caps);
+        return Ok(());
     }
     tracing::info!(
-        "reconciling manifest ({} agent definition(s))",
+        "genesis apply ({} agent definition(s))",
         flat_count(&manifest.agents),
     );
 
@@ -689,7 +639,7 @@ pub fn reconcile(
         )?;
     }
 
-    Ok(ext_caps)
+    Ok(())
 }
 
 fn reconcile_one(

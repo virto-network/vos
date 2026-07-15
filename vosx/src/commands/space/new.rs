@@ -21,7 +21,7 @@ use crate::blob_store::{self, BlobSource};
 use crate::commands::space::op_sign::op_auth;
 use crate::output;
 use crate::paths;
-use crate::spaces_index::{self, SpacesIndex};
+use crate::spaces_index::{self, SpaceEntry, SpacesIndex};
 
 #[derive(Serialize)]
 struct CreatedView<'a> {
@@ -41,15 +41,71 @@ pub struct Args {
     pub data_dir: Option<PathBuf>,
 }
 
+/// The result of scaffolding a fresh space — the index entry (already
+/// upserted + saved) plus the derived identifiers, so callers can print
+/// a summary or drive a follow-on genesis apply.
+pub(crate) struct Scaffolded {
+    pub entry: SpaceEntry,
+    pub genesis_root: [u8; 32],
+    pub peer_id: libp2p::PeerId,
+    pub node_key_path: PathBuf,
+    pub registry_label: String,
+}
+
 pub fn run(args: Args) -> anyhow::Result<()> {
-    if args.name.is_empty() {
+    let s = scaffold(&args.name, args.registry.as_deref(), args.data_dir)?;
+    let space_id_hex = s.entry.id.clone();
+    if output::is_json() {
+        output::print_json(&CreatedView {
+            name: &args.name,
+            space_id: space_id_hex,
+            genesis_root: hex::encode(s.genesis_root),
+            data_dir: s.entry.data_dir.clone(),
+            node_key: s.node_key_path.to_string_lossy().to_string(),
+            registry_hash: s.entry.registry_hash.clone(),
+            registry_source: &s.registry_label,
+            peer_id: s.peer_id.to_string(),
+        });
+    } else {
+        println!("created space '{}'", args.name);
+        println!("  space_id     = {space_id_hex}");
+        println!("  genesis_root = {}", hex::encode(s.genesis_root));
+        println!("  data_dir     = {}", s.entry.data_dir);
+        println!("  node.key     = {}", s.node_key_path.display());
+        println!(
+            "  registry     = {} ({})",
+            s.registry_label, s.entry.registry_hash,
+        );
+        println!("  peer_id      = {}", s.peer_id);
+        println!();
+        println!("next: `vosx space up {} [--listen <multiaddr>]`", args.name);
+        println!("the bootnode hint <space_id>@<multiaddr>/p2p/<peer_id> is");
+        println!(
+            "printed by `space info {}` once the daemon's running.",
+            args.name
+        );
+    }
+    Ok(())
+}
+
+/// Scaffold a fresh space: boot the registry in a temp dir, run the
+/// genesis commits (`set_root` + operator ADMIN grant + first
+/// `add_node`), derive `space_id` from the genesis root, move the dir
+/// into place, persist the node key, and upsert the spaces-index entry.
+/// The registry is *not* left running — the caller boots it via `space
+/// up`. Reused by the `space up <recipe>` create-if-unknown path.
+pub(crate) fn scaffold(
+    name: &str,
+    registry: Option<&str>,
+    data_dir: Option<PathBuf>,
+) -> anyhow::Result<Scaffolded> {
+    if name.is_empty() {
         anyhow::bail!("--name is required and must be non-empty");
     }
 
     // 1. Resolve and cache the registry blob — explicit
     //    --registry first, bundled fallback otherwise.
-    let (registry_hash, registry_bytes, registry_label) =
-        resolve_registry_source(args.registry.as_deref())?;
+    let (registry_hash, registry_bytes, registry_label) = resolve_registry_source(registry)?;
     let registry_blob = grey_transpiler::link_elf(&registry_bytes)
         .map_err(|e| anyhow::anyhow!("transpile registry elf: {e:?}"))?;
 
@@ -170,7 +226,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // 8. Move temp dir to the canonical location. Disarm the
     //    guard once the rename succeeds — the destination dir
     //    is now legitimate state, not a temp leftover.
-    let final_dir = args.data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
+    let final_dir = data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
     if final_dir.exists() {
         anyhow::bail!("space data dir already exists: {}", final_dir.display(),);
     }
@@ -195,43 +251,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // 10. Append to the spaces index.
     let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
-    let mut entry = spaces_index::entry_for(&space_id, &args.name);
+    let mut entry = spaces_index::entry_for(&space_id, name);
     entry.data_dir = final_dir.to_string_lossy().to_string();
     entry.registry_hash = registry_hash.to_hex();
-    spaces_index::upsert(&mut index, entry);
+    spaces_index::upsert(&mut index, entry.clone());
     spaces_index::save(&index)?;
 
-    // 11. Print.
-    let space_id_hex = paths::space_id_hex(&space_id);
-    if output::is_json() {
-        output::print_json(&CreatedView {
-            name: &args.name,
-            space_id: space_id_hex,
-            genesis_root: hex::encode(genesis_root),
-            data_dir: final_dir.to_string_lossy().to_string(),
-            node_key: key_path.to_string_lossy().to_string(),
-            registry_hash: registry_hash.to_hex(),
-            registry_source: &registry_label,
-            peer_id: peer_id.to_string(),
-        });
-    } else {
-        println!("created space '{}'", args.name);
-        println!("  space_id     = {space_id_hex}");
-        println!("  genesis_root = {}", hex::encode(genesis_root));
-        println!("  data_dir     = {}", final_dir.display());
-        println!("  node.key     = {}", key_path.display());
-        println!("  registry     = {registry_label} ({registry_hash})");
-        println!("  peer_id      = {peer_id}");
-        println!();
-        println!("next: `vosx space up {} [--listen <multiaddr>]`", args.name);
-        println!("the bootnode hint <space_id>@<multiaddr>/p2p/<peer_id> is");
-        println!(
-            "printed by `space info {}` once the daemon's running.",
-            args.name
-        );
-    }
-
-    Ok(())
+    Ok(Scaffolded {
+        entry,
+        genesis_root,
+        peer_id,
+        node_key_path: key_path,
+        registry_label,
+    })
 }
 
 /// Resolve the registry source: explicit `--registry` if given,

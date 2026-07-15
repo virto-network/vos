@@ -103,22 +103,20 @@ pub enum SpaceCommand {
         #[arg(long, value_name = "DIR")]
         data_dir: Option<std::path::PathBuf>,
     },
-    /// Boot a saved space — load the registry from cache,
-    /// register it as `ServiceId::REGISTRY`, run forever.
+    /// Boot a space — THE onboarding command. The positional is
+    /// trivalent: an existing `.toml` recipe path (create-if-missing +
+    /// one-shot genesis apply + boot), a `vos1…` invite token
+    /// (join-if-needed + boot + auto-redeem), or a space name / id
+    /// (boot a known space). `-` reads a token from stdin. Loads the
+    /// registry from cache, registers it as `ServiceId::REGISTRY`, and
+    /// runs forever.
     Up {
-        /// Space id (full hex) or name.
+        /// Recipe path, `vos1…` token, `-` (token via stdin), or a
+        /// known space id (full hex) / name.
         space: String,
         /// Exit when the registry goes idle (smoke-test mode).
         #[arg(long)]
         once: bool,
-        /// Optional TOML manifest. The startup pass reconciles
-        /// it into the registry: any `[[agent]]` not yet
-        /// installed gets published+installed; existing entries
-        /// are left alone unless `--reconcile-upgrade` is set.
-        /// Manifests are devhelpers — the registry remains the
-        /// runtime source of truth.
-        #[arg(long, value_name = "FILE")]
-        manifest: Option<std::path::PathBuf>,
         /// libp2p multiaddr to listen on. Repeatable. Overrides
         /// the saved `listen` field on the spaces.toml entry
         /// for this run.
@@ -358,13 +356,11 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Up {
             space,
             once,
-            manifest,
             listen,
             connect,
         } => up::run(up::Args {
             query: space,
             once,
-            manifest,
             listen,
             connect,
         }),

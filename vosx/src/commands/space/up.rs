@@ -6,30 +6,38 @@
 //! with `Consistency::Crdt`, and hands the node off to
 //! `run_forever` (or `run` for `--once`).
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use vos::abi::service::ServiceId;
+use vos::actors::client::{ClientError, Invoker};
 use vos::node::{AgentConfig, Consistency, VosNode};
+use vos::registry::{RegistryRef, Status};
 
 use crate::blob_store::{self, BlobHash};
 use crate::commands::space::common::{
     consistency_from_u8, derive_hyperspace_id, instance_service_id, registry_replication_id,
 };
-use crate::commands::space::payload_codec;
+use crate::commands::space::{payload_codec, reconcile, subscriptions};
 use crate::spaces_index;
 
 pub struct Args {
     pub query: String,
     pub once: bool,
-    pub manifest: Option<PathBuf>,
     pub listen: Vec<String>,
     pub connect: Vec<String>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    // Trivalent positional (decision 1): an existing `.toml` recipe
+    // (create-if-missing + genesis apply), a `vos1…` invite token
+    // (join-if-needed + auto-redeem), or a known space name / id. Any of
+    // these may scaffold/join the space and stamp a pending token or
+    // manifest onto the index; all that flows forward is the lookup key.
+    let lookup = resolve_up_target(&args)?;
     let index = spaces_index::load()?;
-    let entry = spaces_index::find(&index, &args.query)?;
+    let entry = spaces_index::find(&index, &lookup)?;
 
     if entry.registry_hash.is_empty() {
         anyhow::bail!(
@@ -108,57 +116,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // Pre-parse the manifest (if any) so we know whether to spawn
-    // the hyperspace registry alongside the local one. The manifest
-    // gets reconciled below — we only peek at it here.
-    let parsed_manifest = args
-        .manifest
-        .as_ref()
-        .map(|p| crate::commands::space::reconcile::parse_manifest_file(p))
-        .transpose()?;
-    let manifest_hyperspace = parsed_manifest
-        .as_ref()
-        .and_then(|(m, _)| m.hyperspace.clone());
-    // Effective membership: a manifest value wins (and is persisted
-    // below); otherwise fall back to what the index remembers, so a
-    // bare `space up` — a restart without --manifest — re-attaches the
-    // space to its federation instead of silently detaching it.
-    let persisted_hyperspace = (!entry.hyperspace.is_empty()).then(|| entry.hyperspace.clone());
-    let hyperspace = manifest_hyperspace.clone().or(persisted_hyperspace);
-
-    // First `space up --manifest` (or a manifest that changes the name)
-    // records the hyperspace in the spaces index so subsequent boots
-    // re-attach without needing the manifest again.
-    if let Some(name) = &manifest_hyperspace
-        && entry.hyperspace != *name
-    {
-        let mut updated = entry.clone();
-        updated.hyperspace = name.clone();
-        let mut idx = spaces_index::load()?;
-        spaces_index::upsert(&mut idx, updated);
-        spaces_index::save(&idx)?;
-        tracing::info!("persisted hyperspace '{name}' for space '{}'", entry.name);
-    }
-
-    // Agents that declared `device_secret = true` — they get a node-local
-    // secret seed provisioned post-spawn (see `provision_device_seeds`).
-    // Captured here before the manifest is consumed by the reconcile block.
-    // Node-local by design: the flag never rides the replicated AgentRow.
-    let device_secret_agents: Vec<String> = parsed_manifest
-        .as_ref()
-        .map(|(m, _)| {
-            m.agents
-                .iter()
-                .filter(|a| a.device_secret)
-                .map(|a| a.name.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Node-local per-agent policy from the manifest (`tick_ms` + `intra_caps`)
-    // — never replicated. Applied at spawn in `agent_config_from_row`. Malformed
-    // intra_caps fail the boot eagerly (like the extension path).
-    let agent_policies = collect_agent_policies(parsed_manifest.as_ref().map(|(m, _)| m))?;
+    // Hyperspace membership comes from the persisted index entry. A
+    // recipe's `hyperspace = …` is folded into `entry.hyperspace` when
+    // the recipe is resolved (see `resolve_recipe`), so a bare `space
+    // up` re-attaches to the federation without needing the recipe again.
+    let hyperspace = (!entry.hyperspace.is_empty()).then(|| entry.hyperspace.clone());
 
     // Always attach a libp2p network — even local-only spaces
     // bind a loopback port so client commands (`space publish`,
@@ -270,22 +232,28 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .unwrap_or_default(),
     );
 
-    // Reconcile the optional --manifest BEFORE we spawn the
-    // currently-installed agents, so manifest-introduced
-    // agents land in the same boot. Reconcile returns each
-    // extension's effective relay caps, which we stamp into the
-    // local endpoint descriptor below so `space describe` /
-    // `space caps` can surface them.
-    let mut extension_caps = Vec::new();
-    if let Some((manifest, manifest_dir)) = parsed_manifest {
-        extension_caps = crate::commands::space::reconcile::reconcile(
-            &mut node,
-            &manifest,
-            &manifest_dir,
-            local_prefix,
-            &space_id,
-        )?;
+    // Genesis apply: consume a pending recipe exactly once. Installs the
+    // recipe's agents into the just-anchored registry (the replicated
+    // half) and projects its node-local half into `local.toml`, then
+    // clears the marker so a later bare `space up` doesn't re-apply.
+    if !entry.pending_manifest.is_empty() {
+        genesis_apply(&mut node, &entry.pending_manifest, local_prefix, &space_id, &data_dir)?;
+        clear_pending_manifest(&entry.id)?;
     }
+
+    // Node-local policy is now the single source of truth alongside the
+    // registry: `local.toml`. A bare `space up` restart re-applies every
+    // agent's `tick_ms` / `intra_caps` / device-seed provisioning and the
+    // `[[extension]]` registrations from here — the standing bug where a
+    // restart silently dropped them is gone.
+    let local_cfg = subscriptions::load(&data_dir).unwrap_or_default();
+    let agent_policies = agent_policies_from_local(&local_cfg)?;
+    let device_secret_agents = device_secret_agents_from_local(&local_cfg);
+
+    // Register node-local `.so` extensions from `local.toml`, returning
+    // each one's effective relay caps for the endpoint descriptor
+    // (`space describe` / `space caps`).
+    let extension_caps = register_extensions_from_local(&mut node, &local_cfg, &data_dir, local_prefix)?;
 
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
@@ -329,11 +297,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // installed after boot — `space install`, `dev new`, an
         // extension calling `registry.install`, or rows CRDT-synced
         // from a peer — come up within a few seconds instead of
-        // waiting for the next daemon restart. The subscriptions
-        // filter is captured once here; editing local.toml still
-        // needs a restart to take effect.
-        let local_cfg = crate::commands::space::subscriptions::load(&data_dir).unwrap_or_default();
+        // waiting for the next daemon restart. `local_cfg` (loaded
+        // above) is captured once; editing local.toml still needs a
+        // restart to take effect.
         let has_hyperspace = hyperspace.is_some();
+        // A pending invite is redeemed from the same tick: each pass,
+        // until the bootnode grants this node's key, re-parse the token
+        // and invoke the bootnode's `redeem_invite`; clear the marker on
+        // success. The joiner reaches redeem by remote invoke (ungated)
+        // before it can sync anything — the cert IS the auth.
+        let mut pending_token =
+            (!entry.pending_token.is_empty()).then(|| entry.pending_token.clone());
+        let space_id_hex = entry.id.clone();
+        let mut redeem_warned = false;
         let mut damped = std::collections::HashSet::new();
         let mut boot_grace = BootGrace::new();
         // Program-blob fetches in flight, shared with the background fetch
@@ -368,6 +344,26 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 return;
             }
             last_pass = std::time::Instant::now();
+            if let Some(tok) = pending_token.clone() {
+                match try_redeem(n, &data_dir, &tok) {
+                    Ok(true) => {
+                        pending_token = None;
+                        if let Err(e) = clear_pending_token(&space_id_hex) {
+                            tracing::warn!("clearing pending token from the index: {e}");
+                        }
+                        tracing::info!(
+                            "invite redeemed — node key granted; the grant syncs back on the next \
+                             FetchHeads",
+                        );
+                    }
+                    Ok(false) => {} // bootnode not reachable/ready yet — retry next pass
+                    Err(e) if !redeem_warned => {
+                        redeem_warned = true;
+                        tracing::warn!("redeem: {e}");
+                    }
+                    Err(e) => tracing::debug!("redeem: {e}"),
+                }
+            }
             match reconcile_installed_agents(
                 n,
                 &data_dir,
@@ -408,6 +404,348 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     if panics > 0 {
         anyhow::bail!("{panics} pvm panics");
+    }
+    Ok(())
+}
+
+/// Bounded per-attempt timeout for the redeem invoke — short so the
+/// router tick isn't stalled by a slow bootnode.
+const REDEEM_INVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+// ── Trivalent `up` positional (decision 1) ───────────────────────────
+
+/// Resolve `args.query` to the space lookup key, handling the recipe /
+/// token / name trivalent and stamping any pending token or manifest
+/// onto the index. `-` reads a token from stdin.
+fn resolve_up_target(args: &Args) -> anyhow::Result<String> {
+    let raw = if args.query == "-" {
+        read_token_stdin()?
+    } else {
+        args.query.clone()
+    };
+    // (a) recipe: an existing `.toml` path. File existence + extension is
+    //     unambiguous — a space name may not start with `vos1` and a
+    //     token is never a path.
+    if is_recipe_path(&raw) {
+        return resolve_recipe(&raw);
+    }
+    // (b) token: a `vos1…` string.
+    if raw.starts_with(crate::token::TOKEN_HRP) {
+        return resolve_token(&raw);
+    }
+    // (c) known name / id — the caller resolves it via `spaces_index::find`.
+    Ok(raw)
+}
+
+fn is_recipe_path(arg: &str) -> bool {
+    arg.ends_with(".toml") && Path::new(arg).is_file()
+}
+
+/// Read a `vos1…` token from stdin (`space up -`), keeping a bearer
+/// string out of argv / shell history.
+fn read_token_stdin() -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| anyhow::anyhow!("read token from stdin: {e}"))?;
+    let tok = buf.trim().to_string();
+    if tok.is_empty() {
+        anyhow::bail!("no token on stdin (`space up -` expects a vos1… token piped in)");
+    }
+    Ok(tok)
+}
+
+/// Recipe path: parse the recipe, scaffold genesis if its `space = …`
+/// name is unknown, stamp `pending_manifest` (+ any `hyperspace`) on the
+/// entry, and return the space name to boot.
+fn resolve_recipe(path: &str) -> anyhow::Result<String> {
+    let (manifest, _dir) = reconcile::parse_manifest_file(Path::new(path))?;
+    let name = manifest.space.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "recipe {path} has no top-level `space = \"…\"` — add one so `space up` knows which \
+             space to create or boot",
+        )
+    })?;
+    // Absolute so the genesis apply on the next tick re-reads it
+    // regardless of the daemon's cwd.
+    let abs = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| Path::new(path).to_path_buf())
+        .to_string_lossy()
+        .to_string();
+
+    if !spaces_index::load()?.spaces.iter().any(|e| e.name == name) {
+        crate::commands::space::new::scaffold(&name, None, None)?;
+        tracing::info!("created space '{name}' from recipe {path}");
+    }
+
+    let mut index = spaces_index::load()?;
+    let entry = index
+        .spaces
+        .iter_mut()
+        .find(|e| e.name == name)
+        .ok_or_else(|| anyhow::anyhow!("space '{name}' missing after scaffold"))?;
+    entry.pending_manifest = abs;
+    if let Some(hs) = &manifest.hyperspace
+        && !hs.is_empty()
+    {
+        entry.hyperspace = hs.clone();
+    }
+    spaces_index::save(&index)?;
+    Ok(name)
+}
+
+/// Token path: parse the invite, join-if-needed (scaffold the local data
+/// dir + node key + registry blob + index entry, taking `space_id` on
+/// trust — `space up` verifies genesis once synced), stamp
+/// `pending_token`, and return the space name.
+fn resolve_token(token_str: &str) -> anyhow::Result<String> {
+    let payload = crate::token::parse(token_str)?;
+    let space_id_hex = hex::encode(payload.space_id);
+
+    if !spaces_index::load()?
+        .spaces
+        .iter()
+        .any(|e| e.id == space_id_hex)
+    {
+        join_scaffold(&payload)?;
+        tracing::info!("joined space '{}' from invite token", payload.name);
+    }
+
+    let mut index = spaces_index::load()?;
+    let entry = index
+        .spaces
+        .iter_mut()
+        .find(|e| e.id == space_id_hex)
+        .ok_or_else(|| anyhow::anyhow!("space missing after join"))?;
+    entry.pending_token = token_str.to_string();
+    for b in &payload.bootnodes {
+        if !entry.bootnodes.contains(b) {
+            entry.bootnodes.push(b.clone());
+        }
+    }
+    let name = entry.name.clone();
+    spaces_index::save(&index)?;
+    Ok(name)
+}
+
+/// Lay out a joined space's local state from a parsed invite — mirrors
+/// the retired `space join`: a fresh per-space node key, the bundled
+/// registry blob cached under its hash, the data dir, and the index
+/// entry carrying the token's bootnodes.
+fn join_scaffold(payload: &crate::token::InvitePayload) -> anyhow::Result<()> {
+    let (registry_hash, _bytes, _label) =
+        crate::commands::space::new::resolve_registry_source(None)?;
+    let space_dir = crate::paths::space_dir(&payload.space_id);
+    if !space_dir.exists() {
+        std::fs::create_dir_all(&space_dir)?;
+        std::fs::create_dir_all(space_dir.join("agents"))?;
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let key_bytes = keypair
+            .to_protobuf_encoding()
+            .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
+        std::fs::write(space_dir.join("node.key"), key_bytes)?;
+    }
+    let mut index = spaces_index::load().unwrap_or_default();
+    let mut entry = spaces_index::entry_for(&payload.space_id, &payload.name);
+    entry.data_dir = space_dir.to_string_lossy().to_string();
+    entry.registry_hash = registry_hash.to_hex();
+    entry.bootnodes = payload.bootnodes.clone();
+    spaces_index::upsert(&mut index, entry);
+    spaces_index::save(&index)?;
+    Ok(())
+}
+
+// ── Genesis apply + node-local extension registration ────────────────
+
+/// Consume a pending recipe: install its agents into the in-process
+/// registry (replicated half) and project its node-local half into
+/// `local.toml`. `install_agents` tolerates already-present rows, so a
+/// re-run is a no-op; the caller clears `pending_manifest` after.
+fn genesis_apply(
+    node: &mut VosNode,
+    recipe_path: &str,
+    prefix: u16,
+    space_id: &[u8; 32],
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    let path = Path::new(recipe_path);
+    let (manifest, dir) = reconcile::parse_manifest_file(path)?;
+    reconcile::install_agents(node, &manifest, &dir, prefix, space_id)?;
+    let base = subscriptions::load(data_dir).unwrap_or_default();
+    let next = crate::commands::space::apply::project_node_local(&base, &manifest, &dir);
+    if next != base {
+        subscriptions::save(data_dir, &next)?;
+    }
+    tracing::info!("genesis apply of recipe {recipe_path} complete");
+    Ok(())
+}
+
+/// Register every `[[extension]]` recorded in `local.toml`, returning
+/// each one's effective relay caps for the endpoint descriptor. `.so`
+/// paths are stored absolute (by `apply` / genesis), so the base dir
+/// passed to `register_extension` is inert.
+fn register_extensions_from_local(
+    node: &mut VosNode,
+    cfg: &subscriptions::LocalConfig,
+    data_dir: &Path,
+    prefix: u16,
+) -> anyhow::Result<Vec<crate::commands::space::endpoint::ExtensionCaps>> {
+    use crate::commands::space::endpoint::ExtensionCaps;
+    if cfg.extensions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reg = RegistryRef::at(ServiceId::new(prefix, ServiceId::REGISTRY.local_id()));
+    let space_cap_policy = match cfg.cap_policy.as_deref() {
+        Some(s) => vos::extension::CapPolicy::parse(s),
+        None => vos::extension::CapPolicy::default(),
+    };
+    // Roster for named-intra_cap validation: every installed agent +
+    // every extension + the built-in registry.
+    let mut known_names: HashSet<String> = cfg
+        .extensions
+        .iter()
+        .map(|e| e.name.clone())
+        .chain(std::iter::once("space-registry".to_string()))
+        .collect();
+    if let Ok(agents) = vos::block_on(reg.agents(&mut &*node)) {
+        for a in agents {
+            known_names.insert(a.instance_name);
+        }
+    }
+    let mut caps = Vec::with_capacity(cfg.extensions.len());
+    for e in &cfg.extensions {
+        let ext_def = reconcile::ExtensionDef {
+            name: e.name.clone(),
+            path: e.path.clone(),
+            init: e.init.clone(),
+            cap_policy: e.cap_policy.clone(),
+            relay_unauthenticated: e.relay_unauthenticated,
+            intra_caps: e.intra_caps.clone(),
+            tick_ms: e.tick_ms,
+        };
+        let effective = reconcile::register_extension(
+            node,
+            &reg,
+            &ext_def,
+            data_dir,
+            prefix,
+            space_cap_policy,
+            &known_names,
+        )?;
+        caps.push(ExtensionCaps {
+            name: e.name.clone(),
+            caps: effective,
+        });
+    }
+    Ok(caps)
+}
+
+// ── Invite redemption (boot tick) ────────────────────────────────────
+
+/// A bounded-timeout [`Invoker`] over the running node — so a redeem
+/// attempt to a slow or vanished bootnode can't stall the router tick
+/// for the node's 10 s default.
+struct TimedNode<'a> {
+    node: &'a VosNode,
+    timeout: std::time::Duration,
+}
+
+impl Invoker for TimedNode<'_> {
+    fn invoke(
+        &mut self,
+        target: ServiceId,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<vos::value::Value, ClientError>> + '_ {
+        let outcome = self.node.invoke_with_timeout(target, payload, self.timeout);
+        async move {
+            match outcome {
+                Some(b) if b.is_empty() => Ok(vos::value::Value::Unit),
+                Some(b) => Ok(<vos::value::Value as vos::Decode>::decode(&b)),
+                None => Err(ClientError::Unreachable),
+            }
+        }
+    }
+}
+
+/// One redeem attempt: build the joiner's two signatures and invoke each
+/// connected peer's `redeem_invite` until one grants this node's key.
+/// `Ok(true)` = accepted (clear the pending token); `Ok(false)` = no
+/// peer answered `Ok` this pass (retry); `Err` = malformed token /
+/// unreadable key (warned once, then retried).
+fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Result<bool> {
+    let payload = crate::token::parse(token_str)?;
+
+    // Redemption grants the DAEMON's node key (not the operator CLI
+    // key) — the identity peers see on sync — so sign with node.key.
+    let key_bytes = std::fs::read(data_dir.join("node.key"))
+        .map_err(|e| anyhow::anyhow!("read node.key for redeem: {e}"))?;
+    let node_kp = libp2p::identity::Keypair::from_protobuf_encoding(&key_bytes)
+        .map_err(|e| anyhow::anyhow!("decode node.key: {e}"))?;
+    let node_peer_id = libp2p::PeerId::from(node_kp.public()).to_bytes();
+
+    // Both signatures cover the same canonical: the token secret proves
+    // possession, the node key proves control of the granted peer-id.
+    let redeem_sig = crate::token::redeem_sig(&payload, &node_peer_id)?.to_vec();
+    let redeem_canon =
+        vos::registry::canonical_op_bytes("redeem_invite", &[&payload.token_pub, &node_peer_id]);
+    let node_sig = node_kp
+        .sign(&redeem_canon)
+        .map_err(|e| anyhow::anyhow!("node_sig sign: {e}"))?;
+
+    let Some(net) = node.network() else {
+        return Ok(false);
+    };
+    let peers = net.connected_peers();
+    if peers.is_empty() {
+        return Ok(false);
+    }
+    for peer in peers {
+        let peer_prefix = vos::network::derive_node_prefix(&peer);
+        let reg = RegistryRef::at(ServiceId::new(peer_prefix, ServiceId::REGISTRY.local_id()));
+        let mut inv = TimedNode {
+            node,
+            timeout: REDEEM_INVOKE_TIMEOUT,
+        };
+        let status = vos::block_on(reg.redeem_invite(
+            &mut inv,
+            payload.token_pub.to_vec(),
+            payload.role,
+            payload.expires_at,
+            payload.admin_peer_id.clone(),
+            payload.admin_sig.to_vec(),
+            node_peer_id.clone(),
+            redeem_sig.clone(),
+            node_sig.clone(),
+        ));
+        match status {
+            Ok(Status::Ok) => return Ok(true),
+            Ok(other) => tracing::debug!("redeem via {peer}: {other}"),
+            Err(e) => tracing::debug!("redeem via {peer}: {e}"),
+        }
+    }
+    Ok(false)
+}
+
+/// Clear the `pending_token` marker on the space's index entry (by id)
+/// after a successful redemption.
+fn clear_pending_token(space_id_hex: &str) -> anyhow::Result<()> {
+    clear_pending(space_id_hex, |e| e.pending_token.clear())
+}
+
+/// Clear the `pending_manifest` marker after a one-shot genesis apply.
+fn clear_pending_manifest(space_id_hex: &str) -> anyhow::Result<()> {
+    clear_pending(space_id_hex, |e| e.pending_manifest.clear())
+}
+
+fn clear_pending(
+    space_id_hex: &str,
+    clear: impl FnOnce(&mut spaces_index::SpaceEntry),
+) -> anyhow::Result<()> {
+    let mut index = spaces_index::load()?;
+    if let Some(entry) = index.spaces.iter_mut().find(|e| e.id == space_id_hex) {
+        clear(entry);
+        spaces_index::save(&index)?;
     }
     Ok(())
 }
@@ -495,35 +833,35 @@ struct AgentLocalPolicy {
 
 type AgentPolicies = std::collections::BTreeMap<String, AgentLocalPolicy>;
 
-/// Collect the `tick_ms` / `intra_caps` policy for each manifest agent. Parses
-/// the `intra_caps` strings eagerly so a malformed cap fails the boot.
-fn collect_agent_policies(
-    manifest: Option<&crate::commands::space::reconcile::Manifest>,
-) -> anyhow::Result<AgentPolicies> {
+/// Collect the `tick_ms` / `intra_caps` policy for each agent from
+/// `local.toml`. Parses the `intra_caps` strings eagerly so a malformed
+/// cap fails the boot (like the extension path).
+fn agent_policies_from_local(cfg: &subscriptions::LocalConfig) -> anyhow::Result<AgentPolicies> {
     let mut map = AgentPolicies::new();
-    let Some(m) = manifest else {
-        return Ok(map);
-    };
-    for a in &m.agents {
+    for (name, a) in &cfg.agents {
         let mut intra_caps = Vec::with_capacity(a.intra_caps.len());
         for tok in &a.intra_caps {
             intra_caps.push(
                 vos::IntraCap::parse(tok)
-                    .map_err(|e| anyhow::anyhow!("agent '{}': intra_cap '{tok}': {e}", a.name))?,
+                    .map_err(|e| anyhow::anyhow!("agent '{name}': intra_cap '{tok}': {e}"))?,
             );
         }
         let tick_ms = a.tick_ms.filter(|ms| *ms > 0);
         if tick_ms.is_some() || !intra_caps.is_empty() {
-            map.insert(
-                a.name.clone(),
-                AgentLocalPolicy {
-                    tick_ms,
-                    intra_caps,
-                },
-            );
+            map.insert(name.clone(), AgentLocalPolicy { tick_ms, intra_caps });
         }
     }
     Ok(map)
+}
+
+/// The instance names flagged `device_secret = true` in `local.toml` —
+/// each gets a node-local CSPRNG seed provisioned post-spawn.
+fn device_secret_agents_from_local(cfg: &subscriptions::LocalConfig) -> Vec<String> {
+    cfg.agents
+        .iter()
+        .filter(|(_, a)| a.device_secret)
+        .map(|(n, _)| n.clone())
+        .collect()
 }
 
 /// Provision each `device_secret = true` agent with a node-local CSPRNG seed
@@ -1628,6 +1966,68 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
 mod tests {
     use super::*;
     use vos::network::{RaftRole, RaftStatusReply};
+
+    #[test]
+    fn agent_policies_come_from_local_toml() {
+        // Node-local policy is now sourced from local.toml, not the
+        // manifest — the fix for the bare-restart drop. A bare agent
+        // (no tick_ms / caps) gets no policy entry; the malformed-cap
+        // case fails the boot.
+        let mut cfg = subscriptions::LocalConfig::default();
+        cfg.agents.insert(
+            "ticker".into(),
+            subscriptions::AgentLocal {
+                tick_ms: Some(250),
+                intra_caps: vec!["space-registry:member".into()],
+                device_secret: true,
+            },
+        );
+        cfg.agents.insert(
+            "plain".into(),
+            subscriptions::AgentLocal {
+                tick_ms: Some(0), // 0 = off → no policy
+                intra_caps: vec![],
+                device_secret: false,
+            },
+        );
+        let policies = agent_policies_from_local(&cfg).unwrap();
+        assert!(policies.contains_key("ticker"));
+        assert_eq!(policies["ticker"].tick_ms, Some(250));
+        assert_eq!(policies["ticker"].intra_caps.len(), 1);
+        assert!(!policies.contains_key("plain"), "tick_ms=0 → no policy");
+
+        let seeds = device_secret_agents_from_local(&cfg);
+        assert_eq!(seeds, vec!["ticker".to_string()]);
+
+        // A malformed intra_cap fails the boot rather than silently
+        // dropping an authority bound.
+        cfg.agents.insert(
+            "bad".into(),
+            subscriptions::AgentLocal {
+                tick_ms: None,
+                intra_caps: vec!["not a valid cap token !!".into()],
+                device_secret: false,
+            },
+        );
+        assert!(agent_policies_from_local(&cfg).is_err());
+    }
+
+    #[test]
+    fn recipe_path_detection_requires_an_existing_toml() {
+        // Trivalent disambiguation (decision 1): a `.toml` path is a
+        // recipe only if it exists; a nonexistent path or a bare name
+        // is not.
+        assert!(!is_recipe_path("some-space-name"));
+        assert!(!is_recipe_path("/does/not/exist.toml"));
+        let dir = std::env::temp_dir().join(format!("vosx-recipe-detect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = dir.join("r.toml");
+        std::fs::write(&recipe, "space = \"x\"\n").unwrap();
+        assert!(is_recipe_path(recipe.to_str().unwrap()));
+        // A `vos1…` token is never mistaken for a recipe.
+        assert!(!is_recipe_path("vos1abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn status(role: RaftRole, members: Vec<u16>, leader_hint: Option<u16>) -> RaftStatusReply {
         RaftStatusReply {
