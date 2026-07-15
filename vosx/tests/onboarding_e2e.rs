@@ -1,0 +1,225 @@
+//! Onboarding end-to-end: `space up <token>` join + redeem + sync.
+//!
+//! The point of the whole onboarding plan: getting a second node into a
+//! space is one command with one argument. This test drives the real
+//! two-daemon path with the bundled registry (no riscv actor build
+//! needed):
+//!
+//!   host A: `space new` → `space up` → `space invite --role member`
+//!   host B: `space up <token>`  (join-if-needed + auto-redeem)
+//!
+//! and asserts the two properties that make the wave work:
+//!
+//! 1. B's redeem loop reaches A and A records the redemption — A's
+//!    `space members` grows an `# invites` section (an InviteRow is
+//!    written only by the `redeem_invite` handler, so its mere presence
+//!    proves the delegated-grant chain verified on A).
+//! 2. B syncs A's registry — which now serves at the MEMBER floor
+//!    (decision 9). B started with an empty registry, so the genesis
+//!    ADMIN grant showing up in B's `space role list` can only have
+//!    arrived by a Member-gated `FetchHeads` that A served *because* the
+//!    redemption granted B's node key. This is the bootstrap the flip
+//!    depends on: redeem-first (ungated invoke) → grant → sync.
+
+#![cfg(unix)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+use std::{fs, thread};
+
+fn vosx_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_vosx"))
+}
+
+struct TempDir(PathBuf);
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        p.push(format!("vosx-onb-{}-{}-{}", std::process::id(), label, nanos));
+        fs::create_dir_all(&p).expect("create tmpdir");
+        TempDir(p)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("TempDir kept for debugging: {}", self.0.display());
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A running daemon; SIGKILLed on drop so a failed assertion doesn't
+/// leak the process.
+struct Daemon(Child);
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn find_endpoint(root: &Path) -> Option<PathBuf> {
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir()
+            && let Some(found) = find_endpoint(&p)
+        {
+            return Some(found);
+        } else if p.file_name().and_then(|f| f.to_str()) == Some(".endpoint") {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Run a one-shot `vosx` client command against a config/data home.
+fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
+    Command::new(vosx_bin())
+        .args(args)
+        .env("XDG_DATA_HOME", data_home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("VOSX_DISABLE_MDNS", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vosx")
+}
+
+/// Spawn a long-running `space up <arg>` daemon, logging to a file.
+fn spawn_up(data_home: &Path, config_home: &Path, arg: &str, log_path: &Path) -> Child {
+    let log_file = fs::File::create(log_path).expect("create log");
+    Command::new(vosx_bin())
+        .args(["space", "up", arg])
+        .env("XDG_DATA_HOME", data_home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("RUST_LOG", "info")
+        .env("VOSX_DISABLE_MDNS", "1")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(log_file)
+        .spawn()
+        .expect("spawn vosx space up")
+}
+
+fn wait_for_endpoint(data_home: &Path, log_path: &Path, who: &str) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(p) = find_endpoint(data_home) {
+            return p;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "daemon {who} didn't write an endpoint within 15s — log:\n{}",
+                fs::read_to_string(log_path).unwrap_or_default(),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Poll `f` until it returns true or the deadline elapses; panic with
+/// `msg` (and the daemon logs) on timeout.
+fn poll_until(secs: u64, mut f: impl FnMut() -> bool, on_fail: impl FnOnce() -> String) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if f() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("{}", on_fail());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[test]
+fn onboarding_via_token_redeems_and_syncs_member_gated_registry() {
+    let data_a = TempDir::new("a-data");
+    let cfg_a = TempDir::new("a-config");
+    let data_b = TempDir::new("b-data");
+    let cfg_b = TempDir::new("b-config");
+    let space = "onb";
+
+    // ── host A: create + boot ──────────────────────────────────────
+    let new = vosx(data_a.path(), cfg_a.path(), &["space", "new", "--name", space]);
+    assert!(
+        new.status.success(),
+        "space new failed: {}",
+        String::from_utf8_lossy(&new.stderr),
+    );
+    let log_a = data_a.path().join("daemon-a.stderr");
+    let _daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
+    wait_for_endpoint(data_a.path(), &log_a, "A");
+
+    // ── host A: mint a member invite (default bootnodes = A's addrs) ─
+    let invite = vosx(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "invite", space, "--role", "member"],
+    );
+    assert!(
+        invite.status.success(),
+        "space invite failed: {}",
+        String::from_utf8_lossy(&invite.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&invite.stdout);
+    let token = stdout
+        .lines()
+        .next()
+        .expect("invite prints the token first")
+        .trim()
+        .to_string();
+    assert!(token.starts_with("vos1"), "expected a vos1… token, got: {token}");
+
+    // ── host B: literally `space up <token>` — join + redeem + sync ─
+    let log_b = data_b.path().join("daemon-b.stderr");
+    let _daemon_b = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
+    wait_for_endpoint(data_b.path(), &log_b, "B");
+
+    // (1) Redemption reaches A: an `# invites` section appears in A's
+    //     members only once the `redeem_invite` handler records the row.
+    poll_until(
+        40,
+        || {
+            let o = vosx(data_a.path(), cfg_a.path(), &["space", "members", space]);
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("# invites")
+        },
+        || {
+            format!(
+                "A never recorded the redemption (no `# invites` in `space members`) — \
+                 the redeem loop didn't reach A. B log:\n{}\nA log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+
+    // (2) B synced A's MEMBER-gated registry: B started empty, so the
+    //     genesis ADMIN grant in B's role list arrived only via a
+    //     Member-gated FetchHeads A served because the redemption
+    //     granted B's node key. This is the flip working.
+    poll_until(
+        40,
+        || {
+            let o = vosx(data_b.path(), cfg_b.path(), &["space", "role", space, "list"]);
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("admin")
+        },
+        || {
+            format!(
+                "B never synced A's Member-gated registry (no admin grant in B's `space role \
+                 list`) — either the redeem didn't grant B's node key, or the Member floor \
+                 refused B's sync. B log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+            )
+        },
+    );
+}

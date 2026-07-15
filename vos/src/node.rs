@@ -1370,20 +1370,19 @@ impl NodeService {
         use crate::registry::SyncFloor;
         match name {
             "" => return SyncFloor::Public,
-            // The space registry stays PUBLIC until the redeem flow lands
-            // (wave 3). A `Member` registry deadlocks bootstrap: a joiner
-            // must sync the registry to LEARN its own grant, but a `Member`
-            // gate would refuse it until it is already a member. The
-            // ordering note in the plan resolves this by having the joiner
-            // redeem (an ungated remote invoke) FIRST — which grants its
-            // NODE key (the sync identity) — before it syncs. Until
-            // `redeem_invite` is wired into `space up`, the old join flow
-            // grants the OPERATOR (not the node) and enrolls the node only
-            // later, so flipping the registry to `Member` now breaks the
-            // join → sync → learn-grant order. Registry metadata is
-            // non-secret, so `Public` is safe in the interim; the flip
-            // rides with wave 3.
-            REGISTRY_AGENT_NAME => return SyncFloor::Public,
+            // The space registry serves at MEMBER (decision 9): its state
+            // is served only to a caller the serving node's registry knows
+            // as a member (a role grant ≥ READONLY, or an enrolled node).
+            // The bootstrap ordering that makes this non-deadlocking: a
+            // fresh joiner reaches `redeem_invite` by an ungated remote
+            // invoke BEFORE it can sync anything — that grants its NODE key
+            // (the sync identity) on the serving node, so its next
+            // `FetchHeads` passes this gate. `space up <token>` wires the
+            // redeem loop; the grant is checked on the SERVING side, so a
+            // joiner's own empty registry is irrelevant.
+            REGISTRY_AGENT_NAME => return SyncFloor::Member,
+            // The hyperspace (federation) registry stays PUBLIC — it is the
+            // separate-trust cross-space surface, deliberately ungated.
             HYPERSPACE_REGISTRY_AGENT_NAME => return SyncFloor::Public,
             _ => {}
         }
