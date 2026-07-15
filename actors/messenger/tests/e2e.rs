@@ -1,15 +1,24 @@
 //! End-to-end: two real `vosx` daemons in one space exchange
 //! E2E-encrypted messages through the replicated channel actors.
 //!
-//!   host A: `space new` → `space up` (msg-general-{log,ctl} +
-//!           messenger) → register alice → create channel →
-//!           send a pre-invite message
-//!   host B: `space join` (dials A) → `space up` → register bob →
-//!           mint a KeyPackage
+//!   host A: `space new --manifest` → `space up` (genesis-applies the
+//!           recipe: msg-general-{log,ctl} + messenger) → mint a member
+//!           invite → register alice → create channel → send a
+//!           pre-invite message
+//!   host B: `space up <token>` (join + redeem + sync A's registry —
+//!           no per-node manifest) → register bob → mint a KeyPackage
 //!   host A: grant B's operator the member tier → invite bob with
 //!           the KeyPackage
 //!   host B: tick picks the Welcome off the commit chain → joins →
 //!           both sides exchange messages
+//!
+//! KNOWN BLOCK (pre-existing, orthogonal to onboarding): the messenger's
+//! `.vos_meta` (~4.3 KiB) exceeds the registry guest's FETCH buffer
+//! (4 KiB), so `register_meta` is refused at genesis apply and schema
+//! coercion is disabled — channel creation then fails. Raising the guest
+//! buffer (a guest-ELF rebuild + voucher re-pin) is tracked separately;
+//! this test's onboarding uses the current token/redeem flow so it is
+//! ready to pass once that lands.
 //!
 //! The assertions that matter:
 //!   1. plaintext round-trips both directions across two processes
@@ -210,18 +219,20 @@ intra_caps = ["msg-*:member", "space-registry:admin"]
     manifest_path
 }
 
+/// Boot a daemon: `space up <arg>` where `arg` is the space name (host
+/// A, which genesis-applies the recipe banked by `space new --manifest`)
+/// or a `vos1…` invite token (host B, which joins + redeems + syncs).
 fn spawn_up(
     data_home: &TempDir,
     config_home: &TempDir,
     cache_home: &TempDir,
-    manifest: &Path,
+    up_arg: &str,
     connect: Option<&str>,
     log_path: &Path,
 ) -> Child {
     let log_file = fs::File::create(log_path).expect("create daemon log");
     let mut cmd = Command::new(vosx_bin());
-    cmd.args(["space", "up", SPACE_NAME, "--manifest"])
-        .arg(manifest);
+    cmd.args(["space", "up", up_arg]);
     if let Some(bootnode) = connect {
         cmd.args(["--connect", bootnode]);
     }
@@ -272,23 +283,18 @@ fn resolve_space_data_dir(config_home: &Path) -> PathBuf {
     panic!("space '{SPACE_NAME}' not in spaces.toml");
 }
 
-fn space_id(config_home: &Path) -> String {
-    let raw = fs::read_to_string(config_home.join("vosx").join("spaces.toml"))
-        .expect("read spaces.toml for id");
-    raw.lines()
-        .find_map(|l| l.trim().strip_prefix("id = "))
-        .map(|v| v.trim().trim_matches('"').to_string())
-        .expect("spaces.toml should carry the space id")
-}
-
 /// Boot host A: create the space and bring the daemon up.
 fn boot_creator() -> Daemon {
     let data_home = TempDir::new("a-data");
     let config_home = TempDir::new("a-config");
     let cache_home = TempDir::new("a-cache");
 
+    // Bank the recipe at `new`; the first `space up` genesis-applies it
+    // (installs the msg-* agents into the registry).
+    let manifest = write_manifest(config_home.path());
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", SPACE_NAME])
+        .args(["space", "new", "--name", SPACE_NAME, "--manifest"])
+        .arg(&manifest)
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("XDG_CACHE_HOME", cache_home.path())
@@ -301,16 +307,8 @@ fn boot_creator() -> Daemon {
         String::from_utf8_lossy(&new.stderr)
     );
 
-    let manifest = write_manifest(config_home.path());
     let log_path = data_home.path().join("daemon.stderr");
-    let child = spawn_up(
-        &data_home,
-        &config_home,
-        &cache_home,
-        &manifest,
-        None,
-        &log_path,
-    );
+    let child = spawn_up(&data_home, &config_home, &cache_home, SPACE_NAME, None, &log_path);
     let space_data_dir = resolve_space_data_dir(config_home.path());
     wait_endpoint(&space_data_dir, &log_path);
     Daemon {
@@ -323,41 +321,20 @@ fn boot_creator() -> Daemon {
     }
 }
 
-/// Boot host B: join A's space over libp2p and bring a second
-/// daemon up against it.
-fn boot_joiner(bootnode: &str, id: &str) -> Daemon {
+/// Boot host B: `space up <token>` joins A's space, redeems the invite
+/// (granting B's node key), and syncs the catalog — B installs no
+/// manifest of its own; the msg-* agents replicate from A's registry.
+fn boot_joiner(token: &str, bootnode: &str) -> Daemon {
     let data_home = TempDir::new("b-data");
     let config_home = TempDir::new("b-config");
     let cache_home = TempDir::new("b-cache");
 
-    let join = Command::new(vosx_bin())
-        .args([
-            "space",
-            "join",
-            &format!("{id}@{bootnode}"),
-            "--name",
-            SPACE_NAME,
-        ])
-        .env("XDG_DATA_HOME", data_home.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .env("XDG_CACHE_HOME", cache_home.path())
-        .env("VOSX_DISABLE_MDNS", "1")
-        .output()
-        .expect("spawn vosx space join");
-    assert!(
-        join.status.success(),
-        "vosx space join failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&join.stdout),
-        String::from_utf8_lossy(&join.stderr)
-    );
-
-    let manifest = write_manifest(config_home.path());
     let log_path = data_home.path().join("daemon.stderr");
     let child = spawn_up(
         &data_home,
         &config_home,
         &cache_home,
-        &manifest,
+        token,
         Some(bootnode),
         &log_path,
     );
@@ -636,7 +613,19 @@ fn two_nodes_exchange_e2ee_messages() {
         ep_a.multiaddrs.first().expect("A listens"),
         ep_a.peer_id
     );
-    let id = space_id(a.config_home.path());
+    // Mint a member invite for B (embeds A's bootnode). B redeems it via
+    // `space up <token>` — no `space join`, no per-node manifest.
+    let invite_out = run_cli(
+        &a,
+        &["space", "invite", SPACE_NAME, "--role", "member", "--bootnode", &bootnode],
+        "mint member invite",
+    );
+    let token = invite_out
+        .lines()
+        .find(|l| l.trim().starts_with("vos1"))
+        .expect("space invite prints a vos1… token")
+        .trim()
+        .to_string();
 
     let out = messenger(&a, &["register", "nickname=alice"], "alice register");
     assert!(
@@ -650,8 +639,8 @@ fn two_nodes_exchange_e2ee_messages() {
         "alice pre-join send",
     );
 
-    // ── Host B joins the space. ─────────────────────────────────
-    let b = boot_joiner(&bootnode, &id);
+    // ── Host B joins the space via the invite token. ────────────
+    let b = boot_joiner(&token, &bootnode);
 
     // B's operator starts as Guest; A (admin) grants the member
     // tier so B's relayed posts clear the actors' role gates. The

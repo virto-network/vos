@@ -115,7 +115,7 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
                 "no schema registered for '{instance}'. The agent's \
                  program was likely installed before vosx started \
                  forwarding `.vos_meta` to the registry — \
-                 re-`vosx space up --manifest` will refresh it."
+                 `vosx space apply <space> <recipe>` will refresh it."
             ));
         }
         let meta = decode(&blob).ok_or_else(|| {

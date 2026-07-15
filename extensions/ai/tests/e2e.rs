@@ -6,8 +6,8 @@
 //!
 //! What this exercises:
 //!
-//! 1. `vosx space new` + `space up` with the AI extension loaded
-//!    from the manifest.
+//! 1. `vosx space new` + `space up <recipe>` genesis-applies the recipe,
+//!    loading the AI extension.
 //! 2. A `vosx ai generate` invoke through the CLI.
 //! 3. The dispatch sidecar's lazy-load path: model files are
 //!    fetched on the first call into the test's tempdir cache.
@@ -178,8 +178,11 @@ fn boot_daemon() -> Daemon {
 
     let log_path = data_home.path().join("daemon.stderr");
     let log_file = fs::File::create(&log_path).expect("create daemon stderr log");
+    // The trivalent positional detects the .toml recipe, finds the
+    // just-created `ai-e2e` space, and genesis-applies it on first boot
+    // (registers the AI extension from local.toml).
     let child = Command::new(vosx_bin())
-        .args(["space", "up", space_name, "--manifest"])
+        .args(["space", "up"])
         .arg(&manifest)
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())

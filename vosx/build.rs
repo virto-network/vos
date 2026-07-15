@@ -1,5 +1,5 @@
 //! Bundles the pre-built space-registry actor ELF into the vosx
-//! binary so `space new` / `space join` work out of the box
+//! binary so `space new` / `space up <token>` work out of the box
 //! without `--registry`.
 //!
 //! Two source paths, tried in order:
@@ -34,7 +34,7 @@ fn main() {
         "space_registry.elf",
         "bundled_registry.elf",
         "VOSX_BUNDLED_REGISTRY_ELF",
-        "`space new`/`space join` will require --registry",
+        "`space new`/`space up <token>` will require --registry",
         "cd actors/space-registry && cargo actor",
     );
 

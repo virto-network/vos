@@ -12,8 +12,8 @@
 //! private command channel as the actor-runtime senders. Keeping
 //! them in a separate file makes the layering visible: anyone reading
 //! `mod.rs` sees the actor-runtime API; anyone reading `ops.rs` sees
-//! the senders an operator tool (`vosx space join`, future cluster-
-//! status reporters) uses to drive a cluster from the outside.
+//! the senders an operator tool (`vosx space up <token>`, future
+//! cluster-status reporters) uses to drive a cluster from the outside.
 
 use std::sync::mpsc as std_mpsc;
 
@@ -52,9 +52,9 @@ impl Network {
     /// Send a [`Frame::ManifestReq`] to a bootnode. On transport
     /// failure the Sender is dropped.
     ///
-    /// Operator-only: invoked by `vosx join` when the operator
-    /// hasn't supplied `--manifest`. The PVM-actor runtime never
-    /// originates this — it has its own copy.
+    /// Operator-only: invoked by a joining node (`vosx space up
+    /// <token>`) when the operator hasn't supplied `--manifest`. The
+    /// PVM-actor runtime never originates this — it has its own copy.
     ///
     /// [`Frame::ManifestReq`]: super::Frame::ManifestReq
     pub fn send_manifest_req(&self, target_peer: PeerId) -> std_mpsc::Receiver<ManifestReply> {

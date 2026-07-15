@@ -34,11 +34,6 @@
 //! signing-side ed25519 dependency reaches vosx (the verifier's
 //! `ed25519-dalek` stays in the actor crate).
 
-// The public codec API (`mint`/`parse`/`redeem_sig`/`parse_duration`) is
-// wired into the `space invite`/`space up` commands in wave 3; until
-// then it is exercised only by this module's tests.
-#![allow(dead_code)]
-
 use anyhow::{Context, anyhow};
 use libp2p::identity::Keypair;
 use vos::registry::{OP_SIG_LEN, canonical_op_bytes, ed25519_pubkey_from_peer_id};

@@ -276,11 +276,11 @@ pub trait NetworkService: Send + Sync {
         None
     }
 
-    /// Inbound `Frame::ManifestReq` from a fresh `vosx space join`er.
-    /// Default returns `None` (no manifest exposed) — the joiner
-    /// then bails with a clear error and falls back to
-    /// `--manifest <path>`. `vosx space up` overrides this to serve the
-    /// space.toml + actor blobs verbatim.
+    /// Inbound `Frame::ManifestReq` from a fresh joining node
+    /// (`vosx space up <token>`). Default returns `None` (no manifest
+    /// exposed) — the joiner then bails with a clear error and falls
+    /// back to `--manifest <path>`. `vosx space up` overrides this to
+    /// serve the space.toml + actor blobs verbatim.
     fn manifest(&self) -> Option<ManifestReply> {
         None
     }
@@ -742,7 +742,7 @@ impl Network {
 
     // Operator-tooling senders (manifest fetch, raft join, raft
     // status) live in the `ops` submodule — they're driven by
-    // CLI tools (`vosx space join`, cluster-status reporters),
+    // CLI tools (`vosx space up <token>`, cluster-status reporters),
     // never by the PVM-actor runtime.
     // See `vos/src/network/ops.rs`.
 

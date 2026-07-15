@@ -102,7 +102,7 @@ pub fn blob_cache_dir() -> PathBuf {
 }
 
 /// Known-spaces index: TOML file listing every space the user
-/// has interacted with — fed by `space new` / `space join`,
+/// has interacted with — fed by `space new` / `space up <token>`,
 /// read by `space list`.
 pub fn spaces_index_path() -> PathBuf {
     config_root().join("spaces.toml")

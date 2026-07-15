@@ -3,7 +3,7 @@
 //! pipeline through the same wire path an agent would use:
 //!
 //!   `vosx space new` →
-//!   `vosx space up --manifest <with dev extension>` →
+//!   `vosx space up <recipe with dev extension>` →
 //!   `vosx space publish --bundled dev-project` + `space install …` →
 //!   test-client: put_blob(counter source) + commit on `main` →
 //!   `vosx dev compile project_id=… commit=…` (dynamic) →
@@ -133,7 +133,6 @@ struct Daemon {
     child: Option<Child>,
     data_home: TempDir,
     config_home: TempDir,
-    manifest: PathBuf,
     space_name: String,
     space_data_dir: PathBuf,
 }
@@ -143,10 +142,13 @@ impl Daemon {
         &self.space_data_dir
     }
 
-    /// Stop + restart the daemon process against the same
-    /// space + manifest. For tests that assert state survives a
-    /// full daemon cycle (CRDT-restored actor state, re-spawned
-    /// agent threads).
+    /// Stop + restart the daemon process against the same space.
+    /// The recipe was consumed by the genesis apply on first boot,
+    /// so a restart re-boots from the registry + local.toml (no
+    /// manifest re-apply) and re-registers the dev extension from
+    /// local.toml. For tests that assert state survives a full
+    /// daemon cycle (CRDT-restored actor state, re-spawned agent
+    /// threads).
     fn restart(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -162,8 +164,7 @@ impl Daemon {
             .open(&log_path)
             .expect("reopen daemon log");
         let child = Command::new(vosx_bin())
-            .args(["space", "up", &self.space_name, "--manifest"])
-            .arg(&self.manifest)
+            .args(["space", "up", &self.space_name])
             .env("XDG_DATA_HOME", self.data_home.path())
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .env("RUST_LOG", "info")
@@ -221,12 +222,16 @@ fn boot_daemon() -> Daemon {
     // 2. Synthesise a manifest that loads the dev extension.
     let manifest = write_manifest(config_home.path());
 
-    // 3. `vosx space up <name> --manifest <path>`. Stderr to file
-    //    so a failed boot is inspectable without straddling a pipe.
+    // 3. `vosx space up <recipe>` — the trivalent positional detects
+    //    the .toml recipe, finds the just-created space (the recipe's
+    //    `space = "dev-e2e"`), and genesis-applies it on first boot
+    //    (installs agents + registers the dev extension from local.toml).
+    //    Stderr to file so a failed boot is inspectable without
+    //    straddling a pipe.
     let log_path = data_home.path().join("daemon.stderr");
     let log_file = fs::File::create(&log_path).expect("create daemon stderr log");
     let child = Command::new(vosx_bin())
-        .args(["space", "up", space_name, "--manifest"])
+        .args(["space", "up"])
         .arg(&manifest)
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
@@ -249,7 +254,6 @@ fn boot_daemon() -> Daemon {
                 child: Some(child),
                 data_home,
                 config_home,
-                manifest,
                 space_name: space_name.to_string(),
                 space_data_dir,
             };

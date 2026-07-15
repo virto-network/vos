@@ -1,8 +1,11 @@
-//! Manifest → registry reconciliation.
+//! Recipe → registry reconciliation.
 //!
-//! `space up --manifest <path>` reads a TOML, walks every
-//! `[[agent]]` (and nested `actors` children), and ensures
-//! the registry catalog reflects what the manifest declares:
+//! The recipe parser and in-process genesis installer. Reads a
+//! recipe TOML, walks every `[[agent]]` (and nested `actors`
+//! children), and ensures the registry catalog reflects what the
+//! recipe declares. Consumed by `space apply` (against a running
+//! space) and by the genesis apply that runs on a space's first
+//! `space up`:
 //!
 //! - Each `path = "…"` ELF gets blob-cached and published as
 //!   `<name>:manifest` if not already in the catalog.

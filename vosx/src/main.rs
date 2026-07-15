@@ -11,8 +11,10 @@
 //! template; `space up` boots the registry-driven daemon)
 //! and the registry-as-truth model supersedes the
 //! manifest-as-truth model that originally drove them.
-//! `space up --manifest <path>` (declarative reconciliation
-//! of a manifest into a space's registry) is a future addition.
+//! A recipe is applied into a space's registry either at
+//! genesis — `space new --manifest <recipe>` or the one-shot
+//! `space up <recipe.toml>` on a space's first boot — or via
+//! `space apply` against an already-running space.
 
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;

@@ -3,7 +3,7 @@
 //! Two actors get bundled today:
 //!
 //! - **space-registry**: per-space program/agent/member catalog.
-//!   Required for every `vosx space new` / `space join`; without it
+//!   Required for every `vosx space new` / `space up <token>`; without it
 //!   those commands have to take a `--registry` source explicitly.
 //! - **dev-project**: per-project content-addressed object store +
 //!   commit DAG. Backing actor for the dev extension's compile /

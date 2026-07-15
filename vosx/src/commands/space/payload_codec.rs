@@ -2,9 +2,9 @@
 //!
 //! The registry stores a single `Vec<u8>` per agent for any
 //! one-shot messages we should dispatch on cold start (set by
-//! `space up --manifest`'s reconciler from a manifest's
-//! `[[agent.on_start]]` table). On the wire the natural shape
-//! is `Vec<Vec<u8>>`, so we rkyv-encode that and unpack it on
+//! the recipe reconciler — `space apply` or genesis apply — from
+//! a recipe's `[[agent.on_start]]` table). On the wire the natural
+//! shape is `Vec<Vec<u8>>`, so we rkyv-encode that and unpack it on
 //! the daemon side.
 //!
 //! Convention: empty input ⇔ empty bytes. The registry treats
