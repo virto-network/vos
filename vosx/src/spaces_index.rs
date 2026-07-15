@@ -1,7 +1,7 @@
 //! `~/.config/vosx/spaces.toml` — the user's known-spaces index.
 //!
 //! One entry per space the user has created or joined. Read by
-//! `space list`, written by `space new` / `space join`. Lives in
+//! `space list`, written by `space new` / `space up <token>`. Lives in
 //! `$XDG_CONFIG_HOME` so it follows the user across machines that
 //! sync configs (it's metadata, not data — the per-space agent
 //! redbs in `data_root()` are the substantive state).
@@ -37,8 +37,9 @@ pub struct SpaceEntry {
     /// space has been initialized.
     #[serde(default)]
     pub registry_hash: String,
-    /// libp2p multiaddrs to dial on `space up`. Set by
-    /// `space join`; `space new` leaves it empty.
+    /// libp2p multiaddrs to dial on `space up`. Set by `space up
+    /// <token>` (join-if-needed, from the token's bootnodes); `space
+    /// new` leaves it empty.
     #[serde(default)]
     pub bootnodes: Vec<String>,
     /// Hyperspace (federation) name this space belongs to, if any.

@@ -39,6 +39,9 @@ pub struct Args {
     pub name: String,
     pub registry: Option<String>,
     pub data_dir: Option<PathBuf>,
+    /// Recipe TOML recorded as `pending_manifest` — applied once on the
+    /// space's first `space up` (a one-shot genesis apply).
+    pub manifest: Option<PathBuf>,
 }
 
 /// The result of scaffolding a fresh space — the index entry (already
@@ -54,6 +57,22 @@ pub(crate) struct Scaffolded {
 
 pub fn run(args: Args) -> anyhow::Result<()> {
     let s = scaffold(&args.name, args.registry.as_deref(), args.data_dir)?;
+
+    // Record a pending recipe so the first `space up` genesis-applies it
+    // (agents → registry, node-local → local.toml). Absolute so the boot
+    // re-reads it regardless of cwd.
+    if let Some(manifest) = &args.manifest {
+        let abs = std::fs::canonicalize(manifest)
+            .unwrap_or_else(|_| manifest.clone())
+            .to_string_lossy()
+            .to_string();
+        let mut index = spaces_index::load()?;
+        if let Some(entry) = index.spaces.iter_mut().find(|e| e.id == s.entry.id) {
+            entry.pending_manifest = abs;
+            spaces_index::save(&index)?;
+        }
+    }
+
     let space_id_hex = s.entry.id.clone();
     if output::is_json() {
         output::print_json(&CreatedView {

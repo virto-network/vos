@@ -3,9 +3,10 @@
 //!
 //! Three groups of commands:
 //!
-//! - **Offline**: `new`, `list`, `info`, `join`, `delete`,
-//!   `export` (read-only). Operate on `~/.config/vosx/spaces.toml`
-//!   and per-space data dirs without contacting a daemon.
+//! - **Offline**: `new`, `list`, `info`, `delete`, `export`
+//!   (read-only). Operate on `~/.config/vosx/spaces.toml` and
+//!   per-space data dirs without contacting a daemon. Joining a
+//!   remote space is folded into `space up <token>`.
 //! - **Daemon**: `up` runs the libp2p server that owns the
 //!   redb. One daemon per space, identified by an
 //!   `<data_dir>/.endpoint` file.
@@ -32,7 +33,7 @@ pub mod export;
 pub mod forget;
 pub mod info;
 pub mod install;
-pub mod join;
+pub mod invite;
 pub mod list;
 pub mod members;
 pub mod new;
@@ -73,6 +74,11 @@ pub enum SpaceCommand {
         /// `~/.local/share/vosx/<space_id>`).
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
+        /// Optional recipe TOML to apply on the space's first `space
+        /// up` (records it as a pending manifest — a one-shot genesis
+        /// apply, not a boot-time reconcile).
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<PathBuf>,
     },
     /// List spaces in the local index.
     List,
@@ -81,27 +87,23 @@ pub enum SpaceCommand {
         /// Space id (full hex) or name.
         space: String,
     },
-    /// Join a remote space — register it locally so
-    /// `space up` can dial the bootnode and start syncing.
-    Join {
-        /// `<space-id>@<bootnode-multiaddr>`. The space-id half
-        /// is 64 hex chars; the bootnode half is whatever
-        /// follows the `@`.
-        bootstrap: String,
-        /// Source for the space-registry actor blob. Optional —
-        /// falls back to the bundled blob.
-        #[arg(long, value_name = "SOURCE")]
-        registry: Option<String>,
-        /// Local short-name for the space. Defaults to a short
-        /// hex prefix of the space_id.
-        #[arg(long)]
-        name: Option<String>,
-        /// libp2p multiaddr to listen on (optional). Repeatable.
+    /// Mint a `vos1…` invite token for a running space. Requires the
+    /// operator to hold ADMIN. The joiner redeems it with `space up
+    /// <token>`. `--role admin` is online-admission only (prints a
+    /// caveat); `member` / `developer` redeem offline.
+    Invite {
+        /// Space id (full hex) or name.
+        space: String,
+        /// Role the token grants: `member` | `developer` | `admin`.
+        #[arg(long, default_value = "member")]
+        role: String,
+        /// Expiry window: `7d` / `24h` / `30m` / `90s` / bare seconds.
+        #[arg(long, default_value = "7d")]
+        expires: String,
+        /// Bootnode multiaddr(s) to embed. Repeatable. Defaults to the
+        /// running daemon's published listen addrs.
         #[arg(long, value_name = "MULTIADDR")]
-        listen: Vec<String>,
-        /// Override the per-space data directory.
-        #[arg(long, value_name = "DIR")]
-        data_dir: Option<std::path::PathBuf>,
+        bootnode: Vec<String>,
     },
     /// Boot a space — THE onboarding command. The positional is
     /// trivalent: an existing `.toml` recipe path (create-if-missing +
@@ -333,25 +335,25 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             name,
             registry,
             data_dir,
+            manifest,
         } => new::run(new::Args {
             name,
             registry,
             data_dir,
+            manifest,
         }),
         SpaceCommand::List => list::run(),
         SpaceCommand::Info { space } => info::run(&space),
-        SpaceCommand::Join {
-            bootstrap,
-            registry,
-            name,
-            listen,
-            data_dir,
-        } => join::run(join::Args {
-            bootstrap,
-            registry,
-            name,
-            listen,
-            data_dir,
+        SpaceCommand::Invite {
+            space,
+            role,
+            expires,
+            bootnode,
+        } => invite::run(invite::Args {
+            space,
+            role,
+            expires,
+            bootnode,
         }),
         SpaceCommand::Up {
             space,
