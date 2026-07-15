@@ -1921,6 +1921,14 @@ impl crate::network::NetworkService for NodeService {
         // space member — a granted role at or above read-only, or an enrolled
         // node (the `Member`-floor test, identical to `sync_serve_allowed`).
         // A build without the registry can't gate, so it serves nothing.
+        //
+        // Known limitation: the gate is blanket-Member, but the floor is per
+        // agent and a bare hash doesn't reveal it. So a non-member can't fetch
+        // even a `Public` agent's ELF — a stranger that spawns a `Public` agent
+        // installed after it joined (its ELF was never in the manifest) can't
+        // obtain the code. Not a regression (before, no peer fetch existed at
+        // all), and manifest-shipped ELFs are unaffected; resolving hash→floor
+        // to serve `Public` code openly is a deliberate follow-up.
         #[cfg(not(feature = "storage"))]
         {
             let _ = (peer, hash);

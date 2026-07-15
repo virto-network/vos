@@ -847,6 +847,21 @@ impl RegistryRef {
             .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
     }
 
+    /// A node prefix's enrollment: `0` if not enrolled, otherwise
+    /// `role + 1` (so voter/observer both read as `> 0`). Ungated —
+    /// enrollment is non-secret membership metadata. Used to decide
+    /// whether this node is a space member before spawning agents
+    /// whose sync floor requires membership.
+    pub async fn node_role<I: Invoker>(
+        &self,
+        inv: &mut I,
+        prefix: u64,
+    ) -> Result<u8, ClientError> {
+        let v = self.call(inv, Msg::new("node_role").with("prefix", prefix)).await?;
+        v.as_u8()
+            .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
+    }
+
     pub async fn actor_epoch<I: Invoker>(
         &self,
         inv: &mut I,

@@ -685,16 +685,16 @@ fn spawn_installed_agents(
     // spans reconcile passes); the throwaway map just satisfies the
     // protocol — the runtime reconciler owns the durable counters.
     let mut boot_grace = BootGrace::new();
-    // This node's own space role, probed once; rows whose sync floor is above it
-    // are narrowed out — the runtime reconciler re-evaluates them each pass, so
-    // one spawns if a grant lands later.
-    let own_role = probe_own_role(node, &reg);
+    // Whether this node is a space member, probed once; rows whose sync floor
+    // requires membership are narrowed out on a non-member. The runtime
+    // reconciler re-evaluates each pass, so a row spawns if a grant lands later.
+    let is_member = node_is_member(node, &reg, local_prefix);
     for a in agents {
         if !local_cfg.should_spawn(&a.instance_name) {
             tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
             continue;
         }
-        if !node_meets_floor(own_role, a.sync_role) {
+        if !node_meets_floor(is_member, a.sync_role) {
             tracing::info!(
                 "agent '{}' not spawned — its '{}' sync floor is above this \
                  node's space role",
@@ -819,6 +819,21 @@ const PROGRAM_BLOB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// blob and caps total in-flight at [`MAX_INFLIGHT_BLOB_FETCHES`].
 type InFlightBlobs = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>;
 
+/// Clears a hash from the in-flight set when the fetch task ends — including on
+/// an unwinding panic — so a slot can never leak permanently and wedge future
+/// fetches (four leaks would exhaust [`MAX_INFLIGHT_BLOB_FETCHES`]).
+struct InFlightGuard {
+    hash: [u8; 32],
+    in_flight: InFlightBlobs,
+}
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&self.hash);
+        }
+    }
+}
+
 /// Kick off a best-effort background fetch of program blob `hash` from the
 /// node's connected peers, unless it's already in flight or the in-flight cap
 /// is reached. Returns immediately — the reconcile pass never blocks on the
@@ -851,6 +866,9 @@ fn spawn_program_blob_fetch(node: &VosNode, hash: [u8; 32], in_flight: &InFlight
     }
     let in_flight = in_flight.clone();
     std::thread::spawn(move || {
+        // Frees the in-flight slot on return OR panic — the loop below only
+        // touches `network`, so a leak here would be permanent.
+        let _guard = InFlightGuard { hash, in_flight };
         for peer in peers {
             let rx = network.send_fetch_program_blob(peer, hash);
             if let Ok(Some(bytes)) = rx.recv_timeout(PROGRAM_BLOB_FETCH_TIMEOUT) {
@@ -878,9 +896,6 @@ fn spawn_program_blob_fetch(node: &VosNode, hash: [u8; 32], in_flight: &InFlight
                     ),
                 }
             }
-        }
-        if let Ok(mut set) = in_flight.lock() {
-            set.remove(&hash);
         }
     });
 }
@@ -1338,24 +1353,40 @@ enum RowNote {
     BelowFloor,
 }
 
-/// Does this node clear a row's sync floor? `own_role` is the node's own space
-/// role probed once per pass ([`probe_own_role`]); `None` means the probe
-/// failed, which fails OPEN — a transiently unreachable registry must not wedge
-/// spawning. A `Public` row always spawns; a `Member`/`Private` row spawns only
-/// with a read grant. Narrowing only: the sync gate is the real access
-/// boundary; this just keeps a node from spawning replicas it can't sync.
-fn node_meets_floor(own_role: Option<u8>, floor: vos::registry::SyncFloor) -> bool {
-    use vos::registry::{AUTH_ROLE_READONLY, SyncFloor};
-    floor == SyncFloor::Public || own_role.map_or(true, |r| r >= AUTH_ROLE_READONLY)
+/// Does this node clear a row's sync floor? `is_member` is [`node_is_member`]'s
+/// verdict for the whole pass. A `Public` row always spawns; a `Member`/
+/// `Private` row spawns only for a member. Narrowing only — the sync gate is
+/// the real access boundary; this just keeps a node from spawning replicas it
+/// can't sync.
+fn node_meets_floor(is_member: bool, floor: vos::registry::SyncFloor) -> bool {
+    floor == vos::registry::SyncFloor::Public || is_member
 }
 
-/// Probe this node's own space role once per reconcile pass — the grant on the
-/// operator that ran `space up` — for [`node_meets_floor`]. `None` on a probe
-/// failure (fail open). Pre-redeem the operator carries the node's grant; W3's
-/// redeem-grants-node will fold in the node-key grant + enrollment here.
-fn probe_own_role(node: &VosNode, reg: &vos::registry::RegistryRef) -> Option<u8> {
-    let operator = node.operator_peer()?.to_vec();
-    vos::block_on(reg.peer_role(&mut &*node, operator)).ok()
+/// Is this node a member of the space — may it sync `Member`/`Private` floors?
+/// Mirrors `sync_serve_allowed`'s disjunction: a read grant on the operator that
+/// ran `space up` (where a joiner's role lives pre-redeem) OR node enrollment (a
+/// voter/observer is a member even before a grant lands — the case that would
+/// otherwise be wrongly narrowed). Probed once per pass. Errs toward membership:
+/// a missing operator, an unreachable registry, or any probe error returns
+/// `true`, so a transient condition never narrows a legitimate member out of its
+/// replicas — only a node confidently non-member by every signal is narrowed.
+/// W3's redeem-grants-node will fold the node-key grant in here too.
+fn node_is_member(node: &VosNode, reg: &vos::registry::RegistryRef, local_prefix: u16) -> bool {
+    use vos::registry::AUTH_ROLE_READONLY;
+    let Some(operator) = node.operator_peer().map(<[u8]>::to_vec) else {
+        return true; // no operator recorded — can't judge, don't narrow
+    };
+    match vos::block_on(reg.peer_role(&mut &*node, operator)) {
+        Ok(r) if r >= AUTH_ROLE_READONLY => return true, // granted → member
+        Ok(_) => {}                                      // reachable, not granted
+        Err(_) => return true,                           // registry down → fail open
+    }
+    // Not granted via the operator; an enrolled node (voter/observer) is a
+    // member too. `node_role` reads 0 when not enrolled, `role + 1` otherwise.
+    match vos::block_on(reg.node_role(&mut &*node, local_prefix as u64)) {
+        Ok(role) => role > 0,
+        Err(_) => true, // probe failed → fail open
+    }
 }
 
 /// One runtime spawn-reconcile pass: query the registry for
@@ -1399,9 +1430,9 @@ fn reconcile_installed_agents(
     let agents =
         vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
-    // This node's own space role, probed once for the whole pass; rows whose
-    // sync floor is above it are narrowed out below.
-    let own_role = probe_own_role(node, &reg);
+    // Whether this node is a space member, probed once for the whole pass; rows
+    // whose sync floor requires membership are narrowed out below.
+    let is_member = node_is_member(node, &reg, local_prefix);
     let mut spawned_this_pass = 0usize;
     for a in agents {
         if spawned_this_pass >= MAX_SPAWNS_PER_PASS {
@@ -1414,7 +1445,7 @@ fn reconcile_installed_agents(
         if damped.contains(&key(RowNote::Failed)) {
             continue;
         }
-        if !node_meets_floor(own_role, a.sync_role) {
+        if !node_meets_floor(is_member, a.sync_role) {
             if damped.insert(key(RowNote::BelowFloor)) {
                 tracing::info!(
                     "agent '{}' not spawned here — its '{}' sync floor is above \
@@ -1643,21 +1674,19 @@ mod tests {
     }
 
     #[test]
-    fn floor_filter_narrows_spawning_by_role() {
-        use vos::registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, SyncFloor};
-        // Public rows always spawn — any role, even a failed probe.
-        assert!(node_meets_floor(None, SyncFloor::Public));
-        assert!(node_meets_floor(Some(AUTH_ROLE_NONE), SyncFloor::Public));
+    fn floor_filter_narrows_spawning_by_membership() {
+        use vos::registry::SyncFloor;
+        // Public rows always spawn, member or not.
+        assert!(node_meets_floor(false, SyncFloor::Public));
+        assert!(node_meets_floor(true, SyncFloor::Public));
         // A non-member is narrowed out of Member/Private rows.
-        assert!(!node_meets_floor(Some(AUTH_ROLE_NONE), SyncFloor::Member));
-        assert!(!node_meets_floor(Some(AUTH_ROLE_NONE), SyncFloor::Private));
-        // A member (read grant or higher) spawns everything.
-        assert!(node_meets_floor(Some(AUTH_ROLE_READONLY), SyncFloor::Member));
-        assert!(node_meets_floor(Some(AUTH_ROLE_READONLY), SyncFloor::Private));
-        assert!(node_meets_floor(Some(AUTH_ROLE_ADMIN), SyncFloor::Private));
-        // A failed probe fails OPEN — an unreachable registry never narrows.
-        assert!(node_meets_floor(None, SyncFloor::Member));
-        assert!(node_meets_floor(None, SyncFloor::Private));
+        assert!(!node_meets_floor(false, SyncFloor::Member));
+        assert!(!node_meets_floor(false, SyncFloor::Private));
+        // A member spawns everything. (`node_is_member` errs toward `true` — a
+        // granted operator, an enrolled voter, or any probe failure — so a
+        // legitimate member is never narrowed out.)
+        assert!(node_meets_floor(true, SyncFloor::Member));
+        assert!(node_meets_floor(true, SyncFloor::Private));
     }
 
     #[test]
