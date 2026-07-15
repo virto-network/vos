@@ -142,61 +142,24 @@ fn poll_until(secs: u64, mut f: impl FnMut() -> bool, on_fail: impl FnOnce() -> 
 }
 
 #[test]
-fn onboarding_via_token_redeems_and_syncs_member_gated_registry() {
-    let data_a = TempDir::new("a-data");
-    let cfg_a = TempDir::new("a-config");
+fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
+    let space = "onb";
     let data_b = TempDir::new("b-data");
     let cfg_b = TempDir::new("b-config");
-    let space = "onb";
 
-    // ── host A: create + boot ──────────────────────────────────────
-    let new = vosx(data_a.path(), cfg_a.path(), &["space", "new", "--name", space]);
-    assert!(
-        new.status.success(),
-        "space new failed: {}",
-        String::from_utf8_lossy(&new.stderr),
-    );
-    let log_a = data_a.path().join("daemon-a.stderr");
-    let _daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
-    wait_for_endpoint(data_a.path(), &log_a, "A");
-
-    // ── host A: install a MEMBER-floor app agent (bundled dev-project) ─
-    // so B has something to spawn once it is a member. Its sync floor
-    // defaults to `member`, so a node judged non-member would narrow it
-    // out — this is what exercises node_is_member's node-key grant path.
-    let pubd = vosx(
-        data_a.path(),
-        cfg_a.path(),
-        &["space", "publish", space, "--bundled", "dev-project"],
-    );
-    assert!(
-        pubd.status.success(),
-        "space publish --bundled failed: {}",
-        String::from_utf8_lossy(&pubd.stderr),
-    );
-    let inst = vosx(
-        data_a.path(),
-        cfg_a.path(),
-        &["space", "install", space, "dev-project:0.1.0"],
-    );
-    assert!(
-        inst.status.success(),
-        "space install failed: {}",
-        String::from_utf8_lossy(&inst.stderr),
-    );
+    // ── host A: create + boot + install a MEMBER-floor app agent ───
+    // (bundled dev-project) so B has something to spawn once it is a
+    // member. Its sync floor defaults to `member`, so a node judged
+    // non-member would narrow it out — exercising node_is_member's
+    // node-key grant path.
+    let (data_a, cfg_a, _daemon_a, log_a) = boot_admin(space);
 
     // ── host A: mint a member invite (default bootnodes = A's addrs) ─
-    let invite = vosx(
+    let stdout = vosx_ok(
         data_a.path(),
         cfg_a.path(),
         &["space", "invite", space, "--role", "member"],
     );
-    assert!(
-        invite.status.success(),
-        "space invite failed: {}",
-        String::from_utf8_lossy(&invite.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&invite.stdout);
     let token = stdout
         .lines()
         .next()
@@ -207,7 +170,7 @@ fn onboarding_via_token_redeems_and_syncs_member_gated_registry() {
 
     // ── host B: literally `space up <token>` — join + redeem + sync ─
     let log_b = data_b.path().join("daemon-b.stderr");
-    let _daemon_b = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
+    let daemon_b = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
     wait_for_endpoint(data_b.path(), &log_b, "B");
 
     // (1) Redemption reaches A: an `# invites` section appears in A's
@@ -269,6 +232,57 @@ fn onboarding_via_token_redeems_and_syncs_member_gated_registry() {
             )
         },
     );
+
+    // (4) The spawned agent is live + reachable on B — a real call
+    //     (list_branches, a no-arg read) returns rather than erroring.
+    poll_until(
+        30,
+        || {
+            vosx(data_b.path(), cfg_b.path(), &["space", "call", space, "dev-project", "list_branches"])
+                .status
+                .success()
+        },
+        || {
+            format!(
+                "a call to the spawned dev-project on B never succeeded. B log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+            )
+        },
+    );
+
+    // (5) Bare-restart re-attach: kill B and restart with `space up
+    //     <name>` — no token, no manifest. The redemption already
+    //     cleared pending_token, so B re-boots from the index + synced
+    //     registry + local.toml alone and re-spawns dev-project. This is
+    //     the standing restart-bug fix under the onboarding flow.
+    drop(daemon_b); // SIGKILL B's first daemon
+    let restart_at = std::time::SystemTime::now();
+    let log_b2 = data_b.path().join("daemon-b2.stderr");
+    let _daemon_b2 = Daemon(spawn_up(data_b.path(), cfg_b.path(), space, &log_b2));
+    // Wait for a FRESH endpoint (newer than the kill), past the stale one.
+    poll_until(
+        20,
+        || {
+            find_endpoint(data_b.path())
+                .and_then(|p| fs::metadata(&p).ok())
+                .and_then(|m| m.modified().ok())
+                .is_some_and(|mt| mt >= restart_at)
+        },
+        || format!("B didn't re-attach after a bare restart; log:\n{}", fs::read_to_string(&log_b2).unwrap_or_default()),
+    );
+    // Re-spawn is proven by the agent being reachable again (the redb
+    // file persists on disk regardless, so its presence proves nothing);
+    // a successful call means B re-registered dev-project from the cached
+    // registry row + blob with no token/manifest in play.
+    poll_until(
+        30,
+        || {
+            vosx(data_b.path(), cfg_b.path(), &["space", "call", space, "dev-project", "list_branches"])
+                .status
+                .success()
+        },
+        || format!("B didn't re-spawn dev-project after a bare `space up {space}` restart; log:\n{}", fs::read_to_string(&log_b2).unwrap_or_default()),
+    );
 }
 
 /// True once B's agents dir holds a per-agent redb other than the
@@ -285,4 +299,147 @@ fn spawned_app_agent(agents_dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// Run a `vosx` command and assert it succeeded, returning stdout.
+fn vosx_ok(data_home: &Path, config_home: &Path, args: &[&str]) -> String {
+    let o = vosx(data_home, config_home, args);
+    assert!(
+        o.status.success(),
+        "`vosx {}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&o.stderr),
+    );
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// Boot host A (new + up) and install the bundled dev-project as a
+/// member-floor app agent. Returns (data_a, cfg_a, daemon_a, log_a).
+fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
+    let data_a = TempDir::new("a-data");
+    let cfg_a = TempDir::new("a-config");
+    vosx_ok(data_a.path(), cfg_a.path(), &["space", "new", "--name", space]);
+    let log_a = data_a.path().join("daemon-a.stderr");
+    let daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
+    wait_for_endpoint(data_a.path(), &log_a, "A");
+    vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "publish", space, "--bundled", "dev-project"],
+    );
+    vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "install", space, "dev-project:0.1.0"],
+    );
+    (data_a, cfg_a, daemon_a, log_a)
+}
+
+/// A tampered `vos1…` token fails the checksum at parse time, so `space
+/// up` errors immediately (no daemon, no partial join).
+#[test]
+fn tampered_token_fails_parse() {
+    let data = TempDir::new("tamper-data");
+    let cfg = TempDir::new("tamper-config");
+    // A syntactically-`vos1` string with a corrupt body.
+    let o = vosx(
+        data.path(),
+        cfg.path(),
+        &["space", "up", "vos1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+    );
+    assert!(!o.status.success(), "a tampered token must be rejected");
+    let err = String::from_utf8_lossy(&o.stderr).to_lowercase();
+    assert!(
+        err.contains("token") || err.contains("checksum") || err.contains("base58"),
+        "error should name the bad token; got: {err}",
+    );
+}
+
+/// An expired invite is not redeemed (honored on the joiner path), so
+/// the joiner stays a non-member — and the Member-gated registry then
+/// refuses its sync, so it never learns the catalog. One test, both
+/// properties: `--expires` is real AND the Member floor excludes
+/// non-members.
+#[test]
+fn expired_token_not_redeemed_and_non_member_cannot_sync() {
+    let space = "exp";
+    let (data_a, cfg_a, _da, _la) = boot_admin(space);
+
+    // Mint with a 1-second lifetime, then let it lapse before B boots.
+    let stdout = vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "invite", space, "--role", "member", "--expires", "1"],
+    );
+    let token = stdout.lines().next().unwrap().trim().to_string();
+    thread::sleep(Duration::from_secs(2));
+
+    let data_b = TempDir::new("exp-b-data");
+    let cfg_b = TempDir::new("exp-b-config");
+    let log_b = data_b.path().join("daemon-b.stderr");
+    let _db = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
+    wait_for_endpoint(data_b.path(), &log_b, "B");
+
+    // The daemon recognizes the token as expired and refuses to redeem.
+    poll_until(
+        20,
+        || fs::read_to_string(&log_b).unwrap_or_default().contains("expired"),
+        || format!("B never logged the token as expired; log:\n{}", fs::read_to_string(&log_b).unwrap_or_default()),
+    );
+
+    // And because it never became a member, the Member-gated registry is
+    // never served to it: give sync a generous window, then assert its
+    // role list still lacks A's admin grant (it started empty).
+    thread::sleep(Duration::from_secs(6));
+    let roles = vosx_ok(data_b.path(), cfg_b.path(), &["space", "role", space, "list"]);
+    assert!(
+        !roles.contains("admin"),
+        "a non-member must NOT sync the Member-gated registry; got role list:\n{roles}",
+    );
+}
+
+/// Partition honesty (decision 6): the same token redeemed at two
+/// distinct nodes yields two grants, and `space members` flags the
+/// double-redemption rather than pretending to have prevented it.
+#[test]
+fn double_redemption_is_flagged() {
+    let space = "dbl";
+    let (data_a, cfg_a, _da, _la) = boot_admin(space);
+    let stdout = vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "invite", space, "--role", "member"],
+    );
+    let token = stdout.lines().next().unwrap().trim().to_string();
+
+    // Two joiners redeem the SAME token (both dial A; they never connect
+    // to each other — VOSX_DISABLE_MDNS and no cross --connect).
+    let data_b = TempDir::new("dbl-b-data");
+    let cfg_b = TempDir::new("dbl-b-config");
+    let log_b = data_b.path().join("b.stderr");
+    let _db = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
+    wait_for_endpoint(data_b.path(), &log_b, "B");
+
+    let data_c = TempDir::new("dbl-c-data");
+    let cfg_c = TempDir::new("dbl-c-config");
+    let log_c = data_c.path().join("c.stderr");
+    let _dc = Daemon(spawn_up(data_c.path(), cfg_c.path(), &token, &log_c));
+    wait_for_endpoint(data_c.path(), &log_c, "C");
+
+    // A records BOTH redemptions on the one InviteRow → members flags it.
+    poll_until(
+        40,
+        || {
+            let m = vosx_ok(data_a.path(), cfg_a.path(), &["space", "members", space]);
+            m.contains("double-redeemed")
+        },
+        || {
+            format!(
+                "A never flagged the double-redemption. members:\n{}\nB log:\n{}\nC log:\n{}",
+                vosx_ok(data_a.path(), cfg_a.path(), &["space", "members", space]),
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_c).unwrap_or_default(),
+            )
+        },
+    );
 }
