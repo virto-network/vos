@@ -50,11 +50,12 @@ pub struct SpaceEntry {
     #[serde(default)]
     pub hyperspace: String,
     /// An absolute recipe-TOML path awaiting a one-shot genesis apply.
-    /// Set by `space up <recipe>` / `space new --manifest`; consumed on
+    /// Set by `space up <recipe>` / `space new --recipe`; consumed on
     /// the next boot (agents → registry, node-local → local.toml) and
-    /// cleared. Empty = nothing pending.
-    #[serde(default)]
-    pub pending_manifest: String,
+    /// cleared. Empty = nothing pending. The alias reads entries written
+    /// before the recipe-vocabulary rename.
+    #[serde(default, alias = "pending_manifest")]
+    pub pending_recipe: String,
 }
 
 impl SpaceEntry {
@@ -172,7 +173,7 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
         registry_hash: String::new(),
         bootnodes: Vec::new(),
         hyperspace: String::new(),
-        pending_manifest: String::new(),
+        pending_recipe: String::new(),
     }
 }
 
@@ -223,7 +224,7 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: "bank-federation".into(),
-                pending_manifest: String::new(),
+                pending_recipe: String::new(),
             },
         );
         save_to(&idx, &p).unwrap();
@@ -267,7 +268,7 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
-                pending_manifest: String::new(),
+                pending_recipe: String::new(),
             },
         );
         upsert(
@@ -280,7 +281,7 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
-                pending_manifest: String::new(),
+                pending_recipe: String::new(),
             },
         );
         assert_eq!(idx.spaces.len(), 1);
@@ -301,7 +302,7 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
-                pending_manifest: String::new(),
+                pending_recipe: String::new(),
             },
         );
         assert_eq!(find(&idx, &id_a).unwrap().name, "alpha");

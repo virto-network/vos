@@ -781,7 +781,7 @@ pub(crate) fn resolve_space(arg: Option<&str>) -> anyhow::Result<String> {
     match index.spaces.as_slice() {
         [only] => Ok(only.name.clone()),
         [] => bail!(
-            "no spaces registered. Create one with `vosx space new --name <name>` or pass `--space <name>` explicitly."
+            "no spaces registered. Create one with `vosx space new <name>` or pass `--space <name>` explicitly."
         ),
         many => {
             let names = many.iter().map(|s| s.name.as_str()).collect::<Vec<_>>();

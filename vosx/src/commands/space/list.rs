@@ -11,7 +11,7 @@ pub fn run() -> anyhow::Result<()> {
         return Ok(());
     }
     if index.spaces.is_empty() {
-        println!("no spaces. create one with `vosx space new --name <n> --registry <source>`.");
+        println!("no spaces. create one with `vosx space new <name>`.");
         return Ok(());
     }
 

@@ -36,7 +36,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // (create-if-missing + genesis apply), a `vos1…` invite token
     // (join-if-needed + auto-redeem), or a known space name / id. Any of
     // these may scaffold/join the space and persist a pending token or
-    // manifest; all that flows forward is the lookup key.
+    // recipe; all that flows forward is the lookup key.
     let lookup = resolve_up_target(&args)?;
     let index = spaces_index::load()?;
     let entry = spaces_index::find(&index, &lookup)?;
@@ -133,7 +133,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // Serve program blobs (actor ELFs) to space members from the same
     // content-addressed cache `blob_store` writes, so a joiner that installs
-    // an agent it never received in the manifest can fetch the ELF from us.
+    // an agent it never received in the recipe can fetch the ELF from us.
     let mut node =
         VosNode::with_prefix(local_prefix).with_program_blobs_dir(blob_store::cache_dir());
 
@@ -169,7 +169,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             tracing::warn!(
                 "auth: could not load operator identity ({e}); device-local agents will be \
                  unreachable AND this node cannot author registry catalog ops \
-                 (install/publish/upgrade/…) — if this is the space-admin node its manifest \
+                 (install/publish/upgrade/…) — if this is the space-admin node its recipe \
                  agents will not install. Restart with a readable identity matching the space root.",
             );
         }
@@ -239,9 +239,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // recipe's agents into the just-anchored registry (the replicated
     // half) and projects its node-local half into `local.toml`, then
     // clears the marker so a later bare `space up` doesn't re-apply.
-    if !entry.pending_manifest.is_empty() {
-        genesis_apply(&mut node, &entry.pending_manifest, local_prefix, &space_id, &data_dir)?;
-        clear_pending_manifest(&entry.id)?;
+    if !entry.pending_recipe.is_empty() {
+        genesis_apply(&mut node, &entry.pending_recipe, local_prefix, &space_id, &data_dir)?;
+        clear_pending_recipe(&entry.id)?;
     }
 
     // Node-local policy is now the single source of truth alongside the
@@ -436,7 +436,7 @@ const REDEEM_INVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 // ── Trivalent `up` positional (decision 1) ───────────────────────────
 
 /// Resolve `args.query` to the space lookup key, handling the recipe /
-/// token / name trivalent and stamping any pending token or manifest
+/// token / name trivalent and stamping any pending token or recipe
 /// onto the index. `-` reads a token from stdin.
 fn resolve_up_target(args: &Args) -> anyhow::Result<String> {
     let raw = if args.query == "-" {
@@ -478,11 +478,11 @@ fn read_token_stdin() -> anyhow::Result<String> {
 }
 
 /// Recipe path: parse the recipe, scaffold genesis if its `space = …`
-/// name is unknown, stamp `pending_manifest` (+ any `hyperspace`) on the
+/// name is unknown, stamp `pending_recipe` (+ any `hyperspace`) on the
 /// entry, and return the space name to boot.
 fn resolve_recipe(path: &str) -> anyhow::Result<String> {
-    let (manifest, _dir) = reconcile::parse_manifest_file(Path::new(path))?;
-    let name = manifest.space.clone().ok_or_else(|| {
+    let (recipe, _dir) = reconcile::parse_recipe_file(Path::new(path))?;
+    let name = recipe.space.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "recipe {path} has no top-level `space = \"…\"` — add one so `space up` knows which \
              space to create or boot",
@@ -506,8 +506,8 @@ fn resolve_recipe(path: &str) -> anyhow::Result<String> {
         .iter_mut()
         .find(|e| e.name == name)
         .ok_or_else(|| anyhow::anyhow!("space '{name}' missing after scaffold"))?;
-    entry.pending_manifest = abs;
-    if let Some(hs) = &manifest.hyperspace
+    entry.pending_recipe = abs;
+    if let Some(hs) = &recipe.hyperspace
         && !hs.is_empty()
     {
         entry.hyperspace = hs.clone();
@@ -584,7 +584,7 @@ fn join_scaffold(payload: &crate::token::InvitePayload) -> anyhow::Result<()> {
 /// Consume a pending recipe: install its agents into the in-process
 /// registry (replicated half) and project its node-local half into
 /// `local.toml`. `install_agents` tolerates already-present rows, so a
-/// re-run is a no-op; the caller clears `pending_manifest` after.
+/// re-run is a no-op; the caller clears `pending_recipe` after.
 fn genesis_apply(
     node: &mut VosNode,
     recipe_path: &str,
@@ -593,10 +593,10 @@ fn genesis_apply(
     data_dir: &Path,
 ) -> anyhow::Result<()> {
     let path = Path::new(recipe_path);
-    let (manifest, dir) = reconcile::parse_manifest_file(path)?;
-    reconcile::install_agents(node, &manifest, &dir, prefix, space_id)?;
+    let (recipe, dir) = reconcile::parse_recipe_file(path)?;
+    reconcile::install_agents(node, &recipe, &dir, prefix, space_id)?;
     let base = subscriptions::load(data_dir).unwrap_or_default();
-    let next = crate::commands::space::apply::project_node_local(&base, &manifest, &dir);
+    let next = crate::commands::space::apply::project_node_local(&base, &recipe, &dir);
     if next != base {
         subscriptions::save(data_dir, &next)?;
     }
@@ -792,9 +792,9 @@ fn clear_pending_token(data_dir: &Path) -> anyhow::Result<()> {
     crate::secure_file::remove_if_exists(&pending_token_path(data_dir))
 }
 
-/// Clear the `pending_manifest` marker after a one-shot genesis apply.
-fn clear_pending_manifest(space_id_hex: &str) -> anyhow::Result<()> {
-    clear_pending(space_id_hex, |e| e.pending_manifest.clear())
+/// Clear the `pending_recipe` marker after a one-shot genesis apply.
+fn clear_pending_recipe(space_id_hex: &str) -> anyhow::Result<()> {
+    clear_pending(space_id_hex, |e| e.pending_recipe.clear())
 }
 
 fn clear_pending(
@@ -882,7 +882,7 @@ fn build_network_for_daemon(
 }
 
 
-/// Node-local per-agent policy from the manifest (never replicated): the
+/// Node-local per-agent policy from the recipe (never replicated): the
 /// periodic `tick_ms` and the parsed `intra_caps` relay bound.
 #[derive(Default, Clone)]
 struct AgentLocalPolicy {
@@ -1368,7 +1368,7 @@ fn agent_config_from_row(
         )]);
     }
 
-    // on_start payloads (from manifest reconciliation) get
+    // on_start payloads (from recipe reconciliation) get
     // dispatched on cold start. Stored as rkyv-encoded
     // `Vec<Vec<u8>>` on the agent row.
     match payload_codec::decode(&a.install_payloads) {
@@ -1384,7 +1384,7 @@ fn agent_config_from_row(
         }
     }
 
-    // Node-local manifest policy (never replicated): periodic `tick` cadence
+    // Node-local recipe policy (never replicated): periodic `tick` cadence
     // and the bounded outbound-relay caps.
     if let Some(policy) = policies.get(&a.instance_name) {
         if let Some(ms) = policy.tick_ms {
@@ -2042,7 +2042,7 @@ mod tests {
     #[test]
     fn agent_policies_come_from_local_toml() {
         // Node-local policy is now sourced from local.toml, not the
-        // manifest — the fix for the bare-restart drop. A bare agent
+        // recipe — the fix for the bare-restart drop. A bare agent
         // (no tick_ms / caps) gets no policy entry; the malformed-cap
         // case fails the boot.
         let mut cfg = subscriptions::LocalConfig::default();

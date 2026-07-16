@@ -8,15 +8,15 @@
 //! `space up`:
 //!
 //! - Each `path = "…"` ELF gets blob-cached and published as
-//!   `<name>:manifest` if not already in the catalog.
+//!   `<name>:recipe` if not already in the catalog.
 //! - Each agent gets `install()`'d if no instance with that
 //!   `name` is already registered.
 //! - Agents already in the registry are left alone (their
-//!   state takes precedence over the manifest). An explicit
+//!   state takes precedence over the recipe). An explicit
 //!   `space upgrade` is required to re-point at a different
 //!   blob.
 //!
-//! Manifests are dev-time conveniences — the registry stays
+//! Recipes are dev-time conveniences — the registry stays
 //! the runtime source of truth. This module's only job is to
 //! arrange the registry once on startup; after that, `space
 //! up` proceeds normally and spawns whatever the registry says
@@ -36,11 +36,11 @@ use crate::blob_store;
 use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
 use crate::commands::space::payload_codec;
 
-/// Slim view of the manifest TOML — only the fields the
+/// Slim view of the recipe TOML — only the fields the
 /// reconciler cares about. Extra fields are silently ignored
-/// so manifests can carry whatever annotations they want.
+/// so recipes can carry whatever annotations they want.
 #[derive(Deserialize, Debug, Default)]
-pub struct Manifest {
+pub struct Recipe {
     /// Top-level `space = "..."` informational name. Not used
     /// by the reconciler — the space identity is the canonical
     /// `space_id`, looked up from the running entry.
@@ -62,7 +62,7 @@ pub struct Manifest {
     #[serde(rename = "agent", default)]
     pub agents: Vec<AgentDef>,
     /// Native `.so` extension plugins. Each `[[extension]]` entry
-    /// in a manifest maps onto a single `node.register_extension`
+    /// in a recipe maps onto a single `node.register_extension`
     /// call when the daemon boots; the host loads the .so, reads
     /// its meta.kind, and dispatches to actor- or service-mode
     /// glue accordingly. Phase 5 doesn't surface extensions in the
@@ -77,7 +77,7 @@ pub struct ExtensionDef {
     /// Display name. Logged at boot; not used for routing today
     /// (extensions get auto-allocated ServiceIds).
     pub name: String,
-    /// Path to the `.so` — relative to the manifest file's
+    /// Path to the `.so` — relative to the recipe file's
     /// directory.
     pub path: String,
     /// Constructor args. Encoded as a rkyv `vos::value::Args`
@@ -87,7 +87,7 @@ pub struct ExtensionDef {
     #[serde(default)]
     pub init: BTreeMap<String, toml::Value>,
     /// Sprint 2: per-extension override of the space-level
-    /// [`Manifest::cap_policy`]. Useful for relaxing one
+    /// [`Recipe::cap_policy`]. Useful for relaxing one
     /// extension to `"log"` while keeping the rest at `"block"`.
     pub cap_policy: Option<String>,
     /// M9 — this extension is a relay for *external* traffic
@@ -119,7 +119,7 @@ pub struct ExtensionDef {
 #[derive(Deserialize, Debug, Default)]
 pub struct AgentDef {
     pub name: String,
-    /// Path to the actor ELF — relative to the manifest file's
+    /// Path to the actor ELF — relative to the recipe file's
     /// directory. A hand-written recipe carries this; a `space export`
     /// output does NOT (blobs are content-addressed, with no source
     /// path on a running node) and instead carries `program_hash`, so
@@ -137,7 +137,7 @@ pub struct AgentDef {
     #[serde(default)]
     pub program_hash: Option<String>,
     /// `ephemeral` / `local` / `crdt` / `raft`. Defaults to
-    /// `crdt` for replicated actors; manifests that omit this
+    /// `crdt` for replicated actors; recipes that omit this
     /// for one-off services typically want `ephemeral`.
     #[serde(default = "default_consistency")]
     pub consistency: String,
@@ -204,7 +204,7 @@ pub struct AgentDef {
 pub struct OnStartMsg {
     /// Message handler name to invoke.
     pub msg: String,
-    /// Remaining keys are typed args. `flatten` so the manifest
+    /// Remaining keys are typed args. `flatten` so the recipe
     /// can write `{ msg = "set", val = 42 }` without nesting.
     #[serde(flatten, default)]
     pub args: BTreeMap<String, toml::Value>,
@@ -214,14 +214,14 @@ fn default_consistency() -> String {
     "crdt".to_string()
 }
 
-/// Resolve an extension's `.so` path against the manifest dir,
+/// Resolve an extension's `.so` path against the recipe dir,
 /// build init args (rkyv `Args`), and hand off to
 /// `node.register_extension`. Logs the load + each init arg so
-/// operators can spot misconfigured manifests at boot.
+/// operators can spot misconfigured recipes at boot.
 ///
 /// Also pulls the `.so`'s `vos_extension_meta` blob out via a one-
 /// shot `ExtensionPlugin::load` and forwards it to the registry's
-/// `register_extension_meta` keyed by the manifest instance name.
+/// `register_extension_meta` keyed by the recipe instance name.
 /// `vosx <ext> <cmd>` reads back through the same name to
 /// drive its dynamic clap surface. Double-loading the .so here is
 /// trivial: cdylibs are small and meta extraction doesn't run any
@@ -230,12 +230,12 @@ pub(crate) fn register_extension(
     node: &mut VosNode,
     reg: &RegistryRef,
     ext: &ExtensionDef,
-    manifest_dir: &Path,
+    recipe_dir: &Path,
     daemon_prefix: u16,
     space_cap_policy: vos::extension::CapPolicy,
     known_names: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
-    let so_path = manifest_dir.join(&ext.path);
+    let so_path = recipe_dir.join(&ext.path);
     if !so_path.exists() {
         anyhow::bail!(
             "extension '{}': .so not found at {}",
@@ -272,7 +272,7 @@ pub(crate) fn register_extension(
     // narrow race if the worker thread hasn't run yet at our drop;
     // a stronger fix would have `node.register_extension` return
     // the meta blob itself, which is the right Phase 5+ shape.
-    // SAFETY: dlopen on a vos-built extension .so; the manifest's
+    // SAFETY: dlopen on a vos-built extension .so; the recipe's
     // path is operator-supplied. See `vos::extension::ExtensionPlugin::load`
     // for the full FFI contract docstring.
     let plugin = match unsafe { vos::extension::ExtensionPlugin::load(&so_path) } {
@@ -381,13 +381,13 @@ pub(crate) fn register_extension(
     // the host's `serves_max_conns` default of 1024.)
     let cfg = match plugin.as_ref().map(|p| p.kind()) {
         Some(vos::extension::ExtensionKind::Transport) => {
-            configure_transport_serves(cfg, ext, manifest_dir)?
+            configure_transport_serves(cfg, ext, recipe_dir)?
         }
         _ => cfg,
     };
 
     // Install at a *deterministic* ServiceId derived from the
-    // extension's manifest name + daemon prefix, identical to the
+    // extension's recipe name + daemon prefix, identical to the
     // shape `instance_service_id` gives PVM agents. Without this,
     // the host's `alloc_id` hands out an opaque incrementing id
     // that vosx-side `resolve_target` has no way to rediscover
@@ -433,14 +433,14 @@ pub(crate) fn register_extension(
 /// Configure a transport-mode extension's host-owned listener from its
 /// Init args. `bind_addr` (default `127.0.0.1`) + `port`
 /// (default `8080`) become the `serves(..)` endpoint; `tls_cert`/`tls_key`
-/// (relative to the manifest dir, or absolute) — when both are set — make
+/// (relative to the recipe dir, or absolute) — when both are set — make
 /// the host terminate TLS on each accepted connection. The extension's
 /// own `new()` still receives the full init args (for `auth_token` /
 /// `agent_tokens` / its `/__status` port readout).
 fn configure_transport_serves(
     cfg: ExtensionConfig,
     ext: &ExtensionDef,
-    manifest_dir: &Path,
+    recipe_dir: &Path,
 ) -> anyhow::Result<ExtensionConfig> {
     let init_str = |k: &str| ext.init.get(k).and_then(|v| v.as_str()).unwrap_or_default();
     let bind_addr = {
@@ -460,8 +460,8 @@ fn configure_transport_serves(
     let cfg = cfg.serves(addr, tls);
 
     if tls {
-        let cert_path = manifest_dir.join(tls_cert);
-        let key_path = manifest_dir.join(tls_key);
+        let cert_path = recipe_dir.join(tls_cert);
+        let key_path = recipe_dir.join(tls_key);
         let cert_pem = std::fs::read(&cert_path).map_err(|e| {
             anyhow::anyhow!(
                 "extension '{}': reading tls_cert {}: {e}",
@@ -538,14 +538,14 @@ fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<Str
 /// actor this space installs. R3 made the host resolve *any* installed
 /// agent or extension by name (via its reverse map), so the host can no
 /// longer say in isolation whether a name is resolvable — the authority
-/// is the manifest's own roster. `known_names` is that roster (every
+/// is the recipe's own roster. `known_names` is that roster (every
 /// agent + extension instance name, plus the built-in `space-registry`,
 /// compared case-insensitively to match [`vos::IntraCap`]'s matching).
 /// A named cap outside it is almost certainly a typo: it will silently
 /// relay as `Unauthenticated`, so we flag it at boot. Wildcard-actor
 /// caps (`*:<role>`) match anything and are never flagged; trailing-`*`
 /// prefix caps (`msg-*:<role>`) are forward-looking grants for agents
-/// installed after boot, so the manifest roster can't falsify them —
+/// installed after boot, so the recipe roster can't falsify them —
 /// also exempt.
 fn unresolvable_cap_warning(
     name: &str,
@@ -573,18 +573,18 @@ fn unresolvable_cap_warning(
     ))
 }
 
-pub fn parse_manifest_file(path: &Path) -> anyhow::Result<(Manifest, PathBuf)> {
+pub fn parse_recipe_file(path: &Path) -> anyhow::Result<(Recipe, PathBuf)> {
     let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-    let manifest: Manifest = toml::from_str(std::str::from_utf8(&bytes)?)
+    let recipe: Recipe = toml::from_str(std::str::from_utf8(&bytes)?)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     let dir = path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    Ok((manifest, dir))
+    Ok((recipe, dir))
 }
 
-/// Install every manifest agent into the in-process registry (the
+/// Install every recipe agent into the in-process registry (the
 /// *replicated* half of a recipe). Extensions are node-local and are
 /// handled separately from `local.toml` at boot, so this path is
 /// agent-only — the genesis apply `space up` runs when it consumes a
@@ -592,24 +592,24 @@ pub fn parse_manifest_file(path: &Path) -> anyhow::Result<(Manifest, PathBuf)> {
 /// locally (so `&mut &node` drives in-process Ref calls).
 pub(crate) fn install_agents(
     node: &mut VosNode,
-    manifest: &Manifest,
-    manifest_dir: &Path,
+    recipe: &Recipe,
+    recipe_dir: &Path,
     daemon_prefix: u16,
     space_id: &[u8; 32],
 ) -> anyhow::Result<()> {
-    validate_manifest_names(manifest)?;
+    validate_recipe_names(recipe)?;
 
     let reg = RegistryRef::at(ServiceId::new(
         daemon_prefix,
         ServiceId::REGISTRY.local_id(),
     ));
 
-    if manifest.agents.is_empty() {
+    if recipe.agents.is_empty() {
         return Ok(());
     }
     tracing::info!(
         "genesis apply ({} agent definition(s))",
-        flat_count(&manifest.agents),
+        flat_count(&recipe.agents),
     );
 
     // Pre-compute every agent's name → derived svc_id so
@@ -617,7 +617,7 @@ pub(crate) fn install_agents(
     // Vec<u32>) can hand back the right ids without round-
     // tripping through the registry.
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
-    for a in flatten(&manifest.agents) {
+    for a in flatten(&recipe.agents) {
         name_ids.insert(
             a.name.clone(),
             instance_service_id(&a.name, daemon_prefix).0,
@@ -643,12 +643,12 @@ pub(crate) fn install_agents(
         None => false,
     };
 
-    for agent in flatten(&manifest.agents) {
+    for agent in flatten(&recipe.agents) {
         reconcile_one(
             node,
             &reg,
             agent,
-            manifest_dir,
+            recipe_dir,
             daemon_prefix,
             &name_ids,
             node_is_admin,
@@ -663,7 +663,7 @@ fn reconcile_one(
     node: &VosNode,
     reg: &RegistryRef,
     agent: &AgentDef,
-    manifest_dir: &Path,
+    recipe_dir: &Path,
     _daemon_prefix: u16,
     name_ids: &BTreeMap<String, u32>,
     node_is_admin: bool,
@@ -679,7 +679,7 @@ fn reconcile_one(
             agent.name,
         );
     }
-    let elf_path = manifest_dir.join(&agent.path);
+    let elf_path = recipe_dir.join(&agent.path);
     let elf_bytes = std::fs::read(&elf_path).map_err(|e| {
         anyhow::anyhow!(
             "read {} for agent '{}': {e}",
@@ -691,10 +691,10 @@ fn reconcile_one(
         .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
 
     // 2. Ensure published. Treat the agent's `name` as the
-    //    program name; manifests don't carry per-program
-    //    versions yet, so we use the literal "manifest" tag.
+    //    program name; recipes don't carry per-program
+    //    versions yet, so we use the literal "recipe" tag.
     let program_name = agent.name.clone();
-    let program_version = "manifest".to_string();
+    let program_version = "recipe".to_string();
     let existing: Option<ProgramRow> =
         vos::block_on(reg.program(&mut &*node, program_name.clone(), program_version.clone()))
             .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
@@ -704,13 +704,13 @@ fn reconcile_one(
             p.hash
         }
         Some(_) => {
-            // Tag pinned to a different blob — manifest's blob
+            // Tag pinned to a different blob — recipe's blob
             // and registry's disagree. Don't silently overwrite;
             // this is what `space upgrade` is for.
             anyhow::bail!(
-                "manifest's '{program_name}:{program_version}' has a different hash than \
+                "recipe's '{program_name}:{program_version}' has a different hash than \
                  the catalog. Run `vosx space upgrade {} {program_name}:<new-version>` \
-                 explicitly, or remove the agent from the manifest.",
+                 explicitly, or remove the agent from the recipe.",
                 agent.name,
             );
         }
@@ -905,12 +905,12 @@ fn reconcile_one(
         // agent (or one with the same auto-derived id) was installed and
         // uninstalled before, and an `auto`/fixed id can't be reused.
         // Don't resurrect it from a stale slot; surface it so the
-        // operator either removes it from the manifest or assigns a
+        // operator either removes it from the recipe or assigns a
         // fresh `replication_id` (which is a fresh, empty state).
         tracing::warn!(
             "agent {} not (re)installed: its replication_id is a retired tombstone (was \
-             uninstalled). Assign a fresh `replication_id` in the manifest to re-create it with \
-             clean state, or remove it from the manifest.",
+             uninstalled). Assign a fresh `replication_id` in the recipe to re-create it with \
+             clean state, or remove it from the recipe.",
             agent.name,
         );
         return Ok(());
@@ -929,7 +929,7 @@ fn reconcile_one(
 /// Encode init args into rkyv bytes, using the actor's
 /// `.vos_meta` to type each entry. List-of-string init values
 /// whose target type is `Vec<u32>` get translated through
-/// `name_ids` so manifest-style `children = ["greeter", …]`
+/// `name_ids` so recipe-style `children = ["greeter", …]`
 /// resolves to actual ServiceIds.
 pub(crate) fn encode_init_args(
     agent_name: &str,
@@ -968,14 +968,14 @@ pub(crate) fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Resul
         let mut msg = vos::value::Msg::new(&entry.msg);
         for (k, v) in &entry.args {
             // Same heuristic as `space install --init`: numeric
-            // → u64, true/false → bool, else string. Manifest
+            // → u64, true/false → bool, else string. Recipe
             // authors who want explicit typing can upgrade to
             // typed init args once we have schemas.
             //
             // Sprint 3: `$env:VAR` strings get resolved here too
             // so on_start payloads can pull secrets out of the
             // container's env without baking them into the
-            // manifest.
+            // recipe.
             let resolved = resolve_env_indirection(&entry.msg, k, v)?;
             match &resolved {
                 toml::Value::Integer(n) => msg = msg.with(k, *n as u64),
@@ -998,12 +998,12 @@ pub(crate) fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Resul
     payload_codec::encode(&payloads)
 }
 
-/// Sprint 3 — resolve `$env:VAR` indirection in manifest init
+/// Sprint 3 — resolve `$env:VAR` indirection in recipe init
 /// values. String values matching `$env:NAME` are looked up in
 /// the process environment; everything else passes through
 /// unchanged. Used by extension `[[extension]] init = {...}` and
 /// agent `[[agent]] init = {...}` paths so container deployments
-/// can keep secrets (HF tokens, API keys, …) out of the manifest
+/// can keep secrets (HF tokens, API keys, …) out of the recipe
 /// file itself.
 ///
 /// Error semantics:
@@ -1038,7 +1038,7 @@ fn resolve_env_indirection(
             "extension '{ext_name}': init arg '{key}' references \
              env var ${var_name} but it is not set in the daemon's \
              environment. Set it before `vosx space up`, or remove \
-             the `$env:` indirection from the manifest.",
+             the `$env:` indirection from the recipe.",
         ),
     }
 }
@@ -1091,7 +1091,7 @@ fn toml_to_init_value(val: &toml::Value, ty: &str, name_ids: &BTreeMap<String, u
     }
 }
 
-/// Walk every agent in the manifest, including nested children.
+/// Walk every agent in the recipe, including nested children.
 /// Returned in tree-iteration order (parents before children) so
 /// `reconcile` can process them sequentially while `name_ids` is
 /// still being built up.
@@ -1110,7 +1110,7 @@ fn flat_count(agents: &[AgentDef]) -> usize {
     flatten(agents).len()
 }
 
-/// Reject manifests where the same `instance_name` appears in
+/// Reject recipes where the same `instance_name` appears in
 /// more than one slot — agent + agent, agent + extension, or
 /// extension + extension.
 ///
@@ -1123,9 +1123,9 @@ fn flat_count(agents: &[AgentDef]) -> usize {
 /// handler. The registry's `install` catches duplicate agent
 /// names (`Status::InstanceExists`) but it knows nothing about
 /// extensions and nothing about within-extension duplicates;
-/// catching the full set manifest-side gives the operator a
+/// catching the full set recipe-side gives the operator a
 /// single clear error before any side-effects land.
-pub(crate) fn validate_manifest_names(manifest: &Manifest) -> anyhow::Result<()> {
+pub(crate) fn validate_recipe_names(recipe: &Recipe) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
 
     // Preserve first-seen order so duplicates list the original
@@ -1133,10 +1133,10 @@ pub(crate) fn validate_manifest_names(manifest: &Manifest) -> anyhow::Result<()>
     // for an error message; an IndexMap would preserve source
     // order but isn't worth the dep for one-shot validation.
     let mut seen: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
-    for agent in flatten(&manifest.agents) {
+    for agent in flatten(&recipe.agents) {
         seen.entry(agent.name.clone()).or_default().push("agent");
     }
-    for ext in &manifest.extensions {
+    for ext in &recipe.extensions {
         seen.entry(ext.name.clone()).or_default().push("extension");
     }
 
@@ -1150,7 +1150,7 @@ pub(crate) fn validate_manifest_names(manifest: &Manifest) -> anyhow::Result<()>
         return Ok(());
     }
     anyhow::bail!(
-        "manifest has duplicate instance_names — both agents and \
+        "recipe has duplicate instance_names — both agents and \
          extensions install at a deterministic ServiceId derived \
          from the name, so duplicates silently shadow each other's \
          routes:\n  {}",
@@ -1175,12 +1175,12 @@ mod tests {
 
             [[program]]
             name    = "counter"
-            version = "manifest"
+            version = "recipe"
             hash    = "deadbeef"
 
             [[agent]]
             name           = "counter"
-            program        = "counter:manifest"
+            program        = "counter:recipe"
             program_hash   = "deadbeef"
             replication_id = "0011"
             consistency    = "crdt"
@@ -1199,20 +1199,20 @@ mod tests {
             peer_id = "dd"
             role    = 0
         "#;
-        let m: Manifest = toml::from_str(s).expect("export output parses as a recipe");
+        let m: Recipe = toml::from_str(s).expect("export output parses as a recipe");
         assert_eq!(m.space.as_deref(), Some("e2e"));
         assert_eq!(m.agents.len(), 1);
         let a = &m.agents[0];
         assert_eq!(a.name, "counter");
         assert!(a.path.is_empty(), "exported agents carry no source path");
-        assert_eq!(a.program.as_deref(), Some("counter:manifest"));
+        assert_eq!(a.program.as_deref(), Some("counter:recipe"));
         assert_eq!(a.program_hash.as_deref(), Some("deadbeef"));
         assert_eq!(a.sync.as_deref(), Some("member"));
         assert!(a.network_reachable);
     }
 
     #[test]
-    fn parses_minimal_manifest() {
+    fn parses_minimal_recipe() {
         let s = r#"
             space = "demo"
             [[agent]]
@@ -1220,7 +1220,7 @@ mod tests {
             path = "actors/counter/foo.elf"
             consistency = "crdt"
         "#;
-        let m: Manifest = toml::from_str(s).unwrap();
+        let m: Recipe = toml::from_str(s).unwrap();
         assert_eq!(m.space.as_deref(), Some("demo"));
         assert!(m.hyperspace.is_none());
         assert_eq!(m.agents.len(), 1);
@@ -1243,7 +1243,7 @@ mod tests {
             consistency = "ephemeral"
             network_reachable = true
         "#;
-        let m: Manifest = toml::from_str(s).unwrap();
+        let m: Recipe = toml::from_str(s).unwrap();
         assert!(m.agents[0].network_reachable);
         assert_eq!(m.agents[0].consistency, "ephemeral");
     }
@@ -1257,7 +1257,7 @@ mod tests {
             name = "noop"
             path = "actors/noop.elf"
         "#;
-        let m: Manifest = toml::from_str(s).unwrap();
+        let m: Recipe = toml::from_str(s).unwrap();
         assert_eq!(m.space.as_deref(), Some("bank-a"));
         assert_eq!(m.hyperspace.as_deref(), Some("bank-federation"));
     }
@@ -1270,7 +1270,7 @@ mod tests {
             path = "libdev_extension.so"
             intra_caps = ["space-registry:admin", "*:guest"]
         "#;
-        let m: Manifest = toml::from_str(s).unwrap();
+        let m: Recipe = toml::from_str(s).unwrap();
         assert_eq!(m.extensions.len(), 1);
         assert_eq!(
             m.extensions[0].intra_caps,
@@ -1292,7 +1292,7 @@ mod tests {
             name = "math"
             path = "libmath.so"
         "#;
-        let m: Manifest = toml::from_str(s).unwrap();
+        let m: Recipe = toml::from_str(s).unwrap();
         assert!(m.extensions[0].intra_caps.is_empty());
     }
 
@@ -1396,7 +1396,7 @@ mod tests {
             path = "libbad.so"
             intra_caps = ["space-registry"]
         "#;
-        let m: Manifest = toml::from_str(s).unwrap();
+        let m: Recipe = toml::from_str(s).unwrap();
         let err = vos::IntraCap::parse(&m.extensions[0].intra_caps[0]).unwrap_err();
         assert!(err.reason.contains("actor:role"), "{}", err.reason);
     }
@@ -1412,7 +1412,7 @@ mod tests {
                 { name = "greeter", path = "actors/greeter.elf" },
             ]
         "#;
-        let m: Manifest = toml::from_str(s).unwrap();
+        let m: Recipe = toml::from_str(s).unwrap();
         assert_eq!(m.agents.len(), 1);
         assert_eq!(m.agents[0].actors.len(), 1);
         assert_eq!(m.agents[0].actors[0].name, "greeter");
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn validate_names_accepts_distinct() {
-        let m: Manifest = toml::from_str(
+        let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
                 name = "counter"
@@ -1434,7 +1434,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        validate_manifest_names(&m).expect("distinct names pass");
+        validate_recipe_names(&m).expect("distinct names pass");
     }
 
     #[test]
@@ -1443,7 +1443,7 @@ mod tests {
         // extension `gateway`. They'd install at the same
         // `instance_service_id(name, prefix)`, second silently
         // shadows the first.
-        let m: Manifest = toml::from_str(
+        let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
                 name = "gateway"
@@ -1454,7 +1454,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let err = validate_manifest_names(&m).unwrap_err();
+        let err = validate_recipe_names(&m).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("'gateway'"), "{msg}");
         assert!(msg.contains("agent") && msg.contains("extension"), "{msg}");
@@ -1462,7 +1462,7 @@ mod tests {
 
     #[test]
     fn validate_names_rejects_duplicate_extensions() {
-        let m: Manifest = toml::from_str(
+        let m: Recipe = toml::from_str(
             r#"
                 [[extension]]
                 name = "gateway"
@@ -1473,7 +1473,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let err = validate_manifest_names(&m).unwrap_err();
+        let err = validate_recipe_names(&m).unwrap_err();
         assert!(err.to_string().contains("'gateway' appears 2×"), "{}", err);
     }
 
@@ -1481,10 +1481,10 @@ mod tests {
     fn validate_names_rejects_duplicate_agents() {
         // The registry's `install` handler returns
         // Status::InstanceExists for this case at runtime, but
-        // the manifest-side check fails earlier — before any
+        // the recipe-side check fails earlier — before any
         // .elf gets blob-cached or any partial registration
         // lands.
-        let m: Manifest = toml::from_str(
+        let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
                 name = "counter"
@@ -1495,7 +1495,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let err = validate_manifest_names(&m).unwrap_err();
+        let err = validate_recipe_names(&m).unwrap_err();
         assert!(err.to_string().contains("'counter' appears 2×"), "{}", err);
     }
 
@@ -1503,7 +1503,7 @@ mod tests {
     fn validate_names_catches_nested_child_collision() {
         // `flatten` walks parent + child agents; a child named
         // the same as a top-level agent is a collision too.
-        let m: Manifest = toml::from_str(
+        let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
                 name = "scheduler"
@@ -1514,13 +1514,13 @@ mod tests {
             "#,
         )
         .unwrap();
-        let err = validate_manifest_names(&m).unwrap_err();
+        let err = validate_recipe_names(&m).unwrap_err();
         assert!(err.to_string().contains("'scheduler'"), "{}", err);
     }
 
     #[test]
     fn flatten_yields_parents_then_children() {
-        let m: Manifest = toml::from_str(
+        let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
                 name = "scheduler"
@@ -1627,7 +1627,7 @@ mod tests {
         let msg = format!("{err}");
         // Sprint 5: error contract — the operator needs (a) the
         // unset *var name*, (b) the extension + key context so
-        // they can find it in the manifest, and (c) a clear cause
+        // they can find it in the recipe, and (c) a clear cause
         // and remediation hint. Any one of these going missing
         // means a refactor silently degraded the error.
         assert!(

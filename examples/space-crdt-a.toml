@@ -2,7 +2,7 @@
 #
 # The admin installs the crdt-counter agent from this recipe; a second
 # node joins with an invite token and syncs the agent (no per-node
-# manifest). The counter's `on_start` inc fires once on A and the event
+# recipe). The counter's `on_start` inc fires once on A and the event
 # gossips to the joiner's replica so both converge — each event carries a
 # unique (origin, seq); see `vos::effect_log::CrdtEvent`.
 #
@@ -13,7 +13,7 @@
 # (creates two isolated XDG dirs, invites B from A, reaps them.)
 # Step-by-step:
 #
-#   vosx space new --name a --manifest examples/space-crdt-a.toml
+#   vosx space new a --recipe examples/space-crdt-a.toml
 #   vosx space up a --listen /ip4/127.0.0.1/tcp/4811 &     # genesis-applies
 #   vosx space invite a --role member --bootnode <A's bootnode hint>
 #   # … then on the second node:  vosx space up "<the vos1… token>" &

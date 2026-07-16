@@ -53,7 +53,7 @@ impl Network {
     /// failure the Sender is dropped.
     ///
     /// Operator-only: invoked by a joining node (`vosx space up
-    /// <token>`) when the operator hasn't supplied `--manifest`. The
+    /// <token>`) when it has no local recipe. The
     /// PVM-actor runtime never originates this — it has its own copy.
     ///
     /// [`Frame::ManifestReq`]: super::Frame::ManifestReq

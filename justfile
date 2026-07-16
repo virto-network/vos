@@ -219,7 +219,7 @@ demo-crdt-procs: build-crdt-counter build-crates
     mkdir $"($A)/data" $"($A)/config" $"($A)/cache" $"($B)/data" $"($B)/config" $"($B)/cache"
 
     print "→ host A: create space + bank genesis recipe..."
-    vx $ea [space new --name demo --manifest examples/space-crdt-a.toml] | ignore
+    vx $ea [space new demo --recipe examples/space-crdt-a.toml] | ignore
     let space_id = (open --raw $"($A)/config/vosx/spaces.toml" | lines | where ($it | str starts-with "id = ") | first | str replace -r "^id = .(.*).$" "$1")
     print $"  space_id=($space_id)"
 
@@ -270,7 +270,7 @@ demo-msg-procs: build-msg-actors build-chronos build-messenger-actor build-crate
     mkdir $"($A)/data" $"($A)/config" $"($A)/cache" $"($B)/data" $"($B)/config" $"($B)/cache"
 
     print "→ host A: create space + bank genesis recipe..."
-    vx $ea [space new --name msg-demo --manifest examples/space-msg-a.toml] | ignore
+    vx $ea [space new msg-demo --recipe examples/space-msg-a.toml] | ignore
     let space_id = (open --raw $"($A)/config/vosx/spaces.toml" | lines | where ($it | str starts-with "id = ") | first | str replace -r "^id = .(.*).$" "$1")
 
     print "→ host A: starting daemon on :4821 (genesis-applies the recipe)..."

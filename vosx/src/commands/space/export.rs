@@ -1,5 +1,5 @@
 //! `space export` — query a space's registry and dump a
-//! round-trippable TOML manifest.
+//! round-trippable TOML recipe.
 //!
 //! Connects to the running daemon via `DaemonClient`, calls
 //! `programs()` / `agents()` / `members()` over libp2p, and
@@ -21,18 +21,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let programs = client.programs()?;
         let agents = client.agents()?;
         let members = client.members()?;
-        print_manifest(&client.entry, &programs, &agents, &members);
+        print_recipe(&client.entry, &programs, &agents, &members);
         Ok(())
     })
 }
 
-fn print_manifest(
+fn print_recipe(
     entry: &SpaceEntry,
     programs: &[ProgramRow],
     agents: &[AgentRow],
     members: &[MemberRow],
 ) {
-    println!("# vosx space export — round-trippable manifest");
+    println!("# vosx space export — round-trippable recipe");
     println!("space    = {:?}", entry.name);
     println!("space_id = {:?}", entry.id);
     println!();

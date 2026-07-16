@@ -84,7 +84,7 @@ fn auth_gate_admits_admin_refuses_outsider_then_grant_admits() {
 
     // ── A: space new (writes admin_bootstrap.txt for A's id) ─
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", space_name])
+        .args(["space", "new", space_name])
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_a.path())
         .env("VOSX_DISABLE_MDNS", "1")

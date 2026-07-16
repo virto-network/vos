@@ -70,7 +70,7 @@ pub fn registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
 /// both replicas keeps them in separate replication groups.
 ///
 /// Wired into the boot path in Phase 1.3 (`space up` spawns the
-/// hyperspace registry replica when a manifest sets the field).
+/// hyperspace registry replica when a recipe sets the field).
 #[allow(dead_code)]
 pub fn derive_hyperspace_id(hyperspace_name: &str) -> [u8; 32] {
     vos::crypto::blake2b_hash(b"vos-hyperspace/v1", &[&[0u8], hyperspace_name.as_bytes()])

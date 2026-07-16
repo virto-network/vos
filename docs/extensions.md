@@ -187,7 +187,7 @@ init = {
 Then create the space with the recipe and bring the daemon up:
 
 ```bash
-vosx space new --name <space> --manifest <path/to/space.toml>
+vosx space new <space> --recipe <path/to/space.toml>
 vosx space up <space>
 ```
 

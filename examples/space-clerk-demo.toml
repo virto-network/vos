@@ -1,12 +1,11 @@
-# Clerk demo manifest — clerk-ledger + clerk-bridge behind the
+# Clerk demo recipe — clerk-ledger + clerk-bridge behind the
 # http-gateway, single node, Local consistency. Paths are relative to
-# this manifest's directory (examples/), matching space-gateway.toml.
+# this recipe's directory (examples/), matching space-gateway.toml.
 #
 #   cargo build -p http-gateway -p vosx          # gateway is DEBUG only — release LTO hangs
 #   just build-clerk-ledger && just build-clerk-bridge
-#   ./target/debug/vosx space new --name clerk-demo      # bundles the registry
-#   RUST_LOG=warn ./target/debug/vosx space up clerk-demo \
-#       --manifest examples/space-clerk-demo.toml &       # SIGTERM to stop
+#   ./target/debug/vosx space new clerk-demo --recipe examples/space-clerk-demo.toml
+#   RUST_LOG=warn ./target/debug/vosx space up clerk-demo &      # SIGTERM to stop
 #
 #   curl -s http://127.0.0.1:18090/__schema                 # ["clerk-bridge","clerk-ledger"]
 #   curl -s -X POST http://127.0.0.1:18090/clerk-ledger/ping

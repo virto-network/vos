@@ -1,7 +1,7 @@
 //! End-to-end: two real `vosx` daemons in one space exchange
 //! E2E-encrypted messages through the replicated channel actors.
 //!
-//!   host A: `space new --manifest` → `space up` (genesis-applies the
+//!   host A: `space new --recipe` → `space up` (genesis-applies the
 //!           recipe: msg-general-{log,ctl} + messenger) → mint a member
 //!           invite → register alice → create channel → send a
 //!           pre-invite message
@@ -220,7 +220,7 @@ intra_caps = ["msg-*:member", "space-registry:admin"]
 }
 
 /// Boot a daemon: `space up <arg>` where `arg` is the space name (host
-/// A, which genesis-applies the recipe banked by `space new --manifest`)
+/// A, which genesis-applies the recipe banked by `space new --recipe`)
 /// or a `vos1…` invite token (host B, which joins + redeems + syncs).
 fn spawn_up(
     data_home: &TempDir,
@@ -293,7 +293,7 @@ fn boot_creator() -> Daemon {
     // (installs the msg-* agents into the registry).
     let manifest = write_manifest(config_home.path());
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", SPACE_NAME, "--manifest"])
+        .args(["space", "new", SPACE_NAME, "--recipe"])
         .arg(&manifest)
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())

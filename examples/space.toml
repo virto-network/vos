@@ -1,14 +1,16 @@
-# Example space manifest.
+# Example space recipe.
 #
-# Reconcile into a space's registry on startup with:
+# Bank it at creation; the first `space up` genesis-applies it into
+# the registry:
 #
-#   vosx space new --name demo
-#   vosx space up demo --manifest examples/space.toml
+#   vosx space new demo --recipe examples/space.toml
+#   vosx space up demo
 #
 # The TOML is a devhelper — the registry is the runtime source of
-# truth. `vosx space export demo` re-derives an equivalent manifest
-# from the live registry; subsequent `space up --manifest` runs are
-# idempotent reconciliation.
+# truth. `vosx space export demo` re-derives an equivalent recipe
+# from the live registry; `vosx space apply demo <recipe>` reconciles
+# a recipe against the running daemon (idempotent, `--diff` to
+# preview).
 #
 # Per-node settings (libp2p listen, subscriptions) live in
 # `<data_dir>/local.toml`, not here. CLI flags `--listen` / `--connect`

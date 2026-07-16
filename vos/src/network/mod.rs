@@ -279,7 +279,7 @@ pub trait NetworkService: Send + Sync {
     /// Inbound `Frame::ManifestReq` from a fresh joining node
     /// (`vosx space up <token>`). Default returns `None` (no manifest
     /// exposed) — the joiner then bails with a clear error and falls
-    /// back to `--manifest <path>`. `vosx space up` overrides this to
+    /// back to a local recipe. `vosx space up` overrides this to
     /// serve the space.toml + actor blobs verbatim.
     fn manifest(&self) -> Option<ManifestReply> {
         None

@@ -318,7 +318,7 @@ fn vosx_ok(data_home: &Path, config_home: &Path, args: &[&str]) -> String {
 fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
     let data_a = TempDir::new("a-data");
     let cfg_a = TempDir::new("a-config");
-    vosx_ok(data_a.path(), cfg_a.path(), &["space", "new", "--name", space]);
+    vosx_ok(data_a.path(), cfg_a.path(), &["space", "new", space]);
     let log_a = data_a.path().join("daemon-a.stderr");
     let daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
     wait_for_endpoint(data_a.path(), &log_a, "A");

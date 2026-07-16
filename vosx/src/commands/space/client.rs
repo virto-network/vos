@@ -218,7 +218,7 @@ impl DaemonClient {
     ///   its per-node ServiceId via `instance_service_id` (the
     ///   same function `space up` uses to register installed
     ///   agents, so the derived id matches the actual registration).
-    /// - `"<instance_name>"` of a manifest-installed extension —
+    /// - `"<instance_name>"` of a recipe-installed extension —
     ///   the reconciler now installs extensions at the same
     ///   deterministic `instance_service_id(name, prefix)` shape,
     ///   so the fallback path simply confirms the name exists in
@@ -408,7 +408,7 @@ impl DaemonClient {
     /// Forward a program's `.vos_meta` schema blob to the registry,
     /// keyed by its program hash, so `meta_for_instance` (and thus
     /// schema-aware dynamic dispatch) resolves for agents installed off
-    /// this program. Mirrors what the manifest reconciler does; empty
+    /// this program. Mirrors what the recipe reconciler does; empty
     /// `auth` is signed on relay by the daemon's operator key.
     pub fn register_meta(&self, program_hash: Vec<u8>, meta_blob: Vec<u8>) -> anyhow::Result<Status> {
         vos::block_on(self.registry().register_meta(

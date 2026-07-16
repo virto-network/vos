@@ -160,10 +160,10 @@ fn boot_daemon(manifest_path: &Path, port: u16) -> Daemon {
 
     let space_name = "e2e";
 
-    // 1. `vosx space new --name e2e` — bundled registry kicks
+    // 1. `vosx space new e2e` — bundled registry kicks
     //    in automatically (no --registry needed).
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", space_name])
+        .args(["space", "new", space_name])
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .output()

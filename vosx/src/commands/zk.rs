@@ -157,7 +157,7 @@ fn pin(args: PinArgs) -> Result<()> {
         let ext = client.resolve_target(&args.extension).map_err(|_| {
             anyhow!(
                 "no '{}' extension loaded in space '{space}' — add \
-                 `[[extension]] name = \"{}\"` to the manifest and restart `vosx space up`",
+                 `[[extension]] name = \"{}\"` to the recipe and restart `vosx space up`",
                 args.extension,
                 args.extension,
             )

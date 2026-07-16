@@ -10,27 +10,24 @@
 #
 # ## Bootstrap
 #
-# One node creates the space; the others `space join` its
-# bootnode hint. Membership is tracked dynamically via joint
-# consensus — no manual `node_prefix` harvesting.
+# One node creates the space and mints invite tokens; each joiner
+# redeems one with a single command. Voter enrollment stays an
+# explicit admin op (`space members add-node`); once enrolled,
+# replicas join the Raft group via joint consensus — no manual
+# `node_prefix` harvesting. (On one machine, give each node its own
+# XDG_DATA_HOME/XDG_CONFIG_HOME — see `just demo-crdt-procs`.)
 #
 #   # Bootstrap node A
-#   vosx space new --name a
-#   vosx space up a --manifest examples/space-raft.toml \
-#       --listen /ip4/127.0.0.1/tcp/4811 &
-#   vosx space info a  # copy the bootnode hint
+#   vosx space new a --recipe examples/space-raft.toml
+#   vosx space up a --listen /ip4/127.0.0.1/tcp/4811 &
+#   vosx space invite a          # prints a vos1… token per joiner
 #
-#   # Joiner B
-#   vosx space join "<bootnode-hint>" --name b
-#   vosx space up b --manifest examples/space-raft.toml \
-#       --listen /ip4/127.0.0.1/tcp/4812 \
-#       --connect /ip4/127.0.0.1/tcp/4811/p2p/<peer-id-a> &
+#   # hosts B and C — join + boot + auto-redeem, one command each
+#   vosx space up "<the vos1… token>" &
 #
-#   # Joiner C
-#   vosx space join "<bootnode-hint>" --name c
-#   vosx space up c --manifest examples/space-raft.toml \
-#       --listen /ip4/127.0.0.1/tcp/4813 \
-#       --connect /ip4/127.0.0.1/tcp/4811/p2p/<peer-id-a> &
+#   # enroll the joiners as voters (an admin op, from A)
+#   vosx space members a add-node <peer-id-b> --role voter
+#   vosx space members a add-node <peer-id-c> --role voter
 #
 #   # Drive the actor from any replica — only the leader will
 #   # accept writes; followers reply Unreachable until elected.

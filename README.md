@@ -16,11 +16,11 @@ the user's critical path.
 | [`vos-macros/`](vos-macros/) | `#[actor]` / `#[messages]` / `#[msg]` proc-macros |
 | [`vos-raft/`](vos-raft/) | Async Raft implementation used by the `raft` consistency mode |
 | [`merkle-crdt/`](merkle-crdt/) | Merkle-DAG CRDT used by the `crdt` consistency mode |
-| [`vosx/`](vosx/) | Operator-facing CLI (`vosx run …`, `vosx space …`) |
+| [`vosx/`](vosx/) | Operator-facing CLI (`vosx run …`, `vosx space …`) — see its [README](vosx/README.md) |
 | [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
 | [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
 | [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
-| [`examples/`](examples/) | Sample actors, agents, extensions, wasm guests, space manifests |
+| [`examples/`](examples/) | Sample actors, agents, extensions, wasm guests, space recipes |
 | [`book/`](book/) | The VOS Book (architecture, protocols, applications). Source in [`docs/`](docs/) |
 
 ## Quick start
@@ -28,9 +28,9 @@ the user's critical path.
 ```bash
 # Create a space. Generates per-space identity, runs the bundled
 # space-registry briefly to commit a genesis CrdtEvent, derives
-# space_id from the resulting DAG root. A `--manifest` recipe is
+# space_id from the resulting DAG root. A `--recipe` TOML is
 # banked for genesis-apply on the space's first boot.
-vosx space new --name demo --manifest examples/space-crdt-a.toml
+vosx space new demo --recipe examples/space-crdt-a.toml
 
 # Run the daemon. Owns the redb, listens on libp2p (auto-port
 # loopback by default; pass --listen for a routable addr). The
@@ -65,7 +65,7 @@ just demo-crdt-sync    # in-process variant, no separate processes
 
 ## Consistency modes
 
-Each `[[agent]]` in a manifest picks a `consistency` mode:
+Each `[[agent]]` in a recipe picks a `consistency` mode:
 
 | Mode | Replication | Read-from-any-replica | Writes block on |
 |---|---|---|---|
@@ -94,7 +94,7 @@ registry.
 
 ```bash
 # host A — create with a genesis recipe, boot, then invite a member
-vosx space new --name a --manifest space-crdt-a.toml
+vosx space new a --recipe space-crdt-a.toml
 vosx space up a --listen /ip4/0.0.0.0/tcp/4811 &   # first boot genesis-applies the recipe
 vosx space info a            # prints the node's bootnode hint:
                              #   /ip4/.../tcp/4811/p2p/<peer-id>

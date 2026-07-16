@@ -50,7 +50,7 @@ cargo run -p vosx -- run actors/greeter/target/riscv64em-javm/release/greeter.el
 # Run the full example space (scheduler + greeter + counter + fizzbuzz).
 # The recipe is banked at `space new` and genesis-applied on first `up`;
 # `vosx space up examples/space.toml` is the one-shot path equivalent.
-vosx space new --name demo --manifest examples/space.toml
+vosx space new demo --recipe examples/space.toml
 vosx space up demo &
 
 # Then: list state, query agents, exercise handlers

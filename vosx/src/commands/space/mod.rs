@@ -62,7 +62,6 @@ pub enum SpaceCommand {
     New {
         /// Short name for the space. Used in listings and as the
         /// default lookup key.
-        #[arg(long)]
         name: String,
         /// Source for the space-registry actor blob: file path,
         /// 64-hex content hash (cache lookup), `ipfs:<cid>`, or
@@ -75,10 +74,10 @@ pub enum SpaceCommand {
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
         /// Optional recipe TOML to apply on the space's first `space
-        /// up` (records it as a pending manifest — a one-shot genesis
+        /// up` (recorded as the pending recipe — a one-shot genesis
         /// apply, not a boot-time reconcile).
         #[arg(long, value_name = "FILE")]
-        manifest: Option<PathBuf>,
+        recipe: Option<PathBuf>,
     },
     /// List spaces in the local index.
     List,
@@ -149,7 +148,7 @@ pub enum SpaceCommand {
         grace: u64,
     },
     /// Query a space's registry and emit a round-trippable
-    /// TOML manifest to stdout.
+    /// TOML recipe to stdout.
     Export {
         /// Space id (full hex) or name.
         space: String,
@@ -338,12 +337,12 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             name,
             registry,
             data_dir,
-            manifest,
+            recipe,
         } => new::run(new::Args {
             name,
             registry,
             data_dir,
-            manifest,
+            recipe,
         }),
         SpaceCommand::List => list::run(),
         SpaceCommand::Info { space } => info::run(&space),

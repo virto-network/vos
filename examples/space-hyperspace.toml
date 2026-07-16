@@ -4,20 +4,20 @@
 # at this same file converge on a shared directory.
 #
 #   # host A
-#   vosx space new --name hsa
-#   vosx space up hsa --manifest examples/space-hyperspace.toml \
-#     --listen /ip4/127.0.0.1/tcp/4811 &
+#   vosx space new hsa --recipe examples/space-hyperspace.toml
+#   vosx space up hsa --listen /ip4/127.0.0.1/tcp/4811 &
 #
-#   # host B (paste host A's bootnode hint from `space info hsa`)
-#   vosx space join "<bootnode-hint>" --name hsb
-#   vosx space up hsb --manifest examples/space-hyperspace.toml \
+#   # host B — its own space from the same recipe, dialed at A
+#   # (grab A's /p2p multiaddr from `space info hsa`)
+#   vosx space new hsb --recipe examples/space-hyperspace.toml
+#   vosx space up hsb \
 #     --connect /ip4/127.0.0.1/tcp/4811/p2p/<peer-id> &
 
 space = "hyperspace-demo"
 version = "0.1.0"
 hyperspace = "demo-hub"
 # vosx loads this elf for the registry actor. Resolved relative
-# to the manifest directory. Future cycles will embed the actor.
+# to the recipe directory. Future cycles will embed the actor.
 registry_blob = "../actors/space-registry/target/riscv64em-javm/release/space-registry.elf"
 
 [[agent]]

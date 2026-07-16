@@ -34,7 +34,7 @@ use crate::blob_store;
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
 use crate::commands::space::reconcile::{
-    self, encode_init_args, encode_on_start_payloads, flatten, AgentDef, Manifest,
+    self, encode_init_args, encode_on_start_payloads, flatten, AgentDef, Recipe,
 };
 use crate::commands::space::subscriptions::{self, AgentLocal, ExtensionLocal, LocalConfig};
 use crate::output;
@@ -42,7 +42,7 @@ use crate::output;
 /// Initial tag used when a recipe omits `program`. It is safe for first
 /// install and idempotent re-apply; changed content must choose a new,
 /// explicit immutable version.
-const RECIPE_VERSION: &str = "manifest";
+const RECIPE_VERSION: &str = "recipe";
 
 pub struct Args {
     pub space: String,
@@ -68,7 +68,7 @@ pub(crate) struct ApplyReport {
     /// Instances whose catalog blob differs from the recipe but that
     /// weren't upgraded (needs `--upgrade`).
     upgrade_pending: Vec<String>,
-    /// Changed implicit `name:manifest` instances that need an explicit
+    /// Changed implicit `name:recipe` instances that need an explicit
     /// immutable target such as `program = "name:v2"`.
     version_required: Vec<String>,
     /// Whether `local.toml` changed (or would change, under `--diff`).
@@ -82,25 +82,25 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // extension `.so` paths in local.toml — a later bare `space up` has
     // no recipe dir to resolve a relative one against.
     let recipe = std::fs::canonicalize(&args.recipe).unwrap_or(args.recipe);
-    let (manifest, recipe_dir) = reconcile::parse_manifest_file(&recipe)?;
-    reconcile::validate_manifest_names(&manifest)?;
+    let (recipe, recipe_dir) = reconcile::parse_recipe_file(&recipe)?;
+    reconcile::validate_recipe_names(&recipe)?;
 
     DaemonClient::with_connect(&args.space, |client| {
         let data_dir = PathBuf::from(&client.entry.data_dir);
-        let report = apply_manifest(client, &manifest, &recipe_dir, &data_dir, args.diff, args.upgrade)?;
+        let report = apply_recipe(client, &recipe, &recipe_dir, &data_dir, args.diff, args.upgrade)?;
         emit(&client.entry.name, &report);
         Ok(())
     })
 }
 
-/// Reconcile `manifest` against the daemon `client` is connected to.
+/// Reconcile `recipe` against the daemon `client` is connected to.
 /// Returns the plan (or, under `diff`, what the plan *would* be). The
 /// caller owns the `DaemonClient`; genesis apply (`space new
-/// --manifest` / the recipe path of `space up`) reuses this against the
+/// --recipe` / the recipe path of `space up`) reuses this against the
 /// just-booted local daemon.
-pub(crate) fn apply_manifest(
+pub(crate) fn apply_recipe(
     client: &DaemonClient,
-    manifest: &Manifest,
+    recipe: &Recipe,
     recipe_dir: &Path,
     data_dir: &Path,
     diff: bool,
@@ -116,7 +116,7 @@ pub(crate) fn apply_manifest(
     // register the agents, so the ids match.
     let prefix = client.daemon_prefix();
     let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
-    for a in flatten(&manifest.agents) {
+    for a in flatten(&recipe.agents) {
         name_ids.insert(a.name.clone(), instance_service_id(&a.name, prefix).0);
     }
 
@@ -124,14 +124,14 @@ pub(crate) fn apply_manifest(
     // owned sections (cap_policy, per-agent policy, extensions) while
     // node-owned fields (subscriptions, listen) are preserved.
     let mut cfg = subscriptions::load(data_dir)?;
-    let next = project_node_local(&cfg, manifest, recipe_dir);
+    let next = project_node_local(&cfg, recipe, recipe_dir);
     let local_changed = next != cfg;
 
     // Validate the entire plan before the first cache, catalog, instance,
     // or local-config write.
     let mut plans = Vec::new();
     let mut planned_tags: BTreeMap<(String, String), [u8; 32]> = BTreeMap::new();
-    for agent in flatten(&manifest.agents) {
+    for agent in flatten(&recipe.agents) {
         let mut plan = preflight_one(client, agent, recipe_dir, &space_id, &name_ids, upgrade)?;
         if plan.needs_publish {
             let key = (plan.program_name.clone(), plan.program_version.clone());
@@ -483,7 +483,7 @@ fn execute_one(
 
 /// The program `(name, version)` an agent installs from. Changed agents
 /// must name an explicit immutable `program = "name:version"`; the
-/// implicit `<instance>:manifest` tag is only for initial/idempotent apply.
+/// implicit `<instance>:recipe` tag is only for initial/idempotent apply.
 fn program_ref(agent: &AgentDef) -> anyhow::Result<(String, String, bool)> {
     match &agent.program {
         Some(pv) => {
@@ -543,16 +543,16 @@ fn resolve_replication_id(
 /// `recipe_dir` so a later bare `space up` still finds them.
 pub(crate) fn project_node_local(
     base: &LocalConfig,
-    manifest: &Manifest,
+    recipe: &Recipe,
     recipe_dir: &Path,
 ) -> LocalConfig {
     let mut out = base.clone();
     // cap_policy: the recipe overrides only if it declares one.
-    if manifest.cap_policy.is_some() {
-        out.cap_policy = manifest.cap_policy.clone();
+    if recipe.cap_policy.is_some() {
+        out.cap_policy = recipe.cap_policy.clone();
     }
     // agents: upsert each recipe agent that carries node-local policy.
-    for a in flatten(&manifest.agents) {
+    for a in flatten(&recipe.agents) {
         if a.tick_ms.is_none() && a.intra_caps.is_empty() && !a.device_secret {
             continue; // no node-local policy — leave any base entry intact
         }
@@ -567,7 +567,7 @@ pub(crate) fn project_node_local(
     }
     // extensions: upsert by name (recipe wins), preserving base
     // extensions the recipe doesn't mention.
-    for e in &manifest.extensions {
+    for e in &recipe.extensions {
         let projected = ExtensionLocal {
             name: e.name.clone(),
             path: absolutize(recipe_dir, &e.path),
@@ -652,15 +652,15 @@ fn emit(space: &str, report: &ApplyReport) {
 mod tests {
     use super::*;
 
-    fn manifest_from(s: &str) -> Manifest {
+    fn recipe_from(s: &str) -> Recipe {
         toml::from_str(s).unwrap()
     }
 
     #[test]
     fn project_node_local_only_emits_agents_with_policy() {
         // A bare agent gets no [agents.<name>] table; one with node-local
-        // fields does. cap_policy + extensions ride from the manifest.
-        let m = manifest_from(
+        // fields does. cap_policy + extensions ride from the recipe.
+        let m = recipe_from(
             r#"
             cap_policy = "block"
             [[agent]]
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn program_ref_from_program_field_or_defaults() {
         // A hand-written recipe agent (no `program`) installs
-        // `<name>:manifest`; an exported agent carries an explicit
+        // `<name>:recipe`; an exported agent carries an explicit
         // `program = "name:version"`.
         let bare = AgentDef {
             name: "counter".into(),
@@ -715,16 +715,16 @@ mod tests {
 
         let exported = AgentDef {
             name: "counter".into(),
-            program: Some("counter:manifest".into()),
+            program: Some("counter:recipe".into()),
             ..Default::default()
         };
         assert_eq!(
             program_ref(&exported).unwrap(),
-            ("counter".into(), "manifest".into(), true),
+            ("counter".into(), "recipe".into(), true),
         );
 
         // Explicit references always carry a version; otherwise an
-        // upgrade could accidentally target the immutable manifest tag.
+        // upgrade could accidentally target the immutable recipe tag.
         let noversion = AgentDef {
             name: "x".into(),
             program: Some("libcounter".into()),
@@ -759,14 +759,14 @@ mod tests {
                 ..Default::default()
             }],
         };
-        // An export-shaped manifest: agents carry program_hash but no
+        // An export-shaped recipe: agents carry program_hash but no
         // node-local fields, and there are no extensions / cap_policy.
-        let m = manifest_from(
+        let m = recipe_from(
             r#"
             space = "x"
             [[agent]]
             name = "messenger"
-            program = "messenger:manifest"
+            program = "messenger:recipe"
             program_hash = "aa"
         "#,
         );
@@ -778,7 +778,7 @@ mod tests {
     fn project_node_local_is_idempotent() {
         // Re-projecting an already-projected config is a fixed point, so
         // a second `apply` writes nothing (the all-skips guarantee).
-        let m = manifest_from(
+        let m = recipe_from(
             r#"
             cap_policy = "log"
             [[agent]]

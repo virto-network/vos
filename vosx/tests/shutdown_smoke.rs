@@ -80,7 +80,7 @@ fn space_up_exits_cleanly_on_sigterm() {
     let space_name = "shutdown-smoke";
 
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", space_name])
+        .args(["space", "new", space_name])
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("VOSX_DISABLE_MDNS", "1")
@@ -224,7 +224,7 @@ fn space_survives_kill9_restart_with_state_intact() {
 
     // 1. Create + boot daemon A.
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", space_name])
+        .args(["space", "new", space_name])
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("VOSX_DISABLE_MDNS", "1")

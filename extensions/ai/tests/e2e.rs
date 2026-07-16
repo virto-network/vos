@@ -161,7 +161,7 @@ fn boot_daemon() -> Daemon {
     let space_name = "ai-e2e";
 
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", space_name])
+        .args(["space", "new", space_name])
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("XDG_CACHE_HOME", &cache_home)

@@ -49,7 +49,7 @@ const LOCAL_FILE: &str = "local.toml";
 
 /// A node's local half of a space's configuration — everything the
 /// registry does NOT replicate. Written by `space apply` / `space new
-/// --manifest` (the node-local projection of a recipe), read at every
+/// --recipe` (the node-local projection of a recipe), read at every
 /// `space up`. The replicated half (which agents exist, their sync
 /// floor, consistency, init) lives in the registry; this file carries
 /// the per-node policy a recipe declares but that never leaves the node.

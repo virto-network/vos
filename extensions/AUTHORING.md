@@ -313,7 +313,7 @@ init = {
 
 Boot the daemon:
 ```bash
-vosx space new --name <space> --manifest <path/to/space.toml>
+vosx space new <space> --recipe <path/to/space.toml>
 vosx space up <space>
 ```
 

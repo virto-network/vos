@@ -28,11 +28,11 @@
 #   cd ..
 #   cargo build -p http-gateway             # builds the gateway .so
 #   cargo build -p vosx                     # builds vosx if needed
-#   ./target/debug/vosx space new --name gw
+#   ./target/debug/vosx space new gw --recipe examples/space-gateway.toml
 #
-#   # boot — `&` to background, daemon logs to stderr
-#   RUST_LOG=info ./target/debug/vosx space up gw \
-#       --manifest examples/space-gateway.toml &
+#   # boot — `&` to background, daemon logs to stderr; the first
+#   # boot genesis-applies the banked recipe
+#   RUST_LOG=info ./target/debug/vosx space up gw &
 #
 #   # exercise it (each returns 200 with body `null`)
 #   curl -s http://localhost:18080/counter/start; echo

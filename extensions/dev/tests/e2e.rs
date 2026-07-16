@@ -207,7 +207,7 @@ fn boot_daemon() -> Daemon {
     // 1. `vosx space new`. Bundled space-registry blob kicks in
     //    automatically — no --registry needed.
     let new = Command::new(vosx_bin())
-        .args(["space", "new", "--name", space_name])
+        .args(["space", "new", space_name])
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("VOSX_DISABLE_MDNS", "1")

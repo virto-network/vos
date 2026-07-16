@@ -1,5 +1,5 @@
 //! `vosx run <program>` — single-actor PVM executor with no
-//! networking, no manifest, no replication. The simplest entry
+//! networking, no recipe, no replication. The simplest entry
 //! point: load an ELF, queue some FETCH payloads, run until
 //! drained.
 

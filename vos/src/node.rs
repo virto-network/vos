@@ -2538,7 +2538,7 @@ impl VosNode {
     /// `NetworkService` snapshot taken there reads from this slot.
     /// `vosx space up` calls this with the parsed `space.toml` bytes
     /// plus every actor blob so a joining node (`vosx space up
-    /// <token>`) can fetch the cluster's manifest without `--manifest`.
+    /// <token>`) can fetch the cluster's manifest without a local recipe.
     #[cfg(feature = "network")]
     pub fn set_manifest(&self, reply: crate::network::ManifestReply) {
         let _ = self.manifest.set(reply);

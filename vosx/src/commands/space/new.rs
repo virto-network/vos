@@ -39,9 +39,9 @@ pub struct Args {
     pub name: String,
     pub registry: Option<String>,
     pub data_dir: Option<PathBuf>,
-    /// Recipe TOML recorded as `pending_manifest` — applied once on the
+    /// Recipe TOML recorded as `pending_recipe` — applied once on the
     /// space's first `space up` (a one-shot genesis apply).
-    pub manifest: Option<PathBuf>,
+    pub recipe: Option<PathBuf>,
 }
 
 /// The result of scaffolding a fresh space — the index entry (already
@@ -61,14 +61,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Record a pending recipe so the first `space up` genesis-applies it
     // (agents → registry, node-local → local.toml). Absolute so the boot
     // re-reads it regardless of cwd.
-    if let Some(manifest) = &args.manifest {
-        let abs = std::fs::canonicalize(manifest)
-            .unwrap_or_else(|_| manifest.clone())
+    if let Some(recipe) = &args.recipe {
+        let abs = std::fs::canonicalize(recipe)
+            .unwrap_or_else(|_| recipe.clone())
             .to_string_lossy()
             .to_string();
         let mut index = spaces_index::load()?;
         if let Some(entry) = index.spaces.iter_mut().find(|e| e.id == s.entry.id) {
-            entry.pending_manifest = abs;
+            entry.pending_recipe = abs;
             spaces_index::save(&index)?;
         }
     }
@@ -119,7 +119,7 @@ pub(crate) fn scaffold(
     data_dir: Option<PathBuf>,
 ) -> anyhow::Result<Scaffolded> {
     if name.is_empty() {
-        anyhow::bail!("--name is required and must be non-empty");
+        anyhow::bail!("the space name must be non-empty");
     }
 
     // 1. Resolve and cache the registry blob — explicit

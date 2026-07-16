@@ -12,7 +12,7 @@
 //! and the registry-as-truth model supersedes the
 //! manifest-as-truth model that originally drove them.
 //! A recipe is applied into a space's registry either at
-//! genesis — `space new --manifest <recipe>` or the one-shot
+//! genesis — `space new <name> --recipe <file>` or the one-shot
 //! `space up <recipe.toml>` on a space's first boot — or via
 //! `space apply` against an already-running space.
 
@@ -79,7 +79,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a single PVM/ELF program with no manifest (one-shot).
+    /// Run a single PVM/ELF program with no recipe (one-shot).
     /// No registry, no networking — just boot the kernel,
     /// deliver the supplied work items, halt.
     Run {
@@ -260,7 +260,7 @@ fn main() {
             Some(p) => commands::run::run(&p, &[], &[], 100_000_000),
             None => {
                 eprintln!(
-                    "vosx: no command. Try `vosx space new --name foo`, \
+                    "vosx: no command. Try `vosx space new foo`, \
                      `vosx run path/to.elf`, or `vosx --help`."
                 );
                 std::process::exit(EXIT_USAGE_ERROR);

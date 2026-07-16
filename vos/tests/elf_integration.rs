@@ -5067,7 +5067,7 @@ fn raft_status_req_returns_absent_for_unknown_group() {
 fn manifest_req_returns_installed_provider_payload() {
     // Serialize network e2e tests (see net_serial).
     let _net = net_serial();
-    // Regression: `vosx join <bootnode>` (without `--manifest`)
+    // Regression: a fresh joining node (`vosx space up <token>`)
     // hits `Frame::ManifestReq` to fetch the bootnode's
     // space.toml + actor blobs. The bootnode side requires a
     // `NetworkService` to be installed via `set_service`

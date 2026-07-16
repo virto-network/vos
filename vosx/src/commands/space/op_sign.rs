@@ -5,7 +5,7 @@
 //! at handler time and re-verifies on every peer's causal replay.
 //! The signer is the operator's libp2p identity key — held by the
 //! CLI on a `vosx space …` command, and by the daemon at boot for
-//! the genesis (`space new`) and manifest-reconcile paths.
+//! the genesis (`space new`) and recipe-reconcile paths.
 //!
 //! The canonical bytes are built by the shared
 //! [`vos::registry::canonical_op_bytes`], so the signer and the
