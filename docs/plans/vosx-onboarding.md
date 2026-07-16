@@ -166,9 +166,9 @@ files listed in each item before editing them.
 ## End-state interface (operator view)
 
 ```
-vosx space new <name> [--manifest recipe.toml]   # create; recipe applied once on first up
+vosx space new <name> [--recipe recipe.toml]     # create; recipe applied once on first up
 vosx space up <name | vos1-token | recipe.toml>  # THE command. join/redeem/apply as needed
-vosx space invite <space> --role member|developer [--expires 7d] [--bootnode <addr>]
+vosx space invite <space> [--role member|developer] [--expires 7d] [--bootnode <addr>] [list|revoke <prefix>]
 vosx space apply <space> <recipe.toml> [--diff] [--upgrade] # explicit reconcile
 vosx space export <space>                        # registry → round-trippable recipe (unchanged)
 vosx space down|list|info|forget|members|role|subs|… (unchanged)
