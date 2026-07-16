@@ -35,7 +35,7 @@ struct IdentityView {
 }
 
 #[derive(Serialize)]
-struct InviteView {
+pub(crate) struct InviteView {
     token_pub: String,
     role: &'static str,
     expires_at: u64,
@@ -43,6 +43,52 @@ struct InviteView {
     /// double-redemption (detect, don't pretend to prevent — decision 6).
     redeemed_by: usize,
     revoked: bool,
+}
+
+/// JSON projection of the invites table — shared by `space members`
+/// and `space invite list`.
+pub(crate) fn invite_views(invites: &[vos::registry::InviteRow]) -> Vec<InviteView> {
+    invites
+        .iter()
+        .map(|inv| InviteView {
+            token_pub: hex::encode(inv.token_pub),
+            role: auth_role_name(inv.role),
+            expires_at: inv.expires_at,
+            redeemed_by: inv.redeemed_by.len(),
+            revoked: inv.revoked,
+        })
+        .collect()
+}
+
+/// Print the `# invites` table plus the double-redemption warnings
+/// (decision 6 — detect, resolve with revoke). Shared by `space
+/// members` and `space invite list`.
+pub(crate) fn print_invites(space: &str, invites: &[vos::registry::InviteRow]) {
+    println!("# invites");
+    println!(
+        "{:<18}  {:<10}  {:<12}  {:<8}  STATUS",
+        "TOKEN_PUB", "ROLE", "EXPIRES", "REDEEMED"
+    );
+    for inv in invites {
+        let short: String = hex::encode(inv.token_pub).chars().take(16).collect();
+        let status = if inv.revoked { "revoked" } else { "active" };
+        let n = inv.redeemed_by.len();
+        let dup = if n > 1 { "  ⚠ double-redeemed" } else { "" };
+        println!(
+            "{short}…  {:<10}  {:<12}  {:<8}  {status}{dup}",
+            auth_role_name(inv.role),
+            inv.expires_at,
+            n,
+        );
+    }
+    for inv in invites.iter().filter(|i| i.redeemed_by.len() > 1 && !i.revoked) {
+        let short: String = hex::encode(inv.token_pub).chars().take(16).collect();
+        println!(
+            "warning: token {short}… was redeemed by {} nodes — revoke it with \
+             `vosx space invite {space} revoke {short}` and re-grant the intended node.",
+            inv.redeemed_by.len(),
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -151,16 +197,7 @@ fn list(space: &str) -> anyhow::Result<()> {
                         proof_kind: proof_kind_name(i.proof_kind),
                     })
                     .collect(),
-                invites: invites
-                    .iter()
-                    .map(|inv| InviteView {
-                        token_pub: hex::encode(inv.token_pub),
-                        role: auth_role_name(inv.role),
-                        expires_at: inv.expires_at,
-                        redeemed_by: inv.redeemed_by.len(),
-                        revoked: inv.revoked,
-                    })
-                    .collect(),
+                invites: invite_views(&invites),
             };
             output::print_json(&view);
             return Ok(());
@@ -189,33 +226,7 @@ fn list(space: &str) -> anyhow::Result<()> {
             if !nodes.is_empty() || !identities.is_empty() {
                 println!();
             }
-            println!("# invites");
-            println!(
-                "{:<18}  {:<10}  {:<12}  {:<8}  STATUS",
-                "TOKEN_PUB", "ROLE", "EXPIRES", "REDEEMED"
-            );
-            for inv in &invites {
-                let short: String = hex::encode(inv.token_pub).chars().take(16).collect();
-                let status = if inv.revoked { "revoked" } else { "active" };
-                let n = inv.redeemed_by.len();
-                let dup = if n > 1 { "  ⚠ double-redeemed" } else { "" };
-                println!(
-                    "{short}…  {:<10}  {:<12}  {:<8}  {status}{dup}",
-                    auth_role_name(inv.role),
-                    inv.expires_at,
-                    n,
-                );
-            }
-            // Surface the double-redemption warning loudly below the
-            // table too (decision 6 — detect, resolve with revoke).
-            for inv in invites.iter().filter(|i| i.redeemed_by.len() > 1 && !i.revoked) {
-                let short: String = hex::encode(inv.token_pub).chars().take(16).collect();
-                println!(
-                    "warning: token {short}… was redeemed by {} nodes — revoke it with \
-                     `vosx space invite {space} revoke {short}` and re-grant the intended node.",
-                    inv.redeemed_by.len(),
-                );
-            }
+            print_invites(space, &invites);
         }
         if nodes.is_empty() && identities.is_empty() && invites.is_empty() {
             println!(

@@ -89,21 +89,25 @@ pub enum SpaceCommand {
     /// Mint a `vos1…` invite token for a running space. Requires the
     /// operator to hold ADMIN. The joiner redeems it with `space up
     /// <token>`. Tokens grant `member` or `developer`; promote admins
-    /// explicitly with `space role grant` after admission.
+    /// explicitly with `space role grant` after admission. Subcommands:
+    /// `list` shows outstanding invites, `revoke <token_pub-prefix>`
+    /// invalidates one; bare `space invite <space>` mints.
     Invite {
         /// Space id (full hex) or name.
         space: String,
-        /// Role the token grants: `member` | `developer`.
-        #[arg(long, default_value = "member")]
-        role: String,
-        /// Expiry window: `7d` / `24h` / `30m` / `90s` / bare seconds.
-        #[arg(long, default_value = "7d")]
-        expires: String,
+        /// Role the token grants: `member` (default) | `developer`.
+        /// Mint only.
+        #[arg(long)]
+        role: Option<String>,
+        /// Expiry window: `7d` (default) / `24h` / `30m` / `90s` /
+        /// bare seconds. Mint only.
+        #[arg(long)]
+        expires: Option<String>,
         /// Bootnode multiaddr(s) to embed. Repeatable. Defaults to the
-        /// running daemon's published listen addrs.
+        /// running daemon's published listen addrs. Mint only.
         #[arg(long, value_name = "MULTIADDR")]
         bootnode: Vec<String>,
-        /// `revoke <token_pub-prefix>` to revoke an invite; omit to mint.
+        /// `list` / `revoke <token_pub-prefix>`; omit to mint.
         #[command(subcommand)]
         command: Option<invite::InviteCommand>,
     },

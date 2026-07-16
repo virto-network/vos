@@ -24,8 +24,11 @@ use crate::token;
 
 #[derive(Subcommand, Debug)]
 pub enum InviteCommand {
+    /// List outstanding invites — token_pub prefix, role, expiry,
+    /// redemption count, status. The same rows `space members` shows.
+    List,
     /// Revoke an invite by a `token_pub` prefix (as shown in `space
-    /// members`). Grow-only + idempotent; does NOT claw back a role
+    /// invite list`). Grow-only + idempotent; does NOT claw back a role
     /// already granted by a redemption — use `space role revoke` for
     /// that.
     Revoke {
@@ -36,12 +39,13 @@ pub enum InviteCommand {
 
 pub struct Args {
     pub space: String,
-    /// `member` | `developer`.
-    pub role: String,
+    /// `member` | `developer`. Mint only; defaults to `member`.
+    pub role: Option<String>,
     /// Expiry window: `7d` / `24h` / `30m` / `90s` / bare seconds.
-    pub expires: String,
+    /// Mint only; defaults to `7d`.
+    pub expires: Option<String>,
     /// Bootnode multiaddr(s) to embed. Defaults to the running daemon's
-    /// published listen addrs.
+    /// published listen addrs. Mint only.
     pub bootnode: Vec<String>,
     /// Optional subcommand — bare `space invite <space> …` mints.
     pub command: Option<InviteCommand>,
@@ -68,10 +72,42 @@ fn role_from_name(s: &str) -> anyhow::Result<(u8, &'static str)> {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    if let Some(InviteCommand::Revoke { prefix }) = &args.command {
-        return revoke(&args.space, prefix);
+    let Some(command) = &args.command else {
+        return mint(args);
+    };
+    // The mint flags mean nothing to `list`/`revoke` — refuse them
+    // instead of silently ignoring what the user typed.
+    if args.role.is_some() || args.expires.is_some() || !args.bootnode.is_empty() {
+        anyhow::bail!(
+            "--role/--expires/--bootnode only apply when minting — \
+             bare `vosx space invite <space>` mints a token",
+        );
     }
-    mint(args)
+    match command {
+        InviteCommand::List => list(&args.space),
+        InviteCommand::Revoke { prefix } => revoke(&args.space, prefix),
+    }
+}
+
+/// `space invite <space> list` — the invites table (same rows `space
+/// members` folds into its listing).
+fn list(space: &str) -> anyhow::Result<()> {
+    DaemonClient::with_connect(space, |client| {
+        let invites = client.invites()?;
+        if output::is_json() {
+            output::print_json(&super::members::invite_views(&invites));
+            return Ok(());
+        }
+        if invites.is_empty() {
+            println!(
+                "no invites. mint one with `vosx space invite {}`.",
+                client.entry.name,
+            );
+            return Ok(());
+        }
+        super::members::print_invites(&client.entry.name, &invites);
+        Ok(())
+    })
 }
 
 /// `space invite <space> revoke <prefix>` — resolve the `token_pub`
@@ -87,7 +123,7 @@ fn revoke(space: &str, prefix: &str) -> anyhow::Result<()> {
         let token_pub = match matches.as_slice() {
             [] => anyhow::bail!(
                 "no invite token matches prefix '{prefix}' in space '{}' \
-                 (list them with `vosx space members {}`)",
+                 (list them with `vosx space invite {} list`)",
                 client.entry.name,
                 client.entry.name,
             ),
@@ -118,8 +154,9 @@ fn revoke(space: &str, prefix: &str) -> anyhow::Result<()> {
 }
 
 fn mint(args: Args) -> anyhow::Result<()> {
-    let (role, role_name) = role_from_name(&args.role)?;
-    let ttl = token::parse_duration(&args.expires)?;
+    let (role, role_name) = role_from_name(args.role.as_deref().unwrap_or("member"))?;
+    let expires = args.expires.as_deref().unwrap_or("7d");
+    let ttl = token::parse_duration(expires)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -196,7 +233,7 @@ fn mint(args: Args) -> anyhow::Result<()> {
             println!();
             println!("invite for space '{}'", client.entry.name);
             println!("  role      = {role_name}");
-            println!("  expires   = {} (in {})", expires_at, args.expires);
+            println!("  expires   = {expires_at} (in {expires})");
             println!("  bootnodes = {}", bootnodes.join(", "));
             println!();
             println!("redeem with: `vosx space up <token>` (or `vosx space up -` to pipe it in).");
