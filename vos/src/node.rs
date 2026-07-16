@@ -1440,6 +1440,26 @@ impl NodeService {
         registry_probe_u8(&self.invoke_routes, payload)
     }
 
+    /// True only when the local space registry currently catalogs `hash`.
+    /// A missing/unreachable registry fails closed so the global host cache
+    /// never becomes an open cross-space CAS.
+    fn program_hash_catalogued(&self, hash: &[u8; 32]) -> bool {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::value::{Msg, Value, TAG_DYNAMIC};
+        let msg = Msg::new("programs");
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+        let Some(reply) = registry_probe_reply(&self.invoke_routes, payload) else {
+            return false;
+        };
+        let Some(Value::Bytes(bytes)) = <Value as Decode>::try_decode(&reply) else {
+            return false;
+        };
+        <Vec<crate::registry::ProgramRow> as Decode>::try_decode(&bytes)
+            .is_some_and(|programs| programs.iter().any(|p| &p.hash == hash))
+    }
+
     /// Resolve a (possibly prefix-scoped) target `ServiceId` value back
     /// to the installed instance name registered for it. Reads the
     /// node's shared [`AgentNames`] reverse map; `None` for ids this
@@ -1947,16 +1967,20 @@ impl crate::network::NetworkService for NodeService {
         Some(bytes)
     }
 
-    fn get_program_blob(&self, _peer: Option<libp2p::PeerId>, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        // Served to any connected peer. The 32-byte hash comes from a
-        // floor-gated registry row, so the registry floor is the real access
-        // boundary and the ELF follows the hash; the secret is the runtime
-        // DATA (protected by the sync gate + E2EE), never the code. The
-        // network layer caps per-peer volume (`allow_program_blob`) since each
-        // serve is a whole-ELF read. Read from the host's content-addressed
-        // cache dir (`{dir}/{hex_hash}`) — `proof_blob_filename` is the shared
-        // hex-of-hash formatter. No rehash: the fetcher verifies the bytes
-        // against the requested hash before trusting them.
+    fn get_program_blob(&self, peer: Option<libp2p::PeerId>, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        // Program code is a space asset even though it is not confidential:
+        // require membership, then prove this space catalogs the requested
+        // hash before touching the cross-space host cache. The network layer
+        // additionally caps per-peer volume; the fetcher re-hashes the reply.
+        let peer = peer?;
+        if self.lookup_caller_role(Some(&peer)) < AUTH_ROLE_READONLY
+            && !self.caller_is_enrolled_node(&peer)
+        {
+            return None;
+        }
+        if !self.program_hash_catalogued(hash) {
+            return None;
+        }
         let dir = self.program_blobs_dir.as_ref()?;
         std::fs::read(dir.join(proof_blob_filename(hash))).ok()
     }
@@ -9545,6 +9569,46 @@ mod tests {
         (routes, handle)
     }
 
+    /// Role + catalog stub for the program-blob serving gate.
+    #[cfg(feature = "network")]
+    fn spawn_stub_blob_registry(
+        peer_role: u8,
+        node_role: u8,
+        catalogued: bool,
+        hash: [u8; 32],
+    ) -> (InvokeRoutes, thread::JoinHandle<()>) {
+        use crate::actors::codec::Encode;
+        use crate::value::Value;
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let handle = thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                let value = match intercepted_method_name(&req.msg).as_deref() {
+                    Some("node_role") => Value::U8(node_role),
+                    Some("programs") => Value::Bytes(
+                        catalogued
+                            .then(|| vec![crate::registry::ProgramRow {
+                                name: "program".into(),
+                                version: "1".into(),
+                                hash,
+                            }])
+                            .unwrap_or_default()
+                            .encode(),
+                    ),
+                    _ => Value::U8(peer_role),
+                };
+                let reply = encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE,
+                    &[],
+                    &value.encode(),
+                );
+                let _ = req.reply.send(reply);
+            }
+        });
+        (routes, handle)
+    }
+
     /// The `Member` sync floor admits a peer that holds a space read grant
     /// OR is an enrolled node (a voter/observer is a space member) — the
     /// latter unwedges the join→sync→grant bootstrap order. A stranger
@@ -9589,14 +9653,10 @@ mod tests {
         assert!(!svc.sync_serve_allowed(None, "counter"), "anonymous is refused Member");
     }
 
-    /// `get_program_blob` is the serving side of the program-blob peer fetch.
-    /// It is ungated — the registry floor gating the hash is the real boundary,
-    /// and the code is not the secret — so it serves the cached ELF to any
-    /// caller, member or not, including an anonymous one. An uncached hash and a
-    /// node with no cache dir both yield nothing.
+    /// Program blobs require both space membership and a catalogued hash.
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn get_program_blob_serves_any_caller_from_the_cache_dir() {
+    fn get_program_blob_requires_member_and_catalogued_hash() {
         use crate::network::NetworkService;
         // A temp dir standing in for vosx's content-addressed blob cache,
         // holding one ELF keyed by its hex hash (the layout the node reads).
@@ -9611,41 +9671,66 @@ mod tests {
         let hash = crate::crypto::blake2b_hash::<32>(&[], &[&bytes]);
         std::fs::write(dir.join(proof_blob_filename(&hash)), &bytes).unwrap();
 
-        let (routes, _reg) = spawn_stub_role_registry(AUTH_ROLE_NONE, 0);
-        let mut svc = lifecycle_service(
-            routes,
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
-        );
-        svc.program_blobs_dir = Some(dir.clone());
+        let make = |peer_role, node_role, catalogued| {
+            let (routes, _reg) =
+                spawn_stub_blob_registry(peer_role, node_role, catalogued, hash);
+            let mut svc = lifecycle_service(
+                routes,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(std::sync::RwLock::new(HashMap::new())),
+            );
+            svc.program_blobs_dir = Some(dir.clone());
+            svc
+        };
 
-        // Served regardless of the caller — a random peer, and an anonymous
-        // caller with no peer id, both get the cached ELF.
+        let member = make(AUTH_ROLE_READONLY, 0, true);
         assert_eq!(
-            svc.get_program_blob(Some(libp2p::PeerId::random()), &hash)
+            member
+                .get_program_blob(Some(libp2p::PeerId::random()), &hash)
                 .as_deref(),
             Some(bytes.as_slice()),
-            "any connected peer gets the cached ELF",
+            "a member gets a catalogued ELF",
         );
+        let enrolled = make(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER, true);
         assert_eq!(
-            svc.get_program_blob(None, &hash).as_deref(),
+            enrolled
+                .get_program_blob(Some(libp2p::PeerId::random()), &hash)
+                .as_deref(),
             Some(bytes.as_slice()),
-            "an anonymous caller gets it too",
+            "an enrolled node gets a catalogued ELF",
         );
-        // An uncached hash yields nothing.
         assert!(
-            svc.get_program_blob(Some(libp2p::PeerId::random()), &[0xEE; 32])
+            make(AUTH_ROLE_NONE, 0, true)
+                .get_program_blob(Some(libp2p::PeerId::random()), &hash)
                 .is_none(),
-            "an uncached hash yields nothing",
+            "a stranger is refused",
         );
-        // No cache dir configured → nothing to serve.
-        svc.program_blobs_dir = None;
         assert!(
-            svc.get_program_blob(None, &hash).is_none(),
-            "no cache dir → nothing served",
+            member.get_program_blob(None, &hash).is_none(),
+            "an anonymous caller is refused",
+        );
+        assert!(
+            make(AUTH_ROLE_READONLY, 0, false)
+                .get_program_blob(Some(libp2p::PeerId::random()), &hash)
+                .is_none(),
+            "an uncatalogued hash is refused even when cached",
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "network")]
+    fn redeem_invite_expiry_is_checked_at_admission_boundary() {
+        use crate::value::Msg;
+        let before = Msg::new("redeem_invite").with("expires_at", 101u64);
+        let boundary = Msg::new("redeem_invite").with("expires_at", 100u64);
+        let malformed = Msg::new("redeem_invite");
+        assert!(!redeem_invite_is_expired(&before, Some(100)));
+        assert!(redeem_invite_is_expired(&boundary, Some(100)));
+        assert!(redeem_invite_is_expired(&malformed, Some(100)));
+        assert!(redeem_invite_is_expired(&before, None), "clock failure denies");
+        assert!(!redeem_invite_is_expired(&Msg::new("programs"), Some(100)));
     }
 
     #[cfg(feature = "network")]

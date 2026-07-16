@@ -1722,10 +1722,10 @@ fn handle_req_resp(
                             .send_response(channel, Frame::ProofBlobReply { blob });
                     }
                     Frame::FetchProgramBlob { hash } => {
-                        // Served to any peer (the registry floor gating the hash
-                        // is the access boundary), but each serve reads a whole
-                        // ELF off disk, so it rides its own tighter per-peer
-                        // budget. Off the swarm thread like FetchHeads/FetchNode.
+                        // Membership + catalog membership are checked by the
+                        // node service. Each serve still reads a whole ELF off
+                        // disk, so it rides its own tighter per-peer budget and
+                        // runs off the swarm thread like FetchHeads/FetchNode.
                         if !sync_rate.allow_program_blob(peer) {
                             return;
                         }
@@ -2143,8 +2143,7 @@ struct SyncRateLimiter {
     /// Per-peer window for cheap DAG-sync fetches (`FetchHeads`/`FetchNode`).
     sync: HashMap<PeerId, (std::time::Instant, u32)>,
     /// Separate, much tighter window for `FetchProgramBlob`: each serve is a
-    /// whole-ELF disk read (~150x a DAG node) and — unlike the membership-gated
-    /// sync path — it is served to any peer, so it gets its own small budget.
+    /// whole-ELF disk read (~150x a DAG node), so it gets its own small budget.
     program_blob: HashMap<PeerId, (std::time::Instant, u32)>,
 }
 
