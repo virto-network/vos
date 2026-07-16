@@ -24,8 +24,11 @@ use crate::token;
 
 #[derive(Subcommand, Debug)]
 pub enum InviteCommand {
-    /// List outstanding invites — token_pub prefix, role, expiry,
-    /// redemption count, status. The same rows `space members` shows.
+    /// List recorded invites — token_pub prefix, role, expiry,
+    /// redemption count, status. A row appears when a token is first
+    /// redeemed or revoked; a minted-but-unredeemed token is an offline
+    /// credential the registry hasn't seen yet. Same rows as `space
+    /// members`.
     List,
     /// Revoke an invite by a `token_pub` prefix (as shown in `space
     /// invite list`). Grow-only + idempotent; does NOT claw back a role
@@ -100,7 +103,8 @@ fn list(space: &str) -> anyhow::Result<()> {
         }
         if invites.is_empty() {
             println!(
-                "no invites. mint one with `vosx space invite {}`.",
+                "no invites recorded — a row appears once a token is redeemed or revoked. \
+                 Mint one with `vosx space invite {}`.",
                 client.entry.name,
             );
             return Ok(());

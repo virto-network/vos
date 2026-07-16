@@ -147,6 +147,17 @@ fn init_tracing(verbose: bool) {
 }
 
 fn main() {
+    // Restore default SIGPIPE so `vosx … | head` exits quietly when the
+    // reader closes, instead of panicking on a broken stdout — piping
+    // command output (e.g. capturing an invite token) is a documented
+    // pattern. Rust runtimes ignore SIGPIPE by default.
+    // SAFETY: signal(2) with SIG_DFL is a scalar handler reset, done
+    // before any threads exist.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     // Pre-parser: peek argv and decide whether to enter the
     // dynamic-dispatch path before handing off to clap. clap's
     // Subcommand derive only knows the built-in verbs (`run`,

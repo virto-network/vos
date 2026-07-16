@@ -90,8 +90,9 @@ pub enum SpaceCommand {
     /// operator to hold ADMIN. The joiner redeems it with `space up
     /// <token>`. Tokens grant `member` or `developer`; promote admins
     /// explicitly with `space role grant` after admission. Subcommands:
-    /// `list` shows outstanding invites, `revoke <token_pub-prefix>`
-    /// invalidates one; bare `space invite <space>` mints.
+    /// `list` shows recorded invites (rows appear on redemption or
+    /// revocation), `revoke <token_pub-prefix>` invalidates one; bare
+    /// `space invite <space>` mints.
     Invite {
         /// Space id (full hex) or name.
         space: String,
