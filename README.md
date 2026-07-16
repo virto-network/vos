@@ -83,7 +83,7 @@ Raft requires a cluster membership list (every replica's
 `node_prefix`). See `examples/space-raft.toml`.
 
 ```bash
-cargo test --all -- --test-threads=1   # full integration suite
+just test                              # rebuild artifacts + full integration suite
 ```
 
 ## Multi-node

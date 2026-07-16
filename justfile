@@ -52,11 +52,19 @@ build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge 
     cargo build -p prover-extension
     cargo build -p prover-extension --release
 
+# Every generated artifact consumed by the workspace test suite. Keeping
+# this as one dependency target makes both the broad and focused gates
+# rebuild guest ELFs and host extensions before executing tests.
+build-test-artifacts: build-extensions build-pvm build-actors
+    # Compile workspace consumers only after guest artifacts are fresh, so
+    # vosx's build script embeds the just-built registry ELF on the first pass.
+    cargo build
+
 # ── Test ────────────────────────────────────────────────────────────
 
-# Run all tests (workspace + integration)
-test: build-extensions
-    cargo test --all
+# Run all tests (workspace + integration) against freshly-built artifacts.
+test: build-test-artifacts
+    cargo test --all -- --test-threads=1
 
 # Run only extension tests
 test-extensions: build-extensions
@@ -73,8 +81,8 @@ test-wasm: build-wasm
 # actor ELFs + prover .so) so a vos change never runs the e2e against a stale
 # ELF/.so. This is the safe way to run the e2e; prefer it over a bare
 # `cargo test -p vos --test elf_integration`.
-test-pvm: build-crates build-extensions build-pvm build-actors
-    cargo test -p vos --test elf_integration -- --nocapture
+test-pvm: build-test-artifacts
+    cargo test -p vos --test elf_integration -- --nocapture --test-threads=1
 
 # Run a single test by name
 test-one name: build-extensions
