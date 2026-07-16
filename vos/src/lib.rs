@@ -119,9 +119,9 @@ pub mod registry;
 // chronos actor `pub use`s them back; the VRF-driven host feeder lives in the
 // network-gated `chronos_feed` module below.
 pub mod chronos;
+pub mod provable;
 pub mod refine_payload;
 pub mod task_abi;
-pub mod provable;
 
 pub mod effect_log;
 pub mod effects;

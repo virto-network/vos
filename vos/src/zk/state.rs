@@ -823,7 +823,11 @@ mod tests {
         let (proof, touched) = witness_for(&accts, &[a, b, fresh]);
 
         let mut ledger = WitnessedLedger::new(CC, proof, touched, root_before);
-        assert_eq!(ledger.root(), root_before, "pre-mutation root is root_before");
+        assert_eq!(
+            ledger.root(),
+            root_before,
+            "pre-mutation root is root_before"
+        );
 
         // Proven reads: a present account and a proven-absent one.
         assert_eq!(ledger.get(&a), content_of(&accts, &a).as_deref());

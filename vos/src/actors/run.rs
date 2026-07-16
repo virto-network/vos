@@ -700,7 +700,7 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     let reply_bytes = ctx.take_reply_bytes();
     let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
     let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != anchor;
-    let payload = ctx.drain_into_refine_payload(
+    let mut payload = ctx.drain_into_refine_payload(
         anchor_kind,
         anchor,
         super::storage::end_dispatch(),
@@ -728,6 +728,9 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
         &app_public,
     );
     let io_hash = crate::zk::compute_io_hash(&public_prime, &payload.reply);
+    // Surface the folded bytes in the v4 payload so the host's record
+    // capture can persist what a verifier reconstructs public' from.
+    payload.app_public = app_public;
     let encoded = payload.encode();
     halt_with_output_bound(&encoded, &io_hash);
 }

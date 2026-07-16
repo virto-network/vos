@@ -2,6 +2,7 @@ version = 1
 
 [[program]]
 name = "voucher-check"
+version = 1
 commitments = [
     "b0c65a9b5a14dfa601bc5bd3416f6d6e9ce56686806acc1b9bfbc95738bb47cd",
     "95b15a744f002ec161608fc5e88ea838f1da3b59da8cf5ffa50117a5fa83cd28",
