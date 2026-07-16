@@ -6,19 +6,14 @@
 //!           invite → register alice → create channel → send a
 //!           pre-invite message
 //!   host B: `space up <token>` (join + redeem + sync A's registry —
-//!           no per-node manifest) → register bob → mint a KeyPackage
+//!           no per-node recipe for the replicated half) → `space
+//!           apply` the recipe's node-local half (the messenger's
+//!           `device_secret`) + restart so boot provisions the seed →
+//!           register bob → mint a KeyPackage
 //!   host A: grant B's operator the member tier → invite bob with
 //!           the KeyPackage
 //!   host B: tick picks the Welcome off the commit chain → joins →
 //!           both sides exchange messages
-//!
-//! KNOWN BLOCK (pre-existing, orthogonal to onboarding): the messenger's
-//! `.vos_meta` (~4.3 KiB) exceeds the registry guest's FETCH buffer
-//! (4 KiB), so `register_meta` is refused at genesis apply and schema
-//! coercion is disabled — channel creation then fails. Raising the guest
-//! buffer (a guest-ELF rebuild + voucher re-pin) is tracked separately;
-//! this test's onboarding uses the current token/redeem flow so it is
-//! ready to pass once that lands.
 //!
 //! The assertions that matter:
 //!   1. plaintext round-trips both directions across two processes
@@ -166,6 +161,34 @@ impl Daemon {
     fn log_tail(&self) -> String {
         fs::read_to_string(&self.log_path).unwrap_or_default()
     }
+
+    /// Gracefully stop the daemon and boot it again with a bare
+    /// `space up <name>` — the joiner-restart path (re-attach from the
+    /// local index + synced registry + local.toml). `space down`
+    /// SIGTERMs so the endpoint file is removed; a fresh boot rewrites
+    /// it, which is what `wait_endpoint` keys on.
+    fn restart(&mut self) {
+        let _ = Command::new(vosx_bin())
+            .args(["space", "down", SPACE_NAME])
+            .env("XDG_DATA_HOME", self.data_home.path())
+            .env("XDG_CONFIG_HOME", self.config_home.path())
+            .env("XDG_CACHE_HOME", self.cache_home.path())
+            .env("VOSX_DISABLE_MDNS", "1")
+            .output();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+        let child = spawn_up(
+            &self.data_home,
+            &self.config_home,
+            &self.cache_home,
+            SPACE_NAME,
+            None,
+            &self.log_path,
+        );
+        self.child = Some(child);
+        wait_endpoint(&self.space_data_dir, &self.log_path);
+    }
 }
 
 impl Drop for Daemon {
@@ -262,25 +285,41 @@ fn wait_endpoint(space_data_dir: &Path, log_path: &Path) {
     );
 }
 
+/// Resolve the space's data dir from the config-home index, waiting for
+/// the entry to appear: the joiner's `space up <token>` scaffolds the
+/// space (and writes spaces.toml) from inside the spawned daemon, so on
+/// host B the entry lands asynchronously after spawn.
 fn resolve_space_data_dir(config_home: &Path) -> PathBuf {
     let index_path = config_home.join("vosx").join("spaces.toml");
-    let raw = fs::read_to_string(&index_path)
-        .unwrap_or_else(|e| panic!("read spaces.toml {}: {e}", index_path.display()));
-    let parsed: toml::Value = toml::from_str(&raw).expect("parse spaces.toml");
-    for entry in parsed
-        .get("space")
-        .and_then(|v| v.as_array())
-        .unwrap_or_else(|| panic!("spaces.toml missing [[space]] entries: {raw}"))
-    {
-        if entry.get("name").and_then(|v| v.as_str()) == Some(SPACE_NAME) {
-            let d = entry
-                .get("data_dir")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let entry_dir = fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+            .and_then(|parsed| {
+                parsed.get("space").and_then(|v| v.as_array()).and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(SPACE_NAME))
+                        .map(|e| {
+                            e.get("data_dir")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string()
+                        })
+                })
+            });
+        if let Some(d) = entry_dir {
             return PathBuf::from(d);
         }
+        if Instant::now() >= deadline {
+            panic!(
+                "space '{SPACE_NAME}' did not appear in {} within 30s",
+                index_path.display(),
+            );
+        }
+        thread::sleep(Duration::from_millis(150));
     }
-    panic!("space '{SPACE_NAME}' not in spaces.toml");
 }
 
 /// Boot host A: create the space and bring the daemon up.
@@ -483,7 +522,10 @@ impl RawClient {
     /// Raw `msg-directory.publish_kp(owner, kp)` — stages a substitution by
     /// listing a KeyPackage under an `owner` the publisher doesn't actually own
     /// (the directory stores `owner` opaquely; binding is enforced inviter-side).
-    fn publish_kp_raw(&self, owner: &str, kp: Vec<u8>) -> u8 {
+    /// `None` = the daemon dropped the write without a status (a raft
+    /// follower refusing a commit, or a mid-election window) — retry
+    /// against the group's leader.
+    fn publish_kp_raw(&self, owner: &str, kp: Vec<u8>) -> Option<u8> {
         let raw: [u8; 2] =
             vos::crypto::blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"msg-directory"]);
         let local = (u16::from_le_bytes(raw) & 0x7FFF).max(0x100);
@@ -498,10 +540,13 @@ impl RawClient {
             .node
             .invoke_with_timeout(target, payload, Duration::from_secs(30))
             .expect("daemon didn't reply to raw publish_kp");
-        match <Value as Decode>::decode(&reply) {
+        if reply.is_empty() {
+            return None;
+        }
+        Some(match <Value as Decode>::decode(&reply) {
             Value::Bytes(b) if b.len() == 1 => b[0],
             v => v.as_u8().expect("publish_kp status"),
-        }
+        })
     }
 
     /// Page the whole raw envelope log off one of the daemon's
@@ -725,6 +770,74 @@ fn two_nodes_exchange_e2ee_messages() {
         }
     }
 
+    // ── The messenger is device-local: its MLS CSPRNG root is a
+    //    node-local `device_secret` seed, never replicated. A token
+    //    joiner carries no node-local recipe half, so project it
+    //    explicitly — `space apply` is all-skips on the replicated
+    //    half (agents already synced) and writes the recipe's
+    //    node-local half (`device_secret`, `tick_ms`, `intra_caps`)
+    //    into B's local.toml; the next boot provisions the seed. ──
+    let manifest_b = write_manifest(b.config_home.path());
+    run_cli(
+        &b,
+        &[
+            "space",
+            "apply",
+            SPACE_NAME,
+            manifest_b.to_str().expect("manifest path is utf-8"),
+        ],
+        "apply the recipe's node-local half on B",
+    );
+    let mut b = b;
+    b.restart();
+    // Boot resumes the persisted raft replicas (silently — no fresh
+    // "joined raft group" lines) and then provisions the messenger's
+    // device seed, so the seed line doubles as the ready signal for
+    // bob's register (his local directory replica is the publish
+    // target and resumes before provisioning runs).
+    {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let log = b.log_tail();
+            if log.contains("device seed provisioned") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "B's restart never provisioned the device seed\n--- B log ---\n{log}"
+            );
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+    // Register stocks the directory exactly once (no tick retry), so
+    // it must not race B's msg-directory replica resuming its raft
+    // state — poll a cheap read through B's daemon until it answers.
+    {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let (ok, _, _) = cli(
+                &b,
+                &[
+                    "space",
+                    "call",
+                    SPACE_NAME,
+                    "msg-directory",
+                    "kp_count",
+                    &format!("owner={peer_b_hex}"),
+                ],
+            );
+            if ok {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "B's msg-directory replica never answered after restart\n--- B log ---\n{}",
+                b.log_tail(),
+            );
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+
     // ── Bob registers (auto-stocks the directory), watches the
     //    channel. ──────────────────────────────────────────────
     let out = messenger(&b, &["register", "nickname=bob"], "bob register");
@@ -742,7 +855,7 @@ fn two_nodes_exchange_e2ee_messages() {
     // log; alice's claim races that — and the ctl group may still
     // be mid-join (B's admission as a voter) — so poll the invite
     // itself and let the deadline be the real assert.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let out = messenger(
             &a,
@@ -814,13 +927,42 @@ fn two_nodes_exchange_e2ee_messages() {
         // A would-be victim identity that never published its own KeyPackage.
         let victim = libp2p::identity::Keypair::generate_ed25519();
         let victim_hex = to_hex(&libp2p::PeerId::from(victim.public()).to_bytes());
-        // The attacker lists bob's KeyPackage under the victim's identity.
-        let attacker = connect_reader(&a, &a);
-        assert_eq!(
-            attacker.publish_kp_raw(&victim_hex, from_hex(&bob_kp_hex)),
-            0,
-            "the directory stores the (opaque) substituted row",
+        // msg-directory is a raft group and a follower drops writes
+        // ("not the leader"), so aim the raw publish at whichever
+        // daemon currently leads — B's restart can flip the election.
+        let status = run_cli(
+            &a,
+            &["space", "raft-status", SPACE_NAME, "msg-directory"],
+            "msg-directory raft status",
         );
+        let a_prefix = format!("{:#06x}", ep_a.prefix);
+        let leader_daemon = if status
+            .lines()
+            .find(|l| l.starts_with("leader"))
+            .is_some_and(|l| l.contains(&a_prefix))
+        {
+            &a
+        } else {
+            &b
+        };
+        // The attacker lists bob's KeyPackage under the victim's identity.
+        let attacker = connect_reader(leader_daemon, &a);
+        let staged = {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match attacker.publish_kp_raw(&victim_hex, from_hex(&bob_kp_hex)) {
+                    Some(status) => break status,
+                    // A dropped write = follower or mid-election; retry.
+                    None => assert!(
+                        Instant::now() < deadline,
+                        "raw publish_kp kept being dropped — no stable \
+                         msg-directory leader within 30s"
+                    ),
+                }
+                thread::sleep(Duration::from_millis(400));
+            }
+        };
+        assert_eq!(staged, 0, "the directory stores the (opaque) substituted row");
         // Alice invites the victim by identity; the claim returns bob's
         // package, whose credential binds to bob — refused.
         let out = messenger(
@@ -878,13 +1020,17 @@ fn two_nodes_exchange_e2ee_messages() {
         }
     }
 
-    // ── Removal: post-compromise security end to end. ───────────
-    let out = messenger(
+    // ── Removal: post-compromise security end to end. The messenger
+    //    absorbs chain commits on its tick, and A's ctl replica may be
+    //    a raft follower that briefly trails the chain — a remove
+    //    issued in that window is answered "wait for sync", so poll
+    //    until the removal lands.
+    wait_for(
         &a,
         &["remove", "channel=general", "nickname=bob"],
         "alice removes bob",
+        |s| s.contains("removed 'bob'"),
     );
-    assert!(out.contains("removed 'bob'"), "remove reply: {out}");
     wait_for(&b, &["status"], "bob status until removed", |s| {
         s.contains("removed — awaiting re-invite")
     });
@@ -957,12 +1103,14 @@ fn two_nodes_exchange_e2ee_messages() {
         .filter(|run| run.len() > 64)
         .unwrap_or_else(|| panic!("fresh key_package should print hex; got:\n{kp_out}"))
         .to_string();
-    let out = messenger(
+    // Same sync window as the removal above: poll until alice's local
+    // group has absorbed the eviction commit and the re-invite lands.
+    wait_for(
         &a,
         &["invite", "channel=general", &format!("member={kp_hex}")],
         "alice re-invites bob",
+        |s| s.contains("invited"),
     );
-    assert!(out.contains("invited"), "re-invite reply: {out}");
     wait_for(&b, &["status"], "bob status until re-joined", |s| {
         s.contains("joined")
     });
@@ -988,7 +1136,11 @@ fn two_nodes_exchange_e2ee_messages() {
     //    spawn-reconcile brings them up locally, B's spawns them
     //    from the CRDT-synced rows; the invite/join/exchange flow
     //    then runs unchanged on the new channel. ─────────────────
-    messenger(&a, &["create", "channel=dev"], "alice creates dev channel");
+    let created = messenger(&a, &["create", "channel=dev"], "alice creates dev channel");
+    assert!(
+        created.contains("created"),
+        "dev channel create replied an in-band error: {created}"
+    );
     // The first send races the spawn-reconcile window — poll until
     // the channel's freshly spawned log agent answers. This epoch-0
     // message predates bob's join, so it must stay alice-only.
@@ -1023,7 +1175,7 @@ fn two_nodes_exchange_e2ee_messages() {
     {
         // Same KeyPackage-replication race as the general-channel
         // invite, plus bob's msg-dev-ctl spawn window.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let out = messenger(
                 &a,
