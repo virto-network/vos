@@ -23,8 +23,16 @@ use alloc::vec::Vec;
 /// dispatch loop reads each queued FETCH item into. A host that enqueues an
 /// item larger than this cannot deliver it (the guest's `fetch_raw` reports
 /// truncation and drops it; see `node::send_if_deliverable`), so this is shared
-/// host/guest ABI rather than gated to the guest (`pvm`) build.
-pub(crate) const BUF_SIZE: usize = 4096;
+/// host/guest ABI rather than gated to the guest (`pvm`) build: host and guest
+/// ELFs must be built from the same value.
+///
+/// Sizing: FETCH is a consuming pop, so an item either fits this buffer or is
+/// never delivered — there is no probe-and-retry like the READ path. 8 KiB
+/// covers every current `.vos_meta` registration (the largest, the
+/// messenger's, is ~4.3 KiB) with 2x headroom, while the few stack buffers at
+/// this size stay small against the guest's 64 KiB stack (the space below the
+/// first rodata page in the actor ELF layout).
+pub const BUF_SIZE: usize = 8192;
 
 /// Well-known storage key for actor constructor arguments.
 /// The host writes rkyv-encoded init args here before first run.

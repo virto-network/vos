@@ -1551,13 +1551,13 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // `lifecycle::{fetch_raw, read_storage, read_persisted_state}`:
     // they treated `n == buf.len()` as "not found" rather than
     // "fits exactly", silently dropping any value of size
-    // BUF_SIZE (4096 bytes). Fixed by returning the *full* value
+    // BUF_SIZE. Fixed by returning the *full* value
     // length from runtime-side STORAGE_R / FETCH so the guest can
     // distinguish exact-fit from truncation, plus changing the
     // guest's check from `<` to `<=`.
     //
     // Probe shape: build a TAG_DYNAMIC + Msg payload, pad it to
-    // exactly 4096 bytes by stuffing extra bytes onto the rkyv
+    // exactly BUF_SIZE bytes by stuffing extra bytes onto the rkyv
     // tail (the actor's `from_dynamic` decoder doesn't validate
     // trailing bytes), then send it to crdt-counter.
     //
@@ -1593,7 +1593,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // of the buffer — so leading padding is tolerated by `access_unchecked`
     // while trailing padding would break it.
     //
-    // The guest FETCH buffer is BUF_SIZE (4096). `node.invoke` wraps every
+    // The guest FETCH buffer is BUF_SIZE. `node.invoke` wraps every
     // inbox payload with a 6-byte Unauthenticated caller prefix
     // (TAG_CALLER_PREFIX + 5 flag bytes — see `wrap_with_unauthenticated_prefix`),
     // so the WIRE item the guest fetches is `6 + payload`. Size the payload so
@@ -1604,7 +1604,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // `node::send_if_deliverable` refuses it with a `warn!` rather than
     // silently dropping it — see `fetch_over_buf_size_boundary_is_refused`.)
     const CALLER_PREFIX_LEN: usize = 6;
-    let target = 4096 - CALLER_PREFIX_LEN; // wrapped wire item == BUF_SIZE
+    let target = vos::lifecycle::BUF_SIZE - CALLER_PREFIX_LEN; // wrapped wire item == BUF_SIZE
     let m = Msg::new("inc");
     let encoded = m.encode();
     let pad_len = target - 1 - encoded.len();
@@ -1669,10 +1669,10 @@ fn fetch_over_buf_size_boundary_is_refused() {
     let counter = CrdtCounterRef::at(id);
 
     // One byte OVER the boundary: with the 6-byte caller-prefix wrap the wire
-    // item is BUF_SIZE + 1 (4097), which the guest's 4096-byte FETCH buffer
-    // cannot hold — send_if_deliverable refuses it.
+    // item is BUF_SIZE + 1, which the guest's fixed FETCH buffer cannot
+    // hold — send_if_deliverable refuses it.
     const CALLER_PREFIX_LEN: usize = 6;
-    let target = 4096 - CALLER_PREFIX_LEN + 1; // wrapped wire item == BUF_SIZE + 1
+    let target = vos::lifecycle::BUF_SIZE - CALLER_PREFIX_LEN + 1; // wrapped wire item == BUF_SIZE + 1
     let m = Msg::new("inc");
     let encoded = m.encode();
     let pad_len = target - 1 - encoded.len();
@@ -2769,8 +2769,8 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
     // caller's `output_ptr` rather than overrunning the stack.
     //
     // The probe simulates a misbehaving external responder that
-    // returns 5 KiB to a caller whose `lifecycle::invoke_raw`
-    // allocates a 4 KiB buffer. Two invariants must hold:
+    // returns BUF_SIZE + 1 KiB to a caller whose `lifecycle::invoke_raw`
+    // allocates a BUF_SIZE buffer. Two invariants must hold:
     //
     //  1. `VosRuntime` MUST NOT segfault, deadlock, or affect
     //     the surrounding test process.
@@ -2801,15 +2801,18 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
     let invokes = std::sync::Arc::new(AtomicU32::new(0));
     let invokes_clone = invokes.clone();
 
-    // External responder returns 5 KiB of zeros — well past the
-    // caller's 4 KiB invoke output buffer. The bytes themselves
+    // External responder returns BUF_SIZE + 1 KiB of zeros — past the
+    // caller's BUF_SIZE invoke output buffer. The bytes themselves
     // don't matter; what's interesting is the *length*.
     rt.set_external_invoke(Box::new(move |target, _msg| {
         if target != oversized_target {
             return None;
         }
         invokes_clone.fetch_add(1, Ordering::Relaxed);
-        Some(vos::runtime::ExternalInvokeReply::done(vec![0u8; 5_000]))
+        Some(vos::runtime::ExternalInvokeReply::done(vec![
+            0u8;
+            vos::lifecycle::BUF_SIZE + 1_000
+        ]))
     }));
 
     let args = vos::init::InitArgs::new().with(
@@ -2832,8 +2835,9 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
         "external_invoke handler should have been called at least once"
     );
 
-    // Post-fix behaviour: the runtime sees output.len()=5005 >
-    // output_buf_len=4096 and substitutes a single-byte
+    // Post-fix behaviour: the runtime sees output.len() (the reply
+    // plus its envelope header) > output_buf_len (the caller's
+    // BUF_SIZE buffer) and substitutes a single-byte
     // STATUS_PANICKED envelope at the caller's output_ptr. The
     // guest's `invoke_raw` reads back n=1, takes the short-output
     // branch, and surfaces InvokeResult::Panicked to the
@@ -9130,7 +9134,7 @@ fn clerk_ledger_two_bank_federation() {
     // uses `ctx.blob_get(hash, hint)` to fetch the manifest and then
     // each per-segment proof host-side; the bridge → extension dispatch
     // only ever ships the 32-byte hash, well inside the PVM actor's
-    // 4 KiB input buffer. The federation test has libp2p attached, so
+    // BUF_SIZE input buffer. The federation test has libp2p attached, so
     // the producer-side stash on bank A is sufficient: bank B's verifier
     // extension reaches across the wire (via the `peer_prefix` hint
     // registered with `register_peer`) to fetch the manifest + every
@@ -12030,7 +12034,10 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
             let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&pending_batch)
                 .expect("rkyv encode batch")
                 .to_vec();
-            assert!(bytes.len() < 4096, "batch must fit the message cap");
+            assert!(
+                bytes.len() < vos::lifecycle::BUF_SIZE,
+                "batch must fit the message cap"
+            );
             let statuses = vos::block_on(ledger.create_accounts(&mut &node, bytes, ts))
                 .expect("create_accounts");
             assert_eq!(statuses.len(), pending_batch.len(), "one status per item");

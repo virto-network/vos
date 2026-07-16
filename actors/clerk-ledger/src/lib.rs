@@ -332,7 +332,7 @@ impl ClerkLedger {
     /// Accept a batch of registrar-signed `CreateAccount`s in one
     /// dispatch — bulk onboarding (the kernel's
     /// `apply_account_creations` is batch-native). The caller sizes
-    /// batches to the 4 KiB message cap (~8 signed creates). The same
+    /// batches to the `vos::lifecycle::BUF_SIZE` message cap. The same
     /// signature gate as `create_account` runs per item BEFORE the
     /// kernel, and one junk-signed item rejects the whole batch
     /// without touching state. Replies with one `Status` byte per
