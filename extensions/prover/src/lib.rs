@@ -64,8 +64,21 @@
 //!   the CLI does the ELF transpile + `__VOS_WITNESS` lookup and writes the
 //!   catalog TOML; this handler only proves.
 //!
-//! Plus the async prove-job set (`prove_chain_job` / `tick` / `job_poll` /
-//! `job_release`) described below.
+//! - `prove_record(pvm_blob, entry_bytes, witness_addr, seg_steps,
+//!   page_budget, profile) -> Vec<u8>` / `verify_record(allowlist,
+//!   record_bytes, proof_hash, expected_root, peer_prefix) -> u8` — the
+//!   `#[provable]` record surface (`docs/plans/provable.md` W3) over the
+//!   chain machinery above: `prove_record` gates the chain prove on the
+//!   record PRE-FLIGHT (record io-consistency, blob content-address, and
+//!   a witness re-trace to the record's bound io-hash), CASes the
+//!   anchored manifest, and replies `manifest_hash(32) ++ manifest`;
+//!   `verify_record` runs the witness-free four checks — record
+//!   io-consistency, `expected_root` against the record's leading
+//!   `app_public` root, then the streamed chain verify over the
+//!   record-reconstructed `public'` and reply.
+//!
+//! Plus the async prove-job set (`prove_chain_job` / `prove_record_job` /
+//! `tick` / `job_poll` / `job_release`) described below.
 //!
 //! ## Commitment / allowlist provenance
 //!
@@ -83,6 +96,7 @@
 
 use vos::jobs::JobQueue;
 use vos::prelude::*;
+use vos::provable::{ProofRecordEntry, ProvableRecord};
 use zkpvm::{Proof, SegmentState, prove_canonical, prove_mobile};
 use zkpvm_verifier::{CommitmentHash, verify_standalone};
 
@@ -183,6 +197,11 @@ struct PendingProve {
     page_budget: u64,
     /// Canonical forcing profile.
     profile: Vec<u32>,
+    /// Record jobs (`prove_record_job`): the captured io-hash the
+    /// witness must RE-TRACE to before any segment is proven — the
+    /// pre-flight that fails a doctored/stale record in seconds instead
+    /// of after a minutes-long prove. `None` = plain chain job.
+    expected_io_hash: Option<[u8; 32]>,
 }
 
 #[actor]
@@ -330,60 +349,143 @@ impl Prover {
         return_bytes: Vec<u8>,
         peer_prefix: u32,
     ) -> u8 {
-        if proof_hash.len() != 32 {
-            return 0;
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&proof_hash);
-        let hint: u16 = (peer_prefix & 0xFFFF) as u16;
-        // The allowlist is the concatenation of accepted 32-byte commitments.
-        if allowlist.is_empty() || allowlist.len() % 32 != 0 {
-            return 0;
-        }
-        let allowlist: Vec<CommitmentHash> =
-            allowlist.chunks_exact(32).map(CommitmentHash::from).collect();
-        // 1) Fetch the manifest (the single caller-supplied hash addresses it).
-        let Some(manifest_bytes) = ctx.blob_get(hash, hint).await else {
-            return 0;
+        verify_chain_via_cas(
+            ctx,
+            &allowlist,
+            &proof_hash,
+            &public_bytes,
+            &return_bytes,
+            peer_prefix,
+        )
+        .await
+    }
+
+    /// Prove a captured [`ProofRecordEntry`] (`docs/plans/provable.md`
+    /// D4) — the SYNCHRONOUS record analog of `prove_chain`, gated by
+    /// the record PRE-FLIGHT: the entry's internal io-hash consistency,
+    /// the blob's content-address against the record's `task_hash`, and
+    /// a full witness RE-TRACE to the record's bound io-hash (φ[9..12])
+    /// all must hold before the first segment is proven, so a doctored
+    /// or stale record fails in seconds. The chain then streams to the
+    /// host CAS exactly like `prove_chain`, the anchored manifest is
+    /// itself CASed, and the reply is `manifest_hash(32) ++
+    /// manifest_bytes` — the hash is what `verify_record`/`verify_chain`
+    /// consume, the bytes are the caller's offline copy. Empty `Vec` on
+    /// any failure. `seg_steps`/`page_budget`/`profile` MUST be the
+    /// program's pinned catalog values.
+    #[msg]
+    async fn prove_record(
+        &self,
+        ctx: &mut Context<Self>,
+        pvm_blob: Vec<u8>,
+        entry_bytes: Vec<u8>,
+        witness_addr: u64,
+        seg_steps: u64,
+        page_budget: u64,
+        profile: Vec<u32>,
+    ) -> Vec<u8> {
+        let Some(entry) = ProofRecordEntry::decode(&entry_bytes) else {
+            return Vec::new();
         };
-        let Some(manifest) = decode_chain_manifest(&manifest_bytes) else {
-            return 0;
-        };
-        if manifest.segments.is_empty() || manifest.segments.len() > MAX_CHAIN_SEGMENTS {
-            return 0;
+        if !record_preflight(&pvm_blob, &entry, witness_addr as usize) {
+            return Vec::new();
         }
-        // The entering-image anchor: segment 0 must start from the manifest's
-        // declared entering root (skipped when the manifest is unanchored — the
-        // all-zero sentinel). See `ChainManifest::initial_root`.
-        let expected_initial_root = (manifest.initial_root != UNANCHORED_ROOT).then_some(manifest.initial_root);
-        // 2) STREAM the chain: fetch each per-segment proof, verify it, and DROP
-        //    it before fetching the next — so peak memory holds ~ONE proof
-        //    regardless of chain length (a phone-class verifier can check a
-        //    600-segment chain). Any missing segment rejects — the verifier must
-        //    see EVERY listed segment for the continuity chain to bind. Boundary
-        //    continuity carries forward in `prev_final` (a small `SegmentState`);
-        //    the entering-root anchor binds segment 0, the io-binding the FINAL
-        //    segment.
-        let n = manifest.segments.len();
-        let mut prev_final: Option<SegmentState> = None;
-        for (i, seg_hash) in manifest.segments.iter().enumerate() {
-            let Some(blob) = ctx.blob_get(*seg_hash, hint).await else {
-                return 0;
-            };
-            match verify_segment_on_large_stack(
-                blob,
-                &allowlist,
-                prev_final.take(),
-                expected_initial_root,
-                i == n - 1,
-                &public_bytes,
-                &return_bytes,
-            ) {
-                Some(final_state) => prev_final = Some(final_state),
-                None => return 0,
+        match prove_chain_publishing(
+            pvm_blob,
+            entry.input.witness_bytes,
+            witness_addr as usize,
+            seg_steps as usize,
+            page_budget as usize,
+            profile,
+            async |seg| ctx.blob_put(seg).await,
+        )
+        .await
+        {
+            Some((root, hashes)) => {
+                let manifest = encode_chain_manifest_anchored(root, &hashes);
+                let Some(hash) = ctx.blob_put(manifest.clone()).await else {
+                    return Vec::new();
+                };
+                let mut out = Vec::with_capacity(32 + manifest.len());
+                out.extend_from_slice(&hash);
+                out.extend_from_slice(&manifest);
+                out
             }
+            None => Vec::new(),
         }
-        1
+    }
+
+    /// The witness-free third-party check of a shipped
+    /// [`ProvableRecord`] against its proved chain
+    /// (`docs/plans/provable.md` D4) — four checks composed so none is
+    /// meaningful without the others:
+    ///   1. the chain verifies against the caller-supplied `allowlist`
+    ///      (the catalog pin for the record's `(catalog_name,
+    ///      catalog_version)` — WHICH PROGRAM);
+    ///   2. the final segment's `public_io_hash` equals
+    ///      `compute_io_hash(public', reply)` (inside the chain check);
+    ///   3. `public'` is reconstructed from the RECORD's own fields
+    ///      (anchor, transition digest, `app_public`) and
+    ///      `compute_io_hash(public', reply) == record.io_hash` — so
+    ///      every record field is exactly what the proven execution
+    ///      bound (with 2, a tampered field fails one of the two);
+    ///   4. the record's `root_before` (the leading 32 bytes of
+    ///      `app_public`) equals the caller's `expected_root` — the
+    ///      settlement check against state the verifier independently
+    ///      knows. `expected_root` empty = skip (the verifier then
+    ///      learns "a transition between these roots was proven", not
+    ///      "over the state I know"); any other non-32-byte length
+    ///      rejects.
+    ///
+    /// `record_bytes` is the shipped record (untrusted courier
+    /// material); `proof_hash` addresses the chain's manifest in the
+    /// host CAS, streamed segment-by-segment like `verify_chain`.
+    /// Returns 1/0.
+    ///
+    /// Known platform gap, inherited (docs/plans/provable.md trust
+    /// model): a witness-injecting program's entering-image root cannot
+    /// be pinned against its published build yet (the catalog's
+    /// `unpatched_image_root` is diagnostic-only; the masked root is
+    /// pending design), so program identity rests entirely on the
+    /// commitment allowlist and state binding on the app's IN-CIRCUIT
+    /// witness verification (the `WitnessedLedger` pattern — a doctored
+    /// witness traps before it can bind roots).
+    #[msg]
+    async fn verify_record(
+        &self,
+        ctx: &mut Context<Self>,
+        allowlist: Vec<u8>,
+        record_bytes: Vec<u8>,
+        proof_hash: Vec<u8>,
+        expected_root: Vec<u8>,
+        peer_prefix: u32,
+    ) -> u8 {
+        let Some(record) = ProvableRecord::decode(&record_bytes) else {
+            return 0;
+        };
+        if !record.io_consistent() {
+            return 0;
+        }
+        match expected_root.len() {
+            0 => {}
+            32 => {
+                let mut root = [0u8; 32];
+                root.copy_from_slice(&expected_root);
+                if record.root_before() != Some(root) {
+                    return 0;
+                }
+            }
+            _ => return 0,
+        }
+        verify_chain_via_cas(
+            ctx,
+            &allowlist,
+            &proof_hash,
+            &record.public_prime(),
+            &record.reply,
+            peer_prefix,
+        )
+        .await
     }
 
     /// ASYNC analog of `prove_chain` (a `#[msg(job)]` begin): enqueue a
@@ -421,6 +523,53 @@ impl Prover {
             seg_steps,
             page_budget,
             profile,
+            expected_io_hash: None,
+        });
+        id
+    }
+
+    /// ASYNC prove of a captured [`ProofRecordEntry`] over the B8 job
+    /// queue — the `prove_record` analog of `prove_chain_job`.
+    /// `entry_bytes` is the stored `__vos_proofrec/<tag>` row; the cheap
+    /// record checks (internal io-hash consistency, blob content-address
+    /// == the record's `task_hash`) run HERE and refuse with job id `0`
+    /// (real ids start at 1), so an inconsistent record never occupies
+    /// the queue; the witness RE-TRACE pre-flight runs on the proving
+    /// `tick`, failing the job before any segment is proven. `seg_steps`
+    /// / `page_budget` / `profile` MUST be the program's pinned catalog
+    /// values, exactly as for `prove_chain_job`.
+    #[msg(job)]
+    #[allow(clippy::too_many_arguments)]
+    async fn prove_record_job(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        pvm_blob: Vec<u8>,
+        entry_bytes: Vec<u8>,
+        witness_addr: u64,
+        seg_steps: u64,
+        page_budget: u64,
+        profile: Vec<u32>,
+        reply_to: u32,
+        reply_msg: Vec<u8>,
+    ) -> u64 {
+        let Some(entry) = ProofRecordEntry::decode(&entry_bytes) else {
+            return 0;
+        };
+        if !record_checks(&pvm_blob, &entry) {
+            return 0;
+        }
+        let id = self.queue.begin();
+        self.pending.push(PendingProve {
+            id,
+            reply_to,
+            reply_msg,
+            pvm_blob,
+            witness_bytes: entry.input.witness_bytes,
+            witness_addr,
+            seg_steps,
+            page_budget,
+            profile,
+            expected_io_hash: Some(entry.record.io_hash),
         });
         id
     }
@@ -560,7 +709,207 @@ impl Prover {
     }
 }
 
+/// The CAS-streaming chain verify shared by the `verify_chain` and
+/// `verify_record` handlers: fetch the manifest by `proof_hash`, then
+/// fetch + verify + DROP each listed segment proof (peak memory ~one
+/// proof regardless of chain length). Per segment it composes allowlist
+/// membership, STARK validity + boundary continuity, the entering-image
+/// anchor on segment 0 (skipped for an unanchored manifest — the
+/// all-zero sentinel), and the tagless io-binding on the FINAL segment.
+/// Any missing blob rejects — indistinguishable from tampering, by
+/// design. Returns 1/0.
+async fn verify_chain_via_cas(
+    ctx: &mut Context<Prover>,
+    allowlist: &[u8],
+    proof_hash: &[u8],
+    public_bytes: &[u8],
+    return_bytes: &[u8],
+    peer_prefix: u32,
+) -> u8 {
+    if proof_hash.len() != 32 {
+        return 0;
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(proof_hash);
+    let hint: u16 = (peer_prefix & 0xFFFF) as u16;
+    // The allowlist is the concatenation of accepted 32-byte commitments.
+    if allowlist.is_empty() || allowlist.len() % 32 != 0 {
+        return 0;
+    }
+    let allowlist: Vec<CommitmentHash> =
+        allowlist.chunks_exact(32).map(CommitmentHash::from).collect();
+    // 1) Fetch the manifest (the single caller-supplied hash addresses it).
+    let Some(manifest_bytes) = ctx.blob_get(hash, hint).await else {
+        return 0;
+    };
+    let Some(manifest) = decode_chain_manifest(&manifest_bytes) else {
+        return 0;
+    };
+    if manifest.segments.is_empty() || manifest.segments.len() > MAX_CHAIN_SEGMENTS {
+        return 0;
+    }
+    // The entering-image anchor: segment 0 must start from the manifest's
+    // declared entering root (skipped when the manifest is unanchored — the
+    // all-zero sentinel). See `ChainManifest::initial_root`.
+    let expected_initial_root =
+        (manifest.initial_root != UNANCHORED_ROOT).then_some(manifest.initial_root);
+    // 2) STREAM the chain: fetch each per-segment proof, verify it, and DROP
+    //    it before fetching the next — so peak memory holds ~ONE proof
+    //    regardless of chain length (a phone-class verifier can check a
+    //    600-segment chain). Any missing segment rejects — the verifier must
+    //    see EVERY listed segment for the continuity chain to bind. Boundary
+    //    continuity carries forward in `prev_final` (a small `SegmentState`);
+    //    the entering-root anchor binds segment 0, the io-binding the FINAL
+    //    segment.
+    let n = manifest.segments.len();
+    let mut prev_final: Option<SegmentState> = None;
+    for (i, seg_hash) in manifest.segments.iter().enumerate() {
+        let Some(blob) = ctx.blob_get(*seg_hash, hint).await else {
+            return 0;
+        };
+        match verify_segment_on_large_stack(
+            blob,
+            &allowlist,
+            prev_final.take(),
+            expected_initial_root,
+            i == n - 1,
+            public_bytes,
+            return_bytes,
+        ) {
+            Some(final_state) => prev_final = Some(final_state),
+            None => return 0,
+        }
+    }
+    1
+}
+
 // ── Core logic (Context-free, unit-testable) ─────────────────────────
+
+/// The CHEAP half of the record pre-flight — pure hashing, no trace:
+/// the entry's two `task_hash` copies agree, the caller-delivered blob's
+/// content-address IS the record's `task_hash` (a wrong build fails
+/// here, not after minutes of proving), and the record satisfies its
+/// internal binding equation ([`ProvableRecord::io_consistent`] — the
+/// io-hash recomputes from the record's own anchor/digest/app_public/
+/// reply). Runs at job-begin so an inconsistent record never occupies
+/// the queue.
+pub fn record_checks(pvm_blob: &[u8], entry: &ProofRecordEntry) -> bool {
+    entry.input.task_hash == entry.record.task_hash
+        && vos::provable::task_blob_hash(pvm_blob) == entry.record.task_hash
+        && entry.record.io_consistent()
+}
+
+/// The FULL record pre-flight ([`record_checks`] plus the witness
+/// RE-TRACE): the stored witness bytes, patched at `witness_addr` and
+/// traced under the vos stub table, must halt cleanly with the record's
+/// io-hash in φ[9..12] — the producer-side proof that `prove_record` is
+/// about to prove exactly the recorded transition. The re-trace holds
+/// the full step trace resident (~the invocation's steps), so it runs
+/// on a large-stack thread like every heavy zkpvm entry here.
+pub fn record_preflight(pvm_blob: &[u8], entry: &ProofRecordEntry, witness_addr: usize) -> bool {
+    record_checks(pvm_blob, entry)
+        && retrace_io_hash(pvm_blob, &entry.input.witness_bytes, witness_addr)
+            .is_some_and(|io| io == entry.record.io_hash)
+}
+
+/// Re-trace `pvm_blob` with `witness_bytes` patched at `witness_addr`
+/// and return the halt-bound io-hash read from φ[9..12] — `None` on an
+/// unparseable blob, an out-of-range patch, or a trace that does not
+/// halt cleanly (trap/out-of-gas). The tracing interpreter mirrors the
+/// live invoke's hostcall table (`run_with_vos_stubs`).
+fn retrace_io_hash(
+    pvm_blob: &[u8],
+    witness_bytes: &[u8],
+    witness_addr: usize,
+) -> Option<[u8; 32]> {
+    let pvm_blob = pvm_blob.to_vec();
+    let witness_bytes = witness_bytes.to_vec();
+    run_on_large_stack(move || {
+        let (mut interp, mut img) = zkpvm::actor::interpreter_from_blob(&pvm_blob, TRACE_GAS)?;
+        let end = witness_addr.checked_add(witness_bytes.len())?;
+        if end > img.len() {
+            return None;
+        }
+        img[witness_addr..end].copy_from_slice(&witness_bytes);
+        interp.flat_mem = img;
+        let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
+        // zkpvm pins its own javm revision, so its ExitReason is a
+        // different type than vos's — compare the Debug form, as the
+        // elf-integration gates do. HostCall(0)/Ecall = clean halt.
+        let exit = format!("{:?}", tracing.run_with_vos_stubs());
+        if exit != "HostCall(0)" && exit != "Ecall" {
+            return None;
+        }
+        let mut io = [0u8; 32];
+        for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
+            io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        Some(io)
+    })
+}
+
+/// Witness-free verify of a shipped [`ProvableRecord`] against its
+/// chain, delivered as per-segment proof bytes — the offline/test
+/// mirror of the `verify_record` handler (which streams the same
+/// segments from the CAS). The four checks of
+/// `docs/plans/provable.md` D4, composed exactly as the handler
+/// documents them: record io-consistency and the `expected_root_before`
+/// comparison run here; allowlist membership, chain validity, and the
+/// final-segment io-binding over the record-reconstructed `public'`
+/// ride [`verify_chain_segments`]. `None` for `expected_root_before`
+/// skips the settlement check (with the weaker meaning the handler doc
+/// spells out).
+pub fn verify_record_segments(
+    allowlist_bytes: &[u8],
+    record: &ProvableRecord,
+    segment_blobs: &[Vec<u8>],
+    expected_root_before: Option<[u8; 32]>,
+) -> bool {
+    if !record.io_consistent() {
+        return false;
+    }
+    if let Some(expected) = expected_root_before
+        && record.root_before() != Some(expected)
+    {
+        return false;
+    }
+    verify_chain_segments(
+        allowlist_bytes,
+        segment_blobs,
+        &record.public_prime(),
+        &record.reply,
+    )
+}
+
+/// Prove a captured [`ProofRecordEntry`] as a canonical chain, streaming
+/// each segment's `bincode(Proof)` into `sink` — the offline/test mirror
+/// of the `prove_record` handler: the full record pre-flight
+/// ([`record_preflight`]) gates the prove, then the chain runs via
+/// [`prove_chain_segments_with`] over the entry's stored witness bytes.
+/// Returns the chain's entering-image root; `None` on a failed
+/// pre-flight or prove. Parameter contracts are `prove_chain_segments_with`'s.
+pub fn prove_record_segments_with(
+    pvm_blob: &[u8],
+    entry: &ProofRecordEntry,
+    witness_addr: usize,
+    seg_steps: usize,
+    page_budget: usize,
+    profile: &[u32],
+    sink: impl FnMut(Vec<u8>) -> Option<()>,
+) -> Option<[u8; 32]> {
+    if !record_preflight(pvm_blob, entry, witness_addr) {
+        return None;
+    }
+    prove_chain_segments_with(
+        pvm_blob,
+        &entry.input.witness_bytes,
+        witness_addr,
+        seg_steps,
+        page_budget,
+        profile,
+        sink,
+    )
+}
 
 /// The heavy measurement behind [`Prover::measure_catalog`] — traces + proves,
 /// so it runs on a 512 MiB thread (a canonical prove overflows the default
@@ -844,6 +1193,25 @@ async fn advance_one_job(
     // FIFO: take the oldest queued job (and its large blob) out of `pending`;
     // its inputs move into the prove worker and drop when it finishes.
     let job = pending.remove(0);
+    // Record jobs re-trace BEFORE proving: the stored witness must bind
+    // exactly the record's io-hash, or the job fails in seconds instead
+    // of proving a chain no verify_record would ever accept.
+    if let Some(expected) = job.expected_io_hash
+        && retrace_io_hash(&job.pvm_blob, &job.witness_bytes, job.witness_addr as usize)
+            != Some(expected)
+    {
+        queue.fail(
+            job.id,
+            "record pre-flight failed: the stored witness does not re-trace to the record's io-hash",
+        );
+        return Some(JobCallback {
+            reply_to: job.reply_to,
+            reply_msg: job.reply_msg,
+            job_id: job.id,
+            status: JOB_FAILED,
+            segments: 0,
+        });
+    }
     let (status, segments) = match prove_chain_publishing(
         job.pvm_blob,
         job.witness_bytes,
@@ -1373,6 +1741,122 @@ fn verify_one_segment(
 }
 
 #[cfg(test)]
+mod record_tests {
+    //! Cheap (no-prove) halves of the W3 record surface: the pre-flight
+    //! record checks and verify_record's record-local rejections. The
+    //! real record → prove → verify e2e (and its chain-level
+    //! rejections) is the heavy `#[ignore]` gate in
+    //! `vos/tests/elf_integration.rs`.
+    use super::*;
+
+    /// A ProvableRecord satisfying its internal binding equation, plus
+    /// a matching ProofRecordEntry over `blob`'s content-address.
+    fn consistent_entry(blob: &[u8]) -> ProofRecordEntry {
+        let task_hash = vos::provable::task_blob_hash(blob);
+        let anchor_kind = 0x01u8;
+        let anchor = [0x0Au8; 32];
+        let transition_digest = [0x0Bu8; 32];
+        let reply = vec![1u8, 2, 3];
+        let mut app_public = vec![0u8; 64];
+        app_public[..32].copy_from_slice(&[0xAA; 32]);
+        app_public[32..].copy_from_slice(&[0xBB; 32]);
+        let public_prime = vos::refine_payload::folded_public(
+            anchor_kind,
+            &anchor,
+            &transition_digest,
+            &app_public,
+        );
+        let io_hash = vos::zk::compute_io_hash(&public_prime, &reply);
+        ProofRecordEntry {
+            input: vos::provable::ProvableInput {
+                task_hash,
+                witness_bytes: vec![0xEE; 8],
+            },
+            record: ProvableRecord {
+                task_hash,
+                anchor_kind,
+                anchor,
+                transition_digest,
+                reply,
+                io_hash,
+                app_public,
+                catalog_name: String::new(),
+                catalog_version: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn record_checks_reject_wrong_blob_and_tampering() {
+        let blob = b"the-pinned-task-blob".to_vec();
+        let entry = consistent_entry(&blob);
+        assert!(record_checks(&blob, &entry), "a consistent entry passes");
+
+        // A different build fails instantly — before any trace or prove.
+        assert!(!record_checks(b"a-different-build", &entry));
+
+        // Any tampered record field breaks the binding equation.
+        let mut doctored = entry.clone();
+        doctored.record.reply.push(0xFF);
+        assert!(!record_checks(&blob, &doctored));
+        let mut doctored = entry.clone();
+        doctored.record.transition_digest[0] ^= 1;
+        assert!(!record_checks(&blob, &doctored));
+        let mut doctored = entry.clone();
+        doctored.record.app_public[0] ^= 1;
+        assert!(!record_checks(&blob, &doctored));
+
+        // Split-brain entries (input names one blob, record another)
+        // reject even when the record half is self-consistent.
+        let mut doctored = entry.clone();
+        doctored.input.task_hash[0] ^= 1;
+        assert!(!record_checks(&blob, &doctored));
+
+        // The full pre-flight fails soft on an unparseable blob (the
+        // re-trace yields None) rather than panicking.
+        assert!(!record_preflight(&blob, &entry, 0));
+    }
+
+    #[test]
+    fn verify_record_segments_rejects_before_touching_the_chain() {
+        let blob = b"the-pinned-task-blob".to_vec();
+        let record = consistent_entry(&blob).record;
+        let allowlist = vec![0x11u8; 32];
+        let segments = vec![vec![0xDEu8, 0xAD]]; // never reached / garbage
+
+        // Tampered record: io-consistency is the FIRST gate.
+        let mut doctored = record.clone();
+        doctored.reply.push(9);
+        assert!(!verify_record_segments(&allowlist, &doctored, &segments, None));
+
+        // The settlement check: right root passes THAT gate (then fails
+        // on the garbage chain), wrong root rejects outright.
+        assert!(!verify_record_segments(
+            &allowlist,
+            &record,
+            &segments,
+            Some([0xAA; 32]), // correct root_before — rejection is the chain's
+        ));
+        assert!(!verify_record_segments(&allowlist, &record, &segments, Some([0x77; 32])));
+
+        // A record whose app_public is too short to carry a root cannot
+        // satisfy ANY expected root.
+        let mut rootless = record.clone();
+        rootless.app_public = vec![1u8; 8];
+        // Rebind so it stays io-consistent — the failure must be the
+        // missing root, not the binding equation.
+        rootless.io_hash =
+            vos::zk::compute_io_hash(&rootless.public_prime(), &rootless.reply);
+        assert!(rootless.io_consistent());
+        assert!(!verify_record_segments(&allowlist, &rootless, &segments, Some([0xAA; 32])));
+
+        // A consistent record over a garbage chain still rejects (the
+        // chain half of the composition).
+        assert!(!verify_record_segments(&allowlist, &record, &segments, None));
+    }
+}
+
+#[cfg(test)]
 mod anchor_tests {
     //! Entering-image anchor accept/reject over ONE real proved segment — the
     //! cheap, non-`#[ignore]` counterpart to the heavy `voucher_check_chain_
@@ -1821,6 +2305,7 @@ mod job_tests {
             seg_steps: 100,
             page_budget: 0,
             profile: Vec::new(),
+            expected_io_hash: None,
         }
     }
 
@@ -1929,6 +2414,7 @@ mod job_tests {
             seg_steps,
             page_budget: 0,
             profile: floors,
+            expected_io_hash: None,
         }];
 
         // Fake CAS: record each published segment, hand back hash [i+1; 32].
@@ -1963,6 +2449,46 @@ mod job_tests {
     }
 
     #[test]
+    fn record_job_preflight_fails_before_any_publish() {
+        // A record job whose witness cannot re-trace to the expected
+        // io-hash must fail at the tick's pre-flight — before a single
+        // segment is proven or published. The straight-line fixture
+        // TRAPS (no clean vos halt), so its re-trace yields no io-hash
+        // and any expectation fails.
+        let blob = super::test_trace::straight_line_blob(6);
+        let floors = super::chain_stream_tests::tiny_floors(&blob);
+
+        let mut queue = JobQueue::new();
+        let id = queue.begin();
+        let mut pending = vec![PendingProve {
+            id,
+            reply_to: 3,
+            reply_msg: b"proved".to_vec(),
+            pvm_blob: blob,
+            witness_bytes: Vec::new(),
+            witness_addr: 0,
+            seg_steps: super::chain_stream_tests::SEG_STEPS as u64,
+            page_budget: 0,
+            profile: floors,
+            expected_io_hash: Some([0xAB; 32]),
+        }];
+
+        let mut puts = 0usize;
+        let cb = block_on(advance_one_job(&mut pending, &mut queue, async |_seg| {
+            puts += 1;
+            Some([0u8; 32])
+        }))
+        .expect("the pending job is advanced");
+        assert_eq!(cb.status, JOB_FAILED);
+        assert_eq!(cb.segments, 0);
+        assert_eq!(puts, 0, "pre-flight rejection must precede any prove/publish");
+        assert!(pending.is_empty(), "the failed job leaves the queue");
+        let (_, done, error) = queue.poll(id);
+        assert!(done);
+        assert!(error.contains("pre-flight"), "the failure names the pre-flight: {error}");
+    }
+
+    #[test]
     fn failed_publish_fails_the_job() {
         // A `put` that refuses (host CAS unavailable) must fail the job — and
         // abort the remaining prove — rather than report success with proofs
@@ -1982,6 +2508,7 @@ mod job_tests {
             seg_steps: super::chain_stream_tests::SEG_STEPS as u64,
             page_budget: 0,
             profile: floors,
+            expected_io_hash: None,
         }];
 
         let mut puts = 0usize;

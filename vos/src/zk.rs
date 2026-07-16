@@ -429,12 +429,30 @@ pub struct ProvableCatalog {
 /// One provable program's pinned measurements — the canonical-shape
 /// commitment allowlist, forcing profile, segment-step bound, witness-buffer
 /// address, and unpatched entering-image root.
+///
+/// Pins are APPEND-VERSIONED per name (`docs/plans/provable.md` D5): a
+/// re-pin adds a new `(name, version)` entry via [`ProvableCatalog::pin`]
+/// and retires nothing, so a record captured months ago still names a
+/// live allowlist after the program rebuilds — "superseded pin" and
+/// "forged program" stay distinguishable.
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProgramPin {
     /// Catalog identity (e.g. `"voucher-check"`) — the human name; program
     /// identity itself is the cryptographic `commitments`.
     pub name: alloc::string::String,
+    /// Append-only pin version within `name`, assigned by
+    /// [`ProvableCatalog::pin`] (1-based). `0` marks an entry written
+    /// before versioning existed (loads unchanged, treated as oldest).
+    #[serde(default)]
+    pub version: u32,
+    /// Hex content-address of the TRANSPILED program blob this pin
+    /// measures (`vos::provable::task_blob_hash` — the same hash parents
+    /// invoke the Task by), so a captured record resolves its pin by
+    /// `blob_hash == record.task_hash`. Empty when unrecorded (pre-W3
+    /// pins, or programs that never flow through `prove_record`).
+    #[serde(default)]
+    pub blob_hash: alloc::string::String,
     /// Canonical-shape program-commitment ALLOWLIST — hex-encoded 32-byte
     /// preprocessed-trace Merkle roots (`{C_0, C_1, …}`), one per distinct
     /// canonical segment shape. Fed to `verify_chain` as `allowlist`.
@@ -529,24 +547,70 @@ impl ProvableCatalog {
         std::fs::write(path, s).map_err(CatalogError::Io)
     }
 
-    /// The pin for `name`, or `None` if the program isn't cataloged.
+    /// The LATEST pin for `name` (highest version; ties resolve to the
+    /// last appended), or `None` if the program isn't cataloged.
     pub fn get(&self, name: &str) -> Option<&ProgramPin> {
-        self.programs.iter().find(|p| p.name == name)
+        self.programs
+            .iter()
+            .filter(|p| p.name == name)
+            .max_by_key(|p| p.version)
     }
 
-    /// The pin for `name`, or a [`CatalogError::NotFound`].
+    /// The exact `(name, version)` pin — what a captured record's
+    /// `catalog_version` resolves against. Nothing enforces uniqueness
+    /// of `(name, version)` in a hand-merged TOML, so duplicates
+    /// resolve to the LAST entry — the same tie-break `get`/`find_blob`
+    /// apply, keeping the prove and verify sides on one entry.
+    pub fn get_version(&self, name: &str, version: u32) -> Option<&ProgramPin> {
+        self.programs
+            .iter()
+            .filter(|p| p.name == name && p.version == version)
+            .next_back()
+    }
+
+    /// The latest pin for `name`, or a [`CatalogError::NotFound`].
     pub fn require(&self, name: &str) -> Result<&ProgramPin, CatalogError> {
         self.get(name)
             .ok_or_else(|| CatalogError::NotFound(alloc::string::ToString::to_string(&name)))
     }
 
-    /// Insert or replace the pin for `program.name` (idempotent by name).
-    pub fn upsert(&mut self, program: ProgramPin) {
-        if let Some(slot) = self.programs.iter_mut().find(|p| p.name == program.name) {
-            *slot = program;
-        } else {
-            self.programs.push(program);
-        }
+    /// The exact `(name, version)` pin, or a [`CatalogError::NotFound`].
+    pub fn require_version(&self, name: &str, version: u32) -> Result<&ProgramPin, CatalogError> {
+        self.get_version(name, version).ok_or_else(|| {
+            CatalogError::NotFound(alloc::format!("{name} v{version}"))
+        })
+    }
+
+    /// The latest pin whose `blob_hash` names `blob_hash` — how
+    /// `prove_record` resolves the pin a captured record proves under
+    /// (the record's `task_hash` IS the blob's content-address, so the
+    /// match is exact; latest wins when one blob was re-pinned, e.g. a
+    /// `seg_steps` retune).
+    pub fn find_blob(&self, blob_hash: &[u8; 32]) -> Option<&ProgramPin> {
+        let hex = bytes_to_hex(blob_hash);
+        self.programs
+            .iter()
+            .filter(|p| p.blob_hash == hex)
+            .max_by_key(|p| p.version)
+    }
+
+    /// APPEND a pin for `program.name` at the next version (1 past the
+    /// highest existing, starting at 1) and return the assigned version.
+    /// Any version on the input is overwritten — versions are
+    /// catalog-assigned, never caller-chosen. Nothing is replaced or
+    /// retired: records pin the version they prove under (D5), so old
+    /// entries must outlive re-pins.
+    pub fn pin(&mut self, mut program: ProgramPin) -> u32 {
+        let next = self
+            .programs
+            .iter()
+            .filter(|p| p.name == program.name)
+            .map(|p| p.version)
+            .max()
+            .map_or(1, |v| v + 1);
+        program.version = next;
+        self.programs.push(program);
+        next
     }
 }
 
@@ -723,8 +787,11 @@ mod tests {
         let c0 = [0x6du8; 32];
         let c1 = [0x5cu8; 32];
         let root = [0xABu8; 32];
+        let blob_hash = [0x42u8; 32];
         let pin = ProgramPin {
             name: "voucher-check".to_string(),
+            version: 0, // catalog-assigned by pin()
+            blob_hash: bytes_to_hex(&blob_hash),
             commitments: vec![bytes_to_hex(&c0), bytes_to_hex(&c1)],
             canonical_profile: vec![0, 14, 18, 4],
             seg_steps: 100_000,
@@ -733,7 +800,7 @@ mod tests {
             unpatched_image_root: bytes_to_hex(&root),
         };
         let mut cat = ProvableCatalog::new();
-        cat.upsert(pin.clone());
+        assert_eq!(cat.pin(pin.clone()), 1, "first pin of a name is version 1");
 
         // TOML encode → decode is lossless.
         let toml = cat.to_toml_string().expect("encode");
@@ -747,10 +814,63 @@ mod tests {
         assert_eq!(&p.allowlist_concat().unwrap()[..32], &c0);
         assert_eq!(p.unpatched_image_root_bytes().unwrap(), root);
 
-        // Lookups and idempotent upsert.
         assert!(back.get("missing").is_none());
         assert!(matches!(back.require("missing"), Err(CatalogError::NotFound(_))));
-        cat.upsert(pin); // same name again → still one entry
-        assert_eq!(cat.programs.len(), 1, "upsert is idempotent by name");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn catalog_pins_append_versioned() {
+        // D5: a re-pin APPENDS — records pin the version they prove
+        // under, so old entries must outlive re-pins.
+        let old_blob = [0x11u8; 32];
+        let new_blob = [0x22u8; 32];
+        let mk = |blob: &[u8; 32], seg_steps: u64| ProgramPin {
+            name: "tally".to_string(),
+            version: 77, // caller-supplied versions are ignored
+            blob_hash: bytes_to_hex(blob),
+            commitments: vec![bytes_to_hex(&[0xC0u8; 32])],
+            canonical_profile: vec![1, 2],
+            seg_steps,
+            page_budget: 0,
+            witness_addr: 0x1000,
+            unpatched_image_root: bytes_to_hex(&[0xAB; 32]),
+        };
+        let mut cat = ProvableCatalog::new();
+        assert_eq!(cat.pin(mk(&old_blob, 32_000)), 1);
+        assert_eq!(cat.pin(mk(&new_blob, 32_000)), 2);
+        assert_eq!(cat.programs.len(), 2, "re-pin appends, never replaces");
+
+        // get = latest; get_version = exact; find_blob = by content.
+        assert_eq!(cat.get("tally").unwrap().version, 2);
+        assert_eq!(cat.get_version("tally", 1).unwrap().blob_hash, bytes_to_hex(&old_blob));
+        assert!(cat.get_version("tally", 3).is_none());
+        assert!(matches!(cat.require_version("tally", 3), Err(CatalogError::NotFound(_))));
+        assert_eq!(cat.find_blob(&old_blob).unwrap().version, 1);
+        assert_eq!(cat.find_blob(&new_blob).unwrap().version, 2);
+        assert!(cat.find_blob(&[0x33u8; 32]).is_none());
+
+        // Same blob re-pinned (e.g. a seg_steps retune): latest wins.
+        assert_eq!(cat.pin(mk(&new_blob, 64_000)), 3);
+        assert_eq!(cat.find_blob(&new_blob).unwrap().seg_steps, 64_000);
+
+        // Pre-versioning entries (serde default 0) load and stay oldest.
+        let toml = r#"
+version = 1
+[[program]]
+name = "legacy"
+commitments = ["6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d"]
+canonical_profile = [1]
+seg_steps = 1000
+witness_addr = 4096
+unpatched_image_root = "abababababababababababababababababababababababababababababababab"
+"#;
+        let mut legacy = ProvableCatalog::from_toml_str(toml).expect("pre-versioning toml loads");
+        assert_eq!(legacy.get("legacy").unwrap().version, 0);
+        assert!(legacy.get("legacy").unwrap().blob_hash.is_empty());
+        let mut repin = mk(&new_blob, 1_000);
+        repin.name = "legacy".to_string();
+        assert_eq!(legacy.pin(repin), 1, "next version after a 0-entry is 1");
+        assert_eq!(legacy.get("legacy").unwrap().version, 1, "the re-pin supersedes the 0-entry");
     }
 }

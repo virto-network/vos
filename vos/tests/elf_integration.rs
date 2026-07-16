@@ -6145,6 +6145,24 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
             .expect("resolve bridge-b");
     assert_eq!(resolved, bridge_b_id.0, "bridge-b resolves to B");
 
+    // The register_remote CRDT events replicate A→B over gossipsub, and
+    // bridge_b resolves "counter" against B's OWN replica — wait for
+    // convergence, or the first forward can beat the mesh graft and see
+    // FORWARD_NOT_FOUND.
+    wait_for(
+        || {
+            let v = vos::block_on(hs_reg.resolve(
+                &mut &node_b,
+                "counter".to_string(),
+                prefix_b as u64,
+            ))
+            .ok()?;
+            (v != 0).then_some(())
+        },
+        Duration::from_secs(10),
+    )
+    .expect("counter registration replicates to B");
+
     let bridge_remote = SpaceBridgeRef::at(bridge_b_id);
 
     // 1) where_am_i — proves we reached bridge_b on B, not a
@@ -11848,6 +11866,304 @@ fn provable_task_captures_a_durable_re_traceable_record() {
         entry.record.io_hash,
         vos::zk::compute_io_hash(&[], &[]),
         "the io-hash must commit to the transition, not the empty placeholder"
+    );
+}
+
+/// Capture a `ProofRecordEntry` for a provable Task, returning
+/// `(entry, tally_blob, witness_addr)`. Drives the scheduler's
+/// `run_provable_task` with tally's root-binding `add_rooted(5)` over an
+/// empty initial state, then reads the committed `__vos_proofrec/<tag>`
+/// row back — the shared front half of the W3 gates. `None` = SKIP (the
+/// scheduler agent isn't built).
+fn capture_rooted_record() -> Option<(vos::provable::ProofRecordEntry, Vec<u8>, u64)> {
+    use vos::provable::{ProofRecordEntry, proofrec_key};
+    use vos::value::Msg;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return None;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let (witness_addr, witness_cap) =
+        vos::zk::witness_symbol(&tally_elf).expect("tally must export __VOS_WITNESS");
+    let tally_blob = transpile_actor(&tally_elf);
+
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    let task_hash =
+        rt.register_task_blob(tally_blob.clone(), witness_addr as u32, witness_cap as u32);
+
+    let tag = [0xCDu8; 32];
+    let task_msg = task_gate_dyn_msg(&Msg::new("add_rooted").with("n", 5u64));
+    let no_keys = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
+        .expect("encode empty row keys")
+        .to_vec();
+    let id = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_provable_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", task_msg)
+            .with("row_keys", no_keys)
+            .with("tag", tag.to_vec()),
+    )
+    .as_u64()
+    .expect("run_provable_task replies the task id");
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", id));
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Done as u32),
+        "the rooted provable task must complete"
+    );
+    assert_eq!(rt.panics, 0);
+
+    let row = rt
+        .storage
+        .read(sched_id, &proofrec_key(&tag))
+        .expect("a record must be captured under __vos_proofrec/<tag>")
+        .to_vec();
+    let entry = ProofRecordEntry::decode(&row).expect("the record row decodes");
+    assert_eq!(entry.record.task_hash, task_hash);
+
+    // The scheduler's export handler serves the same bytes `vosx zk
+    // prove --from <agent> --tag <hex>` fetches.
+    let exported = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("proof_record").with("tag", tag.to_vec()),
+    )
+    .as_bytes()
+    .expect("proof_record replies bytes")
+    .to_vec();
+    assert_eq!(exported, row, "proof_record must export the committed row verbatim");
+
+    Some((entry, tally_blob, witness_addr))
+}
+
+/// The fixture's app-named root, recomputed host-side (tally binds
+/// `total_root(before) ‖ total_root(after)` — examples/actors/tally).
+fn tally_root(total: u64) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"tally/root/v1", &[&total.to_le_bytes()])
+}
+
+/// docs/plans/provable.md W3 (fast half) — the captured record carries
+/// the app-public bytes the guest bound (surfaced by the v4
+/// work-result), leading with `root_before` per the root convention;
+/// the record satisfies its io-hash binding equation from its OWN
+/// fields (what `verify_record`'s witness-free check 3 reconstructs);
+/// and the stored witness still re-traces to the bound io-hash. Catalog
+/// identity stays empty at capture — `prove_record` resolves it.
+#[test]
+fn provable_record_carries_app_public_and_binds_roots() {
+    let Some((entry, tally_blob, witness_addr)) = capture_rooted_record() else {
+        return;
+    };
+
+    // The app-public bytes: root_before ‖ root_after over the running
+    // total (0 → 5), recomputed here from state the "verifier" knows.
+    let record = &entry.record;
+    assert_eq!(record.app_public.len(), 64, "add_rooted binds two 32-byte roots");
+    assert_eq!(
+        record.root_before(),
+        Some(tally_root(0)),
+        "app_public must LEAD with root_before (the expected_root_before comparand)"
+    );
+    assert_eq!(
+        &record.app_public[32..],
+        &tally_root(5),
+        "the trailing root attests the post-transition state"
+    );
+
+    // The witness-free binding equation over the record's own fields —
+    // and its sensitivity to every field (checks 3 of verify_record).
+    assert!(record.io_consistent(), "the captured record reconstructs its own io-hash");
+    let mut doctored = record.clone();
+    doctored.app_public[0] ^= 1;
+    assert!(!doctored.io_consistent(), "a doctored app_public must break the binding");
+
+    // Catalog identity is resolved at prove time, not capture.
+    assert!(record.catalog_name.is_empty());
+    assert_eq!(record.catalog_version, 0);
+
+    // The SHIPPED pre-flight accepts the capture: content-address
+    // parity + io-consistency + the witness re-trace to the bound
+    // io-hash (v4 path: app_public rides the payload without
+    // disturbing the binding). This is the exact gate `prove_record`
+    // runs before proving, so a drift in it fails fast CI, not just
+    // the #[ignore] heavy gate.
+    assert!(
+        prover_extension::record_preflight(&tally_blob, &entry, witness_addr as usize),
+        "the captured entry must pass prove_record's pre-flight"
+    );
+    // ... and it stays sensitive: the wrong build fails instantly.
+    assert!(
+        !prover_extension::record_preflight(b"not-the-build", &entry, witness_addr as usize),
+        "a different blob must fail the content-address half of the pre-flight"
+    );
+}
+
+/// docs/plans/provable.md W3 gate (heavy half) — record → prove →
+/// verify, end to end: capture a rooted record, measure + pin the tally
+/// build into an (in-memory) append-versioned catalog, prove the record
+/// as a canonical chain through the pre-flighted `prove_record` path,
+/// then run the witness-free `verify_record` checks — ACCEPT with the
+/// correct `expected_root_before`, and REJECT for a wrong expected
+/// root, a tampered-and-rebound reply (io-consistent but unproven), a
+/// foreign allowlist, and a garbled/truncated chain.
+///
+/// Heavy (canonical STARK proving, minutes). Run explicitly:
+/// `RUST_MIN_STACK=268435456 cargo test -p vos --release --test
+/// elf_integration provable_record_proves_and_verifies_end_to_end --
+/// --ignored --nocapture`
+#[test]
+#[ignore]
+fn provable_record_proves_and_verifies_end_to_end() {
+    use vos::zk::{ProgramPin, ProvableCatalog, bytes_to_hex};
+
+    let Some((entry, tally_blob, witness_addr)) = capture_rooted_record() else {
+        return;
+    };
+    const SEG_STEPS: usize = 32_000;
+    const GAS: u64 = 100_000_000;
+
+    // ── Pin the build (what `vosx zk pin` measures + records) ────────
+    let measured = prover_extension::measure_catalog(
+        &tally_blob,
+        &entry.input.witness_bytes,
+        witness_addr as usize,
+        SEG_STEPS,
+        0,
+        &[],
+        GAS,
+    )
+    .expect("measure_catalog over the captured witness");
+    // Reply: image_root(32) ++ n(u32 LE) ++ profile ++ commitment(32)…
+    let n = u32::from_le_bytes(measured[32..36].try_into().unwrap()) as usize;
+    let profile: Vec<u32> = measured[36..36 + n * 4]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let commitments: Vec<String> = measured[36 + n * 4..]
+        .chunks_exact(32)
+        .map(bytes_to_hex)
+        .collect();
+    assert!(!commitments.is_empty(), "the pin must measure an allowlist");
+
+    let mut catalog = ProvableCatalog::new();
+    let version = catalog.pin(ProgramPin {
+        name: "tally".to_string(),
+        version: 0,
+        blob_hash: bytes_to_hex(&entry.record.task_hash),
+        commitments,
+        canonical_profile: profile.clone(),
+        seg_steps: SEG_STEPS as u64,
+        page_budget: 0,
+        witness_addr,
+        unpatched_image_root: bytes_to_hex(&measured[..32]),
+    });
+    let pin = catalog
+        .find_blob(&entry.record.task_hash)
+        .expect("the record's task_hash resolves its pin by blob_hash");
+    assert_eq!(pin.version, version);
+    let allowlist = pin.allowlist_concat().expect("allowlist decodes");
+
+    // ── Prove: the pre-flighted record → canonical chain path ────────
+    let mut segments: Vec<Vec<u8>> = Vec::new();
+    prover_extension::prove_record_segments_with(
+        &tally_blob,
+        &entry,
+        witness_addr as usize,
+        SEG_STEPS,
+        0,
+        &profile,
+        |seg| {
+            segments.push(seg);
+            Some(())
+        },
+    )
+    .expect("pre-flight + chain prove of the captured record");
+    eprintln!("proved {} segment(s)", segments.len());
+
+    // The SHIPPED record: catalog identity resolved in (vosx zk prove).
+    let mut record = entry.record.clone();
+    record.catalog_name = pin.name.clone();
+    record.catalog_version = pin.version;
+    let expected_root = tally_root(0);
+
+    // ── ACCEPT: all four witness-free checks over the real chain ─────
+    assert!(
+        prover_extension::verify_record_segments(
+            &allowlist,
+            &record,
+            &segments,
+            Some(expected_root),
+        ),
+        "the proved chain must verify the shipped record"
+    );
+
+    // ── REJECT: wrong expected_root_before (the settlement check) ────
+    assert!(
+        !prover_extension::verify_record_segments(
+            &allowlist,
+            &record,
+            &segments,
+            Some(tally_root(999)),
+        ),
+        "a prior root the verifier does not know must reject"
+    );
+
+    // ── REJECT: tampered-and-REBOUND reply — io-consistent, so only
+    //    the chain's final-segment io-binding can catch it ────────────
+    let mut forged = record.clone();
+    forged.reply = b"forged-reply".to_vec();
+    forged.io_hash = vos::zk::compute_io_hash(&forged.public_prime(), &forged.reply);
+    assert!(forged.io_consistent(), "the forgery is internally consistent by construction");
+    assert!(
+        !prover_extension::verify_record_segments(
+            &allowlist,
+            &forged,
+            &segments,
+            Some(expected_root),
+        ),
+        "a rebound forgery must fail the proof's io-binding"
+    );
+
+    // ── REJECT: a foreign allowlist (wrong program identity) ─────────
+    let mut foreign = allowlist.clone();
+    foreign[0] ^= 0xFF;
+    assert!(
+        !prover_extension::verify_record_segments(&foreign, &record, &segments, Some(expected_root)),
+        "commitments outside the pin's allowlist must reject"
+    );
+
+    // ── REJECT: garbled / truncated chain ────────────────────────────
+    let mut garbled = segments.clone();
+    let last = garbled.len() - 1;
+    let mid = garbled[last].len() / 2;
+    garbled[last][mid] ^= 1;
+    assert!(
+        !prover_extension::verify_record_segments(&allowlist, &record, &garbled, Some(expected_root)),
+        "a garbled segment must reject"
+    );
+    assert!(
+        !prover_extension::verify_record_segments(
+            &allowlist,
+            &record,
+            &segments[..segments.len() - 1],
+            Some(expected_root),
+        ),
+        "a truncated chain must reject (the final io-binding segment is gone)"
     );
 }
 

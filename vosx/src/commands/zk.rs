@@ -62,6 +62,19 @@ pub enum ZkCommand {
     /// the prover extension's `measure_catalog` handler, so the space must be
     /// `up` with the prover extension loaded.
     Pin(PinArgs),
+    /// Prove a captured provable-Task record: fetch the `__vos_proofrec/<tag>`
+    /// entry (from the owning agent, or a file), resolve its catalog pin,
+    /// pre-flight it, and drive the prover extension's `prove_record` — the
+    /// witness re-traces to the record's bound io-hash, then the canonical
+    /// chain streams to the host proof CAS. Prints the manifest hash a
+    /// verifier consumes; writes the completed verifier-facing record.
+    Prove(ProveArgs),
+    /// Verify a shipped provable-Task record against its proved chain — the
+    /// witness-free third-party check: catalog allowlist for the record's
+    /// pinned (name, version), the record-reconstructed io-binding, and the
+    /// caller's expected prior state root. Drives the prover extension's
+    /// `verify_record` (segments stream from the host proof CAS).
+    Verify(VerifyArgs),
 }
 
 #[derive(clap::Args)]
@@ -92,7 +105,8 @@ pub struct PinArgs {
     /// the same format `--profile` reads.
     #[arg(long, value_name = "FILE")]
     profile_out: Option<PathBuf>,
-    /// Catalog TOML to write (upserts this program; created if absent).
+    /// Catalog TOML to write (appends a new version of this program;
+    /// created if absent).
     #[arg(long, value_name = "FILE")]
     out: PathBuf,
     /// Representative witness payload to inject at `__VOS_WITNESS` before
@@ -117,9 +131,95 @@ pub struct PinArgs {
     extension: String,
 }
 
+#[derive(clap::Args)]
+pub struct ProveArgs {
+    /// File holding the raw `ProofRecordEntry` bytes (the
+    /// `__vos_proofrec/<tag>` row). Alternative to `--from`/`--tag`.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["from", "tag"])]
+    entry: Option<PathBuf>,
+    /// Record-owning agent to fetch the entry from (its `proof_record`
+    /// handler). Requires `--tag`.
+    #[arg(long, value_name = "TARGET", requires = "tag")]
+    from: Option<String>,
+    /// The record's 32-byte business tag, hex.
+    #[arg(long, value_name = "HEX64", requires = "from")]
+    tag: Option<String>,
+    /// The Task's transpiled PVM blob. Its content-address must equal the
+    /// record's task_hash — the exact build that ran.
+    #[arg(long, value_name = "FILE", conflicts_with = "elf")]
+    blob: Option<PathBuf>,
+    /// The Task's ELF; transpiled here (same content-address rule).
+    #[arg(long, value_name = "FILE")]
+    elf: Option<PathBuf>,
+    /// Catalog TOML holding the program's pin (allowlist, profile,
+    /// seg_steps, witness_addr). The pin is resolved by blob_hash ==
+    /// the record's task_hash; `--name` overrides.
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+    /// Resolve the pin by catalog name (latest version) instead of by
+    /// the record's task_hash.
+    #[arg(long)]
+    name: Option<String>,
+    /// Write the anchored chain-manifest bytes here (the per-segment
+    /// proofs are already in the host CAS; this is the offline copy).
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+    /// Write the completed verifier-facing record here — the stored
+    /// record with its catalog identity (name, version) resolved in.
+    /// This is what ships to a counterparty next to the manifest hash.
+    #[arg(long, value_name = "FILE")]
+    record_out: Option<PathBuf>,
+    /// Space whose daemon hosts the prover extension.
+    #[arg(long)]
+    space: Option<String>,
+    /// Registry name of the prover extension instance to drive.
+    #[arg(long, default_value = "prover")]
+    extension: String,
+    /// Client-side wait for the synchronous prove (seconds). A chain
+    /// that outlives it keeps proving extension-side but the reply
+    /// (manifest hash) is lost — for very long chains raise this, or
+    /// drive the async `prove_record_job` surface via dynamic dispatch
+    /// (`vosx <prover> prove_record_job …`) and poll.
+    #[arg(long, default_value_t = 3600)]
+    timeout_secs: u64,
+}
+
+#[derive(clap::Args)]
+pub struct VerifyArgs {
+    /// File holding the shipped `ProvableRecord` bytes (a `--record-out`
+    /// artifact).
+    #[arg(long, value_name = "FILE")]
+    record: PathBuf,
+    /// The chain manifest's 32-byte proof-CAS hash, hex (printed by
+    /// `vosx zk prove`).
+    #[arg(long, value_name = "HEX64")]
+    proof: String,
+    /// Catalog TOML — the VERIFIER's trusted allowlist source. The
+    /// record's pinned (catalog_name, catalog_version) selects the entry.
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+    /// The prior state root the verifier independently knows (hex, 32
+    /// bytes) — compared against the record's leading app-public root
+    /// (the settlement check). Omitting it weakens the statement to
+    /// "some transition between the recorded roots was proven".
+    #[arg(long, value_name = "HEX64")]
+    expected_root: Option<String>,
+    /// `node_prefix` fan-out hint for the CAS fetches (0 = local-first).
+    #[arg(long, default_value_t = 0)]
+    peer_prefix: u32,
+    /// Space whose daemon hosts the prover extension.
+    #[arg(long)]
+    space: Option<String>,
+    /// Registry name of the prover extension instance to drive.
+    #[arg(long, default_value = "prover")]
+    extension: String,
+}
+
 pub fn run(cmd: ZkCommand) -> Result<()> {
     match cmd {
         ZkCommand::Pin(args) => pin(args),
+        ZkCommand::Prove(args) => prove(args),
+        ZkCommand::Verify(args) => verify(args),
     }
 }
 
@@ -231,8 +331,14 @@ fn pin(args: PinArgs) -> Result<()> {
         bail!("no commitments measured/supplied — nothing to pin");
     }
 
+    // The blob content-address is the join key a captured record's
+    // task_hash resolves its pin by (`vosx zk prove`) — same hash the
+    // runtime registers the Task blob under.
+    let blob_hash = vos::provable::task_blob_hash(&blob);
     let pin = ProgramPin {
         name: args.name.clone(),
+        version: 0, // assigned by catalog.pin below
+        blob_hash: bytes_to_hex(&blob_hash),
         commitments: commitments.iter().map(|c| bytes_to_hex(c)).collect(),
         canonical_profile: profile.clone(),
         seg_steps: args.seg_steps,
@@ -246,7 +352,9 @@ fn pin(args: PinArgs) -> Result<()> {
     } else {
         ProvableCatalog::new()
     };
-    catalog.upsert(pin);
+    // Append-versioned (D5): a re-pin adds a new version and retires
+    // nothing, so already-captured records keep a live allowlist.
+    let version = catalog.pin(pin);
     catalog
         .save(&args.out)
         .map_err(|e| anyhow!("write catalog {}: {e}", args.out.display()))?;
@@ -256,7 +364,8 @@ fn pin(args: PinArgs) -> Result<()> {
             .with_context(|| format!("write profile {}", path.display()))?;
     }
 
-    eprintln!("pinned '{}' into {}", args.name, args.out.display());
+    eprintln!("pinned '{}' v{version} into {}", args.name, args.out.display());
+    eprintln!("  blob_hash            = {}", bytes_to_hex(&blob_hash));
     eprintln!("  witness_addr         = {waddr:#x}");
     eprintln!("  unpatched_image_root = {}", bytes_to_hex(&image_root));
     eprintln!("  seg_steps            = {}", args.seg_steps);
@@ -269,6 +378,269 @@ fn pin(args: PinArgs) -> Result<()> {
         eprintln!("    {}", bytes_to_hex(c));
     }
     Ok(())
+}
+
+fn prove(args: ProveArgs) -> Result<()> {
+    use vos::provable::{ProofRecordEntry, task_blob_hash};
+
+    // ── The record entry (the prover-only secret + the record) ───────
+    let space = resolve_space(args.space.as_deref())?;
+    let entry_bytes = match (&args.entry, &args.from, &args.tag) {
+        (Some(path), _, _) => std::fs::read(path)
+            .with_context(|| format!("read record entry {}", path.display()))?,
+        (None, Some(from), Some(tag)) => {
+            let tag = parse_hex32(tag).context("--tag")?;
+            let reply = DaemonClient::with_connect(&space, |client| {
+                let target = client.resolve_target(from)?;
+                client.invoke_dyn(target, &Msg::new("proof_record").with("tag", tag.to_vec()))
+            })?;
+            match reply {
+                Value::Bytes(b) if !b.is_empty() => b,
+                Value::Bytes(_) | Value::Unit => {
+                    bail!("agent '{from}' holds no proof record under that tag")
+                }
+                other => bail!("'{from}' proof_record returned {other:?}, expected Bytes"),
+            }
+        }
+        _ => bail!("pass --entry <FILE>, or --from <TARGET> --tag <HEX64>"),
+    };
+    let entry = ProofRecordEntry::decode(&entry_bytes)
+        .ok_or_else(|| anyhow!("the entry bytes are not a ProofRecordEntry"))?;
+    if !entry.record.io_consistent() {
+        bail!(
+            "the stored record fails its io-hash binding equation — it cannot \
+             correspond to any execution (corrupt row, or a record captured \
+             under a different framework build)"
+        );
+    }
+
+    // ── The catalog pin (allowlist + proving parameters) ─────────────
+    let catalog = ProvableCatalog::load(&args.catalog)
+        .map_err(|e| anyhow!("load catalog {}: {e}", args.catalog.display()))?;
+    let pin = match &args.name {
+        Some(name) => catalog.require(name).map_err(|e| anyhow!("{e}"))?,
+        None => catalog.find_blob(&entry.record.task_hash).ok_or_else(|| {
+            anyhow!(
+                "no catalog pin records blob_hash {} — pin this Task build \
+                 (`vosx zk pin`) or select a pin with --name",
+                bytes_to_hex(&entry.record.task_hash)
+            )
+        })?,
+    };
+    if !pin.blob_hash.is_empty() && pin.blob_hash != bytes_to_hex(&entry.record.task_hash) {
+        bail!(
+            "pin '{}' v{} records blob_hash {} but the record's task ran blob {} — \
+             the record does not prove under this pin",
+            pin.name,
+            pin.version,
+            pin.blob_hash,
+            bytes_to_hex(&entry.record.task_hash)
+        );
+    }
+
+    // ── The blob (must be the exact build the record captured) ───────
+    let blob = match (&args.blob, &args.elf) {
+        (Some(path), _) => {
+            std::fs::read(path).with_context(|| format!("read blob {}", path.display()))?
+        }
+        (None, Some(path)) => {
+            let elf = std::fs::read(path)
+                .with_context(|| format!("read ELF {}", path.display()))?;
+            grey_transpiler::link_elf(&elf)
+                .map_err(|e| anyhow!("transpile {}: {e:?}", path.display()))?
+        }
+        (None, None) => bail!("pass the Task's build: --blob <FILE> or --elf <FILE>"),
+    };
+    if task_blob_hash(&blob) != entry.record.task_hash {
+        bail!(
+            "the supplied build's content-address {} is not the record's task_hash {} — \
+             wrong build (the witness re-traces only against the exact blob that ran)",
+            bytes_to_hex(&task_blob_hash(&blob)),
+            bytes_to_hex(&entry.record.task_hash)
+        );
+    }
+
+    // ── Drive the prover extension (pre-flight + chain, streamed) ────
+    eprintln!(
+        "proving record under pin '{}' v{} ({} commitment(s), seg_steps={}, page_budget={}) — heavy, minutes…",
+        pin.name,
+        pin.version,
+        pin.commitments.len(),
+        pin.seg_steps,
+        pin.page_budget
+    );
+    let reply = DaemonClient::with_connect(&space, |client| {
+        let ext = client.resolve_target(&args.extension).map_err(|_| {
+            anyhow!(
+                "no '{}' extension loaded in space '{space}' — add \
+                 `[[extension]] name = \"{}\"` to the manifest and restart `vosx space up`",
+                args.extension,
+                args.extension,
+            )
+        })?;
+        client.invoke_dyn_with_timeout(
+            ext,
+            &Msg::new("prove_record")
+                .with("pvm_blob", blob.clone())
+                .with("entry_bytes", entry_bytes.clone())
+                .with("witness_addr", pin.witness_addr)
+                .with("seg_steps", pin.seg_steps)
+                .with("page_budget", pin.page_budget)
+                .with("profile", pin.canonical_profile.clone()),
+            Duration::from_secs(args.timeout_secs),
+        )
+    })?;
+    let bytes = match reply {
+        Value::Bytes(b) if b.len() >= 96 && (b.len() - 32) % 32 == 0 => b,
+        Value::Bytes(b) if b.is_empty() => bail!(
+            "prover prove_record failed — pre-flight (witness re-trace vs the \
+             record's io-hash) or the chain prove rejected. Check the daemon log."
+        ),
+        other => bail!("prover prove_record returned {other:?}, expected hash ++ manifest bytes"),
+    };
+    let manifest_hash = &bytes[..32];
+    let manifest = &bytes[32..];
+    let segments = manifest.len() / 32 - 1; // [entering_root:32][seg_hash:32]…
+
+    // ── Outputs ──────────────────────────────────────────────────────
+    if let Some(path) = &args.out {
+        std::fs::write(path, manifest)
+            .with_context(|| format!("write manifest {}", path.display()))?;
+    }
+    eprintln!("proved {} segment(s); proofs + manifest are in the host proof CAS", segments);
+    eprintln!("  manifest_hash = {}", bytes_to_hex(manifest_hash));
+    if let Some(path) = &args.record_out {
+        let mut record = entry.record.clone();
+        record.catalog_name = pin.name.clone();
+        record.catalog_version = pin.version;
+        std::fs::write(path, record.encode())
+            .with_context(|| format!("write record {}", path.display()))?;
+        eprintln!("  record (verifier-facing) = {}", path.display());
+        eprintln!(
+            "verify with: vosx zk verify --record {} --proof {} --catalog {} --expected-root <root>",
+            path.display(),
+            bytes_to_hex(manifest_hash),
+            args.catalog.display()
+        );
+    } else {
+        eprintln!(
+            "note: no --record-out — no verifier-facing record was written, and \
+             `vosx zk verify` needs one (the raw entry has no catalog identity). \
+             Re-run with --record-out <FILE> to produce the shippable artifact."
+        );
+    }
+    Ok(())
+}
+
+fn verify(args: VerifyArgs) -> Result<()> {
+    use vos::provable::ProvableRecord;
+
+    let record_bytes = std::fs::read(&args.record)
+        .with_context(|| format!("read record {}", args.record.display()))?;
+    let record = ProvableRecord::decode(&record_bytes)
+        .ok_or_else(|| anyhow!("the record bytes are not a ProvableRecord"))?;
+    let proof_hash = parse_hex32(&args.proof).context("--proof")?;
+    let expected_root = args
+        .expected_root
+        .as_deref()
+        .map(parse_hex32)
+        .transpose()
+        .context("--expected-root")?;
+
+    // ── The verifier's trusted allowlist for the record's pin ────────
+    let catalog = ProvableCatalog::load(&args.catalog)
+        .map_err(|e| anyhow!("load catalog {}: {e}", args.catalog.display()))?;
+    if record.catalog_name.is_empty() {
+        bail!(
+            "the record carries no catalog identity — verify a record written \
+             by `vosx zk prove --record-out` (the stored row leaves it empty)"
+        );
+    }
+    let pin = catalog
+        .require_version(&record.catalog_name, record.catalog_version)
+        .map_err(|e| anyhow!("{e} — the verifier's catalog does not hold the pin this record proves under"))?;
+    let allowlist = pin.allowlist_concat().map_err(|e| anyhow!("{e}"))?;
+
+    // ── Record-local checks first, for actionable errors (the
+    //    extension re-runs them — rejection there is authoritative) ───
+    if !record.io_consistent() {
+        bail!(
+            "REJECT: the record fails its io-hash binding equation — a field \
+             (anchor, digest, app_public, reply, io_hash) was altered"
+        );
+    }
+    if let Some(expected) = expected_root {
+        match record.root_before() {
+            Some(root) if root == expected => {}
+            Some(root) => bail!(
+                "REJECT: the record attests root_before {} but you expected {} — \
+                 this transition did not run over the state you know",
+                bytes_to_hex(&root),
+                bytes_to_hex(&expected)
+            ),
+            None => bail!(
+                "REJECT: the record's app_public carries no leading root to \
+                 compare your --expected-root against"
+            ),
+        }
+    } else {
+        eprintln!(
+            "note: no --expected-root — verifying \"a transition between the \
+             recorded roots was proven\", not \"over state you know\""
+        );
+    }
+
+    // ── The chain: allowlist + validity + io-binding, streamed ───────
+    let space = resolve_space(args.space.as_deref())?;
+    eprintln!(
+        "verifying chain against pin '{}' v{} ({} commitment(s))…",
+        pin.name,
+        pin.version,
+        pin.commitments.len()
+    );
+    let reply = DaemonClient::with_connect(&space, |client| {
+        let ext = client.resolve_target(&args.extension).map_err(|_| {
+            anyhow!(
+                "no '{}' extension loaded in space '{space}' — add \
+                 `[[extension]] name = \"{}\"` to the manifest and restart `vosx space up`",
+                args.extension,
+                args.extension,
+            )
+        })?;
+        client.invoke_dyn_with_timeout(
+            ext,
+            &Msg::new("verify_record")
+                .with("allowlist", allowlist.clone())
+                .with("record_bytes", record_bytes.clone())
+                .with("proof_hash", proof_hash.to_vec())
+                .with(
+                    "expected_root",
+                    expected_root.map(|r| r.to_vec()).unwrap_or_default(),
+                )
+                .with("peer_prefix", args.peer_prefix),
+            MEASURE_TIMEOUT,
+        )
+    })?;
+    match reply.as_u8() {
+        Some(1) => {
+            eprintln!("ACCEPT: the chain proves this record's transition under pin '{}' v{}", pin.name, pin.version);
+            Ok(())
+        }
+        Some(0) => bail!(
+            "REJECT: chain verification failed — segments missing/tampered, a \
+             commitment outside the pin's allowlist, or an io-binding mismatch"
+        ),
+        _ => bail!("prover verify_record returned {reply:?}, expected 0/1"),
+    }
+}
+
+/// Parse a 64-char hex string into 32 bytes.
+fn parse_hex32(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s.trim()).with_context(|| format!("invalid hex {s:?}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("expected 32 bytes (64 hex chars), got {}", bytes.len()))
 }
 
 /// Decode a `measure_floors` reply — the derived canonical profile as a u32

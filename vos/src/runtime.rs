@@ -440,7 +440,9 @@ fn absorb_work_result(
     svc_id: u32,
     payload: RefinePayload,
 ) -> Result<AbsorbedWorkResult, WorkResultError> {
-    let anchor = if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
+    // v3 and v4 share the anchor-checked apply semantics (v4 only adds
+    // the app_public field); only legacy v2 skips the check.
+    let anchor = if payload.version >= crate::refine_payload::REFINE_PAYLOAD_V3 {
         let expected = expected_anchor(journal, storage, svc_id);
         if (payload.anchor_kind, payload.anchor) != expected {
             return Err(WorkResultError::AnchorMismatch);
@@ -499,6 +501,7 @@ fn claims_refine_payload(bytes: &[u8]) -> bool {
     matches!(
         bytes.first(),
         Some(&crate::refine_payload::REFINE_PAYLOAD_V2)
+            | Some(&crate::refine_payload::REFINE_PAYLOAD_V3)
             | Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
     )
 }
@@ -1928,12 +1931,15 @@ fn run_task_invoke(
     let out_len = (child.active_reg(8) as usize).min(1 << 20);
     let raw_output = kread(&child, out_ptr, out_len);
 
-    // Tasks are v3-native — run_task_service is the only entry that can
-    // produce this halt shape; anything else is a mis-built blob.
+    // Tasks are current-version-native — run_task_service is the only
+    // entry that can produce this halt shape, and it always emits the
+    // current wire (v4, which surfaces app_public for record capture);
+    // anything else is a mis-built or stale blob. No deployed task blob
+    // predates v4, so no compat arm exists here.
     let payload = match RefinePayload::decode(&raw_output) {
         Some(p) if p.version == crate::refine_payload::REFINE_PAYLOAD_VERSION => p,
         _ => {
-            error!(parent_svc_id, "task child: halt output is not a v3 work-result");
+            error!(parent_svc_id, "task child: halt output is not a v4 work-result (stale blob?)");
             journal.rollback_to(invoke_mark);
             return record_and_write_invoke(
                 caller,
@@ -1989,6 +1995,14 @@ fn run_task_invoke(
                 transition_digest: payload.transition_digest(),
                 reply: payload.reply.clone(),
                 io_hash,
+                app_public: payload.app_public.clone(),
+                // No catalog exists node-side at capture; the prove
+                // flow's catalog holder (`vosx zk prove`) resolves the
+                // pin by blob_hash == task_hash (sound and unambiguous
+                // under the append-versioned catalog) and fills these
+                // into the SHIPPED record.
+                catalog_name: alloc::string::String::new(),
+                catalog_version: 0,
             },
         };
         payload.effects.push(crate::refine_payload::Effect::Write {
@@ -2431,13 +2445,13 @@ fn handle_invoke(
     let raw_output = kread(&child, out_ptr, out_len);
 
     let output = if let Some(mut payload) = RefinePayload::decode(&raw_output) {
-        // Parity check: a v3 child's anchor must commit to exactly the
-        // state the host staged for it — or, for a committed-storage
+        // Parity check: a v3/v4 child's anchor must commit to exactly
+        // the state the host staged for it — or, for a committed-storage
         // child, the composite root its own keyspace recorded (read
         // through the same journal overlay; see `expected_anchor`).
         // A mismatch means a buggy guest or a doctored blob — apply
         // nothing, surface a crash.
-        if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
+        if payload.version >= crate::refine_payload::REFINE_PAYLOAD_V3 {
             let expected = if let Some(root) = journal.effective_read(
                 storage,
                 target_svc_id.0,
@@ -2584,7 +2598,8 @@ fn clear_continuation<D: crate::data_layer::DataLayer>(
 /// a code-hash-identified INVOKE cannot be pointed at a forged blob — the
 /// prior XOR fold was trivially collidable.
 fn blob_hash(data: &[u8]) -> [u8; 32] {
-    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/blob-addr/v1", &[data])
+    // One shared definition with the catalog's blob_hash join key.
+    crate::provable::task_blob_hash(data)
 }
 
 #[cfg(test)]

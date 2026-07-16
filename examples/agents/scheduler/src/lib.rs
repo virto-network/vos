@@ -106,6 +106,26 @@ impl Agent {
         id
     }
 
+    /// Export the captured proof record under `tag` — the raw
+    /// `ProofRecordEntry` bytes from this agent's own
+    /// `__vos_proofrec/<tag>` row (empty when no record exists). The
+    /// fetch half of `vosx zk prove`. The entry contains the proving
+    /// SECRET (the exact witness bytes), so a production agent must
+    /// gate this behind its operator role; this example agent leaves it
+    /// open for the gates.
+    #[msg]
+    async fn proof_record(&mut self, tag: [u8; 32]) -> Vec<u8> {
+        // Records live in the guest keyspace — only the pvm build has
+        // one to read (the host rlib surface compiles without it).
+        #[cfg(target_arch = "riscv64")]
+        return vos::provable::read_record_entry(&tag).unwrap_or_default();
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = tag;
+            Vec::new()
+        }
+    }
+
     /// Drive all configured peers with a dynamic `start` message.
     /// Actors without a `start` handler silently skip it.
     #[msg]

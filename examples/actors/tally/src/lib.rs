@@ -9,6 +9,14 @@
 use vos::prelude::*;
 use vos::storage::StorageMap;
 
+/// The fixture's app-named state root: a domain-tagged blake2b over the
+/// running total. Host-recomputable (`vos::crypto::blake2b_hash` is
+/// pure), so gates and verifiers derive the same `expected_root_before`
+/// from the state they know.
+fn total_root(total: u64) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"tally/root/v1", &[&total.to_le_bytes()])
+}
+
 #[actor(task)]
 struct Tally {
     total: u64,
@@ -45,6 +53,31 @@ impl Tally {
     #[msg]
     async fn add(&mut self, n: u64) -> u64 {
         self.total += n;
+        self.total
+    }
+
+    /// Like `add`, but binds the transition's app-public roots — the
+    /// provable-record fixture (`docs/plans/provable.md` W3). The bound
+    /// bytes are `root_before(32) ‖ root_after(32)` over the running
+    /// total, LEADING with `root_before` per the `vos::provable` root
+    /// convention (that leading word is what a verifier's
+    /// `expected_root_before` compares against). The host captures
+    /// these bytes in the `ProvableRecord`; a verifier recomputes the
+    /// same roots from the state it independently knows.
+    #[msg]
+    async fn add_rooted(&mut self, n: u64) -> u64 {
+        let root_before = total_root(self.total);
+        self.total += n;
+        let root_after = total_root(self.total);
+        let mut public = [0u8; 64];
+        public[..32].copy_from_slice(&root_before);
+        public[32..].copy_from_slice(&root_after);
+        // The binding stash is guest-framework state (pvm builds); the
+        // host rlib surface of this crate has no halt to fold it into.
+        #[cfg(target_arch = "riscv64")]
+        vos::zk::bind_public_bytes(&public);
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = public;
         self.total
     }
 

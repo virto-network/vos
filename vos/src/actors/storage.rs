@@ -146,6 +146,14 @@ pub(crate) fn end_dispatch() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     })
 }
 
+/// Read one raw row through the same dispatch overlay the typed handles
+/// use — framework-internal (e.g. `provable::read_record_entry` reading
+/// a reserved `__vos_proofrec/` row back from the owning parent).
+#[cfg_attr(not(feature = "service"), allow(dead_code))]
+pub(crate) fn read_raw(key: &[u8]) -> Option<Vec<u8>> {
+    overlay_load(key)
+}
+
 /// The effective value of `key` for this dispatch: pending mutations
 /// (tombstones = absent), then the read cache, then the host.
 fn overlay_load(key: &[u8]) -> Option<Vec<u8>> {
