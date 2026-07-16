@@ -7,8 +7,8 @@
 //! into `local.toml`:
 //!
 //! - **Replicated half** → the registry, over `DaemonClient`: each
-//!   `[[agent]]`'s ELF is blob-cached + published as `<name>:manifest`
-//!   (if missing) and `install`ed (if no instance of that name exists).
+//!   `[[agent]]`'s ELF is blob-cached + published under its immutable
+//!   program tag (if missing) and installed (if no instance exists).
 //!   The bytes reach the daemon through the shared content-addressed
 //!   blob cache — `publish` only ships `(name, version, hash)`.
 //! - **Node-local half** → `local.toml`: per-agent `tick_ms` /
@@ -39,9 +39,9 @@ use crate::commands::space::reconcile::{
 use crate::commands::space::subscriptions::{self, AgentLocal, ExtensionLocal, LocalConfig};
 use crate::output;
 
-/// The version tag manifest/recipe programs publish under. Recipes
-/// don't carry per-program versions, so both `reconcile` (genesis) and
-/// `apply` (runtime) use the same literal so their catalog rows agree.
+/// Initial tag used when a recipe omits `program`. It is safe for first
+/// install and idempotent re-apply; changed content must choose a new,
+/// explicit immutable version.
 const RECIPE_VERSION: &str = "manifest";
 
 pub struct Args {
@@ -68,6 +68,9 @@ pub(crate) struct ApplyReport {
     /// Instances whose catalog blob differs from the recipe but that
     /// weren't upgraded (needs `--upgrade`).
     upgrade_pending: Vec<String>,
+    /// Changed implicit `name:manifest` instances that need an explicit
+    /// immutable target such as `program = "name:v2"`.
+    version_required: Vec<String>,
     /// Whether `local.toml` changed (or would change, under `--diff`).
     local_changed: bool,
     /// `--diff` dry run — nothing was written.
@@ -103,11 +106,6 @@ pub(crate) fn apply_manifest(
     diff: bool,
     upgrade: bool,
 ) -> anyhow::Result<ApplyReport> {
-    let mut report = ApplyReport {
-        diff,
-        ..Default::default()
-    };
-
     let space_id = client
         .entry
         .id_bytes()
@@ -122,60 +120,133 @@ pub(crate) fn apply_manifest(
         name_ids.insert(a.name.clone(), instance_service_id(&a.name, prefix).0);
     }
 
-    for agent in flatten(&manifest.agents) {
-        apply_one(
-            client,
-            agent,
-            recipe_dir,
-            &space_id,
-            &name_ids,
-            diff,
-            upgrade,
-            &mut report,
-        )?;
-    }
-
     // Node-local half → local.toml. Recipe fields overwrite the recipe-
     // owned sections (cap_policy, per-agent policy, extensions) while
     // node-owned fields (subscriptions, listen) are preserved.
     let mut cfg = subscriptions::load(data_dir)?;
     let next = project_node_local(&cfg, manifest, recipe_dir);
-    if next != cfg {
-        report.local_changed = true;
-        if !diff {
-            cfg = next;
-            subscriptions::save(data_dir, &cfg)?;
+    let local_changed = next != cfg;
+
+    // Validate the entire plan before the first cache, catalog, instance,
+    // or local-config write.
+    let mut plans = Vec::new();
+    let mut planned_tags: BTreeMap<(String, String), [u8; 32]> = BTreeMap::new();
+    for agent in flatten(&manifest.agents) {
+        let mut plan = preflight_one(client, agent, recipe_dir, &space_id, &name_ids, upgrade)?;
+        if plan.needs_publish {
+            let key = (plan.program_name.clone(), plan.program_version.clone());
+            match planned_tags.get(&key) {
+                Some(hash) if hash == &plan.hash => plan.needs_publish = false,
+                Some(_) => anyhow::bail!(
+                    "recipe assigns program {}:{} to multiple blobs; version tags are immutable",
+                    key.0,
+                    key.1,
+                ),
+                None => {
+                    planned_tags.insert(key, plan.hash);
+                }
+            }
         }
+        plans.push(plan);
+    }
+
+    let mut report = ApplyReport {
+        local_changed,
+        diff,
+        ..Default::default()
+    };
+    for plan in &plans {
+        if plan.needs_publish {
+            report
+                .published
+                .push(format!("{}:{}", plan.program_name, plan.program_version));
+        }
+        match &plan.action {
+            ApplyAction::Skip => report.skipped.push(plan.instance_name.clone()),
+            ApplyAction::Install { .. } => report.installed.push(plan.instance_name.clone()),
+            ApplyAction::Upgrade => report.upgraded.push(plan.instance_name.clone()),
+            ApplyAction::UpgradePending => report.upgrade_pending.push(plan.instance_name.clone()),
+            ApplyAction::VersionRequired => {
+                report.version_required.push(plan.instance_name.clone())
+            }
+        }
+    }
+
+    if diff {
+        return Ok(report);
+    }
+
+    // A real apply heals the content-addressed cache even for skipped
+    // instances. Dry runs never reach this write.
+    for plan in &plans {
+        if let Some(bytes) = &plan.elf_bytes {
+            let cached = blob_store::cache_put(bytes)
+                .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", plan.instance_name))?;
+            debug_assert_eq!(cached.0, plan.hash);
+        }
+    }
+    for plan in &plans {
+        execute_one(client, plan, &mut report)?;
+    }
+    if local_changed {
+        cfg = next;
+        subscriptions::save(data_dir, &cfg)?;
     }
 
     Ok(report)
 }
 
+enum ApplyAction {
+    Skip,
+    Install {
+        consistency: u8,
+        replication_id: [u8; 32],
+        install_args: Vec<u8>,
+        install_payloads: Vec<u8>,
+        network_reachable: bool,
+        sync_role: SyncFloor,
+    },
+    Upgrade,
+    UpgradePending,
+    VersionRequired,
+}
+
+struct PreparedAgent {
+    instance_name: String,
+    program_name: String,
+    program_version: String,
+    hash: [u8; 32],
+    elf_bytes: Option<Vec<u8>>,
+    needs_publish: bool,
+    action: ApplyAction,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn apply_one(
+fn preflight_one(
     client: &DaemonClient,
     agent: &AgentDef,
     recipe_dir: &Path,
     space_id: &[u8; 32],
     name_ids: &BTreeMap<String, u32>,
-    diff: bool,
     upgrade: bool,
-    report: &mut ApplyReport,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PreparedAgent> {
     // 1. Resolve the blob hash + program identity from either a source
     //    `path` (a hand-written recipe) or `program_hash` (a `space
     //    export` output, which carries no path). Path-based also yields
     //    the ELF bytes — needed to publish and to encode init args; the
     //    hash-based form resolves against the already-published catalog,
     //    which is what makes `export | apply --diff` all-skips.
-    let (program_name, program_version) = program_ref(agent);
+    let (program_name, program_version, explicit_program) = program_ref(agent)?;
     let (hash, elf_bytes) = if !agent.path.is_empty() {
         let elf_path = recipe_dir.join(&agent.path);
         let bytes = std::fs::read(&elf_path).map_err(|e| {
-            anyhow::anyhow!("read {} for agent '{}': {e}", elf_path.display(), agent.name)
+            anyhow::anyhow!(
+                "read {} for agent '{}': {e}",
+                elf_path.display(),
+                agent.name
+            )
         })?;
-        let h = blob_store::cache_put(&bytes)
-            .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
+        let h = blob_store::BlobHash::of(&bytes);
         (h.0, Some(bytes))
     } else if let Some(ph) = &agent.program_hash {
         let h = blob_store::BlobHash::from_hex(ph)
@@ -189,72 +260,78 @@ fn apply_one(
         );
     };
 
-    // 2. Ensure the program is published at this blob.
-    match client.program(&program_name, &program_version)? {
-        Some(p) if p.hash == hash => {
-            // Already the catalog's blob — nothing to publish.
+    // Resolve the instance first. An unchanged instance is already at the
+    // requested content and does not need a synthetic catalog rewrite.
+    let existing = client.agent(&agent.name)?;
+    if existing
+        .as_ref()
+        .is_some_and(|row| row.program_hash == hash)
+    {
+        return Ok(PreparedAgent {
+            instance_name: agent.name.clone(),
+            program_name,
+            program_version,
+            hash,
+            elf_bytes,
+            needs_publish: false,
+            action: ApplyAction::Skip,
+        });
+    }
+
+    if existing.is_some() && !explicit_program {
+        if upgrade {
+            anyhow::bail!(
+                "agent '{}': an upgrade requires an explicit new immutable target, e.g. \
+                 `program = \"{}:v2\"`",
+                agent.name,
+                agent.name,
+            );
         }
-        Some(_) => {
-            // The tag is pinned to a different blob. Never silently
-            // overwrite (tags are immutable) — `--upgrade` re-points the
-            // instance below; a fresh install would need a new version.
-            report.upgrade_pending.push(agent.name.clone());
-        }
+        return Ok(PreparedAgent {
+            instance_name: agent.name.clone(),
+            program_name,
+            program_version,
+            hash,
+            elf_bytes,
+            needs_publish: false,
+            action: ApplyAction::VersionRequired,
+        });
+    }
+
+    let needs_publish = match client.program(&program_name, &program_version)? {
+        Some(p) if p.hash == hash => false,
+        Some(_) => anyhow::bail!(
+            "agent '{}': program {program_name}:{program_version} is already pinned to a \
+             different blob; choose a new explicit version",
+            agent.name,
+        ),
         None => {
-            let Some(bytes) = &elf_bytes else {
+            if elf_bytes.is_none() {
                 anyhow::bail!(
                     "agent '{}': program {program_name}:{program_version} (hash {}) is not in the \
                      catalog and this recipe carries no `path` to publish it from",
                     agent.name,
                     hex::encode(hash),
                 );
-            };
-            report.published.push(format!("{program_name}:{program_version}"));
-            if !diff {
-                match client.publish(program_name.clone(), program_version.clone(), hash.to_vec())? {
-                    Status::Ok => forward_meta(client, &blob_store::BlobHash(hash), bytes),
-                    Status::Forbidden => anyhow::bail!(
-                        "publish '{program_name}' refused (Status::Forbidden) — the operator key \
-                         is not an admin of this space. `apply` is an admin op; grant the operator \
-                         a role or apply from the admin node."
-                    ),
-                    Status::TagConflict => anyhow::bail!(
-                        "publish '{program_name}:{program_version}' conflicts with an existing tag \
-                         at a different hash (race?). Retry."
-                    ),
-                    other => anyhow::bail!("publish '{program_name}' returned status {other}"),
-                }
             }
+            true
         }
-    }
+    };
 
-    // 3. Ensure the instance is installed.
-    let existing = client.agent(&agent.name)?;
-    match existing {
-        Some(row) if row.program_hash == hash => {
-            report.skipped.push(agent.name.clone());
-            return Ok(());
-        }
-        Some(_) => {
-            // Installed but pointing at a different blob. Upgrade (if
-            // asked) or flag it — a synced-in row must not be silently
-            // clobbered.
-            if upgrade && !diff {
-                match client.upgrade(
-                    agent.name.clone(),
-                    program_name.clone(),
-                    program_version.clone(),
-                    hash.to_vec(),
-                )? {
-                    Status::Ok => report.upgraded.push(agent.name.clone()),
-                    other => anyhow::bail!("upgrade '{}' returned status {other}", agent.name),
-                }
-            } else if !report.upgrade_pending.iter().any(|n| n == &agent.name) {
-                report.upgrade_pending.push(agent.name.clone());
-            }
-            return Ok(());
-        }
-        None => {}
+    if existing.is_some() {
+        return Ok(PreparedAgent {
+            instance_name: agent.name.clone(),
+            program_name,
+            program_version,
+            hash,
+            elf_bytes,
+            needs_publish,
+            action: if upgrade {
+                ApplyAction::Upgrade
+            } else {
+                ApplyAction::UpgradePending
+            },
+        });
     }
 
     // Not installed — install it (replicated half only).
@@ -279,66 +356,153 @@ fn apply_one(
     // Installing a new instance needs the ELF (to encode init args). The
     // path-less `program_hash` form only supports the already-installed
     // (skip) path — the round-trip case.
-    let Some(elf_bytes) = &elf_bytes else {
+    let Some(install_elf_bytes) = &elf_bytes else {
         anyhow::bail!(
             "agent '{}' is not installed and this recipe carries no `path` — the path-less \
              (exported) form can only reconcile already-installed instances",
             agent.name,
         );
     };
-    let install_args = encode_init_args(&agent.name, elf_bytes, &agent.init, name_ids)?;
+    let install_args = encode_init_args(&agent.name, install_elf_bytes, &agent.init, name_ids)?;
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
-    report.installed.push(agent.name.clone());
-    if diff {
-        return Ok(());
-    }
-
-    let status = client.install(
-        agent.name.clone(),
+    Ok(PreparedAgent {
+        instance_name: agent.name.clone(),
         program_name,
         program_version,
-        hash.to_vec(),
-        replication_id.to_vec(),
-        consistency,
-        install_args,
-        install_payloads,
-        agent.network_reachable,
-        sync_role,
-    )?;
-    match status {
-        Status::Ok => {}
-        // A peer's row for this instance synced in between our check and
-        // our install — the post-condition (installed) already holds.
-        Status::InstanceExists => {
-            report.installed.retain(|n| n != &agent.name);
-            report.skipped.push(agent.name.clone());
-        }
-        Status::Forbidden => anyhow::bail!(
-            "install '{}' refused (Status::Forbidden) — the operator key is not an admin of this \
-             space. `apply` is an admin op.",
-            agent.name,
-        ),
-        Status::ReplicationIdReused => anyhow::bail!(
-            "install '{}' refused: its replication_id is a retired tombstone (uninstalled before). \
-             Assign a fresh `replication_id` in the recipe to re-create it with clean state.",
-            agent.name,
-        ),
-        other => anyhow::bail!("install '{}' returned status {other}", agent.name),
-    }
-    Ok(())
+        hash,
+        elf_bytes,
+        needs_publish,
+        action: ApplyAction::Install {
+            consistency,
+            replication_id,
+            install_args,
+            install_payloads,
+            network_reachable: agent.network_reachable,
+            sync_role,
+        },
+    })
 }
 
-/// The program `(name, version)` an agent installs from: an explicit
-/// `program = "name:version"` (as `space export` emits), else the agent
-/// name at the recipe version tag.
-fn program_ref(agent: &AgentDef) -> (String, String) {
-    match &agent.program {
-        Some(pv) => match pv.split_once(':') {
-            Some((n, v)) => (n.to_string(), v.to_string()),
-            None => (pv.clone(), RECIPE_VERSION.to_string()),
+fn execute_one(
+    client: &DaemonClient,
+    plan: &PreparedAgent,
+    report: &mut ApplyReport,
+) -> anyhow::Result<()> {
+    if plan.needs_publish {
+        match client.publish(
+            plan.program_name.clone(),
+            plan.program_version.clone(),
+            plan.hash.to_vec(),
+        )? {
+            Status::Ok => {
+                if let Some(bytes) = &plan.elf_bytes {
+                    forward_meta(client, &blob_store::BlobHash(plan.hash), bytes);
+                }
+            }
+            Status::Forbidden => anyhow::bail!(
+                "publish '{}:{}' refused (Status::Forbidden) — the operator key is not an admin \
+                 of this space. `apply` is an admin op.",
+                plan.program_name,
+                plan.program_version,
+            ),
+            Status::TagConflict => anyhow::bail!(
+                "publish '{}:{}' raced with a different immutable tag; re-run apply and choose a \
+                 fresh version if the conflict remains",
+                plan.program_name,
+                plan.program_version,
+            ),
+            other => anyhow::bail!(
+                "publish '{}:{}' returned status {other}",
+                plan.program_name,
+                plan.program_version,
+            ),
+        }
+    }
+
+    match &plan.action {
+        ApplyAction::Skip | ApplyAction::UpgradePending | ApplyAction::VersionRequired => Ok(()),
+        ApplyAction::Upgrade => match client.upgrade(
+            plan.instance_name.clone(),
+            plan.program_name.clone(),
+            plan.program_version.clone(),
+            plan.hash.to_vec(),
+        )? {
+            Status::Ok => Ok(()),
+            Status::Forbidden => anyhow::bail!(
+                "upgrade '{}' refused (Status::Forbidden) — the operator key is not an admin of \
+                 this space",
+                plan.instance_name,
+            ),
+            other => anyhow::bail!("upgrade '{}' returned status {other}", plan.instance_name),
         },
-        None => (agent.name.clone(), RECIPE_VERSION.to_string()),
+        ApplyAction::Install {
+            consistency,
+            replication_id,
+            install_args,
+            install_payloads,
+            network_reachable,
+            sync_role,
+        } => {
+            let status = client.install(
+                plan.instance_name.clone(),
+                plan.program_name.clone(),
+                plan.program_version.clone(),
+                plan.hash.to_vec(),
+                replication_id.to_vec(),
+                *consistency,
+                install_args.clone(),
+                install_payloads.clone(),
+                *network_reachable,
+                sync_role.clone(),
+            )?;
+            match status {
+                Status::Ok => Ok(()),
+                // A peer's row synced in after preflight. The instance now
+                // exists; report the race as an idempotent skip.
+                Status::InstanceExists => {
+                    report.installed.retain(|n| n != &plan.instance_name);
+                    report.skipped.push(plan.instance_name.clone());
+                    Ok(())
+                }
+                Status::Forbidden => anyhow::bail!(
+                    "install '{}' refused (Status::Forbidden) — the operator key is not an admin \
+                     of this space. `apply` is an admin op.",
+                    plan.instance_name,
+                ),
+                Status::ReplicationIdReused => anyhow::bail!(
+                    "install '{}' refused: its replication_id is a retired tombstone. Assign a \
+                     fresh `replication_id` in the recipe to re-create it with clean state.",
+                    plan.instance_name,
+                ),
+                other => anyhow::bail!("install '{}' returned status {other}", plan.instance_name,),
+            }
+        }
+    }
+}
+
+/// The program `(name, version)` an agent installs from. Changed agents
+/// must name an explicit immutable `program = "name:version"`; the
+/// implicit `<instance>:manifest` tag is only for initial/idempotent apply.
+fn program_ref(agent: &AgentDef) -> anyhow::Result<(String, String, bool)> {
+    match &agent.program {
+        Some(pv) => {
+            let Some((name, version)) = pv.split_once(':') else {
+                anyhow::bail!(
+                    "agent '{}': `program` must be `name:version`, got '{pv}'",
+                    agent.name,
+                );
+            };
+            if name.is_empty() || version.is_empty() || version.contains(':') {
+                anyhow::bail!(
+                    "agent '{}': `program` must contain exactly one `:` with non-empty name and \
+                     version",
+                    agent.name,
+                );
+            }
+            Ok((name.to_string(), version.to_string(), true))
+        }
+        None => Ok((agent.name.clone(), RECIPE_VERSION.to_string(), false)),
     }
 }
 
@@ -459,10 +623,13 @@ fn emit(space: &str, report: &ApplyReport) {
         println!("  {verb}install {i}");
     }
     for u in &report.upgraded {
-        println!("  upgrade {u}");
+        println!("  {verb}upgrade {u}");
     }
     for u in &report.upgrade_pending {
         println!("  {u}: catalog blob differs — run with --upgrade to re-point");
+    }
+    for u in &report.version_required {
+        println!("  {u}: recipe blob differs — set an explicit new `program = \"name:version\"`");
     }
     for s in &report.skipped {
         println!("  skip {s} (already installed)");
@@ -474,6 +641,7 @@ fn emit(space: &str, report: &ApplyReport) {
         && report.installed.is_empty()
         && report.upgraded.is_empty()
         && report.upgrade_pending.is_empty()
+        && report.version_required.is_empty()
         && !report.local_changed
     {
         println!("  nothing to do — registry already matches the recipe");
@@ -540,23 +708,29 @@ mod tests {
             name: "counter".into(),
             ..Default::default()
         };
-        assert_eq!(program_ref(&bare), ("counter".into(), RECIPE_VERSION.into()));
+        assert_eq!(
+            program_ref(&bare).unwrap(),
+            ("counter".into(), RECIPE_VERSION.into(), false),
+        );
 
         let exported = AgentDef {
             name: "counter".into(),
             program: Some("counter:manifest".into()),
             ..Default::default()
         };
-        assert_eq!(program_ref(&exported), ("counter".into(), "manifest".into()));
+        assert_eq!(
+            program_ref(&exported).unwrap(),
+            ("counter".into(), "manifest".into(), true),
+        );
 
-        // A `program` with no `:` is treated as a bare name at the
-        // recipe version.
+        // Explicit references always carry a version; otherwise an
+        // upgrade could accidentally target the immutable manifest tag.
         let noversion = AgentDef {
             name: "x".into(),
             program: Some("libcounter".into()),
             ..Default::default()
         };
-        assert_eq!(program_ref(&noversion), ("libcounter".into(), RECIPE_VERSION.into()));
+        assert!(program_ref(&noversion).is_err());
     }
 
     #[test]
