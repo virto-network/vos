@@ -9,8 +9,8 @@
 //!
 //! Minting requires the operator to hold ADMIN in the target space
 //! (the delegated-grant chain is admin → token → node). Offline-
-//! redeemable tiers are `member` and `developer`; `admin` needs online
-//! admission (decision 5) and prints a caveat.
+//! redeemable tiers are `member` and `developer`. Admin promotion uses
+//! the explicit online `space role grant` path.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,7 +36,7 @@ pub enum InviteCommand {
 
 pub struct Args {
     pub space: String,
-    /// `member` | `developer` | `admin`.
+    /// `member` | `developer`.
     pub role: String,
     /// Expiry window: `7d` / `24h` / `30m` / `90s` / bare seconds.
     pub expires: String,
@@ -63,8 +63,7 @@ fn role_from_name(s: &str) -> anyhow::Result<(u8, &'static str)> {
     match s.to_ascii_lowercase().as_str() {
         "member" | "read" | "readonly" | "read-only" => Ok((AUTH_ROLE_READONLY, "member")),
         "developer" | "dev" => Ok((AUTH_ROLE_DEVELOPER, "developer")),
-        "admin" => Ok((AUTH_ROLE_ADMIN, "admin")),
-        other => anyhow::bail!("unknown role '{other}', expected member|developer|admin"),
+        other => anyhow::bail!("unknown role '{other}', expected member|developer"),
     }
 }
 
@@ -121,11 +120,13 @@ fn revoke(space: &str, prefix: &str) -> anyhow::Result<()> {
 fn mint(args: Args) -> anyhow::Result<()> {
     let (role, role_name) = role_from_name(&args.role)?;
     let ttl = token::parse_duration(&args.expires)?;
-    let expires_at = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
-        + ttl;
+        .unwrap_or(0);
+    let expires_at = now
+        .checked_add(ttl)
+        .ok_or_else(|| anyhow::anyhow!("invite expiry overflows unix seconds"))?;
 
     // Validate any explicit bootnodes early so we don't mint a token
     // that embeds an unusable address.
@@ -198,15 +199,7 @@ fn mint(args: Args) -> anyhow::Result<()> {
             println!("  expires   = {} (in {})", expires_at, args.expires);
             println!("  bootnodes = {}", bootnodes.join(", "));
             println!();
-            if role == AUTH_ROLE_ADMIN {
-                println!(
-                    "note: `admin` is online-admission only — an offline `space up <token>` \
-                     redeem is refused by the registry. The serving admin must countersign the \
-                     grant. Prefer `--role developer` for delegated authoring.",
-                );
-            } else {
-                println!("redeem with: `vosx space up <token>` (or `vosx space up -` to pipe it in).");
-            }
+            println!("redeem with: `vosx space up <token>` (or `vosx space up -` to pipe it in).");
         }
         Ok(())
     })
@@ -229,7 +222,7 @@ mod tests {
     fn role_names_map_to_auth_codes() {
         assert_eq!(role_from_name("member").unwrap(), (AUTH_ROLE_READONLY, "member"));
         assert_eq!(role_from_name("Developer").unwrap().0, AUTH_ROLE_DEVELOPER);
-        assert_eq!(role_from_name("admin").unwrap().0, AUTH_ROLE_ADMIN);
+        assert!(role_from_name("admin").is_err());
         assert!(role_from_name("wizard").is_err());
     }
 }

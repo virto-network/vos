@@ -49,12 +49,6 @@ pub struct SpaceEntry {
     /// is not a hyperspace member.
     #[serde(default)]
     pub hyperspace: String,
-    /// A `vos1…` invite token awaiting redemption. Set by `space up
-    /// <token>` (join-if-needed) and consumed by the redeem loop in the
-    /// boot tick: each pass re-parses it and invokes the bootnode's
-    /// `redeem_invite`, clearing it on success. Empty = nothing pending.
-    #[serde(default)]
-    pub pending_token: String,
     /// An absolute recipe-TOML path awaiting a one-shot genesis apply.
     /// Set by `space up <recipe>` / `space new --manifest`; consumed on
     /// the next boot (agents → registry, node-local → local.toml) and
@@ -178,7 +172,6 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
         registry_hash: String::new(),
         bootnodes: Vec::new(),
         hyperspace: String::new(),
-        pending_token: String::new(),
         pending_manifest: String::new(),
     }
 }
@@ -230,7 +223,6 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: "bank-federation".into(),
-                pending_token: String::new(),
                 pending_manifest: String::new(),
             },
         );
@@ -275,7 +267,6 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
-                pending_token: String::new(),
                 pending_manifest: String::new(),
             },
         );
@@ -289,7 +280,6 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
-                pending_token: String::new(),
                 pending_manifest: String::new(),
             },
         );
@@ -311,7 +301,6 @@ mod tests {
                 registry_hash: String::new(),
                 bootnodes: Vec::new(),
                 hyperspace: String::new(),
-                pending_token: String::new(),
                 pending_manifest: String::new(),
             },
         );

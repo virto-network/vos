@@ -22,6 +22,8 @@ use crate::commands::space::common::{
 use crate::commands::space::{payload_codec, reconcile, subscriptions};
 use crate::spaces_index;
 
+const PENDING_INVITE_FILE: &str = ".pending-invite.token";
+
 pub struct Args {
     pub query: String,
     pub once: bool,
@@ -33,8 +35,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Trivalent positional (decision 1): an existing `.toml` recipe
     // (create-if-missing + genesis apply), a `vos1…` invite token
     // (join-if-needed + auto-redeem), or a known space name / id. Any of
-    // these may scaffold/join the space and stamp a pending token or
-    // manifest onto the index; all that flows forward is the lookup key.
+    // these may scaffold/join the space and persist a pending token or
+    // manifest; all that flows forward is the lookup key.
     let lookup = resolve_up_target(&args)?;
     let index = spaces_index::load()?;
     let entry = spaces_index::find(&index, &lookup)?;
@@ -72,6 +74,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             data_dir.display(),
         );
     }
+    let mut pending_token = load_pending_token(&data_dir)?;
 
     // Verify the genesis CrdtEvent against the advertised
     // space_id BEFORE registering the agent (which opens the
@@ -285,7 +288,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // The redeem loop and spawn-reconcile live only in the
         // run-forever tick, so `--once` (a smoke-test idle-exit) does not
         // redeem a pending token. Warn rather than silently no-op.
-        if !entry.pending_token.is_empty() {
+        if pending_token.is_some() {
             tracing::warn!(
                 "--once will NOT redeem the pending invite (redemption runs in the long-lived \
                  tick). Re-run `space up {}` without --once to join.",
@@ -316,9 +319,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // and invoke the bootnode's `redeem_invite`; clear the marker on
         // success. The joiner reaches redeem by remote invoke (ungated)
         // before it can sync anything — the cert IS the auth.
-        let mut pending_token =
-            (!entry.pending_token.is_empty()).then(|| entry.pending_token.clone());
-        let space_id_hex = entry.id.clone();
         let mut redeem_warned = false;
         let mut damped = std::collections::HashSet::new();
         let mut boot_grace = BootGrace::new();
@@ -355,14 +355,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             }
             last_pass = std::time::Instant::now();
             if let Some(tok) = pending_token.clone() {
-                // Honor `--expires` on the honest redeem path: an expired
-                // token is terminal, not a retry. (Robust enforcement
-                // against a modified redeemer rides the deferred
-                // online-admission hook; short expiry + `space invite
-                // revoke` are the backstop.)
+                // Expiry is checked here for a clean local failure and at
+                // the serving node's admission boundary for enforcement.
                 if token_expired(&tok) {
                     pending_token = None;
-                    let _ = clear_pending_token(&space_id_hex);
+                    let _ = clear_pending_token(&data_dir);
                     tracing::warn!(
                         "invite token expired — not redeeming; ask the admin for a fresh \
                          `space invite`",
@@ -371,8 +368,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     match try_redeem(n, &data_dir, &tok) {
                         Ok(true) => {
                             pending_token = None;
-                            if let Err(e) = clear_pending_token(&space_id_hex) {
-                                tracing::warn!("clearing pending token from the index: {e}");
+                            if let Err(e) = clear_pending_token(&data_dir) {
+                                tracing::warn!("clearing pending invite secret: {e}");
                             }
                             tracing::info!(
                                 "invite redeemed — node key granted; the grant syncs back on the \
@@ -521,8 +518,8 @@ fn resolve_recipe(path: &str) -> anyhow::Result<String> {
 
 /// Token path: parse the invite, join-if-needed (scaffold the local data
 /// dir + node key + registry blob + index entry, taking `space_id` on
-/// trust — `space up` verifies genesis once synced), stamp
-/// `pending_token`, and return the space name.
+/// trust — `space up` verifies genesis once synced), persist the bearer
+/// token in an owner-only per-space file, and return the space id.
 fn resolve_token(token_str: &str) -> anyhow::Result<String> {
     let payload = crate::token::parse(token_str)?;
     let space_id_hex = hex::encode(payload.space_id);
@@ -542,13 +539,14 @@ fn resolve_token(token_str: &str) -> anyhow::Result<String> {
         .iter_mut()
         .find(|e| e.id == space_id_hex)
         .ok_or_else(|| anyhow::anyhow!("space missing after join"))?;
-    entry.pending_token = token_str.to_string();
     for b in &payload.bootnodes {
         if !entry.bootnodes.contains(b) {
             entry.bootnodes.push(b.clone());
         }
     }
+    let data_dir = PathBuf::from(&entry.data_dir);
     spaces_index::save(&index)?;
+    save_pending_token(&data_dir, token_str)?;
     // Return the space_id, not the name: the token's space is unambiguous
     // by id, and a name can collide with another already-known space.
     Ok(space_id_hex)
@@ -752,11 +750,10 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
     Ok(false)
 }
 
-/// True if the invite token's `expires_at` is in the past (host wall
+/// True if the invite token's `expires_at` has been reached (host wall
 /// clock). A parse failure is treated as NOT expired — `try_redeem`
-/// reports the corrupt token with a clearer error. This honors
-/// `--expires` on the honest joiner path; the deferred online-admission
-/// hook adds serving-side enforcement against a modified redeemer.
+/// reports the corrupt token with a clearer error. The serving node
+/// independently enforces the same deadline before actor dispatch.
 fn token_expired(token_str: &str) -> bool {
     let Ok(payload) = crate::token::parse(token_str) else {
         return false;
@@ -764,14 +761,35 @@ fn token_expired(token_str: &str) -> bool {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now > payload.expires_at
+        .unwrap_or(u64::MAX);
+    now >= payload.expires_at
 }
 
-/// Clear the `pending_token` marker on the space's index entry (by id)
-/// after a successful redemption.
-fn clear_pending_token(space_id_hex: &str) -> anyhow::Result<()> {
-    clear_pending(space_id_hex, |e| e.pending_token.clear())
+fn pending_token_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(PENDING_INVITE_FILE)
+}
+
+fn load_pending_token(data_dir: &Path) -> anyhow::Result<Option<String>> {
+    let Some(bytes) = crate::secure_file::read_optional(&pending_token_path(data_dir))? else {
+        return Ok(None);
+    };
+    let token = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("pending invite token is not UTF-8: {e}"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(token))
+    }
+}
+
+fn save_pending_token(data_dir: &Path, token: &str) -> anyhow::Result<()> {
+    crate::secure_file::write_owner_only_atomic(&pending_token_path(data_dir), token.as_bytes())
+}
+
+/// Remove the node-local bearer credential after redemption or expiry.
+fn clear_pending_token(data_dir: &Path) -> anyhow::Result<()> {
+    crate::secure_file::remove_if_exists(&pending_token_path(data_dir))
 }
 
 /// Clear the `pending_manifest` marker after a one-shot genesis apply.

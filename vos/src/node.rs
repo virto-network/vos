@@ -1638,6 +1638,16 @@ fn decode_u8_reply(bytes: &[u8]) -> Option<u8> {
     }
 }
 
+/// Decode a dynamic-dispatch message without disturbing the original bytes.
+#[cfg(feature = "network")]
+fn intercepted_msg(msg: &[u8]) -> Option<crate::value::Msg> {
+    use crate::value::TAG_DYNAMIC;
+    if msg.first() != Some(&TAG_DYNAMIC) {
+        return None;
+    }
+    <crate::value::Msg as crate::Decode>::try_decode(&msg[1..])
+}
+
 /// Peek the dynamic-dispatch `Msg.name` out of an invoke payload
 /// (`[TAG_DYNAMIC][rkyv Msg]`) for the lifecycle interceptor, without
 /// disturbing the original bytes (they're still forwarded verbatim on a
@@ -1645,11 +1655,21 @@ fn decode_u8_reply(bytes: &[u8]) -> Option<u8> {
 /// invoke is never a reserved lifecycle verb) or fails to decode.
 #[cfg(feature = "network")]
 fn intercepted_method_name(msg: &[u8]) -> Option<String> {
-    use crate::value::{Msg, TAG_DYNAMIC};
-    if msg.first() != Some(&TAG_DYNAMIC) {
-        return None;
+    intercepted_msg(msg).map(|m| m.name)
+}
+
+/// Admission-time expiry check for a live inbound redemption. The registry
+/// actor deliberately has no clock because it must replay accepted operations
+/// deterministically; the serving host is the one place wall time belongs.
+#[cfg(feature = "network")]
+fn redeem_invite_is_expired(msg: &crate::value::Msg, now: Option<u64>) -> bool {
+    if msg.name != "redeem_invite" {
+        return false;
     }
-    <Msg as crate::Decode>::try_decode(&msg[1..]).map(|m| m.name)
+    let Some(expires_at) = msg.args.get_u64("expires_at") else {
+        return true;
+    };
+    now.is_none_or(|now| now >= expires_at)
 }
 
 #[cfg(feature = "network")]
@@ -1675,6 +1695,22 @@ impl crate::network::NetworkService for NodeService {
         // matches our own node — same routing decision the local
         // path makes via `is_on_node || is_local`.
         let to_unscoped = to & 0xFFFF;
+
+        // Expiry is checked once, on the serving host, before the operation is
+        // admitted into the registry DAG. The signed deadline is re-verified
+        // by the actor; replay never consults wall time.
+        if to_unscoped == ServiceId::REGISTRY.local_id() as u32
+            && intercepted_msg(&msg).is_some_and(|decoded| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs());
+                redeem_invite_is_expired(&decoded, now)
+            })
+        {
+            warn!(peer = ?caller_peer_id, "redeem_invite refused: token expired");
+            return forbidden_envelope();
+        }
 
         // Locality boundary: a node-confined agent (`Local`/`Ephemeral`)
         // holds device-private state — for the messenger, the MLS keys, the

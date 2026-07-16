@@ -252,7 +252,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
 
     // (5) Bare-restart re-attach: kill B and restart with `space up
     //     <name>` — no token, no manifest. The redemption already
-    //     cleared pending_token, so B re-boots from the index + synced
+    //     cleared the pending invite secret, so B re-boots from the index + synced
     //     registry + local.toml alone and re-spawns dev-project. This is
     //     the standing restart-bug fix under the onboarding flow.
     drop(daemon_b); // SIGKILL B's first daemon

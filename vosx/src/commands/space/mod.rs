@@ -89,12 +89,12 @@ pub enum SpaceCommand {
     },
     /// Mint a `vos1…` invite token for a running space. Requires the
     /// operator to hold ADMIN. The joiner redeems it with `space up
-    /// <token>`. `--role admin` is online-admission only (prints a
-    /// caveat); `member` / `developer` redeem offline.
+    /// <token>`. Tokens grant `member` or `developer`; promote admins
+    /// explicitly with `space role grant` after admission.
     Invite {
         /// Space id (full hex) or name.
         space: String,
-        /// Role the token grants: `member` | `developer` | `admin`.
+        /// Role the token grants: `member` | `developer`.
         #[arg(long, default_value = "member")]
         role: String,
         /// Expiry window: `7d` / `24h` / `30m` / `90s` / bare seconds.

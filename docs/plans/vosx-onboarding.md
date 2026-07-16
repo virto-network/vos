@@ -59,8 +59,8 @@ files listed in each item before editing them.
   `ExtensionDef` parsing. Survives, repurposed for `space apply`.
 - `vosx/src/commands/space/subscriptions.rs` — `LocalConfig` (`local.toml`):
   the node-local policy file that grows in 3.2.
-- `vosx/src/spaces_index.rs` — `SpaceEntry`: gains `pending_token` /
-  `pending_manifest` fields (3.1, 3.3).
+- `vosx/src/spaces_index.rs` — `SpaceEntry`: gains `pending_manifest`;
+  pending bearer tokens live in an owner-only per-space secret file (3.1, 3.3).
 - **Sequencing**: the actor-storage plan is fully landed on master (merge
   `c3e88a5a`); build the invites table as a `StorageMap` from the start —
   there is no blob-backed alternative to consider. `programs`/`agents`
@@ -122,12 +122,10 @@ files listed in each item before editing them.
    current-epoch ADMIN key, redeem_sig against token_pub) and records the
    grant + an invites-table row. `redeem_invite` is deliberately callable by
    unauthenticated callers — the cert IS the auth.
-5. **Two tiers.** Offline-redeemable roles: `member` (`AUTH_ROLE_READONLY`)
-   and `developer` (`AUTH_ROLE_DEVELOPER`). `admin` grants and voter-node
-   enrollment (`add_node` + `NODE_ROLE_VOTER`) are **online-admission only**:
-   the token gets the joiner to the door, but the serving daemon must hold an
-   ADMIN operator key and countersign the actual `add_node`/`grant_role` via
-   the existing host sign-on-relay path (M5 machinery). Raft's
+5. **Two invite tiers.** Redeemable roles are `member`
+   (`AUTH_ROLE_READONLY`) and `developer` (`AUTH_ROLE_DEVELOPER`). Admin grants
+   and voter-node enrollment (`add_node` + `NODE_ROLE_VOTER`) stay explicit
+   online operations via `space role grant` / `space members add-node`.
    `RaftJoinResult::NotAuthorized` remains the backstop.
 6. **Single-use is best-effort, and we say so.** The invites table keys rows
    by `token_pub`; a second redemption with a different peer_id that survives
@@ -170,8 +168,8 @@ files listed in each item before editing them.
 ```
 vosx space new <name> [--manifest recipe.toml]   # create; recipe applied once on first up
 vosx space up <name | vos1-token | recipe.toml>  # THE command. join/redeem/apply as needed
-vosx space invite <space> --role member|developer|admin [--expires 7d] [--bootnode <addr>]
-vosx space apply <space> <recipe.toml> [--diff]  # explicit reconcile; --diff = dry-run
+vosx space invite <space> --role member|developer [--expires 7d] [--bootnode <addr>]
+vosx space apply <space> <recipe.toml> [--diff] [--upgrade] # explicit reconcile
 vosx space export <space>                        # registry → round-trippable recipe (unchanged)
 vosx space down|list|info|forget|members|role|subs|… (unchanged)
 ```
@@ -257,11 +255,9 @@ field order matches signer byte-for-byte; no replay clock checks).
   gated by `sync_serve_allowed`; the handler's auth is the cert. After the
   serving node records the grant, its next `FetchHeads` probe sees the role.
   The joiner's redeem retry loop (3.1) absorbs the window.
-- Online-admission hook (decision 5): when the redeem carries a privileged
-  role and this daemon's operator holds ADMIN, countersign the
-  `add_node`/`grant_role` via the operator-signer already captured in
-  `up.rs` (~185–207); expiry wall-clock check happens here, host-side,
-  before relaying (decision 7).
+- Admission hook: expiry is checked against the serving host's wall clock
+  before `redeem_invite` reaches the actor (decision 7). Admin is not an
+  invite-token role; promotion remains the explicit `space role grant` path.
 - Messenger migration: `msg-*` installs set `sync = "private"`; delete the
   prefix constant; the M4/M5 membership-gated-sync tests keep passing
   unchanged in behavior.
@@ -307,9 +303,10 @@ heads, blob-fetches and spawns a missing program end-to-end.
 
 - `vosx/src/commands/space/up.rs` + `mod.rs`: trivalent positional
   (decision 1). Token path: parse → upsert `SpaceEntry` (id, name from
-  token, bootnodes) with `pending_token` persisted on the entry → boot →
+  token, bootnodes), write the token to `<data_dir>/.pending-invite.token`
+  atomically with owner-only permissions → boot →
   redeem loop from the reconcile tick (retry until the bootnode answers;
-  clear `pending_token` on success — the `hyperspace` persist block is the
+  remove the secret on success/expiry — the `hyperspace` persist block is the
   template). Re-running with the token after joining is a no-op join.
   Recipe path: derive name from the recipe's `space = "…"` (error if
   absent), `space new` semantics if unknown, set `pending_manifest`, boot.
@@ -327,10 +324,11 @@ heads, blob-fetches and spawns a missing program end-to-end.
 - New `vosx/src/commands/space/apply.rs`, repurposing `reconcile.rs`
   parsing: connect via `DaemonClient`, diff manifest vs `programs()` /
   `agents()`, then (in order) publish missing blobs, `install` missing
-  agents (with their `sync` floor), flag existing rows whose blob differs
-  (upgrade only with `--upgrade`, mirroring today's reconcile-upgrade
-  semantics). `--diff` prints the plan (create/skip/upgrade per row +
-  local.toml changes) and exits 0 without acting.
+  agents (with their `sync` floor), and flag existing rows whose blob differs.
+  Upgrades require both `--upgrade` and an explicit fresh immutable
+  `program = "name:version"`; implicit `name:manifest` is initial/idempotent
+  apply only. Preflight the full recipe before any mutation. `--diff` prints
+  the plan and exits 0 without writing the blob cache, registry, or local.toml.
 - Node-local half: `tick_ms`, `intra_caps`, `device_secret` per agent →
   `local.toml` `[agents.<name>]` tables; `cap_policy` + `[[extension]]`
   entries → `local.toml` top level. `LocalConfig` grows accordingly
@@ -350,13 +348,13 @@ heads, blob-fetches and spawns a missing program end-to-end.
   it doesn't hold ADMIN in the target space (probe via `DaemonClient`),
   mint via `token.rs`, print the `vos1…` string plus a human summary (role,
   expiry, bootnodes — default bootnodes: the running daemon's published
-  multiaddrs from `.endpoint`, overridable with `--bootnode`). `--role
-  admin` prints the online-admission caveat.
+  multiaddrs from `.endpoint`, overridable with `--bootnode`). Only member
+  and developer invites are accepted; admin promotion uses `space role grant`.
 - `space new`: add `--manifest` (records `pending_manifest`). Delete the
   `Join` variant, `join.rs`, and its `--help` references; `main.rs`
   `BUILTIN_VERBS`/dispatch untouched otherwise.
-- `spaces_index.rs`: `pending_token: String` + `pending_manifest: String`
-  (empty = none), serde defaults.
+- `spaces_index.rs`: `pending_manifest: String` (empty = none), serde default;
+  invite bearer material never enters the syncable config index.
 
 ### 3.4 Export round-trip + `members` surfacing
 
@@ -366,7 +364,7 @@ heads, blob-fetches and spawns a missing program end-to-end.
   count, revoked); warn inline on multi-redeemed tokens (decision 6). Add
   `space invite revoke <token_pub-prefix>` wiring `revoke_invite`.
 
-**Wave 3 gate**: `cargo test -p vosx` green; `--help` for every touched verb
+**Wave 3 gate**: `just test` green (fresh guest/extension artifacts); `--help` for every touched verb
 reads coherently (no references to join/--manifest); manual smoke: `new
 --manifest` → `up` → `export` → `apply --diff` all-skips.
 

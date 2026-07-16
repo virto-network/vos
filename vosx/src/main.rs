@@ -27,6 +27,7 @@ mod help_schema;
 mod identity;
 mod output;
 mod paths;
+mod secure_file;
 mod shutdown;
 mod spaces_index;
 mod token;

@@ -36,7 +36,10 @@
 
 use anyhow::{Context, anyhow};
 use libp2p::identity::Keypair;
-use vos::registry::{OP_SIG_LEN, canonical_op_bytes, ed25519_pubkey_from_peer_id};
+use vos::registry::{
+    AUTH_ROLE_DEVELOPER, AUTH_ROLE_READONLY, OP_SIG_LEN, canonical_op_bytes,
+    ed25519_pubkey_from_peer_id,
+};
 
 /// Human-readable prefix. A space name may not start with `vos1`, which
 /// keeps `space up <arg>` disambiguation unambiguous.
@@ -103,6 +106,7 @@ pub fn mint(
     role: u8,
     expires_at: u64,
 ) -> anyhow::Result<String> {
+    validate_role(role)?;
     // Fresh single-use token keypair from OS entropy.
     let mut token_secret = [0u8; 32];
     getrandom::getrandom(&mut token_secret)
@@ -167,8 +171,20 @@ pub fn parse(token: &str) -> anyhow::Result<InvitePayload> {
     // anyway — copy the payload into an `AlignedVec` before decoding.
     let mut aligned = vos::rkyv::util::AlignedVec::<16>::new();
     aligned.extend_from_slice(&signed[1..]);
-    vos::rkyv::from_bytes::<InvitePayload, vos::rkyv::rancor::Error>(&aligned)
-        .map_err(|e| anyhow!("decode invite token payload: {e}"))
+    let payload = vos::rkyv::from_bytes::<InvitePayload, vos::rkyv::rancor::Error>(&aligned)
+        .map_err(|e| anyhow!("decode invite token payload: {e}"))?;
+    validate_role(payload.role)?;
+    Ok(payload)
+}
+
+fn validate_role(role: u8) -> anyhow::Result<()> {
+    if matches!(role, AUTH_ROLE_READONLY | AUTH_ROLE_DEVELOPER) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "unsupported invite role {role}; expected member or developer"
+        ))
+    }
 }
 
 /// Produce the joiner's `redeem_sig`: the token keypair signs the
@@ -236,7 +252,7 @@ fn sig64(sig: &[u8]) -> anyhow::Result<[u8; OP_SIG_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vos::registry::AUTH_ROLE_READONLY;
+    use vos::registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_READONLY};
     // The verifier lives in the actor crate (a dev-dependency), exactly
     // like the op_sign interop test — this is the make-or-break check
     // that a token minted here passes `redeem_invite`'s verification.
@@ -278,6 +294,22 @@ mod tests {
         chars[mid] = if chars[mid] == 'a' { 'b' } else { 'a' };
         let corrupted: String = chars.into_iter().collect();
         assert!(parse(&corrupted).is_err());
+    }
+
+    #[test]
+    fn admin_invites_are_rejected_on_mint_and_parse() {
+        let op = Keypair::generate_ed25519();
+        let err = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_ADMIN, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("member or developer"), "unexpected error: {err}");
+
+        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let mut payload = parse(&token).unwrap();
+        payload.role = AUTH_ROLE_ADMIN;
+        let forged = encode(&payload).unwrap();
+        let err = parse(&forged).unwrap_err().to_string();
+        assert!(err.contains("member or developer"), "unexpected error: {err}");
     }
 
     #[test]
