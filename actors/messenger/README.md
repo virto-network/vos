@@ -204,7 +204,7 @@ cargo test --manifest-path actors/messenger/Cargo.toml
 cargo test -p vos --test messenger_pvm --test messenger_transpile
 
 # the PVM actor ELF (deterministic no_std riscv64 build)
-just build-messenger-actor          # = cd actors/messenger && cargo +nightly actor
+just build-actor messenger          # = cd actors/messenger && cargo +nightly actor
 ```
 
 The crate is its own workspace; the ELF lands in

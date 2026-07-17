@@ -380,7 +380,7 @@ Files: new `vos/src/chronos_feed.rs` (+ `vos::chronos` proto types),
 
 ### 4.3 Generic operator-signing flow (replaces `messenger_register`)
 
-Files: `vos/src/actors/metadata.rs`, `vos-macros`, `actors/messenger/src/*`,
+Files: `vos/src/actors/metadata.rs`, `vos/vos-macros`, `actors/messenger/src/*`,
 `vosx/src/commands/dynamic.rs`.
 
 - Metadata trailing section 5: per-message bind spec — for a method declared

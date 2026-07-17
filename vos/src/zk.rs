@@ -324,7 +324,7 @@ pub fn __take_pending_io_hash() -> Option<[u8; 32]> {
 /// Computes [`compute_io_hash_typed`] and stashes it; `run_refine_service`
 /// places it into the final-state register window φ[9..12] at halt,
 /// making it the proof's [`zkpvm::Proof::public_io_hash`]. The host
-/// host verifier checks it against a recomputed `compute_io_hash` over the
+/// verifier checks it against a recomputed `compute_io_hash` over the
 /// same `(public, return)`.
 ///
 /// Call this from a handler after the work it proves, e.g.

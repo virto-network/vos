@@ -33,7 +33,7 @@ build-actor name:
     cd actors/{{name}}; cargo +nightly actor
 
 # Build all generated artifacts consumed by the test suite.
-build-test-artifacts: build-extensions build-pvm build-actors
+build-test-artifacts: build-extensions build-pvm build-actors build-voucher-check
     cargo build
 
 # Build all built-in actors used by host tests.

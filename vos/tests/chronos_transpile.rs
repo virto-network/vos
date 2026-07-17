@@ -7,7 +7,7 @@
 //!
 //! chronos is excluded from the host workspace (it builds with the actor
 //! toolchain), so its ELF lands in the crate-local target dir. Build it with
-//! `just build-chronos` (or `cd actors/chronos && cargo +nightly actor`). If the
+//! `just build-actor chronos` (or `cd actors/chronos && cargo +nightly actor`). If the
 //! ELF is absent the test SKIPs loudly rather than failing the suite.
 
 #[test]
@@ -20,7 +20,7 @@ fn chronos_actor_elf_transpiles() {
         Err(_) => {
             eprintln!(
                 "SKIP: chronos ELF not built at {path}\n      \
-                 run: just build-chronos"
+                 run: just build-actor chronos"
             );
             return;
         }

@@ -28,7 +28,9 @@
 //! Build prerequisites (the harness panics with hints otherwise):
 //!
 //!   cargo build -p vosx; cd actors/messenger && cargo +nightly actor
-//!   just build-msg-actors
+//!   just build-actor msg-log
+//!   just build-actor msg-ctl
+//!   just build-actor msg-directory
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -79,9 +81,9 @@ fn ensure_built() {
     for (path, hint) in [
         (vosx_bin(), "cargo build -p vosx"),
         (messenger_elf(), "cd actors/messenger && cargo +nightly actor"),
-        (msg_log_elf(), "just build-msg-actors"),
-        (msg_ctl_elf(), "just build-msg-actors"),
-        (msg_directory_elf(), "just build-msg-actors"),
+        (msg_log_elf(), "just build-actor msg-log"),
+        (msg_ctl_elf(), "just build-actor msg-ctl"),
+        (msg_directory_elf(), "just build-actor msg-directory"),
     ] {
         if !path.exists() {
             panic!("test artifact missing: {}\nRun: {hint}", path.display());
