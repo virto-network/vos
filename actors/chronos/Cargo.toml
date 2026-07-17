@@ -30,7 +30,7 @@ crate-type = ["rlib", "cdylib"]
 # target is gated via this actor's ELF (vos/tests/chronos_transpile.rs).
 # `chronos` only ever holds PUBLIC VRF keys + proofs; no secret key material
 # lives here.
-vrf = { path = "../../vrf" }
+vrf = { path = "../../support/vrf" }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["macros", "service"] }

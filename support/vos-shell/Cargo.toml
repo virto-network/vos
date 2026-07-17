@@ -12,7 +12,7 @@ description = "Sandboxed nushell-backed console engine for VOS spaces"
 # but NOT the `std` feature (which drags in javm/clap/libp2p). The host
 # binaries that link vos-shell (vosx, the ssh extension) enable those
 # features themselves; cargo unifies them at the leaf.
-vos = { path = "../vos", default-features = false }
+vos = { path = "../../vos", default-features = false }
 
 # nushell — pinned to 0.111.0, the highest release that resolves on the
 # workspace toolchain (nightly-2025-05-09 / rustc 1.88). 0.113+ requires
