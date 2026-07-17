@@ -136,6 +136,7 @@ opt-level = 3
 zkpvm = { path = "zkpvm" }
 zkpvm-derive = { path = "zkpvm/derive" }
 zkpvm-verifier = { path = "zkpvm/verifier" }
+zkpvm-precompiles = { path = "zkpvm/precompiles" }
 # VOS v2 has one execution identity. Every VM, transpiler, tracer, verifier,
 # and fuzz harness must use this exact JAR revision (enforced by
 # `cargo run -p jar-revision-check`).
