@@ -127,6 +127,7 @@ opt-level = 3
 zkpvm = { path = "zkpvm" }
 zkpvm-derive = { path = "zkpvm/derive" }
 zkpvm-verifier = { path = "zkpvm/verifier" }
+zkpvm-precompiles = { path = "zkpvm/precompiles" }
 javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 
 # Stwo — Phase G of the v2.x migration: pinned to upstream HEAD as of

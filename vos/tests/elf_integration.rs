@@ -12243,33 +12243,37 @@ fn clerk_apply_conservation() -> (Vec<u8>, [u8; 32], [u8; 32], [u8; 32]) {
     (witness.encode(), root_before, root_after, batch_digest)
 }
 
-/// docs/plans/provable.md W4 — the flagship provable Task. A real
-/// cipher-clerk batch transition runs through the clerk-apply
-/// `#[actor(task, provable)]` guest as a PURE VERIFIER, TRACED exactly
-/// as the prover would run it (`run_with_vos_stubs` — the path that
-/// gets proven; it executes the Ristretto/scalar precompiles the guest
-/// uses). The gate asserts the guest's `.vos_meta` provable mark, that
-/// the traced execution HALTS CLEANLY (a rule violation would trap),
-/// and — decoding its v4 work-result — that it bound `app_public =
-/// composite root_before ‖ root_after ‖ batch_digest` matching a live
-/// VecLedger apply the "verifier" independently knows, with the
-/// framework io-hash reconstructing over `public'`. That is the whole
-/// W1-W4 stack (WitnessedLedger extraction → clerk-witness bridge →
-/// real kernel → v4 app_public surfacing → the record's binding
-/// equation) over the real ledger kernel.
-///
-/// NOTE: this traces the Task rather than driving it through a live
-/// `run_task_invoke` (which is how W2/W3 capture a record from φ[9..12]).
-/// The live invoke path has no host handler for the Ristretto/scalar
-/// precompiles yet (runtime.rs — "no vos host handler yet, though the
-/// tracer has one"); wiring those in so a pvm-precompile provable Task
-/// is also live-drivable (and clerk-ledger can adopt the precompiles)
-/// is a follow-up orthogonal to the `#[provable]` framework. The proof
-/// path — what a counterparty verifies — is this trace.
+/// docs/plans/provable.md W4 — the flagship provable Task, driven LIVE.
+/// A real cipher-clerk batch transition runs through the clerk-apply
+/// `#[actor(task, provable)]` guest as a PURE VERIFIER, invoked through
+/// the ordinary `run_task_invoke` path (the runtime now executes the
+/// guest's Ristretto/scalar precompile ECALLs host-side). The host
+/// captures a durable `ProvableRecord` whose `app_public` leads with the
+/// composite `root_before` (the settlement comparand), carries
+/// `root_after` and the batch digest, is io-consistent, and RE-TRACES
+/// from its own stored witness to the SAME io-hash — proving the live
+/// invoke and the prover's trace agree (live ≡ traced) for a
+/// precompile-using Task. That is the whole W1-W4 stack (batch_proof
+/// extraction → clerk-witness bridge → real kernel → v4 app_public
+/// surfacing → durable record capture → the binding equation) over the
+/// real ledger kernel, end to end.
 #[test]
-fn clerk_apply_task_binds_a_conservation_transition() {
-    use vos::refine_payload::{RefinePayload, folded_public};
+fn clerk_apply_task_captures_a_conservation_record() {
+    use vos::provable::{ProofRecordEntry, proofrec_key};
+    use vos::value::Msg;
 
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
     if !clerk_apply_elf_path().exists() {
         eprintln!("SKIP: clerk-apply not built (`just build-clerk-apply`)");
         return;
@@ -12282,66 +12286,87 @@ fn clerk_apply_task_binds_a_conservation_transition() {
     assert!(meta.provable, "clerk-apply must be marked provable");
     assert_eq!(meta.actor_name, "ClerkApply");
 
-    let (witness_addr, _cap) =
+    let (witness_addr, witness_cap) =
         vos::zk::witness_symbol(&clerk_elf).expect("clerk-apply exports __VOS_WITNESS");
     let clerk_blob = transpile_actor(&clerk_elf);
 
     let (witness_bytes, root_before, root_after, batch_digest) = clerk_apply_conservation();
 
-    // Build the Task input exactly as `run_task_invoke` would: empty
-    // state, the dynamic `apply(witness)` message, no witnessed rows.
-    let apply_msg = task_gate_dyn_msg(&vos::value::Msg::new("apply").with("witness", witness_bytes));
-    let input = vos::task_abi::encode_task_input_with_rows(&[], &apply_msg, &[]);
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    let task_hash =
+        rt.register_task_blob(clerk_blob.clone(), witness_addr as u32, witness_cap as u32);
 
-    // Trace the guest the way the prover does — run_with_vos_stubs
-    // executes the precompiles natively.
+    // Spawn the provable apply Task LIVE under a business tag (the
+    // transfer's domain), passing the witness as the handler's `witness`
+    // arg. The runtime executes the guest's precompile ECALLs host-side.
+    let tag = [0x4Cu8; 32];
+    let task_msg = task_gate_dyn_msg(&Msg::new("apply").with("witness", witness_bytes));
+    let no_keys = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
+        .expect("encode empty row keys")
+        .to_vec();
+    let id = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_provable_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", task_msg)
+            .with("row_keys", no_keys)
+            .with("tag", tag.to_vec()),
+    )
+    .as_u64()
+    .expect("run_provable_task replies the task id");
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", id));
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Done as u32),
+        "the clerk-apply verifier must complete live (a rule violation would trap)"
+    );
+    assert_eq!(rt.panics, 0);
+
+    let row = rt
+        .storage
+        .read(sched_id, &proofrec_key(&tag))
+        .expect("a record must be captured under __vos_proofrec/<tag>")
+        .to_vec();
+    let entry = ProofRecordEntry::decode(&row).expect("the record row decodes");
+    let record = &entry.record;
+
+    // The app-named roots the Task bound: root_before ‖ root_after ‖
+    // batch_digest, recomputed from a live VecLedger apply the "verifier"
+    // independently knows.
+    assert_eq!(record.app_public.len(), 96, "apply binds two roots + a digest");
+    assert_eq!(
+        record.root_before(),
+        Some(root_before),
+        "app_public must LEAD with the composite root_before (the expected_root_before comparand)"
+    );
+    assert_eq!(&record.app_public[32..64], &root_after, "the post-transition composite root");
+    assert_eq!(&record.app_public[64..], &batch_digest, "the bound batch digest");
+
+    // The record binds itself (verify_record's witness-free check 3).
+    assert!(record.io_consistent(), "the clerk record reconstructs its own io-hash");
+
+    // LIVE ≡ TRACED: the stored witness re-traces (the prover's path) to
+    // the SAME io-hash the live invoke captured — so a proof of this
+    // record will carry exactly this binding. This is the precompile
+    // host handlers' soundness guarantee, exercised end to end.
     let (mut interp, mut img) = zkpvm::actor::interpreter_from_blob(&clerk_blob, 500_000_000)
         .expect("parse clerk-apply blob");
-    img[witness_addr as usize..witness_addr as usize + input.len()].copy_from_slice(&input);
+    let w = &entry.input.witness_bytes;
+    img[witness_addr as usize..witness_addr as usize + w.len()].copy_from_slice(w);
     interp.flat_mem = img;
     let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
-    assert!(
-        exit == "HostCall(0)" || exit == "Ecall",
-        "the clerk-apply verifier must halt cleanly (a rule violation would trap), got {exit}"
-    );
-
-    // The v4 work-result the guest halted with: decode its app_public
-    // and reply from guest memory (out_ptr = φ[7], out_len = φ[8]).
-    let out_ptr = tracing.pvm.registers[7] as usize;
-    let out_len = tracing.pvm.registers[8] as usize;
-    let output = tracing.pvm.flat_mem[out_ptr..out_ptr + out_len].to_vec();
-    let payload = RefinePayload::decode(&output).expect("clerk-apply emits a v4 work-result");
-
-    // The bound app-named roots: root_before ‖ root_after ‖ batch_digest,
-    // recomputed from a live VecLedger apply.
-    assert_eq!(payload.app_public.len(), 96, "apply binds two roots + a digest");
-    assert_eq!(
-        &payload.app_public[..32],
-        &root_before,
-        "app_public must LEAD with the composite root_before (the expected_root_before comparand)"
-    );
-    assert_eq!(&payload.app_public[32..64], &root_after, "the post-transition composite root");
-    assert_eq!(&payload.app_public[64..], &batch_digest, "the bound batch digest");
-
-    // The framework io-hash (φ[9..12]) reconstructs over public' — the
-    // exact binding a captured ProvableRecord carries and verify_record
-    // re-derives.
+    assert!(exit == "HostCall(0)" || exit == "Ecall", "clean halt, got {exit}");
     let mut io = [0u8; 32];
     for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
         io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
     }
-    let public_prime = folded_public(
-        payload.anchor_kind,
-        &payload.anchor,
-        &payload.transition_digest(),
-        &payload.app_public,
-    );
-    assert_eq!(
-        io,
-        vos::zk::compute_io_hash(&public_prime, &payload.reply),
-        "the framework io-hash must bind public' (anchor ‖ digest ‖ app_public) and the reply"
-    );
+    assert_eq!(io, record.io_hash, "live invoke and prover trace must bind the identical io-hash");
     assert_ne!(io, vos::zk::compute_io_hash(&[], &[]), "a real binding, not the empty placeholder");
 }
 

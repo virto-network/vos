@@ -7829,6 +7829,7 @@ dependencies = [
  "vrf",
  "x25519-dalek",
  "zkpvm",
+ "zkpvm-precompiles",
 ]
 
 [[package]]

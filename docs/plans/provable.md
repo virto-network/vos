@@ -360,21 +360,27 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
 - **The flagship Task — `clerk-apply`.** A real
   `#[actor(task, provable)]` guest that verifies a cipher-clerk batch
   transition through the bridge and binds `app_public = root_before ‖
-  root_after ‖ batch_digest`. Its gate traces it exactly as the prover
-  would (the proof path), asserts a clean halt, and checks the bound
-  roots against a live apply + the framework io-hash over `public'`.
+  root_after ‖ batch_digest`. It is driven LIVE through the ordinary
+  `run_task_invoke` path — the runtime executes the guest's Ristretto/
+  scalar precompile ECALLs host-side (`handle_precompile_ecall`, via
+  `zkpvm-precompiles`' curve25519-dalek host fallback, byte-identical to
+  the prover's tracer). Its gate captures a durable `ProvableRecord`,
+  checks the bound roots against a live apply, and re-traces the stored
+  witness to the SAME io-hash the live invoke bound — **live ≡ traced**
+  for a precompile-using Task, so a proof of the captured record carries
+  exactly that binding.
+
+- **Live-drive precompile handlers.** `handle_precompile_ecall`
+  (`runtime.rs`) services ECALLs 110/111 (Ristretto scalar-mult /
+  point-add), 112 (wide-scalar reduce), 113/114 (scalar mul/add mod ℓ)
+  in BOTH the task and refine hostcall paths — the curve crypto a
+  `pvm-precompile` actor issues now runs live, not only when the prover
+  traces it. The host functions are byte-identical to the tracer's
+  `*_sw` reference, so live ≡ traced (gated end to end). This also lets
+  clerk-ledger itself adopt `pvm-precompile` for a smaller trace.
 
 **Deferred (documented, orthogonal to the framework):**
 
-- *Live-drive record capture for precompile Tasks.* clerk-apply uses
-  cipher-clerk's `pvm-precompile` (small prove trace), whose Ristretto/
-  scalar ECALLs the LIVE `run_task_invoke` path has no host handler for
-  yet ("no vos host handler yet, though the tracer has one" —
-  `runtime.rs`). So the W4 gate proves clerk-apply via the *trace* (what
-  a counterparty verifies) rather than a live invoke. Wiring the
-  precompile handlers into `handle_task_hostcall` /
-  `handle_refine_hostcall` (which would also let clerk-ledger itself
-  adopt the precompiles) is a self-contained runtime follow-up.
 - *voucher-check migration.* The bridge's parity gate already
   establishes that `WitnessedLedger` reproduces cipher-clerk's succinct
   verify byte-for-byte, and clerk-apply is a fuller demonstration than
@@ -387,7 +393,10 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
 - *Parent-side delegation glue + the clerk-ledger production wiring.*
   D6's macro-generated "gather touched leaves + `batch_proof` + invoke +
   apply" boilerplate, and rewiring clerk-ledger's `apply_transfer` to
-  spawn the apply Task, follow once the live-drive handler lands.
+  gather touched leaves via `CommittedMap::batch_proof`, `spawn_provable`
+  the apply Task with `tag = transfer.id`, and apply the live writes
+  against the attested root. The live-drive handler (above) unblocks
+  this; it is the natural next step now.
 
 ---
 

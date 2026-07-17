@@ -265,6 +265,87 @@ fn install_vos_precompile_caps(kernel: &mut InvocationKernel) {
     }
 }
 
+/// Execute a zkpvm Ristretto/scalar precompile ECALL host-side — so a
+/// `pvm-precompile` actor (cipher-clerk's curve crypto) runs LIVE in the
+/// runtime, not only when the prover traces it. Returns `true` when
+/// `call_id` was one of these precompiles (and it was serviced), `false`
+/// otherwise so the caller falls through to its own dispatch.
+///
+/// SOUNDNESS — live ≡ traced. The prover's tracer
+/// (`zkpvm::core::tracing::TracingPvm::step_with_vos_stubs`) executes the
+/// identical curve arithmetic through the same `curve25519-dalek`
+/// reference (`zkpvm_precompiles`'s host fallback is byte-for-byte the
+/// tracer's `*_sw` functions), so a Task driven live and the same Task
+/// proven halt with the identical io-hash. The
+/// [`clerk_apply_task_binds_a_conservation_transition`] gate and the
+/// live≡traced Task gate both exercise this.
+///
+/// ECALL ABI (grey-transpiler maps RISC-V `a0/a1/a2` → φ[7/8/9]): the
+/// argument registers hold flat-memory pointers to the 32-byte operands
+/// and the 32-byte output (a 64-byte input for the wide reduction). On a
+/// non-canonical scalar / invalid point the host functions return the
+/// all-zero sentinel, matching the chips' "malformed input" branch.
+///
+/// Honest guests pass in-range pointers, where `kread`/`kwrite` and the
+/// tracer touch the identical addresses. A MALFORMED pointer past the
+/// guest's logical memory is the one asymmetry: the tracer bounds-checks
+/// against `flat_mem.len()` and skips, while the data-cap window here
+/// does not — the same property the blake2b handler already has. It is
+/// fail-closed, never a soundness hole: any divergence makes the
+/// captured record fail to re-trace to its bound io-hash, so
+/// `verify_record` rejects it.
+#[cfg(feature = "std")]
+fn handle_precompile_ecall(k: &mut InvocationKernel, call_id: u32) -> bool {
+    use zkpvm_precompiles::{
+        ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT, ECALL_SCALAR_ADD_MOD_L,
+        ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L, ristretto_point_add,
+        ristretto_scalar_mult, scalar_add_mod_l, scalar_from_bytes_mod_order_wide,
+        scalar_mul_mod_l,
+    };
+    let a0 = k.active_reg(7) as u32;
+    let a1 = k.active_reg(8) as u32;
+    let a2 = k.active_reg(9) as u32;
+    // Read a fixed-width operand; `None` (short read = out-of-bounds ptr)
+    // makes the whole call a no-op, exactly as the tracer skips its
+    // read+write when a buffer is out of range.
+    let read32 = |k: &InvocationKernel, ptr: u32| -> Option<[u8; 32]> {
+        let b = kread(k, ptr, 32);
+        (b.len() == 32).then(|| b.try_into().unwrap())
+    };
+    match call_id {
+        ECALL_RISTRETTO_SCALAR_MULT => {
+            if let (Some(scalar), Some(point)) = (read32(k, a0), read32(k, a1)) {
+                kwrite(k, a2, &ristretto_scalar_mult(&scalar, &point));
+            }
+        }
+        ECALL_RISTRETTO_POINT_ADD => {
+            if let (Some(p), Some(q)) = (read32(k, a0), read32(k, a1)) {
+                kwrite(k, a2, &ristretto_point_add(&p, &q));
+            }
+        }
+        ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE => {
+            // a0 = wide_ptr (64 bytes), a1 = output_ptr (32 bytes).
+            let wide = kread(k, a0, 64);
+            if wide.len() == 64 {
+                let w: [u8; 64] = wide.try_into().unwrap();
+                kwrite(k, a1, &scalar_from_bytes_mod_order_wide(&w));
+            }
+        }
+        ECALL_SCALAR_MUL_MOD_L => {
+            if let (Some(a), Some(b)) = (read32(k, a0), read32(k, a1)) {
+                kwrite(k, a2, &scalar_mul_mod_l(&a, &b));
+            }
+        }
+        ECALL_SCALAR_ADD_MOD_L => {
+            if let (Some(a), Some(b)) = (read32(k, a0), read32(k, a1)) {
+                kwrite(k, a2, &scalar_add_mod_l(&a, &b));
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -1619,6 +1700,12 @@ fn handle_refine_hostcall(
             );
             (result, 0)
         }
+        // The zkpvm Ristretto/scalar precompiles — the curve crypto a
+        // `pvm-precompile` service actor (clerk-ledger's kernel) runs
+        // live, executed host-side bit-identically to the prover's trace
+        // (see `handle_precompile_ecall`). Output rides operand memory,
+        // so the return registers stay `(HOST_OK, 0)`.
+        other if handle_precompile_ecall(kernel, other) => (error::HOST_OK, 0),
         _ => (error::HOST_WHAT, 0),
     };
 
@@ -1820,6 +1907,11 @@ fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
             let _ = std::io::stderr().write_all(&buf);
             let _ = std::io::stderr().flush();
         }
+        // The zkpvm Ristretto/scalar precompiles — refine-pure (pure
+        // functions of their operand memory), so a provable Task using
+        // cipher-clerk's curve crypto runs live bit-identically to the
+        // prover's trace (see `handle_precompile_ecall`).
+        other if handle_precompile_ecall(kernel, other) => {}
         other => {
             error!(call_id = other, "task child: hostcall outside the refine-pure set");
             return false;
