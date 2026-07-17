@@ -94,7 +94,7 @@ through the registry, then asks it.
 | `msg-<chan>-log` | crdt (gossip) | Leaderless ciphertext **envelope log** — the conversation as opaque bytes. | `log_post` (append an encrypted envelope), `log_history` (read) |
 | `msg-<chan>-ctl` | raft | Sequenced **MLS commit chain** — linearizes membership changes so exactly one Commit wins each epoch. | `ctl_commit` (submit a Commit), `ctl_commits` (drain the chain) |
 | `msg-directory` | raft (per-space) | **verified PeerId → KeyPackage** map + channel catalog + single-use KeyPackage claims. | `dir_publish_kp`, `dir_claim_kp`, `dir_release_kp`, `dir_announce_channel`, `dir_channels` |
-| `space-registry` | raft | The space's **agent catalog** + auth grants. | `resolve` (name → ServiceId), `reg_agents` (list channels), `reg_install` (install a channel's agent pair) |
+| `space-registry` | raft | The space's **agent catalog** + auth grants. | `resolve` (name → ServiceId), `reg_agent_by_pattern` (find a channel-pair template), `reg_install` (install a channel's agent pair) |
 | `chronos` | raft | Verifiable-randomness **beacon** (optional). | `chronos_beacon` (latest finalized round → CSPRNG hedge) |
 
 A **channel** is the pair `msg-<chan>-log` + `msg-<chan>-ctl`. The messenger

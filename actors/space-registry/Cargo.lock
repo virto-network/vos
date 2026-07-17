@@ -3917,6 +3917,7 @@ dependencies = [
  "vos-macros",
  "vos-raft",
  "vrf",
+ "zkpvm-precompiles",
 ]
 
 [[package]]
@@ -4500,4 +4501,11 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zkpvm-precompiles"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
 ]

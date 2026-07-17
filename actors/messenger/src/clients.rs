@@ -100,20 +100,31 @@ pub(crate) async fn resolve(ctx: &mut MsgrCtx, name: &str) -> Result<u32, String
     Ok(id)
 }
 
-/// `space-registry.agents` — the installed-agent catalog. Used to
-/// clone an existing channel pair's program rows when creating a
-/// channel dynamically. Ungated on the registry side.
-pub(crate) async fn reg_agents(ctx: &mut MsgrCtx) -> Result<Vec<space_registry::AgentRow>, String> {
-    let msg = Msg::new("agents");
+/// `space-registry.agent_by_pattern` — the first installed agent (in
+/// `instance_name` order) whose name starts with `prefix` and ends with
+/// `suffix`, or `None`. Used to find a `msg-*-log` / `msg-*-ctl` template
+/// row to clone when creating a channel dynamically, without draining the
+/// whole catalog. Ungated on the registry side.
+pub(crate) async fn reg_agent_by_pattern(
+    ctx: &mut MsgrCtx,
+    prefix: &str,
+    suffix: &str,
+) -> Result<Option<space_registry::AgentRow>, String> {
+    let msg = Msg::new("agent_by_pattern")
+        .with("prefix", prefix.to_string())
+        .with("suffix", suffix.to_string());
     let value = ask_value(ctx, ServiceId(REGISTRY_ID), &msg)
         .await
         .ok_or_else(|| "registry unreachable".to_string())?;
+    // `Some(row)` → `Value::Bytes(rkyv(AgentRow))`; `None` → `Value::Unit`
+    // (empty bytes via `value_to_bytes`).
     let inner = value_to_bytes(value).ok_or_else(|| "bad registry reply".to_string())?;
     if inner.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    <Vec<space_registry::AgentRow> as vos::Decode>::try_decode(&inner)
-        .ok_or_else(|| "bad registry agents payload".to_string())
+    <space_registry::AgentRow as vos::Decode>::try_decode(&inner)
+        .map(Some)
+        .ok_or_else(|| "bad registry agent_by_pattern payload".to_string())
 }
 
 /// `space-registry.peer_role` — is `peer_id` an enrolled space member (any
