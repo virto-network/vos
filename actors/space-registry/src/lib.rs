@@ -454,6 +454,12 @@ impl SpaceRegistry {
         ) {
             return Status::Forbidden;
         }
+        // An empty program name is the `programs` pager's start-of-table
+        // sentinel (paired with an empty version), so a stored row carrying
+        // it would wedge the catalog drain — reject it up front.
+        if name.is_empty() {
+            return Status::BadHash;
+        }
         let Some(hash) = bytes_to_32(&hash) else {
             return Status::BadHash;
         };
@@ -705,6 +711,13 @@ impl SpaceRegistry {
             &auth,
         ) {
             return Status::Forbidden;
+        }
+        // An empty instance name is the `agents`/`agent_names` pagers'
+        // start-of-table sentinel, so a stored row carrying it would wedge
+        // every cursor drain that follows the documented protocol (same
+        // reason `register_remote` rejects it).
+        if instance_name.is_empty() {
+            return Status::BadHash;
         }
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Status::BadHash;
@@ -4337,6 +4350,59 @@ mod tests {
             Some(String::from("msg-alpha-log")),
             "the sorted roster makes the first match deterministic"
         );
+    }
+
+    #[test]
+    fn empty_names_are_rejected_so_the_pager_sentinel_cannot_be_stored() {
+        let mut r = registry();
+        // An empty program name is the `programs` pager's start sentinel.
+        let status = dispatch(
+            &mut r,
+            Publish {
+                name: String::new(),
+                version: String::from("1"),
+                hash: alloc::vec![7u8; 32],
+                auth: root_auth("publish", &[b"", b"1", &[7u8; 32]]),
+            },
+        );
+        assert_eq!(status, Status::BadHash, "empty program name must be rejected");
+        // An empty instance name is the `agents`/`agent_names` pager sentinel.
+        let hash = alloc::vec![1u8; 32];
+        let rep = fresh_rep_id();
+        let status = dispatch(
+            &mut r,
+            Install {
+                instance_name: String::new(),
+                program_name: String::from("p"),
+                program_version: String::from("1"),
+                program_hash: hash.clone(),
+                replication_id: rep.clone(),
+                consistency: 1,
+                install_args: Vec::new(),
+                install_payloads: Vec::new(),
+                network_reachable: false,
+                sync_role: SyncFloor::Member as u8,
+                auth: root_auth(
+                    "install",
+                    &[
+                        b"",
+                        b"p",
+                        b"1",
+                        &hash,
+                        &rep,
+                        &[1u8],
+                        &[],
+                        &[],
+                        &[0u8],
+                        &[SyncFloor::Member as u8],
+                    ],
+                ),
+            },
+        );
+        assert_eq!(status, Status::BadHash, "empty instance name must be rejected");
+        // Neither sentinel row landed, so the drains stay wedge-free.
+        assert!(agents_drain(&mut r, 0).is_empty());
+        assert!(programs_drain(&mut r, 0).is_empty());
     }
 
     #[test]
