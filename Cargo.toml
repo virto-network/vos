@@ -135,16 +135,15 @@ javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 # #1389/#1392/#1393).  Lifted-protocol degree-≥2 block stands at this
 # rev — see crates/zkpvm/STWO_2.2.0_MIGRATION.md.  Phase I rewrites the
 # 5 high-bound chips with helper columns to clear the block.
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", features = [
-    "std",
-    "prover",
-    "parallel",
-] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", features = [
-    "std",
-    "prover",
-    "parallel",
-] }
+#
+# Declared with NO features here (workspace-inherited features are
+# additive — a member can add but never remove them).  Prover-side
+# builds get `std,prover,parallel` via zkpvm's `prover` feature
+# (`stwo/std` etc. in zkpvm/Cargo.toml); the verifier-only path
+# (`zkpvm-verifier` for wasm32) stays feature-less so no rayon/std
+# machinery leaks into a verify-only build.
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
 
 # Common deps
 num-traits = "0.2"

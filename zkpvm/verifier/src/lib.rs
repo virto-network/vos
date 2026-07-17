@@ -5,10 +5,12 @@
 // preprocessed trace commitment (which is deterministic per program).
 //
 // no_std-ready: the verifier path of zkpvm pulls only verifier-side stwo,
-// alloc::*, and core::*.  The wasm32-unknown-unknown smoke test is
-// blocked on an upstream javm fix (CODE_WINDOW_SIZE = 1 << 32 overflows on
-// 32-bit usize); the host-side `cargo build --no-default-features` still
-// validates no_std compatibility.
+// alloc::*, and core::*.  Builds for wasm32-unknown-unknown (`just
+// wasm-verifier`): `javm` is prover-only in zkpvm (it doesn't build on
+// 32-bit targets — CODE_WINDOW_SIZE = 1 << 32 overflows usize), and the
+// workspace stwo pin is feature-less, with `std,prover,parallel` added
+// back only by zkpvm's `prover` feature — so this crate's normal-dep graph
+// carries no javm / rayon / curve25519-dalek / zkpvm-blake3.
 
 #![no_std]
 

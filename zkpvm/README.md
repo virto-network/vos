@@ -107,9 +107,15 @@ deployment; use the primitives here to embed proving in your own driver.
 ## Building
 
 ```sh
-cargo build -p zkpvm                     # prover (default): rayon + blake3
+cargo build -p zkpvm                     # prover (default): javm + rayon + blake3
 cargo build -p zkpvm --no-default-features   # verifier-only: no_std, ~50× smaller deps
+cargo build -p zkpvm-verifier --target wasm32-unknown-unknown  # verify-only wasm library (just wasm-verifier)
 ```
+
+The verifier-only build carries no `javm` / `rayon` / `blake3` /
+`curve25519-dalek` (all prover-gated) and gets feature-less stwo: the
+workspace pins stwo with no features, and zkpvm's `prover` feature adds
+`std,prover,parallel` back for prover builds.
 
 Cross-compiling the prover for aarch64 (on-device proving) is a supported
 target — see `docs/plans/roadmap.md` § "Cross-compile recipe".

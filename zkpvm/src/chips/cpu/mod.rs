@@ -35,8 +35,15 @@ use crate::{
     },
 };
 
+// Opcode classification + register-access derivation consume `javm`
+// types (`Opcode`, `InstructionCategory`) and `PvmStep` witnesses, all of
+// which exist only at trace-fill time — prover-only, like the fill code
+// that calls them.  The AIR (`add_constraints`) never classifies opcodes:
+// at verify time the per-row flags are committed columns.
+#[cfg(feature = "prover")]
 pub(crate) mod classify;
 mod columns;
+#[cfg(feature = "prover")]
 mod reg_access;
 // trace fill + interaction-trace generation live in their own files;
 // add_constraints (the AIR) stays in mod.rs.
@@ -45,9 +52,11 @@ mod interaction;
 #[cfg(feature = "prover")]
 mod trace_fill;
 
+#[cfg(feature = "prover")]
 pub(crate) use classify::classify_opcode_for_program_memory;
 pub use columns::Column;
 use columns::PreprocessedColumn;
+#[cfg(feature = "prover")]
 pub(crate) use reg_access::step_reg_accesses;
 
 pub struct CpuChip;

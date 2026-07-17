@@ -8,8 +8,32 @@ license.workspace = true
 default = ["prover"]
 # Prover-side: trace generation, proof creation, the tracer, blake3 commitments,
 # and parallel iteration.  Disable for a verifier-only build (smaller dep tree,
-# no_std-friendly).
-prover = ["dep:rayon", "dep:blake3", "dep:curve25519-dalek"]
+# no_std-friendly, builds for wasm32-unknown-unknown).
+#
+# `javm` (the reference PVM interpreter the tracer drives) is prover-only:
+# the verifier never executes PVM code, and javm does not build on 32-bit
+# targets (CODE_WINDOW_SIZE = 1 << 32 overflows usize), so it must stay out
+# of the wasm32 verifier graph.
+#
+# The stwo `std`/`prover`/`parallel` features are forwarded here rather than
+# pinned at the workspace `[workspace.dependencies]` entry: workspace-inherited
+# features are additive (a member cannot remove them), and the verifier-only
+# build needs feature-less stwo (no rayon).  Proof types and verification are
+# in stwo's always-compiled core, so the verifier path needs no stwo features.
+prover = [
+    "dep:javm",
+    "dep:rayon",
+    "dep:blake3",
+    "dep:curve25519-dalek",
+    "stwo/std",
+    "stwo/prover",
+    "stwo/parallel",
+    "stwo-constraint-framework/std",
+    "stwo-constraint-framework/prover",
+    "stwo-constraint-framework/parallel",
+    "serde/std",
+    "num-traits/std",
+]
 # Diagnostic helpers (`debug_claimed_sums`) for prover-side debugging of
 # logup imbalances.  Off by default so the production prover surface
 # stays clean; turn on with `--features debug-internals` to bisect
@@ -25,11 +49,18 @@ poseidon2-channel = []
 
 [dependencies]
 zkpvm-derive = { workspace = true }
-javm = { workspace = true }
+javm = { workspace = true, optional = true }
 stwo = { workspace = true }
 stwo-constraint-framework = { workspace = true }
-serde = { workspace = true }
-num-traits = { workspace = true }
+# NOT workspace-inherited (workspace-inherited features are additive and the
+# workspace pins carry default features = std): a verify-only build must stay
+# libstd-free so a no_std runtime (e.g. a wasm PVF built with -Zbuild-std) can
+# link the verifier without a duplicate-lang-item clash against its own panic
+# handler. The `prover` feature adds `serde/std` / `num-traits/std` back for
+# native prover builds.
+# Same shape settlement-verifier pins (the proven riscv64em no_std graph).
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+num-traits = { version = "0.2", default-features = false }
 impl-trait-for-tuples = { workspace = true }
 rayon = { workspace = true, optional = true }
 blake3 = { version = "1", optional = true }

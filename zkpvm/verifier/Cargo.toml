@@ -15,7 +15,10 @@ poseidon2-channel = ["zkpvm/poseidon2-channel"]
 zkpvm = { path = "..", default-features = false }
 stwo = { workspace = true }
 stwo-constraint-framework = { workspace = true }
-num-traits = { workspace = true }
+# De-featured like zkpvm's own pin (see the comment there): the workspace pin
+# carries default features (= std), which would drag libstd into a no_std
+# runtime that links this verifier.
+num-traits = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 javm = { workspace = true }

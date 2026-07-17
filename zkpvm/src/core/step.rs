@@ -1,5 +1,18 @@
-use javm::PVM_REGISTER_COUNT;
+#[cfg(feature = "prover")]
 use javm::instruction::Opcode;
+
+/// Number of PVM registers: 13, φ0..φ12 (Gray Paper Appendix A / §I.4.4).
+///
+/// Defined locally so the verifier-only build (no `prover` feature) does not
+/// pull `javm` — the register count is a protocol constant, not an
+/// implementation detail of the interpreter.  The prover build cross-checks
+/// it against the reference interpreter below.
+pub const PVM_REGISTER_COUNT: usize = 13;
+
+// Prover builds carry the javm reference interpreter; assert at compile time
+// that our local protocol constant agrees with it so the two can never drift.
+#[cfg(feature = "prover")]
+const _: () = assert!(PVM_REGISTER_COUNT == javm::PVM_REGISTER_COUNT);
 
 /// Number of PVM registers.
 pub const NUM_REGS: usize = PVM_REGISTER_COUNT;
@@ -7,6 +20,10 @@ pub const NUM_REGS: usize = PVM_REGISTER_COUNT;
 pub const WORD_SIZE: usize = 8;
 
 /// A single PVM execution step witness, capturing the full state transition.
+///
+/// Prover-only: step witnesses exist to fill traces; the standalone verifier
+/// never sees one (and the `Opcode` field type lives in prover-only `javm`).
+#[cfg(feature = "prover")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PvmStep {
     /// Monotonic timestamp (step index).
@@ -80,6 +97,7 @@ pub struct RegWrite {
 /// file. A window's full steps are rebuilt by [`expand_steps`] from the
 /// register file entering the window, so the chips keep consuming
 /// [`PvmStep`] unchanged while a multi-million-step chain holds ~2.6× less.
+#[cfg(feature = "prover")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactStep {
     /// Monotonic timestamp (step index).
@@ -118,6 +136,7 @@ pub struct CompactStep {
     pub exit: bool,
 }
 
+#[cfg(feature = "prover")]
 impl CompactStep {
     /// Rebuild the full step from the register file entering it:
     /// `regs_after` is `regs_before` with [`Self::reg_write`] applied.
@@ -152,6 +171,7 @@ impl CompactStep {
     }
 }
 
+#[cfg(feature = "prover")]
 impl PvmStep {
     /// The compact form of this step. Panics if the snapshots' delta is not
     /// representable — `regs_after` differing from `regs_before` anywhere
@@ -198,6 +218,7 @@ impl PvmStep {
 /// Expand a run of compact steps into full steps, threading the register
 /// file forward from `entering_regs`: `regs_before` of each step is
 /// `regs_after` of the previous (the tracer's continuity invariant).
+#[cfg(feature = "prover")]
 pub fn expand_steps(
     steps: &[CompactStep],
     entering_regs: [u64; NUM_REGS],
@@ -213,7 +234,7 @@ pub fn expand_steps(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prover"))]
 mod tests {
     use super::*;
 

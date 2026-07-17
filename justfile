@@ -342,11 +342,13 @@ check-zkpvm-no-std:
     cargo build -p zkpvm --no-default-features
     cargo build -p zkpvm-verifier
 
-# WASM smoke build of zkpvm-verifier.  Currently blocked on an upstream javm
-# fix: `pub const CODE_WINDOW_SIZE: usize = 1 << 32` in
-# olanod/jar/grey/crates/javm/src/backing.rs overflows on 32-bit usize.
-# Until that lands the recipe will fail at javm const-eval; the
-# `check-no-std` recipe above is the host-side substitute.
+# WASM build of zkpvm-verifier: the verify-only library an on-chain runtime
+# links (downstream verify-only consumers depend on this build — keep it
+# green).  Works because (a) `javm` is prover-only in zkpvm — it doesn't
+# build on 32-bit targets (CODE_WINDOW_SIZE = 1 << 32 overflows usize) — and
+# (b) the workspace stwo pin carries no features; `std,prover,parallel` are
+# added back by zkpvm's `prover` feature.  This graph has no javm / rayon /
+# curve25519-dalek / zkpvm-blake3 (stwo core's own blake3 hasher remains).
 wasm-verifier:
     rustup target add wasm32-unknown-unknown
     cargo build -p zkpvm-verifier --target wasm32-unknown-unknown
