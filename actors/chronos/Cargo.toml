@@ -24,7 +24,7 @@ bin = []
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-# The ECVRF primitive (Phase D v1): per-voter verifiable randomness over
+# The ECVRF primitive: per-voter verifiable randomness over
 # Ristretto255. no_std, pure software (the ristretto precompiles are a
 # performance follow-on, not a correctness gate). Its transpile for the actor
 # target is gated via this actor's ELF (vos/tests/chronos_transpile.rs).

@@ -16,7 +16,7 @@ vos = { path = "../../vos", default-features = false }
 
 # nushell — pinned to 0.111.0, the highest release that resolves on the
 # workspace toolchain (nightly-2025-05-09 / rustc 1.88). 0.113+ requires
-# Rust 1.93. See the Phase 0 spike notes in the plan. NO nu-command /
+# Rust 1.93. NO nu-command / nu-cli / nu-std: the sandbox is the *absence*
 # nu-cli / nu-std: the sandbox is the *absence* of those command sets.
 nu-protocol = { version = "=0.111.0", default-features = false }
 nu-engine = { version = "=0.111.0", default-features = false }

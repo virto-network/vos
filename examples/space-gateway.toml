@@ -83,7 +83,7 @@ consistency = "ephemeral"
 # internally. `bind_addr = "127.0.0.1"` keeps it loopback-only.
 # Lifecycle ops (`stop` / `status`) are reachable via
 # `vosx <space> gateway <cmd>`; the legacy `/__admin/*` HTTP
-# namespace was removed in Phase 6.
+# namespace was removed in favor of the CLI subcommands.
 
 [[extension]]
 name = "gateway"

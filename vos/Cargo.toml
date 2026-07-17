@@ -76,7 +76,7 @@ merkle-crdt = { path = "../support/merkle-crdt", version = "0.1.0", features = [
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
-# ECVRF primitive (Phase D v1) for the host-side `chronos_feed` feeder: the
+# ECVRF primitive for the host-side `chronos_feed` feeder: the
 # leader's feeder derives a static VRF keypair from `node.key`, enrols pubkeys,
 # and posts per-round reveals. no_std pure software; rides the `network`
 # feature (the feeder is network-gated). The chronos actor pulls it directly.

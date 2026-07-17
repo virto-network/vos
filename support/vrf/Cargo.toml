@@ -2,7 +2,7 @@
 
 [package]
 name = "vrf"
-description = "ECVRF over Ristretto255 (SHA-512) — a no_std verifiable random function for VOS chronos bias resistance (Phase D). prove/verify/output + an 80-byte proof codec. Pure software (curve25519-dalek serial backend); the ristretto precompiles are a performance follow-on, not required for correctness."
+description = "ECVRF over Ristretto255 (SHA-512) — a no_std verifiable random function for VOS chronos bias resistance. prove/verify/output + an 80-byte proof codec. Pure software (curve25519-dalek serial backend); the ristretto precompiles are a performance follow-on, not required for correctness."
 keywords = ["vos", "vrf", "ecvrf", "ristretto255", "randomness"]
 categories = ["cryptography", "no-std"]
 version = "0.1.0"

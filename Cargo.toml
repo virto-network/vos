@@ -22,6 +22,9 @@ members = [
 exclude = [
     "examples/agents/*",
     "examples/actors/*",
+    # These specific actor/agent crates define their own `[workspace]` and
+    # must be excluded individually so Cargo does not treat them as nested
+    # workspace roots inside the main workspace.
     "examples/actors/crdt-counter",
     "examples/agents/scheduler",
     "examples/actors/tally",
@@ -76,7 +79,7 @@ homepage = "https://github.com/virto-network/vos"
 authors = ["Daniel Olano <daniel@olanod.com>"]
 readme = "README.md"
 
-# Phase 61: fat LTO + single codegen unit for maximum cross-crate
+# Release profile: fat LTO + single codegen unit for maximum cross-crate
 # inlining of stwo's hot SIMD paths.  Measured at log14 MOBILE on
 # the reference Intel Core Ultra 7 155H (median of 5 trials):
 #
@@ -128,13 +131,11 @@ zkpvm-derive = { path = "zkpvm/derive" }
 zkpvm-verifier = { path = "zkpvm/verifier" }
 javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
 
-# Stwo — Phase G of the v2.x migration: pinned to upstream HEAD as of
-# 2026-04-30 (`e1286720`).  Captures the post-v2.2.0 perf cluster
-# (parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
+# Stwo pinned to upstream rev `e1286720` (post-v2.2.0 perf cluster:
+# parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
 # subdomain quotients #1372/#1373, FRI fold parallelization
-# #1389/#1392/#1393).  Lifted-protocol degree-≥2 block stands at this
-# rev — see crates/zkpvm/STWO_2.2.0_MIGRATION.md.  Phase I rewrites the
-# 5 high-bound chips with helper columns to clear the block.
+# #1389/#1392/#1393). Lifted-protocol degree-≥2 block stands at this
+# rev — see zkpvm/STWO_2.2.0_MIGRATION.md.
 #
 # Declared with NO features here (workspace-inherited features are
 # additive — a member can add but never remove them).  Prover-side

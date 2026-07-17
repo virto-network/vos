@@ -15,7 +15,7 @@
 resolver = "2"
 members = ["gen", "bench", "runner"]
 
-# Mirror the vos workspace release profile (fat LTO + 1 CGU — Phase 61) so
+# Mirror the vos workspace release profile (fat LTO + 1 CGU) so
 # prove/verify numbers are representative of the production build, and
 # runtime-like for the wasm artifact (opt-level 3, lto fat, codegen-units 1).
 [profile.release]
