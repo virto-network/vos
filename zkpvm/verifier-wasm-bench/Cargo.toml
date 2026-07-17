@@ -1,0 +1,33 @@
+# Benchmark harness: measure real full-AIR `zkpvm-verifier` verification
+# inside wasm32 against an on-chain (parachain-PVF-class) execution budget,
+# and generate binding fixtures for external verify-only consumers.
+#
+# A SEPARATE, self-contained workspace (like ../settlement-verifier) so its
+# feature resolution never co-resolves with the vos workspace:
+#   - `gen`    (native)  proves fixtures with zkpvm's `prover` feature on,
+#   - `bench`  (wasm32)  embeds the fixtures and links zkpvm-verifier ONLY
+#                        (zkpvm with default-features = false — no javm/rayon),
+#   - `runner` (native)  executes bench.wasm under the wasmtime crate and
+#                        times the verify calls.
+# Build each with `cargo build -p <member>` (one package per invocation) so
+# resolver-2 feature unification never leaks `prover` into the wasm graph.
+[workspace]
+resolver = "2"
+members = ["gen", "bench", "runner"]
+
+# Mirror the vos workspace release profile (fat LTO + 1 CGU — Phase 61) so
+# prove/verify numbers are representative of the production build, and
+# runtime-like for the wasm artifact (opt-level 3, lto fat, codegen-units 1).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# The wasmtime embedding is measurement scaffolding — don't pay fat-LTO build
+# time for it, and keep unwinding (wasmtime host default).
+[profile.runner]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+panic = "unwind"

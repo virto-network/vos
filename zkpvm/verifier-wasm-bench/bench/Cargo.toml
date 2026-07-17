@@ -1,0 +1,29 @@
+[package]
+name = "verifier-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The measured artifact: a cdylib for wasm32-unknown-unknown that embeds the
+# proof fixtures and exports one `verify_<shape>() -> u32` per fixture.
+# Build with EXACTLY:
+#   cargo build -p verifier-wasm --release --target wasm32-unknown-unknown
+# (one package per invocation — never co-resolve with vwb-gen, whose `prover`
+# feature would drag javm/rayon into the graph and break the wasm build).
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# `embed` bakes the proof fixtures in via include_bytes! (the measured
+# artifact). Build with --no-default-features for the fixtures-free variant
+# whose .wasm size is the verifier's honest code-size footprint — the
+# `verify_supplied` export keeps the whole verify path live.
+default = ["embed"]
+embed = []
+
+[dependencies]
+# Verify-only: zkpvm-verifier pulls zkpvm with default-features = false
+# (no javm, no rayon, no blake3, no dalek) — the F1 carve-out.
+zkpvm-verifier = { path = "../../verifier" }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
