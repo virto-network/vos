@@ -25,7 +25,7 @@ The blob model assumes state of tens of KiB (`vos/src/abi/pvm/alloc.rs:5-8`):
 - 1 MiB halt-output cap carries the full state write
   (`runtime.rs:1264`) → clerk-ledger (~305 B/account) dies near 3k
   accounts.
-- 16 KiB provable-Task witness buffer (`vos-macros/src/lib.rs:1350`)
+- 16 KiB provable-Task witness buffer (`vos/vos-macros/src/lib.rs:1350`)
   → a provable clerk caps out near 50 accounts.
 - Every mutation re-encodes the whole struct; in CRDT mode every DAG
   node carries the **full state blob** (`Effect::Write{STATE_KEY}` in
@@ -63,7 +63,7 @@ is already proven at the application layer in cipher-clerk
 - `vos/src/actors/run.rs` — `run_refine_service` cold/warm split,
   `ACTOR_HOLDER`/`CURRENT_ANCHOR` statics (`:452-500`), state-changed
   gate (`:562-586`).
-- `vos-macros/src/lib.rs` — rkyv derive injection on the state struct
+- `vos/vos-macros/src/lib.rs` — rkyv derive injection on the state struct
   (~`:68-99`); `#[msg]` attr parsing (~`:293-315`).
 - cipher-clerk `merkle.rs` (`SparseMerkleTree`, depth 128, 16-byte
   keys, `BatchProof`), `view.rs` (`SparseLedger`: panics on unproven
@@ -232,7 +232,7 @@ is already proven at the application layer in cipher-clerk
 
 ### 2.3 `#[storage]` field attribute in `#[actor]`
 
-- `vos-macros/src/lib.rs`: parse `#[storage]` /
+- `vos/vos-macros/src/lib.rs`: parse `#[storage]` /
   `#[storage(prefix = "…")]` on state-struct fields. Handle types
   implement rkyv `Archive`/`Serialize`/`Deserialize` manually with a
   unit archived form (they carry no persisted data), so the injected

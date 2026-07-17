@@ -235,7 +235,7 @@ Conventional tokens (loose, not enforced):
 - [`vos/src/node.rs`](https://github.com/virto-network/vos/tree/master/vos/src/node.rs) —
   the host-side driver: the cooperative executor, the byte-stream
   reactor, and the transport accept loop
-- [`vos-macros/src/lib.rs`](https://github.com/virto-network/vos/tree/master/vos-macros/src/lib.rs) —
+- [`vos/vos-macros/src/lib.rs`](https://github.com/virto-network/vos/tree/master/vos/vos-macros/src/lib.rs) —
   `#[actor(kind = …, caps = […])]` + `#[messages]` parsing
 - [`extensions/http-gateway/`](https://github.com/virto-network/vos/tree/master/extensions/http-gateway) —
   the canonical Transport extension

@@ -31,7 +31,7 @@ rather than merged.
 
 ## Source map
 
-- [`merkle-crdt/`](https://github.com/virto-network/vos/tree/master/merkle-crdt)
-- [`vos-raft/`](https://github.com/virto-network/vos/tree/master/vos-raft)
+- [`support/merkle-crdt/`](https://github.com/virto-network/vos/tree/master/support/merkle-crdt)
+- [`support/vos-raft/`](https://github.com/virto-network/vos/tree/master/support/vos-raft)
 - [`vos/src/raft/`](https://github.com/virto-network/vos/tree/master/vos/src/raft)
 - [`vos/src/data_layer.rs`](https://github.com/virto-network/vos/tree/master/vos/src/data_layer.rs)

@@ -20,7 +20,7 @@ first; then read the files listed in each item before editing them.
 - `vosx/src/commands/dynamic.rs` — the dispatcher being promoted. Already has:
   schema-typed coercion (`apply_arg`), `key=@path` file reads, hex↔bytes,
   `#[msg(cli)]` filtering, return-type labels, universal `__stop`/`__describe`.
-- `vos-macros/src/lib.rs` — `#[actor]`/`#[messages]` emit `ActorMeta` +
+- `vos/vos-macros/src/lib.rs` — `#[actor]`/`#[messages]` emit `ActorMeta` +
   `encode::<4096>` (lines ~140, ~1002). `#[msg(cli)]` and `#[msg(role = X)]`
   parse at ~293–315.
 - `vosx/src/main.rs` `should_dynamic_dispatch` (~line 330) — `BUILTIN_VERBS`
@@ -80,7 +80,7 @@ first; then read the files listed in each item before editing them.
   is a ~55-line `SpaceClient` trait adapter), the `Console` variant in
   `space/mod.rs`, and `vosx/tests/console_e2e.rs`.
 - Drop `vos-shell` from `vosx/Cargo.toml`. Grep docs (`README.md`, `docs/`,
-  `book/`) for `space console` / `vos-shell` mentions and update.
+  `docs/`) for `space console` / `support/vos-shell` mentions and update.
 - Do **not** delete the `vos-shell` crate itself (a future shell extension may
   reuse pieces); only unlink it from vosx. If it's a workspace member that now
   builds for nothing, leave it — out of scope.
@@ -103,7 +103,7 @@ File: `vosx/src/commands/dynamic.rs`.
 
 ### 1.3 Metadata v2: doc strings + per-handler timeout
 
-Files: `vos/src/actors/metadata.rs`, `vos-macros/src/lib.rs`,
+Files: `vos/src/actors/metadata.rs`, `vos/vos-macros/src/lib.rs`,
 `vosx/src/commands/dynamic.rs`, `vosx/src/cli_cache.rs`.
 
 - `MessageMeta` gains `doc: &'static str` and `timeout_ms: u32` (0 = default);
@@ -157,7 +157,7 @@ targeted tests above. `vosx --help` and dynamic dispatch smoke unchanged.
 - Standard wire shape for `job_poll` replies: `vos::value::Args` with fields
   `data: Bytes`, `done: bool`, `error: Str` — this is exactly the ai
   extension's `GenerationChunk` shape today; reuse/blessing, not invention.
-- Macro (`vos-macros/src/lib.rs`): `#[msg(job)]` = the handler is a job
+- Macro (`vos/vos-macros/src/lib.rs`): `#[msg(job)]` = the handler is a job
   *begin*: enforce return type `u64` (compile error otherwise), set a new
   per-message `mode` byte in metadata (new trailing section 4:
   `[count:u16][u8]*` index-crossref; `0 = sync`, `1 = job`). `ParsedMessage`

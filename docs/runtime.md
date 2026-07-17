@@ -18,4 +18,4 @@
 - [`vos/src/runtime.rs`](https://github.com/virto-network/vos/tree/master/vos/src/runtime.rs)
 - [`vos/src/actors/`](https://github.com/virto-network/vos/tree/master/vos/src/actors)
 - [`vos/src/abi/`](https://github.com/virto-network/vos/tree/master/vos/src/abi)
-- [`vos-macros/src/lib.rs`](https://github.com/virto-network/vos/tree/master/vos-macros/src/lib.rs)
+- [`vos/vos-macros/src/lib.rs`](https://github.com/virto-network/vos/tree/master/vos/vos-macros/src/lib.rs)

@@ -13,15 +13,16 @@ the user's critical path.
 | Path | What |
 |---|---|
 | [`vos/`](vos/) | Core runtime: PVM host, scheduler, persistence, networking |
-| [`vos-macros/`](vos-macros/) | `#[actor]` / `#[messages]` / `#[msg]` proc-macros |
-| [`vos-raft/`](vos-raft/) | Async Raft implementation used by the `raft` consistency mode |
-| [`merkle-crdt/`](merkle-crdt/) | Merkle-DAG CRDT used by the `crdt` consistency mode |
+| [`vos/vos-macros/`](vos/vos-macros/) | `#[actor]` / `#[messages]` / `#[msg]` proc-macros |
+| [`support/vos-raft/`](support/vos-raft/) | Async Raft implementation used by the `raft` consistency mode |
+| [`support/merkle-crdt/`](support/merkle-crdt/) | Merkle-DAG CRDT used by the `crdt` consistency mode |
+| [`support/vos-shell/`](support/vos-shell/) | Sandboxed nushell-backed console engine |
 | [`vosx/`](vosx/) | Operator-facing CLI (`vosx run …`, `vosx space …`) — see its [README](vosx/README.md) |
 | [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
 | [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
 | [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
 | [`examples/`](examples/) | Sample actors, agents, extensions, wasm guests, space recipes |
-| [`book/`](book/) | The VOS Book (architecture, protocols, applications). Source in [`docs/`](docs/) |
+| [`docs/`](docs/) | The VOS Book (architecture, protocols, applications) |
 
 ## Quick start
 
@@ -59,8 +60,7 @@ vosx space export demo > snapshot.toml  # round-trip back to TOML
 Two-process CRDT convergence demo (one shell):
 
 ```bash
-just demo-crdt-procs   # creates + dials two daemons, both reach count=2
-just demo-crdt-sync    # in-process variant, no separate processes
+# TBD: standalone scripts for the two-process and in-process CRDT demos.
 ```
 
 ## Consistency modes
@@ -222,9 +222,9 @@ It combines the VOS runtime with three protocol layers:
    backend (relay, DHT, DA layer) since storage doesn't need to be trusted.
 
 Kunekt itself is exposed as a built-in actor/service group inside VOS, with
-its own slice of the book covering the protocol layers, threat model, and
-integrations (Nostr, anonymous credentials, zk-promises). See
-[`book/`](book/) → "Applications → Kunekt".
+its own slice of the documentation covering the protocol layers, threat
+model, and integrations (Nostr, anonymous credentials, zk-promises). See
+[`docs/kunekt.md`](docs/kunekt.md).
 
 ## Development
 
