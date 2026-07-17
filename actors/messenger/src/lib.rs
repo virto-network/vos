@@ -63,7 +63,7 @@ mod tick;
 
 use clients::{
     ctl_commit, dir_announce_channel, dir_channels, dir_claim_kp, dir_publish_kp, dir_release_kp,
-    hex_decode, hex_encode, log_post, reg_agents, reg_install, resolve,
+    hex_decode, hex_encode, log_post, reg_agent_by_pattern, reg_install, resolve,
 };
 use mls::{new_key_package, parse_key_package, welcome_nonce};
 use mls_rs::ExtensionList;
@@ -899,17 +899,11 @@ impl Messenger {
             return Ok(());
         }
 
-        let rows = reg_agents(ctx).await.map_err(|e| {
-            format!("channel agents not installed and the catalog is unavailable: {e}")
-        })?;
-        let template_for = |suffix: &str| {
-            rows.iter()
-                .find(|r| r.instance_name.starts_with("msg-") && r.instance_name.ends_with(suffix))
-        };
         // Resolve every needed template BEFORE installing anything:
         // a missing template after the first install would leave a
-        // half-pair of registry rows behind, replicated space-wide.
-        let mut installs = Vec::new();
+        // half-pair of registry rows behind, replicated space-wide. Each
+        // is a targeted `msg-*<suffix>` lookup — no full-roster drain.
+        let mut installs: Vec<(&String, space_registry::AgentRow)> = Vec::new();
         for (missing, name, suffix) in [
             (log_missing, &log_name, "-log"),
             (ctl_missing, &ctl_name, "-ctl"),
@@ -917,7 +911,12 @@ impl Messenger {
             if !missing {
                 continue;
             }
-            let Some(template) = template_for(suffix) else {
+            let template = reg_agent_by_pattern(ctx, "msg-", suffix)
+                .await
+                .map_err(|e| {
+                    format!("channel agents not installed and the catalog is unavailable: {e}")
+                })?;
+            let Some(template) = template else {
                 return Err(format!(
                     "no installed msg-*{suffix} agent to clone program rows from — \
                      declare one channel in the space manifest first"
@@ -927,7 +926,7 @@ impl Messenger {
         }
         for (name, template) in installs {
             let rep_id = mls::fresh_replication_id()?;
-            match reg_install(ctx, name, template, rep_id).await? {
+            match reg_install(ctx, name, &template, rep_id).await? {
                 // EXISTS: someone else's create won the race (or a
                 // peer's row synced in) — the post-condition holds.
                 space_registry::Status::Ok | space_registry::Status::InstanceExists => {}

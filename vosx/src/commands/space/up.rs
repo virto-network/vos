@@ -631,7 +631,7 @@ fn register_extensions_from_local(
         .map(|e| e.name.clone())
         .chain(std::iter::once("space-registry".to_string()))
         .collect();
-    if let Ok(agents) = vos::block_on(reg.agents(&mut &*node)) {
+    if let Ok(agents) = vos::block_on(reg.agents_all(&mut &*node)) {
         for a in agents {
             known_names.insert(a.instance_name);
         }
@@ -1057,8 +1057,8 @@ fn spawn_installed_agents(
     }
 
     let reg = RegistryRef::at(ServiceId::REGISTRY);
-    let agents =
-        vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+    let agents = vos::block_on(reg.agents_all(&mut &*node))
+        .map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
     // Set of svc_ids the catalog knows about — used at the
     // end to sweep orphaned redbs into trash. We add to this
@@ -1837,8 +1837,8 @@ fn reconcile_installed_agents(
     use vos::registry::{RegistryRef, Status};
 
     let reg = RegistryRef::at(ServiceId::REGISTRY);
-    let agents =
-        vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+    let agents = vos::block_on(reg.agents_all(&mut &*node))
+        .map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
 
     // Whether this node is a space member, probed once for the whole pass; rows
     // whose sync floor requires membership are narrowed out below.

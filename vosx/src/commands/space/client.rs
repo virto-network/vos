@@ -325,7 +325,7 @@ impl DaemonClient {
     // prefix. Per-command status decoding stays at the call site.
 
     pub fn programs(&self) -> anyhow::Result<Vec<ProgramRow>> {
-        vos::block_on(self.registry().programs(&mut &self.node))
+        vos::block_on(self.registry().programs_all(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.programs(): {e}"))
     }
 
@@ -339,7 +339,7 @@ impl DaemonClient {
     }
 
     pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
-        vos::block_on(self.registry().agents(&mut &self.node))
+        vos::block_on(self.registry().agents_all(&mut &self.node))
             .map_err(|e| anyhow::anyhow!("registry.agents(): {e}"))
     }
 

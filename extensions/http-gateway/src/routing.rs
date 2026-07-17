@@ -339,21 +339,45 @@ async fn handle_schema(
     Some(schema_for_agent(name, inner, ctx).await)
 }
 
+/// Drain the registry's paginated `agent_names` into one list, in
+/// `instance_name` order. `None` means the registry was unreachable (a
+/// dropped dispatch); a malformed/misaligned page degrades to the names
+/// gathered so far rather than panicking the connection task.
+async fn drain_agent_names(ctx: &mut Context<HttpGateway>) -> Option<Vec<String>> {
+    let mut names: Vec<String> = Vec::new();
+    loop {
+        let after = names.last().cloned().unwrap_or_default();
+        let msg = Msg::new("agent_names")
+            .with("after_name", after)
+            .with("budget", 0u32);
+        let encoded = msg.encode();
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(vos::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        let bytes = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await?;
+        // Reply is `Value::Bytes(rkyv(AgentNamePage))`; anything else (empty,
+        // Unit, non-decodable) ends the drain with what we have.
+        let page = match <vos::value::Value as vos::Decode>::try_decode(&bytes) {
+            Some(vos::value::Value::Bytes(inner)) if !inner.is_empty() => {
+                match <vos::registry::AgentNamePage as vos::Decode>::try_decode(&inner) {
+                    Some(page) => page,
+                    None => break,
+                }
+            }
+            _ => break,
+        };
+        let more = page.more;
+        names.extend(page.names);
+        if !more {
+            break;
+        }
+    }
+    Some(names)
+}
+
 async fn list_schemas(ctx: &mut Context<HttpGateway>) -> Response {
-    let msg = Msg::new("agent_names");
-    let encoded = msg.encode();
-    let mut payload = Vec::with_capacity(1 + encoded.len());
-    payload.push(vos::value::TAG_DYNAMIC);
-    payload.extend_from_slice(&encoded);
-    let bytes = match ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await {
-        Some(b) if !b.is_empty() => b,
-        _ => return text(502, "registry unreachable"),
-    };
-    // try_decode (checked rkyv access) — a malformed/misaligned registry reply
-    // degrades to an empty list rather than panicking the connection task.
-    let names = match <vos::value::Value as vos::Decode>::try_decode(&bytes) {
-        Some(value) => value.as_list_str().map(|s| s.to_vec()).unwrap_or_default(),
-        None => Vec::new(),
+    let Some(names) = drain_agent_names(ctx).await else {
+        return text(502, "registry unreachable");
     };
     json(
         200,
@@ -442,23 +466,8 @@ async fn handle_openapi(
 
 async fn render_openapi(inner: &Inner, ctx: &mut Context<HttpGateway>) -> Response {
     // 1. Get every installed agent's name.
-    let names = {
-        let msg = Msg::new("agent_names");
-        let encoded = msg.encode();
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(vos::value::TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        let Some(bytes) = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await else {
-            return text(502, "registry unreachable");
-        };
-        if bytes.is_empty() {
-            Vec::new()
-        } else {
-            match <vos::value::Value as vos::Decode>::try_decode(&bytes) {
-                Some(value) => value.as_list_str().map(|s| s.to_vec()).unwrap_or_default(),
-                None => Vec::new(),
-            }
-        }
+    let Some(names) = drain_agent_names(ctx).await else {
+        return text(502, "registry unreachable");
     };
 
     // 2. For each agent, fetch its schema (cache-warm) and

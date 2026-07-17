@@ -1446,18 +1446,25 @@ impl NodeService {
     fn program_hash_catalogued(&self, hash: &[u8; 32]) -> bool {
         use crate::actors::codec::{Decode, Encode};
         use crate::value::{Msg, Value, TAG_DYNAMIC};
-        let msg = Msg::new("programs");
+        // Targeted hash lookup — the registry answers with just the matching
+        // row (or none), so this stays a bounded single-reply probe rather
+        // than draining the whole (now paginated) catalog.
+        let msg = Msg::new("program_by_hash").with("hash", hash.to_vec());
         let mut payload = Vec::with_capacity(1 + 64);
         payload.push(TAG_DYNAMIC);
         payload.extend_from_slice(&msg.encode());
         let Some(reply) = registry_probe_reply(&self.invoke_routes, payload) else {
             return false;
         };
-        let Some(Value::Bytes(bytes)) = <Value as Decode>::try_decode(&reply) else {
-            return false;
-        };
-        <Vec<crate::registry::ProgramRow> as Decode>::try_decode(&bytes)
-            .is_some_and(|programs| programs.iter().any(|p| &p.hash == hash))
+        // `Some(row)` → `Value::Bytes(rkyv(ProgramRow))`; `None` → `Value::Unit`
+        // (or empty bytes). Only a decodable row whose hash matches counts.
+        match <Value as Decode>::try_decode(&reply) {
+            Some(Value::Bytes(bytes)) if !bytes.is_empty() => {
+                <crate::registry::ProgramRow as Decode>::try_decode(&bytes)
+                    .is_some_and(|p| &p.hash == hash)
+            }
+            _ => false,
+        }
     }
 
     /// Resolve a (possibly prefix-scoped) target `ServiceId` value back
@@ -9586,16 +9593,23 @@ mod tests {
             while let Ok(req) = rx.recv() {
                 let value = match intercepted_method_name(&req.msg).as_deref() {
                     Some("node_role") => Value::U8(node_role),
-                    Some("programs") => Value::Bytes(
-                        catalogued
-                            .then(|| vec![crate::registry::ProgramRow {
-                                name: "program".into(),
-                                version: "1".into(),
-                                hash,
-                            }])
-                            .unwrap_or_default()
-                            .encode(),
-                    ),
+                    // Targeted hash lookup: `Some(row)` for a catalogued hash,
+                    // `Unit` (→ not catalogued) otherwise — matching the real
+                    // `program_by_hash` verb's `Option<ProgramRow>` wire shape.
+                    Some("program_by_hash") => {
+                        if catalogued {
+                            Value::Bytes(
+                                crate::registry::ProgramRow {
+                                    name: "program".into(),
+                                    version: "1".into(),
+                                    hash,
+                                }
+                                .encode(),
+                            )
+                        } else {
+                            Value::Unit
+                        }
+                    }
                     _ => Value::U8(peer_role),
                 };
                 let reply = encode_invoke_envelope(

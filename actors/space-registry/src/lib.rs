@@ -52,8 +52,9 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
-    ActorAclPage, ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, InvitePage, InviteRow,
-    MemberPage, MemberRow, ProgramRow, SPACE_ID_DOMAIN_TAG, Status, SyncFloor,
+    ActorAclPage, ActorAclRow, AgentNamePage, AgentPage, AgentRow, AuthGrantPage, AuthGrantRow,
+    InvitePage, InviteRow, MemberPage, MemberRow, ProgramPage, ProgramRow, SPACE_ID_DOMAIN_TAG,
+    Status, SyncFloor,
     AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN,
     MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
     PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
@@ -521,14 +522,35 @@ impl SpaceRegistry {
             .cloned()
     }
 
-    /// Snapshot the program catalog, sorted by `(name, version)`. Left
-    /// unpaginated: `programs` stays blob-backed (so the reply is
-    /// heap-bounded like the table itself) and PVM-actor consumers read it
-    /// arg-free — pagination would break those callers for no reply-cap
-    /// gain until the table actually moves to storage.
+    /// The catalogued program (if any) with this `hash` — a targeted
+    /// lookup so a caller checking hash membership (e.g. the host's
+    /// cross-space CAS guard) needn't drain the whole catalog. Returns
+    /// `None` for a non-32-byte hash or no match.
     #[msg]
-    async fn programs(&self) -> Vec<ProgramRow> {
-        self.programs.clone()
+    async fn program_by_hash(&self, hash: Vec<u8>) -> Option<ProgramRow> {
+        let hash = bytes_to_32(&hash)?;
+        self.programs.iter().find(|p| p.hash == hash).cloned()
+    }
+
+    /// Page the program catalog, in `(name, version)` order. Pass an empty
+    /// `(after_name, after_version)` to start; continue from the last
+    /// returned row's `(name, version)` while the page's `more` flag is set
+    /// (a short page alone doesn't mean done — the byte budget can truncate
+    /// one). `budget` caps the page rows (0 = the handler's max). The
+    /// backing `programs` is kept sorted on insert, so a natural cursor over
+    /// the last emitted row pages the whole catalog without a per-page sort.
+    #[msg]
+    async fn programs(&self, after_name: String, after_version: String, budget: u32) -> ProgramPage {
+        let started = after_name.is_empty() && after_version.is_empty();
+        let mut it = self
+            .programs
+            .iter()
+            .filter(|p| {
+                started || compare_program(&p.name, &p.version, &after_name, &after_version) > 0
+            })
+            .cloned();
+        let (rows, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
+        ProgramPage { rows, more }
     }
 
     // ── Metadata blobs ──────────────────────────────────────────
@@ -882,28 +904,51 @@ impl SpaceRegistry {
             .cloned()
     }
 
-    /// Snapshot the installed-agent roster, sorted by `instance_name`.
-    /// Unpaginated for the same reason as `programs` — blob-backed and read
-    /// arg-free by PVM actors (messenger, gateway).
+    /// The first installed agent (in `instance_name` order) whose name
+    /// starts with `prefix` and ends with `suffix` — a template lookup so a
+    /// caller cloning a channel's program rows (the messenger, creating a
+    /// `msg-*-log`/`-ctl` pair) needn't drain the whole roster. `agents` is
+    /// kept sorted on insert, so "first" is deterministic.
     #[msg]
-    async fn agents(&self) -> Vec<AgentRow> {
-        self.agents.clone()
-    }
-
-    /// Lightweight enumeration of installed agent names, sorted by
-    /// `instance_name`. Returns `Vec<String>` so cross-actor callers
-    /// without `AgentRow` schema knowledge (e.g. the gateway rendering
-    /// `/__schema`) can pull the list without an rkyv dance. Unpaginated on
-    /// purpose: it is names-only, its `agents` backing stays blob-backed
-    /// (so the reply is heap-bounded like `agents` itself), and the gateway
-    /// consumes it arg-free — pagination would break that caller for no
-    /// reply-size gain.
-    #[msg]
-    async fn agent_names(&self) -> Vec<String> {
+    async fn agent_by_pattern(&self, prefix: String, suffix: String) -> Option<AgentRow> {
         self.agents
             .iter()
-            .map(|a| a.instance_name.clone())
-            .collect()
+            .find(|a| a.instance_name.starts_with(&prefix) && a.instance_name.ends_with(&suffix))
+            .cloned()
+    }
+
+    /// Page the installed-agent roster, in `instance_name` order. Pass an
+    /// empty `after_name` to start; continue from the last returned row's
+    /// `instance_name` while the page's `more` flag is set. `budget` caps
+    /// the page rows (0 = the handler's max). `agents` is kept sorted on
+    /// insert, so a natural cursor over the last emitted row pages the whole
+    /// roster without a per-page sort.
+    #[msg]
+    async fn agents(&self, after_name: String, budget: u32) -> AgentPage {
+        let started = after_name.is_empty();
+        let mut it = self
+            .agents
+            .iter()
+            .filter(|a| started || a.instance_name.as_str() > after_name.as_str())
+            .cloned();
+        let (rows, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
+        AgentPage { rows, more }
+    }
+
+    /// Page installed-agent names (names only), in `instance_name` order —
+    /// so cross-actor callers without `AgentRow` schema knowledge (e.g. the
+    /// gateway rendering `/__schema`) pull the list without an rkyv dance.
+    /// Same cursor/`more` contract as [`agents`](Self::agents).
+    #[msg]
+    async fn agent_names(&self, after_name: String, budget: u32) -> AgentNamePage {
+        let started = after_name.is_empty();
+        let mut it = self
+            .agents
+            .iter()
+            .filter(|a| started || a.instance_name.as_str() > after_name.as_str())
+            .map(|a| a.instance_name.clone());
+        let (names, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
+        AgentNamePage { names, more }
     }
 
     /// Resolve an installed agent's name to the `ServiceId` it
@@ -4110,5 +4155,199 @@ mod tests {
         assert_eq!(revoke_invite(&mut r, &token_pub), Status::Ok);
         assert_eq!(dispatch_as_system(&mut r, captured), Status::Forbidden);
         assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+    }
+
+    // ── Pagination: programs / agents / agent_names ─────────────
+
+    /// Publish a distinct program `(name, version)` with a per-name hash
+    /// (`[name.len(); 32]`, so distinct-length names get distinct hashes).
+    fn publish_prog(r: &mut SpaceRegistry, name: &str, version: &str) {
+        let hash = alloc::vec![name.len() as u8; 32];
+        let status = dispatch(
+            r,
+            Publish {
+                name: String::from(name),
+                version: String::from(version),
+                hash: hash.clone(),
+                auth: root_auth("publish", &[name.as_bytes(), version.as_bytes(), &hash]),
+            },
+        );
+        assert_eq!(status, Status::Ok, "publish must succeed");
+    }
+
+    /// Drain the paginated `programs` handler at `budget` — the client's
+    /// `programs_all` walk, in test form.
+    fn programs_drain(r: &mut SpaceRegistry, budget: u32) -> Vec<ProgramRow> {
+        let mut out: Vec<ProgramRow> = Vec::new();
+        loop {
+            let (after_name, after_version) = out
+                .last()
+                .map(|p| (p.name.clone(), p.version.clone()))
+                .unwrap_or_default();
+            let page = dispatch(r, Programs { after_name, after_version, budget });
+            let more = page.more;
+            out.extend(page.rows);
+            if !more {
+                return out;
+            }
+        }
+    }
+
+    /// Drain the paginated `agents` handler at `budget`.
+    fn agents_drain(r: &mut SpaceRegistry, budget: u32) -> Vec<AgentRow> {
+        let mut out: Vec<AgentRow> = Vec::new();
+        loop {
+            let after_name = out.last().map(|a| a.instance_name.clone()).unwrap_or_default();
+            let page = dispatch(r, Agents { after_name, budget });
+            let more = page.more;
+            out.extend(page.rows);
+            if !more {
+                return out;
+            }
+        }
+    }
+
+    /// Drain the paginated `agent_names` handler at `budget`.
+    fn agent_names_drain(r: &mut SpaceRegistry, budget: u32) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        loop {
+            let after_name = out.last().cloned().unwrap_or_default();
+            let page = dispatch(r, AgentNames { after_name, budget });
+            let more = page.more;
+            out.extend(page.names);
+            if !more {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn programs_pagination_walks_the_whole_catalog_in_order() {
+        let mut r = registry();
+        // Publish out of order; the catalog keeps itself sorted on insert.
+        publish_prog(&mut r, "beta", "1");
+        publish_prog(&mut r, "alpha", "2");
+        publish_prog(&mut r, "alpha", "1");
+        publish_prog(&mut r, "gamma", "1");
+        let want = alloc::vec![
+            (String::from("alpha"), String::from("1")),
+            (String::from("alpha"), String::from("2")),
+            (String::from("beta"), String::from("1")),
+            (String::from("gamma"), String::from("1")),
+        ];
+        let key = |v: Vec<ProgramRow>| {
+            v.into_iter().map(|p| (p.name, p.version)).collect::<Vec<_>>()
+        };
+        // A single big page and a budget=2 walk agree, both sorted by (name, version).
+        assert_eq!(key(programs_drain(&mut r, 0)), want, "single page is the sorted catalog");
+        assert_eq!(key(programs_drain(&mut r, 2)), want, "budget=2 walk visits every row once, in order");
+    }
+
+    #[test]
+    fn programs_page_more_flag_terminates_the_walk() {
+        let mut r = registry();
+        publish_prog(&mut r, "a", "1");
+        publish_prog(&mut r, "b", "1");
+        publish_prog(&mut r, "c", "1");
+        // budget=2 over 3 rows: full first page + more, then the tail.
+        let page1 = dispatch(
+            &mut r,
+            Programs { after_name: String::new(), after_version: String::new(), budget: 2 },
+        );
+        assert_eq!(page1.rows.len(), 2);
+        assert!(page1.more, "a full page over a longer catalog reports more");
+        let last = page1.rows.last().unwrap().clone();
+        let page2 = dispatch(
+            &mut r,
+            Programs { after_name: last.name, after_version: last.version, budget: 2 },
+        );
+        assert_eq!(page2.rows.len(), 1, "the tail page holds the remainder");
+        assert!(!page2.more, "the last page terminates the walk");
+    }
+
+    #[test]
+    fn empty_tables_page_to_nothing_with_no_more() {
+        let mut r = registry();
+        assert!(programs_drain(&mut r, 2).is_empty());
+        assert!(agents_drain(&mut r, 2).is_empty());
+        assert!(agent_names_drain(&mut r, 2).is_empty());
+        let p = dispatch(
+            &mut r,
+            Programs { after_name: String::new(), after_version: String::new(), budget: 0 },
+        );
+        assert!(p.rows.is_empty() && !p.more, "empty start page has no more");
+    }
+
+    #[test]
+    fn agents_pagination_walks_the_whole_roster_in_order() {
+        let mut r = registry();
+        for name in ["zeta", "alpha", "mu"] {
+            assert_eq!(install_at(&mut r, name, 1), Status::Ok);
+        }
+        let want = alloc::vec![String::from("alpha"), String::from("mu"), String::from("zeta")];
+        let names = |rows: Vec<AgentRow>| rows.into_iter().map(|a| a.instance_name).collect::<Vec<_>>();
+        assert_eq!(names(agents_drain(&mut r, 0)), want, "single page is the sorted roster");
+        assert_eq!(names(agents_drain(&mut r, 1)), want, "budget=1 walk visits every agent once, in order");
+    }
+
+    #[test]
+    fn agent_names_pagination_matches_the_agent_roster() {
+        let mut r = registry();
+        for name in ["b-agent", "a-agent", "c-agent"] {
+            assert_eq!(install_at(&mut r, name, 1), Status::Ok);
+        }
+        let from_rows: Vec<String> =
+            agents_drain(&mut r, 0).into_iter().map(|a| a.instance_name).collect();
+        assert_eq!(
+            agent_names_drain(&mut r, 2),
+            from_rows,
+            "names page is the roster's instance_name projection"
+        );
+    }
+
+    #[test]
+    fn agent_by_pattern_finds_a_template_and_misses_cleanly() {
+        let mut r = registry();
+        for name in ["msg-general-log", "msg-general-ctl", "other-thing"] {
+            assert_eq!(install_at(&mut r, name, 1), Status::Ok);
+        }
+        let by = |r: &mut SpaceRegistry, pre: &str, suf: &str| {
+            dispatch(r, AgentByPattern { prefix: String::from(pre), suffix: String::from(suf) })
+                .map(|a| a.instance_name)
+        };
+        assert_eq!(by(&mut r, "msg-", "-log"), Some(String::from("msg-general-log")));
+        assert_eq!(by(&mut r, "msg-", "-ctl"), Some(String::from("msg-general-ctl")));
+        // Both ends must match: a missing suffix or a wrong prefix yields None.
+        assert_eq!(by(&mut r, "msg-", "-xyz"), None);
+        assert_eq!(by(&mut r, "zzz-", "-log"), None);
+    }
+
+    #[test]
+    fn agent_by_pattern_returns_the_first_in_instance_name_order() {
+        let mut r = registry();
+        for name in ["msg-zeta-log", "msg-alpha-log"] {
+            assert_eq!(install_at(&mut r, name, 1), Status::Ok);
+        }
+        let hit = dispatch(
+            &mut r,
+            AgentByPattern { prefix: String::from("msg-"), suffix: String::from("-log") },
+        );
+        assert_eq!(
+            hit.map(|a| a.instance_name),
+            Some(String::from("msg-alpha-log")),
+            "the sorted roster makes the first match deterministic"
+        );
+    }
+
+    #[test]
+    fn program_by_hash_matches_and_rejects() {
+        let mut r = registry();
+        publish_prog(&mut r, "alpha", "1"); // hash = [5; 32]
+        publish_prog(&mut r, "beta", "1"); //  hash = [4; 32]
+        let hit = dispatch(&mut r, ProgramByHash { hash: alloc::vec![5u8; 32] });
+        assert_eq!(hit.map(|p| p.name), Some(String::from("alpha")));
+        // Unknown hash → None; a non-32-byte hash → None (never panics).
+        assert!(dispatch(&mut r, ProgramByHash { hash: alloc::vec![9u8; 32] }).is_none());
+        assert!(dispatch(&mut r, ProgramByHash { hash: alloc::vec![5u8; 4] }).is_none());
     }
 }

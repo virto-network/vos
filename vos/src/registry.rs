@@ -30,6 +30,19 @@ pub struct ProgramRow {
     pub hash: [u8; 32],
 }
 
+/// One page of [`RegistryRef::programs`]. The catalog is returned in
+/// `(name, version)` order and every scanned row is emitted (no
+/// filtering), so — unlike [`AuthGrantPage`] — the cursor is just the
+/// last row's `(name, version)`; `more` is the terminator. Start with an
+/// empty `(after_name, after_version)` and continue while `more` is set.
+/// Use [`RegistryRef::programs_all`] to drain the whole catalog.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct ProgramPage {
+    pub rows: Vec<ProgramRow>,
+    pub more: bool,
+}
+
 /// One row in the agent (installed-instance) table.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
 #[rkyv(crate = rkyv)]
@@ -72,6 +85,30 @@ pub struct AgentRow {
     /// payload. Reconciled from the manifest's `on_start = [{msg=…}]`
     /// list. Empty when the agent has no on_start.
     pub install_payloads: Vec<u8>,
+}
+
+/// One page of [`RegistryRef::agents`]. The roster is returned in
+/// `instance_name` order with every scanned row emitted, so the cursor is
+/// the last row's `instance_name` and `more` is the terminator. Start with
+/// an empty `after_name` and continue while `more` is set. Use
+/// [`RegistryRef::agents_all`] to drain the whole roster.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct AgentPage {
+    pub rows: Vec<AgentRow>,
+    pub more: bool,
+}
+
+/// One page of [`RegistryRef::agent_names`] — the names-only projection of
+/// [`AgentPage`], for callers (e.g. the gateway rendering `/__schema`) that
+/// want the instance-name list without the `AgentRow` rkyv decode. Same
+/// `instance_name`-ordered cursor + `more` terminator. Use
+/// [`RegistryRef::agent_names_all`] to drain.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[rkyv(crate = rkyv)]
+pub struct AgentNamePage {
+    pub names: Vec<String>,
+    pub more: bool,
 }
 
 /// Serving-side sync floor for a replica — who its state (`FetchHeads`/
@@ -737,8 +774,51 @@ impl RegistryRef {
 
     // ── Catalog reads ─────────────────────────────────────────────
 
-    pub async fn programs<I: Invoker>(&self, inv: &mut I) -> Result<Vec<ProgramRow>, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("programs")).await?)
+    /// One page of the program catalog, in `(name, version)` order. Pass
+    /// an empty `(after_name, after_version)` to start; continue from the
+    /// last returned row's `(name, version)` while the page's `more` flag
+    /// is set. `budget` caps the page (0 = the registry's max). Prefer
+    /// [`programs_all`](Self::programs_all) unless paging by hand.
+    pub async fn programs<I: Invoker>(
+        &self,
+        inv: &mut I,
+        after_name: String,
+        after_version: String,
+        budget: u32,
+    ) -> Result<ProgramPage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("programs")
+                    .with("after_name", after_name)
+                    .with("after_version", after_version)
+                    .with("budget", budget),
+            )
+            .await?,
+        )
+    }
+
+    /// Drain the whole program catalog into one `Vec` (name/version order).
+    /// Callers that need the full set — `space programs`, `space info`,
+    /// manifest export — use this.
+    pub async fn programs_all<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<ProgramRow>, ClientError> {
+        let mut out: Vec<ProgramRow> = Vec::new();
+        loop {
+            let (after_name, after_version) = out
+                .last()
+                .map(|p| (p.name.clone(), p.version.clone()))
+                .unwrap_or_default();
+            let page = self.programs(inv, after_name, after_version, 0).await?;
+            let more = page.more;
+            out.extend(page.rows);
+            if !more {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub async fn program<I: Invoker>(
@@ -753,8 +833,55 @@ impl RegistryRef {
         )
     }
 
-    pub async fn agents<I: Invoker>(&self, inv: &mut I) -> Result<Vec<AgentRow>, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("agents")).await?)
+    /// The catalogued program (if any) whose `hash` matches — a targeted
+    /// lookup so a hash-membership check needn't drain the whole catalog.
+    pub async fn program_by_hash<I: Invoker>(
+        &self,
+        inv: &mut I,
+        hash: Vec<u8>,
+    ) -> Result<Option<ProgramRow>, ClientError> {
+        decode_opt(self.call(inv, Msg::new("program_by_hash").with("hash", hash)).await?)
+    }
+
+    /// One page of the installed-agent roster, in `instance_name` order.
+    /// Pass an empty `after_name` to start; continue from the last returned
+    /// row's `instance_name` while `more` is set. `budget` caps the page
+    /// (0 = the registry's max). Prefer [`agents_all`](Self::agents_all)
+    /// unless paging by hand.
+    pub async fn agents<I: Invoker>(
+        &self,
+        inv: &mut I,
+        after_name: String,
+        budget: u32,
+    ) -> Result<AgentPage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("agents")
+                    .with("after_name", after_name)
+                    .with("budget", budget),
+            )
+            .await?,
+        )
+    }
+
+    /// Drain the whole installed-agent roster into one `Vec`
+    /// (`instance_name` order).
+    pub async fn agents_all<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<AgentRow>, ClientError> {
+        let mut out: Vec<AgentRow> = Vec::new();
+        loop {
+            let after = out.last().map(|a| a.instance_name.clone()).unwrap_or_default();
+            let page = self.agents(inv, after, 0).await?;
+            let more = page.more;
+            out.extend(page.rows);
+            if !more {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub async fn agent<I: Invoker>(
@@ -766,6 +893,66 @@ impl RegistryRef {
             self.call(inv, Msg::new("agent").with("instance_name", instance_name))
                 .await?,
         )
+    }
+
+    /// The first installed agent (in `instance_name` order) whose name
+    /// starts with `prefix` and ends with `suffix` — a template lookup so a
+    /// caller cloning a channel's program rows needn't drain the roster.
+    pub async fn agent_by_pattern<I: Invoker>(
+        &self,
+        inv: &mut I,
+        prefix: String,
+        suffix: String,
+    ) -> Result<Option<AgentRow>, ClientError> {
+        decode_opt(
+            self.call(
+                inv,
+                Msg::new("agent_by_pattern")
+                    .with("prefix", prefix)
+                    .with("suffix", suffix),
+            )
+            .await?,
+        )
+    }
+
+    /// One page of installed-agent names (names only), in `instance_name`
+    /// order. Same cursor/`more` contract as [`agents`](Self::agents).
+    /// Prefer [`agent_names_all`](Self::agent_names_all) unless paging by
+    /// hand.
+    pub async fn agent_names<I: Invoker>(
+        &self,
+        inv: &mut I,
+        after_name: String,
+        budget: u32,
+    ) -> Result<AgentNamePage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("agent_names")
+                    .with("after_name", after_name)
+                    .with("budget", budget),
+            )
+            .await?,
+        )
+    }
+
+    /// Drain every installed-agent name into one `Vec<String>`
+    /// (`instance_name` order).
+    pub async fn agent_names_all<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<String>, ClientError> {
+        let mut out: Vec<String> = Vec::new();
+        loop {
+            let after = out.last().cloned().unwrap_or_default();
+            let page = self.agent_names(inv, after, 0).await?;
+            let more = page.more;
+            out.extend(page.names);
+            if !more {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub async fn meta_for_instance<I: Invoker>(

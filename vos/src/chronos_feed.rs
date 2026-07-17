@@ -152,13 +152,10 @@ impl ChronosFeeder {
         // Resolve the chronos raft group id once (stable from name+program).
         if self.chronos_rep.is_none() {
             let reg = RegistryRef::at(ServiceId::REGISTRY);
-            let Ok(rows) = crate::block_on(reg.agents(&mut &*node)) else {
+            let Ok(row) = crate::block_on(reg.agent(&mut &*node, "chronos".to_string())) else {
                 return; // catalog unavailable — retry next pass
             };
-            self.chronos_rep = rows
-                .iter()
-                .find(|r| r.instance_name == "chronos")
-                .map(|r| r.replication_id);
+            self.chronos_rep = row.map(|r| r.replication_id);
         }
         let Some(rep) = self.chronos_rep else {
             return; // chronos row not in the catalog yet
