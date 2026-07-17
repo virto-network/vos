@@ -14,68 +14,22 @@
 //!   fixture_bytes  native_verify_best_ms  native_verify_median_ms
 //!   max_log  n_components  peak_rss_mib
 //!
-//! The trace shape replicates `zkpvm/benches/prove.rs::add_side_note` (the
-//! established log-ladder: N sequential Add64s + Trap, 64 KiB memory) so the
-//! numbers are comparable with the existing prove benchmarks.
+//! The trace shape uses the shared `zkpvm::bench_helpers::add_side_note` helper
+//! (the established log-ladder: N sequential Add64s + Trap, 64 KiB memory) so
+//! the numbers are comparable with the existing prove benchmarks.
 
 use std::time::Instant;
 
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
 use javm::PVM_REGISTER_COUNT;
-
+use zkpvm::bench_helpers::add_side_note;
 use zkpvm::core::tracing::TracingPvm;
 use zkpvm::{
     production_pcs_config, production_pcs_config_mobile, program_commitment_of_proof,
     prove_with_config, PcsPolicy, SideNote,
 };
 use zkpvm_verifier::{verify_standalone_with_pcs_policy, CommitmentHash, Proof};
-
-/// N sequential ADD64s + Trap, registers cycled to avoid hazards — identical
-/// to `zkpvm/benches/prove.rs::generate_add_program`.
-fn generate_add_program(n: usize) -> (Vec<u8>, Vec<u8>) {
-    let mut code = Vec::with_capacity(n * 3 + 1);
-    let mut bitmask = Vec::with_capacity(n * 3 + 1);
-    let (mut ra, mut rb, mut rd): (u8, u8, u8) = (0, 1, 2);
-    for _ in 0..n {
-        code.push(Opcode::Add64 as u8);
-        code.push(ra | (rb << 4));
-        code.push(rd);
-        bitmask.extend_from_slice(&[1, 0, 0]);
-        ra = (ra + 1) % 13;
-        rb = (rb + 1) % 13;
-        rd = (rd + 1) % 13;
-    }
-    code.push(Opcode::Trap as u8);
-    bitmask.push(1);
-    (code, bitmask)
-}
-
-/// Trace an `n = 2^log_size`-step add program — identical to
-/// `zkpvm/benches/prove.rs::add_side_note`.
-fn add_side_note(log_size: u32) -> (SideNote, usize) {
-    let n_steps = 1usize << log_size;
-    let (code, bitmask) = generate_add_program(n_steps);
-    let mut regs = [0u64; PVM_REGISTER_COUNT];
-    for (i, r) in regs.iter_mut().enumerate().take(13) {
-        *r = (i as u64) + 1;
-    }
-    let gas = (n_steps as u64 + 100) * 100;
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        vec![0u8; 64 * 1024],
-        gas,
-        16,
-    );
-    let mut tracing = TracingPvm::new(pvm);
-    let _exit = tracing.run();
-    let steps = tracing.into_trace();
-    assert!(steps.len() >= n_steps, "trace shorter than requested");
-    (SideNote::new(steps, code, bitmask), n_steps)
-}
 
 /// Peak resident set of this process, in KiB (`VmHWM` from /proc).
 fn peak_rss_kib() -> u64 {

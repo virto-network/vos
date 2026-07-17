@@ -26,8 +26,3 @@ panic = "abort"
 
 # The wasmtime embedding is measurement scaffolding — don't pay fat-LTO build
 # time for it, and keep unwinding (wasmtime host default).
-[profile.runner]
-inherits = "release"
-lto = "off"
-codegen-units = 16
-panic = "unwind"

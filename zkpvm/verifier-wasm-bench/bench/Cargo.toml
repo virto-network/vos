@@ -27,3 +27,8 @@ embed = []
 # (no javm, no rayon, no blake3, no dalek) — the F1 carve-out.
 zkpvm-verifier = { path = "../../verifier" }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+# wasm32-unknown-unknown has no default allocator or panic handler; provide a
+# small one so the verify-only cdylib can decode postcard fixtures and run.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dlmalloc = { version = "0.2", features = ["global"] }

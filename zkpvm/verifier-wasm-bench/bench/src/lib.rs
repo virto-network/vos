@@ -6,14 +6,24 @@
 //! chosen at fixture-generation time so postcard still decodes) must return 0
 //! — proving this build actually verifies rather than trivially succeeding.
 //!
-//! The crate itself is `#![no_std]` (alloc only). The linked graph still
-//! carries wasm32 `std`, because the vos workspace pins serde with default
-//! features (std) — the same graph shape an F3 runtime integration would
-//! inherit today. std provides the global allocator and panic handler here.
+//! The crate itself is `#![no_std]` (alloc only). wasm32-unknown-unknown has no
+//! default allocator or panic handler, so we supply a small `dlmalloc` global
+//! allocator and a minimal panic handler below. The `zkpvm-verifier` library
+//! stays `no_std`; only this measurement embedding needs the runtime support.
 
 #![no_std]
 
 extern crate alloc;
+
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
+#[cfg(target_arch = "wasm32")]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable();
+}
 
 use zkpvm_verifier::{verify_standalone_with_pcs_policy, CommitmentHash, PcsPolicy, Proof};
 

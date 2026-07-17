@@ -6,7 +6,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-# Same major as the installed wasmtime CLI (45.0.2) — report the exact
-# resolved version from `cargo tree` in the spike write-up.
-wasmtime = "45"
+# Pinned to the newest wasmtime whose MSRV matches the project's rust-toolchain
+# (1.88.0-nightly). Report the exact resolved version from `cargo tree` in the
+# spike write-up.
+wasmtime = "38"
 anyhow = "1"
