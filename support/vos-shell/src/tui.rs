@@ -774,6 +774,7 @@ mod tests {
             caps: vec![],
             doc: String::new(),
             crdt: false,
+            provable: false,
         };
         let engine = ConsoleEngine::new(Arc::new(Mock { schema })).unwrap();
         App::new(engine).unwrap().with_label("demo")

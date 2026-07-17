@@ -113,8 +113,21 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   #[actor(error = Type)]         — custom error type for Actor::Error
     //   #[actor(kind = "transport")]   — opt into transport-mode (handle_connection)
     //   #[actor(caps = ["net.tcp.bind", ...])] — declarative capability list
+    // A proof exists only for the witness-delivered, refine-pure Task
+    // shape — `provable` on anything else is a category error, not a
+    // flag to ignore (docs/plans/provable.md D1/D6).
+    if parsed.provable && parsed.task_buf.is_none() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[actor(provable)] requires `task`: a provable actor is a \
+             witness-delivered Task — write #[actor(task, provable)]",
+        )
+        .to_compile_error()
+        .into();
+    }
     let error_ty = parsed.error_ty;
     let kind_byte = parsed.kind_byte;
+    let provable = parsed.provable;
     let caps_lits = parsed.caps;
     let role_ty = parsed.role_ty;
     let default_role = parsed.default_role;
@@ -344,6 +357,10 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Extension kind discriminant; defaulted on the trait,
             // overridden here from `#[actor(kind = "...")]`.
             const KIND_BYTE: u8 = #kind_byte;
+
+            // Provable-program publication mark; defaulted false on
+            // the trait, set by `#[actor(task, provable)]`.
+            const PROVABLE: bool = #provable;
 
             // Declared capability tokens. Empty by default; overridden
             // from `#[actor(caps = [...])]`.
@@ -1201,6 +1218,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 doc: <#actor_ty as vos::Actor>::DOC,
                 // Only `#[actor(crdt)]` programs may select CRDT storage.
                 crdt: <#actor_ty as vos::Actor>::CRDT,
+                // Provable-program mark — set on the Actor trait by
+                // `#[actor(task, provable)]`, defaulted false.
+                provable: <#actor_ty as vos::Actor>::PROVABLE,
             };
         }
     };
@@ -1787,6 +1807,11 @@ struct ActorAttrs {
     task_buf: Option<usize>,
     /// Explicit CRDT source model (`#[actor(crdt)]`).
     crdt: bool,
+    /// `#[actor(task, provable)]` — publish this Task as a provable
+    /// program: sets `Actor::PROVABLE`, which lands as the `.vos_meta`
+    /// trailing provable flag (`docs/plans/provable.md` D6). Valid
+    /// only with `task`; the macro rejects it otherwise.
+    provable: bool,
 }
 
 /// Pull `#[storage]` / `#[storage(prefix = "…")]` off the state
@@ -1915,6 +1940,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
         space_role_map: quote! { vos::NO_ROLES_MAP },
         task_buf: None,
         crdt: false,
+        provable: false,
     };
     if attr.is_empty() {
         return out;
@@ -1991,6 +2017,12 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
                 {
                     out.task_buf = Some(n.base10_parse().unwrap_or(DEFAULT_TASK_BUF));
                 }
+            }
+            // Publication mark for the pin/verify tooling; validated
+            // against `task` in `actor()` (the parse layer has no
+            // error channel).
+            syn::Meta::Path(p) if p.is_ident("provable") => {
+                out.provable = true;
             }
             _ => {}
         }

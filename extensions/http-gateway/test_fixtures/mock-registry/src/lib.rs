@@ -205,6 +205,7 @@ const KITCHEN_META: ActorMeta = ActorMeta {
     cli_methods: &[],
     doc: "",
     crdt: false,
+    provable: false,
 };
 
 /// Pre-encoded meta blob — same wire bytes the bundled registry's

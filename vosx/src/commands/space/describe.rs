@@ -53,6 +53,10 @@ struct MetaView<'a> {
     /// Unauthenticated (no relay authority).
     #[serde(skip_serializing_if = "Option::is_none")]
     relay_caps: Option<Vec<String>>,
+    /// `#[actor(task, provable)]` publication mark — this Task is
+    /// meant to be pinned/proved. Omitted when false.
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
+    provable: bool,
 }
 
 impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
@@ -89,6 +93,7 @@ impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
             // Filled in by `run` from the daemon's endpoint descriptor;
             // ParsedMeta (registry schema) doesn't carry relay caps.
             relay_caps: None,
+            provable: m.provable,
         }
     }
 }

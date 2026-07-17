@@ -47,6 +47,7 @@
 //! [actor_role_count:u16 LE]      (one entry per message, in order)
 //!   [actor_role:u8]             (0xff = none, otherwise `Actor::Role`)
 //!   ...
+//! [provable:u8]                 (actor-level: #[actor(task, provable)])
 //! ```
 //!
 //! Each trailing section is append-only: older decoders that don't
@@ -144,6 +145,12 @@ pub struct ActorMeta {
     /// therefore be installed with CRDT consistency.  Ordinary actors must
     /// use Ephemeral, Local, or Raft storage.
     pub crdt: bool,
+    /// `#[actor(task, provable)]` — this Task is published as a
+    /// provable program (`docs/plans/provable.md` D6): a discovery/
+    /// publication mark for the pin/verify tooling, not a semantic
+    /// fork (record capture is the caller's `spawn_provable` opt-in
+    /// either way). Trailing section; old blobs decode `false`.
+    pub provable: bool,
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -459,6 +466,11 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         ar += 1;
     }
 
+    // Actor-level provable flag, one trailing byte. Absent →
+    // `ParsedMeta.provable` is false.
+    buf[pos] = meta.provable as u8;
+    pos += 1;
+
     (buf, pos)
 }
 
@@ -512,6 +524,7 @@ mod tests {
             cli_methods: &[],
             doc: "",
             crdt: false,
+            provable: false,
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -538,13 +551,15 @@ mod tests {
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
         assert_eq!(parsed.kind, 0);
+        assert!(!parsed.provable);
 
         assert!(
-            decode(&buf[..len - 1]).is_none(),
-            "a present policy section must contain every declared entry"
+            decode(&buf[..len - 1]).is_some(),
+            "metadata predating the trailing provable flag remains readable"
         );
         let mut wrong_count = buf[..len].to_vec();
-        let policy_count_offset = len - (2 + META.messages.len()) - (2 + META.messages.len() * 2);
+        let policy_count_offset =
+            len - 1 - (2 + META.messages.len()) - (2 + META.messages.len() * 2);
         wrong_count[policy_count_offset..policy_count_offset + 2]
             .copy_from_slice(&1u16.to_le_bytes());
         assert!(
@@ -557,7 +572,7 @@ mod tests {
             decode(&trailing).is_some(),
             "older decoders ignore a future append-only metadata section"
         );
-        let partial_actor_roles = &buf[..len - 1];
+        let partial_actor_roles = &buf[..len - 2];
         assert!(
             decode(partial_actor_roles).is_none(),
             "a present actor-role section must contain every declared entry"
@@ -587,6 +602,7 @@ mod tests {
             cli_methods: &[],
             doc: "",
             crdt: false,
+            provable: false,
         };
 
         let _ = encode::<128>(&META);
@@ -603,6 +619,7 @@ mod tests {
             cli_methods: &[],
             doc: "",
             crdt: false,
+            provable: false,
         };
         let (buf, len) = encode::<128>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -620,11 +637,13 @@ mod tests {
             cli_methods: &[],
             doc: "",
             crdt: true,
+            provable: false,
         };
         let (buf, len) = encode::<128>(&META);
         assert!(decode(&buf[..len]).unwrap().crdt);
-        // Drop both appended policy-section counts and the CRDT byte itself.
-        assert!(!decode(&buf[..len - 5]).unwrap().crdt);
+        // Drop the provable flag, both appended policy-section counts, and
+        // the CRDT byte itself.
+        assert!(!decode(&buf[..len - 6]).unwrap().crdt);
     }
 
     #[test]
@@ -656,6 +675,7 @@ mod tests {
             cli_methods: &[],
             doc: "",
             crdt: false,
+            provable: false,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -736,6 +756,7 @@ mod tests {
             cli_methods: &["stop", "status"],
             doc: "",
             crdt: false,
+            provable: false,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -855,6 +876,7 @@ mod tests {
             cli_methods: &["prove"],
             doc: "A pure-PVM prover/verifier.",
             crdt: false,
+            provable: true,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -862,6 +884,7 @@ mod tests {
         assert_eq!(parsed.messages[0].doc, "Enqueue a prove job.");
         assert_eq!(parsed.messages[0].timeout_ms, 600_000);
         assert_eq!(parsed.messages[0].mode, 1, "job-mode handler round-trips");
+        assert!(parsed.provable, "provable flag round-trips");
         assert_eq!(parsed.messages[1].doc, "");
         assert_eq!(parsed.messages[1].timeout_ms, 0);
         assert_eq!(parsed.messages[1].mode, 0, "sync handler stays mode 0");
@@ -972,6 +995,10 @@ mod decode {
         pub doc: String,
         /// True only for programs explicitly compiled with `#[actor(crdt)]`.
         pub crdt: bool,
+        /// `#[actor(task, provable)]` publication mark — this Task is
+        /// meant to be pinned/proved (`docs/plans/provable.md` D6).
+        /// `false` when the blob predates the section.
+        pub provable: bool,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -1185,6 +1212,14 @@ mod decode {
             // all-or-nothing and count-checked above.
         }
 
+        // Actor-level provable flag, one trailing byte. Absent → false.
+        let mut provable = false;
+        if let Some(&p) = data.get(pos) {
+            provable = p != 0;
+            pos += 1;
+        }
+        let _ = pos;
+
         Some(ParsedMeta {
             actor_name,
             messages,
@@ -1193,6 +1228,7 @@ mod decode {
             caps,
             doc,
             crdt,
+            provable,
         })
     }
 

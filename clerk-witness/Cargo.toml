@@ -1,0 +1,22 @@
+[package]
+name = "clerk-witness"
+version = "0.1.0"
+edition = "2024"
+
+# The cipher-clerk ↔ vos witness bridge: cipher-clerk must not depend
+# on vos and vos must not depend on cipher-clerk, so the LedgerState
+# adapter over vos::zk::state::WitnessedLedger lives here — consumed by
+# the clerk-apply provable Task, the voucher-check guest, and the
+# clerk-ledger parent (docs/plans/provable.md W4).
+
+[dependencies]
+vos = { path = "../vos", default-features = false }
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false }
+
+[dev-dependencies]
+# Host-side reference machinery for the parity tests: VecLedger +
+# keypair generation (signing pulls OsRng — host only).
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+    "helpers",
+    "signing",
+] }

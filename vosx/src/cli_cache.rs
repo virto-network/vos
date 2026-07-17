@@ -364,6 +364,7 @@ mod tests {
             caps: vec![],
             doc: String::new(),
             crdt: false,
+            provable: false,
         }
     }
 
