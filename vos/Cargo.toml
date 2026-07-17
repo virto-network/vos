@@ -187,6 +187,10 @@ zkpvm = { workspace = true }
 # links it (the clerk-ledger crate keeps cipher-clerk on
 # default-features = []).
 cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["signing", "viewing-keys", "voucher", "notes", "helpers", "settlement"] }
+# The cipher-clerk ↔ vos witness bridge — the W4 clerk-apply gate builds
+# a ClerkTransitionWitness through it and asserts the Task's attested
+# roots match a live apply.
+clerk-witness = { path = "../clerk-witness", default-features = false }
 # Used by a single robustness test that hand-corrupts the
 # actor's persisted state to simulate schema drift.
 redb = "2"

@@ -48,7 +48,7 @@ build-settle:
 # surfaces as `register_remote Unreachable` and a stale voucher-check /
 # prover .so as a `ProofInvalid`. (Run `just build-actors` by hand if you invoke
 # `cargo test` directly instead of through `just test-pvm`.)
-build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge build-clerk-settle build-voucher-check build-witnessed-transfer
+build-actors: build-registry build-bridge build-clerk-ledger build-clerk-bridge build-clerk-settle build-voucher-check build-witnessed-transfer build-clerk-apply
     cargo build -p prover-extension
     cargo build -p prover-extension --release
 
@@ -168,6 +168,16 @@ build-clerk-settle:
 # replication, no Ref API consumers.
 build-voucher-check:
     cd examples/actors/voucher-check; cargo +nightly build --release
+
+
+# Build the clerk-apply PVM guest — the flagship `#[actor(task, provable)]`
+# Task (docs/plans/provable.md W4). A pure verifier of a cipher-clerk batch
+# transition over a witnessed `clerk_witness::ClerkTransitionWitness`: it
+# reconstructs `root_before`, re-runs the real kernel over the witnessed
+# leaves, computes `root_after`, and binds the two roots + batch digest.
+# The W4 gate in `vos/tests/elf_integration.rs` captures its `ProvableRecord`.
+build-clerk-apply:
+    cd examples/actors/clerk-apply; cargo +nightly build --release
 
 
 # Build the witnessed-transfer PVM guest — the `#[provable]` W1 fixture

@@ -1,0 +1,45 @@
+[workspace]
+
+[package]
+name = "clerk-apply"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `bin` gates the PVM entry-point block (`_start` + the `.vos_meta`
+# section) the `#[actor]` macro emits on riscv64. Default-on so a plain
+# `cargo build` produces the actor ELF.
+default = ["bin"]
+bin = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
+
+# The flagship #[provable] Task (docs/plans/provable.md W4): a PURE
+# VERIFIER of a cipher-clerk batch transition. A clerk-ledger parent
+# gathers the touched committed leaves + a BatchProof per sub-tree
+# (CommittedMap::batch_proof), ships them as a ClerkTransitionWitness,
+# and invokes this Task with a record tag; the Task verifies root_before,
+# re-runs the real kernel over the witnessed leaves, computes root_after,
+# and binds (root_before ‖ root_after ‖ batch_digest) — the parent then
+# applies the live writes against the attested root.
+#
+# Built via `cargo +nightly build --release` (the .cargo/config.toml pins
+# the riscv64em-javm target + build-std, exactly like voucher-check).
+
+[dependencies]
+vos = { path = "../../../vos", default-features = false, features = ["macros", "service"] }
+clerk-witness = { path = "../../../clerk-witness", default-features = false }
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+    "pvm-precompile",
+] }
+
+# `pvm-precompile` routes cipher-clerk's Ristretto / scalar ops through
+# zkpvm's precompile ECALLs instead of software dalek — the small-trace
+# path voucher-check already proves against. `signing`/`helpers` stay
+# OFF: the Task only DECODES + verifies a witness (no OsRng/getrandom).
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

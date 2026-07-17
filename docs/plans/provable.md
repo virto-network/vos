@@ -336,6 +336,59 @@ the record opt-in, not a semantic fork — "every Task is one
    the generalized helper; docs. This is the proof the whole design
    pays for itself — voucher-check should shrink, not grow.
 
+## Landing status (W1–W4)
+
+W1–W3 landed as described. **W4 landed** with these concrete pieces:
+
+- **Parent-side extraction.** `CommittedMap::batch_proof(touched)`
+  reads a `vos::zk::state::BatchProof` multiproof (+ each key's raw
+  value row) straight off the stored tree's memoized branch refs —
+  O(touched·log n), byte-identical to `BatchProof::build` over the full
+  leaf set. This is the crux the plan flagged: a 10k-account transfer
+  cannot walk every leaf to build a proof.
+- **The bridge — `clerk-witness`.** cipher-clerk must not depend on vos
+  and vice-versa, so the `LedgerState`-over-six-`WitnessedLedger`s
+  adapter lives in its own crate. It runs the REAL cipher-clerk kernel
+  as a pure verifier; a parity gate proves it reconstructs
+  byte-identical `(root_before, root_after)` to cipher-clerk's own
+  `SuccinctTransitionWitness` and a live `VecLedger` apply, and rejects
+  swapped / lying-absent / tampered witnesses.
+- **The macro flag.** `#[actor(task, provable)]` sets `Actor::PROVABLE`
+  → the `.vos_meta` trailing `provable` byte (old blobs decode false);
+  the macro rejects `provable` without `task`. `vosx zk pin` notes the
+  mark, `vosx describe` surfaces it.
+- **The flagship Task — `clerk-apply`.** A real
+  `#[actor(task, provable)]` guest that verifies a cipher-clerk batch
+  transition through the bridge and binds `app_public = root_before ‖
+  root_after ‖ batch_digest`. Its gate traces it exactly as the prover
+  would (the proof path), asserts a clean halt, and checks the bound
+  roots against a live apply + the framework io-hash over `public'`.
+
+**Deferred (documented, orthogonal to the framework):**
+
+- *Live-drive record capture for precompile Tasks.* clerk-apply uses
+  cipher-clerk's `pvm-precompile` (small prove trace), whose Ristretto/
+  scalar ECALLs the LIVE `run_task_invoke` path has no host handler for
+  yet ("no vos host handler yet, though the tracer has one" —
+  `runtime.rs`). So the W4 gate proves clerk-apply via the *trace* (what
+  a counterparty verifies) rather than a live invoke. Wiring the
+  precompile handlers into `handle_task_hostcall` /
+  `handle_refine_hostcall` (which would also let clerk-ledger itself
+  adopt the precompiles) is a self-contained runtime follow-up.
+- *voucher-check migration.* The bridge's parity gate already
+  establishes that `WitnessedLedger` reproduces cipher-clerk's succinct
+  verify byte-for-byte, and clerk-apply is a fuller demonstration than
+  a voucher-check swap. Migrating voucher-check's guest would change its
+  witness wire (six `LedgerWitness` vs the private-field
+  `SuccinctTransitionWitness`), break the federation e2e's six witness
+  builders, and force another money-path re-pin for marginal in-repo
+  shrink (voucher-check's guest is already a ~110-line wrapper; the
+  shrinkable machinery lives in cipher-clerk, a separate repo).
+- *Parent-side delegation glue + the clerk-ledger production wiring.*
+  D6's macro-generated "gather touched leaves + `batch_proof` + invoke +
+  apply" boilerplate, and rewiring clerk-ledger's `apply_transfer` to
+  spawn the apply Task, follow once the live-drive handler lands.
+
 ---
 
 ## Review archive (why the rewrite happened)
