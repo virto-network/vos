@@ -71,7 +71,7 @@ build-test-artifacts: build-extensions build-pvm build-v2-pvm-test-artifacts bui
 build-actors: (build-actor "space-registry") (build-actor "space-bridge") \
               (build-actor "space-authority") \
               (build-actor "clerk-ledger") (build-actor "clerk-bridge") \
-              (build-actor "clerk-settle")
+              (build-actor "clerk-settle") build-clerk-apply
     cargo build -p prover-extension
     cargo build -p prover-extension --release
 
@@ -82,6 +82,10 @@ build-voucher-check:
 # Build the pure-verifier Task used by the WitnessedLedger proof gate.
 build-witnessed-transfer:
     cd tests/fixtures/legacy-v1/actors/witnessed-transfer; cargo +nightly actor
+
+# Build the flagship #[actor(task, provable)] pure verifier.
+build-clerk-apply:
+    cd examples/actors/clerk-apply; cargo +nightly build --release
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")

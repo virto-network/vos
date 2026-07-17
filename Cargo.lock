@@ -7677,6 +7677,7 @@ dependencies = [
  "clerk-bridge",
  "clerk-ledger",
  "clerk-settle",
+ "clerk-witness",
  "committed-counter",
  "crdt-counter",
  "dlmalloc",

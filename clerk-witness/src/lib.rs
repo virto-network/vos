@@ -518,6 +518,34 @@ pub fn ledger_witness_from_leaves(
     }
 }
 
+/// The six sub-trees of a [`VecLedger`](cipher_clerk::snapshot::VecLedger)
+/// as [`FullLeaves`] — each `(key, canonical leaf content)` pair the
+/// cipher-clerk SMT commits, in the six-tuple order the witness
+/// builders take (accounts, transfers, journals, external_ids, voided,
+/// pending). Producer/test tooling: a `VecLedger` holds the whole
+/// ledger, so this walks every leaf; a live clerk-ledger parent
+/// extracts touched-only proofs via `CommittedMap::batch_proof`
+/// instead.
+pub fn vec_ledger_full_leaves(
+    l: &cipher_clerk::snapshot::VecLedger,
+) -> [FullLeaves; 6] {
+    let accounts = l.accounts.iter().map(|a| (a.id.0, account_leaf_content(a))).collect();
+    let transfers = l.transfers.iter().map(|t| (t.id.0, transfer_leaf_content(t))).collect();
+    let journals = l.journal.iter().map(|j| (j.id.0, journal_leaf_content(j))).collect();
+    let external_ids = l
+        .external_ids
+        .iter()
+        .map(|eid| (external_id_key(eid), external_id_leaf_content(eid)))
+        .collect();
+    let voided = l.voided_transfers.iter().map(|id| (*id, voided_leaf_content(id))).collect();
+    let pending = l
+        .pending_statuses
+        .iter()
+        .map(|e| (e.id, pending_leaf_content(&e.id, e.status)))
+        .collect();
+    [accounts, transfers, journals, external_ids, voided, pending]
+}
+
 /// Assemble a full [`ClerkTransitionWitness`] from the six trees'
 /// complete leaf sets — the host/test producer (the e2e conservation
 /// builder). `touched` normally comes from [`discover_touched`].
@@ -545,4 +573,36 @@ pub fn witness_from_leaves(
         events,
         batch_seed_timestamp,
     }
+}
+
+/// One-call producer over a [`VecLedger`](cipher_clerk::snapshot::VecLedger):
+/// discover the touched keys, extract the full-leaf witness, and return
+/// it — the host/test path (the federation e2e + the W4 gate). Panics
+/// if the probe batch would not apply cleanly (a caller should never
+/// prove a rejected batch). A live clerk-ledger parent instead probes
+/// its own committed state and extracts per-field `batch_proof`s.
+pub fn witness_from_vec_ledger(
+    ledger: &cipher_clerk::snapshot::VecLedger,
+    events: Vec<Transfer>,
+    oracle: OpeningsOracle,
+    batch_seed_timestamp: u64,
+) -> ClerkTransitionWitness {
+    let (touched, statuses) = discover_touched(ledger, &events, &oracle, batch_seed_timestamp);
+    for s in &statuses {
+        assert!(*s == EventStatus::Created, "probe batch does not apply cleanly");
+    }
+    let [accounts, transfers, journals, external_ids, voided, pending] =
+        vec_ledger_full_leaves(ledger);
+    witness_from_leaves(
+        &accounts,
+        &transfers,
+        &journals,
+        &external_ids,
+        &voided,
+        &pending,
+        &touched,
+        oracle,
+        events,
+        batch_seed_timestamp,
+    )
 }
