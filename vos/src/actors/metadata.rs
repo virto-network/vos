@@ -40,6 +40,7 @@
 //! [mode_count:u16 LE]           (one entry per message, in order)
 //!   [mode:u8]                   (0 = sync, 1 = job)
 //!   ...
+//! [provable:u8]                 (actor-level: #[actor(task, provable)])
 //! ```
 //!
 //! Each trailing section is append-only: older decoders that don't
@@ -121,6 +122,12 @@ pub struct ActorMeta {
     /// struct's `///` doc, threaded through `Actor::DOC` by the macro.
     /// Empty when undocumented. Trailing section; old blobs decode empty.
     pub doc: &'static str,
+    /// `#[actor(task, provable)]` — this Task is published as a
+    /// provable program (`docs/plans/provable.md` D6): a discovery/
+    /// publication mark for the pin/verify tooling, not a semantic
+    /// fork (record capture is the caller's `spawn_provable` opt-in
+    /// either way). Trailing section; old blobs decode `false`.
+    pub provable: bool,
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -392,6 +399,11 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         md += 1;
     }
 
+    // Actor-level provable flag, one trailing byte. Absent →
+    // `ParsedMeta.provable` is false.
+    buf[pos] = meta.provable as u8;
+    pos += 1;
+
     (buf, pos)
 }
 
@@ -438,6 +450,7 @@ mod tests {
             caps: &[],
             cli_methods: &[],
             doc: "",
+            provable: false,
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -471,6 +484,7 @@ mod tests {
             caps: &[],
             cli_methods: &[],
             doc: "",
+            provable: false,
         };
         let (buf, len) = encode::<128>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -505,6 +519,7 @@ mod tests {
             caps: &["net.tcp.bind", "net.tcp.connect", "tokio-runtime"],
             cli_methods: &[],
             doc: "",
+            provable: false,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -575,6 +590,7 @@ mod tests {
             caps: &[],
             cli_methods: &["stop", "status"],
             doc: "",
+            provable: false,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -687,6 +703,7 @@ mod tests {
             caps: &[],
             cli_methods: &["prove"],
             doc: "A pure-PVM prover/verifier.",
+            provable: true,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -694,6 +711,7 @@ mod tests {
         assert_eq!(parsed.messages[0].doc, "Enqueue a prove job.");
         assert_eq!(parsed.messages[0].timeout_ms, 600_000);
         assert_eq!(parsed.messages[0].mode, 1, "job-mode handler round-trips");
+        assert!(parsed.provable, "provable flag round-trips");
         assert_eq!(parsed.messages[1].doc, "");
         assert_eq!(parsed.messages[1].timeout_ms, 0);
         assert_eq!(parsed.messages[1].mode, 0, "sync handler stays mode 0");
@@ -792,6 +810,10 @@ mod decode {
         /// One-line actor description (metadata v2). Empty when the
         /// blob predates the doc section or the actor is undocumented.
         pub doc: String,
+        /// `#[actor(task, provable)]` publication mark — this Task is
+        /// meant to be pinned/proved (`docs/plans/provable.md` D6).
+        /// `false` when the blob predates the section.
+        pub provable: bool,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -961,6 +983,14 @@ mod decode {
             }
         }
 
+        // Actor-level provable flag, one trailing byte. Absent → false.
+        let mut provable = false;
+        if let Some(&p) = data.get(pos) {
+            provable = p != 0;
+            pos += 1;
+        }
+        let _ = pos;
+
         Some(ParsedMeta {
             actor_name,
             messages,
@@ -968,6 +998,7 @@ mod decode {
             kind,
             caps,
             doc,
+            provable,
         })
     }
 

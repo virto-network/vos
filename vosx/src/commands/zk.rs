@@ -231,6 +231,23 @@ fn pin(args: PinArgs) -> Result<()> {
         .map_err(|e| anyhow!("transpile {}: {e:?}", args.elf.display()))?;
     let waddr = witness_addr(&elf)
         .with_context(|| format!("{} must export a resolved __VOS_WITNESS", args.elf.display()))?;
+    // The `.vos_meta` provable mark (`#[actor(task, provable)]`) is
+    // advisory at pin time: voucher-check-style refine provables carry
+    // no mark (the flag is Task-only), so an unmarked ELF pins with a
+    // note rather than a refusal.
+    match vos::metadata::from_elf(&elf) {
+        Some(meta) if meta.provable => {
+            eprintln!("'{}' is marked provable (#[actor(task, provable)])", meta.actor_name);
+        }
+        Some(meta) => {
+            eprintln!(
+                "note: '{}' carries no provable mark — pinning anyway (refine-style \
+                 provables don't carry it; Tasks should declare #[actor(task, provable)])",
+                meta.actor_name
+            );
+        }
+        None => {}
+    }
     let profile_arg = args.profile.as_ref().map(read_profile).transpose()?;
 
     // The witness drives the MEASURE path; the `--allowlist` re-pin path passes

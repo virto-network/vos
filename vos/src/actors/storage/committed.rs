@@ -365,6 +365,145 @@ impl<K: FixedKey, V: Encode + Decode> CommittedMap<K, V> {
         }
     }
 
+    /// Extract a [`BatchProof`](state::BatchProof) multiproof for
+    /// `touched` keys, plus each key's current raw VALUE-row bytes
+    /// (`None` = absent — a proven non-inclusion), from the stored tree
+    /// — WITHOUT walking the full leaf set. The branch-node rows
+    /// memoize every untouched subtree's hash, so the walk reads
+    /// O(touched · log n) rows; the result is byte-identical to
+    /// [`state::BatchProof::build`] over the full sorted leaves.
+    ///
+    /// This is the provable-Task parent's witness half
+    /// (`docs/plans/provable.md` D2): together with [`Self::root`] as
+    /// `root_before`, the returned pair feeds a
+    /// [`LedgerWitness`](state::LedgerWitness) — the caller maps each
+    /// value to its LEAF CONTENT first (identity for [`Self::insert`]
+    /// rows; the pinned encoding, e.g. `tag ‖ bytes`, for
+    /// [`Self::insert_with_leaf`] rows — the same lockstep contract as
+    /// the insert side). Reads the dispatch-effective overlay, exactly
+    /// like every other accessor: extract BEFORE mutating if the
+    /// witness must be against the entry state.
+    ///
+    /// Duplicate keys in `touched` collapse; the returned values are
+    /// sorted ascending by key bytes — the order
+    /// [`WitnessedLedger`](state::WitnessedLedger) construction expects.
+    pub fn batch_proof(
+        &self,
+        touched: &[K],
+    ) -> (state::BatchProof, Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        let p = self.params();
+        let chain = state::empty_chain(&p);
+        let mut keys: Vec<Vec<u8>> = touched.iter().map(|k| Self::key_bytes(k)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let values: Vec<(Vec<u8>, Option<Vec<u8>>)> = keys
+            .iter()
+            .map(|kb| (kb.clone(), overlay_load(&self.value_row(kb))))
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let (_, _, top) = self.read_root();
+        let mut frontier = Vec::new();
+        self.collect_frontier(
+            &p,
+            &chain,
+            &top,
+            0,
+            alloc::vec![0u8; p.width],
+            &key_refs,
+            &mut frontier,
+        );
+        (state::BatchProof::from_frontier(frontier), values)
+    }
+
+    /// The extraction walk behind [`Self::batch_proof`] — mirrors
+    /// `BatchProof::root_rec`'s touched-split recursion exactly (same
+    /// cells, same partition), sourcing each untouched non-empty
+    /// subtree's hash from the stored ref (memoized branch/leaf hash,
+    /// spine-lifted to the cell) instead of a full-leaf recompute. The
+    /// off-path side of a compressed spine holds no stored content, so
+    /// touched keys splitting onto it emit nothing (the verifier folds
+    /// the empty chain — their non-inclusion).
+    #[allow(clippy::too_many_arguments)]
+    fn collect_frontier(
+        &self,
+        p: &SmtParams,
+        chain: &[[u8; 32]],
+        r: &Ref,
+        level: usize,
+        prefix: Vec<u8>,
+        touched: &[&[u8]],
+        out: &mut Vec<state::FrontierNode>,
+    ) {
+        if touched.is_empty() {
+            if !matches!(r, Ref::Empty) {
+                out.push(state::FrontierNode {
+                    level: level as u16,
+                    prefix,
+                    hash: ref_subtree_hash(p, chain, r, level),
+                });
+            }
+            return;
+        }
+        if matches!(r, Ref::Empty) {
+            // Nothing stored below this cell: no frontier to record,
+            // and the touched keys here prove absent through the empty
+            // chain — no need to recurse the remaining levels.
+            return;
+        }
+        if p.depth() == level {
+            // A touched leaf cell: the verifier supplies its content
+            // hash, so nothing is recorded whether or not a leaf is
+            // stored here.
+            return;
+        }
+        // The single stored occupant below this cell (leaf, or a deeper
+        // branch) continues down its own side of every split; the other
+        // side is stored-empty. A real two-child split happens only at
+        // the branch's own level, where the node row names both sides.
+        let (left_ref, right_ref);
+        match r {
+            Ref::Empty => unreachable!("guarded above"),
+            Ref::Leaf { key, .. } => {
+                if state::level_bit(key, level) {
+                    left_ref = Ref::Empty;
+                    right_ref = r.clone();
+                } else {
+                    left_ref = r.clone();
+                    right_ref = Ref::Empty;
+                }
+            }
+            Ref::Branch {
+                level: node_level,
+                prefix: node_prefix,
+                ..
+            } => {
+                if level < *node_level as usize {
+                    // Spine descent toward the branch's own level.
+                    if state::level_bit(node_prefix, level) {
+                        left_ref = Ref::Empty;
+                        right_ref = r.clone();
+                    } else {
+                        left_ref = r.clone();
+                        right_ref = Ref::Empty;
+                    }
+                } else {
+                    debug_assert_eq!(level, *node_level as usize);
+                    let (l, rt) = self.read_node(*node_level, node_prefix);
+                    left_ref = l;
+                    right_ref = rt;
+                }
+            }
+        }
+        let byte_idx = level / 8;
+        let bit_idx = 7 - (level % 8);
+        let split = touched.partition_point(|k| (k[byte_idx] >> bit_idx) & 1 == 0);
+        let (t_left, t_right) = touched.split_at(split);
+        let mut prefix_r = prefix.clone();
+        prefix_r[byte_idx] |= 1 << bit_idx;
+        self.collect_frontier(p, chain, &left_ref, level + 1, prefix, t_left, out);
+        self.collect_frontier(p, chain, &right_ref, level + 1, prefix_r, t_right, out);
+    }
+
     /// Set (`Some(leaf_hash)`) or clear (`None`) `kb`'s leaf and
     /// rewrite the branch path up to the root row. Returns whether the
     /// key-set changed (fresh insert / real removal).
@@ -648,6 +787,127 @@ mod tests {
         let walked: Vec<([u8; 16], u64)> = m.iter().collect();
         let expected: Vec<([u8; 16], u64)> = model.iter().map(|(k, v)| (*k, *v)).collect();
         assert_eq!(walked, expected, "in-order walk mismatch");
+    }
+
+    #[test]
+    fn batch_proof_matches_full_build_and_feeds_witnessed_ledger() {
+        use crate::zk::state::{BatchProof, WitnessedLedger};
+        fresh();
+        let mut m = map();
+        let p = m.params();
+        let mut model: BTreeMap<[u8; 16], u64> = BTreeMap::new();
+        for step in 0u64..120 {
+            let k = key(step % 37);
+            match step % 5 {
+                0..=2 => {
+                    m.insert(&k, &step);
+                    model.insert(k, step);
+                }
+                3 => {
+                    m.remove(&k);
+                    model.remove(&k);
+                }
+                _ => {}
+            }
+        }
+        let full: Vec<([u8; 16], [u8; 32])> = model
+            .iter()
+            .map(|(k, v)| (*k, leaf_hash(&p, &v.encode())))
+            .collect();
+
+        // Touched mixes: present-only, absent-only, mixed (+ a duplicate),
+        // and the whole key set — every shape the extraction must agree
+        // with the full-leaf reference builder on, byte for byte.
+        let present: Vec<[u8; 16]> = model.keys().take(3).copied().collect();
+        let absent = [key(1_000), key(2_000)];
+        let mut mixed: Vec<[u8; 16]> = present.clone();
+        mixed.extend_from_slice(&absent);
+        mixed.push(present[0]); // duplicates collapse
+        let everything: Vec<[u8; 16]> = model.keys().copied().collect();
+        for touched in [&present[..], &absent[..], &mixed[..], &everything[..]] {
+            let (proof, values) = m.batch_proof(touched);
+            let mut kb: Vec<Vec<u8>> = touched.iter().map(|k| k.to_vec()).collect();
+            kb.sort_unstable();
+            kb.dedup();
+            let refs: Vec<&[u8]> = kb.iter().map(|k| k.as_slice()).collect();
+            assert_eq!(
+                proof,
+                BatchProof::build(&p, &full, &refs),
+                "extracted frontier must equal the full-leaf build ({} touched)",
+                refs.len()
+            );
+            // Values are the raw rows, sorted, with proven absence as None.
+            assert_eq!(values.len(), refs.len());
+            for (k, v) in &values {
+                let mut key16 = [0u8; 16];
+                key16.copy_from_slice(k);
+                assert_eq!(v.as_deref(), model.get(&key16).map(|x| x.encode()).as_deref());
+            }
+        }
+
+        // The extraction feeds WitnessedLedger end to end: plain inserts
+        // hash the value's own encoding, so content == the returned row
+        // bytes. Verify root_before, apply a write, and match the model.
+        let (proof, values) = m.batch_proof(&mixed);
+        let touched: Vec<(Vec<u8>, Option<Vec<u8>>)> = values;
+        let mut ledger = WitnessedLedger::new(p, proof, touched, m.root());
+        let target = present[1];
+        ledger.insert(&target, 777u64.encode());
+        model.insert(target, 777);
+        assert_eq!(
+            ledger.root(),
+            reference_root(&p, &model),
+            "witnessed root_after must match the full model recompute"
+        );
+    }
+
+    #[test]
+    fn batch_proof_covers_pinned_leaf_contents_and_edge_trees() {
+        use crate::zk::state::{BatchProof, WitnessedLedger};
+        // Pinned leaf contents (insert_with_leaf, the cipher-clerk
+        // tag ‖ payload shape): the caller maps rows to contents and
+        // the extracted proof still verifies the roots.
+        fresh();
+        let mut m = map();
+        let p = m.params();
+        const TAG: u8 = 3;
+        let content = |bytes: &[u8]| {
+            let mut c = Vec::with_capacity(1 + bytes.len());
+            c.push(TAG);
+            c.extend_from_slice(bytes);
+            c
+        };
+        for i in 0u64..12 {
+            let v = i * 11;
+            m.insert_with_leaf(&key(i), &v, &content(&v.encode()));
+        }
+        let touched_keys = [key(2), key(7), key(50_000)];
+        let (proof, values) = m.batch_proof(&touched_keys);
+        let touched: Vec<(Vec<u8>, Option<Vec<u8>>)> = values
+            .into_iter()
+            .map(|(k, v)| (k, v.map(|bytes| content(&bytes))))
+            .collect();
+        let ledger = WitnessedLedger::new(p, proof, touched, m.root());
+        assert_eq!(ledger.get(&key(2)), Some(content(&22u64.encode()).as_slice()));
+        assert_eq!(ledger.get(&key(50_000)), None, "named-but-absent is proven absent");
+
+        // Edge trees: empty map (all-absent witness over the empty
+        // root), and a single-leaf map probed off-path.
+        fresh();
+        let m = map();
+        let (proof, values) = m.batch_proof(&[key(1), key(2)]);
+        assert_eq!(proof, BatchProof::build::<[u8; 16]>(&p, &[], &[&key(1), &key(2)]));
+        let touched: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+            values.into_iter().map(|(k, v)| (k, v)).collect();
+        let ledger = WitnessedLedger::new(p, proof, touched, m.root());
+        assert_eq!(ledger.get(&key(1)), None);
+
+        fresh();
+        let mut m = map();
+        m.insert(&key(9), &9u64);
+        let full = [(key(9), leaf_hash(&p, &9u64.encode()))];
+        let (proof, _) = m.batch_proof(&[key(4)]);
+        assert_eq!(proof, BatchProof::build(&p, &full, &[&key(4)]));
     }
 
     #[test]

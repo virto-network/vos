@@ -255,13 +255,26 @@ pub struct BatchProof {
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
 #[rkyv(crate = rkyv)]
-struct FrontierNode {
-    level: u16,
-    prefix: Vec<u8>,
-    hash: [u8; 32],
+pub(crate) struct FrontierNode {
+    pub(crate) level: u16,
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) hash: [u8; 32],
 }
 
 impl BatchProof {
+    /// Assemble a proof from already-computed frontier nodes — the
+    /// [`CommittedMap::batch_proof`](crate::storage::CommittedMap::batch_proof)
+    /// extraction path, which reads the hashes off the stored tree's
+    /// memoized branch refs instead of recomputing them from the full
+    /// leaf set. Crate-internal: an arbitrary frontier is an arbitrary
+    /// CLAIM — the only public constructors are [`build`](Self::build)
+    /// (from the full tree) and the extraction, both of which produce
+    /// frontiers that verify against the tree they came from.
+    pub(crate) fn from_frontier(mut frontier: Vec<FrontierNode>) -> Self {
+        frontier.sort_unstable_by(|a, b| (a.level, &a.prefix).cmp(&(b.level, &b.prefix)));
+        Self { frontier }
+    }
+
     /// Build a multiproof for `touched_keys` against the full tree
     /// given as sorted `(key, leaf_hash)` leaves. Touched keys absent
     /// from the tree are valid (non-inclusion). Host-side only in

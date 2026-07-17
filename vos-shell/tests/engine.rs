@@ -41,6 +41,7 @@ fn meta(actor: &str, msgs: &[(&str, &[(&str, &str)], bool, bool)]) -> ParsedMeta
         kind: 0,
         caps: vec![],
         doc: String::new(),
+        provable: false,
     }
 }
 

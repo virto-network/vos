@@ -84,6 +84,16 @@ pub trait Actor: Sized + Encode + Decode {
     /// only `Actor` and `Transport` exist.)
     const KIND_BYTE: u8 = 0;
 
+    /// `#[actor(task, provable)]` — this Task is published as a
+    /// provable program (`docs/plans/provable.md` D6): a discovery /
+    /// publication mark landing in `.vos_meta` for the pin/verify
+    /// tooling. Not a semantic fork — record capture stays the
+    /// caller's `spawn_provable` opt-in either way. Only valid
+    /// alongside `task` (the macro rejects the flag on non-Task
+    /// actors: a proof exists only for the witness-delivered,
+    /// refine-pure execution shape).
+    const PROVABLE: bool = false;
+
     /// Capability tokens the actor / extension wants to use.
     /// Declarative-only: the host logs them at load time and surfaces
     /// them in operator-facing tools. PVM actors leave this empty —
