@@ -31,8 +31,8 @@ const INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 /// Resolve the per-invoke timeout, honouring an env override.
 /// `VOSX_INVOKE_TIMEOUT_MS` lets the e2e suite shorten the wait
 /// when it intentionally talks to a handler that doesn't reply
-/// (extension dispatch before Phase 5 wires the `stop`/`status`
-/// handlers). Production callers never set it, so the default
+/// (extension dispatch before `stop`/`status` handlers are
+/// wired). Production callers never set it, so the default
 /// stays at 10s.
 fn invoke_timeout() -> Duration {
     std::env::var("VOSX_INVOKE_TIMEOUT_MS")
@@ -102,11 +102,10 @@ impl DaemonClient {
         let bootstrap: libp2p::Multiaddr = libp2p::Multiaddr::from_str(bootstrap_str)
             .map_err(|e| anyhow::anyhow!("bad daemon multiaddr '{bootstrap_str}': {e}"))?;
 
-        // Sprint 2: load the operator's persistent libp2p
-        // identity from $XDG_CONFIG_HOME/vosx/identity.key
-        // (auto-create on first call). The daemon recognises
-        // the same PeerId across invocations and consults its
-        // members ACL table.
+        // Load the operator's persistent libp2p identity from
+        // $XDG_CONFIG_HOME/vosx/identity.key (auto-create on first
+        // call). The daemon recognises the same PeerId across
+        // invocations and consults its members ACL table.
         let keypair = crate::identity::load_or_create()?;
         let peer_id = libp2p::PeerId::from(keypair.public());
         let local_prefix = vos::network::derive_node_prefix(&peer_id);
@@ -645,7 +644,7 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.revoke_invite(): {e}"))
     }
 
-    // ── M4/M8 actor-local grants ────────────────────────────────
+    // ── Actor-local grants ────────────────────────────────
 
     pub fn grant_actor_role(
         &self,

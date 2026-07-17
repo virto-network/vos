@@ -1,5 +1,5 @@
-// Phase 1 will exercise every public symbol; until then the
-// module is loaded but unused.
+// Blob helpers are referenced by command paths that may not be built
+// in every configuration.
 #![allow(dead_code)]
 
 //! Content-addressed blob cache and source resolver.

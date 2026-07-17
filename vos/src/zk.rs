@@ -50,10 +50,10 @@
 //! 2. The actor's halt sequence places that hash into the final-state
 //!    register window φ[9..12] (RISC-V `a2..a5`) via inline-asm `in`
 //!    operands on the halting `ecall` (see `actors::run`'s
-//!    `halt_with_output_bound`).  Phase Z0's closing chip pins the
-//!    final-register columns and the verifier's boundary-binding check
+//!    `halt_with_output_bound`). The closing chip pins the final-register
+//!    columns and the verifier's boundary-binding check
 //!    (`zkpvm::boundary_binding`) equates `final_state.registers` to
-//!    them — no new ECALL, no prover changes.  That equality binds the
+//!    them — no new ECALL, no prover changes. That equality binds the
 //!    public registers to the committed closing-chip columns, and those
 //!    columns are pinned to the trace's true final registers by
 //!    `RegisterMemoryChip` read-consistency — a cross-row
@@ -322,8 +322,8 @@ pub fn __take_pending_io_hash() -> Option<[u8; 32]> {
 /// enters the hash).
 ///
 /// Computes [`compute_io_hash_typed`] and stashes it; `run_refine_service`
-/// places it into the Phase-Z0-bound final-state register window φ[9..12]
-/// at halt, making it the proof's [`zkpvm::Proof::public_io_hash`].  The
+/// places it into the final-state register window φ[9..12] at halt,
+/// making it the proof's [`zkpvm::Proof::public_io_hash`]. The host
 /// host verifier checks it against a recomputed `compute_io_hash` over the
 /// same `(public, return)`.
 ///

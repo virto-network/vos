@@ -5,29 +5,11 @@
 //! envelope around frames — the libp2p `request_response` codec
 //! length-prefixes the bytes for us.
 //!
-//! Cycle 2 frames:
-//!
-//! - [`Frame::Hello`] — exchanged once per connection so peers learn
-//!   each other's `node_prefix`. Sent as a request; the receiver's
-//!   own `Hello` rides back as the response.
-//! - [`Frame::Tell`] — fire-and-forget envelope addressed to a
-//!   service on the remote node. The response slot carries
-//!   [`Frame::Ack`].
-//! - [`Frame::InvokeRequest`] / [`Frame::InvokeReply`] — synchronous
-//!   request/reply pair, one round trip per call. Reuses the
-//!   `chain` field from [`crate::node`] for cross-node cycle and
-//!   depth detection.
-//!
-//! Cycle 3 frames (CRDT replication):
-//!
-//! - [`Frame::FetchHeads`] / [`Frame::Heads`] — "what are your
-//!   merkle-clock roots for this replication group?" Carries a
-//!   32-byte `replication_id` (typically `blake2b(blob || name)`)
-//!   so peers don't need a shared ServiceId.
-//! - [`Frame::FetchNode`] / [`Frame::NodeReply`] — point-fetch a
-//!   single DAG node by CID. The reply slot carries
-//!   `Some(node_bytes)` when the peer has the node, `None`
-//!   otherwise.
+//! Frames carry control messages (`Hello`, `Tell`, `InvokeRequest` /
+//! `InvokeReply`), CRDT sync reads (`FetchHeads` / `Heads`,
+//! `FetchNode` / `NodeReply`), Raft RPCs, manifest fetches, and
+//! content-addressed blob fetches. Each frame is tagged so the
+//! decoder can dispatch without a schema.
 //!
 //! The encoding is deliberately hand-rolled (no serde / rkyv): the
 //! schema is small, framing the wire format ourselves makes
@@ -43,21 +25,20 @@ const TAG_FETCH_HEADS: u8 = 0x20;
 const TAG_HEADS: u8 = 0x21;
 const TAG_FETCH_NODE: u8 = 0x22;
 const TAG_NODE_REPLY: u8 = 0x23;
-// Raft RPCs. 0x30..=0x35 reserved for the basic election +
-// replication round; 0x36 reserved for follower→leader propose
-// forwarding (later phase); 0x37..=0x38 for snapshot install
-// (phase 7).
+// Raft RPCs. 0x30..=0x35 for election and replication; 0x36
+// reserved for follower→leader propose forwarding; 0x37..=0x38 for
+// snapshot install.
 const TAG_RAFT_APPEND_REQ: u8 = 0x30;
 const TAG_RAFT_APPEND_RESP: u8 = 0x31;
 const TAG_RAFT_VOTE_REQ: u8 = 0x32;
 const TAG_RAFT_VOTE_RESP: u8 = 0x33;
 const TAG_RAFT_INSTALL_REQ: u8 = 0x37;
 const TAG_RAFT_INSTALL_RESP: u8 = 0x38;
-// Dynamic membership / cluster discovery (Phase B, second half).
-// `RAFT_JOIN_*` lets a fresh node ask an existing replica to
-// add it as a voter. `MANIFEST_*` lets a fresh node fetch the
-// space.toml + actor blobs from a bootnode so `vosx join`
-// works without the operator pre-distributing the manifest.
+// Dynamic membership and cluster discovery. `RAFT_JOIN_*` lets a
+// fresh node ask an existing replica to add it as a voter.
+// `MANIFEST_*` lets a fresh node fetch the space.toml + actor blobs
+// from a bootnode so `vosx join` works without the operator pre-
+// distributing the manifest.
 const TAG_RAFT_JOIN_REQ: u8 = 0x40;
 const TAG_RAFT_JOIN_RESP: u8 = 0x41;
 const TAG_MANIFEST_REQ: u8 = 0x42;
@@ -70,10 +51,9 @@ const TAG_RAFT_STATUS_REQ: u8 = 0x44;
 const TAG_RAFT_STATUS_RESP: u8 = 0x45;
 // Content-addressed proof-blob fetch. Consumers ship the 32-byte
 // hash of a proof they want; producers (or any node that has the
-// bytes cached) serve them back. Large STARK
-// payloads (~1.4 MiB today) ride a single frame thanks to the
-// `MAX_FRAME_BYTES` cap below — chunked transport lands in a
-// later cycle once production proofs start to push past it.
+// bytes cached) serve them back. Large STARK payloads (~1.4 MiB
+// today) ride a single frame thanks to the `MAX_FRAME_BYTES` cap
+// below — chunked transport is a separate concern.
 const TAG_FETCH_PROOF_BLOB: u8 = 0x50;
 const TAG_PROOF_BLOB_REPLY: u8 = 0x51;
 const TAG_FETCH_PROGRAM_BLOB: u8 = 0x52;
@@ -223,7 +203,7 @@ pub enum Frame {
     /// follower the actor state at `last_included_index`/term so
     /// the follower doesn't need a log replay it can no longer
     /// reconstruct (the entries have been compacted away).
-    /// Single-shot for now; chunked support is a later phase.
+    /// Single-shot for now; chunked support is a separate concern.
     RaftInstallSnapshotReq {
         replication_id: [u8; REPLICATION_ID_BYTES],
         term: u64,
@@ -301,8 +281,8 @@ pub enum Frame {
     /// doesn't have the blob (typical when the consumer is asking
     /// the wrong producer first; the consumer can try another
     /// peer). Real STARK bytes ride here; bounded by
-    /// `MAX_FRAME_BYTES` (8 MiB) — production proofs exceeding
-    /// that need the chunked transport reserved for a later cycle.
+    /// `MAX_FRAME_BYTES` (8 MiB). Production proofs exceeding
+    /// that need chunked transport.
     ProofBlobReply {
         blob: Option<Vec<u8>>,
     },

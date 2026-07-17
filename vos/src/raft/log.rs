@@ -1,15 +1,12 @@
 //! Persistent Raft log + meta scalars on top of redb.
 //!
-//! Phase 1 storage layer: durable log of `EffectLog` payloads keyed
-//! by 1-based, contiguous index, plus the four scalars Raft needs to
-//! survive a crash (`current_term`, `voted_for`, `commit_index`,
-//! `last_applied`). No election, no replication, no snapshots —
-//! that machinery layers on top of these tables in later phases.
-//!
-//! Tables live in the same redb file as `STATE_TABLE` so a single
-//! txn can append a log entry, advance `last_applied`, and write
-//! the post-apply actor state atomically. A crash between dispatches
-//! either rolls all three back together or commits all three.
+//! Durable log of `EffectLog` payloads keyed by 1-based, contiguous
+//! index, plus the scalars Raft needs to survive a crash
+//! (`current_term`, `voted_for`, `commit_index`, `last_applied`,
+//! `snap_last_index`, `snap_last_term`). Tables live in the same redb
+//! file as `STATE_TABLE` so a single txn can append a log entry,
+//! advance `last_applied`, and write the post-apply actor state
+//! atomically.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -23,9 +20,8 @@ pub const RAFT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log
 
 /// Meta scalars table — one row per scalar, key is the scalar name.
 ///
-/// Phase 1 keys: `"current_term"`, `"voted_for"`, `"commit_index"`,
-/// `"last_applied"`. Phase 6 adds `"snap_last_index"` /
-/// `"snap_last_term"`.
+/// Keys: `"current_term"`, `"voted_for"`, `"commit_index"`,
+/// `"last_applied"`, `"snap_last_index"`, `"snap_last_term"`.
 pub const RAFT_META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 
 const META_TERM: &str = "current_term";
@@ -238,9 +234,8 @@ impl RaftLog {
     /// Read entries `[start..=end]` in index order. Indices that
     /// have been compacted away (index ≤ `snap_last_index`) are
     /// silently skipped — callers asking for those should fall
-    /// back to a snapshot install (later phase) or accept that
-    /// only the post-snapshot tail of the requested range is
-    /// returned.
+    /// back to a snapshot install or accept that only the
+    /// post-snapshot tail of the requested range is returned.
     pub fn entries(&self, start: u64, end: u64) -> Result<Vec<LogEntry>, CommitError> {
         if start > end {
             return Ok(Vec::new());
@@ -279,9 +274,8 @@ impl RaftLog {
     ///
     /// Caller is responsible for the wisdom of the choice —
     /// compacting past a follower's `match_index` strands that
-    /// follower (it'll need a snapshot install to catch up,
-    /// which lands in a later phase). The worker computes
-    /// `min(match_index across followers, own last_index)`
+    /// follower (it needs a snapshot install to catch up). The
+    /// worker computes `min(match_index across followers, own last_index)`
     /// before calling this.
     pub fn compact_to_in_txn(
         &mut self,
@@ -442,7 +436,7 @@ impl RaftLog {
 pub struct RaftMeta {
     pub current_term: u64,
     /// libp2p `node_prefix` of the peer we voted for in `current_term`,
-    /// or `None` if no vote cast. Always `None` in phase 1.
+    /// or `None` if no vote cast. Always `None` in single-node mode.
     pub voted_for: Option<u16>,
     pub commit_index: u64,
     pub last_applied: u64,

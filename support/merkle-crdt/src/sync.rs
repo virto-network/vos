@@ -72,7 +72,7 @@ where
     L: Store<H, P>,
     R: Store<H, P>,
 {
-    // Phase 1: BFS from root, collecting missing nodes
+    // Step 1: BFS from root, collecting missing nodes
     let mut missing: BTreeMap<Cid<H>, DagNode<H, P>> = BTreeMap::new();
     let mut queue = VecDeque::new();
     let mut visited = BTreeSet::new();
@@ -109,7 +109,7 @@ where
         return Ok(Vec::new());
     }
 
-    // Phase 2: Topological sort — oldest (leaves) first, newest (roots) last.
+    // Step 2: Topological sort — oldest (leaves) first, newest (roots) last.
     // We want: if A references B as a child, B comes before A.
     // This is a reverse topological sort using out-degree (Kahn's algorithm).
     Ok(topological_sort(missing))

@@ -104,12 +104,12 @@ pub struct ActorMeta {
     /// universe is always `Actor`.
     pub kind: u8,
     /// Capability tokens the extension wants to use — declarative
-    /// only, not enforced. Phase 6 logs them at load time so
-    /// manifest reviewers can spot a sketchy install. Conventional
-    /// strings: `net.tcp.bind`, `net.tcp.connect`,
-    /// `fs.read:/etc/...`, `tokio-runtime`, `thread.spawn`. PVM
-    /// actors leave this empty — they live in the deterministic
-    /// universe and have no OS access by construction.
+    /// only, not enforced. Logged at load time so manifest reviewers
+    /// can spot a sketchy install. Conventional strings:
+    /// `net.tcp.bind`, `net.tcp.connect`, `fs.read:/etc/...`,
+    /// `tokio-runtime`, `thread.spawn`. PVM actors leave this empty
+    /// — they live in the deterministic universe and have no OS
+    /// access by construction.
     pub caps: &'static [&'static str],
     /// Names of `#[msg]` handlers that should be reachable via
     /// the `vosx <ext> <cmd>` CLI dispatcher. Subset of `messages`
@@ -244,15 +244,14 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         c += 1;
     }
 
-    // Extension kind discriminant. Trailing byte so decoders that
-    // predate Phase 2 (no kind byte) still parse cleanly — they fall
-    // off the end of the buffer and ParsedMeta defaults to Actor.
+    // Extension kind discriminant. Trailing byte so older decoders
+    // that don't read it parse cleanly — they fall off the end of the
+    // buffer and ParsedMeta defaults to Actor.
     buf[pos] = meta.kind;
     pos += 1;
 
-    // Capability list (Phase 6, declarative-only). Same trailing-
-    // append discipline: pre-Phase-6 decoders stop here and read
-    // an empty caps list.
+    // Capability list. Same trailing-append discipline: older
+    // decoders stop here and read an empty caps list.
     let [lo, hi] = (meta.caps.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -274,8 +273,8 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     }
 
     // CLI-exposed method names. Same trailing-append discipline:
-    // pre-CLI decoders stop after caps and parse all
-    // `ParsedMessage.exposed_to_cli=false`. The cross-reference
+    // older decoders stop after caps and every
+    // `ParsedMessage.exposed_to_cli` stays `false`. Cross-reference
     // by name (rather than a per-message flag inline with the
     // existing record) keeps the existing per-message wire format
     // untouched — adding a byte mid-record would break every
@@ -300,11 +299,11 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         c += 1;
     }
 
-    // Per-message return-type names (added 2026-07 for reply labeling).
-    // Same trailing-append discipline: one entry per message in message
-    // order, so a decoder cross-references by index. Blobs produced
-    // before this section simply stop after cli_methods and every
-    // `ParsedMessage.returns` defaults to the empty string.
+    // Per-message return-type names. Same trailing-append discipline:
+    // one entry per message in message order, so a decoder
+    // cross-references by index. Blobs produced before this section
+    // simply stop after cli_methods and every `ParsedMessage.returns`
+    // defaults to the empty string.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -325,9 +324,9 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         r += 1;
     }
 
-    // Per-message doc strings (metadata v2, 2026-07). One entry per message
-    // in order, index-crossref like `returns`. Blobs produced before this
-    // section stop after `returns` and every `ParsedMessage.doc` is empty.
+    // Per-message doc strings. One entry per message in order,
+    // index-crossref like `returns`. Older blobs stop after `returns`
+    // and every `ParsedMessage.doc` is empty.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -348,8 +347,8 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         d += 1;
     }
 
-    // Actor-level doc string (metadata v2). A single length-prefixed
-    // string. Absent → `ParsedMeta.doc` empty.
+    // Actor-level doc string. A single length-prefixed string.
+    // Absent → `ParsedMeta.doc` empty.
     let actor_doc = meta.doc.as_bytes();
     let [lo, hi] = (actor_doc.len() as u16).to_le_bytes();
     buf[pos] = lo;
@@ -362,8 +361,8 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     }
     pos += actor_doc.len();
 
-    // Per-message invoke timeouts (metadata v2), u32 LE each, one per
-    // message in order. Absent → every `ParsedMessage.timeout_ms` is 0.
+    // Per-message invoke timeouts, u32 LE each, one per message in
+    // order. Absent → every `ParsedMessage.timeout_ms` stays 0.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -379,7 +378,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         t += 1;
     }
 
-    // Per-message dispatch mode (metadata v2), one u8 per message in order.
+    // Per-message dispatch mode, one u8 per message in order.
     // `0` = sync, `1` = job. Absent → every `ParsedMessage.mode` is 0 (sync).
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
@@ -480,7 +479,7 @@ mod tests {
     #[test]
     fn kind_byte_defaults_to_actor_when_missing() {
         // Manually craft a meta blob without the trailing kind byte
-        // (simulates a pre-Phase-2 ELF). actor_name "X", 0 messages,
+        // (simulates an older ELF). actor_name "X", 0 messages,
         // 0 constructor fields. No kind byte.
         let blob: &[u8] = &[
             1, 0,    // actor_name_len = 1
@@ -520,8 +519,8 @@ mod tests {
     }
 
     #[test]
-    fn caps_empty_when_pre_phase_6_blob() {
-        // Pre-Phase-6 blob: name + msg_count=0 + ctor_count=0 +
+    fn caps_empty_when_older_blob_missing_section() {
+        // Older blob: name + msg_count=0 + ctor_count=0 +
         // kind=1, no trailing caps section.
         let blob: &[u8] = &[
             1, 0,    // name_len = 1
@@ -591,8 +590,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_methods_absent_in_pre_phase_blob_defaults_false() {
-        // Pre-CLI-section blob: walks through messages, ctor,
+    fn cli_methods_absent_in_older_blob_defaults_false() {
+        // Older blob: walks through messages, ctor,
         // kind, caps — stops cleanly without the cli_methods
         // section. Decoder must default `exposed_to_cli=false`
         // on every parsed message rather than panicking.
@@ -765,14 +764,15 @@ mod decode {
         /// Empty when the blob predates the `returns` section. The CLI
         /// and gateway use it to label an otherwise-opaque reply.
         pub returns: String,
-        /// One-line handler description (metadata v2). Empty when the
-        /// blob predates the doc section or the handler is undocumented.
+        /// One-line handler description. Empty when the blob predates
+        /// the doc section or the handler is undocumented.
         pub doc: String,
-        /// Per-handler invoke timeout in milliseconds (metadata v2);
-        /// `0` = the client's default. Empty/old blobs decode `0`.
+        /// Per-handler invoke timeout in milliseconds; `0` = the
+        /// client's default. Empty/old blobs decode `0`.
         pub timeout_ms: u32,
-        /// Dispatch mode (metadata v2): `0` = sync, `1` = job (a
-        /// `#[msg(job)]` begin). Empty/old blobs decode `0`.
+        /// Dispatch mode: `0` = sync (the reply is the result), `1` =
+        /// job (the handler is a `#[msg(job)]` begin). Empty/old blobs
+        /// decode `0`.
         pub mode: u8,
     }
 
@@ -786,11 +786,11 @@ mod decode {
         /// from the trailing byte of the meta blob; absent / unknown
         /// values default to `Actor`.
         pub kind: u8,
-        /// Declared capability tokens (Phase 6). Empty when the
-        /// blob predates the field.
+        /// Declared capability tokens. Empty when the blob predates
+        /// the field.
         pub caps: Vec<String>,
-        /// One-line actor description (metadata v2). Empty when the
-        /// blob predates the doc section or the actor is undocumented.
+        /// One-line actor description. Empty when the blob predates
+        /// the doc section or the actor is undocumented.
         pub doc: String,
     }
 
@@ -848,15 +848,15 @@ mod decode {
             }
         }
 
-        // Extension kind byte (optional — pre-Phase-2 ELFs lack it,
-        // default to Actor). Trailing position so older decoders
-        // simply stop before reaching it.
+        // Extension kind byte (optional — older ELFs lack it, default
+        // to Actor). Trailing position so older decoders simply stop
+        // before reaching it.
         let kind = data.get(pos).copied().unwrap_or(0);
         if pos < data.len() {
             pos += 1;
         }
 
-        // Capability list (Phase 6). Empty if absent.
+        // Capability list. Empty if absent.
         let mut caps: Vec<String> = Vec::new();
         if pos < data.len()
             && let Some(cap_count) = read_u16(data, &mut pos)
@@ -870,14 +870,11 @@ mod decode {
             }
         }
 
-        // CLI-exposed method names (added 2026-05-11 for the
-        // `vosx <ext> <cmd>` dispatcher). Trailing-append: blobs
-        // produced before this section was added simply stop at
-        // caps and every `ParsedMessage.exposed_to_cli` stays
-        // `false`. Cross-reference by name rather than by index
-        // so the per-message wire format stays unchanged —
-        // adding a flag inline would have broken every older
-        // decoder.
+        // CLI-exposed method names. Trailing-append: older blobs
+        // stop after caps and every `ParsedMessage.exposed_to_cli` stays
+        // `false`. Cross-reference by name rather than by index so the
+        // per-message wire format stays unchanged — adding a flag
+        // inline would break older decoders.
         if pos < data.len()
             && let Some(cli_count) = read_u16(data, &mut pos)
         {
@@ -891,7 +888,7 @@ mod decode {
             }
         }
 
-        // Per-message return types (added 2026-07). Cross-referenced by
+        // Per-message return-type names. Cross-referenced by
         // index — the encoder writes one entry per message in order.
         // Trailing-append: an absent section leaves every `returns` empty.
         if pos < data.len()
@@ -907,7 +904,7 @@ mod decode {
             }
         }
 
-        // Per-message doc strings (metadata v2). Index-crossref like
+        // Per-message doc strings. Index-crossref like
         // `returns`. Absent → every `doc` empty.
         if pos < data.len()
             && let Some(doc_count) = read_u16(data, &mut pos)
@@ -922,7 +919,7 @@ mod decode {
             }
         }
 
-        // Actor-level doc string (metadata v2). A single string; absent → empty.
+        // Actor-level doc string. A single string; absent → empty.
         let mut doc = String::new();
         if pos < data.len()
             && let Some(s) = read_str(data, &mut pos)
@@ -930,7 +927,7 @@ mod decode {
             doc = s;
         }
 
-        // Per-message invoke timeouts (metadata v2), u32 LE each,
+        // Per-message invoke timeouts, u32 LE each,
         // index-crossref. Absent → every `timeout_ms` stays 0.
         if pos < data.len()
             && let Some(to_count) = read_u16(data, &mut pos)
@@ -945,7 +942,7 @@ mod decode {
             }
         }
 
-        // Per-message dispatch mode (metadata v2), one u8 each,
+        // Per-message dispatch mode, one u8 each,
         // index-crossref. Absent → every `mode` stays 0 (sync).
         if pos < data.len()
             && let Some(mode_count) = read_u16(data, &mut pos)

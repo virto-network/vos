@@ -1,31 +1,13 @@
 //! Networking layer — peer transport over libp2p.
 //!
 //! [`Network`] runs the libp2p swarm on its own tokio thread,
-//! independent of [`VosNode`](crate::node::VosNode). Cycle 1 stood
-//! up the pipe (TCP/Noise/yamux/mDNS/identify/ping); cycle 2 added
-//! the wire format and a `request_response` channel for cross-node
-//! envelopes.
-//!
-//! # What's wired up today
-//!
-//! - TCP / Noise / yamux transport.
-//! - Identify + ping for keepalive and peer info exchange.
-//! - mDNS for LAN peer discovery.
-//! - `Identity::auto` derives (or loads) an Ed25519 keypair at
-//!   `{data_dir}/node.key`; explicit `path` strings load the
-//!   keypair from that file.
-//! - `request_response` over `/vos/0.1.0` carrying [`Frame`]:
-//!   `Hello` exchanges `node_prefix` on first contact, `Tell`
-//!   delivers fire-and-forget envelopes. Inbound Tell is pushed
-//!   into the caller-supplied [`NetworkConfig::inbox`].
-//!
-//! # Out of scope (later cycles)
-//!
-//! - InvokeRequest / InvokeReply frames cross-node (cycle 2.5).
-//! - VosNode integration so `route()` forwards non-local prefixes
-//!   over the network.
-//! - CRDT gossip / sync via libp2p pubsub.
-//! - Hyperspace-driven peer discovery.
+//! independent of [`VosNode`](crate::node::VosNode). It provides a
+//! `request_response` channel over `/vos/0.1.0` carrying [`Frame`]:
+//! `Hello` exchanges `node_prefix` on first contact, `Tell` delivers
+//! fire-and-forget envelopes, and additional frames support CRDT sync,
+//! Raft RPCs, manifest fetches, and content-addressed blob fetches.
+//! Inbound Tells are pushed into the caller-supplied
+//! [`NetworkConfig::inbox`].
 
 mod codec;
 mod ops;
@@ -231,12 +213,11 @@ pub trait NetworkService: Send + Sync {
     ///
     /// `caller_peer_id` is the libp2p-noise-verified PeerId of
     /// the remote peer that opened the request_response stream.
-    /// Sprint 2's auth gate consults the registry's `auth_grants`
-    /// for this PeerId before forwarding gated handlers; non-
-    /// auth-gated handlers ignore it. `None` is reserved for
-    /// in-process calls that don't traverse libp2p (no current
-    /// callers — every InvokeRequest arrives over a noise
-    /// session).
+    /// The auth gate consults the registry's `auth_grants` for
+    /// this PeerId before forwarding gated handlers; non-auth-gated
+    /// handlers ignore it. `None` is reserved for in-process calls
+    /// that don't traverse libp2p (no current callers — every
+    /// InvokeRequest arrives over a noise session).
     fn dispatch_invoke(
         &self,
         _caller_peer_id: Option<libp2p::PeerId>,
@@ -1030,8 +1011,8 @@ impl Network {
 
     /// Snapshot of all peers that have completed the Hello
     /// handshake. Used by the sync ticker to fan out fetches
-    /// across every reachable replica, since cycle 3 doesn't
-    /// yet maintain a per-replication-group peer index.
+    /// across every reachable replica, since the sync layer
+    /// doesn't maintain a per-replication-group peer index.
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.prefix_map
             .lock()
@@ -1636,11 +1617,11 @@ fn handle_req_resp(
                         // calls back with (channel, InvokeReply) which the
                         // swarm select! arm forwards via send_response.
                         //
-                        // Sprint 2: the libp2p `peer` is the
-                        // noise-verified PeerId of the remote that
-                        // opened this stream. Threaded into the
-                        // dispatch so vos::node's auth gate can
-                        // consult `auth_grants` for the caller.
+                        // The libp2p `peer` is the noise-verified
+                        // PeerId of the remote that opened this
+                        // stream. Threaded into the dispatch so
+                        // vos::node's auth gate can consult
+                        // `auth_grants` for the caller.
                         let svc = service.get().cloned();
                         let response_tx = response_tx.clone();
                         let caller = peer;
@@ -2270,7 +2251,7 @@ fn record_prefix(map: &PrefixMap, prefix: u16, peer: PeerId) {
 /// Collisions are possible (1 in 65 536 per peer pair) — they don't
 /// happen in practice for small networks but will need real
 /// addressing once a space grows past hyperspace-sized clusters.
-/// That's a Cycle 3+ concern; for now we log a warning when the
+/// That's a concern for large clusters; for now we log a warning when the
 /// prefix map sees a collision.
 pub fn derive_node_prefix(peer_id: &PeerId) -> u16 {
     let hash = blake2b_simd::Params::new()
@@ -2416,7 +2397,7 @@ mod tests {
         }
     }
 
-    /// Cycle 3 convergence: replica A is driven by two commits,
+    /// CRDT convergence: replica A is driven by two commits,
     /// replica B (empty) automatically pulls A's DAG via the
     /// background sync ticker. After a brief settle period,
     /// re-open B's redb and verify `replay_logs` reproduces A's
@@ -2762,8 +2743,8 @@ mod tests {
     /// Network-level test: gossipsub head announcements route a
     /// `Frame::Heads` published by A to a hint sender registered
     /// by B, with the publisher's PeerId surfaced as the hint
-    /// payload. Proves the cycle-8 push path independently of
-    /// the cycle-3 request_response fallback.
+    /// payload. Proves the gossipsub push path independently of
+    /// the request_response fallback.
     #[test]
     fn gossipsub_head_announcement_hints_subscribers() {
         let kp_a = identity::Keypair::generate_ed25519();
@@ -3211,12 +3192,12 @@ mod tests {
         let _ = join_b.join();
     }
 
-    /// Phase-2 boundary for Raft: the wire frames + libp2p plumbing
-    /// route an outbound `AppendEntries` / `RequestVote` to the
-    /// remote peer, the stub handler observes the call, and the
-    /// canned response makes it back through the caller's channel.
-    /// No election or replication logic is exercised — that's
-    /// phase 3+ — but every wire bit is.
+    /// Raft wire frames and libp2p plumbing route an outbound
+    /// `AppendEntries` / `RequestVote` to the remote peer, the
+    /// stub handler observes the call, and the canned response
+    /// makes it back through the caller's channel. No election or
+    /// replication logic is exercised — those are handled by the
+    /// worker — but every wire bit is.
     #[test]
     fn raft_rpcs_route_through_libp2p_to_handler_and_back() {
         use std::sync::Mutex as StdMutex;
@@ -3395,7 +3376,7 @@ mod tests {
         net_b.join();
     }
 
-    /// Phase-3.2 boundary: three networked nodes spin up Raft
+    /// Raft election: three networked nodes spin up Raft
     /// workers configured for the same cluster, run for a short
     /// while, and exactly one becomes Leader. No replication,
     /// no log writes — just election. The leader's term must
@@ -3515,11 +3496,10 @@ mod tests {
         net_b.register_raft_handler(rep_id, Arc::new(w_b.handler()));
         net_c.register_raft_handler(rep_id, Arc::new(w_c.handler()));
 
-        // Phase 3.3: heartbeats keep followers' timers reset, so
-        // leadership is *stable* — once a Leader emerges it stays
-        // Leader and the term doesn't drift. Wait for a Leader,
-        // then sample for several heartbeat intervals and assert
-        // role + term hold.
+        // Heartbeats keep followers' timers reset, so leadership
+        // is *stable* — once a Leader emerges it stays Leader and
+        // the term doesn't drift. Wait for a Leader, then sample for
+        // several heartbeat intervals and assert role + term hold.
         let until = StdInstant::now() + Duration::from_secs(5);
         let mut observed: Option<(u16, u64)> = None;
         loop {
@@ -3557,7 +3537,7 @@ mod tests {
         assert!([prefix_a, prefix_b, prefix_c].contains(&leader_prefix));
         assert!(leader_term >= 1);
 
-        // ── Steady-state probe (phase 3.3) ────────────────────
+        // ── Steady-state probe ────────────────────
         // Sample for ~10 heartbeat intervals: the same node stays
         // Leader, the term doesn't bump, and the followers stay
         // Followers with their `voted_for` pointing at the leader.
@@ -3571,12 +3551,12 @@ mod tests {
         assert_eq!(
             snap_leader.role,
             Role::Leader,
-            "phase 3.3: heartbeats must keep the leader from getting demoted; \
+            "heartbeats must keep the leader from getting demoted; \
              snap = {snap_leader:?}"
         );
         assert_eq!(
             snap_leader.current_term, leader_term,
-            "phase 3.3: term must not drift while the leader is heartbeating"
+            "term must not drift while the leader is heartbeating"
         );
 
         let other_snaps: Vec<_> = [
@@ -3621,7 +3601,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Phase-4.3 boundary: 3-node cluster, elect a leader, propose
+    /// Raft replication: 3-node cluster, elect a leader, propose
     /// three entries via the leader's `WorkerHandle::propose`, and
     /// wait for both followers to replicate them. Direct redb
     /// introspection asserts every replica has four rows in

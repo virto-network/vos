@@ -1,20 +1,17 @@
 //! `RaftCommit` — `CommitStrategy` impl backed by [`RaftLog`].
 //!
-//! Phase 1.2: single-node mode. Every `commit_with_log` is treated
-//! as if `me` is the only voter — append the entry, mark it
-//! committed + applied, and persist the post-apply actor state, all
-//! in one redb txn. No peers, no leader, no RPCs yet; phase 3
-//! introduces those by replacing [`Role::SingleNode`] with a
-//! `Multi` variant that owns the cluster state machine and forwards
-//! `commit_with_log` requests through a channel to a worker task.
+//! In single-node mode every `commit_with_log` is treated as if `me`
+//! is the only voter: append the entry, mark it committed and applied,
+//! and persist the post-apply actor state, all in one redb txn. On
+//! multi-node clusters the strategy owns a [`RaftWorker`] and routes
+//! `commit_with_log` through propose plus quorum-wait.
 //!
 //! The agent thread sees the same [`crate::commit::CommitStrategy`]
-//! interface as `LocalCommit` / `CrdtCommit`. On a cold boot,
-//! `restore` returns the last persisted state (fast path) or `None`
-//! when the state row hasn't been materialized yet — in which case
-//! the agent's existing replay loop calls `replay_logs` and feeds
-//! each entry's `EffectLog` through the runtime's replay session,
-//! exactly like CRDT cold-start does today.
+//! interface as `LocalCommit` and `CrdtCommit`. On a cold boot,
+//! `restore` returns the last persisted state when available, or
+//! `None` when the state row has not been materialized yet; the
+//! replay loop then calls `replay_logs` and feeds each entry's
+//! `EffectLog` through the runtime's replay session.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -63,21 +60,22 @@ enum Role {
     },
 }
 
-/// Configuration for a Raft replication group. Phase 1 only uses
-/// `me` informationally (it lives in `RaftMeta::voted_for` once
-/// elections land); `members` and `election_timeout_ms` are wired
-/// at phase 3, `heartbeat_interval_ms` at phase 3.3.
+/// Configuration for a Raft replication group. In single-node mode
+/// `me` is recorded for use once multi-node elections are enabled,
+/// `members` is empty, and the timeout fields are ignored. In
+/// multi-node mode `members` is the static cluster membership and
+/// the timeouts drive election and replication.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     /// Local node prefix (libp2p-derived `node_prefix`). Identifies
     /// this replica inside the cluster.
     pub me: u16,
-    /// Static cluster membership. Empty in phase 1's single-node
-    /// mode — a non-empty list is treated as advisory until the
-    /// election machinery lands.
+    /// Static cluster membership. Empty in single-node mode; a
+    /// non-empty list is treated as advisory until election
+    /// machinery is enabled.
     pub members: Vec<u16>,
     /// Randomized election-timeout window (low, high) in milliseconds.
-    /// Ignored in phase 1.
+    /// Ignored in single-node mode.
     pub election_timeout_ms: (u64, u64),
     /// Leader heartbeat interval in milliseconds. Should be
     /// substantially smaller than `election_timeout_ms.0`.
@@ -110,9 +108,9 @@ impl Default for RaftConfig {
 /// On a single node this is equivalent to `LocalCommit` plus a
 /// monotonically growing log of `EffectLog` payloads — restart
 /// rebuilds state by replaying the log. On multi-node clusters
-/// (phase 3+) the log becomes the consensus log: only the leader
-/// appends, and `commit_with_log` blocks until the entry replicates
-/// to a majority and applies locally.
+/// the log becomes the consensus log: only the leader appends,
+/// and `commit_with_log` blocks until the entry replicates to a
+/// majority and applies locally.
 pub struct RaftCommit {
     db: Arc<Database>,
     log: RaftLog,
@@ -122,9 +120,9 @@ pub struct RaftCommit {
     /// commit, and serves as the `restore` fast-path source.
     last_state: Vec<u8>,
     role: Role,
-    /// Phase-3 placeholder — set when the cluster worker has been
-    /// asked to stop. Phase 1 never reads it; kept here so the
-    /// shape of the strategy is stable across phases.
+    /// Set when the multi-node cluster worker has been asked to stop.
+    /// Single-node mode never reads it; kept here so the strategy has
+    /// the same fields in both modes.
     #[allow(dead_code)]
     shutdown: Arc<AtomicBool>,
     #[allow(dead_code)]
@@ -522,10 +520,10 @@ impl CommitStrategy for RaftCommit {
     }
 
     fn reload(&mut self) -> Result<(), CommitError> {
-        // Phase 1 has only one writer (the agent thread), so
-        // there's no "background apply" to catch up on. Phase 3
-        // wires this to the apply notification from the cluster
-        // worker, mirroring CrdtCommit's sync_rx path.
+        // Single-node mode has only one writer (the agent thread), so
+        // there's no background apply to catch up on. Multi-node mode
+        // loads meta from the worker's apply notification, mirroring
+        // CrdtCommit's sync_rx path.
         self.meta = RaftMeta::load(&self.db)?;
         self.log = RaftLog::open(self.db.clone())?;
         self.last_state = read_state(&self.db)?.unwrap_or_default();
@@ -534,7 +532,7 @@ impl CommitStrategy for RaftCommit {
 
     fn roots(&self) -> Vec<[u8; 32]> {
         // Raft doesn't gossip heads — the cluster has its own
-        // heartbeat path (AppendEntries with no entries, phase 4).
+        // heartbeat path (AppendEntries with no entries).
         Vec::new()
     }
 
@@ -704,10 +702,7 @@ mod tests {
 
         // Wait for the self-elected leadership before proposing.
         // The single-member quorum fires on the first election
-        // tick (10-30ms randomized). Generous deadline because
-        // `futures-timer` (the std-clock timer) gets sluggish under
-        // heavy `cargo test` parallelism — the production runtime
-        // doesn't see this contention.
+        // tick (10-30ms randomized).
         let h = worker.handler();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

@@ -1,14 +1,12 @@
 //! `vosx <target> <method> [args]` — schema-aware dispatch
 //! against any agent or extension instance in a space's registry.
 //!
-//! Phase 4 of the CLI-dispatch plan. Built on top of
-//! [`DaemonClient::invoke_dyn`] + [`DaemonClient::meta_for_instance`]
-//! so the wire path is identical to `vosx space call`; the new
-//! surface is just (a) more ergonomic (no `space call <space>`
-//! prefix), (b) schema-aware (positional args coerce against the
-//! handler's declared types), and (c) doubles as the discovery
-//! mechanism — `vosx <target>` with no method prints the CLI-
-//! exposed handler list.
+//! Built on top of [`DaemonClient::invoke_dyn`] +
+//! [`DaemonClient::meta_for_instance`] so the wire path is identical
+//! to `vosx space call`; this surface is more ergonomic (no
+//! `space call <space>` prefix), schema-aware (positional args coerce
+//! against the handler's declared types), and doubles as discovery —
+//! `vosx <target>` with no method prints the CLI-exposed handler list.
 //!
 //! ## Surface
 //!

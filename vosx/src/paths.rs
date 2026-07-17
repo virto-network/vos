@@ -1,5 +1,5 @@
-// Phase 1 will exercise every public symbol; until then the
-// module is loaded but unused.
+// Path helpers are referenced by command paths that may not be built
+// in every configuration.
 #![allow(dead_code)]
 
 //! Standard filesystem layout for `vosx` state.
@@ -109,11 +109,11 @@ pub fn spaces_index_path() -> PathBuf {
 }
 
 /// Operator's persistent libp2p keypair, shared across every
-/// `vosx` client invocation from this shell user. Used by
-/// Sprint 2's daemon-auth path: the daemon recognises the same
-/// PeerId across calls and consults its `members` allow-list.
-/// Persistence is per-config-home; an operator with multiple
-/// machines / containers gets multiple identities.
+/// `vosx` client invocation from this shell user. Used by the
+/// daemon-auth path: the daemon recognises the same PeerId across
+/// calls and consults its `members` allow-list. Persistence is
+/// per-config-home; an operator with multiple machines /
+/// containers gets multiple identities.
 pub fn client_identity_path() -> PathBuf {
     config_root().join("identity.key")
 }

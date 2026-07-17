@@ -46,17 +46,17 @@ pub struct Recipe {
     /// `space_id`, looked up from the running entry.
     #[allow(dead_code)]
     pub space: Option<String>,
-    /// Sprint 2: default `cap_policy` for every extension in
-    /// this space — `"log"` / `"block"` / `"kill"`. Per-extension
-    /// `cap_policy` overrides. Omitted → host default
+    /// Default `cap_policy` for every extension in this space —
+    /// `"log"` / `"block"` / `"kill"`. Per-extension `cap_policy`
+    /// overrides. Omitted → host default
     /// ([`vos::extension::CapPolicy::Block`]).
     pub cap_policy: Option<String>,
     /// Hyperspace this space belongs to. When set, the daemon
     /// additionally spawns a registry replica into the
     /// hyperspace's replication group so cross-space `resolve`
     /// can fall through. See `derive_hyperspace_id` for the
-    /// replication-id derivation. Wired up in Phase 1.3 of the
-    /// hyperspace runtime; for now the parser just round-trips it.
+    /// replication-id derivation. Wired up by the boot path when a
+    /// recipe sets the field; for now the parser just round-trips it.
     #[allow(dead_code)]
     pub hyperspace: Option<String>,
     #[serde(rename = "agent", default)]
@@ -65,9 +65,9 @@ pub struct Recipe {
     /// in a recipe maps onto a single `node.register_extension`
     /// call when the daemon boots; the host loads the .so, reads
     /// its meta.kind, and dispatches to actor- or service-mode
-    /// glue accordingly. Phase 5 doesn't surface extensions in the
-    /// space registry — they're host-local; only PVM agents live in
-    /// the registry today.
+    /// glue accordingly. The registry doesn't surface extensions
+    /// today — they're host-local; only PVM agents live in the
+    /// registry.
     #[serde(rename = "extension", default)]
     pub extensions: Vec<ExtensionDef>,
 }
@@ -86,13 +86,13 @@ pub struct ExtensionDef {
     /// (Vec<u32> name-list, etc.) come later if needed.
     #[serde(default)]
     pub init: BTreeMap<String, toml::Value>,
-    /// Sprint 2: per-extension override of the space-level
+    /// Per-extension override of the space-level
     /// [`Recipe::cap_policy`]. Useful for relaxing one
     /// extension to `"log"` while keeping the rest at `"block"`.
     pub cap_policy: Option<String>,
-    /// M9 — this extension is a relay for *external* traffic
-    /// (HTTP gateway, future REST adapters). When `true`, the
-    /// extension's outbound calls tag every InvokeRequest as
+    /// This extension is a relay for *external* traffic (HTTP
+    /// gateway, future REST adapters). When `true`, the extension's
+    /// outbound calls tag every InvokeRequest as
     /// [`Caller::Unauthenticated`] so the targeted actor's
     /// role-gated handlers refuse anonymous traffic.
     ///
@@ -271,7 +271,7 @@ pub(crate) fn register_extension(
     // library never round-trips through an unmap. There's still a
     // narrow race if the worker thread hasn't run yet at our drop;
     // a stronger fix would have `node.register_extension` return
-    // the meta blob itself, which is the right Phase 5+ shape.
+    // the meta blob itself, which is the right long-term shape.
     // SAFETY: dlopen on a vos-built extension .so; the recipe's
     // path is operator-supplied. See `vos::extension::ExtensionPlugin::load`
     // for the full FFI contract docstring.
@@ -292,9 +292,9 @@ pub(crate) fn register_extension(
         .map(|p| p.meta_bytes().to_vec())
         .unwrap_or_default();
 
-    // Sprint 2: per-extension cap_policy override > space-level
-    // default. Falls back to the host-side CapPolicy::default()
-    // when neither is set.
+    // Per-extension cap_policy override > space-level default.
+    // Falls back to the host-side CapPolicy::default() when
+    // neither is set.
     let cap_policy = match ext.cap_policy.as_deref() {
         Some(s) => vos::extension::CapPolicy::parse(s),
         None => space_cap_policy,
@@ -324,7 +324,7 @@ pub(crate) fn register_extension(
         );
     }
 
-    // M4 — operator visibility. `intra_caps` are host-side daemon
+    // Operator visibility. `intra_caps` are host-side daemon
     // config (not replicated registry state). Render the *effective*
     // caps (relay mode collapses to none) for the boot log, warn
     // loudly on footgun wildcards, and capture the canonical tokens to
@@ -528,16 +528,8 @@ fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<Str
 }
 
 /// Warn when an extension declares a cap for a *named* actor the host
-/// can't resolve at dispatch time. v1 maps only the well-known
-/// `space-registry` target id back to a name, so a named cap for any
-/// other actor is silently never matched (the relay falls back to
-/// `Unauthenticated`). Surfacing it at boot keeps a typo'd or
-/// premature cap from vanishing without the operator noticing. `*`
-/// (wildcard-actor) caps always match, so they're exempt.
-/// Warn about named `intra_cap` targets that don't correspond to any
-/// actor this space installs. R3 made the host resolve *any* installed
-/// agent or extension by name (via its reverse map), so the host can no
-/// longer say in isolation whether a name is resolvable — the authority
+/// can't resolve at dispatch time. The host resolves any installed
+/// agent or extension by name (via its reverse map), so the authority
 /// is the recipe's own roster. `known_names` is that roster (every
 /// agent + extension instance name, plus the built-in `space-registry`,
 /// compared case-insensitively to match [`vos::IntraCap`]'s matching).
@@ -972,10 +964,9 @@ pub(crate) fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Resul
             // authors who want explicit typing can upgrade to
             // typed init args once we have schemas.
             //
-            // Sprint 3: `$env:VAR` strings get resolved here too
-            // so on_start payloads can pull secrets out of the
-            // container's env without baking them into the
-            // recipe.
+            // `$env:VAR` strings are resolved here too so on_start
+            // payloads can pull secrets out of the container's env
+            // without baking them into the recipe.
             let resolved = resolve_env_indirection(&entry.msg, k, v)?;
             match &resolved {
                 toml::Value::Integer(n) => msg = msg.with(k, *n as u64),
@@ -998,13 +989,12 @@ pub(crate) fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Resul
     payload_codec::encode(&payloads)
 }
 
-/// Sprint 3 — resolve `$env:VAR` indirection in recipe init
-/// values. String values matching `$env:NAME` are looked up in
-/// the process environment; everything else passes through
-/// unchanged. Used by extension `[[extension]] init = {...}` and
-/// agent `[[agent]] init = {...}` paths so container deployments
-/// can keep secrets (HF tokens, API keys, …) out of the recipe
-/// file itself.
+/// Resolve `$env:VAR` indirection in recipe init values. String values
+/// matching `$env:NAME` are looked up in the process environment;
+/// everything else passes through unchanged. Used by extension
+/// `[[extension]] init = {...}` and agent `[[agent]] init = {...}`
+/// paths so container deployments can keep secrets (HF tokens,
+/// API keys, …) out of the recipe file itself.
 ///
 /// Error semantics:
 /// - `$env:NAME` where `NAME` is unset → `Err(anyhow)` so the
@@ -1567,7 +1557,7 @@ mod tests {
         }
     }
 
-    // ── Sprint 3: $env:VAR indirection ──────────────────────
+    // ── $env:VAR indirection ──────────────────────
 
     /// Use a per-test process-unique env-var name so concurrent
     /// tests don't race on the same key. We unset on Drop so
@@ -1625,8 +1615,8 @@ mod tests {
         let err =
             resolve_env_indirection("ai", "hf_token", &val).expect_err("unset var must error");
         let msg = format!("{err}");
-        // Sprint 5: error contract — the operator needs (a) the
-        // unset *var name*, (b) the extension + key context so
+        // The error contract — the operator needs (a) the unset
+        // *var name*, (b) the extension + key context so they can
         // they can find it in the recipe, and (c) a clear cause
         // and remediation hint. Any one of these going missing
         // means a refactor silently degraded the error.

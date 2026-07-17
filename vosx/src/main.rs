@@ -119,8 +119,7 @@ enum Command {
     /// identity the daemon sees when this `vosx` invocation
     /// dials it. Creates the keypair on first run at
     /// `$XDG_CONFIG_HOME/vosx/identity.key`. Useful for
-    /// enrolling the operator into a space's `members`
-    /// ACL table (Sprint 2 daemon-auth work).
+    /// enrolling the operator into a space's `members` ACL.
     Whoami {
         /// Emit JSON `{"peer_id": "...", "path": "..."}` instead
         /// of plain text. Pipe into `jq` for scripting.
@@ -298,8 +297,8 @@ fn is_top_level_help(argv: &[String]) -> bool {
             // `--space` rides here too: `vosx --space demo --help`
             // is a legitimate "show me what `demo` knows about"
             // request; we don't currently filter the cache
-            // listing to that space (Phase 4d), but we shouldn't
-            // bail out as if the user typed garbage.
+            // listing to that space, but we shouldn't bail out as
+            // if the user typed garbage.
             "--format" | "--space" => i += 1,
             s if s.starts_with("--format=") || s.starts_with("--space=") => {}
             // Anything else (built-in subcommand, dynamic verb,
@@ -462,7 +461,7 @@ mod routing_tests {
 
     #[test]
     fn non_builtin_word_triggers_dynamic_dispatch() {
-        // The actual Phase-4 ergonomic surface.
+        // Dynamic dispatch for extension instances.
         assert!(should_dynamic_dispatch(&s(&["gateway"])));
         assert!(should_dynamic_dispatch(&s(&["gateway", "stop"])));
         assert!(should_dynamic_dispatch(&s(&["math", "add", "a=2", "b=3"])));

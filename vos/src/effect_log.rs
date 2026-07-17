@@ -12,8 +12,8 @@
 //! handing back each reply as the handler re-issues its asks.
 //!
 //! The module is intentionally decoupled from merkle-crdt — it only
-//! needs `alloc`. Phase 4 adds the merkle-crdt `Encode`/`Decode`
-//! trait impls.
+//! needs `alloc`. The `merkle-crdt` crate provides the `Encode` and
+//! `Decode` implementations for `EffectLog`.
 
 #![allow(clippy::len_without_is_empty)]
 
@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 /// `ANCHOR_GENESIS` (0x00), which is a real, comparable anchor.
 pub const ANCHOR_UNRECORDED: u8 = 0xFF;
 
-/// Caller-prefix bytes recorded per dispatch — the M7 wire the host
+/// Caller-prefix bytes recorded per dispatch — the wire the host
 /// prepends so the guest's dispatch gate sees the caller's trust flag
 /// and role grants: `[trust_flag, has_space_role, space_role,
 /// has_actor_local_role, actor_local_role]`. Recording them makes
@@ -92,7 +92,7 @@ pub struct EffectLog {
     pub anchor_kind: u8,
     /// The recorded anchor bytes; zero-filled when unrecorded.
     pub anchor: [u8; 32],
-    /// The M7 caller-prefix bytes this dispatch ran under; replay wraps
+    /// The caller-prefix bytes this dispatch ran under; replay wraps
     /// the message with exactly these so gate decisions reproduce
     /// (see [`CallerPrefix`]). [`CALLER_SYSTEM`] for legacy logs.
     pub caller_prefix: CallerPrefix,
