@@ -135,7 +135,9 @@ impl SharedBoard {{
 
     #[msg]
     fn set_title(&mut self, change: [u8; 32], title: String) {{
-        self.title.set(crdt::ChangeId::new(change).operation(0), title);
+        self.title
+            .set(crdt::ChangeId::new(change).operation(0), title)
+            .expect("one operation id must always describe the same assignment");
     }}
 
     #[msg]

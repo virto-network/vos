@@ -118,46 +118,71 @@ impl<T> Value<T> {
         this
     }
 
-    /// Assign a value, superseding every version observed by this replica.
-    pub fn set(&mut self, id: OpId, value: T) {
-        self.removed.extend(self.values.keys().copied());
-        self.values.clear();
-        if !self.removed.contains(&id) {
-            self.values.insert(id, value);
-        }
-    }
-
     pub fn get(&self) -> Option<&T> {
-        self.values.last_key_value().map(|(_, value)| value)
+        self.values
+            .iter()
+            .rev()
+            .find(|(id, _)| !self.removed.contains(id))
+            .map(|(_, value)| value)
     }
 
     pub fn visible_id(&self) -> Option<OpId> {
-        self.values.last_key_value().map(|(id, _)| *id)
+        self.values
+            .keys()
+            .rev()
+            .find(|id| !self.removed.contains(id))
+            .copied()
     }
 
     pub fn conflicts(&self) -> impl Iterator<Item = &T> {
         let visible = self.visible_id();
         self.values
             .iter()
-            .filter(move |(id, _)| Some(**id) != visible)
+            .filter(move |(id, _)| !self.removed.contains(id) && Some(**id) != visible)
             .map(|(_, value)| value)
     }
 
     pub fn versions(&self) -> impl Iterator<Item = (OpId, &T)> {
-        self.values.iter().map(|(id, value)| (*id, value))
+        self.values
+            .iter()
+            .filter(|(id, _)| !self.removed.contains(id))
+            .map(|(id, value)| (*id, value))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.visible_id().is_none()
     }
 
     fn remove_observed(&mut self) {
         self.removed.extend(self.values.keys().copied());
-        self.values.clear();
     }
 }
 
 impl<T: Clone + PartialEq> Value<T> {
+    /// Assign a value, superseding every version observed by this replica.
+    /// Reusing an operation ID with identical contents is an idempotent retry;
+    /// reusing it with different contents is rejected.
+    pub fn set(&mut self, id: OpId, value: T) -> Result<(), Error> {
+        if let Some(existing) = self.values.get(&id) {
+            return if existing == &value {
+                Ok(())
+            } else {
+                Err(Error::DivergentOperation(id))
+            };
+        }
+        if !self.removed.contains(&id) {
+            let observed: Vec<_> = self
+                .values
+                .keys()
+                .filter(|observed| !self.removed.contains(observed))
+                .copied()
+                .collect();
+            self.removed.extend(observed);
+        }
+        self.values.insert(id, value);
+        Ok(())
+    }
+
     pub fn merge(&mut self, other: &Self) -> Result<(), Error> {
         for (id, value) in &other.values {
             if let Some(existing) = self.values.get(id)
@@ -168,11 +193,8 @@ impl<T: Clone + PartialEq> Value<T> {
         }
         self.removed.extend(other.removed.iter().copied());
         for (id, value) in &other.values {
-            if !self.removed.contains(id) {
-                self.values.entry(*id).or_insert_with(|| value.clone());
-            }
+            self.values.entry(*id).or_insert_with(|| value.clone());
         }
-        self.values.retain(|id, _| !self.removed.contains(id));
         Ok(())
     }
 }
@@ -182,26 +204,40 @@ impl<T: Clone + PartialEq> Value<T> {
 #[rkyv(crate = rkyv)]
 pub struct Map<K, V> {
     entries: BTreeMap<K, Value<V>>,
+    operation_keys: BTreeMap<OpId, K>,
 }
 
 impl<K, V> Default for Map<K, V> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
+            operation_keys: BTreeMap::new(),
         }
     }
 }
 
-impl<K: Ord, V> Map<K, V> {
-    pub fn insert(&mut self, id: OpId, key: K, value: V) {
+impl<K: Ord, V: Clone + PartialEq> Map<K, V> {
+    pub fn insert(&mut self, id: OpId, key: K, value: V) -> Result<(), Error>
+    where
+        K: Clone + PartialEq,
+    {
+        if let Some(existing_key) = self.operation_keys.get(&id)
+            && existing_key != &key
+        {
+            return Err(Error::DivergentOperation(id));
+        }
         match self.entries.get_mut(&key) {
-            Some(entry) => entry.set(id, value),
+            Some(entry) => entry.set(id, value)?,
             None => {
-                self.entries.insert(key, Value::new(id, value));
+                self.entries.insert(key.clone(), Value::new(id, value));
             }
         }
+        self.operation_keys.insert(id, key);
+        Ok(())
     }
+}
 
+impl<K: Ord, V> Map<K, V> {
     pub fn get(&self, key: &K) -> Option<&V> {
         self.entries.get(key).and_then(Value::get)
     }
@@ -236,14 +272,29 @@ impl<K: Ord, V> Map<K, V> {
 
 impl<K: Ord + Clone, V: Clone + PartialEq> Map<K, V> {
     pub fn merge(&mut self, other: &Self) -> Result<(), Error> {
+        for (id, key) in &other.operation_keys {
+            if let Some(existing_key) = self.operation_keys.get(id)
+                && existing_key != key
+            {
+                return Err(Error::DivergentOperation(*id));
+            }
+        }
+        let mut staged = self.clone();
         for (key, value) in &other.entries {
-            match self.entries.get_mut(key) {
+            match staged.entries.get_mut(key) {
                 Some(entry) => entry.merge(value)?,
                 None => {
-                    self.entries.insert(key.clone(), value.clone());
+                    staged.entries.insert(key.clone(), value.clone());
                 }
             }
         }
+        staged.operation_keys.extend(
+            other
+                .operation_keys
+                .iter()
+                .map(|(id, key)| (*id, key.clone())),
+        );
+        *self = staged;
         Ok(())
     }
 }
@@ -252,48 +303,57 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Map<K, V> {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(crate = rkyv)]
 pub struct Set<T> {
-    adds: BTreeMap<T, BTreeSet<OpId>>,
-    removed: BTreeMap<T, BTreeSet<OpId>>,
+    operations: BTreeMap<OpId, T>,
+    removed: BTreeSet<OpId>,
 }
 
 impl<T> Default for Set<T> {
     fn default() -> Self {
         Self {
-            adds: BTreeMap::new(),
-            removed: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            removed: BTreeSet::new(),
         }
     }
 }
 
-impl<T: Ord + Clone> Set<T> {
-    pub fn insert(&mut self, id: OpId, value: T) -> bool {
-        self.adds.entry(value).or_default().insert(id)
+impl<T: Ord + Clone + PartialEq> Set<T> {
+    pub fn insert(&mut self, id: OpId, value: T) -> Result<bool, Error> {
+        if let Some(existing) = self.operations.get(&id) {
+            return if existing == &value {
+                Ok(false)
+            } else {
+                Err(Error::DivergentOperation(id))
+            };
+        }
+        self.operations.insert(id, value);
+        Ok(true)
     }
 
     pub fn remove(&mut self, value: &T) -> bool {
-        let Some(observed) = self.adds.get(value) else {
-            return false;
-        };
-        if observed.is_empty() {
-            return false;
-        }
-        self.removed
-            .entry(value.clone())
-            .or_default()
-            .extend(observed.iter().copied());
-        self.prune(value);
-        true
+        let observed: Vec<_> = self
+            .operations
+            .iter()
+            .filter(|(id, candidate)| !self.removed.contains(id) && *candidate == value)
+            .map(|(id, _)| *id)
+            .collect();
+        let existed = !observed.is_empty();
+        self.removed.extend(observed);
+        existed
     }
 
     pub fn contains(&self, value: &T) -> bool {
-        self.adds.get(value).is_some_and(|ids| !ids.is_empty())
+        self.operations
+            .iter()
+            .any(|(id, candidate)| !self.removed.contains(id) && candidate == value)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.adds
+        self.operations
             .iter()
-            .filter(|(_, ids)| !ids.is_empty())
-            .map(|(value, _)| value)
+            .filter(|(id, _)| !self.removed.contains(id))
+            .map(|(_, value)| value)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
     }
 
     pub fn len(&self) -> usize {
@@ -304,29 +364,22 @@ impl<T: Ord + Clone> Set<T> {
         self.len() == 0
     }
 
-    pub fn merge(&mut self, other: &Self) {
-        for (value, ids) in &other.adds {
-            self.adds
-                .entry(value.clone())
-                .or_default()
-                .extend(ids.iter().copied());
+    pub fn merge(&mut self, other: &Self) -> Result<(), Error> {
+        for (id, value) in &other.operations {
+            if let Some(existing) = self.operations.get(id)
+                && existing != value
+            {
+                return Err(Error::DivergentOperation(*id));
+            }
         }
-        for (value, ids) in &other.removed {
-            self.removed
-                .entry(value.clone())
-                .or_default()
-                .extend(ids.iter().copied());
-        }
-        let keys: Vec<_> = self.adds.keys().cloned().collect();
-        for key in &keys {
-            self.prune(key);
-        }
-    }
-
-    fn prune(&mut self, value: &T) {
-        if let (Some(adds), Some(removed)) = (self.adds.get_mut(value), self.removed.get(value)) {
-            adds.retain(|id| !removed.contains(id));
-        }
+        self.operations.extend(
+            other
+                .operations
+                .iter()
+                .map(|(id, value)| (*id, value.clone())),
+        );
+        self.removed.extend(other.removed.iter().copied());
+        Ok(())
     }
 }
 
@@ -355,7 +408,7 @@ impl<T> Default for List<T> {
     }
 }
 
-impl<T> List<T> {
+impl<T: PartialEq> List<T> {
     pub fn push(&mut self, id: OpId, value: T) -> Result<(), Error> {
         let after = self.ordered_ids().last().copied();
         self.insert_after(id, after, value)
@@ -405,8 +458,12 @@ impl<T> List<T> {
     }
 
     fn insert_after(&mut self, id: OpId, after: Option<OpId>, value: T) -> Result<(), Error> {
-        if self.elements.contains_key(&id) {
-            return Err(Error::DivergentOperation(id));
+        if let Some(existing) = self.elements.get(&id) {
+            return if existing.after == after && existing.value == value {
+                Ok(())
+            } else {
+                Err(Error::DivergentOperation(id))
+            };
         }
         self.elements.insert(id, ListElement { id, after, value });
         Ok(())
@@ -461,10 +518,14 @@ impl<T: Clone + PartialEq> List<T> {
                 if existing != element {
                     return Err(Error::DivergentOperation(*id));
                 }
-            } else {
-                self.elements.insert(*id, element.clone());
             }
         }
+        self.elements.extend(
+            other
+                .elements
+                .iter()
+                .map(|(id, element)| (*id, element.clone())),
+        );
         self.removed.extend(other.removed.iter().copied());
         Ok(())
     }
@@ -483,10 +544,13 @@ impl Text {
         if index > self.len() {
             return Err(Error::IndexOutOfBounds);
         }
+        let mut staged = self.clone();
         for (offset, ch) in text.chars().enumerate() {
-            self.chars
+            staged
+                .chars
                 .insert(index + offset, change.operation(offset as u32), ch)?;
         }
+        *self = staged;
         Ok(())
     }
 
@@ -530,33 +594,58 @@ impl core::fmt::Display for Text {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Default)]
 #[rkyv(crate = rkyv)]
 pub struct Counter {
-    operations: BTreeMap<OpId, i64>,
+    operations: BTreeMap<OpId, i128>,
 }
 
 impl Counter {
-    pub fn increment(&mut self, id: OpId, amount: i64) -> Result<(), Error> {
-        self.apply(id, amount)
+    pub fn increment(&mut self, id: OpId, amount: u64) -> Result<(), Error> {
+        self.apply(id, amount as i128)
     }
 
-    pub fn decrement(&mut self, id: OpId, amount: i64) -> Result<(), Error> {
-        self.apply(id, amount.saturating_neg())
+    pub fn decrement(&mut self, id: OpId, amount: u64) -> Result<(), Error> {
+        self.apply(id, -(amount as i128))
+    }
+
+    pub fn add(&mut self, id: OpId, delta: i64) -> Result<(), Error> {
+        self.apply(id, delta as i128)
     }
 
     pub fn value(&self) -> i64 {
-        self.operations
-            .values()
-            .copied()
-            .fold(0i64, i64::saturating_add)
+        let mut positive = 0u128;
+        let mut negative = 0u128;
+        for amount in self.operations.values() {
+            if *amount >= 0 {
+                positive = positive.saturating_add(*amount as u128);
+            } else {
+                negative = negative.saturating_add(amount.unsigned_abs());
+            }
+        }
+        if positive >= negative {
+            positive.saturating_sub(negative).min(i64::MAX as u128) as i64
+        } else {
+            let magnitude = negative.saturating_sub(positive);
+            if magnitude >= (i64::MAX as u128) + 1 {
+                i64::MIN
+            } else {
+                -(magnitude as i64)
+            }
+        }
     }
 
     pub fn merge(&mut self, other: &Self) -> Result<(), Error> {
         for (id, amount) in &other.operations {
-            self.apply(*id, *amount)?;
+            if let Some(existing) = self.operations.get(id)
+                && existing != amount
+            {
+                return Err(Error::DivergentOperation(*id));
+            }
         }
+        self.operations
+            .extend(other.operations.iter().map(|(id, amount)| (*id, *amount)));
         Ok(())
     }
 
-    fn apply(&mut self, id: OpId, amount: i64) -> Result<(), Error> {
+    fn apply(&mut self, id: OpId, amount: i128) -> Result<(), Error> {
         if let Some(existing) = self.operations.get(&id) {
             return if *existing == amount {
                 Ok(())
@@ -603,12 +692,12 @@ mod tests {
     #[test]
     fn observed_remove_set_is_add_wins() {
         let mut a = Set::default();
-        a.insert(change(1).operation(0), "task");
+        a.insert(change(1).operation(0), "task").unwrap();
         let mut b = a.clone();
         a.remove(&"task");
-        b.insert(change(2).operation(0), "task");
-        a.merge(&b);
-        b.merge(&a);
+        b.insert(change(2).operation(0), "task").unwrap();
+        a.merge(&b).unwrap();
+        b.merge(&a).unwrap();
         assert!(a.contains(&"task"));
         assert!(b.contains(&"task"));
     }
@@ -640,11 +729,202 @@ mod tests {
     fn map_retains_concurrent_value_conflicts() {
         let mut a = Map::default();
         let mut b = Map::default();
-        a.insert(change(1).operation(0), "title", "one");
-        b.insert(change(2).operation(0), "title", "two");
+        a.insert(change(1).operation(0), "title", "one").unwrap();
+        b.insert(change(2).operation(0), "title", "two").unwrap();
         a.merge(&b).unwrap();
         b.merge(&a).unwrap();
         assert_eq!(a.get(&"title"), b.get(&"title"));
         assert_eq!(a.conflicts(&"title").count(), 1);
+    }
+
+    #[test]
+    fn scalar_operation_retry_is_idempotent_and_divergence_is_rejected() {
+        let original = change(1).operation(0);
+        let concurrent = change(2).operation(0);
+        let mut value = Value::new(original, "one");
+        value.merge(&Value::new(concurrent, "two")).unwrap();
+        value.set(original, "one").unwrap();
+        assert_eq!(value.versions().count(), 2);
+        assert_eq!(
+            value.set(original, "different"),
+            Err(Error::DivergentOperation(original))
+        );
+        assert_eq!(value.versions().count(), 2);
+    }
+
+    #[test]
+    fn collection_operation_ids_bind_their_exact_contents() {
+        let id = change(7).operation(0);
+
+        let mut set = Set::default();
+        set.insert(id, "left").unwrap();
+        assert_eq!(set.insert(id, "right"), Err(Error::DivergentOperation(id)));
+        assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec!["left"]);
+
+        let mut left = Map::default();
+        left.insert(id, "left", 1).unwrap();
+        let mut right = Map::default();
+        right.insert(id, "right", 1).unwrap();
+        assert_eq!(left.merge(&right), Err(Error::DivergentOperation(id)));
+        assert_eq!(left.get(&"left"), Some(&1));
+        assert_eq!(left.get(&"right"), None);
+    }
+
+    #[test]
+    fn failed_merges_leave_materialized_state_unchanged() {
+        let divergent = change(9).operation(0);
+
+        let mut map = Map::default();
+        map.insert(divergent, "z", 1).unwrap();
+        let mut other_map = Map::default();
+        other_map.insert(change(1).operation(0), "a", 2).unwrap();
+        other_map.insert(divergent, "z", 3).unwrap();
+        assert_eq!(
+            map.merge(&other_map),
+            Err(Error::DivergentOperation(divergent))
+        );
+        assert_eq!(
+            map.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+            vec![("z", 1)]
+        );
+
+        let mut list = List::default();
+        list.push(divergent, 'a').unwrap();
+        let mut other_list = List::default();
+        other_list.push(change(1).operation(0), 'x').unwrap();
+        other_list.push(divergent, 'b').unwrap();
+        assert_eq!(
+            list.merge(&other_list),
+            Err(Error::DivergentOperation(divergent))
+        );
+        assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec!['a']);
+
+        let mut counter = Counter::default();
+        counter.increment(divergent, 1).unwrap();
+        let mut other_counter = Counter::default();
+        other_counter.increment(change(1).operation(0), 5).unwrap();
+        other_counter.increment(divergent, 2).unwrap();
+        assert_eq!(
+            counter.merge(&other_counter),
+            Err(Error::DivergentOperation(divergent))
+        );
+        assert_eq!(counter.value(), 1);
+    }
+
+    #[test]
+    fn every_builtin_converges_for_all_three_replica_sync_orders() {
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+
+        let values = [
+            Value::new(change(1).operation(0), "a"),
+            Value::new(change(2).operation(0), "b"),
+            Value::new(change(3).operation(0), "c"),
+        ];
+        let mut expected_value = None;
+        for order in permutations {
+            let mut merged = Value::default();
+            for index in order {
+                merged.merge(&values[index]).unwrap();
+            }
+            let view = merged
+                .versions()
+                .map(|(id, value)| (id, *value))
+                .collect::<Vec<_>>();
+            assert_eq!(expected_value.get_or_insert_with(|| view.clone()), &view);
+        }
+
+        let mut maps = [Map::default(), Map::default(), Map::default()];
+        maps[0]
+            .insert(change(1).operation(0), "title", "a")
+            .unwrap();
+        maps[1]
+            .insert(change(2).operation(0), "title", "b")
+            .unwrap();
+        maps[2]
+            .insert(change(3).operation(0), "other", "c")
+            .unwrap();
+        let mut expected_map = None;
+        for order in permutations {
+            let mut merged = Map::default();
+            for index in order {
+                merged.merge(&maps[index]).unwrap();
+            }
+            let view = merged
+                .iter()
+                .map(|(key, value)| (*key, *value))
+                .collect::<Vec<_>>();
+            assert_eq!(expected_map.get_or_insert_with(|| view.clone()), &view);
+        }
+
+        let mut base_set = Set::default();
+        base_set.insert(change(4).operation(0), "x").unwrap();
+        let mut sets = [base_set.clone(), base_set.clone(), base_set];
+        sets[0].remove(&"x");
+        sets[1].insert(change(5).operation(0), "x").unwrap();
+        sets[2].insert(change(6).operation(0), "y").unwrap();
+        let mut expected_set = None;
+        for order in permutations {
+            let mut merged = Set::default();
+            for index in order {
+                merged.merge(&sets[index]).unwrap();
+            }
+            let view = merged.iter().copied().collect::<Vec<_>>();
+            assert_eq!(expected_set.get_or_insert_with(|| view.clone()), &view);
+        }
+
+        let mut base_list = List::default();
+        base_list.push(change(7).operation(0), 'a').unwrap();
+        let mut lists = [base_list.clone(), base_list.clone(), base_list];
+        lists[0].push(change(8).operation(0), 'x').unwrap();
+        lists[1].push(change(9).operation(0), 'y').unwrap();
+        lists[2].push(change(10).operation(0), 'z').unwrap();
+        let mut expected_list = None;
+        for order in permutations {
+            let mut merged = List::default();
+            for index in order {
+                merged.merge(&lists[index]).unwrap();
+            }
+            let view = merged.iter().copied().collect::<Vec<_>>();
+            assert_eq!(expected_list.get_or_insert_with(|| view.clone()), &view);
+        }
+
+        let mut base_text = Text::default();
+        base_text.insert(0, change(11), "A").unwrap();
+        let mut texts = [base_text.clone(), base_text.clone(), base_text];
+        texts[0].insert(1, change(12), "x").unwrap();
+        texts[1].insert(1, change(13), "y").unwrap();
+        texts[2].insert(1, change(14), "z").unwrap();
+        let mut expected_text = None;
+        for order in permutations {
+            let mut merged = Text::default();
+            for index in order {
+                merged.merge(&texts[index]).unwrap();
+            }
+            let view = merged.as_string();
+            assert_eq!(expected_text.get_or_insert_with(|| view.clone()), &view);
+        }
+
+        let mut counters = [Counter::default(), Counter::default(), Counter::default()];
+        counters[0]
+            .increment(change(15).operation(0), u64::MAX)
+            .unwrap();
+        counters[1]
+            .decrement(change(16).operation(0), u64::MAX)
+            .unwrap();
+        counters[2].add(change(17).operation(0), -7).unwrap();
+        for order in permutations {
+            let mut merged = Counter::default();
+            for index in order {
+                merged.merge(&counters[index]).unwrap();
+            }
+            assert_eq!(merged.value(), -7);
+        }
     }
 }
