@@ -17,6 +17,20 @@ pub trait Store<H: Hasher, P> {
     /// Store a node under the given CID.
     fn put(&mut self, cid: Cid<H>, node: DagNode<H, P>) -> Result<(), Self::Error>;
 
+    /// Store a causally ordered batch. Durable stores should override this
+    /// with one transaction. The default may leave an unreachable prefix on
+    /// failure; callers must not publish roots or materialized state until the
+    /// whole batch succeeds, making retry safe.
+    fn put_batch(
+        &mut self,
+        nodes: alloc::vec::Vec<(Cid<H>, DagNode<H, P>)>,
+    ) -> Result<(), Self::Error> {
+        for (cid, node) in nodes {
+            self.put(cid, node)?;
+        }
+        Ok(())
+    }
+
     /// Check whether a CID exists without fetching the full node.
     ///
     /// This is an important optimization for DAG inclusion checks during merge

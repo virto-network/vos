@@ -127,6 +127,22 @@ where
         Ok(())
     }
 
+    fn put_batch(
+        &mut self,
+        nodes: alloc::vec::Vec<(Cid<H>, DagNode<H, P>)>,
+    ) -> Result<(), Self::Error> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DAG_TABLE)?;
+            for (cid, node) in nodes {
+                let bytes = node.to_bytes();
+                table.insert(cid.as_ref(), bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
         let txn = self.db.begin_read()?;
         let table = match txn.open_table(DAG_TABLE) {

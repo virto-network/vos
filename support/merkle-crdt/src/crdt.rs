@@ -1,4 +1,4 @@
-use crate::sync::{self, SyncError};
+use crate::sync::{self, AcceptAll, NodeValidator, SyncError};
 use crate::{Cid, DagNode, Encode, Error, Hasher, MerkleClock, Store};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -59,8 +59,11 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
     /// Returns the CID of the new node. Broadcast this CID to other replicas so they
     /// can sync (the *Broadcaster* component from the paper).
     pub fn apply(&mut self, op: P) -> Result<Cid<H>, Error<S::Error>> {
-        P::apply(&mut self.state, &op);
-        self.clock.record(op, &mut self.store)
+        let mut staged_state = self.state.clone();
+        P::apply(&mut staged_state, &op);
+        let cid = self.clock.record(op, &mut self.store)?;
+        self.state = staged_state;
+        Ok(cid)
     }
 
     /// Sync with a remote replica by fetching missing nodes from `remote_root` downward.
@@ -75,27 +78,47 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
         remote_root: &Cid<H>,
         remote: &R,
     ) -> Result<(), SyncError<S::Error, R::Error>> {
+        self.sync_validated(remote_root, remote, &AcceptAll)
+    }
+
+    /// Sync with explicit author/payload validation. Nodes are durably staged
+    /// first; roots and materialized state activate together only after the
+    /// complete ancestry is available and verified.
+    pub fn sync_validated<R: Store<H, P>, V: NodeValidator<H, P>>(
+        &mut self,
+        remote_root: &Cid<H>,
+        remote: &R,
+        validator: &V,
+    ) -> Result<(), SyncError<S::Error, R::Error>> {
         let missing = sync::fetch_missing(remote_root, &self.store, remote)?;
-
-        // Def 7 step 4: if D is empty, M_β ⊆ M_α — no action needed
-        if missing.is_empty() {
-            return Ok(());
+        if missing
+            .iter()
+            .any(|(cid, node)| !validator.validate(cid, node))
+        {
+            return Err(SyncError::InvalidAuthor);
         }
 
-        // Def 7 steps 5-6: apply payloads in causal order
-        for (cid, node) in missing {
-            P::apply(&mut self.state, &node.payload);
-            self.store.put(cid, node).map_err(SyncError::Local)?;
-        }
+        // Store failures may leave an unreachable prefix for a backend using
+        // Store::put_batch's default. Logical state is unchanged, and retry
+        // safely finishes the ancestry. Transactional stores override the
+        // method and commit this batch atomically.
+        self.store.put_batch(missing).map_err(SyncError::Local)?;
 
-        // Def 7 steps 7-8: merge roots (compact prunes subsumed ones)
-        self.clock.add_roots([remote_root.clone()]);
-        self.clock
+        let mut staged_clock = self.clock.clone();
+        staged_clock.add_roots([remote_root.clone()]);
+        staged_clock
             .compact_roots::<P, S>(&self.store)
-            .map_err(|e| match e {
-                Error::Store(e) => SyncError::Local(e),
-                Error::MissingNode => SyncError::MissingNode,
-            })?;
+            .map_err(map_local_error)?;
+        if !ancestry_is_valid::<H, P, S, V>(&staged_clock, &self.store, validator)
+            .map_err(map_local_error)?
+        {
+            return Err(SyncError::InvalidAuthor);
+        }
+        let staged_state =
+            materialize::<H, P, S>(&staged_clock, &self.store).map_err(map_local_error)?;
+
+        self.clock = staged_clock;
+        self.state = staged_state;
         Ok(())
     }
 
@@ -130,39 +153,93 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
     /// operations on nodes reachable from multiple roots.
     /// Useful after loading a store from disk or when state may be inconsistent.
     pub fn rebuild_state(&mut self) -> Result<(), Error<S::Error>> {
-        self.state = P::State::default();
-
-        // Collect all reachable nodes from all roots (single pass, deduplicated)
-        let mut nodes: BTreeMap<Cid<H>, DagNode<H, P>> = BTreeMap::new();
-        let mut visited = BTreeSet::new();
-        let mut stack: Vec<Cid<H>> = self.clock.roots().iter().cloned().collect();
-
-        while let Some(cid) = stack.pop() {
-            if !visited.insert(cid.clone()) {
-                continue;
-            }
-            if let Some(node) = self.store.get(&cid)? {
-                for child in &node.children {
-                    if !visited.contains(child) {
-                        stack.push(child.clone());
-                    }
-                }
-                nodes.insert(cid, node);
-            }
-        }
-
-        // Apply in causal order (oldest first)
-        for (_cid, node) in sync::topological_sort(nodes) {
-            P::apply(&mut self.state, &node.payload);
-        }
+        let staged = materialize::<H, P, S>(&self.clock, &self.store)?;
+        self.state = staged;
         Ok(())
     }
+
+    /// Recover a replica from durably stored nodes plus its persisted roots.
+    /// Activation fails if any ancestry is missing or content-addressed bytes
+    /// do not verify.
+    pub fn from_roots(
+        store: S,
+        roots: impl IntoIterator<Item = Cid<H>>,
+    ) -> Result<Self, Error<S::Error>> {
+        let mut clock = MerkleClock::new();
+        clock.add_roots(roots);
+        clock.compact_roots::<P, S>(&store)?;
+        let state = materialize::<H, P, S>(&clock, &store)?;
+        Ok(Self {
+            clock,
+            store,
+            state,
+        })
+    }
+}
+
+fn map_local_error<L, R>(error: Error<L>) -> SyncError<L, R> {
+    match error {
+        Error::Store(error) => SyncError::Local(error),
+        Error::MissingNode => SyncError::MissingNode,
+    }
+}
+
+fn materialize<H: Hasher, P: Payload, S: Store<H, P>>(
+    clock: &MerkleClock<H>,
+    store: &S,
+) -> Result<P::State, Error<S::Error>> {
+    let mut nodes: BTreeMap<Cid<H>, DagNode<H, P>> = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    let mut stack: Vec<Cid<H>> = clock.roots().iter().cloned().collect();
+    while let Some(cid) = stack.pop() {
+        if !visited.insert(cid.clone()) {
+            continue;
+        }
+        let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
+        if node.cid() != cid {
+            return Err(Error::MissingNode);
+        }
+        for child in &node.children {
+            if !visited.contains(child) {
+                stack.push(child.clone());
+            }
+        }
+        nodes.insert(cid, node);
+    }
+    let mut state = P::State::default();
+    for (_, node) in sync::topological_sort(nodes) {
+        P::apply(&mut state, &node.payload);
+    }
+    Ok(state)
+}
+
+fn ancestry_is_valid<H: Hasher, P: Payload, S: Store<H, P>, V: NodeValidator<H, P>>(
+    clock: &MerkleClock<H>,
+    store: &S,
+    validator: &V,
+) -> Result<bool, Error<S::Error>> {
+    let mut visited = BTreeSet::new();
+    let mut stack: Vec<Cid<H>> = clock.roots().iter().cloned().collect();
+    while let Some(cid) = stack.pop() {
+        if !visited.insert(cid.clone()) {
+            continue;
+        }
+        let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
+        if node.cid() != cid {
+            return Err(Error::MissingNode);
+        }
+        if !validator.validate(&cid, &node) {
+            return Ok(false);
+        }
+        stack.extend(node.children.iter().cloned());
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemStore;
+    use crate::{MemStore, Store};
 
     struct TestHasher;
     impl crate::Hasher for TestHasher {
@@ -199,6 +276,55 @@ mod tests {
     }
 
     type TestCrdt = MerkleCrdt<TestHasher, CounterOp, MemStore<TestHasher, CounterOp>>;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InjectedError {
+        Write,
+    }
+
+    struct FailStore {
+        inner: MemStore<TestHasher, CounterOp>,
+        writes_before_failure: Option<usize>,
+    }
+
+    impl FailStore {
+        fn new(writes_before_failure: Option<usize>) -> Self {
+            Self {
+                inner: MemStore::new(),
+                writes_before_failure,
+            }
+        }
+    }
+
+    impl Store<TestHasher, CounterOp> for FailStore {
+        type Error = InjectedError;
+
+        fn get(
+            &self,
+            cid: &Cid<TestHasher>,
+        ) -> Result<Option<DagNode<TestHasher, CounterOp>>, Self::Error> {
+            Ok(self.inner.get(cid).unwrap())
+        }
+
+        fn put(
+            &mut self,
+            cid: Cid<TestHasher>,
+            node: DagNode<TestHasher, CounterOp>,
+        ) -> Result<(), Self::Error> {
+            if let Some(remaining) = &mut self.writes_before_failure {
+                if *remaining == 0 {
+                    return Err(InjectedError::Write);
+                }
+                *remaining -= 1;
+            }
+            self.inner.put(cid, node).unwrap();
+            Ok(())
+        }
+
+        fn contains(&self, cid: &Cid<TestHasher>) -> Result<bool, Self::Error> {
+            Ok(self.inner.contains(cid).unwrap())
+        }
+    }
 
     #[test]
     fn rebuild_state_no_double_apply_with_shared_sub_dag() {
@@ -293,5 +419,118 @@ mod tests {
             7,
             "syncing already-included root should be no-op"
         );
+    }
+
+    #[test]
+    fn local_store_failure_does_not_mutate_clock_or_state() {
+        let store = FailStore::new(Some(0));
+        let mut replica: MerkleCrdt<TestHasher, CounterOp, _> = MerkleCrdt::new(store);
+        assert!(matches!(
+            replica.apply(CounterOp(7)),
+            Err(Error::Store(InjectedError::Write))
+        ));
+        assert_eq!(*replica.state(), 0);
+        assert!(replica.roots().is_empty());
+    }
+
+    #[test]
+    fn partial_sync_is_unpublished_and_safely_retryable() {
+        let mut remote: TestCrdt = MerkleCrdt::default();
+        remote.apply(CounterOp(1)).unwrap();
+        remote.apply(CounterOp(2)).unwrap();
+        remote.apply(CounterOp(4)).unwrap();
+        let root = remote.roots().iter().next().unwrap().clone();
+
+        let store = FailStore::new(Some(1));
+        let mut local: MerkleCrdt<TestHasher, CounterOp, _> = MerkleCrdt::new(store);
+        assert!(matches!(
+            local.sync(&root, remote.store()),
+            Err(SyncError::Local(InjectedError::Write))
+        ));
+        assert_eq!(*local.state(), 0, "partial nodes must not materialize");
+        assert!(local.roots().is_empty(), "partial root must not publish");
+
+        local.store_mut().writes_before_failure = None;
+        local.sync(&root, remote.store()).unwrap();
+        assert_eq!(*local.state(), 7);
+        assert_eq!(local.roots(), remote.roots());
+    }
+
+    #[test]
+    fn missing_parent_never_activates_root() {
+        let missing = Cid::<TestHasher>([9; 32]);
+        let node = DagNode::new(CounterOp(2), [missing].into_iter().collect());
+        let root = node.cid();
+        let mut remote = MemStore::new();
+        remote.put(root.clone(), node).unwrap();
+        let mut local: TestCrdt = MerkleCrdt::default();
+        assert!(matches!(
+            local.sync(&root, &remote),
+            Err(SyncError::MissingNode)
+        ));
+        assert_eq!(*local.state(), 0);
+        assert!(local.roots().is_empty());
+    }
+
+    #[test]
+    fn malicious_cid_is_rejected() {
+        let node = DagNode::leaf(CounterOp(1));
+        let false_cid = Cid::<TestHasher>([0x55; 32]);
+        assert_ne!(node.cid(), false_cid);
+        let mut remote = MemStore::new();
+        remote.put(false_cid.clone(), node).unwrap();
+        let mut local: TestCrdt = MerkleCrdt::default();
+        assert!(matches!(
+            local.sync(&false_cid, &remote),
+            Err(SyncError::InvalidCid)
+        ));
+    }
+
+    #[test]
+    fn recovery_requires_complete_ancestry() {
+        let mut original: TestCrdt = MerkleCrdt::default();
+        original.apply(CounterOp(3)).unwrap();
+        original.apply(CounterOp(8)).unwrap();
+        let roots = original.roots().iter().cloned().collect::<Vec<_>>();
+        let mut copied = MemStore::new();
+        for root in &roots {
+            original
+                .clock()
+                .walk(root, original.store(), |cid, node| {
+                    copied.put(cid.clone(), node.clone()).unwrap();
+                })
+                .unwrap();
+        }
+        let recovered = TestCrdt::from_roots(copied, roots).unwrap();
+        assert_eq!(*recovered.state(), 11);
+    }
+
+    #[test]
+    fn validation_covers_previously_staged_ancestry() {
+        struct RejectAll;
+        impl NodeValidator<TestHasher, CounterOp> for RejectAll {
+            fn validate(
+                &self,
+                _cid: &Cid<TestHasher>,
+                _node: &DagNode<TestHasher, CounterOp>,
+            ) -> bool {
+                false
+            }
+        }
+
+        let node = DagNode::leaf(CounterOp(5));
+        let root = node.cid();
+        let mut local_store = MemStore::new();
+        local_store.put(root.clone(), node.clone()).unwrap();
+        let mut local: TestCrdt = MerkleCrdt::new(local_store);
+        let mut remote = MemStore::new();
+        remote.put(root.clone(), node).unwrap();
+
+        assert!(matches!(
+            local.sync_validated(&root, &remote, &RejectAll),
+            Err(SyncError::InvalidAuthor)
+        ));
+        assert_eq!(*local.state(), 0);
+        assert!(local.roots().is_empty());
     }
 }

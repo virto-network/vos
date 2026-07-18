@@ -25,7 +25,8 @@ pub trait Decode: Sized {
     /// Convenience: decode from a full byte slice.
     fn decode(buf: &[u8]) -> Option<Self> {
         let mut pos = 0;
-        Self::decode_from(buf, &mut pos)
+        let value = Self::decode_from(buf, &mut pos)?;
+        (pos == buf.len()).then_some(value)
     }
 }
 
@@ -205,7 +206,9 @@ impl<T: Decode + Ord> Decode for alloc::collections::BTreeSet<T> {
         let count = read_u64(buf, pos)? as usize;
         let mut s = alloc::collections::BTreeSet::new();
         for _ in 0..count {
-            s.insert(T::decode_from(buf, pos)?);
+            if !s.insert(T::decode_from(buf, pos)?) {
+                return None;
+            }
         }
         Some(s)
     }

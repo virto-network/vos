@@ -25,6 +25,8 @@ pub enum SyncError<L, R> {
     MissingNode,
     /// A fetched node's recomputed CID didn't match the expected CID.
     InvalidCid,
+    /// A fetched node failed the application-provided author/signature policy.
+    InvalidAuthor,
 }
 
 impl<L: core::fmt::Display, R: core::fmt::Display> core::fmt::Display for SyncError<L, R> {
@@ -34,6 +36,7 @@ impl<L: core::fmt::Display, R: core::fmt::Display> core::fmt::Display for SyncEr
             SyncError::Remote(e) => write!(f, "remote store error: {e}"),
             SyncError::MissingNode => write!(f, "referenced node not found"),
             SyncError::InvalidCid => write!(f, "fetched node CID verification failed"),
+            SyncError::InvalidAuthor => write!(f, "fetched node author validation failed"),
         }
     }
 }
@@ -113,6 +116,21 @@ where
     // We want: if A references B as a child, B comes before A.
     // This is a reverse topological sort using out-degree (Kahn's algorithm).
     Ok(topological_sort(missing))
+}
+
+/// Policy hook for signed-author or payload validation. Merkle addressing
+/// authenticates bytes, not who was allowed to create them.
+pub trait NodeValidator<H: Hasher, P> {
+    fn validate(&self, cid: &Cid<H>, node: &DagNode<H, P>) -> bool;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcceptAll;
+
+impl<H: Hasher, P> NodeValidator<H, P> for AcceptAll {
+    fn validate(&self, _cid: &Cid<H>, _node: &DagNode<H, P>) -> bool {
+        true
+    }
 }
 
 /// Topologically sort DAG nodes so children (older events) come before parents (newer events).

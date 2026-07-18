@@ -58,10 +58,13 @@ impl<H: Hasher> MerkleClock<H> {
         payload: P,
         store: &mut S,
     ) -> Result<Cid<H>, Error<S::Error>> {
-        let children = core::mem::take(&mut self.roots);
+        // Do not take the current roots before durable recording succeeds. A
+        // failed store write must leave the logical clock untouched.
+        let children = self.roots.clone();
         let node = DagNode::new(payload, children);
         let cid = node.cid();
         store.put(cid.clone(), node)?;
+        self.roots.clear();
         self.roots.insert(cid.clone());
         Ok(cid)
     }
@@ -76,20 +79,23 @@ impl<H: Hasher> MerkleClock<H> {
     ///
     /// This implements the join operation `M ⊔ N = M ∪ N` from the paper,
     /// followed by root compaction to keep only the "heads".
-    pub fn merge<P: Clone, S: Store<H, P>>(
+    pub fn merge<P: Encode + Clone, S: Store<H, P>>(
         &mut self,
         remote_roots: &BTreeSet<Cid<H>>,
         store: &S,
     ) -> Result<(), Error<S::Error>> {
-        self.roots.extend(remote_roots.iter().cloned());
-        self.compact_roots::<P, S>(store)
+        let mut staged = self.clone();
+        staged.roots.extend(remote_roots.iter().cloned());
+        staged.compact_roots::<P, S>(store)?;
+        *self = staged;
+        Ok(())
     }
 
     /// Remove roots that are ancestors of other roots.
     ///
     /// After merging, some roots may be subsumed by others (i.e., reachable
     /// as descendants from another root). This walks the DAG to prune them.
-    pub fn compact_roots<P: Clone, S: Store<H, P>>(
+    pub fn compact_roots<P: Encode + Clone, S: Store<H, P>>(
         &mut self,
         store: &S,
     ) -> Result<(), Error<S::Error>> {
@@ -107,18 +113,20 @@ impl<H: Hasher> MerkleClock<H> {
             if !visited.insert(cid.clone()) {
                 continue;
             }
-            if let Some(node) = store.get(&cid)? {
-                for child in &node.children {
-                    if candidates.contains(child) && subsumed.insert(child.clone()) {
-                        // Early exit: found all but one
-                        if subsumed.len() >= target_count - 1 {
-                            self.roots = candidates.difference(&subsumed).cloned().collect();
-                            return Ok(());
-                        }
+            let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
+            if node.cid() != cid {
+                return Err(Error::MissingNode);
+            }
+            for child in &node.children {
+                if candidates.contains(child) && subsumed.insert(child.clone()) {
+                    // Early exit: found all but one
+                    if subsumed.len() >= target_count - 1 {
+                        self.roots = candidates.difference(&subsumed).cloned().collect();
+                        return Ok(());
                     }
-                    if !visited.contains(child) {
-                        stack.push(child.clone());
-                    }
+                }
+                if !visited.contains(child) {
+                    stack.push(child.clone());
                 }
             }
         }
@@ -136,7 +144,7 @@ impl<H: Hasher> MerkleClock<H> {
         mut visitor: F,
     ) -> Result<(), Error<S::Error>>
     where
-        P: Clone,
+        P: Encode + Clone,
         S: Store<H, P>,
         F: FnMut(&Cid<H>, &DagNode<H, P>),
     {
@@ -153,15 +161,17 @@ impl<H: Hasher> MerkleClock<H> {
             if !visited.insert(cid.clone()) {
                 continue;
             }
-            if let Some(node) = store.get(&cid)? {
-                // Push children first (they'll be processed before this node)
-                for child in node.children.iter().rev() {
-                    if !visited.contains(child) {
-                        stack.push((child.clone(), None));
-                    }
+            let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
+            if node.cid() != cid {
+                return Err(Error::MissingNode);
+            }
+            // LIFO post-order: push self first, then children in reverse so
+            // every child exits before its parent.
+            stack.push((cid, Some(node.clone())));
+            for child in node.children.iter().rev() {
+                if !visited.contains(child) {
+                    stack.push((child.clone(), None));
                 }
-                // Push self for post-order visit (with cached node, single fetch)
-                stack.push((cid, Some(node)));
             }
         }
 
@@ -227,5 +237,19 @@ mod tests {
         // Recording a new event consolidates into 1 root
         let _a2 = clock_a.record(30u64, &mut store_a).unwrap();
         assert_eq!(clock_a.roots().len(), 1);
+    }
+
+    #[test]
+    fn walk_visits_children_before_parents() {
+        let mut clock = MerkleClock::<TestHasher>::new();
+        let mut store = MemStore::new();
+        let first = clock.record(1u64, &mut store).unwrap();
+        let second = clock.record(2u64, &mut store).unwrap();
+        let third = clock.record(3u64, &mut store).unwrap();
+        let mut order = Vec::new();
+        clock
+            .walk(&third, &store, |cid, _| order.push(cid.clone()))
+            .unwrap();
+        assert_eq!(order, vec![first, second, third]);
     }
 }

@@ -14,13 +14,18 @@
 //!   provides causal ordering, content-addressing enables efficient sync, and the whole
 //!   system works without coordination between replicas.
 //!
+//! The Merkle-DAG is causal transport and durable storage; it does **not** make an
+//! arbitrary payload convergent. `Payload::apply` must itself implement a CRDT whose
+//! result is independent of every valid causal replay order. Command logs that overwrite
+//! ordinary mutable state are not CRDTs.
+//!
 //! ## Properties
 //!
 //! - **Transport-agnostic**: works over any network (DHT, PubSub, sneakernet)
 //! - **No coordination**: replicas operate independently, sync when convenient
 //! - **Self-verifying**: content-addressed nodes can be fetched from untrusted sources
-//! - **Crytographic deduplication**: identical events have identical CIDs
-//! - **Crytographic causal ordering**: the DAG encodes happened-before relationships
+//! - **Cryptographic deduplication**: identical events have identical CIDs
+//! - **Cryptographic causal ordering**: the DAG encodes happened-before relationships
 //!
 //! ## Quick Example
 //!
@@ -84,6 +89,7 @@ pub use encode::{Decode, Encode};
 pub use hasher::Hasher;
 pub use node::DagNode;
 pub use store::{MemStore, Store};
+pub use sync::{AcceptAll, NodeValidator};
 
 #[cfg(feature = "redb")]
 mod store_redb;

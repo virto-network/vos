@@ -77,17 +77,23 @@ impl<H: Hasher, P: Encode> DagNode<H, P> {
 impl<H: Hasher, P: Decode> DagNode<H, P> {
     /// Deserialize a node from bytes (inverse of `to_bytes`).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut pos = 0;
+        let mut pos: usize = 0;
         let payload_len = {
-            let b = &bytes[pos..pos + 8];
+            let b = bytes.get(pos..pos.checked_add(8)?)?;
             pos += 8;
             u64::from_le_bytes(b.try_into().ok()?) as usize
         };
-        if pos + payload_len > bytes.len() {
+        let payload_end = pos.checked_add(payload_len)?;
+        if payload_end > bytes.len() {
             return None;
         }
-        let payload = P::decode_from(&bytes[pos..pos + payload_len], &mut 0)?;
-        pos += payload_len;
+        let payload_bytes = &bytes[pos..payload_end];
+        let mut payload_pos = 0;
+        let payload = P::decode_from(payload_bytes, &mut payload_pos)?;
+        if payload_pos != payload_bytes.len() {
+            return None;
+        }
+        pos = payload_end;
         let count = {
             if pos + 8 > bytes.len() {
                 return None;
@@ -105,6 +111,44 @@ impl<H: Hasher, P: Decode> DagNode<H, P> {
             let h = H::Output::decode_from(bytes, &mut pos)?;
             children.insert(Cid(h));
         }
+        if pos != bytes.len() || children.len() != count {
+            return None;
+        }
         Some(DagNode { payload, children })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestHasher;
+    impl Hasher for TestHasher {
+        type Output = [u8; 32];
+        fn hash(data: &[u8]) -> Self::Output {
+            let mut out = [0; 32];
+            for (i, byte) in data.iter().enumerate() {
+                out[i % 32] ^= byte;
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn decode_rejects_truncation_trailing_bytes_and_duplicate_children() {
+        assert!(DagNode::<TestHasher, u64>::from_bytes(&[]).is_none());
+        let node = DagNode::<TestHasher, u64>::leaf(7);
+        let mut trailing = node.to_bytes();
+        trailing.push(0);
+        assert!(DagNode::<TestHasher, u64>::from_bytes(&trailing).is_none());
+
+        let child = Cid::<TestHasher>([1; 32]);
+        let mut duplicate = Vec::new();
+        duplicate.extend_from_slice(&8u64.to_le_bytes());
+        duplicate.extend_from_slice(&7u64.to_le_bytes());
+        duplicate.extend_from_slice(&2u64.to_le_bytes());
+        duplicate.extend_from_slice(child.as_ref());
+        duplicate.extend_from_slice(child.as_ref());
+        assert!(DagNode::<TestHasher, u64>::from_bytes(&duplicate).is_none());
     }
 }
