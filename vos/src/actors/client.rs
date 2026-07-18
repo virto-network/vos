@@ -35,6 +35,10 @@ pub enum ClientError {
     /// call (`STATUS_FORBIDDEN` envelope). The local peer lacks
     /// the role required for the targeted handler.
     Forbidden,
+    /// Name resolution did not find an installed actor.
+    NotFound,
+    /// `Context::child` resolved an actor outside the caller's owned tree.
+    NotOwnedChild,
 }
 
 impl core::fmt::Display for ClientError {
@@ -44,6 +48,8 @@ impl core::fmt::Display for ClientError {
             Self::UnexpectedReply(s) => write!(f, "client: unexpected reply: {s}"),
             Self::Decode => write!(f, "client: failed to decode reply"),
             Self::Forbidden => write!(f, "permission denied: caller lacks the required role"),
+            Self::NotFound => write!(f, "client: actor name was not found"),
+            Self::NotOwnedChild => write!(f, "client: actor is not an owned child"),
         }
     }
 }
@@ -74,6 +80,20 @@ pub trait Invoker {
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_;
 }
+
+/// Implemented by every macro-generated `{Actor}Ref`. It binds the route-only
+/// reference to an invoker and returns the generated handle whose methods no
+/// longer need an extra `ctx` argument.
+pub trait ActorReference: Copy {
+    type Handle<'a, I: Invoker + 'a>: 'a
+    where
+        Self: 'a;
+
+    fn bind<'a, I: Invoker + 'a>(target: ServiceId, invoker: &'a mut I) -> Self::Handle<'a, I>;
+}
+
+/// Generic spelling for a bound macro-generated actor handle.
+pub type ActorHandle<'a, R, I> = <R as ActorReference>::Handle<'a, I>;
 
 // `Context<A>` already exposes the right primitive — `ask_raw` returns
 // an `Ask` future yielding `Result<Value, InvokeError>`. The Invoker

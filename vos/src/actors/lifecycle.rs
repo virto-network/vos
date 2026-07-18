@@ -437,7 +437,7 @@ pub fn invoke_hash_with_rows(
 /// before each handler runs. Layout:
 ///
 ///   raw[0] = TAG_CALLER_PREFIX (0xFE)
-///   raw[1] = trust_flag (0 = external, 1 = trusted-bypass)
+///   raw[1] = internal_origin (0 = external, 1 = system)
 ///   raw[2] = has_space_role (0 / 1)
 ///   raw[3] = space_role byte (only meaningful if has_space_role)
 ///   raw[4] = has_actor_local_role (0 / 1)

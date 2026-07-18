@@ -99,6 +99,10 @@ fn first_doc_paragraph(attrs: &[syn::Attribute]) -> String {
 #[proc_macro_attribute]
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as ItemStruct);
+    let parsed = parse_actor_attrs(attr);
+    if let Err(error) = prepare_crdt_fields(&mut input, parsed.crdt) {
+        return error.to_compile_error().into();
+    }
     let storage_fields = extract_storage_fields(&mut input);
     let name = &input.ident;
     let msg_enum = format_ident!("{}Msg", name);
@@ -108,13 +112,13 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   #[actor(error = Type)]         — custom error type for Actor::Error
     //   #[actor(kind = "transport")]   — opt into transport-mode (handle_connection)
     //   #[actor(caps = ["net.tcp.bind", ...])] — declarative capability list
-    let parsed = parse_actor_attrs(attr);
     let error_ty = parsed.error_ty;
     let kind_byte = parsed.kind_byte;
     let caps_lits = parsed.caps;
     let role_ty = parsed.role_ty;
     let default_role = parsed.default_role;
     let space_role_map = parsed.space_role_map;
+    let crdt = parsed.crdt;
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let vis = &input.vis;
@@ -295,6 +299,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // One-line actor description from the struct's `///` doc.
             const DOC: &'static str = #actor_doc;
+
+            const CRDT: bool = #crdt;
 
             fn create() -> Self {
                 Self::__vos_create()
@@ -1009,6 +1015,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Actor-level doc — the struct's `///` first paragraph,
                 // threaded through the Actor trait (defaulted empty).
                 doc: <#actor_ty as vos::Actor>::DOC,
+                // Only `#[actor(crdt)]` programs may select CRDT storage.
+                crdt: <#actor_ty as vos::Actor>::CRDT,
             };
         }
     };
@@ -1230,11 +1238,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     quote! { #n: #t }
                 })
                 .collect();
-            let with_calls: Vec<proc_macro2::TokenStream> = m
-                .args
-                .iter()
-                .map(|(n, t)| ref_arg_with(n, t))
-                .collect();
+            let with_calls: Vec<proc_macro2::TokenStream> =
+                m.args.iter().map(|(n, t)| ref_arg_with(n, t)).collect();
             let return_ty: proc_macro2::TokenStream = match &m.success_ty {
                 None => quote! { () },
                 Some(t) => quote! { #t },
@@ -1262,6 +1267,31 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    let handle_methods_emit: Vec<proc_macro2::TokenStream> = client_methods
+        .iter()
+        .map(|m| {
+            let method_ident = &m.wire_name;
+            let arg_decls: Vec<proc_macro2::TokenStream> =
+                m.args.iter().map(|(n, t)| quote! { #n: #t }).collect();
+            let arg_names: Vec<&syn::Ident> = m.args.iter().map(|(n, _)| n).collect();
+            let return_ty: proc_macro2::TokenStream = match &m.success_ty {
+                None => quote! { () },
+                Some(t) => quote! { #t },
+            };
+            quote! {
+                pub async fn #method_ident(
+                    &mut self,
+                    #( #arg_decls ),*
+                ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
+                    self.reference
+                        .#method_ident(&mut *self.invoker, #( #arg_names ),*)
+                        .await
+                }
+            }
+        })
+        .collect();
+    let handle_struct_name = format_ident!("{}Handle", actor_name);
+
     let ref_emission = quote! {
         #[derive(Copy, Clone)]
         pub struct #ref_struct_name {
@@ -1280,6 +1310,35 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #( #ref_methods_emit )*
+        }
+
+        pub struct #handle_struct_name<'a, __I: vos::actors::client::Invoker> {
+            reference: #ref_struct_name,
+            invoker: &'a mut __I,
+        }
+
+        impl<'a, __I: vos::actors::client::Invoker> #handle_struct_name<'a, __I> {
+            /// Advanced escape hatch for host/runtime integrations.
+            pub const fn id(&self) -> vos::abi::service::ServiceId {
+                self.reference.id()
+            }
+
+            #( #handle_methods_emit )*
+        }
+
+        impl vos::actors::client::ActorReference for #ref_struct_name {
+            type Handle<'a, __I: vos::actors::client::Invoker + 'a> =
+                #handle_struct_name<'a, __I>;
+
+            fn bind<'a, __I: vos::actors::client::Invoker + 'a>(
+                target: vos::abi::service::ServiceId,
+                invoker: &'a mut __I,
+            ) -> Self::Handle<'a, __I> {
+                #handle_struct_name {
+                    reference: Self::at(target),
+                    invoker,
+                }
+            }
         }
     };
 
@@ -1411,6 +1470,8 @@ struct ActorAttrs {
     /// that many bytes is emitted for the invoker (and the prover) to
     /// patch `(state, msg)` into.
     task_buf: Option<usize>,
+    /// Explicit CRDT source model (`#[actor(crdt)]`).
+    crdt: bool,
 }
 
 /// Pull `#[storage]` / `#[storage(prefix = "…")]` off the state
@@ -1538,6 +1599,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
         default_role: quote! { vos::NoRoles::Any },
         space_role_map: quote! { vos::NO_ROLES_MAP },
         task_buf: None,
+        crdt: false,
     };
     if attr.is_empty() {
         return out;
@@ -1603,6 +1665,9 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
             syn::Meta::Path(p) if p.is_ident("task") => {
                 out.task_buf = Some(DEFAULT_TASK_BUF);
             }
+            syn::Meta::Path(p) if p.is_ident("crdt") => {
+                out.crdt = true;
+            }
             syn::Meta::NameValue(nv) if nv.path.is_ident("task") => {
                 if let syn::Expr::Lit(syn::ExprLit {
                     lit: syn::Lit::Int(n),
@@ -1616,6 +1681,93 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
         }
     }
     out
+}
+
+/// Strip and validate `#[crdt(const)]` / `#[crdt(skip)]` field annotations.
+/// Plain mutable fields on a CRDT actor are rejected with application-facing
+/// guidance instead of silently becoming last-writer-wins command replay.
+fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<()> {
+    let syn::Fields::Named(named) = &mut input.fields else {
+        if is_crdt && !matches!(input.fields, syn::Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                &input.fields,
+                "#[actor(crdt)] requires named fields so each replicated field has explicit semantics",
+            ));
+        }
+        return Ok(());
+    };
+
+    for field in &mut named.named {
+        let mut is_const = false;
+        let mut is_skip = false;
+        let mut crdt_attr = None;
+        field.attrs.retain(|attr| {
+            if attr.path().is_ident("crdt") {
+                crdt_attr = Some(attr.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        if let Some(attr) = crdt_attr {
+            if !is_crdt {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[crdt(...)] fields require #[actor(crdt)]",
+                ));
+            }
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("const") {
+                    is_const = true;
+                    Ok(())
+                } else if meta.path.is_ident("skip") {
+                    is_skip = true;
+                    Ok(())
+                } else {
+                    Err(meta.error("expected #[crdt(const)] or #[crdt(skip)]"))
+                }
+            })?;
+            if is_const && is_skip {
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "a CRDT field cannot be both const and skip",
+                ));
+            }
+            if is_skip {
+                field
+                    .attrs
+                    .push(syn::parse_quote!(#[rkyv(with = vos::rkyv::with::Skip)]));
+            }
+        }
+
+        if is_crdt && !is_const && !is_skip && !is_crdt_field_type(&field.ty) {
+            let name = field
+                .ident
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "field".into());
+            return Err(syn::Error::new_spanned(
+                &field.ty,
+                format!(
+                    "plain mutable field `{name}` has no convergent merge rule; use crdt::Counter for additive changes, crdt::Value<T> when one assignment should be visible, crdt::Map for independently editable keys, crdt::Set for membership, crdt::List/crdt::Text for sequences, or mark derived data #[crdt(skip)]",
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_crdt_field_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    path.path.segments.last().is_some_and(|segment| {
+        matches!(
+            segment.ident.to_string().as_str(),
+            "Value" | "Map" | "Set" | "List" | "Text" | "Counter"
+        )
+    })
 }
 
 /// Default `__VOS_WITNESS` capacity for `#[actor(task)]` blobs.
@@ -2019,9 +2171,7 @@ mod doc_tests {
 
     #[test]
     fn block_comment_strips_star_and_stops_at_blank() {
-        let a = attrs(
-            "/**\n * First line.\n * still first.\n *\n * Second para.\n */\nstruct X;",
-        );
+        let a = attrs("/**\n * First line.\n * still first.\n *\n * Second para.\n */\nstruct X;");
         assert_eq!(first_doc_paragraph(&a), "First line. still first.");
     }
 }

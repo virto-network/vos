@@ -33,6 +33,7 @@ pub use auth::{
     Caller, Forbidden, IntraCap, IntraCapParseError, NO_ROLES_MAP, NoRoles, RoleByte, SpaceRole,
     SpaceRoleMap, cap_for,
 };
+pub use client::{ActorHandle, ActorReference, ClientError};
 pub use codec::{Decode, Encode};
 pub mod context;
 pub use context::{Context, Extension, ExtensionCtx};

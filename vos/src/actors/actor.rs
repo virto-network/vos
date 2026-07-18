@@ -96,6 +96,11 @@ pub trait Actor: Sized + Encode + Decode {
     /// struct's `///` doc; empty when undocumented.
     const DOC: &'static str = "";
 
+    /// Whether this actor's replicated state is expressed exclusively through
+    /// `vos::crdt` field types. Registration must reject `Consistency::Crdt`
+    /// for actors where this is false.
+    const CRDT: bool = false;
+
     /// Create a fresh actor instance with default state.
     /// Any initialization data should arrive as a regular message.
     fn create() -> Self;

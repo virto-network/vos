@@ -51,6 +51,7 @@ pub use ::log;
 ///
 /// Each actor lib.rs typically only needs this single line.
 pub mod prelude {
+    pub use crate::crdt;
     pub use crate::lifecycle;
     pub use crate::value::Msg;
     pub use crate::{Decode, Encode};
@@ -61,6 +62,8 @@ pub mod prelude {
     // `handle_connection` body is kept verbatim, so it must resolve via the
     // prelude like the rest of an extension's surface.
     pub use crate::Context;
+    pub use crate::{ActorId, CallId, InvocationId, Origin};
+    pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
     // Guest-side stdout shims backed by DEBUG_WRITE. Available at
@@ -83,7 +86,14 @@ pub mod __io {
 // --- ABI (hostcall IDs, error codes, ecall wrappers) ---
 
 pub mod abi;
+pub mod attestation;
 pub mod crypto;
+/// Version-2 JAM service contracts and the local conformance harness.
+///
+/// This module is intentionally independent of the legacy `RefinePayload`
+/// journal. V2 packages and persisted stores never decode through the v1
+/// runtime.
+pub mod v2;
 
 /// ZK actor-IO ABI: bind a zkpvm proof to a `(public, return)` tuple
 /// (TAGLESS — program identity lives in the proof's program commitment,
@@ -95,6 +105,8 @@ pub mod zk;
 // --- Actor framework (always available, no_std compatible) ---
 
 pub mod actors;
+/// Convergent, PVM-safe field types for `#[actor(crdt)]` state.
+pub mod crdt;
 pub mod jobs;
 // Space-registry protocol — wire rows, status/role consts, and the
 // consensus-critical canonical signing-byte encodings. Always available
@@ -157,15 +169,20 @@ pub use actors::storage;
 pub use actors::run_refine;
 pub use actors::value;
 pub use actors::{
-    Actor, Ask, Caller, Context, Extension, ExtensionCtx, Forbidden, IntraCap, IntraCapParseError,
-    Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult, SpaceRole, SpaceRoleMap, Yield, metadata,
-    run_blocking, try_poll,
+    Actor, ActorHandle, ActorReference, Ask, Caller, ClientError, Context, Extension, ExtensionCtx,
+    Forbidden, IntraCap, IntraCapParseError, Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult,
+    SpaceRole, SpaceRoleMap, Yield, metadata, run_blocking, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
     InvokeStatus, STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
     STATUS_TOO_BIG, STATUS_YIELDED, service_code_hash,
 };
+pub use attestation::{
+    Attestation, AttestationError, AttestationReplayGuard, AttestationStatementV3, ProofVerifier,
+    StateCommitmentV3, Verified, verify_once,
+};
+pub use v2::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the
 // `__vos_emit_worker_glue!` macro can name `$crate::TaskTable` / `$crate::TaskState`

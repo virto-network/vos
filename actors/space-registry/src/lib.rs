@@ -706,6 +706,19 @@ impl SpaceRegistry {
             return Status::ProgramNotFound;
         }
 
+        // CRDT is a source-level opt-in. Missing or legacy metadata describes
+        // an ordinary actor and cannot silently select different semantics.
+        if consistency == 2 {
+            let crdt_enabled = self
+                .metas
+                .get(&program_hash)
+                .and_then(|row| vos::metadata::decode(&row.blob))
+                .is_some_and(|meta| meta.crdt);
+            if !crdt_enabled {
+                return Status::CrdtOptInRequired;
+            }
+        }
+
         let mut idx = 0usize;
         while idx < self.agents.len() {
             let cur = &self.agents[idx];
@@ -863,6 +876,16 @@ impl SpaceRegistry {
                 // re-injecting a superseded `upgrade` op.
                 if self.agents[idx].program_hash != from_hash {
                     return Status::StaleUpgrade;
+                }
+                if self.agents[idx].consistency == 2 {
+                    let crdt_enabled = self
+                        .metas
+                        .get(&new_program_hash)
+                        .and_then(|row| vos::metadata::decode(&row.blob))
+                        .is_some_and(|meta| meta.crdt);
+                    if !crdt_enabled {
+                        return Status::CrdtOptInRequired;
+                    }
                 }
                 self.agents[idx].program_name = new_program_name;
                 self.agents[idx].program_version = new_program_version;
@@ -2395,6 +2418,32 @@ mod tests {
         rep
     }
 
+    fn register_crdt_meta(r: &mut SpaceRegistry, hash: &[u8]) {
+        const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
+            actor_name: "TestCrdt",
+            messages: &[],
+            constructor: &[],
+            kind: 0,
+            caps: &[],
+            cli_methods: &[],
+            doc: "",
+            crdt: true,
+        };
+        let (buf, len) = vos::metadata::encode::<128>(&META);
+        let blob = buf[..len].to_vec();
+        assert_eq!(
+            dispatch(
+                r,
+                RegisterMeta {
+                    program_hash: hash.to_vec(),
+                    blob: blob.clone(),
+                    auth: root_auth("register_meta", &[hash, &blob]),
+                },
+            ),
+            Status::Ok,
+        );
+    }
+
     /// Publish a throwaway program (idempotent for the same hash)
     /// and install `name` at `consistency` with a fresh
     /// `replication_id`, returning the status.
@@ -2410,6 +2459,9 @@ mod tests {
             },
         );
         assert!(pub_status == Status::Ok, "program publish must succeed");
+        if consistency == 2 {
+            register_crdt_meta(r, &hash);
+        }
         let rep = fresh_rep_id();
         dispatch(
             r,
@@ -2547,6 +2599,7 @@ mod tests {
             Status::Ok
         );
         let rep = fresh_rep_id();
+        register_crdt_meta(&mut r, &hash);
         let st = dispatch(
             &mut r,
             Install {
@@ -2580,6 +2633,49 @@ mod tests {
         assert_eq!(install_at(&mut r, "open", 2 /* Crdt */), Status::Ok);
         let o = r.agents.iter().find(|a| a.instance_name == "open").unwrap();
         assert_eq!(o.sync_role, SyncFloor::Member, "default install floor is Member");
+    }
+
+    #[test]
+    fn ordinary_actor_cannot_select_crdt_consistency() {
+        let mut r = registry();
+        let hash = alloc::vec![9u8; 32];
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Publish {
+                    name: String::from("plain"),
+                    version: String::from("1"),
+                    hash: hash.clone(),
+                    auth: root_auth("publish", &[b"plain", b"1", &hash]),
+                },
+            ),
+            Status::Ok,
+        );
+        let rep = fresh_rep_id();
+        let status = dispatch(
+            &mut r,
+            Install {
+                instance_name: String::from("plain"),
+                program_name: String::from("plain"),
+                program_version: String::from("1"),
+                program_hash: hash.clone(),
+                replication_id: rep.clone(),
+                consistency: 2,
+                install_args: Vec::new(),
+                install_payloads: Vec::new(),
+                network_reachable: false,
+                sync_role: SyncFloor::Member as u8,
+                auth: root_auth(
+                    "install",
+                    &[
+                        b"plain", b"plain", b"1", &hash, &rep, &[2], &[], &[], &[0],
+                        &[SyncFloor::Member as u8],
+                    ],
+                ),
+            },
+        );
+        assert_eq!(status, Status::CrdtOptInRequired);
+        assert!(r.agents.is_empty(), "a rejected install must not add a row");
     }
 
     #[test]
@@ -3541,6 +3637,7 @@ mod tests {
                 auth: root_auth("publish", &[b"p", b"1", &hash]),
             },
         );
+        register_crdt_meta(&mut r, &hash);
         let rep = alloc::vec![5u8; 32];
         let install_auth = root_auth(
             "install",
@@ -3631,6 +3728,8 @@ mod tests {
                 },
             );
         }
+        register_crdt_meta(&mut r, &h1);
+        register_crdt_meta(&mut r, &h2);
         let rep = alloc::vec![8u8; 32];
         assert_eq!(
             dispatch(

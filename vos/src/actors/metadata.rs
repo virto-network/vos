@@ -121,6 +121,10 @@ pub struct ActorMeta {
     /// struct's `///` doc, threaded through `Actor::DOC` by the macro.
     /// Empty when undocumented. Trailing section; old blobs decode empty.
     pub doc: &'static str,
+    /// Whether this program was declared with `#[actor(crdt)]` and may
+    /// therefore be installed with CRDT consistency.  Ordinary actors must
+    /// use Ephemeral, Local, or Raft storage.
+    pub crdt: bool,
 }
 
 // --- Binary serialization (const, used by the macro at compile time) ---
@@ -391,6 +395,11 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         md += 1;
     }
 
+    // Actor replication model. Appended so pre-v2 metadata remains readable,
+    // but it defaults to `false` and therefore can never opt into CRDT mode.
+    buf[pos] = meta.crdt as u8;
+    pos += 1;
+
     (buf, pos)
 }
 
@@ -437,6 +446,7 @@ mod tests {
             caps: &[],
             cli_methods: &[],
             doc: "",
+            crdt: false,
         };
 
         let (buf, len) = encode::<256>(&META);
@@ -470,10 +480,28 @@ mod tests {
             caps: &[],
             cli_methods: &[],
             doc: "",
+            crdt: false,
         };
         let (buf, len) = encode::<128>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
         assert_eq!(parsed.kind, 1);
+    }
+
+    #[test]
+    fn crdt_opt_in_roundtrips_and_legacy_defaults_off() {
+        const META: ActorMeta = ActorMeta {
+            actor_name: "Board",
+            messages: &[],
+            constructor: &[],
+            kind: 0,
+            caps: &[],
+            cli_methods: &[],
+            doc: "",
+            crdt: true,
+        };
+        let (buf, len) = encode::<128>(&META);
+        assert!(decode(&buf[..len]).unwrap().crdt);
+        assert!(!decode(&buf[..len - 1]).unwrap().crdt);
     }
 
     #[test]
@@ -504,6 +532,7 @@ mod tests {
             caps: &["net.tcp.bind", "net.tcp.connect", "tokio-runtime"],
             cli_methods: &[],
             doc: "",
+            crdt: false,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -574,6 +603,7 @@ mod tests {
             caps: &[],
             cli_methods: &["stop", "status"],
             doc: "",
+            crdt: false,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -686,6 +716,7 @@ mod tests {
             caps: &[],
             cli_methods: &["prove"],
             doc: "A pure-PVM prover/verifier.",
+            crdt: false,
         };
         let (buf, len) = encode::<512>(&META);
         let parsed = decode(&buf[..len]).expect("decode");
@@ -718,7 +749,8 @@ mod tests {
             0, 0, // caps_count = 0
             0, 0, // cli_methods_count = 0
             1, 0, // returns_count = 1
-            3, 0, b'u', b'6', b'4', // returns[0] = "u64"
+            3, 0, b'u', b'6',
+            b'4', // returns[0] = "u64"
                   // no doc / actor-doc / timeout sections
         ];
         let parsed = decode(blob).expect("decode");
@@ -792,6 +824,8 @@ mod decode {
         /// One-line actor description. Empty when the blob predates
         /// the doc section or the actor is undocumented.
         pub doc: String,
+        /// True only for programs explicitly compiled with `#[actor(crdt)]`.
+        pub crdt: bool,
     }
 
     /// Decode binary metadata from a `.vos_meta` section.
@@ -958,6 +992,8 @@ mod decode {
             }
         }
 
+        let crdt = data.get(pos).copied().unwrap_or(0) == 1;
+
         Some(ParsedMeta {
             actor_name,
             messages,
@@ -965,6 +1001,7 @@ mod decode {
             kind,
             caps,
             doc,
+            crdt,
         })
     }
 
@@ -981,12 +1018,7 @@ mod decode {
         if *pos + 4 > data.len() {
             return None;
         }
-        let val = u32::from_le_bytes([
-            data[*pos],
-            data[*pos + 1],
-            data[*pos + 2],
-            data[*pos + 3],
-        ]);
+        let val = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
         *pos += 4;
         Some(val)
     }

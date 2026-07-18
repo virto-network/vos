@@ -20,6 +20,10 @@ pub struct Context<A: Actor> {
     /// `Unauthenticated` by default until per-invoke plumbing
     /// overwrites it from the [`InvokeRequest`].
     caller: Caller,
+    /// Typed v2 origin. Legacy callers are mapped into this field at the
+    /// dispatch boundary; new service code sets it directly from the work
+    /// envelope.
+    origin: crate::v2::Origin,
 
     /// Caller's space-wide role byte — a
     /// [`SpaceRole`](super::auth::SpaceRole) discriminant. `None`
@@ -79,6 +83,7 @@ impl<A: Actor> Context<A> {
             id,
             stop_requested: false,
             caller: Caller::Unauthenticated,
+            origin: crate::v2::Origin::Anonymous,
             space_role: None,
             actor_local_role: None,
             forbidden: false,
@@ -118,7 +123,30 @@ impl<A: Actor> Context<A> {
     /// each invocation sees the right caller — Context outlives
     /// individual invocations, so this is a per-call slot.
     pub fn set_caller(&mut self, caller: Caller) {
+        self.origin = match &caller {
+            Caller::Unauthenticated => crate::v2::Origin::Anonymous,
+            Caller::System => crate::v2::Origin::System,
+            Caller::Peer(bytes) => crate::v2::Origin::Member(crate::v2::SubjectId(
+                crate::crypto::blake2b_hash::<32>(b"vos/subject/v2", &[bytes]),
+            )),
+            Caller::Actor(id) => {
+                crate::v2::Origin::Actor(crate::v2::ActorId(crate::crypto::blake2b_hash::<32>(
+                    b"vos/legacy-service-actor/v2",
+                    &[&id.0.to_le_bytes()],
+                )))
+            }
+        };
         self.caller = caller;
+    }
+
+    /// Authenticated, typed origin supplied by `WorkEnvelopeV2`.
+    pub fn origin(&self) -> crate::v2::Origin {
+        self.origin
+    }
+
+    #[doc(hidden)]
+    pub fn __set_origin(&mut self, origin: crate::v2::Origin) {
+        self.origin = origin;
     }
 
     /// Overwrite the per-invocation role bytes. Mirrors
@@ -160,15 +188,10 @@ impl<A: Actor> Context<A> {
 
     /// True iff the caller's effective role satisfies `required`
     /// — i.e. `>=` in the actor's role hierarchy.
-    /// [`Caller::is_trusted`] callers ([`Caller::System`] +
-    /// [`Caller::Actor`]) return `true` regardless: they
-    /// originate inside the daemon process, past the network
-    /// trust boundary. See [`Self::caller_role`] for the
-    /// rationale.
+    /// System and actor origins do not bypass this check. Internal callers
+    /// must carry an explicit actor grant or platform capability just like
+    /// any other origin.
     pub fn has_role(&self, required: A::Role) -> bool {
-        if self.caller.is_trusted() {
-            return true;
-        }
         self.caller_role().is_some_and(|r| r >= required)
     }
 
@@ -460,6 +483,61 @@ impl<A: Actor> Context<A> {
         }
     }
 
+    /// Resolve an installed root actor by name and bind its generated typed
+    /// reference to this context. Generated handle methods need no separate
+    /// `ctx` argument.
+    pub async fn actor<'a, R: super::client::ActorReference + 'a>(
+        &'a mut self,
+        name: impl Into<alloc::string::String>,
+    ) -> Result<R::Handle<'a, Self>, super::client::ClientError> {
+        let id = self.resolve(name).await;
+        if id == 0 {
+            return Err(super::client::ClientError::NotFound);
+        }
+        Ok(R::bind(ServiceId(id), self))
+    }
+
+    /// Resolve an existing actor owned by this root tree. The legacy service
+    /// host can only enforce node locality; the v2 root-tree scheduler performs
+    /// the authoritative ownership check before dispatch.
+    pub async fn child<'a, R: super::client::ActorReference + 'a>(
+        &'a mut self,
+        name: impl Into<alloc::string::String>,
+    ) -> Result<R::Handle<'a, Self>, super::client::ClientError> {
+        let id = self.resolve(name).await;
+        if id == 0 {
+            return Err(super::client::ClientError::NotFound);
+        }
+        let target = ServiceId(id);
+        if target.node_prefix() != self.id.node_prefix() {
+            return Err(super::client::ClientError::NotOwnedChild);
+        }
+        Ok(R::bind(target, self))
+    }
+
+    /// Create and initialize an owned child. This is the only beginner API
+    /// which creates a child; `actor` and `child` are resolution-only.
+    pub async fn spawn<'a, R, T>(
+        &'a mut self,
+        name: impl Into<alloc::string::String>,
+        init: &T,
+    ) -> Result<R::Handle<'a, Self>, super::client::ClientError>
+    where
+        R: super::client::ActorReference + 'a,
+        T: super::codec::Encode,
+    {
+        let name = name.into();
+        let request = super::value::Msg::new("spawn_child")
+            .with("owner", self.id.0)
+            .with("name", name)
+            .with("init", super::value::Value::Bytes(init.encode()));
+        let id = match self.ask(ServiceId::REGISTRY, &request).await {
+            Ok(super::value::Value::U32(id)) if id != 0 => id,
+            _ => return Err(super::client::ClientError::Unreachable),
+        };
+        Ok(R::bind(ServiceId(id), self))
+    }
+
     // --- Host I/O (worker mode) ---
 
     /// Issue an async host call. The handler future yields `Pending`; the host
@@ -595,7 +673,8 @@ impl<A: Actor> Context<A> {
 
     /// Queue a key-value write to per-service storage.
     pub fn store(&mut self, key: &[u8], value: &[u8]) {
-        self.pending_writes.push((key.to_vec(), Some(value.to_vec())));
+        self.pending_writes
+            .push((key.to_vec(), Some(value.to_vec())));
     }
 
     /// Queue a key removal from per-service storage. Last-wins per key
@@ -623,7 +702,8 @@ impl<A: Actor> Context<A> {
     /// id reserved at buffer time (and replicated identically across
     /// CRDT/Raft replicas), which lands with the `vos::agent::Tasks`
     /// work that reshapes child identity.
-    pub fn spawn(&mut self, code_hash: [u8; 32]) {
+    #[doc(hidden)]
+    pub fn spawn_code(&mut self, code_hash: [u8; 32]) {
         self.pending_spawns.push(code_hash);
     }
 
@@ -644,7 +724,7 @@ impl<A: Actor> Context<A> {
     /// facility to compute it.
     pub fn install(&mut self, hash: [u8; 32], code_blob: Vec<u8>) {
         self.provide(hash, code_blob);
-        self.spawn(hash);
+        self.spawn_code(hash);
     }
 
     /// Request the actor to stop after the current message.
@@ -1200,28 +1280,17 @@ mod tests {
     }
 
     #[test]
-    fn intra_system_actor_caller_bypasses_role_checks() {
-        // Trust-model invariant: anything past the libp2p auth
-        // gate that's now calling intra-system is trusted. No
-        // role bytes, but `has_role` still returns true so
-        // intra-actor compositions don't accidentally lock
-        // themselves out.
+    fn intra_system_actor_caller_requires_an_explicit_role() {
         let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::Actor(ServiceId(99)), None, None);
-        assert!(ctx.has_role(FixtureRole::Maintainer));
-        assert!(ctx.ensure_role(FixtureRole::Maintainer).is_ok());
+        assert!(!ctx.has_role(FixtureRole::Maintainer));
+        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Err(Forbidden));
     }
 
     #[test]
-    fn system_caller_bypasses_role_checks() {
-        // Trust-model invariant: host-initiated calls
-        // (`Caller::System`) originate inside the daemon
-        // process — past the network trust boundary.
-        // `vosx space up` uses this to grant the operator
-        // their initial admin role *before* any peer exists,
-        // and tests use it as the embedder-side entry point.
+    fn system_caller_requires_an_explicit_role() {
         let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::System, None, None);
-        assert!(ctx.has_role(FixtureRole::Maintainer));
-        assert!(ctx.ensure_role(FixtureRole::Maintainer).is_ok());
+        assert!(!ctx.has_role(FixtureRole::Maintainer));
+        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Err(Forbidden));
     }
 
     #[test]

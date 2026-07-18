@@ -196,9 +196,8 @@ pub enum Caller {
     /// bootstrap (which grants the operator their initial admin
     /// role *before* any libp2p connection exists), internal
     /// host probes, and other embedder-controlled entry points
-    /// land here. Treated as trusted by `has_role` since it
-    /// originates inside the daemon's process boundary; external
-    /// peers can't synthesise this variant.
+    /// land here. It still needs an explicit platform capability or role;
+    /// originating inside the daemon is not authorization.
     System,
     /// libp2p peer, identity verified by noise at connect time.
     /// The carried bytes are the peer's multihash encoding (the
@@ -209,8 +208,7 @@ pub enum Caller {
     /// Intra-system invoke from another actor on the same node
     /// (or forwarded over the cross-thread channel between
     /// agent threads). The carried `ServiceId` identifies the
-    /// calling actor; policy typically allows by virtue of "if
-    /// it's already inside the system, it's trusted."
+    /// calling actor so policy can require an explicit actor grant.
     Actor(crate::actors::context::ServiceId),
     // `Member { session_key, ... }` lands with the per-space ZK
     // login service. Until then the only authenticated-but-
@@ -229,9 +227,7 @@ impl Caller {
     /// True iff the caller is trusted by virtue of originating
     /// inside the daemon process — [`Self::System`] (host-
     /// initiated) or [`Self::Actor`] (intra-system invoke).
-    /// `Context::has_role` short-circuits these variants to
-    /// `true` so they can call admin-gated handlers without an
-    /// explicit grant.
+    /// This classifies origin only. It deliberately grants no role.
     pub const fn is_trusted(&self) -> bool {
         matches!(self, Self::System | Self::Actor(_))
     }

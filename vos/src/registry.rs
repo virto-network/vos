@@ -366,6 +366,9 @@ pub enum Status {
     /// live program hash no longer matches the `from_hash` the op was
     /// authored against.
     StaleUpgrade = 11,
+    /// CRDT consistency was requested for a program that was not compiled
+    /// with `#[actor(crdt)]`, or whose v2 metadata is unavailable.
+    CrdtOptInRequired = 12,
 }
 
 impl Status {
@@ -385,6 +388,7 @@ impl Status {
             9 => Some(Self::ConsistencyWidenDenied),
             10 => Some(Self::ReplicationIdReused),
             11 => Some(Self::StaleUpgrade),
+            12 => Some(Self::CrdtOptInRequired),
             _ => None,
         }
     }
@@ -405,6 +409,7 @@ impl core::fmt::Display for Status {
             Status::ConsistencyWidenDenied => "consistency widen denied",
             Status::ReplicationIdReused => "replication id reused",
             Status::StaleUpgrade => "stale upgrade",
+            Status::CrdtOptInRequired => "CRDT consistency requires #[actor(crdt)]",
         })
     }
 }

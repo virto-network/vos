@@ -33,12 +33,7 @@ mod fixture {
     /// `Value::Bytes` and is decoded through the checked `rkyv::access`
     /// path (G28) and the `from_bytes` fallback accessor (G25).
     #[derive(
-        vos::rkyv::Archive,
-        vos::rkyv::Serialize,
-        vos::rkyv::Deserialize,
-        Debug,
-        Clone,
-        PartialEq,
+        vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Debug, Clone, PartialEq,
     )]
     #[rkyv(crate = vos::rkyv)]
     pub struct Receipt {
@@ -101,11 +96,59 @@ mod fixture {
 
 use fixture::{Receipt, VaultMsg, VaultRef};
 
+mod crdt_fixture {
+    use vos::prelude::*;
+
+    #[actor(crdt)]
+    pub struct Board {
+        title: crdt::Value<String>,
+        edits: crdt::Counter,
+        #[crdt(const)]
+        space: u64,
+        #[crdt(skip)]
+        cache: Option<u64>,
+    }
+
+    #[messages]
+    impl Board {
+        fn new() -> Self {
+            Self {
+                title: crdt::Value::default(),
+                edits: crdt::Counter::default(),
+                space: 1,
+                cache: None,
+            }
+        }
+
+        #[msg]
+        fn edits(&self) -> i64 {
+            self.edits.value()
+        }
+    }
+}
+
 /// An `Invoker` that ignores the request and hands back a canned
 /// reply `Value`, so a `{Actor}Ref` method can be driven end-to-end
 /// on the host without a live daemon.
 struct MockInvoker {
     reply: Value,
+}
+
+#[test]
+fn crdt_actor_metadata_is_explicit() {
+    assert!(crdt_fixture::BoardMsg::META.crdt);
+}
+
+#[test]
+fn bound_handle_methods_do_not_take_an_invoker_argument() {
+    use vos::ActorReference;
+
+    let mut invoker = MockInvoker {
+        reply: Value::U64(42),
+    };
+    let mut handle = VaultRef::bind(ServiceId(7), &mut invoker);
+    let value = vos::block_on(handle.deposit(42)).unwrap();
+    assert_eq!(value, 42);
 }
 
 impl Invoker for MockInvoker {
@@ -265,7 +308,8 @@ fn vec_byte_array_arg_round_trips() {
     let vault = VaultRef::at(ServiceId(9));
     let _ = vos::block_on(vault.pin_roots(&mut inv, roots.clone())).expect("invoke");
     let msg = inv.captured_msg();
-    let VaultMsg::PinRoots(inner) = VaultMsg::from_msg(&msg).expect("from_msg decodes Vec<[u8;32]>")
+    let VaultMsg::PinRoots(inner) =
+        VaultMsg::from_msg(&msg).expect("from_msg decodes Vec<[u8;32]>")
     else {
         panic!("expected PinRoots variant");
     };
