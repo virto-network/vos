@@ -4,6 +4,7 @@
 
 ## Part I — Platform
 
+- [Runtime v2 contract](runtime-v2.md)
 - [Architecture Overview](architecture.md)
 - [Spaces, Actors & Documents](documents.md)
 - [PVM Runtime](runtime.md)

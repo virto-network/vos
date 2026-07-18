@@ -2,8 +2,8 @@
 //! installed agent.
 
 use serde::Serialize;
-use vos::registry::Status;
 use vos::init::{InitArgs, InitValue};
+use vos::registry::Status;
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::{auto_replication_id, parse_consistency, parse_program_ref};
@@ -130,6 +130,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                  a name's locality may only narrow, never widen. Use a fresh --name to install at \
                  '{}'.",
                 args.consistency,
+            ),
+            Status::CrdtOptInRequired => anyhow::bail!(
+                "'{instance_name}' cannot use CRDT consistency: its program was not built with \
+                 #[actor(crdt)]. Choose local/raft, or declare CRDT fields explicitly and rebuild.",
             ),
             other => anyhow::bail!("install returned status {other}"),
         }

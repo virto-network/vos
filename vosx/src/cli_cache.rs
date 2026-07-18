@@ -354,6 +354,7 @@ mod tests {
             kind: 1,
             caps: vec![],
             doc: String::new(),
+            crdt: false,
         }
     }
 

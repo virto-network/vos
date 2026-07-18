@@ -24,6 +24,10 @@ the user's critical path.
 | [`examples/`](examples/) | Sample actors, agents, extensions, wasm guests, space recipes |
 | [`docs/`](docs/) | The VOS Book (architecture, protocols, applications) |
 
+The clean-break service, continuation, wire, package and CRDT contracts—and
+their current implementation status—are documented in
+[`docs/runtime-v2.md`](docs/runtime-v2.md).
+
 ## Quick start
 
 ```bash
@@ -74,8 +78,9 @@ Each `[[agent]]` in a recipe picks a `consistency` mode:
 | `crdt` | merkle-CRDT, eventual | yes | local commit |
 | `raft` | Raft consensus, strict | leader only (today) | quorum ack |
 
-CRDT fits commutative state (counters, sets, LWW maps,
-append-only logs) where reads-from-anywhere matter. Raft fits
+CRDT is available only to `#[actor(crdt)]` programs whose fields use explicit
+convergent types such as `Counter`, `Value`, `Map`, `Set`, `List`, and `Text`.
+Raft fits
 strictly sequenced state where divergence corrupts (ledgers,
 unique-name registries). Modes mix freely per-agent.
 
@@ -133,23 +138,22 @@ impl Counter {
 }
 ```
 
-`#[actor]` emits the PVM `_start` / `accumulate` entry points.
-`#[messages]` generates the per-handler message types and a
-typed `CounterRef` for host-side calls:
+`#[actor]` emits the canonical actor PVM entrypoint. The generic VOS service,
+not application code, owns Refine and Accumulate. `#[messages]` generates the
+per-handler message types, route-only `CounterRef`, and a bound handle whose
+methods need no extra context argument:
 
 ```rust
-use vos::node::{AgentConfig, VosNode};
 use counter::CounterRef;
 
-let mut node = VosNode::new();
-let id = node.register(AgentConfig::new(blob));
-let counter = CounterRef::at(id);
-vos::block_on(counter.inc(&mut &node))?;
-let n = vos::block_on(counter.get(&mut &node))?;
+let mut counter = ctx.actor::<CounterRef>("counter").await?;
+counter.inc().await?;
+let n = counter.get().await?;
 ```
 
-Compile with the `riscv64em-javm` target — see
-`examples/actors/counter/.cargo/config.toml`.
+`vosx new counter` creates the target configuration that injects `no_std` and
+`no_main` plus the required `core,alloc,compiler_builtins` build-std flags.
+Use `vosx new shared-board --crdt` for an explicit CRDT template.
 
 ## Writing an extension
 

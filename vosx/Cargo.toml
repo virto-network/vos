@@ -28,6 +28,7 @@ vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage"
 # transitively but doesn't re-export, so vosx pulls its own.
 # `version` is what crates.io resolves at publish time.
 grey-transpiler = { workspace = true }
+javm = { workspace = true }
 # The per-space clock + verifiable-randomness feed now lives in
 # `vos::chronos_feed` (behind vos's `network` feature); its protocol types +
 # the `ChronosRef` client are in `vos::chronos`, and the VRF primitive it uses

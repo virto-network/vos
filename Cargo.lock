@@ -7744,6 +7744,7 @@ dependencies = [
  "getrandom 0.2.17",
  "grey-transpiler",
  "hex",
+ "javm",
  "libc",
  "libp2p",
  "redb",

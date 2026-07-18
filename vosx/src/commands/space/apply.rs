@@ -475,6 +475,11 @@ fn execute_one(
                      fresh `replication_id` in the recipe to re-create it with clean state.",
                     plan.instance_name,
                 ),
+                Status::CrdtOptInRequired => anyhow::bail!(
+                    "install '{}' requested CRDT consistency, but the program is not declared \
+                     #[actor(crdt)]",
+                    plan.instance_name,
+                ),
                 other => anyhow::bail!("install '{}' returned status {other}", plan.instance_name,),
             }
         }

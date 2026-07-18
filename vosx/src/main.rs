@@ -79,6 +79,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a minimal v2 actor project.
+    New {
+        path: PathBuf,
+        /// Scaffold an explicitly convergent actor using VOS CRDT fields.
+        #[arg(long)]
+        crdt: bool,
+    },
+    /// Build one canonical actor PVM and signed `.vos` v2 package.
+    Build {
+        /// Actor ELF (transpiled once) or an already-canonical `.pvm`.
+        program: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "0.1.0")]
+        version: String,
+        #[arg(long, default_value = "dist")]
+        out_dir: PathBuf,
+        /// ProgramId of the protocol-pinned `vos-service.pvm`.
+        #[arg(long)]
+        service_program_id: String,
+        #[arg(long)]
+        interfaces: Option<PathBuf>,
+        #[arg(long)]
+        role_policies: Option<PathBuf>,
+        #[arg(long)]
+        schemas: Option<PathBuf>,
+        #[arg(long)]
+        source_map: Option<PathBuf>,
+        /// Retain the input ELF as non-authoritative diagnostics.
+        #[arg(long)]
+        include_elf: bool,
+        /// For raw PVM input only; ELF builds derive this from `#[actor(crdt)]`.
+        #[arg(long)]
+        crdt: bool,
+    },
     /// Run a single PVM/ELF program with no recipe (one-shot).
     /// No registry, no networking — just boot the kernel,
     /// deliver the supplied work items, halt.
@@ -214,6 +249,40 @@ fn main() {
     output::set(cli.format);
 
     match cli.command {
+        Some(Command::New { path, crdt }) => {
+            if let Err(error) = commands::new_project::run(path, crdt) {
+                report_error(error);
+            }
+        }
+        Some(Command::Build {
+            program,
+            name,
+            version,
+            out_dir,
+            service_program_id,
+            interfaces,
+            role_policies,
+            schemas,
+            source_map,
+            include_elf,
+            crdt,
+        }) => {
+            if let Err(error) = commands::build::run(commands::build::Args {
+                program,
+                name,
+                version,
+                out_dir,
+                service_program_id,
+                interfaces,
+                role_policies,
+                schemas,
+                source_map,
+                include_elf,
+                crdt,
+            }) {
+                report_error(error);
+            }
+        }
         Some(Command::Run {
             program,
             payload,
@@ -317,7 +386,16 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// (one with `/` or `\`, or starting with `.`) is preserved for
 /// the existing one-shot ELF run path.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
-    const BUILTIN_VERBS: &[&str] = &["run", "space", "zk", "help-schema", "help", "whoami"];
+    const BUILTIN_VERBS: &[&str] = &[
+        "new",
+        "build",
+        "run",
+        "space",
+        "zk",
+        "help-schema",
+        "help",
+        "whoami",
+    ];
     // Skip global flags; `--format` / `--out` take a value, the
     // rest are boolean-shaped. `--out` is a dynamic-only flag but
     // we skip its value here (rather than `return true`) so its path

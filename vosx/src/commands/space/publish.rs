@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use vos::registry::Status;
+use vos::v2::{V2Wire, VosPackageV2};
 
 use crate::blob_store::{self, BlobHash, BlobSource};
 use crate::bundled;
@@ -52,13 +53,24 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     // Resolve and cache the blob bytes locally.
     let source = BlobSource::parse(&source);
-    let (hash, bytes) = blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
+    let (source_hash, bytes) =
+        blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
+    let (hash, program_bytes, package_meta) =
+        canonical_program(&name, &version, source_hash, bytes)?;
+    if hash != source_hash {
+        blob_store::cache_put(&program_bytes)
+            .map_err(|e| anyhow::anyhow!("cache canonical PVM: {e}"))?;
+    }
 
     DaemonClient::with_connect(&args.space, |client| {
         let status = client.publish(name.clone(), version.clone(), hash.0.to_vec())?;
         match status {
             Status::Ok => {
-                forward_meta(client, &hash, &bytes);
+                if let Some(meta) = package_meta.as_deref() {
+                    forward_meta_blob(client, &hash, meta);
+                } else {
+                    forward_meta(client, &hash, &program_bytes);
+                }
                 emit(&name, &version, &hash, false);
                 Ok(())
             }
@@ -69,6 +81,40 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             other => anyhow::bail!("publish returned status {other}"),
         }
     })
+}
+
+fn canonical_program(
+    name: &str,
+    version: &str,
+    source_hash: BlobHash,
+    bytes: Vec<u8>,
+) -> anyhow::Result<(BlobHash, Vec<u8>, Option<Vec<u8>>)> {
+    if bytes.get(..4) != Some(b"VOSP") {
+        return Ok((source_hash, bytes, None));
+    }
+    let package = VosPackageV2::decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("decode .vos v2 package: {error}"))?;
+    package.validate()?;
+    javm::program::parse_blob(&package.actor_pvm)
+        .ok_or_else(|| anyhow::anyhow!("package actor PVM is invalid"))?;
+    if package.manifest.name != name || package.manifest.version != version {
+        anyhow::bail!(
+            "package identity is {}:{}, but publish requested {name}:{version}",
+            package.manifest.name,
+            package.manifest.version,
+        );
+    }
+    let public_key =
+        libp2p::identity::PublicKey::try_decode_protobuf(&package.deployment_signature.public_key)
+            .map_err(|error| anyhow::anyhow!("decode deployment public key: {error}"))?;
+    if !public_key.verify(
+        &package.signing_message(),
+        &package.deployment_signature.signature,
+    ) {
+        anyhow::bail!("deployment signature is invalid");
+    }
+    let hash = BlobHash::of(&package.actor_pvm);
+    Ok((hash, package.actor_pvm, Some(package.schemas)))
 }
 
 /// Catalog identity + ELF resolver for each bundled program. The tuple
@@ -150,6 +196,15 @@ fn forward_meta(client: &DaemonClient, hash: &BlobHash, elf_bytes: &[u8]) {
     };
     if let Err(e) = client.register_meta(hash.0.to_vec(), meta_blob) {
         tracing::debug!("register_meta for bundled/published program skipped: {e}");
+    }
+}
+
+fn forward_meta_blob(client: &DaemonClient, hash: &BlobHash, meta_blob: &[u8]) {
+    if meta_blob.is_empty() {
+        return;
+    }
+    if let Err(e) = client.register_meta(hash.0.to_vec(), meta_blob.to_vec()) {
+        tracing::debug!("register_meta for v2 package skipped: {e}");
     }
 }
 

@@ -1334,8 +1334,14 @@ fn agent_config_from_row(
         Some(b) => b,
         None => return Ok(RowConfig::MissingBlob),
     };
-    let blob = grey_transpiler::link_elf(&elf)
-        .map_err(|e| anyhow::anyhow!("transpile {}: {e:?}", a.instance_name))?;
+    // v2 stores canonical PVM bytes from the signed `.vos` package. The ELF
+    // fallback remains only for bundled infrastructure fixtures.
+    let blob = if elf.get(..3) == Some(b"JAR") {
+        elf
+    } else {
+        grey_transpiler::link_elf(&elf)
+            .map_err(|e| anyhow::anyhow!("transpile legacy {}: {e:?}", a.instance_name))?
+    };
 
     let Some(consistency) = consistency_from_u8(a.consistency) else {
         return Ok(RowConfig::BadConsistency);
