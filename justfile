@@ -119,10 +119,17 @@ check-zkpvm-wasm:
 
 # Check everything compiles without producing artifacts.
 check:
+    cargo run -p jar-revision-check
     cargo check --all-targets
+
+# Reject mixed JAVM/transpiler/tracer/verifier revisions, including excluded
+# fuzz and benchmark workspaces.
+check-jar-revisions:
+    cargo run -p jar-revision-check
 
 # Run the same checks the pre-commit and pre-push hooks run.
 check-all:
+    cargo run -p jar-revision-check
     cargo fmt -- --check
     cargo clippy --workspace -- -D warnings \
         -A clippy::too_many_arguments \

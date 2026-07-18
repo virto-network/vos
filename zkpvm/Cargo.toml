@@ -75,7 +75,7 @@ curve25519-dalek = { version = "4.1", optional = true, default-features = false,
 # Carries the `SLT rd, x0, rs2` x0-as-rs1 lowering the voucher-check ELF needs,
 # plus the `SLLI/SRLI/SRAI rd, x0, n` fix (shift x0 → 0, not RA) that makes the
 # settlement verify ACCEPT on the JAM PVM (tests/settle_run.rs).
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ec9debbec0bd06c686af8a24fabe222491558481" }
+grey-transpiler = { workspace = true }
 bincode = "1"
 # no_std + serde wire format shared with the PVM settlement verifier
 # (settlement-verifier): the fixture this crate serializes is deserialized there.

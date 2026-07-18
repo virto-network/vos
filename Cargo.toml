@@ -7,6 +7,7 @@ members = [
     "support/vos-raft",
     "support/vos-shell",
     "support/merkle-crdt",
+    "support/jar-revision-check",
     "zkpvm",
     # zkpvm-{precompiles,derive,verifier} live nested inside the
     # zkpvm crate's directory tree.
@@ -129,7 +130,11 @@ opt-level = 3
 zkpvm = { path = "zkpvm" }
 zkpvm-derive = { path = "zkpvm/derive" }
 zkpvm-verifier = { path = "zkpvm/verifier" }
-javm = { git = "ssh://git@github.com/olanod/jar.git", rev = "6db1168" }
+# VOS v2 has one execution identity. Every VM, transpiler, tracer, verifier,
+# and fuzz harness must use this exact JAR revision (enforced by
+# `cargo run -p jar-revision-check`).
+javm = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.4" }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.1" }
 
 # Stwo pinned to upstream rev `e1286720` (post-v2.2.0 perf cluster:
 # parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
