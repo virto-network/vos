@@ -15,6 +15,8 @@ mod continuation;
 mod contracts;
 mod identity;
 mod package;
+#[cfg(feature = "std")]
+mod pvm;
 mod service;
 mod storage;
 pub(crate) mod wire;
@@ -40,6 +42,11 @@ pub use identity::{
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2, VosPackageV2,
     artifact_hash,
+};
+#[cfg(feature = "std")]
+pub use pvm::{
+    NoRefineProtocolHostV2, RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2,
+    ServicePvmV2,
 };
 pub use service::{JamServiceV2, ServiceDispatchError, ServiceDispatchOutputV2};
 pub use storage::{StoreHeaderV2, StoreOpenError};
