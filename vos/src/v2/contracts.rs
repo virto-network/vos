@@ -125,6 +125,27 @@ pub struct RefineImportsV2 {
     pub blobs: Vec<ImportedBlobV2>,
 }
 
+/// Input placed in the invocation-owned IPC DATA capability before the
+/// generic service CALLs an actor VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorSliceInputV2 {
+    pub actor: ActorId,
+    pub state: Vec<u8>,
+    /// Canonical generated actor-message bytes.
+    pub message: Vec<u8>,
+    pub origin: Origin,
+}
+
+/// Actor-produced result returned through the same IPC DATA capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorSliceOutputV2 {
+    pub actor: ActorId,
+    pub writes: Vec<ActorWriteV2>,
+    pub reply: Vec<u8>,
+    pub yielded: bool,
+    pub forbidden: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkEnvelopeV2 {
     pub service: ServiceIdentityV2,
@@ -464,6 +485,54 @@ impl V2Wire for RefineImportsV2 {
             .iter()
             .any(|blob| !blob.reference.matches(&blob.bytes))
         {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for ActorSliceInputV2 {
+    const MAGIC: [u8; 4] = *b"VSI2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.actor.0);
+        e.bytes(&self.state);
+        e.bytes(&self.message);
+        encode_origin(&mut e, self.origin);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            actor: ActorId(d.fixed()?),
+            state: d.bytes()?,
+            message: d.bytes()?,
+            origin: decode_origin(d)?,
+        })
+    }
+}
+
+impl V2Wire for ActorSliceOutputV2 {
+    const MAGIC: [u8; 4] = *b"VSO2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.actor.0);
+        e.list(&self.writes, encode_write);
+        e.bytes(&self.reply);
+        e.bool(self.yielded);
+        e.bool(self.forbidden);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            actor: ActorId(d.fixed()?),
+            writes: d.list(decode_write)?,
+            reply: d.bytes()?,
+            yielded: d.bool()?,
+            forbidden: d.bool()?,
+        };
+        if value.writes.iter().any(|write| write.actor != value.actor) {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -913,6 +982,40 @@ mod tests {
         assert_eq!(
             tampered.validate_for(&work),
             Err(RefineError::InvalidImport(Hash(program.0)))
+        );
+    }
+
+    #[test]
+    fn actor_slice_wires_round_trip_and_bind_writes_to_the_actor() {
+        let input = ActorSliceInputV2 {
+            actor: ActorId([21; 32]),
+            state: b"before".to_vec(),
+            message: b"message".to_vec(),
+            origin: Origin::Actor(ActorId([22; 32])),
+        };
+        assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
+
+        let output = ActorSliceOutputV2 {
+            actor: ActorId([21; 32]),
+            writes: vec![ActorWriteV2 {
+                actor: ActorId([21; 32]),
+                key: b"state".to_vec(),
+                value: Some(b"after".to_vec()),
+            }],
+            reply: b"ok".to_vec(),
+            yielded: false,
+            forbidden: false,
+        };
+        assert_eq!(
+            ActorSliceOutputV2::decode(&output.encode()).unwrap(),
+            output
+        );
+
+        let mut cross_actor_write = output;
+        cross_actor_write.writes[0].actor = ActorId([23; 32]);
+        assert_eq!(
+            ActorSliceOutputV2::decode(&cross_actor_write.encode()),
+            Err(DecodeError::NonCanonical)
         );
     }
 

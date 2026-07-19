@@ -30,10 +30,11 @@ pub use continuation::{
     ResumedKernelV2, SchedulerSnapshotV2, VmLifecycleV2, VmSnapshotV2,
 };
 pub use contracts::{
-    AccumulationReceiptV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2,
-    ConsistencyModeV2, ContinuationChangeV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2,
-    ImportedBlobV2, ImportedProgramV2, MessageRecordV2, ProofCommitmentV2, Refine, RefineError,
-    RefineImportsV2, ReplyRecordV2, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
+    AccumulationReceiptV2, ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2,
+    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, MessageRecordV2, ProofCommitmentV2, Refine, RefineError, RefineImportsV2,
+    ReplyRecordV2, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
 };
 pub use identity::{
     ActorId, CallId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId, ProgramId,
@@ -67,10 +68,16 @@ pub const ACCUMULATE_ENTRY_IC: u32 = 5;
 /// Owning HANDLE through which the generic service enters the target actor VM.
 /// This is a JAR capability-table slot supplied at invocation setup, not a JAM
 /// protocol capability or hostcall number.
-pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 100;
+pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 80;
 
-/// Successful result returned by the nested actor slice foundation entry.
-pub const ACTOR_SLICE_OK: u64 = 0x564f_532d_4143_5432;
+/// Move-only DATA capability used for service↔actor slice input/output.
+pub const ACTOR_IPC_CAP_SLOT: u8 = 90;
+/// Temporary actor-CNode slot used while CALL owns the reserved IPC slot 0.
+pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;
+/// High virtual page kept outside transpiler-owned actor memory layouts.
+pub const ACTOR_IPC_BASE_PAGE: u32 = 0x000f_0000;
+/// Marker passed in phi[10] so the canonical actor entry selects CALL/REPLY.
+pub const NESTED_ACTOR_CALL_MAGIC: u64 = 0x564f_532d_4143_5432;
 
 /// The two functions exposed by the generic service program through the Gray
 /// Paper two-slot entry prologue.

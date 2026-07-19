@@ -96,6 +96,14 @@ impl InvocationId {
             &[&self.0, &await_ordinal.to_le_bytes()],
         ))
     }
+
+    /// Stable completion identifier for the invocation itself. Durable actor
+    /// awaits use [`Self::call_id`]; a root caller has no await ordinal, so its
+    /// reply preserves the already unique invocation bytes under the `CallId`
+    /// type instead of invoking a guest-side hashing precompile.
+    pub const fn root_reply_id(self) -> CallId {
+        CallId(self.0)
+    }
 }
 
 /// Authenticated origin presented to an actor. `System` is only an identity
@@ -118,6 +126,7 @@ mod tests {
         let invocation = InvocationId::derive(b"test", b"nonce");
         assert_eq!(invocation.call_id(3), invocation.call_id(3));
         assert_ne!(invocation.call_id(3), invocation.call_id(4));
+        assert_eq!(invocation.root_reply_id().0, invocation.0);
     }
 
     #[test]

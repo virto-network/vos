@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 /// - `sleep(n)` — commit state and sleep for N ticks
 pub struct Context<A: Actor> {
     id: ServiceId,
+    actor_id: Option<crate::v2::ActorId>,
     stop_requested: bool,
 
     /// Identity of whoever invoked the handler currently running.
@@ -81,6 +82,7 @@ impl<A: Actor> Context<A> {
     pub fn new(id: ServiceId) -> Self {
         Self {
             id,
+            actor_id: None,
             stop_requested: false,
             caller: Caller::Unauthenticated,
             origin: crate::v2::Origin::Anonymous,
@@ -102,6 +104,18 @@ impl<A: Actor> Context<A> {
     /// Get this actor's service ID.
     pub fn id(&self) -> ServiceId {
         self.id
+    }
+
+    /// Typed v2 identity of this actor when running under the generic service.
+    /// Legacy standalone/service paths do not synthesize an `ActorId` and
+    /// therefore return `None`.
+    pub fn actor_id(&self) -> Option<crate::v2::ActorId> {
+        self.actor_id
+    }
+
+    #[doc(hidden)]
+    pub fn __set_actor_id(&mut self, actor: crate::v2::ActorId) {
+        self.actor_id = Some(actor);
     }
 
     /// Who invoked the currently-running handler. The host writes
@@ -864,6 +878,42 @@ impl<A: Actor> Context<A> {
             ..RefinePayload::new()
         }
     }
+
+    /// Drain the state-row effects supported by the v2 nested actor slice.
+    /// Messaging and service-management effects are deliberately rejected
+    /// until the root-tree scheduler can translate them into typed
+    /// inbox/outbox records without falling back to the v1 effect journal.
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __drain_actor_writes_v2(
+        &mut self,
+        actor: crate::v2::ActorId,
+        row_effects: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        state_write: Option<Vec<u8>>,
+    ) -> Result<Vec<crate::v2::ActorWriteV2>, ()> {
+        if !self.pending_tells.is_empty()
+            || !self.pending_spawns.is_empty()
+            || !self.pending_provides.is_empty()
+        {
+            return Err(());
+        }
+
+        let mut writes = Vec::new();
+        for (key, value) in self.pending_writes.drain(..).chain(row_effects) {
+            if key.is_empty() {
+                return Err(());
+            }
+            writes.push(crate::v2::ActorWriteV2 { actor, key, value });
+        }
+        if let Some(value) = state_write {
+            writes.push(crate::v2::ActorWriteV2 {
+                actor,
+                key: crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+                value: Some(value),
+            });
+        }
+        Ok(writes)
+    }
 }
 
 // ── FetchBuilder ─────────────────────────────────────────────────────
@@ -1152,6 +1202,16 @@ mod tests {
 
         ctx.set_caller(Caller::Actor(ServiceId(42)));
         assert_eq!(ctx.caller(), &Caller::Actor(ServiceId(42)));
+    }
+
+    #[test]
+    fn v2_actor_identity_is_not_truncated_into_a_route_id() {
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        let actor = crate::v2::ActorId([0xab; 32]);
+        assert_eq!(ctx.actor_id(), None);
+        ctx.__set_actor_id(actor);
+        assert_eq!(ctx.actor_id(), Some(actor));
+        assert_eq!(ctx.id(), ServiceId(0));
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

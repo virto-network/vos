@@ -7,15 +7,19 @@
 
 use alloc::vec::Vec;
 
-use javm::cap::{Cap, ProtocolCap};
-use javm::kernel::{DormantProgram, InvocationKernel, KernelResult};
+use javm::cap::{Access, Cap, DataCap, ProtocolCap};
+use javm::kernel::{DispatchResult, DormantProgram, InvocationKernel, KernelResult};
 use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
 use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 
 use super::{
-    ACCUMULATE_ENTRY_IC, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT,
-    V2Wire, WorkEnvelopeV2,
+    ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, ActorSliceInputV2, ProgramId,
+    REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
+
+const MAX_ACTOR_IPC_PAGES: u32 = 1024;
+const MIN_ACTOR_OUTPUT_HEADROOM: usize = 16 * javm::PVM_PAGE_SIZE as usize;
+const RESULT_WHAT: u64 = u64::MAX - 1;
 
 /// Result of one completed service-PVM execution slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +35,7 @@ pub enum ServicePvmErrorV2 {
     InvalidServiceEntries,
     Panic,
     OutOfGas,
-    PageFault(u32),
+    PageFault { vm: u16, address: u32 },
     UnreadableOutput,
     ForbiddenRefineProtocolCall(u8),
     RefineHostRejected(u8),
@@ -41,6 +45,9 @@ pub enum ServicePvmErrorV2 {
     InvalidWorkEnvelope,
     InvalidRefineImports,
     TooManyImportedActors,
+    UnsupportedContinuation,
+    ActorIpcExhausted,
+    ActorIpcSetupFailed,
     InvalidVmLifecycle,
 }
 
@@ -172,6 +179,25 @@ impl ServicePvmV2 {
             .iter()
             .find(|actor| actor.actor == work.target)
             .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
+        if target.continuation.is_some() {
+            // Replaying a suspended handler from PC 0 is never a valid
+            // fallback. Exact kernel restoration is wired in the durable
+            // scheduler slice; until then continuation work fails closed.
+            return Err(ServicePvmErrorV2::UnsupportedContinuation);
+        }
+        let target_state = imports
+            .blobs
+            .binary_search_by_key(&target.state.hash, |blob| blob.reference.hash)
+            .ok()
+            .map(|index| &imports.blobs[index].bytes)
+            .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
+        let actor_input = ActorSliceInputV2 {
+            actor: work.target,
+            state: target_state.clone(),
+            message: work.arguments.clone(),
+            origin: work.origin,
+        }
+        .encode();
         actors.push(target);
         actors.extend(
             work.imported_actors
@@ -204,6 +230,12 @@ impl ServicePvmV2 {
             javm::PvmBackend::Default,
         )
         .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
+        let (actor_input_len, actor_ipc_capacity) = install_actor_ipc(&mut kernel, &actor_input)?;
+        // The GP argument registers remain phi[7]/phi[8]. These two additional
+        // invocation-setup values arrive as the third/fourth Rust ABI
+        // arguments and describe the ordinary DATA capability in slot 90.
+        kernel.set_active_reg(9, actor_input_len as u64);
+        kernel.set_active_reg(10, actor_ipc_capacity as u64);
         install_refine_scheduler_caps(&mut kernel);
         run_refine_kernel(kernel, gas_limit, host)
     }
@@ -239,7 +271,10 @@ impl ServicePvmV2 {
                 KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
                 KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
                 KernelResult::PageFault(address) => {
-                    return Err(ServicePvmErrorV2::PageFault(address));
+                    return Err(ServicePvmErrorV2::PageFault {
+                        vm: kernel.active_vm,
+                        address,
+                    });
                 }
                 KernelResult::ProtocolCall { slot } => {
                     let mut registers = [0; 13];
@@ -254,6 +289,76 @@ impl ServicePvmV2 {
             }
         }
     }
+}
+
+fn install_actor_ipc(
+    kernel: &mut InvocationKernel,
+    input: &[u8],
+) -> Result<(u32, u32), ServicePvmErrorV2> {
+    let input_len = u32::try_from(input.len()).map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?;
+    let minimum_capacity = input
+        .len()
+        .checked_add(MIN_ACTOR_OUTPUT_HEADROOM)
+        .ok_or(ServicePvmErrorV2::ActorIpcExhausted)?;
+    let page_count = u32::try_from(minimum_capacity.div_ceil(javm::PVM_PAGE_SIZE as usize))
+        .map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?;
+    let capacity = page_count
+        .checked_mul(javm::PVM_PAGE_SIZE)
+        .ok_or(ServicePvmErrorV2::ActorIpcExhausted)?;
+    if page_count == 0
+        || page_count > MAX_ACTOR_IPC_PAGES
+        || page_count > kernel.untyped.remaining()
+        || !kernel
+            .vm_arena
+            .vm(kernel.active_vm)
+            .cap_table
+            .is_empty(ACTOR_IPC_CAP_SLOT)
+    {
+        return Err(ServicePvmErrorV2::ActorIpcExhausted);
+    }
+
+    let backing_offset = kernel
+        .untyped
+        .retype(page_count)
+        .ok_or(ServicePvmErrorV2::ActorIpcExhausted)?;
+    if !kernel.backing.write_init_data(backing_offset, input) {
+        return Err(ServicePvmErrorV2::ActorIpcSetupFailed);
+    }
+    kernel.vm_arena.vm_mut(kernel.active_vm).cap_table.set(
+        ACTOR_IPC_CAP_SLOT,
+        Cap::Data(DataCap::new(backing_offset, page_count)),
+    );
+
+    // Exercise the ordinary JAR MAP operation instead of reaching around the
+    // capability model to synthesize a mapped address. Preserve the guest's
+    // invocation registers around this host-owned setup call.
+    let saved = core::array::from_fn::<_, 6, _>(|offset| kernel.active_reg(7 + offset));
+    kernel.set_active_reg(7, ACTOR_IPC_BASE_PAGE as u64);
+    kernel.set_active_reg(8, 0);
+    kernel.set_active_reg(9, page_count as u64);
+    kernel.set_active_reg(10, 1); // RW
+    kernel.set_active_reg(12, (ACTOR_IPC_CAP_SLOT as u64) << 32);
+    let result = kernel.dispatch_ecall(0x02);
+    let mapped = kernel.active_reg(7) != RESULT_WHAT
+        && matches!(result, DispatchResult::Continue)
+        && matches!(
+            kernel
+                .vm_arena
+                .vm(kernel.active_vm)
+                .cap_table
+                .get(ACTOR_IPC_CAP_SLOT),
+            Some(Cap::Data(data))
+                if data.base_offset == Some(ACTOR_IPC_BASE_PAGE)
+                    && data.access == Some(Access::RW)
+                    && data.mapped_page_count() == page_count
+        );
+    for (offset, value) in saved.into_iter().enumerate() {
+        kernel.set_active_reg(7 + offset, value);
+    }
+    if !mapped {
+        return Err(ServicePvmErrorV2::ActorIpcSetupFailed);
+    }
+    Ok((input_len, capacity))
 }
 
 fn run_refine_kernel<H: RefineProtocolHostV2>(
@@ -280,7 +385,10 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
             KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
             KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
             KernelResult::PageFault(address) => {
-                return Err(ServicePvmErrorV2::PageFault(address));
+                return Err(ServicePvmErrorV2::PageFault {
+                    vm: kernel.active_vm,
+                    address,
+                });
             }
             KernelResult::ProtocolCall { slot } => {
                 if !refine_protocol_call_is_pure(slot) {

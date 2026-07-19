@@ -29,6 +29,7 @@
 /// every hostcall. Matches the stack DATA cap emitted by
 /// `grey-transpiler/src/emitter.rs`. Direct reference, no indirection.
 pub const VOS_OBJECT_CAP: u64 = 65;
+const RESULT_WHAT: u64 = u64::MAX - 1;
 
 /// Invoke a hostcall with no arguments.
 #[inline(always)]
@@ -73,6 +74,91 @@ pub fn ecall5(id: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 #[inline(always)]
 pub fn ecall6(id: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, obj_cap: u64) -> u64 {
     _ecall(id as u64, a0, a1, a2, a3, a4, obj_cap)
+}
+
+/// Reference a slot in the current CNode for a dynamic JAR management call.
+pub const fn local_cap_ref(slot: u8) -> u32 {
+    slot as u32
+}
+
+/// Reference `slot` in the CNode owned through a local HANDLE.
+pub const fn cap_ref_through_handle(handle_slot: u8, slot: u8) -> u32 {
+    slot as u32 | ((handle_slot as u32) << 8)
+}
+
+/// Map every page of a DATA capability read/write at `base_page`.
+#[inline(always)]
+pub fn map_cap_rw(cap_slot: u8, base_page: u32, page_count: u32) -> bool {
+    _management_ecall(
+        base_page as u64,
+        0,
+        page_count as u64,
+        1,
+        0x02,
+        (local_cap_ref(cap_slot) as u64) << 32,
+    ) != RESULT_WHAT
+}
+
+/// Move a capability between CNodes using ordinary JAR cap references.
+#[inline(always)]
+pub fn move_cap(subject: u32, object: u32) -> bool {
+    _management_ecall(0, 0, 0, 0, 0x06, ((subject as u64) << 32) | object as u64) != RESULT_WHAT
+}
+
+/// Return from a nested JAR CALL through the reserved IPC capability slot.
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub fn reply(value: u64) -> ! {
+    // SAFETY: ecalli(0) is JAR REPLY for a nested VM. The kernel transfers
+    // control to the waiting caller, so this actor invocation never resumes.
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x801, zero",
+            "ecall",
+            in("t0") 0u64,
+            in("a0") value,
+            in("a1") 0u64,
+            in("a2") 0u64,
+            in("a3") 0u64,
+            in("a4") 0u64,
+            in("a5") 0u64,
+            options(noreturn, nostack),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline(always)]
+pub fn reply(_value: u64) -> ! {
+    panic!("vos-abi JAR reply requires RISC-V target")
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn _management_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: CSR 0x800 is the transpiler marker for the GP dynamic `ecall`
+    // form. phi[11] carries the operation and phi[12] the subject/object refs.
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x800, zero",
+            "ecall",
+            inlateout("a0") a0 => ret,
+            in("a1") a1,
+            in("a2") a2,
+            in("a3") a3,
+            in("a4") op,
+            in("a5") refs,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline(always)]
+fn _management_ecall(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64) -> u64 {
+    panic!("vos-abi JAR management ecalls require RISC-V target (op={op})")
 }
 
 #[cfg(target_arch = "riscv64")]

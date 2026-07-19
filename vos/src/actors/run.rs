@@ -723,6 +723,101 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     halt_with_output_bound(&encoded, &io_hash);
 }
 
+/// Execute one canonical actor message as a nested JAR VM and return its v2
+/// slice result through the move-only IPC DATA capability in slot 0.
+///
+/// The generic service owns scheduling and transition construction. This
+/// entry only materializes the actor from imported bytes, dispatches once,
+/// and reports buffered actor writes; it has no persistent host surface.
+#[cfg(feature = "service")]
+pub fn run_nested_actor_service<A: super::Actor>(
+    input_address: u64,
+    input_len: u64,
+    capacity: u64,
+) -> ! {
+    use super::context::ServiceId;
+    use super::lifecycle::{self, DispatchResult};
+    use crate::v2::{ActorSliceInputV2, ActorSliceOutputV2, V2Wire};
+
+    crate::log_impl::install_pvm_logger();
+    set_refine_mode(true);
+
+    let expected_address =
+        crate::v2::ACTOR_IPC_BASE_PAGE as u64 * javm_page_size_for_guest() as u64;
+    let page_size = javm_page_size_for_guest() as u64;
+    let input_len = usize::try_from(input_len).expect("actor IPC input length exceeds usize");
+    let capacity = usize::try_from(capacity).expect("actor IPC capacity exceeds usize");
+    assert_eq!(
+        input_address, expected_address,
+        "actor IPC address mismatch"
+    );
+    assert!(capacity > 0 && capacity.is_multiple_of(page_size as usize));
+    assert!(input_len <= capacity);
+    let page_count =
+        u32::try_from(capacity / page_size as usize).expect("actor IPC page count exceeds u32");
+    assert!(crate::abi::pvm::ecall::map_cap_rw(
+        0,
+        crate::v2::ACTOR_IPC_BASE_PAGE,
+        page_count,
+    ));
+
+    // SAFETY: MAP above established a readable DATA-cap range covering the
+    // complete input. The service does not regain this cap until REPLY.
+    let bytes = unsafe { core::slice::from_raw_parts(input_address as *const u8, input_len) };
+    let input = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
+    let mut actor = lifecycle::load_or_create::<A>(Some(&input.state));
+    // The legacy route-only ServiceId is deliberately not derived by
+    // truncating ActorId. Nested v2 actors retain their complete typed identity
+    // in Context and all v2 scheduler effects use that value.
+    let mut ctx = super::Context::new(ServiceId(0));
+    ctx.__set_actor_id(input.actor);
+    ctx.__set_origin(input.origin);
+
+    let dispatch = lifecycle::dispatch_one::<A>(&input.message, &mut actor, &mut ctx);
+    assert!(
+        !matches!(dispatch, DispatchResult::Skipped),
+        "actor message did not match the canonical program ABI"
+    );
+    let yielded = matches!(dispatch, DispatchResult::Yielded) || ctx.self_scheduled();
+    let forbidden = ctx.was_forbidden();
+    let reply = ctx.take_reply_bytes();
+    let new_state = actor.encode();
+    let state_changed = input.state.is_empty() || new_state != input.state;
+    let writes = ctx
+        .__drain_actor_writes_v2(
+            input.actor,
+            super::storage::end_dispatch(),
+            state_changed.then_some(new_state),
+        )
+        .expect("nested actor emitted an unsupported v2 effect");
+    let encoded = ActorSliceOutputV2 {
+        actor: input.actor,
+        writes,
+        reply,
+        yielded,
+        forbidden,
+    }
+    .encode();
+    assert!(
+        encoded.len() <= capacity,
+        "actor slice output exceeds IPC cap"
+    );
+
+    // SAFETY: the DATA cap is mapped RW over `capacity` bytes and `encoded`
+    // was bounds-checked. The owned decoded input no longer borrows this range.
+    unsafe {
+        core::ptr::copy_nonoverlapping(encoded.as_ptr(), input_address as *mut u8, encoded.len());
+    }
+    crate::abi::pvm::ecall::reply(encoded.len() as u64)
+}
+
+#[cfg(feature = "service")]
+const fn javm_page_size_for_guest() -> usize {
+    // This is the GP/JAR page size. Keep the guest free of a javm dependency;
+    // the workspace-side host checks the same value through javm::PVM_PAGE_SIZE.
+    1 << 12
+}
+
 // ── Refine phase (all actors) ─────────────────────────────────────────
 
 /// Refine-only actor lifecycle — JAR refine phase (PC=0).

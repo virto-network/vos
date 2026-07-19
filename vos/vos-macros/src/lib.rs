@@ -191,8 +191,12 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! {
             #[cfg(all(target_arch = "riscv64", feature = "bin"))]
             #[unsafe(no_mangle)]
-            pub extern "C" fn _start() {
-                vos::run_refine_entry::<#name>();
+            pub extern "C" fn _start(a0: u64, a1: u64, a2: u64, a3: u64) {
+                if a3 == vos::v2::NESTED_ACTOR_CALL_MAGIC {
+                    vos::run_nested_actor_entry::<#name>(a0, a1, a2)
+                } else {
+                    vos::run_refine_entry::<#name>();
+                }
             }
         },
     };

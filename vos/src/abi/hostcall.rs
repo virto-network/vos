@@ -124,4 +124,25 @@ mod tests {
         assert_eq!(DEBUG_WRITE, zkpvm::core::ecall::ECALL_VOS_DEBUG_WRITE);
         assert_eq!(INVOKE, zkpvm::core::ecall::ECALL_VOS_INVOKE);
     }
+
+    #[test]
+    fn v2_actor_handles_do_not_shadow_supplied_capabilities() {
+        let actor_handles =
+            crate::v2::TARGET_ACTOR_HANDLE_SLOT..crate::v2::TARGET_ACTOR_HANDLE_SLOT + 5;
+        let occupied = [
+            crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
+            GROW_HEAP as u8,
+            DEBUG_WRITE as u8,
+            INVOKE as u8,
+            BOOT_CONTEXT as u8,
+            NOW_MS as u8,
+            SUSPEND as u8,
+            crate::v2::ACTOR_IPC_CAP_SLOT,
+        ];
+        assert!(
+            occupied
+                .into_iter()
+                .all(|slot| !actor_handles.contains(&slot))
+        );
+    }
 }

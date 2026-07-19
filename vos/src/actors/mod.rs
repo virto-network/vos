@@ -58,6 +58,11 @@ pub use value::InvokeError;
 pub fn run_refine_entry<A: Actor>() {
     run::run_refine_service::<A>()
 }
+/// Nested JAR actor entry selected by the v2 CALL marker.
+#[cfg(feature = "service")]
+pub fn run_nested_actor_entry<A: Actor>(input_address: u64, input_len: u64, capacity: u64) -> ! {
+    run::run_nested_actor_service::<A>(input_address, input_len, capacity)
+}
 #[cfg(all(feature = "pvm", not(feature = "service")))]
 pub fn run_refine_entry<A: Actor>() {
     run::run_refine::<A>()
