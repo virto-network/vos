@@ -12,7 +12,7 @@
 //! [`trace_blob_with_patches`], which applies the patches before tracing
 //! and still assembles the `SideNote` here.  Callers whose witness
 //! protocol is more bespoke build the `Interpreter` with
-//! [`interpreter_from_blob`], mutate `interp.flat_mem`, then drive
+//! [`interpreter_from_blob`], mutate memory with [`Interpreter::write_u8`], then drive
 //! `TracingPvm` directly.
 
 use javm::{
@@ -273,8 +273,11 @@ fn trace_setup(blob: &[u8], gas: u64, patches: &[(usize, &[u8])]) -> Option<Trac
                 return None;
             }
             flat_mem[*offset..end].copy_from_slice(bytes);
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                let address = u32::try_from(*offset + index).ok()?;
+                interp.write_u8(address, byte).ok()?;
+            }
         }
-        interp.flat_mem = flat_mem.clone();
     }
 
     Some(TraceSetup {

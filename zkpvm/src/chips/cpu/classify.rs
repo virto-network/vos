@@ -788,7 +788,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_exit = true;
         }
         // Trap: causes panic exit
-        Opcode::Trap => {
+        Opcode::Trap | Opcode::Invalid => {
             f.is_exit = true;
             f.is_trap = true;
         }

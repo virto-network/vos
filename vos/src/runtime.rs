@@ -1363,7 +1363,7 @@ fn run_refine_kernel(
 ) -> Option<Vec<u8>> {
     loop {
         match kernel.run() {
-            KernelResult::Halt(_exit) => {
+            KernelResult::Halt => {
                 let ptr = kernel.active_reg(7) as u32;
                 let len = (kernel.active_reg(8) as usize).min(1 << 20);
                 return Some(kread(kernel, ptr, len));
@@ -1619,7 +1619,9 @@ fn handle_refine_hostcall(
         _ => (error::HOST_WHAT, 0),
     };
 
-    kernel.resume_protocol_call(r7, r8);
+    kernel
+        .resume_protocol_call(r7, r8)
+        .expect("refine hostcall must resume its pending protocol boundary");
 }
 
 /// Write an invoke output into the caller's buffer, and — when a
@@ -1812,7 +1814,9 @@ fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
             return false;
         }
     }
-    kernel.resume_protocol_call(echo7, echo8);
+    kernel
+        .resume_protocol_call(echo7, echo8)
+        .expect("task hostcall must resume its pending protocol boundary");
     true
 }
 
@@ -1872,7 +1876,7 @@ fn run_task_invoke(
     let invoke_mark = journal.mark();
     loop {
         match child.run() {
-            KernelResult::Halt(_) => break,
+            KernelResult::Halt => break,
             KernelResult::Panic | KernelResult::PageFault(_) => {
                 journal.rollback_to(invoke_mark);
                 return record_and_write_invoke(
@@ -2310,7 +2314,7 @@ fn handle_invoke(
 
     loop {
         match child.run() {
-            KernelResult::Halt(_) => break,
+            KernelResult::Halt => break,
             KernelResult::Panic => {
                 let pc = child.vm_arena.vm(child.active_vm).pc;
                 error!(pc, ?target_svc_id, "child invoke panicked");

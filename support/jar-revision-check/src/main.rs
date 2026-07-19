@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EXPECTED: &str = "ba1276acffa3e84f33cb90491e389280fd070a48";
+const EXPECTED: &str = "cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe";
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -9,16 +9,18 @@ fn main() {
         .and_then(Path::parent)
         .expect("checker must live at support/jar-revision-check");
     let mut manifests = Vec::new();
-    collect_manifests(root, &mut manifests).expect("walk workspace manifests");
+    let mut locks = Vec::new();
+    collect_dependency_files(root, &mut manifests, &mut locks)
+        .expect("walk workspace dependency files");
 
     let mut errors = Vec::new();
     for path in manifests {
         let source = fs::read_to_string(&path).expect("read Cargo.toml");
         validate_manifest(&path, &source, &mut errors);
     }
-    let lock_path = root.join("Cargo.lock");
-    if let Ok(lock) = fs::read_to_string(&lock_path) {
-        validate_lock(&lock_path, &lock, &mut errors);
+    for path in locks {
+        let source = fs::read_to_string(&path).expect("read Cargo.lock");
+        validate_lock(&path, &source, &mut errors);
     }
 
     if !errors.is_empty() {
@@ -31,7 +33,11 @@ fn main() {
     println!("all JAR consumers use {EXPECTED}");
 }
 
-fn collect_manifests(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_dependency_files(
+    dir: &Path,
+    manifests: &mut Vec<PathBuf>,
+    locks: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -41,10 +47,12 @@ fn collect_manifests(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> 
             // part of this checkout's dependency graph.
             let hidden = name.to_string_lossy().starts_with('.');
             if !hidden && name != "target" {
-                collect_manifests(&path, out)?;
+                collect_dependency_files(&path, manifests, locks)?;
             }
         } else if entry.file_name() == "Cargo.toml" {
-            out.push(path);
+            manifests.push(path);
+        } else if entry.file_name() == "Cargo.lock" {
+            locks.push(path);
         }
     }
     Ok(())
@@ -111,5 +119,16 @@ mod tests {
             &mut errors,
         );
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_stale_nested_lock_revision() {
+        let mut errors = Vec::new();
+        validate_lock(
+            Path::new("nested/Cargo.lock"),
+            "source = \"git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168\"",
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
     }
 }

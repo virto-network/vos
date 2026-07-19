@@ -493,16 +493,16 @@ impl TracingPvm {
 
         for i in 0..8 {
             let off = h_ptr_u + i * 8;
-            if off + 8 <= self.pvm.flat_mem.len() {
-                h[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off + 8].try_into().unwrap());
-                h_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off + 8]);
+            if off + 8 <= self.pvm.flat_mem().len() {
+                h[i] = u64::from_le_bytes(self.pvm.flat_mem()[off..off + 8].try_into().unwrap());
+                h_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem()[off..off + 8]);
             }
         }
         for i in 0..16 {
             let off = m_ptr_u + i * 8;
-            if off + 8 <= self.pvm.flat_mem.len() {
-                m[i] = u64::from_le_bytes(self.pvm.flat_mem[off..off + 8].try_into().unwrap());
-                m_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem[off..off + 8]);
+            if off + 8 <= self.pvm.flat_mem().len() {
+                m[i] = u64::from_le_bytes(self.pvm.flat_mem()[off..off + 8].try_into().unwrap());
+                m_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem()[off..off + 8]);
             }
         }
 
@@ -517,8 +517,8 @@ impl TracingPvm {
             let off = h_ptr_u + i * 8;
             let bytes = result[i].to_le_bytes();
             out_bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-            if off + 8 <= self.pvm.flat_mem.len() {
-                self.pvm.flat_mem[off..off + 8].copy_from_slice(&bytes);
+            if off + 8 <= self.pvm.flat_mem().len() {
+                self.write_flat_bytes(off, &bytes);
             }
         }
 
@@ -563,19 +563,19 @@ impl TracingPvm {
 
         let mut scalar_bytes = [0u8; 32];
         let mut point_bytes = [0u8; 32];
-        let mem_len = self.pvm.flat_mem.len();
+        let mem_len = self.pvm.flat_mem().len();
         let buffers_in_bounds = scalar_ptr_u.saturating_add(32) <= mem_len
             && point_ptr_u.saturating_add(32) <= mem_len
             && output_ptr_u.saturating_add(32) <= mem_len;
         if buffers_in_bounds {
-            scalar_bytes.copy_from_slice(&self.pvm.flat_mem[scalar_ptr_u..scalar_ptr_u + 32]);
-            point_bytes.copy_from_slice(&self.pvm.flat_mem[point_ptr_u..point_ptr_u + 32]);
+            scalar_bytes.copy_from_slice(&self.pvm.flat_mem()[scalar_ptr_u..scalar_ptr_u + 32]);
+            point_bytes.copy_from_slice(&self.pvm.flat_mem()[point_ptr_u..point_ptr_u + 32]);
         }
 
         let out_bytes = ristretto_scalar_mult_sw(&scalar_bytes, &point_bytes);
 
         if buffers_in_bounds {
-            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+            self.write_flat_bytes(output_ptr_u, &out_bytes);
         }
 
         let ts = self.timestamp - 1;
@@ -615,19 +615,19 @@ impl TracingPvm {
 
         let mut a_bytes = [0u8; 32];
         let mut b_bytes = [0u8; 32];
-        let mem_len = self.pvm.flat_mem.len();
+        let mem_len = self.pvm.flat_mem().len();
         let buffers_in_bounds = a_ptr_u.saturating_add(32) <= mem_len
             && b_ptr_u.saturating_add(32) <= mem_len
             && output_ptr_u.saturating_add(32) <= mem_len;
         if buffers_in_bounds {
-            a_bytes.copy_from_slice(&self.pvm.flat_mem[a_ptr_u..a_ptr_u + 32]);
-            b_bytes.copy_from_slice(&self.pvm.flat_mem[b_ptr_u..b_ptr_u + 32]);
+            a_bytes.copy_from_slice(&self.pvm.flat_mem()[a_ptr_u..a_ptr_u + 32]);
+            b_bytes.copy_from_slice(&self.pvm.flat_mem()[b_ptr_u..b_ptr_u + 32]);
         }
 
         let out_bytes = scalar_binop_sw(op_id, &a_bytes, &b_bytes);
 
         if buffers_in_bounds {
-            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+            self.write_flat_bytes(output_ptr_u, &out_bytes);
         }
 
         let ts = self.timestamp - 1;
@@ -670,17 +670,17 @@ impl TracingPvm {
         let output_ptr = self.pvm.registers[8] as u32;
 
         let mut wide_bytes = [0u8; 64];
-        let mem_len = self.pvm.flat_mem.len();
+        let mem_len = self.pvm.flat_mem().len();
         let buffers_in_bounds =
             wide_ptr_u.saturating_add(64) <= mem_len && output_ptr_u.saturating_add(32) <= mem_len;
         if buffers_in_bounds {
-            wide_bytes.copy_from_slice(&self.pvm.flat_mem[wide_ptr_u..wide_ptr_u + 64]);
+            wide_bytes.copy_from_slice(&self.pvm.flat_mem()[wide_ptr_u..wide_ptr_u + 64]);
         }
 
         let out_bytes = scalar_reduce_wide_sw(&wide_bytes);
 
         if buffers_in_bounds {
-            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+            self.write_flat_bytes(output_ptr_u, &out_bytes);
         }
 
         let ts = self.timestamp - 1;
@@ -715,19 +715,19 @@ impl TracingPvm {
 
         let mut p_bytes = [0u8; 32];
         let mut q_bytes = [0u8; 32];
-        let mem_len = self.pvm.flat_mem.len();
+        let mem_len = self.pvm.flat_mem().len();
         let buffers_in_bounds = p_ptr_u.saturating_add(32) <= mem_len
             && q_ptr_u.saturating_add(32) <= mem_len
             && output_ptr_u.saturating_add(32) <= mem_len;
         if buffers_in_bounds {
-            p_bytes.copy_from_slice(&self.pvm.flat_mem[p_ptr_u..p_ptr_u + 32]);
-            q_bytes.copy_from_slice(&self.pvm.flat_mem[q_ptr_u..q_ptr_u + 32]);
+            p_bytes.copy_from_slice(&self.pvm.flat_mem()[p_ptr_u..p_ptr_u + 32]);
+            q_bytes.copy_from_slice(&self.pvm.flat_mem()[q_ptr_u..q_ptr_u + 32]);
         }
 
         let out_bytes = ristretto_point_add_sw(&p_bytes, &q_bytes);
 
         if buffers_in_bounds {
-            self.pvm.flat_mem[output_ptr_u..output_ptr_u + 32].copy_from_slice(&out_bytes);
+            self.write_flat_bytes(output_ptr_u, &out_bytes);
         }
 
         let ts = self.timestamp - 1;
@@ -745,6 +745,17 @@ impl TracingPvm {
             q_bytes,
             out_bytes,
         });
+    }
+
+    fn write_flat_bytes(&mut self, address: usize, bytes: &[u8]) {
+        debug_assert!(address.saturating_add(bytes.len()) <= self.pvm.flat_mem().len());
+        for (offset, byte) in bytes.iter().copied().enumerate() {
+            let address = u32::try_from(address + offset)
+                .expect("in-bounds PVM flat-memory address must fit u32");
+            self.pvm
+                .write_u8(address, byte)
+                .expect("tracing flat memory is writable");
+        }
     }
 
     /// Number of steps recorded so far.

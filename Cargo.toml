@@ -133,8 +133,8 @@ zkpvm-verifier = { path = "zkpvm/verifier" }
 # VOS v2 has one execution identity. Every VM, transpiler, tracer, verifier,
 # and fuzz harness must use this exact JAR revision (enforced by
 # `cargo run -p jar-revision-check`).
-javm = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.4" }
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "ba1276acffa3e84f33cb90491e389280fd070a48", version = "0.1" }
+javm = { git = "https://github.com/olanod/jar.git", rev = "cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe", version = "0.4" }
+grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe", version = "0.1" }
 
 # Stwo pinned to upstream rev `e1286720` (post-v2.2.0 perf cluster:
 # parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
