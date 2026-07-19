@@ -658,6 +658,20 @@ impl<A: Actor> Context<A> {
         #[cfg(feature = "pvm")]
         {
             let restored = crate::abi::pvm::hostcalls::suspend() == 1;
+            if restored {
+                // The snapshot is taken before the suspension call observes
+                // a result, so it still contains the effect queues that the
+                // finalize fork emitted for the durable checkpoint. They are
+                // already committed when result `1` is injected. Drop only
+                // that checkpoint bookkeeping; actor memory and the handler
+                // future remain exactly as captured.
+                self.pending_writes.clear();
+                self.pending_tells.clear();
+                self.pending_provides.clear();
+                self.pending_spawns.clear();
+                self.reply = None;
+                let _ = super::storage::end_dispatch();
+            }
             self.self_schedule = !restored;
             super::run::Yield::after_checkpoint(restored)
         }

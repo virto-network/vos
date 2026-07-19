@@ -472,23 +472,7 @@ pub fn run_refine_service<A: super::Actor>() {
     // as `usize` because `A` differs per service; safe because PVM is
     // single-threaded.
     static mut ACTOR_HOLDER: usize = 0;
-    // The work-result anchor: `(anchor_kind, anchor, state_hash)`
-    // committing to the state this refine runs against. Computed on
-    // cold start from the exact serialized bytes READ returned (before
-    // deserialization) — plus, for committed actors, the recorded
-    // composite-root row; carried across exact continuations and advanced
-    // after every state-changing work-result. `state_hash` tracks
-    // the blob alone: under a composite (0x02) anchor, "anchor moved"
-    // and "blob moved" are separate questions (a committed-field write
-    // moves the composite while the blob stands), and the final
-    // `Write{STATE_KEY}` is gated on the blob.
-    static mut CURRENT_ANCHOR: (u8, [u8; 32], [u8; 32]) = (
-        crate::refine_payload::ANCHOR_GENESIS,
-        [0u8; 32],
-        [0u8; 32],
-    );
     let holder_ptr = addr_of_mut!(ACTOR_HOLDER);
-    let anchor_ptr = addr_of_mut!(CURRENT_ANCHOR);
     let mut cold_start = false;
     // SAFETY: PVM is single-threaded; the static-mut access goes via
     // a raw pointer (no shared/exclusive ref conflict). The cast from
@@ -508,18 +492,6 @@ pub fn run_refine_service<A: super::Actor>() {
             // large state as missing and silently resurrect the actor
             // as default, persisting the wipe on the next save.
             let state = lifecycle::read_persisted_state_owned();
-            let (kind, anchor) = crate::refine_payload::anchor_for(state.as_deref());
-            let state_hash = match &state {
-                Some(bytes) if !bytes.is_empty() => crate::refine_payload::state_anchor(bytes),
-                _ => [0u8; 32],
-            };
-            // A committed actor whose first dispatch already completed
-            // resumes the 0x02 chain from the recorded composite row;
-            // before that (or for plain actors) the blob rules apply.
-            *anchor_ptr = match A::COMMITTED.then(lifecycle::read_committed_root).flatten() {
-                Some(root) => (crate::refine_payload::ANCHOR_SMT_ROOT, root, state_hash),
-                None => (kind, anchor, state_hash),
-            };
             let boxed = Box::new(lifecycle::load_or_create::<A>(state.as_deref()));
             *holder_ptr = Box::into_raw(boxed) as usize;
         }
@@ -586,8 +558,23 @@ pub fn run_refine_service<A: super::Actor>() {
         // Genesis always emits: there is no prior blob to be equal to,
         // and the first work-result is what materializes the actor's
         // row.
-        // SAFETY: single-threaded PVM, raw-pointer access as above.
-        let (anchor_kind, anchor, prior_state_hash) = unsafe { *anchor_ptr };
+        // The exact suspension snapshot is captured before the finalize fork
+        // drains a checkpoint and advances its anchor. On resume, derive the
+        // base from durable storage instead of retaining the pre-commit anchor
+        // in VM memory. Non-reentrancy guarantees this is precisely the state
+        // committed for the suspended workflow's previous slice.
+        let prior_state = lifecycle::read_persisted_state_owned();
+        let (plain_anchor_kind, plain_anchor) =
+            crate::refine_payload::anchor_for(prior_state.as_deref());
+        let prior_state_hash = match &prior_state {
+            Some(bytes) if !bytes.is_empty() => crate::refine_payload::state_anchor(bytes),
+            _ => [0u8; 32],
+        };
+        let (anchor_kind, anchor) =
+            match A::COMMITTED.then(lifecycle::read_committed_root).flatten() {
+                Some(root) => (crate::refine_payload::ANCHOR_SMT_ROOT, root),
+                None => (plain_anchor_kind, plain_anchor),
+            };
         let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
         // Empty state is genesis, not a hash anchor — the host's overlay
         // computes `anchor_for(Some(empty)) == GENESIS`, so a fieldless
@@ -625,14 +612,6 @@ pub fn run_refine_service<A: super::Actor>() {
             state_changed.then_some(new_state_bytes),
             reply_bytes,
         );
-        // SAFETY: single-threaded PVM, raw-pointer access as above.
-        unsafe {
-            *anchor_ptr = (
-                next_kind,
-                next_anchor,
-                if new_is_empty { [0u8; 32] } else { new_hash },
-            );
-        }
         drop(ctx);
         let encoded = payload.encode();
         out_buf.clear();
