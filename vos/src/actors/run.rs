@@ -312,12 +312,12 @@ fn halt_with_output(data: &[u8]) -> ! {
 ///
 /// This is the ZK actor-IO ABI binding mechanism (see [`crate::zk`]).
 /// The four little-endian hash words are passed as `in` operands on the
-/// halting `ecall`, so the compiler materialises them into a2-a5 via
-/// real instructions immediately before the ecall.  Because the halt
-/// (`t0=0`, RootHalt) only reads a0/a1, a2-a5 persist unchanged into
+/// Gray Paper halt jump, so the compiler materialises them into a2-a5 via
+/// real instructions immediately before the jump. The dynamic jump consumes
+/// only its target register, so a0-a5 persist unchanged into
 /// `final_state.registers`, where Phase Z0's closing chip pins the
 /// columns and the verifier's boundary-binding check equates the
-/// metadata to them (`zkpvm::Proof::public_io_hash`).  No new ECALL, no
+/// metadata to them (`zkpvm::Proof::public_io_hash`). No new hostcall, no
 /// tracer/prover cooperation, no register-ledger surgery: it is ordinary
 /// register state at halt.  The closing-read column binds to the true
 /// final register via the register-ledger read-consistency (v6: cross-row

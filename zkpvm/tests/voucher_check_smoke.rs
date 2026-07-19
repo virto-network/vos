@@ -262,11 +262,11 @@ fn final_state_registers_are_stark_bound() {
 /// ZK actor-IO ABI (halt-asm binding): the framework's
 /// `halt_with_output_bound` places a 32-byte `vos::zk::compute_io_hash`
 /// value into the final-state register window φ[9..12] as part of the
-/// halting ecall (the four hash words ride in `a2..a5` as inline-asm
-/// `in` operands).  The closing chip pins the final-register columns
+/// Gray Paper halt jump (the four hash words ride in `a2..a5` as inline-asm
+/// `in` operands). The closing chip pins the final-register columns
 /// and the boundary-binding check equates `final_state.registers` to
 /// them, so the hash is read back by `Proof::public_io_hash` — no new
-/// ECALL, no prover changes.  (The column→trace link rests on the
+/// hostcall, no prover changes. (The column→trace link rests on the
 /// register-ledger read-consistency, sound against an honest prover;
 /// the from-scratch-prover gap is tracked in
 /// `chips/register_memory_closing.rs`. These honest-prover tests are

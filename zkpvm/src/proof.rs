@@ -188,10 +188,10 @@ impl Proof {
     /// the final-state register window φ[9..13].
     ///
     /// A binding actor places `H = compute_io_hash(public, return)` (see
-    /// `vos::zk`) into φ[9..12] as part of its halting `ecall` — the four
+    /// `vos::zk`) into φ[9..12] as part of its Gray Paper halt jump — the four
     /// hash words are passed as inline-asm `in` operands (`a2..a5`), so
     /// the compiler materialises them via real instructions immediately
-    /// before halt.  No host/tracer cooperation is involved: the binding
+    /// before halt. No host/tracer cooperation is involved: the binding
     /// is just ordinary register state at halt.  The verifier's
     /// boundary-binding check (`boundary_binding`) equates this field to
     /// the closing chip's committed RegVal column, which is pinned to the

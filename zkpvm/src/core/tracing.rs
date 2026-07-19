@@ -9,6 +9,7 @@ use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, expand_steps}
 pub use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
     ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+    ECALL_VOS_DEBUG_WRITE,
 };
 
 /// A recorded blake2b call for the precompile chip.
@@ -396,10 +397,9 @@ impl TracingPvm {
     /// Run with stub handlers for the JAM/VOS lifecycle hostcalls so a
     /// vos-style actor can be driven cold-start by a bare interpreter.
     /// Stubbed: `INFO=6`, `STORAGE_R=4`, `FETCH=2`, `OUTPUT=26`,
-    /// `DEBUG_WRITE=11`, `STORAGE_W=5`, `GAS=1` — all return 0 in φ[7].
-    /// `ExitReason::Ecall` (the no-immediate halt with `t0=0`) is treated
-    /// as a clean termination.  Blake2b ecalls are still intercepted and
-    /// executed natively.  Unknown hostcall IDs propagate as-is.
+    /// `DEBUG_WRITE=118`, `STORAGE_W=5`, `GAS=1` — all return 0 in φ[7].
+    /// Blake2b ecalls are still intercepted and executed natively. Unknown
+    /// hostcall IDs propagate as-is.
     pub fn run_with_vos_stubs(&mut self) -> ExitReason {
         loop {
             if let Some(exit) = self.step_with_vos_stubs() {
@@ -444,10 +444,9 @@ impl TracingPvm {
                 None
             }
             ExitReason::HostCall(id) => match id {
-                // imm=0 is the IPC/REPLY slot — `halt_with_output`
-                // emits `ecalli 0` with `t0=0`, the clean-termination
-                // sentinel.  Treat as halt.
-                0 => Some(ExitReason::HostCall(0)),
+                // Slot 0 is nested CALL/REPLY, never root termination. Match
+                // the JAVM kernel: a root REPLY has no caller and panics.
+                0 => Some(ExitReason::Panic),
                 // GAS, FETCH, STORAGE_R, STORAGE_W, INFO,
                 // DEBUG_WRITE, OUTPUT — leave registers
                 // untouched so the RegisterMemoryChip ledger
@@ -458,11 +457,13 @@ impl TracingPvm {
                 // state, no fetched message.  Same effect as a
                 // proper stub but without disturbing the
                 // register ledger.
-                1 | 2 | 4 | 5 | 6 | 11 | 26 => None,
+                1 | 2 | 4 | 5 | 6 | ECALL_VOS_DEBUG_WRITE | 26 => None,
                 _ => Some(ExitReason::HostCall(id)),
             },
-            // Plain Ecall (no immediate) is also a halt sentinel.
-            ExitReason::Ecall => Some(ExitReason::Ecall),
+            // Opcode-3 Ecall is outside the GP conformance ISA. Old VOS blobs
+            // used it as another halt shortcut; current canonical actors halt
+            // only by dynamically jumping to the GP halt address.
+            ExitReason::Ecall => Some(ExitReason::Panic),
             other => Some(other),
         }
     }
@@ -1360,6 +1361,35 @@ fn decode_mem_access(
 #[cfg(all(test, feature = "prover"))]
 mod tests {
     use super::*;
+
+    fn vos_stub_program(call: u32) -> TracingPvm {
+        use grey_transpiler::assembler::{Assembler, Reg};
+
+        let mut assembler = Assembler::new();
+        assembler
+            .ecalli(call)
+            .load_imm_64(Reg::T0, javm::PVM_HALT_ADDR)
+            .jump_ind(Reg::T0, 0);
+        let blob = assembler.build();
+        let (interpreter, _) = crate::actor::interpreter_from_blob(&blob, 1_000_000)
+            .expect("assembler program is a valid PVM blob");
+        TracingPvm::new(interpreter)
+    }
+
+    #[test]
+    fn vos_stub_accepts_supplied_debug_capability_but_not_reserved_slot() {
+        let mut current = vos_stub_program(ECALL_VOS_DEBUG_WRITE);
+        assert_eq!(current.run_with_vos_stubs(), ExitReason::Halt);
+
+        let mut reserved = vos_stub_program(11);
+        assert_eq!(reserved.run_with_vos_stubs(), ExitReason::HostCall(11));
+    }
+
+    #[test]
+    fn vos_stub_rejects_retired_root_reply_termination() {
+        let mut tracing = vos_stub_program(0);
+        assert_eq!(tracing.run_with_vos_stubs(), ExitReason::Panic);
+    }
 
     #[test]
     fn detects_basepoint() {

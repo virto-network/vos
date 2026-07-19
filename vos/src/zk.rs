@@ -49,11 +49,11 @@
 //!    (or computes the hash directly with [`compute_io_hash_typed`]).
 //! 2. The actor's halt sequence places that hash into the final-state
 //!    register window φ[9..12] (RISC-V `a2..a5`) via inline-asm `in`
-//!    operands on the halting `ecall` (see `actors::run`'s
+//!    operands on the Gray Paper halt jump (see `actors::run`'s
 //!    `halt_with_output_bound`). The closing chip pins the final-register
 //!    columns and the verifier's boundary-binding check
 //!    (`zkpvm::boundary_binding`) equates `final_state.registers` to
-//!    them — no new ECALL, no prover changes. That equality binds the
+//!    them — no new hostcall, no prover changes. That equality binds the
 //!    public registers to the committed closing-chip columns, and those
 //!    columns are pinned to the trace's true final registers by
 //!    `RegisterMemoryChip` read-consistency — a cross-row

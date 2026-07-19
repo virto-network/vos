@@ -79,3 +79,11 @@ pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
 /// Hostcall ID for scalar addition mod ℓ.  Mirrors dalek's
 /// `Scalar + Scalar` public API.  Same convention as MUL above.
 pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
+
+/// VOS scheduler-supplied guest allocator capability. This is deliberately
+/// outside JAM's reserved protocol range 10..=14.
+pub const ECALL_VOS_GROW_HEAP: u32 = 117;
+/// VOS scheduler-supplied diagnostic output capability.
+pub const ECALL_VOS_DEBUG_WRITE: u32 = 118;
+/// VOS scheduler-supplied nested actor invocation capability.
+pub const ECALL_VOS_INVOKE: u32 = 119;

@@ -221,6 +221,12 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
 ///   112 = scalar_from_bytes_mod_order_wide
 ///   113 = scalar_mul_mod_l
 ///   114 = scalar_add_mod_l
+///   117 = grow_heap
+///   118 = debug_write
+///   119 = invoke
+///   120 = boot_context
+///   121 = now_ms
+///   122 = suspend
 ///
 /// All fit in JAVM's `imm ≤ 127` budget. Call this once for each fresh
 /// kernel before its first run. An exact restore reconstructs the captured
@@ -233,13 +239,16 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
     // handler today); ristretto IDs are hardcoded here until vos
     // grows its own handler — the install is a no-op for slots
     // whose ECALL never fires.
-    let slots: [u8; 9] = [
+    let slots: [u8; 12] = [
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8, // 100
         110,                                         // ristretto_scalar_mult
         111,                                         // ristretto_point_add
         112,                                         // scalar_from_bytes_mod_order_wide
         113,                                         // scalar_mul_mod_l
         114,                                         // scalar_add_mod_l
+        hostcall::GROW_HEAP as u8,                   // 117 (guest allocator)
+        hostcall::DEBUG_WRITE as u8,                 // 118 (guest diagnostics)
+        hostcall::INVOKE as u8,                      // 119 (nested actor invoke)
         hostcall::BOOT_CONTEXT as u8,                // 120 (boot-context seam)
         hostcall::NOW_MS as u8,                      // 121 (host wall-clock seam)
         hostcall::SUSPEND as u8,                     // 122 (durable await boundary)

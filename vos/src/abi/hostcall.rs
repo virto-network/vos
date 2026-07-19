@@ -20,10 +20,9 @@
 //! [255]     free
 //! ```
 //!
-//! Slots 10..=14 are reserved by the spec for future protocol caps. VOS
-//! provisionally squats on three of them for its own debug/allocator/invoke
-//! hooks; these must migrate to VOS-owned program caps (slots 29..=63) in a
-//! follow-up that teaches `grey-transpiler` to emit them.
+//! Slots 10..=14 are reserved by the spec for future protocol caps and VOS
+//! never assigns them. Scheduler-supplied VOS capabilities use explicit high
+//! slots below the JAVM immediate limit.
 
 // --- Spec-canonical protocol caps (slots 1..=28) ---
 
@@ -36,11 +35,6 @@ pub const INFO: u32 = 6;
 pub const HISTORICAL: u32 = 7;
 pub const EXPORT: u32 = 8;
 pub const COMPILE: u32 = 9;
-
-// Spec-reserved range 10..=14 — provisional VOS squatters.
-pub const GROW_HEAP: u32 = 10;
-pub const DEBUG_WRITE: u32 = 11;
-pub const INVOKE: u32 = 12;
 
 pub const BLESS: u32 = 15;
 pub const ASSIGN: u32 = 16;
@@ -58,12 +52,21 @@ pub const PREIMAGE_PROVIDE: u32 = 27;
 pub const QUOTA: u32 = 28;
 
 // --- VOS-specific high-range hostcalls (slots 29..=127, cap-installed by the
-// host via `install_vos_precompile_caps`, NOT spec protocol caps) ---
+// VOS service/scheduler, NOT spec protocol caps) ---
 //
 // These share the program-cap range the blake2b/ristretto precompiles squat
 // (`vos::crypto` IDs 100/110..=114). The host installs a cap for each slot so a
 // guest `ecalli N` resolves to a `ProtocolCall { slot: N }` the runtime handles
 // rather than `RESULT_WHAT`. All fit javm's `imm <= 127` budget.
+
+/// Request additional guest heap pages.
+pub const GROW_HEAP: u32 = 117;
+
+/// Best-effort guest diagnostic output.
+pub const DEBUG_WRITE: u32 = 118;
+
+/// Invoke a nested actor PVM through the owning VOS scheduler.
+pub const INVOKE: u32 = 119;
 
 /// Boot-context seam. Mints a
 /// **fresh** 32-byte `boot_token` on every (re)instantiation (cold AND warm
@@ -93,3 +96,32 @@ pub const NOW_MS: u32 = 121;
 /// that transition commits, restoring the snapshot injects `1` and execution
 /// continues immediately after the source-level `.await`.
 pub const SUSPEND: u32 = 122;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vos_capabilities_never_use_jam_protocol_slots() {
+        let supplied = [
+            GROW_HEAP,
+            DEBUG_WRITE,
+            INVOKE,
+            BOOT_CONTEXT,
+            NOW_MS,
+            SUSPEND,
+        ];
+        assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
+        for (index, slot) in supplied.iter().enumerate() {
+            assert!(!supplied[..index].contains(slot));
+            assert!(*slot <= 127, "JAVM ecall immediate overflow");
+        }
+    }
+
+    #[test]
+    fn proof_tracer_uses_the_same_scheduler_capability_ids() {
+        assert_eq!(GROW_HEAP, zkpvm::core::ecall::ECALL_VOS_GROW_HEAP);
+        assert_eq!(DEBUG_WRITE, zkpvm::core::ecall::ECALL_VOS_DEBUG_WRITE);
+        assert_eq!(INVOKE, zkpvm::core::ecall::ECALL_VOS_INVOKE);
+    }
+}

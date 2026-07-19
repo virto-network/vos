@@ -55,7 +55,7 @@ fn trace_fibonacci_actor() {
     eprintln!(
         "Interpreter: code={} bytes, flat_mem={} bytes",
         interp.code.len(),
-        interp.flat_mem.len()
+        interp.flat_mem().len()
     );
 
     let mut tracing = TracingPvm::new(interp);
@@ -1381,7 +1381,7 @@ fn ristretto_scalar_mult_via_ecall_tracing() {
 
     // Confirm the precompile actually wrote the result back into flat_mem
     // (so a follow-up PVM instruction could read it).
-    let written = &tracing.pvm.flat_mem[output_addr as usize..output_addr as usize + 32];
+    let written = &tracing.pvm.flat_mem()[output_addr as usize..output_addr as usize + 32];
     assert_eq!(written, &expected_out[..], "flat_mem write mismatch");
 
     eprintln!(
