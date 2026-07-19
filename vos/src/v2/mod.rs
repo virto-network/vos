@@ -93,9 +93,9 @@ impl ServiceFunction {
 
 /// Revision shared by JAVM, the transpiler, proof tracer, verifier, and fuzz
 /// targets. `just check-jar-revisions` verifies that every manifest uses it.
-pub const JAR_REVISION: &str = "13c82dbc8715bd84e9c1c478f7261b2f5f64620b";
+pub const JAR_REVISION: &str = "b17aeda84497cc481589ae71a5ae60819649abe8";
 
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-13c82db-semantics-v2\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-b17aeda-semantics-v2\0");
