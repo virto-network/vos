@@ -118,9 +118,10 @@ mod guest {
             fail_closed();
         }
 
+        let consumed_input = work.input_id();
         let transition = TransitionV2 {
             service: work.service,
-            consumed_input: work.invocation,
+            consumed_input,
             target_program: work.target_program,
             base: work.base,
             writes: actor_output.writes,

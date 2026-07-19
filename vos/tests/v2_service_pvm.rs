@@ -65,6 +65,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
         },
         invocation: InvocationId([4; 32]),
+        workflow_step: 0,
         target: ActorId([5; 32]),
         target_program: actor_program,
         method: "start".into(),
@@ -156,7 +157,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         .expect("generic Refine completes");
     let transition = TransitionV2::decode(&output.bytes).expect("Refine returns TransitionV2");
     assert_eq!(transition.service, work.service);
-    assert_eq!(transition.consumed_input, work.invocation);
+    assert_eq!(transition.consumed_input, work.input_id());
     assert_eq!(transition.target_program, work.target_program);
     assert_eq!(transition.base, work.base);
     assert_eq!(transition.writes.len(), 1);

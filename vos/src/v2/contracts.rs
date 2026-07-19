@@ -149,7 +149,12 @@ pub struct ActorSliceOutputV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkEnvelopeV2 {
     pub service: ServiceIdentityV2,
+    /// Stable identity of the complete workflow across durable awaits.
     pub invocation: InvocationId,
+    /// Zero-based execution slice within `invocation`. Each committed await
+    /// advances this value, so retries deduplicate without conflating later
+    /// checkpoints with the first transition.
+    pub workflow_step: u64,
     pub target: ActorId,
     pub target_program: ProgramId,
     pub method: String,
@@ -166,11 +171,25 @@ pub struct WorkEnvelopeV2 {
 }
 
 impl WorkEnvelopeV2 {
+    pub const fn input_id(&self) -> WorkInputIdV2 {
+        WorkInputIdV2 {
+            invocation: self.invocation,
+            workflow_step: self.workflow_step,
+        }
+    }
+
     /// Consensus identity of the complete work input, including origin,
     /// authorization evidence, consistency base, and every import reference.
     pub fn hash(&self) -> Hash {
         Hash::digest(b"vos/work/v2", &[&self.encode()])
     }
+}
+
+/// Exactly-once identity of one consumable workflow slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorkInputIdV2 {
+    pub invocation: InvocationId,
+    pub workflow_step: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +250,7 @@ pub struct ProofCommitmentV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionV2 {
     pub service: ServiceIdentityV2,
-    pub consumed_input: InvocationId,
+    pub consumed_input: WorkInputIdV2,
     pub target_program: ProgramId,
     pub base: ConsistencyBaseV2,
     pub writes: Vec<ActorWriteV2>,
@@ -384,6 +403,7 @@ impl V2Wire for WorkEnvelopeV2 {
         let mut e = Encoder(out);
         encode_service(&mut e, &self.service);
         e.fixed(&self.invocation.0);
+        e.u64(self.workflow_step);
         e.fixed(&self.target.0);
         e.fixed(&self.target_program.0);
         e.string(&self.method);
@@ -402,6 +422,7 @@ impl V2Wire for WorkEnvelopeV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let service = decode_service(d)?;
         let invocation = InvocationId(d.fixed()?);
+        let workflow_step = d.u64()?;
         let target = ActorId(d.fixed()?);
         let target_program = ProgramId(d.fixed()?);
         let method = d.string()?;
@@ -426,6 +447,7 @@ impl V2Wire for WorkEnvelopeV2 {
         Ok(Self {
             service,
             invocation,
+            workflow_step,
             target,
             target_program,
             method,
@@ -545,7 +567,8 @@ impl V2Wire for TransitionV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         encode_service(&mut e, &self.service);
-        e.fixed(&self.consumed_input.0);
+        e.fixed(&self.consumed_input.invocation.0);
+        e.u64(self.consumed_input.workflow_step);
         e.fixed(&self.target_program.0);
         encode_base(&mut e, &self.base);
         e.list(&self.writes, encode_write);
@@ -565,7 +588,10 @@ impl V2Wire for TransitionV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let result = Self {
             service: decode_service(d)?,
-            consumed_input: InvocationId(d.fixed()?),
+            consumed_input: WorkInputIdV2 {
+                invocation: InvocationId(d.fixed()?),
+                workflow_step: d.u64()?,
+            },
             target_program: ProgramId(d.fixed()?),
             base: decode_base(d)?,
             writes: d.list(decode_write)?,
@@ -892,6 +918,7 @@ mod tests {
         WorkEnvelopeV2 {
             service: service(),
             invocation: InvocationId([4; 32]),
+            workflow_step: 0,
             target: ActorId([5; 32]),
             target_program: ProgramId([6; 32]),
             method: "increment".into(),
@@ -1023,7 +1050,10 @@ mod tests {
     fn transition_hash_excludes_nothing() {
         let base = TransitionV2 {
             service: service(),
-            consumed_input: InvocationId([9; 32]),
+            consumed_input: WorkInputIdV2 {
+                invocation: InvocationId([9; 32]),
+                workflow_step: 0,
+            },
             target_program: ProgramId([10; 32]),
             base: ConsistencyBaseV2::Linear {
                 revision: 0,

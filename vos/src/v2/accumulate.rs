@@ -123,7 +123,7 @@ pub struct InMemoryServiceState {
     outbox: Vec<MessageRecordV2>,
     blobs: BTreeSet<Hash>,
     operations: BTreeMap<OperationId, CrdtOperationV2>,
-    receipts: BTreeMap<InvocationId, DedupRecord>,
+    receipts: BTreeMap<WorkInputIdV2, DedupRecord>,
 }
 
 impl InMemoryServiceState {
@@ -218,7 +218,7 @@ impl InMemoryServiceState {
         let work_hash = work.hash();
         let transition_hash = transition.hash();
 
-        if let Some(existing) = self.receipts.get(&work.invocation) {
+        if let Some(existing) = self.receipts.get(&work.input_id()) {
             if existing.work != work_hash || existing.transition != transition_hash {
                 return Err(AccumulateError::DivergentDuplicate);
             }
@@ -252,7 +252,7 @@ impl InMemoryServiceState {
             consistency: next.consistency,
         };
         next.receipts.insert(
-            work.invocation,
+            work.input_id(),
             DedupRecord {
                 work: work_hash,
                 transition: transition_hash,
@@ -296,7 +296,7 @@ impl InMemoryServiceState {
         {
             return Err(AccumulateError::InvalidConsistency);
         }
-        if transition.consumed_input != work.invocation {
+        if transition.consumed_input != work.input_id() {
             return Err(AccumulateError::TransitionInputMismatch);
         }
         if transition.base != work.base {
@@ -593,6 +593,7 @@ mod tests {
         let work = WorkEnvelopeV2 {
             service: identity(),
             invocation: InvocationId([6; 32]),
+            workflow_step: 0,
             target: actor,
             target_program: program,
             method: "inc".into(),
@@ -609,7 +610,7 @@ mod tests {
         };
         let transition = TransitionV2 {
             service: identity(),
-            consumed_input: work.invocation,
+            consumed_input: work.input_id(),
             target_program: program,
             base,
             writes: vec![ActorWriteV2 {
@@ -658,7 +659,7 @@ mod tests {
         let mut second_work = work.clone();
         second_work.invocation = InvocationId([8; 32]);
         let mut second = transition.clone();
-        second.consumed_input = second_work.invocation;
+        second.consumed_input = second_work.input_id();
         let root_before = state.state_root();
         assert!(matches!(
             state.accumulate(&second_work, &second, &AllowPublic),
@@ -693,6 +694,36 @@ mod tests {
     }
 
     #[test]
+    fn later_slices_of_one_invocation_accumulate_independently() {
+        let (mut state, work, transition) = fixture();
+        let first = state.accumulate(&work, &transition, &AllowPublic).unwrap();
+
+        let mut resumed_work = work.clone();
+        resumed_work.workflow_step = 1;
+        resumed_work.base = state.current_base();
+        let mut resumed = transition.clone();
+        resumed.consumed_input = resumed_work.input_id();
+        resumed.base = resumed_work.base.clone();
+        resumed.writes[0].value = Some(2u64.to_le_bytes().to_vec());
+
+        let second = state
+            .accumulate(&resumed_work, &resumed, &AllowPublic)
+            .unwrap();
+        assert!(!second.duplicate);
+        assert_ne!(second.receipt, first.receipt);
+        assert_eq!(
+            state.row(work.target, b"count"),
+            Some(&2u64.to_le_bytes()[..])
+        );
+
+        let retry = state
+            .accumulate(&resumed_work, &resumed, &AllowPublic)
+            .unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.receipt, second.receipt);
+    }
+
+    #[test]
     fn refine_has_no_mutable_service_state_surface() {
         struct Pure;
         impl Refine for Pure {
@@ -702,7 +733,7 @@ mod tests {
             ) -> Result<TransitionV2, RefineError> {
                 Ok(TransitionV2 {
                     service: work.service.clone(),
-                    consumed_input: work.invocation,
+                    consumed_input: work.input_id(),
                     target_program: work.target_program,
                     base: work.base.clone(),
                     writes: vec![],
@@ -746,6 +777,7 @@ mod tests {
         let work = WorkEnvelopeV2 {
             service: identity(),
             invocation: InvocationId([26; 32]),
+            workflow_step: 0,
             target: actor,
             target_program: program,
             method: "inc".into(),
@@ -762,7 +794,7 @@ mod tests {
         };
         let mut transition = TransitionV2 {
             service: identity(),
-            consumed_input: work.invocation,
+            consumed_input: work.input_id(),
             target_program: program,
             base: work.base.clone(),
             writes: vec![],

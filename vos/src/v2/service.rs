@@ -107,7 +107,7 @@ mod tests {
         ) -> Result<TransitionV2, RefineError> {
             Ok(TransitionV2 {
                 service: work.service.clone(),
-                consumed_input: work.invocation,
+                consumed_input: work.input_id(),
                 target_program: work.target_program,
                 base: work.base.clone(),
                 writes: vec![],
@@ -144,6 +144,7 @@ mod tests {
         let work = WorkEnvelopeV2 {
             service: identity,
             invocation: InvocationId([6; 32]),
+            workflow_step: 0,
             target: actor,
             target_program: program,
             method: "tick".to_string(),
