@@ -64,6 +64,14 @@ pub const REFINE_ENTRY_IC: u32 = 0;
 /// Gray Paper instruction counter for the service Accumulate entry.
 pub const ACCUMULATE_ENTRY_IC: u32 = 5;
 
+/// Owning HANDLE through which the generic service enters the target actor VM.
+/// This is a JAR capability-table slot supplied at invocation setup, not a JAM
+/// protocol capability or hostcall number.
+pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 100;
+
+/// Successful result returned by the nested actor slice foundation entry.
+pub const ACTOR_SLICE_OK: u64 = 0x564f_532d_4143_5432;
+
 /// The two functions exposed by the generic service program through the Gray
 /// Paper two-slot entry prologue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,5 +98,4 @@ pub const JAR_REVISION: &str = "13c82dbc8715bd84e9c1c478f7261b2f5f64620b";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash =
-    Hash(*b"vos-jar-v2-13c82db-semantics-v2\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-13c82db-semantics-v2\0");

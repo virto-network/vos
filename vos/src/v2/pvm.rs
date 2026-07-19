@@ -8,10 +8,14 @@
 use alloc::vec::Vec;
 
 use javm::cap::{Cap, ProtocolCap};
-use javm::kernel::{InvocationKernel, KernelResult};
+use javm::kernel::{DormantProgram, InvocationKernel, KernelResult};
 use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
+use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 
-use super::{ACCUMULATE_ENTRY_IC, ProgramId, REFINE_ENTRY_IC};
+use super::{
+    ACCUMULATE_ENTRY_IC, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT,
+    V2Wire, WorkEnvelopeV2,
+};
 
 /// Result of one completed service-PVM execution slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +38,10 @@ pub enum ServicePvmErrorV2 {
     AccumulateHostRejected(u8),
     AccumulateCommitRejected,
     InvalidProtocolResume,
+    InvalidWorkEnvelope,
+    InvalidRefineImports,
+    TooManyImportedActors,
+    InvalidVmLifecycle,
 }
 
 impl core::fmt::Display for ServicePvmErrorV2 {
@@ -132,37 +140,72 @@ impl ServicePvmV2 {
         let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
             .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
         install_refine_scheduler_caps(&mut kernel);
-        kernel.set_entry_ic(REFINE_ENTRY_IC);
+        run_refine_kernel(kernel, gas_limit, host)
+    }
 
-        loop {
-            match kernel.run() {
-                KernelResult::Halt => {
-                    let bytes = read_output(&kernel)?;
-                    return Ok(ServicePvmOutputV2 {
-                        bytes,
-                        gas_used: gas_limit.saturating_sub(kernel.active_gas()),
-                    });
-                }
-                KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
-                KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
-                KernelResult::PageFault(address) => {
-                    return Err(ServicePvmErrorV2::PageFault(address));
-                }
-                KernelResult::ProtocolCall { slot } => {
-                    if !refine_protocol_call_is_pure(slot) {
-                        return Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(slot));
-                    }
-                    let mut registers = [0; 13];
-                    for (index, register) in registers.iter_mut().enumerate() {
-                        *register = kernel.active_reg(index);
-                    }
-                    let [result0, result1] = host.handle(slot, &registers, &mut kernel)?;
-                    kernel
-                        .resume_protocol_call(result0, result1)
-                        .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
-                }
-            }
+    /// Execute Refine with every declared actor instantiated as a dormant JAR
+    /// VM owned by this service invocation.
+    ///
+    /// The target actor is always installed at
+    /// [`super::TARGET_ACTOR_HANDLE_SLOT`]. Other imported actors follow in
+    /// canonical actor-ID order. No `INVOKE` protocol capability is installed:
+    /// nested execution must use the ordinary JAR HANDLE/CALL/REPLY path.
+    pub fn refine_actor_tree<H: RefineProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        imports: &RefineImportsV2,
+        gas_limit: u64,
+        host: &H,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        let work = WorkEnvelopeV2::decode(arguments)
+            .map_err(|_| ServicePvmErrorV2::InvalidWorkEnvelope)?;
+        imports
+            .validate_for(&work)
+            .map_err(|_| ServicePvmErrorV2::InvalidRefineImports)?;
+        if work.imported_actors.len() >= MAX_CODE_CAPS {
+            return Err(ServicePvmErrorV2::TooManyImportedActors);
         }
+
+        let mut actors = Vec::with_capacity(work.imported_actors.len());
+        let target = work
+            .imported_actors
+            .iter()
+            .find(|actor| actor.actor == work.target)
+            .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
+        actors.push(target);
+        actors.extend(
+            work.imported_actors
+                .iter()
+                .filter(|actor| actor.actor != work.target),
+        );
+
+        let mut dormant = Vec::with_capacity(actors.len());
+        for (ordinal, actor) in actors.into_iter().enumerate() {
+            let imported = imports
+                .programs
+                .binary_search_by_key(&actor.program, |program| program.program)
+                .ok()
+                .map(|index| &imports.programs[index])
+                .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
+            let handle_slot = TARGET_ACTOR_HANDLE_SLOT
+                .checked_add(ordinal as u8)
+                .ok_or(ServicePvmErrorV2::TooManyImportedActors)?;
+            dormant.push(DormantProgram {
+                blob: &imported.pvm,
+                handle_slot,
+            });
+        }
+
+        let mut kernel = InvocationKernel::new_with_dormant_programs(
+            &self.program,
+            arguments,
+            gas_limit,
+            &dormant,
+            javm::PvmBackend::Default,
+        )
+        .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
+        install_refine_scheduler_caps(&mut kernel);
+        run_refine_kernel(kernel, gas_limit, host)
     }
 
     /// Execute the physical IC-5 Accumulate entry against an isolated staging
@@ -176,6 +219,11 @@ impl ServicePvmV2 {
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
             .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
+        kernel
+            .vm_arena
+            .vm_mut(kernel.active_vm)
+            .transition(VmState::Running)
+            .map_err(|_| ServicePvmErrorV2::InvalidVmLifecycle)?;
         install_accumulate_scheduler_caps(&mut kernel);
         kernel.set_entry_ic(ACCUMULATE_ENTRY_IC);
         let mut transaction = host.begin()?;
@@ -208,6 +256,49 @@ impl ServicePvmV2 {
     }
 }
 
+fn run_refine_kernel<H: RefineProtocolHostV2>(
+    mut kernel: InvocationKernel,
+    gas_limit: u64,
+    host: &H,
+) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+    kernel
+        .vm_arena
+        .vm_mut(kernel.active_vm)
+        .transition(VmState::Running)
+        .map_err(|_| ServicePvmErrorV2::InvalidVmLifecycle)?;
+    kernel.set_entry_ic(REFINE_ENTRY_IC);
+
+    loop {
+        match kernel.run() {
+            KernelResult::Halt => {
+                let bytes = read_output(&kernel)?;
+                return Ok(ServicePvmOutputV2 {
+                    bytes,
+                    gas_used: gas_limit.saturating_sub(kernel.active_gas()),
+                });
+            }
+            KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
+            KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
+            KernelResult::PageFault(address) => {
+                return Err(ServicePvmErrorV2::PageFault(address));
+            }
+            KernelResult::ProtocolCall { slot } => {
+                if !refine_protocol_call_is_pure(slot) {
+                    return Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(slot));
+                }
+                let mut registers = [0; 13];
+                for (index, register) in registers.iter_mut().enumerate() {
+                    *register = kernel.active_reg(index);
+                }
+                let [result0, result1] = host.handle(slot, &registers, &mut kernel)?;
+                kernel
+                    .resume_protocol_call(result0, result1)
+                    .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+            }
+        }
+    }
+}
+
 fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
     // These are VOS scheduler capabilities, not JAM protocol slots. The
     // nondeterministic BOOT_CONTEXT/NOW_MS seams are intentionally absent from
@@ -215,7 +306,6 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
     for slot in [
         crate::abi::hostcall::GROW_HEAP as u8,
         crate::abi::hostcall::DEBUG_WRITE as u8,
-        crate::abi::hostcall::INVOKE as u8,
         crate::abi::hostcall::SUSPEND as u8,
     ] {
         kernel
@@ -287,7 +377,6 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
             | crate::abi::hostcall::PREIMAGE_LOOKUP
             | crate::abi::hostcall::GROW_HEAP
             | crate::abi::hostcall::DEBUG_WRITE
-            | crate::abi::hostcall::INVOKE
             | crate::abi::hostcall::SUSPEND
     )
 }

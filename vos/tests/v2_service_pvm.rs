@@ -7,10 +7,11 @@ use std::path::PathBuf;
 
 use javm::kernel::InvocationKernel;
 use vos::v2::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, ActorId, AuthorizationEvidenceV2,
-    ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, GasAccountingV2, Hash, InvocationId,
-    NoRefineProtocolHostV2, Origin, ProgramId, RefineProtocolHostV2, RootServiceId,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, ActorId, AuthorizationEvidenceV2, BlobRefV2,
+    ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, Hash, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, InvocationId, NoRefineProtocolHostV2, Origin, ProgramId, RefineImportsV2,
+    RootServiceId, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
+    WorkEnvelopeV2,
 };
 
 fn service_elf() -> Option<Vec<u8>> {
@@ -28,7 +29,15 @@ fn service_elf() -> Option<Vec<u8>> {
     }
 }
 
-fn work() -> WorkEnvelopeV2 {
+fn actor_pvm(result: u64) -> Vec<u8> {
+    let mut assembler = grey_transpiler::assembler::Assembler::new();
+    assembler
+        .load_imm_64(grey_transpiler::assembler::Reg::A0, result)
+        .ecalli(0);
+    assembler.build()
+}
+
+fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     WorkEnvelopeV2 {
         service: ServiceIdentityV2 {
             root_service: RootServiceId([1; 32]),
@@ -39,7 +48,7 @@ fn work() -> WorkEnvelopeV2 {
         },
         invocation: InvocationId([4; 32]),
         target: ActorId([5; 32]),
-        target_program: ProgramId([6; 32]),
+        target_program: actor_program,
         method: "increment".into(),
         arguments: vec![7],
         origin: Origin::Anonymous,
@@ -51,13 +60,16 @@ fn work() -> WorkEnvelopeV2 {
             revision: 0,
             state_root: Hash([8; 32]),
         },
-        imported_actors: vec![],
+        imported_actors: vec![ImportedActorV2 {
+            actor: ActorId([5; 32]),
+            program: actor_program,
+            state,
+            continuation: None,
+        }],
         imported_blobs: vec![],
         proof_requested: false,
     }
 }
-
-struct NestedActorHost;
 
 struct FailClosedAccumulateHost {
     committed: bool,
@@ -89,62 +101,6 @@ impl AccumulateProtocolHostV2 for FailClosedAccumulateHost {
     }
 }
 
-impl RefineProtocolHostV2 for NestedActorHost {
-    fn handle(
-        &self,
-        slot: u8,
-        registers: &[u64; 13],
-        kernel: &mut InvocationKernel,
-    ) -> Result<[u64; 2], ServicePvmErrorV2> {
-        if slot == vos::abi::hostcall::GAS as u8 {
-            return Ok([kernel.active_gas(), 0]);
-        }
-        if slot != vos::abi::hostcall::INVOKE as u8 {
-            return NoRefineProtocolHostV2.handle(slot, registers, kernel);
-        }
-
-        let program = kernel
-            .read_data_cap_window(registers[7] as u32, 32)
-            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-        let input = kernel
-            .read_data_cap_window(registers[8] as u32, registers[9] as u32)
-            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-        let work = WorkEnvelopeV2::decode(&input)
-            .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
-        assert_eq!(program, work.target_program.0);
-
-        let transition = TransitionV2 {
-            service: work.service.clone(),
-            consumed_input: work.invocation,
-            target_program: work.target_program,
-            base: work.base.clone(),
-            writes: vec![],
-            crdt_operations: vec![],
-            resulting_crdt_heads: vec![],
-            continuations: vec![],
-            inbox: vec![],
-            outbox: vec![],
-            reply: None,
-            exported_blobs: vec![],
-            gas: GasAccountingV2 {
-                refine_used: 10,
-                proof_used: 0,
-                accumulate_used: 0,
-            },
-            proof: None,
-        };
-        let output = transition.encode();
-        let output_packed = registers[11];
-        let output_address = output_packed as u32;
-        let output_capacity = (output_packed >> 32) as usize;
-        if output.len() > output_capacity || !kernel.write_data_cap_window(output_address, &output)
-        {
-            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
-        }
-        Ok([output.len() as u64, 0])
-    }
-}
-
 #[test]
 fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let Some(elf) = service_elf() else {
@@ -153,16 +109,69 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm))
         .expect("generic service has the GP IC0/IC5 entries");
-    let work = work();
+    let actor = actor_pvm(vos::v2::ACTOR_SLICE_OK);
+    let actor_program = ProgramId::of_pvm(&actor);
+    let state_bytes = Vec::new();
+    let state = BlobRefV2::of_bytes(&state_bytes);
+    let work = work(actor_program, state.clone());
+    let imports = RefineImportsV2 {
+        programs: vec![ImportedProgramV2 {
+            program: actor_program,
+            pvm: actor,
+        }],
+        blobs: vec![ImportedBlobV2 {
+            reference: state,
+            bytes: state_bytes,
+        }],
+    };
 
     let output = service
-        .refine(&work.encode(), 10_000_000, &NestedActorHost)
+        .refine_actor_tree(
+            &work.encode(),
+            &imports,
+            10_000_000,
+            &NoRefineProtocolHostV2,
+        )
         .expect("generic Refine completes");
     let transition = TransitionV2::decode(&output.bytes).expect("Refine returns TransitionV2");
     assert_eq!(transition.service, work.service);
     assert_eq!(transition.consumed_input, work.invocation);
     assert_eq!(transition.target_program, work.target_program);
     assert_eq!(transition.base, work.base);
+}
+
+#[test]
+fn canonical_guest_rejects_a_nested_actor_without_the_reply_abi() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
+    let actor = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor);
+    let state_bytes = Vec::new();
+    let state = BlobRefV2::of_bytes(&state_bytes);
+    let work = work(actor_program, state.clone());
+    let imports = RefineImportsV2 {
+        programs: vec![ImportedProgramV2 {
+            program: actor_program,
+            pvm: actor,
+        }],
+        blobs: vec![ImportedBlobV2 {
+            reference: state,
+            bytes: state_bytes,
+        }],
+    };
+
+    assert_eq!(
+        service.refine_actor_tree(
+            &work.encode(),
+            &imports,
+            10_000_000,
+            &NoRefineProtocolHostV2,
+        ),
+        Err(ServicePvmErrorV2::Panic)
+    );
 }
 
 #[test]
