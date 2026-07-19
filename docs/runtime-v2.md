@@ -8,9 +8,11 @@
 > v2 conformance.
 
 VOS v2 assigns one logical JAM service to a root actor and its owned child
-tree. The protocol-pinned `vos-service.pvm` has one physical entrypoint;
-JAM register `φ[7]` selects logical Refine (`0`) or Accumulate (`1`). Actor
-packages contain application PVMs, not application-written Refine or
+tree. The protocol-pinned `vos-service.pvm` is one generic program with the
+Gray Paper two-slot entry prologue: Refine begins at instruction counter 0 and
+Accumulate at instruction counter 5. Registers `φ[7]`/`φ[8]` remain the
+standard argument pointer/length window; they are never VOS phase selectors.
+Actor packages contain application PVMs, not application-written Refine or
 Accumulate functions.
 
 Refine is pure. A `WorkEnvelopeV2` imports the exact deployment, program,

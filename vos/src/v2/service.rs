@@ -1,4 +1,4 @@
-//! One physical service entrypoint with logical Refine/Accumulate selection.
+//! One generic service program with Gray Paper Refine/Accumulate entries.
 
 use super::{
     AccumulateError, AccumulationOutcome, AccumulationValidator, InMemoryServiceState, Refine,
@@ -13,7 +13,7 @@ pub enum ServiceDispatchOutputV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceDispatchError {
-    UnknownFunction(u64),
+    UnknownEntryIc(u32),
     UnexpectedTransition,
     MissingTransition,
     Refine(RefineError),
@@ -28,10 +28,10 @@ impl core::fmt::Display for ServiceDispatchError {
 
 impl core::error::Error for ServiceDispatchError {}
 
-/// Local conformance harness for the same logical service entrypoint deployed
-/// as `vos-service.pvm`. The selector is the value JAM places in `phi[7]`.
-/// Refine receives only immutable inputs; the service store is reachable only
-/// in the Accumulate branch.
+/// Local conformance harness for the same generic program deployed as
+/// `vos-service.pvm`. JAM enters Refine at IC 0 and Accumulate at IC 5 while
+/// `phi[7]`/`phi[8]` carry the standard argument window. Refine receives only
+/// immutable inputs; the service store is reachable only in Accumulate.
 pub struct JamServiceV2<R, V> {
     refiner: R,
     validator: V,
@@ -53,14 +53,14 @@ impl<R, V> JamServiceV2<R, V> {
 }
 
 impl<R: Refine, V: AccumulationValidator> JamServiceV2<R, V> {
-    pub fn dispatch_phi7(
+    pub fn dispatch_entry_ic(
         &mut self,
-        phi7: u64,
+        entry_ic: u32,
         work: &WorkEnvelopeV2,
         imports: &R::Imports,
         transition: Option<&TransitionV2>,
     ) -> Result<ServiceDispatchOutputV2, ServiceDispatchError> {
-        match ServiceFunction::from_phi7(phi7) {
+        match ServiceFunction::from_entry_ic(entry_ic) {
             Some(ServiceFunction::Refine) => {
                 if transition.is_some() {
                     return Err(ServiceDispatchError::UnexpectedTransition);
@@ -77,7 +77,7 @@ impl<R: Refine, V: AccumulationValidator> JamServiceV2<R, V> {
                     .map(ServiceDispatchOutputV2::Accumulated)
                     .map_err(ServiceDispatchError::Accumulate)
             }
-            None => Err(ServiceDispatchError::UnknownFunction(phi7)),
+            None => Err(ServiceDispatchError::UnknownEntryIc(entry_ic)),
         }
     }
 }
@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_selector_keeps_refine_stateless() {
+    fn gp_entries_keep_refine_stateless() {
         let identity = ServiceIdentityV2 {
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
@@ -156,19 +156,27 @@ mod tests {
         };
         let mut service = JamServiceV2::new(Echo, crate::v2::AllowPublic, state);
         let revision = service.state().revision();
-        let transition = match service.dispatch_phi7(0, &work, &(), None).unwrap() {
+        let transition = match service
+            .dispatch_entry_ic(crate::v2::REFINE_ENTRY_IC, &work, &(), None)
+            .unwrap()
+        {
             ServiceDispatchOutputV2::Refined(transition) => transition,
             _ => panic!("wrong logical function"),
         };
         assert_eq!(service.state().revision(), revision);
         let outcome = service
-            .dispatch_phi7(1, &work, &(), Some(&transition))
+            .dispatch_entry_ic(
+                crate::v2::ACCUMULATE_ENTRY_IC,
+                &work,
+                &(),
+                Some(&transition),
+            )
             .unwrap();
         assert!(matches!(outcome, ServiceDispatchOutputV2::Accumulated(_)));
         assert_eq!(service.state().revision(), revision + 1);
         assert_eq!(
-            service.dispatch_phi7(7, &work, &(), None),
-            Err(ServiceDispatchError::UnknownFunction(7)),
+            service.dispatch_entry_ic(1, &work, &(), None),
+            Err(ServiceDispatchError::UnknownEntryIc(1)),
         );
         assert_ne!(service.state().state_root(), Hash::ZERO);
         assert!(matches!(work.base, ConsistencyBaseV2::Linear { .. }));

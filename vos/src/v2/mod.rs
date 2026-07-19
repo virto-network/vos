@@ -1,9 +1,11 @@
 //! VOS runtime v2: JAM-aligned service contracts.
 //!
-//! A root actor tree is owned by one logical JAM service. The service has one
-//! physical entry point; `phi[7]` selects the logical function. Refine receives
-//! every input explicitly and returns a deterministic [`TransitionV2`]. Only
-//! Accumulate may mutate service state or publish effects.
+//! A root actor tree is owned by one logical JAM service. One generic service
+//! program exposes the two Gray Paper entry instruction counters: Refine at IC
+//! 0 and Accumulate at IC 5. Registers `phi[7]`/`phi[8]` retain their standard
+//! argument-window meaning. Refine receives every input explicitly and returns
+//! a deterministic [`TransitionV2`]. Only Accumulate may mutate service state
+//! or publish effects.
 //!
 //! This is a clean boundary. None of the types in this module accept legacy
 //! `RefinePayload`, `EffectLog`, or continuation encodings.
@@ -50,20 +52,25 @@ pub const SNAPSHOT_VERSION: u16 = 2;
 /// Attestation statement version required by runtime v2.
 pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 
-/// The two logical functions exposed through the service PVM's physical PC-0
-/// entry point. JAM supplies the selector in `phi[7]`.
+/// Gray Paper instruction counter for the service Refine entry.
+pub const REFINE_ENTRY_IC: u32 = 0;
+/// Gray Paper instruction counter for the service Accumulate entry.
+pub const ACCUMULATE_ENTRY_IC: u32 = 5;
+
+/// The two functions exposed by the generic service program through the Gray
+/// Paper two-slot entry prologue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
+#[repr(u32)]
 pub enum ServiceFunction {
-    Refine = 0,
-    Accumulate = 1,
+    Refine = REFINE_ENTRY_IC,
+    Accumulate = ACCUMULATE_ENTRY_IC,
 }
 
 impl ServiceFunction {
-    pub const fn from_phi7(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(Self::Refine),
-            1 => Some(Self::Accumulate),
+    pub const fn from_entry_ic(entry_ic: u32) -> Option<Self> {
+        match entry_ic {
+            REFINE_ENTRY_IC => Some(Self::Refine),
+            ACCUMULATE_ENTRY_IC => Some(Self::Accumulate),
             _ => None,
         }
     }
