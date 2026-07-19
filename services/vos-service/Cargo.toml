@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "vos-service"
+description = "Protocol-pinned generic JAM service for VOS root actor trees"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/virto-network/vos"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["pvm"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
