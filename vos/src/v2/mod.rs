@@ -25,10 +25,7 @@ pub use accumulate::{
     AccumulateError, AccumulationOutcome, AccumulationValidator, AllowPublic, InMemoryServiceState,
     PublishedEffects,
 };
-pub use continuation::{
-    CapabilitySnapshotV2, ContinuationSnapshotV2, MemoryPageRefV2, PendingProtocolCallV2,
-    ResumedKernelV2, SchedulerSnapshotV2, VmLifecycleV2, VmSnapshotV2,
-};
+pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulationReceiptV2, ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
