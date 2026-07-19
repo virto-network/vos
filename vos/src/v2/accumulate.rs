@@ -688,7 +688,6 @@ mod tests {
         impl Refine for Pure {
             type Imports = ();
             fn refine(
-                &self,
                 work: &WorkEnvelopeV2,
                 _imports: &(),
             ) -> Result<TransitionV2, RefineError> {
@@ -712,8 +711,8 @@ mod tests {
         }
         let (_state, work, _) = fixture();
         assert_eq!(
-            Pure.refine(&work, &()).unwrap(),
-            Pure.refine(&work, &()).unwrap()
+            Pure::refine(&work, &()).unwrap(),
+            Pure::refine(&work, &()).unwrap()
         );
     }
 

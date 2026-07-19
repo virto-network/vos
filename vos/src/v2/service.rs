@@ -1,5 +1,7 @@
 //! One generic service program with Gray Paper Refine/Accumulate entries.
 
+use core::marker::PhantomData;
+
 use super::{
     AccumulateError, AccumulationOutcome, AccumulationValidator, InMemoryServiceState, Refine,
     RefineError, ServiceFunction, TransitionV2, WorkEnvelopeV2,
@@ -33,15 +35,15 @@ impl core::error::Error for ServiceDispatchError {}
 /// `phi[7]`/`phi[8]` carry the standard argument window. Refine receives only
 /// immutable inputs; the service store is reachable only in Accumulate.
 pub struct JamServiceV2<R, V> {
-    refiner: R,
+    refiner: PhantomData<fn() -> R>,
     validator: V,
     state: InMemoryServiceState,
 }
 
 impl<R, V> JamServiceV2<R, V> {
-    pub fn new(refiner: R, validator: V, state: InMemoryServiceState) -> Self {
+    pub fn new(validator: V, state: InMemoryServiceState) -> Self {
         Self {
-            refiner,
+            refiner: PhantomData,
             validator,
             state,
         }
@@ -65,8 +67,7 @@ impl<R: Refine, V: AccumulationValidator> JamServiceV2<R, V> {
                 if transition.is_some() {
                     return Err(ServiceDispatchError::UnexpectedTransition);
                 }
-                self.refiner
-                    .refine(work, imports)
+                R::refine(work, imports)
                     .map(ServiceDispatchOutputV2::Refined)
                     .map_err(ServiceDispatchError::Refine)
             }
@@ -94,14 +95,12 @@ mod tests {
         WorkEnvelopeV2,
     };
 
-    #[derive(Clone)]
     struct Echo;
 
     impl Refine for Echo {
         type Imports = ();
 
         fn refine(
-            &self,
             work: &WorkEnvelopeV2,
             _: &Self::Imports,
         ) -> Result<TransitionV2, RefineError> {
@@ -154,7 +153,7 @@ mod tests {
             imported_blobs: vec![],
             proof_requested: false,
         };
-        let mut service = JamServiceV2::new(Echo, crate::v2::AllowPublic, state);
+        let mut service = JamServiceV2::<Echo, _>::new(crate::v2::AllowPublic, state);
         let revision = service.state().revision();
         let transition = match service
             .dispatch_entry_ic(crate::v2::REFINE_ENTRY_IC, &work, &(), None)

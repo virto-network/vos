@@ -214,14 +214,19 @@ impl core::fmt::Display for RefineError {
 
 impl core::error::Error for RefineError {}
 
-/// Pure logical Refine implementation. It receives no mutable service store;
-/// all code, state, credentials, continuations, and blobs must be present in
-/// `work`/`imports`.
+/// Pure logical Refine implementation. It has no receiver and receives no
+/// mutable service store; all code, state, credentials, continuations, and
+/// blobs must be present in `work`/`imports`.
+///
+/// Making Refine an associated operation is deliberate: a service cannot
+/// smuggle invocation-to-invocation state through a refiner instance. The
+/// production service still enforces determinism at the PVM boundary, but the
+/// Rust conformance surface does not make stateful Refine implementations look
+/// valid in the first place.
 pub trait Refine {
     type Imports;
 
     fn refine(
-        &self,
         work: &WorkEnvelopeV2,
         imports: &Self::Imports,
     ) -> Result<TransitionV2, RefineError>;
