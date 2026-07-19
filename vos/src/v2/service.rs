@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 
 use super::{
     AccumulateError, AccumulationOutcome, AccumulationValidator, InMemoryServiceState, Refine,
-    RefineError, ServiceFunction, TransitionV2, WorkEnvelopeV2,
+    RefineError, RefineImportsV2, ServiceFunction, TransitionV2, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +59,7 @@ impl<R: Refine, V: AccumulationValidator> JamServiceV2<R, V> {
         &mut self,
         entry_ic: u32,
         work: &WorkEnvelopeV2,
-        imports: &R::Imports,
+        imports: &RefineImportsV2,
         transition: Option<&TransitionV2>,
     ) -> Result<ServiceDispatchOutputV2, ServiceDispatchError> {
         match ServiceFunction::from_entry_ic(entry_ic) {
@@ -67,6 +67,9 @@ impl<R: Refine, V: AccumulationValidator> JamServiceV2<R, V> {
                 if transition.is_some() {
                     return Err(ServiceDispatchError::UnexpectedTransition);
                 }
+                imports
+                    .validate_for(work)
+                    .map_err(ServiceDispatchError::Refine)?;
                 R::refine(work, imports)
                     .map(ServiceDispatchOutputV2::Refined)
                     .map_err(ServiceDispatchError::Refine)
@@ -98,11 +101,9 @@ mod tests {
     struct Echo;
 
     impl Refine for Echo {
-        type Imports = ();
-
         fn refine(
             work: &WorkEnvelopeV2,
-            _: &Self::Imports,
+            _: &RefineImportsV2,
         ) -> Result<TransitionV2, RefineError> {
             Ok(TransitionV2 {
                 service: work.service.clone(),
@@ -133,9 +134,13 @@ mod tests {
             execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
         };
         let actor = ActorId([4; 32]);
-        let program = ProgramId([5; 32]);
+        let actor_pvm = vec![5, 6, 7];
+        let program = ProgramId::of_pvm(&actor_pvm);
+        let actor_state_bytes = b"actor-state".to_vec();
+        let actor_state = crate::v2::BlobRefV2::of_bytes(&actor_state_bytes);
         let mut state = InMemoryServiceState::new(identity.clone(), ConsistencyModeV2::Local);
         state.install_actor(actor, program);
+        state.make_blob_available(actor_state.hash);
         let work = WorkEnvelopeV2 {
             service: identity,
             invocation: InvocationId([6; 32]),
@@ -149,14 +154,29 @@ mod tests {
             parent_call: None,
             consistency: ConsistencyModeV2::Local,
             base: state.current_base(),
-            imported_actors: vec![],
+            imported_actors: vec![crate::v2::ImportedActorV2 {
+                actor,
+                program,
+                state: actor_state.clone(),
+                continuation: None,
+            }],
             imported_blobs: vec![],
             proof_requested: false,
+        };
+        let imports = RefineImportsV2 {
+            programs: vec![crate::v2::ImportedProgramV2 {
+                program,
+                pvm: actor_pvm,
+            }],
+            blobs: vec![crate::v2::ImportedBlobV2 {
+                reference: actor_state,
+                bytes: actor_state_bytes,
+            }],
         };
         let mut service = JamServiceV2::<Echo, _>::new(crate::v2::AllowPublic, state);
         let revision = service.state().revision();
         let transition = match service
-            .dispatch_entry_ic(crate::v2::REFINE_ENTRY_IC, &work, &(), None)
+            .dispatch_entry_ic(crate::v2::REFINE_ENTRY_IC, &work, &imports, None)
             .unwrap()
         {
             ServiceDispatchOutputV2::Refined(transition) => transition,
@@ -167,14 +187,14 @@ mod tests {
             .dispatch_entry_ic(
                 crate::v2::ACCUMULATE_ENTRY_IC,
                 &work,
-                &(),
+                &imports,
                 Some(&transition),
             )
             .unwrap();
         assert!(matches!(outcome, ServiceDispatchOutputV2::Accumulated(_)));
         assert_eq!(service.state().revision(), revision + 1);
         assert_eq!(
-            service.dispatch_entry_ic(1, &work, &(), None),
+            service.dispatch_entry_ic(1, &work, &imports, None),
             Err(ServiceDispatchError::UnknownEntryIc(1)),
         );
         assert_ne!(service.state().state_root(), Hash::ZERO);

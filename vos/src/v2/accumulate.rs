@@ -686,10 +686,9 @@ mod tests {
     fn refine_has_no_mutable_service_state_surface() {
         struct Pure;
         impl Refine for Pure {
-            type Imports = ();
             fn refine(
                 work: &WorkEnvelopeV2,
-                _imports: &(),
+                _imports: &RefineImportsV2,
             ) -> Result<TransitionV2, RefineError> {
                 Ok(TransitionV2 {
                     service: work.service.clone(),
@@ -710,9 +709,10 @@ mod tests {
             }
         }
         let (_state, work, _) = fixture();
+        let imports = RefineImportsV2::default();
         assert_eq!(
-            Pure::refine(&work, &()).unwrap(),
-            Pure::refine(&work, &()).unwrap()
+            Pure::refine(&work, &imports).unwrap(),
+            Pure::refine(&work, &imports).unwrap()
         );
     }
 

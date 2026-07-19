@@ -30,8 +30,8 @@ pub use continuation::{
 pub use contracts::{
     AccumulationReceiptV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2,
     ConsistencyModeV2, ContinuationChangeV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2,
-    MessageRecordV2, ProofCommitmentV2, Refine, RefineError, ReplyRecordV2, ServiceIdentityV2,
-    TransitionV2, WorkEnvelopeV2,
+    ImportedBlobV2, ImportedProgramV2, MessageRecordV2, ProofCommitmentV2, Refine, RefineError,
+    RefineImportsV2, ReplyRecordV2, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
 };
 pub use identity::{
     ActorId, CallId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId, ProgramId,

@@ -80,12 +80,49 @@ pub struct BlobRefV2 {
     pub len: u64,
 }
 
+impl BlobRefV2 {
+    /// Construct a content reference for bytes imported into or exported from
+    /// a VOS v2 service invocation.
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        Self {
+            hash: Hash::digest(b"vos/blob/v2", &[bytes]),
+            len: bytes.len() as u64,
+        }
+    }
+
+    pub fn matches(&self, bytes: &[u8]) -> bool {
+        self.len == bytes.len() as u64 && *self == Self::of_bytes(bytes)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedActorV2 {
     pub actor: ActorId,
     pub program: ProgramId,
     pub state: BlobRefV2,
     pub continuation: Option<BlobRefV2>,
+}
+
+/// Canonical code supplied to Refine. An ELF, JIT image, or proving artifact
+/// is never accepted here: `pvm` is the exact executable/proof identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedProgramV2 {
+    pub program: ProgramId,
+    pub pvm: Vec<u8>,
+}
+
+/// Content-addressed bytes supplied to Refine for one declared blob reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedBlobV2 {
+    pub reference: BlobRefV2,
+    pub bytes: Vec<u8>,
+}
+
+/// Complete immutable import set for one Refine execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefineImportsV2 {
+    pub programs: Vec<ImportedProgramV2>,
+    pub blobs: Vec<ImportedBlobV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +238,10 @@ pub struct AccumulationReceiptV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefineError {
     WrongAbi,
+    WrongExecutionSemantics,
     MissingImport(Hash),
+    InvalidImport(Hash),
+    NonCanonicalImports,
     InvalidConsistency,
     Execution(Vec<u8>),
 }
@@ -224,12 +264,88 @@ impl core::error::Error for RefineError {}
 /// Rust conformance surface does not make stateful Refine implementations look
 /// valid in the first place.
 pub trait Refine {
-    type Imports;
-
     fn refine(
         work: &WorkEnvelopeV2,
-        imports: &Self::Imports,
+        imports: &RefineImportsV2,
     ) -> Result<TransitionV2, RefineError>;
+}
+
+impl RefineImportsV2 {
+    /// Verify that Refine has every byte named by the work envelope and that
+    /// no imported code/blob can masquerade under a different content ID.
+    pub fn validate_for(&self, work: &WorkEnvelopeV2) -> Result<(), RefineError> {
+        if work.service.service_abi != super::ABI_VERSION {
+            return Err(RefineError::WrongAbi);
+        }
+        if work.service.execution_semantics != super::EXECUTION_SEMANTICS_ID {
+            return Err(RefineError::WrongExecutionSemantics);
+        }
+        if !work.base.mode_compatible(work.consistency) {
+            return Err(RefineError::InvalidConsistency);
+        }
+
+        if self
+            .programs
+            .windows(2)
+            .any(|pair| pair[0].program >= pair[1].program)
+            || self
+                .blobs
+                .windows(2)
+                .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
+        {
+            return Err(RefineError::NonCanonicalImports);
+        }
+        for imported in &self.programs {
+            if imported.pvm.is_empty() || ProgramId::of_pvm(&imported.pvm) != imported.program {
+                return Err(RefineError::InvalidImport(Hash(imported.program.0)));
+            }
+        }
+        for imported in &self.blobs {
+            if !imported.reference.matches(&imported.bytes) {
+                return Err(RefineError::InvalidImport(imported.reference.hash));
+            }
+        }
+
+        let target = work
+            .imported_actors
+            .iter()
+            .find(|actor| actor.actor == work.target)
+            .ok_or(RefineError::MissingImport(Hash(work.target.0)))?;
+        if target.program != work.target_program {
+            return Err(RefineError::InvalidImport(Hash(target.program.0)));
+        }
+
+        for actor in &work.imported_actors {
+            if self
+                .programs
+                .binary_search_by_key(&actor.program, |program| program.program)
+                .is_err()
+            {
+                return Err(RefineError::MissingImport(Hash(actor.program.0)));
+            }
+            self.require_blob(&actor.state)?;
+            if let Some(continuation) = &actor.continuation {
+                self.require_blob(continuation)?;
+            }
+        }
+        for reference in &work.imported_blobs {
+            self.require_blob(reference)?;
+        }
+        Ok(())
+    }
+
+    fn require_blob(&self, reference: &BlobRefV2) -> Result<(), RefineError> {
+        let imported = self
+            .blobs
+            .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+            .ok()
+            .map(|index| &self.blobs[index])
+            .ok_or(RefineError::MissingImport(reference.hash))?;
+        if imported.reference != *reference {
+            return Err(RefineError::InvalidImport(reference.hash));
+        }
+        Ok(())
+    }
 }
 
 impl V2Wire for WorkEnvelopeV2 {
@@ -276,6 +392,7 @@ impl V2Wire for WorkEnvelopeV2 {
         let imported_actors = d.list(decode_imported_actor)?;
         let imported_blobs = d.list(decode_blob_ref)?;
         let proof_requested = d.bool()?;
+        ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
         Ok(Self {
             service,
@@ -294,6 +411,54 @@ impl V2Wire for WorkEnvelopeV2 {
             imported_blobs,
             proof_requested,
         })
+    }
+}
+
+impl V2Wire for RefineImportsV2 {
+    const MAGIC: [u8; 4] = *b"VRI2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.list(&self.programs, |e, program| {
+            e.fixed(&program.program.0);
+            e.bytes(&program.pvm);
+        });
+        e.list(&self.blobs, |e, blob| {
+            encode_blob_ref(e, &blob.reference);
+            e.bytes(&blob.bytes);
+        });
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            programs: d.list(|d| {
+                Ok(ImportedProgramV2 {
+                    program: ProgramId(d.fixed()?),
+                    pvm: d.bytes()?,
+                })
+            })?,
+            blobs: d.list(|d| {
+                Ok(ImportedBlobV2 {
+                    reference: decode_blob_ref(d)?,
+                    bytes: d.bytes()?,
+                })
+            })?,
+        };
+        ensure_sorted_unique(&value.programs, |program| program.program.0)?;
+        ensure_sorted_unique(&value.blobs, |blob| blob.reference.hash.0)?;
+        for program in &value.programs {
+            if program.pvm.is_empty() || ProgramId::of_pvm(&program.pvm) != program.program {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        if value
+            .blobs
+            .iter()
+            .any(|blob| !blob.reference.matches(&blob.bytes))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -687,6 +852,59 @@ mod tests {
         assert_eq!(
             WorkEnvelopeV2::decode(&old),
             Err(DecodeError::InvalidVersion)
+        );
+    }
+
+    #[test]
+    fn refine_imports_bind_all_program_and_blob_bytes() {
+        let pvm = b"canonical-actor-pvm".to_vec();
+        let program = ProgramId::of_pvm(&pvm);
+        let state_bytes = b"actor-state".to_vec();
+        let state = BlobRefV2::of_bytes(&state_bytes);
+        let extra_bytes = b"schema-or-credential".to_vec();
+        let extra = BlobRefV2::of_bytes(&extra_bytes);
+
+        let mut work = work();
+        work.target_program = program;
+        work.imported_actors = vec![ImportedActorV2 {
+            actor: work.target,
+            program,
+            state: state.clone(),
+            continuation: None,
+        }];
+        work.imported_blobs = vec![extra.clone()];
+
+        let mut blobs = vec![
+            ImportedBlobV2 {
+                reference: state,
+                bytes: state_bytes,
+            },
+            ImportedBlobV2 {
+                reference: extra,
+                bytes: extra_bytes,
+            },
+        ];
+        blobs.sort_by_key(|blob| blob.reference.hash);
+        let imports = RefineImportsV2 {
+            programs: vec![ImportedProgramV2 { program, pvm }],
+            blobs,
+        };
+        imports.validate_for(&work).unwrap();
+        let encoded = imports.encode();
+        assert_eq!(RefineImportsV2::decode(&encoded).unwrap(), imports);
+
+        let mut missing = imports.clone();
+        missing.blobs.retain(|blob| blob.reference != work.imported_blobs[0]);
+        assert_eq!(
+            missing.validate_for(&work),
+            Err(RefineError::MissingImport(work.imported_blobs[0].hash))
+        );
+
+        let mut tampered = imports;
+        tampered.programs[0].pvm.push(0);
+        assert_eq!(
+            tampered.validate_for(&work),
+            Err(RefineError::InvalidImport(Hash(program.0)))
         );
     }
 
