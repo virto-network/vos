@@ -11,7 +11,7 @@ use javm::cap::{Cap, ProtocolCap};
 use javm::kernel::{InvocationKernel, KernelResult};
 use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
 
-use super::{ProgramId, REFINE_ENTRY_IC};
+use super::{ACCUMULATE_ENTRY_IC, ProgramId, REFINE_ENTRY_IC};
 
 /// Result of one completed service-PVM execution slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,8 @@ pub enum ServicePvmErrorV2 {
     UnreadableOutput,
     ForbiddenRefineProtocolCall(u8),
     RefineHostRejected(u8),
+    AccumulateHostRejected(u8),
+    AccumulateCommitRejected,
     InvalidProtocolResume,
 }
 
@@ -54,6 +56,29 @@ pub trait RefineProtocolHostV2 {
         registers: &[u64; 13],
         kernel: &mut InvocationKernel,
     ) -> Result<[u64; 2], ServicePvmErrorV2>;
+}
+
+/// Private staging area for one Accumulate execution.
+///
+/// Implementations buffer storage mutations, receipts, dedup rows, messages,
+/// replies, and publications here. Dropping the transaction must discard all
+/// of them; only [`AccumulateProtocolHostV2::commit`] may make them visible.
+pub trait AccumulateTransactionV2 {
+    fn handle(
+        &mut self,
+        slot: u8,
+        registers: &[u64; 13],
+        kernel: &mut InvocationKernel,
+    ) -> Result<[u64; 2], ServicePvmErrorV2>;
+}
+
+/// Atomic host boundary exposed to the physical IC-5 Accumulate entry.
+pub trait AccumulateProtocolHostV2 {
+    type Transaction: AccumulateTransactionV2;
+
+    fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2>;
+
+    fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2>;
 }
 
 /// Host used by pure service programs that need no protocol imports.
@@ -139,6 +164,48 @@ impl ServicePvmV2 {
             }
         }
     }
+
+    /// Execute the physical IC-5 Accumulate entry against an isolated staging
+    /// transaction. The service output becomes observable only after the host
+    /// commits that transaction successfully.
+    pub fn accumulate<H: AccumulateProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        gas_limit: u64,
+        host: &mut H,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
+            .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
+        install_accumulate_scheduler_caps(&mut kernel);
+        kernel.set_entry_ic(ACCUMULATE_ENTRY_IC);
+        let mut transaction = host.begin()?;
+
+        loop {
+            match kernel.run() {
+                KernelResult::Halt => {
+                    let bytes = read_output(&kernel)?;
+                    let gas_used = gas_limit.saturating_sub(kernel.active_gas());
+                    host.commit(transaction)?;
+                    return Ok(ServicePvmOutputV2 { bytes, gas_used });
+                }
+                KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
+                KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
+                KernelResult::PageFault(address) => {
+                    return Err(ServicePvmErrorV2::PageFault(address));
+                }
+                KernelResult::ProtocolCall { slot } => {
+                    let mut registers = [0; 13];
+                    for (index, register) in registers.iter_mut().enumerate() {
+                        *register = kernel.active_reg(index);
+                    }
+                    let [result0, result1] = transaction.handle(slot, &registers, &mut kernel)?;
+                    kernel
+                        .resume_protocol_call(result0, result1)
+                        .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                }
+            }
+        }
+    }
 }
 
 fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
@@ -150,6 +217,21 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
         crate::abi::hostcall::DEBUG_WRITE as u8,
         crate::abi::hostcall::INVOKE as u8,
         crate::abi::hostcall::SUSPEND as u8,
+    ] {
+        kernel
+            .vm_arena
+            .vm_mut(kernel.active_vm)
+            .cap_table
+            .set(slot, Cap::Protocol(ProtocolCap { id: slot }));
+    }
+}
+
+fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
+    // Accumulate never executes actor calls or suspension. These two supplied
+    // capabilities are mechanical VM support and diagnostics only.
+    for slot in [
+        crate::abi::hostcall::GROW_HEAP as u8,
+        crate::abi::hostcall::DEBUG_WRITE as u8,
     ] {
         kernel
             .vm_arena
@@ -230,7 +312,11 @@ mod tests {
         emit_instruction(code, bitmask, &jump);
     }
 
-    fn two_entry_program(refine_call: Option<u32>) -> Vec<u8> {
+    fn service_program(
+        refine_call: Option<u32>,
+        accumulate_call: Option<u32>,
+        accumulate_panics: bool,
+    ) -> Vec<u8> {
         let mut code = vec![40, 0, 0, 0, 0, 40, 0, 0, 0, 0];
         let mut bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0];
 
@@ -243,12 +329,67 @@ mod tests {
         emit_halt(&mut code, &mut bitmask);
 
         let accumulate_body = code.len();
-        emit_halt(&mut code, &mut bitmask);
+        if let Some(slot) = accumulate_call {
+            let mut call = vec![10];
+            call.extend_from_slice(&slot.to_le_bytes());
+            emit_instruction(&mut code, &mut bitmask, &call);
+        }
+        if accumulate_panics {
+            emit_instruction(&mut code, &mut bitmask, &[0]);
+        } else {
+            emit_halt(&mut code, &mut bitmask);
+        }
 
         code[1..5].copy_from_slice(&(refine_body as i32).to_le_bytes());
         code[6..10].copy_from_slice(&((accumulate_body as i32) - 5).to_le_bytes());
 
         grey_transpiler::emitter::build_service_program(&code, &bitmask, &[], &[], &[], 1, 0, 4)
+    }
+
+    fn two_entry_program(refine_call: Option<u32>) -> Vec<u8> {
+        service_program(refine_call, None, false)
+    }
+
+    #[derive(Default)]
+    struct RecordingAccumulateHost {
+        committed_calls: usize,
+        reject_commit: bool,
+    }
+
+    #[derive(Default)]
+    struct RecordingTransaction {
+        staged_calls: usize,
+    }
+
+    impl AccumulateTransactionV2 for RecordingTransaction {
+        fn handle(
+            &mut self,
+            slot: u8,
+            _registers: &[u64; 13],
+            _kernel: &mut InvocationKernel,
+        ) -> Result<[u64; 2], ServicePvmErrorV2> {
+            if slot != crate::abi::hostcall::STORAGE_W as u8 {
+                return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
+            }
+            self.staged_calls += 1;
+            Ok([0, 0])
+        }
+    }
+
+    impl AccumulateProtocolHostV2 for RecordingAccumulateHost {
+        type Transaction = RecordingTransaction;
+
+        fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
+            Ok(RecordingTransaction::default())
+        }
+
+        fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2> {
+            if self.reject_commit {
+                return Err(ServicePvmErrorV2::AccumulateCommitRejected);
+            }
+            self.committed_calls += transaction.staged_calls;
+            Ok(())
+        }
     }
 
     #[test]
@@ -290,5 +431,38 @@ mod tests {
             ServicePvmV2::new(actor.clone(), ProgramId::of_pvm(&actor)),
             Err(ServicePvmErrorV2::InvalidServiceEntries)
         ));
+    }
+
+    #[test]
+    fn accumulate_commits_staged_calls_only_after_ic5_halts() {
+        let program = service_program(None, Some(crate::abi::hostcall::STORAGE_W), false);
+        let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
+        let mut host = RecordingAccumulateHost::default();
+
+        let output = service.accumulate(&[], 1_000_000, &mut host).unwrap();
+        assert!(output.bytes.is_empty());
+        assert_eq!(host.committed_calls, 1);
+    }
+
+    #[test]
+    fn accumulate_discards_staging_on_panic_or_commit_failure() {
+        let panicking = service_program(None, Some(crate::abi::hostcall::STORAGE_W), true);
+        let service = ServicePvmV2::new(panicking.clone(), ProgramId::of_pvm(&panicking)).unwrap();
+        let mut host = RecordingAccumulateHost::default();
+        assert_eq!(
+            service.accumulate(&[], 1_000_000, &mut host),
+            Err(ServicePvmErrorV2::Panic)
+        );
+        assert_eq!(host.committed_calls, 0);
+
+        let committing = service_program(None, Some(crate::abi::hostcall::STORAGE_W), false);
+        let service =
+            ServicePvmV2::new(committing.clone(), ProgramId::of_pvm(&committing)).unwrap();
+        host.reject_commit = true;
+        assert_eq!(
+            service.accumulate(&[], 1_000_000, &mut host),
+            Err(ServicePvmErrorV2::AccumulateCommitRejected)
+        );
+        assert_eq!(host.committed_calls, 0);
     }
 }

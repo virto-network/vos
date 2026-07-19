@@ -45,8 +45,8 @@ pub use package::{
 };
 #[cfg(feature = "std")]
 pub use pvm::{
-    NoRefineProtocolHostV2, RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2,
-    ServicePvmV2,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
+    RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
 };
 pub use service::{JamServiceV2, ServiceDispatchError, ServiceDispatchOutputV2};
 pub use storage::{StoreHeaderV2, StoreOpenError};
