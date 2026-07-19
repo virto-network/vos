@@ -115,7 +115,7 @@ impl<H: Hasher> MerkleClock<H> {
             }
             let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
             if node.cid() != cid {
-                return Err(Error::MissingNode);
+                return Err(Error::InvalidCid);
             }
             for child in &node.children {
                 if candidates.contains(child) && subsumed.insert(child.clone()) {
@@ -163,7 +163,7 @@ impl<H: Hasher> MerkleClock<H> {
             }
             let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
             if node.cid() != cid {
-                return Err(Error::MissingNode);
+                return Err(Error::InvalidCid);
             }
             // LIFO post-order: push self first, then children in reverse so
             // every child exits before its parent.

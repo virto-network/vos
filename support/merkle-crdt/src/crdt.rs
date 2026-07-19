@@ -165,9 +165,24 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
         store: S,
         roots: impl IntoIterator<Item = Cid<H>>,
     ) -> Result<Self, Error<S::Error>> {
+        Self::from_roots_validated(store, roots, &AcceptAll)
+    }
+
+    /// Recover a replica while validating every node in the complete reachable
+    /// ancestry. This must be used when node authorship or payload policy is
+    /// part of the application's trust boundary; content addressing alone only
+    /// authenticates bytes.
+    pub fn from_roots_validated<V: NodeValidator<H, P>>(
+        store: S,
+        roots: impl IntoIterator<Item = Cid<H>>,
+        validator: &V,
+    ) -> Result<Self, Error<S::Error>> {
         let mut clock = MerkleClock::new();
         clock.add_roots(roots);
         clock.compact_roots::<P, S>(&store)?;
+        if !ancestry_is_valid::<H, P, S, V>(&clock, &store, validator)? {
+            return Err(Error::InvalidAuthor);
+        }
         let state = materialize::<H, P, S>(&clock, &store)?;
         Ok(Self {
             clock,
@@ -181,6 +196,8 @@ fn map_local_error<L, R>(error: Error<L>) -> SyncError<L, R> {
     match error {
         Error::Store(error) => SyncError::Local(error),
         Error::MissingNode => SyncError::MissingNode,
+        Error::InvalidCid => SyncError::InvalidCid,
+        Error::InvalidAuthor => SyncError::InvalidAuthor,
     }
 }
 
@@ -197,7 +214,7 @@ fn materialize<H: Hasher, P: Payload, S: Store<H, P>>(
         }
         let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
         if node.cid() != cid {
-            return Err(Error::MissingNode);
+            return Err(Error::InvalidCid);
         }
         for child in &node.children {
             if !visited.contains(child) {
@@ -226,7 +243,7 @@ fn ancestry_is_valid<H: Hasher, P: Payload, S: Store<H, P>, V: NodeValidator<H, 
         }
         let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
         if node.cid() != cid {
-            return Err(Error::MissingNode);
+            return Err(Error::InvalidCid);
         }
         if !validator.validate(&cid, &node) {
             return Ok(false);
@@ -503,6 +520,110 @@ mod tests {
         }
         let recovered = TestCrdt::from_roots(copied, roots).unwrap();
         assert_eq!(*recovered.state(), 11);
+    }
+
+    #[test]
+    fn recovery_rejects_corrupt_content_addressed_nodes() {
+        let node = DagNode::leaf(CounterOp(3));
+        let false_root = Cid::<TestHasher>([0x44; 32]);
+        assert_ne!(node.cid(), false_root);
+        let mut store = MemStore::new();
+        store.put(false_root.clone(), node).unwrap();
+
+        assert!(matches!(
+            TestCrdt::from_roots(store, [false_root]),
+            Err(Error::InvalidCid)
+        ));
+    }
+
+    #[test]
+    fn recovery_validates_every_author_in_reachable_ancestry() {
+        struct RejectNegative;
+        impl NodeValidator<TestHasher, CounterOp> for RejectNegative {
+            fn validate(
+                &self,
+                _cid: &Cid<TestHasher>,
+                node: &DagNode<TestHasher, CounterOp>,
+            ) -> bool {
+                node.payload.0 >= 0
+            }
+        }
+
+        let mut original: TestCrdt = MerkleCrdt::default();
+        original.apply(CounterOp(-3)).unwrap();
+        original.apply(CounterOp(8)).unwrap();
+        let roots = original.roots().iter().cloned().collect::<Vec<_>>();
+        let mut copied = MemStore::new();
+        for root in &roots {
+            original
+                .clock()
+                .walk(root, original.store(), |cid, node| {
+                    copied.put(cid.clone(), node.clone()).unwrap();
+                })
+                .unwrap();
+        }
+
+        assert!(matches!(
+            TestCrdt::from_roots_validated(copied, roots, &RejectNegative),
+            Err(Error::InvalidAuthor)
+        ));
+    }
+
+    fn sync_all(dst: &mut TestCrdt, src: &TestCrdt) {
+        for root in src.roots().iter().cloned().collect::<Vec<_>>() {
+            dst.sync(&root, src.store()).unwrap();
+        }
+    }
+
+    fn permute_actions(actions: &mut [u8], offset: usize, permutations: &mut Vec<Vec<u8>>) {
+        if offset == actions.len() {
+            permutations.push(actions.to_vec());
+            return;
+        }
+        for index in offset..actions.len() {
+            actions.swap(offset, index);
+            permute_actions(actions, offset + 1, permutations);
+            actions.swap(offset, index);
+        }
+    }
+
+    #[test]
+    fn three_replicas_converge_for_every_pairwise_sync_order() {
+        let mut actions = [0, 1, 2, 3, 4, 5];
+        let mut permutations = Vec::new();
+        permute_actions(&mut actions, 0, &mut permutations);
+        assert_eq!(permutations.len(), 720);
+
+        for schedule in permutations {
+            let mut alice: TestCrdt = MerkleCrdt::default();
+            let mut bob: TestCrdt = MerkleCrdt::default();
+            let mut carol: TestCrdt = MerkleCrdt::default();
+
+            alice.apply(CounterOp(10)).unwrap();
+            sync_all(&mut bob, &alice);
+            sync_all(&mut carol, &alice);
+            alice.apply(CounterOp(1)).unwrap();
+            bob.apply(CounterOp(2)).unwrap();
+            carol.apply(CounterOp(4)).unwrap();
+
+            for action in schedule {
+                match action {
+                    0 => sync_all(&mut alice, &bob),
+                    1 => sync_all(&mut alice, &carol),
+                    2 => sync_all(&mut bob, &alice),
+                    3 => sync_all(&mut bob, &carol),
+                    4 => sync_all(&mut carol, &alice),
+                    5 => sync_all(&mut carol, &bob),
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_eq!(*alice.state(), 17);
+            assert_eq!(alice.state(), bob.state());
+            assert_eq!(alice.state(), carol.state());
+            assert_eq!(alice.roots(), bob.roots());
+            assert_eq!(alice.roots(), carol.roots());
+        }
     }
 
     #[test]

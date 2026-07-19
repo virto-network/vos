@@ -103,6 +103,10 @@ pub enum Error<E> {
     Store(E),
     /// A referenced node was not found.
     MissingNode,
+    /// Stored bytes do not match the content identifier under which they were found.
+    InvalidCid,
+    /// A stored node failed the application-provided author or payload policy.
+    InvalidAuthor,
 }
 
 impl<E> From<E> for Error<E> {
@@ -116,6 +120,8 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
         match self {
             Error::Store(e) => write!(f, "store error: {e}"),
             Error::MissingNode => write!(f, "referenced node not found in store"),
+            Error::InvalidCid => write!(f, "stored node CID verification failed"),
+            Error::InvalidAuthor => write!(f, "stored node author validation failed"),
         }
     }
 }
@@ -125,7 +131,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Store(e) => Some(e),
-            Error::MissingNode => None,
+            Error::MissingNode | Error::InvalidCid | Error::InvalidAuthor => None,
         }
     }
 }
