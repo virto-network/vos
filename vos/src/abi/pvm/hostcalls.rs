@@ -24,6 +24,15 @@ pub fn now_ms() -> u64 {
     ecall0(hostcall::NOW_MS)
 }
 
+/// Stop at an exact durable continuation boundary.
+///
+/// Returns `0` to the refine fork that finalizes the current execution slice,
+/// and `1` when the committed continuation is restored.
+#[inline]
+pub fn suspend() -> u64 {
+    ecall0(hostcall::SUSPEND)
+}
+
 /// Request additional heap pages.
 #[inline]
 pub fn grow_heap(pages: u32) -> u64 {

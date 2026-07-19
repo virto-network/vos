@@ -85,3 +85,11 @@ pub const BOOT_CONTEXT: u32 = 120;
 /// state transition — replicated actors take time from the `chronos` beacon
 /// (sampled once at the raft leader and committed), never from this hostcall.
 pub const NOW_MS: u32 = 121;
+
+/// Durable actor suspension boundary supplied by the VOS scheduler.
+///
+/// Refine captures the complete nested JAVM kernel before this call observes
+/// a result. A result of `0` drives the transition-finalization branch; after
+/// that transition commits, restoring the snapshot injects `1` and execution
+/// continues immediately after the source-level `.await`.
+pub const SUSPEND: u32 = 122;

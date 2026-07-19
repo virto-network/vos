@@ -1,14 +1,13 @@
-//! Pluggable data layer for VOS service continuation bodies.
+//! Pluggable data layer for exact VOS kernel snapshots.
 //!
 //! In the CoreVM-on-JAM split, a service's persisted continuation has
 //! two parts:
 //!
-//! - A small **header** (PC, registers, heap, commitment hash, …) that
-//!   lives in the service's on-chain storage. See
+//! - A small **header** (snapshot length, execution semantics, commitment)
+//!   that lives in the service's on-chain storage. See
 //!   [`crate::pvm_image::ContinuationHeader`].
-//! - A large **body** (the PVM `flat_mem` bytes) that lives in the
-//!   data-availability layer, content-addressed by the blake2b hash of
-//!   its bytes.
+//! - A large **body** (the portable JAVM kernel snapshot wire) that lives in
+//!   the data-availability layer, content-addressed by its blake2b hash.
 //!
 //! [`DataLayer`] abstracts the body store. The default in-process
 //! [`MemoryDataLayer`] is a `HashMap<[u8; 32], Vec<u8>>`. A real
@@ -34,10 +33,9 @@ use std::collections::HashMap;
 ///
 /// Implementations MUST be monotonic per `(commitment, body)`: a
 /// `put` followed by a `get` must return the same bytes the caller
-/// wrote. Beyond that the backend is free to dedup, evict cold blobs,
-/// shard, replicate, etc. Because the keyspace is content-addressed,
-/// two services that capture identical flat_mem will share one body —
-/// no extra bookkeeping required.
+/// wrote. Beyond that the backend is free to dedup, retain cold blobs, shard,
+/// replicate, etc. A committed continuation header must never become visible
+/// before its body is durable and available.
 pub trait DataLayer: Send + Sync {
     /// Fetch the body for `commitment`, or `None` if it isn't stored.
     async fn get(&self, commitment: &[u8; 32]) -> Option<Vec<u8>>;

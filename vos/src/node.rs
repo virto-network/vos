@@ -2163,7 +2163,7 @@ fn soft_restart_crdt(
 /// header (host bookkeeping written outside dispatch deltas by
 /// design — a replica applying the same history incrementally never
 /// persists it, so persisting it here would break cross-replica
-/// byte-parity and re-seed a dangling header whose flat_mem body is
+/// byte-parity and re-seed a dangling header whose kernel-snapshot body is
 /// gone), and `host_seeded` keys (rows the host writes from the
 /// manifest on every spawn, INIT_KEY at minimum — persisting one
 /// would let a stale copy shadow a manifest edit on the next boot).

@@ -96,8 +96,8 @@ mod pvm {
 
     static LOGGER: PvmLogger = PvmLogger;
 
-    /// Install the PVM logger. Idempotent — subsequent calls are
-    /// no-ops, so warm restarts that re-enter `_start` don't error.
+    /// Install the PVM logger. Idempotent — subsequent fresh dispatches are
+    /// no-ops, while exact restores continue past their captured boundary.
     ///
     /// Uses `set_logger_racy` / `set_max_level_racy` because the
     /// riscv64em-javm target lacks `target_has_atomic = "ptr"`
@@ -107,8 +107,7 @@ mod pvm {
     pub fn install() {
         // SAFETY: PVM is single-threaded; `_start` runs to
         // completion before any other entry point. Cold start
-        // calls this exactly once; warm restarts re-call it but
-        // by that point no concurrent log emission is in flight.
+        // calls are serialized and there is no concurrent log emission.
         unsafe {
             let _ = ::log::set_logger_racy(&LOGGER);
             ::log::set_max_level_racy(LevelFilter::Trace);

@@ -88,6 +88,15 @@ impl Yield {
     pub fn once() -> Self {
         Self { yielded: false }
     }
+
+    /// Construct the source-level await state after a VOS suspension call.
+    /// A restored PVM has already crossed the durable boundary, so its first
+    /// poll is immediately ready; the transition-finalization fork still
+    /// returns pending and unwinds into its refine output.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn after_checkpoint(restored: bool) -> Self {
+        Self { yielded: restored }
+    }
 }
 
 impl Future for Yield {
@@ -438,8 +447,7 @@ pub fn run_refine_service<A: super::Actor>() {
 
     // Install the PVM `log::Log` impl on the first refine call.
     // `set_logger` returns Err on duplicate install — we ignore it
-    // so warm restarts (which re-enter `_start` without flat_mem
-    // reset) don't trip on the second call.
+    // because an exact continuation retains the already-installed logger.
     crate::log_impl::install_pvm_logger();
 
     set_refine_mode(true);
@@ -447,17 +455,15 @@ pub fn run_refine_service<A: super::Actor>() {
     let id = lifecycle::service_id();
     let mut ctx = super::Context::new(ServiceId(id));
 
-    // Warm-restart actor holder. Lives in static rw_data, which sits
-    // inside the PVM's flat_mem; VOS preserves flat_mem across ticks
-    // via `new_warm`, so on a warm restart this pointer still references
-    // a valid heap-allocated `A` and we skip cold init entirely.
+    // Actor holder. It lives in the PVM's mutable memory, so an exact kernel
+    // continuation preserves both this pointer and the referenced allocation.
+    // A fresh invocation starts with a zero slot and rehydrates from storage.
     //
     // Cold start (ACTOR_HOLDER == 0): reads STATE_KEY via READ hostcall
-    // and deserializes the actor. This is the JAM-compatible path that
-    // works on any conformant host without flat_mem support.
+    // and deserializes the actor. This is the portable fresh-invocation path.
     //
     // Per-service uniqueness: each service has its own PVM instance
-    // with its own flat_mem, so each one gets its own copy of this
+    // with its own mutable memory, so each one gets its own copy of this
     // static — even when two services share the same blob. Type-erased
     // as `usize` because `A` differs per service; safe because PVM is
     // single-threaded.
@@ -466,10 +472,8 @@ pub fn run_refine_service<A: super::Actor>() {
     // committing to the state this refine runs against. Computed on
     // cold start from the exact serialized bytes READ returned (before
     // deserialization) — plus, for committed actors, the recorded
-    // composite-root row; carried forward across warm restarts in
-    // flat_mem and advanced after every state-changing work-result, so
-    // the up-to-64 work-results of one tick form the anchor chain the
-    // host verifies against its journal overlay. `state_hash` tracks
+    // composite-root row; carried across exact continuations and advanced
+    // after every state-changing work-result. `state_hash` tracks
     // the blob alone: under a composite (0x02) anchor, "anchor moved"
     // and "blob moved" are separate questions (a committed-field write
     // moves the composite while the blob stands), and the final
@@ -492,8 +496,8 @@ pub fn run_refine_service<A: super::Actor>() {
             // Cold start: try to restore from persisted state in storage.
             // This is the JAM-compatible path — the guest reads its own
             // serialized state via READ (legal in refine) without any
-            // host cooperation. On VOS, this path is skipped because
-            // ACTOR_HOLDER is warm from the flat_mem overlay.
+            // host cooperation. Exact continuation restore skips it because
+            // it resumes the existing call stack after the await boundary.
             //
             // The read grows onto the heap when the state outgrew the
             // probe buffer — a fixed-buffer read here would treat a
@@ -556,7 +560,7 @@ pub fn run_refine_service<A: super::Actor>() {
     // RefinePayload. Drop temporaries eagerly before halt_with_output
     // (which is `-> !` and never runs destructors).
     //
-    // The output buffer is a static Vec reused across warm restarts to
+    // The output buffer is a static Vec reused across exact restores to
     // avoid leaking a fresh allocation on every halt (the `-> !` ecall
     // never runs destructors).
     static mut OUTPUT_BUF: usize = 0;
@@ -775,7 +779,7 @@ pub fn run_refine<A: super::Actor>() {
     // Pack output: [status:u8][state_len:u32][state...][reply...]
     // Drop temporaries and ctx eagerly — halt_with_output is `-> !`
     // so destructors never run; without explicit drops the Vecs leak
-    // on every warm-restart iteration.
+    // on every invocation.
     let out = {
         let state = lifecycle::save_state::<A>(&actor, &ctx);
         let reply_bytes = ctx.take_reply_bytes();

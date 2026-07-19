@@ -655,8 +655,17 @@ impl<A: Actor> Context<A> {
     /// Checkpoint state and yield to other actors. Resumes next tick.
     /// Each invocation runs one iteration; state is saved automatically.
     pub fn yield_now(&mut self) -> super::run::Yield {
-        self.self_schedule = true;
-        super::run::Yield::once()
+        #[cfg(feature = "pvm")]
+        {
+            let restored = crate::abi::pvm::hostcalls::suspend() == 1;
+            self.self_schedule = !restored;
+            super::run::Yield::after_checkpoint(restored)
+        }
+        #[cfg(not(feature = "pvm"))]
+        {
+            self.self_schedule = true;
+            super::run::Yield::once()
+        }
     }
 
     /// Checkpoint state and yield. `sleep` is an alias for
@@ -665,8 +674,7 @@ impl<A: Actor> Context<A> {
     /// next tick. Kept for source compatibility and as the natural name
     /// for a periodic-work loop.
     pub fn sleep(&mut self, _ticks: u32) -> super::run::Yield {
-        self.self_schedule = true;
-        super::run::Yield::once()
+        self.yield_now()
     }
 
     // --- Storage ---

@@ -264,7 +264,7 @@ fn refine_completes_and_clears_continuation() {
     // Smoke test for the CoreVM-on-JAM model: a service that completes
     // its work in one tick should leave behind no continuation image
     // and no pending transfers. (When a service yields mid-work, the
-    // continuation is preserved instead — covered by the cooperative
+    // exact continuation is preserved instead — covered by the cooperative
     // loop test.)
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
@@ -303,17 +303,9 @@ fn refine_completes_and_clears_continuation() {
 fn data_layer_roundtrip_via_runtime() {
     // Basic wiring test for the pluggable DataLayer: poke bytes
     // directly into the backend under a service id and verify the
-    // runtime's `is_suspended` surfaces them. This covers the
-    // DataLayer <-> VosRuntime plumbing without needing a service
-    // actor that actually calls `yield_now` (none of the current
-    // examples do — the scheduler drives progress via `send_self`
-    // transfers, not explicit refine yields).
-    //
-    // TODO: add an end-to-end "suspend in runtime A, resume in
-    // runtime B through a shared DataLayer" test once we have a
-    // service actor whose refine body calls `ctx.yield_now()` or
-    // `ctx.sleep()`. That's the test that exercises
-    // `pvm_image::capture`/`restore` against a real PVM image.
+    // runtime's `is_suspended` surfaces them. Exact snapshot decoding and
+    // process-restart resume are covered by the runtime unit tests; this one
+    // isolates DataLayer <-> VosRuntime plumbing.
     use vos::data_layer::{DataLayer, MemoryDataLayer};
     use vos::pvm_image::{ContinuationHeader, commit};
 
@@ -333,14 +325,9 @@ fn data_layer_roundtrip_via_runtime() {
     );
 
     let header = ContinuationHeader {
-        pc: 0,
-        heap_base: 0,
-        heap_top: 0,
-        need_gas_charge: false,
-        iters: 1,
-        flat_mem_len: body.len() as u32,
+        snapshot_len: body.len() as u32,
         commitment,
-        registers: [0; 13],
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID.0,
     };
     let encoded = header.encode();
 
@@ -368,14 +355,9 @@ fn data_layer_survives_runtime_teardown() {
     let commitment = commit(&body);
 
     let header = ContinuationHeader {
-        pc: 0,
-        heap_base: 0x1000,
-        heap_top: 0x2000,
-        need_gas_charge: false,
-        iters: 1,
-        flat_mem_len: body.len() as u32,
+        snapshot_len: body.len() as u32,
         commitment,
-        registers: [0; 13],
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID.0,
     };
 
     // Runtime A: inject the continuation.
@@ -11560,7 +11542,11 @@ fn task_invoke_live_equals_traced() {
         zkpvm::actor::interpreter_from_blob(&tally_blob, 100_000_000).expect("parse tally blob");
     let (start, end) = (witness_addr as usize, witness_addr as usize + input.len());
     traced_img[start..end].copy_from_slice(&input);
-    interp.flat_mem = traced_img.clone();
+    for (offset, byte) in input.iter().copied().enumerate() {
+        interp
+            .write_u8((start + offset) as u32, byte)
+            .expect("witness patch is inside traced memory");
+    }
     assert!(
         live_img.len() >= traced_img.len(),
         "live image must cover the blob-declared pages"
@@ -11582,7 +11568,7 @@ fn task_invoke_live_equals_traced() {
     );
     let ptr = tracing.pvm.registers[7] as usize;
     let len = tracing.pvm.registers[8] as usize;
-    let raw = &tracing.pvm.flat_mem[ptr..ptr + len];
+    let raw = &tracing.pvm.flat_mem()[ptr..ptr + len];
     let mut traced_payload =
         RefinePayload::decode(raw).expect("traced halt output is a v3 work-result");
     assert_eq!(traced_payload.anchor_kind, ANCHOR_GENESIS);

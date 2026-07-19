@@ -40,9 +40,9 @@ pub const INIT_KEY: &[u8] = b"__vos_init";
 
 /// Per-service storage key under which the runtime records a
 /// suspended PVM's `ContinuationHeader`. Written by the host runtime
-/// (`save_continuation`) into the tick's journal when refine sets
-/// `continue_next = true`; read at the start of the next tick to
-/// warm-restart the kernel.
+/// after the snapshot body is available when refine sets
+/// `continue_next = true`; read at the start of the next tick to restore
+/// the exact kernel boundary.
 ///
 /// The leading NUL keeps this key disjoint from any guest-chosen
 /// key: guest keys originate from `Encode`d Rust types whose rkyv
@@ -461,7 +461,7 @@ pub const TAG_CALLER_PREFIX: u8 = 0xFE;
 pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -> DispatchResult {
     // Reset the per-invocation forbidden flag so a prior refused
     // call doesn't poison this dispatch. Context lives across
-    // invocations on the warm-restart path.
+    // continuation slices while one handler remains suspended.
     ctx.__reset_forbidden();
 
     // Strip the M7 caller-info prefix if present. The host

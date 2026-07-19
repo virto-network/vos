@@ -49,38 +49,30 @@
 //! framework emits. Unknown versions and malformed payloads fail loud
 //! (treated like a trapped dispatch), never silently as defaults.
 //!
-//! Self-directed transfers (a service sending to itself) become
-//! **intra-round re-entries**: the runtime re-invokes the same service
-//! at PC=0 with the self-messages as fresh FETCH items, capped by
+//! Self-directed transfers (a service sending to itself) become fresh
+//! **intra-round invocations** after the current handler is idle, capped by
 //! [`MAX_REFINE_ITERATIONS`] per tick to guard against guest loops.
 //!
 //! Nested `INVOKE` children also run at PC=0 under the same refine
 //! policy; their effects merge into the parent's journal.
 //!
-//! ## Continuations (host-side warm restart)
+//! ## Exact continuations
 //!
-//! When a service's refine sets `continue_next = true` (a `yield_now` /
-//! `sleep` handler), the runtime:
-//!
-//!   * already holds the actor's serialized state — the guest emits a
-//!     `Write{STATE_KEY}` effect on every state-changing dispatch, not
-//!     just on yield — so a cold restart at PC=0 rehydrates it via
-//!     `READ`; and
-//!   * captures `flat_mem` into the [`DataLayer`] with a
-//!     [`ContinuationHeader`](crate::pvm_image::ContinuationHeader) so
-//!     the next tick restores the kernel via `InvocationKernel::new_warm`
-//!     — the guest's `ACTOR_HOLDER` static is already populated and it
-//!     skips the `READ` + deserialize.
+//! `yield_now`/`sleep` invokes the VOS suspension capability before the guest
+//! observes its result. Refine snapshots the complete JAVM kernel at that
+//! boundary, including the exact PC, registers, heap, capabilities, nested
+//! call stack, scheduler, and pending result location. The live fork receives
+//! `0` and emits the transition up to the await. Once committed, restore
+//! injects `1` into the captured boundary and execution continues after the
+//! source-level `.await`; code before it is never replayed from PC 0.
 //!
 //! Continuation header saves/clears are VOS host bookkeeping: written
 //! directly to [`ServiceStorage`], never through the journal, never
 //! targeting `STATE_KEY` — they are not part of any work-result and must
-//! not shadow one. The warm-restart overlay is a top-level-service
-//! optimization only (invoke children always cold-start via
-//! `new_cached`); its absence never changes semantics. There is no
-//! automatic wake-up: a service that yielded with nothing left to do
-//! under its own steam is resumed by the next external message
-//! (typically a parent agent's INVOKE).
+//! not shadow one. The snapshot body is stored in the [`DataLayer`] before
+//! its header becomes visible and is authenticated by both its content hash
+//! and the pinned execution-semantics ID. There is no automatic wake-up: a
+//! suspended service resumes on its next input.
 //!
 //! ## Memory model
 //!
@@ -97,6 +89,7 @@ use crate::abi::error;
 use crate::abi::hostcall;
 use crate::abi::service::ServiceId;
 use javm::kernel::{InvocationKernel, KernelResult};
+use javm::snapshot::KernelSnapshot;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use tracing::error;
@@ -216,14 +209,9 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
     out
 }
 
-/// Install the VOS-specific zkpvm-precompile slots as Protocol caps in
-/// the active VM's cap table. javm auto-installs slots 1..=28 (the
-/// spec-canonical protocol range) but leaves higher slots empty, so
-/// each precompile slot has to be slotted in here before the actor's
-/// first `ecalli` against it. Without this, `ecalli imm=N` falls into
-/// `handle_call(N)` which finds no cap and returns RESULT_WHAT — the
-/// actor's inline asm doesn't check the return value, so the
-/// precompile silently no-ops and the actor gets garbage output.
+/// Supply VOS runtime and crypto capabilities in the active VM's cap table.
+/// JAVM owns the JAM-reserved protocol range 1..=28; VOS capabilities live in
+/// explicitly supplied high slots and are never mistaken for JAM host ABI.
 ///
 /// Slot layout (`zkpvm/src/core/ecall.rs` is the source of truth):
 ///
@@ -234,13 +222,10 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
 ///   113 = scalar_mul_mod_l
 ///   114 = scalar_add_mod_l
 ///
-/// All fit in javm's `imm ≤ 127` budget. Call this once per kernel
-/// construction, before the first `run()`, for every refine entry
-/// path (`new_cached`, `new_warm`, and child `handle_invoke`). The
-/// slots collide with javm's program-cap range (29..=63 via CREATE,
-/// 64..=127 via MOVE); until javm grows native zkpvm-precompile
-/// support, we squat.
-fn install_vos_precompile_caps(kernel: &mut InvocationKernel) {
+/// All fit in JAVM's `imm ≤ 127` budget. Call this once for each fresh
+/// kernel before its first run. An exact restore reconstructs the captured
+/// capability table and must not reinstall or renumber these slots.
+fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
     use javm::cap::{Cap, ProtocolCap};
     // Source-of-truth IDs live in `zkpvm::core::ecall`, mirrored on
     // the guest side in `zkpvm::precompiles::ecalls`. We import
@@ -248,7 +233,7 @@ fn install_vos_precompile_caps(kernel: &mut InvocationKernel) {
     // handler today); ristretto IDs are hardcoded here until vos
     // grows its own handler — the install is a no-op for slots
     // whose ECALL never fires.
-    let slots: [u8; 8] = [
+    let slots: [u8; 9] = [
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8, // 100
         110,                                         // ristretto_scalar_mult
         111,                                         // ristretto_point_add
@@ -257,6 +242,7 @@ fn install_vos_precompile_caps(kernel: &mut InvocationKernel) {
         114,                                         // scalar_add_mod_l
         hostcall::BOOT_CONTEXT as u8,                // 120 (boot-context seam)
         hostcall::NOW_MS as u8,                      // 121 (host wall-clock seam)
+        hostcall::SUSPEND as u8,                     // 122 (durable await boundary)
     ];
     let vm = kernel.vm_arena.vm_mut(kernel.active_vm);
     for &slot in &slots {
@@ -982,7 +968,8 @@ impl<D: DataLayer> VosRuntime<D> {
         let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) else {
             return false;
         };
-        self.data.contains(&header.commitment)
+        header.execution_semantics == crate::v2::EXECUTION_SEMANTICS_ID.0
+            && self.data.contains(&header.commitment)
     }
 
     /// Run one round: for each service with pending input, run refine
@@ -1030,49 +1017,74 @@ impl<D: DataLayer> VosRuntime<D> {
             did_work = true;
             let mut journal = RefineJournal::default();
 
-            // Load any existing continuation for the first iteration.
-            // Subsequent iterations use the previous iteration's captured
-            // flat_mem so `ACTOR_HOLDER` and heap state survive across
-            // self-message re-entries within the same tick.
-            let mut warm_mem: Option<(Vec<u8>, u32, u32)> =
-                load_continuation(storage, &self.data, svc_id);
+            // A durable continuation is consumed only by the first slice.
+            // Completed handlers processing later self-messages cold-start
+            // from the journal-overlay state; they are idle invocations, not
+            // suspended machine stacks.
+            let mut saved_continuation = match load_continuation(storage, &self.data, svc_id) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    error!(
+                        svc_id,
+                        %err,
+                        "service: continuation unavailable; reset or reinstall the service"
+                    );
+                    *panics += 1;
+                    continue;
+                }
+            };
 
             for iteration in 0..MAX_REFINE_ITERATIONS {
-                let mut kernel = if let Some((ref flat_mem, heap_base, heap_top)) = warm_mem {
-                    match InvocationKernel::new_warm(
+                let (mut kernel, restored) = if let Some(snapshot) = saved_continuation.take() {
+                    let mut kernel = match InvocationKernel::restore(
                         blob,
-                        &[],
-                        refine_gas,
-                        flat_mem,
-                        heap_base,
-                        heap_top,
+                        &snapshot,
+                        javm::PvmBackend::Default,
                         Some(&mut self.code_cache),
                     ) {
                         Ok(k) => k,
                         Err(e) => {
-                            error!(svc_id, error = %e, "service: warm kernel init failed");
+                            error!(svc_id, error = %e, "service: exact kernel restore failed");
+                            *panics += 1;
                             break;
                         }
+                    };
+                    if let Err(err) = kernel.resume_protocol_call(1, 0) {
+                        error!(
+                            svc_id,
+                            ?err,
+                            "service: continuation resume injection failed"
+                        );
+                        *panics += 1;
+                        break;
                     }
+                    (kernel, true)
                 } else {
-                    match InvocationKernel::new_cached(blob, &[], refine_gas, &mut self.code_cache)
-                    {
+                    let kernel = match InvocationKernel::new_cached(
+                        blob,
+                        &[],
+                        refine_gas,
+                        &mut self.code_cache,
+                    ) {
                         Ok(k) => k,
                         Err(e) => {
                             error!(svc_id, error = %e, "service: kernel init failed");
                             break;
                         }
-                    }
+                    };
+                    (kernel, false)
                 };
-                install_vos_precompile_caps(&mut kernel);
-                // Zero the entry register (a0 / φ[7]). The guest runs the
-                // single refine entry at PC=0 and reads no phase selector.
-                kernel.set_active_reg(7, 0);
-                // Transition VM 0 from Ready → Running so kernel.run() executes.
-                let _ = kernel
-                    .vm_arena
-                    .vm_mut(0)
-                    .transition(javm::vm_pool::VmState::Running);
+                if !restored {
+                    install_vos_runtime_caps(&mut kernel);
+                    // Zero the entry register (a0 / φ[7]). The guest runs the
+                    // single refine entry at PC=0 and reads no phase selector.
+                    kernel.set_active_reg(7, 0);
+                    // Transition VM 0 from Ready → Running so kernel.run() executes.
+                    let _ = kernel
+                        .vm_arena
+                        .vm_mut(0)
+                        .transition(javm::vm_pool::VmState::Running);
+                }
 
                 // Stage FETCH items (raw transfers become one item each).
                 // Filter out empty wake-up transfers (used to re-tick
@@ -1084,8 +1096,9 @@ impl<D: DataLayer> VosRuntime<D> {
                 // can drop them whole (A2 discard-on-panic).
                 let dispatch_mark = journal.mark();
 
-                let halted = run_refine_kernel(
+                let (halted, continuation) = match run_refine_kernel(
                     &mut kernel,
+                    blob,
                     svc_id,
                     &mut round_items,
                     &mut journal,
@@ -1099,7 +1112,13 @@ impl<D: DataLayer> VosRuntime<D> {
                     &mut self.code_cache,
                     next_id,
                     &self.external_invoke,
-                );
+                ) {
+                    RefineKernelExit::Halted {
+                        output,
+                        continuation,
+                    } => (Some(output), continuation),
+                    RefineKernelExit::Failed => (None, None),
+                };
 
                 // Verify + absorb the guest's work-result (if any) into
                 // the journal. This covers the actor framework's
@@ -1174,29 +1193,43 @@ impl<D: DataLayer> VosRuntime<D> {
                             journal.rollback_to(dispatch_mark);
                             self.last_reply.remove(&svc_id);
                             self.last_status.remove(&svc_id);
-                            clear_continuation(storage, &mut self.data, svc_id);
+                            clear_continuation(storage, svc_id);
                             self.work_result_rejects += 1;
                             break;
                         }
                     };
 
                     if continue_next {
-                        let (flat_mem, heap_base, heap_top) = kernel.extract_flat_mem();
-                        save_continuation(
-                            svc_id,
-                            flat_mem,
-                            heap_base,
-                            heap_top,
-                            &mut self.data,
-                            storage,
-                        );
+                        let Some(snapshot) = continuation else {
+                            error!(
+                                svc_id,
+                                "service: yielded without an exact kernel suspension boundary"
+                            );
+                            journal.rollback_to(dispatch_mark);
+                            self.last_reply.remove(&svc_id);
+                            self.last_status.remove(&svc_id);
+                            clear_continuation(storage, svc_id);
+                            self.work_result_rejects += 1;
+                            break;
+                        };
+                        if let Err(err) =
+                            save_continuation(svc_id, &snapshot, &mut self.data, storage)
+                        {
+                            error!(svc_id, %err, "service: continuation persistence failed");
+                            journal.rollback_to(dispatch_mark);
+                            self.last_reply.remove(&svc_id);
+                            self.last_status.remove(&svc_id);
+                            clear_continuation(storage, svc_id);
+                            self.work_result_rejects += 1;
+                            break;
+                        }
                         // Re-queue mail the guest had not FETCHed before it
                         // yielded, then any self-directed transfers. A
                         // handler that yields mid-batch leaves the rest of
                         // this round's items unconsumed; dropping them would
                         // silently lose messages. Both redeliver next tick —
                         // un-fetched mail first — and the saved continuation
-                        // warm-restarts the guest to process them. On a JAM
+                        // resumes the guest exactly after its await. On a JAM
                         // host, accumulate would replay the self-transfers
                         // via hostcalls; VOS must match.
                         for msg in round_items.drain(..) {
@@ -1213,10 +1246,24 @@ impl<D: DataLayer> VosRuntime<D> {
                         break;
                     }
 
+                    if continuation.is_some() {
+                        error!(
+                            svc_id,
+                            "service: suspension boundary did not yield its refine slice"
+                        );
+                        journal.rollback_to(dispatch_mark);
+                        self.last_reply.remove(&svc_id);
+                        self.last_status.remove(&svc_id);
+                        clear_continuation(storage, svc_id);
+                        self.work_result_rejects += 1;
+                        break;
+                    }
+
+                    // The handler is idle now. Any continuation restored for
+                    // this slice has been consumed exactly once; subsequent
+                    // self-messages are fresh actor invocations.
+                    clear_continuation(storage, svc_id);
                     if journal.self_messages.is_empty() {
-                        // Guest signalled it's done; clear any prior
-                        // continuation and exit the refine loop.
-                        clear_continuation(storage, &mut self.data, svc_id);
                         break;
                     }
                 } else {
@@ -1248,31 +1295,18 @@ impl<D: DataLayer> VosRuntime<D> {
                 if journal.self_messages.is_empty() {
                     break;
                 }
-                // Capture flat_mem for the next iteration's warm restart
-                // so ACTOR_HOLDER and heap state survive across self-message
-                // re-entries within the same tick.
-                let captured = kernel.extract_flat_mem();
                 items = std::mem::take(&mut journal.self_messages);
                 if iteration + 1 == MAX_REFINE_ITERATIONS {
                     // Spill remaining self-messages as pending transfers
-                    // for the next tick. Capture a continuation so the
-                    // service warm-restarts with its current heap/actor.
-                    let (flat_mem, heap_base, heap_top) = captured;
-                    save_continuation(
-                        svc_id,
-                        flat_mem,
-                        heap_base,
-                        heap_top,
-                        &mut self.data,
-                        storage,
-                    );
+                    // for the next tick. The actor is idle, so the next
+                    // dispatch cold-starts from committed state rather than
+                    // manufacturing a PC-0 "continuation".
                     // Re-queue leftover self-messages for next tick.
                     for msg in items.drain(..) {
                         new_transfers.push((ServiceId(svc_id), msg));
                     }
                     break;
                 }
-                warm_mem = Some(captured);
             }
 
             // Commit the journal (accumulate as a direct replay).
@@ -1341,12 +1375,24 @@ impl Default for VosRuntime<MemoryDataLayer> {
     }
 }
 
-/// Drive a refine-phase kernel to halt. Returns the guest's halt
-/// output bytes (read from φ[7]/φ[8] as ptr/len) on success, `None` on
-/// panic / OOG / page fault.
+enum RefineKernelExit {
+    Halted {
+        output: Vec<u8>,
+        continuation: Option<KernelSnapshot>,
+    },
+    Failed,
+}
+
+/// Drive a refine-phase kernel to halt.
+///
+/// At the VOS suspension capability, capture the exact still-live kernel
+/// before the guest observes a result. The live refine fork receives `0` so
+/// it unwinds and emits the transition up to the await; the stored snapshot
+/// later receives `1` and continues immediately after that boundary.
 #[allow(clippy::too_many_arguments)]
 fn run_refine_kernel(
     kernel: &mut InvocationKernel,
+    canonical_blob: &[u8],
     svc_id: u32,
     items: &mut Vec<Vec<u8>>,
     journal: &mut RefineJournal,
@@ -1360,22 +1406,26 @@ fn run_refine_kernel(
     code_cache: &mut javm::CodeCache,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
-) -> Option<Vec<u8>> {
+) -> RefineKernelExit {
+    let mut continuation = None;
     loop {
         match kernel.run() {
             KernelResult::Halt => {
                 let ptr = kernel.active_reg(7) as u32;
                 let len = (kernel.active_reg(8) as usize).min(1 << 20);
-                return Some(kread(kernel, ptr, len));
+                return RefineKernelExit::Halted {
+                    output: kread(kernel, ptr, len),
+                    continuation,
+                };
             }
             KernelResult::Panic => {
                 let pc = kernel.vm_arena.vm(kernel.active_vm).pc;
                 error!(svc_id, pc, "service: panicked in refine");
-                return None;
+                return RefineKernelExit::Failed;
             }
             KernelResult::OutOfGas => {
                 error!(svc_id, "service: out of gas in refine");
-                return None;
+                return RefineKernelExit::Failed;
             }
             KernelResult::PageFault(addr) => {
                 error!(
@@ -1383,7 +1433,48 @@ fn run_refine_kernel(
                     addr = format!("{addr:#x}"),
                     "service: page fault in refine"
                 );
-                return None;
+                return RefineKernelExit::Failed;
+            }
+            KernelResult::ProtocolCall { slot } if slot as u32 == hostcall::SUSPEND => {
+                if continuation.is_some() {
+                    error!(
+                        svc_id,
+                        "service: multiple suspension boundaries in one refine slice"
+                    );
+                    return RefineKernelExit::Failed;
+                }
+                let snapshot = match kernel.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        error!(svc_id, ?err, "service: kernel snapshot failed");
+                        return RefineKernelExit::Failed;
+                    }
+                };
+                // Snapshotting flushes backend-private execution state. Fork
+                // the transition-finalization branch from the portable
+                // snapshot too; the original live kernel is no longer a
+                // valid continuation target after that flush.
+                *kernel = match InvocationKernel::restore(
+                    canonical_blob,
+                    &snapshot,
+                    javm::PvmBackend::Default,
+                    Some(code_cache),
+                ) {
+                    Ok(kernel) => kernel,
+                    Err(err) => {
+                        error!(svc_id, ?err, "service: finalize fork restore failed");
+                        return RefineKernelExit::Failed;
+                    }
+                };
+                if let Err(err) = kernel.resume_protocol_call(0, 0) {
+                    error!(
+                        svc_id,
+                        ?err,
+                        "service: suspension finalize injection failed"
+                    );
+                    return RefineKernelExit::Failed;
+                }
+                continuation = Some(snapshot);
             }
             KernelResult::ProtocolCall { slot } => {
                 handle_refine_hostcall(
@@ -1547,7 +1638,7 @@ fn handle_refine_hostcall(
                 (error::HOST_NONE, 0)
             }
         }
-        hostcall::OUTPUT | hostcall::CHECKPOINT => (error::HOST_OK, 0),
+        hostcall::OUTPUT | hostcall::CHECKPOINT | hostcall::SUSPEND => (error::HOST_OK, 0),
         hostcall::BOOT_CONTEXT => {
             // Boot-context seam: mint a FRESH boot context for this (re)entry —
             // a0 = guest out-buffer ptr, a1 = its length. Writes
@@ -1751,7 +1842,7 @@ fn build_task_kernel(
     code_cache: &mut javm::CodeCache,
 ) -> Option<InvocationKernel> {
     let mut child = InvocationKernel::new_cached(blob, &[], gas, code_cache).ok()?;
-    install_vos_precompile_caps(&mut child);
+    install_vos_runtime_caps(&mut child);
     child.set_active_reg(7, 0);
     let _ = child
         .vm_arena
@@ -2252,7 +2343,7 @@ fn handle_invoke(
             );
         }
     };
-    install_vos_precompile_caps(&mut child);
+    install_vos_runtime_caps(&mut child);
     child.set_active_reg(7, 0); // refine
     let _ = child
         .vm_arena
@@ -2464,76 +2555,104 @@ fn handle_invoke(
     record_and_write_invoke(caller, output_ptr, output_buf_len, &output, depth, mode)
 }
 
-/// Capture a continuation: hash flat_mem, store in the data layer, and
-/// record the ContinuationHeader directly in storage. Host bookkeeping —
-/// deliberately not journaled, so it is never part of a work-result's
-/// apply scope and never shadows a payload's state write.
+#[derive(Debug)]
+enum ContinuationError {
+    SnapshotTooLarge,
+    LegacyOrMalformedHeader,
+    ExecutionSemanticsMismatch,
+    MissingBody,
+    LengthMismatch,
+    CommitmentMismatch,
+    InvalidSnapshot(javm::snapshot::SnapshotError),
+}
+
+impl core::fmt::Display for ContinuationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SnapshotTooLarge => {
+                f.write_str("kernel snapshot exceeds the continuation size limit")
+            }
+            Self::LegacyOrMalformedHeader => f.write_str(
+                "legacy or malformed continuation header (v2 requires service reset/reinstall)",
+            ),
+            Self::ExecutionSemanticsMismatch => {
+                f.write_str("continuation belongs to different execution semantics")
+            }
+            Self::MissingBody => f.write_str("continuation body is not available"),
+            Self::LengthMismatch => f.write_str("continuation body length does not match header"),
+            Self::CommitmentMismatch => {
+                f.write_str("continuation body does not match its commitment")
+            }
+            Self::InvalidSnapshot(err) => write!(f, "invalid JAVM kernel snapshot: {err}"),
+        }
+    }
+}
+
+/// Persist an exact kernel snapshot body before publishing its small header.
+/// Host bookkeeping is deliberately outside the guest work-result namespace,
+/// so it cannot shadow an actor-state write.
 fn save_continuation<D: crate::data_layer::DataLayer>(
     svc_id: u32,
-    flat_mem: Vec<u8>,
-    heap_base: u32,
-    heap_top: u32,
+    snapshot: &KernelSnapshot,
     data: &mut D,
     storage: &mut ServiceStorage,
-) {
-    let commitment = crate::pvm_image::commit(&flat_mem);
-    let flat_mem_len = flat_mem.len() as u32;
-    pollster::block_on(data.put(commitment, flat_mem));
+) -> Result<(), ContinuationError> {
+    let body = snapshot.to_bytes();
+    let snapshot_len =
+        u32::try_from(body.len()).map_err(|_| ContinuationError::SnapshotTooLarge)?;
+    let commitment = crate::pvm_image::commit(&body);
+    // Availability precedes the header: a visible header must never point at
+    // a body that has not been made durable yet.
+    pollster::block_on(data.put(commitment, body));
     let header = crate::pvm_image::ContinuationHeader {
-        pc: 0,
-        heap_base,
-        heap_top,
-        need_gas_charge: false,
-        iters: 0,
-        flat_mem_len,
+        snapshot_len,
         commitment,
-        registers: [0; 13],
+        execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID.0,
     };
     storage.write(
         ServiceId(svc_id),
         crate::lifecycle::CONTINUATION_HEADER_KEY,
         &header.encode(),
     );
+    Ok(())
 }
 
-/// Load a continuation for a service: read header from storage (checking
-/// journal first for read-your-own-writes), fetch the body from the data
-/// layer, and return `Some((flat_mem, heap_base, heap_top))`.
+/// Load and authenticate an exact kernel continuation. Old flat-memory
+/// headers are rejected explicitly instead of silently replaying from PC 0.
 fn load_continuation<D: crate::data_layer::DataLayer>(
     storage: &ServiceStorage,
     data: &D,
     svc_id: u32,
-) -> Option<(Vec<u8>, u32, u32)> {
+) -> Result<Option<KernelSnapshot>, ContinuationError> {
     let id = ServiceId(svc_id);
-    let header_bytes = storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY)?;
+    let Some(header_bytes) = storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY) else {
+        return Ok(None);
+    };
     if header_bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let header = crate::pvm_image::ContinuationHeader::decode(header_bytes)?;
-    let body = pollster::block_on(data.get(&header.commitment))?;
-    Some((body, header.heap_base, header.heap_top))
+    let header = crate::pvm_image::ContinuationHeader::decode(header_bytes)
+        .ok_or(ContinuationError::LegacyOrMalformedHeader)?;
+    if header.execution_semantics != crate::v2::EXECUTION_SEMANTICS_ID.0 {
+        return Err(ContinuationError::ExecutionSemanticsMismatch);
+    }
+    let body =
+        pollster::block_on(data.get(&header.commitment)).ok_or(ContinuationError::MissingBody)?;
+    if body.len() != header.snapshot_len as usize {
+        return Err(ContinuationError::LengthMismatch);
+    }
+    if crate::pvm_image::commit(&body) != header.commitment {
+        return Err(ContinuationError::CommitmentMismatch);
+    }
+    let snapshot = KernelSnapshot::from_bytes(&body).map_err(ContinuationError::InvalidSnapshot)?;
+    Ok(Some(snapshot))
 }
 
-/// Clear any prior continuation for a service: remove the body from the
-/// data layer and delete the header row directly. Host bookkeeping —
-/// never journaled, and it must never touch `STATE_KEY` (an empty state
-/// write here would clobber the payload's state under last-wins and
-/// break the next dispatch's anchor). State teardown, if ever intended,
-/// must be an explicit guest-emitted effect. No-op if the service has no
-/// continuation.
-fn clear_continuation<D: crate::data_layer::DataLayer>(
-    storage: &mut ServiceStorage,
-    data: &mut D,
-    svc_id: u32,
-) {
+/// Consume a continuation header. Content-addressed bodies are retained until
+/// a storage backend with continuation reference counting can prove they are
+/// unreachable; eagerly deleting a shared body would break another service.
+fn clear_continuation(storage: &mut ServiceStorage, svc_id: u32) {
     let id = ServiceId(svc_id);
-    let header_bytes = match storage.read(id, crate::lifecycle::CONTINUATION_HEADER_KEY) {
-        Some(b) if !b.is_empty() => b,
-        _ => return, // no prior continuation — nothing to clean up
-    };
-    if let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) {
-        pollster::block_on(data.remove(&header.commitment));
-    }
     storage.delete(id, crate::lifecycle::CONTINUATION_HEADER_KEY);
 }
 
@@ -2547,6 +2666,135 @@ fn blob_hash(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exact_resume_blob() -> Vec<u8> {
+        use grey_transpiler::assembler::{Assembler, Reg};
+
+        let mut asm = Assembler::new();
+        // This register and stack write model code and a stack local before
+        // `.await`. Re-entering at PC 0 would execute the increment again;
+        // losing memory would make the post-resume load return zero.
+        asm.load_imm(Reg::T0, 41)
+            .add_imm_64(Reg::T0, Reg::T0, 1)
+            .store_ind_u64(Reg::T0, Reg::SP, -8)
+            .ecalli(hostcall::SUSPEND)
+            .load_ind_u64(Reg::T1, Reg::SP, -8)
+            .jump_ind(Reg::RA, 0);
+        asm.build()
+    }
+
+    fn snapshot_exact_resume(blob: &[u8], backend: javm::PvmBackend) -> KernelSnapshot {
+        use grey_transpiler::assembler::Reg;
+
+        let mut kernel = InvocationKernel::new_with_backend(blob, &[], DEFAULT_GAS, backend)
+            .expect("test kernel initializes");
+        install_vos_runtime_caps(&mut kernel);
+        kernel
+            .vm_arena
+            .vm_mut(0)
+            .transition(javm::vm_pool::VmState::Running)
+            .expect("root VM starts");
+        assert!(matches!(
+            kernel.run(),
+            KernelResult::ProtocolCall { slot } if slot as u32 == hostcall::SUSPEND
+        ));
+        assert_eq!(kernel.active_reg(Reg::T0 as usize), 42);
+        let snapshot = kernel
+            .snapshot()
+            .expect("snapshot at flushed call boundary");
+        assert_ne!(snapshot.pending_call.resume_pc, 0, "resume PC is not entry");
+        snapshot
+    }
+
+    #[test]
+    fn persisted_continuation_resumes_exact_pc_register_and_stack() {
+        use grey_transpiler::assembler::Reg;
+        use javm::PvmBackend;
+
+        let blob = exact_resume_blob();
+        let snapshot = snapshot_exact_resume(&blob, PvmBackend::ForceInterpreter);
+        assert_eq!(
+            snapshot,
+            snapshot_exact_resume(&blob, PvmBackend::ForceRecompiler),
+            "interpreter and recompiler capture identical portable state",
+        );
+
+        let mut data = MemoryDataLayer::new();
+        let mut storage = ServiceStorage::new();
+        save_continuation(7, &snapshot, &mut data, &mut storage)
+            .expect("body is available before header publication");
+        let loaded = load_continuation(&storage, &data, 7)
+            .expect("stored continuation authenticates")
+            .expect("continuation is present");
+        assert_eq!(loaded, snapshot);
+        for backend in [
+            PvmBackend::ForceInterpreter,
+            PvmBackend::ForceRecompiler,
+        ] {
+            // No live kernel is retained: each backend reconstructs the exact
+            // machine solely from canonical code plus the persisted body.
+            let mut restored = InvocationKernel::restore(&blob, &loaded, backend, None)
+                .expect("canonical program matches snapshot");
+            restored
+                .resume_protocol_call(1, 0)
+                .expect("inject exactly one restored result");
+            assert!(matches!(restored.run(), KernelResult::Halt));
+
+            assert_eq!(
+                restored.active_reg(Reg::T0 as usize),
+                42,
+                "code before the boundary executes exactly once on {backend:?}",
+            );
+            assert_eq!(
+                restored.active_reg(Reg::T1 as usize),
+                42,
+                "the stack local survives process restart on {backend:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_load_rejects_unavailable_tampered_and_legacy_bodies() {
+        use javm::PvmBackend;
+
+        let blob = exact_resume_blob();
+        let snapshot = snapshot_exact_resume(&blob, PvmBackend::ForceInterpreter);
+
+        let mut data = MemoryDataLayer::new();
+        let mut storage = ServiceStorage::new();
+        save_continuation(9, &snapshot, &mut data, &mut storage).expect("save");
+        let header = crate::pvm_image::ContinuationHeader::decode(
+            storage
+                .read(ServiceId(9), crate::lifecycle::CONTINUATION_HEADER_KEY)
+                .expect("header"),
+        )
+        .expect("current header");
+        let body = pollster::block_on(data.get(&header.commitment)).expect("body");
+
+        pollster::block_on(data.remove(&header.commitment));
+        assert!(matches!(
+            load_continuation(&storage, &data, 9),
+            Err(ContinuationError::MissingBody)
+        ));
+
+        let mut tampered = body;
+        tampered[0] ^= 1;
+        pollster::block_on(data.put(header.commitment, tampered));
+        assert!(matches!(
+            load_continuation(&storage, &data, 9),
+            Err(ContinuationError::CommitmentMismatch)
+        ));
+
+        storage.write(
+            ServiceId(9),
+            crate::lifecycle::CONTINUATION_HEADER_KEY,
+            b"VPVM\x02legacy-v1-memory-image",
+        );
+        assert!(matches!(
+            load_continuation(&storage, &data, 9),
+            Err(ContinuationError::LegacyOrMalformedHeader)
+        ));
+    }
 
     #[test]
     fn gas_config_default_refine_gas() {

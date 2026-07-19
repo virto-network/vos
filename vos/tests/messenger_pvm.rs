@@ -183,7 +183,7 @@ fn send_tick(rt: &mut VosRuntime, id: ServiceId) {
 
 /// The periodic `tick` (the host dispatches it every `tick_ms` once the
 /// messenger is a PVM agent) must not trap on a fresh, channel-less messenger,
-/// neither on a cold first dispatch nor after a warm restart.
+/// neither on a cold first dispatch nor after another committed dispatch.
 #[test]
 fn messenger_pvm_tick_does_not_panic() {
     let Some(_) = messenger_elf() else { return };
@@ -191,10 +191,10 @@ fn messenger_pvm_tick_does_not_panic() {
     // Cold first dispatch.
     send_tick(&mut rt, id);
     assert_eq!(rt.panics, 0, "tick trapped on the cold first dispatch");
-    // After a warm restart (a prior mutating dispatch).
+    // After a prior mutating dispatch.
     let _ = call(&mut rt, id, Msg::new("seed").with("seed_bytes", vec![7u8; 32]));
     send_tick(&mut rt, id);
-    assert_eq!(rt.panics, 0, "tick trapped after a warm restart");
+    assert_eq!(rt.panics, 0, "tick trapped after a committed dispatch");
 }
 
 /// A channel in the messenger's node-local state must survive a `tick`.
