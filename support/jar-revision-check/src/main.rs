@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EXPECTED: &str = "cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe";
+const EXPECTED: &str = "13c82dbc8715bd84e9c1c478f7261b2f5f64620b";
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))

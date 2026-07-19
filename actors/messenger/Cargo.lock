@@ -1423,7 +1423,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "grey-crypto"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe#cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe"
+source = "git+https://github.com/olanod/jar.git?rev=13c82dbc8715bd84e9c1c478f7261b2f5f64620b#13c82dbc8715bd84e9c1c478f7261b2f5f64620b"
 dependencies = [
  "ark-vrf",
  "blake2",
@@ -1438,7 +1438,7 @@ dependencies = [
 [[package]]
 name = "grey-transpiler"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe#cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe"
+source = "git+https://github.com/olanod/jar.git?rev=13c82dbc8715bd84e9c1c478f7261b2f5f64620b#13c82dbc8715bd84e9c1c478f7261b2f5f64620b"
 dependencies = [
  "javm",
  "scale",
@@ -1450,7 +1450,7 @@ dependencies = [
 [[package]]
 name = "grey-types"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe#cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe"
+source = "git+https://github.com/olanod/jar.git?rev=13c82dbc8715bd84e9c1c478f7261b2f5f64620b#13c82dbc8715bd84e9c1c478f7261b2f5f64620b"
 dependencies = [
  "hex",
  "scale",
@@ -1936,7 +1936,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "javm"
 version = "0.4.0"
-source = "git+https://github.com/olanod/jar.git?rev=cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe#cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe"
+source = "git+https://github.com/olanod/jar.git?rev=13c82dbc8715bd84e9c1c478f7261b2f5f64620b#13c82dbc8715bd84e9c1c478f7261b2f5f64620b"
 dependencies = [
  "grey-crypto",
  "libc",
@@ -3664,7 +3664,7 @@ dependencies = [
 [[package]]
 name = "scale"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe#cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe"
+source = "git+https://github.com/olanod/jar.git?rev=13c82dbc8715bd84e9c1c478f7261b2f5f64620b#13c82dbc8715bd84e9c1c478f7261b2f5f64620b"
 dependencies = [
  "scale-derive",
  "thiserror 2.0.18",
@@ -3673,7 +3673,7 @@ dependencies = [
 [[package]]
 name = "scale-derive"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe#cd8ad8449c5f9ccf78dcfdf743141cf98464c2fe"
+source = "git+https://github.com/olanod/jar.git?rev=13c82dbc8715bd84e9c1c478f7261b2f5f64620b#13c82dbc8715bd84e9c1c478f7261b2f5f64620b"
 dependencies = [
  "proc-macro2",
  "quote",
