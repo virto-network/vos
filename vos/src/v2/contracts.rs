@@ -144,6 +144,14 @@ pub struct WorkEnvelopeV2 {
     pub proof_requested: bool,
 }
 
+impl WorkEnvelopeV2 {
+    /// Consensus identity of the complete work input, including origin,
+    /// authorization evidence, consistency base, and every import reference.
+    pub fn hash(&self) -> Hash {
+        Hash::digest(b"vos/work/v2", &[&self.encode()])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorWriteV2 {
     pub actor: ActorId,

@@ -102,6 +102,7 @@ pub struct AccumulationOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DedupRecord {
+    work: Hash,
     transition: Hash,
     receipt: AccumulationReceiptV2,
 }
@@ -214,10 +215,11 @@ impl InMemoryServiceState {
         transition: &TransitionV2,
         validator: &V,
     ) -> Result<AccumulationOutcome, AccumulateError> {
+        let work_hash = work.hash();
         let transition_hash = transition.hash();
 
         if let Some(existing) = self.receipts.get(&work.invocation) {
-            if existing.transition != transition_hash {
+            if existing.work != work_hash || existing.transition != transition_hash {
                 return Err(AccumulateError::DivergentDuplicate);
             }
             return Ok(AccumulationOutcome {
@@ -252,6 +254,7 @@ impl InMemoryServiceState {
         next.receipts.insert(
             work.invocation,
             DedupRecord {
+                work: work_hash,
                 transition: transition_hash,
                 receipt: receipt.clone(),
             },
@@ -674,10 +677,17 @@ mod tests {
         assert_eq!(retry.receipt, first.receipt);
         assert_eq!(retry.published, PublishedEffects::default());
 
-        let mut divergent = transition;
+        let mut divergent = transition.clone();
         divergent.writes[0].value = Some(vec![2]);
         assert_eq!(
             state.accumulate(&work, &divergent, &AllowPublic),
+            Err(AccumulateError::DivergentDuplicate)
+        );
+
+        let mut altered_work = work;
+        altered_work.method = "different-method".into();
+        assert_eq!(
+            state.accumulate(&altered_work, &transition, &AllowPublic),
             Err(AccumulateError::DivergentDuplicate)
         );
     }
