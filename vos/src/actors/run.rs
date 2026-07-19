@@ -285,18 +285,23 @@ pub fn is_refine_mode() -> bool {
 
 // ── Halt ──────────────────────────────────────────────────────────────
 
+/// Gray Paper dynamic-jump halt address (2^32 - 2^16).
+#[cfg(target_arch = "riscv64")]
+const PVM_HALT_ADDR: u64 = 0xFFFF_0000;
+
 /// Halt with output data in registers a0 (ptr) and a1 (len).
 #[cfg(target_arch = "riscv64")]
 fn halt_with_output(data: &[u8]) -> ! {
-    // SAFETY: terminal PVM hostcall. The host reads `len` bytes from
-    // `data.as_ptr()` before we lose control; the slice is owned by
-    // the caller until then. `noreturn` — no liveness after.
+    // SAFETY: terminal PVM dynamic jump. The host reads `len` bytes from
+    // `data.as_ptr()` after observing the GP halt address; the slice is owned
+    // by the caller until then. Root REPLY (ecalli 0) is not a halt in JAR:
+    // it is reserved for returning from a nested CALL and panics at the root.
     unsafe {
         core::arch::asm!(
-            "ecall",
+            "jr t0",
             in("a0") data.as_ptr() as u64,
             in("a1") data.len() as u64,
-            in("t0") 0u64, // IPC_SLOT = REPLY → RootHalt
+            in("t0") PVM_HALT_ADDR,
             options(noreturn),
         );
     }
@@ -359,20 +364,19 @@ fn halt_with_output_bound(data: &[u8], io_hash: &[u8; 32]) -> ! {
         io_hash[30],
         io_hash[31],
     ]);
-    // SAFETY: terminal PVM hostcall. The host reads `len` bytes from
-    // `data.as_ptr()` before we lose control; a2-a5 carry the io-hash
-    // (φ[9..12]) — ignored by the RootHalt handler but captured in
-    // `final_state`. `noreturn` — no liveness after.
+    // SAFETY: terminal PVM dynamic jump. The host reads `len` bytes from
+    // `data.as_ptr()` after observing the GP halt address; a2-a5 carry the
+    // io-hash (φ[9..12]) and are captured in `final_state`.
     unsafe {
         core::arch::asm!(
-            "ecall",
+            "jr t0",
             in("a0") data.as_ptr() as u64,
             in("a1") data.len() as u64,
             in("a2") w0,
             in("a3") w1,
             in("a4") w2,
             in("a5") w3,
-            in("t0") 0u64, // IPC_SLOT = REPLY → RootHalt
+            in("t0") PVM_HALT_ADDR,
             options(noreturn),
         );
     }
