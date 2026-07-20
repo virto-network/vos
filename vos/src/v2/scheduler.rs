@@ -9,15 +9,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use super::causal::{CausalFrontierError, CausalSelectionError, load_causal_frontier};
+use super::causal::{
+    CausalFrontierError, CausalFrontierV2, CausalSelectionError, load_causal_frontier,
+};
 use super::contracts::crdt_change_blob_references;
 use super::{
-    AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
-    CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2,
-    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, ImportedActorV2,
-    ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
-    MessageRecordV2, Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2,
-    WorkflowCheckpointV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
+    BlobRefV2, CallId, CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationSnapshotV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2,
+    LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2, V2Wire,
+    WorkEnvelopeV2, WorkflowCheckpointV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -54,6 +56,7 @@ pub enum ScheduleErrorV2 {
     UnsupportedConsistency(ConsistencyModeV2),
     MissingActor(ActorId),
     InvalidActorDescriptor(ActorId),
+    CorruptActorDirectory,
     ActorConsistencyMismatch(ActorId),
     MissingProgram(super::ProgramId),
     MissingState(ActorId),
@@ -282,6 +285,15 @@ impl LocalWorkSchedulerV2 {
             return Err(ScheduleErrorV2::EmptyMethod);
         }
         let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let directory = decode_row::<ActorDirectoryV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::ActorDirectory,
+        )?
+        .ok_or(ScheduleErrorV2::CorruptActorDirectory)?;
+        if directory.actors.binary_search(&request.target).is_err() {
+            return Err(ScheduleErrorV2::CorruptActorDirectory);
+        }
         let descriptor_key = StateKeyV2::ActorDescriptor(request.target);
         let descriptor = decode_row::<ActorGenesisV2>(store, header.service_root, &descriptor_key)?
             .ok_or(ScheduleErrorV2::MissingActor(request.target))?;
@@ -294,7 +306,7 @@ impl LocalWorkSchedulerV2 {
             .program(descriptor.program)
             .ok_or(ScheduleErrorV2::MissingProgram(descriptor.program))?
             .to_vec();
-        let (base, base_causal_height, mut states) =
+        let (base, base_causal_height, mut states, causal_frontier) =
             if header.consistency == ConsistencyModeV2::Crdt {
                 let heads = header.crdt_heads.clone();
                 let frontier = load_causal_frontier(&heads, |cid| {
@@ -307,7 +319,12 @@ impl LocalWorkSchedulerV2 {
                     .map_err(|error| match error {
                         CausalSelectionError::Corrupt => ScheduleErrorV2::CorruptCausalDag,
                     })?;
-                (ConsistencyBaseV2::Crdt { heads }, Some(height), states)
+                (
+                    ConsistencyBaseV2::Crdt { heads },
+                    Some(height),
+                    states,
+                    Some(frontier),
+                )
             } else {
                 let state_root = header
                     .state_root
@@ -325,6 +342,7 @@ impl LocalWorkSchedulerV2 {
                     },
                     None,
                     alloc::vec![state],
+                    None,
                 )
             };
         let state = states.remove(0);
@@ -418,15 +436,15 @@ impl LocalWorkSchedulerV2 {
             causal_states: states.clone(),
             continuation: continuation.clone(),
         });
-        work.imported_blobs.sort_by_key(|blob| blob.hash);
-        if work
-            .imported_blobs
-            .windows(2)
-            .any(|pair| pair[0].hash == pair[1].hash)
-        {
-            return Err(ScheduleErrorV2::NonCanonicalImports);
-        }
 
+        let mut programs = BTreeMap::new();
+        programs.insert(
+            descriptor.program,
+            ImportedProgramV2 {
+                program: descriptor.program,
+                pvm: program_bytes,
+            },
+        );
         let mut blobs = BTreeMap::new();
         import_blob(store, &mut blobs, &state)?;
         for reference in &states {
@@ -434,6 +452,69 @@ impl LocalWorkSchedulerV2 {
         }
         if let Some(reference) = continuation.as_ref() {
             import_blob(store, &mut blobs, reference)?;
+        }
+
+        // Refine owns the complete root tree. Every sibling's exact code,
+        // state frontier, and continuation is imported even when this slice
+        // initially targets only one actor. CRDT siblings reuse the one
+        // already validated causal frontier above.
+        for actor in directory
+            .actors
+            .iter()
+            .copied()
+            .filter(|actor| *actor != request.target)
+        {
+            let descriptor = decode_row::<ActorGenesisV2>(
+                store,
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(actor),
+            )?
+            .ok_or(ScheduleErrorV2::CorruptActorDirectory)?;
+            if descriptor.actor != actor {
+                return Err(ScheduleErrorV2::CorruptActorDirectory);
+            }
+            validate_actor_consistency(descriptor.crdt, header.consistency, actor)?;
+            let mut sibling_states =
+                actor_states(store, &header, &descriptor, causal_frontier.as_ref())?;
+            let sibling_state = sibling_states.remove(0);
+            let sibling_continuation = decode_row::<BlobRefV2>(
+                store,
+                header.service_root,
+                &StateKeyV2::Continuation(actor),
+            )?;
+            work.imported_actors.push(ImportedActorV2 {
+                actor,
+                program: descriptor.program,
+                state: sibling_state.clone(),
+                causal_states: sibling_states.clone(),
+                continuation: sibling_continuation.clone(),
+            });
+            let pvm = store
+                .program(descriptor.program)
+                .ok_or(ScheduleErrorV2::MissingProgram(descriptor.program))?
+                .to_vec();
+            programs
+                .entry(descriptor.program)
+                .or_insert(ImportedProgramV2 {
+                    program: descriptor.program,
+                    pvm,
+                });
+            import_blob(store, &mut blobs, &sibling_state)?;
+            for reference in &sibling_states {
+                import_blob(store, &mut blobs, reference)?;
+            }
+            if let Some(reference) = sibling_continuation.as_ref() {
+                import_blob(store, &mut blobs, reference)?;
+            }
+        }
+        work.imported_actors.sort_by_key(|actor| actor.actor);
+        work.imported_blobs.sort_by_key(|blob| blob.hash);
+        if work
+            .imported_blobs
+            .windows(2)
+            .any(|pair| pair[0].hash == pair[1].hash)
+        {
+            return Err(ScheduleErrorV2::NonCanonicalImports);
         }
         for reference in &work.imported_blobs {
             import_blob(store, &mut blobs, reference)?;
@@ -452,10 +533,7 @@ impl LocalWorkSchedulerV2 {
             _ => Vec::new(),
         };
         let imports = RefineImportsV2 {
-            programs: alloc::vec![ImportedProgramV2 {
-                program: descriptor.program,
-                pvm: program_bytes,
-            }],
+            programs: programs.into_values().collect(),
             blobs: blobs.into_values().collect(),
             private_blobs,
         };
@@ -521,6 +599,30 @@ fn validate_await_boundary(
         (Some(call), Some(reply)) if reply.reply.call_id == call => Ok(()),
         (_, Some(reply)) => Err(ScheduleErrorV2::UnexpectedAwaitedReply(reply.reply.call_id)),
     }
+}
+
+fn actor_states(
+    store: &LocalJamStoreV2,
+    header: &super::StoreHeaderV2,
+    descriptor: &ActorGenesisV2,
+    causal_frontier: Option<&CausalFrontierV2>,
+) -> Result<Vec<BlobRefV2>, ScheduleErrorV2> {
+    if header.consistency != ConsistencyModeV2::Crdt {
+        let state_key = StateKeyV2::ActorRow {
+            actor: descriptor.actor,
+            key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+        };
+        return decode_row(store, header.service_root, &state_key)?
+            .map(|state| alloc::vec![state])
+            .ok_or(ScheduleErrorV2::MissingState(descriptor.actor));
+    }
+
+    causal_frontier
+        .ok_or(ScheduleErrorV2::CorruptCausalDag)?
+        .actor_materializations(descriptor)
+        .map_err(|error| match error {
+            CausalSelectionError::Corrupt => ScheduleErrorV2::CorruptCausalDag,
+        })
 }
 
 fn dynamic_method(payload: &[u8]) -> Option<String> {

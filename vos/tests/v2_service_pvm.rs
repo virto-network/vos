@@ -2146,25 +2146,36 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         "platform dispatch must bind work to the PVM executing Refine"
     );
 
+    let child = ActorId([36; 32]);
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
         service: seed_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
-        actors: vec![ActorGenesisV2 {
-            actor: seed_work.target,
-            parent: None,
-            program: actor_program,
-            initial_state: initial.clone(),
-            crdt: false,
-            role_policies: role_policies(vec![MethodPolicyV2 {
-                method: "start".into(),
-                schema: Hash([32; 32]),
-                policy: public_policy_hash(),
-                public: true,
-                attested: false,
-                space_role: None,
-                actor_role: None,
-            }]),
-        }],
+        actors: vec![
+            ActorGenesisV2 {
+                actor: seed_work.target,
+                parent: None,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: "start".into(),
+                    schema: Hash([32; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                }]),
+            },
+            ActorGenesisV2 {
+                actor: child,
+                parent: Some(seed_work.target),
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![]),
+            },
+        ],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
             authenticator: vec![35],
@@ -2273,6 +2284,20 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         }
     );
     assert_eq!(prepared.work.imported_actors[0].state, initial);
+    assert_eq!(
+        prepared
+            .work
+            .imported_actors
+            .iter()
+            .map(|actor| actor.actor)
+            .collect::<Vec<_>>(),
+        vec![seed_work.target, child]
+    );
+    assert_eq!(
+        prepared.imports.programs.len(),
+        1,
+        "program bytes are deduplicated when root and child share code"
+    );
     assert_eq!(prepared.imports.programs[0].pvm, actor_pvm);
     let work = prepared.work;
     let continuation = ContinuationSnapshotV2 {
@@ -2495,8 +2520,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     );
     assert_eq!(
         resumed.imports.blobs.len(),
-        2,
-        "state and continuation bytes are both imported after snapshot reopen"
+        3,
+        "root state, child state, and continuation bytes are imported after snapshot reopen"
     );
 
     let resumed_transition = TransitionV2 {
