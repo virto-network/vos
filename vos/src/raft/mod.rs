@@ -1,9 +1,10 @@
 //! Raft consensus storage and strategy for VOS actors.
 //!
 //! The durable layer lives in [`log::RaftLog`] / [`log::RaftMeta`] on redb.
-//! The agent thread uses the same [`CommitStrategy`] boundary as `LocalCommit`
-//! and `CrdtCommit`; single-node and multi-node modes are implemented in
-//! [`strategy::RaftCommit`].
+//! [`v2::RaftAccumulateLogV2`] orders canonical JAM service requests and leaves
+//! their application to the guest Accumulate entry. The legacy agent runtime
+//! still uses the [`CommitStrategy`] implementation in [`strategy::RaftCommit`]
+//! until the production-node cutover is complete.
 
 #[cfg(feature = "storage")]
 pub mod log;
@@ -11,6 +12,8 @@ pub mod log;
 pub mod redb_storage;
 #[cfg(feature = "storage")]
 pub mod strategy;
+#[cfg(feature = "storage")]
+pub mod v2;
 #[cfg(all(feature = "storage", feature = "network"))]
 pub mod vos_transport;
 #[cfg(all(feature = "storage", feature = "network"))]
@@ -22,6 +25,8 @@ pub use log::{LogEntry, RAFT_LOG, RAFT_META, RaftLog, RaftMeta};
 pub use redb_storage::RedbStorage;
 #[cfg(feature = "storage")]
 pub use strategy::{RaftCommit, RaftConfig};
+#[cfg(feature = "storage")]
+pub use v2::RaftAccumulateLogV2;
 #[cfg(all(feature = "storage", feature = "network"))]
 pub use vos_transport::{VosTransport, VosTransportError};
 #[cfg(all(feature = "storage", feature = "network"))]
