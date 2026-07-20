@@ -325,6 +325,8 @@ mod tests {
                     doc: "Stop the gateway.".into(),
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
                 ParsedMessage {
                     name: "status".into(),
@@ -335,6 +337,8 @@ mod tests {
                     doc: String::new(),
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
                 ParsedMessage {
                     name: "internal".into(),
@@ -348,6 +352,8 @@ mod tests {
                     doc: String::new(),
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
             ],
             constructor: vec![],

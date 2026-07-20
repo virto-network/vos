@@ -62,7 +62,7 @@ pub mod prelude {
     // `handle_connection` body is kept verbatim, so it must resolve via the
     // prelude like the rest of an extension's surface.
     pub use crate::Context;
-    pub use crate::{ActorId, CallId, InvocationId, Origin};
+    pub use crate::{ActorId, CallId, InvocationId, Origin, SpaceRole};
     pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};

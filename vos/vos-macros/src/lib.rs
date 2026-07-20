@@ -446,6 +446,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // variants emit a `None` arm so the dispatch boundary skips
     // the role check.
     let mut required_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut attested_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut required_space_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
     // One entry per `#[msg]`: the data the host-Client emission
@@ -489,6 +491,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // silently defaulting.
         let mut exposed_to_cli = false;
         let mut role_expr: Option<syn::Expr> = None;
+        let mut space_role_expr: Option<syn::Expr> = None;
+        let mut is_attested = false;
         // `#[msg(timeout_ms = N)]` — per-handler invoke timeout in ms
         // (0 = client default), recorded in `.vos_meta` so the dispatcher
         // waits long enough for a legitimately slow handler.
@@ -511,6 +515,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     is_job = true;
                     return Ok(());
                 }
+                if meta.path.is_ident("attested") {
+                    is_attested = true;
+                    return Ok(());
+                }
                 if meta.path.is_ident("role") {
                     let value = meta.value()?;
                     let expr: syn::Expr = value.parse()?;
@@ -521,6 +529,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     let value = meta.value()?;
                     let lit: syn::LitInt = value.parse()?;
                     timeout_ms = lit.base10_parse()?;
+                    return Ok(());
+                }
+                if meta.path.is_ident("space_role") {
+                    let value = meta.value()?;
+                    let expr: syn::Expr = value.parse()?;
+                    space_role_expr = Some(expr);
                     return Ok(());
                 }
                 Ok(())
@@ -570,6 +584,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         msg_handler_count += 1;
+        if is_attested && is_job {
+            return syn::Error::new_spanned(
+                &method.sig,
+                "#[msg(attested)] must complete in one execution slice and cannot be #[msg(job)]",
+            )
+            .to_compile_error()
+            .into();
+        }
         let method_name = &method.sig.ident;
         if method_name == "start" {
             has_start_handler = true;
@@ -768,7 +790,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // `__mark_forbidden + return false` is short and
         // side-effect-free so a refused call leaves no trace
         // behind beyond the wire status.
-        let role_check = if let Some(role) = &role_expr {
+        let actor_role_check = if let Some(role) = &role_expr {
             quote! {
                 if !ctx.has_role_byte(
                     <<#actor_name as vos::Actor>::Role as vos::RoleByte>::as_byte(#role)
@@ -779,6 +801,20 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         } else {
             quote! {}
+        };
+        let space_role_check = if let Some(role) = &space_role_expr {
+            quote! {
+                if !ctx.has_space_role(#role) {
+                    ctx.__mark_forbidden();
+                    return false;
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let role_check = quote! {
+            #actor_role_check
+            #space_role_check
         };
 
         // Stash a `required_role()` arm for this variant. The
@@ -795,6 +831,17 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #enum_name::#struct_name(_) => None }
         };
         required_role_arms.push(required_role_arm);
+        attested_arms.push(quote! {
+            #enum_name::#struct_name(_) => #is_attested
+        });
+        let required_space_role_arm = if let Some(role) = &space_role_expr {
+            quote! {
+                #enum_name::#struct_name(_) => Some((#role).as_u8())
+            }
+        } else {
+            quote! { #enum_name::#struct_name(_) => None }
+        };
+        required_space_role_arms.push(required_space_role_arm);
 
         // Deliver arm — different code for infallible vs fallible handlers
         let deliver_arm = if returns_result {
@@ -851,6 +898,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             })
             .collect();
+        let space_role_meta = if let Some(role) = &space_role_expr {
+            quote! { Some((#role).as_u8()) }
+        } else {
+            quote! { None }
+        };
         meta_messages.push(quote! {
             vos::metadata::MessageMeta {
                 name: #msg_name_str,
@@ -860,6 +912,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 doc: #method_doc,
                 timeout_ms: #timeout_ms,
                 mode: #mode_byte,
+                attested: #is_attested,
+                space_role: #space_role_meta,
             }
         });
         if exposed_to_cli {
@@ -972,6 +1026,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         required_role_arms.push(quote! {
             #enum_name::__VosNoMessages => ::core::option::Option::None
         });
+        attested_arms.push(quote! {
+            #enum_name::__VosNoMessages => false
+        });
+        required_space_role_arms.push(quote! {
+            #enum_name::__VosNoMessages => ::core::option::Option::None
+        });
     }
 
     // Generate the aggregated enum
@@ -1030,6 +1090,21 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn required_role(&self) -> Option<u8> {
                 match self {
                     #( #required_role_arms ),*
+                }
+            }
+
+            /// Whether this handler requires a proof-bearing single-slice
+            /// transition before guest Accumulate may commit it.
+            pub fn is_attested(&self) -> bool {
+                match self {
+                    #( #attested_arms ),*
+                }
+            }
+
+            /// Direct minimum space role declared on this handler.
+            pub fn required_space_role(&self) -> Option<u8> {
+                match self {
+                    #( #required_space_role_arms ),*
                 }
             }
 

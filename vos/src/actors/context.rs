@@ -198,11 +198,9 @@ impl<A: Actor> Context<A> {
     ///    [`Self::ensure_role`](Self::ensure_role) at any tier
     ///    higher than `A::DEFAULT_ROLE` will fail.
     ///
-    /// `Caller::Actor` (intra-system) bypasses the lookup and
-    /// surfaces no role — the dispatch boundary trusts in-system
-    /// calls by virtue of having passed through the libp2p auth
-    /// gate already. Handlers that want stricter policy can
-    /// inspect `ctx.caller()` directly.
+    /// Actor and system origins receive no implicit role. Internal callers
+    /// must carry an explicit actor grant or authenticated platform
+    /// capability just like any other origin.
     pub fn caller_role(&self) -> Option<A::Role> {
         if let Some(b) = self.actor_local_role {
             return A::Role::from_byte(b);
@@ -219,6 +217,23 @@ impl<A: Actor> Context<A> {
     /// any other origin.
     pub fn has_role(&self, required: A::Role) -> bool {
         self.caller_role().is_some_and(|r| r >= required)
+    }
+
+    /// True iff the authenticated space-wide grant directly satisfies the
+    /// requested tier. Actor-local role mappings are deliberately irrelevant
+    /// to `#[msg(space_role = ...)]` policies.
+    pub fn has_space_role(&self, required: SpaceRole) -> bool {
+        self.space_role
+            .and_then(SpaceRole::from_u8)
+            .is_some_and(|role| role >= required)
+    }
+
+    pub fn ensure_space_role(&self, required: SpaceRole) -> Result<(), Forbidden> {
+        if self.has_space_role(required) {
+            Ok(())
+        } else {
+            Err(Forbidden)
+        }
     }
 
     /// `?`-friendly role check. Returns [`Forbidden`] when the
@@ -1473,6 +1488,39 @@ mod tests {
         assert_eq!(ctx.caller_role(), None);
         assert!(!ctx.has_role(FixtureRole::Viewer));
         assert_eq!(ctx.ensure_role(FixtureRole::Viewer), Err(Forbidden));
+    }
+
+    #[test]
+    fn direct_space_role_policy_uses_only_the_authenticated_space_grant() {
+        let member = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Member.as_u8()),
+            None,
+        );
+        assert!(member.has_space_role(SpaceRole::Member));
+        assert!(!member.has_space_role(SpaceRole::Developer));
+        assert_eq!(member.ensure_space_role(SpaceRole::Member), Ok(()));
+
+        let guest_with_local_admin = fixture_ctx_with(
+            Caller::Peer(alloc::vec![1]),
+            Some(SpaceRole::Guest.as_u8()),
+            Some(FixtureRole::Maintainer.as_byte()),
+        );
+        assert!(guest_with_local_admin.has_role(FixtureRole::Maintainer));
+        assert!(!guest_with_local_admin.has_space_role(SpaceRole::Member));
+        assert_eq!(
+            guest_with_local_admin.ensure_space_role(SpaceRole::Member),
+            Err(Forbidden)
+        );
+    }
+
+    #[test]
+    fn actor_and_system_origins_do_not_bypass_direct_space_roles() {
+        for caller in [Caller::Actor(ServiceId(99)), Caller::System] {
+            let ctx = fixture_ctx_with(caller, None, None);
+            assert!(!ctx.has_space_role(SpaceRole::Guest));
+            assert_eq!(ctx.ensure_space_role(SpaceRole::Guest), Err(Forbidden));
+        }
     }
 
     #[test]

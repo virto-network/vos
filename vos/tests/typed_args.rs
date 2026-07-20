@@ -51,7 +51,7 @@ mod fixture {
         }
 
         /// Returns a custom rkyv struct — reply travels as `Value::Bytes`.
-        #[msg]
+        #[msg(attested, space_role = SpaceRole::Member)]
         fn last_receipt(&self) -> Receipt {
             Receipt {
                 id: 1,
@@ -94,7 +94,7 @@ mod fixture {
     }
 }
 
-use fixture::{Receipt, VaultMsg, VaultRef};
+use fixture::{Receipt, Vault, VaultMsg, VaultRef};
 
 mod crdt_fixture {
     use vos::prelude::*;
@@ -163,6 +163,52 @@ struct MockInvoker {
 #[test]
 fn crdt_actor_metadata_is_explicit() {
     assert!(crdt_fixture::BoardMsg::META.crdt);
+}
+
+#[test]
+fn attested_and_regular_method_policies_are_generated_together() {
+    let attested = VaultMsg::from_msg(&Msg::new("last_receipt")).expect("attested message");
+    assert!(attested.is_attested());
+    assert_eq!(
+        attested.required_space_role(),
+        Some(vos::SpaceRole::Member.as_u8())
+    );
+
+    let regular = VaultMsg::from_msg(&Msg::new("deposit").with("amount", Value::U64(1)))
+        .expect("regular message");
+    assert!(!regular.is_attested());
+    assert_eq!(regular.required_space_role(), None);
+
+    let meta = VaultMsg::META
+        .messages
+        .iter()
+        .find(|message| message.name == "last_receipt")
+        .expect("attested method metadata");
+    assert!(meta.attested);
+    assert_eq!(meta.space_role, Some(vos::SpaceRole::Member.as_u8()));
+}
+
+#[test]
+fn attested_space_role_is_enforced_before_the_handler_runs() {
+    let mut guest_actor = <Vault as vos::Actor>::create();
+    let mut guest_ctx = vos::Context::new(ServiceId(7));
+    guest_ctx.set_caller_roles(Some(vos::SpaceRole::Guest.as_u8()), None);
+    let guest_message = VaultMsg::from_msg(&Msg::new("last_receipt")).expect("message");
+    assert!(matches!(
+        vos::Actor::dispatch(&mut guest_actor, guest_message, &mut guest_ctx),
+        vos::RunResult::Complete(false)
+    ));
+    assert!(guest_ctx.was_forbidden());
+
+    let mut member_actor = <Vault as vos::Actor>::create();
+    let mut member_ctx = vos::Context::new(ServiceId(7));
+    member_ctx.set_caller_roles(Some(vos::SpaceRole::Member.as_u8()), None);
+    let member_message = VaultMsg::from_msg(&Msg::new("last_receipt")).expect("message");
+    assert!(matches!(
+        vos::Actor::dispatch(&mut member_actor, member_message, &mut member_ctx),
+        vos::RunResult::Complete(false)
+    ));
+    assert!(!member_ctx.was_forbidden());
 }
 
 #[test]

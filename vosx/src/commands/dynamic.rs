@@ -1186,6 +1186,8 @@ mod tests {
             doc: String::new(),
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         };
         let err = build_msg("add", Some(&m), &["a=notanumber"]).unwrap_err();
         assert!(err.to_string().contains("u64"), "{err}");
@@ -1204,6 +1206,8 @@ mod tests {
             doc: String::new(),
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         }
     }
 

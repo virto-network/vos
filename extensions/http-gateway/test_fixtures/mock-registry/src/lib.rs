@@ -38,6 +38,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "last_text",
@@ -47,6 +49,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "add",
@@ -65,6 +69,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "last_sum",
@@ -74,6 +80,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "flip",
@@ -86,6 +94,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "flip_count",
@@ -95,6 +105,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "sum_list",
@@ -107,6 +119,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "concat",
@@ -119,6 +133,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "range",
@@ -131,6 +147,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "split",
@@ -143,6 +161,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "ping",
@@ -152,6 +172,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
         MessageMeta {
             name: "boom",
@@ -161,6 +183,8 @@ const KITCHEN_META: ActorMeta = ActorMeta {
             doc: "",
             timeout_ms: 0,
             mode: 0,
+            attested: false,
+            space_role: None,
         },
     ],
     constructor: &[],

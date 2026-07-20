@@ -751,6 +751,8 @@ mod tests {
                     doc: String::new(),
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
                 ParsedMessage {
                     name: "reset".into(),
@@ -761,6 +763,8 @@ mod tests {
                     doc: String::new(),
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
             ],
             constructor: vec![],
