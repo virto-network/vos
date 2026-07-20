@@ -19,7 +19,7 @@ use super::{
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CHECKPOINT_TOKEN_CAPACITY,
     CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
-    CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
+    CrdtDispatchV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
     EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2, ProgramId,
     ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialV2,
@@ -719,14 +719,6 @@ fn materialize_workflow_crdt(
                             None,
                         );
                     }
-                    if let Some(awaited) = &work.awaited_reply {
-                        insert_causal_value(
-                            frontier,
-                            result.outbox.entry(awaited.reply.call_id).or_default(),
-                            cid,
-                            None,
-                        );
-                    }
                 }
                 WorkflowOperationV2::Continuation(change) => {
                     let values = result.continuations.entry(change.actor).or_default();
@@ -751,6 +743,12 @@ fn materialize_workflow_crdt(
                     result.outbox.entry(message.call_id).or_default(),
                     cid,
                     Some(message.clone()),
+                ),
+                WorkflowOperationV2::ConsumeOutbox(call) => insert_causal_value(
+                    frontier,
+                    result.outbox.entry(*call).or_default(),
+                    cid,
+                    None,
                 ),
                 WorkflowOperationV2::Reply(reply) => insert_causal_value(
                     frontier,
@@ -936,7 +934,9 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     };
     let work = &envelope.work;
-    let transition = &envelope.transition;
+    let attached_proof = envelope.transition.proof.as_ref();
+    let proofless_transition = envelope.transition.proofless_clone();
+    let transition = &proofless_transition;
     if work.service != header.service || transition.service != header.service {
         return Ok(rejected(AccumulationRejectionV2::WrongService));
     }
@@ -1053,16 +1053,20 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
     match mode {
         ApplyMode::PrepareAttested => {
-            if !proof_required || transition.proof.is_some() {
+            if !proof_required || attached_proof.is_some() {
                 return Ok(rejected(AccumulationRejectionV2::InvalidProof));
             }
         }
         ApplyMode::Commit => {
-            if proof_required && transition.proof.is_none() {
-                return Ok(rejected(AccumulationRejectionV2::MissingProof));
+            if proof_required {
+                if attached_proof.is_none() {
+                    return Ok(rejected(AccumulationRejectionV2::MissingProof));
+                }
             }
-            if !proof_required && transition.proof.is_some() {
-                return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+            if attached_proof.is_some() {
+                if !proof_required {
+                    return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+                }
             }
         }
     }
@@ -1104,13 +1108,6 @@ fn apply<S: GuestAccumulateStoreV2>(
         });
     }
 
-    if !valid_workflow_input(&tree, work)? {
-        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
-    }
-    if !work_matches_durable_inbox(&tree, work)? {
-        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
-    }
-
     if transition.consumed_input != work.input_id() {
         return Ok(rejected(AccumulationRejectionV2::TransitionInputMismatch));
     }
@@ -1128,6 +1125,17 @@ fn apply<S: GuestAccumulateStoreV2>(
         CrdtValidationV2::Frontiers(frontiers) => Some(frontiers),
         CrdtValidationV2::Rejected(rejection) => return Ok(rejected(rejection)),
     };
+    let base_workflow = crdt_frontiers
+        .as_ref()
+        .map(|frontiers| materialize_workflow_crdt(&frontiers.base, &header.service))
+        .transpose()
+        .map_err(|_| GuestAccumulateError::CorruptStore)?;
+    if !valid_workflow_input(&tree, work, base_workflow.as_ref())? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    if !work_matches_durable_inbox(&tree, work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
     if header.consistency != ConsistencyModeV2::Crdt && header.revision == u64::MAX {
         return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
     }
@@ -1153,8 +1161,16 @@ fn apply<S: GuestAccumulateStoreV2>(
         if descriptor.name != imported.name || descriptor.parent != imported.parent {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
         }
-        let committed_continuation =
-            tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(imported.actor))?;
+        let committed_continuation = match base_workflow.as_ref() {
+            Some(materialized) => materialized
+                .continuations
+                .get(&imported.actor)
+                .and_then(|values| values.first())
+                .and_then(|value| value.value.clone()),
+            None => {
+                tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(imported.actor))?
+            }
+        };
         if committed_continuation != imported.continuation {
             return Ok(rejected(AccumulationRejectionV2::ContinuationConflict(
                 imported.actor,
@@ -1195,7 +1211,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(rejection) = validate_continuation_change(tree.store_ref(), envelope)? {
         return Ok(rejected(rejection));
     }
-    if let Some(rejection) = validate_awaited_reply(&tree, work)? {
+    if let Some(rejection) = validate_awaited_reply(&tree, work, base_workflow.as_ref())? {
         return Ok(rejected(rejection));
     }
 
@@ -1243,12 +1259,9 @@ fn apply<S: GuestAccumulateStoreV2>(
             )));
         }
     }
+    let proof_blob = attached_proof.map(|proof| &proof.proof_blob);
     for candidate in &envelope.provided_blobs {
-        if transition
-            .proof
-            .as_ref()
-            .is_some_and(|proof| proof.proof_blob == candidate.reference)
-        {
+        if proof_blob == Some(&candidate.reference) {
             // Proof artifacts are verifier/CAS inputs rather than service
             // state. Their content identity is checked here, while the host's
             // PROOF_VERIFY capability reads the same bytes from its external
@@ -1338,7 +1351,10 @@ fn apply<S: GuestAccumulateStoreV2>(
             Some(&message.encode()),
         )?;
     }
-    let workflow = WorkflowCheckpointV2 {
+    // `WorkEnvelopeV2` is intentionally complete and therefore large. Keep
+    // the durable workflow value off the bounded service-PVM stack while its
+    // nested wire encoder is active.
+    let workflow = alloc::boxed::Box::new(WorkflowCheckpointV2 {
         input: work.input_id(),
         workflow_identity: work.workflow_identity(),
         resume_work: work.clone(),
@@ -1351,7 +1367,7 @@ fn apply<S: GuestAccumulateStoreV2>(
             .as_ref()
             .map(CrdtChangeV2::cid)
             .unwrap_or(transition_commitment),
-    };
+    });
     tree_apply(
         &mut tree,
         &StateKeyV2::Workflow(work.invocation),
@@ -1440,10 +1456,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         None
     };
     if mode == ApplyMode::Commit && proof_required {
-        let proof = transition
-            .proof
-            .as_ref()
-            .expect("proof presence was validated");
+        let proof = attached_proof.expect("proof presence was validated");
         let statement = &preparation
             .as_ref()
             .expect("attested preparation was required")
@@ -1509,7 +1522,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         reply: transition.reply.clone(),
         outbox: transition.outbox.clone(),
         exported_blobs: transition.exported_blobs.clone(),
-        proof: transition.proof.clone(),
+        proof: attached_proof.cloned(),
     };
     if mode == ApplyMode::Commit && published != PublishedEffectsV2::default() {
         let publication = PublicationRecordV2 {
@@ -1593,15 +1606,6 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
         } else {
             CrdtValidationV2::Linear
         });
-    }
-    // Consuming an existing outbox row must be represented by the built-in
-    // workflow CRDT before awaited replies can be merged safely. The current
-    // change payload records emitted workflow rows, not replicated deletion
-    // of a pending call, so fail closed until that operation is defined.
-    if work.awaited_reply.is_some() {
-        return Ok(CrdtValidationV2::Rejected(
-            AccumulationRejectionV2::InvalidConsistency,
-        ));
     }
     let Some(change) = transition.crdt_change.as_ref() else {
         return Ok(CrdtValidationV2::Rejected(
@@ -1873,10 +1877,26 @@ fn work_matches_durable_inbox<S: StateTreeStore>(
 fn valid_workflow_input<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
     work: &super::WorkEnvelopeV2,
+    crdt_base: Option<&WorkflowMaterializationV2>,
 ) -> GuestResult<bool, S::Error> {
-    let checkpoint =
-        tree_get_wire::<_, WorkflowCheckpointV2>(tree, &StateKeyV2::Workflow(work.invocation))?;
-    let continuation = tree_get_wire::<_, BlobRefV2>(tree, &StateKeyV2::Continuation(work.target))?;
+    let (checkpoint, continuation) = match crdt_base {
+        Some(materialized) => (
+            materialized
+                .workflows
+                .get(&work.invocation)
+                .and_then(|values| values.first())
+                .map(|value| value.value.clone()),
+            materialized
+                .continuations
+                .get(&work.target)
+                .and_then(|values| values.first())
+                .and_then(|value| value.value.clone()),
+        ),
+        None => (
+            tree_get_wire::<_, WorkflowCheckpointV2>(tree, &StateKeyV2::Workflow(work.invocation))?,
+            tree_get_wire::<_, BlobRefV2>(tree, &StateKeyV2::Continuation(work.target))?,
+        ),
+    };
     Ok(match (work.workflow_step, checkpoint, continuation) {
         (0, None, None) => true,
         (0, _, _) => false,
@@ -1942,7 +1962,7 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         if BlobRefV2::of_bytes(&bytes) != *reference {
             return Err(GuestAccumulateError::CorruptStore);
         }
-        let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
+        let snapshot = match ContinuationSnapshotV2::decode_metadata(&bytes) {
             Ok(snapshot) if snapshot.validate_checkpoint_for(work).is_ok() => snapshot,
             _ => {
                 return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -2022,6 +2042,7 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
 fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
     tree: &ServiceStateTreeV2<'_, S>,
     work: &super::WorkEnvelopeV2,
+    crdt_base: Option<&WorkflowMaterializationV2>,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     let current = work
         .imported_actors
@@ -2044,7 +2065,7 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
     if BlobRefV2::of_bytes(&bytes) != *current {
         return Err(GuestAccumulateError::CorruptStore);
     }
-    let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
+    let snapshot = match ContinuationSnapshotV2::decode_metadata(&bytes) {
         Ok(snapshot) if snapshot.validate_resume_for(work).is_ok() => snapshot,
         _ => {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -2057,8 +2078,14 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
     };
-    let Some(message) = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?
-    else {
+    let message = match crdt_base {
+        Some(materialized) => materialized
+            .outbox
+            .get(&call)
+            .and_then(|values| values.iter().find_map(|value| value.value.clone())),
+        None => tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?,
+    };
+    let Some(message) = message else {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     };
     if message.call_id != call
@@ -2089,7 +2116,8 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
             work_hash: work.hash(),
             resume_work: Some(work.clone()),
             base_causal_height: work.base_causal_height,
-            change: None,
+            change: CrdtChangeV2::derive_id(work)
+                .map(|change| CrdtDispatchV2 { change, ordinal: 0 }),
             expected: Some(current.hash),
             replacement: None,
             pending_call: Some(call),
@@ -2356,6 +2384,8 @@ fn rejected(rejection: AccumulationRejectionV2) -> AccumulationResultV2 {
 
 #[cfg(test)]
 mod tests {
+    use core::convert::Infallible;
+
     use super::*;
     use crate::v2::{
         ActorWriteV2, ContinuationChangeV2, CrdtMaterializationV2, CrdtOperationV2, DeploymentId,
@@ -4258,6 +4288,60 @@ mod tests {
     }
 
     #[test]
+    fn workflow_dag_reconstructs_an_awaited_outbox_consumption() {
+        let initial = BlobRefV2::of_bytes(b"initial");
+        let first_state = BlobRefV2::of_bytes(b"checkpoint");
+        let first_work = crdt_work(initial, 19, vec![]);
+        let call = first_work.invocation.call_id(0);
+        let mut first = crdt_transition(&first_work, first_state.clone(), 1);
+        first.outbox.push(MessageRecordV2 {
+            call_id: call,
+            caller_invocation: first_work.invocation,
+            await_ordinal: 0,
+            from: actor(),
+            to: ActorId([44; 32]),
+            parent: None,
+            payload: vec![1],
+            authorization: AuthorizationEvidenceV2::Public,
+            deadline_timeslot: None,
+        });
+        let workflow = first.workflow_operations(&first_work);
+        first.crdt_change.as_mut().unwrap().workflow = workflow;
+        let first_change = first.crdt_change.unwrap();
+        let first_cid = first_change.cid();
+
+        let mut resumed_work = first_work;
+        resumed_work.workflow_step = 1;
+        resumed_work.base = ConsistencyBaseV2::Crdt {
+            heads: vec![first_cid],
+        };
+        resumed_work.base_causal_height = Some(1);
+        resumed_work.imported_actors[0].state = first_state;
+        let mut resumed = crdt_transition(&resumed_work, BlobRefV2::of_bytes(b"done"), 2);
+        let workflow = resumed.workflow_operations_with_consumed_outbox(&resumed_work, Some(call));
+        resumed.crdt_change.as_mut().unwrap().workflow = workflow;
+        let resumed_change = resumed.crdt_change.unwrap();
+        assert!(
+            resumed_change
+                .workflow
+                .contains(&WorkflowOperationV2::ConsumeOutbox(call))
+        );
+        let resumed_cid = resumed_change.cid();
+
+        let nodes = BTreeMap::from([
+            (first_cid, first_change.encode()),
+            (resumed_cid, resumed_change.encode()),
+        ]);
+        let frontier = load_causal_frontier(&[resumed_cid], |cid| {
+            Ok::<_, Infallible>(nodes.get(&cid).cloned())
+        })
+        .unwrap();
+        let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
+        assert_eq!(materialized.outbox[&call].len(), 1);
+        assert!(materialized.outbox[&call][0].value.is_none());
+    }
+
+    #[test]
     fn crdt_nodes_heads_and_materializations_are_committed_by_the_guest() {
         let mut store = MemStore::default();
         let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
@@ -4309,41 +4393,6 @@ mod tests {
         };
         assert_eq!(receipt.resulting_crdt_heads, vec![next_cid]);
         assert_eq!(receipt.sequence, 2);
-    }
-
-    #[test]
-    fn crdt_awaited_reply_is_rejected_until_outbox_consumption_is_replicated() {
-        let mut store = MemStore::default();
-        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
-        let mut work = crdt_work(initial, 22, Vec::new());
-        let reply = ReplyRecordV2 {
-            call_id: work.invocation.call_id(0),
-            producer: ActorId([44; 32]),
-            result: b"peer result".to_vec(),
-        };
-        let mut remote_service = work.service.clone();
-        remote_service.root_service = RootServiceId([45; 32]);
-        work.awaited_reply = Some(super::super::AccumulatedReplyV2 {
-            receipt: AccumulationReceiptV2 {
-                service: remote_service,
-                accepted_transition: Hash([46; 32]),
-                reply_commitment: Some(reply.commitment()),
-                outbox_commitment: None,
-                resulting_state_root: None,
-                resulting_crdt_heads: vec![Hash([47; 32])],
-                sequence: 1,
-                checkpoint: 0,
-                consistency: ConsistencyModeV2::Crdt,
-            },
-            reply,
-        });
-        let transition = crdt_transition(&work, BlobRefV2::of_bytes(b"next"), 1);
-        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
-
-        assert!(matches!(
-            validate_crdt(&store, &header, &work, &transition).unwrap(),
-            CrdtValidationV2::Rejected(AccumulationRejectionV2::InvalidConsistency)
-        ));
     }
 
     #[test]
@@ -4725,7 +4774,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(checkpoint.resume_work, work);
+        assert_eq!(checkpoint.resume_work, work.workflow_checkpoint());
         assert_eq!(checkpoint.transition_hash, cid);
         assert_eq!(
             BlobRefV2::decode(

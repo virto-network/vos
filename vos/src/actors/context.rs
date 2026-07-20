@@ -600,7 +600,7 @@ impl<A: Actor> Context<A> {
         target: crate::v2::ActorId,
         payload: &[u8],
     ) -> Option<super::run::Ask> {
-        self.actor_id?;
+        let caller = self.actor_id?;
         let index = self
             .actor_tree
             .binary_search_by_key(&target, |actor| actor.actor)
@@ -673,6 +673,23 @@ impl<A: Actor> Context<A> {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::Panicked,
             ));
+        }
+        if output.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .previously_suspended
+                .binary_search(&caller)
+                .is_ok()
+        }) {
+            // A nested child is the active VM which directly receives the
+            // scheduler's resume token. Its suspended caller crosses the same
+            // durable boundary when JAR returns the child output, before any
+            // new-slice effects are aggregated into this restored Context.
+            let checkpoint = output
+                .checkpoint
+                .as_ref()
+                .expect("checked nested checkpoint presence");
+            self.__rebind_checkpoint_change_v2(checkpoint);
+            self.__clear_committed_checkpoint_effects_v2();
         }
         self.next_await_ordinal = output.next_await_ordinal;
         if output.yielded {

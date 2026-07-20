@@ -39,7 +39,6 @@ impl CrdtCounterV2 {
         }
         value
     }
-
     #[msg]
     async fn call_yielding_child(&mut self, ctx: &mut Context<Self>, amount: u64) -> i64 {
         match ctx
@@ -68,6 +67,48 @@ impl CrdtCounterV2 {
         self.count
             .increment(amount)
             .expect("restored actor rebinds its CRDT change scope");
+        self.count.value()
+    }
+
+    #[msg]
+    async fn increment_around_peer(
+        &mut self,
+        before: u64,
+        after: u64,
+        ctx: &mut Context<Self>,
+    ) -> i64 {
+        self.count
+            .increment(before)
+            .expect("actor dispatch establishes a CRDT change scope");
+        let _ = ctx
+            .ask_actor(ActorId([44; 32]), &Msg::new("peer_value"), None)
+            .await;
+        self.count
+            .increment(after)
+            .expect("restored dispatch rebinds the CRDT change scope");
+        self.count.value()
+    }
+
+    #[msg]
+    async fn increment_child_around_peer(
+        &mut self,
+        before: u64,
+        after: u64,
+        parent_after: u64,
+        ctx: &mut Context<Self>,
+    ) -> i64 {
+        let _ = ctx
+            .ask_actor(
+                ActorId([36; 32]),
+                &Msg::new("increment_around_peer")
+                    .with("before", before)
+                    .with("after", after),
+                None,
+            )
+            .await;
+        self.count
+            .increment(parent_after)
+            .expect("restored parent dispatch rebinds the CRDT change scope");
         self.count.value()
     }
 }

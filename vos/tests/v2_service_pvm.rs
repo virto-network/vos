@@ -27,7 +27,7 @@ use vos::v2::{
     ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
     RootServiceId, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
     ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
-    public_policy_hash, space_role_policy_hash,
+    WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     AttestedMethod, Decode, Encode,
@@ -1999,6 +1999,15 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
                 crdt: true,
                 role_policies: role_policies(vec![
                     MethodPolicyV2 {
+                        method: "increment".into(),
+                        schema: Hash([49; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
                         method: "increment_child_twice".into(),
                         schema: Hash([50; 32]),
                         policy: public_policy_hash(),
@@ -2010,6 +2019,15 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
                     MethodPolicyV2 {
                         method: "call_yielding_child".into(),
                         schema: Hash([55; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "increment_child_around_peer".into(),
+                        schema: Hash([57; 32]),
                         policy: public_policy_hash(),
                         public: true,
                         attested: false,
@@ -2038,6 +2056,15 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
                     MethodPolicyV2 {
                         method: "increment_around_yield".into(),
                         schema: Hash([56; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "increment_around_peer".into(),
+                        schema: Hash([58; 32]),
                         policy: public_policy_hash(),
                         public: true,
                         attested: false,
@@ -2184,24 +2211,245 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
         "the next slice privately imports the child's committed materialization"
     );
 
-    let unsupported = prepare(
-        service.accumulate_host(),
-        InvocationId([57; 32]),
-        3,
-        "call_yielding_child",
+    // Refine a suspended child workflow and a concurrent root update from the
+    // same causal base. Resumption must select the checkpoint's branch rather
+    // than injecting the concurrent materialization into the captured heap.
+    let mut around_arguments = vec![vos::value::TAG_DYNAMIC];
+    around_arguments.extend_from_slice(
+        &Msg::new("increment_child_around_peer")
+            .with("before", 5u64)
+            .with("after", 7u64)
+            .with("parent_after", 13u64)
+            .encode(),
     );
-    let before = service.accumulate_host().snapshot();
-    assert!(matches!(
-        service.refine_actor_tree(&unsupported.work, &unsupported.imports),
-        Err(ServiceDispatchError::Pvm(ServicePvmErrorV2::Panic {
-            vm: 0,
-            ..
+    let around = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([59; 32]),
+            workflow_step: 0,
+            logical_timeslot: 3,
+            target: seed.target,
+            method: "increment_child_around_peer".into(),
+            arguments: around_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let mut concurrent_arguments = vec![vos::value::TAG_DYNAMIC];
+    concurrent_arguments.extend_from_slice(&Msg::new("increment").with("amount", 11u64).encode());
+    let concurrent = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([60; 32]),
+            workflow_step: 0,
+            logical_timeslot: 3,
+            target: seed.target,
+            method: "increment".into(),
+            arguments: concurrent_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(around.work.base, concurrent.work.base);
+    let around_refined = service
+        .refine_actor_tree(&around.work, &around.imports)
+        .expect("CRDT child workflow checkpoints after its pre-await mutation");
+    let concurrent_refined = service
+        .refine_actor_tree(&concurrent.work, &concurrent.imports)
+        .expect("concurrent CRDT work refines from the same causal base");
+    let checkpoint_change = around_refined.transition.crdt_change.as_ref().unwrap();
+    assert_eq!(checkpoint_change.operations.len(), 1);
+    assert_eq!(checkpoint_change.operations[0].actor, child);
+    assert_eq!(checkpoint_change.operations[0].ordinal, 0);
+    assert!(around_refined.transition.reply.is_none());
+    assert_eq!(around_refined.transition.outbox.len(), 1);
+    let pending_call = around_refined.transition.outbox[0].call_id;
+    let checkpoint_cid = checkpoint_change.cid();
+    let concurrent_cid = concurrent_refined
+        .transition
+        .crdt_change
+        .as_ref()
+        .unwrap()
+        .cid();
+
+    let checkpoint_apply = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: around.work.clone(),
+            transition: around_refined.transition,
+            provided_blobs: around_refined.exported_blobs,
         }))
+        .unwrap()
+        .result;
+    assert!(matches!(
+        checkpoint_apply,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
     ));
+    let concurrent_apply = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: concurrent.work,
+            transition: concurrent_refined.transition,
+            provided_blobs: concurrent_refined.exported_blobs,
+        }))
+        .unwrap()
+        .result;
+    let AccumulationResultV2::Accepted { receipt, .. } = &concurrent_apply else {
+        panic!("concurrent CRDT branch was rejected: {concurrent_apply:?}")
+    };
+    let mut concurrent_heads = vec![checkpoint_cid, concurrent_cid];
+    concurrent_heads.sort();
+    assert_eq!(receipt.resulting_crdt_heads, concurrent_heads);
+
+    let reply = ReplyRecordV2 {
+        call_id: pending_call,
+        producer: ActorId([44; 32]),
+        result: Value::U32(0).encode(),
+    };
+    let mut remote_service = around.work.service.clone();
+    remote_service.root_service = RootServiceId([62; 32]);
+    remote_service.deployment = DeploymentId([63; 32]);
+    let awaited = AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: remote_service,
+            accepted_transition: Hash([64; 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([65; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply,
+    };
+    service
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: awaited.receipt.clone(),
+        });
+    let resumed = LocalWorkSchedulerV2::prepare_resume(
+        service.accumulate_host(),
+        around.work.invocation,
+        4,
+        Some(awaited),
+    )
+    .expect("CRDT resume selects only the checkpoint's causal branch");
     assert_eq!(
-        service.accumulate_host().snapshot(),
-        before,
-        "a nested CRDT suspension fails during pure Refine and leaves no service-state trace"
+        resumed.work.base,
+        ConsistencyBaseV2::Crdt {
+            heads: vec![checkpoint_cid]
+        }
+    );
+    assert_eq!(resumed.work.base_causal_height, Some(2));
+    assert!(resumed.work.imported_actors[0].causal_states.is_empty());
+    let resumed_refined = service
+        .refine_actor_tree(&resumed.work, &resumed.imports)
+        .expect("restored CRDT machines rebind to the new slice change");
+    let resumed_change = resumed_refined.transition.crdt_change.as_ref().unwrap();
+    assert_eq!(resumed_change.causal_dependencies, vec![checkpoint_cid]);
+    assert!(
+        resumed_change
+            .workflow
+            .contains(&WorkflowOperationV2::ConsumeOutbox(pending_call))
+    );
+    assert_eq!(resumed_change.operations.len(), 2);
+    assert!(resumed_change.operations.iter().all(|operation| {
+        operation.ordinal == 0
+            && operation.id
+                == resumed_change.id.operation(
+                    operation.actor,
+                    operation.dispatch_ordinal,
+                    operation.field,
+                    0,
+                )
+    }));
+    assert!(
+        resumed_change
+            .operations
+            .iter()
+            .any(|operation| operation.actor == seed.target)
+    );
+    assert!(
+        resumed_change
+            .operations
+            .iter()
+            .any(|operation| operation.actor == child)
+    );
+    assert_eq!(
+        resumed_refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::I64(13)),
+        "the suspended root heap must not observe the concurrent +11 branch"
+    );
+    let resumed_cid = resumed_change.cid();
+    let resumed_apply = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: resumed.work,
+            transition: resumed_refined.transition,
+            provided_blobs: resumed_refined.exported_blobs,
+        }))
+        .unwrap()
+        .result;
+    let AccumulationResultV2::Accepted { receipt, .. } = resumed_apply else {
+        panic!("resumed CRDT transition was rejected: {resumed_apply:?}")
+    };
+    let mut final_heads = vec![concurrent_cid, resumed_cid];
+    final_heads.sort();
+    assert_eq!(receipt.resulting_crdt_heads, final_heads);
+
+    let mut merged_arguments = vec![vos::value::TAG_DYNAMIC];
+    merged_arguments.extend_from_slice(&Msg::new("increment").with("amount", 1u64).encode());
+    let merged = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([66; 32]),
+            workflow_step: 0,
+            logical_timeslot: 5,
+            target: seed.target,
+            method: "increment".into(),
+            arguments: merged_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("both post-checkpoint branches remain available for a later merge");
+    assert_eq!(merged.work.imported_actors[0].causal_states.len(), 1);
+    let merged_refined = service
+        .refine_actor_tree(&merged.work, &merged.imports)
+        .unwrap();
+    assert_eq!(
+        merged_refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::I64(25))
     );
 }
 

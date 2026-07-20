@@ -255,14 +255,20 @@ pub fn with_change<R>(change: ChangeId, f: impl FnOnce() -> Result<R, Error>) ->
 pub fn rebind_change(change: ChangeId) -> Result<(), Error> {
     #[cfg(feature = "std")]
     {
-        CHANGE_SCOPE.with(|scope| rebind_change_in(scope.borrow_mut().as_mut(), change))
+        CHANGE_SCOPE.with(|scope| {
+            rebind_change_in(scope.borrow_mut().as_mut(), change)?;
+            COMPLETED_CHANGE.with(|completed| *completed.borrow_mut() = None);
+            Ok(())
+        })
     }
     #[cfg(not(feature = "std"))]
     {
         // SAFETY: PVM guests are single-threaded and resume one actor at a
         // flushed protocol boundary.
         let state = unsafe { &mut *CHANGE_STATE.0.get() };
-        rebind_change_in(state.active.as_mut(), change)
+        rebind_change_in(state.active.as_mut(), change)?;
+        state.completed = None;
+        Ok(())
     }
 }
 
@@ -1458,6 +1464,36 @@ mod tests {
             ChangeId::for_dispatch(batch, actor, 0),
             ChangeId::for_dispatch(batch, crate::v2::ActorId([7; 32]), 0)
         );
+    }
+
+    #[test]
+    fn restored_slice_rebinds_and_discards_checkpoint_operations() {
+        let mut counter = Counter::default();
+        Field::__vos_init(&mut counter, "Board", "edits");
+        let actor = crate::v2::ActorId([5; 32]);
+        let before = crate::v2::ChangeId([5; 32]);
+        let after = crate::v2::ChangeId([6; 32]);
+        let after_dispatch = crate::v2::CrdtDispatchV2 {
+            change: after,
+            ordinal: 0,
+        };
+
+        with_change(ChangeId::for_dispatch(before, actor, 0), || {
+            counter.increment(2)?;
+            rebind_change(ChangeId::for_dispatch(after, actor, 0))?;
+            counter.increment(3)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let operations = take_operations(actor, after_dispatch).unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].ordinal, 0);
+        assert_eq!(
+            operations[0].id,
+            after.operation(actor, 0, field_tag("Board", "edits"), 0)
+        );
+        assert_eq!(counter.value(), 5);
     }
 
     #[test]

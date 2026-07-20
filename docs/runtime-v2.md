@@ -229,7 +229,7 @@ an independently constructed genesis directly to guest Install is only a
 conformance seam.
 
 This is still a conformance orchestrator, not production network routing.
-Automatic node discovery and CRDT delivery/reply consumption remain staged.
+Automatic node discovery and production routing remain staged.
 Acknowledging a publication containing several
 effects is the transport host's responsibility only after every required
 consumer has accepted it.
@@ -243,6 +243,12 @@ only in the accepted resumed transition. The local harness uses an explicit
 receipt-and-producer allowlist for conformance. Refine injects an admitted
 reply into the exact saved protocol-call result buffer, so execution continues
 after the await rather than replaying the handler. The inline injection
+also applies to CRDT workflows: the scheduler selects the checkpoint node's
+causal branch rather than the service's later merged heads, the resumed slice
+records an explicit workflow-CRDT outbox consumption, and post-await
+operations receive a fresh change/dispatch identity. The suspended heap
+continues against the materialization it originally observed; concurrent
+branches merge only after that resumed change commits.
 envelope is bounded by `CHECKPOINT_TOKEN_CAPACITY`; larger application results
 must use a content-addressed blob reference once the transport API exposes
 that result form. This path is currently linear-only: CRDT services reject an

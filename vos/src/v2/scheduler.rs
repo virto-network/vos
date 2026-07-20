@@ -68,7 +68,6 @@ pub enum ScheduleErrorV2 {
     InvalidContinuation(ActorId),
     MissingAwaitedReply(CallId),
     UnexpectedAwaitedReply(CallId),
-    CrdtAwaitUnsupported(CallId),
     InvocationAlreadyCommitted(InvocationId),
     InvalidWorkflowStep(InvocationId),
     MissingInbox(CallId),
@@ -301,6 +300,34 @@ impl LocalWorkSchedulerV2 {
             return Err(ScheduleErrorV2::InvalidActorDescriptor(request.target));
         }
         validate_actor_consistency(descriptor.crdt, header.consistency, request.target)?;
+        let continuation_key = StateKeyV2::Continuation(request.target);
+        let continuation = decode_row::<BlobRefV2>(store, header.service_root, &continuation_key)?;
+        let workflow_key = StateKeyV2::Workflow(request.invocation);
+        let workflow =
+            decode_row::<WorkflowCheckpointV2>(store, header.service_root, &workflow_key)?;
+
+        match (
+            request.workflow_step,
+            continuation.as_ref(),
+            workflow.as_ref(),
+        ) {
+            (0, Some(_), _) => return Err(ScheduleErrorV2::ActorBusy(request.target)),
+            (0, None, Some(_)) => {
+                return Err(ScheduleErrorV2::InvocationAlreadyCommitted(
+                    request.invocation,
+                ));
+            }
+            (0, None, None) => {}
+            (_, None, _) => {
+                return Err(ScheduleErrorV2::MissingContinuation(request.target));
+            }
+            (step, Some(_), Some(checkpoint))
+                if checkpoint.input.invocation == request.invocation
+                    && checkpoint.input.workflow_step.checked_add(1) == Some(step) => {}
+            (_, Some(_), _) => {
+                return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
+            }
+        }
 
         let program_bytes = store
             .program(descriptor.program)
@@ -308,11 +335,31 @@ impl LocalWorkSchedulerV2 {
             .to_vec();
         let (base, base_causal_height, mut states, causal_frontier) =
             if header.consistency == ConsistencyModeV2::Crdt {
-                let heads = header.crdt_heads.clone();
-                let frontier = load_causal_frontier(&heads, |cid| {
+                let current = load_causal_frontier(&header.crdt_heads, |cid| {
                     Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
                 })
                 .map_err(schedule_causal_error)?;
+                let heads =
+                    if request.workflow_step == 0 {
+                        header.crdt_heads.clone()
+                    } else {
+                        let checkpoint = workflow
+                            .as_ref()
+                            .expect("validated continuation has a workflow checkpoint");
+                        if !header.crdt_heads.iter().any(|head| {
+                            current.contains_ancestor(*head, checkpoint.transition_hash)
+                        }) {
+                            return Err(ScheduleErrorV2::CorruptCausalDag);
+                        }
+                        alloc::vec![checkpoint.transition_hash]
+                    };
+                let frontier = if heads == header.crdt_heads {
+                    current
+                } else {
+                    current
+                        .at_heads(&heads)
+                        .ok_or(ScheduleErrorV2::CorruptCausalDag)?
+                };
                 let height = frontier.max_head_height;
                 let states = frontier
                     .actor_materializations(&descriptor)
@@ -346,34 +393,6 @@ impl LocalWorkSchedulerV2 {
                 )
             };
         let state = states.remove(0);
-        let continuation_key = StateKeyV2::Continuation(request.target);
-        let continuation = decode_row::<BlobRefV2>(store, header.service_root, &continuation_key)?;
-        let workflow_key = StateKeyV2::Workflow(request.invocation);
-        let workflow =
-            decode_row::<WorkflowCheckpointV2>(store, header.service_root, &workflow_key)?;
-
-        match (
-            request.workflow_step,
-            continuation.as_ref(),
-            workflow.as_ref(),
-        ) {
-            (0, Some(_), _) => return Err(ScheduleErrorV2::ActorBusy(request.target)),
-            (0, None, Some(_)) => {
-                return Err(ScheduleErrorV2::InvocationAlreadyCommitted(
-                    request.invocation,
-                ));
-            }
-            (0, None, None) => {}
-            (_, None, _) => {
-                return Err(ScheduleErrorV2::MissingContinuation(request.target));
-            }
-            (step, Some(_), Some(checkpoint))
-                if checkpoint.input.invocation == request.invocation
-                    && checkpoint.input.workflow_step.checked_add(1) == Some(step) => {}
-            (_, Some(_), _) => {
-                return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
-            }
-        }
 
         let mut work = WorkEnvelopeV2 {
             service: header.service.clone(),
@@ -554,11 +573,7 @@ impl LocalWorkSchedulerV2 {
             snapshot
                 .validate_resume_for(&work)
                 .map_err(|_| ScheduleErrorV2::InvalidContinuation(request.target))?;
-            validate_await_boundary(
-                header.consistency,
-                snapshot.pending_call,
-                work.awaited_reply.as_ref(),
-            )?;
+            validate_await_boundary(snapshot.pending_call, work.awaited_reply.as_ref())?;
         }
         imports
             .validate_for(&work)
@@ -588,15 +603,9 @@ fn schedule_causal_error(error: CausalFrontierError<Infallible>) -> ScheduleErro
 }
 
 fn validate_await_boundary(
-    consistency: ConsistencyModeV2,
     pending_call: Option<CallId>,
     awaited_reply: Option<&AccumulatedReplyV2>,
 ) -> Result<(), ScheduleErrorV2> {
-    if consistency == ConsistencyModeV2::Crdt
-        && let Some(call) = pending_call
-    {
-        return Err(ScheduleErrorV2::CrdtAwaitUnsupported(call));
-    }
     match (pending_call, awaited_reply) {
         (None, None) => Ok(()),
         (Some(call), None) => Err(ScheduleErrorV2::MissingAwaitedReply(call)),
@@ -698,11 +707,11 @@ mod tests {
 
         let call = CallId([3; 32]);
         assert_eq!(
-            validate_await_boundary(ConsistencyModeV2::Crdt, Some(call), None),
-            Err(ScheduleErrorV2::CrdtAwaitUnsupported(call))
+            validate_await_boundary(Some(call), None),
+            Err(ScheduleErrorV2::MissingAwaitedReply(call))
         );
         assert_eq!(
-            validate_await_boundary(ConsistencyModeV2::Local, Some(call), None),
+            validate_await_boundary(Some(call), None),
             Err(ScheduleErrorV2::MissingAwaitedReply(call))
         );
     }

@@ -207,6 +207,13 @@ mod guest {
                 }
             }
         }
+        let consumed_outbox = actor_output.checkpoint.as_ref().and_then(|checkpoint| {
+            checkpoint
+                .replacement
+                .is_none()
+                .then_some(checkpoint.pending_call)
+                .flatten()
+        });
 
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();
@@ -368,7 +375,7 @@ mod guest {
             gas: GasAccountingV2::default(),
             proof: None,
         };
-        let workflow = transition.workflow_operations(&work);
+        let workflow = transition.workflow_operations_with_consumed_outbox(&work, consumed_outbox);
         if let Some(change) = transition.crdt_change.as_mut() {
             change.workflow = workflow;
         }
@@ -438,8 +445,6 @@ mod guest {
                         .entry(output.actor)
                         .or_insert(1u32);
                     if !output.writes.is_empty()
-                        || (output.actor != work.target
-                            && (output.yielded || output.checkpoint.is_some()))
                         || state.actor != output.actor
                         || state.next_dispatch_ordinal != *expected_next
                         || output.crdt_operations.iter().any(|operation| {
