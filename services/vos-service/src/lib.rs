@@ -14,7 +14,8 @@ mod guest {
 
     use vos::abi::pvm::ecall;
     use vos::v2::{
-        ActorSliceOutputV2, GasAccountingV2, ReplyRecordV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+        ActorSliceOutputV2, ContinuationChangeV2, GasAccountingV2, ReplyRecordV2, TransitionV2,
+        V2Wire, WorkEnvelopeV2,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -111,33 +112,54 @@ mod guest {
         };
         let actor_output =
             ActorSliceOutputV2::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
-        if actor_output.actor != work.target || actor_output.yielded || actor_output.forbidden {
-            // Durable continuation capture and typed authorization rejection
-            // are scheduler concerns. This single-slice entry never replays or
-            // silently commits an unsupported result.
+        if actor_output.actor != work.target || actor_output.forbidden {
             fail_closed();
         }
 
-        let consumed_input = work.input_id();
+        let mut consumed_input = work.input_id();
+        let mut base = work.base.clone();
+        let mut continuations = alloc::vec::Vec::new();
+        let mut exported_blobs = alloc::vec::Vec::new();
+        if let Some(checkpoint) = actor_output.checkpoint {
+            if checkpoint.input.invocation != work.invocation
+                || !checkpoint.base.mode_compatible(work.consistency)
+            {
+                fail_closed();
+            }
+            consumed_input = checkpoint.input;
+            base = checkpoint.base;
+            if let Some(replacement) = checkpoint.replacement.as_ref() {
+                exported_blobs.push(replacement.clone());
+            }
+            continuations.push(ContinuationChangeV2 {
+                actor: work.target,
+                expected: checkpoint.expected,
+                replacement: checkpoint.replacement,
+            });
+        } else if actor_output.yielded {
+            fail_closed();
+        }
+
+        let reply = (!actor_output.yielded).then(|| ReplyRecordV2 {
+            call_id: work
+                .parent_call
+                .unwrap_or_else(|| work.invocation.root_reply_id()),
+            producer: work.target,
+            result: actor_output.reply,
+        });
         let transition = TransitionV2 {
             service: work.service,
             consumed_input,
             target_program: work.target_program,
-            base: work.base,
+            base,
             writes: actor_output.writes,
             crdt_operations: alloc::vec::Vec::new(),
             resulting_crdt_heads: alloc::vec::Vec::new(),
-            continuations: alloc::vec::Vec::new(),
+            continuations,
             inbox: alloc::vec::Vec::new(),
             outbox: alloc::vec::Vec::new(),
-            reply: Some(ReplyRecordV2 {
-                call_id: work
-                    .parent_call
-                    .unwrap_or_else(|| work.invocation.root_reply_id()),
-                producer: work.target,
-                result: actor_output.reply,
-            }),
-            exported_blobs: alloc::vec::Vec::new(),
+            reply,
+            exported_blobs,
             gas: GasAccountingV2::default(),
             proof: None,
         };

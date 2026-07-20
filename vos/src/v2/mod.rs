@@ -28,7 +28,7 @@ pub use accumulate::{
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulationReceiptV2, ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2,
-    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
+    AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
     ImportedProgramV2, MessageRecordV2, ProofCommitmentV2, Refine, RefineError, RefineImportsV2,
     ReplyRecordV2, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
@@ -73,6 +73,8 @@ pub const ACTOR_IPC_CAP_SLOT: u8 = 90;
 pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;
 /// High virtual page kept outside transpiler-owned actor memory layouts.
 pub const ACTOR_IPC_BASE_PAGE: u32 = 0x000f_0000;
+/// Bounded stack window receiving a checkpoint token after snapshot capture.
+pub const CHECKPOINT_TOKEN_CAPACITY: usize = 4096;
 /// Marker passed in phi[10] so the canonical actor entry selects CALL/REPLY.
 pub const NESTED_ACTOR_CALL_MAGIC: u64 = 0x564f_532d_4143_5432;
 

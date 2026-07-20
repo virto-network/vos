@@ -13,7 +13,7 @@ use vos::v2::{
     RootServiceId, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
     WorkEnvelopeV2,
 };
-use vos::{Encode, value::Msg};
+use vos::{Decode, Encode, value::Msg};
 
 fn service_elf() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -38,6 +38,21 @@ fn greeter_elf() -> Option<Vec<u8>> {
         Err(_) => {
             eprintln!(
                 "skipping: build the actor first with `cd examples/actors/greeter && cargo +nightly actor` ({})",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn probe_elf() -> Option<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/actors/probe/target/riscv64em-javm/release/probe.elf");
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            eprintln!(
+                "skipping: build the actor first with `cd examples/actors/probe && cargo +nightly actor` ({})",
                 path.display()
             );
             None
@@ -250,7 +265,133 @@ fn actor_tree_refuses_to_replay_a_continuation_from_pc_zero() {
             10_000_000,
             &NoRefineProtocolHostV2,
         ),
-        Err(ServicePvmErrorV2::UnsupportedContinuation)
+        Err(ServicePvmErrorV2::InvalidContinuation)
+    );
+}
+
+#[test]
+fn yielding_actor_restores_exactly_after_restart() {
+    let (Some(service_elf), Some(actor_elf)) = (service_elf(), probe_elf()) else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
+    let service =
+        ServicePvmV2::new(service_pvm.clone(), ProgramId::of_pvm(&service_pvm)).unwrap();
+    let actor = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor);
+    let initial_state = Vec::new();
+    let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
+    let mut first_work = work(actor_program, initial_state_ref.clone());
+    let mut ping = vec![vos::value::TAG_DYNAMIC];
+    ping.extend_from_slice(&Msg::new("ping").encode());
+    first_work.method = "ping".into();
+    first_work.arguments = ping;
+    let first_imports = RefineImportsV2 {
+        programs: vec![ImportedProgramV2 {
+            program: actor_program,
+            pvm: actor.clone(),
+        }],
+        blobs: vec![ImportedBlobV2 {
+            reference: initial_state_ref,
+            bytes: initial_state,
+        }],
+    };
+
+    let first_output = service
+        .refine_actor_tree(
+            &first_work.encode(),
+            &first_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+        )
+        .unwrap();
+    let deterministic_retry = service
+        .refine_actor_tree(
+            &first_work.encode(),
+            &first_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+        )
+        .unwrap();
+    assert_eq!(
+        deterministic_retry, first_output,
+        "checkpoint bytes and transition must be deterministic"
+    );
+    let first = TransitionV2::decode(&first_output.bytes).unwrap();
+    assert!(first.reply.is_none(), "yield must not publish a reply");
+    assert_eq!(first.continuations.len(), 1);
+    let first_continuation = first.continuations[0].replacement.clone().unwrap();
+    assert_eq!(first.exported_blobs, vec![first_continuation.clone()]);
+    assert_eq!(first_output.exported_blobs.len(), 1);
+    assert_eq!(
+        first_output.exported_blobs[0].reference,
+        first_continuation
+    );
+    let checkpoint_state = first
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.clone())
+        .expect("checkpoint commits the mutation before await");
+    assert_eq!(u32::decode(&checkpoint_state), 1);
+
+    // Simulate a process restart after Accumulate committed slice 0. Only
+    // canonical programs, the committed state, and the continuation blob are
+    // supplied to the next Refine invocation.
+    let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
+    let mut resumed_work = first_work.clone();
+    resumed_work.workflow_step = 1;
+    resumed_work.base = ConsistencyBaseV2::Linear {
+        revision: 1,
+        state_root: Hash([9; 32]),
+    };
+    resumed_work.imported_actors[0].state = checkpoint_state_ref.clone();
+    resumed_work.imported_actors[0].continuation = Some(first_continuation.clone());
+    let mut resumed_blobs = vec![
+        ImportedBlobV2 {
+            reference: checkpoint_state_ref,
+            bytes: checkpoint_state,
+        },
+        first_output.exported_blobs[0].clone(),
+    ];
+    resumed_blobs.sort_by_key(|blob| blob.reference.hash);
+    let resumed_imports = RefineImportsV2 {
+        programs: vec![ImportedProgramV2 {
+            program: actor_program,
+            pvm: actor,
+        }],
+        blobs: resumed_blobs,
+    };
+
+    let resumed_output = service
+        .refine_actor_tree(
+            &resumed_work.encode(),
+            &resumed_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+        )
+        .unwrap();
+    let resumed = TransitionV2::decode(&resumed_output.bytes).unwrap();
+    assert!(resumed.reply.is_some(), "handler completes after exact resume");
+    assert_eq!(resumed.consumed_input, resumed_work.input_id());
+    assert_eq!(resumed.base, resumed_work.base);
+    assert_eq!(resumed.continuations.len(), 1);
+    assert_eq!(
+        resumed.continuations[0].expected,
+        Some(first_continuation.hash)
+    );
+    assert_eq!(resumed.continuations[0].replacement, None);
+    assert!(resumed_output.exported_blobs.is_empty());
+    let resumed_state = resumed
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .expect("resumed actor reports its retained state");
+    assert_eq!(
+        u32::decode(resumed_state),
+        1,
+        "code before .await must not execute again"
     );
 }
 

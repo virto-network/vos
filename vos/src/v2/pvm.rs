@@ -10,22 +10,29 @@ use alloc::vec::Vec;
 use javm::cap::{Access, Cap, DataCap, ProtocolCap};
 use javm::kernel::{DispatchResult, DormantProgram, InvocationKernel, KernelResult};
 use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
+use javm::snapshot::KernelSnapshot;
 use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 
 use super::{
-    ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, ActorSliceInputV2, ProgramId,
-    REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, ActorSliceInputV2, BlobRefV2,
+    CheckpointTokenV2, ContinuationSnapshotV2, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC,
+    RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
 const MIN_ACTOR_OUTPUT_HEADROOM: usize = 16 * javm::PVM_PAGE_SIZE as usize;
 const RESULT_WHAT: u64 = u64::MAX - 1;
+const ACTOR_STACK_OBJECT_CAP: u64 = 65;
 
 /// Result of one completed service-PVM execution slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicePvmOutputV2 {
     pub bytes: Vec<u8>,
     pub gas_used: u64,
+    /// Content-addressed artifacts produced purely during Refine. Callers must
+    /// make these bytes available before submitting the transition to
+    /// Accumulate; publication still occurs only after commit.
+    pub exported_blobs: Vec<ImportedBlobV2>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +52,10 @@ pub enum ServicePvmErrorV2 {
     InvalidWorkEnvelope,
     InvalidRefineImports,
     TooManyImportedActors,
-    UnsupportedContinuation,
+    InvalidContinuation,
+    ContinuationMismatch,
+    SnapshotFailed,
+    CheckpointTokenWriteFailed,
     ActorIpcExhausted,
     ActorIpcSetupFailed,
     InvalidVmLifecycle,
@@ -147,7 +157,7 @@ impl ServicePvmV2 {
         let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
             .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
         install_refine_scheduler_caps(&mut kernel);
-        run_refine_kernel(kernel, gas_limit, host)
+        run_refine_kernel(kernel, host, true, None, None, Vec::new())
     }
 
     /// Execute Refine with every declared actor instantiated as a dormant JAR
@@ -179,25 +189,6 @@ impl ServicePvmV2 {
             .iter()
             .find(|actor| actor.actor == work.target)
             .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
-        if target.continuation.is_some() {
-            // Replaying a suspended handler from PC 0 is never a valid
-            // fallback. Exact kernel restoration is wired in the durable
-            // scheduler slice; until then continuation work fails closed.
-            return Err(ServicePvmErrorV2::UnsupportedContinuation);
-        }
-        let target_state = imports
-            .blobs
-            .binary_search_by_key(&target.state.hash, |blob| blob.reference.hash)
-            .ok()
-            .map(|index| &imports.blobs[index].bytes)
-            .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
-        let actor_input = ActorSliceInputV2 {
-            actor: work.target,
-            state: target_state.clone(),
-            message: work.arguments.clone(),
-            origin: work.origin,
-        }
-        .encode();
         actors.push(target);
         actors.extend(
             work.imported_actors
@@ -222,6 +213,55 @@ impl ServicePvmV2 {
             });
         }
 
+        if let Some(reference) = target.continuation.as_ref() {
+            let bytes = imported_blob_bytes(imports, reference)?;
+            let continuation = ContinuationSnapshotV2::decode(bytes)
+                .map_err(|_| ServicePvmErrorV2::InvalidContinuation)?;
+            continuation
+                .validate_resume_for(&work)
+                .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
+            let snapshot = KernelSnapshot::from_bytes(&continuation.kernel_snapshot)
+                .map_err(|_| ServicePvmErrorV2::InvalidContinuation)?;
+            if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
+                return Err(ServicePvmErrorV2::InvalidContinuation);
+            }
+            let mut kernel = InvocationKernel::restore_with_dormant_programs(
+                &self.program,
+                &dormant,
+                &snapshot,
+                javm::PvmBackend::Default,
+            )
+            .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
+            let token_len = write_checkpoint_token(
+                &mut kernel,
+                &CheckpointTokenV2 {
+                    input: work.input_id(),
+                    base: work.base.clone(),
+                    expected: Some(reference.hash),
+                    replacement: None,
+                },
+            )?;
+            kernel
+                .resume_protocol_call(1, token_len)
+                .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+            return run_refine_kernel(
+                kernel,
+                host,
+                false,
+                Some(&work),
+                Some((&self.program, &dormant)),
+                Vec::new(),
+            );
+        }
+
+        let target_state = imported_blob_bytes(imports, &target.state)?;
+        let actor_input = ActorSliceInputV2 {
+            actor: work.target,
+            state: target_state.to_vec(),
+            message: work.arguments.clone(),
+            origin: work.origin,
+        }
+        .encode();
         let mut kernel = InvocationKernel::new_with_dormant_programs(
             &self.program,
             arguments,
@@ -237,7 +277,15 @@ impl ServicePvmV2 {
         kernel.set_active_reg(9, actor_input_len as u64);
         kernel.set_active_reg(10, actor_ipc_capacity as u64);
         install_refine_scheduler_caps(&mut kernel);
-        run_refine_kernel(kernel, gas_limit, host)
+        install_actor_scheduler_caps(&mut kernel, dormant.len());
+        run_refine_kernel(
+            kernel,
+            host,
+            true,
+            Some(&work),
+            Some((&self.program, &dormant)),
+            Vec::new(),
+        )
     }
 
     /// Execute the physical IC-5 Accumulate entry against an isolated staging
@@ -266,7 +314,11 @@ impl ServicePvmV2 {
                     let bytes = read_output(&kernel)?;
                     let gas_used = gas_limit.saturating_sub(kernel.active_gas());
                     host.commit(transaction)?;
-                    return Ok(ServicePvmOutputV2 { bytes, gas_used });
+                    return Ok(ServicePvmOutputV2 {
+                        bytes,
+                        gas_used,
+                        exported_blobs: Vec::new(),
+                    });
                 }
                 KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
                 KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
@@ -361,17 +413,83 @@ fn install_actor_ipc(
     Ok((input_len, capacity))
 }
 
+fn imported_blob_bytes<'a>(
+    imports: &'a RefineImportsV2,
+    reference: &BlobRefV2,
+) -> Result<&'a [u8], ServicePvmErrorV2> {
+    imports
+        .blobs
+        .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+        .ok()
+        .map(|index| imports.blobs[index].bytes.as_slice())
+        .ok_or(ServicePvmErrorV2::InvalidRefineImports)
+}
+
+fn write_checkpoint_token(
+    kernel: &mut InvocationKernel,
+    token: &CheckpointTokenV2,
+) -> Result<u64, ServicePvmErrorV2> {
+    let encoded = token.encode();
+    let address = u32::try_from(kernel.active_reg(7))
+        .map_err(|_| ServicePvmErrorV2::CheckpointTokenWriteFailed)?;
+    let capacity = usize::try_from(kernel.active_reg(8))
+        .map_err(|_| ServicePvmErrorV2::CheckpointTokenWriteFailed)?;
+    let cap = u8::try_from(kernel.active_reg(12))
+        .map_err(|_| ServicePvmErrorV2::CheckpointTokenWriteFailed)?;
+    if cap as u64 != ACTOR_STACK_OBJECT_CAP
+        || encoded.len() > capacity
+        || !kernel.write_data_cap_window(address, &encoded)
+    {
+        return Err(ServicePvmErrorV2::CheckpointTokenWriteFailed);
+    }
+    u64::try_from(encoded.len()).map_err(|_| ServicePvmErrorV2::CheckpointTokenWriteFailed)
+}
+
+fn capture_checkpoint(
+    kernel: &mut InvocationKernel,
+    work: &WorkEnvelopeV2,
+) -> Result<(ImportedBlobV2, KernelSnapshot), ServicePvmErrorV2> {
+    let snapshot = kernel
+        .snapshot()
+        .map_err(|_| ServicePvmErrorV2::SnapshotFailed)?;
+    if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
+        return Err(ServicePvmErrorV2::SnapshotFailed);
+    }
+    let continuation = ContinuationSnapshotV2 {
+        snapshot_version: super::SNAPSHOT_VERSION,
+        jar_semantics: super::EXECUTION_SEMANTICS_ID,
+        vos_abi: super::ABI_VERSION,
+        service: work.service.clone(),
+        invocation: work.invocation,
+        checkpoint_step: work.workflow_step,
+        actor: work.target,
+        actor_program: work.target_program,
+        await_ordinal: work.workflow_step,
+        pending_call: None,
+        kernel_snapshot: snapshot.to_bytes(),
+    };
+    let bytes = continuation.encode();
+    let reference = BlobRefV2::of_bytes(&bytes);
+    Ok((ImportedBlobV2 { reference, bytes }, snapshot))
+}
+
 fn run_refine_kernel<H: RefineProtocolHostV2>(
     mut kernel: InvocationKernel,
-    gas_limit: u64,
     host: &H,
+    fresh: bool,
+    suspension_work: Option<&WorkEnvelopeV2>,
+    invocation_layout: Option<(&[u8], &[DormantProgram<'_>])>,
+    mut exported_blobs: Vec<ImportedBlobV2>,
 ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
-    kernel
-        .vm_arena
-        .vm_mut(kernel.active_vm)
-        .transition(VmState::Running)
-        .map_err(|_| ServicePvmErrorV2::InvalidVmLifecycle)?;
-    kernel.set_entry_ic(REFINE_ENTRY_IC);
+    if fresh {
+        kernel
+            .vm_arena
+            .vm_mut(kernel.active_vm)
+            .transition(VmState::Running)
+            .map_err(|_| ServicePvmErrorV2::InvalidVmLifecycle)?;
+        kernel.set_entry_ic(REFINE_ENTRY_IC);
+    }
+    let starting_gas = kernel.active_gas();
 
     loop {
         match kernel.run() {
@@ -379,7 +497,8 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 let bytes = read_output(&kernel)?;
                 return Ok(ServicePvmOutputV2 {
                     bytes,
-                    gas_used: gas_limit.saturating_sub(kernel.active_gas()),
+                    gas_used: starting_gas.saturating_sub(kernel.active_gas()),
+                    exported_blobs,
                 });
             }
             KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
@@ -393,6 +512,55 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
             KernelResult::ProtocolCall { slot } => {
                 if !refine_protocol_call_is_pure(slot) {
                     return Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(slot));
+                }
+                if slot == crate::abi::hostcall::SUSPEND as u8 {
+                    if let Some(work) = suspension_work {
+                        let (artifact, snapshot) = capture_checkpoint(&mut kernel, work)?;
+                        let (service_program, dormant) = invocation_layout
+                            .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+                        let mut finalization = InvocationKernel::restore_with_dormant_programs(
+                            service_program,
+                            dormant,
+                            &snapshot,
+                            javm::PvmBackend::Default,
+                        )
+                        .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
+                        let expected = work
+                            .imported_actors
+                            .iter()
+                            .find(|actor| actor.actor == work.target)
+                            .and_then(|actor| actor.continuation.as_ref())
+                            .map(|continuation| continuation.hash);
+                        let token_len = write_checkpoint_token(
+                            &mut finalization,
+                            &CheckpointTokenV2 {
+                                input: work.input_id(),
+                                base: work.base.clone(),
+                                expected,
+                                replacement: Some(artifact.reference.clone()),
+                            },
+                        )?;
+                        finalization
+                            .resume_protocol_call(0, token_len)
+                            .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                        kernel = finalization;
+                        exported_blobs.push(artifact);
+                        continue;
+                    }
+                }
+                let mechanical_result = match slot as u32 {
+                    crate::abi::hostcall::GAS => Some([kernel.active_gas(), 0]),
+                    crate::abi::hostcall::GROW_HEAP => Some([0, 0]),
+                    // Debugging is deliberately non-observable to Refine. The
+                    // guest is told the full input length was accepted.
+                    crate::abi::hostcall::DEBUG_WRITE => Some([kernel.active_reg(8), 0]),
+                    _ => None,
+                };
+                if let Some([result0, result1]) = mechanical_result {
+                    kernel
+                        .resume_protocol_call(result0, result1)
+                        .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                    continue;
                 }
                 let mut registers = [0; 13];
                 for (index, register) in registers.iter_mut().enumerate() {
@@ -421,6 +589,22 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
             .vm_mut(kernel.active_vm)
             .cap_table
             .set(slot, Cap::Protocol(ProtocolCap { id: slot }));
+    }
+}
+
+fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usize) {
+    for vm in 1..=actor_count {
+        for slot in [
+            crate::abi::hostcall::GROW_HEAP as u8,
+            crate::abi::hostcall::DEBUG_WRITE as u8,
+            crate::abi::hostcall::SUSPEND as u8,
+        ] {
+            kernel
+                .vm_arena
+                .vm_mut(vm as u16)
+                .cap_table
+                .set(slot, Cap::Protocol(ProtocolCap { id: slot }));
+        }
     }
 }
 

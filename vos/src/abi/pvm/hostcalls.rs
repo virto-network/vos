@@ -33,6 +33,19 @@ pub fn suspend() -> u64 {
     ecall0(hostcall::SUSPEND)
 }
 
+/// Stop at an exact durable boundary and receive the post-snapshot VOS
+/// checkpoint token. The token buffer is deliberately guest-owned stack
+/// memory: JAR snapshots it before the host writes the token, so restoration
+/// cannot accidentally reuse the finalization fork's bytes.
+#[inline]
+pub fn suspend_checkpoint(token: &mut [u8]) -> [u64; 2] {
+    ecall2_pair(
+        hostcall::SUSPEND,
+        token.as_mut_ptr() as u64,
+        token.len() as u64,
+    )
+}
+
 /// Request additional heap pages.
 #[inline]
 pub fn grow_heap(pages: u32) -> u64 {

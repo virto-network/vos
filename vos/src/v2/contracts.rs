@@ -144,6 +144,20 @@ pub struct ActorSliceOutputV2 {
     pub reply: Vec<u8>,
     pub yielded: bool,
     pub forbidden: bool,
+    /// Present after a restored continuation or when this slice creates a new
+    /// durable checkpoint. The generic service uses it to bind the transition
+    /// to the current base and atomically replace/delete continuation state.
+    pub checkpoint: Option<CheckpointTokenV2>,
+}
+
+/// Pure host-to-guest handoff written only after JAR captured the exact
+/// pre-result machine snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointTokenV2 {
+    pub input: WorkInputIdV2,
+    pub base: ConsistencyBaseV2,
+    pub expected: Option<Hash>,
+    pub replacement: Option<BlobRefV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +558,7 @@ impl V2Wire for ActorSliceOutputV2 {
         e.bytes(&self.reply);
         e.bool(self.yielded);
         e.bool(self.forbidden);
+        e.option(&self.checkpoint, encode_checkpoint_token);
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -553,11 +568,31 @@ impl V2Wire for ActorSliceOutputV2 {
             reply: d.bytes()?,
             yielded: d.bool()?,
             forbidden: d.bool()?,
+            checkpoint: d.option(decode_checkpoint_token)?,
         };
-        if value.writes.iter().any(|write| write.actor != value.actor) {
+        if value.writes.iter().any(|write| write.actor != value.actor)
+            || (value.yielded
+                && value
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.replacement.as_ref())
+                    .is_none())
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
+    }
+}
+
+impl V2Wire for CheckpointTokenV2 {
+    const MAGIC: [u8; 4] = *b"VCP2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        encode_checkpoint_token(&mut Encoder(out), self);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_checkpoint_token(d)
     }
 }
 
@@ -833,6 +868,26 @@ fn encode_continuation_change(e: &mut Encoder<'_>, value: &ContinuationChangeV2)
     e.option(&value.replacement, encode_blob_ref);
 }
 
+fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
+    e.fixed(&value.input.invocation.0);
+    e.u64(value.input.workflow_step);
+    encode_base(e, &value.base);
+    e.option(&value.expected, |e, hash| e.fixed(&hash.0));
+    e.option(&value.replacement, encode_blob_ref);
+}
+
+fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, DecodeError> {
+    Ok(CheckpointTokenV2 {
+        input: WorkInputIdV2 {
+            invocation: InvocationId(d.fixed()?),
+            workflow_step: d.u64()?,
+        },
+        base: decode_base(d)?,
+        expected: d.option(|d| d.fixed().map(Hash))?,
+        replacement: d.option(decode_blob_ref)?,
+    })
+}
+
 fn decode_continuation_change(d: &mut Decoder<'_>) -> Result<ContinuationChangeV2, DecodeError> {
     Ok(ContinuationChangeV2 {
         actor: ActorId(d.fixed()?),
@@ -1032,6 +1087,7 @@ mod tests {
             reply: b"ok".to_vec(),
             yielded: false,
             forbidden: false,
+            checkpoint: None,
         };
         assert_eq!(
             ActorSliceOutputV2::decode(&output.encode()).unwrap(),
@@ -1043,6 +1099,42 @@ mod tests {
         assert_eq!(
             ActorSliceOutputV2::decode(&cross_actor_write.encode()),
             Err(DecodeError::NonCanonical)
+        );
+
+        let replacement = BlobRefV2::of_bytes(b"kernel snapshot");
+        let checkpoint = CheckpointTokenV2 {
+            input: WorkInputIdV2 {
+                invocation: InvocationId([24; 32]),
+                workflow_step: 3,
+            },
+            base: ConsistencyBaseV2::Linear {
+                revision: 3,
+                state_root: Hash([25; 32]),
+            },
+            expected: Some(Hash([26; 32])),
+            replacement: Some(replacement),
+        };
+        assert_eq!(
+            CheckpointTokenV2::decode(&checkpoint.encode()).unwrap(),
+            checkpoint
+        );
+
+        let mut invalid_yield = ActorSliceOutputV2 {
+            actor: ActorId([21; 32]),
+            writes: vec![],
+            reply: vec![],
+            yielded: true,
+            forbidden: false,
+            checkpoint: None,
+        };
+        assert_eq!(
+            ActorSliceOutputV2::decode(&invalid_yield.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+        invalid_yield.checkpoint = Some(checkpoint);
+        assert_eq!(
+            ActorSliceOutputV2::decode(&invalid_yield.encode()).unwrap(),
+            invalid_yield
         );
     }
 

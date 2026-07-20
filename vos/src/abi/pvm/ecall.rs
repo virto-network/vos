@@ -76,6 +76,12 @@ pub fn ecall6(id: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, obj_cap: u64
     _ecall(id as u64, a0, a1, a2, a3, a4, obj_cap)
 }
 
+/// Invoke a two-argument hostcall and preserve both result registers.
+#[inline(always)]
+pub fn ecall2_pair(id: u32, a0: u64, a1: u64) -> [u64; 2] {
+    _ecall_pair(id as u64, a0, a1, 0, 0, 0, VOS_OBJECT_CAP)
+}
+
 /// Reference a slot in the current CNode for a dynamic JAR management call.
 pub const fn local_cap_ref(slot: u8) -> u32 {
     slot as u32
@@ -189,5 +195,34 @@ fn _ecall(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 
 #[cfg(not(target_arch = "riscv64"))]
 #[inline(always)]
 fn _ecall(id: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    panic!("vos-abi ecalls require RISC-V target (id={id})")
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn _ecall_pair(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> [u64; 2] {
+    let ret0: u64;
+    let ret1: u64;
+    // SAFETY: same hostcall boundary as `_ecall`; JAR injects the one
+    // suspension result into phi[7]/phi[8] before execution resumes.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("t0") id,
+            inlateout("a0") a0 => ret0,
+            inlateout("a1") a1 => ret1,
+            in("a2") a2,
+            in("a3") a3,
+            in("a4") a4,
+            in("a5") a5,
+            options(nostack),
+        );
+    }
+    [ret0, ret1]
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline(always)]
+fn _ecall_pair(id: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> [u64; 2] {
     panic!("vos-abi ecalls require RISC-V target (id={id})")
 }

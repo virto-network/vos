@@ -781,6 +781,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let yielded = matches!(dispatch, DispatchResult::Yielded) || ctx.self_scheduled();
     let forbidden = ctx.was_forbidden();
     let reply = ctx.take_reply_bytes();
+    let checkpoint = ctx.__take_checkpoint_v2();
     let new_state = actor.encode();
     let state_changed = input.state.is_empty() || new_state != input.state;
     let writes = ctx
@@ -796,6 +797,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         reply,
         yielded,
         forbidden,
+        checkpoint,
     }
     .encode();
     assert!(

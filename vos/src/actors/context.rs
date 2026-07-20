@@ -60,6 +60,8 @@ pub struct Context<A: Actor> {
 
     // Cooperative scheduling
     self_schedule: bool,
+    #[cfg(feature = "pvm")]
+    checkpoint: Option<crate::v2::CheckpointTokenV2>,
 
     // Worker host I/O: the handler yields with a request, the host
     // fulfills it and provides the result before re-polling.
@@ -95,6 +97,8 @@ impl<A: Actor> Context<A> {
             pending_provides: Vec::new(),
             reply: None,
             self_schedule: false,
+            #[cfg(feature = "pvm")]
+            checkpoint: None,
             host_io_request: None,
             host_io_result: None,
             _phantom: core::marker::PhantomData,
@@ -671,7 +675,23 @@ impl<A: Actor> Context<A> {
     pub fn yield_now(&mut self) -> super::run::Yield {
         #[cfg(feature = "pvm")]
         {
-            let restored = crate::abi::pvm::hostcalls::suspend() == 1;
+            let restored = if self.actor_id.is_some() {
+                let mut token = [0u8; crate::v2::CHECKPOINT_TOKEN_CAPACITY];
+                let [resume_kind, token_len] =
+                    crate::abi::pvm::hostcalls::suspend_checkpoint(&mut token);
+                let token_len = usize::try_from(token_len)
+                    .expect("checkpoint token length exceeds guest usize");
+                assert!(token_len <= token.len(), "checkpoint token exceeds buffer");
+                self.checkpoint = Some(
+                    <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
+                        &token[..token_len],
+                    )
+                    .expect("invalid v2 checkpoint token"),
+                );
+                resume_kind == 1
+            } else {
+                crate::abi::pvm::hostcalls::suspend() == 1
+            };
             if restored {
                 // The snapshot is taken before the suspension call observes
                 // a result, so it still contains the effect queues that the
@@ -694,6 +714,12 @@ impl<A: Actor> Context<A> {
             self.self_schedule = true;
             super::run::Yield::once()
         }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __take_checkpoint_v2(&mut self) -> Option<crate::v2::CheckpointTokenV2> {
+        self.checkpoint.take()
     }
 
     /// Checkpoint state and yield. `sleep` is an alias for
