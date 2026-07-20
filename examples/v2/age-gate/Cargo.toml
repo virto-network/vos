@@ -1,0 +1,8 @@
+[package]
+name = "v2-age-gate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+private-age = { package = "v2-private-age", path = "../private-age", default-features = false }
+vos.workspace = true
