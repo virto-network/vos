@@ -1725,55 +1725,123 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         .iter()
         .find(|actor| actor.actor == work.target)
         .and_then(|actor| actor.continuation.as_ref());
-    let change = match envelope.transition.continuations.as_slice() {
-        [] if current.is_none() => return Ok(None),
-        [] => {
-            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
-        }
-        [change] if change.actor == work.target => change,
-        _ => {
-            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
-        }
+    let changes = &envelope.transition.continuations;
+    if changes.is_empty() {
+        return Ok(current
+            .is_some()
+            .then_some(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    let Some(target_change) = changes
+        .binary_search_by_key(&work.target, |change| change.actor)
+        .ok()
+        .map(|index| &changes[index])
+    else {
+        return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     };
-    if current.map(|reference| reference.hash) != change.expected {
+    if current.map(|reference| reference.hash) != target_change.expected {
         return Ok(Some(AccumulationRejectionV2::ContinuationConflict(
             work.target,
         )));
     }
-    let Some(replacement) = change.replacement.as_ref() else {
-        return Ok(None);
-    };
-    let candidate = envelope
-        .provided_blobs
-        .binary_search_by_key(&replacement.hash, |blob| blob.reference.hash)
-        .ok()
-        .filter(|index| envelope.provided_blobs[*index].reference == *replacement)
-        .map(|index| envelope.provided_blobs[index].bytes.clone());
-    let bytes = match candidate {
-        Some(bytes) => bytes,
-        None => match store
-            .load_blob(replacement)
+
+    let previous = if let Some(reference) = current {
+        let Some(bytes) = store
+            .load_blob(reference)
             .map_err(GuestAccumulateError::Storage)?
-        {
-            Some(bytes) => bytes,
-            None => {
-                return Ok(Some(AccumulationRejectionV2::MissingBlob(replacement.hash)));
-            }
-        },
-    };
-    if BlobRefV2::of_bytes(&bytes) != *replacement {
-        return Err(GuestAccumulateError::CorruptStore);
-    }
-    let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
-        Ok(snapshot) => snapshot,
-        Err(_) => {
-            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        else {
+            return Ok(Some(AccumulationRejectionV2::MissingBlob(reference.hash)));
+        };
+        if BlobRefV2::of_bytes(&bytes) != *reference {
+            return Err(GuestAccumulateError::CorruptStore);
         }
+        let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
+            Ok(snapshot) if snapshot.validate_resume_for(work).is_ok() => snapshot,
+            _ => {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+        };
+        Some(snapshot)
+    } else {
+        None
     };
-    if snapshot.validate_checkpoint_for(work).is_err() {
+
+    let replacement = target_change.replacement.as_ref();
+    let next = if let Some(reference) = replacement {
+        let candidate = envelope
+            .provided_blobs
+            .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+            .ok()
+            .filter(|index| envelope.provided_blobs[*index].reference == *reference)
+            .map(|index| envelope.provided_blobs[index].bytes.clone());
+        let bytes = match candidate {
+            Some(bytes) => bytes,
+            None => match store
+                .load_blob(reference)
+                .map_err(GuestAccumulateError::Storage)?
+            {
+                Some(bytes) => bytes,
+                None => {
+                    return Ok(Some(AccumulationRejectionV2::MissingBlob(reference.hash)));
+                }
+            },
+        };
+        if BlobRefV2::of_bytes(&bytes) != *reference {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
+            Ok(snapshot) if snapshot.validate_checkpoint_for(work).is_ok() => snapshot,
+            _ => {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+        };
+        Some(snapshot)
+    } else {
+        None
+    };
+
+    let previous_actors = previous
+        .as_ref()
+        .map(|snapshot| snapshot.suspended_actors.as_slice())
+        .unwrap_or_default();
+    let next_actors = next
+        .as_ref()
+        .map(|snapshot| snapshot.suspended_actors.as_slice())
+        .unwrap_or_default();
+    let mut changed = previous_actors.to_vec();
+    changed.extend_from_slice(next_actors);
+    changed.sort_unstable();
+    changed.dedup();
+    if changed.len() != changes.len() {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
-    if let Some(call) = snapshot.pending_call {
+    for (actor, change) in changed.iter().zip(changes) {
+        let imported = work
+            .imported_actors
+            .binary_search_by_key(actor, |candidate| candidate.actor)
+            .ok()
+            .map(|index| &work.imported_actors[index]);
+        let expected = previous_actors
+            .binary_search(actor)
+            .ok()
+            .and_then(|_| current.map(|reference| reference.hash));
+        let replacement = next_actors
+            .binary_search(actor)
+            .ok()
+            .and_then(|_| replacement.cloned());
+        let imported_continuation = imported
+            .and_then(|actor| actor.continuation.as_ref())
+            .map(|reference| reference.hash);
+        if change.actor != *actor
+            || change.expected != expected
+            || change.replacement != replacement
+            || imported.is_none()
+            || imported_continuation != expected
+        {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    }
+
+    if let Some(call) = next.as_ref().and_then(|snapshot| snapshot.pending_call) {
         let matching = envelope
             .transition
             .outbox
@@ -2650,6 +2718,7 @@ mod tests {
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: None,
+            suspended_actors: vec![first_work.target],
             kernel_snapshot: vec![1],
         }
         .encode();
@@ -2805,6 +2874,7 @@ mod tests {
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: Some(call),
+            suspended_actors: vec![first_work.target],
             kernel_snapshot: vec![1],
         }
         .encode();

@@ -604,12 +604,25 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
     assert_eq!(first.outbox[0].from, child);
     assert_eq!(first.outbox[0].to, ActorId([44; 32]));
     assert_eq!(first.outbox[0].deadline_timeslot, Some(100));
-    assert_eq!(first.continuations.len(), 1);
-    assert_eq!(first.continuations[0].actor, seed.target);
+    assert_eq!(
+        first
+            .continuations
+            .iter()
+            .map(|change| change.actor)
+            .collect::<Vec<_>>(),
+        vec![seed.target, child]
+    );
     let continuation = first.continuations[0]
         .replacement
         .clone()
         .expect("the complete nested machine stack is exported");
+    assert!(
+        first
+            .continuations
+            .iter()
+            .all(|change| change.expected.is_none()
+                && change.replacement.as_ref() == Some(&continuation))
+    );
     assert_eq!(
         first
             .writes
@@ -633,6 +646,20 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
             artifact.reference
         );
     }
+    let mut incomplete_checkpoint = first.clone();
+    incomplete_checkpoint.continuations.pop();
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: nested.work.clone(),
+                transition: incomplete_checkpoint,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::InvalidWorkflowTransition),
+        "guest Accumulate rejects a checkpoint that omits an active child"
+    );
     let first_apply = service
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: nested.work.clone(),
@@ -647,6 +674,28 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
             ..
         }
     ));
+    let mut child_message = vec![vos::value::TAG_DYNAMIC];
+    child_message.extend_from_slice(&Msg::new("increment").with("amount", 1u32).encode());
+    let child_request = LocalWorkRequestV2 {
+        invocation: InvocationId([72; 32]),
+        workflow_step: 0,
+        logical_timeslot: 3,
+        target: child,
+        method: "increment".into(),
+        arguments: child_message,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), child_request.clone()),
+        Err(ScheduleErrorV2::ActorBusy(child)),
+        "the active child is non-reentrant while its caller stack is suspended"
+    );
 
     let persisted = service.accumulate_host().snapshot_bytes();
     let restarted_store = LocalJamStoreV2::from_snapshot_bytes(&persisted)
@@ -694,9 +743,12 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
         Some(awaited_reply),
     )
     .expect("the scheduler reconstructs the nested workflow from guest state");
-    assert_eq!(
-        resumed.work.imported_actors[0].continuation,
-        Some(continuation.clone())
+    assert!(
+        resumed
+            .work
+            .imported_actors
+            .iter()
+            .all(|actor| actor.continuation.as_ref() == Some(&continuation))
     );
     let resumed_bytes = runner
         .refine_actor_tree_with_backend(
@@ -726,9 +778,13 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
         resumed_output
             .transition
             .continuations
-            .first()
-            .map(|change| (&change.expected, &change.replacement)),
-        Some((&Some(continuation.hash), &None))
+            .iter()
+            .map(|change| (change.actor, change.expected, change.replacement.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (seed.target, Some(continuation.hash), None),
+            (child, Some(continuation.hash), None),
+        ]
     );
     assert_eq!(
         resumed_output
@@ -768,6 +824,10 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
             ..
         }
     ));
+    assert!(
+        LocalWorkSchedulerV2::prepare(restarted.accumulate_host(), child_request).is_ok(),
+        "completion unlocks every actor from the exact suspended stack"
+    );
 }
 
 #[test]
@@ -1057,15 +1117,15 @@ fn canonical_guest_rejects_a_nested_actor_without_the_reply_abi() {
         }],
     };
 
-    assert_eq!(
+    assert!(matches!(
         service.refine_actor_tree(
             &work.encode(),
             &imports,
             10_000_000,
             &NoRefineProtocolHostV2,
         ),
-        Err(ServicePvmErrorV2::Panic)
-    );
+        Err(ServicePvmErrorV2::Panic { vm: 0, .. })
+    ));
 }
 
 #[test]
@@ -1789,6 +1849,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor_program,
         await_ordinal: 0,
         pending_call: None,
+        suspended_actors: vec![work.target],
         kernel_snapshot: vec![1],
     };
     let continuation_bytes = continuation.encode();

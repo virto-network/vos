@@ -175,11 +175,40 @@ mod guest {
             if let Some(replacement) = checkpoint.replacement.as_ref() {
                 exported_blobs.push(replacement.clone());
             }
-            continuations.push(ContinuationChangeV2 {
-                actor: work.target,
-                expected: checkpoint.expected,
-                replacement: checkpoint.replacement,
-            });
+            if checkpoint
+                .previously_suspended
+                .binary_search(&work.target)
+                .is_err()
+                && checkpoint.suspended.binary_search(&work.target).is_err()
+            {
+                fail_closed();
+            }
+            let mut changed = checkpoint.previously_suspended.clone();
+            changed.extend(checkpoint.suspended.iter().copied());
+            changed.sort_unstable();
+            changed.dedup();
+            for actor in changed {
+                if !work
+                    .imported_actors
+                    .iter()
+                    .any(|candidate| candidate.actor == actor)
+                {
+                    fail_closed();
+                }
+                continuations.push(ContinuationChangeV2 {
+                    actor,
+                    expected: checkpoint
+                        .previously_suspended
+                        .binary_search(&actor)
+                        .ok()
+                        .and(checkpoint.expected),
+                    replacement: checkpoint
+                        .suspended
+                        .binary_search(&actor)
+                        .ok()
+                        .and_then(|_| checkpoint.replacement.clone()),
+                });
+            }
         } else if actor_output.yielded {
             fail_closed();
         }

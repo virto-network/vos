@@ -263,6 +263,11 @@ pub struct CheckpointTokenV2 {
     pub expected: Option<Hash>,
     pub replacement: Option<BlobRefV2>,
     pub pending_call: Option<CallId>,
+    /// Actors locked by the continuation being replaced or deleted.
+    pub previously_suspended: Vec<ActorId>,
+    /// Exact actor stack locked by `replacement`. Empty when the workflow
+    /// completes and deletes its continuation.
+    pub suspended: Vec<ActorId>,
 }
 
 /// Actor-to-scheduler portion of a durable cross-root call.
@@ -1228,6 +1233,13 @@ impl V2Wire for ActorSliceOutputV2 {
                     .as_ref()
                     .and_then(|checkpoint| checkpoint.replacement.as_ref())
                     .is_none())
+            || value.checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint
+                    .previously_suspended
+                    .binary_search(&value.actor)
+                    .is_err()
+                    && checkpoint.suspended.binary_search(&value.actor).is_err()
+            })
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -2702,6 +2714,8 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     e.option(&value.expected, |e, hash| e.fixed(&hash.0));
     e.option(&value.replacement, encode_blob_ref);
     e.option(&value.pending_call, |e, call| e.fixed(&call.0));
+    e.list(&value.previously_suspended, |e, actor| e.fixed(&actor.0));
+    e.list(&value.suspended, |e, actor| e.fixed(&actor.0));
 }
 
 fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, DecodeError> {
@@ -2712,8 +2726,18 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         expected: d.option(|d| d.fixed().map(Hash))?,
         replacement: d.option(decode_blob_ref)?,
         pending_call: d.option(|d| d.fixed().map(CallId))?,
+        previously_suspended: d.list(|d| d.fixed().map(ActorId))?,
+        suspended: d.list(|d| d.fixed().map(ActorId))?,
     };
     if matches!(value.base, ConsistencyBaseV2::Linear { .. }) != value.base_causal_height.is_none()
+        || value.expected.is_some() != !value.previously_suspended.is_empty()
+        || value.replacement.is_some() != !value.suspended.is_empty()
+        || (value.previously_suspended.is_empty() && value.suspended.is_empty())
+        || value
+            .previously_suspended
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || value.suspended.windows(2).any(|pair| pair[0] >= pair[1])
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -3045,6 +3069,8 @@ mod tests {
             expected: Some(Hash([26; 32])),
             replacement: Some(replacement),
             pending_call: Some(InvocationId([24; 32]).call_id(3)),
+            previously_suspended: vec![ActorId([21; 32])],
+            suspended: vec![ActorId([21; 32]), ActorId([23; 32])],
         };
         assert_eq!(
             CheckpointTokenV2::decode(&checkpoint.encode()).unwrap(),
@@ -3075,6 +3101,7 @@ mod tests {
         let resume = AwaitResumeV2 {
             checkpoint: CheckpointTokenV2 {
                 replacement: None,
+                suspended: vec![],
                 ..checkpoint.clone()
             },
             reply: ReplyRecordV2 {

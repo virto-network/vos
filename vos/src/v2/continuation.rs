@@ -29,6 +29,10 @@ pub struct ContinuationSnapshotV2 {
     pub await_ordinal: u64,
     /// `None` for an explicit scheduler yield; `Some` for an awaited call.
     pub pending_call: Option<CallId>,
+    /// Exact actors whose machines are running or waiting on the nested JAR
+    /// call stack. Each is non-reentrant until this continuation is replaced
+    /// by a snapshot that omits it or is deleted on completion.
+    pub suspended_actors: Vec<ActorId>,
     pub kernel_snapshot: Vec<u8>,
 }
 
@@ -47,6 +51,12 @@ impl ContinuationSnapshotV2 {
             return Err(DecodeError::InvalidVersion);
         }
         if self.kernel_snapshot.is_empty()
+            || self.suspended_actors.is_empty()
+            || self.suspended_actors.binary_search(&self.actor).is_err()
+            || self
+                .suspended_actors
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || self
                 .pending_call
                 .is_some_and(|call| call != self.invocation.call_id(self.await_ordinal))
@@ -102,6 +112,7 @@ impl V2Wire for ContinuationSnapshotV2 {
         e.fixed(&self.actor_program.0);
         e.u64(self.await_ordinal);
         e.option(&self.pending_call, |e, call| e.fixed(&call.0));
+        e.list(&self.suspended_actors, |e, actor| e.fixed(&actor.0));
         e.bytes(&self.kernel_snapshot);
     }
 
@@ -117,6 +128,7 @@ impl V2Wire for ContinuationSnapshotV2 {
             actor_program: ProgramId(d.fixed()?),
             await_ordinal: d.u64()?,
             pending_call: d.option(|d| d.fixed().map(CallId))?,
+            suspended_actors: d.list(|d| d.fixed().map(ActorId))?,
             kernel_snapshot: d.bytes()?,
         };
         value.validate()?;
@@ -179,6 +191,7 @@ mod tests {
             actor_program: ProgramId([6; 32]),
             await_ordinal: 3,
             pending_call: Some(invocation.call_id(3)),
+            suspended_actors: vec![ActorId([5; 32])],
             kernel_snapshot: b"canonical JAR kernel snapshot".to_vec(),
         }
     }

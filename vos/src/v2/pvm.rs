@@ -42,7 +42,7 @@ pub enum ServicePvmErrorV2 {
     InvalidProgram,
     ProgramIdMismatch,
     InvalidServiceEntries,
-    Panic,
+    Panic { vm: u16, pc: u32 },
     OutOfGas { vm: u16, pc: u32 },
     PageFault { vm: u16, address: u32 },
     UnreadableOutput,
@@ -175,6 +175,7 @@ impl ServicePvmV2 {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -277,6 +278,8 @@ impl ServicePvmV2 {
                 expected: Some(reference.hash),
                 replacement: None,
                 pending_call: continuation.pending_call,
+                previously_suspended: continuation.suspended_actors.clone(),
+                suspended: Vec::new(),
             };
             let (resume_kind, payload_len) =
                 match (continuation.pending_call, work.awaited_reply.as_ref()) {
@@ -303,6 +306,7 @@ impl ServicePvmV2 {
                 false,
                 Some(&work),
                 Some((&self.program, &dormant)),
+                continuation.suspended_actors,
                 Vec::new(),
             );
         }
@@ -369,6 +373,7 @@ impl ServicePvmV2 {
             Some(&work),
             Some((&self.program, &dormant)),
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -419,7 +424,12 @@ impl ServicePvmV2 {
                         exported_blobs: Vec::new(),
                     });
                 }
-                KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
+                KernelResult::Panic => {
+                    return Err(ServicePvmErrorV2::Panic {
+                        vm: kernel.active_vm,
+                        pc: kernel.vm_arena.vm(kernel.active_vm).pc,
+                    });
+                }
                 KernelResult::OutOfGas => {
                     return Err(ServicePvmErrorV2::OutOfGas {
                         vm: kernel.active_vm,
@@ -607,7 +617,15 @@ fn write_suspension_payload(
 fn capture_checkpoint(
     kernel: &mut InvocationKernel,
     work: &WorkEnvelopeV2,
-) -> Result<(ImportedBlobV2, KernelSnapshot, Option<super::CallId>), ServicePvmErrorV2> {
+) -> Result<
+    (
+        ImportedBlobV2,
+        KernelSnapshot,
+        Option<super::CallId>,
+        Vec<super::ActorId>,
+    ),
+    ServicePvmErrorV2,
+> {
     let awaited = kernel.active_reg(10) == super::AWAIT_SUSPEND_MAGIC;
     let await_ordinal = if awaited {
         kernel.active_reg(9)
@@ -621,6 +639,7 @@ fn capture_checkpoint(
     if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
         return Err(ServicePvmErrorV2::SnapshotFailed);
     }
+    let suspended_actors = suspended_actor_stack(&snapshot, work)?;
     let continuation = ContinuationSnapshotV2 {
         snapshot_version: super::SNAPSHOT_VERSION,
         jar_semantics: super::EXECUTION_SEMANTICS_ID,
@@ -632,11 +651,46 @@ fn capture_checkpoint(
         actor_program: work.target_program,
         await_ordinal,
         pending_call,
+        suspended_actors: suspended_actors.clone(),
         kernel_snapshot: snapshot.to_bytes(),
     };
     let bytes = continuation.encode();
     let reference = BlobRefV2::of_bytes(&bytes);
-    Ok((ImportedBlobV2 { reference, bytes }, snapshot, pending_call))
+    Ok((
+        ImportedBlobV2 { reference, bytes },
+        snapshot,
+        pending_call,
+        suspended_actors,
+    ))
+}
+
+fn suspended_actor_stack(
+    snapshot: &KernelSnapshot,
+    work: &WorkEnvelopeV2,
+) -> Result<Vec<super::ActorId>, ServicePvmErrorV2> {
+    let mut actors = Vec::with_capacity(work.imported_actors.len());
+    actors.push(work.target);
+    actors.extend(
+        work.imported_actors
+            .iter()
+            .filter(|actor| actor.actor != work.target)
+            .map(|actor| actor.actor),
+    );
+    let mut suspended = snapshot
+        .call_stack
+        .iter()
+        .map(|frame| frame.caller_vm_id)
+        .chain(core::iter::once(snapshot.active_vm))
+        .filter(|vm| *vm != 0)
+        .map(|vm| actors.get(vm.checked_sub(1)? as usize).copied())
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ServicePvmErrorV2::SnapshotFailed)?;
+    suspended.sort_unstable();
+    suspended.dedup();
+    if suspended.is_empty() || suspended.binary_search(&work.target).is_err() {
+        return Err(ServicePvmErrorV2::SnapshotFailed);
+    }
+    Ok(suspended)
 }
 
 fn run_refine_kernel<H: RefineProtocolHostV2>(
@@ -646,6 +700,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
     fresh: bool,
     suspension_work: Option<&WorkEnvelopeV2>,
     invocation_layout: Option<(&[u8], &[DormantProgram<'_>])>,
+    previously_suspended: Vec<super::ActorId>,
     mut exported_blobs: Vec<ImportedBlobV2>,
 ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
     if fresh {
@@ -668,7 +723,12 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                     exported_blobs,
                 });
             }
-            KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
+            KernelResult::Panic => {
+                return Err(ServicePvmErrorV2::Panic {
+                    vm: kernel.active_vm,
+                    pc: kernel.vm_arena.vm(kernel.active_vm).pc,
+                });
+            }
             KernelResult::OutOfGas => {
                 return Err(ServicePvmErrorV2::OutOfGas {
                     vm: kernel.active_vm,
@@ -687,7 +747,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 }
                 if slot == crate::abi::hostcall::SUSPEND as u8 {
                     if let Some(work) = suspension_work {
-                        let (artifact, snapshot, pending_call) =
+                        let (artifact, snapshot, pending_call, suspended) =
                             capture_checkpoint(&mut kernel, work)?;
                         let (service_program, dormant) =
                             invocation_layout.ok_or(ServicePvmErrorV2::InvalidContinuation)?;
@@ -713,6 +773,8 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                                 expected,
                                 replacement: Some(artifact.reference.clone()),
                                 pending_call,
+                                previously_suspended: previously_suspended.clone(),
+                                suspended,
                             },
                         )?;
                         finalization
@@ -1172,10 +1234,10 @@ mod tests {
         let panicking = service_program(None, Some(crate::abi::hostcall::STORAGE_W), true);
         let service = ServicePvmV2::new(panicking.clone(), ProgramId::of_pvm(&panicking)).unwrap();
         let mut host = RecordingAccumulateHost::default();
-        assert_eq!(
+        assert!(matches!(
             service.accumulate(&[], 1_000_000, &mut host),
-            Err(ServicePvmErrorV2::Panic)
-        );
+            Err(ServicePvmErrorV2::Panic { vm: 0, .. })
+        ));
         assert_eq!(host.committed_calls, 0);
 
         let committing = service_program(None, Some(crate::abi::hostcall::STORAGE_W), false);
