@@ -22,12 +22,16 @@ const HEADER_STORAGE_KEY: &[u8] = b"\0vos/v2/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
+const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreHeaderV2 {
     pub schema_version: u16,
     pub service: ServiceIdentityV2,
     pub consistency: ConsistencyModeV2,
+    /// Root of the guest-owned service metadata/workflow tree. It exists for
+    /// every consistency mode; CRDT receipts expose causal heads instead.
+    pub service_root: Hash,
     /// Exact current revision for Ephemeral, Local, and Raft. CRDT services
     /// derive receipt sequence from causal height and keep this at zero.
     pub revision: u64,
@@ -42,6 +46,7 @@ impl StoreHeaderV2 {
             schema_version: SERVICE_STORE_SCHEMA_VERSION,
             service,
             consistency,
+            service_root: super::state_tree::empty_state_root(),
             revision: 0,
             state_root: (consistency != ConsistencyModeV2::Crdt)
                 .then(super::state_tree::empty_state_root),
@@ -82,6 +87,7 @@ impl V2Wire for StoreHeaderV2 {
         e.u16(self.schema_version);
         encode_service(&mut e, &self.service);
         e.u8(self.consistency as u8);
+        e.fixed(&self.service_root.0);
         e.u64(self.revision);
         e.option(&self.state_root, |e, root| e.fixed(&root.0));
         e.list(&self.crdt_heads, |e, head| e.fixed(&head.0));
@@ -93,6 +99,7 @@ impl V2Wire for StoreHeaderV2 {
             schema_version: d.u16()?,
             service: decode_service(d)?,
             consistency: decode_consistency(d)?,
+            service_root: Hash(d.fixed()?),
             revision: d.u64()?,
             state_root: d.option(|d| d.fixed().map(Hash))?,
             crdt_heads: d.list(|d| d.fixed().map(Hash))?,
@@ -102,7 +109,7 @@ impl V2Wire for StoreHeaderV2 {
         let valid_commitment = match value.consistency {
             ConsistencyModeV2::Crdt => value.state_root.is_none() && value.revision == 0,
             ConsistencyModeV2::Ephemeral | ConsistencyModeV2::Local | ConsistencyModeV2::Raft => {
-                value.state_root.is_some() && value.crdt_heads.is_empty()
+                value.state_root == Some(value.service_root) && value.crdt_heads.is_empty()
             }
         };
         if !valid_commitment {
@@ -207,6 +214,35 @@ pub struct DedupRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+/// Non-recursive workflow row covered by the service tree. Receipts live in
+/// the physical bookkeeping namespace because including their resulting root
+/// in this row would make the commitment circular.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowCheckpointV2 {
+    pub input: WorkInputIdV2,
+    pub work_hash: Hash,
+    pub transition_hash: Hash,
+}
+
+impl V2Wire for WorkflowCheckpointV2 {
+    const MAGIC: [u8; 4] = *b"VWF2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_input(&mut e, self.input);
+        e.fixed(&self.work_hash.0);
+        e.fixed(&self.transition_hash.0);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            input: decode_input(d)?,
+            work_hash: Hash(d.fixed()?),
+            transition_hash: Hash(d.fixed()?),
+        })
+    }
+}
+
 impl V2Wire for DedupRecordV2 {
     const MAGIC: [u8; 4] = *b"VDD2";
 
@@ -250,6 +286,13 @@ pub fn crdt_node_storage_key(cid: Hash) -> Vec<u8> {
     let mut key = Vec::with_capacity(CRDT_NODE_STORAGE_PREFIX.len() + cid.0.len());
     key.extend_from_slice(CRDT_NODE_STORAGE_PREFIX);
     key.extend_from_slice(&cid.0);
+    key
+}
+
+pub fn crdt_change_storage_key(change: super::ChangeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CRDT_CHANGE_STORAGE_PREFIX.len() + change.0.len());
+    key.extend_from_slice(CRDT_CHANGE_STORAGE_PREFIX);
+    key.extend_from_slice(&change.0);
     key
 }
 
@@ -341,7 +384,10 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::v2::{ABI_VERSION, DeploymentId, EXECUTION_SEMANTICS_ID, ProgramId, RootServiceId};
+    use crate::v2::{
+        ABI_VERSION, ChangeId, DeploymentId, EXECUTION_SEMANTICS_ID, ProgramId, RootServiceId,
+        empty_state_root,
+    };
 
     fn service(byte: u8) -> ServiceIdentityV2 {
         ServiceIdentityV2 {
@@ -367,11 +413,13 @@ mod tests {
         let linear = StoreHeaderV2::current(service(7), ConsistencyModeV2::Local);
         assert_eq!(StoreHeaderV2::open(&linear.encode()).unwrap(), linear);
         assert!(linear.state_root.is_some());
+        assert_eq!(linear.service_root, linear.state_root.unwrap());
 
         let crdt = StoreHeaderV2::current(service(9), ConsistencyModeV2::Crdt);
         assert_eq!(StoreHeaderV2::open(&crdt.encode()).unwrap(), crdt);
         assert_eq!(crdt.state_root, None);
         assert_eq!(crdt.revision, 0);
+        assert_eq!(crdt.service_root, empty_state_root());
     }
 
     #[test]
@@ -416,6 +464,10 @@ mod tests {
         assert_ne!(dedup, receipt);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
+        assert_ne!(
+            crdt_change_storage_key(ChangeId([6; 32])),
+            crdt_node_storage_key(Hash([6; 32]))
+        );
     }
 
     #[test]
