@@ -94,9 +94,9 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
     };
     match request {
         AccumulateRequestV2::Install(genesis) => install(store, &genesis),
-        AccumulateRequestV2::Apply(envelope) => apply(store, &envelope),
-        AccumulateRequestV2::PrepareAttested(_) => {
-            Ok(rejected(AccumulationRejectionV2::ProofUnavailable))
+        AccumulateRequestV2::Apply(envelope) => apply(store, &envelope, ApplyMode::Commit),
+        AccumulateRequestV2::PrepareAttested(envelope) => {
+            apply(store, &envelope, ApplyMode::PrepareAttested)
         }
         AccumulateRequestV2::Deliver(envelope) => deliver(store, &envelope),
         AccumulateRequestV2::AcknowledgePublication(acknowledgement) => {
@@ -104,6 +104,12 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
         }
         AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, &envelope),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    Commit,
+    PrepareAttested,
 }
 
 fn install<S: GuestAccumulateStoreV2>(
@@ -867,6 +873,7 @@ fn require_actor<S: StateTreeStore>(
 fn apply<S: GuestAccumulateStoreV2>(
     store: &mut S,
     envelope: &AccumulationEnvelopeV2,
+    mode: ApplyMode,
 ) -> GuestResult<AccumulationResultV2, S::Error> {
     let Some(header_bytes) = read(store, header_storage_key())? else {
         return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
@@ -928,10 +935,13 @@ fn apply<S: GuestAccumulateStoreV2>(
                 return Err(GuestAccumulateError::CorruptStore);
             }
         }
-        return Ok(AccumulationResultV2::Accepted {
-            receipt: record.receipt,
-            published: PublishedEffectsV2::default(),
-            duplicate: true,
+        return Ok(match mode {
+            ApplyMode::Commit => AccumulationResultV2::Accepted {
+                receipt: record.receipt,
+                published: PublishedEffectsV2::default(),
+                duplicate: true,
+            },
+            ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(record.receipt),
         });
     }
     if let Some(awaited_reply) = work.awaited_reply.as_ref()
@@ -984,15 +994,25 @@ fn apply<S: GuestAccumulateStoreV2>(
     if !work_matches_durable_inbox(&tree, work)? {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
-    if policy.attested || work.proof_requested {
-        return Ok(rejected(if transition.proof.is_none() {
-            AccumulationRejectionV2::MissingProof
-        } else {
-            AccumulationRejectionV2::ProofUnavailable
-        }));
-    }
-    if transition.proof.is_some() {
-        return Ok(rejected(AccumulationRejectionV2::ProofUnavailable));
+    let proof_required = policy.attested || work.proof_requested;
+    match mode {
+        ApplyMode::PrepareAttested => {
+            if !proof_required || transition.proof.is_some() {
+                return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+            }
+        }
+        ApplyMode::Commit => {
+            if proof_required {
+                return Ok(rejected(if transition.proof.is_none() {
+                    AccumulationRejectionV2::MissingProof
+                } else {
+                    AccumulationRejectionV2::ProofUnavailable
+                }));
+            }
+            if transition.proof.is_some() {
+                return Ok(rejected(AccumulationRejectionV2::ProofUnavailable));
+            }
+        }
     }
 
     if transition.consumed_input != work.input_id() {
@@ -1332,7 +1352,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         exported_blobs: transition.exported_blobs.clone(),
         proof: transition.proof.clone(),
     };
-    if published != PublishedEffectsV2::default() {
+    if mode == ApplyMode::Commit && published != PublishedEffectsV2::default() {
         let publication = PublicationRecordV2 {
             input: work.input_id(),
             receipt: receipt.clone(),
@@ -1345,10 +1365,13 @@ fn apply<S: GuestAccumulateStoreV2>(
         )?;
     }
 
-    Ok(AccumulationResultV2::Accepted {
-        receipt,
-        published,
-        duplicate: false,
+    Ok(match mode {
+        ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(receipt),
+        ApplyMode::Commit => AccumulationResultV2::Accepted {
+            receipt,
+            published,
+            duplicate: false,
+        },
     })
 }
 
