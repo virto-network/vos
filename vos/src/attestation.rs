@@ -296,6 +296,10 @@ fn authorization_input(authorization: &crate::v2::AuthorizationEvidenceV2) -> Ha
         crate::v2::AuthorizationEvidenceV2::Credential {
             credential_commitment,
             ..
+        }
+        | crate::v2::AuthorizationEvidenceV2::PrivateCredential {
+            credential_commitment,
+            ..
         } => *credential_commitment,
         crate::v2::AuthorizationEvidenceV2::SystemCapability { capability, .. } => {
             Hash(capability.0)

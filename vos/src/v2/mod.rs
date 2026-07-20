@@ -43,8 +43,8 @@ pub use contracts::{
     ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
     ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2,
-    ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
-    WorkflowOperationV2,
+    ServiceIdentityV2, ServiceInstallReceiptV2, SpaceRoleCredentialV2, TransitionV2,
+    WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -63,7 +63,7 @@ pub use local_store::{
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2,
     PackageRolePoliciesV2, VosPackageV2, artifact_hash, method_schema_hash, public_policy_hash,
-    space_role_policy_hash,
+    space_role_for_policy, space_role_policy_hash,
 };
 #[cfg(feature = "std")]
 pub use pvm::{
@@ -110,8 +110,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x56, 0xbe, 0x0f, 0xc4, 0xa7, 0xa4, 0xd2, 0xf3, 0x60, 0x1c, 0x5c, 0xc7, 0xf0, 0xe4, 0x33, 0x84,
-    0xb8, 0xa3, 0x19, 0x90, 0xbd, 0xeb, 0x2c, 0x08, 0xe2, 0x99, 0x6f, 0xfd, 0xad, 0x72, 0x6b, 0xe1,
+    0x07, 0xf2, 0x50, 0x3b, 0x03, 0x8c, 0xe3, 0xf6, 0xb5, 0x2e, 0x3a, 0x64, 0x3b, 0x3d, 0x5d, 0x14,
+    0xbe, 0xb1, 0x98, 0x4c, 0xa4, 0x9f, 0xfb, 0x4c, 0x6b, 0xb3, 0x44, 0x52, 0xb5, 0x5d, 0x62, 0x89,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

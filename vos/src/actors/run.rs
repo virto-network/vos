@@ -782,6 +782,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         causal_states,
         message,
         origin,
+        space_role,
     } = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
     let mut actor = lifecycle::load_or_create::<A>(Some(&state));
     for causal_state in causal_states {
@@ -796,6 +797,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let mut ctx = super::Context::new(ServiceId(0));
     ctx.__set_actor_id(actor_id);
     ctx.__set_origin(origin);
+    ctx.set_caller_roles(space_role, None);
 
     assert_eq!(
         A::CRDT,

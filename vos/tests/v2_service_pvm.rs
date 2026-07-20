@@ -24,8 +24,9 @@ use vos::v2::{
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
     ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
     ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, TransitionV2,
-    V2Wire, WorkEnvelopeV2,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2,
+    StateKeyV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2, public_policy_hash,
+    space_role_policy_hash,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -476,7 +477,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             methods: vec![MethodPolicyV2 {
                 method: "increment".into(),
                 schema: Hash([44; 32]),
-                policy: Hash([45; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -752,7 +753,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
             methods: vec![MethodPolicyV2 {
                 method: "increment_around_yield".into(),
                 schema: Hash([50; 32]),
-                policy: Hash([51; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -977,7 +978,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             methods: vec![MethodPolicyV2 {
                 method: "ping".into(),
                 schema: Hash([32; 32]),
-                policy: Hash([33; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -1270,7 +1271,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             methods: vec![MethodPolicyV2 {
                 method: "await_peer".into(),
                 schema: Hash([32; 32]),
-                policy: Hash([33; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -1556,7 +1557,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 methods: vec![MethodPolicyV2 {
                     method: "seed".into(),
                     schema: Hash([31; 32]),
-                    policy: Hash([32; 32]),
+                    policy: public_policy_hash(),
                     public: true,
                     attested: false,
                 }],
@@ -1570,7 +1571,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 methods: vec![MethodPolicyV2 {
                     method: "await_two_peers".into(),
                     schema: Hash([33; 32]),
-                    policy: Hash([34; 32]),
+                    policy: public_policy_hash(),
                     public: true,
                     attested: false,
                 }],
@@ -2115,7 +2116,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([32; 32]),
-                policy: Hash([33; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -2320,7 +2321,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             &MethodPolicyV2 {
                 method: proof_work.method.clone(),
                 schema: Hash([32; 32]),
-                policy: Hash([33; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             },
@@ -2922,6 +2923,15 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let mut seed = work(actor_program, initial.clone());
     seed.service.service_program = service_program;
+    let private_origin = Origin::Member(SubjectId([0xA7; 32]));
+    let private_policy = space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap();
+    let private_credential = SpaceRoleCredentialV2 {
+        holder: private_origin,
+        role: vos::SpaceRole::Developer,
+        authenticator: b"authenticated private role grant".to_vec(),
+    };
+    let (private_authorization, private_witness) =
+        private_credential.private_evidence(private_policy);
 
     let genesis = ServiceGenesisV2 {
         service: seed.service.clone(),
@@ -2935,8 +2945,8 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
             methods: vec![MethodPolicyV2 {
                 method: seed.method.clone(),
                 schema: Hash([0xA1; 32]),
-                policy: Hash([0xA2; 32]),
-                public: true,
+                policy: private_policy,
+                public: false,
                 attested: true,
             }],
         }],
@@ -2948,6 +2958,10 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     let install = AccumulateRequestV2::Install(genesis);
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(
+        host.import_blob(private_witness.bytes.clone()),
+        private_witness.reference
+    );
     assert_eq!(host.import_program(actor_pvm), actor_program);
     let mut service = JamServiceV2::new(
         service_pvm,
@@ -2974,13 +2988,13 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
             target: seed.target,
             method: seed.method,
             arguments: seed.arguments,
-            origin: seed.origin,
-            authorization: seed.authorization,
+            origin: private_origin,
+            authorization: private_authorization,
             causal_parent: None,
             parent_call: None,
             causal_context: None,
             awaited_reply: None,
-            imported_blobs: vec![],
+            imported_blobs: vec![private_witness.reference.clone()],
             proof_requested: true,
         },
     )
@@ -2991,6 +3005,15 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
             revision: 0,
             state_root: installed.resulting_state_root.unwrap(),
         }
+    );
+    assert!(prepared.imports.blobs.contains(&private_witness));
+    assert!(
+        !prepared
+            .work
+            .encode()
+            .windows(private_witness.bytes.len())
+            .any(|window| window == private_witness.bytes),
+        "the work wire carries only the private witness commitment and content reference"
     );
     let transition = TransitionV2 {
         service: prepared.work.service.clone(),
@@ -3102,7 +3125,7 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([32; 32]),
-                policy: Hash([33; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -3209,7 +3232,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
                 methods: vec![MethodPolicyV2 {
                     method: method.into(),
                     schema: Hash([91; 32]),
-                    policy: Hash([92; 32]),
+                    policy: public_policy_hash(),
                     public: true,
                     attested: false,
                 }],
@@ -3562,7 +3585,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([121; 32]),
-                policy: Hash([122; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -3847,7 +3870,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([0xD1; 32]),
-                policy: Hash([0xD2; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -4020,7 +4043,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([131; 32]),
-                policy: Hash([132; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: true,
             }],
@@ -4196,7 +4219,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([127; 32]),
-                policy: Hash([128; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],

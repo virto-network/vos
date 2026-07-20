@@ -62,13 +62,21 @@ impl ConsistencyBaseV2 {
 pub enum AuthorizationEvidenceV2 {
     /// Method policy explicitly allows anonymous invocation.
     Public,
-    /// Opaque credential and the generated policy it must satisfy. For an
-    /// attested method the credential is supplied to the prover privately;
-    /// only its commitment appears here.
+    /// Opaque credential disclosed to ordinary authorization validation and
+    /// the generated policy it must satisfy. Attested private roles use
+    /// [`Self::PrivateCredential`] instead.
     Credential {
         policy: Hash,
         credential_commitment: Hash,
         bytes: Vec<u8>,
+    },
+    /// Private attestation witness. Refine/proving receives the preimage as an
+    /// imported blob, while work and statement wires expose only this content
+    /// reference, the credential commitment, and the generated policy.
+    PrivateCredential {
+        policy: Hash,
+        credential_commitment: Hash,
+        witness: BlobRefV2,
     },
     /// Authenticated platform operation. This never bypasses the method's
     /// generated policy.
@@ -76,6 +84,19 @@ pub enum AuthorizationEvidenceV2 {
         capability: SystemCapabilityId,
         authenticator: Vec<u8>,
     },
+}
+
+/// Canonical authenticated space grant used as disclosed authorization input
+/// or as the private witness of an attested call.
+///
+/// `authenticator` is issued and checked by the platform credential provider;
+/// the generic service additionally binds the exact bytes to `holder`, the
+/// work origin, and the generated role-threshold policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceRoleCredentialV2 {
+    pub holder: Origin,
+    pub role: crate::SpaceRole,
+    pub authenticator: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +171,9 @@ pub struct ActorSliceInputV2 {
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
     pub origin: Origin,
+    /// Authenticated role recovered from the disclosed credential or private
+    /// witness before entering the canonical actor PVM.
+    pub space_role: Option<u8>,
 }
 
 /// Unique operation-allocation namespace for one actor dispatch inside a CRDT
@@ -1018,6 +1042,15 @@ impl V2Wire for WorkEnvelopeV2 {
         let proof_requested = d.bool()?;
         ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
+        if let AuthorizationEvidenceV2::PrivateCredential { witness, .. } = &authorization {
+            let present = imported_blobs
+                .binary_search_by_key(&witness.hash, |blob| blob.hash)
+                .ok()
+                .is_some_and(|index| imported_blobs[index] == *witness);
+            if !proof_requested || !present {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
         for actor in &imported_actors {
             ensure_sorted_unique(&actor.causal_states, |state| state.hash.0)?;
             if actor
@@ -1122,6 +1155,7 @@ impl V2Wire for ActorSliceInputV2 {
         e.list(&self.causal_states, |e, state| e.bytes(state));
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
+        e.option(&self.space_role, |e, role| e.u8(*role));
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1141,6 +1175,12 @@ impl V2Wire for ActorSliceInputV2 {
             causal_states: d.list(Decoder::bytes)?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
+            space_role: d.option(|d| {
+                let role = d.u8()?;
+                crate::SpaceRole::from_u8(role)
+                    .map(|_| role)
+                    .ok_or(DecodeError::NonCanonical)
+            })?,
         };
         if value.change.is_none() && !value.causal_states.is_empty() {
             return Err(DecodeError::NonCanonical);
@@ -1397,6 +1437,59 @@ impl V2Wire for BlobRefV2 {
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_blob_ref(d)
+    }
+}
+
+impl SpaceRoleCredentialV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/credential-commitment/v2", &[&self.encode()])
+    }
+
+    pub fn disclosed_evidence(&self, policy: Hash) -> AuthorizationEvidenceV2 {
+        let bytes = self.encode();
+        AuthorizationEvidenceV2::Credential {
+            policy,
+            credential_commitment: Hash::digest(b"vos/credential-commitment/v2", &[&bytes]),
+            bytes,
+        }
+    }
+
+    pub fn private_evidence(&self, policy: Hash) -> (AuthorizationEvidenceV2, ImportedBlobV2) {
+        let bytes = self.encode();
+        let reference = BlobRefV2::of_bytes(&bytes);
+        (
+            AuthorizationEvidenceV2::PrivateCredential {
+                policy,
+                credential_commitment: Hash::digest(b"vos/credential-commitment/v2", &[&bytes]),
+                witness: reference.clone(),
+            },
+            ImportedBlobV2 { reference, bytes },
+        )
+    }
+}
+
+impl V2Wire for SpaceRoleCredentialV2 {
+    const MAGIC: [u8; 4] = *b"VRC2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encode_origin(&mut encoder, self.holder);
+        encoder.u8(self.role.as_u8());
+        encoder.bytes(&self.authenticator);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            holder: decode_origin(decoder)?,
+            role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
+            authenticator: decoder.bytes()?,
+        };
+        if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
+            || value.authenticator.is_empty()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -2323,6 +2416,16 @@ fn encode_auth(e: &mut Encoder<'_>, value: &AuthorizationEvidenceV2) {
             e.fixed(&capability.0);
             e.bytes(authenticator);
         }
+        AuthorizationEvidenceV2::PrivateCredential {
+            policy,
+            credential_commitment,
+            witness,
+        } => {
+            e.u8(3);
+            e.fixed(&policy.0);
+            e.fixed(&credential_commitment.0);
+            encode_blob_ref(e, witness);
+        }
     }
 }
 
@@ -2337,6 +2440,11 @@ fn decode_auth(d: &mut Decoder<'_>) -> Result<AuthorizationEvidenceV2, DecodeErr
         2 => Ok(AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId(d.fixed()?),
             authenticator: d.bytes()?,
+        }),
+        3 => Ok(AuthorizationEvidenceV2::PrivateCredential {
+            policy: Hash(d.fixed()?),
+            credential_commitment: Hash(d.fixed()?),
+            witness: decode_blob_ref(d)?,
         }),
         _ => Err(DecodeError::InvalidTag),
     }
@@ -2751,6 +2859,41 @@ mod tests {
             WorkEnvelopeV2::decode(&sentinel.encode()),
             Err(DecodeError::NonCanonical)
         );
+
+        let origin = Origin::Member(SubjectId([43; 32]));
+        let credential = SpaceRoleCredentialV2 {
+            holder: origin,
+            role: crate::SpaceRole::Member,
+            authenticator: b"private role witness".to_vec(),
+        };
+        let policy =
+            super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
+        let (authorization, witness) = credential.private_evidence(policy);
+        let mut private = work();
+        private.origin = origin;
+        private.authorization = authorization;
+        private.imported_blobs = vec![witness.reference.clone()];
+        private.proof_requested = true;
+        assert_eq!(WorkEnvelopeV2::decode(&private.encode()).unwrap(), private);
+        assert!(
+            !private
+                .encode()
+                .windows(witness.bytes.len())
+                .any(|window| window == witness.bytes),
+            "private witness bytes are imports, not public work-wire fields"
+        );
+
+        private.proof_requested = false;
+        assert_eq!(
+            WorkEnvelopeV2::decode(&private.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+        private.proof_requested = true;
+        private.imported_blobs.clear();
+        assert_eq!(
+            WorkEnvelopeV2::decode(&private.encode()),
+            Err(DecodeError::NonCanonical)
+        );
     }
 
     #[test]
@@ -2825,6 +2968,7 @@ mod tests {
             causal_states: vec![b"concurrent".to_vec()],
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),
+            space_role: Some(crate::SpaceRole::Developer.as_u8()),
         };
         assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
 

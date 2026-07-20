@@ -169,7 +169,6 @@ impl VosPackageV2 {
     pub fn actor_genesis(
         &self,
         actor: ActorId,
-        name: String,
         parent: Option<ActorId>,
         initial_state: BlobRefV2,
     ) -> Result<ActorGenesisV2, PackageError> {
@@ -178,7 +177,6 @@ impl VosPackageV2 {
             .map_err(|_| PackageError::InvalidRolePolicies)?;
         Ok(ActorGenesisV2 {
             actor,
-            name,
             parent,
             program: self.manifest.actor_program,
             initial_state,
@@ -251,6 +249,19 @@ pub fn space_role_policy_hash(required_role: u8) -> Option<Hash> {
             &[core::slice::from_ref(&required_role)],
         )
     })
+}
+
+/// Recover the declared threshold from one of the four canonical v2 role
+/// predicates. Arbitrary hashes are not role policies.
+pub fn space_role_for_policy(policy: Hash) -> Option<crate::SpaceRole> {
+    [
+        crate::SpaceRole::Guest,
+        crate::SpaceRole::Member,
+        crate::SpaceRole::Developer,
+        crate::SpaceRole::Admin,
+    ]
+    .into_iter()
+    .find(|role| space_role_policy_hash(role.as_u8()) == Some(policy))
 }
 
 pub fn artifact_hash(kind: &[u8], bytes: &[u8]) -> Hash {
@@ -486,9 +497,7 @@ mod tests {
         let package = package();
         let actor = ActorId([7; 32]);
         let state = BlobRefV2::of_bytes(b"initial state");
-        let genesis = package
-            .actor_genesis(actor, "counter".into(), None, state.clone())
-            .unwrap();
+        let genesis = package.actor_genesis(actor, None, state.clone()).unwrap();
         let policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
         assert_eq!(genesis.actor, actor);
         assert_eq!(genesis.program, package.manifest.actor_program);
