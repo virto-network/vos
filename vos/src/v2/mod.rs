@@ -10,6 +10,7 @@
 //! This is a clean boundary. None of the types in this module accept legacy
 //! `RefinePayload`, `EffectLog`, or continuation encodings.
 
+mod causal;
 mod continuation;
 mod contracts;
 mod guest_accumulate;
