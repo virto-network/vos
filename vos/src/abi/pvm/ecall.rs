@@ -117,6 +117,36 @@ pub fn move_cap(subject: u32, object: u32) -> bool {
     _management_ecall(0, 0, 0, 0, 0x06, ((subject as u64) << 32) | object as u64) != RESULT_WHAT
 }
 
+/// Copy a copyable capability between CNodes using ordinary JAR cap
+/// references. HANDLE and DATA capabilities remain move-only and fail closed.
+#[inline(always)]
+pub fn copy_cap(subject: u32, object: u32) -> bool {
+    _management_ecall(0, 0, 0, 0, 0x07, ((subject as u64) << 32) | object as u64) != RESULT_WHAT
+}
+
+/// Downgrade a HANDLE into a CALLABLE placed at `object`.
+///
+/// The HANDLE remains owned by the scheduler. The actor receives only the
+/// authority to CALL the already-instantiated same-tree VM.
+#[inline(always)]
+pub fn downgrade_cap(subject: u32, object: u32) -> bool {
+    _management_ecall(0, 0, 0, 0, 0x0a, ((subject as u64) << 32) | object as u64) != RESULT_WHAT
+}
+
+/// CALL a dynamically selected HANDLE/CALLABLE with an optional move-only IPC
+/// DATA capability. The four values become the callee's `phi[7..=10]`.
+#[inline(always)]
+pub fn call_cap(subject: u32, ipc_cap_slot: u8, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    _management_ecall(
+        a0,
+        a1,
+        a2,
+        a3,
+        0x00,
+        ((subject as u64) << 32) | local_cap_ref(ipc_cap_slot) as u64,
+    )
+}
+
 /// Return from a nested JAR CALL through the reserved IPC capability slot.
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
