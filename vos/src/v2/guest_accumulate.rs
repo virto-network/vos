@@ -297,6 +297,9 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     }
 
+    if let Some(rejection) = validate_durable_messages(&tree, transition)? {
+        return Ok(rejected(rejection));
+    }
     if contains_cycle(&transition.outbox) {
         return Ok(rejected(AccumulationRejectionV2::MessageCycle));
     }
@@ -729,6 +732,76 @@ fn contains_cycle(messages: &[MessageRecordV2]) -> bool {
         .any(|actor| visit(*actor, &edges, &mut visiting, &mut visited))
 }
 
+/// Validate stable call IDs against both new and committed workflow rows, then
+/// walk each new outbound call through its causal parents. A child call must
+/// originate at its parent's recipient, cannot extend a parent deadline, and
+/// cannot target an actor already present in its causal caller chain.
+fn validate_durable_messages<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    transition: &super::TransitionV2,
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    let mut staged = BTreeMap::<super::CallId, MessageRecordV2>::new();
+    for message in transition.inbox.iter().chain(&transition.outbox) {
+        if staged.insert(message.call_id, message.clone()).is_some() {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+        if tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Inbox(message.call_id))?.is_some()
+            || tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(message.call_id))?
+                .is_some()
+        {
+            // Exact work retries were handled by the input dedup row before
+            // reaching this point. Reusing a call ID in different work is an
+            // invalid workflow transition even when the bytes are identical.
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    }
+
+    for message in &transition.outbox {
+        let mut current = message.clone();
+        let mut visited = BTreeSet::new();
+        while let Some(parent_id) = current.parent {
+            if !visited.insert(parent_id) || parent_id == message.call_id {
+                return Ok(Some(AccumulationRejectionV2::MessageCycle));
+            }
+            let Some(parent) = lookup_message(tree, &staged, parent_id)? else {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            };
+            if parent.to != current.from {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+            if let Some(parent_deadline) = parent.deadline_timeslot
+                && current
+                    .deadline_timeslot
+                    .is_none_or(|deadline| deadline > parent_deadline)
+            {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+            if parent.from == message.to {
+                return Ok(Some(AccumulationRejectionV2::MessageCycle));
+            }
+            current = parent;
+        }
+    }
+    Ok(None)
+}
+
+fn lookup_message<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    staged: &BTreeMap<super::CallId, MessageRecordV2>,
+    call: super::CallId,
+) -> GuestResult<Option<MessageRecordV2>, S::Error> {
+    if let Some(message) = staged.get(&call) {
+        return Ok(Some(message.clone()));
+    }
+    let inbox = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Inbox(call))?;
+    let outbox = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?;
+    match (inbox, outbox) {
+        (Some(_), Some(_)) => Err(GuestAccumulateError::CorruptStore),
+        (Some(message), None) | (None, Some(message)) => Ok(Some(message)),
+        (None, None) => Ok(None),
+    }
+}
+
 fn is_sorted_unique_by<T, K: Ord>(values: &[T], mut key: impl FnMut(&T) -> K) -> bool {
     values.windows(2).all(|pair| key(&pair[0]) < key(&pair[1]))
 }
@@ -1119,6 +1192,112 @@ mod tests {
         assert_eq!(
             store, before,
             "missing canonical actor code must stage no service changes"
+        );
+    }
+
+    fn message(
+        call: u8,
+        from: ActorId,
+        to: ActorId,
+        parent: Option<super::super::CallId>,
+        deadline_timeslot: Option<u64>,
+    ) -> MessageRecordV2 {
+        MessageRecordV2 {
+            call_id: super::super::CallId([call; 32]),
+            from,
+            to,
+            parent,
+            payload: vec![call],
+            deadline_timeslot,
+        }
+    }
+
+    #[test]
+    fn durable_messages_validate_parent_cycles_deadlines_and_call_ids() {
+        let mut installed = MemStore::default();
+        let (initial, receipt) =
+            install_fixture(&mut installed, ConsistencyModeV2::Local, b"before");
+        let root = receipt.resulting_state_root.unwrap();
+        let caller = ActorId([40; 32]);
+        let peer = ActorId([41; 32]);
+        let incoming = message(42, caller, actor(), None, Some(10));
+
+        let mut valid_work = linear_work(initial.clone(), root);
+        valid_work.invocation = InvocationId([43; 32]);
+        let mut valid = linear_transition(&valid_work, b"valid");
+        valid.inbox.push(incoming.clone());
+        valid
+            .outbox
+            .push(message(44, actor(), peer, Some(incoming.call_id), Some(9)));
+        let accepted = execute_guest_accumulate(
+            &mut installed,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: valid_work,
+                transition: valid,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(accepted, AccumulationResultV2::Accepted { .. }));
+
+        let reject = |outgoing: MessageRecordV2| {
+            let mut store = MemStore::default();
+            let (initial, receipt) =
+                install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+            let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+            let mut transition = linear_transition(&work, b"must-not-commit");
+            transition.inbox.push(incoming.clone());
+            transition.outbox.push(outgoing);
+            let before = store.clone();
+            let result = execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition }),
+            )
+            .unwrap();
+            assert_eq!(store, before);
+            result
+        };
+
+        assert_eq!(
+            reject(message(
+                45,
+                actor(),
+                caller,
+                Some(incoming.call_id),
+                Some(9),
+            )),
+            rejected(AccumulationRejectionV2::MessageCycle)
+        );
+        assert_eq!(
+            reject(message(46, actor(), peer, Some(incoming.call_id), Some(11),)),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(
+            reject(message(
+                47,
+                actor(),
+                peer,
+                Some(super::super::CallId([99; 32])),
+                Some(9),
+            )),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+
+        let mut store = MemStore::default();
+        let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        let mut collision = linear_transition(&work, b"must-not-commit");
+        collision.inbox.push(incoming.clone());
+        collision.outbox.push(incoming);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition: collision,
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
         );
     }
 
