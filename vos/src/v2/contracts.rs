@@ -1,3 +1,4 @@
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 #[cfg(test)]
 use alloc::vec;
@@ -295,6 +296,133 @@ pub struct AccumulationReceiptV2 {
     pub sequence: u64,
     pub checkpoint: u64,
     pub consistency: ConsistencyModeV2,
+}
+
+/// Generated policy bound to one actor method at service installation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodPolicyV2 {
+    pub method: String,
+    pub schema: Hash,
+    pub policy: Hash,
+    pub public: bool,
+    pub attested: bool,
+}
+
+/// One canonical actor installed into the root actor tree owned by a service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorGenesisV2 {
+    pub actor: ActorId,
+    /// `None` identifies the single root actor; every child names an actor in
+    /// the same genesis tree.
+    pub parent: Option<ActorId>,
+    pub program: ProgramId,
+    pub initial_state: BlobRefV2,
+    pub crdt: bool,
+    pub methods: Vec<MethodPolicyV2>,
+}
+
+/// Clean-break initialization accepted only by an empty v2 service store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceGenesisV2 {
+    pub service: ServiceIdentityV2,
+    pub consistency: ConsistencyModeV2,
+    pub actors: Vec<ActorGenesisV2>,
+    pub authorization: AuthorizationEvidenceV2,
+}
+
+/// Complete input required by guest-owned Accumulate to validate a Refine
+/// result. The host does not supply a journal or a native apply plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulationEnvelopeV2 {
+    pub work: WorkEnvelopeV2,
+    pub transition: TransitionV2,
+}
+
+/// Physical IC-5 request. `PrepareAttested` is wire-reserved now so adding the
+/// proof-before-commit flow does not silently reinterpret an Apply payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccumulateRequestV2 {
+    Install(ServiceGenesisV2),
+    Apply(AccumulationEnvelopeV2),
+    PrepareAttested(AccumulationEnvelopeV2),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishedEffectsV2 {
+    pub reply: Option<ReplyRecordV2>,
+    pub outbox: Vec<MessageRecordV2>,
+    pub exported_blobs: Vec<BlobRefV2>,
+    pub proof: Option<ProofCommitmentV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceInstallReceiptV2 {
+    pub service: ServiceIdentityV2,
+    pub consistency: ConsistencyModeV2,
+    pub resulting_state_root: Option<Hash>,
+    pub resulting_crdt_heads: Vec<Hash>,
+}
+
+/// Stable rejection codes returned without committing guest storage writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccumulationRejectionV2 {
+    StoreAlreadyInitialized,
+    StoreUninitialized,
+    WrongService,
+    WrongAbi,
+    WrongExecutionSemantics,
+    WrongProgram,
+    InvalidConsistency,
+    Unauthorized,
+    MissingBlob(Hash),
+    MissingProof,
+    ProofUnavailable,
+    InvalidProof,
+    StaleLinearWork {
+        expected_revision: u64,
+        actual_revision: u64,
+    },
+    StaleStateRoot,
+    MissingCausalDependency(Hash),
+    TransitionInputMismatch,
+    TransitionBaseMismatch,
+    DivergentDuplicate,
+    InvalidWorkflowTransition,
+    ContinuationConflict(ActorId),
+    MessageCycle,
+    StorageFull,
+    SequenceOverflow,
+    NonCanonical,
+}
+
+impl AccumulationRejectionV2 {
+    /// A retry can succeed without changing the submitted logical operation.
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::StaleLinearWork { .. }
+                | Self::StaleStateRoot
+                | Self::MissingBlob(_)
+                | Self::MissingCausalDependency(_)
+                | Self::ContinuationConflict(_)
+                | Self::StorageFull
+                | Self::ProofUnavailable
+        )
+    }
+}
+
+/// Guest output. Only `Installed` and `Accepted` authorize the local driver to
+/// commit its isolated transaction; `Prepared` and `Rejected` are read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccumulationResultV2 {
+    Installed(ServiceInstallReceiptV2),
+    Accepted {
+        receipt: AccumulationReceiptV2,
+        published: PublishedEffectsV2,
+        duplicate: bool,
+    },
+    Prepared(AccumulationReceiptV2),
+    Rejected(AccumulationRejectionV2),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -675,7 +803,389 @@ impl V2Wire for AccumulationReceiptV2 {
             consistency: ConsistencyModeV2::decode(d)?,
         };
         ensure_sorted_unique(&value.resulting_crdt_heads, |h| h.0)?;
+        validate_result_commitment(
+            value.consistency,
+            value.resulting_state_root,
+            &value.resulting_crdt_heads,
+        )?;
         Ok(value)
+    }
+}
+
+impl V2Wire for ServiceGenesisV2 {
+    const MAGIC: [u8; 4] = *b"VGN2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.u8(self.consistency as u8);
+        e.list(&self.actors, encode_actor_genesis);
+        encode_auth(&mut e, &self.authorization);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            consistency: ConsistencyModeV2::decode(d)?,
+            actors: d.list(decode_actor_genesis)?,
+            authorization: decode_auth(d)?,
+        };
+        validate_genesis(&value)?;
+        Ok(value)
+    }
+}
+
+impl V2Wire for AccumulationEnvelopeV2 {
+    const MAGIC: [u8; 4] = *b"VAE2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.bytes(&self.work.encode());
+        e.bytes(&self.transition.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            work: WorkEnvelopeV2::decode(&d.bytes()?)?,
+            transition: TransitionV2::decode(&d.bytes()?)?,
+        };
+        validate_accumulation_envelope(&value)?;
+        Ok(value)
+    }
+}
+
+impl V2Wire for AccumulateRequestV2 {
+    const MAGIC: [u8; 4] = *b"VAC2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        match self {
+            Self::Install(genesis) => {
+                e.u8(0);
+                e.bytes(&genesis.encode());
+            }
+            Self::Apply(envelope) => {
+                e.u8(1);
+                e.bytes(&envelope.encode());
+            }
+            Self::PrepareAttested(envelope) => {
+                e.u8(2);
+                e.bytes(&envelope.encode());
+            }
+        }
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        match d.u8()? {
+            0 => Ok(Self::Install(ServiceGenesisV2::decode(&d.bytes()?)?)),
+            1 => Ok(Self::Apply(AccumulationEnvelopeV2::decode(&d.bytes()?)?)),
+            2 => Ok(Self::PrepareAttested(AccumulationEnvelopeV2::decode(
+                &d.bytes()?,
+            )?)),
+            _ => Err(DecodeError::InvalidTag),
+        }
+    }
+}
+
+impl V2Wire for PublishedEffectsV2 {
+    const MAGIC: [u8; 4] = *b"VEF2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.option(&self.reply, encode_reply);
+        e.list(&self.outbox, encode_message);
+        e.list(&self.exported_blobs, encode_blob_ref);
+        e.option(&self.proof, encode_proof);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            reply: d.option(decode_reply)?,
+            outbox: d.list(decode_message)?,
+            exported_blobs: d.list(decode_blob_ref)?,
+            proof: d.option(decode_proof)?,
+        };
+        ensure_sorted_unique(&value.outbox, |message| message.call_id.0)?;
+        ensure_sorted_unique(&value.exported_blobs, |blob| blob.hash.0)?;
+        Ok(value)
+    }
+}
+
+impl V2Wire for AccumulationResultV2 {
+    const MAGIC: [u8; 4] = *b"VAO2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        match self {
+            Self::Installed(receipt) => {
+                e.u8(0);
+                encode_install_receipt(&mut e, receipt);
+            }
+            Self::Accepted {
+                receipt,
+                published,
+                duplicate,
+            } => {
+                e.u8(1);
+                e.bytes(&receipt.encode());
+                e.bytes(&published.encode());
+                e.bool(*duplicate);
+            }
+            Self::Prepared(receipt) => {
+                e.u8(2);
+                e.bytes(&receipt.encode());
+            }
+            Self::Rejected(rejection) => {
+                e.u8(3);
+                encode_rejection(&mut e, rejection);
+            }
+        }
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        match d.u8()? {
+            0 => Ok(Self::Installed(decode_install_receipt(d)?)),
+            1 => {
+                let receipt = AccumulationReceiptV2::decode(&d.bytes()?)?;
+                let published = PublishedEffectsV2::decode(&d.bytes()?)?;
+                let duplicate = d.bool()?;
+                if duplicate && published != PublishedEffectsV2::default() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(Self::Accepted {
+                    receipt,
+                    published,
+                    duplicate,
+                })
+            }
+            2 => Ok(Self::Prepared(AccumulationReceiptV2::decode(&d.bytes()?)?)),
+            3 => Ok(Self::Rejected(decode_rejection(d)?)),
+            _ => Err(DecodeError::InvalidTag),
+        }
+    }
+}
+
+fn encode_actor_genesis(e: &mut Encoder<'_>, value: &ActorGenesisV2) {
+    e.fixed(&value.actor.0);
+    e.option(&value.parent, |e, parent| e.fixed(&parent.0));
+    e.fixed(&value.program.0);
+    encode_blob_ref(e, &value.initial_state);
+    e.bool(value.crdt);
+    e.list(&value.methods, |e, method| {
+        e.string(&method.method);
+        e.fixed(&method.schema.0);
+        e.fixed(&method.policy.0);
+        e.bool(method.public);
+        e.bool(method.attested);
+    });
+}
+
+fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeError> {
+    let value = ActorGenesisV2 {
+        actor: ActorId(d.fixed()?),
+        parent: d.option(|d| d.fixed().map(ActorId))?,
+        program: ProgramId(d.fixed()?),
+        initial_state: decode_blob_ref(d)?,
+        crdt: d.bool()?,
+        methods: d.list(|d| {
+            Ok(MethodPolicyV2 {
+                method: d.string()?,
+                schema: Hash(d.fixed()?),
+                policy: Hash(d.fixed()?),
+                public: d.bool()?,
+                attested: d.bool()?,
+            })
+        })?,
+    };
+    if value.methods.iter().any(|method| method.method.is_empty())
+        || value
+            .methods
+            .windows(2)
+            .any(|pair| pair[0].method >= pair[1].method)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
+fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
+    if value.actors.is_empty() {
+        return Err(DecodeError::NonCanonical);
+    }
+    ensure_sorted_unique(&value.actors, |actor| actor.actor.0)?;
+    let roots: Vec<_> = value
+        .actors
+        .iter()
+        .filter(|actor| actor.parent.is_none())
+        .map(|actor| actor.actor)
+        .collect();
+    if roots.len() != 1 {
+        return Err(DecodeError::NonCanonical);
+    }
+    let root = roots[0];
+    let known: BTreeSet<_> = value.actors.iter().map(|actor| actor.actor).collect();
+    for actor in &value.actors {
+        if value.consistency == ConsistencyModeV2::Crdt && !actor.crdt {
+            return Err(DecodeError::NonCanonical);
+        }
+        if actor.parent == Some(actor.actor)
+            || actor.parent.is_some_and(|parent| !known.contains(&parent))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let mut cursor = actor.actor;
+        for _ in 0..value.actors.len() {
+            if cursor == root {
+                break;
+            }
+            let parent = value
+                .actors
+                .iter()
+                .find(|candidate| candidate.actor == cursor)
+                .and_then(|candidate| candidate.parent)
+                .ok_or(DecodeError::NonCanonical)?;
+            cursor = parent;
+        }
+        if cursor != root {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    match &value.authorization {
+        AuthorizationEvidenceV2::SystemCapability { authenticator, .. }
+            if !authenticator.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(DecodeError::NonCanonical),
+    }
+}
+
+fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), DecodeError> {
+    if value.work.service != value.transition.service
+        || value.work.input_id() != value.transition.consumed_input
+        || value.work.target_program != value.transition.target_program
+        || value.work.base != value.transition.base
+        || !value.work.base.mode_compatible(value.work.consistency)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn encode_install_receipt(e: &mut Encoder<'_>, value: &ServiceInstallReceiptV2) {
+    encode_service(e, &value.service);
+    e.u8(value.consistency as u8);
+    e.option(&value.resulting_state_root, |e, root| e.fixed(&root.0));
+    e.list(&value.resulting_crdt_heads, |e, head| e.fixed(&head.0));
+}
+
+fn decode_install_receipt(d: &mut Decoder<'_>) -> Result<ServiceInstallReceiptV2, DecodeError> {
+    let value = ServiceInstallReceiptV2 {
+        service: decode_service(d)?,
+        consistency: ConsistencyModeV2::decode(d)?,
+        resulting_state_root: d.option(|d| d.fixed().map(Hash))?,
+        resulting_crdt_heads: d.list(|d| d.fixed().map(Hash))?,
+    };
+    ensure_sorted_unique(&value.resulting_crdt_heads, |head| head.0)?;
+    validate_result_commitment(
+        value.consistency,
+        value.resulting_state_root,
+        &value.resulting_crdt_heads,
+    )?;
+    Ok(value)
+}
+
+fn validate_result_commitment(
+    consistency: ConsistencyModeV2,
+    state_root: Option<Hash>,
+    crdt_heads: &[Hash],
+) -> Result<(), DecodeError> {
+    let valid = match consistency {
+        ConsistencyModeV2::Crdt => state_root.is_none(),
+        ConsistencyModeV2::Ephemeral | ConsistencyModeV2::Local | ConsistencyModeV2::Raft => {
+            state_root.is_some() && crdt_heads.is_empty()
+        }
+    };
+    valid.then_some(()).ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_rejection(e: &mut Encoder<'_>, value: &AccumulationRejectionV2) {
+    use AccumulationRejectionV2 as R;
+    match value {
+        R::StoreAlreadyInitialized => e.u8(0),
+        R::StoreUninitialized => e.u8(1),
+        R::WrongService => e.u8(2),
+        R::WrongAbi => e.u8(3),
+        R::WrongExecutionSemantics => e.u8(4),
+        R::WrongProgram => e.u8(5),
+        R::InvalidConsistency => e.u8(6),
+        R::Unauthorized => e.u8(7),
+        R::MissingBlob(hash) => {
+            e.u8(8);
+            e.fixed(&hash.0);
+        }
+        R::MissingProof => e.u8(9),
+        R::ProofUnavailable => e.u8(10),
+        R::InvalidProof => e.u8(11),
+        R::StaleLinearWork {
+            expected_revision,
+            actual_revision,
+        } => {
+            e.u8(12);
+            e.u64(*expected_revision);
+            e.u64(*actual_revision);
+        }
+        R::StaleStateRoot => e.u8(13),
+        R::MissingCausalDependency(hash) => {
+            e.u8(14);
+            e.fixed(&hash.0);
+        }
+        R::TransitionInputMismatch => e.u8(15),
+        R::TransitionBaseMismatch => e.u8(16),
+        R::DivergentDuplicate => e.u8(17),
+        R::InvalidWorkflowTransition => e.u8(18),
+        R::ContinuationConflict(actor) => {
+            e.u8(19);
+            e.fixed(&actor.0);
+        }
+        R::MessageCycle => e.u8(20),
+        R::StorageFull => e.u8(21),
+        R::SequenceOverflow => e.u8(22),
+        R::NonCanonical => e.u8(23),
+    }
+}
+
+fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejectionV2, DecodeError> {
+    use AccumulationRejectionV2 as R;
+    match d.u8()? {
+        0 => Ok(R::StoreAlreadyInitialized),
+        1 => Ok(R::StoreUninitialized),
+        2 => Ok(R::WrongService),
+        3 => Ok(R::WrongAbi),
+        4 => Ok(R::WrongExecutionSemantics),
+        5 => Ok(R::WrongProgram),
+        6 => Ok(R::InvalidConsistency),
+        7 => Ok(R::Unauthorized),
+        8 => Ok(R::MissingBlob(Hash(d.fixed()?))),
+        9 => Ok(R::MissingProof),
+        10 => Ok(R::ProofUnavailable),
+        11 => Ok(R::InvalidProof),
+        12 => Ok(R::StaleLinearWork {
+            expected_revision: d.u64()?,
+            actual_revision: d.u64()?,
+        }),
+        13 => Ok(R::StaleStateRoot),
+        14 => Ok(R::MissingCausalDependency(Hash(d.fixed()?))),
+        15 => Ok(R::TransitionInputMismatch),
+        16 => Ok(R::TransitionBaseMismatch),
+        17 => Ok(R::DivergentDuplicate),
+        18 => Ok(R::InvalidWorkflowTransition),
+        19 => Ok(R::ContinuationConflict(ActorId(d.fixed()?))),
+        20 => Ok(R::MessageCycle),
+        21 => Ok(R::StorageFull),
+        22 => Ok(R::SequenceOverflow),
+        23 => Ok(R::NonCanonical),
+        _ => Err(DecodeError::InvalidTag),
     }
 }
 
@@ -1053,7 +1563,9 @@ mod tests {
         assert_eq!(RefineImportsV2::decode(&encoded).unwrap(), imports);
 
         let mut missing = imports.clone();
-        missing.blobs.retain(|blob| blob.reference != work.imported_blobs[0]);
+        missing
+            .blobs
+            .retain(|blob| blob.reference != work.imported_blobs[0]);
         assert_eq!(
             missing.validate_for(&work),
             Err(RefineError::MissingImport(work.imported_blobs[0].hash))
@@ -1170,5 +1682,149 @@ mod tests {
         });
         assert_ne!(base.hash(), changed.hash());
         assert_eq!(TransitionV2::decode(&changed.encode()).unwrap(), changed);
+    }
+
+    #[test]
+    fn accumulate_request_wires_bind_install_and_apply_inputs() {
+        let genesis = ServiceGenesisV2 {
+            service: service(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![
+                ActorGenesisV2 {
+                    actor: ActorId([5; 32]),
+                    parent: None,
+                    program: ProgramId([6; 32]),
+                    initial_state: BlobRefV2::of_bytes(b"root-state"),
+                    crdt: false,
+                    methods: vec![MethodPolicyV2 {
+                        method: "increment".into(),
+                        schema: Hash([7; 32]),
+                        policy: Hash([8; 32]),
+                        public: true,
+                        attested: false,
+                    }],
+                },
+                ActorGenesisV2 {
+                    actor: ActorId([9; 32]),
+                    parent: Some(ActorId([5; 32])),
+                    program: ProgramId([10; 32]),
+                    initial_state: BlobRefV2::of_bytes(b"child-state"),
+                    crdt: false,
+                    methods: vec![],
+                },
+            ],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([11; 32]),
+                authenticator: b"platform-authenticator".to_vec(),
+            },
+        };
+        let install = AccumulateRequestV2::Install(genesis);
+        assert_eq!(
+            AccumulateRequestV2::decode(&install.encode()).unwrap(),
+            install
+        );
+
+        let work = work();
+        let transition = TransitionV2 {
+            service: work.service.clone(),
+            consumed_input: work.input_id(),
+            target_program: work.target_program,
+            base: work.base.clone(),
+            writes: vec![],
+            crdt_operations: vec![],
+            resulting_crdt_heads: vec![],
+            continuations: vec![],
+            inbox: vec![],
+            outbox: vec![],
+            reply: None,
+            exported_blobs: vec![],
+            gas: GasAccountingV2::default(),
+            proof: None,
+        };
+        let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition });
+        assert_eq!(AccumulateRequestV2::decode(&apply.encode()).unwrap(), apply);
+
+        let AccumulateRequestV2::Apply(mut divergent) = apply else {
+            unreachable!()
+        };
+        divergent.transition.consumed_input.workflow_step += 1;
+        assert_eq!(
+            AccumulationEnvelopeV2::decode(&divergent.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn genesis_rejects_cycles_and_plain_actors_in_crdt_services() {
+        let mut genesis = ServiceGenesisV2 {
+            service: service(),
+            consistency: ConsistencyModeV2::Crdt,
+            actors: vec![ActorGenesisV2 {
+                actor: ActorId([5; 32]),
+                parent: None,
+                program: ProgramId([6; 32]),
+                initial_state: BlobRefV2::of_bytes(b"state"),
+                crdt: false,
+                methods: vec![],
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([7; 32]),
+                authenticator: vec![1],
+            },
+        };
+        assert_eq!(
+            ServiceGenesisV2::decode(&genesis.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        genesis.consistency = ConsistencyModeV2::Local;
+        genesis.actors[0].parent = Some(genesis.actors[0].actor);
+        assert_eq!(
+            ServiceGenesisV2::decode(&genesis.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn accumulation_results_are_commit_decisions_on_the_wire() {
+        let receipt = AccumulationReceiptV2 {
+            service: service(),
+            accepted_transition: Hash([12; 32]),
+            resulting_state_root: Some(Hash([13; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 4,
+            checkpoint: 2,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let accepted = AccumulationResultV2::Accepted {
+            receipt: receipt.clone(),
+            published: PublishedEffectsV2::default(),
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&accepted.encode()).unwrap(),
+            accepted
+        );
+
+        let duplicate = AccumulationResultV2::Accepted {
+            receipt,
+            published: PublishedEffectsV2::default(),
+            duplicate: true,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&duplicate.encode()).unwrap(),
+            duplicate
+        );
+
+        let rejection = AccumulationResultV2::Rejected(AccumulationRejectionV2::StaleLinearWork {
+            expected_revision: 3,
+            actual_revision: 4,
+        });
+        assert_eq!(
+            AccumulationResultV2::decode(&rejection.encode()).unwrap(),
+            rejection
+        );
+        assert!(AccumulationRejectionV2::StaleStateRoot.is_retryable());
+        assert!(!AccumulationRejectionV2::DivergentDuplicate.is_retryable());
     }
 }
