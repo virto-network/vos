@@ -40,6 +40,11 @@
 //! [mode_count:u16 LE]           (one entry per message, in order)
 //!   [mode:u8]                   (0 = sync, 1 = job)
 //!   ...
+//! [crdt:u8]                     (0 = ordinary actor, 1 = CRDT actor)
+//! [policy_count:u16 LE]         (one entry per message, in order)
+//!   [attested:u8]               (0 = regular, 1 = proof required)
+//!   [space_role:u8]             (0xff = none, otherwise `SpaceRole`)
+//!   ...
 //! ```
 //!
 //! Each trailing section is append-only: older decoders that don't
@@ -90,6 +95,14 @@ pub struct MessageMeta {
     /// dispatcher then drives poll → stream → release). Trailing section;
     /// old blobs decode `0`.
     pub mode: u8,
+    /// Whether the handler requires proof production before its transition may
+    /// be accumulated. Declared with `#[msg(attested)]`.
+    pub attested: bool,
+    /// Direct space-wide role predicate declared with
+    /// `#[msg(space_role = SpaceRole::...)]`. This is distinct from the
+    /// actor-local `role = ...` hierarchy. `None` leaves the method open to
+    /// any otherwise-authorized origin.
+    pub space_role: Option<u8>,
 }
 
 /// Actor descriptor — actor name, messages, and constructor params.
@@ -400,6 +413,23 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     buf[pos] = meta.crdt as u8;
     pos += 1;
 
+    // Per-message attestation and direct space-role policy. Appended after the
+    // actor replication flag so all older metadata remains prefix-readable.
+    let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut ap = 0;
+    while ap < meta.messages.len() {
+        buf[pos] = meta.messages[ap].attested as u8;
+        buf[pos + 1] = match meta.messages[ap].space_role {
+            Some(role) => role,
+            None => u8::MAX,
+        };
+        pos += 2;
+        ap += 1;
+    }
+
     (buf, pos)
 }
 
@@ -424,6 +454,8 @@ mod tests {
                     doc: "",
                     timeout_ms: 0,
                     mode: 0,
+                    attested: true,
+                    space_role: Some(1),
                 },
                 MessageMeta {
                     name: "status",
@@ -436,6 +468,8 @@ mod tests {
                     doc: "",
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
             ],
             constructor: &[FieldMeta {
@@ -458,12 +492,16 @@ mod tests {
         assert!(!parsed.messages[0].is_query);
         assert!(parsed.messages[0].fields.is_empty());
         assert_eq!(parsed.messages[0].returns, "()");
+        assert!(parsed.messages[0].attested);
+        assert_eq!(parsed.messages[0].space_role, Some(1));
         assert_eq!(parsed.messages[1].name, "status");
         assert!(parsed.messages[1].is_query);
         assert_eq!(parsed.messages[1].fields.len(), 1);
         assert_eq!(parsed.messages[1].fields[0].name, "verbose");
         assert_eq!(parsed.messages[1].fields[0].ty, "bool");
         assert_eq!(parsed.messages[1].returns, "[u8;32]");
+        assert!(!parsed.messages[1].attested);
+        assert_eq!(parsed.messages[1].space_role, None);
         assert_eq!(parsed.constructor.len(), 1);
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
@@ -501,7 +539,8 @@ mod tests {
         };
         let (buf, len) = encode::<128>(&META);
         assert!(decode(&buf[..len]).unwrap().crdt);
-        assert!(!decode(&buf[..len - 1]).unwrap().crdt);
+        // Drop the appended policy count and the CRDT byte itself.
+        assert!(!decode(&buf[..len - 3]).unwrap().crdt);
     }
 
     #[test]
@@ -578,6 +617,8 @@ mod tests {
                     doc: "",
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -587,6 +628,8 @@ mod tests {
                     doc: "",
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
                 MessageMeta {
                     name: "internal_only",
@@ -596,6 +639,8 @@ mod tests {
                     doc: "",
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
             ],
             constructor: &[],
@@ -700,6 +745,8 @@ mod tests {
                     doc: "Enqueue a prove job.",
                     timeout_ms: 600_000,
                     mode: 1,
+                    attested: false,
+                    space_role: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -709,6 +756,8 @@ mod tests {
                     doc: "",
                     timeout_ms: 0,
                     mode: 0,
+                    attested: false,
+                    space_role: None,
                 },
             ],
             constructor: &[],
@@ -760,6 +809,8 @@ mod tests {
         assert_eq!(parsed.messages[0].doc, "");
         assert_eq!(parsed.messages[0].timeout_ms, 0);
         assert_eq!(parsed.messages[0].mode, 0);
+        assert!(!parsed.messages[0].attested);
+        assert_eq!(parsed.messages[0].space_role, None);
     }
 }
 
@@ -806,6 +857,10 @@ mod decode {
         /// job (the handler is a `#[msg(job)]` begin). Empty/old blobs
         /// decode `0`.
         pub mode: u8,
+        /// True only for handlers explicitly declared `#[msg(attested)]`.
+        pub attested: bool,
+        /// Minimum direct space-wide role byte, if declared.
+        pub space_role: Option<u8>,
     }
 
     /// Parsed actor metadata from binary metadata.
@@ -864,6 +919,8 @@ mod decode {
                 doc: String::new(),
                 timeout_ms: 0,
                 mode: 0,
+                attested: false,
+                space_role: None,
             });
         }
 
@@ -993,6 +1050,32 @@ mod decode {
         }
 
         let crdt = data.get(pos).copied().unwrap_or(0) == 1;
+        if pos < data.len() {
+            pos += 1;
+        }
+
+        // Per-message attestation policy. Old blobs end after `crdt`, leaving
+        // both fields at their deny-by-default values.
+        if pos < data.len()
+            && let Some(policy_count) = read_u16(data, &mut pos)
+        {
+            for i in 0..policy_count as usize {
+                let Some(&attested) = data.get(pos) else {
+                    break;
+                };
+                let Some(&space_role) = data.get(pos + 1) else {
+                    break;
+                };
+                pos += 2;
+                if attested > 1 || (space_role != u8::MAX && space_role > 3) {
+                    return None;
+                }
+                if let Some(message) = messages.get_mut(i) {
+                    message.attested = attested == 1;
+                    message.space_role = (space_role != u8::MAX).then_some(space_role);
+                }
+            }
+        }
 
         Some(ParsedMeta {
             actor_name,
