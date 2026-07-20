@@ -157,7 +157,15 @@ impl ServicePvmV2 {
         let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
             .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
         install_refine_scheduler_caps(&mut kernel);
-        run_refine_kernel(kernel, host, true, None, None, Vec::new())
+        run_refine_kernel(
+            kernel,
+            host,
+            javm::PvmBackend::Default,
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
     }
 
     /// Execute Refine with every declared actor instantiated as a dormant JAR
@@ -173,6 +181,26 @@ impl ServicePvmV2 {
         imports: &RefineImportsV2,
         gas_limit: u64,
         host: &H,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        self.refine_actor_tree_with_backend(
+            arguments,
+            imports,
+            gas_limit,
+            host,
+            javm::PvmBackend::Default,
+        )
+    }
+
+    /// Conformance variant of [`Self::refine_actor_tree`] selecting a JAR
+    /// backend explicitly. Consensus outputs must be identical across the
+    /// interpreter and recompiler.
+    pub fn refine_actor_tree_with_backend<H: RefineProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        imports: &RefineImportsV2,
+        gas_limit: u64,
+        host: &H,
+        backend: javm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let work = WorkEnvelopeV2::decode(arguments)
             .map_err(|_| ServicePvmErrorV2::InvalidWorkEnvelope)?;
@@ -229,7 +257,7 @@ impl ServicePvmV2 {
                 &self.program,
                 &dormant,
                 &snapshot,
-                javm::PvmBackend::Default,
+                backend,
             )
             .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
             let token_len = write_checkpoint_token(
@@ -247,6 +275,7 @@ impl ServicePvmV2 {
             return run_refine_kernel(
                 kernel,
                 host,
+                backend,
                 false,
                 Some(&work),
                 Some((&self.program, &dormant)),
@@ -267,7 +296,7 @@ impl ServicePvmV2 {
             arguments,
             gas_limit,
             &dormant,
-            javm::PvmBackend::Default,
+            backend,
         )
         .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
         let (actor_input_len, actor_ipc_capacity) = install_actor_ipc(&mut kernel, &actor_input)?;
@@ -281,6 +310,7 @@ impl ServicePvmV2 {
         run_refine_kernel(
             kernel,
             host,
+            backend,
             true,
             Some(&work),
             Some((&self.program, &dormant)),
@@ -476,6 +506,7 @@ fn capture_checkpoint(
 fn run_refine_kernel<H: RefineProtocolHostV2>(
     mut kernel: InvocationKernel,
     host: &H,
+    backend: javm::PvmBackend,
     fresh: bool,
     suspension_work: Option<&WorkEnvelopeV2>,
     invocation_layout: Option<(&[u8], &[DormantProgram<'_>])>,
@@ -516,13 +547,13 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 if slot == crate::abi::hostcall::SUSPEND as u8 {
                     if let Some(work) = suspension_work {
                         let (artifact, snapshot) = capture_checkpoint(&mut kernel, work)?;
-                        let (service_program, dormant) = invocation_layout
-                            .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+                        let (service_program, dormant) =
+                            invocation_layout.ok_or(ServicePvmErrorV2::InvalidContinuation)?;
                         let mut finalization = InvocationKernel::restore_with_dormant_programs(
                             service_program,
                             dormant,
                             &snapshot,
-                            javm::PvmBackend::Default,
+                            backend,
                         )
                         .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
                         let expected = work

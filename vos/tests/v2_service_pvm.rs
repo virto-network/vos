@@ -275,8 +275,7 @@ fn yielding_actor_restores_exactly_after_restart() {
         return;
     };
     let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
-    let service =
-        ServicePvmV2::new(service_pvm.clone(), ProgramId::of_pvm(&service_pvm)).unwrap();
+    let service = ServicePvmV2::new(service_pvm.clone(), ProgramId::of_pvm(&service_pvm)).unwrap();
     let actor = grey_transpiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor);
     let initial_state = Vec::new();
@@ -298,24 +297,39 @@ fn yielding_actor_restores_exactly_after_restart() {
     };
 
     let first_output = service
-        .refine_actor_tree(
+        .refine_actor_tree_with_backend(
             &first_work.encode(),
             &first_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     let deterministic_retry = service
-        .refine_actor_tree(
+        .refine_actor_tree_with_backend(
             &first_work.encode(),
             &first_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     assert_eq!(
         deterministic_retry, first_output,
         "checkpoint bytes and transition must be deterministic"
+    );
+    let recompiled_first = service
+        .refine_actor_tree_with_backend(
+            &first_work.encode(),
+            &first_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceRecompiler,
+        )
+        .unwrap();
+    assert_eq!(
+        recompiled_first, first_output,
+        "interpreter and recompiler checkpoints must be identical"
     );
     let first = TransitionV2::decode(&first_output.bytes).unwrap();
     assert!(first.reply.is_none(), "yield must not publish a reply");
@@ -323,10 +337,7 @@ fn yielding_actor_restores_exactly_after_restart() {
     let first_continuation = first.continuations[0].replacement.clone().unwrap();
     assert_eq!(first.exported_blobs, vec![first_continuation.clone()]);
     assert_eq!(first_output.exported_blobs.len(), 1);
-    assert_eq!(
-        first_output.exported_blobs[0].reference,
-        first_continuation
-    );
+    assert_eq!(first_output.exported_blobs[0].reference, first_continuation);
     let checkpoint_state = first
         .writes
         .iter()
@@ -364,15 +375,32 @@ fn yielding_actor_restores_exactly_after_restart() {
     };
 
     let resumed_output = service
-        .refine_actor_tree(
+        .refine_actor_tree_with_backend(
             &resumed_work.encode(),
             &resumed_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
+    let recompiled_resumed = service
+        .refine_actor_tree_with_backend(
+            &resumed_work.encode(),
+            &resumed_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceRecompiler,
+        )
+        .unwrap();
+    assert_eq!(
+        recompiled_resumed, resumed_output,
+        "interpreter and recompiler resumes must be identical"
+    );
     let resumed = TransitionV2::decode(&resumed_output.bytes).unwrap();
-    assert!(resumed.reply.is_some(), "handler completes after exact resume");
+    assert!(
+        resumed.reply.is_some(),
+        "handler completes after exact resume"
+    );
     assert_eq!(resumed.consumed_input, resumed_work.input_id());
     assert_eq!(resumed.base, resumed_work.base);
     assert_eq!(resumed.continuations.len(), 1);
