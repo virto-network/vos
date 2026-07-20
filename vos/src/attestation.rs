@@ -36,6 +36,57 @@ pub struct AttestationStatementV3 {
     pub accumulation_receipt: AccumulationReceiptV2,
 }
 
+/// Canonical public inputs returned by guest-owned attestation preparation.
+///
+/// The host passes this value to the proof producer unchanged. In particular,
+/// it must not reconstruct the method policy or predicted receipt outside the
+/// service guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationPreparationV2 {
+    pub receipt: AccumulationReceiptV2,
+    pub statement: AttestationStatementV3,
+}
+
+impl AttestationPreparationV2 {
+    pub fn for_transition(
+        work: &WorkEnvelopeV2,
+        transition: &TransitionV2,
+        policy: &MethodPolicyV2,
+        receipt: AccumulationReceiptV2,
+    ) -> Result<Self, AttestationError> {
+        let statement =
+            AttestationStatementV3::for_transition(work, transition, policy, receipt.clone())?;
+        Ok(Self { receipt, statement })
+    }
+
+    pub fn validate(&self) -> Result<(), AttestationError> {
+        self.statement.validate()?;
+        if self.statement.accumulation_receipt != self.receipt {
+            return Err(AttestationError::ReceiptMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl V2Wire for AttestationPreparationV2 {
+    const MAGIC: [u8; 4] = *b"VAP2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.bytes(&self.receipt.encode());
+        encoder.bytes(&self.statement.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            receipt: AccumulationReceiptV2::decode(&decoder.bytes()?)?,
+            statement: AttestationStatementV3::decode(&decoder.bytes()?)?,
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
 impl AttestationStatementV3 {
     /// Construct the one canonical statement for a prepared actor transition.
     /// Both the prover and guest Accumulate use this function, preventing a
@@ -503,6 +554,26 @@ mod tests {
                 &verifier,
             ),
             Err(AttestationError::StateCommitmentMismatch),
+        );
+    }
+
+    #[test]
+    fn preparation_wire_binds_the_guest_receipt_to_the_statement() {
+        let package = package(21);
+        let preparation = AttestationPreparationV2 {
+            receipt: package.statement.accumulation_receipt.clone(),
+            statement: package.statement.clone(),
+        };
+        assert_eq!(
+            AttestationPreparationV2::decode(&preparation.encode()).unwrap(),
+            preparation
+        );
+
+        let mut mismatched = preparation;
+        mismatched.receipt.sequence += 1;
+        assert_eq!(
+            AttestationPreparationV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
         );
     }
 }

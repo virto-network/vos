@@ -963,7 +963,26 @@ mod tests {
                 duplicate: false,
             }
         } else {
-            AccumulationResultV2::Prepared(receipt)
+            let statement = crate::attestation::AttestationStatementV3 {
+                statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
+                space: receipt.service.space,
+                actor: crate::v2::ActorId([6; 32]),
+                deployment: receipt.service.deployment,
+                actor_program: ProgramId([7; 32]),
+                method: "attested".into(),
+                schema: Hash([8; 32]),
+                invocation: crate::v2::InvocationId([9; 32]),
+                before: crate::attestation::StateCommitmentV3::Linear(Hash([10; 32])),
+                after: crate::attestation::StateCommitmentV3::Linear(Hash([5; 32])),
+                claim_commitment: Hash([11; 32]),
+                input_commitment: Hash([12; 32]),
+                authorization_policy: Hash([13; 32]),
+                accumulation_receipt: receipt.clone(),
+            };
+            AccumulationResultV2::Prepared(crate::attestation::AttestationPreparationV2 {
+                receipt,
+                statement,
+            })
         }
         .encode()
     }

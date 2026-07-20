@@ -8,7 +8,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use crate::attestation::AttestationStatementV3;
+use crate::attestation::AttestationPreparationV2;
 
 use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::contracts::crdt_change_blob_references;
@@ -942,25 +942,20 @@ fn apply<S: GuestAccumulateStoreV2>(
 
     let work_hash = work.hash();
     let transition_commitment = transition.commitment();
-    if let Some(bytes) = read(store, &dedup_storage_key(work.input_id()))? {
+    let duplicate_receipt = if let Some(bytes) = read(store, &dedup_storage_key(work.input_id()))? {
         let record =
             DedupRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
-        return if record.input == work.input_id()
+        if record.input == work.input_id()
             && record.work_hash == work_hash
             && record.transition_commitment == transition_commitment
         {
-            Ok(match mode {
-                ApplyMode::Commit => AccumulationResultV2::Accepted {
-                    receipt: record.receipt,
-                    published: PublishedEffectsV2::default(),
-                    duplicate: true,
-                },
-                ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(record.receipt),
-            })
+            Some(record.receipt)
         } else {
-            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
-        };
-    }
+            return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+        }
+    } else {
+        None
+    };
 
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
     let Some(actor) =
@@ -986,12 +981,6 @@ fn apply<S: GuestAccumulateStoreV2>(
     };
     if !authorized(work, &policy) {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
-    }
-    if !valid_workflow_input(&tree, work)? {
-        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
-    }
-    if !work_matches_durable_inbox(&tree, work)? {
-        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     let proof_required = policy.attested || work.proof_requested;
     if proof_required
@@ -1019,6 +1008,32 @@ fn apply<S: GuestAccumulateStoreV2>(
                 }
             }
         }
+    }
+
+    if let Some(receipt) = duplicate_receipt {
+        return Ok(match mode {
+            ApplyMode::Commit => AccumulationResultV2::Accepted {
+                receipt,
+                published: PublishedEffectsV2::default(),
+                duplicate: true,
+            },
+            ApplyMode::PrepareAttested => {
+                let preparation = match AttestationPreparationV2::for_transition(
+                    work, transition, &policy, receipt,
+                ) {
+                    Ok(preparation) => preparation,
+                    Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
+                };
+                AccumulationResultV2::Prepared(preparation)
+            }
+        });
+    }
+
+    if !valid_workflow_input(&tree, work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    if !work_matches_durable_inbox(&tree, work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
 
     if transition.consumed_input != work.input_id() {
@@ -1280,21 +1295,32 @@ fn apply<S: GuestAccumulateStoreV2>(
         checkpoint: work.workflow_step,
         consistency: header.consistency,
     };
-    if mode == ApplyMode::Commit && proof_required {
-        let proof = transition
-            .proof
-            .as_ref()
-            .expect("proof presence was validated");
-        let statement = match AttestationStatementV3::for_transition(
+    let preparation = if proof_required {
+        let preparation = match AttestationPreparationV2::for_transition(
             work,
             transition,
             &policy,
             receipt.clone(),
         ) {
-            Ok(statement) => statement,
+            Ok(preparation) => preparation,
             Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
         };
-        if proof.statement != statement.commitment() {
+        Some(preparation)
+    } else {
+        None
+    };
+    if mode == ApplyMode::Commit && proof_required {
+        let proof = transition
+            .proof
+            .as_ref()
+            .expect("proof presence was validated");
+        if proof.statement
+            != preparation
+                .as_ref()
+                .expect("proof preparation was constructed")
+                .statement
+                .commitment()
+        {
             return Ok(rejected(AccumulationRejectionV2::InvalidProof));
         }
         let verification = ProofVerificationRequestV2 {
@@ -1357,7 +1383,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
 
     Ok(match mode {
-        ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(receipt),
+        ApplyMode::PrepareAttested => {
+            AccumulationResultV2::Prepared(preparation.expect("attested preparation was required"))
+        }
         ApplyMode::Commit => AccumulationResultV2::Accepted {
             receipt,
             published,
@@ -2210,6 +2238,52 @@ mod tests {
             gas: GasAccountingV2::default(),
             proof: None,
         }
+    }
+
+    #[test]
+    fn attestation_preparation_is_guest_derived_and_read_only() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let mut work = linear_work(initial, install.resulting_state_root.unwrap());
+        work.proof_requested = true;
+        let transition = linear_transition(&work, b"after");
+        let before = store.clone();
+        let mut staging = store.clone();
+
+        let result = execute_guest_accumulate(
+            &mut staging,
+            &AccumulateRequestV2::PrepareAttested(AccumulationEnvelopeV2 {
+                work: work.clone(),
+                transition: transition.clone(),
+                provided_blobs: vec![],
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Prepared(preparation) = result else {
+            panic!("attested transition was not prepared")
+        };
+        let policy = MethodPolicyV2 {
+            method: "set".into(),
+            schema: Hash([6; 32]),
+            policy: Hash([7; 32]),
+            public: true,
+            attested: false,
+        };
+        assert_eq!(
+            preparation,
+            AttestationPreparationV2::for_transition(
+                &work,
+                &transition,
+                &policy,
+                preparation.receipt.clone(),
+            )
+            .unwrap()
+        );
+        assert_eq!(store, before, "preparation must not commit guest state");
+        assert_ne!(
+            staging, before,
+            "receipt prediction executes against an isolated staging transaction"
+        );
     }
 
     #[test]

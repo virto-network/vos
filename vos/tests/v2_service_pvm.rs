@@ -1656,9 +1656,10 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             },
         ))
         .expect("guest predicts the attested receipt without committing");
-    let AccumulationResultV2::Prepared(predicted) = prepared.result else {
+    let AccumulationResultV2::Prepared(preparation) = prepared.result else {
         panic!("guest did not prepare the attested transition")
     };
+    let predicted = preparation.receipt.clone();
     assert!(
         service
             .accumulate_host()
@@ -1680,6 +1681,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         predicted.clone(),
     )
     .unwrap();
+    assert_eq!(preparation.statement, statement);
     let proof_bytes = b"canonical proof bytes".to_vec();
     let proof_blob = BlobRefV2::of_bytes(&proof_bytes);
     let proof = ProofCommitmentV2 {

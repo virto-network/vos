@@ -29,6 +29,8 @@ mod state_tree;
 mod storage;
 pub(crate) mod wire;
 
+pub use crate::attestation::AttestationPreparationV2;
+
 pub use accumulate::{
     AccumulateError, AccumulationOutcome, AccumulationValidator, AllowPublic, InMemoryServiceState,
     PublishedEffects,
