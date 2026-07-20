@@ -45,12 +45,37 @@ impl AttestationStatementV3 {
         if self.statement_version != crate::v2::ATTESTATION_STATEMENT_VERSION {
             return Err(AttestationError::WrongStatementVersion);
         }
+        if self.method.is_empty()
+            || self.accumulation_receipt.service.service_abi != crate::v2::ABI_VERSION
+            || self.accumulation_receipt.service.execution_semantics
+                != crate::v2::EXECUTION_SEMANTICS_ID
+        {
+            return Err(AttestationError::InvalidStatement);
+        }
         if self.deployment != self.accumulation_receipt.service.deployment
             || self.accumulation_receipt.accepted_transition == Hash::ZERO
         {
             return Err(AttestationError::ReceiptMismatch);
         }
-        Ok(())
+        match (&self.before, &self.after) {
+            (StateCommitmentV3::Linear(_), StateCommitmentV3::Linear(after))
+                if self.accumulation_receipt.consistency != crate::v2::ConsistencyModeV2::Crdt
+                    && self.accumulation_receipt.resulting_state_root == Some(*after)
+                    && self.accumulation_receipt.resulting_crdt_heads.is_empty() =>
+            {
+                Ok(())
+            }
+            (StateCommitmentV3::Crdt(before), StateCommitmentV3::Crdt(after))
+                if self.accumulation_receipt.consistency == crate::v2::ConsistencyModeV2::Crdt
+                    && self.accumulation_receipt.resulting_state_root.is_none()
+                    && self.accumulation_receipt.resulting_crdt_heads == *after
+                    && hashes_are_canonical(before)
+                    && hashes_are_canonical(after) =>
+            {
+                Ok(())
+            }
+            _ => Err(AttestationError::StateCommitmentMismatch),
+        }
     }
 }
 
@@ -76,7 +101,7 @@ impl V2Wire for AttestationStatementV3 {
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
+        let value = Self {
             statement_version: decoder.u16()?,
             space: SpaceId(decoder.fixed()?),
             actor: ActorId(decoder.fixed()?),
@@ -91,8 +116,14 @@ impl V2Wire for AttestationStatementV3 {
             input_commitment: Hash(decoder.fixed()?),
             authorization_policy: Hash(decoder.fixed()?),
             accumulation_receipt: AccumulationReceiptV2::decode(&decoder.bytes()?)?,
-        })
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
     }
+}
+
+fn hashes_are_canonical(values: &[Hash]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn encode_state(encoder: &mut Encoder<'_>, state: &StateCommitmentV3) {
@@ -188,9 +219,11 @@ impl<T> core::ops::Deref for Verified<T> {
 pub enum AttestationError {
     CannotSuspend,
     WrongStatementVersion,
+    InvalidStatement,
     WrongProducer,
     ClaimCommitmentMismatch,
     ReceiptMismatch,
+    StateCommitmentMismatch,
     InvalidProof,
     Replay,
 }
@@ -239,10 +272,11 @@ pub struct AttestationReplayGuard {
 pub fn verify_once<T: crate::Encode, M>(
     package: Attestation<T, M>,
     expected_producer_name: &str,
+    expected_producer: ProducerId,
     replay: &mut AttestationReplayGuard,
     verifier: &impl ProofVerifier,
 ) -> Result<Verified<T>, AttestationError> {
-    if package.producer_name != expected_producer_name {
+    if package.producer_name != expected_producer_name || package.producer != expected_producer {
         return Err(AttestationError::WrongProducer);
     }
     package.statement.validate()?;
@@ -309,7 +343,7 @@ mod tests {
             schema: Hash([9; 32]),
             invocation: InvocationId([10; 32]),
             before: StateCommitmentV3::Linear(Hash([11; 32])),
-            after: StateCommitmentV3::Linear(Hash([12; 32])),
+            after: StateCommitmentV3::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&claim.encode()]),
             input_commitment: Hash([13; 32]),
             authorization_policy: Hash([14; 32]),
@@ -329,13 +363,25 @@ mod tests {
         let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
         let mut replay = AttestationReplayGuard::default();
         assert_eq!(
-            verify_once(package(21), "private-age", &mut replay, &verifier)
-                .unwrap()
-                .into_inner(),
+            verify_once(
+                package(21),
+                "private-age",
+                ProducerId([15; 32]),
+                &mut replay,
+                &verifier,
+            )
+            .unwrap()
+            .into_inner(),
             21,
         );
         assert_eq!(
-            verify_once(package(21), "private-age", &mut replay, &verifier),
+            verify_once(
+                package(21),
+                "private-age",
+                ProducerId([15; 32]),
+                &mut replay,
+                &verifier,
+            ),
             Err(AttestationError::Replay),
         );
 
@@ -345,10 +391,35 @@ mod tests {
             verify_once(
                 tampered,
                 "private-age",
+                ProducerId([15; 32]),
                 &mut AttestationReplayGuard::default(),
                 &verifier,
             ),
             Err(AttestationError::ClaimCommitmentMismatch),
+        );
+
+        assert_eq!(
+            verify_once(
+                package(22),
+                "private-age",
+                ProducerId([99; 32]),
+                &mut AttestationReplayGuard::default(),
+                &verifier,
+            ),
+            Err(AttestationError::WrongProducer),
+        );
+
+        let mut wrong_state = package(23);
+        wrong_state.statement.after = StateCommitmentV3::Linear(Hash([99; 32]));
+        assert_eq!(
+            verify_once(
+                wrong_state,
+                "private-age",
+                ProducerId([15; 32]),
+                &mut AttestationReplayGuard::default(),
+                &verifier,
+            ),
+            Err(AttestationError::StateCommitmentMismatch),
         );
     }
 }
