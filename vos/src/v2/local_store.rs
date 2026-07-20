@@ -15,8 +15,9 @@ use javm::kernel::InvocationKernel;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
-    ProofVerificationRequestV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2,
-    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
+    ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Recoverable committed image of a local v2 service account.
@@ -214,6 +215,7 @@ impl CommittedImageStoreV2 for FileCommittedImageStoreV2 {
 pub enum LocalStoreReadErrorV2 {
     InvalidHeader(StoreOpenError),
     CorruptStateTree,
+    CorruptPublication,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -383,6 +385,25 @@ impl LocalJamStoreV2 {
         ServiceStateTreeV2::new(&mut view, root)
             .get(key)
             .map_err(|_| LocalStoreReadErrorV2::CorruptStateTree)
+    }
+
+    /// Recover committed effects which have not yet been acknowledged through
+    /// guest Accumulate. Canonical row order is stable across restarts.
+    pub fn pending_publications(&self) -> Result<Vec<PublicationRecordV2>, LocalStoreReadErrorV2> {
+        let prefix = super::storage::publication_storage_prefix();
+        self.committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, bytes)| {
+                let publication = PublicationRecordV2::decode(bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptPublication)?;
+                if super::publication_storage_key(publication.input).as_slice() != key.as_slice() {
+                    return Err(LocalStoreReadErrorV2::CorruptPublication);
+                }
+                Ok(publication)
+            })
+            .collect()
     }
 
     /// Make an installation input available to guest Accumulate. This is a

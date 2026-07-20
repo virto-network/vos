@@ -27,6 +27,14 @@ operations, continuations, inbox/outbox rows and the receipt atomically.
 Replies, outbound calls and proof packages become visible only after that
 commit. A stale linear transition is rejected intact for rescheduling.
 
+Publishable effects also live in a guest-owned `PublicationRecordV2` keyed by
+the consumed workflow input. A process restart drains these committed records;
+an exact retry returns no duplicate effects but cannot erase the pending row.
+After the external consumer accepts the reply, outbox batch, or proof package,
+the host submits a commitment-bound acknowledgement through physical
+Accumulate. That acknowledgement deletes the record atomically and is itself
+idempotent.
+
 Cross-root transport is also guest-owned. The source receipt commits to the
 complete canonical outbox published by its accepted transition. A destination
 submits that finalized receipt and outbox through the physical Accumulate

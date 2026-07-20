@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
     AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, Hash, InvocationId,
-    ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
 pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 2;
@@ -21,6 +21,7 @@ pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 2;
 const HEADER_STORAGE_KEY: &[u8] = b"\0vos/v2/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
+const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
@@ -246,6 +247,22 @@ pub struct DeliveryRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+/// Recoverable effects created by one committed actor slice. The host may
+/// expose these bytes only after the surrounding service transaction commits,
+/// then removes the row through guest Accumulate acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationRecordV2 {
+    pub input: WorkInputIdV2,
+    pub receipt: AccumulationReceiptV2,
+    pub published: PublishedEffectsV2,
+}
+
+impl PublicationRecordV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/publication/v2", &[&self.encode()])
+    }
+}
+
 /// Non-recursive workflow row covered by the service tree. Receipts live in
 /// the physical bookkeeping namespace because including their resulting root
 /// in this row would make the commitment circular.
@@ -357,6 +374,39 @@ impl V2Wire for DeliveryRecordV2 {
     }
 }
 
+impl V2Wire for PublicationRecordV2 {
+    const MAGIC: [u8; 4] = *b"VPB2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_input(&mut e, self.input);
+        e.bytes(&self.receipt.encode());
+        e.bytes(&self.published.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            input: decode_input(d)?,
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+            published: PublishedEffectsV2::decode(&d.bytes()?)?,
+        };
+        if value.published == PublishedEffectsV2::default()
+            || value.receipt.checkpoint != value.input.workflow_step
+            || value
+                .published
+                .reply
+                .as_ref()
+                .map(super::ReplyRecordV2::commitment)
+                != value.receipt.reply_commitment
+            || super::MessageRecordV2::outbox_commitment(&value.published.outbox)
+                != value.receipt.outbox_commitment
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 pub const fn header_storage_key() -> &'static [u8] {
     HEADER_STORAGE_KEY
 }
@@ -367,6 +417,15 @@ pub fn dedup_storage_key(input: WorkInputIdV2) -> Vec<u8> {
 
 pub fn receipt_storage_key(input: WorkInputIdV2) -> Vec<u8> {
     input_storage_key(RECEIPT_STORAGE_PREFIX, input)
+}
+
+pub fn publication_storage_key(input: WorkInputIdV2) -> Vec<u8> {
+    input_storage_key(PUBLICATION_STORAGE_PREFIX, input)
+}
+
+#[cfg(feature = "std")]
+pub(crate) const fn publication_storage_prefix() -> &'static [u8] {
+    PUBLICATION_STORAGE_PREFIX
 }
 
 pub fn delivery_storage_key(call: CallId) -> Vec<u8> {
@@ -488,8 +547,8 @@ mod tests {
 
     use super::*;
     use crate::v2::{
-        ABI_VERSION, ChangeId, DeploymentId, EXECUTION_SEMANTICS_ID, ProgramId, RootServiceId,
-        empty_state_root,
+        ABI_VERSION, ChangeId, DeploymentId, EXECUTION_SEMANTICS_ID, ProgramId, ReplyRecordV2,
+        RootServiceId, empty_state_root,
     };
 
     fn service(byte: u8) -> ServiceIdentityV2 {
@@ -571,8 +630,11 @@ mod tests {
         };
         let dedup = dedup_storage_key(input);
         let receipt = receipt_storage_key(input);
+        let publication = publication_storage_key(input);
         let delivery = delivery_storage_key(CallId([7; 32]));
         assert_ne!(dedup, receipt);
+        assert_ne!(publication, receipt);
+        assert_ne!(publication, dedup);
         assert_ne!(delivery, receipt);
         assert_ne!(delivery, dedup);
         assert_ne!(dedup.as_slice(), header_storage_key());
@@ -636,6 +698,34 @@ mod tests {
         assert_eq!(
             DeliveryRecordV2::decode(&delivery.encode()).unwrap(),
             delivery
+        );
+
+        let reply = ReplyRecordV2 {
+            call_id: CallId([19; 32]),
+            producer: ActorId([20; 32]),
+            result: b"committed reply".to_vec(),
+        };
+        let publication = PublicationRecordV2 {
+            input,
+            receipt: AccumulationReceiptV2 {
+                service: service(21),
+                accepted_transition: Hash([22; 32]),
+                reply_commitment: Some(reply.commitment()),
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([23; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 11,
+                checkpoint: input.workflow_step,
+                consistency: ConsistencyModeV2::Local,
+            },
+            published: PublishedEffectsV2 {
+                reply: Some(reply),
+                ..PublishedEffectsV2::default()
+            },
+        };
+        assert_eq!(
+            PublicationRecordV2::decode(&publication.encode()).unwrap(),
+            publication
         );
     }
 }

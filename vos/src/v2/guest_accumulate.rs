@@ -18,11 +18,12 @@ use super::{
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2,
     DeliveryRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2,
-    ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2,
-    ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
-    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2,
-    crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
-    dedup_storage_key, delivery_storage_key, header_storage_key, receipt_storage_key,
+    ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2, ServiceStateTreeV2,
+    StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    WorkflowCheckpointV2, WorkflowOperationV2, crdt_change_storage_key,
+    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
+    header_storage_key, publication_storage_key, receipt_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -110,6 +111,9 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
         }
         AccumulateRequestV2::Deliver(envelope) => deliver(store, &envelope),
         AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, &envelope),
+        AccumulateRequestV2::AcknowledgePublication(acknowledgement) => {
+            acknowledge_publication(store, &acknowledgement)
+        }
     }
 }
 
@@ -117,6 +121,50 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
 enum ApplyMode {
     Commit,
     PrepareAttested,
+}
+
+fn acknowledge_publication<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    acknowledgement: &PublicationAckV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let Some(header_bytes) = read(store, header_storage_key())? else {
+        return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
+    };
+    let header = match StoreHeaderV2::open(&header_bytes) {
+        Ok(header) => header,
+        Err(StoreOpenError::WrongService) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongService));
+        }
+        Err(StoreOpenError::IncompatibleSemantics) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+        }
+        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
+    };
+    if acknowledgement.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    let key = publication_storage_key(acknowledgement.input);
+    let Some(bytes) = read(store, &key)? else {
+        return Ok(AccumulationResultV2::PublicationAcknowledged {
+            input: acknowledgement.input,
+            duplicate: true,
+        });
+    };
+    let publication =
+        PublicationRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+    if publication.input != acknowledgement.input
+        || publication.commitment() != acknowledgement.publication
+        || publication.receipt.service != header.service
+    {
+        return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+    }
+    write(store, &key, None)?;
+    Ok(AccumulationResultV2::PublicationAcknowledged {
+        input: acknowledgement.input,
+        duplicate: false,
+    })
 }
 
 fn install<S: GuestAccumulateStoreV2>(
@@ -1275,6 +1323,12 @@ fn apply<S: GuestAccumulateStoreV2>(
         transition_commitment,
         receipt: receipt.clone(),
     };
+    let published = PublishedEffectsV2 {
+        reply: transition.reply.clone(),
+        outbox: transition.outbox.clone(),
+        exported_blobs: transition.exported_blobs.clone(),
+        proof: transition.proof.clone(),
+    };
     write(store, header_storage_key(), Some(&header.encode()))?;
     write(
         store,
@@ -1289,17 +1343,24 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(change) = transition.crdt_change.as_ref() {
         write_crdt_node_receipt(store, change.cid(), &receipt)?;
     }
+    if mode == ApplyMode::Commit && published != PublishedEffectsV2::default() {
+        let publication = PublicationRecordV2 {
+            input: work.input_id(),
+            receipt: receipt.clone(),
+            published: published.clone(),
+        };
+        write(
+            store,
+            &publication_storage_key(work.input_id()),
+            Some(&publication.encode()),
+        )?;
+    }
 
     Ok(match mode {
         ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(receipt),
         ApplyMode::Commit => AccumulationResultV2::Accepted {
             receipt,
-            published: PublishedEffectsV2 {
-                reply: transition.reply.clone(),
-                outbox: transition.outbox.clone(),
-                exported_blobs: transition.exported_blobs.clone(),
-                proof: transition.proof.clone(),
-            },
+            published,
             duplicate: false,
         },
     })
@@ -2181,6 +2242,16 @@ mod tests {
         assert_eq!(header.state_root, receipt.resulting_state_root);
         assert_eq!(header.service_root, receipt.resulting_state_root.unwrap());
         assert!(store.blobs.values().any(|bytes| bytes == b"after"));
+        let publication_key = publication_storage_key(work.input_id());
+        let publication = PublicationRecordV2::decode(
+            store
+                .rows
+                .get(&publication_key)
+                .expect("reply publication is durable in guest storage"),
+        )
+        .unwrap();
+        assert_eq!(publication.receipt, receipt);
+        assert_eq!(publication.published, published);
 
         let rows_after_commit = store.rows.clone();
         let blobs_after_commit = store.blobs.clone();
@@ -2208,6 +2279,43 @@ mod tests {
             rejected(AccumulationRejectionV2::DivergentDuplicate)
         );
         assert_eq!(store.rows, rows_after_commit);
+
+        let mut wrong_acknowledgement = PublicationAckV2 {
+            service: identity(),
+            input: work.input_id(),
+            publication: publication.commitment(),
+        };
+        wrong_acknowledgement.publication = Hash([99; 32]);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AcknowledgePublication(wrong_acknowledgement),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::DivergentDuplicate)
+        );
+        assert!(store.rows.contains_key(&publication_key));
+
+        let acknowledgement = AccumulateRequestV2::AcknowledgePublication(PublicationAckV2 {
+            service: identity(),
+            input: work.input_id(),
+            publication: publication.commitment(),
+        });
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &acknowledgement).unwrap(),
+            AccumulationResultV2::PublicationAcknowledged {
+                input: work.input_id(),
+                duplicate: false,
+            }
+        );
+        assert!(!store.rows.contains_key(&publication_key));
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &acknowledgement).unwrap(),
+            AccumulationResultV2::PublicationAcknowledged {
+                input: work.input_id(),
+                duplicate: true,
+            }
+        );
     }
 
     #[test]

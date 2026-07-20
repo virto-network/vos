@@ -42,9 +42,9 @@ pub use contracts::{
     CrdtChangeV2, CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
     DeliveryEnvelopeV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
     MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2,
-    ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2,
-    WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError,
+    RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -80,10 +80,10 @@ pub use state_tree::{
     ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,
 };
 pub use storage::{
-    DedupRecordV2, DeliveryRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2,
-    StoreOpenError, WorkflowCheckpointV2, crdt_change_storage_key, crdt_node_receipt_storage_key,
-    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    receipt_storage_key,
+    DedupRecordV2, DeliveryRecordV2, PublicationRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2,
+    StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2, crdt_change_storage_key,
+    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
+    header_storage_key, publication_storage_key, receipt_storage_key,
 };
 pub use wire::{DecodeError, V2Wire};
 

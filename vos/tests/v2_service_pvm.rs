@@ -13,7 +13,7 @@ use vos::v2::{
     DurableJamStoreV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
     InMemoryServiceState, InvocationId, JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    ProgramId, ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2,
+    ProgramId, ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
     ServicePvmV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
@@ -1307,6 +1307,15 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(published.reply, transition.reply);
     assert!(service.accumulate_host().row_count() > installed_rows);
     assert_eq!(service.accumulate_host().commit_sequence(), 2);
+    let pending = service
+        .accumulate_host()
+        .pending_publications()
+        .expect("committed effects are recoverable before acknowledgement");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].input, work.input_id());
+    assert_eq!(pending[0].receipt, receipt);
+    assert_eq!(pending[0].published, published);
+    let publication_commitment = pending[0].commitment();
     let committed_state = BlobRefV2::of_bytes(b"committed actor state");
     assert_eq!(
         service.accumulate_host().blob(&committed_state),
@@ -1336,6 +1345,34 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let persisted = service.accumulate_host().snapshot_bytes();
     let restarted = LocalJamStoreV2::from_snapshot_bytes(&persisted)
         .expect("guest-owned workflow rows survive durable restart");
+    assert_eq!(
+        restarted.pending_publications().unwrap(),
+        pending,
+        "restart must recover effects committed before external delivery"
+    );
+    let acknowledged = service
+        .accumulate(&AccumulateRequestV2::AcknowledgePublication(
+            PublicationAckV2 {
+                service: work.service.clone(),
+                input: work.input_id(),
+                publication: publication_commitment,
+            },
+        ))
+        .expect("publication acknowledgement executes through physical IC-5");
+    assert_eq!(
+        acknowledged.result,
+        AccumulationResultV2::PublicationAcknowledged {
+            input: work.input_id(),
+            duplicate: false,
+        }
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .pending_publications()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         LocalWorkSchedulerV2::prepare_inbox(&restarted, call_id, 50),
         Err(ScheduleErrorV2::ActorBusy(work.target))
@@ -1628,6 +1665,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     );
 
     proof_transition.proof = Some(proof.clone());
+    let proof_input = proof_work.input_id();
     let proved = service
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: proof_work,
@@ -1649,6 +1687,15 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     };
     assert_eq!(receipt, predicted);
     assert_eq!(published.proof, Some(proof));
+    let pending_proof = service
+        .accumulate_host()
+        .pending_publications()
+        .unwrap()
+        .into_iter()
+        .find(|publication| publication.input == proof_input)
+        .expect("proof package remains recoverable until external acknowledgement");
+    assert_eq!(pending_proof.receipt, receipt);
+    assert_eq!(pending_proof.published, published);
 }
 
 #[test]

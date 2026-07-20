@@ -375,6 +375,10 @@ impl ServicePvmV2 {
                                 duplicate: false,
                                 ..
                             }
+                            | AccumulationResultV2::PublicationAcknowledged {
+                                duplicate: false,
+                                ..
+                            }
                     ) {
                         host.commit(transaction)?;
                     }

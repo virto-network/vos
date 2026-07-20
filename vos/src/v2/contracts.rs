@@ -673,6 +673,16 @@ impl CrdtSyncEnvelopeV2 {
     }
 }
 
+/// Guest-owned acknowledgement that one committed publication has been
+/// handed to its external consumer. The commitment prevents a stale or
+/// mismatched acknowledgement from deleting a different pending package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationAckV2 {
+    pub service: ServiceIdentityV2,
+    pub input: WorkInputIdV2,
+    pub publication: Hash,
+}
+
 /// Physical IC-5 request. Every service-state mutation, including external
 /// message admission, passes through one of these guest-owned operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -682,6 +692,7 @@ pub enum AccumulateRequestV2 {
     PrepareAttested(AccumulationEnvelopeV2),
     Deliver(DeliveryEnvelopeV2),
     SyncCrdt(CrdtSyncEnvelopeV2),
+    AcknowledgePublication(PublicationAckV2),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -763,6 +774,10 @@ pub enum AccumulationResultV2 {
     },
     Prepared(AccumulationReceiptV2),
     Rejected(AccumulationRejectionV2),
+    PublicationAcknowledged {
+        input: WorkInputIdV2,
+        duplicate: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1622,6 +1637,25 @@ impl V2Wire for CrdtSyncEnvelopeV2 {
     }
 }
 
+impl V2Wire for PublicationAckV2 {
+    const MAGIC: [u8; 4] = *b"VPA2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        encode_work_input(&mut e, self.input);
+        e.fixed(&self.publication.0);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            service: decode_service(d)?,
+            input: decode_work_input(d)?,
+            publication: Hash(d.fixed()?),
+        })
+    }
+}
+
 impl V2Wire for AccumulateRequestV2 {
     const MAGIC: [u8; 4] = *b"VAC2";
 
@@ -1648,6 +1682,10 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(4);
                 e.bytes(&envelope.encode());
             }
+            Self::AcknowledgePublication(acknowledgement) => {
+                e.u8(5);
+                e.bytes(&acknowledgement.encode());
+            }
         }
     }
 
@@ -1660,6 +1698,9 @@ impl V2Wire for AccumulateRequestV2 {
             )?)),
             3 => Ok(Self::Deliver(DeliveryEnvelopeV2::decode(&d.bytes()?)?)),
             4 => Ok(Self::SyncCrdt(CrdtSyncEnvelopeV2::decode(&d.bytes()?)?)),
+            5 => Ok(Self::AcknowledgePublication(PublicationAckV2::decode(
+                &d.bytes()?,
+            )?)),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -1717,6 +1758,11 @@ impl V2Wire for AccumulationResultV2 {
                 e.u8(3);
                 encode_rejection(&mut e, rejection);
             }
+            Self::PublicationAcknowledged { input, duplicate } => {
+                e.u8(4);
+                encode_work_input(&mut e, *input);
+                e.bool(*duplicate);
+            }
         }
     }
 
@@ -1746,6 +1792,10 @@ impl V2Wire for AccumulationResultV2 {
             }
             2 => Ok(Self::Prepared(AccumulationReceiptV2::decode(&d.bytes()?)?)),
             3 => Ok(Self::Rejected(decode_rejection(d)?)),
+            4 => Ok(Self::PublicationAcknowledged {
+                input: decode_work_input(d)?,
+                duplicate: d.bool()?,
+            }),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -2325,9 +2375,20 @@ fn encode_continuation_change(e: &mut Encoder<'_>, value: &ContinuationChangeV2)
     e.option(&value.replacement, encode_blob_ref);
 }
 
+fn encode_work_input(e: &mut Encoder<'_>, value: WorkInputIdV2) {
+    e.fixed(&value.invocation.0);
+    e.u64(value.workflow_step);
+}
+
+fn decode_work_input(d: &mut Decoder<'_>) -> Result<WorkInputIdV2, DecodeError> {
+    Ok(WorkInputIdV2 {
+        invocation: InvocationId(d.fixed()?),
+        workflow_step: d.u64()?,
+    })
+}
+
 fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
-    e.fixed(&value.input.invocation.0);
-    e.u64(value.input.workflow_step);
+    encode_work_input(e, value.input);
     encode_base(e, &value.base);
     e.option(&value.base_causal_height, |e, height| e.u64(*height));
     e.option(&value.expected, |e, hash| e.fixed(&hash.0));
@@ -2337,10 +2398,7 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
 
 fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, DecodeError> {
     let value = CheckpointTokenV2 {
-        input: WorkInputIdV2 {
-            invocation: InvocationId(d.fixed()?),
-            workflow_step: d.u64()?,
-        },
+        input: decode_work_input(d)?,
         base: decode_base(d)?,
         base_causal_height: d.option(Decoder::u64)?,
         expected: d.option(|d| d.fixed().map(Hash))?,
@@ -2796,6 +2854,7 @@ mod tests {
         );
 
         let work = work();
+        let work_input = work.input_id();
         let artifact = ImportedBlobV2 {
             reference: BlobRefV2::of_bytes(b"candidate artifact"),
             bytes: b"candidate artifact".to_vec(),
@@ -2826,6 +2885,16 @@ mod tests {
             provided_blobs: vec![artifact],
         });
         assert_eq!(AccumulateRequestV2::decode(&apply.encode()).unwrap(), apply);
+
+        let acknowledgement = AccumulateRequestV2::AcknowledgePublication(PublicationAckV2 {
+            service: service(),
+            input: work_input,
+            publication: Hash([19; 32]),
+        });
+        assert_eq!(
+            AccumulateRequestV2::decode(&acknowledgement.encode()).unwrap(),
+            acknowledgement
+        );
 
         let caller_invocation = InvocationId([20; 32]);
         let message = MessageRecordV2 {
@@ -3001,6 +3070,18 @@ mod tests {
         assert_eq!(
             AccumulationResultV2::decode(&duplicate.encode()).unwrap(),
             duplicate
+        );
+
+        let acknowledged = AccumulationResultV2::PublicationAcknowledged {
+            input: WorkInputIdV2 {
+                invocation: InvocationId([16; 32]),
+                workflow_step: 7,
+            },
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&acknowledged.encode()).unwrap(),
+            acknowledged
         );
 
         let rejection = AccumulationResultV2::Rejected(AccumulationRejectionV2::StaleLinearWork {
