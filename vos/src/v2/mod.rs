@@ -18,6 +18,7 @@ mod identity;
 mod package;
 #[cfg(feature = "std")]
 mod pvm;
+#[cfg(feature = "std")]
 mod service;
 mod state_tree;
 mod storage;
@@ -34,7 +35,7 @@ pub use contracts::{
     AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2,
-    ProofCommitmentV2, PublishedEffectsV2, Refine, RefineError, RefineImportsV2, ReplyRecordV2,
+    ProofCommitmentV2, PublishedEffectsV2, RefineError, RefineImportsV2, ReplyRecordV2,
     ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
     WorkInputIdV2, WorkflowOperationV2,
 };
@@ -54,7 +55,10 @@ pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
     RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
 };
-pub use service::{JamServiceV2, ServiceDispatchError, ServiceDispatchOutputV2};
+#[cfg(feature = "std")]
+pub use service::{
+    AccumulatedServiceOutputV2, JamServiceV2, RefinedServiceOutputV2, ServiceDispatchError,
+};
 pub use state_tree::{
     SERVICE_STATE_KEY_DOMAIN, SERVICE_STATE_LEAF_DOMAIN, SERVICE_STATE_NODE_DOMAIN,
     ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,

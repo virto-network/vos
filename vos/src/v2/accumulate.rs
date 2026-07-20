@@ -744,39 +744,6 @@ mod tests {
     }
 
     #[test]
-    fn refine_has_no_mutable_service_state_surface() {
-        struct Pure;
-        impl Refine for Pure {
-            fn refine(
-                work: &WorkEnvelopeV2,
-                _imports: &RefineImportsV2,
-            ) -> Result<TransitionV2, RefineError> {
-                Ok(TransitionV2 {
-                    service: work.service.clone(),
-                    consumed_input: work.input_id(),
-                    target_program: work.target_program,
-                    base: work.base.clone(),
-                    writes: vec![],
-                    crdt_change: None,
-                    continuations: vec![],
-                    inbox: vec![],
-                    outbox: vec![],
-                    reply: None,
-                    exported_blobs: vec![],
-                    gas: GasAccountingV2::default(),
-                    proof: None,
-                })
-            }
-        }
-        let (_state, work, _) = fixture();
-        let imports = RefineImportsV2::default();
-        assert_eq!(
-            Pure::refine(&work, &imports).unwrap(),
-            Pure::refine(&work, &imports).unwrap()
-        );
-    }
-
-    #[test]
     fn crdt_heads_are_derived_and_preserve_concurrent_branches() {
         let actor = ActorId([21; 32]);
         let program = ProgramId([22; 32]);
