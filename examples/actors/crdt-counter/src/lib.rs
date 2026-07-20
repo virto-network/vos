@@ -19,11 +19,10 @@ pub struct CrdtCounter {
 }
 
 impl CrdtCounter {
-    fn apply_increment(&mut self, invocation_id: InvocationId) {
-        let id = crdt::ChangeId::from(invocation_id).operation(0);
-        // Reapplying the same durable event is idempotent. A divergent reuse
-        // is a runtime invariant violation and must not silently mutate state.
-        if self.count.increment(id, 1).is_err() {
+    fn apply_increment(&mut self) {
+        // The service allocates a stable change scope for the complete actor
+        // slice; each field mutation receives its next operation ordinal.
+        if self.count.increment(1).is_err() {
             panic!("crdt-counter: divergent operation id");
         }
     }
@@ -38,8 +37,8 @@ impl CrdtCounter {
     }
 
     #[msg]
-    async fn inc(&mut self, ctx: &mut Context<Self>) {
-        self.apply_increment(ctx.invocation_id());
+    async fn inc(&mut self) {
+        self.apply_increment();
         log::info!("crdt-counter: inc -> count={}", self.count.value());
     }
 
@@ -74,13 +73,23 @@ mod tests {
     fn concurrent_increments_from_the_same_value_both_survive_merge() {
         let mut left = CrdtCounter::new();
         let mut right = CrdtCounter::new();
-        let mut left_ctx: Context<CrdtCounter> = Context::new(vos::actors::context::ServiceId(1));
-        let mut right_ctx: Context<CrdtCounter> = Context::new(vos::actors::context::ServiceId(1));
-        left_ctx.__set_invocation_id(InvocationId::derive(b"test-replica", b"left"));
-        right_ctx.__set_invocation_id(InvocationId::derive(b"test-replica", b"right"));
 
-        left.apply_increment(left_ctx.invocation_id());
-        right.apply_increment(right_ctx.invocation_id());
+        crdt::with_change(
+            crdt::ChangeId::from(InvocationId::derive(b"test-replica", b"left")),
+            || {
+                left.apply_increment();
+                Ok(())
+            },
+        )
+        .unwrap();
+        crdt::with_change(
+            crdt::ChangeId::from(InvocationId::derive(b"test-replica", b"right")),
+            || {
+                right.apply_increment();
+                Ok(())
+            },
+        )
+        .unwrap();
         left.count.merge(&right.count).expect("counter merge");
 
         assert_eq!(left.count.value(), 2);

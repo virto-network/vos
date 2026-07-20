@@ -769,12 +769,28 @@ pub fn run_nested_actor_service<A: super::Actor>(
     ctx.__set_actor_id(input.actor);
     ctx.__set_origin(input.origin);
 
-    let dispatch = lifecycle::dispatch_one_with_invocation::<A>(
-        &input.message,
-        &mut actor,
-        &mut ctx,
-        input.invocation,
+    assert_eq!(
+        A::CRDT,
+        input.change.is_some(),
+        "actor CRDT metadata does not match the service consistency mode"
     );
+    let dispatch = match input.change {
+        Some(change) => crate::crdt::with_change(crate::crdt::ChangeId(change.0), || {
+            Ok(lifecycle::dispatch_one_with_invocation::<A>(
+                &input.message,
+                &mut actor,
+                &mut ctx,
+                input.input.invocation,
+            ))
+        })
+        .expect("nested CRDT actor dispatch must establish one change scope"),
+        None => lifecycle::dispatch_one_with_invocation::<A>(
+            &input.message,
+            &mut actor,
+            &mut ctx,
+            input.input.invocation,
+        ),
+    };
     assert!(
         !matches!(dispatch, DispatchResult::Skipped),
         "actor message did not match the canonical program ABI"
