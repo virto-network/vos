@@ -1,0 +1,17 @@
+[package]
+name = "v2-shared-board"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { workspace = true, features = ["macros", "service"] }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+vos = { workspace = true, features = ["macros", "extension"] }

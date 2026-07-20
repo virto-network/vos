@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["counter", "shared-board"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+vos = { path = "../../vos", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
