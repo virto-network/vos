@@ -2250,23 +2250,48 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let before_prepare = service.accumulate_host().snapshot();
     let mut proof_work = work.clone();
     proof_work.proof_requested = true;
+    let mut proof_transition = transition.clone();
+    proof_transition.continuations.clear();
+    proof_transition.inbox.clear();
+    proof_transition.exported_blobs.clear();
+    proof_transition.reply = Some(ReplyRecordV2 {
+        call_id: proof_work.invocation.root_reply_id(),
+        producer: proof_work.target,
+        result: b"attested result".to_vec(),
+    });
     let prepared_attestation = service
         .accumulate(&AccumulateRequestV2::PrepareAttested(
             AccumulationEnvelopeV2 {
-                work: proof_work,
-                transition: transition.clone(),
-                provided_blobs: vec![ImportedBlobV2 {
-                    reference: continuation_ref.clone(),
-                    bytes: continuation_bytes.clone(),
-                }],
+                work: proof_work.clone(),
+                transition: proof_transition.clone(),
+                provided_blobs: vec![],
             },
         ))
         .expect("guest predicts the attested receipt without committing");
-    let AccumulationResultV2::Prepared(predicted) = prepared_attestation.result else {
+    let AccumulationResultV2::Prepared(preparation) = prepared_attestation.result else {
         panic!("guest did not prepare the attested transition")
     };
-    assert_eq!(predicted.accepted_transition, transition.commitment());
-    assert_eq!(predicted.sequence, 1);
+    assert_eq!(
+        preparation.receipt.accepted_transition,
+        proof_transition.commitment()
+    );
+    assert_eq!(preparation.receipt.sequence, 1);
+    assert_eq!(
+        preparation,
+        vos::v2::AttestationPreparationV2::for_transition(
+            &proof_work,
+            &proof_transition,
+            &MethodPolicyV2 {
+                method: proof_work.method.clone(),
+                schema: Hash([32; 32]),
+                policy: Hash([33; 32]),
+                public: true,
+                attested: false,
+            },
+            preparation.receipt.clone(),
+        )
+        .unwrap()
+    );
     assert!(
         service
             .accumulate_host()

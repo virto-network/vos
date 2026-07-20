@@ -4,6 +4,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::attestation::AttestationPreparationV2;
+
 use super::identity::*;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 
@@ -814,7 +816,7 @@ pub enum AccumulationResultV2 {
         published: PublishedEffectsV2,
         duplicate: bool,
     },
-    Prepared(AccumulationReceiptV2),
+    Prepared(AttestationPreparationV2),
     PublicationAcknowledged {
         input: WorkInputIdV2,
         duplicate: bool,
@@ -1797,9 +1799,9 @@ impl V2Wire for AccumulationResultV2 {
                 e.bytes(&published.encode());
                 e.bool(*duplicate);
             }
-            Self::Prepared(receipt) => {
+            Self::Prepared(preparation) => {
                 e.u8(2);
-                e.bytes(&receipt.encode());
+                e.bytes(&preparation.encode());
             }
             Self::PublicationAcknowledged { input, duplicate } => {
                 e.u8(4);
@@ -1838,7 +1840,9 @@ impl V2Wire for AccumulationResultV2 {
                     duplicate,
                 })
             }
-            2 => Ok(Self::Prepared(AccumulationReceiptV2::decode(&d.bytes()?)?)),
+            2 => Ok(Self::Prepared(AttestationPreparationV2::decode(
+                &d.bytes()?,
+            )?)),
             3 => Ok(Self::Rejected(decode_rejection(d)?)),
             4 => {
                 let input = WorkInputIdV2 {
