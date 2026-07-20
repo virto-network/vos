@@ -8,6 +8,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
@@ -549,20 +550,18 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
             return Ok(Some(AccumulationRejectionV2::DivergentDuplicate));
         }
     }
-    let mut max_height = 0;
-    for dependency in heads {
-        let Some(bytes) = read(store, &crdt_node_storage_key(*dependency))? else {
-            return Ok(Some(AccumulationRejectionV2::MissingCausalDependency(
-                *dependency,
-            )));
-        };
-        let parent =
-            CrdtChangeV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
-        if parent.cid() != *dependency {
-            return Err(GuestAccumulateError::CorruptStore);
+    let frontier = match load_causal_frontier(heads, |cid| store.read(&crdt_node_storage_key(cid)))
+    {
+        Ok(frontier) => frontier,
+        Err(CausalFrontierError::Storage(error)) => {
+            return Err(GuestAccumulateError::Storage(error));
         }
-        max_height = max_height.max(parent.causal_height);
-    }
+        Err(CausalFrontierError::Missing(cid)) => {
+            return Ok(Some(AccumulationRejectionV2::MissingCausalDependency(cid)));
+        }
+        Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
+    };
+    let max_height = frontier.max_head_height;
     if work.base_causal_height != Some(max_height)
         || max_height.checked_add(1) != Some(change.causal_height)
     {
@@ -577,66 +576,22 @@ fn crdt_base_materializations<S: StateTreeStore>(
     actor: ActorId,
     heads: &[Hash],
 ) -> GuestResult<Option<Vec<BlobRefV2>>, S::Error> {
-    if heads.is_empty() {
-        return Ok(Some(alloc::vec![descriptor.initial_state.clone()]));
-    }
-
-    // First make the complete ancestry available and CID-valid. A node with a
-    // convenient materialization does not permit missing ancestors to remain
-    // latent in the committed DAG.
-    let mut nodes = BTreeMap::<Hash, CrdtChangeV2>::new();
-    let mut pending = heads.to_vec();
-    while let Some(cid) = pending.pop() {
-        if nodes.contains_key(&cid) {
-            continue;
+    let frontier = match load_causal_frontier(heads, |cid| store.read(&crdt_node_storage_key(cid)))
+    {
+        Ok(frontier) => frontier,
+        Err(CausalFrontierError::Storage(error)) => {
+            return Err(GuestAccumulateError::Storage(error));
         }
-        let Some(bytes) = read(store, &crdt_node_storage_key(cid))? else {
-            return Ok(None);
-        };
-        let change =
-            CrdtChangeV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
-        if change.cid() != cid {
-            return Err(GuestAccumulateError::CorruptStore);
-        }
-        pending.extend(change.causal_dependencies.iter().copied());
-        nodes.insert(cid, change);
-    }
-
-    // For each branch, the nearest materialization for this actor already
-    // includes everything that branch observed. Stop there for selection, but
-    // retain every concurrent frontier and fold it inside the actor PVM.
-    let mut frontier = BTreeMap::<Hash, BlobRefV2>::new();
-    let mut visited = BTreeSet::new();
-    let mut pending = heads.to_vec();
-    while let Some(cid) = pending.pop() {
-        if !visited.insert(cid) {
-            continue;
-        }
-        let change = nodes.get(&cid).ok_or(GuestAccumulateError::CorruptStore)?;
-        if let Some(materialization) = change
-            .materializations
-            .iter()
-            .find(|materialization| materialization.actor == actor)
-        {
-            if let Some(existing) = frontier.get(&materialization.state.hash)
-                && existing != &materialization.state
-            {
-                return Err(GuestAccumulateError::CorruptStore);
-            }
-            frontier.insert(materialization.state.hash, materialization.state.clone());
-        } else if change.causal_dependencies.is_empty() {
-            frontier.insert(
-                descriptor.initial_state.hash,
-                descriptor.initial_state.clone(),
-            );
-        } else {
-            pending.extend(change.causal_dependencies.iter().copied());
+        Err(CausalFrontierError::Missing(_)) => return Ok(None),
+        Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
+    };
+    match frontier.actor_materializations::<S::Error>(descriptor, actor) {
+        Ok(states) => Ok(Some(states)),
+        Err(CausalFrontierError::Corrupt) => Err(GuestAccumulateError::CorruptStore),
+        Err(CausalFrontierError::Storage(_) | CausalFrontierError::Missing(_)) => {
+            unreachable!("materialization selection performs no storage reads")
         }
     }
-    if frontier.is_empty() {
-        return Err(GuestAccumulateError::CorruptStore);
-    }
-    Ok(Some(frontier.into_values().collect()))
 }
 
 fn write_crdt_change<S: GuestAccumulateStoreV2>(
@@ -1327,7 +1282,9 @@ mod tests {
                 }),
             )
             .unwrap(),
-            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+            rejected(AccumulationRejectionV2::MissingCausalDependency(
+                branches[0].0,
+            ))
         );
     }
 

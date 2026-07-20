@@ -11,6 +11,7 @@
 //! `RefinePayload`, `EffectLog`, or continuation encodings.
 
 mod accumulate;
+mod causal;
 mod continuation;
 mod contracts;
 mod guest_accumulate;

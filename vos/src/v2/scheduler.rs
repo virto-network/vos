@@ -7,12 +7,15 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::convert::Infallible;
 
+use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::{
     ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId, ConsistencyBaseV2,
     ConsistencyModeV2, ContinuationSnapshotV2, DecodeError, ImportedActorV2, ImportedBlobV2,
     ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2, Origin,
     RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
+    crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -45,7 +48,7 @@ pub enum ScheduleErrorV2 {
     StoreUninitialized,
     UnsupportedConsistency(ConsistencyModeV2),
     MissingActor(ActorId),
-    CrdtActorInLinearService(ActorId),
+    ActorConsistencyMismatch(ActorId),
     MissingProgram(super::ProgramId),
     MissingState(ActorId),
     MissingBlob(super::Hash),
@@ -56,6 +59,8 @@ pub enum ScheduleErrorV2 {
     InvalidContinuation(ActorId),
     InvocationAlreadyCommitted(InvocationId),
     InvalidWorkflowStep(InvocationId),
+    MissingCausalDependency(super::Hash),
+    CorruptCausalDag,
     NonCanonicalImports,
 }
 
@@ -76,9 +81,8 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
-    /// Prepare one Ephemeral/Local/Raft slice from the current committed root.
-    /// CRDT work uses causal frontier materializations and is intentionally a
-    /// separate path rather than pretending that one current row is a DAG.
+    /// Prepare one slice from the current committed linear revision or CRDT
+    /// frontier. Both paths use the same guest-owned header and actor rows.
     pub fn prepare(
         store: &LocalJamStoreV2,
         request: LocalWorkRequestV2,
@@ -87,27 +91,65 @@ impl LocalWorkSchedulerV2 {
             return Err(ScheduleErrorV2::EmptyMethod);
         }
         let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
-        if header.consistency == ConsistencyModeV2::Crdt {
-            return Err(ScheduleErrorV2::UnsupportedConsistency(header.consistency));
-        }
-
         let descriptor_key = StateKeyV2::ActorDescriptor(request.target);
         let descriptor = decode_row::<ActorGenesisV2>(store, header.service_root, &descriptor_key)?
             .ok_or(ScheduleErrorV2::MissingActor(request.target))?;
-        if descriptor.crdt {
-            return Err(ScheduleErrorV2::CrdtActorInLinearService(request.target));
+        if descriptor.crdt != (header.consistency == ConsistencyModeV2::Crdt) {
+            return Err(ScheduleErrorV2::ActorConsistencyMismatch(request.target));
         }
 
         let program_bytes = store
             .program(descriptor.program)
             .ok_or(ScheduleErrorV2::MissingProgram(descriptor.program))?
             .to_vec();
-        let state_key = StateKeyV2::ActorRow {
-            actor: request.target,
-            key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
-        };
-        let state = decode_row::<BlobRefV2>(store, header.service_root, &state_key)?
-            .ok_or(ScheduleErrorV2::MissingState(request.target))?;
+        let (base, base_causal_height, mut states) =
+            if header.consistency == ConsistencyModeV2::Crdt {
+                let heads = header.crdt_heads.clone();
+                let frontier = load_causal_frontier(&heads, |cid| {
+                    Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
+                });
+                let frontier = match frontier {
+                    Ok(frontier) => frontier,
+                    Err(CausalFrontierError::Missing(cid)) => {
+                        return Err(ScheduleErrorV2::MissingCausalDependency(cid));
+                    }
+                    Err(CausalFrontierError::Corrupt) => {
+                        return Err(ScheduleErrorV2::CorruptCausalDag);
+                    }
+                    Err(CausalFrontierError::Storage(error)) => match error {},
+                };
+                let height = frontier.max_head_height;
+                let states = frontier
+                    .actor_materializations::<Infallible>(&descriptor, request.target)
+                    .map_err(|error| match error {
+                        CausalFrontierError::Corrupt => ScheduleErrorV2::CorruptCausalDag,
+                        CausalFrontierError::Storage(error) => match error {},
+                        CausalFrontierError::Missing(_) => ScheduleErrorV2::CorruptCausalDag,
+                    })?;
+                (ConsistencyBaseV2::Crdt { heads }, Some(height), states)
+            } else {
+                let state_root = header
+                    .state_root
+                    .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?;
+                let state_key = StateKeyV2::ActorRow {
+                    actor: request.target,
+                    key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+                };
+                let state = decode_row::<BlobRefV2>(store, header.service_root, &state_key)?
+                    .ok_or(ScheduleErrorV2::MissingState(request.target))?;
+                (
+                    ConsistencyBaseV2::Linear {
+                        revision: header.revision,
+                        state_root,
+                    },
+                    None,
+                    alloc::vec![state],
+                )
+            };
+        if states.is_empty() {
+            return Err(ScheduleErrorV2::CorruptCausalDag);
+        }
+        let state = states.remove(0);
         let continuation_key = StateKeyV2::Continuation(request.target);
         let continuation = decode_row::<BlobRefV2>(store, header.service_root, &continuation_key)?;
         let workflow_key = StateKeyV2::Workflow(request.invocation);
@@ -137,9 +179,6 @@ impl LocalWorkSchedulerV2 {
             }
         }
 
-        let state_root = header
-            .state_root
-            .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?;
         let mut work = WorkEnvelopeV2 {
             service: header.service.clone(),
             invocation: request.invocation,
@@ -153,11 +192,8 @@ impl LocalWorkSchedulerV2 {
             causal_parent: request.causal_parent,
             parent_call: request.parent_call,
             consistency: header.consistency,
-            base: ConsistencyBaseV2::Linear {
-                revision: header.revision,
-                state_root,
-            },
-            base_causal_height: None,
+            base,
+            base_causal_height,
             imported_actors: Vec::new(),
             imported_blobs: request.imported_blobs,
             proof_requested: request.proof_requested,
@@ -166,7 +202,7 @@ impl LocalWorkSchedulerV2 {
             actor: request.target,
             program: descriptor.program,
             state: state.clone(),
-            causal_states: Vec::new(),
+            causal_states: states.clone(),
             continuation: continuation.clone(),
         });
         work.imported_blobs.sort_by_key(|blob| blob.hash);
@@ -180,6 +216,9 @@ impl LocalWorkSchedulerV2 {
 
         let mut blobs = BTreeMap::new();
         import_blob(store, &mut blobs, &state)?;
+        for reference in &states {
+            import_blob(store, &mut blobs, reference)?;
+        }
         if let Some(reference) = continuation.as_ref() {
             import_blob(store, &mut blobs, reference)?;
         }

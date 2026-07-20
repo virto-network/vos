@@ -200,18 +200,9 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
     work.base_causal_height = Some(0);
 
-    let imports = RefineImportsV2 {
-        programs: vec![ImportedProgramV2 {
-            program: actor_program,
-            pvm: actor_pvm.clone(),
-        }],
-        blobs: vec![ImportedBlobV2 {
-            reference: initial.clone(),
-            bytes: initial_bytes.clone(),
-        }],
-    };
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
     let mut service = JamServiceV2::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
@@ -247,6 +238,26 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         service.accumulate(&install).unwrap().result,
         AccumulationResultV2::Installed(_)
     ));
+
+    let scheduled = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: work.invocation,
+            workflow_step: 0,
+            target: work.target,
+            method: work.method.clone(),
+            arguments: work.arguments.clone(),
+            origin: work.origin,
+            authorization: work.authorization.clone(),
+            causal_parent: None,
+            parent_call: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("scheduler imports the empty CRDT frontier");
+    assert_eq!(scheduled.work, work);
+    let imports = scheduled.imports;
 
     let refined = service.refine_actor_tree(&work, &imports).unwrap();
     assert!(refined.transition.writes.is_empty());
@@ -320,35 +331,34 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     heads.sort();
     assert_eq!(receipt.resulting_crdt_heads, heads);
 
-    // Supply the exact frontier materializations in content order. The
-    // generated actor merger folds both counters before the handler observes
-    // state, so 2 + 3 + 4 is returned and materialized as one causal child.
-    let mut frontier = vec![
-        refined.exported_blobs[0].clone(),
-        right_refined.exported_blobs[0].clone(),
-    ];
-    frontier.sort_by_key(|blob| blob.reference.hash);
-    let mut merge_work = work;
-    merge_work.invocation = InvocationId([48; 32]);
-    merge_work.base = ConsistencyBaseV2::Crdt {
-        heads: heads.clone(),
-    };
-    merge_work.base_causal_height = Some(1);
-    merge_work.imported_actors[0].state = frontier[0].reference.clone();
-    merge_work.imported_actors[0].causal_states = frontier[1..]
-        .iter()
-        .map(|blob| blob.reference.clone())
-        .collect();
+    // The scheduler walks both complete branches and imports the exact
+    // materialization frontier. The generated actor merger folds both counters
+    // before the handler observes state, so 2 + 3 + 4 becomes 9.
     let mut merge_message = vec![vos::value::TAG_DYNAMIC];
     merge_message.extend_from_slice(&Msg::new("increment").with("amount", 4u64).encode());
-    merge_work.arguments = merge_message;
-    let merge_imports = RefineImportsV2 {
-        programs: vec![ImportedProgramV2 {
-            program: actor_program,
-            pvm: actor_pvm,
-        }],
-        blobs: frontier,
-    };
+    let merge = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([48; 32]),
+            workflow_step: 0,
+            target: work.target,
+            method: work.method.clone(),
+            arguments: merge_message,
+            origin: work.origin,
+            authorization: work.authorization.clone(),
+            causal_parent: None,
+            parent_call: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("scheduler imports both concurrent CRDT heads");
+    let merge_work = merge.work;
+    let merge_imports = merge.imports;
+    assert_eq!(merge_work.base, ConsistencyBaseV2::Crdt { heads });
+    assert_eq!(merge_work.base_causal_height, Some(1));
+    assert_eq!(merge_work.imported_actors[0].causal_states.len(), 1);
+    assert_eq!(merge_imports.blobs.len(), 2);
     let merged = service
         .refine_actor_tree(&merge_work, &merge_imports)
         .unwrap();
