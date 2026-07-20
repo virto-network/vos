@@ -249,6 +249,10 @@ impl Storage<u16> for RedbStorage {
         read_state_bytes(&self.db)
     }
 
+    async fn applied_index(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(RaftMeta::load(&self.db)?.last_applied))
+    }
+
     async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
         Ok(meta_from_raft(&self.meta))
     }

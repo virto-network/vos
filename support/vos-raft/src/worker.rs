@@ -2990,7 +2990,13 @@ where
     // a `debug_assert!` so a future refactor that introduces a
     // path where the two diverge cannot silently compact past
     // committed state in release builds.
-    let floor = majority_floor.min(state.meta.commit_index);
+    let committed_floor = majority_floor.min(state.meta.commit_index);
+    let applied_floor = state
+        .storage
+        .applied_index()
+        .await?
+        .unwrap_or(committed_floor);
+    let floor = committed_floor.min(applied_floor);
     let snap = state.storage.snap_last_index();
     if floor <= snap || floor.saturating_sub(snap) < state.cfg.compact_hysteresis {
         return Ok(());
@@ -3265,6 +3271,44 @@ mod tests {
         assert_eq!(snap.last_log_index, 2);
         assert_eq!(snap.commit_index, 2);
 
+        worker.shutdown();
+    }
+
+    #[test]
+    fn compaction_never_crosses_durable_application_cursor() {
+        // The state bytes represent index 1. Even after index 2 reaches the
+        // single-member quorum, the worker may compact the leader no-op but
+        // must retain the unapplied application entry.
+        let storage = MemStorage::<u16>::new().with_applied_index(1);
+        let transport = Arc::new(RecordingTransport::default());
+        let mut cfg = cfg(0xAAAA, alloc::vec![0xAAAA]);
+        cfg.election_timeout_ms = (10, 30);
+        cfg.heartbeat_interval_ms = 5;
+        cfg.compact_hysteresis = 1;
+        let worker = Worker::spawn_with(
+            storage,
+            transport,
+            cfg,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        let handle = worker.handler();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if block_on(handle.snapshot()).is_some_and(|snapshot| snapshot.role == Role::Leader) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no leadership");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(block_on(handle.propose(alloc::vec![9])).unwrap(), 2);
+        std::thread::sleep(Duration::from_millis(30));
+        let snapshot = block_on(handle.snapshot()).unwrap();
+        assert_eq!(snapshot.commit_index, 2);
+        assert_eq!(snapshot.snap_last_index, 1);
+        assert_eq!(snapshot.last_log_index, 2);
         worker.shutdown();
     }
 
