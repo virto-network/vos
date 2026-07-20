@@ -338,12 +338,16 @@ impl ServicePvmV2 {
                 })
             })
             .collect::<Result<Vec<_>, ServicePvmErrorV2>>()?;
+        let active_actor_index = actor_tree
+            .binary_search_by_key(&work.target, |actor| actor.actor)
+            .map_err(|_| ServicePvmErrorV2::InvalidRefineImports)?;
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
             change: CrdtChangeV2::derive_id(&work),
             state: target_state.to_vec(),
             causal_states,
             actor_tree,
+            active_actor_mask: 1u64 << active_actor_index,
             first_await_ordinal: 0,
             message: work.arguments.clone(),
             origin: work.origin,

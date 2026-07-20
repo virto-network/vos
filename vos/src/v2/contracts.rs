@@ -187,6 +187,10 @@ pub struct ActorSliceInputV2 {
     /// Complete canonical root-tree import. Actor code resolves typed names
     /// and same-tree CALLABLE slots only from this authenticated input.
     pub actor_tree: Vec<ActorTreeImportV2>,
+    /// Canonical actor-tree-indexed set of active same-tree callers, including
+    /// `actor`. Re-entering any member is a deterministic causal cycle. JAR's
+    /// kernel snapshot retains the corresponding ordered machine stack.
+    pub active_actor_mask: u64,
     /// First tree-wide await ordinal available to this actor and its inline
     /// descendants.
     pub first_await_ordinal: u64,
@@ -1142,6 +1146,7 @@ impl V2Wire for ActorSliceInputV2 {
         e.bytes(&self.state);
         e.list(&self.causal_states, |e, state| e.bytes(state));
         e.list(&self.actor_tree, encode_actor_tree_import);
+        e.u64(self.active_actor_mask);
         e.u64(self.first_await_ordinal);
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
@@ -1155,6 +1160,7 @@ impl V2Wire for ActorSliceInputV2 {
             state: d.bytes()?,
             causal_states: d.list(Decoder::bytes)?,
             actor_tree: d.list(decode_actor_tree_import)?,
+            active_actor_mask: d.u64()?,
             first_await_ordinal: d.u64()?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
@@ -1167,15 +1173,21 @@ impl V2Wire for ActorSliceInputV2 {
         };
         ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
         validate_actor_slice_tree(&value.actor_tree)?;
-        let Some(self_import) = value
+        if value.actor_tree.len() > super::MAX_ROOT_TREE_ACTORS {
+            return Err(DecodeError::NonCanonical);
+        }
+        let Some((self_index, self_import)) = value
             .actor_tree
             .binary_search_by_key(&value.actor, |actor| actor.actor)
             .ok()
-            .map(|index| &value.actor_tree[index])
+            .map(|index| (index, &value.actor_tree[index]))
         else {
             return Err(DecodeError::NonCanonical);
         };
-        if self_import.suspended
+        let valid_actor_mask = (1u64 << value.actor_tree.len()) - 1;
+        if value.active_actor_mask & !valid_actor_mask != 0
+            || value.active_actor_mask & (1u64 << self_index) == 0
+            || self_import.suspended
             || self_import.state != value.state
             || self_import.causal_states != value.causal_states
             || (value.change.is_none()
@@ -3022,12 +3034,19 @@ mod tests {
                     suspended: false,
                 },
             ],
+            active_actor_mask: 1,
             first_await_ordinal: 7,
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),
             space_role: Some(crate::SpaceRole::Developer.as_u8()),
         };
         assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
+        let mut invalid_active_set = input.clone();
+        invalid_active_set.active_actor_mask |= 1u64 << 63;
+        assert_eq!(
+            ActorSliceInputV2::decode(&invalid_active_set.encode()),
+            Err(DecodeError::NonCanonical)
+        );
         assert_eq!(
             input.resolve_owned(Some(input.actor), "child"),
             Some(ActorId([22; 32]))

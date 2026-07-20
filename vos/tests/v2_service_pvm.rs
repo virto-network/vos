@@ -256,6 +256,21 @@ fn workflow_v2_elf() -> Option<Vec<u8>> {
     }
 }
 
+fn cycle_v2_elf() -> Option<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cycle-v2/target/riscv64em-javm/release/cycle_v2_fixture.elf");
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            eprintln!(
+                "skipping: build the v2 cycle fixture with `cd vos/tests/fixtures/cycle-v2 && cargo +nightly actor` ({})",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn actor_pvm(result: u64) -> Vec<u8> {
     let mut assembler = grey_transpiler::assembler::Assembler::new();
     assembler
@@ -1035,6 +1050,130 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                 work: after_second.work,
                 transition: finished.transition,
                 provided_blobs: finished.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn same_tree_causal_cycles_return_an_explicit_guest_error() {
+    let (Some(service_elf), Some(actor_elf)) = (service_elf(), cycle_v2_elf()) else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed = work(actor_program, initial.clone());
+    let child = ActorId([36; 32]);
+
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let mut service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        host,
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![
+            ActorGenesisV2 {
+                actor: seed.target,
+                name: "root".into(),
+                parent: None,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "root_cycle".into(),
+                    schema: Hash([81; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                }],
+            },
+            ActorGenesisV2 {
+                actor: child,
+                name: "child".into(),
+                parent: Some(seed.target),
+                program: actor_program,
+                initial_state: initial,
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "child_cycle".into(),
+                    schema: Hash([82; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                }],
+            },
+        ],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([83; 32]),
+            authenticator: vec![84],
+        },
+    });
+    let AccumulateRequestV2::Install(genesis) = &install else {
+        unreachable!()
+    };
+    service.accumulate_host_mut().allow_install(genesis);
+    assert!(matches!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let mut message = vec![vos::value::TAG_DYNAMIC];
+    message.extend_from_slice(&Msg::new("root_cycle").encode());
+    let scheduled = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([85; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: seed.target,
+            method: "root_cycle".into(),
+            arguments: message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let refined = service
+        .refine_actor_tree(&scheduled.work, &scheduled.imports)
+        .expect("A -> B -> A returns Cycle before re-entering A");
+    assert!(refined.transition.outbox.is_empty());
+    assert!(refined.transition.continuations.is_empty());
+    assert_eq!(
+        refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(1))
+    );
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: scheduled.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
             }))
             .unwrap()
             .result,

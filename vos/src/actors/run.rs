@@ -792,6 +792,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         input.change,
         capacity,
         input.first_await_ordinal,
+        input.active_actor_mask,
     );
     ctx.__set_origin(input.origin);
     ctx.set_caller_roles(input.space_role, None);

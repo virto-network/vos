@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "cycle-v2-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../..", default-features = false, features = ["macros", "service"] }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+vos = { path = "../../..", default-features = false, features = ["macros", "extension"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
