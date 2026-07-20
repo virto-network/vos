@@ -56,6 +56,12 @@ protocol boundary. Resume consumes the checkpoint, injects one result into its
 declared registers and continues at `resume_pc`. It never restarts the handler
 at PC 0. Suspended actors are non-reentrant; later messages remain queued.
 
+The local conformance host persists the complete committed service image as a
+canonical `LocalJamStoreSnapshotV2` wire. Restore verifies every blob and
+program against its content identity and validates the current v2 store header
+before exposing any rows; in-flight transactions and host verifier policy are
+deliberately excluded.
+
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls
 may execute inline. Cross-root calls always use durable outbox/inbox rows and a

@@ -892,8 +892,9 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
 
     // Simulate a complete process restart. The only retained workflow inputs
     // are now the guest-owned service rows and content-addressed blobs.
-    let restarted_store =
-        LocalJamStoreV2::from_snapshot(committed_service.accumulate_host().snapshot());
+    let persisted = committed_service.accumulate_host().snapshot_bytes();
+    let restarted_store = LocalJamStoreV2::from_snapshot_bytes(&persisted)
+        .expect("canonical committed image survives process restart");
     let mut restarted_service = JamServiceV2::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
@@ -1290,7 +1291,9 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         "a read-only duplicate transaction must not commit"
     );
 
-    let restarted = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
+    let persisted = service.accumulate_host().snapshot_bytes();
+    let restarted = LocalJamStoreV2::from_snapshot_bytes(&persisted)
+        .expect("guest-owned workflow rows survive durable restart");
     assert_eq!(
         LocalWorkSchedulerV2::prepare_inbox(&restarted, call_id, 50),
         Err(ScheduleErrorV2::ActorBusy(work.target))
