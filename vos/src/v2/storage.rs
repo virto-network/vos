@@ -243,6 +243,8 @@ pub struct DedupRecordV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowCheckpointV2 {
     pub input: WorkInputIdV2,
+    /// Stable service/actor/caller binding shared by all continuation slices.
+    pub workflow_identity: Hash,
     pub work_hash: Hash,
     pub transition_commitment: Hash,
 }
@@ -253,6 +255,7 @@ impl V2Wire for WorkflowCheckpointV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         encode_input(&mut e, self.input);
+        e.fixed(&self.workflow_identity.0);
         e.fixed(&self.work_hash.0);
         e.fixed(&self.transition_commitment.0);
     }
@@ -260,6 +263,7 @@ impl V2Wire for WorkflowCheckpointV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(Self {
             input: decode_input(d)?,
+            workflow_identity: Hash(d.fixed()?),
             work_hash: Hash(d.fixed()?),
             transition_commitment: Hash(d.fixed()?),
         })

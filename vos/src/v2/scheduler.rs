@@ -295,6 +295,13 @@ impl LocalWorkSchedulerV2 {
             imported_blobs: request.imported_blobs,
             proof_requested: request.proof_requested,
         };
+        if request.workflow_step != 0
+            && workflow
+                .as_ref()
+                .is_none_or(|checkpoint| checkpoint.workflow_identity != work.workflow_identity())
+        {
+            return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
+        }
         work.imported_actors.push(ImportedActorV2 {
             actor: request.target,
             program: descriptor.program,
