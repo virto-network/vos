@@ -5,6 +5,7 @@
 //! that deployment installs; the host supplies only imports and an atomic JAM
 //! storage transaction boundary.
 
+use alloc::boxed::Box;
 use alloc::{string::String, vec::Vec};
 
 use crate::attestation::{
@@ -14,12 +15,12 @@ use crate::attestation::{
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, CommittedServiceImageHostV2, ImportedBlobV2,
-    LocalJamStoreSnapshotV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
-    PublishedEffectsV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2,
-    ServiceImageInstallErrorV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
-    WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
+    AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestationDeliveryV2,
+    CommittedServiceImageHostV2, ImportedBlobV2, LocalJamStoreSnapshotV2, ProducerId, ProgramId,
+    ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2,
+    RefineOutputV2, RefineProtocolHostV2, ServiceImageInstallErrorV2, ServicePvmErrorV2,
+    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,41 @@ pub struct CommittedAttestationOutputV2 {
 }
 
 impl CommittedAttestationOutputV2 {
+    /// Build the durable reply input and its separately transported proof
+    /// blob. This type can exist only after guest Accumulate committed, so a
+    /// caller cannot observe a prepared or merely proved package.
+    pub fn into_accumulated_reply(
+        self,
+        producer_name: String,
+        producer: ProducerId,
+    ) -> Result<(AccumulatedReplyV2, ImportedBlobV2), AttestationError> {
+        let reply = self
+            .published
+            .reply
+            .ok_or(AttestationError::InvalidStatement)?;
+        if self.published.proof.as_ref() != Some(&self.proof)
+            || !self.proof.proof_blob.matches(&self.proof_bytes)
+        {
+            return Err(AttestationError::InvalidProof);
+        }
+        let proof_blob = ImportedBlobV2 {
+            reference: self.proof.proof_blob.clone(),
+            bytes: self.proof_bytes,
+        };
+        let accumulated = AccumulatedReplyV2 {
+            reply,
+            receipt: self.preparation.receipt,
+            attestation: Some(Box::new(AttestationDeliveryV2 {
+                producer_name,
+                producer,
+                statement: self.preparation.statement,
+                proof: self.proof,
+            })),
+        };
+        accumulated.validate()?;
+        Ok((accumulated, proof_blob))
+    }
+
     /// Produce the transport record consumed by macro-generated attested
     /// handles. Only the reply published by successful guest Accumulate is
     /// decoded; prepare/proof output alone cannot construct this record.

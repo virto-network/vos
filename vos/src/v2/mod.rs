@@ -38,15 +38,15 @@ pub use contracts::{
     AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorCallResultV2,
     ActorCrdtStateV2, ActorDirectoryV2, ActorEffectBatchV2, ActorGenesisV2, ActorPrivateInputV2,
     ActorSliceInputV2, ActorSliceOutputV2, ActorTreeImportV2, ActorWriteV2,
-    AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CausalCallContextV2, CheckpointTokenV2,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
-    CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2,
-    GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
-    MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2,
-    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
-    ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
-    WorkflowOperationV2,
+    AttestationDeliveryV2, AttestationResumeV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
+    CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
+    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, GasAccountingV2, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
+    ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -164,6 +164,9 @@ pub const ACTOR_EFFECT_BATCH_MAX_BYTES: usize =
     MAX_ROOT_TREE_ACTORS * ACTOR_PRIVATE_INPUT_MAX_BYTES;
 /// Bounded stack window receiving a checkpoint token after snapshot capture.
 pub const CHECKPOINT_TOKEN_CAPACITY: usize = 4096;
+/// Maximum portable proof payload carried through one actor resume. Bytes are
+/// staged in the invocation-owned IPC capability, never the stack token.
+pub const MAX_ATTESTATION_PROOF_BYTES: usize = 16 * 4096;
 /// Register marker distinguishing an awaited-call suspension from an explicit
 /// scheduler yield at the shared SUSPEND capability.
 pub const AWAIT_SUSPEND_MAGIC: u64 = 0x564f_532d_4157_5432;

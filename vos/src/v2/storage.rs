@@ -753,6 +753,7 @@ mod tests {
             parent: None,
             payload: vec![1],
             authorization: super::super::AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot: Some(30),
         };
         let published = PublishedEffectsV2 {
@@ -846,6 +847,7 @@ mod tests {
                     consistency: ConsistencyModeV2::Local,
                 },
                 reply,
+                attestation: None,
             },
             work_hash: Hash([47; 32]),
         };

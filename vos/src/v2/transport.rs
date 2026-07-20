@@ -197,6 +197,7 @@ impl LocalTransportV2 {
         let awaited_reply = AccumulatedReplyV2 {
             reply: reply.clone(),
             receipt: canonical.receipt,
+            attestation: None,
         };
         if let Some((admission, receipt)) = caller
             .accumulate_host()

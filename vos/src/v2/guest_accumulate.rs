@@ -2116,6 +2116,7 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
         || message.await_ordinal != snapshot.await_ordinal
         || snapshot.pending_actor != Some(message.from)
         || message.to != awaited.reply.producer
+        || message.proof_requested != awaited.attestation.is_some()
         || message
             .deadline_timeslot
             .is_some_and(|deadline| work.logical_timeslot >= deadline)
@@ -2149,6 +2150,10 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
             suspended: Vec::new(),
         },
         reply: awaited.reply.clone(),
+        // Accumulate validates only the fixed suspension buffer bound here.
+        // Refine resolves and stages an attestation proof from its imported
+        // blob, then supplies the concrete proof window in this descriptor.
+        attestation: None,
     };
     if injection.encode().len() > CHECKPOINT_TOKEN_CAPACITY {
         return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
@@ -3572,6 +3577,7 @@ mod tests {
             parent: None,
             payload,
             authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot: Some(10),
         };
         let continuation_bytes = ContinuationSnapshotV2 {
@@ -3669,6 +3675,7 @@ mod tests {
         let awaited = super::super::AccumulatedReplyV2 {
             reply: remote_reply,
             receipt: remote_receipt,
+            attestation: None,
         };
         let mut resume = first_work;
         resume.workflow_step = 1;
@@ -3746,6 +3753,7 @@ mod tests {
                 suspended: Vec::new(),
             },
             reply: oversized.awaited_reply.as_ref().unwrap().reply.clone(),
+            attestation: None,
         };
         assert!(injection.encode().len() > super::super::CHECKPOINT_TOKEN_CAPACITY);
         assert_eq!(
@@ -3863,6 +3871,7 @@ mod tests {
             parent,
             payload,
             authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot,
         }
     }
@@ -4326,6 +4335,7 @@ mod tests {
             parent: None,
             payload: vec![1],
             authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot: None,
         });
         let workflow = first.workflow_operations(&first_work);

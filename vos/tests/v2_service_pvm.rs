@@ -416,6 +416,7 @@ fn peer_reply(
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     }
 }
 
@@ -2441,6 +2442,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     };
     service
         .accumulate_host_mut()
@@ -2627,6 +2629,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     };
     service
         .accumulate_host_mut()
@@ -3415,6 +3418,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     };
     let mut resume_request = request;
     resume_request.workflow_step = 1;
@@ -3628,6 +3632,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         parent: None,
         payload: payload.clone(),
         authorization: AuthorizationEvidenceV2::Public,
+        proof_requested: false,
         deadline_timeslot: Some(200),
     };
     let mut seed_payload = vec![vos::value::TAG_DYNAMIC];
@@ -3785,6 +3790,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             consistency: ConsistencyModeV2::Local,
         },
         reply: first_reply,
+        attestation: None,
     };
 
     let reopened = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
@@ -3992,6 +3998,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             consistency: ConsistencyModeV2::Local,
         },
         reply: second_reply,
+        attestation: None,
     };
 
     let reopened = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
@@ -4315,6 +4322,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         parent: None,
         payload: work.arguments.clone(),
         authorization: AuthorizationEvidenceV2::Public,
+        proof_requested: false,
         deadline_timeslot: Some(100),
     };
     let transition = TransitionV2 {
@@ -4780,6 +4788,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         parent: None,
         payload: caller.work.arguments.clone(),
         authorization: AuthorizationEvidenceV2::Public,
+        proof_requested: false,
         deadline_timeslot: Some(90),
     };
     let checkpoint = TransitionV2 {
@@ -4845,6 +4854,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             consistency: ConsistencyModeV2::Local,
         },
         reply: remote_reply,
+        attestation: None,
     };
     let resume_request = LocalWorkRequestV2 {
         invocation: caller.work.invocation,
