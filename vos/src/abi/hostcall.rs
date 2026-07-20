@@ -106,6 +106,10 @@ pub const PROOF_VERIFY: u32 = 123;
 /// initialized. Installed only on the generic service's Accumulate entry.
 pub const INSTALL_AUTH_VERIFY: u32 = 124;
 
+/// Validate an external service's exact accumulation receipt before a
+/// committed reply is admitted as continuation input. Accumulate-only.
+pub const RECEIPT_VERIFY: u32 = 125;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +125,7 @@ mod tests {
             SUSPEND,
             PROOF_VERIFY,
             INSTALL_AUTH_VERIFY,
+            RECEIPT_VERIFY,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
         for (index, slot) in supplied.iter().enumerate() {
@@ -150,6 +155,7 @@ mod tests {
             SUSPEND as u8,
             PROOF_VERIFY as u8,
             INSTALL_AUTH_VERIFY as u8,
+            RECEIPT_VERIFY as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];
         assert!(

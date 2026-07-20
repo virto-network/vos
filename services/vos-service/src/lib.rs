@@ -365,6 +365,17 @@ mod guest {
                 _ => vos::v2::ProofVerificationV2::Invalid,
             })
         }
+
+        fn verify_receipt(
+            &self,
+            request: &vos::v2::ReceiptVerificationRequestV2,
+        ) -> Result<vos::v2::ReceiptVerificationV2, Self::Error> {
+            Ok(match hostcalls::verify_receipt(&request.encode()) {
+                error::HOST_OK => vos::v2::ReceiptVerificationV2::Valid,
+                error::HOST_NONE => vos::v2::ReceiptVerificationV2::Unavailable,
+                _ => vos::v2::ReceiptVerificationV2::Invalid,
+            })
+        }
     }
 
     fn output(encoded: &[u8]) -> OutputWindow {

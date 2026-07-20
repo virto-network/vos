@@ -12,8 +12,8 @@ use javm::kernel::InvocationKernel;
 
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
-    ProofVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
-    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    ProofVerificationRequestV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2,
+    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Recoverable committed image of a local v2 service account.
@@ -64,6 +64,7 @@ pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
     proof_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
+    receipt_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamStoreV2 {
@@ -77,6 +78,7 @@ impl LocalJamStoreV2 {
             },
             proof_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
+            receipt_allowlist: BTreeSet::new(),
         }
     }
 
@@ -86,6 +88,7 @@ impl LocalJamStoreV2 {
             committed: snapshot,
             proof_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
+            receipt_allowlist: BTreeSet::new(),
         }
     }
 
@@ -180,6 +183,13 @@ impl LocalJamStoreV2 {
     pub fn allow_install(&mut self, genesis: &ServiceGenesisV2) {
         self.install_allowlist.insert(install_hash(genesis));
     }
+
+    /// Configure the conformance host to accept one exact finalized receipt.
+    /// Production hosts replace this allowlist with their JAM receipt/finality
+    /// verifier.
+    pub fn allow_receipt(&mut self, request: &ReceiptVerificationRequestV2) {
+        self.receipt_allowlist.insert(request.hash());
+    }
 }
 
 struct CommittedRows<'a>(&'a BTreeMap<Vec<u8>, Vec<u8>>);
@@ -201,6 +211,7 @@ pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
     proof_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
+    receipt_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamTransactionV2 {
@@ -329,6 +340,19 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                     0,
                 ])
             }
+            hostcall::RECEIPT_VERIFY => {
+                let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
+                let request = ReceiptVerificationRequestV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                Ok([
+                    if self.receipt_allowlist.contains(&request.hash()) {
+                        error::HOST_OK
+                    } else {
+                        error::HOST_NONE
+                    },
+                    0,
+                ])
+            }
             _ => Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
         }
     }
@@ -342,6 +366,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
             staged: self.committed.clone(),
             proof_allowlist: self.proof_allowlist.clone(),
             install_allowlist: self.install_allowlist.clone(),
+            receipt_allowlist: self.receipt_allowlist.clone(),
         })
     }
 

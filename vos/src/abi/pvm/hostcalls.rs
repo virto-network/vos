@@ -207,6 +207,18 @@ pub fn verify_install_authorization(genesis: &[u8]) -> u64 {
     )
 }
 
+/// Validate a committed external accumulation receipt used to resume an
+/// awaited cross-root call.
+#[cfg(feature = "service")]
+#[inline]
+pub fn verify_receipt(request: &[u8]) -> u64 {
+    ecall2(
+        hostcall::RECEIPT_VERIFY,
+        request.as_ptr() as u64,
+        request.len() as u64,
+    )
+}
+
 /// Transfer to another service with a memo.
 #[cfg(feature = "service")]
 #[inline]

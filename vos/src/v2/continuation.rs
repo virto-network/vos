@@ -198,6 +198,7 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
             parent_call: snapshot.pending_call,
+            awaited_reply: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
                 revision: 8,
