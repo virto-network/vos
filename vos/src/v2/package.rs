@@ -8,7 +8,10 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::identity::{DeploymentId, Hash, ProducerId, ProgramId};
+use crate::metadata::{ParsedMessage, ParsedMeta};
+
+use super::contracts::{ActorGenesisV2, BlobRefV2, MethodPolicyV2};
+use super::identity::{ActorId, DeploymentId, Hash, ProducerId, ProgramId};
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +53,16 @@ pub struct VosPackageV2 {
     pub deployment_signature: DeploymentSignatureV2,
 }
 
+/// Canonical generated authorization artifact carried by `.vos` v2.
+///
+/// The package stores this exact wire value rather than an opaque policy file.
+/// Registries and installers can therefore prove that every installed method
+/// policy was derived from the signed schema and source annotations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRolePoliciesV2 {
+    pub methods: Vec<MethodPolicyV2>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageError {
     WrongAbi,
@@ -61,6 +74,10 @@ pub enum PackageError {
     InterfaceHashMismatch,
     PolicyHashMismatch,
     SchemaHashMismatch,
+    InvalidSchema,
+    InvalidRolePolicies,
+    PolicySchemaMismatch,
+    CrdtMetadataMismatch,
     MissingSignature,
     ProducerIdMismatch,
 }
@@ -214,6 +231,16 @@ impl VosPackageV2 {
         if artifact_hash(b"schemas", &self.schemas) != self.manifest.schemas_hash {
             return Err(PackageError::SchemaHashMismatch);
         }
+        let metadata = crate::metadata::decode(&self.schemas).ok_or(PackageError::InvalidSchema)?;
+        let policies = PackageRolePoliciesV2::decode(&self.role_policies)
+            .map_err(|_| PackageError::InvalidRolePolicies)?;
+        let expected = PackageRolePoliciesV2::from_metadata(&metadata)?;
+        if policies != expected {
+            return Err(PackageError::PolicySchemaMismatch);
+        }
+        if self.manifest.crdt != metadata.crdt {
+            return Err(PackageError::CrdtMetadataMismatch);
+        }
         if self.deployment_signature.signature.is_empty() {
             return Err(PackageError::MissingSignature);
         }
@@ -242,6 +269,95 @@ impl VosPackageV2 {
     pub fn signing_message(&self) -> [u8; 32] {
         self.deployment_id().0
     }
+
+    /// Build the exact actor descriptor accepted by guest-owned installation.
+    /// No caller can substitute hand-authored method policies after package
+    /// validation: the rows come from the signed canonical policy artifact.
+    pub fn actor_genesis(
+        &self,
+        actor: ActorId,
+        name: String,
+        parent: Option<ActorId>,
+        initial_state: BlobRefV2,
+    ) -> Result<ActorGenesisV2, PackageError> {
+        self.validate()?;
+        let policies = PackageRolePoliciesV2::decode(&self.role_policies)
+            .map_err(|_| PackageError::InvalidRolePolicies)?;
+        Ok(ActorGenesisV2 {
+            actor,
+            name,
+            parent,
+            program: self.manifest.actor_program,
+            initial_state,
+            crdt: self.manifest.crdt,
+            methods: policies.methods,
+        })
+    }
+}
+
+impl PackageRolePoliciesV2 {
+    pub fn from_metadata(metadata: &ParsedMeta) -> Result<Self, PackageError> {
+        let mut methods = metadata
+            .messages
+            .iter()
+            .map(|message| {
+                let policy = match message.space_role {
+                    Some(role) => {
+                        space_role_policy_hash(role).ok_or(PackageError::InvalidRolePolicies)?
+                    }
+                    None => public_policy_hash(),
+                };
+                Ok(MethodPolicyV2 {
+                    method: message.name.clone(),
+                    schema: method_schema_hash(message),
+                    policy,
+                    public: message.space_role.is_none(),
+                    attested: message.attested,
+                })
+            })
+            .collect::<Result<Vec<_>, PackageError>>()?;
+        methods.sort_by(|left, right| left.method.cmp(&right.method));
+        if methods
+            .windows(2)
+            .any(|pair| pair[0].method == pair[1].method)
+        {
+            return Err(PackageError::InvalidRolePolicies);
+        }
+        Ok(Self { methods })
+    }
+}
+
+/// Commitment to one method's argument/reply schema. Operational metadata
+/// such as documentation, timeout, CLI exposure, and job scheduling mode is
+/// deliberately excluded.
+pub fn method_schema_hash(message: &ParsedMessage) -> Hash {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder(&mut bytes);
+    encoder.string(&message.name);
+    encoder.bool(message.is_query);
+    encoder.list(&message.fields, |encoder, field| {
+        encoder.string(&field.name);
+        encoder.string(&field.ty);
+    });
+    encoder.string(&message.returns);
+    Hash::digest(b"vos/method-schema/v2", &[&bytes])
+}
+
+/// Stable public-method predicate used even for attested public methods, so
+/// an attestation statement never carries an ambiguous zero policy.
+pub fn public_policy_hash() -> Hash {
+    Hash::digest(b"vos/public-policy/v2", &[])
+}
+
+/// Stable predicate for a direct `SpaceRole` threshold. Unknown role bytes
+/// are rejected instead of entering deployment identity.
+pub fn space_role_policy_hash(required_role: u8) -> Option<Hash> {
+    crate::SpaceRole::from_u8(required_role).map(|_| {
+        Hash::digest(
+            b"vos/space-role-policy/v2",
+            &[core::slice::from_ref(&required_role)],
+        )
+    })
 }
 
 pub fn artifact_hash(kind: &[u8], bytes: &[u8]) -> Hash {
@@ -294,6 +410,27 @@ impl V2Wire for VosPackageV2 {
     }
 }
 
+impl V2Wire for PackageRolePoliciesV2 {
+    const MAGIC: [u8; 4] = *b"VRP2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        Encoder(out).list(&self.methods, |encoder, method| {
+            encoder.bytes(&method.encode())
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let methods = decoder.list(|decoder| MethodPolicyV2::decode(&decoder.bytes()?))?;
+        if methods
+            .windows(2)
+            .any(|pair| pair[0].method >= pair[1].method)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self { methods })
+    }
+}
+
 fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifestV2) {
     encoder.string(&manifest.name);
     encoder.string(&manifest.version);
@@ -328,13 +465,58 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifestV2, Decod
 mod tests {
     use alloc::vec;
 
+    use crate::metadata::{ActorMeta, MessageMeta};
+
     use super::*;
+
+    const META: ActorMeta = ActorMeta {
+        actor_name: "counter",
+        messages: &[
+            MessageMeta {
+                name: "increment",
+                is_query: false,
+                fields: &[],
+                returns: "u64",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: false,
+                space_role: None,
+            },
+            MessageMeta {
+                name: "is_positive",
+                is_query: true,
+                fields: &[],
+                returns: "bool",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: true,
+                space_role: Some(crate::SpaceRole::Member as u8),
+            },
+        ],
+        constructor: &[],
+        kind: 0,
+        caps: &[],
+        cli_methods: &[],
+        doc: "",
+        crdt: false,
+    };
+
+    fn schema_and_policies() -> (Vec<u8>, Vec<u8>) {
+        let (buffer, length) = crate::metadata::encode::<512>(&META);
+        let schemas = buffer[..length].to_vec();
+        let metadata = crate::metadata::decode(&schemas).unwrap();
+        let policies = PackageRolePoliciesV2::from_metadata(&metadata)
+            .unwrap()
+            .encode();
+        (schemas, policies)
+    }
 
     fn package() -> VosPackageV2 {
         let pvm = vec![1, 2, 3, 4];
         let interfaces = b"interface".to_vec();
-        let policies = b"policy".to_vec();
-        let schemas = b"schema".to_vec();
+        let (schemas, policies) = schema_and_policies();
         VosPackageV2 {
             manifest: PackageManifestV2 {
                 name: "counter".into(),
@@ -371,6 +553,54 @@ mod tests {
         assert_eq!(decoded, package);
         assert_eq!(decoded.encode(), bytes);
         assert_eq!(decoded.deployment_id(), package.deployment_id());
+    }
+
+    #[test]
+    fn method_policies_are_derived_from_schema_and_annotations() {
+        let package = package();
+        let policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
+        assert_eq!(policies.methods.len(), 2);
+
+        let increment = &policies.methods[0];
+        assert_eq!(increment.method, "increment");
+        assert!(increment.public);
+        assert!(!increment.attested);
+        assert_eq!(increment.policy, public_policy_hash());
+
+        let is_positive = &policies.methods[1];
+        assert_eq!(is_positive.method, "is_positive");
+        assert!(!is_positive.public);
+        assert!(is_positive.attested);
+        assert_eq!(
+            is_positive.policy,
+            space_role_policy_hash(crate::SpaceRole::Member as u8).unwrap()
+        );
+    }
+
+    #[test]
+    fn package_rejects_policy_schema_drift() {
+        let mut package = package();
+        let mut policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
+        policies.methods[1].attested = false;
+        package.role_policies = policies.encode();
+        package.manifest.role_policies_hash =
+            artifact_hash(b"role-policies", &package.role_policies);
+        assert_eq!(package.validate(), Err(PackageError::PolicySchemaMismatch));
+    }
+
+    #[test]
+    fn guest_install_descriptor_uses_only_signed_package_policies() {
+        let package = package();
+        let actor = ActorId([7; 32]);
+        let state = BlobRefV2::of_bytes(b"initial state");
+        let genesis = package
+            .actor_genesis(actor, "counter".into(), None, state.clone())
+            .unwrap();
+        let policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
+        assert_eq!(genesis.actor, actor);
+        assert_eq!(genesis.program, package.manifest.actor_program);
+        assert_eq!(genesis.initial_state, state);
+        assert_eq!(genesis.methods, policies.methods);
     }
 
     #[test]

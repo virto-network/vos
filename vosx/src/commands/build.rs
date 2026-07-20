@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
 use vos::v2::{
-    DeploymentSignatureV2, PackageDiagnosticsV2, PackageManifestV2, ProducerId, ProgramId, V2Wire,
-    VosPackageV2, artifact_hash,
+    DeploymentSignatureV2, PackageDiagnosticsV2, PackageManifestV2, PackageRolePoliciesV2,
+    ProducerId, ProgramId, V2Wire, VosPackageV2, artifact_hash,
 };
 
 pub struct Args {
@@ -38,31 +38,43 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     javm::program::parse_blob(&actor_pvm)
         .ok_or_else(|| anyhow!("invalid canonical actor PVM"))?;
 
-    let actor_metadata = (!is_pvm).then(|| vos::metadata::from_elf(&input)).flatten();
-    if args.crdt && actor_metadata.as_ref().is_some_and(|meta| !meta.crdt) {
+    let schemas = match args.schemas.as_deref() {
+        Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+        None if !is_pvm => vos::metadata::raw_section_from_elf(&input).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let actor_metadata = vos::metadata::decode(&schemas).ok_or_else(|| {
+        anyhow!(
+            "{} has no valid v2 actor schema; build from its ELF or pass --schemas with exact .vos_meta bytes",
+            args.program.display()
+        )
+    })?;
+    if args.crdt && !actor_metadata.crdt {
         bail!(
             "{} is an ordinary actor; use #[actor(crdt)] instead of forcing --crdt",
             args.program.display(),
         );
     }
-    let crdt = actor_metadata.as_ref().is_some_and(|meta| meta.crdt) || args.crdt;
+    let crdt = actor_metadata.crdt || args.crdt;
     let name = args
         .name
-        .or_else(|| actor_metadata.as_ref().map(|meta| meta.actor_name.clone()))
-        .or_else(|| {
-            args.program
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-        })
-        .ok_or_else(|| anyhow!("--name is required for this path"))?;
+        .unwrap_or_else(|| actor_metadata.actor_name.clone());
 
     let interfaces = read_optional(args.interfaces.as_deref())?;
-    let role_policies = read_optional(args.role_policies.as_deref())?;
-    let schemas = match args.schemas.as_deref() {
-        Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
-        None if !is_pvm => vos::metadata::raw_section_from_elf(&input).unwrap_or_default(),
-        None => Vec::new(),
+    let generated_role_policies = PackageRolePoliciesV2::from_metadata(&actor_metadata)?.encode();
+    let role_policies = match args.role_policies.as_deref() {
+        Some(path) => {
+            let supplied =
+                std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            if supplied != generated_role_policies {
+                bail!(
+                    "{} does not match the policies generated from the actor's .vos_meta annotations",
+                    path.display()
+                );
+            }
+            supplied
+        }
+        None => generated_role_policies,
     };
     let source_map = read_optional(args.source_map.as_deref())?;
     let service_program = ProgramId(parse_hash(&args.service_program_id)?);

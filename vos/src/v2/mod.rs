@@ -65,7 +65,8 @@ pub use local_store::{
 pub use package::{
     DeploymentRegistryV2, DeploymentSignatureV2, DeploymentSignatureVerifierV2,
     PackageDiagnosticsV2, PackageError, PackageManifestV2, PackageRegistrationErrorV2,
-    VosPackageV2, artifact_hash,
+    PackageRolePoliciesV2, VosPackageV2, artifact_hash, method_schema_hash, public_policy_hash,
+    space_role_policy_hash,
 };
 #[cfg(feature = "std")]
 pub use pvm::{
