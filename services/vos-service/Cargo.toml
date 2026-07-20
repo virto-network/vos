@@ -12,7 +12,7 @@ repository = "https://github.com/virto-network/vos"
 crate-type = ["rlib", "cdylib"]
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["pvm"] }
+vos = { path = "../../vos", version = "0.1.0", default-features = false, features = ["service"] }
 
 [profile.release]
 opt-level = "s"

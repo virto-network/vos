@@ -3,15 +3,17 @@
 //! Build the guest first with:
 //! `cd services/vos-service && cargo +nightly actor`.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use javm::kernel::InvocationKernel;
 use vos::v2::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, ActorId, AllowPublic,
-    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, Hash,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
-    NoRefineProtocolHostV2, Origin, ProgramId, RefineImportsV2, RootServiceId, ServiceIdentityV2,
-    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulateTransactionV2, AccumulationEnvelopeV2,
+    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AllowPublic,
+    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId,
+    GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    InMemoryServiceState, InvocationId, MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId,
+    PublishedEffectsV2, RefineImportsV2, ReplyRecordV2, RootServiceId, ServiceGenesisV2,
+    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -105,32 +107,117 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     }
 }
 
-struct FailClosedAccumulateHost {
-    committed: bool,
+#[derive(Clone, Default)]
+struct DurableAccumulateHost {
+    rows: BTreeMap<Vec<u8>, Vec<u8>>,
+    preimages: BTreeMap<[u8; 32], Vec<u8>>,
+    commits: usize,
 }
 
-struct EmptyTransaction;
+struct DurableTransaction {
+    rows: BTreeMap<Vec<u8>, Vec<u8>>,
+    preimages: BTreeMap<[u8; 32], Vec<u8>>,
+}
 
-impl AccumulateTransactionV2 for EmptyTransaction {
+impl AccumulateTransactionV2 for DurableTransaction {
     fn handle(
         &mut self,
         slot: u8,
-        _registers: &[u64; 13],
-        _kernel: &mut InvocationKernel,
+        registers: &[u64; 13],
+        kernel: &mut InvocationKernel,
     ) -> Result<[u64; 2], ServicePvmErrorV2> {
-        Err(ServicePvmErrorV2::AccumulateHostRejected(slot))
+        use vos::abi::{error, hostcall};
+
+        let read = |kernel: &InvocationKernel, address: u64, len: u64| {
+            let address = u32::try_from(address).ok()?;
+            let len = u32::try_from(len).ok()?;
+            kernel.read_data_cap_window(address, len)
+        };
+        match slot as u32 {
+            hostcall::STORAGE_R => {
+                let key = read(kernel, registers[7], registers[8])
+                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let Some(value) = self.rows.get(&key) else {
+                    return Ok([error::HOST_NONE, 0]);
+                };
+                let capacity = usize::try_from(registers[10])
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let copy_len = value.len().min(capacity);
+                if copy_len != 0
+                    && !kernel.write_data_cap_window(
+                        u32::try_from(registers[9])
+                            .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?,
+                        &value[..copy_len],
+                    )
+                {
+                    return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
+                }
+                Ok([value.len() as u64, 0])
+            }
+            hostcall::STORAGE_W => {
+                let key = read(kernel, registers[7], registers[8])
+                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let value = read(kernel, registers[9], registers[10])
+                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                if value.is_empty() {
+                    self.rows.remove(&key);
+                } else {
+                    self.rows.insert(key, value);
+                }
+                Ok([error::HOST_OK, 0])
+            }
+            hostcall::PREIMAGE_LOOKUP => {
+                let hash: [u8; 32] = read(kernel, registers[7], 32)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let Some(value) = self.preimages.get(&hash) else {
+                    return Ok([error::HOST_NONE, 0]);
+                };
+                let capacity = usize::try_from(registers[9])
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let copy_len = value.len().min(capacity);
+                if copy_len != 0
+                    && !kernel.write_data_cap_window(
+                        u32::try_from(registers[8])
+                            .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?,
+                        &value[..copy_len],
+                    )
+                {
+                    return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
+                }
+                Ok([value.len() as u64, 0])
+            }
+            hostcall::PREIMAGE_PROVIDE => {
+                let hash: [u8; 32] = read(kernel, registers[7], 32)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let value = read(kernel, registers[8], registers[9])
+                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                if BlobRefV2::of_bytes(&value).hash.0 != hash {
+                    return Ok([error::HOST_WHAT, 0]);
+                }
+                self.preimages.insert(hash, value);
+                Ok([error::HOST_OK, 0])
+            }
+            _ => Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
+        }
     }
 }
 
-impl AccumulateProtocolHostV2 for FailClosedAccumulateHost {
-    type Transaction = EmptyTransaction;
+impl AccumulateProtocolHostV2 for DurableAccumulateHost {
+    type Transaction = DurableTransaction;
 
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
-        Ok(EmptyTransaction)
+        Ok(DurableTransaction {
+            rows: self.rows.clone(),
+            preimages: self.preimages.clone(),
+        })
     }
 
-    fn commit(&mut self, _transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2> {
-        self.committed = true;
+    fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2> {
+        self.rows = transaction.rows;
+        self.preimages = transaction.preimages;
+        self.commits += 1;
         Ok(())
     }
 }
@@ -461,17 +548,145 @@ fn yielding_actor_restores_exactly_after_restart() {
 }
 
 #[test]
-fn unfinished_guest_accumulate_traps_without_committing() {
+fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let Some(elf) = service_elf() else {
         return;
     };
     let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
-    let mut host = FailClosedAccumulateHost { committed: false };
+    let actor_program = ProgramId([31; 32]);
+    let initial_bytes = b"initial actor state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed_work = work(actor_program, initial.clone());
+    let mut host = DurableAccumulateHost::default();
+    host.preimages.insert(initial.hash.0, initial_bytes);
 
-    assert_eq!(
-        service.accumulate(&[], 10_000_000, &mut host),
-        Err(ServicePvmErrorV2::Panic)
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: seed_work.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed_work.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([32; 32]),
+                policy: Hash([33; 32]),
+                public: true,
+                attested: false,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([34; 32]),
+            authenticator: vec![35],
+        },
+    });
+    let installed_output = service
+        .accumulate(&install.encode(), 5_000_000_000, &mut host)
+        .expect("guest install completes");
+    let AccumulationResultV2::Installed(installed) =
+        AccumulationResultV2::decode(&installed_output.bytes).unwrap()
+    else {
+        panic!("guest install rejected")
+    };
+    assert_eq!(host.commits, 1);
+    let installed_rows = host.rows.len();
+
+    let mut work = seed_work;
+    work.base = ConsistencyBaseV2::Linear {
+        revision: 0,
+        state_root: installed.resulting_state_root.unwrap(),
+    };
+    let transition = TransitionV2 {
+        service: work.service.clone(),
+        consumed_input: work.input_id(),
+        target_program: work.target_program,
+        base: work.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: work.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"committed actor state".to_vec()),
+        }],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: work.invocation.root_reply_id(),
+            producer: work.target,
+            result: b"committed reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work,
+        transition: transition.clone(),
+    });
+    let applied_output = service
+        .accumulate(&apply.encode(), 5_000_000_000, &mut host)
+        .expect("guest apply completes");
+    let AccumulationResultV2::Accepted {
+        receipt,
+        published,
+        duplicate,
+    } = AccumulationResultV2::decode(&applied_output.bytes).unwrap()
+    else {
+        panic!("guest apply rejected")
+    };
+    assert!(!duplicate);
+    assert_eq!(receipt.sequence, 1);
+    assert_eq!(published.reply, transition.reply);
+    assert!(host.rows.len() > installed_rows);
+    assert_eq!(host.commits, 2);
+    assert!(
+        host.preimages
+            .values()
+            .any(|bytes| bytes == b"committed actor state")
     );
-    assert!(!host.committed);
+
+    let rows_after_apply = host.rows.clone();
+    let preimages_after_apply = host.preimages.clone();
+    let duplicate_output = service
+        .accumulate(&apply.encode(), 5_000_000_000, &mut host)
+        .expect("guest retry completes");
+    let AccumulationResultV2::Accepted {
+        published,
+        duplicate,
+        ..
+    } = AccumulationResultV2::decode(&duplicate_output.bytes).unwrap()
+    else {
+        panic!("guest retry rejected")
+    };
+    assert!(duplicate);
+    assert_eq!(published, PublishedEffectsV2::default());
+    assert_eq!(host.rows, rows_after_apply);
+    assert_eq!(host.preimages, preimages_after_apply);
+    assert_eq!(
+        host.commits, 3,
+        "a read-only duplicate transaction may commit"
+    );
+}
+
+#[test]
+fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
+    let mut host = DurableAccumulateHost::default();
+
+    let output = service
+        .accumulate(b"not a v2 request", 10_000_000, &mut host)
+        .unwrap();
+    assert_eq!(
+        AccumulationResultV2::decode(&output.bytes).unwrap(),
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::NonCanonical)
+    );
+    assert!(host.rows.is_empty());
+    assert!(host.preimages.is_empty());
 }

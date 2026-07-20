@@ -361,6 +361,14 @@ impl ServicePvmV2 {
                     });
                 }
                 KernelResult::ProtocolCall { slot } => {
+                    if let Some([result0, result1]) =
+                        handle_accumulate_mechanical_call(slot, &mut kernel)
+                    {
+                        kernel
+                            .resume_protocol_call(result0, result1)
+                            .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                        continue;
+                    }
                     let mut registers = [0; 13];
                     for (index, register) in registers.iter_mut().enumerate() {
                         *register = kernel.active_reg(index);
@@ -642,9 +650,11 @@ fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usiz
 }
 
 fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
-    // Accumulate never executes actor calls or suspension. These two supplied
-    // capabilities are mechanical VM support and diagnostics only.
+    // Accumulate never executes actor calls or suspension. These supplied
+    // capabilities are deterministic hashing, mechanical VM support, and
+    // diagnostics only.
     for slot in [
+        crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
         crate::abi::hostcall::GROW_HEAP as u8,
         crate::abi::hostcall::DEBUG_WRITE as u8,
     ] {
@@ -653,6 +663,34 @@ fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
             .vm_mut(kernel.active_vm)
             .cap_table
             .set(slot, Cap::Protocol(ProtocolCap { id: slot }));
+    }
+}
+
+fn handle_accumulate_mechanical_call(slot: u8, kernel: &mut InvocationKernel) -> Option<[u64; 2]> {
+    use crate::abi::error;
+
+    match slot as u32 {
+        crate::abi::hostcall::GAS => Some([kernel.active_gas(), 0]),
+        crate::abi::hostcall::GROW_HEAP => Some([error::HOST_OK, 0]),
+        crate::abi::hostcall::DEBUG_WRITE => Some([kernel.active_reg(8), 0]),
+        crate::crypto::ECALL_BLAKE2B_COMPRESS => {
+            let h_address = u32::try_from(kernel.active_reg(7)).ok()?;
+            let m_address = u32::try_from(kernel.active_reg(8)).ok()?;
+            let h = kernel.read_data_cap_window(h_address, 64)?;
+            let m = kernel.read_data_cap_window(m_address, 128)?;
+            let mut h: [u8; 64] = h.try_into().ok()?;
+            let m: [u8; 128] = m.try_into().ok()?;
+            crate::crypto::blake2b::host_compress_block(
+                &mut h,
+                &m,
+                kernel.active_reg(9) as u128,
+                kernel.active_reg(10) != 0,
+            );
+            kernel
+                .write_data_cap_window(h_address, &h)
+                .then_some([error::HOST_OK, 0])
+        }
+        _ => None,
     }
 }
 
