@@ -8,14 +8,15 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use vos::raft::{RaftAccumulateLogV2, RaftConfig};
+use vos::network::RaftRpcHandler;
+use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
     BlobRefV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
-    CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
-    ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
+    CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2,
+    Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
     JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
     ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
@@ -83,6 +84,7 @@ struct TestCommittedLog {
     shared: Arc<Mutex<SharedCommittedLog>>,
     applied: u64,
     leader: bool,
+    before_next_proposal: Vec<Vec<u8>>,
 }
 
 impl TestCommittedLog {
@@ -91,7 +93,12 @@ impl TestCommittedLog {
             shared,
             applied: 0,
             leader,
+            before_next_proposal: Vec::new(),
         }
+    }
+
+    fn commit_before_next_proposal(&mut self, request: Vec<u8>) {
+        self.before_next_proposal.push(request);
     }
 }
 
@@ -103,6 +110,13 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
             return Err(TestLogError::NotLeader);
         }
         let mut shared = self.shared.lock().unwrap();
+        for request in core::mem::take(&mut self.before_next_proposal) {
+            let entry = CommittedAccumulateEntryV2 {
+                index: shared.entries.len() as u64 + 1,
+                request,
+            };
+            shared.entries.push(entry);
+        }
         let entry = CommittedAccumulateEntryV2 {
             index: shared.entries.len() as u64 + 1,
             request: request.to_vec(),
@@ -134,7 +148,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
         Ok(self.applied)
     }
 
-    fn mark_applied(&mut self, index: u64) -> Result<(), Self::Error> {
+    fn mark_applied(&mut self, index: u64, _service_image: &[u8]) -> Result<(), Self::Error> {
         let committed = self.shared.lock().unwrap().entries.len() as u64;
         if index < self.applied || index > committed {
             return Err(TestLogError::InvalidCursor);
@@ -3397,6 +3411,43 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         gas: GasAccountingV2::default(),
         proof: None,
     };
+
+    // Another client can reach the Raft worker between this service's
+    // catch-up and its proposal. The wrapper must apply that earlier entry
+    // before its own committed request instead of jumping the cursor past it.
+    let mut prior = first.clone();
+    prior.invocation = InvocationId([124; 32]);
+    let prior_transition = TransitionV2 {
+        service: prior.service.clone(),
+        consumed_input: prior.input_id(),
+        target_program: prior.target_program,
+        base: prior.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: prior.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"interleaved state".to_vec()),
+        }],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: prior.invocation.root_reply_id(),
+            producer: prior.target,
+            result: b"interleaved reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    leader.log_mut().commit_before_next_proposal(
+        AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: prior,
+            transition: prior_transition,
+            provided_blobs: vec![],
+        })
+        .encode(),
+    );
     assert!(matches!(
         leader
             .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
@@ -3406,12 +3457,23 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             }))
             .unwrap()
             .result,
-        AccumulationResultV2::Accepted {
-            duplicate: false,
-            ..
-        }
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::StaleLinearWork {
+            expected_revision: 0,
+            actual_revision: 1,
+        })
     ));
-    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert_eq!(
+        leader
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .unwrap()
+            .revision,
+        1,
+        "the earlier committed request is applied before the caller's proposal"
+    );
+    assert_eq!(follower.catch_up().unwrap(), 2);
     assert!(
         leader
             .service()
@@ -3488,8 +3550,8 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             .snapshot()
             .same_service_state(&follower.service().accumulate_host().snapshot())
     );
-    assert_eq!(leader.log_mut().applied_index().unwrap(), 3);
-    assert_eq!(follower.log_mut().applied_index().unwrap(), 3);
+    assert_eq!(leader.log_mut().applied_index().unwrap(), 4);
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 4);
 }
 
 #[test]
@@ -3566,12 +3628,101 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         .expect("physical guest committed the service header");
     assert_eq!(header.consistency, ConsistencyModeV2::Raft);
     assert_eq!(header.revision, 0);
+    let source_snapshot = replicated.service().accumulate_host().snapshot();
+    let source_image = replicated.service().accumulate_host().snapshot_bytes();
 
     drop(replicated);
     let mut reopened = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();
     assert_eq!(reopened.applied_index().unwrap(), 1);
     assert!(reopened.committed_after(1).unwrap().entries.is_empty());
     drop(reopened);
+
+    // Deliver the exact snapshot through the real inbound vos-raft worker.
+    // The worker owns only the log/snapshot database at this point; catch-up
+    // must install the canonical image into the physical service host before
+    // advancing its application cursor.
+    let follower_db = Arc::new(redb::Database::create(directory.join("follower.redb")).unwrap());
+    let snapshot = CommittedServiceSnapshotV2 {
+        applied_index: 1,
+        service_image: source_image,
+    };
+    let raft_config = RaftConfig {
+        me: 0xBBBB,
+        members: vec![0xAAAA, 0xBBBB],
+        election_timeout_ms: (5_000, 10_000),
+        heartbeat_interval_ms: 500,
+        replication_id: [0xD1; 32],
+        propose_timeout_ms: 2_000,
+    };
+    let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+    let worker = RaftWorker::spawn(
+        follower_db.clone(),
+        WorkerConfig {
+            me: raft_config.me,
+            members: raft_config.members.clone(),
+            replication_id: raft_config.replication_id,
+            election_timeout_ms: raft_config.election_timeout_ms,
+            heartbeat_interval_ms: raft_config.heartbeat_interval_ms,
+        },
+        None,
+        Some(apply_tx),
+    );
+    let installed = worker.handler().install_snapshot(
+        &raft_config.replication_id,
+        0xAAAA,
+        1,
+        1,
+        1,
+        snapshot.encode(),
+    );
+    assert_eq!(installed.term, 1);
+
+    let follower_service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        DurableJamStoreV2::open(FailableCommittedImages {
+            image: None,
+            fail_next_commit: true,
+        })
+        .unwrap(),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let follower_log =
+        RaftAccumulateLogV2::from_worker(follower_db, raft_config, worker, apply_rx).unwrap();
+    let mut follower = ReplicatedJamServiceV2::new(follower_service, follower_log);
+    assert!(matches!(
+        follower.catch_up(),
+        Err(vos::v2::ReplicatedServiceErrorV2::ServiceImage(
+            vos::v2::ServiceImageInstallErrorV2::PersistenceRejected
+        ))
+    ));
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 0);
+    assert!(
+        follower
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_none()
+    );
+    follower
+        .service_mut()
+        .accumulate_host_mut()
+        .backend_mut()
+        .fail_next_commit = false;
+    assert_eq!(follower.catch_up().unwrap(), 0);
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 1);
+    assert!(
+        follower
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&source_snapshot)
+    );
+    drop(follower);
     std::fs::remove_dir_all(directory).unwrap();
 }
 

@@ -547,6 +547,14 @@ impl RaftMeta {
         t.insert(META_LAST_APPLIED, &self.last_applied.to_le_bytes()[..])?;
         Ok(())
     }
+
+    pub(crate) fn last_applied_in_txn(txn: &redb::WriteTransaction) -> Result<u64, CommitError> {
+        let table = txn.open_table(RAFT_META)?;
+        Ok(table
+            .get(META_LAST_APPLIED)?
+            .map(|value| u64_le(value.value()))
+            .unwrap_or_default())
+    }
 }
 
 fn u64_le(b: &[u8]) -> u64 {
