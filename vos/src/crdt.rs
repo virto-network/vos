@@ -8,6 +8,28 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[derive(Debug, Clone, Copy)]
+struct ChangeScope {
+    change: ChangeId,
+    next_ordinal: u32,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static CHANGE_SCOPE: core::cell::RefCell<Option<ChangeScope>> = const {
+        core::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(not(feature = "std"))]
+struct GuestChangeScope(core::cell::UnsafeCell<Option<ChangeScope>>);
+
+#[cfg(not(feature = "std"))]
+unsafe impl Sync for GuestChangeScope {}
+
+#[cfg(not(feature = "std"))]
+static CHANGE_SCOPE: GuestChangeScope = GuestChangeScope(core::cell::UnsafeCell::new(None));
+
 #[derive(
     rkyv::Archive,
     rkyv::Serialize,
@@ -77,6 +99,9 @@ pub struct OpId {
 pub enum Error {
     DivergentOperation(OpId),
     IndexOutOfBounds,
+    NoChangeScope,
+    NestedChangeScope,
+    OperationOverflow,
 }
 
 impl core::fmt::Display for Error {
@@ -86,11 +111,97 @@ impl core::fmt::Display for Error {
                 write!(f, "CRDT operation {id:?} has divergent contents")
             }
             Self::IndexOutOfBounds => f.write_str("CRDT sequence index is out of bounds"),
+            Self::NoChangeScope => f.write_str(
+                "CRDT mutation requires an active actor execution slice; mutate replicated fields only inside an actor method",
+            ),
+            Self::NestedChangeScope => {
+                f.write_str("a CRDT execution slice cannot start another change scope")
+            }
+            Self::OperationOverflow => {
+                f.write_str("one CRDT execution slice emitted too many operations")
+            }
         }
     }
 }
 
 impl core::error::Error for Error {}
+
+/// Run one actor execution slice with stable CRDT operation allocation.
+/// Generated actor glue establishes this scope; it is public only so native
+/// tests and advanced materializers can exercise the same deterministic API.
+#[doc(hidden)]
+pub fn with_change<R>(change: ChangeId, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+    begin_change(change)?;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            end_change();
+        }
+    }
+    let _reset = Reset;
+    f()
+}
+
+#[cfg(feature = "std")]
+fn begin_change(change: ChangeId) -> Result<(), Error> {
+    CHANGE_SCOPE.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        if scope.is_some() {
+            return Err(Error::NestedChangeScope);
+        }
+        *scope = Some(ChangeScope {
+            change,
+            next_ordinal: 0,
+        });
+        Ok(())
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn begin_change(change: ChangeId) -> Result<(), Error> {
+    // SAFETY: PVM guests are single-threaded and actor dispatch never nests a
+    // change scope. The explicit occupied check turns accidental nesting into
+    // a deterministic error.
+    let scope = unsafe { &mut *CHANGE_SCOPE.0.get() };
+    if scope.is_some() {
+        return Err(Error::NestedChangeScope);
+    }
+    *scope = Some(ChangeScope {
+        change,
+        next_ordinal: 0,
+    });
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+fn end_change() {
+    CHANGE_SCOPE.with(|scope| *scope.borrow_mut() = None);
+}
+
+#[cfg(not(feature = "std"))]
+fn end_change() {
+    // SAFETY: see `begin_change`; this clears the same single-threaded slot.
+    unsafe { *CHANGE_SCOPE.0.get() = None };
+}
+
+#[cfg(feature = "std")]
+fn next_operation() -> Result<OpId, Error> {
+    CHANGE_SCOPE.with(|scope| next_operation_from(scope.borrow_mut().as_mut()))
+}
+
+#[cfg(not(feature = "std"))]
+fn next_operation() -> Result<OpId, Error> {
+    // SAFETY: see `begin_change`; mutation is serialized by actor dispatch.
+    let scope = unsafe { &mut *CHANGE_SCOPE.0.get() };
+    next_operation_from(scope.as_mut())
+}
+
+fn next_operation_from(scope: Option<&mut ChangeScope>) -> Result<OpId, Error> {
+    let scope = scope.ok_or(Error::NoChangeScope)?;
+    let ordinal = scope.next_ordinal;
+    scope.next_ordinal = ordinal.checked_add(1).ok_or(Error::OperationOverflow)?;
+    Ok(scope.change.operation(ordinal))
+}
 
 /// Multi-value register. The visible value is selected deterministically by
 /// operation id; concurrent alternatives remain available through
@@ -112,7 +223,12 @@ impl<T> Default for Value<T> {
 }
 
 impl<T> Value<T> {
-    pub fn new(id: OpId, value: T) -> Self {
+    pub fn new(value: T) -> Result<Self, Error> {
+        Ok(Self::new_with_id(next_operation()?, value))
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_id(id: OpId, value: T) -> Self {
         let mut this = Self::default();
         this.values.insert(id, value);
         this
@@ -162,7 +278,12 @@ impl<T: Clone + PartialEq> Value<T> {
     /// Assign a value, superseding every version observed by this replica.
     /// Reusing an operation ID with identical contents is an idempotent retry;
     /// reusing it with different contents is rejected.
-    pub fn set(&mut self, id: OpId, value: T) -> Result<(), Error> {
+    pub fn set(&mut self, value: T) -> Result<(), Error> {
+        self.set_with_id(next_operation()?, value)
+    }
+
+    #[doc(hidden)]
+    pub fn set_with_id(&mut self, id: OpId, value: T) -> Result<(), Error> {
         if let Some(existing) = self.values.get(&id) {
             return if existing == &value {
                 Ok(())
@@ -217,7 +338,15 @@ impl<K, V> Default for Map<K, V> {
 }
 
 impl<K: Ord, V: Clone + PartialEq> Map<K, V> {
-    pub fn insert(&mut self, id: OpId, key: K, value: V) -> Result<(), Error>
+    pub fn insert(&mut self, key: K, value: V) -> Result<(), Error>
+    where
+        K: Clone + PartialEq,
+    {
+        self.insert_with_id(next_operation()?, key, value)
+    }
+
+    #[doc(hidden)]
+    pub fn insert_with_id(&mut self, id: OpId, key: K, value: V) -> Result<(), Error>
     where
         K: Clone + PartialEq,
     {
@@ -227,9 +356,10 @@ impl<K: Ord, V: Clone + PartialEq> Map<K, V> {
             return Err(Error::DivergentOperation(id));
         }
         match self.entries.get_mut(&key) {
-            Some(entry) => entry.set(id, value)?,
+            Some(entry) => entry.set_with_id(id, value)?,
             None => {
-                self.entries.insert(key.clone(), Value::new(id, value));
+                self.entries
+                    .insert(key.clone(), Value::new_with_id(id, value));
             }
         }
         self.operation_keys.insert(id, key);
@@ -317,7 +447,12 @@ impl<T> Default for Set<T> {
 }
 
 impl<T: Ord + Clone + PartialEq> Set<T> {
-    pub fn insert(&mut self, id: OpId, value: T) -> Result<bool, Error> {
+    pub fn insert(&mut self, value: T) -> Result<bool, Error> {
+        self.insert_with_id(next_operation()?, value)
+    }
+
+    #[doc(hidden)]
+    pub fn insert_with_id(&mut self, id: OpId, value: T) -> Result<bool, Error> {
         if let Some(existing) = self.operations.get(&id) {
             return if existing == &value {
                 Ok(false)
@@ -409,18 +544,28 @@ impl<T> Default for List<T> {
 }
 
 impl<T: PartialEq> List<T> {
-    pub fn push(&mut self, id: OpId, value: T) -> Result<(), Error> {
-        let after = self.ordered_ids().last().copied();
-        self.insert_after(id, after, value)
+    pub fn push(&mut self, value: T) -> Result<(), Error> {
+        self.push_with_id(next_operation()?, value)
     }
 
-    pub fn insert(&mut self, index: usize, id: OpId, value: T) -> Result<(), Error> {
+    #[doc(hidden)]
+    pub fn push_with_id(&mut self, id: OpId, value: T) -> Result<(), Error> {
+        let after = self.ordered_ids().last().copied();
+        self.insert_after_with_id(id, after, value)
+    }
+
+    pub fn insert(&mut self, index: usize, value: T) -> Result<(), Error> {
+        self.insert_with_id(index, next_operation()?, value)
+    }
+
+    #[doc(hidden)]
+    pub fn insert_with_id(&mut self, index: usize, id: OpId, value: T) -> Result<(), Error> {
         let visible = self.visible_ids();
         if index > visible.len() {
             return Err(Error::IndexOutOfBounds);
         }
         let after = index.checked_sub(1).and_then(|i| visible.get(i).copied());
-        self.insert_after(id, after, value)
+        self.insert_after_with_id(id, after, value)
     }
 
     pub fn remove(&mut self, index: usize) -> Result<T, Error>
@@ -457,7 +602,12 @@ impl<T: PartialEq> List<T> {
         self.len() == 0
     }
 
-    fn insert_after(&mut self, id: OpId, after: Option<OpId>, value: T) -> Result<(), Error> {
+    fn insert_after_with_id(
+        &mut self,
+        id: OpId,
+        after: Option<OpId>,
+        value: T,
+    ) -> Result<(), Error> {
         if let Some(existing) = self.elements.get(&id) {
             return if existing.after == after && existing.value == value {
                 Ok(())
@@ -540,7 +690,25 @@ pub struct Text {
 }
 
 impl Text {
-    pub fn insert(&mut self, index: usize, change: ChangeId, text: &str) -> Result<(), Error> {
+    pub fn insert(&mut self, index: usize, text: &str) -> Result<(), Error> {
+        if index > self.len() {
+            return Err(Error::IndexOutOfBounds);
+        }
+        let mut staged = self.clone();
+        for (offset, ch) in text.chars().enumerate() {
+            staged.chars.insert(index + offset, ch)?;
+        }
+        *self = staged;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn insert_with_change(
+        &mut self,
+        index: usize,
+        change: ChangeId,
+        text: &str,
+    ) -> Result<(), Error> {
         if index > self.len() {
             return Err(Error::IndexOutOfBounds);
         }
@@ -548,7 +716,7 @@ impl Text {
         for (offset, ch) in text.chars().enumerate() {
             staged
                 .chars
-                .insert(index + offset, change.operation(offset as u32), ch)?;
+                .insert_with_id(index + offset, change.operation(offset as u32), ch)?;
         }
         *self = staged;
         Ok(())
@@ -598,15 +766,30 @@ pub struct Counter {
 }
 
 impl Counter {
-    pub fn increment(&mut self, id: OpId, amount: u64) -> Result<(), Error> {
+    pub fn increment(&mut self, amount: u64) -> Result<(), Error> {
+        self.increment_with_id(next_operation()?, amount)
+    }
+
+    #[doc(hidden)]
+    pub fn increment_with_id(&mut self, id: OpId, amount: u64) -> Result<(), Error> {
         self.apply(id, amount as i128)
     }
 
-    pub fn decrement(&mut self, id: OpId, amount: u64) -> Result<(), Error> {
+    pub fn decrement(&mut self, amount: u64) -> Result<(), Error> {
+        self.decrement_with_id(next_operation()?, amount)
+    }
+
+    #[doc(hidden)]
+    pub fn decrement_with_id(&mut self, id: OpId, amount: u64) -> Result<(), Error> {
         self.apply(id, -(amount as i128))
     }
 
-    pub fn add(&mut self, id: OpId, delta: i64) -> Result<(), Error> {
+    pub fn add(&mut self, delta: i64) -> Result<(), Error> {
+        self.add_with_id(next_operation()?, delta)
+    }
+
+    #[doc(hidden)]
+    pub fn add_with_id(&mut self, id: OpId, delta: i64) -> Result<(), Error> {
         self.apply(id, delta as i128)
     }
 
@@ -668,11 +851,65 @@ mod tests {
     }
 
     #[test]
+    fn actor_slice_allocates_stable_operation_ids() {
+        let mut left = Counter::default();
+        let mut right = Counter::default();
+
+        with_change(change(7), || {
+            left.increment(2)?;
+            left.decrement(1)?;
+            Ok(())
+        })
+        .unwrap();
+        with_change(change(7), || {
+            right.increment(2)?;
+            right.decrement(1)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(left.operations, right.operations);
+        assert_eq!(
+            left.operations.keys().copied().collect::<Vec<_>>(),
+            vec![change(7).operation(0), change(7).operation(1)]
+        );
+        assert_eq!(left.increment(1), Err(Error::NoChangeScope));
+    }
+
+    #[test]
+    fn actor_slice_scope_cannot_nest_and_is_cleared_after_failure() {
+        assert_eq!(
+            with_change(change(1), || with_change(change(2), || Ok(()))),
+            Err(Error::NestedChangeScope)
+        );
+        assert_eq!(
+            with_change(change(3), || Err::<(), _>(Error::IndexOutOfBounds)),
+            Err(Error::IndexOutOfBounds)
+        );
+
+        let mut value = Value::default();
+        with_change(change(4), || value.set("ready")).unwrap();
+        assert_eq!(value.visible_id(), Some(change(4).operation(0)));
+    }
+
+    #[test]
+    fn text_uses_one_stable_operation_per_unicode_scalar() {
+        let mut text = Text::default();
+        with_change(change(5), || text.insert(0, "A👋")).unwrap();
+
+        assert_eq!(text.as_string(), "A👋");
+        assert_eq!(
+            text.chars.elements.keys().copied().collect::<Vec<_>>(),
+            vec![change(5).operation(0), change(5).operation(1)]
+        );
+    }
+
+    #[test]
     fn concurrent_counter_increments_survive() {
         let mut a = Counter::default();
         let mut b = Counter::default();
-        a.increment(change(1).operation(0), 2).unwrap();
-        b.increment(change(2).operation(0), 3).unwrap();
+        a.increment_with_id(change(1).operation(0), 2).unwrap();
+        b.increment_with_id(change(2).operation(0), 3).unwrap();
         a.merge(&b).unwrap();
         b.merge(&a).unwrap();
         assert_eq!(a.value(), 5);
@@ -681,8 +918,8 @@ mod tests {
 
     #[test]
     fn scalar_winner_converges_and_conflict_remains_visible() {
-        let mut a = Value::new(change(1).operation(0), "a");
-        let mut b = Value::new(change(2).operation(0), "b");
+        let mut a = Value::new_with_id(change(1).operation(0), "a");
+        let mut b = Value::new_with_id(change(2).operation(0), "b");
         a.merge(&b).unwrap();
         b.merge(&a).unwrap();
         assert_eq!(a.get(), b.get());
@@ -692,10 +929,10 @@ mod tests {
     #[test]
     fn observed_remove_set_is_add_wins() {
         let mut a = Set::default();
-        a.insert(change(1).operation(0), "task").unwrap();
+        a.insert_with_id(change(1).operation(0), "task").unwrap();
         let mut b = a.clone();
         a.remove(&"task");
-        b.insert(change(2).operation(0), "task").unwrap();
+        b.insert_with_id(change(2).operation(0), "task").unwrap();
         a.merge(&b).unwrap();
         b.merge(&a).unwrap();
         assert!(a.contains(&"task"));
@@ -705,10 +942,10 @@ mod tests {
     #[test]
     fn concurrent_list_and_text_edits_converge() {
         let mut a = List::default();
-        a.push(change(1).operation(0), 'a').unwrap();
+        a.push_with_id(change(1).operation(0), 'a').unwrap();
         let mut b = a.clone();
-        a.push(change(2).operation(0), 'x').unwrap();
-        b.push(change(3).operation(0), 'y').unwrap();
+        a.push_with_id(change(2).operation(0), 'x').unwrap();
+        b.push_with_id(change(3).operation(0), 'y').unwrap();
         a.merge(&b).unwrap();
         b.merge(&a).unwrap();
         assert_eq!(
@@ -718,8 +955,8 @@ mod tests {
 
         let mut ta = Text::default();
         let mut tb = Text::default();
-        ta.insert(0, change(4), "Hi").unwrap();
-        tb.insert(0, change(5), "👋").unwrap();
+        ta.insert_with_change(0, change(4), "Hi").unwrap();
+        tb.insert_with_change(0, change(5), "👋").unwrap();
         ta.merge(&tb).unwrap();
         tb.merge(&ta).unwrap();
         assert_eq!(ta.as_string(), tb.as_string());
@@ -729,8 +966,10 @@ mod tests {
     fn map_retains_concurrent_value_conflicts() {
         let mut a = Map::default();
         let mut b = Map::default();
-        a.insert(change(1).operation(0), "title", "one").unwrap();
-        b.insert(change(2).operation(0), "title", "two").unwrap();
+        a.insert_with_id(change(1).operation(0), "title", "one")
+            .unwrap();
+        b.insert_with_id(change(2).operation(0), "title", "two")
+            .unwrap();
         a.merge(&b).unwrap();
         b.merge(&a).unwrap();
         assert_eq!(a.get(&"title"), b.get(&"title"));
@@ -741,12 +980,12 @@ mod tests {
     fn scalar_operation_retry_is_idempotent_and_divergence_is_rejected() {
         let original = change(1).operation(0);
         let concurrent = change(2).operation(0);
-        let mut value = Value::new(original, "one");
-        value.merge(&Value::new(concurrent, "two")).unwrap();
-        value.set(original, "one").unwrap();
+        let mut value = Value::new_with_id(original, "one");
+        value.merge(&Value::new_with_id(concurrent, "two")).unwrap();
+        value.set_with_id(original, "one").unwrap();
         assert_eq!(value.versions().count(), 2);
         assert_eq!(
-            value.set(original, "different"),
+            value.set_with_id(original, "different"),
             Err(Error::DivergentOperation(original))
         );
         assert_eq!(value.versions().count(), 2);
@@ -757,14 +996,17 @@ mod tests {
         let id = change(7).operation(0);
 
         let mut set = Set::default();
-        set.insert(id, "left").unwrap();
-        assert_eq!(set.insert(id, "right"), Err(Error::DivergentOperation(id)));
+        set.insert_with_id(id, "left").unwrap();
+        assert_eq!(
+            set.insert_with_id(id, "right"),
+            Err(Error::DivergentOperation(id))
+        );
         assert_eq!(set.iter().copied().collect::<Vec<_>>(), vec!["left"]);
 
         let mut left = Map::default();
-        left.insert(id, "left", 1).unwrap();
+        left.insert_with_id(id, "left", 1).unwrap();
         let mut right = Map::default();
-        right.insert(id, "right", 1).unwrap();
+        right.insert_with_id(id, "right", 1).unwrap();
         assert_eq!(left.merge(&right), Err(Error::DivergentOperation(id)));
         assert_eq!(left.get(&"left"), Some(&1));
         assert_eq!(left.get(&"right"), None);
@@ -775,10 +1017,12 @@ mod tests {
         let divergent = change(9).operation(0);
 
         let mut map = Map::default();
-        map.insert(divergent, "z", 1).unwrap();
+        map.insert_with_id(divergent, "z", 1).unwrap();
         let mut other_map = Map::default();
-        other_map.insert(change(1).operation(0), "a", 2).unwrap();
-        other_map.insert(divergent, "z", 3).unwrap();
+        other_map
+            .insert_with_id(change(1).operation(0), "a", 2)
+            .unwrap();
+        other_map.insert_with_id(divergent, "z", 3).unwrap();
         assert_eq!(
             map.merge(&other_map),
             Err(Error::DivergentOperation(divergent))
@@ -789,10 +1033,12 @@ mod tests {
         );
 
         let mut list = List::default();
-        list.push(divergent, 'a').unwrap();
+        list.push_with_id(divergent, 'a').unwrap();
         let mut other_list = List::default();
-        other_list.push(change(1).operation(0), 'x').unwrap();
-        other_list.push(divergent, 'b').unwrap();
+        other_list
+            .push_with_id(change(1).operation(0), 'x')
+            .unwrap();
+        other_list.push_with_id(divergent, 'b').unwrap();
         assert_eq!(
             list.merge(&other_list),
             Err(Error::DivergentOperation(divergent))
@@ -800,10 +1046,12 @@ mod tests {
         assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec!['a']);
 
         let mut counter = Counter::default();
-        counter.increment(divergent, 1).unwrap();
+        counter.increment_with_id(divergent, 1).unwrap();
         let mut other_counter = Counter::default();
-        other_counter.increment(change(1).operation(0), 5).unwrap();
-        other_counter.increment(divergent, 2).unwrap();
+        other_counter
+            .increment_with_id(change(1).operation(0), 5)
+            .unwrap();
+        other_counter.increment_with_id(divergent, 2).unwrap();
         assert_eq!(
             counter.merge(&other_counter),
             Err(Error::DivergentOperation(divergent))
@@ -823,9 +1071,9 @@ mod tests {
         ];
 
         let values = [
-            Value::new(change(1).operation(0), "a"),
-            Value::new(change(2).operation(0), "b"),
-            Value::new(change(3).operation(0), "c"),
+            Value::new_with_id(change(1).operation(0), "a"),
+            Value::new_with_id(change(2).operation(0), "b"),
+            Value::new_with_id(change(3).operation(0), "c"),
         ];
         let mut expected_value = None;
         for order in permutations {
@@ -842,13 +1090,13 @@ mod tests {
 
         let mut maps = [Map::default(), Map::default(), Map::default()];
         maps[0]
-            .insert(change(1).operation(0), "title", "a")
+            .insert_with_id(change(1).operation(0), "title", "a")
             .unwrap();
         maps[1]
-            .insert(change(2).operation(0), "title", "b")
+            .insert_with_id(change(2).operation(0), "title", "b")
             .unwrap();
         maps[2]
-            .insert(change(3).operation(0), "other", "c")
+            .insert_with_id(change(3).operation(0), "other", "c")
             .unwrap();
         let mut expected_map = None;
         for order in permutations {
@@ -864,11 +1112,13 @@ mod tests {
         }
 
         let mut base_set = Set::default();
-        base_set.insert(change(4).operation(0), "x").unwrap();
+        base_set
+            .insert_with_id(change(4).operation(0), "x")
+            .unwrap();
         let mut sets = [base_set.clone(), base_set.clone(), base_set];
         sets[0].remove(&"x");
-        sets[1].insert(change(5).operation(0), "x").unwrap();
-        sets[2].insert(change(6).operation(0), "y").unwrap();
+        sets[1].insert_with_id(change(5).operation(0), "x").unwrap();
+        sets[2].insert_with_id(change(6).operation(0), "y").unwrap();
         let mut expected_set = None;
         for order in permutations {
             let mut merged = Set::default();
@@ -880,11 +1130,11 @@ mod tests {
         }
 
         let mut base_list = List::default();
-        base_list.push(change(7).operation(0), 'a').unwrap();
+        base_list.push_with_id(change(7).operation(0), 'a').unwrap();
         let mut lists = [base_list.clone(), base_list.clone(), base_list];
-        lists[0].push(change(8).operation(0), 'x').unwrap();
-        lists[1].push(change(9).operation(0), 'y').unwrap();
-        lists[2].push(change(10).operation(0), 'z').unwrap();
+        lists[0].push_with_id(change(8).operation(0), 'x').unwrap();
+        lists[1].push_with_id(change(9).operation(0), 'y').unwrap();
+        lists[2].push_with_id(change(10).operation(0), 'z').unwrap();
         let mut expected_list = None;
         for order in permutations {
             let mut merged = List::default();
@@ -896,11 +1146,11 @@ mod tests {
         }
 
         let mut base_text = Text::default();
-        base_text.insert(0, change(11), "A").unwrap();
+        base_text.insert_with_change(0, change(11), "A").unwrap();
         let mut texts = [base_text.clone(), base_text.clone(), base_text];
-        texts[0].insert(1, change(12), "x").unwrap();
-        texts[1].insert(1, change(13), "y").unwrap();
-        texts[2].insert(1, change(14), "z").unwrap();
+        texts[0].insert_with_change(1, change(12), "x").unwrap();
+        texts[1].insert_with_change(1, change(13), "y").unwrap();
+        texts[2].insert_with_change(1, change(14), "z").unwrap();
         let mut expected_text = None;
         for order in permutations {
             let mut merged = Text::default();
@@ -913,12 +1163,14 @@ mod tests {
 
         let mut counters = [Counter::default(), Counter::default(), Counter::default()];
         counters[0]
-            .increment(change(15).operation(0), u64::MAX)
+            .increment_with_id(change(15).operation(0), u64::MAX)
             .unwrap();
         counters[1]
-            .decrement(change(16).operation(0), u64::MAX)
+            .decrement_with_id(change(16).operation(0), u64::MAX)
             .unwrap();
-        counters[2].add(change(17).operation(0), -7).unwrap();
+        counters[2]
+            .add_with_id(change(17).operation(0), -7)
+            .unwrap();
         for order in permutations {
             let mut merged = Counter::default();
             for index in order {

@@ -131,6 +131,9 @@ pub struct RefineImportsV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSliceInputV2 {
     pub actor: ActorId,
+    /// Stable identity allocated by the generic service for this complete
+    /// execution slice. Present only for an explicitly CRDT service.
+    pub change: Option<ChangeId>,
     pub state: Vec<u8>,
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
@@ -733,6 +736,7 @@ impl V2Wire for ActorSliceInputV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
+        e.option(&self.change, |e, change| e.fixed(&change.0));
         e.bytes(&self.state);
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
@@ -741,6 +745,7 @@ impl V2Wire for ActorSliceInputV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(Self {
             actor: ActorId(d.fixed()?),
+            change: d.option(|d| d.fixed().map(ChangeId))?,
             state: d.bytes()?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
@@ -1772,6 +1777,7 @@ mod tests {
     fn actor_slice_wires_round_trip_and_bind_writes_to_the_actor() {
         let input = ActorSliceInputV2 {
             actor: ActorId([21; 32]),
+            change: Some(ChangeId([23; 32])),
             state: b"before".to_vec(),
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),

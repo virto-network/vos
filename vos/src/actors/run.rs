@@ -581,8 +581,8 @@ pub fn run_refine_service<A: super::Actor>() {
         // (empty-encoding) actor must carry genesis forward or its next
         // self-message iteration would AnchorMismatch and silently drop.
         let new_is_empty = new_state_bytes.is_empty();
-        let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS
-            || new_hash != prior_state_hash;
+        let state_changed =
+            anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != prior_state_hash;
 
         // Committed actors: recompute the composite AFTER the handler
         // (the field root rows are current through the overlay) and
@@ -599,10 +599,7 @@ pub fn run_refine_service<A: super::Actor>() {
         if next_kind == crate::refine_payload::ANCHOR_SMT_ROOT
             && (next_kind, next_anchor) != (anchor_kind, anchor)
         {
-            super::storage::store_raw(
-                lifecycle::COMMITTED_ROOT_KEY.to_vec(),
-                next_anchor.to_vec(),
-            );
+            super::storage::store_raw(lifecycle::COMMITTED_ROOT_KEY.to_vec(), next_anchor.to_vec());
         }
 
         let payload = ctx.drain_into_refine_payload(
@@ -689,8 +686,7 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     let new_state_bytes = super::codec::Encode::encode(&actor);
     let reply_bytes = ctx.take_reply_bytes();
     let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
-    let state_changed =
-        anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != anchor;
+    let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != anchor;
     let payload = ctx.drain_into_refine_payload(
         anchor_kind,
         anchor,
@@ -773,7 +769,22 @@ pub fn run_nested_actor_service<A: super::Actor>(
     ctx.__set_actor_id(input.actor);
     ctx.__set_origin(input.origin);
 
-    let dispatch = lifecycle::dispatch_one::<A>(&input.message, &mut actor, &mut ctx);
+    assert_eq!(
+        A::CRDT,
+        input.change.is_some(),
+        "actor CRDT metadata does not match the service consistency mode"
+    );
+    let dispatch = match input.change {
+        Some(change) => crate::crdt::with_change(crate::crdt::ChangeId(change.0), || {
+            Ok(lifecycle::dispatch_one::<A>(
+                &input.message,
+                &mut actor,
+                &mut ctx,
+            ))
+        })
+        .expect("nested CRDT actor dispatch must establish one change scope"),
+        None => lifecycle::dispatch_one::<A>(&input.message, &mut actor, &mut ctx),
+    };
     assert!(
         !matches!(dispatch, DispatchResult::Skipped),
         "actor message did not match the canonical program ABI"

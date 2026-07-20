@@ -15,8 +15,8 @@ use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, ActorSliceInputV2, BlobRefV2,
-    CheckpointTokenV2, ContinuationSnapshotV2, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC,
-    RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, ImportedBlobV2, ProgramId,
+    REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -286,6 +286,7 @@ impl ServicePvmV2 {
         let target_state = imported_blob_bytes(imports, &target.state)?;
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
+            change: CrdtChangeV2::derive_id(&work),
             state: target_state.to_vec(),
             message: work.arguments.clone(),
             origin: work.origin,
