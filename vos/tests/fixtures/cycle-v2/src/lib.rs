@@ -1,6 +1,4 @@
-use vos::InvokeError;
 use vos::prelude::*;
-use vos::value::Value;
 
 #[actor]
 pub struct CycleV2;
@@ -13,23 +11,25 @@ impl CycleV2 {
 
     #[msg]
     async fn child_cycle(&mut self, ctx: &mut Context<Self>) -> u32 {
-        match ctx
-            .ask_actor(ActorId([5; 32]), &Msg::new("unused_root_method"), None)
-            .await
-        {
-            Err(InvokeError::Cycle) => 1,
+        let Ok(mut root) = ctx.actor::<CycleV2Ref>("root").await else {
+            return 0;
+        };
+        match root.unused_root_method().await {
+            Err(vos::ClientError::Call(CallError::Cycle)) => 1,
             _ => 0,
         }
     }
 
     #[msg]
+    fn unused_root_method(&self) -> u32 {
+        0
+    }
+
+    #[msg]
     async fn root_cycle(&mut self, ctx: &mut Context<Self>) -> u32 {
-        match ctx
-            .ask_actor(ActorId([36; 32]), &Msg::new("child_cycle"), None)
-            .await
-        {
-            Ok(Value::U32(value)) => value,
-            _ => 0,
-        }
+        let Ok(mut child) = ctx.child::<CycleV2Ref>("child").await else {
+            return 0;
+        };
+        child.child_cycle().await.unwrap_or(0)
     }
 }

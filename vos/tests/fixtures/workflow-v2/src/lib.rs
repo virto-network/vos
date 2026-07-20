@@ -21,13 +21,8 @@ impl WorkflowV2 {
     #[msg]
     async fn call_child(&mut self, ctx: &mut Context<Self>) -> u32 {
         self.value += 10;
-        if let Ok(Value::U32(value)) = ctx
-            .ask_actor(
-                ActorId([36; 32]),
-                &Msg::new("increment").with("amount", 1u32),
-                None,
-            )
-            .await
+        if let Ok(mut child) = ctx.child::<WorkflowV2Ref>("child").await
+            && let Ok(value) = child.increment(1).await
         {
             self.value += value;
         }
@@ -49,9 +44,8 @@ impl WorkflowV2 {
     #[msg]
     async fn root_child_await(&mut self, ctx: &mut Context<Self>) -> u32 {
         self.value += 10;
-        if let Ok(Value::U32(value)) = ctx
-            .ask_actor(ActorId([36; 32]), &Msg::new("child_await_peer"), None)
-            .await
+        if let Ok(mut child) = ctx.child::<WorkflowV2Ref>("child").await
+            && let Ok(value) = child.child_await_peer().await
         {
             self.value += value;
         }
@@ -75,9 +69,8 @@ impl WorkflowV2 {
     #[msg]
     async fn root_child_two_awaits(&mut self, ctx: &mut Context<Self>) -> u32 {
         self.value += 10;
-        if let Ok(Value::U32(value)) = ctx
-            .ask_actor(ActorId([36; 32]), &Msg::new("child_two_awaits"), None)
-            .await
+        if let Ok(mut child) = ctx.child::<WorkflowV2Ref>("child").await
+            && let Ok(value) = child.child_two_awaits().await
         {
             self.value += value;
         }

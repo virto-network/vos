@@ -1,5 +1,4 @@
 use vos::prelude::*;
-use vos::value::Value;
 
 #[actor(crdt)]
 pub struct CrdtCounterV2 {
@@ -25,15 +24,11 @@ impl CrdtCounterV2 {
     #[msg]
     async fn increment_child_twice(&mut self, amount: u64, ctx: &mut Context<Self>) -> i64 {
         let mut value = 0;
+        let Ok(mut child) = ctx.child::<CrdtCounterV2Ref>("child").await else {
+            return value;
+        };
         for _ in 0..2 {
-            if let Ok(Value::I64(next)) = ctx
-                .ask_actor(
-                    ActorId([36; 32]),
-                    &Msg::new("increment").with("amount", amount),
-                    None,
-                )
-                .await
-            {
+            if let Ok(next) = child.increment(amount).await {
                 value = next;
             }
         }
@@ -67,15 +62,9 @@ impl CrdtCounterV2 {
         parent_after: u64,
         ctx: &mut Context<Self>,
     ) -> i64 {
-        let _ = ctx
-            .ask_actor(
-                ActorId([36; 32]),
-                &Msg::new("increment_around_peer")
-                    .with("before", before)
-                    .with("after", after),
-                None,
-            )
-            .await;
+        if let Ok(mut child) = ctx.child::<CrdtCounterV2Ref>("child").await {
+            let _ = child.increment_around_peer(before, after).await;
+        }
         self.count
             .increment(parent_after)
             .expect("restored parent dispatch rebinds the CRDT change scope");
