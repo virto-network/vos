@@ -184,6 +184,7 @@ pub struct OpId {
 pub enum Error {
     DivergentOperation(OpId),
     LogicalClockOverflow,
+    ConstMismatch,
     IndexOutOfBounds,
     NoChangeScope,
     NestedChangeScope,
@@ -199,6 +200,9 @@ impl core::fmt::Display for Error {
                 write!(f, "CRDT operation {id:?} has divergent contents")
             }
             Self::LogicalClockOverflow => f.write_str("CRDT logical clock overflow"),
+            Self::ConstMismatch => {
+                f.write_str("concurrent CRDT states disagree on immutable configuration")
+            }
             Self::IndexOutOfBounds => f.write_str("CRDT sequence index is out of bounds"),
             Self::NoChangeScope => f.write_str(
                 "CRDT mutation requires an active actor execution slice; mutate replicated fields only inside an actor method",

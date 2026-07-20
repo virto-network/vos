@@ -284,17 +284,21 @@ fn apply<S: GuestAccumulateStoreV2>(
                 return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
             };
             let Some(expected) =
-                crdt_base_materialization(tree.store_ref(), &descriptor, imported.actor, heads)?
+                crdt_base_materializations(tree.store_ref(), &descriptor, imported.actor, heads)?
             else {
-                // Multi-head materialization is enabled with the generated
-                // field-delta merger; never accept a host-invented heap in the
-                // meantime.
                 return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
             };
-            if expected != imported.state {
+            let actual = core::iter::once(&imported.state)
+                .chain(imported.causal_states.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            if expected != actual {
                 return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
             }
         } else {
+            if !imported.causal_states.is_empty() {
+                return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
             let Some(committed_state) = tree_get_wire::<_, BlobRefV2>(
                 &tree,
                 &actor_state_key(header.consistency, imported.actor),
@@ -587,31 +591,72 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
     Ok(None)
 }
 
-fn crdt_base_materialization<S: StateTreeStore>(
+fn crdt_base_materializations<S: StateTreeStore>(
     store: &S,
     descriptor: &ActorGenesisV2,
     actor: ActorId,
     heads: &[Hash],
-) -> GuestResult<Option<BlobRefV2>, S::Error> {
-    match heads {
-        [] => Ok(Some(descriptor.initial_state.clone())),
-        [head] => {
-            let Some(bytes) = read(store, &crdt_node_storage_key(*head))? else {
-                return Ok(None);
-            };
-            let change =
-                CrdtChangeV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
-            if change.cid() != *head {
+) -> GuestResult<Option<Vec<BlobRefV2>>, S::Error> {
+    if heads.is_empty() {
+        return Ok(Some(alloc::vec![descriptor.initial_state.clone()]));
+    }
+
+    // First make the complete ancestry available and CID-valid. A node with a
+    // convenient materialization does not permit missing ancestors to remain
+    // latent in the committed DAG.
+    let mut nodes = BTreeMap::<Hash, CrdtChangeV2>::new();
+    let mut pending = heads.to_vec();
+    while let Some(cid) = pending.pop() {
+        if nodes.contains_key(&cid) {
+            continue;
+        }
+        let Some(bytes) = read(store, &crdt_node_storage_key(cid))? else {
+            return Ok(None);
+        };
+        let change =
+            CrdtChangeV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if change.cid() != cid {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        pending.extend(change.causal_dependencies.iter().copied());
+        nodes.insert(cid, change);
+    }
+
+    // For each branch, the nearest materialization for this actor already
+    // includes everything that branch observed. Stop there for selection, but
+    // retain every concurrent frontier and fold it inside the actor PVM.
+    let mut frontier = BTreeMap::<Hash, BlobRefV2>::new();
+    let mut visited = BTreeSet::new();
+    let mut pending = heads.to_vec();
+    while let Some(cid) = pending.pop() {
+        if !visited.insert(cid) {
+            continue;
+        }
+        let change = nodes.get(&cid).ok_or(GuestAccumulateError::CorruptStore)?;
+        if let Some(materialization) = change
+            .materializations
+            .iter()
+            .find(|materialization| materialization.actor == actor)
+        {
+            if let Some(existing) = frontier.get(&materialization.state.hash)
+                && existing != &materialization.state
+            {
                 return Err(GuestAccumulateError::CorruptStore);
             }
-            Ok(change
-                .materializations
-                .iter()
-                .find(|materialization| materialization.actor == actor)
-                .map(|materialization| materialization.state.clone()))
+            frontier.insert(materialization.state.hash, materialization.state.clone());
+        } else if change.causal_dependencies.is_empty() {
+            frontier.insert(
+                descriptor.initial_state.hash,
+                descriptor.initial_state.clone(),
+            );
+        } else {
+            pending.extend(change.causal_dependencies.iter().copied());
         }
-        _ => Ok(None),
     }
+    if frontier.is_empty() {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    Ok(Some(frontier.into_values().collect()))
 }
 
 fn write_crdt_change<S: GuestAccumulateStoreV2>(
@@ -774,11 +819,11 @@ fn referenced_blobs<'a>(
 ) -> impl Iterator<Item = &'a BlobRefV2> {
     work.imported_blobs
         .iter()
-        .chain(
-            work.imported_actors
-                .iter()
-                .flat_map(|actor| core::iter::once(&actor.state).chain(actor.continuation.iter())),
-        )
+        .chain(work.imported_actors.iter().flat_map(|actor| {
+            core::iter::once(&actor.state)
+                .chain(actor.causal_states.iter())
+                .chain(actor.continuation.iter())
+        }))
         .chain(transition.exported_blobs.iter())
         .chain(
             transition
@@ -1158,6 +1203,7 @@ mod tests {
                 actor: actor(),
                 program: program(),
                 state: initial,
+                causal_states: vec![],
                 continuation: None,
             }],
             imported_blobs: Vec::new(),
@@ -1665,6 +1711,7 @@ mod tests {
                 actor: actor(),
                 program: program(),
                 state: initial,
+                causal_states: vec![],
                 continuation: None,
             }],
             imported_blobs: Vec::new(),
@@ -1772,6 +1819,89 @@ mod tests {
         };
         assert_eq!(receipt.resulting_crdt_heads, vec![next_cid]);
         assert_eq!(receipt.sequence, 2);
+    }
+
+    #[test]
+    fn crdt_work_binds_complete_multi_head_materialization_frontier() {
+        let mut store = MemStore::default();
+        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
+
+        let mut branches = Vec::new();
+        for (invocation, bytes) in [(30, b"left".as_slice()), (31, b"right".as_slice())] {
+            let materialization = BlobRefV2::of_bytes(bytes);
+            let work = crdt_work(initial.clone(), invocation, Vec::new());
+            let transition = crdt_transition(&work, materialization.clone(), 1);
+            let cid = transition.crdt_change.as_ref().unwrap().cid();
+            let result = execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: vec![ImportedBlobV2 {
+                        reference: materialization.clone(),
+                        bytes: bytes.to_vec(),
+                    }],
+                }),
+            )
+            .unwrap();
+            assert!(matches!(result, AccumulationResultV2::Accepted { .. }));
+            branches.push((cid, materialization));
+        }
+
+        branches.sort_by_key(|(cid, _)| *cid);
+        let heads = branches.iter().map(|(cid, _)| *cid).collect::<Vec<_>>();
+        let mut states = branches
+            .iter()
+            .map(|(_, state)| state.clone())
+            .collect::<Vec<_>>();
+        states.sort_by_key(|state| state.hash);
+        let state = states.remove(0);
+        let mut work = crdt_work(state, 32, heads.clone());
+        work.imported_actors[0].causal_states = states;
+        work.base_causal_height = Some(1);
+        let merged = BlobRefV2::of_bytes(b"merged");
+        let transition = crdt_transition(&work, merged.clone(), 2);
+        let merged_cid = transition.crdt_change.as_ref().unwrap().cid();
+        let accepted = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work,
+                transition,
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: merged,
+                    bytes: b"merged".to_vec(),
+                }],
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
+            panic!("multi-head CRDT transition rejected")
+        };
+        assert_eq!(receipt.resulting_crdt_heads, vec![merged_cid]);
+
+        // A present head cannot hide an unavailable ancestor during activation.
+        let mut incomplete = store.clone();
+        incomplete
+            .rows
+            .remove(&crdt_node_storage_key(branches[0].0));
+        let mut work = crdt_work(BlobRefV2::of_bytes(b"merged"), 33, vec![merged_cid]);
+        work.base_causal_height = Some(2);
+        let next = crdt_transition(&work, BlobRefV2::of_bytes(b"next"), 3);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut incomplete,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition: next,
+                    provided_blobs: vec![ImportedBlobV2 {
+                        reference: BlobRefV2::of_bytes(b"next"),
+                        bytes: b"next".to_vec(),
+                    }],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
     }
 
     #[test]

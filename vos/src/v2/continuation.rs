@@ -207,6 +207,7 @@ mod tests {
                     hash: Hash([9; 32]),
                     len: 1,
                 },
+                causal_states: vec![],
                 continuation: None,
             }],
             imported_blobs: vec![],

@@ -100,7 +100,11 @@ impl BlobRefV2 {
 pub struct ImportedActorV2 {
     pub actor: ActorId,
     pub program: ProgramId,
+    /// First canonical state materialization for this actor at the work base.
+    /// Linear work has exactly this state. CRDT work may additionally import
+    /// concurrent frontier states which the actor PVM merges before dispatch.
     pub state: BlobRefV2,
+    pub causal_states: Vec<BlobRefV2>,
     pub continuation: Option<BlobRefV2>,
 }
 
@@ -137,6 +141,9 @@ pub struct ActorSliceInputV2 {
     /// service. Present only for an explicitly CRDT service.
     pub change: Option<CrdtDispatchV2>,
     pub state: Vec<u8>,
+    /// Additional canonical CRDT frontier materializations. The generated
+    /// actor merger folds these into `state` before the message is observed.
+    pub causal_states: Vec<Vec<u8>>,
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
     pub origin: Origin,
@@ -637,6 +644,9 @@ impl RefineImportsV2 {
                 return Err(RefineError::MissingImport(Hash(actor.program.0)));
             }
             self.require_blob(&actor.state)?;
+            for state in &actor.causal_states {
+                self.require_blob(state)?;
+            }
             if let Some(continuation) = &actor.continuation {
                 self.require_blob(continuation)?;
             }
@@ -718,6 +728,21 @@ impl V2Wire for WorkEnvelopeV2 {
         let proof_requested = d.bool()?;
         ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
+        for actor in &imported_actors {
+            ensure_sorted_unique(&actor.causal_states, |state| state.hash.0)?;
+            if actor
+                .causal_states
+                .iter()
+                .any(|state| state.hash == actor.state.hash)
+                || actor
+                    .causal_states
+                    .first()
+                    .is_some_and(|state| state.hash <= actor.state.hash)
+                || (consistency != ConsistencyModeV2::Crdt && !actor.causal_states.is_empty())
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
         Ok(Self {
             service,
             invocation,
@@ -801,12 +826,13 @@ impl V2Wire for ActorSliceInputV2 {
             e.u32(dispatch.ordinal);
         });
         e.bytes(&self.state);
+        e.list(&self.causal_states, |e, state| e.bytes(state));
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
+        let value = Self {
             actor: ActorId(d.fixed()?),
             input: WorkInputIdV2 {
                 invocation: InvocationId(d.fixed()?),
@@ -819,9 +845,14 @@ impl V2Wire for ActorSliceInputV2 {
                 })
             })?,
             state: d.bytes()?,
+            causal_states: d.list(Decoder::bytes)?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
-        })
+        };
+        if value.change.is_none() && !value.causal_states.is_empty() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -1730,6 +1761,7 @@ fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
     e.fixed(&value.actor.0);
     e.fixed(&value.program.0);
     encode_blob_ref(e, &value.state);
+    e.list(&value.causal_states, encode_blob_ref);
     e.option(&value.continuation, encode_blob_ref);
 }
 
@@ -1738,6 +1770,7 @@ fn decode_imported_actor(d: &mut Decoder<'_>) -> Result<ImportedActorV2, DecodeE
         actor: ActorId(d.fixed()?),
         program: ProgramId(d.fixed()?),
         state: decode_blob_ref(d)?,
+        causal_states: d.list(decode_blob_ref)?,
         continuation: d.option(decode_blob_ref)?,
     })
 }
@@ -2020,6 +2053,7 @@ mod tests {
             actor: work.target,
             program,
             state: state.clone(),
+            causal_states: vec![],
             continuation: None,
         }];
         work.imported_blobs = vec![extra.clone()];
@@ -2073,6 +2107,7 @@ mod tests {
                 ordinal: 4,
             }),
             state: b"before".to_vec(),
+            causal_states: vec![b"concurrent".to_vec()],
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),
         };

@@ -119,6 +119,14 @@ pub trait Actor: Sized + Encode + Decode {
     #[doc(hidden)]
     fn __init_crdt_fields(&mut self) {}
 
+    /// Merge another causal frontier materialization into this actor before a
+    /// CRDT handler runs. `#[actor(crdt)]` generates one field-wise merge;
+    /// ordinary actors never receive multiple state inputs.
+    #[doc(hidden)]
+    fn __merge_crdt(&mut self, _other: &Self) -> Result<(), crate::crdt::Error> {
+        Ok(())
+    }
+
     /// Whether any `#[storage(committed)]` field exists. A committed
     /// actor anchors its work-results with `anchor_kind 0x02`
     /// composite roots; the cold-start path uses this to know whether

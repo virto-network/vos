@@ -763,6 +763,12 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let bytes = unsafe { core::slice::from_raw_parts(input_address as *const u8, input_len) };
     let input = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
     let mut actor = lifecycle::load_or_create::<A>(Some(&input.state));
+    for state in &input.causal_states {
+        let other = lifecycle::load_or_create::<A>(Some(state));
+        actor
+            .__merge_crdt(&other)
+            .expect("invalid concurrent CRDT actor materialization");
+    }
     // The legacy route-only ServiceId is deliberately not derived by
     // truncating ActorId. Nested v2 actors retain their complete typed identity
     // in Context and all v2 scheduler effects use that value.

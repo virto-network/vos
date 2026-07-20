@@ -154,6 +154,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             actor: ActorId([5; 32]),
             program: actor_program,
             state,
+            causal_states: vec![],
             continuation: None,
         }],
         imported_blobs: vec![],
@@ -376,7 +377,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     let imports = RefineImportsV2 {
         programs: vec![ImportedProgramV2 {
             program: actor_program,
-            pvm: actor_pvm,
+            pvm: actor_pvm.clone(),
         }],
         blobs: vec![ImportedBlobV2 {
             reference: initial.clone(),
@@ -401,7 +402,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             actor: work.target,
             parent: None,
             program: actor_program,
-            initial_state: initial,
+            initial_state: initial.clone(),
             crdt: true,
             methods: vec![MethodPolicyV2 {
                 method: "increment".into(),
@@ -434,7 +435,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     );
     let cid = change.cid();
     let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-        work,
+        work: work.clone(),
         transition: refined.transition.clone(),
         provided_blobs: refined.exported_blobs.clone(),
     });
@@ -468,6 +469,78 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     };
     assert!(duplicate);
     assert_eq!(published, PublishedEffectsV2::default());
+
+    // Refine a concurrent sibling from the same empty causal base after the
+    // first branch has committed. CRDT Accumulate preserves both heads.
+    let mut right_work = work.clone();
+    right_work.invocation = InvocationId([47; 32]);
+    let mut right_message = vec![vos::value::TAG_DYNAMIC];
+    right_message.extend_from_slice(&Msg::new("increment").with("amount", 3u64).encode());
+    right_work.arguments = right_message;
+    let right_refined = service.refine_actor_tree(&right_work, &imports).unwrap();
+    let right_cid = right_refined.transition.crdt_change.as_ref().unwrap().cid();
+    let right = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: right_work,
+            transition: right_refined.transition.clone(),
+            provided_blobs: right_refined.exported_blobs.clone(),
+        }))
+        .unwrap()
+        .result;
+    let AccumulationResultV2::Accepted { receipt, .. } = right else {
+        panic!("concurrent CRDT branch rejected")
+    };
+    let mut heads = vec![cid, right_cid];
+    heads.sort();
+    assert_eq!(receipt.resulting_crdt_heads, heads);
+
+    // Supply the exact frontier materializations in content order. The
+    // generated actor merger folds both counters before the handler observes
+    // state, so 2 + 3 + 4 is returned and materialized as one causal child.
+    let mut frontier = vec![
+        refined.exported_blobs[0].clone(),
+        right_refined.exported_blobs[0].clone(),
+    ];
+    frontier.sort_by_key(|blob| blob.reference.hash);
+    let mut merge_work = work;
+    merge_work.invocation = InvocationId([48; 32]);
+    merge_work.base = ConsistencyBaseV2::Crdt {
+        heads: heads.clone(),
+    };
+    merge_work.base_causal_height = Some(1);
+    merge_work.imported_actors[0].state = frontier[0].reference.clone();
+    merge_work.imported_actors[0].causal_states = frontier[1..]
+        .iter()
+        .map(|blob| blob.reference.clone())
+        .collect();
+    let mut merge_message = vec![vos::value::TAG_DYNAMIC];
+    merge_message.extend_from_slice(&Msg::new("increment").with("amount", 4u64).encode());
+    merge_work.arguments = merge_message;
+    let merge_imports = RefineImportsV2 {
+        programs: vec![ImportedProgramV2 {
+            program: actor_program,
+            pvm: actor_pvm,
+        }],
+        blobs: frontier,
+    };
+    let merged = service
+        .refine_actor_tree(&merge_work, &merge_imports)
+        .unwrap();
+    let reply = merged.transition.reply.as_ref().unwrap();
+    assert_eq!(vos::value::Value::decode(&reply.result).as_i64(), Some(9));
+    let merged_cid = merged.transition.crdt_change.as_ref().unwrap().cid();
+    let accepted = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: merge_work,
+            transition: merged.transition,
+            provided_blobs: merged.exported_blobs,
+        }))
+        .unwrap()
+        .result;
+    let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
+        panic!("merged CRDT child rejected")
+    };
+    assert_eq!(receipt.resulting_crdt_heads, vec![merged_cid]);
 }
 
 #[test]
