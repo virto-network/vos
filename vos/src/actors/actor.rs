@@ -113,6 +113,12 @@ pub trait Actor: Sized + Encode + Decode {
     #[doc(hidden)]
     fn __init_storage(&mut self) {}
 
+    /// Assign stable generated tags to every replicated CRDT field after
+    /// create/decode. Field tags are runtime handles and are not archived in
+    /// actor state.
+    #[doc(hidden)]
+    fn __init_crdt_fields(&mut self) {}
+
     /// Whether any `#[storage(committed)]` field exists. A committed
     /// actor anchors its work-results with `anchor_kind 0x02`
     /// composite roots; the cold-start path uses this to know whether

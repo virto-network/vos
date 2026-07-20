@@ -155,6 +155,13 @@ pub struct CrdtDispatchV2 {
 pub struct ActorSliceOutputV2 {
     pub actor: ActorId,
     pub writes: Vec<ActorWriteV2>,
+    /// Concrete field operations emitted by one `#[actor(crdt)]` execution
+    /// slice. Ordinary actors always leave this empty.
+    pub crdt_operations: Vec<CrdtOperationV2>,
+    /// Canonical archived actor state after applying `crdt_operations` to the
+    /// imported causal materialization. This is transported as a candidate
+    /// blob; Refine never persists it directly.
+    pub crdt_materialization: Option<Vec<u8>>,
     pub reply: Vec<u8>,
     pub yielded: bool,
     pub forbidden: bool,
@@ -798,6 +805,8 @@ impl V2Wire for ActorSliceOutputV2 {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
         e.list(&self.writes, encode_write);
+        e.list(&self.crdt_operations, encode_crdt_op);
+        e.option(&self.crdt_materialization, |e, state| e.bytes(state));
         e.bytes(&self.reply);
         e.bool(self.yielded);
         e.bool(self.forbidden);
@@ -808,12 +817,40 @@ impl V2Wire for ActorSliceOutputV2 {
         let value = Self {
             actor: ActorId(d.fixed()?),
             writes: d.list(decode_write)?,
+            crdt_operations: d.list(decode_crdt_op)?,
+            crdt_materialization: d.option(Decoder::bytes)?,
             reply: d.bytes()?,
             yielded: d.bool()?,
             forbidden: d.bool()?,
             checkpoint: d.option(decode_checkpoint_token)?,
         };
         if value.writes.iter().any(|write| write.actor != value.actor)
+            || value
+                .crdt_operations
+                .iter()
+                .any(|operation| operation.actor != value.actor || operation.payload.is_empty())
+            || value
+                .crdt_operations
+                .windows(2)
+                .any(|pair| {
+                    (
+                        pair[0].dispatch_ordinal,
+                        pair[0].ordinal,
+                    ) >= (
+                        pair[1].dispatch_ordinal,
+                        pair[1].ordinal,
+                    )
+                })
+            || value
+                .crdt_operations
+                .first()
+                .is_some_and(|first| {
+                    value
+                        .crdt_operations
+                        .iter()
+                        .any(|operation| operation.dispatch_ordinal != first.dispatch_ordinal)
+                })
+            || (!value.crdt_operations.is_empty() && value.crdt_materialization.is_none())
             || (value.yielded
                 && value
                     .checkpoint
@@ -1942,6 +1979,8 @@ mod tests {
                 key: b"state".to_vec(),
                 value: Some(b"after".to_vec()),
             }],
+            crdt_operations: vec![],
+            crdt_materialization: None,
             reply: b"ok".to_vec(),
             yielded: false,
             forbidden: false,
@@ -2000,6 +2039,8 @@ mod tests {
         let mut invalid_yield = ActorSliceOutputV2 {
             actor: ActorId([21; 32]),
             writes: vec![],
+            crdt_operations: vec![],
+            crdt_materialization: None,
             reply: vec![],
             yielded: true,
             forbidden: false,
