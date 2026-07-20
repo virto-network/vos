@@ -1,6 +1,7 @@
 //! Build a canonical actor PVM and its signed `.vos` v2 package.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
 use vos::v2::{
@@ -23,20 +24,19 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let input =
-        std::fs::read(&args.program).with_context(|| format!("read {}", args.program.display()))?;
-    let is_pvm = args.program.extension().and_then(|x| x.to_str()) == Some("pvm");
+    let program = resolve_program_input(&args.program)?;
+    let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
+    let is_pvm = program.extension().and_then(|x| x.to_str()) == Some("pvm");
     let actor_pvm = if is_pvm {
         input.clone()
     } else {
         grey_transpiler::link_elf(&input)
-            .map_err(|error| anyhow!("transpile {}: {error:?}", args.program.display()))?
+            .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
     };
     if actor_pvm.is_empty() {
-        bail!("{} produced an empty PVM", args.program.display());
+        bail!("{} produced an empty PVM", program.display());
     }
-    javm::program::parse_blob(&actor_pvm)
-        .ok_or_else(|| anyhow!("invalid canonical actor PVM"))?;
+    javm::program::parse_blob(&actor_pvm).ok_or_else(|| anyhow!("invalid canonical actor PVM"))?;
 
     let schemas = match args.schemas.as_deref() {
         Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
@@ -46,13 +46,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let actor_metadata = vos::metadata::decode(&schemas).ok_or_else(|| {
         anyhow!(
             "{} has no valid v2 actor schema; build from its ELF or pass --schemas with exact .vos_meta bytes",
-            args.program.display()
+            program.display()
         )
     })?;
     if args.crdt && !actor_metadata.crdt {
         bail!(
             "{} is an ordinary actor; use #[actor(crdt)] instead of forcing --crdt",
-            args.program.display(),
+            program.display(),
         );
     }
     let crdt = actor_metadata.crdt || args.crdt;
@@ -135,6 +135,71 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
+    if !input.is_dir() {
+        return Ok(input.to_path_buf());
+    }
+    let manifest_path = input.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read actor manifest {}", manifest_path.display()))?;
+    let package_name = package_name_from_manifest(&manifest)?;
+    let build_root = actor_build_root(input)?;
+    let mut command = Command::new("cargo");
+    command.args(["+nightly", "actor"]);
+    if build_root != input {
+        command.args(["-p", &package_name]);
+    }
+    let status = command
+        .current_dir(&build_root)
+        .status()
+        .with_context(|| format!("run `cargo +nightly actor` in {}", build_root.display()))?;
+    if !status.success() {
+        bail!(
+            "actor build failed in {} with status {status}",
+            input.display()
+        );
+    }
+    let elf = build_root
+        .join("target/riscv64em-javm/release")
+        .join(format!("{}.elf", package_name.replace('-', "_")));
+    if !elf.is_file() {
+        bail!(
+            "actor build succeeded but did not produce {}; ensure the project uses the VOS cargo actor configuration",
+            elf.display()
+        );
+    }
+    Ok(elf)
+}
+
+fn actor_build_root(project: &Path) -> anyhow::Result<PathBuf> {
+    project
+        .ancestors()
+        .find(|candidate| {
+            candidate.join(".cargo/config.toml").is_file()
+                && candidate.join("riscv64em-javm.json").is_file()
+        })
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} is missing the VOS .cargo/config.toml and riscv64em-javm.json build configuration",
+                project.display()
+            )
+        })
+}
+
+fn package_name_from_manifest(manifest: &str) -> anyhow::Result<String> {
+    let manifest: toml::Value = manifest
+        .parse()
+        .map_err(|error| anyhow!("parse actor Cargo.toml: {error}"))?;
+    manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .ok_or_else(|| anyhow!("actor Cargo.toml needs a non-empty [package].name"))
+}
+
 fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
     path.map(std::fs::read)
         .transpose()
@@ -159,5 +224,33 @@ mod tests {
         assert_eq!(parse_hash(&"ab".repeat(32)).unwrap(), [0xab; 32]);
         assert!(parse_hash("ab").is_err());
         assert!(parse_hash("zz").is_err());
+    }
+
+    #[test]
+    fn project_output_uses_the_cargo_package_name() {
+        assert_eq!(
+            package_name_from_manifest(
+                r#"
+                    [package]
+                    name = "private-age"
+                    version = "0.1.0"
+                "#,
+            )
+            .unwrap(),
+            "private-age"
+        );
+        assert!(package_name_from_manifest("[workspace]").is_err());
+    }
+
+    #[test]
+    fn workspace_member_builds_from_the_actor_workspace_root() {
+        let member = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/v2/counter");
+        let root = actor_build_root(&member).unwrap();
+        assert_eq!(root.file_name().and_then(|name| name.to_str()), Some("v2"));
+        assert_eq!(
+            root.join("target/riscv64em-javm/release/v2_counter.elf"),
+            root.join("target/riscv64em-javm/release")
+                .join(format!("{}.elf", "v2-counter".replace('-', "_")))
+        );
     }
 }

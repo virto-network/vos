@@ -88,7 +88,7 @@ enum Command {
     },
     /// Build one canonical actor PVM and signed `.vos` v2 package.
     Build {
-        /// Actor ELF (transpiled once) or an already-canonical `.pvm`.
+        /// Actor project directory, ELF (transpiled once), or canonical `.pvm`.
         program: PathBuf,
         #[arg(long)]
         name: Option<String>,
