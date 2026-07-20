@@ -907,6 +907,69 @@ impl V2Wire for CrdtChangeV2 {
     }
 }
 
+impl V2Wire for BlobRefV2 {
+    const MAGIC: [u8; 4] = *b"VBR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        encode_blob_ref(&mut Encoder(out), self);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_blob_ref(d)
+    }
+}
+
+impl V2Wire for MethodPolicyV2 {
+    const MAGIC: [u8; 4] = *b"VMP2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.string(&self.method);
+        e.fixed(&self.schema.0);
+        e.fixed(&self.policy.0);
+        e.bool(self.public);
+        e.bool(self.attested);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            method: d.string()?,
+            schema: Hash(d.fixed()?),
+            policy: Hash(d.fixed()?),
+            public: d.bool()?,
+            attested: d.bool()?,
+        };
+        if value.method.is_empty() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for ActorGenesisV2 {
+    const MAGIC: [u8; 4] = *b"VAG2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        encode_actor_genesis(&mut Encoder(out), self);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_actor_genesis(d)
+    }
+}
+
+impl V2Wire for MessageRecordV2 {
+    const MAGIC: [u8; 4] = *b"VMR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        encode_message(&mut Encoder(out), self);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_message(d)
+    }
+}
+
 impl V2Wire for AccumulationReceiptV2 {
     const MAGIC: [u8; 4] = *b"VAR2";
 

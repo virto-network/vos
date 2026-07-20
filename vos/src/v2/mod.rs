@@ -13,6 +13,7 @@
 mod accumulate;
 mod continuation;
 mod contracts;
+mod guest_accumulate;
 mod identity;
 mod package;
 #[cfg(feature = "std")]
@@ -37,6 +38,9 @@ pub use contracts::{
     ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
     WorkInputIdV2, WorkflowOperationV2,
 };
+pub use guest_accumulate::{
+    GuestAccumulateError, GuestAccumulateStoreV2, execute_guest_accumulate,
+};
 pub use identity::{
     ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,
     ProgramId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
@@ -57,7 +61,8 @@ pub use state_tree::{
 };
 pub use storage::{
     DedupRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError,
-    crdt_node_storage_key, dedup_storage_key, header_storage_key, receipt_storage_key,
+    WorkflowCheckpointV2, crdt_change_storage_key, crdt_node_storage_key, dedup_storage_key,
+    header_storage_key, receipt_storage_key,
 };
 pub use wire::{DecodeError, V2Wire};
 
