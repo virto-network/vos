@@ -19,9 +19,6 @@
 //! would silently lose the high half and produce a divergent
 //! digest. Not a practical concern — matches zkpvm-precompiles.
 
-#[cfg(target_arch = "riscv64")]
-use crate::abi::pvm::ecall::VOS_OBJECT_CAP;
-
 /// blake2b compression precompile. ID matches `zkpvm-precompiles`
 /// so the same actor binary lights up the chip path under zkpvm.
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
@@ -128,24 +125,7 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let m_ptr = m.as_ptr() as u64;
     let t_low = t as u64;
     let f_flag: u64 = if f { 1 } else { 0 };
-    // SAFETY: hostcall trap into BLAKE2B_COMPRESS. The host reads
-    // 128 bytes from `m_ptr` and writes 64 bytes back through
-    // `h_ptr`, sizes that match the borrowed `[u8; 64]` / `[u8; 128]`
-    // we just took the pointers of. `nostack` — we don't touch SP.
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("t0") ECALL_BLAKE2B_COMPRESS as u64,
-            in("a0") h_ptr,
-            in("a1") m_ptr,
-            in("a2") t_low,
-            in("a3") f_flag,
-            in("t2") f_flag, // φ[7] convention for f
-            in("a4") 0u64,
-            in("a5") VOS_OBJECT_CAP,
-            options(nostack),
-        );
-    }
+    let _ = crate::abi::pvm::ecall::ecall4(ECALL_BLAKE2B_COMPRESS, h_ptr, m_ptr, t_low, f_flag);
 }
 
 // ── Host kernel handler: per-block compress for the ECALL ──

@@ -654,6 +654,9 @@ where
         }
         let committed = AccumulateRequestV2::decode(&entry.request)
             .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+        if committed != *request {
+            return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
+        }
         ensure_request_proof_available(self.service.accumulate_host_mut(), &committed)
             .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
         let output = self
