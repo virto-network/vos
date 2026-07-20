@@ -438,7 +438,10 @@ impl ReceiptVerificationRequestV2 {
 /// Fixed-schema workflow operations merged alongside application CRDT fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowOperationV2 {
-    Consumed(WorkInputIdV2),
+    /// Complete scheduler checkpoint for one admitted workflow slice. A peer
+    /// syncing only the causal DAG can reconstruct the next exact resume input
+    /// without process-local request state.
+    Checkpoint(WorkEnvelopeV2),
     Continuation(ContinuationChangeV2),
     Inbox(MessageRecordV2),
     Outbox(MessageRecordV2),
@@ -519,14 +522,14 @@ impl TransitionV2 {
         Hash::digest(b"vos/transition/v2", &[&encoded])
     }
 
-    pub fn workflow_operations(&self) -> Vec<WorkflowOperationV2> {
+    pub fn workflow_operations(&self, work: &WorkEnvelopeV2) -> Vec<WorkflowOperationV2> {
         let mut operations = Vec::with_capacity(
             1 + self.continuations.len()
                 + self.inbox.len()
                 + self.outbox.len()
                 + usize::from(self.reply.is_some()),
         );
-        operations.push(WorkflowOperationV2::Consumed(self.consumed_input));
+        operations.push(WorkflowOperationV2::Checkpoint(work.clone()));
         operations.extend(
             self.continuations
                 .iter()
@@ -646,6 +649,33 @@ impl DeliveryEnvelopeV2 {
     }
 }
 
+/// One causal node imported from another replica of the same CRDT service.
+/// The finalized accumulation receipt authenticates that this exact CID was
+/// admitted by the canonical service guest; sync never trusts unsigned DAG
+/// bytes supplied by the native transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrdtSyncNodeV2 {
+    pub change: CrdtChangeV2,
+    pub receipt: AccumulationReceiptV2,
+}
+
+/// Complete CRDT synchronization input accepted by guest Accumulate. Nodes
+/// and blobs may be a delta, but `advertised_heads` must have complete ancestry
+/// after combining the delta with locally committed nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrdtSyncEnvelopeV2 {
+    pub service: ServiceIdentityV2,
+    pub advertised_heads: Vec<Hash>,
+    pub nodes: Vec<CrdtSyncNodeV2>,
+    pub provided_blobs: Vec<ImportedBlobV2>,
+}
+
+impl CrdtSyncEnvelopeV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/crdt-sync/v2", &[&self.encode()])
+    }
+}
+
 /// Guest-owned acknowledgement that a committed publication reached its
 /// external consumer. Removal is another physical Accumulate transaction;
 /// native transport never deletes a recoverable publication row directly.
@@ -656,8 +686,8 @@ pub struct PublicationAckV2 {
     pub publication: Hash,
 }
 
-/// Physical IC-5 request. Every mutation of service or transport bookkeeping
-/// remains guest-owned.
+/// Physical IC-5 request. Every mutation of service, transport, or causal
+/// synchronization bookkeeping remains guest-owned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulateRequestV2 {
     Install(ServiceGenesisV2),
@@ -665,6 +695,7 @@ pub enum AccumulateRequestV2 {
     PrepareAttested(AccumulationEnvelopeV2),
     Deliver(DeliveryEnvelopeV2),
     AcknowledgePublication(PublicationAckV2),
+    SyncCrdt(CrdtSyncEnvelopeV2),
 }
 
 impl AccumulateRequestV2 {
@@ -679,6 +710,7 @@ impl AccumulateRequestV2 {
             Self::Apply(envelope) | Self::PrepareAttested(envelope) => &envelope.work.service,
             Self::Deliver(envelope) => &envelope.service,
             Self::AcknowledgePublication(acknowledgement) => &acknowledgement.service,
+            Self::SyncCrdt(envelope) => &envelope.service,
         }
     }
 }
@@ -1575,6 +1607,80 @@ impl PublicationAckV2 {
     }
 }
 
+impl V2Wire for CrdtSyncEnvelopeV2 {
+    const MAGIC: [u8; 4] = *b"VCS2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.list(&self.advertised_heads, |e, head| e.fixed(&head.0));
+        e.list(&self.nodes, |e, node| {
+            e.bytes(&node.change.encode());
+            e.bytes(&node.receipt.encode());
+        });
+        e.list(&self.provided_blobs, |e, blob| {
+            encode_blob_ref(e, &blob.reference);
+            e.bytes(&blob.bytes);
+        });
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            advertised_heads: d.list(|d| d.fixed().map(Hash))?,
+            nodes: d.list(|d| {
+                Ok(CrdtSyncNodeV2 {
+                    change: CrdtChangeV2::decode(&d.bytes()?)?,
+                    receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+                })
+            })?,
+            provided_blobs: d.list(|d| {
+                Ok(ImportedBlobV2 {
+                    reference: decode_blob_ref(d)?,
+                    bytes: d.bytes()?,
+                })
+            })?,
+        };
+        ensure_sorted_unique(&value.advertised_heads, |head| head.0)?;
+        if value.advertised_heads.is_empty()
+            || value
+                .nodes
+                .windows(2)
+                .any(|pair| pair[0].change.cid() >= pair[1].change.cid())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        ensure_sorted_unique(&value.provided_blobs, |blob| blob.reference.hash.0)?;
+        for node in &value.nodes {
+            let cid = node.change.cid();
+            if node.receipt.service != value.service
+                || node.receipt.consistency != ConsistencyModeV2::Crdt
+                || node.receipt.resulting_state_root.is_some()
+                || node.receipt.sequence != node.change.causal_height
+                || node
+                    .receipt
+                    .resulting_crdt_heads
+                    .binary_search(&cid)
+                    .is_err()
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        for blob in &value.provided_blobs {
+            if !blob.reference.matches(&blob.bytes)
+                || !value.nodes.iter().any(|node| {
+                    crdt_change_blob_references(&node.change)
+                        .into_iter()
+                        .any(|reference| reference == &blob.reference)
+                })
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for AccumulateRequestV2 {
     const MAGIC: [u8; 4] = *b"VAC2";
 
@@ -1601,6 +1707,10 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(4);
                 e.bytes(&acknowledgement.encode());
             }
+            Self::SyncCrdt(envelope) => {
+                e.u8(5);
+                e.bytes(&envelope.encode());
+            }
         }
     }
 
@@ -1615,6 +1725,7 @@ impl V2Wire for AccumulateRequestV2 {
             4 => Ok(Self::AcknowledgePublication(PublicationAckV2::decode(
                 &d.bytes()?,
             )?)),
+            5 => Ok(Self::SyncCrdt(CrdtSyncEnvelopeV2::decode(&d.bytes()?)?)),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -1839,7 +1950,7 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
                     .base_causal_height
                     .and_then(|height| height.checked_add(1))
                     == Some(change.causal_height)
-                && change.workflow == value.transition.workflow_operations() =>
+                && change.workflow == value.transition.workflow_operations(&value.work) =>
         {
             Ok(())
         }
@@ -1887,6 +1998,33 @@ fn transition_blob_references(transition: &TransitionV2) -> impl Iterator<Item =
                 .flat_map(|change| change.materializations.iter())
                 .map(|materialization| &materialization.state),
         )
+}
+
+pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRefV2> {
+    let mut references = change
+        .materializations
+        .iter()
+        .map(|materialization| &materialization.state)
+        .collect::<Vec<_>>();
+    for operation in &change.workflow {
+        match operation {
+            WorkflowOperationV2::Checkpoint(work) => {
+                references.extend(work.imported_blobs.iter());
+                for actor in &work.imported_actors {
+                    references.push(&actor.state);
+                    references.extend(actor.causal_states.iter());
+                    references.extend(actor.continuation.iter());
+                }
+            }
+            WorkflowOperationV2::Continuation(change) => {
+                references.extend(change.replacement.iter());
+            }
+            WorkflowOperationV2::Inbox(_)
+            | WorkflowOperationV2::Outbox(_)
+            | WorkflowOperationV2::Reply(_) => {}
+        }
+    }
+    references
 }
 
 fn encode_install_receipt(e: &mut Encoder<'_>, value: &ServiceInstallReceiptV2) {
@@ -2204,10 +2342,9 @@ fn decode_crdt_op(d: &mut Decoder<'_>) -> Result<CrdtOperationV2, DecodeError> {
 
 fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
     match value {
-        WorkflowOperationV2::Consumed(input) => {
+        WorkflowOperationV2::Checkpoint(work) => {
             e.u8(0);
-            e.fixed(&input.invocation.0);
-            e.u64(input.workflow_step);
+            e.bytes(&work.encode());
         }
         WorkflowOperationV2::Continuation(change) => {
             e.u8(1);
@@ -2230,10 +2367,9 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
 
 fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2, DecodeError> {
     match d.u8()? {
-        0 => Ok(WorkflowOperationV2::Consumed(WorkInputIdV2 {
-            invocation: InvocationId(d.fixed()?),
-            workflow_step: d.u64()?,
-        })),
+        0 => Ok(WorkflowOperationV2::Checkpoint(WorkEnvelopeV2::decode(
+            &d.bytes()?,
+        )?)),
         1 => Ok(WorkflowOperationV2::Continuation(
             decode_continuation_change(d)?,
         )),
@@ -3200,7 +3336,7 @@ mod tests {
                     id: change_id.operation(work.target, 0, field, 0),
                     payload: b"counter +1".to_vec(),
                 }],
-                workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
+                workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
                 materializations: vec![CrdtMaterializationV2 {
                     actor: work.target,
                     state: BlobRefV2::of_bytes(b"materialized-state"),
@@ -3321,7 +3457,7 @@ mod tests {
             causal_dependencies: vec![],
             causal_height: 1,
             operations,
-            workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
+            workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
             materializations: vec![],
         };
         assert_eq!(CrdtChangeV2::decode(&value.encode()).unwrap(), value);

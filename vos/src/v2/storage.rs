@@ -14,7 +14,7 @@ use super::{
     InvocationId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 4;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 5;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -25,6 +25,7 @@ const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const REPLY_ADMISSION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/reply-admission/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
+const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,6 +486,13 @@ pub fn crdt_node_storage_key(cid: Hash) -> Vec<u8> {
     key
 }
 
+pub fn crdt_node_receipt_storage_key(cid: Hash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CRDT_NODE_RECEIPT_STORAGE_PREFIX.len() + cid.0.len());
+    key.extend_from_slice(CRDT_NODE_RECEIPT_STORAGE_PREFIX);
+    key.extend_from_slice(&cid.0);
+    key
+}
+
 pub fn crdt_change_storage_key(change: super::ChangeId) -> Vec<u8> {
     let mut key = Vec::with_capacity(CRDT_CHANGE_STORAGE_PREFIX.len() + change.0.len());
     key.extend_from_slice(CRDT_CHANGE_STORAGE_PREFIX);
@@ -668,6 +676,10 @@ mod tests {
         assert_ne!(reply_admission, publication);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
+        assert_ne!(
+            crdt_node_receipt_storage_key(Hash([6; 32])),
+            crdt_node_storage_key(Hash([6; 32]))
+        );
         assert_ne!(
             crdt_change_storage_key(ChangeId([6; 32])),
             crdt_node_storage_key(Hash([6; 32]))

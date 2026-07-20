@@ -59,6 +59,16 @@ Injected destination and caller commit failures expose neither an admitted
 inbox nor resumed reply effects; the exact envelopes remain retryable from the
 previous durable images.
 
+CRDT anti-entropy also enters through physical Accumulate. A
+`CrdtSyncEnvelopeV2` carries advertised heads, canonical causal nodes, the
+content-addressed blobs they reference, and each node's finalized admission
+receipt. The guest verifies receipt/service identity, node CID, change-ID
+deduplication, exact causal height, complete ancestry, workflow rules, and blob
+hashes before staging anything. It preserves concurrent heads, reconstructs
+continuation/inbox/outbox/workflow rows from the DAG, and commits nodes,
+receipts, blobs, materialized rows, and the header atomically. The read-only
+local scheduler only packages these authenticated bytes.
+
 Guest Install is fail-closed on an exact-genesis authorization capability. It
 binds service/deployment identity, consistency mode, the complete actor tree,
 programs, initial states, method policies, and the supplied authorization
@@ -209,6 +219,13 @@ fields use explicit `vos::crdt` merge rules (`Value`, `Map`, `Set`, `List`,
 `Text`, `Counter`). Stable logical operation IDs and causal metadata replace
 wall clocks. The Merkle-DAG supplies causal transport and persistence, not
 convergence for arbitrary commands.
+
+Workflow operations are a built-in CRDT payload alongside application fields.
+Every actor slice records its complete `WorkEnvelopeV2`; synchronized peers can
+therefore reconstruct the exact workflow step without a process-local request
+cache. Concurrent identical messages are add-wins and deduplicated by stable
+`CallId`; divergent continuations, replies, or executions of the same workflow
+step are rejected instead of selecting an arbitrary branch.
 
 Concurrent scalar assignments retain alternatives through `conflicts()` while
 choosing the same visible value; counter increments, list and text operations
