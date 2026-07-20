@@ -47,6 +47,20 @@ pub struct CommittedAttestationOutputV2 {
     pub accumulate_gas_used: u64,
 }
 
+struct ProvedAttestationV2 {
+    envelope: AccumulationEnvelopeV2,
+    preparation: AttestationPreparationV2,
+    proof: ProofCommitmentV2,
+    proof_bytes: Vec<u8>,
+}
+
+enum AttestationBuildErrorV2<P> {
+    InvalidPreparation,
+    Producer(P),
+    InvalidProducedProof,
+    ProofUnavailable,
+}
+
 #[derive(Debug)]
 pub enum AttestedServiceErrorV2<E, P> {
     Service(E),
@@ -158,6 +172,7 @@ pub enum ReplicatedServiceErrorV2<E> {
     Dispatch(ServiceDispatchError),
     Log(E),
     ServiceImage(ServiceImageInstallErrorV2),
+    ProofUnavailable,
     InvalidCommittedLog,
 }
 
@@ -325,7 +340,7 @@ where
     /// only from a successful non-duplicate guest commit.
     pub fn accumulate_attested<P: AttestationProofProducerV2>(
         &mut self,
-        mut envelope: AccumulationEnvelopeV2,
+        envelope: AccumulationEnvelopeV2,
         imports: &RefineImportsV2,
         producer: &mut P,
     ) -> Result<CommittedAttestationOutputV2, AttestedServiceErrorV2<ServiceDispatchError, P::Error>>
@@ -341,6 +356,22 @@ where
             _ => return Err(AttestedServiceErrorV2::InvalidPreparation),
         };
 
+        let proved = self
+            .prove_prepared_attestation(envelope, imports, preparation, producer)
+            .map_err(map_attestation_build_error)?;
+        let committed = self
+            .accumulate(&AccumulateRequestV2::Apply(proved.envelope.clone()))
+            .map_err(AttestedServiceErrorV2::Service)?;
+        finish_committed_attestation(proved, prepared.gas_used, committed)
+    }
+
+    fn prove_prepared_attestation<P: AttestationProofProducerV2>(
+        &mut self,
+        mut envelope: AccumulationEnvelopeV2,
+        imports: &RefineImportsV2,
+        preparation: AttestationPreparationV2,
+        producer: &mut P,
+    ) -> Result<ProvedAttestationV2, AttestationBuildErrorV2<P::Error>> {
         let produced = {
             let request = AttestationProofRequestV2 {
                 canonical_service_pvm: self.pvm.canonical_pvm(),
@@ -351,14 +382,14 @@ where
             };
             request
                 .validate()
-                .map_err(|_| AttestedServiceErrorV2::InvalidPreparation)?;
+                .map_err(|_| AttestationBuildErrorV2::InvalidPreparation)?;
             producer
                 .prove(&request)
-                .map_err(AttestedServiceErrorV2::Producer)?
+                .map_err(AttestationBuildErrorV2::Producer)?
         };
         produced
             .validate()
-            .map_err(|_| AttestedServiceErrorV2::InvalidProducedProof)?;
+            .map_err(|_| AttestationBuildErrorV2::InvalidProducedProof)?;
 
         let proof_blob = super::BlobRefV2::of_bytes(&produced.proof);
         let proof = ProofCommitmentV2 {
@@ -378,7 +409,7 @@ where
             .accumulate_host
             .make_proof_available(&verification, &produced.proof)
         {
-            return Err(AttestedServiceErrorV2::ProofUnavailable);
+            return Err(AttestationBuildErrorV2::ProofUnavailable);
         }
         envelope.transition.proof = Some(proof.clone());
         let imported = ImportedBlobV2 {
@@ -390,34 +421,62 @@ where
             .binary_search_by_key(&imported.reference.hash, |blob| blob.reference.hash)
         {
             Ok(index) if envelope.provided_blobs[index] == imported => {}
-            Ok(_) => return Err(AttestedServiceErrorV2::InvalidProducedProof),
+            Ok(_) => return Err(AttestationBuildErrorV2::InvalidProducedProof),
             Err(index) => envelope.provided_blobs.insert(index, imported),
         }
 
-        let committed = self
-            .accumulate(&AccumulateRequestV2::Apply(envelope))
-            .map_err(AttestedServiceErrorV2::Service)?;
-        let (receipt, published) = match committed.result {
-            AccumulationResultV2::Accepted {
-                receipt,
-                published,
-                duplicate: false,
-            } => (receipt, published),
-            AccumulationResultV2::Rejected(rejection) => {
-                return Err(AttestedServiceErrorV2::Rejected(rejection));
-            }
-            _ => return Err(AttestedServiceErrorV2::CommitMismatch),
-        };
-        validate_committed_attestation(&preparation.receipt, &proof, &receipt, &published)?;
-        Ok(CommittedAttestationOutputV2 {
+        Ok(ProvedAttestationV2 {
+            envelope,
             preparation,
             proof,
             proof_bytes: produced.proof,
-            published,
-            prepare_gas_used: prepared.gas_used,
-            accumulate_gas_used: committed.gas_used,
         })
     }
+}
+
+fn map_attestation_build_error<E, P>(
+    error: AttestationBuildErrorV2<P>,
+) -> AttestedServiceErrorV2<E, P> {
+    match error {
+        AttestationBuildErrorV2::InvalidPreparation => AttestedServiceErrorV2::InvalidPreparation,
+        AttestationBuildErrorV2::Producer(error) => AttestedServiceErrorV2::Producer(error),
+        AttestationBuildErrorV2::InvalidProducedProof => {
+            AttestedServiceErrorV2::InvalidProducedProof
+        }
+        AttestationBuildErrorV2::ProofUnavailable => AttestedServiceErrorV2::ProofUnavailable,
+    }
+}
+
+fn finish_committed_attestation<E, P>(
+    proved: ProvedAttestationV2,
+    prepare_gas_used: u64,
+    committed: AccumulatedServiceOutputV2,
+) -> Result<CommittedAttestationOutputV2, AttestedServiceErrorV2<E, P>> {
+    let (receipt, published) = match committed.result {
+        AccumulationResultV2::Accepted {
+            receipt,
+            published,
+            duplicate: false,
+        } => (receipt, published),
+        AccumulationResultV2::Rejected(rejection) => {
+            return Err(AttestedServiceErrorV2::Rejected(rejection));
+        }
+        _ => return Err(AttestedServiceErrorV2::CommitMismatch),
+    };
+    validate_committed_attestation(
+        &proved.preparation.receipt,
+        &proved.proof,
+        &receipt,
+        &published,
+    )?;
+    Ok(CommittedAttestationOutputV2 {
+        preparation: proved.preparation,
+        proof: proved.proof,
+        proof_bytes: proved.proof_bytes,
+        published,
+        prepare_gas_used,
+        accumulate_gas_used: committed.gas_used,
+    })
 }
 
 fn validate_committed_attestation<E, P>(
@@ -438,7 +497,7 @@ fn validate_committed_attestation<E, P>(
 impl<R, A, L> ReplicatedJamServiceV2<R, A, L>
 where
     R: RefineProtocolHostV2,
-    A: AccumulateProtocolHostV2 + CommittedServiceImageHostV2,
+    A: AccumulateProtocolHostV2 + AttestationProofHostV2 + CommittedServiceImageHostV2,
     L: CommittedAccumulateLogV2,
 {
     /// Apply every committed request not yet reflected in this replica's
@@ -488,6 +547,8 @@ where
         for entry in batch.entries {
             let request = AccumulateRequestV2::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+            ensure_request_proof_available(self.service.accumulate_host_mut(), &request)
+                .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
             self.service
                 .accumulate(&request)
                 .map_err(ReplicatedServiceErrorV2::Dispatch)?;
@@ -532,6 +593,8 @@ where
                 .accumulate(request)
                 .map_err(ReplicatedServiceErrorV2::Dispatch);
         }
+        ensure_request_proof_available(self.service.accumulate_host_mut(), request)
+            .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
 
         let request_bytes = request.encode();
         let entry = self
@@ -547,6 +610,8 @@ where
         }
         let committed = AccumulateRequestV2::decode(&entry.request)
             .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+        ensure_request_proof_available(self.service.accumulate_host_mut(), &committed)
+            .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
         let output = self
             .service
             .accumulate(&committed)
@@ -557,4 +622,71 @@ where
             .map_err(ReplicatedServiceErrorV2::Log)?;
         Ok(output)
     }
+
+    /// Produce the proof before proposing the final Apply request. Only the
+    /// proved Apply bytes enter Raft; read-only preparation never consumes a
+    /// log position. Followers make the same proof artifact available before
+    /// executing the committed request through physical IC-5.
+    pub fn accumulate_attested<P: AttestationProofProducerV2>(
+        &mut self,
+        envelope: AccumulationEnvelopeV2,
+        imports: &RefineImportsV2,
+        producer: &mut P,
+    ) -> Result<
+        CommittedAttestationOutputV2,
+        AttestedServiceErrorV2<ReplicatedServiceErrorV2<L::Error>, P::Error>,
+    > {
+        let prepared = self
+            .accumulate(&AccumulateRequestV2::PrepareAttested(envelope.clone()))
+            .map_err(AttestedServiceErrorV2::Service)?;
+        let preparation = match prepared.result {
+            AccumulationResultV2::Prepared(preparation) => preparation,
+            AccumulationResultV2::Rejected(rejection) => {
+                return Err(AttestedServiceErrorV2::Rejected(rejection));
+            }
+            _ => return Err(AttestedServiceErrorV2::InvalidPreparation),
+        };
+        let proved = self
+            .service
+            .prove_prepared_attestation(envelope, imports, preparation, producer)
+            .map_err(map_attestation_build_error)?;
+        let committed = self
+            .accumulate(&AccumulateRequestV2::Apply(proved.envelope.clone()))
+            .map_err(AttestedServiceErrorV2::Service)?;
+        finish_committed_attestation(proved, prepared.gas_used, committed)
+    }
+}
+
+fn ensure_request_proof_available<A: AttestationProofHostV2>(
+    host: &mut A,
+    request: &AccumulateRequestV2,
+) -> Result<(), ()> {
+    let AccumulateRequestV2::Apply(envelope) = request else {
+        return Ok(());
+    };
+    let Some(proof) = envelope.transition.proof.as_ref() else {
+        return Ok(());
+    };
+    let Some(imported) = envelope
+        .provided_blobs
+        .iter()
+        .find(|blob| blob.reference == proof.proof_blob)
+    else {
+        // The proof may already be present in a production verifier/CAS. In
+        // that case guest Accumulate decides availability through IC-5.
+        return Ok(());
+    };
+    let verification = ProofVerificationRequestV2 {
+        actor_program: envelope.work.target_program,
+        execution_semantics: envelope.work.service.execution_semantics,
+        statement: proof.statement,
+        trace: proof.trace,
+        proof_blob: proof.proof_blob.clone(),
+    };
+    if !proof.proof_blob.matches(&imported.bytes)
+        || !host.make_proof_available(&verification, &imported.bytes)
+    {
+        return Err(());
+    }
+    Ok(())
 }

@@ -2071,6 +2071,176 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
 }
 
 #[test]
+fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"raft attested initial state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut seed = work(actor_program, initial.clone());
+    seed.service.service_program = service_program;
+    let genesis = ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Raft,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            name: "root".into(),
+            parent: None,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([131; 32]),
+                policy: Hash([132; 32]),
+                public: true,
+                attested: true,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([133; 32]),
+            authenticator: vec![134],
+        },
+    };
+
+    let mut leader_host = LocalJamStoreV2::default();
+    assert_eq!(leader_host.import_blob(initial_bytes.clone()), initial);
+    assert_eq!(leader_host.import_program(actor_pvm.clone()), actor_program);
+    leader_host.allow_install(&genesis);
+    let mut follower_host = LocalJamStoreV2::default();
+    assert_eq!(follower_host.import_blob(initial_bytes), initial);
+    assert_eq!(follower_host.import_program(actor_pvm), actor_program);
+    follower_host.allow_install(&genesis);
+
+    let shared_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let leader_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        leader_host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let follower_service = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        follower_host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let mut leader = ReplicatedJamServiceV2::new(
+        leader_service,
+        TestCommittedLog::new(shared_log.clone(), true),
+    );
+    let mut follower = ReplicatedJamServiceV2::new(
+        follower_service,
+        TestCommittedLog::new(shared_log.clone(), false),
+    );
+    assert!(matches!(
+        leader
+            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let prepared = LocalWorkSchedulerV2::prepare(
+        leader.service().accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([135; 32]),
+            workflow_step: 0,
+            logical_timeslot: 20,
+            target: seed.target,
+            method: "start".into(),
+            arguments: seed.arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: true,
+        },
+    )
+    .unwrap();
+    let transition = TransitionV2 {
+        service: prepared.work.service.clone(),
+        consumed_input: prepared.work.input_id(),
+        target_program: prepared.work.target_program,
+        base: prepared.work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: prepared.work.invocation.root_reply_id(),
+            producer: prepared.work.target,
+            result: b"raft attested reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let input = prepared.work.input_id();
+    let mut producer = CanonicalTestProofProducer {
+        trace: Hash([136; 32]),
+        proof: b"raft canonical proof".to_vec(),
+        calls: 0,
+    };
+    let committed = leader
+        .accumulate_attested(
+            AccumulationEnvelopeV2 {
+                work: prepared.work,
+                transition,
+                provided_blobs: vec![],
+            },
+            &prepared.imports,
+            &mut producer,
+        )
+        .expect("leader proves before proposing Apply");
+    assert_eq!(producer.calls, 1);
+    assert_eq!(committed.published.proof, Some(committed.proof.clone()));
+
+    let entries = shared_log.lock().unwrap().entries.clone();
+    assert_eq!(entries.len(), 2, "PrepareAttested must not enter Raft");
+    let AccumulateRequestV2::Apply(logged) =
+        AccumulateRequestV2::decode(&entries[1].request).unwrap()
+    else {
+        panic!("the second Raft entry was not the proved Apply")
+    };
+    assert_eq!(logged.transition.proof, Some(committed.proof));
+
+    assert_eq!(follower.catch_up().unwrap(), 2);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower.service().accumulate_host().snapshot())
+    );
+    let follower_publication = follower
+        .service()
+        .accumulate_host()
+        .pending_publications()
+        .unwrap()
+        .into_iter()
+        .find(|publication| publication.input == input)
+        .expect("follower verifies and commits the recoverable proof publication");
+    assert_eq!(
+        follower_publication.published.proof,
+        logged.transition.proof
+    );
+}
+
+#[test]
 fn redb_raft_log_drives_physical_guest_accumulate() {
     let Some(elf) = service_elf() else {
         return;
