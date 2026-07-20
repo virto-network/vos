@@ -41,6 +41,13 @@ impl AttestedMethod<Vec<u8>> for StartMethod {
     fn claim_wire(claim: &Vec<u8>) -> Vec<u8> {
         Value::Bytes(claim.clone()).encode()
     }
+
+    fn decode_claim_wire(wire: &[u8]) -> Option<Vec<u8>> {
+        match <Value as Decode>::try_decode(wire)? {
+            Value::Bytes(value) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
