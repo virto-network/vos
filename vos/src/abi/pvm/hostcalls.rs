@@ -78,6 +78,27 @@ pub fn debug_write(data: &[u8]) -> u64 {
 
 // --- Refine-legal ---
 
+/// Fetch invocation-private actor input, or the service-visible opaque actor
+/// effect batch when called by the generic service VM.
+#[inline]
+pub fn actor_private_fetch(buf: &mut [u8]) -> u64 {
+    ecall2(
+        hostcall::ACTOR_PRIVATE_FETCH,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
+/// Export one canonical actor-slice output to the generic service scheduler.
+#[inline]
+pub fn actor_effect_export(bytes: &[u8]) -> u64 {
+    ecall2(
+        hostcall::ACTOR_EFFECT_EXPORT,
+        bytes.as_ptr() as u64,
+        bytes.len() as u64,
+    )
+}
+
 /// Read-only storage access. Legal in both refine and accumulate.
 #[inline]
 pub fn peek(key: &[u8], value_buf: &mut [u8]) -> u64 {

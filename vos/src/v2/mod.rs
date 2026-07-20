@@ -35,17 +35,17 @@ pub use crate::attestation::AttestationPreparationV2;
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorDirectoryV2,
-    ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorTreeImportV2, ActorWriteV2,
-    AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CausalCallContextV2, CheckpointTokenV2,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
-    CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2,
-    GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
-    MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2,
-    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
-    ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
-    WorkflowOperationV2,
+    AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorCallResultV2,
+    ActorDirectoryV2, ActorEffectBatchV2, ActorGenesisV2, ActorPrivateInputV2, ActorSliceInputV2,
+    ActorSliceOutputV2, ActorTreeImportV2, ActorWriteV2, AuthorizationEvidenceV2, AwaitResumeV2,
+    BlobRefV2, CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
+    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, GasAccountingV2, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
+    ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -111,8 +111,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x76, 0x20, 0xed, 0xbc, 0x7d, 0x76, 0xf5, 0x13, 0xd7, 0x30, 0x05, 0xfd, 0xca, 0x0f, 0x22, 0x16,
-    0xef, 0xc5, 0xc4, 0x43, 0x4e, 0xea, 0x05, 0x80, 0xef, 0xf4, 0x5f, 0xae, 0x62, 0x1a, 0x07, 0xa6,
+    0x31, 0x9d, 0x61, 0x42, 0x5c, 0x2c, 0x36, 0x4c, 0x20, 0xc7, 0xd5, 0xfc, 0x9f, 0x61, 0x68, 0x6d,
+    0x15, 0x24, 0x9f, 0xb3, 0x55, 0x0c, 0xcb, 0xe0, 0xa2, 0xf1, 0x46, 0x2a, 0x48, 0x11, 0x0c, 0x15,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -146,15 +146,21 @@ pub const ACTOR_CALLABLE_BASE_SLOT: u8 = 128;
 pub const ACTOR_IPC_CAP_SLOT: u8 = 240;
 /// Temporary actor-CNode slot used while CALL owns the reserved IPC slot 0.
 pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;
+/// Actor-local spare used to pass the exclusive IPC cap through nested CALL.
+pub const ACTOR_NESTED_IPC_CAP_SLOT: u8 = 252;
 /// High virtual page kept outside transpiler-owned actor memory layouts.
 pub const ACTOR_IPC_BASE_PAGE: u32 = 0x000f_0000;
-/// Maximum encoded input handed to one nested application actor.
+/// Maximum shared directory/message input handed to one application actor.
+pub const ACTOR_SLICE_INPUT_MAX_BYTES: usize = 64 * 1024;
+/// Maximum private state frontier handed to one active actor VM.
 ///
 /// Application actors retain the compact 256 KiB heap while the generic
-/// service may receive multi-megabyte work envelopes. Bounding the owned
-/// decode before CALL keeps a wide CRDT frontier from becoming a deterministic
-/// nested-guest allocation trap.
-pub const ACTOR_SLICE_INPUT_MAX_BYTES: usize = 64 * 1024;
+/// service may receive multi-megabyte work envelopes. State is bounded
+/// separately from shared IPC so one actor never receives a sibling's bytes.
+pub const ACTOR_PRIVATE_INPUT_MAX_BYTES: usize = 64 * 1024;
+/// Maximum opaque actor-effect batch returned to the generic service guest.
+pub const ACTOR_EFFECT_BATCH_MAX_BYTES: usize =
+    MAX_ROOT_TREE_ACTORS * ACTOR_PRIVATE_INPUT_MAX_BYTES;
 /// Bounded stack window receiving a checkpoint token after snapshot capture.
 pub const CHECKPOINT_TOKEN_CAPACITY: usize = 4096;
 /// Register marker distinguishing an awaited-call suspension from an explicit

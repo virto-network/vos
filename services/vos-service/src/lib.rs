@@ -10,16 +10,18 @@ mod guest {
 
     extern crate alloc;
 
+    use alloc::collections::BTreeMap;
     use core::arch::global_asm;
 
     use vos::abi::pvm::ecall;
     use vos::abi::{error, pvm::hostcalls};
     use vos::v2::{
-        AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
-        BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
-        CrdtMaterializationV2, GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2,
-        MessageRecordV2, ProgramId, RefineOutputV2, ReplyRecordV2, StateTreeStore, TransitionV2,
-        V2Wire, WorkEnvelopeV2, execute_guest_accumulate,
+        AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorCallResultV2,
+        ActorEffectBatchV2, ActorSliceOutputV2, BlobRefV2, ConsistencyBaseV2,
+        ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2,
+        GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, ProgramId,
+        RefineOutputV2, ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+        execute_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -28,6 +30,9 @@ mod guest {
     const TRANSITION_CAPACITY: usize = 4 * 1024 * 1024;
     #[unsafe(link_section = ".bss.vos_service_transition")]
     static mut TRANSITION_BUFFER: [u8; TRANSITION_CAPACITY] = [0; TRANSITION_CAPACITY];
+    #[unsafe(link_section = ".bss.vos_actor_effects")]
+    static mut ACTOR_EFFECT_BUFFER: [u8; vos::v2::ACTOR_EFFECT_BATCH_MAX_BYTES] =
+        [0; vos::v2::ACTOR_EFFECT_BATCH_MAX_BYTES];
 
     #[repr(C)]
     struct OutputWindow {
@@ -82,21 +87,7 @@ mod guest {
             fail_closed();
         }
 
-        provision_same_tree_callables(&work);
-
-        // Actor manifests use slot 0 for their standalone argument window,
-        // while JAR reserves slot 0 as the callee IPC slot. Preserve that
-        // canonical manifest capability in a spare slot for the duration of
-        // CALL; this is VOS policy expressed with ordinary JAR MOVE, not a
-        // kernel special case.
-        let actor_args = ecall::cap_ref_through_handle(vos::v2::TARGET_ACTOR_HANDLE_SLOT, 0);
-        let saved_actor_args = ecall::cap_ref_through_handle(
-            vos::v2::TARGET_ACTOR_HANDLE_SLOT,
-            vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT,
-        );
-        if !ecall::move_cap(actor_args, saved_actor_args) {
-            fail_closed();
-        }
+        prepare_actor_cnodes(&work);
 
         let actor_output_len = ecall::call_cap(
             ecall::local_cap_ref(vos::v2::TARGET_ACTOR_HANDLE_SLOT),
@@ -106,10 +97,8 @@ mod guest {
             actor_ipc_capacity as u64,
             vos::v2::NESTED_ACTOR_CALL_MAGIC,
         ) as usize;
-        if !ecall::move_cap(saved_actor_args, actor_args)
-            || actor_output_len == 0
-            || actor_output_len > actor_ipc_capacity
-        {
+        restore_actor_cnodes(&work);
+        if actor_output_len == 0 || actor_output_len > actor_ipc_capacity {
             fail_closed();
         }
         let actor_output_address = vos::v2::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
@@ -118,11 +107,26 @@ mod guest {
         let actor_output_bytes = unsafe {
             core::slice::from_raw_parts(actor_output_address as *const u8, actor_output_len)
         };
-        let actor_output =
-            ActorSliceOutputV2::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
-        if actor_output.actor != work.target || actor_output.forbidden {
+        let call_result =
+            ActorCallResultV2::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
+        if call_result.actor != work.target || call_result.forbidden {
             fail_closed();
         }
+        // SAFETY: Refine is single-threaded and this invocation owns the
+        // infrastructure guest's static scheduler buffer.
+        let effect_buffer = unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(ACTOR_EFFECT_BUFFER).cast::<u8>(),
+                vos::v2::ACTOR_EFFECT_BATCH_MAX_BYTES,
+            )
+        };
+        let effect_len = hostcalls::actor_private_fetch(effect_buffer) as usize;
+        if effect_len == 0 || effect_len > effect_buffer.len() {
+            fail_closed();
+        }
+        let effects = ActorEffectBatchV2::decode(&effect_buffer[..effect_len])
+            .unwrap_or_else(|_| fail_closed());
+        let actor_output = aggregate_actor_effects(&work, &call_result, effects);
         if let Some(checkpoint) = actor_output.checkpoint.as_ref() {
             if checkpoint.input != work.input_id() {
                 work = checkpoint
@@ -146,6 +150,19 @@ mod guest {
                 fail_closed();
             }
         }
+        let imported = |actor: vos::v2::ActorId| {
+            work.imported_actors
+                .binary_search_by_key(&actor, |candidate| candidate.actor)
+                .is_ok()
+        };
+        if actor_output
+            .writes
+            .iter()
+            .any(|write| !imported(write.actor))
+            || actor_output.outbox.iter().any(|call| !imported(call.from))
+        {
+            fail_closed();
+        }
 
         let outbox = actor_output
             .outbox
@@ -154,7 +171,7 @@ mod guest {
                 call_id: work.invocation.call_id(call.await_ordinal),
                 caller_invocation: work.invocation,
                 await_ordinal: call.await_ordinal,
-                from: work.target,
+                from: call.from,
                 to: call.to,
                 parent: work.parent_call,
                 payload: call.payload.clone(),
@@ -329,13 +346,108 @@ mod guest {
         }
     }
 
+    fn aggregate_actor_effects(
+        work: &WorkEnvelopeV2,
+        call_result: &ActorCallResultV2,
+        batch: ActorEffectBatchV2,
+    ) -> ActorSliceOutputV2 {
+        let imported = |actor: vos::v2::ActorId| {
+            work.imported_actors
+                .binary_search_by_key(&actor, |candidate| candidate.actor)
+                .is_ok()
+        };
+        let mut root = None;
+        let mut writes = BTreeMap::new();
+        let mut outbox = alloc::vec::Vec::new();
+        let mut checkpoints = alloc::vec::Vec::new();
+
+        for output in batch.outputs {
+            if !imported(output.actor) {
+                fail_closed();
+            }
+            if output.forbidden {
+                if output.actor == work.target
+                    || !output.writes.is_empty()
+                    || !output.crdt_operations.is_empty()
+                    || output.crdt_materialization.is_some()
+                    || !output.outbox.is_empty()
+                    || !output.reply.is_empty()
+                    || output.yielded
+                    || output.checkpoint.is_some()
+                {
+                    fail_closed();
+                }
+                continue;
+            }
+            if work.consistency == vos::v2::ConsistencyModeV2::Crdt
+                && output.actor != work.target
+            {
+                // Tree-wide CRDT aggregation is a separate protocol slice.
+                fail_closed();
+            }
+            if let Some(checkpoint) = output.checkpoint.as_ref() {
+                checkpoints.push(checkpoint.clone());
+            }
+            for write in &output.writes {
+                writes.insert((write.actor, write.key.clone()), write.value.clone());
+            }
+            outbox.extend(output.outbox.iter().cloned());
+            if output.actor == work.target {
+                if root.replace(output).is_some() {
+                    fail_closed();
+                }
+            } else if !output.reply.is_empty() {
+                // Nested replies are delivered only through the direct CALL
+                // result and are never promoted to the root transition reply.
+            }
+        }
+
+        let mut root = root.unwrap_or_else(|| fail_closed());
+        if root.reply != call_result.reply
+            || root.yielded != call_result.yielded
+            || root.forbidden != call_result.forbidden
+            || root.checkpoint != call_result.checkpoint
+            || checkpoints
+                .iter()
+                .any(|checkpoint| Some(checkpoint) != root.checkpoint.as_ref())
+        {
+            fail_closed();
+        }
+        outbox.sort_by_key(|call| call.await_ordinal);
+        if outbox
+            .windows(2)
+            .any(|pair| pair[0].await_ordinal >= pair[1].await_ordinal)
+        {
+            fail_closed();
+        }
+        root.writes = writes
+            .into_iter()
+            .map(|((actor, key), value)| vos::v2::ActorWriteV2 { actor, key, value })
+            .collect();
+        root.outbox = outbox;
+        root
+    }
+
     /// Give every actor a directory-indexed CALLABLE for each other idle actor
     /// in its owned tree. The generic service retains the HANDLEs; DOWNGRADE
     /// is the ordinary JAM/JAR authority-narrowing operation and does not add
     /// a VOS-specific kernel call surface.
-    fn provision_same_tree_callables(work: &WorkEnvelopeV2) {
+    fn prepare_actor_cnodes(work: &WorkEnvelopeV2) {
         if work.imported_actors.len() > vos::v2::MAX_ROOT_TREE_ACTORS {
             fail_closed();
+        }
+        // Every canonical actor manifest owns slot 0 for standalone args, but
+        // JAR CALL reserves it for the move-only IPC cap. Preserve all actor
+        // arg caps up front so arbitrary main→child→peer nesting sees an empty
+        // IPC slot in every dormant callee.
+        for actor in &work.imported_actors {
+            let handle = actor_handle_slot(work, actor.actor);
+            if !ecall::move_cap(
+                ecall::cap_ref_through_handle(handle, 0),
+                ecall::cap_ref_through_handle(handle, vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT),
+            ) {
+                fail_closed();
+            }
         }
         for destination in &work.imported_actors {
             let destination_handle = actor_handle_slot(work, destination.actor);
@@ -353,6 +465,18 @@ mod guest {
                 ) {
                     fail_closed();
                 }
+            }
+        }
+    }
+
+    fn restore_actor_cnodes(work: &WorkEnvelopeV2) {
+        for actor in &work.imported_actors {
+            let handle = actor_handle_slot(work, actor.actor);
+            if !ecall::move_cap(
+                ecall::cap_ref_through_handle(handle, vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT),
+                ecall::cap_ref_through_handle(handle, 0),
+            ) {
+                fail_closed();
             }
         }
     }

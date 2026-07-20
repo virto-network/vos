@@ -59,6 +59,19 @@ pub const QUOTA: u32 = 28;
 // guest `ecalli N` resolves to a `ProtocolCall { slot: N }` the runtime handles
 // rather than `RESULT_WHAT`. All fit javm's `imm <= 127` budget.
 
+/// Exchange invocation-private actor data with the generic VOS scheduler.
+///
+/// An active application VM receives only its own state and authenticated
+/// caller. The service VM receives the opaque effect batch after the complete
+/// same-tree stack unwinds. Refine-only.
+pub const ACTOR_PRIVATE_FETCH: u32 = 115;
+
+/// Export one actor's buffered effects to the generic service scheduler.
+///
+/// The host binds the bytes to the currently active JAR VM; the service guest
+/// later validates and canonicalizes them into `TransitionV2`. Refine-only.
+pub const ACTOR_EFFECT_EXPORT: u32 = 116;
+
 /// Request additional guest heap pages.
 pub const GROW_HEAP: u32 = 117;
 

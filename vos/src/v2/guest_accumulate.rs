@@ -1718,7 +1718,10 @@ fn canonical_transition_shape(
     let writes = transition.writes.iter().map(|write| {
         let mut key = write.actor.0.to_vec();
         key.extend_from_slice(&write.key);
-        let valid = write.actor == work.target
+        let valid = work
+            .imported_actors
+            .binary_search_by_key(&write.actor, |actor| actor.actor)
+            .is_ok()
             && !write.key.is_empty()
             && (write.key.as_slice() != crate::actors::lifecycle::STATE_KEY_BYTES
                 || write.value.is_some());
@@ -1932,7 +1935,10 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         Some(call)
             if envelope.transition.outbox.len() == 1
                 && envelope.transition.outbox[0].call_id == call
-                && envelope.transition.outbox[0].from == work.target => {}
+                && work
+                    .imported_actors
+                    .binary_search_by_key(&envelope.transition.outbox[0].from, |actor| actor.actor)
+                    .is_ok() => {}
         None => {}
         _ => {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -1986,7 +1992,10 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
     if message.call_id != call
         || message.caller_invocation != work.invocation
         || message.await_ordinal != snapshot.await_ordinal
-        || message.from != work.target
+        || work
+            .imported_actors
+            .binary_search_by_key(&message.from, |actor| actor.actor)
+            .is_err()
         || message.to != awaited.reply.producer
         || message
             .deadline_timeslot

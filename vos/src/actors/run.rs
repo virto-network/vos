@@ -739,6 +739,11 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
 /// entry only materializes the actor from imported bytes, dispatches once,
 /// and reports buffered actor writes; it has no persistent host surface.
 #[cfg(feature = "service")]
+#[unsafe(link_section = ".bss.vos_actor_private")]
+static mut ACTOR_PRIVATE_BUFFER: [u8; crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES] =
+    [0; crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES];
+
+#[cfg(feature = "service")]
 pub fn run_nested_actor_service<A: super::Actor>(
     input_address: u64,
     input_len: u64,
@@ -746,7 +751,9 @@ pub fn run_nested_actor_service<A: super::Actor>(
 ) -> ! {
     use super::context::ServiceId;
     use super::lifecycle::{self, DispatchResult};
-    use crate::v2::{ActorSliceInputV2, ActorSliceOutputV2, V2Wire};
+    use crate::v2::{
+        ActorCallResultV2, ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2, V2Wire,
+    };
 
     crate::log_impl::install_pvm_logger();
     set_refine_mode(true);
@@ -774,18 +781,43 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // SAFETY: MAP above established a readable DATA-cap range covering the
     // complete input. The service does not regain this cap until REPLY.
     let bytes = unsafe { core::slice::from_raw_parts(input_address as *const u8, input_len) };
-    let ActorSliceInputV2 {
+    let input = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
+    // SAFETY: each actor VM has an isolated memory image and dispatch is
+    // non-reentrant, so this active VM exclusively owns its static buffer.
+    let private_buffer = unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(ACTOR_PRIVATE_BUFFER).cast::<u8>(),
+            crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES,
+        )
+    };
+    let private_len = usize::try_from(crate::abi::pvm::hostcalls::actor_private_fetch(
+        private_buffer,
+    ))
+    .expect("private actor input length exceeds usize");
+    assert!(
+        private_len > 0 && private_len <= private_buffer.len(),
+        "private actor input exceeds its deterministic bound"
+    );
+    let ActorPrivateInputV2 {
         actor: actor_id,
         input: work_input,
         change,
         state,
         causal_states,
-        actor_tree: _,
-        message,
         origin,
         space_role,
         actor_role,
-    } = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
+    } = ActorPrivateInputV2::decode(&private_buffer[..private_len])
+        .expect("invalid private actor input");
+    assert_eq!(
+        input.actor, actor_id,
+        "shared actor route does not match the active private VM"
+    );
+    let ActorSliceInputV2 {
+        actor: _,
+        actor_tree,
+        message,
+    } = input;
     let mut actor = lifecycle::load_or_create::<A>(Some(&state));
     for causal_state in causal_states {
         let other = lifecycle::load_or_create::<A>(Some(&causal_state));
@@ -798,6 +830,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // in Context and all v2 scheduler effects use that value.
     let mut ctx = super::Context::new(ServiceId(0));
     ctx.__set_actor_id(actor_id);
+    ctx.__set_actor_tree_v2(actor_tree, change.map(|change| change.change), capacity);
     ctx.__set_origin(origin);
     ctx.set_caller_roles(space_role, actor_role);
 
@@ -864,7 +897,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         .__drain_actor_writes_v2(actor_id, super::storage::end_dispatch(), linear_state)
         .expect("nested actor emitted an unsupported v2 effect");
     let outbox = ctx.__drain_actor_calls_v2();
-    let encoded = ActorSliceOutputV2 {
+    let output = ActorSliceOutputV2 {
         actor: actor_id,
         writes,
         crdt_operations,
@@ -873,12 +906,29 @@ pub fn run_nested_actor_service<A: super::Actor>(
         reply,
         yielded,
         forbidden,
+        checkpoint: checkpoint.clone(),
+    };
+    let effects = output.encode();
+    assert!(
+        effects.len() <= crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES,
+        "actor slice effects exceed their deterministic bound"
+    );
+    assert_eq!(
+        crate::abi::pvm::hostcalls::actor_effect_export(&effects),
+        crate::abi::error::HOST_OK,
+        "generic service rejected canonical actor effects"
+    );
+    let encoded = ActorCallResultV2 {
+        actor: actor_id,
+        reply: output.reply,
+        yielded,
+        forbidden,
         checkpoint,
     }
     .encode();
     assert!(
         encoded.len() <= capacity,
-        "actor slice output exceeds IPC cap"
+        "actor call result exceeds IPC cap"
     );
 
     // SAFETY: the DATA cap is mapped RW over `capacity` bytes and `encoded`

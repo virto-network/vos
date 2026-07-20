@@ -38,6 +38,7 @@ build-v2-pvm-test-artifacts: build-vos-service
     cd examples/actors/greeter; cargo +nightly actor
     cd examples/actors/probe; cargo +nightly actor
     cd vos/tests/fixtures/crdt-counter-v2; cargo +nightly actor
+    cd vos/tests/fixtures/workflow-v2; cargo +nightly actor
 
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:

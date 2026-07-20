@@ -184,6 +184,23 @@ pub struct RefineImportsV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSliceInputV2 {
     pub actor: ActorId,
+    /// Complete canonical root-tree directory. Actor code resolves typed names
+    /// and same-tree CALLABLE slots only from this authenticated metadata.
+    /// Sibling state is not included.
+    pub actor_tree: Vec<ActorTreeImportV2>,
+    /// Canonical generated actor-message bytes.
+    pub message: Vec<u8>,
+}
+
+/// Invocation-private input returned only to the currently active actor VM.
+///
+/// The generic service host derives `actor` and `origin` from JAR's live CALL
+/// stack. A parent actor therefore receives no sibling materialization and
+/// cannot impersonate another same-tree caller by rewriting the shared IPC
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorPrivateInputV2 {
+    pub actor: ActorId,
     /// Canonical identity of the workflow slice executing this actor.
     pub input: WorkInputIdV2,
     /// Batch identity and scheduler dispatch ordinal allocated by the generic
@@ -193,17 +210,33 @@ pub struct ActorSliceInputV2 {
     /// Additional canonical CRDT frontier materializations. The generated
     /// actor merger folds these into `state` before the message is observed.
     pub causal_states: Vec<Vec<u8>>,
-    /// Complete canonical root-tree directory. Actor code resolves typed names
-    /// and same-tree CALLABLE slots only from this authenticated metadata.
-    /// Sibling state is not included.
-    pub actor_tree: Vec<ActorTreeImportV2>,
-    /// Canonical generated actor-message bytes.
-    pub message: Vec<u8>,
     pub origin: Origin,
     /// Authenticated role recovered from the disclosed credential or private
     /// witness before entering the canonical actor PVM.
     pub space_role: Option<u8>,
     pub actor_role: Option<u8>,
+}
+
+/// Minimal result visible to an inline same-tree caller.
+///
+/// Actor state and buffered effects travel over the private scheduler
+/// capability instead; a caller observes only the method result and durable
+/// checkpoint control flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorCallResultV2 {
+    pub actor: ActorId,
+    pub reply: Vec<u8>,
+    pub yielded: bool,
+    pub forbidden: bool,
+    pub checkpoint: Option<CheckpointTokenV2>,
+}
+
+/// Opaque per-dispatch effects returned to the generic service VM after the
+/// root actor stack unwinds. Temporal order is execution order; the service
+/// guest canonicalizes the final transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorEffectBatchV2 {
+    pub outputs: Vec<ActorSliceOutputV2>,
 }
 
 /// Unique operation-allocation namespace for one actor dispatch inside a CRDT
@@ -296,6 +329,7 @@ pub struct CheckpointTokenV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorCallRequestV2 {
     pub await_ordinal: u64,
+    pub from: ActorId,
     pub to: ActorId,
     pub payload: Vec<u8>,
     pub authorization: AuthorizationEvidenceV2,
@@ -1345,6 +1379,39 @@ impl V2Wire for ActorSliceInputV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
+        e.list(&self.actor_tree, encode_actor_tree_import);
+        e.bytes(&self.message);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            actor: ActorId(d.fixed()?),
+            actor_tree: d.list(decode_actor_tree_import)?,
+            message: d.bytes()?,
+        };
+        ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
+        validate_actor_slice_tree(&value.actor_tree)?;
+        let Some(self_import) = value
+            .actor_tree
+            .binary_search_by_key(&value.actor, |actor| actor.actor)
+            .ok()
+            .map(|index| &value.actor_tree[index])
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        if self_import.suspended {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for ActorPrivateInputV2 {
+    const MAGIC: [u8; 4] = *b"VPI2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.actor.0);
         e.fixed(&self.input.invocation.0);
         e.u64(self.input.workflow_step);
         e.option(&self.change, |e, dispatch| {
@@ -1353,8 +1420,6 @@ impl V2Wire for ActorSliceInputV2 {
         });
         e.bytes(&self.state);
         e.list(&self.causal_states, |e, state| e.bytes(state));
-        e.list(&self.actor_tree, encode_actor_tree_import);
-        e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
         e.option(&self.space_role, |e, role| e.u8(*role));
         e.option(&self.actor_role, |e, role| e.u8(*role));
@@ -1375,8 +1440,6 @@ impl V2Wire for ActorSliceInputV2 {
             })?,
             state: d.bytes()?,
             causal_states: d.list(Decoder::bytes)?,
-            actor_tree: d.list(decode_actor_tree_import)?,
-            message: d.bytes()?,
             origin: decode_origin(d)?,
             space_role: d.option(|d| {
                 let role = d.u8()?;
@@ -1386,20 +1449,62 @@ impl V2Wire for ActorSliceInputV2 {
             })?,
             actor_role: d.option(Decoder::u8)?,
         };
-        ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
-        validate_actor_slice_tree(&value.actor_tree)?;
-        let Some(self_import) = value
-            .actor_tree
-            .binary_search_by_key(&value.actor, |actor| actor.actor)
-            .ok()
-            .map(|index| &value.actor_tree[index])
-        else {
-            return Err(DecodeError::NonCanonical);
-        };
-        if self_import.suspended || (value.change.is_none() && !value.causal_states.is_empty()) {
+        if value.change.is_none() && !value.causal_states.is_empty() {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
+    }
+}
+
+impl V2Wire for ActorCallResultV2 {
+    const MAGIC: [u8; 4] = *b"VAC2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.actor.0);
+        e.bytes(&self.reply);
+        e.bool(self.yielded);
+        e.bool(self.forbidden);
+        e.option(&self.checkpoint, encode_checkpoint_token);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            actor: ActorId(d.fixed()?),
+            reply: d.bytes()?,
+            yielded: d.bool()?,
+            forbidden: d.bool()?,
+            checkpoint: d.option(decode_checkpoint_token)?,
+        };
+        if value.yielded
+            != value
+                .checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.replacement.as_ref())
+                .is_some()
+            || (value.forbidden
+                && (value.yielded || !value.reply.is_empty() || value.checkpoint.is_some()))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for ActorEffectBatchV2 {
+    const MAGIC: [u8; 4] = *b"VEB2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.list(&self.outputs, |e, output| e.bytes(&output.encode()));
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let outputs = d.list(|d| ActorSliceOutputV2::decode(&d.bytes()?))?;
+        if outputs.is_empty() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self { outputs })
     }
 }
 
@@ -1433,6 +1538,10 @@ impl V2Wire for ActorSliceOutputV2 {
         };
         if value.writes.iter().any(|write| write.actor != value.actor)
             || value
+                .writes
+                .windows(2)
+                .any(|pair| pair[0].key >= pair[1].key)
+            || value
                 .crdt_operations
                 .iter()
                 .any(|operation| operation.actor != value.actor || operation.payload.is_empty())
@@ -1450,7 +1559,10 @@ impl V2Wire for ActorSliceOutputV2 {
                 .outbox
                 .windows(2)
                 .any(|pair| pair[0].await_ordinal >= pair[1].await_ordinal)
-            || value.outbox.iter().any(|call| call.payload.is_empty())
+            || value
+                .outbox
+                .iter()
+                .any(|call| call.from != value.actor || call.payload.is_empty())
             || (!value.crdt_operations.is_empty() && value.crdt_materialization.is_none())
             || (value.yielded
                 && value
@@ -3043,6 +3155,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
 
 fn encode_actor_call(e: &mut Encoder<'_>, value: &ActorCallRequestV2) {
     e.u64(value.await_ordinal);
+    e.fixed(&value.from.0);
     e.fixed(&value.to.0);
     e.bytes(&value.payload);
     encode_auth(e, &value.authorization);
@@ -3052,6 +3165,7 @@ fn encode_actor_call(e: &mut Encoder<'_>, value: &ActorCallRequestV2) {
 fn decode_actor_call(d: &mut Decoder<'_>) -> Result<ActorCallRequestV2, DecodeError> {
     Ok(ActorCallRequestV2 {
         await_ordinal: d.u64()?,
+        from: ActorId(d.fixed()?),
         to: ActorId(d.fixed()?),
         payload: d.bytes()?,
         authorization: decode_auth(d)?,
@@ -3407,19 +3521,9 @@ mod tests {
     }
 
     #[test]
-    fn actor_slice_wires_round_trip_and_bind_writes_to_the_actor() {
+    fn actor_slice_wires_round_trip_and_require_canonical_writes() {
         let input = ActorSliceInputV2 {
             actor: ActorId([21; 32]),
-            input: WorkInputIdV2 {
-                invocation: InvocationId([23; 32]),
-                workflow_step: 7,
-            },
-            change: Some(CrdtDispatchV2 {
-                change: ChangeId([23; 32]),
-                ordinal: 4,
-            }),
-            state: b"before".to_vec(),
-            causal_states: vec![b"concurrent".to_vec()],
             actor_tree: vec![
                 ActorTreeImportV2 {
                     actor: ActorId([21; 32]),
@@ -3437,11 +3541,35 @@ mod tests {
                 },
             ],
             message: b"message".to_vec(),
+        };
+        let private = ActorPrivateInputV2 {
+            actor: input.actor,
+            input: WorkInputIdV2 {
+                invocation: InvocationId([23; 32]),
+                workflow_step: 7,
+            },
+            change: Some(CrdtDispatchV2 {
+                change: ChangeId([23; 32]),
+                ordinal: 4,
+            }),
+            state: b"before".to_vec(),
+            causal_states: vec![b"concurrent".to_vec()],
             origin: Origin::Actor(ActorId([22; 32])),
             space_role: Some(crate::SpaceRole::Developer.as_u8()),
             actor_role: Some(7),
         };
         assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
+        assert_eq!(
+            ActorPrivateInputV2::decode(&private.encode()).unwrap(),
+            private
+        );
+        assert!(
+            !input
+                .encode()
+                .windows(private.state.len())
+                .any(|window| window == private.state),
+            "shared same-tree IPC must not disclose an actor materialization"
+        );
         assert_eq!(
             input.resolve_owned(Some(input.actor), "child"),
             Some(ActorId([22; 32]))
@@ -3463,6 +3591,7 @@ mod tests {
             crdt_materialization: None,
             outbox: vec![ActorCallRequestV2 {
                 await_ordinal: 0,
+                from: ActorId([21; 32]),
                 to: ActorId([27; 32]),
                 payload: b"peer request".to_vec(),
                 authorization: AuthorizationEvidenceV2::Public,
@@ -3478,10 +3607,12 @@ mod tests {
             output
         );
 
-        let mut cross_actor_write = output;
-        cross_actor_write.writes[0].actor = ActorId([23; 32]);
+        let mut duplicate_write = output;
+        duplicate_write
+            .writes
+            .push(duplicate_write.writes[0].clone());
         assert_eq!(
-            ActorSliceOutputV2::decode(&cross_actor_write.encode()),
+            ActorSliceOutputV2::decode(&duplicate_write.encode()),
             Err(DecodeError::NonCanonical)
         );
 

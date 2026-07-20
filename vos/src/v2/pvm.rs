@@ -5,6 +5,7 @@
 //! Refine the host surface is read-only and persistent JAM protocol calls are
 //! rejected before a handler can observe them.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use javm::cap::{Access, Cap, DataCap, ProtocolCap};
@@ -14,11 +15,12 @@ use javm::snapshot::KernelSnapshot;
 use javm::vm_pool::VmState;
 
 use super::{
-    ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
-    ActorSliceInputV2, ActorTreeImportV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
-    CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, Hash, ImportedBlobV2,
-    MAX_ROOT_TREE_ACTORS, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, RoleCredentialV2,
-    TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    ACCUMULATE_ENTRY_IC, ACTOR_EFFECT_BATCH_MAX_BYTES, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT,
+    ACTOR_PRIVATE_INPUT_MAX_BYTES, AccumulationResultV2, ActorEffectBatchV2, ActorPrivateInputV2,
+    ActorSliceInputV2, ActorSliceOutputV2, ActorTreeImportV2, AuthorizationEvidenceV2,
+    AwaitResumeV2, BlobRefV2, CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2,
+    CrdtDispatchV2, Hash, ImportedBlobV2, MAX_ROOT_TREE_ACTORS, Origin, ProgramId, REFINE_ENTRY_IC,
+    RefineImportsV2, RoleCredentialV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -155,6 +157,192 @@ pub struct ServicePvmV2 {
     program_id: ProgramId,
 }
 
+/// Pure invocation-local bridge between isolated actor VMs and the generic
+/// service guest.
+///
+/// Actor materializations never enter the shared CALL IPC window. The bridge
+/// selects private input from the active JAR VM and authenticates nested
+/// `Origin::Actor` from the live call stack. Actor outputs are retained as
+/// opaque canonical wires until VM 0 fetches the batch and constructs the
+/// transition itself.
+struct ActorRefineRuntimeV2 {
+    target: super::ActorId,
+    actor_by_vm: Vec<Option<super::ActorId>>,
+    private_inputs: BTreeMap<super::ActorId, ActorPrivateInputV2>,
+    outputs: Vec<ActorSliceOutputV2>,
+}
+
+impl ActorRefineRuntimeV2 {
+    fn new(
+        work: &WorkEnvelopeV2,
+        imports: &RefineImportsV2,
+        space_role: Option<u8>,
+        actor_role: Option<u8>,
+    ) -> Result<Self, ServicePvmErrorV2> {
+        let mut actor_by_vm = Vec::with_capacity(work.imported_actors.len() + 1);
+        actor_by_vm.push(None);
+        actor_by_vm.push(Some(work.target));
+        actor_by_vm.extend(
+            work.imported_actors
+                .iter()
+                .filter(|actor| actor.actor != work.target)
+                .map(|actor| Some(actor.actor)),
+        );
+
+        let mut private_inputs = BTreeMap::new();
+        for actor in &work.imported_actors {
+            let state = imported_blob_bytes(imports, &actor.state)?.to_vec();
+            let causal_states = actor
+                .causal_states
+                .iter()
+                .map(|reference| imported_blob_bytes(imports, reference).map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>, _>>()?;
+            let private = ActorPrivateInputV2 {
+                actor: actor.actor,
+                input: work.input_id(),
+                change: crdt_dispatch(work, 0),
+                state,
+                causal_states,
+                origin: work.origin,
+                space_role,
+                actor_role,
+            };
+            if private.encode().len() > ACTOR_PRIVATE_INPUT_MAX_BYTES {
+                return Err(ServicePvmErrorV2::ActorInputTooLarge);
+            }
+            private_inputs.insert(actor.actor, private);
+        }
+        Ok(Self {
+            target: work.target,
+            actor_by_vm,
+            private_inputs,
+            outputs: Vec::new(),
+        })
+    }
+
+    fn actor_for_vm(&self, vm: u16) -> Option<super::ActorId> {
+        self.actor_by_vm.get(vm as usize).copied().flatten()
+    }
+
+    fn handle(
+        &mut self,
+        slot: u8,
+        kernel: &mut InvocationKernel,
+    ) -> Result<Option<[u64; 2]>, ServicePvmErrorV2> {
+        match slot as u32 {
+            crate::abi::hostcall::ACTOR_PRIVATE_FETCH => {
+                let bytes = if kernel.active_vm == 0 {
+                    if !kernel.call_stack.is_empty() {
+                        return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                    }
+                    ActorEffectBatchV2 {
+                        outputs: self.outputs.clone(),
+                    }
+                    .encode()
+                } else {
+                    let actor = self
+                        .actor_for_vm(kernel.active_vm)
+                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    let caller_vm = kernel
+                        .call_stack
+                        .last()
+                        .map(|frame| frame.caller_vm_id)
+                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    let mut private = self
+                        .private_inputs
+                        .get(&actor)
+                        .cloned()
+                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    if caller_vm == 0 {
+                        if actor != self.target {
+                            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                        }
+                    } else {
+                        let caller = self
+                            .actor_for_vm(caller_vm)
+                            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                        private.origin = Origin::Actor(caller);
+                        private.space_role = None;
+                        private.actor_role = None;
+                    }
+                    private.encode()
+                };
+                if bytes.is_empty()
+                    || bytes.len()
+                        > if kernel.active_vm == 0 {
+                            ACTOR_EFFECT_BATCH_MAX_BYTES
+                        } else {
+                            ACTOR_PRIVATE_INPUT_MAX_BYTES
+                        }
+                {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                write_refine_protocol_bytes(kernel, &bytes)
+                    .map(Some)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))
+            }
+            crate::abi::hostcall::ACTOR_EFFECT_EXPORT => {
+                if kernel.active_vm == 0 {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                let actor = self
+                    .actor_for_vm(kernel.active_vm)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let address = u32::try_from(kernel.active_reg(7))
+                    .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let len = u32::try_from(kernel.active_reg(8))
+                    .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                if len == 0 || len as usize > ACTOR_PRIVATE_INPUT_MAX_BYTES {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                let bytes = kernel
+                    .read_data_cap_window(address, len)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let output = ActorSliceOutputV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                if output.actor != actor {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                if let Some(write) = output
+                    .writes
+                    .iter()
+                    .find(|write| write.key.as_slice() == crate::lifecycle::STATE_KEY_BYTES)
+                {
+                    let state = write
+                        .value
+                        .as_ref()
+                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    let private = self
+                        .private_inputs
+                        .get_mut(&actor)
+                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    private.state = state.clone();
+                    private.causal_states.clear();
+                } else if let Some(state) = output.crdt_materialization.as_ref() {
+                    let private = self
+                        .private_inputs
+                        .get_mut(&actor)
+                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    private.state = state.clone();
+                    private.causal_states.clear();
+                }
+                self.outputs.push(output);
+                if (ActorEffectBatchV2 {
+                    outputs: self.outputs.clone(),
+                })
+                .encode()
+                .len()
+                    > ACTOR_EFFECT_BATCH_MAX_BYTES
+                {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                Ok(Some([crate::abi::error::HOST_OK, 0]))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 impl ServicePvmV2 {
     pub fn new(program: Vec<u8>, expected: ProgramId) -> Result<Self, ServicePvmErrorV2> {
         validate_service_entries(&program)?;
@@ -196,6 +384,7 @@ impl ServicePvmV2 {
             host,
             javm::PvmBackend::Default,
             true,
+            None,
             None,
             None,
             Vec::new(),
@@ -275,6 +464,8 @@ impl ServicePvmV2 {
                 handle_slot,
             });
         }
+        let (space_role, actor_role) = authorization_roles(&work, imports)?;
+        let actor_runtime = ActorRefineRuntimeV2::new(&work, imports, space_role, actor_role)?;
 
         if let Some(reference) = target.continuation.as_ref() {
             let bytes = imported_blob_bytes(imports, reference)?;
@@ -331,17 +522,11 @@ impl ServicePvmV2 {
                 false,
                 Some(&work),
                 Some((&self.program, &dormant)),
+                Some(actor_runtime),
                 Vec::new(),
             );
         }
 
-        let target_state = imported_blob_bytes(imports, &target.state)?;
-        let causal_states = target
-            .causal_states
-            .iter()
-            .map(|reference| imported_blob_bytes(imports, reference).map(<[u8]>::to_vec))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (space_role, actor_role) = authorization_roles(&work, imports)?;
         let actor_tree = work
             .imported_actors
             .iter()
@@ -357,15 +542,8 @@ impl ServicePvmV2 {
             .collect::<Result<Vec<_>, ServicePvmErrorV2>>()?;
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
-            input: work.input_id(),
-            change: crdt_dispatch(&work, 0),
-            state: target_state.to_vec(),
-            causal_states,
             actor_tree,
             message: work.arguments.clone(),
-            origin: work.origin,
-            space_role,
-            actor_role,
         }
         .encode();
         if actor_input.len() > super::ACTOR_SLICE_INPUT_MAX_BYTES {
@@ -394,6 +572,7 @@ impl ServicePvmV2 {
             true,
             Some(&work),
             Some((&self.program, &dormant)),
+            Some(actor_runtime),
             Vec::new(),
         )
     }
@@ -491,6 +670,16 @@ fn map_kernel_initialization_error(error: javm::kernel::KernelError) -> ServiceP
         | javm::kernel::KernelError::ImportHandleUnavailable(_)
         | javm::kernel::KernelError::TooManyVms => ServicePvmErrorV2::InvalidProgram,
     }
+}
+
+fn write_refine_protocol_bytes(kernel: &mut InvocationKernel, bytes: &[u8]) -> Option<[u64; 2]> {
+    let address = u32::try_from(kernel.active_reg(7)).ok()?;
+    let capacity = usize::try_from(kernel.active_reg(8)).ok()?;
+    let len = u64::try_from(bytes.len()).ok()?;
+    if bytes.len() <= capacity && !kernel.write_data_cap_window(address, bytes) {
+        return None;
+    }
+    Some([len, 0])
 }
 
 fn install_actor_ipc(
@@ -710,6 +899,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
     fresh: bool,
     suspension_work: Option<&WorkEnvelopeV2>,
     invocation_layout: Option<(&[u8], &[DormantProgram<'_>])>,
+    mut actor_runtime: Option<ActorRefineRuntimeV2>,
     mut exported_blobs: Vec<ImportedBlobV2>,
 ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
     if fresh {
@@ -746,6 +936,14 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 });
             }
             KernelResult::ProtocolCall { slot } => {
+                if let Some(runtime) = actor_runtime.as_mut()
+                    && let Some([result0, result1]) = runtime.handle(slot, &mut kernel)?
+                {
+                    kernel
+                        .resume_protocol_call(result0, result1)
+                        .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                    continue;
+                }
                 if !refine_protocol_call_is_pure(slot) {
                     return Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(slot));
                 }
@@ -815,6 +1013,7 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
     // nondeterministic BOOT_CONTEXT/NOW_MS seams are intentionally absent from
     // v2 Refine.
     for slot in [
+        crate::abi::hostcall::ACTOR_PRIVATE_FETCH as u8,
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
         crate::abi::hostcall::GROW_HEAP as u8,
         crate::abi::hostcall::DEBUG_WRITE as u8,
@@ -831,6 +1030,8 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
 fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usize) {
     for vm in 1..=actor_count {
         for slot in [
+            crate::abi::hostcall::ACTOR_PRIVATE_FETCH as u8,
+            crate::abi::hostcall::ACTOR_EFFECT_EXPORT as u8,
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             crate::abi::hostcall::GROW_HEAP as u8,
             crate::abi::hostcall::DEBUG_WRITE as u8,
@@ -942,6 +1143,9 @@ pub fn validate_actor_program_layout(program: &[u8]) -> Result<(), ServicePvmErr
     if parsed.caps.iter().any(|cap| {
         (super::ACTOR_CALLABLE_BASE_SLOT..callable_end).contains(&cap.cap_index)
             || cap.cap_index == super::ACTOR_SAVED_ARGS_CAP_SLOT
+            || cap.cap_index == super::ACTOR_NESTED_IPC_CAP_SLOT
+            || cap.cap_index == crate::abi::hostcall::ACTOR_PRIVATE_FETCH as u8
+            || cap.cap_index == crate::abi::hostcall::ACTOR_EFFECT_EXPORT as u8
     }) {
         return Err(ServicePvmErrorV2::InvalidActorCapabilityLayout);
     }
@@ -966,6 +1170,8 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
     matches!(
         slot as u32,
         crate::abi::hostcall::GAS
+            | crate::abi::hostcall::ACTOR_PRIVATE_FETCH
+            | crate::abi::hostcall::ACTOR_EFFECT_EXPORT
             | crate::crypto::ECALL_BLAKE2B_COMPRESS
             | crate::abi::hostcall::FETCH
             | crate::abi::hostcall::COMPILE

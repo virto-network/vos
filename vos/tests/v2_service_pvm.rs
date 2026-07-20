@@ -320,6 +320,13 @@ fn crdt_counter_v2_elf() -> Vec<u8> {
     )
 }
 
+fn workflow_v2_elf() -> Vec<u8> {
+    required_elf(
+        "tests/fixtures/workflow-v2/target/riscv64em-javm/release/workflow_v2_fixture.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
+}
+
 fn actor_pvm(result: u64) -> Vec<u8> {
     let mut assembler = grey_transpiler::assembler::Assembler::new();
     assembler
@@ -437,7 +444,121 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
 }
 
 #[test]
-fn nested_actor_input_is_bounded_before_entering_the_compact_guest_heap() {
+fn same_tree_linear_call_aggregates_private_actor_effects_in_the_service_guest() {
+    let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed = work(actor_program, initial.clone());
+    let child = ActorId([36; 32]);
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let mut service = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        host,
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![
+            ActorGenesisV2 {
+                actor: seed.target,
+                name: "root".into(),
+                parent: None,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: "call_child".into(),
+                    schema: Hash([61; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                }]),
+            },
+            ActorGenesisV2 {
+                actor: child,
+                name: "child".into(),
+                parent: Some(seed.target),
+                program: actor_program,
+                initial_state: initial,
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: "increment".into(),
+                    schema: Hash([62; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                }]),
+            },
+        ],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([63; 32]),
+            authenticator: vec![64],
+        },
+    });
+    authorize_install(&mut service, &install);
+    assert!(matches!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let mut message = vec![vos::value::TAG_DYNAMIC];
+    message.extend_from_slice(&Msg::new("call_child").encode());
+    let scheduled = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: seed.invocation,
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: seed.target,
+            method: "call_child".into(),
+            arguments: message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let refined = service
+        .refine_actor_tree(&scheduled.work, &scheduled.imports)
+        .expect("root calls its child through an ordinary JAR CALLABLE");
+    assert_eq!(
+        refined
+            .transition
+            .writes
+            .iter()
+            .map(|write| (write.actor, u32::decode(write.value.as_ref().unwrap())))
+            .collect::<Vec<_>>(),
+        vec![(seed.target, 11), (child, 1)]
+    );
+    assert_eq!(
+        refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(11))
+    );
+}
+
+#[test]
+fn private_actor_input_is_bounded_before_entering_the_compact_guest_heap() {
     let actor_elf = greeter_elf();
     let actor = grey_transpiler::link_elf(&actor_elf).expect("canonical actor ELF transpiles");
     let actor_program = ProgramId::of_pvm(&actor);
