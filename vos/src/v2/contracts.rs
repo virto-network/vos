@@ -396,7 +396,10 @@ impl ReceiptVerificationRequestV2 {
 /// Fixed-schema workflow operations merged alongside application CRDT fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowOperationV2 {
-    Consumed(WorkInputIdV2),
+    /// Complete scheduler checkpoint for one admitted workflow slice. A peer
+    /// that syncs only the causal DAG can reconstruct the next exact resume
+    /// input without process-local request state.
+    Checkpoint(WorkEnvelopeV2),
     Continuation(ContinuationChangeV2),
     Inbox(MessageRecordV2),
     Outbox(MessageRecordV2),
@@ -523,14 +526,14 @@ impl TransitionV2 {
         Hash::digest(b"vos/transition/v2", &[&candidate.encode()])
     }
 
-    pub fn workflow_operations(&self) -> Vec<WorkflowOperationV2> {
+    pub fn workflow_operations(&self, work: &WorkEnvelopeV2) -> Vec<WorkflowOperationV2> {
         let mut operations = Vec::with_capacity(
             1 + self.continuations.len()
                 + self.inbox.len()
                 + self.outbox.len()
                 + usize::from(self.reply.is_some()),
         );
-        operations.push(WorkflowOperationV2::Consumed(self.consumed_input));
+        operations.push(WorkflowOperationV2::Checkpoint(work.clone()));
         operations.extend(
             self.continuations
                 .iter()
@@ -1762,7 +1765,7 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
                     .base_causal_height
                     .and_then(|height| height.checked_add(1))
                     == Some(change.causal_height)
-                && change.workflow == value.transition.workflow_operations() =>
+                && change.workflow == value.transition.workflow_operations(&value.work) =>
         {
             Ok(())
         }
@@ -2138,10 +2141,9 @@ fn decode_crdt_op(d: &mut Decoder<'_>) -> Result<CrdtOperationV2, DecodeError> {
 
 fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
     match value {
-        WorkflowOperationV2::Consumed(input) => {
+        WorkflowOperationV2::Checkpoint(work) => {
             e.u8(0);
-            e.fixed(&input.invocation.0);
-            e.u64(input.workflow_step);
+            e.bytes(&work.encode());
         }
         WorkflowOperationV2::Continuation(change) => {
             e.u8(1);
@@ -2164,10 +2166,9 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
 
 fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2, DecodeError> {
     match d.u8()? {
-        0 => Ok(WorkflowOperationV2::Consumed(WorkInputIdV2 {
-            invocation: InvocationId(d.fixed()?),
-            workflow_step: d.u64()?,
-        })),
+        0 => Ok(WorkflowOperationV2::Checkpoint(WorkEnvelopeV2::decode(
+            &d.bytes()?,
+        )?)),
         1 => Ok(WorkflowOperationV2::Continuation(
             decode_continuation_change(d)?,
         )),
@@ -2907,7 +2908,7 @@ mod tests {
                     id: change_id.operation(work.target, field, 0),
                     payload: b"counter +1".to_vec(),
                 }],
-                workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
+                workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
                 materializations: vec![CrdtMaterializationV2 {
                     actor: work.target,
                     state: BlobRefV2::of_bytes(b"materialized-state"),
@@ -2922,14 +2923,16 @@ mod tests {
             proof: None,
         };
         let envelope = AccumulationEnvelopeV2 {
-            work,
+            work: work.clone(),
             transition,
             provided_blobs: vec![],
         };
-        assert_eq!(
-            AccumulationEnvelopeV2::decode(&envelope.encode()).unwrap(),
-            envelope
-        );
+        let decoded = AccumulationEnvelopeV2::decode(&envelope.encode()).unwrap();
+        assert_eq!(decoded, envelope);
+        assert!(matches!(
+            &decoded.transition.crdt_change.as_ref().unwrap().workflow[0],
+            WorkflowOperationV2::Checkpoint(checkpoint) if checkpoint == &work
+        ));
 
         let mut bad_id = envelope.clone();
         bad_id.transition.crdt_change.as_mut().unwrap().operations[0].id = OperationId([99; 32]);

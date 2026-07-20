@@ -867,7 +867,7 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
     if !transition.writes.is_empty()
         || Some(change.id) != CrdtChangeV2::derive_id(work)
         || change.causal_dependencies.as_slice() != heads.as_slice()
-        || change.workflow != transition.workflow_operations()
+        || change.workflow != transition.workflow_operations(work)
     {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
@@ -2486,7 +2486,7 @@ mod tests {
             gas: GasAccountingV2::default(),
             proof: None,
         };
-        let workflow = transition.workflow_operations();
+        let workflow = transition.workflow_operations(&work);
         transition.crdt_change.as_mut().unwrap().workflow = workflow;
         transition
     }

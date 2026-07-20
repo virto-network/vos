@@ -370,7 +370,7 @@ impl InMemoryServiceState {
                 };
                 if !transition.writes.is_empty()
                     || Some(change.id) != CrdtChangeV2::derive_id(work)
-                    || change.workflow != transition.workflow_operations()
+                    || change.workflow != transition.workflow_operations(work)
                 {
                     return Err(AccumulateError::InvalidWorkflowTransition);
                 }
@@ -797,7 +797,7 @@ mod tests {
             causal_dependencies: vec![left],
             causal_height: 1,
             operations: vec![operation],
-            workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
+            workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
             materializations: vec![],
         };
         let emitted = change.cid();
