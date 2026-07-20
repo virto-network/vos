@@ -6,6 +6,9 @@ These examples use the clean v2 actor source surface. Platform rustflags add
 - `counter`: ordinary Rust state for Local or Raft consistency.
 - `workflow`: a root calls its owned child by name; the child checkpoints on a
   durable cross-root call and resumes after the peer has accumulated a reply.
+- `private-age` + `age-gate`: one actor mixes regular and role-gated attested
+  methods; a separate verifier resolves the producer and consumes the package
+  exactly once without invoking it.
 - `shared-board`: explicit `Map`, `List`, `Text`, and `Counter` fields. Its
   native test merges concurrent edits from two replicas in both orders.
 
@@ -14,6 +17,7 @@ Build the canonical actor ELFs:
 ```sh
 cargo actor -p v2-counter
 cargo actor -p v2-workflow
+cargo actor -p v2-private-age
 cargo actor -p v2-shared-board
 ```
 
