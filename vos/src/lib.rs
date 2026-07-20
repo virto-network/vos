@@ -62,7 +62,7 @@ pub mod prelude {
     // `handle_connection` body is kept verbatim, so it must resolve via the
     // prelude like the rest of an extension's surface.
     pub use crate::Context;
-    pub use crate::{ActorId, CallId, InvocationId, Origin, SpaceRole};
+    pub use crate::{ActorId, CallError, CallId, InvocationId, Origin, SpaceRole};
     pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
@@ -169,9 +169,9 @@ pub use actors::storage;
 pub use actors::run_refine;
 pub use actors::value;
 pub use actors::{
-    Actor, ActorHandle, ActorReference, Ask, Caller, ClientError, Context, Extension, ExtensionCtx,
-    Forbidden, IntraCap, IntraCapParseError, Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult,
-    SpaceRole, SpaceRoleMap, Yield, metadata, run_blocking, try_poll,
+    Actor, ActorHandle, ActorReference, Ask, CallError, Caller, ClientError, Context, Extension,
+    ExtensionCtx, Forbidden, IntraCap, IntraCapParseError, Message, NO_ROLES_MAP, NoRoles, RoleByte,
+    RunResult, SpaceRole, SpaceRoleMap, Yield, metadata, run_blocking, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
