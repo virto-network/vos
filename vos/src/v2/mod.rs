@@ -61,8 +61,9 @@ pub use local_store::{
     LocalStoreReadErrorV2, ServiceImageInstallErrorV2,
 };
 pub use package::{
-    DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2, VosPackageV2,
-    artifact_hash,
+    DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2,
+    PackageRolePoliciesV2, VosPackageV2, artifact_hash, method_schema_hash, public_policy_hash,
+    space_role_policy_hash,
 };
 #[cfg(feature = "std")]
 pub use pvm::{
