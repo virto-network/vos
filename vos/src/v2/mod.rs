@@ -98,7 +98,7 @@ pub use wire::{DecodeError, V2Wire};
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
 pub const ABI_VERSION: u16 = 2;
 /// Portable continuation format version.
-pub const SNAPSHOT_VERSION: u16 = 2;
+pub const SNAPSHOT_VERSION: u16 = 3;
 /// Attestation statement version required by runtime v2.
 pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 
@@ -157,9 +157,9 @@ impl ServiceFunction {
 
 /// Revision shared by JAVM, the transpiler, proof tracer, verifier, and fuzz
 /// targets. `just check-jar-revisions` verifies that every manifest uses it.
-pub const JAR_REVISION: &str = "6221c247b3798599413a785c6eccc074ec190426";
+pub const JAR_REVISION: &str = "ef641647b6610ff82a32a108db6a7966371407cb";
 
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-73355df-semantics-v2\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-ef64164-semantics-v3\0");

@@ -16,7 +16,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-javm = { git = "https://github.com/olanod/jar.git", rev = "6221c247b3798599413a785c6eccc074ec190426" }
+javm = { git = "https://github.com/olanod/jar.git", rev = "ef641647b6610ff82a32a108db6a7966371407cb" }
 zkpvm = { path = ".." }
 zkpvm-verifier = { path = "../verifier" }
 
