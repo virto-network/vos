@@ -329,26 +329,28 @@ impl InMemoryServiceState {
 
         self.validate_base(&work.base)?;
 
-        for blob in
-            work.imported_blobs
-                .iter()
-                .chain(work.imported_actors.iter().flat_map(|actor| {
-                    core::iter::once(&actor.state).chain(actor.continuation.iter())
-                }))
-                .chain(transition.exported_blobs.iter())
-                .chain(
-                    transition
-                        .continuations
-                        .iter()
-                        .filter_map(|change| change.replacement.as_ref()),
-                )
-                .chain(
-                    transition
-                        .crdt_change
-                        .iter()
-                        .flat_map(|change| change.materializations.iter())
-                        .map(|materialization| &materialization.state),
-                )
+        for blob in work
+            .imported_blobs
+            .iter()
+            .chain(work.imported_actors.iter().flat_map(|actor| {
+                core::iter::once(&actor.state)
+                    .chain(actor.causal_states.iter())
+                    .chain(actor.continuation.iter())
+            }))
+            .chain(transition.exported_blobs.iter())
+            .chain(
+                transition
+                    .continuations
+                    .iter()
+                    .filter_map(|change| change.replacement.as_ref()),
+            )
+            .chain(
+                transition
+                    .crdt_change
+                    .iter()
+                    .flat_map(|change| change.materializations.iter())
+                    .map(|materialization| &materialization.state),
+            )
         {
             if !self.blobs.contains(&blob.hash) && !validator.blob_available(blob) {
                 return Err(AccumulateError::MissingBlob(blob.hash));

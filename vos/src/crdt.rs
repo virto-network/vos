@@ -166,6 +166,7 @@ pub struct OpId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     DivergentOperation(OpId),
+    ConstMismatch,
     IndexOutOfBounds,
     NoChangeScope,
     NestedChangeScope,
@@ -179,6 +180,9 @@ impl core::fmt::Display for Error {
         match self {
             Self::DivergentOperation(id) => {
                 write!(f, "CRDT operation {id:?} has divergent contents")
+            }
+            Self::ConstMismatch => {
+                f.write_str("concurrent CRDT states disagree on immutable configuration")
             }
             Self::IndexOutOfBounds => f.write_str("CRDT sequence index is out of bounds"),
             Self::NoChangeScope => f.write_str(

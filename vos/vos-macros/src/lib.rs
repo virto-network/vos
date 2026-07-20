@@ -251,11 +251,11 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let init_crdt_fields = if crdt_fields.is_empty() {
+    let init_crdt_fields = if crdt_fields.replicated.is_empty() {
         quote! {}
     } else {
         let actor_name = name.to_string();
-        let inits = crdt_fields.iter().map(|ident| {
+        let inits = crdt_fields.replicated.iter().map(|ident| {
             let field_name = ident.to_string();
             quote! {
                 vos::crdt::Field::__vos_init(&mut self.#ident, #actor_name, #field_name);
@@ -265,6 +265,35 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             fn __init_crdt_fields(&mut self) {
                 #( #inits )*
+            }
+        }
+    };
+
+    let merge_crdt = if !crdt {
+        quote! {}
+    } else {
+        let merge_fields = crdt_fields.replicated.iter().map(|ident| {
+            quote! { merged.#ident.merge(&other.#ident)?; }
+        });
+        let check_constants = crdt_fields.constants.iter().map(|ident| {
+            quote! {
+                if vos::Encode::encode(&self.#ident) != vos::Encode::encode(&other.#ident) {
+                    return core::result::Result::Err(vos::crdt::Error::ConstMismatch);
+                }
+            }
+        });
+        quote! {
+            #[doc(hidden)]
+            fn __merge_crdt(
+                &mut self,
+                other: &Self,
+            ) -> core::result::Result<(), vos::crdt::Error> {
+                #( #check_constants )*
+                let mut merged = <Self as vos::Decode>::decode(&vos::Encode::encode(self));
+                #( #merge_fields )*
+                *self = merged;
+                <Self as vos::Actor>::__init_crdt_fields(self);
+                core::result::Result::Ok(())
             }
         }
     };
@@ -332,6 +361,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             #init_storage
 
             #init_crdt_fields
+
+            #merge_crdt
 
             #committed_root
 
@@ -1711,7 +1742,13 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
 /// Strip and validate `#[crdt(const)]` / `#[crdt(skip)]` field annotations.
 /// Plain mutable fields on a CRDT actor are rejected with application-facing
 /// guidance instead of silently becoming last-writer-wins command replay.
-fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<Vec<syn::Ident>> {
+#[derive(Default)]
+struct CrdtFieldPlan {
+    replicated: Vec<syn::Ident>,
+    constants: Vec<syn::Ident>,
+}
+
+fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<CrdtFieldPlan> {
     let syn::Fields::Named(named) = &mut input.fields else {
         if is_crdt && !matches!(input.fields, syn::Fields::Unit) {
             return Err(syn::Error::new_spanned(
@@ -1719,10 +1756,10 @@ fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<Vec
                 "#[actor(crdt)] requires named fields so each replicated field has explicit semantics",
             ));
         }
-        return Ok(Vec::new());
+        return Ok(CrdtFieldPlan::default());
     };
 
-    let mut replicated = Vec::new();
+    let mut plan = CrdtFieldPlan::default();
     for field in &mut named.named {
         let mut is_const = false;
         let mut is_skip = false;
@@ -1780,11 +1817,15 @@ fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<Vec
                 ),
             ));
         }
-        if is_crdt && !is_const && !is_skip {
-            replicated.push(field.ident.clone().expect("named CRDT field"));
+        if is_crdt && is_const {
+            plan.constants
+                .push(field.ident.clone().expect("named CRDT field"));
+        } else if is_crdt && !is_skip {
+            plan.replicated
+                .push(field.ident.clone().expect("named CRDT field"));
         }
     }
-    Ok(replicated)
+    Ok(plan)
 }
 
 fn is_crdt_field_type(ty: &syn::Type) -> bool {

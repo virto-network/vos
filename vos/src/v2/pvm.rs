@@ -284,10 +284,16 @@ impl ServicePvmV2 {
         }
 
         let target_state = imported_blob_bytes(imports, &target.state)?;
+        let causal_states = target
+            .causal_states
+            .iter()
+            .map(|reference| imported_blob_bytes(imports, reference).map(<[u8]>::to_vec))
+            .collect::<Result<Vec<_>, _>>()?;
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
             change: CrdtChangeV2::derive_id(&work),
             state: target_state.to_vec(),
+            causal_states,
             message: work.arguments.clone(),
             origin: work.origin,
         }

@@ -125,6 +125,32 @@ mod crdt_fixture {
             self.edits.value()
         }
     }
+
+    #[test]
+    fn generated_crdt_merger_folds_fields_checks_constants_and_resets_skips() {
+        let mut left = Board::new();
+        left.edits
+            .increment_with_id(crdt::ChangeId([1; 32]).operation(0), 2)
+            .unwrap();
+        left.cache = Some(99);
+        let mut right = Board::new();
+        right
+            .edits
+            .increment_with_id(crdt::ChangeId([2; 32]).operation(0), 3)
+            .unwrap();
+
+        <Board as vos::Actor>::__merge_crdt(&mut left, &right).unwrap();
+        assert_eq!(left.edits.value(), 5);
+        assert_eq!(left.cache, None, "#[crdt(skip)] resets on materialization");
+
+        let mut wrong_space = Board::new();
+        wrong_space.space = 2;
+        assert_eq!(
+            <Board as vos::Actor>::__merge_crdt(&mut left, &wrong_space),
+            Err(crdt::Error::ConstMismatch)
+        );
+        assert_eq!(left.edits.value(), 5, "a rejected merge is atomic");
+    }
 }
 
 /// An `Invoker` that ignores the request and hands back a canned
