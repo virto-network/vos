@@ -83,6 +83,15 @@ cursor. Followers and a newly elected leader use the same catch-up path;
 replaying after a cursor-write failure is safe because guest deduplication sees
 the already committed workflow input.
 
+`RaftAccumulateLogV2` is the redb/`vos-raft` implementation of that boundary.
+In multi-replica mode it accepts writes only from the elected leader, waits for
+the worker's quorum-commit notification, then re-reads and verifies the exact
+committed request bytes. Its `last_applied` cursor advances separately and only
+after the local service image commits. A replica behind the compacted Raft
+prefix currently fails with an explicit service-snapshot-install requirement;
+binding Raft `InstallSnapshot` payloads to `LocalJamStoreSnapshotV2` is still a
+production cutover task.
+
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls
 may execute inline. Cross-root calls always use durable outbox/inbox rows and a

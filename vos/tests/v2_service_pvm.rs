@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use vos::attestation::AttestationStatementV3;
+use vos::raft::{RaftAccumulateLogV2, RaftConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AllowPublic,
@@ -1998,6 +1999,92 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     );
     assert_eq!(leader.log_mut().applied_index().unwrap(), 3);
     assert_eq!(follower.log_mut().applied_index().unwrap(), 3);
+}
+
+#[test]
+fn redb_raft_log_drives_physical_guest_accumulate() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"raft-backed initial state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed = work(actor_program, initial.clone());
+    let genesis = ServiceGenesisV2 {
+        service: seed.service,
+        consistency: ConsistencyModeV2::Raft,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            name: "root".into(),
+            parent: None,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([127; 32]),
+                policy: Hash([128; 32]),
+                public: true,
+                attested: false,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([129; 32]),
+            authenticator: vec![130],
+        },
+    };
+
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    host.allow_install(&genesis);
+    let service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-physical-raft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();
+    let mut replicated = ReplicatedJamServiceV2::new(service, log);
+
+    assert!(matches!(
+        replicated
+            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Installed(_)
+    ));
+    assert_eq!(replicated.log_mut().applied_index().unwrap(), 1);
+    let header = replicated
+        .service()
+        .accumulate_host()
+        .header()
+        .unwrap()
+        .expect("physical guest committed the service header");
+    assert_eq!(header.consistency, ConsistencyModeV2::Raft);
+    assert_eq!(header.revision, 0);
+
+    drop(replicated);
+    let mut reopened = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();
+    assert_eq!(reopened.applied_index().unwrap(), 1);
+    assert!(reopened.committed_after(1).unwrap().entries.is_empty());
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
