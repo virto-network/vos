@@ -179,8 +179,10 @@ pub use actors::{
     STATUS_TOO_BIG, STATUS_YIELDED, service_code_hash,
 };
 pub use attestation::{
-    Attestation, AttestationError, AttestationReplayGuard, AttestationStatementV3, ProofVerifier,
-    StateCommitmentV3, Verified, verify_once,
+    Attestation, AttestationError, AttestationPreparationV2, AttestationProofHostV2,
+    AttestationProofProducerV2, AttestationProofRequestV2, AttestationReplayGuard,
+    AttestationStatementV3, ProducedAttestationProofV2, ProofVerifier, StateCommitmentV3, Verified,
+    verify_once,
 };
 pub use v2::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};
 // Per-task future machinery for native extensions: the scheduler lives

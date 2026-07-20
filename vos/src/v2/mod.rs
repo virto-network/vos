@@ -76,9 +76,10 @@ pub use pvm::{
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};
 #[cfg(feature = "std")]
 pub use service::{
-    AccumulatedServiceOutputV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, CommittedServiceSnapshotV2, JamServiceV2, RefinedServiceOutputV2,
-    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ServiceDispatchError,
+    AccumulatedServiceOutputV2, AttestedServiceErrorV2, CommittedAccumulateBatchV2,
+    CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedAttestationOutputV2,
+    CommittedServiceSnapshotV2, JamServiceV2, RefinedServiceOutputV2, ReplicatedJamServiceV2,
+    ReplicatedServiceErrorV2, ServiceDispatchError,
 };
 pub use state_tree::{
     SERVICE_STATE_KEY_DOMAIN, SERVICE_STATE_LEAF_DOMAIN, SERVICE_STATE_NODE_DOMAIN,

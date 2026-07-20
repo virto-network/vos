@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use javm::kernel::InvocationKernel;
 
+use crate::attestation::AttestationProofHostV2;
+
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
@@ -484,6 +486,22 @@ impl LocalJamStoreV2 {
     /// verifier.
     pub fn allow_receipt(&mut self, request: &ReceiptVerificationRequestV2) {
         self.receipt_allowlist.insert(request.hash());
+    }
+}
+
+impl AttestationProofHostV2 for LocalJamStoreV2 {
+    fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
+        if !request.proof_blob.matches(proof) {
+            return false;
+        }
+        self.allow_proof(request);
+        true
+    }
+}
+
+impl<B> AttestationProofHostV2 for DurableJamStoreV2<B> {
+    fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
+        self.local.make_proof_available(request, proof)
     }
 }
 

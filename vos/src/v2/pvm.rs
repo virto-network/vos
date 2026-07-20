@@ -146,6 +146,12 @@ impl ServicePvmV2 {
         self.program_id
     }
 
+    /// Exact protocol-pinned service bytes used for both live scheduling and
+    /// attestation replay.
+    pub fn canonical_pvm(&self) -> &[u8] {
+        &self.program
+    }
+
     /// Execute the physical IC-0 Refine entry.
     ///
     /// Identical program bytes, arguments, gas, and import-host responses reach

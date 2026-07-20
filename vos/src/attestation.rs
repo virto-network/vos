@@ -8,7 +8,8 @@ use core::marker::PhantomData;
 use crate::v2::wire::{Decoder, Encoder};
 use crate::v2::{
     AccumulationReceiptV2, ActorId, DecodeError, DeploymentId, Hash, InvocationId, MethodPolicyV2,
-    ProducerId, ProgramId, SpaceId, TransitionV2, V2Wire, WorkEnvelopeV2,
+    ProducerId, ProgramId, ProofVerificationRequestV2, RefineImportsV2, SpaceId, TransitionV2,
+    V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,48 @@ impl AttestationPreparationV2 {
         self.statement.validate()?;
         if self.statement.accumulation_receipt != self.receipt {
             return Err(AttestationError::ReceiptMismatch);
+        }
+        Ok(())
+    }
+
+    /// Check the public inputs against the exact live Refine execution that a
+    /// proof producer will deterministically replay.
+    pub fn validate_for_execution(
+        &self,
+        work: &WorkEnvelopeV2,
+        transition: &TransitionV2,
+    ) -> Result<(), AttestationError> {
+        self.validate()?;
+        let statement = &self.statement;
+        let receipt = &self.receipt;
+        let reply = transition
+            .reply
+            .as_ref()
+            .filter(|reply| reply.producer == work.target)
+            .ok_or(AttestationError::InvalidStatement)?;
+        let authorization_input = authorization_input(&work.authorization);
+        if transition.proof.is_some()
+            || work.service != transition.service
+            || work.service != receipt.service
+            || work.input_id() != transition.consumed_input
+            || work.base != transition.base
+            || work.target_program != transition.target_program
+            || receipt.accepted_transition != transition.commitment()
+            || statement.space != work.service.space
+            || statement.actor != work.target
+            || statement.deployment != work.service.deployment
+            || statement.actor_program != work.target_program
+            || statement.method != work.method
+            || statement.invocation != work.invocation
+            || statement.claim_commitment
+                != Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])
+            || statement.input_commitment
+                != Hash::digest(
+                    b"vos/attestation-input/v3",
+                    &[&work.arguments, &authorization_input.0],
+                )
+        {
+            return Err(AttestationError::InvalidStatement);
         }
         Ok(())
     }
@@ -130,20 +173,7 @@ impl AttestationStatementV3 {
                     .ok_or(AttestationError::InvalidStatement)?,
             ),
         };
-        let authorization_input = match &work.authorization {
-            crate::v2::AuthorizationEvidenceV2::Public => Hash::ZERO,
-            crate::v2::AuthorizationEvidenceV2::Credential {
-                credential_commitment,
-                ..
-            }
-            | crate::v2::AuthorizationEvidenceV2::PrivateCredential {
-                credential_commitment,
-                ..
-            } => *credential_commitment,
-            crate::v2::AuthorizationEvidenceV2::SystemCapability { capability, .. } => {
-                Hash(capability.0)
-            }
-        };
+        let authorization_input = authorization_input(&work.authorization);
         let value = Self {
             statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
             space: work.service.space,
@@ -208,6 +238,81 @@ impl AttestationStatementV3 {
             _ => Err(AttestationError::StateCommitmentMismatch),
         }
     }
+}
+
+fn authorization_input(authorization: &crate::v2::AuthorizationEvidenceV2) -> Hash {
+    match authorization {
+        crate::v2::AuthorizationEvidenceV2::Public => Hash::ZERO,
+        crate::v2::AuthorizationEvidenceV2::Credential {
+            credential_commitment,
+            ..
+        }
+        | crate::v2::AuthorizationEvidenceV2::PrivateCredential {
+            credential_commitment,
+            ..
+        } => *credential_commitment,
+        crate::v2::AuthorizationEvidenceV2::SystemCapability { capability, .. } => {
+            Hash(capability.0)
+        }
+    }
+}
+
+/// Exact replay input handed to the configured proof producer. It includes
+/// the protocol-pinned service scheduler, all canonical actor PVMs and blobs,
+/// the live work input/output, and the guest-derived public statement.
+pub struct AttestationProofRequestV2<'a> {
+    pub canonical_service_pvm: &'a [u8],
+    pub work: &'a WorkEnvelopeV2,
+    pub imports: &'a RefineImportsV2,
+    pub transition: &'a TransitionV2,
+    pub preparation: &'a AttestationPreparationV2,
+}
+
+impl AttestationProofRequestV2<'_> {
+    pub fn validate(&self) -> Result<(), AttestationError> {
+        if ProgramId::of_pvm(self.canonical_service_pvm) != self.work.service.service_program
+            || self.imports.validate_for(self.work).is_err()
+        {
+            return Err(AttestationError::InvalidStatement);
+        }
+        self.preparation
+            .validate_for_execution(self.work, self.transition)
+    }
+}
+
+/// Trace and proof bytes produced from one exact canonical replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducedAttestationProofV2 {
+    pub trace: Hash,
+    pub proof: Vec<u8>,
+}
+
+impl ProducedAttestationProofV2 {
+    pub fn validate(&self) -> Result<(), AttestationError> {
+        if self.trace == Hash::ZERO || self.proof.is_empty() {
+            return Err(AttestationError::InvalidProof);
+        }
+        Ok(())
+    }
+}
+
+/// Canonical actor-PVM proof engine. Implementations may trace the live run or
+/// deterministically replay the exact request; they may not substitute an
+/// attestation-only program.
+pub trait AttestationProofProducerV2 {
+    type Error;
+
+    fn prove(
+        &mut self,
+        request: &AttestationProofRequestV2<'_>,
+    ) -> Result<ProducedAttestationProofV2, Self::Error>;
+}
+
+/// Host cache/verifier seam used after proof generation and before Apply.
+/// Making proof bytes available is not a service-state commit and never
+/// publishes an application attestation package.
+pub trait AttestationProofHostV2 {
+    fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool;
 }
 
 impl V2Wire for AttestationStatementV3 {

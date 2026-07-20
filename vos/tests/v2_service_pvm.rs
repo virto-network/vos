@@ -5,7 +5,10 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use vos::attestation::AttestationStatementV3;
+use vos::attestation::{
+    AttestationProofProducerV2, AttestationProofRequestV2, AttestationStatementV3,
+    ProducedAttestationProofV2,
+};
 use vos::network::RaftRpcHandler;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
@@ -29,6 +32,39 @@ use vos::{Decode, Encode, value::Msg};
 struct FailableCommittedImages {
     image: Option<Vec<u8>>,
     fail_next_commit: bool,
+}
+
+#[derive(Debug)]
+struct CanonicalTestProofProducer {
+    trace: Hash,
+    proof: Vec<u8>,
+    calls: usize,
+}
+
+impl AttestationProofProducerV2 for CanonicalTestProofProducer {
+    type Error = ();
+
+    fn prove(
+        &mut self,
+        request: &AttestationProofRequestV2<'_>,
+    ) -> Result<ProducedAttestationProofV2, Self::Error> {
+        request.validate().map_err(|_| ())?;
+        assert_eq!(
+            request
+                .imports
+                .programs
+                .iter()
+                .find(|program| program.program == request.work.target_program)
+                .map(|program| ProgramId::of_pvm(&program.pvm)),
+            Some(request.work.target_program),
+            "the proof request carries the live canonical actor PVM"
+        );
+        self.calls += 1;
+        Ok(ProducedAttestationProofV2 {
+            trace: self.trace,
+            proof: self.proof.clone(),
+        })
+    }
 }
 
 impl CommittedImageStoreV2 for FailableCommittedImages {
@@ -1165,7 +1201,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
-    let seed_work = work(actor_program, initial.clone());
+    let mut seed_work = work(actor_program, initial.clone());
+    seed_work.service.service_program = ProgramId::of_pvm(&pvm);
     let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
@@ -1576,7 +1613,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         .import_blob(private_credential.clone());
     let credential_commitment =
         Hash::digest(b"vos/credential-commitment/v2", &[&private_credential]);
-    let proof_work = LocalWorkSchedulerV2::prepare(
+    let prepared_proof_work = LocalWorkSchedulerV2::prepare(
         service.accumulate_host(),
         LocalWorkRequestV2 {
             invocation: InvocationId([110; 32]),
@@ -1598,10 +1635,11 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             proof_requested: true,
         },
     )
-    .expect("scheduler imports a private role witness without disclosing it")
-    .work;
+    .expect("scheduler imports a private role witness without disclosing it");
+    let proof_work = prepared_proof_work.work;
+    let proof_imports = prepared_proof_work.imports;
     let attested_call = proof_work.invocation.call_id(0);
-    let mut proof_transition = TransitionV2 {
+    let proof_transition = TransitionV2 {
         service: proof_work.service.clone(),
         consumed_input: proof_work.input_id(),
         target_program: proof_work.target_program,
@@ -1747,29 +1785,57 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             .same_service_state(&before_invalid_proof)
     );
 
-    proof_transition.proof = Some(proof.clone());
     let proof_input = proof_work.input_id();
-    let proved = service
-        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-            work: proof_work,
-            transition: proof_transition,
-            provided_blobs: vec![ImportedBlobV2 {
-                reference: proof_blob,
-                bytes: proof_bytes,
-            }],
-        }))
-        .expect("guest validates the proof before committing");
-    let result = proved.result;
-    let AccumulationResultV2::Accepted {
-        receipt,
-        published,
-        duplicate: false,
-    } = result.clone()
-    else {
-        panic!("proved transition was not accepted: {result:?}")
+    let before_empty_proof = service.accumulate_host().snapshot();
+    let mut empty_producer = CanonicalTestProofProducer {
+        trace: Hash::ZERO,
+        proof: vec![],
+        calls: 0,
     };
+    assert!(matches!(
+        service.accumulate_attested(
+            AccumulationEnvelopeV2 {
+                work: proof_work.clone(),
+                transition: proof_transition.clone(),
+                provided_blobs: vec![],
+            },
+            &proof_imports,
+            &mut empty_producer,
+        ),
+        Err(vos::v2::AttestedServiceErrorV2::InvalidProducedProof)
+    ));
+    assert_eq!(empty_producer.calls, 1);
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_empty_proof),
+        "proof production failure cannot reach committing Apply"
+    );
+
+    let mut producer = CanonicalTestProofProducer {
+        trace: proof.trace,
+        proof: proof_bytes.clone(),
+        calls: 0,
+    };
+    let proved = service
+        .accumulate_attested(
+            AccumulationEnvelopeV2 {
+                work: proof_work,
+                transition: proof_transition,
+                provided_blobs: vec![],
+            },
+            &proof_imports,
+            &mut producer,
+        )
+        .expect("the driver proves before guest Accumulate commits");
+    assert_eq!(producer.calls, 1);
+    let receipt = proved.preparation.receipt;
+    let published = proved.published;
     assert_eq!(receipt, predicted);
-    assert_eq!(published.proof, Some(proof));
+    assert_eq!(proved.proof, proof);
+    assert_eq!(proved.proof_bytes, proof_bytes);
+    assert_eq!(published.proof, Some(proved.proof));
     let pending_proof = service
         .accumulate_host()
         .pending_publications()

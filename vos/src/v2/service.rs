@@ -7,12 +7,19 @@
 
 use alloc::vec::Vec;
 
+use crate::attestation::{
+    AttestationPreparationV2, AttestationProofHostV2, AttestationProofProducerV2,
+    AttestationProofRequestV2,
+};
+
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationResultV2,
-    CommittedServiceImageHostV2, ImportedBlobV2, LocalJamStoreSnapshotV2, ProgramId,
-    RefineImportsV2, RefineOutputV2, RefineProtocolHostV2, ServiceImageInstallErrorV2,
-    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
+    AccumulationRejectionV2, AccumulationResultV2, CommittedServiceImageHostV2, ImportedBlobV2,
+    LocalJamStoreSnapshotV2, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
+    PublishedEffectsV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2,
+    ServiceImageInstallErrorV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
+    WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +34,37 @@ pub struct AccumulatedServiceOutputV2 {
     pub result: AccumulationResultV2,
     pub gas_used: u64,
 }
+
+/// Proof package released by the service driver only after guest Accumulate
+/// accepted the transition and committed its recoverable publication row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedAttestationOutputV2 {
+    pub preparation: AttestationPreparationV2,
+    pub proof: ProofCommitmentV2,
+    pub proof_bytes: Vec<u8>,
+    pub published: PublishedEffectsV2,
+    pub prepare_gas_used: u64,
+    pub accumulate_gas_used: u64,
+}
+
+#[derive(Debug)]
+pub enum AttestedServiceErrorV2<E, P> {
+    Service(E),
+    Rejected(AccumulationRejectionV2),
+    InvalidPreparation,
+    Producer(P),
+    InvalidProducedProof,
+    ProofUnavailable,
+    CommitMismatch,
+}
+
+impl<E: core::fmt::Debug, P: core::fmt::Debug> core::fmt::Display for AttestedServiceErrorV2<E, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "attested VOS v2 accumulation failed: {self:?}")
+    }
+}
+
+impl<E: core::fmt::Debug, P: core::fmt::Debug> core::error::Error for AttestedServiceErrorV2<E, P> {}
 
 /// One canonical Accumulate request whose Raft log position is committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +310,129 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
             gas_used: output.gas_used,
         })
     }
+}
+
+impl<R, A> JamServiceV2<R, A>
+where
+    R: RefineProtocolHostV2,
+    A: AccumulateProtocolHostV2 + AttestationProofHostV2,
+{
+    /// Prepare, prove, and commit one single-slice attested transition.
+    ///
+    /// The proof producer receives the exact service scheduler PVM, canonical
+    /// actor imports, and guest-derived statement. Apply is not invoked until
+    /// a non-empty proof is available; the returned package is constructed
+    /// only from a successful non-duplicate guest commit.
+    pub fn accumulate_attested<P: AttestationProofProducerV2>(
+        &mut self,
+        mut envelope: AccumulationEnvelopeV2,
+        imports: &RefineImportsV2,
+        producer: &mut P,
+    ) -> Result<CommittedAttestationOutputV2, AttestedServiceErrorV2<ServiceDispatchError, P::Error>>
+    {
+        let prepared = self
+            .accumulate(&AccumulateRequestV2::PrepareAttested(envelope.clone()))
+            .map_err(AttestedServiceErrorV2::Service)?;
+        let preparation = match prepared.result {
+            AccumulationResultV2::Prepared(preparation) => preparation,
+            AccumulationResultV2::Rejected(rejection) => {
+                return Err(AttestedServiceErrorV2::Rejected(rejection));
+            }
+            _ => return Err(AttestedServiceErrorV2::InvalidPreparation),
+        };
+
+        let produced = {
+            let request = AttestationProofRequestV2 {
+                canonical_service_pvm: self.pvm.canonical_pvm(),
+                work: &envelope.work,
+                imports,
+                transition: &envelope.transition,
+                preparation: &preparation,
+            };
+            request
+                .validate()
+                .map_err(|_| AttestedServiceErrorV2::InvalidPreparation)?;
+            producer
+                .prove(&request)
+                .map_err(AttestedServiceErrorV2::Producer)?
+        };
+        produced
+            .validate()
+            .map_err(|_| AttestedServiceErrorV2::InvalidProducedProof)?;
+
+        let proof_blob = super::BlobRefV2::of_bytes(&produced.proof);
+        let proof = ProofCommitmentV2 {
+            statement: preparation.statement.commitment(),
+            trace: produced.trace,
+            proof_blob: proof_blob.clone(),
+            statement_version: super::ATTESTATION_STATEMENT_VERSION,
+        };
+        let verification = ProofVerificationRequestV2 {
+            actor_program: envelope.work.target_program,
+            execution_semantics: envelope.work.service.execution_semantics,
+            statement: proof.statement,
+            trace: proof.trace,
+            proof_blob: proof_blob.clone(),
+        };
+        if !self
+            .accumulate_host
+            .make_proof_available(&verification, &produced.proof)
+        {
+            return Err(AttestedServiceErrorV2::ProofUnavailable);
+        }
+        envelope.transition.proof = Some(proof.clone());
+        let imported = ImportedBlobV2 {
+            reference: proof_blob,
+            bytes: produced.proof.clone(),
+        };
+        match envelope
+            .provided_blobs
+            .binary_search_by_key(&imported.reference.hash, |blob| blob.reference.hash)
+        {
+            Ok(index) if envelope.provided_blobs[index] == imported => {}
+            Ok(_) => return Err(AttestedServiceErrorV2::InvalidProducedProof),
+            Err(index) => envelope.provided_blobs.insert(index, imported),
+        }
+
+        let committed = self
+            .accumulate(&AccumulateRequestV2::Apply(envelope))
+            .map_err(AttestedServiceErrorV2::Service)?;
+        let (receipt, published) = match committed.result {
+            AccumulationResultV2::Accepted {
+                receipt,
+                published,
+                duplicate: false,
+            } => (receipt, published),
+            AccumulationResultV2::Rejected(rejection) => {
+                return Err(AttestedServiceErrorV2::Rejected(rejection));
+            }
+            _ => return Err(AttestedServiceErrorV2::CommitMismatch),
+        };
+        validate_committed_attestation(&preparation.receipt, &proof, &receipt, &published)?;
+        Ok(CommittedAttestationOutputV2 {
+            preparation,
+            proof,
+            proof_bytes: produced.proof,
+            published,
+            prepare_gas_used: prepared.gas_used,
+            accumulate_gas_used: committed.gas_used,
+        })
+    }
+}
+
+fn validate_committed_attestation<E, P>(
+    prepared_receipt: &AccumulationReceiptV2,
+    proof: &ProofCommitmentV2,
+    committed_receipt: &AccumulationReceiptV2,
+    published: &PublishedEffectsV2,
+) -> Result<(), AttestedServiceErrorV2<E, P>> {
+    if committed_receipt != prepared_receipt
+        || published.proof.as_ref() != Some(proof)
+        || published.reply.is_none()
+    {
+        return Err(AttestedServiceErrorV2::CommitMismatch);
+    }
+    Ok(())
 }
 
 impl<R, A, L> ReplicatedJamServiceV2<R, A, L>
