@@ -269,6 +269,7 @@ pub struct CheckpointTokenV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorCallRequestV2 {
     pub await_ordinal: u64,
+    pub from: ActorId,
     pub to: ActorId,
     pub payload: Vec<u8>,
     pub authorization: AuthorizationEvidenceV2,
@@ -1205,11 +1206,12 @@ impl V2Wire for ActorSliceOutputV2 {
             forbidden: d.bool()?,
             checkpoint: d.option(decode_checkpoint_token)?,
         };
-        if value.writes.iter().any(|write| write.actor != value.actor)
-            || value
-                .crdt_operations
-                .iter()
-                .any(|operation| operation.actor != value.actor || operation.payload.is_empty())
+        if value.writes.windows(2).any(|pair| {
+            (pair[0].actor, pair[0].key.as_slice()) >= (pair[1].actor, pair[1].key.as_slice())
+        }) || value
+            .crdt_operations
+            .iter()
+            .any(|operation| operation.actor != value.actor || operation.payload.is_empty())
             || value
                 .crdt_operations
                 .windows(2)
@@ -2720,6 +2722,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
 
 fn encode_actor_call(e: &mut Encoder<'_>, value: &ActorCallRequestV2) {
     e.u64(value.await_ordinal);
+    e.fixed(&value.from.0);
     e.fixed(&value.to.0);
     e.bytes(&value.payload);
     encode_auth(e, &value.authorization);
@@ -2729,6 +2732,7 @@ fn encode_actor_call(e: &mut Encoder<'_>, value: &ActorCallRequestV2) {
 fn decode_actor_call(d: &mut Decoder<'_>) -> Result<ActorCallRequestV2, DecodeError> {
     Ok(ActorCallRequestV2 {
         await_ordinal: d.u64()?,
+        from: ActorId(d.fixed()?),
         to: ActorId(d.fixed()?),
         payload: d.bytes()?,
         authorization: decode_auth(d)?,
@@ -2950,7 +2954,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_slice_wires_round_trip_and_bind_writes_to_the_actor() {
+    fn actor_slice_wires_round_trip_and_require_canonical_writes() {
         let input = ActorSliceInputV2 {
             actor: ActorId([21; 32]),
             change: Some(ChangeId([23; 32])),
@@ -3002,6 +3006,7 @@ mod tests {
             crdt_materialization: None,
             outbox: vec![ActorCallRequestV2 {
                 await_ordinal: 0,
+                from: ActorId([21; 32]),
                 to: ActorId([27; 32]),
                 payload: b"peer request".to_vec(),
                 authorization: AuthorizationEvidenceV2::Public,
@@ -3017,10 +3022,12 @@ mod tests {
             output
         );
 
-        let mut cross_actor_write = output;
-        cross_actor_write.writes[0].actor = ActorId([23; 32]);
+        let mut duplicate_write = output;
+        duplicate_write
+            .writes
+            .push(duplicate_write.writes[0].clone());
         assert_eq!(
-            ActorSliceOutputV2::decode(&cross_actor_write.encode()),
+            ActorSliceOutputV2::decode(&duplicate_write.encode()),
             Err(DecodeError::NonCanonical)
         );
 

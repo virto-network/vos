@@ -1,5 +1,7 @@
 use super::Actor;
 use super::auth::{Caller, Forbidden, RoleByte, SpaceRole};
+#[cfg(feature = "pvm")]
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// Execution context passed to message handlers.
@@ -58,6 +60,16 @@ pub struct Context<A: Actor> {
     pending_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
     #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
+    #[cfg(feature = "pvm")]
+    actor_tree: Vec<crate::v2::ActorTreeImportV2>,
+    #[cfg(feature = "pvm")]
+    actor_change: Option<crate::v2::ChangeId>,
+    #[cfg(feature = "pvm")]
+    actor_ipc_capacity: usize,
+    #[cfg(feature = "pvm")]
+    nested_writes: BTreeMap<(crate::v2::ActorId, Vec<u8>), Option<Vec<u8>>>,
+    #[cfg(feature = "pvm")]
+    nested_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
 
     // Reply data (rkyv-encoded Value, included in refine output)
     reply: Option<Vec<u8>>,
@@ -103,6 +115,16 @@ impl<A: Actor> Context<A> {
             pending_actor_calls: Vec::new(),
             #[cfg(feature = "pvm")]
             next_await_ordinal: 0,
+            #[cfg(feature = "pvm")]
+            actor_tree: Vec::new(),
+            #[cfg(feature = "pvm")]
+            actor_change: None,
+            #[cfg(feature = "pvm")]
+            actor_ipc_capacity: 0,
+            #[cfg(feature = "pvm")]
+            nested_writes: BTreeMap::new(),
+            #[cfg(feature = "pvm")]
+            nested_actor_calls: Vec::new(),
             reply: None,
             self_schedule: false,
             #[cfg(feature = "pvm")]
@@ -128,6 +150,19 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn __set_actor_id(&mut self, actor: crate::v2::ActorId) {
         self.actor_id = Some(actor);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __set_actor_tree_v2(
+        &mut self,
+        actor_tree: Vec<crate::v2::ActorTreeImportV2>,
+        change: Option<crate::v2::ChangeId>,
+        ipc_capacity: usize,
+    ) {
+        self.actor_tree = actor_tree;
+        self.actor_change = change;
+        self.actor_ipc_capacity = ipc_capacity;
     }
 
     /// Who invoked the currently-running handler. The host writes
@@ -445,6 +480,12 @@ impl<A: Actor> Context<A> {
             if self.actor_id.is_none() || payload.is_empty() {
                 return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
             }
+            if let Some(inline) = self.__try_inline_actor_v2(target, payload) {
+                return inline;
+            }
+            if self.actor_tree.iter().any(|actor| actor.actor == target) {
+                return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
+            }
             let await_ordinal = self.next_await_ordinal;
             self.next_await_ordinal = self
                 .next_await_ordinal
@@ -453,6 +494,7 @@ impl<A: Actor> Context<A> {
             self.pending_actor_calls
                 .push(crate::v2::ActorCallRequestV2 {
                     await_ordinal,
+                    from: self.actor_id.expect("v2 actor identity was checked"),
                     to: target,
                     payload: payload.to_vec(),
                     authorization: crate::v2::AuthorizationEvidenceV2::Public,
@@ -508,6 +550,122 @@ impl<A: Actor> Context<A> {
         {
             let _ = (target, payload, deadline_timeslot);
             super::run::Ask::ready_err(super::value::InvokeError::NotFound)
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn __try_inline_actor_v2(
+        &mut self,
+        target: crate::v2::ActorId,
+        payload: &[u8],
+    ) -> Option<super::run::Ask> {
+        let caller = self.actor_id?;
+        let index = self
+            .actor_tree
+            .binary_search_by_key(&target, |actor| actor.actor)
+            .ok()?;
+        let imported = self.actor_tree[index].clone();
+        let callable_slot = crate::v2::ACTOR_CALLABLE_BASE_SLOT.checked_add(index as u8)?;
+        if target == caller || imported.suspended || self.actor_change.is_some() {
+            return Some(super::run::Ask::ready_err(
+                super::value::InvokeError::NotFound,
+            ));
+        }
+
+        let child_input = crate::v2::ActorSliceInputV2 {
+            actor: target,
+            change: None,
+            state: imported.state,
+            causal_states: Vec::new(),
+            actor_tree: self.actor_tree.clone(),
+            message: payload.to_vec(),
+            origin: crate::v2::Origin::Actor(caller),
+            space_role: None,
+        };
+        let encoded = <crate::v2::ActorSliceInputV2 as crate::v2::V2Wire>::encode(&child_input);
+        let capacity = self.actor_ipc_capacity;
+        if encoded.len() > capacity {
+            return Some(super::run::Ask::ready_err(
+                super::value::InvokeError::TooBig,
+            ));
+        }
+        let address = crate::v2::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
+        // SAFETY: this actor owns the mapped invocation IPC DATA capability.
+        // It remains mapped until JAR CALL moves it to the child.
+        unsafe {
+            core::ptr::copy_nonoverlapping(encoded.as_ptr(), address as *mut u8, encoded.len());
+        }
+        let local_ipc = crate::abi::pvm::ecall::local_cap_ref(0);
+        let nested_ipc =
+            crate::abi::pvm::ecall::local_cap_ref(crate::v2::ACTOR_NESTED_IPC_CAP_SLOT);
+        assert!(crate::abi::pvm::ecall::move_cap(local_ipc, nested_ipc));
+        let output_len = crate::abi::pvm::ecall::call_cap(
+            crate::abi::pvm::ecall::local_cap_ref(callable_slot),
+            crate::v2::ACTOR_NESTED_IPC_CAP_SLOT,
+            address as u64,
+            encoded.len() as u64,
+            capacity as u64,
+            crate::v2::NESTED_ACTOR_CALL_MAGIC,
+        );
+        assert!(crate::abi::pvm::ecall::move_cap(nested_ipc, local_ipc));
+        if output_len == u64::MAX - 1 || output_len == 0 || output_len as usize > capacity {
+            return Some(super::run::Ask::ready_err(
+                super::value::InvokeError::NotFound,
+            ));
+        }
+        // SAFETY: JAR returned and remapped the exclusive IPC cap to this VM.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(address as *const u8, output_len as usize) };
+        let Ok(output) = <crate::v2::ActorSliceOutputV2 as crate::v2::V2Wire>::decode(bytes) else {
+            return Some(super::run::Ask::ready_err(
+                super::value::InvokeError::Panicked,
+            ));
+        };
+        if output.actor != target
+            || output.forbidden
+            || !output.crdt_operations.is_empty()
+            || output.crdt_materialization.is_some()
+        {
+            return Some(super::run::Ask::ready_err(
+                super::value::InvokeError::Panicked,
+            ));
+        }
+        for write in output.writes {
+            if write.key.as_slice() == crate::lifecycle::STATE_KEY_BYTES
+                && let Some(state) = write.value.as_ref()
+                && let Ok(index) = self
+                    .actor_tree
+                    .binary_search_by_key(&write.actor, |actor| actor.actor)
+            {
+                self.actor_tree[index].state = state.clone();
+            }
+            self.nested_writes
+                .insert((write.actor, write.key), write.value);
+        }
+        self.nested_actor_calls.extend(output.outbox);
+        if output.yielded {
+            let Some(checkpoint) = output.checkpoint else {
+                return Some(super::run::Ask::ready_err(
+                    super::value::InvokeError::Panicked,
+                ));
+            };
+            self.checkpoint = Some(checkpoint);
+            self.self_schedule = false;
+            Some(super::run::Ask::checkpoint_pending())
+        } else {
+            // A resumed child completes with a checkpoint token whose
+            // replacement is `None`. Preserve that continuation deletion on
+            // the parent output while still delivering the child's reply to
+            // the original suspended caller.
+            if let Some(checkpoint) = output.checkpoint {
+                if checkpoint.replacement.is_some() {
+                    return Some(super::run::Ask::ready_err(
+                        super::value::InvokeError::Panicked,
+                    ));
+                }
+                self.checkpoint = Some(checkpoint);
+            }
+            Some(super::run::Ask::ready(output.reply))
         }
     }
 
@@ -845,6 +1003,8 @@ impl<A: Actor> Context<A> {
         self.pending_provides.clear();
         self.pending_spawns.clear();
         self.pending_actor_calls.clear();
+        self.nested_writes.clear();
+        self.nested_actor_calls.clear();
         self.reply = None;
         let _ = super::storage::end_dispatch();
     }
@@ -1073,7 +1233,19 @@ impl<A: Actor> Context<A> {
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
     pub fn __drain_actor_calls_v2(&mut self) -> Vec<crate::v2::ActorCallRequestV2> {
-        core::mem::take(&mut self.pending_actor_calls)
+        let mut calls = core::mem::take(&mut self.nested_actor_calls);
+        calls.append(&mut self.pending_actor_calls);
+        calls.sort_by_key(|call| call.await_ordinal);
+        calls
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __drain_nested_writes_v2(&mut self) -> Vec<crate::v2::ActorWriteV2> {
+        core::mem::take(&mut self.nested_writes)
+            .into_iter()
+            .map(|((actor, key), value)| crate::v2::ActorWriteV2 { actor, key, value })
+            .collect()
     }
 }
 

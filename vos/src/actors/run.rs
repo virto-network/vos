@@ -787,6 +787,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // in Context and all v2 scheduler effects use that value.
     let mut ctx = super::Context::new(ServiceId(0));
     ctx.__set_actor_id(input.actor);
+    ctx.__set_actor_tree_v2(input.actor_tree.clone(), input.change, capacity);
     ctx.__set_origin(input.origin);
     ctx.set_caller_roles(input.space_role, None);
 
@@ -824,13 +825,18 @@ pub fn run_nested_actor_service<A: super::Actor>(
         ),
         None => (alloc::vec::Vec::new(), None),
     };
-    let writes = ctx
+    let mut writes = ctx
         .__drain_actor_writes_v2(
             input.actor,
             super::storage::end_dispatch(),
             (!A::CRDT && state_changed).then_some(new_state),
         )
         .expect("nested actor emitted an unsupported v2 effect");
+    writes.extend(ctx.__drain_nested_writes_v2());
+    writes.sort_by(|left, right| (left.actor, &left.key).cmp(&(right.actor, &right.key)));
+    assert!(writes.windows(2).all(|pair| {
+        (pair[0].actor, pair[0].key.as_slice()) < (pair[1].actor, pair[1].key.as_slice())
+    }));
     let outbox = ctx.__drain_actor_calls_v2();
     let encoded = ActorSliceOutputV2 {
         actor: input.actor,

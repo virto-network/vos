@@ -1064,7 +1064,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     if transition.base != work.base {
         return Ok(rejected(AccumulationRejectionV2::TransitionBaseMismatch));
     }
-    if !canonical_transition_shape(work.target, transition) {
+    if !canonical_transition_shape(work, transition) {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     if let Some(rejection) = validate_base(tree.store_ref(), &header, &work.base)? {
@@ -1586,11 +1586,17 @@ fn rematerialize_crdt_service<S: GuestAccumulateStoreV2>(
     Ok(())
 }
 
-fn canonical_transition_shape(target: ActorId, transition: &super::TransitionV2) -> bool {
+fn canonical_transition_shape(
+    work: &super::WorkEnvelopeV2,
+    transition: &super::TransitionV2,
+) -> bool {
     let writes = transition.writes.iter().map(|write| {
         let mut key = write.actor.0.to_vec();
         key.extend_from_slice(&write.key);
-        let valid = write.actor == target
+        let valid = work
+            .imported_actors
+            .binary_search_by_key(&write.actor, |actor| actor.actor)
+            .is_ok()
             && !write.key.is_empty()
             && (write.key.as_slice() != crate::actors::lifecycle::STATE_KEY_BYTES
                 || write.value.is_some());
@@ -1609,7 +1615,7 @@ fn canonical_transition_shape(target: ActorId, transition: &super::TransitionV2)
         && transition
             .reply
             .as_ref()
-            .is_none_or(|reply| reply.producer == target)
+            .is_none_or(|reply| reply.producer == work.target)
 }
 
 fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
@@ -1772,7 +1778,13 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
             .transition
             .outbox
             .iter()
-            .filter(|message| message.call_id == call && message.from == work.target)
+            .filter(|message| {
+                message.call_id == call
+                    && work
+                        .imported_actors
+                        .binary_search_by_key(&message.from, |actor| actor.actor)
+                        .is_ok()
+            })
             .count();
         if matching != 1 {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -1826,7 +1838,10 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
     if message.call_id != call
         || message.caller_invocation != work.invocation
         || message.await_ordinal != snapshot.await_ordinal
-        || message.from != work.target
+        || work
+            .imported_actors
+            .binary_search_by_key(&message.from, |actor| actor.actor)
+            .is_err()
         || message.to != awaited.reply.producer
         || message
             .deadline_timeslot

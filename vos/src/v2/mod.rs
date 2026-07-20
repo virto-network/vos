@@ -124,6 +124,8 @@ pub const ACTOR_CALLABLE_BASE_SLOT: u8 = 128;
 pub const ACTOR_IPC_CAP_SLOT: u8 = 240;
 /// Temporary actor-CNode slot used while CALL owns the reserved IPC slot 0.
 pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;
+/// Actor-local spare used to pass the exclusive IPC cap through nested CALL.
+pub const ACTOR_NESTED_IPC_CAP_SLOT: u8 = 252;
 /// High virtual page kept outside transpiler-owned actor memory layouts.
 pub const ACTOR_IPC_BASE_PAGE: u32 = 0x000f_0000;
 /// Bounded stack window receiving a checkpoint token after snapshot capture.

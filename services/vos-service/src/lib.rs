@@ -79,21 +79,7 @@ mod guest {
             fail_closed();
         }
 
-        provision_same_tree_callables(&work);
-
-        // Actor manifests use slot 0 for their standalone argument window,
-        // while JAR reserves slot 0 as the callee IPC slot. Preserve that
-        // canonical manifest capability in a spare slot for the duration of
-        // CALL; this is VOS policy expressed with ordinary JAR MOVE, not a
-        // kernel special case.
-        let actor_args = ecall::cap_ref_through_handle(vos::v2::TARGET_ACTOR_HANDLE_SLOT, 0);
-        let saved_actor_args = ecall::cap_ref_through_handle(
-            vos::v2::TARGET_ACTOR_HANDLE_SLOT,
-            vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT,
-        );
-        if !ecall::move_cap(actor_args, saved_actor_args) {
-            fail_closed();
-        }
+        prepare_actor_cnodes(&work);
 
         let actor_output_len = ecall::call_cap(
             ecall::local_cap_ref(vos::v2::TARGET_ACTOR_HANDLE_SLOT),
@@ -103,10 +89,8 @@ mod guest {
             actor_ipc_capacity as u64,
             vos::v2::NESTED_ACTOR_CALL_MAGIC,
         ) as usize;
-        if !ecall::move_cap(saved_actor_args, actor_args)
-            || actor_output_len == 0
-            || actor_output_len > actor_ipc_capacity
-        {
+        restore_actor_cnodes(&work);
+        if actor_output_len == 0 || actor_output_len > actor_ipc_capacity {
             fail_closed();
         }
         let actor_output_address = vos::v2::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
@@ -120,6 +104,19 @@ mod guest {
         if actor_output.actor != work.target || actor_output.forbidden {
             fail_closed();
         }
+        let imported = |actor: vos::v2::ActorId| {
+            work.imported_actors
+                .binary_search_by_key(&actor, |candidate| candidate.actor)
+                .is_ok()
+        };
+        if actor_output
+            .writes
+            .iter()
+            .any(|write| !imported(write.actor))
+            || actor_output.outbox.iter().any(|call| !imported(call.from))
+        {
+            fail_closed();
+        }
 
         let outbox = actor_output
             .outbox
@@ -128,7 +125,7 @@ mod guest {
                 call_id: work.invocation.call_id(call.await_ordinal),
                 caller_invocation: work.invocation,
                 await_ordinal: call.await_ordinal,
-                from: work.target,
+                from: call.from,
                 to: call.to,
                 parent: work.parent_call,
                 payload: call.payload.clone(),
@@ -285,9 +282,22 @@ mod guest {
     /// in its owned tree. The generic service retains the HANDLEs; DOWNGRADE
     /// is the ordinary JAM/JAR authority-narrowing operation and does not add
     /// a VOS-specific kernel call surface.
-    fn provision_same_tree_callables(work: &WorkEnvelopeV2) {
+    fn prepare_actor_cnodes(work: &WorkEnvelopeV2) {
         if work.imported_actors.len() > vos::v2::MAX_ROOT_TREE_ACTORS {
             fail_closed();
+        }
+        // Every canonical actor manifest owns slot 0 for standalone args, but
+        // JAR CALL reserves it for the move-only IPC cap. Preserve all actor
+        // arg caps up front so arbitrary main→child→peer nesting sees an empty
+        // IPC slot in every dormant callee.
+        for actor in &work.imported_actors {
+            let handle = actor_handle_slot(work, actor.actor);
+            if !ecall::move_cap(
+                ecall::cap_ref_through_handle(handle, 0),
+                ecall::cap_ref_through_handle(handle, vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT),
+            ) {
+                fail_closed();
+            }
         }
         for destination in &work.imported_actors {
             let destination_handle = actor_handle_slot(work, destination.actor);
@@ -305,6 +315,18 @@ mod guest {
                 ) {
                     fail_closed();
                 }
+            }
+        }
+    }
+
+    fn restore_actor_cnodes(work: &WorkEnvelopeV2) {
+        for actor in &work.imported_actors {
+            let handle = actor_handle_slot(work, actor.actor);
+            if !ecall::move_cap(
+                ecall::cap_ref_through_handle(handle, vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT),
+                ecall::cap_ref_through_handle(handle, 0),
+            ) {
+                fail_closed();
             }
         }
     }
