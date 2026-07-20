@@ -1088,6 +1088,9 @@ fn apply<S: GuestAccumulateStoreV2>(
         if descriptor.program != imported.program {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
         }
+        if descriptor.name != imported.name || descriptor.parent != imported.parent {
+            return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
         let committed_continuation =
             tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(imported.actor))?;
         if committed_continuation != imported.continuation {
@@ -2228,6 +2231,8 @@ mod tests {
             base_causal_height: None,
             imported_actors: vec![ImportedActorV2 {
                 actor: actor(),
+                name: "root".into(),
+                parent: None,
                 program: program(),
                 state: initial,
                 causal_states: vec![],
@@ -3319,6 +3324,8 @@ mod tests {
             base_causal_height,
             imported_actors: vec![ImportedActorV2 {
                 actor: actor(),
+                name: "root".into(),
+                parent: None,
                 program: program(),
                 state: initial,
                 causal_states: vec![],

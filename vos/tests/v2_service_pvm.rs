@@ -281,6 +281,8 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         base_causal_height: None,
         imported_actors: vec![ImportedActorV2 {
             actor: ActorId([5; 32]),
+            name: "root".into(),
+            parent: None,
             program: actor_program,
             state,
             causal_states: vec![],
@@ -309,6 +311,8 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let mut work = work(actor_program, state.clone());
     work.imported_actors.push(ImportedActorV2 {
         actor: ActorId([6; 32]),
+        name: "child".into(),
+        parent: Some(work.target),
         program: actor_program,
         state: state.clone(),
         causal_states: vec![],

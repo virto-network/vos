@@ -123,6 +123,8 @@ impl BlobRefV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedActorV2 {
     pub actor: ActorId,
+    pub name: String,
+    pub parent: Option<ActorId>,
     pub program: ProgramId,
     /// First canonical state materialization for this actor at the work base.
     /// Linear work has exactly this state. CRDT work may additionally import
@@ -130,6 +132,22 @@ pub struct ImportedActorV2 {
     pub state: BlobRefV2,
     pub causal_states: Vec<BlobRefV2>,
     pub continuation: Option<BlobRefV2>,
+}
+
+/// Exact root-tree member materialized into an actor's invocation-owned IPC
+/// input. Its canonical list index selects the CALLABLE slot granted by the
+/// generic service (`ACTOR_CALLABLE_BASE_SLOT + index`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorTreeImportV2 {
+    pub actor: ActorId,
+    pub name: String,
+    pub parent: Option<ActorId>,
+    pub program: ProgramId,
+    pub state: Vec<u8>,
+    pub causal_states: Vec<Vec<u8>>,
+    /// A suspended actor remains visible for name/ownership resolution but no
+    /// new CALLABLE is granted until its exact continuation drains.
+    pub suspended: bool,
 }
 
 /// Canonical code supplied to Refine. An ELF, JIT image, or proving artifact
@@ -166,12 +184,45 @@ pub struct ActorSliceInputV2 {
     /// Additional canonical CRDT frontier materializations. The generated
     /// actor merger folds these into `state` before the message is observed.
     pub causal_states: Vec<Vec<u8>>,
+    /// Complete canonical root-tree import. Actor code resolves typed names
+    /// and same-tree CALLABLE slots only from this authenticated input.
+    pub actor_tree: Vec<ActorTreeImportV2>,
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
     pub origin: Origin,
     /// Authenticated role recovered from the disclosed credential or private
     /// witness before entering the canonical actor PVM.
     pub space_role: Option<u8>,
+}
+
+impl ActorSliceInputV2 {
+    pub fn actor_import(&self, actor: ActorId) -> Option<&ActorTreeImportV2> {
+        self.actor_tree
+            .binary_search_by_key(&actor, |candidate| candidate.actor)
+            .ok()
+            .map(|index| &self.actor_tree[index])
+    }
+
+    pub fn resolve_owned(&self, parent: Option<ActorId>, name: &str) -> Option<ActorId> {
+        self.actor_tree
+            .iter()
+            .find(|actor| actor.parent == parent && actor.name == name)
+            .map(|actor| actor.actor)
+    }
+
+    /// Actor-local JAR CALLABLE slot for an idle same-tree peer. Self-calls
+    /// and suspended actors intentionally have no usable route.
+    pub fn callable_slot(&self, actor: ActorId) -> Option<u8> {
+        let index = self
+            .actor_tree
+            .binary_search_by_key(&actor, |candidate| candidate.actor)
+            .ok()?;
+        let imported = &self.actor_tree[index];
+        if imported.actor == self.actor || imported.suspended {
+            return None;
+        }
+        super::ACTOR_CALLABLE_BASE_SLOT.checked_add(index as u8)
+    }
 }
 
 /// Actor-produced result returned through the same IPC DATA capability.
@@ -972,6 +1023,7 @@ impl V2Wire for WorkEnvelopeV2 {
         let proof_requested = d.bool()?;
         ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
+        validate_imported_actor_tree(&imported_actors, target, target_program)?;
         if let AuthorizationEvidenceV2::PrivateCredential { witness, .. } = &authorization {
             let present = imported_blobs
                 .binary_search_by_key(&witness.hash, |blob| blob.hash)
@@ -1077,6 +1129,7 @@ impl V2Wire for ActorSliceInputV2 {
         e.option(&self.change, |e, change| e.fixed(&change.0));
         e.bytes(&self.state);
         e.list(&self.causal_states, |e, state| e.bytes(state));
+        e.list(&self.actor_tree, encode_actor_tree_import);
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
         e.option(&self.space_role, |e, role| e.u8(*role));
@@ -1088,6 +1141,7 @@ impl V2Wire for ActorSliceInputV2 {
             change: d.option(|d| d.fixed().map(ChangeId))?,
             state: d.bytes()?,
             causal_states: d.list(Decoder::bytes)?,
+            actor_tree: d.list(decode_actor_tree_import)?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
             space_role: d.option(|d| {
@@ -1097,7 +1151,26 @@ impl V2Wire for ActorSliceInputV2 {
                     .ok_or(DecodeError::NonCanonical)
             })?,
         };
-        if value.change.is_none() && !value.causal_states.is_empty() {
+        ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
+        validate_actor_slice_tree(&value.actor_tree)?;
+        let Some(self_import) = value
+            .actor_tree
+            .binary_search_by_key(&value.actor, |actor| actor.actor)
+            .ok()
+            .map(|index| &value.actor_tree[index])
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        if self_import.suspended
+            || self_import.state != value.state
+            || self_import.causal_states != value.causal_states
+            || (value.change.is_none()
+                && (!value.causal_states.is_empty()
+                    || value
+                        .actor_tree
+                        .iter()
+                        .any(|actor| !actor.causal_states.is_empty())))
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -2011,6 +2084,100 @@ fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
     }
 }
 
+fn validate_imported_actor_tree(
+    actors: &[ImportedActorV2],
+    target: ActorId,
+    target_program: ProgramId,
+) -> Result<(), DecodeError> {
+    if actors.is_empty() {
+        return Err(DecodeError::NonCanonical);
+    }
+    let known: BTreeSet<_> = actors.iter().map(|actor| actor.actor).collect();
+    let roots = actors.iter().filter(|actor| actor.parent.is_none()).count();
+    let mut names = BTreeSet::new();
+    for actor in actors {
+        if actor.name.is_empty()
+            || actor.parent == Some(actor.actor)
+            || actor.parent.is_some_and(|parent| !known.contains(&parent))
+            || !names.insert((actor.parent, actor.name.as_str()))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    let target_matches = actors
+        .binary_search_by_key(&target, |actor| actor.actor)
+        .ok()
+        .is_some_and(|index| actors[index].program == target_program);
+    if roots != 1 || !target_matches {
+        return Err(DecodeError::NonCanonical);
+    }
+    let root = actors
+        .iter()
+        .find(|actor| actor.parent.is_none())
+        .map(|actor| actor.actor)
+        .ok_or(DecodeError::NonCanonical)?;
+    for actor in actors {
+        let mut cursor = actor.actor;
+        for _ in 0..actors.len() {
+            if cursor == root {
+                break;
+            }
+            cursor = actors
+                .iter()
+                .find(|candidate| candidate.actor == cursor)
+                .and_then(|candidate| candidate.parent)
+                .ok_or(DecodeError::NonCanonical)?;
+        }
+        if cursor != root {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    Ok(())
+}
+
+fn validate_actor_slice_tree(actors: &[ActorTreeImportV2]) -> Result<(), DecodeError> {
+    if actors.is_empty() {
+        return Err(DecodeError::NonCanonical);
+    }
+    let known: BTreeSet<_> = actors.iter().map(|actor| actor.actor).collect();
+    let roots = actors.iter().filter(|actor| actor.parent.is_none()).count();
+    let mut names = BTreeSet::new();
+    for actor in actors {
+        if actor.name.is_empty()
+            || actor.parent == Some(actor.actor)
+            || actor.parent.is_some_and(|parent| !known.contains(&parent))
+            || !names.insert((actor.parent, actor.name.as_str()))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    if roots != 1 {
+        return Err(DecodeError::NonCanonical);
+    }
+    let root = actors
+        .iter()
+        .find(|actor| actor.parent.is_none())
+        .map(|actor| actor.actor)
+        .ok_or(DecodeError::NonCanonical)?;
+    for actor in actors {
+        let mut cursor = actor.actor;
+        for _ in 0..actors.len() {
+            if cursor == root {
+                break;
+            }
+            cursor = actors
+                .iter()
+                .find(|candidate| candidate.actor == cursor)
+                .and_then(|candidate| candidate.parent)
+                .ok_or(DecodeError::NonCanonical)?;
+        }
+        if cursor != root {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    Ok(())
+}
+
 fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), DecodeError> {
     if value.work.service != value.transition.service
         || value.work.input_id() != value.transition.consumed_input
@@ -2380,6 +2547,8 @@ fn decode_blob_ref(d: &mut Decoder<'_>) -> Result<BlobRefV2, DecodeError> {
 
 fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
     e.fixed(&value.actor.0);
+    e.string(&value.name);
+    e.option(&value.parent, |e, parent| e.fixed(&parent.0));
     e.fixed(&value.program.0);
     encode_blob_ref(e, &value.state);
     e.list(&value.causal_states, encode_blob_ref);
@@ -2389,11 +2558,39 @@ fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
 fn decode_imported_actor(d: &mut Decoder<'_>) -> Result<ImportedActorV2, DecodeError> {
     Ok(ImportedActorV2 {
         actor: ActorId(d.fixed()?),
+        name: d.string()?,
+        parent: d.option(|d| d.fixed().map(ActorId))?,
         program: ProgramId(d.fixed()?),
         state: decode_blob_ref(d)?,
         causal_states: d.list(decode_blob_ref)?,
         continuation: d.option(decode_blob_ref)?,
     })
+}
+
+fn encode_actor_tree_import(e: &mut Encoder<'_>, value: &ActorTreeImportV2) {
+    e.fixed(&value.actor.0);
+    e.string(&value.name);
+    e.option(&value.parent, |e, parent| e.fixed(&parent.0));
+    e.fixed(&value.program.0);
+    e.bytes(&value.state);
+    e.list(&value.causal_states, |e, state| e.bytes(state));
+    e.bool(value.suspended);
+}
+
+fn decode_actor_tree_import(d: &mut Decoder<'_>) -> Result<ActorTreeImportV2, DecodeError> {
+    let value = ActorTreeImportV2 {
+        actor: ActorId(d.fixed()?),
+        name: d.string()?,
+        parent: d.option(|d| d.fixed().map(ActorId))?,
+        program: ProgramId(d.fixed()?),
+        state: d.bytes()?,
+        causal_states: d.list(Decoder::bytes)?,
+        suspended: d.bool()?,
+    };
+    if value.name.is_empty() || value.parent == Some(value.actor) {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 fn encode_write(e: &mut Encoder<'_>, value: &ActorWriteV2) {
@@ -2659,7 +2856,15 @@ mod tests {
                 state_root: Hash([8; 32]),
             },
             base_causal_height: None,
-            imported_actors: vec![],
+            imported_actors: vec![ImportedActorV2 {
+                actor: ActorId([5; 32]),
+                name: "root".into(),
+                parent: None,
+                program: ProgramId([6; 32]),
+                state: BlobRefV2::of_bytes(b"state"),
+                causal_states: vec![],
+                continuation: None,
+            }],
             imported_blobs: vec![],
             proof_requested: false,
         }
@@ -2699,6 +2904,8 @@ mod tests {
         work.target_program = program;
         work.imported_actors = vec![ImportedActorV2 {
             actor: work.target,
+            name: "root".into(),
+            parent: None,
             program,
             state: state.clone(),
             causal_states: vec![],
@@ -2749,11 +2956,40 @@ mod tests {
             change: Some(ChangeId([23; 32])),
             state: b"before".to_vec(),
             causal_states: vec![b"concurrent".to_vec()],
+            actor_tree: vec![
+                ActorTreeImportV2 {
+                    actor: ActorId([21; 32]),
+                    name: "root".into(),
+                    parent: None,
+                    program: ProgramId([24; 32]),
+                    state: b"before".to_vec(),
+                    causal_states: vec![b"concurrent".to_vec()],
+                    suspended: false,
+                },
+                ActorTreeImportV2 {
+                    actor: ActorId([22; 32]),
+                    name: "child".into(),
+                    parent: Some(ActorId([21; 32])),
+                    program: ProgramId([25; 32]),
+                    state: b"child".to_vec(),
+                    causal_states: vec![],
+                    suspended: false,
+                },
+            ],
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),
             space_role: Some(crate::SpaceRole::Developer.as_u8()),
         };
         assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
+        assert_eq!(
+            input.resolve_owned(Some(input.actor), "child"),
+            Some(ActorId([22; 32]))
+        );
+        assert_eq!(input.callable_slot(input.actor), None);
+        assert_eq!(
+            input.callable_slot(ActorId([22; 32])),
+            Some(super::super::ACTOR_CALLABLE_BASE_SLOT + 1)
+        );
 
         let output = ActorSliceOutputV2 {
             actor: ActorId([21; 32]),

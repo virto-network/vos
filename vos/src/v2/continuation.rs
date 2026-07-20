@@ -207,6 +207,8 @@ mod tests {
             base_causal_height: None,
             imported_actors: vec![ImportedActorV2 {
                 actor: snapshot.actor,
+                name: "root".into(),
+                parent: None,
                 program: snapshot.actor_program,
                 state: crate::v2::BlobRefV2 {
                     hash: Hash([9; 32]),

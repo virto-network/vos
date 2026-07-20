@@ -488,6 +488,8 @@ impl LocalWorkSchedulerV2 {
         }
         work.imported_actors.push(ImportedActorV2 {
             actor: request.target,
+            name: descriptor.name.clone(),
+            parent: descriptor.parent,
             program: descriptor.program,
             state: state.clone(),
             causal_states: states.clone(),
@@ -545,6 +547,8 @@ impl LocalWorkSchedulerV2 {
             )?;
             work.imported_actors.push(ImportedActorV2 {
                 actor,
+                name: descriptor.name.clone(),
+                parent: descriptor.parent,
                 program: descriptor.program,
                 state: actor_state.clone(),
                 causal_states: actor_states.clone(),

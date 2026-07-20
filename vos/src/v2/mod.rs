@@ -39,7 +39,7 @@ pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorDirectoryV2,
-    ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2,
+    ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorTreeImportV2, ActorWriteV2,
     AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2,
     ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2,
     CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, GasAccountingV2,
