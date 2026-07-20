@@ -36,11 +36,11 @@ pub use accumulate::{
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorSliceInputV2,
-    ActorSliceOutputV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2,
-    CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
+    AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorGenesisV2,
+    ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2, AuthorizationEvidenceV2, AwaitResumeV2,
+    BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
+    CrdtChangeV2, CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
     ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError,
     RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2,
     ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
@@ -107,6 +107,9 @@ pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;
 pub const ACTOR_IPC_BASE_PAGE: u32 = 0x000f_0000;
 /// Bounded stack window receiving a checkpoint token after snapshot capture.
 pub const CHECKPOINT_TOKEN_CAPACITY: usize = 4096;
+/// Register marker distinguishing an awaited-call suspension from an explicit
+/// scheduler yield at the shared SUSPEND capability.
+pub const AWAIT_SUSPEND_MAGIC: u64 = 0x564f_532d_4157_5432;
 /// Marker passed in phi[10] so the canonical actor entry selects CALL/REPLY.
 pub const NESTED_ACTOR_CALL_MAGIC: u64 = 0x564f_532d_4143_5432;
 

@@ -129,6 +129,11 @@ enum AskInner {
     Immediate(Result<alloc::vec::Vec<u8>, super::value::InvokeError>),
     /// Deferred host I/O (worker path).
     HostIo(HostIo),
+    /// Finalization fork of a durable v2 await. The exact machine snapshot
+    /// resumes before this future is constructed, so this variant is never
+    /// polled again after a committed reply is injected.
+    #[cfg(feature = "pvm")]
+    CheckpointPending,
 }
 
 impl Ask {
@@ -145,6 +150,12 @@ impl Ask {
     pub fn host_io(io: HostIo) -> Self {
         Self {
             inner: AskInner::HostIo(io),
+        }
+    }
+    #[cfg(feature = "pvm")]
+    pub(crate) fn checkpoint_pending() -> Self {
+        Self {
+            inner: AskInner::CheckpointPending,
         }
     }
 }
@@ -174,6 +185,8 @@ impl Future for Ask {
                 Poll::Ready(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
                 Poll::Pending => Poll::Pending,
             },
+            #[cfg(feature = "pvm")]
+            AskInner::CheckpointPending => Poll::Pending,
         }
     }
 }
@@ -817,11 +830,13 @@ pub fn run_nested_actor_service<A: super::Actor>(
             (!A::CRDT && state_changed).then_some(new_state),
         )
         .expect("nested actor emitted an unsupported v2 effect");
+    let outbox = ctx.__drain_actor_calls_v2();
     let encoded = ActorSliceOutputV2 {
         actor: input.actor,
         writes,
         crdt_operations,
         crdt_materialization,
+        outbox,
         reply,
         yielded,
         forbidden,

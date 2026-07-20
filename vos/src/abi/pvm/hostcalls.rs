@@ -46,6 +46,20 @@ pub fn suspend_checkpoint(token: &mut [u8]) -> [u64; 2] {
     )
 }
 
+/// Suspend at an awaited cross-root call. `await_ordinal` is captured before
+/// the call observes a result; the marker distinguishes this from an explicit
+/// scheduler yield while using the same VOS-supplied capability.
+#[inline]
+pub fn suspend_await(response: &mut [u8], await_ordinal: u64, marker: u64) -> [u64; 2] {
+    ecall4_pair(
+        hostcall::SUSPEND,
+        response.as_mut_ptr() as u64,
+        response.len() as u64,
+        await_ordinal,
+        marker,
+    )
+}
+
 /// Request additional heap pages.
 #[inline]
 pub fn grow_heap(pages: u32) -> u64 {

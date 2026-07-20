@@ -17,8 +17,9 @@ mod guest {
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
         BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2,
-        GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, RefineOutputV2, ReplyRecordV2,
-        StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2, execute_guest_accumulate,
+        GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, RefineOutputV2,
+        ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+        execute_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -66,7 +67,7 @@ mod guest {
     ) -> OutputWindow {
         // SAFETY: JAM initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
-        let work = WorkEnvelopeV2::decode(input).unwrap_or_else(|_| fail_closed());
+        let mut work = WorkEnvelopeV2::decode(input).unwrap_or_else(|_| fail_closed());
         if work.service.service_abi != vos::v2::ABI_VERSION
             || work.service.execution_semantics != vos::v2::EXECUTION_SEMANTICS_ID
             || !work.base.mode_compatible(work.consistency)
@@ -119,16 +120,60 @@ mod guest {
             fail_closed();
         }
 
+        let outbox = actor_output
+            .outbox
+            .iter()
+            .map(|call| MessageRecordV2 {
+                call_id: work.invocation.call_id(call.await_ordinal),
+                caller_invocation: work.invocation,
+                await_ordinal: call.await_ordinal,
+                from: work.target,
+                to: call.to,
+                parent: work.parent_call,
+                payload: call.payload.clone(),
+                authorization: call.authorization.clone(),
+                deadline_timeslot: call.deadline_timeslot,
+            })
+            .collect::<alloc::vec::Vec<_>>();
+        match actor_output.checkpoint.as_ref() {
+            Some(checkpoint) if checkpoint.replacement.is_some() => {
+                if !actor_output.yielded {
+                    fail_closed();
+                }
+                match checkpoint.pending_call {
+                    Some(pending) if outbox.len() == 1 && outbox[0].call_id == pending => {}
+                    None if outbox.is_empty() => {}
+                    _ => fail_closed(),
+                }
+            }
+            Some(_) => {
+                if actor_output.yielded || !outbox.is_empty() {
+                    fail_closed();
+                }
+            }
+            None => {
+                if actor_output.yielded || !outbox.is_empty() {
+                    fail_closed();
+                }
+            }
+        }
+
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();
         let mut continuations = alloc::vec::Vec::new();
         let mut exported_blobs = alloc::vec::Vec::new();
         if let Some(checkpoint) = actor_output.checkpoint {
-            if checkpoint.input != work.input_id() || checkpoint.base != work.base {
-                fail_closed();
-            }
             consumed_input = checkpoint.input;
-            base = checkpoint.base;
+            base = checkpoint.base.clone();
+            // The service VM is itself part of the exact nested snapshot and
+            // therefore retains its pre-suspension WorkEnvelope. The
+            // post-snapshot token is the scheduler's handoff for consensus
+            // inputs that advance between slices; Accumulate independently
+            // checks all of them against the admitted current work.
+            work.invocation = checkpoint.input.invocation;
+            work.workflow_step = checkpoint.input.workflow_step;
+            work.base = checkpoint.base;
+            work.base_causal_height = checkpoint.base_causal_height;
             if let Some(replacement) = checkpoint.replacement.as_ref() {
                 exported_blobs.push(replacement.clone());
             }
@@ -204,7 +249,7 @@ mod guest {
             crdt_change,
             continuations,
             inbox: alloc::vec::Vec::new(),
-            outbox: alloc::vec::Vec::new(),
+            outbox,
             reply,
             exported_blobs,
             gas: GasAccountingV2::default(),

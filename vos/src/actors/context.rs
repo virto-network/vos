@@ -54,6 +54,10 @@ pub struct Context<A: Actor> {
     pending_writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pending_spawns: Vec<[u8; 32]>,
     pending_provides: Vec<([u8; 32], Vec<u8>)>,
+    #[cfg(feature = "pvm")]
+    pending_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
+    #[cfg(feature = "pvm")]
+    next_await_ordinal: u64,
 
     // Reply data (rkyv-encoded Value, included in refine output)
     reply: Option<Vec<u8>>,
@@ -95,6 +99,10 @@ impl<A: Actor> Context<A> {
             pending_writes: Vec::new(),
             pending_spawns: Vec::new(),
             pending_provides: Vec::new(),
+            #[cfg(feature = "pvm")]
+            pending_actor_calls: Vec::new(),
+            #[cfg(feature = "pvm")]
+            next_await_ordinal: 0,
             reply: None,
             self_schedule: false,
             #[cfg(feature = "pvm")]
@@ -387,6 +395,104 @@ impl<A: Actor> Context<A> {
             request.extend_from_slice(&target.0.to_le_bytes());
             request.extend_from_slice(payload);
             super::run::Ask::host_io(self.host_call(request))
+        }
+    }
+
+    /// Issue a durable v2 call to an actor in another root tree.
+    ///
+    /// Unlike the legacy route-oriented [`ask`](Self::ask), this call records
+    /// a stable await ordinal, checkpoints the exact guest machine before it
+    /// observes a result, and resumes only after the owning service injects an
+    /// accumulated reply at that same protocol-call boundary.
+    pub fn ask_actor(
+        &mut self,
+        target: crate::v2::ActorId,
+        msg: &super::value::Msg,
+        deadline_timeslot: Option<u64>,
+    ) -> super::run::Ask {
+        let encoded = super::codec::Encode::encode(msg);
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(super::value::TAG_DYNAMIC);
+        payload.extend_from_slice(&encoded);
+        self.ask_actor_raw(target, &payload, deadline_timeslot)
+    }
+
+    /// Raw durable v2 actor call. This is an advanced runtime primitive;
+    /// generated bound handles are the application-facing API.
+    pub fn ask_actor_raw(
+        &mut self,
+        target: crate::v2::ActorId,
+        payload: &[u8],
+        deadline_timeslot: Option<u64>,
+    ) -> super::run::Ask {
+        #[cfg(feature = "pvm")]
+        {
+            if self.actor_id.is_none() || payload.is_empty() {
+                return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
+            }
+            let await_ordinal = self.next_await_ordinal;
+            self.next_await_ordinal = self
+                .next_await_ordinal
+                .checked_add(1)
+                .expect("v2 actor await ordinal overflow");
+            self.pending_actor_calls
+                .push(crate::v2::ActorCallRequestV2 {
+                    await_ordinal,
+                    to: target,
+                    payload: payload.to_vec(),
+                    authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                    deadline_timeslot,
+                });
+
+            let mut response = [0u8; crate::v2::CHECKPOINT_TOKEN_CAPACITY];
+            let [resume_kind, response_len] = crate::abi::pvm::hostcalls::suspend_await(
+                &mut response,
+                await_ordinal,
+                crate::v2::AWAIT_SUSPEND_MAGIC,
+            );
+            match resume_kind {
+                0 => {
+                    let response_len = usize::try_from(response_len)
+                        .expect("await checkpoint payload length exceeds guest usize");
+                    assert!(
+                        response_len <= response.len(),
+                        "await checkpoint payload exceeds buffer"
+                    );
+                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
+                        &response[..response_len],
+                    )
+                    .expect("invalid v2 await checkpoint token");
+                    assert!(
+                        checkpoint.pending_call.is_some(),
+                        "await checkpoint is missing its stable CallId"
+                    );
+                    self.checkpoint = Some(checkpoint);
+                    self.self_schedule = false;
+                    super::run::Ask::checkpoint_pending()
+                }
+                2 => {
+                    let response_len = usize::try_from(response_len)
+                        .expect("await resume payload length exceeds guest usize");
+                    assert!(
+                        response_len <= response.len(),
+                        "await resume payload exceeds buffer"
+                    );
+                    let resume = <crate::v2::AwaitResumeV2 as crate::v2::V2Wire>::decode(
+                        &response[..response_len],
+                    )
+                    .expect("invalid v2 accumulated reply");
+                    self.checkpoint = Some(resume.checkpoint);
+                    self.__clear_committed_checkpoint_effects_v2();
+                    self.self_schedule = false;
+                    super::run::Ask::ready(resume.reply.result)
+                }
+                _ => panic!("invalid v2 await resume kind"),
+            }
+        }
+        #[cfg(not(feature = "pvm"))]
+        {
+            let _ = (target, payload, deadline_timeslot);
+            super::run::Ask::ready_err(super::value::InvokeError::NotFound)
         }
     }
 
@@ -699,12 +805,7 @@ impl<A: Actor> Context<A> {
                 // already committed when result `1` is injected. Drop only
                 // that checkpoint bookkeeping; actor memory and the handler
                 // future remain exactly as captured.
-                self.pending_writes.clear();
-                self.pending_tells.clear();
-                self.pending_provides.clear();
-                self.pending_spawns.clear();
-                self.reply = None;
-                let _ = super::storage::end_dispatch();
+                self.__clear_committed_checkpoint_effects_v2();
             }
             self.self_schedule = !restored;
             super::run::Yield::after_checkpoint(restored)
@@ -720,6 +821,17 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn __take_checkpoint_v2(&mut self) -> Option<crate::v2::CheckpointTokenV2> {
         self.checkpoint.take()
+    }
+
+    #[cfg(feature = "pvm")]
+    fn __clear_committed_checkpoint_effects_v2(&mut self) {
+        self.pending_writes.clear();
+        self.pending_tells.clear();
+        self.pending_provides.clear();
+        self.pending_spawns.clear();
+        self.pending_actor_calls.clear();
+        self.reply = None;
+        let _ = super::storage::end_dispatch();
     }
 
     /// Checkpoint state and yield. `sleep` is an alias for
@@ -939,6 +1051,14 @@ impl<A: Actor> Context<A> {
             });
         }
         Ok(writes)
+    }
+
+    /// Drain durable cross-root calls separately from actor state writes so
+    /// the generic service can derive canonical `CallId`s from its invocation.
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __drain_actor_calls_v2(&mut self) -> Vec<crate::v2::ActorCallRequestV2> {
+        core::mem::take(&mut self.pending_actor_calls)
     }
 }
 

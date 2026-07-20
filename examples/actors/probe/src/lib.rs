@@ -35,6 +35,22 @@ impl Probe {
         ctx.yield_now().await;
     }
 
+    /// Mutate before a durable cross-root await, then incorporate the exact
+    /// accumulated peer reply after restart. Runtime v2 integration tests use
+    /// this to prove the pre-await code executes once and the return value is
+    /// injected into the original handler future rather than replaying PC 0.
+    #[msg]
+    async fn await_peer(&mut self, ctx: &mut Context<Self>) -> u32 {
+        self.seen += 1;
+        if let Ok(vos::value::Value::U32(value)) = ctx
+            .ask_actor(ActorId([44; 32]), &Msg::new("peer_value"), Some(100))
+            .await
+        {
+            self.seen += value;
+        }
+        self.seen
+    }
+
     /// Number of `ping`s delivered so far.
     #[msg]
     async fn seen(&self) -> u32 {
