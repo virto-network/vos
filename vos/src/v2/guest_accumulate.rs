@@ -1145,6 +1145,9 @@ fn apply<S: GuestAccumulateStoreV2>(
         if descriptor.program != imported.program {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
         }
+        if descriptor.name != imported.name || descriptor.parent != imported.parent {
+            return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
         let committed_continuation =
             tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(imported.actor))?;
         if committed_continuation != imported.continuation {
@@ -2408,6 +2411,7 @@ mod tests {
             consistency,
             actors: vec![ActorGenesisV2 {
                 actor: actor(),
+                name: "root".into(),
                 parent: None,
                 program: program(),
                 initial_state: initial.clone(),
@@ -2447,6 +2451,7 @@ mod tests {
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
                 actor: actor(),
+                name: "root".into(),
                 parent: None,
                 program: program(),
                 initial_state: initial,
@@ -2484,6 +2489,7 @@ mod tests {
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
                 actor: actor(),
+                name: "root".into(),
                 parent: None,
                 program: program(),
                 initial_state: initial,
@@ -2536,6 +2542,8 @@ mod tests {
             base_causal_height: None,
             imported_actors: vec![ImportedActorV2 {
                 actor: actor(),
+                name: "root".into(),
+                parent: None,
                 program: program(),
                 state: initial,
                 causal_states: vec![],
@@ -2788,6 +2796,7 @@ mod tests {
             actors: vec![
                 ActorGenesisV2 {
                     actor: actor(),
+                    name: "root".into(),
                     parent: None,
                     program: program(),
                     initial_state: initial.clone(),
@@ -2804,6 +2813,7 @@ mod tests {
                 },
                 ActorGenesisV2 {
                     actor: child,
+                    name: "child".into(),
                     parent: Some(actor()),
                     program: program(),
                     initial_state: initial.clone(),
@@ -2958,6 +2968,7 @@ mod tests {
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
                 actor: actor(),
+                name: "root".into(),
                 parent: None,
                 program: program(),
                 initial_state: initial.clone(),
@@ -3901,6 +3912,8 @@ mod tests {
             base_causal_height,
             imported_actors: vec![ImportedActorV2 {
                 actor: actor(),
+                name: "root".into(),
+                parent: None,
                 program: program(),
                 state: initial,
                 causal_states: vec![],

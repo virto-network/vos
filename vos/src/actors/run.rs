@@ -780,6 +780,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         change,
         state,
         causal_states,
+        actor_tree: _,
         message,
         origin,
         space_role,

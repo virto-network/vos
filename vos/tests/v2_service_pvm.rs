@@ -361,6 +361,8 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         base_causal_height: None,
         imported_actors: vec![ImportedActorV2 {
             actor: ActorId([5; 32]),
+            name: "root".into(),
+            parent: None,
             program: actor_program,
             state,
             causal_states: vec![],
@@ -385,6 +387,8 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let mut work = work(actor_program, state.clone());
     work.imported_actors.push(ImportedActorV2 {
         actor: ActorId([6; 32]),
+        name: "child".into(),
+        parent: Some(work.target),
         program: actor_program,
         state: state.clone(),
         causal_states: vec![],
@@ -503,6 +507,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         consistency: ConsistencyModeV2::Crdt,
         actors: vec![ActorGenesisV2 {
             actor: work.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),
@@ -782,6 +787,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
         consistency: ConsistencyModeV2::Crdt,
         actors: vec![ActorGenesisV2 {
             actor: first_work.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial,
@@ -1012,6 +1018,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
             actor: first_work.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial_state_ref.clone(),
@@ -1307,6 +1314,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
             actor: seed_work.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial_state_ref,
@@ -1595,6 +1603,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         actors: vec![
             ActorGenesisV2 {
                 actor: caller,
+                name: "root".into(),
                 parent: None,
                 program: actor_program,
                 initial_state: initial_state_ref.clone(),
@@ -1611,6 +1620,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             },
             ActorGenesisV2 {
                 actor: target,
+                name: "child".into(),
                 parent: Some(caller),
                 program: actor_program,
                 initial_state: initial_state_ref,
@@ -2160,6 +2170,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actors: vec![
             ActorGenesisV2 {
                 actor: seed_work.target,
+                name: "root".into(),
                 parent: None,
                 program: actor_program,
                 initial_state: initial.clone(),
@@ -2176,6 +2187,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             },
             ActorGenesisV2 {
                 actor: child,
+                name: "child".into(),
                 parent: Some(seed_work.target),
                 program: actor_program,
                 initial_state: initial.clone(),
@@ -3010,6 +3022,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
             actor: work.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),
@@ -3186,6 +3199,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
             actor: seed.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),
@@ -3390,6 +3404,7 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
             actor: seed_work.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial,
@@ -3449,6 +3464,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
             actor: seed_work.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: seed_work.imported_actors[0].state.clone(),
@@ -3499,6 +3515,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
                 actor,
+                name: "root".into(),
                 parent: None,
                 program: actor_program,
                 initial_state: initial_state_ref.clone(),
@@ -3854,6 +3871,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
             actor: seed.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),
@@ -4141,6 +4159,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
             actor: seed.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),
@@ -4316,6 +4335,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
             actor: seed.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),
@@ -4494,6 +4514,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
             actor: seed.target,
+            name: "root".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),

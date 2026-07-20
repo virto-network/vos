@@ -292,6 +292,7 @@ mod tests {
 
         let descriptor = ActorGenesisV2 {
             actor: ActorId([7; 32]),
+            name: "root".into(),
             parent: None,
             program: super::super::ProgramId([8; 32]),
             initial_state: BlobRefV2::of_bytes(b"initial"),

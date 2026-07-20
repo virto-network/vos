@@ -169,12 +169,14 @@ impl VosPackageV2 {
     pub fn actor_genesis(
         &self,
         actor: ActorId,
+        name: String,
         parent: Option<ActorId>,
         initial_state: BlobRefV2,
     ) -> Result<ActorGenesisV2, PackageError> {
         self.validate()?;
         Ok(ActorGenesisV2 {
             actor,
+            name,
             parent,
             program: self.manifest.actor_program,
             initial_state,
@@ -529,7 +531,9 @@ mod tests {
         let package = package();
         let actor = ActorId([7; 32]);
         let state = BlobRefV2::of_bytes(b"initial state");
-        let genesis = package.actor_genesis(actor, None, state.clone()).unwrap();
+        let genesis = package
+            .actor_genesis(actor, "root".into(), None, state.clone())
+            .unwrap();
         let policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
         assert_eq!(genesis.actor, actor);
         assert_eq!(genesis.program, package.manifest.actor_program);

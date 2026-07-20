@@ -15,8 +15,8 @@ use javm::vm_pool::VmState;
 
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
-    ActorSliceInputV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2,
-    ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, Hash, ImportedBlobV2,
+    ActorSliceInputV2, ActorTreeImportV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
+    CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, Hash, ImportedBlobV2,
     MAX_ROOT_TREE_ACTORS, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, RoleCredentialV2,
     TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
@@ -340,12 +340,34 @@ impl ServicePvmV2 {
             .map(|reference| imported_blob_bytes(imports, reference).map(<[u8]>::to_vec))
             .collect::<Result<Vec<_>, _>>()?;
         let (space_role, actor_role) = authorization_roles(&work, imports)?;
+        let actor_tree = work
+            .imported_actors
+            .iter()
+            .map(|actor| {
+                Ok(ActorTreeImportV2 {
+                    actor: actor.actor,
+                    name: actor.name.clone(),
+                    parent: actor.parent,
+                    program: actor.program,
+                    state: imported_blob_bytes(imports, &actor.state)?.to_vec(),
+                    causal_states: actor
+                        .causal_states
+                        .iter()
+                        .map(|reference| {
+                            imported_blob_bytes(imports, reference).map(<[u8]>::to_vec)
+                        })
+                        .collect::<Result<Vec<_>, ServicePvmErrorV2>>()?,
+                    suspended: actor.continuation.is_some(),
+                })
+            })
+            .collect::<Result<Vec<_>, ServicePvmErrorV2>>()?;
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
             input: work.input_id(),
             change: crdt_dispatch(&work, 0),
             state: target_state.to_vec(),
             causal_states,
+            actor_tree,
             message: work.arguments.clone(),
             origin: work.origin,
             space_role,
