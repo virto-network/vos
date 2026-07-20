@@ -49,7 +49,10 @@ pub use pvm::{
     RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
 };
 pub use service::{JamServiceV2, ServiceDispatchError, ServiceDispatchOutputV2};
-pub use storage::{StoreHeaderV2, StoreOpenError};
+pub use storage::{
+    DedupRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError,
+    crdt_node_storage_key, dedup_storage_key, header_storage_key, receipt_storage_key,
+};
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
