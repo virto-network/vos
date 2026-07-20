@@ -272,6 +272,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     message.extend_from_slice(&Msg::new("start").encode());
     WorkEnvelopeV2 {
         service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0; 32]),
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
@@ -2978,6 +2979,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
     };
 
     let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([79; 32]),
         root_service: RootServiceId([80; 32]),
         deployment: DeploymentId([81; 32]),
         service_program,
@@ -2985,6 +2987,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
     };
     let destination_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([79; 32]),
         root_service: RootServiceId([82; 32]),
         deployment: DeploymentId([83; 32]),
         service_program,

@@ -14,7 +14,7 @@ use super::{
     InvocationId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 5;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 6;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -524,6 +524,7 @@ fn decode_input(d: &mut Decoder<'_>) -> Result<WorkInputIdV2, DecodeError> {
 }
 
 fn encode_service(e: &mut Encoder<'_>, service: &ServiceIdentityV2) {
+    e.fixed(&service.space.0);
     e.fixed(&service.root_service.0);
     e.fixed(&service.deployment.0);
     e.fixed(&service.service_program.0);
@@ -533,6 +534,7 @@ fn encode_service(e: &mut Encoder<'_>, service: &ServiceIdentityV2) {
 
 fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
     Ok(ServiceIdentityV2 {
+        space: super::SpaceId(d.fixed()?),
         root_service: super::RootServiceId(d.fixed()?),
         deployment: super::DeploymentId(d.fixed()?),
         service_program: super::ProgramId(d.fixed()?),
@@ -598,6 +600,7 @@ mod tests {
 
     fn service(byte: u8) -> ServiceIdentityV2 {
         ServiceIdentityV2 {
+            space: crate::v2::SpaceId([0; 32]),
             root_service: RootServiceId([byte; 32]),
             deployment: DeploymentId([byte.wrapping_add(1); 32]),
             service_program: ProgramId([byte.wrapping_add(2); 32]),

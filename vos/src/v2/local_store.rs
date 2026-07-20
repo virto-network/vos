@@ -905,6 +905,7 @@ mod tests {
     fn valid_header() -> StoreHeaderV2 {
         StoreHeaderV2::current(
             super::super::ServiceIdentityV2 {
+                space: super::super::SpaceId([1; 32]),
                 root_service: super::super::RootServiceId([2; 32]),
                 deployment: super::super::DeploymentId([3; 32]),
                 service_program: ProgramId([4; 32]),

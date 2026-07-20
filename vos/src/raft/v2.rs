@@ -343,13 +343,14 @@ mod tests {
     use super::*;
     use crate::v2::{
         ABI_VERSION, DeploymentId, EXECUTION_SEMANTICS_ID, Hash, InvocationId, ProgramId,
-        PublicationAckV2, RootServiceId, ServiceIdentityV2, WorkInputIdV2,
+        PublicationAckV2, RootServiceId, ServiceIdentityV2, SpaceId, WorkInputIdV2,
     };
     use vos_raft::{Meta, Storage, WriteBatch};
 
     fn request(byte: u8) -> AccumulateRequestV2 {
         AccumulateRequestV2::AcknowledgePublication(PublicationAckV2 {
             service: ServiceIdentityV2 {
+                space: SpaceId([2; 32]),
                 root_service: RootServiceId([byte; 32]),
                 deployment: DeploymentId([3; 32]),
                 service_program: ProgramId([4; 32]),
