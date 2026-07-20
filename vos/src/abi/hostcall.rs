@@ -97,6 +97,11 @@ pub const NOW_MS: u32 = 121;
 /// continues immediately after the source-level `.await`.
 pub const SUSPEND: u32 = 122;
 
+/// Validate an attestation proof against guest-derived public inputs.
+/// Installed only on the generic service's Accumulate entry; actor PVMs and
+/// Refine never receive this capability.
+pub const PROOF_VERIFY: u32 = 123;
+
 /// Validate an external service's exact accumulation receipt before a
 /// committed reply is admitted as continuation input. Accumulate-only.
 pub const RECEIPT_VERIFY: u32 = 125;
@@ -122,6 +127,7 @@ mod tests {
             BOOT_CONTEXT,
             NOW_MS,
             SUSPEND,
+            PROOF_VERIFY,
             RECEIPT_VERIFY,
             INSTALL_AUTH_VERIFY,
             PROGRAM_LOOKUP,
@@ -152,6 +158,7 @@ mod tests {
             BOOT_CONTEXT as u8,
             NOW_MS as u8,
             SUSPEND as u8,
+            PROOF_VERIFY as u8,
             RECEIPT_VERIFY as u8,
             INSTALL_AUTH_VERIFY as u8,
             PROGRAM_LOOKUP as u8,

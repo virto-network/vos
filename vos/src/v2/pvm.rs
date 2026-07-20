@@ -750,6 +750,7 @@ fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
         crate::abi::hostcall::GROW_HEAP as u8,
         crate::abi::hostcall::DEBUG_WRITE as u8,
+        crate::abi::hostcall::PROOF_VERIFY as u8,
         crate::abi::hostcall::RECEIPT_VERIFY as u8,
         crate::abi::hostcall::INSTALL_AUTH_VERIFY as u8,
         crate::abi::hostcall::PROGRAM_LOOKUP as u8,

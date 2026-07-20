@@ -502,9 +502,28 @@ pub struct GasAccountingV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProofCommitmentV2 {
+    pub statement: Hash,
     pub trace: Hash,
     pub proof_blob: BlobRefV2,
     pub statement_version: u16,
+}
+
+/// Exact public inputs passed from guest Accumulate to the configured proof
+/// verifier capability. Proof bytes remain content addressed and are read by
+/// the host from `proof_blob`; the guest never trusts a host-supplied claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofVerificationRequestV2 {
+    pub actor_program: ProgramId,
+    pub execution_semantics: Hash,
+    pub statement: Hash,
+    pub trace: Hash,
+    pub proof_blob: BlobRefV2,
+}
+
+impl ProofVerificationRequestV2 {
+    pub fn hash(&self) -> Hash {
+        Hash::digest(b"vos/proof-verification/v2", &[&self.encode()])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1508,6 +1527,33 @@ impl V2Wire for ReceiptVerificationRequestV2 {
     }
 }
 
+impl V2Wire for ProofVerificationRequestV2 {
+    const MAGIC: [u8; 4] = *b"VPV2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.actor_program.0);
+        e.fixed(&self.execution_semantics.0);
+        e.fixed(&self.statement.0);
+        e.fixed(&self.trace.0);
+        encode_blob_ref(&mut e, &self.proof_blob);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            actor_program: ProgramId(d.fixed()?),
+            execution_semantics: Hash(d.fixed()?),
+            statement: Hash(d.fixed()?),
+            trace: Hash(d.fixed()?),
+            proof_blob: decode_blob_ref(d)?,
+        };
+        if value.statement == Hash::ZERO || value.trace == Hash::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for ServiceGenesisV2 {
     const MAGIC: [u8; 4] = *b"VGN2";
 
@@ -2024,6 +2070,7 @@ fn transition_blob_references(transition: &TransitionV2) -> impl Iterator<Item =
                 .flat_map(|change| change.materializations.iter())
                 .map(|materialization| &materialization.state),
         )
+        .chain(transition.proof.iter().map(|proof| &proof.proof_blob))
 }
 
 pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRefV2> {
@@ -2566,6 +2613,7 @@ fn decode_reply(d: &mut Decoder<'_>) -> Result<ReplyRecordV2, DecodeError> {
 }
 
 fn encode_proof(e: &mut Encoder<'_>, value: &ProofCommitmentV2) {
+    e.fixed(&value.statement.0);
     e.fixed(&value.trace.0);
     encode_blob_ref(e, &value.proof_blob);
     e.u16(value.statement_version);
@@ -2573,11 +2621,15 @@ fn encode_proof(e: &mut Encoder<'_>, value: &ProofCommitmentV2) {
 
 fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitmentV2, DecodeError> {
     let value = ProofCommitmentV2 {
+        statement: Hash(d.fixed()?),
         trace: Hash(d.fixed()?),
         proof_blob: decode_blob_ref(d)?,
         statement_version: d.u16()?,
     };
-    if value.statement_version != super::ATTESTATION_STATEMENT_VERSION {
+    if value.statement_version != super::ATTESTATION_STATEMENT_VERSION
+        || value.statement == Hash::ZERO
+        || value.trace == Hash::ZERO
+    {
         return Err(DecodeError::InvalidVersion);
     }
     Ok(value)
@@ -2956,6 +3008,7 @@ mod tests {
 
         let mut proved = changed.clone();
         proved.proof = Some(ProofCommitmentV2 {
+            statement: Hash([14; 32]),
             trace: Hash([13; 32]),
             proof_blob: BlobRefV2::of_bytes(b"proof"),
             statement_version: super::super::ATTESTATION_STATEMENT_VERSION,

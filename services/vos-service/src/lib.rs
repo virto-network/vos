@@ -449,6 +449,17 @@ mod guest {
             }
         }
 
+        fn verify_proof(
+            &self,
+            request: &vos::v2::ProofVerificationRequestV2,
+        ) -> Result<vos::v2::ProofVerificationV2, Self::Error> {
+            Ok(match hostcalls::verify_proof(&request.encode()) {
+                error::HOST_OK => vos::v2::ProofVerificationV2::Valid,
+                error::HOST_NONE => vos::v2::ProofVerificationV2::Unavailable,
+                _ => vos::v2::ProofVerificationV2::Invalid,
+            })
+        }
+
         fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error> {
             Ok(hostcalls::program_available(&program.0) == error::HOST_OK)
         }
