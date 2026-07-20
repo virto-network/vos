@@ -550,6 +550,7 @@ impl ServicePvmV2 {
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
             actor_tree,
+            first_await_ordinal: 0,
             message: work.arguments.clone(),
         }
         .encode();

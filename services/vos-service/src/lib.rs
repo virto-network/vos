@@ -109,7 +109,10 @@ mod guest {
         };
         let call_result =
             ActorCallResultV2::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
-        if call_result.actor != work.target || call_result.forbidden {
+        if call_result.actor != work.target
+            || call_result.first_await_ordinal != 0
+            || call_result.forbidden
+        {
             fail_closed();
         }
         // SAFETY: Refine is single-threaded and this invocation owns the
@@ -433,6 +436,8 @@ mod guest {
 
         let mut root = root.unwrap_or_else(|| fail_closed());
         if root.reply != call_result.reply
+            || root.first_await_ordinal != call_result.first_await_ordinal
+            || root.next_await_ordinal != call_result.next_await_ordinal
             || root.yielded != call_result.yielded
             || root.forbidden != call_result.forbidden
             || root.checkpoint != call_result.checkpoint

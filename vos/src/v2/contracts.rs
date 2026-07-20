@@ -188,6 +188,9 @@ pub struct ActorSliceInputV2 {
     /// and same-tree CALLABLE slots only from this authenticated metadata.
     /// Sibling state is not included.
     pub actor_tree: Vec<ActorTreeImportV2>,
+    /// First tree-wide await ordinal available to this actor and its inline
+    /// descendants.
+    pub first_await_ordinal: u64,
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
 }
@@ -225,6 +228,9 @@ pub struct ActorPrivateInputV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorCallResultV2 {
     pub actor: ActorId,
+    pub first_await_ordinal: u64,
+    /// First tree-wide await ordinal not consumed by this actor subtree.
+    pub next_await_ordinal: u64,
     pub reply: Vec<u8>,
     pub yielded: bool,
     pub forbidden: bool,
@@ -281,6 +287,9 @@ impl ActorSliceInputV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSliceOutputV2 {
     pub actor: ActorId,
+    pub first_await_ordinal: u64,
+    /// First tree-wide await ordinal not consumed by this actor tree slice.
+    pub next_await_ordinal: u64,
     pub writes: Vec<ActorWriteV2>,
     /// Concrete field operations emitted by one `#[actor(crdt)]` execution
     /// slice. Ordinary actors always leave this empty.
@@ -1385,6 +1394,7 @@ impl V2Wire for ActorSliceInputV2 {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
         e.list(&self.actor_tree, encode_actor_tree_import);
+        e.u64(self.first_await_ordinal);
         e.bytes(&self.message);
     }
 
@@ -1392,6 +1402,7 @@ impl V2Wire for ActorSliceInputV2 {
         let value = Self {
             actor: ActorId(d.fixed()?),
             actor_tree: d.list(decode_actor_tree_import)?,
+            first_await_ordinal: d.u64()?,
             message: d.bytes()?,
         };
         ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
@@ -1467,6 +1478,8 @@ impl V2Wire for ActorCallResultV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
+        e.u64(self.first_await_ordinal);
+        e.u64(self.next_await_ordinal);
         e.bytes(&self.reply);
         e.bool(self.yielded);
         e.bool(self.forbidden);
@@ -1476,17 +1489,20 @@ impl V2Wire for ActorCallResultV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             actor: ActorId(d.fixed()?),
+            first_await_ordinal: d.u64()?,
+            next_await_ordinal: d.u64()?,
             reply: d.bytes()?,
             yielded: d.bool()?,
             forbidden: d.bool()?,
             checkpoint: d.option(decode_checkpoint_token)?,
         };
-        if value.yielded
-            != value
-                .checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.replacement.as_ref())
-                .is_some()
+        if value.first_await_ordinal > value.next_await_ordinal
+            || value.yielded
+                != value
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.replacement.as_ref())
+                    .is_some()
             || (value.forbidden
                 && (value.yielded || !value.reply.is_empty() || value.checkpoint.is_some()))
         {
@@ -1519,6 +1535,8 @@ impl V2Wire for ActorSliceOutputV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
+        e.u64(self.first_await_ordinal);
+        e.u64(self.next_await_ordinal);
         e.list(&self.writes, encode_write);
         e.list(&self.crdt_operations, encode_crdt_op);
         e.option(&self.crdt_materialization, |e, state| e.bytes(state));
@@ -1532,6 +1550,8 @@ impl V2Wire for ActorSliceOutputV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             actor: ActorId(d.fixed()?),
+            first_await_ordinal: d.u64()?,
+            next_await_ordinal: d.u64()?,
             writes: d.list(decode_write)?,
             crdt_operations: d.list(decode_crdt_op)?,
             crdt_materialization: d.option(Decoder::bytes)?,
@@ -1541,7 +1561,12 @@ impl V2Wire for ActorSliceOutputV2 {
             forbidden: d.bool()?,
             checkpoint: d.option(decode_checkpoint_token)?,
         };
-        if value.writes.iter().any(|write| write.actor != value.actor)
+        if value.first_await_ordinal > value.next_await_ordinal
+            || value.outbox.iter().any(|call| {
+                call.await_ordinal < value.first_await_ordinal
+                    || call.await_ordinal >= value.next_await_ordinal
+            })
+            || value.writes.iter().any(|write| write.actor != value.actor)
             || value
                 .writes
                 .windows(2)
@@ -3564,6 +3589,7 @@ mod tests {
                     suspended: false,
                 },
             ],
+            first_await_ordinal: 7,
             message: b"message".to_vec(),
         };
         let private = ActorPrivateInputV2 {
@@ -3606,6 +3632,8 @@ mod tests {
 
         let output = ActorSliceOutputV2 {
             actor: ActorId([21; 32]),
+            first_await_ordinal: 7,
+            next_await_ordinal: 8,
             writes: vec![ActorWriteV2 {
                 actor: ActorId([21; 32]),
                 key: b"state".to_vec(),
@@ -3614,7 +3642,7 @@ mod tests {
             crdt_operations: vec![],
             crdt_materialization: None,
             outbox: vec![ActorCallRequestV2 {
-                await_ordinal: 0,
+                await_ordinal: 7,
                 from: ActorId([21; 32]),
                 to: ActorId([27; 32]),
                 payload: b"peer request".to_vec(),
@@ -3716,6 +3744,8 @@ mod tests {
 
         let mut invalid_yield = ActorSliceOutputV2 {
             actor: ActorId([21; 32]),
+            first_await_ordinal: 7,
+            next_await_ordinal: 7,
             writes: vec![],
             crdt_operations: vec![],
             crdt_materialization: None,

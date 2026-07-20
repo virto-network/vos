@@ -62,6 +62,8 @@ pub struct Context<A: Actor> {
     #[cfg(feature = "pvm")]
     pending_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
     #[cfg(feature = "pvm")]
+    first_await_ordinal: u64,
+    #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
     #[cfg(feature = "pvm")]
     actor_tree: Vec<crate::v2::ActorTreeImportV2>,
@@ -113,6 +115,8 @@ impl<A: Actor> Context<A> {
             pending_provides: Vec::new(),
             #[cfg(feature = "pvm")]
             pending_actor_calls: Vec::new(),
+            #[cfg(feature = "pvm")]
+            first_await_ordinal: 0,
             #[cfg(feature = "pvm")]
             next_await_ordinal: 0,
             #[cfg(feature = "pvm")]
@@ -173,10 +177,13 @@ impl<A: Actor> Context<A> {
         actor_tree: Vec<crate::v2::ActorTreeImportV2>,
         change: Option<crate::v2::ChangeId>,
         ipc_capacity: usize,
+        first_await_ordinal: u64,
     ) {
         self.actor_tree = actor_tree;
         self.actor_change = change;
         self.actor_ipc_capacity = ipc_capacity;
+        self.first_await_ordinal = first_await_ordinal;
+        self.next_await_ordinal = first_await_ordinal;
     }
 
     /// Who invoked the currently-running handler. The host writes
@@ -603,6 +610,7 @@ impl<A: Actor> Context<A> {
         let child_input = crate::v2::ActorSliceInputV2 {
             actor: target,
             actor_tree: self.actor_tree.clone(),
+            first_await_ordinal: self.next_await_ordinal,
             message: payload.to_vec(),
         };
         let encoded = <crate::v2::ActorSliceInputV2 as crate::v2::V2Wire>::encode(&child_input);
@@ -644,11 +652,16 @@ impl<A: Actor> Context<A> {
                 super::value::InvokeError::Panicked,
             ));
         };
-        if output.actor != target || output.forbidden {
+        if output.actor != target
+            || output.first_await_ordinal != self.next_await_ordinal
+            || output.next_await_ordinal < output.first_await_ordinal
+            || output.forbidden
+        {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::Panicked,
             ));
         }
+        self.next_await_ordinal = output.next_await_ordinal;
         if output.yielded {
             let Some(checkpoint) = output.checkpoint else {
                 return Some(super::run::Ask::ready_err(
@@ -1255,6 +1268,12 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn __drain_actor_calls_v2(&mut self) -> Vec<crate::v2::ActorCallRequestV2> {
         core::mem::take(&mut self.pending_actor_calls)
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __await_ordinal_range_v2(&self) -> (u64, u64) {
+        (self.first_await_ordinal, self.next_await_ordinal)
     }
 }
 

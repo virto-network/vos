@@ -816,6 +816,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let ActorSliceInputV2 {
         actor: _,
         actor_tree,
+        first_await_ordinal,
         message,
     } = input;
     let mut actor = lifecycle::load_or_create::<A>(Some(&state));
@@ -830,7 +831,12 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // in Context and all v2 scheduler effects use that value.
     let mut ctx = super::Context::new(ServiceId(0));
     ctx.__set_actor_id(actor_id);
-    ctx.__set_actor_tree_v2(actor_tree, change.map(|change| change.change), capacity);
+    ctx.__set_actor_tree_v2(
+        actor_tree,
+        change.map(|change| change.change),
+        capacity,
+        first_await_ordinal,
+    );
     ctx.__set_origin(origin);
     ctx.set_caller_roles(space_role, actor_role);
 
@@ -897,8 +903,11 @@ pub fn run_nested_actor_service<A: super::Actor>(
         .__drain_actor_writes_v2(actor_id, super::storage::end_dispatch(), linear_state)
         .expect("nested actor emitted an unsupported v2 effect");
     let outbox = ctx.__drain_actor_calls_v2();
+    let (first_await_ordinal, next_await_ordinal) = ctx.__await_ordinal_range_v2();
     let output = ActorSliceOutputV2 {
         actor: actor_id,
+        first_await_ordinal,
+        next_await_ordinal,
         writes,
         crdt_operations,
         crdt_materialization,
@@ -920,6 +929,8 @@ pub fn run_nested_actor_service<A: super::Actor>(
     );
     let encoded = ActorCallResultV2 {
         actor: actor_id,
+        first_await_ordinal,
+        next_await_ordinal,
         reply: output.reply,
         yielded,
         forbidden,
