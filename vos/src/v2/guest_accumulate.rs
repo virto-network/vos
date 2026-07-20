@@ -61,11 +61,17 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
     };
     match request {
         AccumulateRequestV2::Install(genesis) => install(store, &genesis),
-        AccumulateRequestV2::Apply(envelope) => apply(store, &envelope),
-        AccumulateRequestV2::PrepareAttested(_) => {
-            Ok(rejected(AccumulationRejectionV2::ProofUnavailable))
+        AccumulateRequestV2::Apply(envelope) => apply(store, &envelope, ApplyMode::Commit),
+        AccumulateRequestV2::PrepareAttested(envelope) => {
+            apply(store, &envelope, ApplyMode::PrepareAttested)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    Commit,
+    PrepareAttested,
 }
 
 fn install<S: GuestAccumulateStoreV2>(
@@ -130,6 +136,7 @@ fn install<S: GuestAccumulateStoreV2>(
 fn apply<S: GuestAccumulateStoreV2>(
     store: &mut S,
     envelope: &AccumulationEnvelopeV2,
+    mode: ApplyMode,
 ) -> GuestResult<AccumulationResultV2, S::Error> {
     let Some(header_bytes) = read(store, header_storage_key())? else {
         return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
@@ -173,10 +180,13 @@ fn apply<S: GuestAccumulateStoreV2>(
             && record.work_hash == work_hash
             && record.transition_commitment == transition_commitment
         {
-            Ok(AccumulationResultV2::Accepted {
-                receipt: record.receipt,
-                published: PublishedEffectsV2::default(),
-                duplicate: true,
+            Ok(match mode {
+                ApplyMode::Commit => AccumulationResultV2::Accepted {
+                    receipt: record.receipt,
+                    published: PublishedEffectsV2::default(),
+                    duplicate: true,
+                },
+                ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(record.receipt),
             })
         } else {
             Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
@@ -211,15 +221,25 @@ fn apply<S: GuestAccumulateStoreV2>(
     if !work_matches_durable_inbox(&tree, work)? {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
-    if policy.attested || work.proof_requested {
-        return Ok(rejected(if transition.proof.is_none() {
-            AccumulationRejectionV2::MissingProof
-        } else {
-            AccumulationRejectionV2::ProofUnavailable
-        }));
-    }
-    if transition.proof.is_some() {
-        return Ok(rejected(AccumulationRejectionV2::ProofUnavailable));
+    let proof_required = policy.attested || work.proof_requested;
+    match mode {
+        ApplyMode::PrepareAttested => {
+            if !proof_required || transition.proof.is_some() {
+                return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+            }
+        }
+        ApplyMode::Commit => {
+            if proof_required {
+                return Ok(rejected(if transition.proof.is_none() {
+                    AccumulationRejectionV2::MissingProof
+                } else {
+                    AccumulationRejectionV2::ProofUnavailable
+                }));
+            }
+            if transition.proof.is_some() {
+                return Ok(rejected(AccumulationRejectionV2::ProofUnavailable));
+            }
+        }
     }
 
     if transition.consumed_input != work.input_id() {
@@ -480,15 +500,18 @@ fn apply<S: GuestAccumulateStoreV2>(
         Some(&record.encode()),
     )?;
 
-    Ok(AccumulationResultV2::Accepted {
-        receipt,
-        published: PublishedEffectsV2 {
-            reply: transition.reply.clone(),
-            outbox: transition.outbox.clone(),
-            exported_blobs: transition.exported_blobs.clone(),
-            proof: transition.proof.clone(),
+    Ok(match mode {
+        ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(receipt),
+        ApplyMode::Commit => AccumulationResultV2::Accepted {
+            receipt,
+            published: PublishedEffectsV2 {
+                reply: transition.reply.clone(),
+                outbox: transition.outbox.clone(),
+                exported_blobs: transition.exported_blobs.clone(),
+                proof: transition.proof.clone(),
+            },
+            duplicate: false,
         },
-        duplicate: false,
     })
 }
 

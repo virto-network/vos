@@ -790,6 +790,35 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         gas: GasAccountingV2::default(),
         proof: None,
     };
+
+    let before_prepare = service.accumulate_host().snapshot();
+    let mut proof_work = work.clone();
+    proof_work.proof_requested = true;
+    let prepared_attestation = service
+        .accumulate(&AccumulateRequestV2::PrepareAttested(
+            AccumulationEnvelopeV2 {
+                work: proof_work,
+                transition: transition.clone(),
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: continuation_ref.clone(),
+                    bytes: continuation_bytes.clone(),
+                }],
+            },
+        ))
+        .expect("guest predicts the attested receipt without committing");
+    let AccumulationResultV2::Prepared(predicted) = prepared_attestation.result else {
+        panic!("guest did not prepare the attested transition")
+    };
+    assert_eq!(predicted.accepted_transition, transition.commitment());
+    assert_eq!(predicted.sequence, 1);
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_prepare)
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), 1);
+
     let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
         work: work.clone(),
         transition: transition.clone(),
