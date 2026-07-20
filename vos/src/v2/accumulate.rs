@@ -797,7 +797,7 @@ mod tests {
             causal_dependencies: vec![left],
             causal_height: 1,
             operations: vec![operation],
-            workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
+            workflow: vec![WorkflowOperationV2::Checkpoint(work.workflow_checkpoint())],
             materializations: vec![],
         };
         let emitted = change.cid();

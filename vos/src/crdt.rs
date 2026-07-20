@@ -92,6 +92,38 @@ pub fn reset_actor_slice() {
     }
 }
 
+/// Advance a restored actor machine to the CRDT identity of its next durable
+/// execution slice. The actor heap remains untouched; only operations already
+/// committed with the checkpoint are discarded and ordinal allocation starts
+/// again under the new change.
+#[doc(hidden)]
+pub fn rebind_change(change: ChangeId) -> Result<(), Error> {
+    #[cfg(feature = "std")]
+    {
+        CHANGE_SCOPE.with(|scope| {
+            let mut scope = scope.borrow_mut();
+            let scope = scope.as_mut().ok_or(Error::NoChangeScope)?;
+            scope.change = change;
+            scope.next_ordinal = 0;
+            scope.operations.clear();
+            COMPLETED_CHANGE.with(|completed| *completed.borrow_mut() = None);
+            Ok(())
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // SAFETY: guest dispatch is single-threaded and a continuation can be
+        // resumed only while its captured change scope is active.
+        let state = unsafe { &mut *CHANGE_STATE.0.get() };
+        let scope = state.active.as_mut().ok_or(Error::NoChangeScope)?;
+        scope.change = change;
+        scope.next_ordinal = 0;
+        scope.operations.clear();
+        state.completed = None;
+        Ok(())
+    }
+}
+
 fn field_tag(actor: &str, field: &str) -> crate::v2::Hash {
     crate::v2::Hash::digest(
         b"vos/crdt-field-tag/v2",
@@ -1344,6 +1376,34 @@ mod tests {
         let mut value = Value::default();
         with_change(change(4), || value.set(String::from("ready"))).unwrap();
         assert_eq!(value.visible_id(), Some(change(4).operation(0)));
+    }
+
+    #[test]
+    fn restored_slice_rebinds_and_discards_checkpoint_operations() {
+        let mut counter = Counter::default();
+        Field::__vos_init(&mut counter, "Board", "edits");
+        let actor = crate::v2::ActorId([5; 32]);
+        let before = change(5);
+        let after = change(6);
+
+        with_change(before, || {
+            counter.increment(2)?;
+            rebind_change(after)?;
+            counter.increment(3)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let (operations, next_ordinal) =
+            take_operation_batch(actor, crate::v2::ChangeId(after.0)).unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].ordinal, 0);
+        assert_eq!(
+            operations[0].id,
+            crate::v2::ChangeId(after.0).operation(actor, field_tag("Board", "edits"), 0,)
+        );
+        assert_eq!(next_ordinal, 1);
+        assert_eq!(counter.value(), 5);
     }
 
     #[test]

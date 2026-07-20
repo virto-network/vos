@@ -25,7 +25,7 @@ use vos::v2::{
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
     ServicePvmV2, SpaceRoleCredentialV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
-    public_policy_hash, space_role_policy_hash,
+    WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     AttestedMethod, Decode, Encode,
@@ -1246,6 +1246,20 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
                         attested: false,
                     },
                     MethodPolicyV2 {
+                        method: "increment_around_peer".into(),
+                        schema: Hash([51; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                    MethodPolicyV2 {
+                        method: "increment_child_around_peer".into(),
+                        schema: Hash([52; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                    MethodPolicyV2 {
                         method: "increment_child_twice".into(),
                         schema: Hash([49; 32]),
                         policy: public_policy_hash(),
@@ -1261,13 +1275,22 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: true,
-                methods: vec![MethodPolicyV2 {
-                    method: "increment".into(),
-                    schema: Hash([50; 32]),
-                    policy: public_policy_hash(),
-                    public: true,
-                    attested: false,
-                }],
+                methods: vec![
+                    MethodPolicyV2 {
+                        method: "increment".into(),
+                        schema: Hash([50; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                    MethodPolicyV2 {
+                        method: "increment_around_peer".into(),
+                        schema: Hash([53; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                ],
             },
         ],
         authorization: AuthorizationEvidenceV2::SystemCapability {
@@ -1560,6 +1583,258 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             ..
         }
     ));
+
+    // Refine two branches from the same causal base before either commits.
+    // One branch checkpoints between two mutations; the other is a genuinely
+    // concurrent replica update which must not be injected into the captured
+    // heap when the first workflow resumes.
+    let mut around_arguments = vec![vos::value::TAG_DYNAMIC];
+    around_arguments.extend_from_slice(
+        &Msg::new("increment_child_around_peer")
+            .with("before", 5u64)
+            .with("after", 7u64)
+            .with("parent_after", 13u64)
+            .encode(),
+    );
+    let around = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([52; 32]),
+            workflow_step: 0,
+            logical_timeslot: 3,
+            target: work.target,
+            method: "increment_child_around_peer".into(),
+            arguments: around_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let mut concurrent_arguments = vec![vos::value::TAG_DYNAMIC];
+    concurrent_arguments.extend_from_slice(&Msg::new("increment").with("amount", 11u64).encode());
+    let concurrent = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([53; 32]),
+            workflow_step: 0,
+            logical_timeslot: 3,
+            target: work.target,
+            method: "increment".into(),
+            arguments: concurrent_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(around.work.base, concurrent.work.base);
+    let around_refined = service
+        .refine_actor_tree(&around.work, &around.imports)
+        .expect("CRDT workflow checkpoints after its pre-await mutation");
+    let concurrent_refined = service
+        .refine_actor_tree(&concurrent.work, &concurrent.imports)
+        .expect("concurrent CRDT work refines from the same causal base");
+    let checkpoint_change = around_refined.transition.crdt_change.as_ref().unwrap();
+    assert_eq!(checkpoint_change.operations.len(), 1);
+    assert_eq!(checkpoint_change.operations[0].actor, child);
+    assert_eq!(checkpoint_change.operations[0].ordinal, 0);
+    assert!(around_refined.transition.reply.is_none());
+    assert_eq!(around_refined.transition.outbox.len(), 1);
+    let pending_call = around_refined.transition.outbox[0].call_id;
+    let checkpoint_cid = checkpoint_change.cid();
+    let concurrent_cid = concurrent_refined
+        .transition
+        .crdt_change
+        .as_ref()
+        .unwrap()
+        .cid();
+
+    for artifact in &around_refined.exported_blobs {
+        assert_eq!(
+            service
+                .accumulate_host_mut()
+                .import_blob(artifact.bytes.clone()),
+            artifact.reference
+        );
+    }
+
+    let checkpoint_apply = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: around.work.clone(),
+            transition: around_refined.transition,
+            provided_blobs: vec![],
+        }))
+        .unwrap()
+        .result;
+    assert!(matches!(
+        checkpoint_apply,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let concurrent_apply = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: concurrent.work,
+            transition: concurrent_refined.transition,
+            provided_blobs: concurrent_refined.exported_blobs,
+        }))
+        .unwrap()
+        .result;
+    let AccumulationResultV2::Accepted { receipt, .. } = &concurrent_apply else {
+        panic!("concurrent CRDT branch was rejected: {concurrent_apply:?}")
+    };
+    let mut concurrent_heads = vec![checkpoint_cid, concurrent_cid];
+    concurrent_heads.sort();
+    assert_eq!(receipt.resulting_crdt_heads, concurrent_heads);
+
+    let reply = ReplyRecordV2 {
+        call_id: pending_call,
+        producer: ActorId([44; 32]),
+        result: Value::U32(0).encode(),
+    };
+    let mut remote_service = around.work.service.clone();
+    remote_service.root_service = RootServiceId([54; 32]);
+    remote_service.deployment = DeploymentId([55; 32]);
+    let awaited = AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: remote_service,
+            accepted_transition: Hash([56; 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([57; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply,
+    };
+    service
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: awaited.receipt.clone(),
+        });
+    let resumed = LocalWorkSchedulerV2::prepare_resume(
+        service.accumulate_host(),
+        around.work.invocation,
+        4,
+        Some(awaited),
+    )
+    .expect("CRDT resume selects only the checkpoint's causal branch");
+    assert_eq!(
+        resumed.work.base,
+        ConsistencyBaseV2::Crdt {
+            heads: vec![checkpoint_cid]
+        }
+    );
+    assert_eq!(resumed.work.base_causal_height, Some(4));
+    assert!(resumed.work.imported_actors[0].causal_states.is_empty());
+    let resumed_refined = service
+        .refine_actor_tree(&resumed.work, &resumed.imports)
+        .expect("restored CRDT machine rebinds to the new slice change");
+    let resumed_change = resumed_refined.transition.crdt_change.as_ref().unwrap();
+    assert_eq!(resumed_change.causal_dependencies, vec![checkpoint_cid]);
+    assert!(
+        resumed_change
+            .workflow
+            .contains(&WorkflowOperationV2::ConsumeOutbox(pending_call))
+    );
+    assert_eq!(resumed_change.operations.len(), 2);
+    assert!(resumed_change.operations.iter().all(|operation| {
+        operation.ordinal == 0
+            && operation.id
+                == resumed_change
+                    .id
+                    .operation(operation.actor, operation.field, 0)
+    }));
+    assert!(
+        resumed_change
+            .operations
+            .iter()
+            .any(|operation| operation.actor == work.target)
+    );
+    assert!(
+        resumed_change
+            .operations
+            .iter()
+            .any(|operation| operation.actor == child)
+    );
+    assert_eq!(
+        resumed_refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::I64(22)),
+        "the suspended heap observes its own checkpoint branch, not the concurrent update"
+    );
+    let resumed_cid = resumed_change.cid();
+    for artifact in &resumed_refined.exported_blobs {
+        assert_eq!(
+            service
+                .accumulate_host_mut()
+                .import_blob(artifact.bytes.clone()),
+            artifact.reference
+        );
+    }
+    let resumed_apply = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: resumed.work,
+            transition: resumed_refined.transition,
+            provided_blobs: vec![],
+        }))
+        .unwrap()
+        .result;
+    let AccumulationResultV2::Accepted { receipt, .. } = resumed_apply else {
+        panic!("resumed CRDT transition was rejected")
+    };
+    let mut final_heads = vec![concurrent_cid, resumed_cid];
+    final_heads.sort();
+    assert_eq!(receipt.resulting_crdt_heads, final_heads);
+
+    let mut merged_arguments = vec![vos::value::TAG_DYNAMIC];
+    merged_arguments.extend_from_slice(&Msg::new("increment").with("amount", 1u64).encode());
+    let merged = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([58; 32]),
+            workflow_step: 0,
+            logical_timeslot: 5,
+            target: work.target,
+            method: "increment".into(),
+            arguments: merged_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("both post-checkpoint branches remain available for a later merge");
+    assert_eq!(merged.work.imported_actors[0].causal_states.len(), 1);
+    let merged_refined = service
+        .refine_actor_tree(&merged.work, &merged.imports)
+        .unwrap();
+    assert_eq!(
+        merged_refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::I64(34))
+    );
 }
 
 #[test]
@@ -2737,6 +3012,22 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let before_invalid_proof = service.accumulate_host().snapshot();
     let mut unavailable_transition = proof_transition.clone();
     unavailable_transition.proof = Some(proof.clone());
+    assert_eq!(
+        unavailable_transition.commitment(),
+        proof_transition.commitment(),
+        "attaching proof bytes cannot change the proved transition commitment"
+    );
+    assert_eq!(
+        AttestationStatementV3::for_transition(
+            &proof_work,
+            &unavailable_transition,
+            &policy,
+            predicted.clone(),
+        )
+        .unwrap(),
+        statement,
+        "the Apply statement must equal the guest's prepared public inputs"
+    );
     let unavailable = service
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: proof_work.clone(),
@@ -3215,16 +3506,13 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         proof: b"raft canonical proof".to_vec(),
         calls: 0,
     };
+    let envelope = AccumulationEnvelopeV2 {
+        work: prepared.work,
+        transition,
+        provided_blobs: vec![],
+    };
     let committed = leader
-        .accumulate_attested(
-            AccumulationEnvelopeV2 {
-                work: prepared.work,
-                transition,
-                provided_blobs: vec![],
-            },
-            &prepared.imports,
-            &mut producer,
-        )
+        .accumulate_attested(envelope, &prepared.imports, &mut producer)
         .expect("leader proves before proposing Apply");
     assert_eq!(producer.calls, 1);
     assert_eq!(committed.published.proof, Some(committed.proof.clone()));

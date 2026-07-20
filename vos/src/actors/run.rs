@@ -831,7 +831,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let checkpoint = ctx.__take_checkpoint_v2();
     let new_state = actor.encode();
     let state_changed = input.state.is_empty() || new_state != input.state;
-    let (mut crdt_operations, mut crdt_states) = match input.change {
+    let (mut crdt_operations, mut crdt_states) = match ctx.__actor_change_v2() {
         Some(change) => {
             let (operations, next_ordinal) = crate::crdt::take_operation_batch(input.actor, change)
                 .expect("nested CRDT actor must return its completed field operations");

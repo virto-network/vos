@@ -559,8 +559,8 @@ impl<A: Actor> Context<A> {
                         &response[..response_len],
                     )
                     .expect("invalid v2 accumulated reply");
+                    self.__resume_checkpoint_v2(&resume.checkpoint);
                     self.checkpoint = Some(resume.checkpoint);
-                    self.__clear_committed_checkpoint_effects_v2();
                     self.self_schedule = false;
                     super::run::Ask::ready(resume.reply.result)
                 }
@@ -659,6 +659,23 @@ impl<A: Actor> Context<A> {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::Panicked,
             ));
+        }
+        if output.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .previously_suspended
+                .binary_search(&caller)
+                .is_ok()
+        }) {
+            // A nested child is the active VM which directly receives the
+            // scheduler's resume token. Its suspended caller crosses the same
+            // durable boundary when JAR returns the child output, before any
+            // new-slice effects are aggregated into this restored Context.
+            self.__resume_checkpoint_v2(
+                output
+                    .checkpoint
+                    .as_ref()
+                    .expect("checked nested checkpoint presence"),
+            );
         }
         self.next_await_ordinal = output.next_await_ordinal;
         self.nested_crdt_operations.extend(output.crdt_operations);
@@ -1007,25 +1024,19 @@ impl<A: Actor> Context<A> {
                 let token_len = usize::try_from(token_len)
                     .expect("checkpoint token length exceeds guest usize");
                 assert!(token_len <= token.len(), "checkpoint token exceeds buffer");
-                self.checkpoint = Some(
-                    <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
-                        &token[..token_len],
-                    )
-                    .expect("invalid v2 checkpoint token"),
-                );
-                resume_kind == 1
+                let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
+                    &token[..token_len],
+                )
+                .expect("invalid v2 checkpoint token");
+                let restored = resume_kind == 1;
+                if restored {
+                    self.__resume_checkpoint_v2(&checkpoint);
+                }
+                self.checkpoint = Some(checkpoint);
+                restored
             } else {
                 crate::abi::pvm::hostcalls::suspend() == 1
             };
-            if restored {
-                // The snapshot is taken before the suspension call observes
-                // a result, so it still contains the effect queues that the
-                // finalize fork emitted for the durable checkpoint. They are
-                // already committed when result `1` is injected. Drop only
-                // that checkpoint bookkeeping; actor memory and the handler
-                // future remain exactly as captured.
-                self.__clear_committed_checkpoint_effects_v2();
-            }
             self.self_schedule = !restored;
             super::run::Yield::after_checkpoint(restored)
         }
@@ -1051,8 +1062,33 @@ impl<A: Actor> Context<A> {
         self.pending_actor_calls.clear();
         self.nested_writes.clear();
         self.nested_actor_calls.clear();
+        self.nested_crdt_operations.clear();
+        self.nested_crdt_states.clear();
         self.reply = None;
         let _ = super::storage::end_dispatch();
+    }
+
+    #[cfg(feature = "pvm")]
+    fn __resume_checkpoint_v2(&mut self, checkpoint: &crate::v2::CheckpointTokenV2) {
+        match (self.actor_change, checkpoint.change) {
+            (None, None) => {}
+            (Some(_), Some(change)) => {
+                crate::crdt::rebind_change(crate::crdt::ChangeId(change.0))
+                    .expect("restored CRDT continuation has no active change scope");
+                self.actor_change = Some(change);
+                for actor in &mut self.actor_tree {
+                    actor.next_crdt_ordinal = 0;
+                }
+            }
+            _ => panic!("checkpoint consistency changed while the actor was suspended"),
+        }
+        self.__clear_committed_checkpoint_effects_v2();
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __actor_change_v2(&self) -> Option<crate::v2::ChangeId> {
+        self.actor_change
     }
 
     /// Checkpoint state and yield. `sleep` is an alias for

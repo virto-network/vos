@@ -36,6 +36,24 @@ pub struct ContinuationSnapshotV2 {
     pub kernel_snapshot: Vec<u8>,
 }
 
+/// Allocation-bounded view used by guest Accumulate. The inner JAR snapshot
+/// remains opaque and content-addressed there; only Refine restore needs to
+/// allocate and parse its complete machine bytes.
+pub(crate) struct ContinuationMetadataV2 {
+    snapshot_version: u16,
+    jar_semantics: super::Hash,
+    vos_abi: u16,
+    service: ServiceIdentityV2,
+    invocation: InvocationId,
+    checkpoint_step: u64,
+    actor: ActorId,
+    actor_program: ProgramId,
+    pub(crate) await_ordinal: u64,
+    pub pending_call: Option<CallId>,
+    pub suspended_actors: Vec<ActorId>,
+    kernel_snapshot_len: usize,
+}
+
 impl ContinuationSnapshotV2 {
     pub fn hash(&self) -> super::Hash {
         super::Hash::digest(b"vos/continuation/v2", &[&self.encode()])
@@ -84,6 +102,88 @@ impl ContinuationSnapshotV2 {
     /// Check the VOS workflow binding before JAR parses or restores the inner
     /// machine snapshot. A continuation always resumes in the next slice.
     pub fn validate_resume_for(&self, work: &WorkEnvelopeV2) -> Result<(), DecodeError> {
+        self.validate()?;
+        if self.service != work.service
+            || self.invocation != work.invocation
+            || self.checkpoint_step.checked_add(1) != Some(work.workflow_step)
+            || self.actor != work.target
+            || self.actor_program != work.target_program
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_metadata(bytes: &[u8]) -> Result<ContinuationMetadataV2, DecodeError> {
+        let mut d = Decoder::new(bytes);
+        if d.take(4)? != Self::MAGIC {
+            return Err(DecodeError::InvalidTag);
+        }
+        if d.u16()? != super::ABI_VERSION {
+            return Err(DecodeError::InvalidVersion);
+        }
+        let value = ContinuationMetadataV2 {
+            snapshot_version: d.u16()?,
+            jar_semantics: super::Hash(d.fixed()?),
+            vos_abi: d.u16()?,
+            service: decode_service(&mut d)?,
+            invocation: InvocationId(d.fixed()?),
+            checkpoint_step: d.u64()?,
+            actor: ActorId(d.fixed()?),
+            actor_program: ProgramId(d.fixed()?),
+            await_ordinal: d.u64()?,
+            pending_call: d.option(|d| d.fixed().map(CallId))?,
+            suspended_actors: d.list(|d| d.fixed().map(ActorId))?,
+            kernel_snapshot_len: d.bytes_ref()?.len(),
+        };
+        if !d.exhausted() {
+            return Err(DecodeError::TrailingBytes);
+        }
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+impl ContinuationMetadataV2 {
+    fn validate(&self) -> Result<(), DecodeError> {
+        if self.snapshot_version != super::SNAPSHOT_VERSION
+            || self.vos_abi != super::ABI_VERSION
+            || self.jar_semantics != super::EXECUTION_SEMANTICS_ID
+            || self.service.service_abi != super::ABI_VERSION
+            || self.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+        {
+            return Err(DecodeError::InvalidVersion);
+        }
+        if self.kernel_snapshot_len == 0
+            || self.suspended_actors.is_empty()
+            || self.suspended_actors.binary_search(&self.actor).is_err()
+            || self
+                .suspended_actors
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .pending_call
+                .is_some_and(|call| call != self.invocation.call_id(self.await_ordinal))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_checkpoint_for(&self, work: &WorkEnvelopeV2) -> Result<(), DecodeError> {
+        self.validate()?;
+        if self.service != work.service
+            || self.invocation != work.invocation
+            || self.checkpoint_step != work.workflow_step
+            || self.actor != work.target
+            || self.actor_program != work.target_program
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_resume_for(&self, work: &WorkEnvelopeV2) -> Result<(), DecodeError> {
         self.validate()?;
         if self.service != work.service
             || self.invocation != work.invocation
@@ -243,6 +343,25 @@ mod tests {
             value
         );
         value.validate_resume_for(&resume_work()).unwrap();
+    }
+
+    #[test]
+    fn allocation_bounded_metadata_validates_the_same_envelope() {
+        let value = snapshot();
+        let encoded = value.encode();
+        let metadata = ContinuationSnapshotV2::decode_metadata(&encoded).unwrap();
+        assert_eq!(metadata.pending_call, value.pending_call);
+        assert_eq!(metadata.suspended_actors, value.suspended_actors);
+        assert_eq!(metadata.await_ordinal, value.await_ordinal);
+        assert_eq!(metadata.kernel_snapshot_len, value.kernel_snapshot.len());
+        metadata.validate_resume_for(&resume_work()).unwrap();
+
+        let mut truncated = encoded;
+        truncated.pop();
+        assert!(matches!(
+            ContinuationSnapshotV2::decode_metadata(&truncated),
+            Err(DecodeError::Truncated)
+        ));
     }
 
     #[test]

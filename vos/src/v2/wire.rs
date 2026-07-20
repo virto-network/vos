@@ -186,6 +186,14 @@ impl<'a> Decoder<'a> {
         Ok(self.take(len)?.to_vec())
     }
 
+    pub(crate) fn bytes_ref(&mut self) -> Result<&'a [u8], DecodeError> {
+        let len = self.u32()? as usize;
+        if len > MAX_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        self.take(len)
+    }
+
     pub(crate) fn string(&mut self) -> Result<String, DecodeError> {
         String::from_utf8(self.bytes()?).map_err(|_| DecodeError::InvalidUtf8)
     }

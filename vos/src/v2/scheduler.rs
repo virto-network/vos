@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use super::causal::{CausalFrontierError, load_causal_frontier};
+use super::causal::{CausalFrontierError, CausalFrontierV2, load_causal_frontier};
 use super::contracts::crdt_change_blob_references;
 use super::{
     AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
@@ -376,6 +376,34 @@ impl LocalWorkSchedulerV2 {
         if descriptor.crdt != (header.consistency == ConsistencyModeV2::Crdt) {
             return Err(ScheduleErrorV2::ActorConsistencyMismatch(request.target));
         }
+        let continuation_key = StateKeyV2::Continuation(request.target);
+        let continuation = decode_row::<BlobRefV2>(store, header.service_root, &continuation_key)?;
+        let workflow_key = StateKeyV2::Workflow(request.invocation);
+        let workflow =
+            decode_row::<WorkflowCheckpointV2>(store, header.service_root, &workflow_key)?;
+
+        match (
+            request.workflow_step,
+            continuation.as_ref(),
+            workflow.as_ref(),
+        ) {
+            (0, Some(_), _) => return Err(ScheduleErrorV2::ActorBusy(request.target)),
+            (0, None, Some(_)) => {
+                return Err(ScheduleErrorV2::InvocationAlreadyCommitted(
+                    request.invocation,
+                ));
+            }
+            (0, None, None) => {}
+            (_, None, _) => {
+                return Err(ScheduleErrorV2::MissingContinuation(request.target));
+            }
+            (step, Some(_), Some(checkpoint))
+                if checkpoint.input.invocation == request.invocation
+                    && checkpoint.input.workflow_step.checked_add(1) == Some(step) => {}
+            (_, Some(_), _) => {
+                return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
+            }
+        }
 
         let program_bytes = store
             .program(descriptor.program)
@@ -383,19 +411,24 @@ impl LocalWorkSchedulerV2 {
             .to_vec();
         let (base, base_causal_height, mut states) =
             if header.consistency == ConsistencyModeV2::Crdt {
-                let heads = header.crdt_heads.clone();
-                let frontier = load_causal_frontier(&heads, |cid| {
-                    Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
-                });
-                let frontier = match frontier {
-                    Ok(frontier) => frontier,
-                    Err(CausalFrontierError::Missing(cid)) => {
-                        return Err(ScheduleErrorV2::MissingCausalDependency(cid));
-                    }
-                    Err(CausalFrontierError::Corrupt) => {
+                let current = load_store_causal_frontier(store, &header.crdt_heads)?;
+                let heads = if request.workflow_step == 0 {
+                    header.crdt_heads.clone()
+                } else {
+                    let checkpoint = workflow
+                        .as_ref()
+                        .expect("validated continuation has a workflow checkpoint");
+                    if !header.crdt_heads.iter().any(|head| {
+                        current.contains_ancestor(*head, checkpoint.transition_commitment)
+                    }) {
                         return Err(ScheduleErrorV2::CorruptCausalDag);
                     }
-                    Err(CausalFrontierError::Storage(error)) => match error {},
+                    alloc::vec![checkpoint.transition_commitment]
+                };
+                let frontier = if heads == header.crdt_heads {
+                    current
+                } else {
+                    load_store_causal_frontier(store, &heads)?
                 };
                 let height = frontier.max_head_height;
                 let states = frontier
@@ -429,34 +462,6 @@ impl LocalWorkSchedulerV2 {
             return Err(ScheduleErrorV2::CorruptCausalDag);
         }
         let state = states.remove(0);
-        let continuation_key = StateKeyV2::Continuation(request.target);
-        let continuation = decode_row::<BlobRefV2>(store, header.service_root, &continuation_key)?;
-        let workflow_key = StateKeyV2::Workflow(request.invocation);
-        let workflow =
-            decode_row::<WorkflowCheckpointV2>(store, header.service_root, &workflow_key)?;
-
-        match (
-            request.workflow_step,
-            continuation.as_ref(),
-            workflow.as_ref(),
-        ) {
-            (0, Some(_), _) => return Err(ScheduleErrorV2::ActorBusy(request.target)),
-            (0, None, Some(_)) => {
-                return Err(ScheduleErrorV2::InvocationAlreadyCommitted(
-                    request.invocation,
-                ));
-            }
-            (0, None, None) => {}
-            (_, None, _) => {
-                return Err(ScheduleErrorV2::MissingContinuation(request.target));
-            }
-            (step, Some(_), Some(checkpoint))
-                if checkpoint.input.invocation == request.invocation
-                    && checkpoint.input.workflow_step.checked_add(1) == Some(step) => {}
-            (_, Some(_), _) => {
-                return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
-            }
-        }
 
         let mut work = WorkEnvelopeV2 {
             service: header.service.clone(),
@@ -535,7 +540,11 @@ impl LocalWorkSchedulerV2 {
             if descriptor.crdt != (header.consistency == ConsistencyModeV2::Crdt) {
                 return Err(ScheduleErrorV2::ActorConsistencyMismatch(actor));
             }
-            let mut actor_states = actor_states(store, &header, &descriptor)?;
+            let crdt_heads = match &work.base {
+                ConsistencyBaseV2::Crdt { heads } => Some(heads.as_slice()),
+                ConsistencyBaseV2::Linear { .. } => None,
+            };
+            let mut actor_states = actor_states(store, &header, &descriptor, crdt_heads)?;
             if actor_states.is_empty() {
                 return Err(ScheduleErrorV2::CorruptCausalDag);
             }
@@ -622,6 +631,7 @@ fn actor_states(
     store: &LocalJamStoreV2,
     header: &super::StoreHeaderV2,
     descriptor: &ActorGenesisV2,
+    crdt_heads: Option<&[super::Hash]>,
 ) -> Result<Vec<BlobRefV2>, ScheduleErrorV2> {
     if header.consistency != ConsistencyModeV2::Crdt {
         let state_key = StateKeyV2::ActorRow {
@@ -633,17 +643,8 @@ fn actor_states(
             .ok_or(ScheduleErrorV2::MissingState(descriptor.actor));
     }
 
-    let frontier = load_causal_frontier(&header.crdt_heads, |cid| {
-        Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
-    });
-    let frontier = match frontier {
-        Ok(frontier) => frontier,
-        Err(CausalFrontierError::Missing(cid)) => {
-            return Err(ScheduleErrorV2::MissingCausalDependency(cid));
-        }
-        Err(CausalFrontierError::Corrupt) => return Err(ScheduleErrorV2::CorruptCausalDag),
-        Err(CausalFrontierError::Storage(error)) => match error {},
-    };
+    let frontier =
+        load_store_causal_frontier(store, crdt_heads.ok_or(ScheduleErrorV2::CorruptCausalDag)?)?;
     frontier
         .actor_materializations::<Infallible>(descriptor, descriptor.actor)
         .map_err(|error| match error {
@@ -652,6 +653,22 @@ fn actor_states(
             }
             CausalFrontierError::Storage(error) => match error {},
         })
+}
+
+fn load_store_causal_frontier(
+    store: &LocalJamStoreV2,
+    heads: &[super::Hash],
+) -> Result<CausalFrontierV2, ScheduleErrorV2> {
+    match load_causal_frontier(heads, |cid| {
+        Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
+    }) {
+        Ok(frontier) => Ok(frontier),
+        Err(CausalFrontierError::Missing(cid)) => {
+            Err(ScheduleErrorV2::MissingCausalDependency(cid))
+        }
+        Err(CausalFrontierError::Corrupt) => Err(ScheduleErrorV2::CorruptCausalDag),
+        Err(CausalFrontierError::Storage(error)) => match error {},
+    }
 }
 
 fn dynamic_method(payload: &[u8]) -> Option<String> {

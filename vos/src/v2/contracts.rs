@@ -282,6 +282,10 @@ pub struct CheckpointTokenV2 {
     /// pre-suspension envelope, so the injected token carries the consensus
     /// inputs needed for the next transition without replaying that VM.
     pub base_causal_height: Option<u64>,
+    /// CRDT operation scope for the slice receiving this token. A restored
+    /// machine keeps its exact heap but must allocate any post-checkpoint
+    /// operations under the newly admitted work identity.
+    pub change: Option<ChangeId>,
     pub expected: Option<Hash>,
     pub replacement: Option<BlobRefV2>,
     pub pending_call: Option<CallId>,
@@ -373,6 +377,24 @@ impl WorkEnvelopeV2 {
         e.u8(self.consistency as u8);
         e.bool(self.proof_requested);
         Hash::digest(b"vos/workflow/v2", &[&bytes])
+    }
+
+    /// Canonical CRDT workflow record retained in the causal DAG. Scheduling
+    /// time, an already-consumed awaited reply, and actor materialization
+    /// references are slice-local imports rather than resume instructions.
+    /// Normalizing them lets an exact restored service VM emit the same
+    /// checkpoint as guest Accumulate derives from the newly admitted work.
+    pub fn workflow_checkpoint(&self) -> Self {
+        let mut checkpoint = self.clone();
+        checkpoint.logical_timeslot = 0;
+        checkpoint.awaited_reply = None;
+        let empty = BlobRefV2::of_bytes(&[]);
+        for actor in &mut checkpoint.imported_actors {
+            actor.state = empty.clone();
+            actor.causal_states.clear();
+            actor.continuation = None;
+        }
+        checkpoint
     }
 }
 
@@ -500,6 +522,10 @@ pub enum WorkflowOperationV2 {
     Continuation(ContinuationChangeV2),
     Inbox(MessageRecordV2),
     Outbox(MessageRecordV2),
+    /// Causally consume the durable request completed by an awaited reply.
+    /// The reply receipt itself is an accumulation input, not persistent
+    /// workflow state copied into every later DAG node.
+    ConsumeOutbox(CallId),
     Reply(ReplyRecordV2),
 }
 
@@ -618,19 +644,58 @@ impl TransitionV2 {
     /// while independently requiring and validating the proof for attested
     /// methods.
     pub fn commitment(&self) -> Hash {
-        let mut candidate = self.clone();
-        candidate.proof = None;
+        // Construct the projection directly. Cloning `self` first needlessly
+        // allocates proof bytes in the guest before receipt construction; the
+        // proof is explicitly outside this commitment and must not perturb
+        // execution of the proved transition.
+        let candidate = self.proofless_clone();
         Hash::digest(b"vos/transition/v2", &[&candidate.encode()])
     }
 
+    pub(crate) fn proofless_clone(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            consumed_input: self.consumed_input,
+            target_program: self.target_program,
+            base: self.base.clone(),
+            writes: self.writes.clone(),
+            crdt_change: self.crdt_change.clone(),
+            continuations: self.continuations.clone(),
+            inbox: self.inbox.clone(),
+            outbox: self.outbox.clone(),
+            reply: self.reply.clone(),
+            exported_blobs: self.exported_blobs.clone(),
+            gas: self.gas.clone(),
+            proof: None,
+        }
+    }
+
     pub fn workflow_operations(&self, work: &WorkEnvelopeV2) -> Vec<WorkflowOperationV2> {
+        self.workflow_operations_with_consumed_outbox(
+            work,
+            work.awaited_reply
+                .as_ref()
+                .map(|awaited| awaited.reply.call_id),
+        )
+    }
+
+    /// Build the canonical workflow payload when the exact restored service
+    /// VM learns the consumed call from its checkpoint token rather than from
+    /// the pre-suspension `WorkEnvelopeV2` captured in that same snapshot.
+    #[doc(hidden)]
+    pub fn workflow_operations_with_consumed_outbox(
+        &self,
+        work: &WorkEnvelopeV2,
+        consumed_outbox: Option<CallId>,
+    ) -> Vec<WorkflowOperationV2> {
         let mut operations = Vec::with_capacity(
             1 + self.continuations.len()
                 + self.inbox.len()
                 + self.outbox.len()
+                + usize::from(consumed_outbox.is_some())
                 + usize::from(self.reply.is_some()),
         );
-        operations.push(WorkflowOperationV2::Checkpoint(work.clone()));
+        operations.push(WorkflowOperationV2::Checkpoint(work.workflow_checkpoint()));
         operations.extend(
             self.continuations
                 .iter()
@@ -639,6 +704,7 @@ impl TransitionV2 {
         );
         operations.extend(self.inbox.iter().cloned().map(WorkflowOperationV2::Inbox));
         operations.extend(self.outbox.iter().cloned().map(WorkflowOperationV2::Outbox));
+        operations.extend(consumed_outbox.map(WorkflowOperationV2::ConsumeOutbox));
         operations.extend(self.reply.iter().cloned().map(WorkflowOperationV2::Reply));
         operations.sort_by_key(workflow_operation_bytes);
         operations
@@ -2335,17 +2401,13 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
         match operation {
             WorkflowOperationV2::Checkpoint(work) => {
                 references.extend(work.imported_blobs.iter());
-                for actor in &work.imported_actors {
-                    references.push(&actor.state);
-                    references.extend(actor.causal_states.iter());
-                    references.extend(actor.continuation.iter());
-                }
             }
             WorkflowOperationV2::Continuation(change) => {
                 references.extend(change.replacement.iter());
             }
             WorkflowOperationV2::Inbox(_)
             | WorkflowOperationV2::Outbox(_)
+            | WorkflowOperationV2::ConsumeOutbox(_)
             | WorkflowOperationV2::Reply(_) => {}
         }
     }
@@ -2729,6 +2791,10 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
             e.u8(4);
             encode_reply(e, reply);
         }
+        WorkflowOperationV2::ConsumeOutbox(call) => {
+            e.u8(5);
+            e.fixed(&call.0);
+        }
     }
 }
 
@@ -2743,6 +2809,7 @@ fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2,
         2 => Ok(WorkflowOperationV2::Inbox(decode_message(d)?)),
         3 => Ok(WorkflowOperationV2::Outbox(decode_message(d)?)),
         4 => Ok(WorkflowOperationV2::Reply(decode_reply(d)?)),
+        5 => Ok(WorkflowOperationV2::ConsumeOutbox(CallId(d.fixed()?))),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -2775,6 +2842,7 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     encode_work_input(e, value.input);
     encode_base(e, &value.base);
     e.option(&value.base_causal_height, |e, height| e.u64(*height));
+    e.option(&value.change, |e, change| e.fixed(&change.0));
     e.option(&value.expected, |e, hash| e.fixed(&hash.0));
     e.option(&value.replacement, encode_blob_ref);
     e.option(&value.pending_call, |e, call| e.fixed(&call.0));
@@ -2787,6 +2855,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         input: decode_work_input(d)?,
         base: decode_base(d)?,
         base_causal_height: d.option(Decoder::u64)?,
+        change: d.option(|d| d.fixed().map(ChangeId))?,
         expected: d.option(|d| d.fixed().map(Hash))?,
         replacement: d.option(decode_blob_ref)?,
         pending_call: d.option(|d| d.fixed().map(CallId))?,
@@ -2794,6 +2863,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         suspended: d.list(|d| d.fixed().map(ActorId))?,
     };
     if matches!(value.base, ConsistencyBaseV2::Linear { .. }) != value.base_causal_height.is_none()
+        || matches!(value.base, ConsistencyBaseV2::Crdt { .. }) != value.change.is_some()
         || value.expected.is_some() != !value.previously_suspended.is_empty()
         || value.replacement.is_some() != !value.suspended.is_empty()
         || (value.previously_suspended.is_empty() && value.suspended.is_empty())
@@ -3185,6 +3255,7 @@ mod tests {
                 state_root: Hash([25; 32]),
             },
             base_causal_height: None,
+            change: None,
             expected: Some(Hash([26; 32])),
             replacement: Some(replacement),
             pending_call: Some(InvocationId([24; 32]).call_id(3)),
@@ -3647,7 +3718,7 @@ mod tests {
                     id: change_id.operation(work.target, field, 0),
                     payload: b"counter +1".to_vec(),
                 }],
-                workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
+                workflow: vec![WorkflowOperationV2::Checkpoint(work.workflow_checkpoint())],
                 materializations: vec![CrdtMaterializationV2 {
                     actor: work.target,
                     state: BlobRefV2::of_bytes(b"materialized-state"),
@@ -3670,7 +3741,7 @@ mod tests {
         assert_eq!(decoded, envelope);
         assert!(matches!(
             &decoded.transition.crdt_change.as_ref().unwrap().workflow[0],
-            WorkflowOperationV2::Checkpoint(checkpoint) if checkpoint == &work
+            WorkflowOperationV2::Checkpoint(checkpoint) if checkpoint == &work.workflow_checkpoint()
         ));
 
         let mut bad_id = envelope.clone();

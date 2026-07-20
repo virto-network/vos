@@ -158,6 +158,13 @@ mod guest {
                 }
             }
         }
+        let consumed_outbox = actor_output.checkpoint.as_ref().and_then(|checkpoint| {
+            checkpoint
+                .replacement
+                .is_none()
+                .then_some(checkpoint.pending_call)
+                .flatten()
+        });
 
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();
@@ -175,6 +182,9 @@ mod guest {
             work.workflow_step = checkpoint.input.workflow_step;
             work.base = checkpoint.base;
             work.base_causal_height = checkpoint.base_causal_height;
+            if checkpoint.change != CrdtChangeV2::derive_id(&work) {
+                fail_closed();
+            }
             if let Some(replacement) = checkpoint.replacement.as_ref() {
                 exported_blobs.push(replacement.clone());
             }
@@ -300,7 +310,7 @@ mod guest {
             gas: GasAccountingV2::default(),
             proof: None,
         };
-        let workflow = transition.workflow_operations(&work);
+        let workflow = transition.workflow_operations_with_consumed_outbox(&work, consumed_outbox);
         if let Some(change) = transition.crdt_change.as_mut() {
             change.workflow = workflow;
         }
