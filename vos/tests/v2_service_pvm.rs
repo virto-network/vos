@@ -22,13 +22,23 @@ use vos::v2::{
     Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
     JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageRolePoliciesV2, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    PackageRolePoliciesV2, ProducerId, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
     ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
     TransitionV2, V2Wire, WorkEnvelopeV2, public_policy_hash, space_role_policy_hash,
 };
-use vos::{Decode, Encode, value::Msg};
+use vos::{AttestedMethod, Decode, Encode, value::Msg};
+
+enum StartMethod {}
+
+impl AttestedMethod<Vec<u8>> for StartMethod {
+    const METHOD: &'static str = "start";
+
+    fn claim_wire(claim: &Vec<u8>) -> Vec<u8> {
+        claim.clone()
+    }
+}
 
 fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
     PackageRolePoliciesV2 { methods }.encode()
@@ -3267,6 +3277,22 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         .accumulate_attested(envelope.clone(), &prepared.imports, &mut producer)
         .expect("proof is available before guest Accumulate commits");
     assert_eq!(producer.calls, 1);
+    let application_package = committed
+        .clone()
+        .into_attestation::<Vec<u8>, StartMethod>(
+            "attested-actor".into(),
+            ProducerId([0xA8; 32]),
+            b"attested claim".to_vec(),
+        )
+        .expect("a committed reply becomes the portable typed package");
+    assert_eq!(
+        application_package.unverified_preview(),
+        b"attested claim"
+    );
+    assert_eq!(
+        application_package.statement(),
+        &committed.preparation.statement
+    );
     assert_eq!(committed.proof_bytes, proof_bytes);
     assert_eq!(committed.preparation.receipt.sequence, 1);
     assert_eq!(committed.published.proof, Some(committed.proof.clone()));
