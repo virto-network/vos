@@ -171,6 +171,15 @@ protocol boundary. Resume consumes the checkpoint, injects one result into its
 declared registers and continues at `resume_pc`. It never restarts the handler
 at PC 0. Suspended actors are non-reentrant; later messages remain queued.
 
+Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
+continuation/blob byte required by that request. It does not replicate an
+`EffectLog` or a leader-produced post-state image. `ReplicatedJamServiceV2`
+waits for the request's log position to commit, then applies it through the
+physical service-PVM Accumulate entry before advancing the replica's applied
+cursor. Followers and a newly elected leader use the same catch-up path;
+replaying after a cursor-write failure is safe because guest deduplication sees
+the already committed workflow input.
+
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls
 may execute inline. Cross-root calls always use durable outbox/inbox rows and a

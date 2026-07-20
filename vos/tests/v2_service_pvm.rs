@@ -7,18 +7,20 @@
 //! not optional smoke tests.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
-    BlobRefV2, CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
+    BlobRefV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
+    CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
     ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
     JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
     ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
-    ReplyRecordV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, TransitionV2, V2Wire,
-    WorkEnvelopeV2,
+    ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, TransitionV2,
+    V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -63,6 +65,82 @@ fn restart_durable_service(
         5_000_000_000,
     )
     .unwrap()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestLogError {
+    NotLeader,
+    InvalidCursor,
+}
+
+#[derive(Debug, Default)]
+struct SharedCommittedLog {
+    entries: Vec<CommittedAccumulateEntryV2>,
+}
+
+struct TestCommittedLog {
+    shared: Arc<Mutex<SharedCommittedLog>>,
+    applied: u64,
+    leader: bool,
+}
+
+impl TestCommittedLog {
+    fn new(shared: Arc<Mutex<SharedCommittedLog>>, leader: bool) -> Self {
+        Self {
+            shared,
+            applied: 0,
+            leader,
+        }
+    }
+}
+
+impl CommittedAccumulateLogV2 for TestCommittedLog {
+    type Error = TestLogError;
+
+    fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error> {
+        if !self.leader {
+            return Err(TestLogError::NotLeader);
+        }
+        let mut shared = self.shared.lock().unwrap();
+        let entry = CommittedAccumulateEntryV2 {
+            index: shared.entries.len() as u64 + 1,
+            request: request.to_vec(),
+        };
+        shared.entries.push(entry.clone());
+        Ok(entry)
+    }
+
+    fn committed_after(
+        &mut self,
+        applied_index: u64,
+    ) -> Result<CommittedAccumulateBatchV2, Self::Error> {
+        if applied_index != self.applied {
+            return Err(TestLogError::InvalidCursor);
+        }
+        let shared = self.shared.lock().unwrap();
+        Ok(CommittedAccumulateBatchV2 {
+            entries: shared
+                .entries
+                .iter()
+                .filter(|entry| entry.index > applied_index)
+                .cloned()
+                .collect(),
+            committed_index: shared.entries.len() as u64,
+        })
+    }
+
+    fn applied_index(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.applied)
+    }
+
+    fn mark_applied(&mut self, index: u64) -> Result<(), Self::Error> {
+        let committed = self.shared.lock().unwrap().entries.len() as u64;
+        if index < self.applied || index > committed {
+            return Err(TestLogError::InvalidCursor);
+        }
+        self.applied = index;
+        Ok(())
+    }
 }
 
 fn authorize_install<A: LocalJamStoreHostV2>(
@@ -3189,6 +3267,228 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         caller_publications,
         "the caller's newly committed publication is independent of the callee acknowledgement"
     );
+}
+
+#[test]
+fn raft_failover_applies_committed_requests_through_the_physical_guest() {
+    let elf = service_elf();
+    let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"raft initial state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed = work(actor_program, initial.clone());
+    let genesis = ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Raft,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([121; 32]),
+                policy: Hash([122; 32]),
+                public: true,
+                attested: false,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([123; 32]),
+            authenticator: vec![124],
+        },
+    };
+
+    let mut leader_host = LocalJamStoreV2::default();
+    assert_eq!(leader_host.import_blob(initial_bytes.clone()), initial);
+    assert_eq!(leader_host.import_program(actor_pvm.clone()), actor_program);
+    leader_host.allow_install(&genesis);
+    let mut follower_host = LocalJamStoreV2::default();
+    assert_eq!(follower_host.import_blob(initial_bytes), initial);
+    assert_eq!(follower_host.import_program(actor_pvm), actor_program);
+    follower_host.allow_install(&genesis);
+
+    let shared_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let leader_service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        leader_host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let follower_service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        follower_host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let mut leader = ReplicatedJamServiceV2::new(
+        leader_service,
+        TestCommittedLog::new(shared_log.clone(), true),
+    );
+    let mut follower =
+        ReplicatedJamServiceV2::new(follower_service, TestCommittedLog::new(shared_log, false));
+
+    assert!(matches!(
+        leader
+            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Installed(_)
+    ));
+    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower.service().accumulate_host().snapshot())
+    );
+
+    let first = LocalWorkSchedulerV2::prepare(
+        leader.service().accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([125; 32]),
+            workflow_step: 0,
+            logical_timeslot: 10,
+            target: seed.target,
+            method: "start".into(),
+            arguments: seed.arguments.clone(),
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap()
+    .work;
+    let first_transition = TransitionV2 {
+        service: first.service.clone(),
+        consumed_input: first.input_id(),
+        target_program: first.target_program,
+        base: first.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: first.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"leader state".to_vec()),
+        }],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: first.invocation.root_reply_id(),
+            producer: first.target,
+            result: b"leader reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    assert!(matches!(
+        leader
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: first,
+                transition: first_transition,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower.service().accumulate_host().snapshot())
+    );
+
+    leader.log_mut().leader = false;
+    follower.log_mut().leader = true;
+    let second = LocalWorkSchedulerV2::prepare(
+        follower.service().accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([126; 32]),
+            workflow_step: 0,
+            logical_timeslot: 11,
+            target: seed.target,
+            method: "start".into(),
+            arguments: seed.arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap()
+    .work;
+    let second_transition = TransitionV2 {
+        service: second.service.clone(),
+        consumed_input: second.input_id(),
+        target_program: second.target_program,
+        base: second.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: second.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"failover state".to_vec()),
+        }],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: second.invocation.root_reply_id(),
+            producer: second.target,
+            result: b"failover reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    assert!(matches!(
+        follower
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: second,
+                transition: second_transition,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(leader.catch_up().unwrap(), 1);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower.service().accumulate_host().snapshot())
+    );
+    assert_eq!(leader.log_mut().applied_index().unwrap(), 3);
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 3);
 }
 
 #[test]
