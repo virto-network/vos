@@ -7,6 +7,8 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 
 use javm::kernel::InvocationKernel;
 
@@ -122,6 +124,92 @@ fn decode_content_map(
     Ok(result)
 }
 
+/// Durable sink for one complete, canonical service-account image.
+///
+/// `commit` must not return success until the image is recoverable after a
+/// process restart. A local filesystem implementation can use atomic rename;
+/// a Raft implementation can block until the bytes have reached a quorum.
+/// The service host never exposes the candidate image before this boundary
+/// succeeds.
+pub trait CommittedImageStoreV2 {
+    type Error;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug)]
+pub enum DurableStoreOpenErrorV2<E> {
+    Backend(E),
+    InvalidSnapshot(DecodeError),
+}
+
+impl<E: core::fmt::Debug> core::fmt::Display for DurableStoreOpenErrorV2<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "cannot open durable VOS v2 service state: {self:?}")
+    }
+}
+
+impl<E: core::fmt::Debug> core::error::Error for DurableStoreOpenErrorV2<E> {}
+
+/// Atomic filesystem sink for canonical service-account images.
+///
+/// The next image is flushed to a sibling temporary file, renamed over the
+/// committed path, and followed by a parent-directory sync. One store path is
+/// owned by one service writer; Raft-backed services use a quorum sink instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCommittedImageStoreV2 {
+    path: PathBuf,
+}
+
+impl FileCommittedImageStoreV2 {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn temporary_path(&self) -> PathBuf {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".v2-next");
+        self.path.with_file_name(name)
+    }
+}
+
+impl CommittedImageStoreV2 for FileCommittedImageStoreV2 {
+    type Error = std::io::Error;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        use std::io::Write;
+
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let temporary = self.temporary_path();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(image)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &self.path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalStoreReadErrorV2 {
     InvalidHeader(StoreOpenError),
@@ -149,6 +237,53 @@ pub struct LocalJamStoreV2 {
     proof_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
+}
+
+/// JAM storage host whose committed image is made durable before IC-5 returns.
+///
+/// Host policy (proof, installation, and receipt verifier configuration)
+/// remains process-local. Only consensus-visible service state crosses the
+/// [`CommittedImageStoreV2`] boundary.
+pub struct DurableJamStoreV2<B> {
+    local: LocalJamStoreV2,
+    backend: B,
+}
+
+impl<B: CommittedImageStoreV2> DurableJamStoreV2<B> {
+    pub fn open(mut backend: B) -> Result<Self, DurableStoreOpenErrorV2<B::Error>> {
+        let local = match backend.load().map_err(DurableStoreOpenErrorV2::Backend)? {
+            Some(bytes) => LocalJamStoreV2::from_snapshot_bytes(&bytes)
+                .map_err(DurableStoreOpenErrorV2::InvalidSnapshot)?,
+            None => LocalJamStoreV2::new(),
+        };
+        Ok(Self { local, backend })
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
+    pub fn into_parts(self) -> (LocalJamStoreV2, B) {
+        (self.local, self.backend)
+    }
+}
+
+impl<B> Deref for DurableJamStoreV2<B> {
+    type Target = LocalJamStoreV2;
+
+    fn deref(&self) -> &Self::Target {
+        &self.local
+    }
+}
+
+impl<B> DerefMut for DurableJamStoreV2<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.local
+    }
 }
 
 impl LocalJamStoreV2 {
@@ -476,6 +611,29 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     }
 }
 
+impl<B: CommittedImageStoreV2> AccumulateProtocolHostV2 for DurableJamStoreV2<B> {
+    type Transaction = LocalJamTransactionV2;
+
+    fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        self.local.begin()
+    }
+
+    fn commit(&mut self, mut transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2> {
+        transaction.staged.commit_sequence = self
+            .local
+            .committed
+            .commit_sequence
+            .checked_add(1)
+            .ok_or(ServicePvmErrorV2::AccumulateCommitRejected)?;
+        let image = transaction.staged.encode();
+        self.backend
+            .commit(&image)
+            .map_err(|_| ServicePvmErrorV2::AccumulateCommitRejected)?;
+        self.local.committed = transaction.staged;
+        Ok(())
+    }
+}
+
 fn install_hash(genesis: &ServiceGenesisV2) -> super::Hash {
     super::Hash::digest(
         b"vos/service-install-authorization/v2",
@@ -486,6 +644,45 @@ fn install_hash(genesis: &ServiceGenesisV2) -> super::Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct InjectedFailure;
+
+    #[derive(Debug, Default)]
+    struct TestImageStore {
+        image: Option<Vec<u8>>,
+        fail_next_commit: bool,
+    }
+
+    impl CommittedImageStoreV2 for TestImageStore {
+        type Error = InjectedFailure;
+
+        fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.image.clone())
+        }
+
+        fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+            if core::mem::take(&mut self.fail_next_commit) {
+                return Err(InjectedFailure);
+            }
+            self.image = Some(image.to_vec());
+            Ok(())
+        }
+    }
+
+    fn valid_header() -> StoreHeaderV2 {
+        StoreHeaderV2::current(
+            super::super::ServiceIdentityV2 {
+                space: super::super::SpaceId([1; 32]),
+                root_service: super::super::RootServiceId([2; 32]),
+                deployment: super::super::DeploymentId([3; 32]),
+                service_program: ProgramId([4; 32]),
+                service_abi: super::super::ABI_VERSION,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            },
+            super::super::ConsistencyModeV2::Local,
+        )
+    }
 
     #[test]
     fn snapshots_exclude_uncommitted_transactions() {
@@ -543,15 +740,7 @@ mod tests {
         let mut store = LocalJamStoreV2::new();
         let blob = store.import_blob(b"continuation page".to_vec());
         let program = store.import_program(b"canonical actor pvm".to_vec());
-        let service = super::super::ServiceIdentityV2 {
-            space: super::super::SpaceId([1; 32]),
-            root_service: super::super::RootServiceId([2; 32]),
-            deployment: super::super::DeploymentId([3; 32]),
-            service_program: ProgramId([4; 32]),
-            service_abi: super::super::ABI_VERSION,
-            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
-        };
-        let header = StoreHeaderV2::current(service, super::super::ConsistencyModeV2::Local);
+        let header = valid_header();
         let mut transaction = store.begin().unwrap();
         transaction
             .staged
@@ -585,5 +774,75 @@ mod tests {
             LocalJamStoreSnapshotV2::decode(&corrupt_program.encode()),
             Err(DecodeError::NonCanonical)
         );
+    }
+
+    #[test]
+    fn durable_boundary_never_exposes_a_failed_commit_and_retry_is_exact() {
+        let backend = TestImageStore {
+            fail_next_commit: true,
+            ..TestImageStore::default()
+        };
+        let mut store = DurableJamStoreV2::open(backend).unwrap();
+        let blob = store.import_blob(b"continuation page".to_vec());
+        let program = store.import_program(b"canonical actor pvm".to_vec());
+        let before = store.snapshot();
+
+        let mut rejected = store.begin().unwrap();
+        rejected.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        assert_eq!(
+            store.commit(rejected),
+            Err(ServicePvmErrorV2::AccumulateCommitRejected)
+        );
+        assert_eq!(store.snapshot(), before);
+        assert!(store.backend().image.is_none());
+
+        let mut retry = store.begin().unwrap();
+        retry.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.commit(retry).unwrap();
+        assert_eq!(store.commit_sequence(), 1);
+
+        let expected = store.snapshot();
+        let (_, backend) = store.into_parts();
+        let restarted = DurableJamStoreV2::open(backend).unwrap();
+        assert_eq!(restarted.snapshot(), expected);
+        assert_eq!(restarted.blob(&blob), Some(b"continuation page".as_slice()));
+        assert_eq!(
+            restarted.program(program),
+            Some(b"canonical actor pvm".as_slice())
+        );
+    }
+
+    #[test]
+    fn file_backend_atomically_reopens_the_committed_image() {
+        let directory = std::env::temp_dir().join(alloc::format!(
+            "vos-v2-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let path = directory.join("service.v2");
+        let mut store = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
+        let mut transaction = store.begin().unwrap();
+        transaction.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.commit(transaction).unwrap();
+        let expected = store.snapshot();
+        drop(store);
+
+        let restarted = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
+        assert_eq!(restarted.snapshot(), expected);
+        assert!(!path.with_file_name("service.v2.v2-next").exists());
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

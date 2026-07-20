@@ -60,7 +60,11 @@ The local conformance host persists the complete committed service image as a
 canonical `LocalJamStoreSnapshotV2` wire. Restore verifies every blob and
 program against its content identity and validates the current v2 store header
 before exposing any rows; in-flight transactions and host verifier policy are
-deliberately excluded.
+deliberately excluded. `DurableJamStoreV2` sends that candidate image through a
+`CommittedImageStoreV2` boundary before making it visible or returning effects.
+The filesystem backend flushes a sibling file, atomically renames it, and syncs
+the parent directory. A backend rejection leaves the previous in-process image
+visible and the same work may be retried exactly.
 
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls
