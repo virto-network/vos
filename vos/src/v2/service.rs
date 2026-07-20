@@ -1,25 +1,36 @@
-//! One generic service program with Gray Paper Refine/Accumulate entries.
+//! Local conformance harness for the protocol-pinned generic service PVM.
+//!
+//! There is deliberately no native Refine implementation and no native
+//! transition-apply shortcut here. Both paths execute the same canonical PVM
+//! that deployment installs; the host supplies only imports and an atomic JAM
+//! storage transaction boundary.
 
-use core::marker::PhantomData;
+use alloc::vec::Vec;
 
 use super::{
-    AccumulateError, AccumulationOutcome, AccumulationValidator, InMemoryServiceState, Refine,
-    RefineError, RefineImportsV2, ServiceFunction, TransitionV2, WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationResultV2, ImportedBlobV2, ProgramId,
+    RefineImportsV2, RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
+    WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServiceDispatchOutputV2 {
-    Refined(TransitionV2),
-    Accumulated(AccumulationOutcome),
+pub struct RefinedServiceOutputV2 {
+    pub transition: TransitionV2,
+    pub gas_used: u64,
+    pub exported_blobs: Vec<ImportedBlobV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulatedServiceOutputV2 {
+    pub result: AccumulationResultV2,
+    pub gas_used: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceDispatchError {
-    UnknownEntryIc(u32),
-    UnexpectedTransition,
-    MissingTransition,
-    Refine(RefineError),
-    Accumulate(AccumulateError),
+    Pvm(ServicePvmErrorV2),
+    InvalidRefineOutput,
+    InvalidAccumulateOutput,
 }
 
 impl core::fmt::Display for ServiceDispatchError {
@@ -30,174 +41,90 @@ impl core::fmt::Display for ServiceDispatchError {
 
 impl core::error::Error for ServiceDispatchError {}
 
-/// Local conformance harness for the same generic program deployed as
-/// `vos-service.pvm`. JAM enters Refine at IC 0 and Accumulate at IC 5 while
-/// `phi[7]`/`phi[8]` carry the standard argument window. Refine receives only
-/// immutable inputs; the service store is reachable only in Accumulate.
-pub struct JamServiceV2<R, V> {
-    refiner: PhantomData<fn() -> R>,
-    validator: V,
-    state: InMemoryServiceState,
+/// Drives the canonical service PVM in a local node or conformance test.
+/// `R` is immutable Refine import plumbing; `A` owns the atomic Accumulate
+/// transaction. Neither is allowed to implement actor semantics.
+pub struct JamServiceV2<R, A> {
+    pvm: ServicePvmV2,
+    refine_host: R,
+    accumulate_host: A,
+    refine_gas: u64,
+    accumulate_gas: u64,
 }
 
-impl<R, V> JamServiceV2<R, V> {
-    pub fn new(validator: V, state: InMemoryServiceState) -> Self {
-        Self {
-            refiner: PhantomData,
-            validator,
-            state,
-        }
+impl<R, A> JamServiceV2<R, A> {
+    pub fn new(
+        canonical_service_pvm: Vec<u8>,
+        expected_program: ProgramId,
+        refine_host: R,
+        accumulate_host: A,
+        refine_gas: u64,
+        accumulate_gas: u64,
+    ) -> Result<Self, ServiceDispatchError> {
+        let pvm = ServicePvmV2::new(canonical_service_pvm, expected_program)
+            .map_err(ServiceDispatchError::Pvm)?;
+        Ok(Self {
+            pvm,
+            refine_host,
+            accumulate_host,
+            refine_gas,
+            accumulate_gas,
+        })
     }
 
-    pub fn state(&self) -> &InMemoryServiceState {
-        &self.state
+    pub const fn program_id(&self) -> ProgramId {
+        self.pvm.program_id()
+    }
+
+    pub fn accumulate_host(&self) -> &A {
+        &self.accumulate_host
+    }
+
+    pub fn accumulate_host_mut(&mut self) -> &mut A {
+        &mut self.accumulate_host
+    }
+
+    pub fn into_hosts(self) -> (R, A) {
+        (self.refine_host, self.accumulate_host)
     }
 }
 
-impl<R: Refine, V: AccumulationValidator> JamServiceV2<R, V> {
-    pub fn dispatch_entry_ic(
-        &mut self,
-        entry_ic: u32,
+impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
+    pub fn refine_actor_tree(
+        &self,
         work: &WorkEnvelopeV2,
         imports: &RefineImportsV2,
-        transition: Option<&TransitionV2>,
-    ) -> Result<ServiceDispatchOutputV2, ServiceDispatchError> {
-        match ServiceFunction::from_entry_ic(entry_ic) {
-            Some(ServiceFunction::Refine) => {
-                if transition.is_some() {
-                    return Err(ServiceDispatchError::UnexpectedTransition);
-                }
-                imports
-                    .validate_for(work)
-                    .map_err(ServiceDispatchError::Refine)?;
-                R::refine(work, imports)
-                    .map(ServiceDispatchOutputV2::Refined)
-                    .map_err(ServiceDispatchError::Refine)
-            }
-            Some(ServiceFunction::Accumulate) => {
-                let transition = transition.ok_or(ServiceDispatchError::MissingTransition)?;
-                self.state
-                    .accumulate(work, transition, &self.validator)
-                    .map(ServiceDispatchOutputV2::Accumulated)
-                    .map_err(ServiceDispatchError::Accumulate)
-            }
-            None => Err(ServiceDispatchError::UnknownEntryIc(entry_ic)),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alloc::string::ToString;
-    use alloc::vec;
-
-    use super::*;
-    use crate::v2::{
-        ActorId, AuthorizationEvidenceV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId,
-        GasAccountingV2, Hash, InvocationId, Origin, ProgramId, RootServiceId, ServiceIdentityV2,
-        WorkEnvelopeV2,
-    };
-
-    struct Echo;
-
-    impl Refine for Echo {
-        fn refine(
-            work: &WorkEnvelopeV2,
-            _: &RefineImportsV2,
-        ) -> Result<TransitionV2, RefineError> {
-            Ok(TransitionV2 {
-                service: work.service.clone(),
-                consumed_input: work.input_id(),
-                target_program: work.target_program,
-                base: work.base.clone(),
-                writes: vec![],
-                crdt_change: None,
-                continuations: vec![],
-                inbox: vec![],
-                outbox: vec![],
-                reply: None,
-                exported_blobs: vec![],
-                gas: GasAccountingV2::default(),
-                proof: None,
-            })
-        }
+    ) -> Result<RefinedServiceOutputV2, ServiceDispatchError> {
+        let output = self
+            .pvm
+            .refine_actor_tree(&work.encode(), imports, self.refine_gas, &self.refine_host)
+            .map_err(ServiceDispatchError::Pvm)?;
+        let transition = TransitionV2::decode(&output.bytes)
+            .map_err(|_| ServiceDispatchError::InvalidRefineOutput)?;
+        Ok(RefinedServiceOutputV2 {
+            transition,
+            gas_used: output.gas_used,
+            exported_blobs: output.exported_blobs,
+        })
     }
 
-    #[test]
-    fn gp_entries_keep_refine_stateless() {
-        let identity = ServiceIdentityV2 {
-            root_service: RootServiceId([1; 32]),
-            deployment: DeploymentId([2; 32]),
-            service_program: ProgramId([3; 32]),
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-        };
-        let actor = ActorId([4; 32]);
-        let actor_pvm = vec![5, 6, 7];
-        let program = ProgramId::of_pvm(&actor_pvm);
-        let actor_state_bytes = b"actor-state".to_vec();
-        let actor_state = crate::v2::BlobRefV2::of_bytes(&actor_state_bytes);
-        let mut state = InMemoryServiceState::new(identity.clone(), ConsistencyModeV2::Local);
-        state.install_actor(actor, program);
-        state.make_blob_available(actor_state.hash);
-        let work = WorkEnvelopeV2 {
-            service: identity,
-            invocation: InvocationId([6; 32]),
-            workflow_step: 0,
-            target: actor,
-            target_program: program,
-            method: "tick".to_string(),
-            arguments: vec![],
-            origin: Origin::Anonymous,
-            authorization: AuthorizationEvidenceV2::Public,
-            causal_parent: None,
-            parent_call: None,
-            consistency: ConsistencyModeV2::Local,
-            base: state.current_base(),
-            imported_actors: vec![crate::v2::ImportedActorV2 {
-                actor,
-                program,
-                state: actor_state.clone(),
-                continuation: None,
-            }],
-            imported_blobs: vec![],
-            proof_requested: false,
-        };
-        let imports = RefineImportsV2 {
-            programs: vec![crate::v2::ImportedProgramV2 {
-                program,
-                pvm: actor_pvm,
-            }],
-            blobs: vec![crate::v2::ImportedBlobV2 {
-                reference: actor_state,
-                bytes: actor_state_bytes,
-            }],
-        };
-        let mut service = JamServiceV2::<Echo, _>::new(crate::v2::AllowPublic, state);
-        let revision = service.state().revision();
-        let transition = match service
-            .dispatch_entry_ic(crate::v2::REFINE_ENTRY_IC, &work, &imports, None)
-            .unwrap()
-        {
-            ServiceDispatchOutputV2::Refined(transition) => transition,
-            _ => panic!("wrong logical function"),
-        };
-        assert_eq!(service.state().revision(), revision);
-        let outcome = service
-            .dispatch_entry_ic(
-                crate::v2::ACCUMULATE_ENTRY_IC,
-                &work,
-                &imports,
-                Some(&transition),
+    pub fn accumulate(
+        &mut self,
+        request: &AccumulateRequestV2,
+    ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
+        let output = self
+            .pvm
+            .accumulate(
+                &request.encode(),
+                self.accumulate_gas,
+                &mut self.accumulate_host,
             )
-            .unwrap();
-        assert!(matches!(outcome, ServiceDispatchOutputV2::Accumulated(_)));
-        assert_eq!(service.state().revision(), revision + 1);
-        assert_eq!(
-            service.dispatch_entry_ic(1, &work, &imports, None),
-            Err(ServiceDispatchError::UnknownEntryIc(1)),
-        );
-        assert_ne!(service.state().state_root(), Hash::ZERO);
-        assert!(matches!(work.base, ConsistencyBaseV2::Linear { .. }));
+            .map_err(ServiceDispatchError::Pvm)?;
+        let result = AccumulationResultV2::decode(&output.bytes)
+            .map_err(|_| ServiceDispatchError::InvalidAccumulateOutput)?;
+        Ok(AccumulatedServiceOutputV2 {
+            result,
+            gas_used: output.gas_used,
+        })
     }
 }

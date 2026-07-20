@@ -11,9 +11,10 @@ use vos::v2::{
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AllowPublic,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId,
     GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InMemoryServiceState, InvocationId, MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId,
-    PublishedEffectsV2, RefineImportsV2, ReplyRecordV2, RootServiceId, ServiceGenesisV2,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    InMemoryServiceState, InvocationId, JamServiceV2, MethodPolicyV2, NoRefineProtocolHostV2,
+    Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, ReplyRecordV2, RootServiceId,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
+    WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -553,13 +554,21 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         return;
     };
     let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
-    let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
     let actor_program = ProgramId([31; 32]);
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
     let mut host = DurableAccumulateHost::default();
     host.preimages.insert(initial.hash.0, initial_bytes);
+    let mut service = JamServiceV2::new(
+        pvm.clone(),
+        ProgramId::of_pvm(&pvm),
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
 
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
         service: seed_work.service.clone(),
@@ -584,15 +593,14 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         },
     });
     let installed_output = service
-        .accumulate(&install.encode(), 5_000_000_000, &mut host)
+        .accumulate(&install)
         .expect("guest install completes");
-    let AccumulationResultV2::Installed(installed) =
-        AccumulationResultV2::decode(&installed_output.bytes).unwrap()
+    let AccumulationResultV2::Installed(installed) = installed_output.result
     else {
         panic!("guest install rejected")
     };
-    assert_eq!(host.commits, 1);
-    let installed_rows = host.rows.len();
+    assert_eq!(service.accumulate_host().commits, 1);
+    let installed_rows = service.accumulate_host().rows.len();
 
     let mut work = seed_work;
     work.base = ConsistencyBaseV2::Linear {
@@ -627,46 +635,49 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         transition: transition.clone(),
     });
     let applied_output = service
-        .accumulate(&apply.encode(), 5_000_000_000, &mut host)
+        .accumulate(&apply)
         .expect("guest apply completes");
     let AccumulationResultV2::Accepted {
         receipt,
         published,
         duplicate,
-    } = AccumulationResultV2::decode(&applied_output.bytes).unwrap()
+    } = applied_output.result
     else {
         panic!("guest apply rejected")
     };
     assert!(!duplicate);
     assert_eq!(receipt.sequence, 1);
     assert_eq!(published.reply, transition.reply);
-    assert!(host.rows.len() > installed_rows);
-    assert_eq!(host.commits, 2);
+    assert!(service.accumulate_host().rows.len() > installed_rows);
+    assert_eq!(service.accumulate_host().commits, 2);
     assert!(
-        host.preimages
+        service
+            .accumulate_host()
+            .preimages
             .values()
             .any(|bytes| bytes == b"committed actor state")
     );
 
-    let rows_after_apply = host.rows.clone();
-    let preimages_after_apply = host.preimages.clone();
+    let rows_after_apply = service.accumulate_host().rows.clone();
+    let preimages_after_apply = service.accumulate_host().preimages.clone();
     let duplicate_output = service
-        .accumulate(&apply.encode(), 5_000_000_000, &mut host)
+        .accumulate(&apply)
         .expect("guest retry completes");
     let AccumulationResultV2::Accepted {
         published,
         duplicate,
         ..
-    } = AccumulationResultV2::decode(&duplicate_output.bytes).unwrap()
+    } = duplicate_output.result
     else {
         panic!("guest retry rejected")
     };
     assert!(duplicate);
     assert_eq!(published, PublishedEffectsV2::default());
-    assert_eq!(host.rows, rows_after_apply);
-    assert_eq!(host.preimages, preimages_after_apply);
+    assert_eq!(service.accumulate_host().rows, rows_after_apply);
+    assert_eq!(service.accumulate_host().preimages, preimages_after_apply);
     assert_eq!(
-        host.commits, 3,
+        service.accumulate_host().commits,
+        3,
         "a read-only duplicate transaction may commit"
     );
 }
