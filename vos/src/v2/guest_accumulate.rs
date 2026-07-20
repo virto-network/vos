@@ -579,7 +579,9 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
         }
         max_height = max_height.max(parent.causal_height);
     }
-    if max_height.checked_add(1) != Some(change.causal_height) {
+    if work.base_causal_height != Some(max_height)
+        || max_height.checked_add(1) != Some(change.causal_height)
+    {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     Ok(None)
@@ -1151,6 +1153,7 @@ mod tests {
                 revision: 0,
                 state_root: base_root,
             },
+            base_causal_height: None,
             imported_actors: vec![ImportedActorV2 {
                 actor: actor(),
                 program: program(),
@@ -1642,6 +1645,7 @@ mod tests {
     }
 
     fn crdt_work(initial: BlobRefV2, invocation: u8, heads: Vec<Hash>) -> WorkEnvelopeV2 {
+        let base_causal_height = Some(u64::from(!heads.is_empty()));
         WorkEnvelopeV2 {
             service: identity(),
             invocation: InvocationId([invocation; 32]),
@@ -1656,6 +1660,7 @@ mod tests {
             parent_call: None,
             consistency: ConsistencyModeV2::Crdt,
             base: ConsistencyBaseV2::Crdt { heads },
+            base_causal_height,
             imported_actors: vec![ImportedActorV2 {
                 actor: actor(),
                 program: program(),

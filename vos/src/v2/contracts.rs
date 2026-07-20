@@ -202,6 +202,10 @@ pub struct WorkEnvelopeV2 {
     pub parent_call: Option<CallId>,
     pub consistency: ConsistencyModeV2,
     pub base: ConsistencyBaseV2,
+    /// Maximum causal height among `base` heads. Present only for CRDT work;
+    /// Accumulate recomputes it from committed parent nodes before accepting
+    /// the child change.
+    pub base_causal_height: Option<u64>,
     pub imported_actors: Vec<ImportedActorV2>,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
@@ -675,6 +679,7 @@ impl V2Wire for WorkEnvelopeV2 {
         e.option(&self.parent_call, |e, id| e.fixed(&id.0));
         e.u8(self.consistency as u8);
         encode_base(&mut e, &self.base);
+        e.option(&self.base_causal_height, |e, height| e.u64(*height));
         e.list(&self.imported_actors, encode_imported_actor);
         e.list(&self.imported_blobs, encode_blob_ref);
         e.bool(self.proof_requested);
@@ -700,6 +705,14 @@ impl V2Wire for WorkEnvelopeV2 {
         if !base.mode_compatible(consistency) {
             return Err(DecodeError::NonCanonical);
         }
+        let base_causal_height = d.option(Decoder::u64)?;
+        match (&base, base_causal_height) {
+            (ConsistencyBaseV2::Linear { .. }, None) => {}
+            (ConsistencyBaseV2::Crdt { heads }, Some(0)) if heads.is_empty() => {}
+            (ConsistencyBaseV2::Crdt { heads }, Some(height))
+                if !heads.is_empty() && height != 0 => {}
+            _ => return Err(DecodeError::NonCanonical),
+        }
         let imported_actors = d.list(decode_imported_actor)?;
         let imported_blobs = d.list(decode_blob_ref)?;
         let proof_requested = d.bool()?;
@@ -719,6 +732,7 @@ impl V2Wire for WorkEnvelopeV2 {
             parent_call,
             consistency,
             base,
+            base_causal_height,
             imported_actors,
             imported_blobs,
             proof_requested,
@@ -1404,6 +1418,11 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
                 && Some(change.id) == CrdtChangeV2::derive_id(&value.work)
                 && change.work_hash == value.work.hash()
                 && change.causal_dependencies.as_slice() == heads.as_slice()
+                && value
+                    .work
+                    .base_causal_height
+                    .and_then(|height| height.checked_add(1))
+                    == Some(change.causal_height)
                 && change.workflow == value.transition.workflow_operations() =>
         {
             Ok(())
@@ -1948,6 +1967,7 @@ mod tests {
                 revision: 7,
                 state_root: Hash([8; 32]),
             },
+            base_causal_height: None,
             imported_actors: vec![],
             imported_blobs: vec![],
             proof_requested: false,
@@ -2350,6 +2370,7 @@ mod tests {
         work.base = ConsistencyBaseV2::Crdt {
             heads: vec![Hash([31; 32])],
         };
+        work.base_causal_height = Some(3);
         let change_id = CrdtChangeV2::derive_id(&work).unwrap();
         let field = Hash([32; 32]);
         let transition = TransitionV2 {
