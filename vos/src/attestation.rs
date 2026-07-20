@@ -527,13 +527,46 @@ pub struct AttestationReplayGuard {
     seen: BTreeSet<(ActorId, InvocationId)>,
 }
 
+/// Durable replay seam used by the verifier path. Deployment adapters must
+/// make this admission atomic with any state change authorized by the claim.
+pub trait AttestationReplayStore {
+    fn admit_once(&mut self, actor: ActorId, invocation: InvocationId) -> bool;
+}
+
+impl AttestationReplayStore for AttestationReplayGuard {
+    fn admit_once(&mut self, actor: ActorId, invocation: InvocationId) -> bool {
+        self.seen.insert((actor, invocation))
+    }
+}
+
+/// Authenticated registry result for the producer name supplied to
+/// [`VerifyAttestationBuilder::from`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttestationSource {
+    pub actor: ActorId,
+    pub producer: ProducerId,
+}
+
+pub trait AttestationSourceResolver {
+    fn resolve_attestation_source(&self, name: &str) -> Option<AttestationSource>;
+}
+
+impl<F> AttestationSourceResolver for F
+where
+    F: Fn(&str) -> Option<AttestationSource>,
+{
+    fn resolve_attestation_source(&self, name: &str) -> Option<AttestationSource> {
+        self(name)
+    }
+}
+
 /// Verify an already-produced package. This path never invokes the producer.
 pub fn verify_once<T, M: AttestedMethod<T>>(
     package: Attestation<T, M>,
     expected_producer_name: &str,
     expected_actor: ActorId,
     expected_producer: ProducerId,
-    replay: &mut AttestationReplayGuard,
+    replay: &mut impl AttestationReplayStore,
     verifier: &impl ProofVerifier,
 ) -> Result<Verified<T>, AttestationError> {
     if package.producer_name != expected_producer_name
@@ -565,11 +598,96 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
     ) {
         return Err(AttestationError::InvalidProof);
     }
-    let key = (package.statement.actor, package.statement.invocation);
-    if !replay.seen.insert(key) {
+    if !replay.admit_once(package.statement.actor, package.statement.invocation) {
         return Err(AttestationError::Replay);
     }
     Ok(Verified(package.preview))
+}
+
+/// Verifier-side dependencies. It deliberately contains no proof producer or
+/// invocation capability: verification cannot execute the source actor.
+pub struct VerificationContext<'a, R, V, S> {
+    resolver: &'a R,
+    verifier: &'a V,
+    replay: &'a mut S,
+}
+
+impl<'a, R, V, S> VerificationContext<'a, R, V, S> {
+    pub fn new(resolver: &'a R, verifier: &'a V, replay: &'a mut S) -> Self {
+        Self {
+            resolver,
+            verifier,
+            replay,
+        }
+    }
+
+    pub fn verify<T, M>(
+        &mut self,
+        package: Attestation<T, M>,
+    ) -> VerifyAttestationBuilder<'_, T, M, R, V, S> {
+        VerifyAttestationBuilder {
+            package,
+            resolver: self.resolver,
+            verifier: self.verifier,
+            replay: self.replay,
+        }
+    }
+}
+
+/// First verifier-builder state. Calling `from` is mandatory before the
+/// once-only verification operation becomes available.
+pub struct VerifyAttestationBuilder<'a, T, M, R, V, S> {
+    package: Attestation<T, M>,
+    resolver: &'a R,
+    verifier: &'a V,
+    replay: &'a mut S,
+}
+
+impl<'a, T, M, R, V, S> VerifyAttestationBuilder<'a, T, M, R, V, S> {
+    pub fn from(
+        self,
+        producer_name: impl Into<String>,
+    ) -> VerifyAttestationFrom<'a, T, M, R, V, S> {
+        VerifyAttestationFrom {
+            package: self.package,
+            producer_name: producer_name.into(),
+            resolver: self.resolver,
+            verifier: self.verifier,
+            replay: self.replay,
+        }
+    }
+}
+
+/// Builder state with an authenticated producer name ready to resolve.
+pub struct VerifyAttestationFrom<'a, T, M, R, V, S> {
+    package: Attestation<T, M>,
+    producer_name: String,
+    resolver: &'a R,
+    verifier: &'a V,
+    replay: &'a mut S,
+}
+
+impl<T, M, R, V, S> VerifyAttestationFrom<'_, T, M, R, V, S>
+where
+    M: AttestedMethod<T>,
+    R: AttestationSourceResolver,
+    V: ProofVerifier,
+    S: AttestationReplayStore,
+{
+    pub async fn once(self) -> Result<Verified<T>, AttestationError> {
+        let source = self
+            .resolver
+            .resolve_attestation_source(&self.producer_name)
+            .ok_or(AttestationError::WrongProducer)?;
+        verify_once(
+            self.package,
+            &self.producer_name,
+            source.actor,
+            source.producer,
+            self.replay,
+            self.verifier,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -718,6 +836,35 @@ mod tests {
                 &verifier,
             ),
             Err(AttestationError::StateCommitmentMismatch),
+        );
+    }
+
+    #[test]
+    fn verifier_builder_resolves_the_source_and_never_needs_a_producer() {
+        let resolver = |name: &str| {
+            (name == "private-age").then_some(AttestationSource {
+                actor: ActorId([7; 32]),
+                producer: ProducerId([15; 32]),
+            })
+        };
+        let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
+        let mut replay = AttestationReplayGuard::default();
+        let mut context = VerificationContext::new(&resolver, &verifier, &mut replay);
+
+        let claim =
+            crate::block_on(context.verify(package(25)).from("private-age").once()).unwrap();
+        assert_eq!(claim.into_inner(), 25);
+
+        assert_eq!(
+            crate::block_on(context.verify(package(25)).from("private-age").once(),),
+            Err(AttestationError::Replay),
+        );
+
+        let mut fresh_replay = AttestationReplayGuard::default();
+        let mut fresh_context = VerificationContext::new(&resolver, &verifier, &mut fresh_replay);
+        assert_eq!(
+            crate::block_on(fresh_context.verify(package(26)).from("unknown-age").once(),),
+            Err(AttestationError::WrongProducer),
         );
     }
 
