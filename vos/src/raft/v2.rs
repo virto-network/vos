@@ -18,7 +18,7 @@ use redb::Database;
 use crate::commit::CommitError;
 use crate::v2::{
     AccumulateRequestV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, V2Wire,
+    CommittedAccumulateLogV2, CommittedServiceSnapshotV2, LocalJamStoreSnapshotV2, V2Wire,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -278,7 +278,35 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
         Ok(self.meta.last_applied)
     }
 
-    fn mark_applied(&mut self, index: u64) -> Result<(), Self::Error> {
+    fn installed_snapshot_after(
+        &mut self,
+        applied_index: u64,
+    ) -> Result<Option<CommittedServiceSnapshotV2>, Self::Error> {
+        self.reload()?;
+        if applied_index != self.meta.last_applied {
+            return Err(CommitError::Config(alloc::format!(
+                "raft v2 snapshot cursor mismatch: requested {applied_index}, durable {}",
+                self.meta.last_applied,
+            )));
+        }
+        if applied_index >= self.meta.snap_last_index {
+            return Ok(None);
+        }
+        let bytes = super::redb_storage::read_state_bytes(&self.db)?;
+        let snapshot = CommittedServiceSnapshotV2::decode(&bytes).map_err(|_| {
+            CommitError::Config("raft v2 installed service snapshot is not canonical".into())
+        })?;
+        if snapshot.applied_index != self.meta.snap_last_index {
+            return Err(CommitError::Config(alloc::format!(
+                "raft v2 snapshot image index {} does not match installed index {}",
+                snapshot.applied_index,
+                self.meta.snap_last_index,
+            )));
+        }
+        Ok(Some(snapshot))
+    }
+
+    fn mark_applied(&mut self, index: u64, service_image: &[u8]) -> Result<(), Self::Error> {
         self.meta = RaftMeta::load(&self.db)?;
         if index < self.meta.last_applied || index > self.meta.commit_index {
             return Err(CommitError::Config(alloc::format!(
@@ -287,7 +315,16 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
                 self.meta.commit_index,
             )));
         }
+        LocalJamStoreSnapshotV2::decode(service_image).map_err(|_| {
+            CommitError::Config("raft v2 applied service image is not canonical".into())
+        })?;
+        let snapshot = CommittedServiceSnapshotV2 {
+            applied_index: index,
+            service_image: service_image.to_vec(),
+        }
+        .encode();
         let transaction = self.db.begin_write()?;
+        super::redb_storage::write_applied_state_v2_in_txn(&transaction, index, &snapshot)?;
         self.meta.last_applied = index;
         self.meta.write_host_fields_in_txn(&transaction)?;
         transaction.commit()?;
@@ -297,11 +334,13 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::redb_storage::RedbStorage;
     use super::*;
     use crate::v2::{
         ABI_VERSION, DeploymentId, EXECUTION_SEMANTICS_ID, Hash, InvocationId, ProgramId,
         PublicationAckV2, RootServiceId, ServiceIdentityV2, SpaceId, WorkInputIdV2,
     };
+    use vos_raft::{Meta, Storage, WriteBatch};
 
     fn request(byte: u8) -> AccumulateRequestV2 {
         AccumulateRequestV2::AcknowledgePublication(PublicationAckV2 {
@@ -334,6 +373,12 @@ mod tests {
         (directory.join("raft.redb"), directory)
     }
 
+    fn service_image(byte: u8) -> Vec<u8> {
+        let mut store = crate::v2::LocalJamStoreV2::default();
+        store.import_blob(vec![byte]);
+        store.snapshot_bytes()
+    }
+
     #[test]
     fn single_node_log_recovers_canonical_requests_and_apply_cursor() {
         let (path, directory) = temp_path();
@@ -349,7 +394,8 @@ mod tests {
                 committed_index: 1,
             }
         );
-        log.mark_applied(1).unwrap();
+        let service_image = LocalJamStoreSnapshotV2::default().encode();
+        log.mark_applied(1, &service_image).unwrap();
         drop(log);
 
         let mut restarted = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();
@@ -362,6 +408,82 @@ mod tests {
             }
         );
         assert!(restarted.propose(b"not a v2 request").is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_freezes_the_exact_applied_service_image() {
+        let (path, directory) = temp_path();
+        let db = Arc::new(Database::create(&path).unwrap());
+        let mut log = RaftAccumulateLogV2::from_db_arc(db.clone(), RaftConfig::default()).unwrap();
+        let first = log.propose(&request(1).encode()).unwrap();
+        let first_image = service_image(1);
+        log.mark_applied(first.index, &first_image).unwrap();
+        let second = log.propose(&request(2).encode()).unwrap();
+        let second_image = service_image(2);
+        log.mark_applied(second.index, &second_image).unwrap();
+        drop(log);
+
+        let mut storage = RedbStorage::open(db).unwrap();
+        futures_executor::block_on(storage.commit_batch(WriteBatch {
+            compact_to: Some((first.index, 0)),
+            ..Default::default()
+        }))
+        .unwrap();
+        let frozen = CommittedServiceSnapshotV2::decode(
+            &futures_executor::block_on(storage.read_state()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frozen.applied_index, first.index);
+        assert_eq!(frozen.service_image, first_image);
+
+        futures_executor::block_on(storage.commit_batch(WriteBatch {
+            compact_to: Some((second.index, 0)),
+            ..Default::default()
+        }))
+        .unwrap();
+        let frozen = CommittedServiceSnapshotV2::decode(
+            &futures_executor::block_on(storage.read_state()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frozen.applied_index, second.index);
+        assert_eq!(frozen.service_image, second_image);
+        drop(storage);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn installed_snapshot_is_exposed_until_its_service_image_is_applied() {
+        let (path, directory) = temp_path();
+        let db = Arc::new(Database::create(&path).unwrap());
+        let service_image = service_image(3);
+        let snapshot = CommittedServiceSnapshotV2 {
+            applied_index: 4,
+            service_image: service_image.clone(),
+        };
+        let mut storage = RedbStorage::open(db.clone()).unwrap();
+        futures_executor::block_on(storage.commit_batch(WriteBatch {
+            compact_to: Some((4, 2)),
+            state: Some(snapshot.encode()),
+            meta: Some(Meta {
+                current_term: 2,
+                voted_for: None,
+                commit_index: 4,
+                snap_last_index: 4,
+                snap_last_term: 2,
+            }),
+            ..Default::default()
+        }))
+        .unwrap();
+        drop(storage);
+
+        let mut log = RaftAccumulateLogV2::from_db_arc(db, RaftConfig::default()).unwrap();
+        assert_eq!(log.applied_index().unwrap(), 0);
+        assert_eq!(log.installed_snapshot_after(0).unwrap(), Some(snapshot));
+        log.mark_applied(4, &service_image).unwrap();
+        assert_eq!(log.applied_index().unwrap(), 4);
+        assert_eq!(log.installed_snapshot_after(4).unwrap(), None);
+        drop(log);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -423,7 +545,8 @@ mod tests {
                 committed_index: 2,
             }
         );
-        log.mark_applied(2).unwrap();
+        let service_image = LocalJamStoreSnapshotV2::default().encode();
+        log.mark_applied(2, &service_image).unwrap();
         assert_eq!(log.applied_index().unwrap(), 2);
 
         drop(log);

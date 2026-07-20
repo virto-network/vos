@@ -140,6 +140,25 @@ pub trait CommittedImageStoreV2 {
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceImageInstallErrorV2 {
+    InvalidSnapshot,
+    ServiceMismatch,
+    PersistenceRejected,
+}
+
+/// Read and atomically replace the consensus-visible image owned by a
+/// physical service host. Raft catch-up uses this boundary for an installed
+/// snapshot; it never reconstructs actor state from native commands.
+pub trait CommittedServiceImageHostV2 {
+    fn committed_service_image(&self) -> Vec<u8>;
+
+    fn install_committed_service_image(
+        &mut self,
+        image: &[u8],
+    ) -> Result<(), ServiceImageInstallErrorV2>;
+}
+
 #[derive(Debug)]
 pub enum DurableStoreOpenErrorV2<E> {
     Backend(E),
@@ -318,6 +337,31 @@ impl LocalJamStoreV2 {
         LocalJamStoreSnapshotV2::decode(bytes).map(Self::from_snapshot)
     }
 
+    fn validate_replacement(
+        &self,
+        image: &[u8],
+    ) -> Result<LocalJamStoreSnapshotV2, ServiceImageInstallErrorV2> {
+        let replacement = LocalJamStoreSnapshotV2::decode(image)
+            .map_err(|_| ServiceImageInstallErrorV2::InvalidSnapshot)?;
+        let replacement_header = replacement
+            .rows
+            .get(super::header_storage_key())
+            .map(|bytes| StoreHeaderV2::open(bytes))
+            .transpose()
+            .map_err(|_| ServiceImageInstallErrorV2::InvalidSnapshot)?;
+        let current_header = self
+            .header()
+            .map_err(|_| ServiceImageInstallErrorV2::InvalidSnapshot)?;
+        if let Some(current) = current_header
+            && replacement_header.as_ref().is_none_or(|next| {
+                next.service != current.service || next.consistency != current.consistency
+            })
+        {
+            return Err(ServiceImageInstallErrorV2::ServiceMismatch);
+        }
+        Ok(replacement)
+    }
+
     /// Capture only committed state. An active Accumulate transaction is owned
     /// by the service invocation and cannot be observed through this object.
     pub fn snapshot(&self) -> LocalJamStoreSnapshotV2 {
@@ -440,6 +484,38 @@ impl LocalJamStoreV2 {
     /// verifier.
     pub fn allow_receipt(&mut self, request: &ReceiptVerificationRequestV2) {
         self.receipt_allowlist.insert(request.hash());
+    }
+}
+
+impl CommittedServiceImageHostV2 for LocalJamStoreV2 {
+    fn committed_service_image(&self) -> Vec<u8> {
+        self.snapshot_bytes()
+    }
+
+    fn install_committed_service_image(
+        &mut self,
+        image: &[u8],
+    ) -> Result<(), ServiceImageInstallErrorV2> {
+        self.committed = self.validate_replacement(image)?;
+        Ok(())
+    }
+}
+
+impl<B: CommittedImageStoreV2> CommittedServiceImageHostV2 for DurableJamStoreV2<B> {
+    fn committed_service_image(&self) -> Vec<u8> {
+        self.local.snapshot_bytes()
+    }
+
+    fn install_committed_service_image(
+        &mut self,
+        image: &[u8],
+    ) -> Result<(), ServiceImageInstallErrorV2> {
+        let replacement = self.local.validate_replacement(image)?;
+        self.backend
+            .commit(image)
+            .map_err(|_| ServiceImageInstallErrorV2::PersistenceRejected)?;
+        self.local.committed = replacement;
+        Ok(())
     }
 }
 
@@ -795,6 +871,51 @@ mod tests {
             LocalJamStoreSnapshotV2::decode(&corrupt_program.encode()),
             Err(DecodeError::NonCanonical)
         );
+    }
+
+    #[test]
+    fn service_image_install_validates_identity_and_persists_before_visibility() {
+        let mut source = LocalJamStoreV2::new();
+        let mut source_transaction = source.begin().unwrap();
+        source_transaction.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        source.commit(source_transaction).unwrap();
+        let image = source.snapshot_bytes();
+
+        let mut fresh = LocalJamStoreV2::new();
+        fresh.install_committed_service_image(&image).unwrap();
+        assert!(fresh.snapshot().same_service_state(&source.snapshot()));
+
+        let mut different_header = valid_header();
+        different_header.service.root_service = super::super::RootServiceId([99; 32]);
+        let mut different = LocalJamStoreV2::new();
+        let mut transaction = different.begin().unwrap();
+        transaction.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            different_header.encode(),
+        );
+        different.commit(transaction).unwrap();
+        let before = different.snapshot();
+        assert_eq!(
+            different.install_committed_service_image(&image),
+            Err(ServiceImageInstallErrorV2::ServiceMismatch)
+        );
+        assert_eq!(different.snapshot(), before);
+
+        let backend = TestImageStore {
+            fail_next_commit: true,
+            ..TestImageStore::default()
+        };
+        let mut durable = DurableJamStoreV2::open(backend).unwrap();
+        let before = durable.snapshot();
+        assert_eq!(
+            durable.install_committed_service_image(&image),
+            Err(ServiceImageInstallErrorV2::PersistenceRejected)
+        );
+        assert_eq!(durable.snapshot(), before);
+        assert!(durable.backend().image.is_none());
     }
 
     #[test]

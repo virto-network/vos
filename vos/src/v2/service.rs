@@ -7,10 +7,12 @@
 
 use alloc::vec::Vec;
 
+use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationResultV2, ImportedBlobV2, ProgramId,
-    RefineImportsV2, RefineOutputV2, RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmV2,
-    TransitionV2, V2Wire, WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationResultV2,
+    CommittedServiceImageHostV2, ImportedBlobV2, LocalJamStoreSnapshotV2, ProgramId,
+    RefineImportsV2, RefineOutputV2, RefineProtocolHostV2, ServiceImageInstallErrorV2,
+    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +44,37 @@ pub struct CommittedAccumulateBatchV2 {
     pub committed_index: u64,
 }
 
+/// Exact physical service image represented by one compacted Raft prefix.
+/// The image remains the canonical `LocalJamStoreSnapshotV2` wire; this
+/// envelope binds it to the log position advertised by InstallSnapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedServiceSnapshotV2 {
+    pub applied_index: u64,
+    pub service_image: Vec<u8>,
+}
+
+impl V2Wire for CommittedServiceSnapshotV2 {
+    const MAGIC: [u8; 4] = *b"VRS2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.u64(self.applied_index);
+        encoder.bytes(&self.service_image);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let applied_index = decoder.u64()?;
+        let service_image = decoder.bytes()?;
+        if applied_index == 0 || LocalJamStoreSnapshotV2::decode(&service_image).is_err() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self {
+            applied_index,
+            service_image,
+        })
+    }
+}
+
 /// Raft boundary for the v2 service state machine.
 ///
 /// Implementations order the exact canonical request bytes and return from
@@ -60,10 +93,19 @@ pub trait CommittedAccumulateLogV2 {
 
     fn applied_index(&mut self) -> Result<u64, Self::Error>;
 
+    /// Return a Raft-installed service snapshot newer than the local physical
+    /// service image. Logs without compaction may keep the default.
+    fn installed_snapshot_after(
+        &mut self,
+        _applied_index: u64,
+    ) -> Result<Option<CommittedServiceSnapshotV2>, Self::Error> {
+        Ok(None)
+    }
+
     /// Persist only after the service image for every application entry at or
     /// below `index` has committed locally. Replaying after a failed cursor
     /// write is safe because guest Accumulate deduplicates exact inputs.
-    fn mark_applied(&mut self, index: u64) -> Result<(), Self::Error>;
+    fn mark_applied(&mut self, index: u64, service_image: &[u8]) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +119,7 @@ pub enum ServiceDispatchError {
 pub enum ReplicatedServiceErrorV2<E> {
     Dispatch(ServiceDispatchError),
     Log(E),
+    ServiceImage(ServiceImageInstallErrorV2),
     InvalidCommittedLog,
 }
 
@@ -234,17 +277,34 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
 impl<R, A, L> ReplicatedJamServiceV2<R, A, L>
 where
     R: RefineProtocolHostV2,
-    A: AccumulateProtocolHostV2,
+    A: AccumulateProtocolHostV2 + CommittedServiceImageHostV2,
     L: CommittedAccumulateLogV2,
 {
     /// Apply every committed request not yet reflected in this replica's
     /// service image. Effects are recovered as guest-owned publication rows;
     /// followers never publish the returned execution output directly.
     pub fn catch_up(&mut self) -> Result<usize, ReplicatedServiceErrorV2<L::Error>> {
-        let applied = self
+        let mut applied = self
             .log
             .applied_index()
             .map_err(ReplicatedServiceErrorV2::Log)?;
+        if let Some(snapshot) = self
+            .log
+            .installed_snapshot_after(applied)
+            .map_err(ReplicatedServiceErrorV2::Log)?
+        {
+            if snapshot.applied_index <= applied {
+                return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
+            }
+            self.service
+                .accumulate_host_mut()
+                .install_committed_service_image(&snapshot.service_image)
+                .map_err(ReplicatedServiceErrorV2::ServiceImage)?;
+            self.log
+                .mark_applied(snapshot.applied_index, &snapshot.service_image)
+                .map_err(ReplicatedServiceErrorV2::Log)?;
+            applied = snapshot.applied_index;
+        }
         let batch = self
             .log
             .committed_after(applied)
@@ -270,15 +330,17 @@ where
             self.service
                 .accumulate(&request)
                 .map_err(ReplicatedServiceErrorV2::Dispatch)?;
+            let service_image = self.service.accumulate_host().committed_service_image();
             self.log
-                .mark_applied(entry.index)
+                .mark_applied(entry.index, &service_image)
                 .map_err(ReplicatedServiceErrorV2::Log)?;
             cursor = entry.index;
             applied_entries += 1;
         }
         if batch.committed_index > cursor {
+            let service_image = self.service.accumulate_host().committed_service_image();
             self.log
-                .mark_applied(batch.committed_index)
+                .mark_applied(batch.committed_index, &service_image)
                 .map_err(ReplicatedServiceErrorV2::Log)?;
         }
         Ok(applied_entries)
@@ -328,8 +390,9 @@ where
             .service
             .accumulate(&committed)
             .map_err(ReplicatedServiceErrorV2::Dispatch)?;
+        let service_image = self.service.accumulate_host().committed_service_image();
         self.log
-            .mark_applied(entry.index)
+            .mark_applied(entry.index, &service_image)
             .map_err(ReplicatedServiceErrorV2::Log)?;
         Ok(output)
     }

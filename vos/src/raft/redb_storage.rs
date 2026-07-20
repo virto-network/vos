@@ -26,7 +26,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use redb::Database;
+use redb::{Database, ReadableTable, TableDefinition};
 use vos_raft::{EntryKind, LogEntry, Meta, Storage, WriteBatch};
 
 use crate::commit::{CommitError, STATE_KEY, STATE_TABLE};
@@ -42,6 +42,12 @@ use super::log::{RaftLog, RaftMeta};
 /// latter without parsing them as `EffectLog` blobs.
 pub(crate) const ENTRY_KIND_DATA: u8 = 0;
 pub(crate) const ENTRY_KIND_CONFIG_CHANGE: u8 = 1;
+
+/// Exact v2 service image at each durably applied Raft index. The live apply
+/// loop appends here; compaction copies the image matching its exact boundary
+/// into `STATE_TABLE`, which remains frozen until the next compaction.
+pub(crate) const RAFT_APPLIED_STATE_V2: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("raft_applied_state_v2");
 
 /// Encode a `vos_raft::EntryKind<u16>` to its on-disk byte
 /// sequence. The leading byte is the kind tag; the rest is
@@ -322,9 +328,30 @@ impl Storage<u16> for RedbStorage {
                     entry.index, assigned,
                 );
             }
-            if let Some(state_bytes) = new_state.as_deref() {
+            let (snapshot_state, prune_applied_images) = if let Some(state) = new_state.as_ref() {
+                (Some(state.clone()), batch.compact_to.is_some())
+            } else if let Some((index, _)) = batch.compact_to {
+                let table = txn.open_table(RAFT_APPLIED_STATE_V2)?;
+                match table.get(index)? {
+                    Some(value) => (Some(value.value().to_vec()), true),
+                    None => (None, false),
+                }
+            } else {
+                (None, false)
+            };
+            if let Some(state_bytes) = snapshot_state.as_deref() {
                 let mut state_table = txn.open_table(STATE_TABLE)?;
                 state_table.insert(STATE_KEY, state_bytes)?;
+            }
+            if prune_applied_images && let Some((compacted_index, _)) = batch.compact_to {
+                let mut table = txn.open_table(RAFT_APPLIED_STATE_V2)?;
+                let keys = table
+                    .range(..=compacted_index)?
+                    .map(|row| row.map(|(key, _)| key.value()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys {
+                    table.remove(key)?;
+                }
             }
             if let Some(m) = &new_meta {
                 // Merge the worker-managed fields into the
@@ -367,14 +394,23 @@ impl Storage<u16> for RedbStorage {
             // META_LAST_APPLIED).
             self.meta = raft_from_meta(&self.meta, &m);
         }
-        let _ = new_state;
         Ok(())
     }
 }
 
+pub(crate) fn write_applied_state_v2_in_txn(
+    txn: &redb::WriteTransaction,
+    index: u64,
+    state: &[u8],
+) -> Result<(), CommitError> {
+    let mut table = txn.open_table(RAFT_APPLIED_STATE_V2)?;
+    table.insert(index, state)?;
+    Ok(())
+}
+
 /// Read the post-apply actor state row as raw bytes. Empty `Vec`
 /// when no state row has been materialized yet.
-fn read_state_bytes(db: &Database) -> Result<Vec<u8>, CommitError> {
+pub(crate) fn read_state_bytes(db: &Database) -> Result<Vec<u8>, CommitError> {
     let txn = db.begin_read()?;
     let table = match txn.open_table(STATE_TABLE) {
         Ok(t) => t,

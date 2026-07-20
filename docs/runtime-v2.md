@@ -87,10 +87,14 @@ the already committed workflow input.
 In multi-replica mode it accepts writes only from the elected leader, waits for
 the worker's quorum-commit notification, then re-reads and verifies the exact
 committed request bytes. Its `last_applied` cursor advances separately and only
-after the local service image commits. A replica behind the compacted Raft
-prefix currently fails with an explicit service-snapshot-install requirement;
-binding Raft `InstallSnapshot` payloads to `LocalJamStoreSnapshotV2` is still a
-production cutover task.
+after the local service image commits. Each cursor advance also records the
+canonical `LocalJamStoreSnapshotV2` image for that exact log index. Automatic
+compaction cannot cross this durable application cursor and freezes the matching
+image—not a newer mutable state row—into a `CommittedServiceSnapshotV2`.
+A lagging follower receives that envelope through Raft `InstallSnapshot`,
+checks that its bound index matches the installed snapshot metadata, durably
+replaces its physical service image, and only then advances `last_applied` and
+replays any surviving log tail.
 
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls
