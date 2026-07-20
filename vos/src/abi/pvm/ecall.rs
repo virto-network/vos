@@ -177,6 +177,7 @@ fn _management_ecall(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64
 #[inline(always)]
 fn _ecall(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     let ret: u64;
+    let discarded_result1: u64;
     // SAFETY: this is the PVM hostcall trap. The asm! block has no
     // memory operands; the host reads guest memory through caps. The
     // `nostack` option promises we don't touch the stack pointer.
@@ -187,7 +188,10 @@ fn _ecall(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 
             "ecall",
             in("t0") id,
             inlateout("a0") a0 => ret,
-            in("a1") a1,
+            // JAR protocol calls inject their two-word result into phi[7]/
+            // phi[8] (a0/a1). Even hostcalls whose public wrapper returns one
+            // word therefore clobber a1 at the suspension boundary.
+            inlateout("a1") a1 => discarded_result1,
             in("a2") a2,
             in("a3") a3,
             in("a4") a4,
@@ -195,6 +199,7 @@ fn _ecall(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 
             options(nostack),
         );
     }
+    let _ = discarded_result1;
     ret
 }
 
