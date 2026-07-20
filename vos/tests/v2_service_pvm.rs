@@ -27,7 +27,10 @@ use vos::v2::{
     ServicePvmV2, SpaceRoleCredentialV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
     public_policy_hash, space_role_policy_hash,
 };
-use vos::{AttestedMethod, Decode, Encode, value::Msg};
+use vos::{
+    AttestedMethod, Decode, Encode,
+    value::{Msg, Value},
+};
 
 enum PrivateStart {}
 
@@ -35,7 +38,7 @@ impl AttestedMethod<Vec<u8>> for PrivateStart {
     const METHOD: &'static str = "private_start";
 
     fn claim_wire(claim: &Vec<u8>) -> Vec<u8> {
-        claim.clone()
+        Value::Bytes(claim.clone()).encode()
     }
 }
 
@@ -1675,7 +1678,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         reply: Some(vos::v2::ReplyRecordV2 {
             call_id: attested_call,
             producer: proof_work.target,
-            result: b"attested reply".to_vec(),
+            result: Value::Bytes(b"attested reply".to_vec()).encode(),
         }),
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
@@ -1853,6 +1856,14 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         )
         .expect("the driver proves before guest Accumulate commits");
     assert_eq!(producer.calls, 1);
+    let invocation_result = proved
+        .clone()
+        .into_invocation_result("private-age".into(), ProducerId([112; 32]))
+        .expect("committed proof output becomes the generated-handle transport");
+    assert_eq!(
+        invocation_result.value,
+        Value::Bytes(b"attested reply".to_vec())
+    );
     let application_package = proved
         .clone()
         .into_attestation::<Vec<u8>, PrivateStart>(

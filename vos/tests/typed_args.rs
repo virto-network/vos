@@ -18,7 +18,11 @@
 #![allow(unexpected_cfgs)]
 
 use vos::abi::service::ServiceId;
-use vos::actors::client::{ClientError, Invoker};
+use vos::actors::client::{AttestationInvoker, AttestedInvocationResult, ClientError, Invoker};
+use vos::v2::{
+    AccumulationReceiptV2, ActorId, ConsistencyModeV2, DeploymentId, Hash, InvocationId,
+    ProducerId, ProgramId, RootServiceId, ServiceIdentityV2, SpaceId,
+};
 use vos::value::{Msg, Value};
 
 // The actor lives in its own module because `#[messages]` emits a
@@ -53,6 +57,16 @@ mod fixture {
         /// Returns a custom rkyv struct — reply travels as `Value::Bytes`.
         #[msg(attested, space_role = SpaceRole::Member)]
         fn last_receipt(&self) -> Receipt {
+            Receipt {
+                id: 1,
+                tag: [0u8; 32],
+            }
+        }
+
+        /// The same custom wire shape on a regular method, used to prove that
+        /// ordinary and attested generated handles expose different types.
+        #[msg]
+        fn read_receipt(&self) -> Receipt {
             Receipt {
                 id: 1,
                 tag: [0u8; 32],
@@ -160,6 +174,10 @@ struct MockInvoker {
     reply: Value,
 }
 
+struct MockAttestationInvoker {
+    result: Option<AttestedInvocationResult>,
+}
+
 #[test]
 fn crdt_actor_metadata_is_explicit() {
     assert!(crdt_fixture::BoardMsg::META.crdt);
@@ -210,6 +228,50 @@ fn attested_method_marker_binds_the_exact_committed_reply_wire() {
 }
 
 #[test]
+fn attested_handle_returns_a_typed_package_not_a_bare_claim() {
+    let claim = Receipt {
+        id: 8,
+        tag: [10; 32],
+    };
+    let mut invoker = MockAttestationInvoker {
+        result: Some(attested_receipt_result(&claim)),
+    };
+    let vault = VaultRef::at(ServiceId(5));
+    let package: vos::Attestation<Receipt, fixture::LastReceipt> =
+        vos::block_on(vault.last_receipt(&mut invoker)).unwrap();
+    assert_eq!(package.unverified_preview(), &claim);
+    assert_eq!(package.statement().method, "last_receipt");
+    assert_eq!(package.producer(), ProducerId([15; 32]));
+}
+
+#[test]
+fn attested_handle_rejects_a_reply_that_does_not_match_the_statement() {
+    let claim = Receipt {
+        id: 8,
+        tag: [10; 32],
+    };
+    let mut result = attested_receipt_result(&claim);
+    result.value = Value::Bytes(
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Receipt {
+            id: 9,
+            tag: [10; 32],
+        })
+        .unwrap()
+        .to_vec(),
+    );
+    let mut invoker = MockAttestationInvoker {
+        result: Some(result),
+    };
+    let vault = VaultRef::at(ServiceId(5));
+    assert!(matches!(
+        vos::block_on(vault.last_receipt(&mut invoker)),
+        Err(ClientError::InvalidAttestation(
+            vos::AttestationError::ClaimCommitmentMismatch
+        ))
+    ));
+}
+
+#[test]
 fn attested_space_role_is_enforced_before_the_handler_runs() {
     let mut guest_actor = <Vault as vos::Actor>::create();
     let mut guest_ctx = vos::Context::new(ServiceId(7));
@@ -252,6 +314,80 @@ impl Invoker for MockInvoker {
     ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
         let reply = self.reply.clone();
         async move { Ok(reply) }
+    }
+}
+
+impl Invoker for MockAttestationInvoker {
+    fn invoke(
+        &mut self,
+        _target: ServiceId,
+        _payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
+        async { Err(ClientError::Unreachable) }
+    }
+}
+
+impl AttestationInvoker for MockAttestationInvoker {
+    fn invoke_attested(
+        &mut self,
+        _target: ServiceId,
+        _payload: Vec<u8>,
+    ) -> impl core::future::Future<
+        Output = core::result::Result<AttestedInvocationResult, ClientError>,
+    > + '_ {
+        let result = self.result.take().ok_or(ClientError::Unreachable);
+        async move { result }
+    }
+}
+
+fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
+    use vos::Encode;
+
+    let value = Value::Bytes(
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(claim)
+            .expect("rkyv encode")
+            .to_vec(),
+    );
+    let deployment = DeploymentId([3; 32]);
+    let receipt = AccumulationReceiptV2 {
+        service: ServiceIdentityV2 {
+            space: SpaceId([6; 32]),
+            root_service: RootServiceId([1; 32]),
+            deployment,
+            service_program: ProgramId([2; 32]),
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        accepted_transition: Hash([4; 32]),
+        reply_commitment: None,
+        outbox_commitment: None,
+        resulting_state_root: Some(Hash([5; 32])),
+        resulting_crdt_heads: vec![],
+        sequence: 1,
+        checkpoint: 1,
+        consistency: ConsistencyModeV2::Local,
+    };
+    AttestedInvocationResult {
+        producer_name: "private-vault".into(),
+        producer: ProducerId([15; 32]),
+        statement: vos::AttestationStatementV3 {
+            statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+            space: SpaceId([6; 32]),
+            actor: ActorId([7; 32]),
+            deployment,
+            actor_program: ProgramId([8; 32]),
+            method: "last_receipt".into(),
+            schema: Hash([9; 32]),
+            invocation: InvocationId([10; 32]),
+            before: vos::StateCommitmentV3::Linear(Hash([11; 32])),
+            after: vos::StateCommitmentV3::Linear(Hash([5; 32])),
+            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]),
+            input_commitment: Hash([13; 32]),
+            authorization_policy: Hash([14; 32]),
+            accumulation_receipt: receipt,
+        },
+        proof: vec![1],
+        value,
     }
 }
 
@@ -308,7 +444,7 @@ fn ref_decodes_valid_custom_reply() {
         reply: Value::Bytes(rkyv_bytes!(receipt)),
     };
     let vault = VaultRef::at(ServiceId(5));
-    let got = vos::block_on(vault.last_receipt(&mut inv)).expect("valid reply decodes");
+    let got = vos::block_on(vault.read_receipt(&mut inv)).expect("valid reply decodes");
     assert_eq!(got, receipt);
 }
 
@@ -321,7 +457,7 @@ fn ref_rejects_corrupted_custom_reply() {
         reply: Value::Bytes(vec![0xff, 0x00, 0x13, 0x37]),
     };
     let vault = VaultRef::at(ServiceId(5));
-    let got = vos::block_on(vault.last_receipt(&mut inv));
+    let got = vos::block_on(vault.read_receipt(&mut inv));
     assert!(
         matches!(got, Err(ClientError::Decode)),
         "corrupted reply bytes must fail checked decode, got {got:?}"
@@ -342,7 +478,7 @@ fn ref_rejects_truncated_custom_reply() {
         reply: Value::Bytes(bytes),
     };
     let vault = VaultRef::at(ServiceId(5));
-    let got = vos::block_on(vault.last_receipt(&mut inv));
+    let got = vos::block_on(vault.read_receipt(&mut inv));
     assert!(
         matches!(got, Err(ClientError::Decode)),
         "truncated reply must fail checked decode, got {got:?}"

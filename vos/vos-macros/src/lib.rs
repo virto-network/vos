@@ -1015,6 +1015,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             wire_name: method_name.clone(),
             args: client_args,
             success_ty,
+            attested: is_attested,
         });
     }
 
@@ -1419,24 +1420,62 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 None => quote! { () },
                 Some(t) => quote! { #t },
             };
+            let method_marker = format_ident!("{}", to_pascal_case(&wire_name));
             let value_ident = format_ident!("__value");
             let decode = client_decode_body(&m.success_ty, &value_ident);
-            quote! {
-                pub async fn #method_ident<__I: vos::actors::client::Invoker>(
-                    &self,
-                    __inv: &mut __I,
-                    #( #arg_decls ),*
-                ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
-                    use vos::Encode;
-                    let __msg = vos::value::Msg::new(#wire_name)
-                        #( #with_calls )*;
-                    let __encoded = __msg.encode();
-                    let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
-                    __payload.push(vos::value::TAG_DYNAMIC);
-                    __payload.extend_from_slice(&__encoded);
-                    let #value_ident: vos::value::Value =
-                        __inv.invoke(self.target, __payload).await?;
-                    #decode
+            if m.attested {
+                quote! {
+                    pub async fn #method_ident<__I: vos::actors::client::AttestationInvoker>(
+                        &self,
+                        __inv: &mut __I,
+                        #( #arg_decls ),*
+                    ) -> core::result::Result<
+                        vos::Attestation<#return_ty, #method_marker>,
+                        vos::actors::client::ClientError,
+                    > {
+                        use vos::Encode;
+                        let __msg = vos::value::Msg::new(#wire_name)
+                            #( #with_calls )*;
+                        let __encoded = __msg.encode();
+                        let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
+                        __payload.push(vos::value::TAG_DYNAMIC);
+                        __payload.extend_from_slice(&__encoded);
+                        let vos::actors::client::AttestedInvocationResult {
+                            value: #value_ident,
+                            producer_name: __producer_name,
+                            producer: __producer,
+                            statement: __statement,
+                            proof: __proof,
+                        } = __inv.invoke_attested(self.target, __payload).await?;
+                        let __preview: #return_ty = (#decode)?;
+                        vos::Attestation::__from_runtime(
+                            __producer_name,
+                            __producer,
+                            __statement,
+                            __preview,
+                            __proof,
+                        )
+                        .map_err(vos::actors::client::ClientError::InvalidAttestation)
+                    }
+                }
+            } else {
+                quote! {
+                    pub async fn #method_ident<__I: vos::actors::client::Invoker>(
+                        &self,
+                        __inv: &mut __I,
+                        #( #arg_decls ),*
+                    ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
+                        use vos::Encode;
+                        let __msg = vos::value::Msg::new(#wire_name)
+                            #( #with_calls )*;
+                        let __encoded = __msg.encode();
+                        let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
+                        __payload.push(vos::value::TAG_DYNAMIC);
+                        __payload.extend_from_slice(&__encoded);
+                        let #value_ident: vos::value::Value =
+                            __inv.invoke(self.target, __payload).await?;
+                        #decode
+                    }
                 }
             }
         })
@@ -1453,14 +1492,34 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 None => quote! { () },
                 Some(t) => quote! { #t },
             };
-            quote! {
-                pub async fn #method_ident(
-                    &mut self,
-                    #( #arg_decls ),*
-                ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
-                    self.reference
-                        .#method_ident(&mut *self.invoker, #( #arg_names ),*)
-                        .await
+            let method_marker = format_ident!("{}", to_pascal_case(&m.wire_name.to_string()));
+            if m.attested {
+                quote! {
+                    pub async fn #method_ident(
+                        &mut self,
+                        #( #arg_decls ),*
+                    ) -> core::result::Result<
+                        vos::Attestation<#return_ty, #method_marker>,
+                        vos::actors::client::ClientError,
+                    >
+                    where
+                        __I: vos::actors::client::AttestationInvoker,
+                    {
+                        self.reference
+                            .#method_ident(&mut *self.invoker, #( #arg_names ),*)
+                            .await
+                    }
+                }
+            } else {
+                quote! {
+                    pub async fn #method_ident(
+                        &mut self,
+                        #( #arg_decls ),*
+                    ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
+                        self.reference
+                            .#method_ident(&mut *self.invoker, #( #arg_names ),*)
+                            .await
+                    }
                 }
             }
         })
@@ -2020,6 +2079,9 @@ struct ClientMethodInfo {
     /// or the inner `T` if the handler returns `Result<T, E>`.
     /// `None` means unit.
     success_ty: Option<syn::Type>,
+    /// Whether the generated handle must return a proved package instead of
+    /// exposing the decoded reply directly.
+    attested: bool,
 }
 
 /// Emit the body of a generated client method's reply-decoding
