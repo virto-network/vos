@@ -15,9 +15,10 @@ use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
-    ActorSliceInputV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2, ContinuationSnapshotV2,
-    CrdtChangeV2, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC, RefineImportsV2,
-    TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    ActorSliceInputV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2,
+    ContinuationSnapshotV2, CrdtChangeV2, Hash, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC,
+    RefineImportsV2, SpaceRoleCredentialV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    space_role_for_policy,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -53,6 +54,7 @@ pub enum ServicePvmErrorV2 {
     InvalidProtocolResume,
     InvalidWorkEnvelope,
     InvalidRefineImports,
+    InvalidAuthorization,
     TooManyImportedActors,
     InvalidContinuation,
     ContinuationMismatch,
@@ -318,6 +320,7 @@ impl ServicePvmV2 {
             causal_states,
             message: work.arguments.clone(),
             origin: work.origin,
+            space_role: authorization_space_role(work.origin, &work.authorization, imports)?,
         }
         .encode();
         let mut kernel = InvocationKernel::new_with_dormant_programs(
@@ -508,6 +511,42 @@ fn imported_blob_bytes<'a>(
         .ok()
         .map(|index| imports.blobs[index].bytes.as_slice())
         .ok_or(ServicePvmErrorV2::InvalidRefineImports)
+}
+
+fn authorization_space_role(
+    origin: super::Origin,
+    authorization: &AuthorizationEvidenceV2,
+    imports: &RefineImportsV2,
+) -> Result<Option<u8>, ServicePvmErrorV2> {
+    let (policy, commitment, bytes) = match authorization {
+        AuthorizationEvidenceV2::Public | AuthorizationEvidenceV2::SystemCapability { .. } => {
+            return Ok(None);
+        }
+        AuthorizationEvidenceV2::Credential {
+            policy,
+            credential_commitment,
+            bytes,
+        } => (*policy, *credential_commitment, bytes.as_slice()),
+        AuthorizationEvidenceV2::PrivateCredential {
+            policy,
+            credential_commitment,
+            witness,
+        } => (
+            *policy,
+            *credential_commitment,
+            imported_blob_bytes(imports, witness)?,
+        ),
+    };
+    let credential = SpaceRoleCredentialV2::decode(bytes)
+        .map_err(|_| ServicePvmErrorV2::InvalidAuthorization)?;
+    let required = space_role_for_policy(policy).ok_or(ServicePvmErrorV2::InvalidAuthorization)?;
+    if credential.holder != origin
+        || credential.role < required
+        || commitment != Hash::digest(b"vos/credential-commitment/v2", &[bytes])
+    {
+        return Err(ServicePvmErrorV2::InvalidAuthorization);
+    }
+    Ok(Some(credential.role.as_u8()))
 }
 
 fn write_checkpoint_token(
@@ -822,6 +861,39 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
 mod tests {
     use super::*;
     use grey_transpiler::assembler::Reg;
+
+    #[test]
+    fn disclosed_and_private_role_credentials_feed_the_same_actor_role() {
+        let origin = super::super::Origin::Member(super::super::SubjectId([41; 32]));
+        let credential = SpaceRoleCredentialV2 {
+            holder: origin,
+            role: crate::SpaceRole::Developer,
+            authenticator: b"signed space grant".to_vec(),
+        };
+        let policy =
+            super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
+        let disclosed = credential.disclosed_evidence(policy);
+        assert_eq!(
+            authorization_space_role(origin, &disclosed, &RefineImportsV2::default()),
+            Ok(Some(crate::SpaceRole::Developer.as_u8()))
+        );
+
+        let (private, witness) = credential.private_evidence(policy);
+        let imports = RefineImportsV2 {
+            programs: vec![],
+            blobs: vec![witness],
+        };
+        assert_eq!(
+            authorization_space_role(origin, &private, &imports),
+            Ok(Some(crate::SpaceRole::Developer.as_u8()))
+        );
+
+        let other = super::super::Origin::Member(super::super::SubjectId([42; 32]));
+        assert_eq!(
+            authorization_space_role(other, &private, &imports),
+            Err(ServicePvmErrorV2::InvalidAuthorization)
+        );
+    }
 
     fn emit_instruction(code: &mut Vec<u8>, bitmask: &mut Vec<u8>, bytes: &[u8]) {
         code.extend_from_slice(bytes);

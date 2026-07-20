@@ -788,6 +788,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let mut ctx = super::Context::new(ServiceId(0));
     ctx.__set_actor_id(input.actor);
     ctx.__set_origin(input.origin);
+    ctx.set_caller_roles(input.space_role, None);
 
     assert_eq!(
         A::CRDT,

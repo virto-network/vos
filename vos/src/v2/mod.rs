@@ -46,7 +46,8 @@ pub use contracts::{
     MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
     PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError,
     RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    ServiceInstallReceiptV2, SpaceRoleCredentialV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
+    WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -66,7 +67,7 @@ pub use package::{
     DeploymentRegistryV2, DeploymentSignatureV2, DeploymentSignatureVerifierV2,
     PackageDiagnosticsV2, PackageError, PackageManifestV2, PackageRegistrationErrorV2,
     PackageRolePoliciesV2, VosPackageV2, artifact_hash, method_schema_hash, public_policy_hash,
-    space_role_policy_hash,
+    space_role_for_policy, space_role_policy_hash,
 };
 #[cfg(feature = "std")]
 pub use pvm::{

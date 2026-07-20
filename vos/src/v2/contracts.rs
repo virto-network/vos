@@ -86,6 +86,19 @@ pub enum AuthorizationEvidenceV2 {
     },
 }
 
+/// Canonical authenticated space grant used as disclosed authorization input
+/// or as the private witness of an attested call.
+///
+/// `authenticator` is issued and checked by the platform credential provider;
+/// the generic service additionally binds the exact bytes to `holder`, the
+/// work origin, and the generated role-threshold policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceRoleCredentialV2 {
+    pub holder: Origin,
+    pub role: crate::SpaceRole,
+    pub authenticator: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRefV2 {
     pub hash: Hash,
@@ -156,6 +169,9 @@ pub struct ActorSliceInputV2 {
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
     pub origin: Origin,
+    /// Authenticated role recovered from the disclosed credential or private
+    /// witness before entering the canonical actor PVM.
+    pub space_role: Option<u8>,
 }
 
 /// Actor-produced result returned through the same IPC DATA capability.
@@ -1053,6 +1069,7 @@ impl V2Wire for ActorSliceInputV2 {
         e.list(&self.causal_states, |e, state| e.bytes(state));
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
+        e.option(&self.space_role, |e, role| e.u8(*role));
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1063,6 +1080,12 @@ impl V2Wire for ActorSliceInputV2 {
             causal_states: d.list(Decoder::bytes)?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
+            space_role: d.option(|d| {
+                let role = d.u8()?;
+                crate::SpaceRole::from_u8(role)
+                    .map(|_| role)
+                    .ok_or(DecodeError::NonCanonical)
+            })?,
         };
         if value.change.is_none() && !value.causal_states.is_empty() {
             return Err(DecodeError::NonCanonical);
@@ -1302,6 +1325,59 @@ impl V2Wire for BlobRefV2 {
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_blob_ref(d)
+    }
+}
+
+impl SpaceRoleCredentialV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/credential-commitment/v2", &[&self.encode()])
+    }
+
+    pub fn disclosed_evidence(&self, policy: Hash) -> AuthorizationEvidenceV2 {
+        let bytes = self.encode();
+        AuthorizationEvidenceV2::Credential {
+            policy,
+            credential_commitment: Hash::digest(b"vos/credential-commitment/v2", &[&bytes]),
+            bytes,
+        }
+    }
+
+    pub fn private_evidence(&self, policy: Hash) -> (AuthorizationEvidenceV2, ImportedBlobV2) {
+        let bytes = self.encode();
+        let reference = BlobRefV2::of_bytes(&bytes);
+        (
+            AuthorizationEvidenceV2::PrivateCredential {
+                policy,
+                credential_commitment: Hash::digest(b"vos/credential-commitment/v2", &[&bytes]),
+                witness: reference.clone(),
+            },
+            ImportedBlobV2 { reference, bytes },
+        )
+    }
+}
+
+impl V2Wire for SpaceRoleCredentialV2 {
+    const MAGIC: [u8; 4] = *b"VRC2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encode_origin(&mut encoder, self.holder);
+        encoder.u8(self.role.as_u8());
+        encoder.bytes(&self.authenticator);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            holder: decode_origin(decoder)?,
+            role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
+            authenticator: decoder.bytes()?,
+        };
+        if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
+            || value.authenticator.is_empty()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -2646,6 +2722,7 @@ mod tests {
             causal_states: vec![b"concurrent".to_vec()],
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),
+            space_role: Some(crate::SpaceRole::Developer.as_u8()),
         };
         assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
 

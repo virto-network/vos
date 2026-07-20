@@ -20,10 +20,11 @@ use super::{
     DeliveryRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2,
     ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2, ServiceStateTreeV2,
-    StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
-    WorkflowCheckpointV2, WorkflowOperationV2, crdt_change_storage_key,
+    SpaceRoleCredentialV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2,
+    StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2, crdt_change_storage_key,
     crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
-    header_storage_key, publication_storage_key, receipt_storage_key,
+    header_storage_key, public_policy_hash, publication_storage_key, receipt_storage_key,
+    space_role_for_policy,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -1589,27 +1590,29 @@ fn canonical_transition_shape(target: ActorId, transition: &super::TransitionV2)
 
 fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
     match &work.authorization {
-        AuthorizationEvidenceV2::Public => policy.public,
+        AuthorizationEvidenceV2::Public => policy.public && policy.policy == public_policy_hash(),
         AuthorizationEvidenceV2::Credential {
             policy: supplied_policy,
             credential_commitment,
             bytes,
-        } => {
-            !bytes.is_empty()
-                && matches!(
-                    work.origin,
-                    super::Origin::Member(_) | super::Origin::Actor(_)
-                )
-                && *supplied_policy == policy.policy
-                && *credential_commitment == Hash::digest(b"vos/credential-commitment/v2", &[bytes])
-                && policy.policy == Hash::digest(b"vos/bearer-policy/v2", &[bytes])
-        }
+        } => SpaceRoleCredentialV2::decode(bytes)
+            .ok()
+            .is_some_and(|credential| {
+                !policy.public
+                    && credential.holder == work.origin
+                    && space_role_for_policy(policy.policy)
+                        .is_some_and(|required| credential.role >= required)
+                    && *supplied_policy == policy.policy
+                    && *credential_commitment == credential.commitment()
+            }),
         AuthorizationEvidenceV2::PrivateCredential {
             policy: supplied_policy,
             credential_commitment,
             witness,
         } => {
-            (policy.attested || work.proof_requested)
+            !policy.public
+                && (policy.attested || work.proof_requested)
+                && space_role_for_policy(policy.policy).is_some()
                 && matches!(
                     work.origin,
                     super::Origin::Member(_) | super::Origin::Actor(_)
@@ -2163,7 +2166,7 @@ mod tests {
                 methods: vec![MethodPolicyV2 {
                     method: "set".into(),
                     schema: Hash([6; 32]),
-                    policy: Hash([7; 32]),
+                    policy: public_policy_hash(),
                     public: true,
                     attested: false,
                 }],
@@ -2265,7 +2268,7 @@ mod tests {
         let policy = MethodPolicyV2 {
             method: "set".into(),
             schema: Hash([6; 32]),
-            policy: Hash([7; 32]),
+            policy: public_policy_hash(),
             public: true,
             attested: false,
         };
@@ -2442,6 +2445,86 @@ mod tests {
         assert_eq!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(unauthorized))
                 .unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized)
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
+    fn disclosed_space_role_credentials_satisfy_generated_thresholds() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"before").unwrap();
+        let required_policy =
+            super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                program: program(),
+                initial_state: initial.clone(),
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "set".into(),
+                    schema: Hash([6; 32]),
+                    policy: required_policy,
+                    public: false,
+                    attested: false,
+                }],
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResultV2::Installed(receipt) =
+            execute_guest_accumulate(&mut store, &install).unwrap()
+        else {
+            panic!("install rejected")
+        };
+        let base = receipt.resulting_state_root.unwrap();
+        let origin = super::super::Origin::Member(super::super::SubjectId([40; 32]));
+
+        let developer = SpaceRoleCredentialV2 {
+            holder: origin,
+            role: crate::SpaceRole::Developer,
+            authenticator: b"developer grant".to_vec(),
+        };
+        let mut admitted_work = linear_work(initial.clone(), base);
+        admitted_work.origin = origin;
+        admitted_work.authorization = developer.disclosed_evidence(required_policy);
+        let admitted = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            transition: linear_transition(&admitted_work, b"admitted"),
+            work: admitted_work,
+            provided_blobs: vec![],
+        });
+        let mut admitted_store = store.clone();
+        assert!(matches!(
+            execute_guest_accumulate(&mut admitted_store, &admitted).unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+
+        let guest = SpaceRoleCredentialV2 {
+            holder: origin,
+            role: crate::SpaceRole::Guest,
+            authenticator: b"guest grant".to_vec(),
+        };
+        let mut denied_work = linear_work(initial, base);
+        denied_work.origin = origin;
+        denied_work.authorization = guest.disclosed_evidence(required_policy);
+        let denied = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            transition: linear_transition(&denied_work, b"denied"),
+            work: denied_work,
+            provided_blobs: vec![],
+        });
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &denied).unwrap(),
             rejected(AccumulationRejectionV2::Unauthorized)
         );
         assert_eq!(store, before);

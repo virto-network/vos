@@ -360,6 +360,19 @@ pub fn space_role_policy_hash(required_role: u8) -> Option<Hash> {
     })
 }
 
+/// Recover the declared threshold from one of the four canonical v2 role
+/// predicates. Arbitrary hashes are not role policies.
+pub fn space_role_for_policy(policy: Hash) -> Option<crate::SpaceRole> {
+    [
+        crate::SpaceRole::Guest,
+        crate::SpaceRole::Member,
+        crate::SpaceRole::Developer,
+        crate::SpaceRole::Admin,
+    ]
+    .into_iter()
+    .find(|role| space_role_policy_hash(role.as_u8()) == Some(policy))
+}
+
 pub fn artifact_hash(kind: &[u8], bytes: &[u8]) -> Hash {
     Hash(crate::crypto::blake2b_hash::<32>(
         b"vos/package-artifact/v2",

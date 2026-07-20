@@ -24,7 +24,8 @@ use vos::v2::{
     ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
+    ServicePvmV2, SpaceRoleCredentialV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
+    public_policy_hash, space_role_policy_hash,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -371,7 +372,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             methods: vec![MethodPolicyV2 {
                 method: "increment".into(),
                 schema: Hash([44; 32]),
-                policy: Hash([45; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -927,7 +928,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             methods: vec![MethodPolicyV2 {
                 method: "await_peer".into(),
                 schema: Hash([50; 32]),
-                policy: Hash([51; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -1227,13 +1228,22 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
-                methods: vec![MethodPolicyV2 {
-                    method: "start".into(),
-                    schema: Hash([32; 32]),
-                    policy: Hash([33; 32]),
-                    public: true,
-                    attested: false,
-                }],
+                methods: vec![
+                    MethodPolicyV2 {
+                        method: "private_start".into(),
+                        schema: Hash([32; 32]),
+                        policy: space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap(),
+                        public: false,
+                        attested: true,
+                    },
+                    MethodPolicyV2 {
+                        method: "start".into(),
+                        schema: Hash([32; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                ],
             },
             ActorGenesisV2 {
                 actor: ActorId([36; 32]),
@@ -1607,12 +1617,19 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         "a committed delivery cannot be scheduled from its inbox again"
     );
 
-    let private_credential = b"private member credential".to_vec();
+    let private_origin = Origin::Member(SubjectId([111; 32]));
+    let private_policy = space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap();
+    let private_credential = SpaceRoleCredentialV2 {
+        holder: private_origin,
+        role: vos::SpaceRole::Member,
+        authenticator: b"private member credential".to_vec(),
+    };
+    let (private_authorization, private_witness) =
+        private_credential.private_evidence(private_policy);
     let witness = service
         .accumulate_host_mut()
-        .import_blob(private_credential.clone());
-    let credential_commitment =
-        Hash::digest(b"vos/credential-commitment/v2", &[&private_credential]);
+        .import_blob(private_witness.bytes);
+    assert_eq!(witness, private_witness.reference);
     let prepared_proof_work = LocalWorkSchedulerV2::prepare(
         service.accumulate_host(),
         LocalWorkRequestV2 {
@@ -1620,14 +1637,10 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             workflow_step: 0,
             logical_timeslot: 51,
             target: delivered.work.target,
-            method: delivered.work.method.clone(),
+            method: "private_start".into(),
             arguments: delivered.work.arguments.clone(),
-            origin: Origin::Member(SubjectId([111; 32])),
-            authorization: AuthorizationEvidenceV2::PrivateCredential {
-                policy: Hash([33; 32]),
-                credential_commitment,
-                witness: witness.clone(),
-            },
+            origin: private_origin,
+            authorization: private_authorization,
             causal_parent: None,
             parent_call: None,
             awaited_reply: None,
@@ -1706,11 +1719,11 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     );
 
     let policy = MethodPolicyV2 {
-        method: "start".into(),
+        method: "private_start".into(),
         schema: Hash([32; 32]),
-        policy: Hash([33; 32]),
-        public: true,
-        attested: false,
+        policy: private_policy,
+        public: false,
+        attested: true,
     };
     let statement = AttestationStatementV3::for_transition(
         &proof_work,
@@ -1871,7 +1884,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([121; 32]),
-                policy: Hash([122; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -2096,7 +2109,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([131; 32]),
-                policy: Hash([132; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: true,
             }],
@@ -2264,7 +2277,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
             methods: vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([127; 32]),
-                policy: Hash([128; 32]),
+                policy: public_policy_hash(),
                 public: true,
                 attested: false,
             }],
@@ -2480,7 +2493,7 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
                 methods: vec![MethodPolicyV2 {
                     method: "start".into(),
                     schema: Hash([63; 32]),
-                    policy: Hash([64; 32]),
+                    policy: public_policy_hash(),
                     public: true,
                     attested: false,
                 }],
