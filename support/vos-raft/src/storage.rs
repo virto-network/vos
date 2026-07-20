@@ -150,6 +150,20 @@ pub trait Storage<N: NodeId>: Send + 'static {
     fn read_state(&self)
     -> impl core::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send;
 
+    /// Highest committed log index represented by [`Self::read_state`].
+    ///
+    /// A worker must not compact beyond this cursor: doing so would advertise
+    /// snapshot metadata newer than the state-machine bytes sent to a lagging
+    /// follower. `None` preserves the historical behavior for storage engines
+    /// whose state machine is applied synchronously inside the consensus
+    /// transaction. Hosts with an out-of-band apply loop should persist and
+    /// return an explicit cursor.
+    fn applied_index(
+        &self,
+    ) -> impl core::future::Future<Output = Result<Option<u64>, Self::Error>> + Send {
+        async { Ok(None) }
+    }
+
     /// Read all durable scalars. Default for a fresh log:
     /// `Meta::default()`.
     fn load_meta(&self) -> impl core::future::Future<Output = Result<Meta<N>, Self::Error>> + Send;
@@ -197,6 +211,7 @@ pub struct MemStorage<N: NodeId> {
     log: alloc::collections::BTreeMap<u64, LogEntry<N>>,
     state: Vec<u8>,
     meta: Meta<N>,
+    applied_index: Option<u64>,
     /// Persisted active configuration view — mirrors what the
     /// worker most recently wrote via `WriteBatch::active_config`.
     /// `None` until a `ConfigChange` has been observed.
@@ -209,6 +224,7 @@ impl<N: NodeId> Default for MemStorage<N> {
             log: alloc::collections::BTreeMap::new(),
             state: Vec::new(),
             meta: Meta::default(),
+            applied_index: None,
             active_config: None,
         }
     }
@@ -217,6 +233,13 @@ impl<N: NodeId> Default for MemStorage<N> {
 impl<N: NodeId> MemStorage<N> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pin automatic compaction to state-machine progress in tests and
+    /// simulators. `None` models synchronous application.
+    pub fn with_applied_index(mut self, applied_index: u64) -> Self {
+        self.applied_index = Some(applied_index);
+        self
     }
 }
 
@@ -276,6 +299,10 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         Ok(self.state.clone())
     }
 
+    async fn applied_index(&self) -> Result<Option<u64>, Self::Error> {
+        Ok(self.applied_index)
+    }
+
     async fn load_meta(&self) -> Result<Meta<N>, Self::Error> {
         Ok(self.meta.clone())
     }
@@ -298,6 +325,9 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         }
         if let Some(state) = batch.state {
             self.state = state;
+            if let Some((index, _)) = batch.compact_to {
+                self.applied_index = Some(index);
+            }
         }
         if let Some(meta) = batch.meta {
             // Caller's meta wins. (compact_to + meta combinations
