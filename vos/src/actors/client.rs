@@ -20,6 +20,28 @@ use super::value::Value;
 use alloc::{string::String, vec::Vec};
 use core::future::Future;
 
+/// Deterministic failure returned by an actor execution or scheduler call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallError {
+    Panicked,
+    Cycle,
+    OutOfGas,
+    ReplyTooBig,
+    Unknown(u8),
+}
+
+impl core::fmt::Display for CallError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Panicked => f.write_str("target actor panicked"),
+            Self::Cycle => f.write_str("causal actor-call cycle"),
+            Self::OutOfGas => f.write_str("target actor ran out of gas"),
+            Self::ReplyTooBig => f.write_str("actor reply exceeds the caller buffer"),
+            Self::Unknown(status) => write!(f, "unknown actor-call status 0x{status:02x}"),
+        }
+    }
+}
+
 /// Error returned by every macro-generated host client method.
 #[derive(Debug)]
 pub enum ClientError {
@@ -45,6 +67,8 @@ pub enum ClientError {
     /// The runtime returned an attestation package whose typed method, claim
     /// wire, or statement did not match the committed reply.
     InvalidAttestation(crate::AttestationError),
+    /// The target or scheduler returned a deterministic execution failure.
+    Call(CallError),
 }
 
 impl core::fmt::Display for ClientError {
@@ -57,11 +81,25 @@ impl core::fmt::Display for ClientError {
             Self::NotFound => write!(f, "client: actor name was not found"),
             Self::NotOwnedChild => write!(f, "client: actor is not an owned child"),
             Self::InvalidAttestation(error) => write!(f, "client: {error}"),
+            Self::Call(error) => write!(f, "client: {error}"),
         }
     }
 }
 
 impl core::error::Error for ClientError {}
+
+impl From<super::value::InvokeError> for ClientError {
+    fn from(error: super::value::InvokeError) -> Self {
+        match error {
+            super::value::InvokeError::NotFound => Self::NotFound,
+            super::value::InvokeError::Panicked => Self::Call(CallError::Panicked),
+            super::value::InvokeError::Cycle => Self::Call(CallError::Cycle),
+            super::value::InvokeError::OutOfGas => Self::Call(CallError::OutOfGas),
+            super::value::InvokeError::TooBig => Self::Call(CallError::ReplyTooBig),
+            super::value::InvokeError::Unknown(status) => Self::Call(CallError::Unknown(status)),
+        }
+    }
+}
 
 /// Send a dynamically-shaped message to a service and await its reply.
 ///
@@ -185,7 +223,7 @@ impl<A: super::Actor> Invoker for super::Context<A> {
         async move {
             self.ask_raw(target, &payload)
                 .await
-                .map_err(|_| ClientError::Unreachable)
+                .map_err(ClientError::from)
         }
     }
 
@@ -198,7 +236,20 @@ impl<A: super::Actor> Invoker for super::Context<A> {
         async move {
             self.ask_actor_raw(target, &payload, None)
                 .await
-                .map_err(|_| ClientError::Unreachable)
+                .map_err(ClientError::from)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn causal_cycles_remain_typed_at_the_generated_handle_boundary() {
+        assert!(matches!(
+            ClientError::from(super::super::value::InvokeError::Cycle),
+            ClientError::Call(CallError::Cycle)
+        ));
     }
 }
