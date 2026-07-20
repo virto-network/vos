@@ -3219,6 +3219,160 @@ mod tests {
     }
 
     #[test]
+    fn every_three_replica_sync_order_converges() {
+        let mut envelopes = Vec::new();
+        for (invocation, state_bytes) in [
+            (80, b"alice".as_slice()),
+            (81, b"bob".as_slice()),
+            (82, b"carol".as_slice()),
+        ] {
+            let mut source = MemStore::default();
+            let (initial, _) = install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
+            let work = crdt_work(initial, invocation, vec![]);
+            let materialized = BlobRefV2::of_bytes(state_bytes);
+            let transition = crdt_transition(&work, materialized.clone(), 1);
+            let change = transition.crdt_change.clone().unwrap();
+            let accepted = execute_guest_accumulate(
+                &mut source,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: vec![ImportedBlobV2 {
+                        reference: materialized.clone(),
+                        bytes: state_bytes.to_vec(),
+                    }],
+                }),
+            )
+            .unwrap();
+            let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
+                panic!("source branch was rejected")
+            };
+            envelopes.push(CrdtSyncEnvelopeV2 {
+                service: identity(),
+                advertised_heads: vec![change.cid()],
+                nodes: vec![super::super::CrdtSyncNodeV2 { change, receipt }],
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: materialized,
+                    bytes: state_bytes.to_vec(),
+                }],
+            });
+        }
+
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let mut expected = None;
+        for order in orders {
+            let mut replica = MemStore::default();
+            install_fixture(&mut replica, ConsistencyModeV2::Crdt, b"before");
+            for envelope in &envelopes {
+                replica.receipt_allowlist.insert(
+                    ReceiptVerificationRequestV2 {
+                        receipt: envelope.nodes[0].receipt.clone(),
+                    }
+                    .hash(),
+                );
+            }
+            for index in order {
+                assert!(matches!(
+                    execute_guest_accumulate(
+                        &mut replica,
+                        &AccumulateRequestV2::SyncCrdt(envelopes[index].clone()),
+                    )
+                    .unwrap(),
+                    AccumulationResultV2::Accepted {
+                        duplicate: false,
+                        ..
+                    }
+                ));
+            }
+            let header =
+                StoreHeaderV2::open(replica.rows.get(header_storage_key()).unwrap()).unwrap();
+            assert_eq!(header.crdt_heads.len(), 3);
+            match expected {
+                None => expected = Some((header.crdt_heads, header.service_root)),
+                Some((ref heads, root)) => {
+                    assert_eq!(&header.crdt_heads, heads);
+                    assert_eq!(header.service_root, root);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sync_rejects_divergent_results_for_the_same_workflow_step() {
+        let mut destination = MemStore::default();
+        let (initial, _) = install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
+        let work = crdt_work(initial, 83, vec![]);
+        let mut nodes = [b"left".as_slice(), b"right".as_slice()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let state = BlobRefV2::of_bytes(bytes);
+                let change = crdt_transition(&work, state.clone(), 1)
+                    .crdt_change
+                    .unwrap();
+                let cid = change.cid();
+                let receipt = AccumulationReceiptV2 {
+                    service: identity(),
+                    accepted_transition: Hash([90 + index as u8; 32]),
+                    reply_commitment: None,
+                    outbox_commitment: None,
+                    resulting_state_root: None,
+                    resulting_crdt_heads: vec![cid],
+                    sequence: 1,
+                    checkpoint: 0,
+                    consistency: ConsistencyModeV2::Crdt,
+                };
+                (
+                    super::super::CrdtSyncNodeV2 { change, receipt },
+                    ImportedBlobV2 {
+                        reference: state,
+                        bytes: bytes.to_vec(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|(node, _)| node.change.cid());
+        let mut advertised_heads = nodes
+            .iter()
+            .map(|(node, _)| node.change.cid())
+            .collect::<Vec<_>>();
+        advertised_heads.sort();
+        let mut provided_blobs = nodes
+            .iter()
+            .map(|(_, blob)| blob.clone())
+            .collect::<Vec<_>>();
+        provided_blobs.sort_by_key(|blob| blob.reference.hash);
+        for (node, _) in &nodes {
+            destination.receipt_allowlist.insert(
+                ReceiptVerificationRequestV2 {
+                    receipt: node.receipt.clone(),
+                }
+                .hash(),
+            );
+        }
+        let envelope = CrdtSyncEnvelopeV2 {
+            service: identity(),
+            advertised_heads,
+            nodes: nodes.into_iter().map(|(node, _)| node).collect(),
+            provided_blobs,
+        };
+        let before = destination.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut destination, &AccumulateRequestV2::SyncCrdt(envelope),)
+                .unwrap(),
+            rejected(AccumulationRejectionV2::DivergentDuplicate)
+        );
+        assert_eq!(destination, before);
+    }
+
+    #[test]
     fn guest_sync_authenticates_nodes_and_reconstructs_workflow_rows() {
         let mut source = MemStore::default();
         let mut destination = MemStore::default();
