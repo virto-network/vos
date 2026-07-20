@@ -60,6 +60,8 @@ exclude = [
     "extensions/http-gateway/test_fixtures/mock-registry",
     "extensions/http-gateway/test_fixtures/counter",
     "extensions/http-gateway/test_fixtures/kitchen-sink",
+    # Canonical no_std actor PVMs used only by v2 integration gates.
+    "vos/tests/fixtures/*",
     # transport-soundness Miri gate: a zero-dep, self-contained crate (own
     # `[workspace]`) run only under `cargo miri test` on the Miri nightly.
     # Excluded so `cargo build --workspace` + the pre-commit hook never try to

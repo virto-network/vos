@@ -63,6 +63,22 @@ fn probe_elf() -> Option<Vec<u8>> {
     }
 }
 
+fn crdt_counter_v2_elf() -> Option<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/crdt-counter-v2/target/riscv64em-javm/release/crdt_counter_v2_fixture.elf",
+    );
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            eprintln!(
+                "skipping: build the v2 CRDT fixture with `cd vos/tests/fixtures/crdt-counter-v2 && cargo +nightly actor` ({})",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn actor_pvm(result: u64) -> Vec<u8> {
     let mut assembler = grey_transpiler::assembler::Assembler::new();
     assembler
@@ -97,6 +113,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             revision: 0,
             state_root: Hash([8; 32]),
         },
+        base_causal_height: None,
         imported_actors: vec![ImportedActorV2 {
             actor: ActorId([5; 32]),
             program: actor_program,
@@ -278,6 +295,122 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         transition.reply.as_ref().map(|reply| reply.call_id),
         Some(work.invocation.root_reply_id())
     );
+}
+
+#[test]
+fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
+    let (Some(service_elf), Some(actor_elf)) = (service_elf(), crdt_counter_v2_elf()) else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut work = work(actor_program, initial.clone());
+    work.method = "increment".into();
+    let mut message = vec![vos::value::TAG_DYNAMIC];
+    message.extend_from_slice(&Msg::new("increment").with("amount", 2u64).encode());
+    work.arguments = message;
+    work.consistency = ConsistencyModeV2::Crdt;
+    work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+    work.base_causal_height = Some(0);
+
+    let imports = RefineImportsV2 {
+        programs: vec![ImportedProgramV2 {
+            program: actor_program,
+            pvm: actor_pvm,
+        }],
+        blobs: vec![ImportedBlobV2 {
+            reference: initial.clone(),
+            bytes: initial_bytes.clone(),
+        }],
+    };
+    let mut host = DurableAccumulateHost::default();
+    host.preimages.insert(initial.hash.0, initial_bytes);
+    let mut service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        host,
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: work.service.clone(),
+        consistency: ConsistencyModeV2::Crdt,
+        actors: vec![ActorGenesisV2 {
+            actor: work.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial,
+            crdt: true,
+            methods: vec![MethodPolicyV2 {
+                method: "increment".into(),
+                schema: Hash([44; 32]),
+                policy: Hash([45; 32]),
+                public: true,
+                attested: false,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([46; 32]),
+            authenticator: vec![1],
+        },
+    });
+    assert!(matches!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let refined = service.refine_actor_tree(&work, &imports).unwrap();
+    assert!(refined.transition.writes.is_empty());
+    let change = refined.transition.crdt_change.as_ref().unwrap();
+    assert_eq!(change.causal_height, 1);
+    assert_eq!(change.operations.len(), 1);
+    assert_eq!(change.materializations.len(), 1);
+    assert_eq!(refined.exported_blobs.len(), 1);
+    assert_eq!(
+        refined.exported_blobs[0].reference,
+        change.materializations[0].state
+    );
+    let cid = change.cid();
+    let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work,
+        transition: refined.transition.clone(),
+        provided_blobs: refined.exported_blobs.clone(),
+    });
+    let applied = service.accumulate(&apply).unwrap().result;
+    let AccumulationResultV2::Accepted {
+        receipt,
+        published,
+        duplicate,
+    } = applied
+    else {
+        panic!("CRDT transition rejected")
+    };
+    assert!(!duplicate);
+    assert_eq!(receipt.resulting_crdt_heads, vec![cid]);
+    assert!(published.reply.is_some());
+    assert!(
+        service
+            .accumulate_host()
+            .preimages
+            .contains_key(&refined.exported_blobs[0].reference.hash.0)
+    );
+
+    let duplicate = service.accumulate(&apply).unwrap().result;
+    let AccumulationResultV2::Accepted {
+        published,
+        duplicate,
+        ..
+    } = duplicate
+    else {
+        panic!("CRDT retry rejected")
+    };
+    assert!(duplicate);
+    assert_eq!(published, PublishedEffectsV2::default());
 }
 
 #[test]

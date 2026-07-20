@@ -737,6 +737,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
 
     crate::log_impl::install_pvm_logger();
     set_refine_mode(true);
+    crate::crdt::reset_actor_slice();
 
     let expected_address =
         crate::v2::ACTOR_IPC_BASE_PAGE as u64 * javm_page_size_for_guest() as u64;

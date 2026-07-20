@@ -16,9 +16,9 @@ mod guest {
     use vos::abi::{error, pvm::hostcalls};
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
-        BlobRefV2, ContinuationChangeV2, GasAccountingV2, GuestAccumulateStoreV2, RefineOutputV2,
-        ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
-        execute_guest_accumulate,
+        BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2,
+        GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, RefineOutputV2, ReplyRecordV2,
+        StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2, execute_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -124,9 +124,7 @@ mod guest {
         let mut continuations = alloc::vec::Vec::new();
         let mut exported_blobs = alloc::vec::Vec::new();
         if let Some(checkpoint) = actor_output.checkpoint {
-            if checkpoint.input.invocation != work.invocation
-                || !checkpoint.base.mode_compatible(work.consistency)
-            {
+            if checkpoint.input != work.input_id() || checkpoint.base != work.base {
                 fail_closed();
             }
             consumed_input = checkpoint.input;
@@ -150,13 +148,60 @@ mod guest {
             producer: work.target,
             result: actor_output.reply,
         });
-        let transition = TransitionV2 {
+        let (writes, crdt_change, candidate_blobs) = match (&work.base, work.base_causal_height) {
+            (ConsistencyBaseV2::Linear { .. }, None) => {
+                if !actor_output.crdt_operations.is_empty()
+                    || actor_output.crdt_materialization.is_some()
+                {
+                    fail_closed();
+                }
+                (actor_output.writes, None, alloc::vec::Vec::new())
+            }
+            (ConsistencyBaseV2::Crdt { heads }, Some(base_height)) => {
+                if !actor_output.writes.is_empty() {
+                    fail_closed();
+                }
+                let materialized = actor_output
+                    .crdt_materialization
+                    .unwrap_or_else(|| fail_closed());
+                let id = CrdtChangeV2::derive_id(&work).unwrap_or_else(|| fail_closed());
+                if actor_output.crdt_operations.iter().any(|operation| {
+                    operation.actor != work.target
+                        || operation.id
+                            != id.operation(operation.actor, operation.field, operation.ordinal)
+                }) {
+                    fail_closed();
+                }
+                let causal_height = base_height.checked_add(1).unwrap_or_else(|| fail_closed());
+                let reference = BlobRefV2::of_bytes(&materialized);
+                (
+                    alloc::vec::Vec::new(),
+                    Some(CrdtChangeV2 {
+                        id,
+                        causal_dependencies: heads.clone(),
+                        causal_height,
+                        operations: actor_output.crdt_operations,
+                        workflow: alloc::vec::Vec::new(),
+                        materializations: alloc::vec![CrdtMaterializationV2 {
+                            actor: work.target,
+                            state: reference.clone(),
+                        }],
+                    }),
+                    alloc::vec![ImportedBlobV2 {
+                        reference,
+                        bytes: materialized,
+                    }],
+                )
+            }
+            _ => fail_closed(),
+        };
+        let mut transition = TransitionV2 {
             service: work.service,
             consumed_input,
             target_program: work.target_program,
             base,
-            writes: actor_output.writes,
-            crdt_change: None,
+            writes,
+            crdt_change,
             continuations,
             inbox: alloc::vec::Vec::new(),
             outbox: alloc::vec::Vec::new(),
@@ -165,9 +210,13 @@ mod guest {
             gas: GasAccountingV2::default(),
             proof: None,
         };
+        let workflow = transition.workflow_operations();
+        if let Some(change) = transition.crdt_change.as_mut() {
+            change.workflow = workflow;
+        }
         let encoded = RefineOutputV2 {
             transition,
-            candidate_blobs: alloc::vec::Vec::new(),
+            candidate_blobs,
         }
         .encode();
         if encoded.len() > TRANSITION_CAPACITY {

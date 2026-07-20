@@ -41,7 +41,7 @@ pub enum ServicePvmErrorV2 {
     ProgramIdMismatch,
     InvalidServiceEntries,
     Panic,
-    OutOfGas,
+    OutOfGas { vm: u16, pc: u32 },
     PageFault { vm: u16, address: u32 },
     UnreadableOutput,
     ForbiddenRefineProtocolCall(u8),
@@ -352,7 +352,12 @@ impl ServicePvmV2 {
                     });
                 }
                 KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
-                KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
+                KernelResult::OutOfGas => {
+                    return Err(ServicePvmErrorV2::OutOfGas {
+                        vm: kernel.active_vm,
+                        pc: kernel.vm_arena.vm(kernel.active_vm).pc,
+                    });
+                }
                 KernelResult::PageFault(address) => {
                     return Err(ServicePvmErrorV2::PageFault {
                         vm: kernel.active_vm,
@@ -360,9 +365,7 @@ impl ServicePvmV2 {
                     });
                 }
                 KernelResult::ProtocolCall { slot } => {
-                    if let Some([result0, result1]) =
-                        handle_accumulate_mechanical_call(slot, &mut kernel)
-                    {
+                    if let Some([result0, result1]) = handle_mechanical_call(slot, &mut kernel) {
                         kernel
                             .resume_protocol_call(result0, result1)
                             .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
@@ -542,7 +545,12 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 });
             }
             KernelResult::Panic => return Err(ServicePvmErrorV2::Panic),
-            KernelResult::OutOfGas => return Err(ServicePvmErrorV2::OutOfGas),
+            KernelResult::OutOfGas => {
+                return Err(ServicePvmErrorV2::OutOfGas {
+                    vm: kernel.active_vm,
+                    pc: kernel.vm_arena.vm(kernel.active_vm).pc,
+                });
+            }
             KernelResult::PageFault(address) => {
                 return Err(ServicePvmErrorV2::PageFault {
                     vm: kernel.active_vm,
@@ -588,14 +596,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                         continue;
                     }
                 }
-                let mechanical_result = match slot as u32 {
-                    crate::abi::hostcall::GAS => Some([kernel.active_gas(), 0]),
-                    crate::abi::hostcall::GROW_HEAP => Some([0, 0]),
-                    // Debugging is deliberately non-observable to Refine. The
-                    // guest is told the full input length was accepted.
-                    crate::abi::hostcall::DEBUG_WRITE => Some([kernel.active_reg(8), 0]),
-                    _ => None,
-                };
+                let mechanical_result = handle_mechanical_call(slot, &mut kernel);
                 if let Some([result0, result1]) = mechanical_result {
                     kernel
                         .resume_protocol_call(result0, result1)
@@ -620,6 +621,7 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
     // nondeterministic BOOT_CONTEXT/NOW_MS seams are intentionally absent from
     // v2 Refine.
     for slot in [
+        crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
         crate::abi::hostcall::GROW_HEAP as u8,
         crate::abi::hostcall::DEBUG_WRITE as u8,
         crate::abi::hostcall::SUSPEND as u8,
@@ -635,6 +637,7 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
 fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usize) {
     for vm in 1..=actor_count {
         for slot in [
+            crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             crate::abi::hostcall::GROW_HEAP as u8,
             crate::abi::hostcall::DEBUG_WRITE as u8,
             crate::abi::hostcall::SUSPEND as u8,
@@ -665,12 +668,14 @@ fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
     }
 }
 
-fn handle_accumulate_mechanical_call(slot: u8, kernel: &mut InvocationKernel) -> Option<[u64; 2]> {
+fn handle_mechanical_call(slot: u8, kernel: &mut InvocationKernel) -> Option<[u64; 2]> {
     use crate::abi::error;
 
     match slot as u32 {
         crate::abi::hostcall::GAS => Some([kernel.active_gas(), 0]),
         crate::abi::hostcall::GROW_HEAP => Some([error::HOST_OK, 0]),
+        // Debugging is deliberately non-observable to consensus execution.
+        // The guest only observes that its complete input was accepted.
         crate::abi::hostcall::DEBUG_WRITE => Some([kernel.active_reg(8), 0]),
         crate::crypto::ECALL_BLAKE2B_COMPRESS => {
             let h_address = u32::try_from(kernel.active_reg(7)).ok()?;
@@ -734,6 +739,7 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
     matches!(
         slot as u32,
         crate::abi::hostcall::GAS
+            | crate::crypto::ECALL_BLAKE2B_COMPRESS
             | crate::abi::hostcall::FETCH
             | crate::abi::hostcall::COMPILE
             | crate::abi::hostcall::PREIMAGE_LOOKUP

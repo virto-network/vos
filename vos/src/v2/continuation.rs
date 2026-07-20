@@ -179,6 +179,7 @@ mod tests {
                 revision: 8,
                 state_root: Hash([8; 32]),
             },
+            base_causal_height: None,
             imported_actors: vec![ImportedActorV2 {
                 actor: snapshot.actor,
                 program: snapshot.actor_program,

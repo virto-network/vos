@@ -39,23 +39,23 @@ std::thread_local! {
 }
 
 #[cfg(not(feature = "std"))]
-struct GuestChangeScope(core::cell::UnsafeCell<Option<ChangeScope>>);
+struct GuestChangeState {
+    active: Option<ChangeScope>,
+    completed: Option<CompletedChange>,
+}
 
 #[cfg(not(feature = "std"))]
-unsafe impl Sync for GuestChangeScope {}
+struct GuestChangeCell(core::cell::UnsafeCell<GuestChangeState>);
 
 #[cfg(not(feature = "std"))]
-static CHANGE_SCOPE: GuestChangeScope = GuestChangeScope(core::cell::UnsafeCell::new(None));
+unsafe impl Sync for GuestChangeCell {}
 
 #[cfg(not(feature = "std"))]
-struct GuestCompletedChange(core::cell::UnsafeCell<Option<CompletedChange>>);
-
-#[cfg(not(feature = "std"))]
-unsafe impl Sync for GuestCompletedChange {}
-
-#[cfg(not(feature = "std"))]
-static COMPLETED_CHANGE: GuestCompletedChange =
-    GuestCompletedChange(core::cell::UnsafeCell::new(None));
+static CHANGE_STATE: GuestChangeCell =
+    GuestChangeCell(core::cell::UnsafeCell::new(GuestChangeState {
+        active: None,
+        completed: None,
+    }));
 
 /// Runtime identity assigned by generated `#[actor(crdt)]` glue. The tag is
 /// deliberately absent from archived actor state: it is reconstructed from
@@ -63,6 +63,32 @@ static COMPLETED_CHANGE: GuestCompletedChange =
 #[doc(hidden)]
 pub trait Field {
     fn __vos_init(&mut self, actor: &str, field: &str);
+}
+
+/// Initialize execution-local CRDT scratch for a fresh nested actor CALL.
+/// Continuation restore does not re-enter the actor entrypoint, so a suspended
+/// slice retains its captured scope while every genuinely fresh slice starts
+/// from an explicit empty boundary independent of loader/BSS behavior.
+#[doc(hidden)]
+pub fn reset_actor_slice() {
+    #[cfg(feature = "std")]
+    {
+        CHANGE_SCOPE.with(|scope| *scope.borrow_mut() = None);
+        COMPLETED_CHANGE.with(|completed| *completed.borrow_mut() = None);
+    }
+    #[cfg(not(feature = "std"))]
+    // SAFETY: a fresh guest entry has no live references into this
+    // execution-local state. `write` avoids interpreting pre-entry loader
+    // bytes as initialized `Vec`s merely to discard them.
+    unsafe {
+        core::ptr::write(
+            CHANGE_STATE.0.get(),
+            GuestChangeState {
+                active: None,
+                completed: None,
+            },
+        );
+    }
 }
 
 fn field_tag(actor: &str, field: &str) -> crate::v2::Hash {
@@ -218,18 +244,16 @@ fn begin_change(change: ChangeId) -> Result<(), Error> {
     // SAFETY: PVM guests are single-threaded and actor dispatch never nests a
     // change scope. The explicit occupied check turns accidental nesting into
     // a deterministic error.
-    let scope = unsafe { &mut *CHANGE_SCOPE.0.get() };
-    if scope.is_some() {
+    let state = unsafe { &mut *CHANGE_STATE.0.get() };
+    if state.active.is_some() {
         return Err(Error::NestedChangeScope);
     }
-    *scope = Some(ChangeScope {
+    state.active = Some(ChangeScope {
         change,
         next_ordinal: 0,
         operations: Vec::new(),
     });
-    // SAFETY: the guest is single-threaded and this slot is paired with the
-    // active change scope above.
-    unsafe { *COMPLETED_CHANGE.0.get() = None };
+    state.completed = None;
     Ok(())
 }
 
@@ -250,16 +274,15 @@ fn complete_change() {
 
 #[cfg(not(feature = "std"))]
 fn complete_change() {
-    // SAFETY: see `begin_change`; both slots are guest-local and serialized.
-    let Some(scope) = (unsafe { &mut *CHANGE_SCOPE.0.get() }).take() else {
+    // SAFETY: see `begin_change`; guest-local mutation is serialized.
+    let state = unsafe { &mut *CHANGE_STATE.0.get() };
+    let Some(scope) = state.active.take() else {
         return;
     };
-    unsafe {
-        *COMPLETED_CHANGE.0.get() = Some(CompletedChange {
-            change: scope.change,
-            operations: scope.operations,
-        });
-    }
+    state.completed = Some(CompletedChange {
+        change: scope.change,
+        operations: scope.operations,
+    });
 }
 
 #[cfg(feature = "std")]
@@ -270,7 +293,7 @@ fn end_change() {
 #[cfg(not(feature = "std"))]
 fn end_change() {
     // SAFETY: see `begin_change`; this clears the same single-threaded slot.
-    unsafe { *CHANGE_SCOPE.0.get() = None };
+    unsafe { (*CHANGE_STATE.0.get()).active = None };
 }
 
 #[cfg(feature = "std")]
@@ -281,8 +304,8 @@ fn next_operation() -> Result<OpId, Error> {
 #[cfg(not(feature = "std"))]
 fn next_operation() -> Result<OpId, Error> {
     // SAFETY: see `begin_change`; mutation is serialized by actor dispatch.
-    let scope = unsafe { &mut *CHANGE_SCOPE.0.get() };
-    next_operation_from(scope.as_mut())
+    let state = unsafe { &mut *CHANGE_STATE.0.get() };
+    next_operation_from(state.active.as_mut())
 }
 
 fn next_operation_from(scope: Option<&mut ChangeScope>) -> Result<OpId, Error> {
@@ -302,8 +325,8 @@ fn record_operation(field: crate::v2::Hash, id: OpId, payload: Vec<u8>) -> Resul
     #[cfg(not(feature = "std"))]
     {
         // SAFETY: see `begin_change`; actor mutation is single-threaded.
-        let scope = unsafe { &mut *CHANGE_SCOPE.0.get() };
-        record_operation_in(scope.as_mut(), field, id, payload)
+        let state = unsafe { &mut *CHANGE_STATE.0.get() };
+        record_operation_in(state.active.as_mut(), field, id, payload)
     }
 }
 
@@ -334,7 +357,7 @@ pub fn take_operations(
     let completed = COMPLETED_CHANGE.with(|completed| completed.borrow_mut().take());
     #[cfg(not(feature = "std"))]
     // SAFETY: see `begin_change`; the actor entrypoint consumes this once.
-    let completed = unsafe { (&mut *COMPLETED_CHANGE.0.get()).take() };
+    let completed = unsafe { (&mut *CHANGE_STATE.0.get()).completed.take() };
 
     let completed = completed.ok_or(Error::NoCompletedChange)?;
     if completed.change.0 != change.0 {
