@@ -677,8 +677,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(service.accumulate_host().preimages, preimages_after_apply);
     assert_eq!(
         service.accumulate_host().commits,
-        3,
-        "a read-only duplicate transaction may commit"
+        2,
+        "a read-only duplicate transaction must not commit"
     );
 }
 
