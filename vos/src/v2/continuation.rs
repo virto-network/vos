@@ -46,7 +46,26 @@ impl ContinuationSnapshotV2 {
         {
             return Err(DecodeError::InvalidVersion);
         }
-        if self.kernel_snapshot.is_empty() {
+        if self.kernel_snapshot.is_empty()
+            || self
+                .pending_call
+                .is_some_and(|call| call != self.invocation.call_id(self.await_ordinal))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    /// Bind a newly emitted checkpoint to the slice which produced it. This
+    /// is the Accumulate-side counterpart to [`Self::validate_resume_for`].
+    pub fn validate_checkpoint_for(&self, work: &WorkEnvelopeV2) -> Result<(), DecodeError> {
+        self.validate()?;
+        if self.service != work.service
+            || self.invocation != work.invocation
+            || self.checkpoint_step != work.workflow_step
+            || self.actor != work.target
+            || self.actor_program != work.target_program
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(())
@@ -145,17 +164,18 @@ mod tests {
     }
 
     fn snapshot() -> ContinuationSnapshotV2 {
+        let invocation = InvocationId([4; 32]);
         ContinuationSnapshotV2 {
             snapshot_version: crate::v2::SNAPSHOT_VERSION,
             jar_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
             vos_abi: crate::v2::ABI_VERSION,
             service: service(),
-            invocation: InvocationId([4; 32]),
+            invocation,
             checkpoint_step: 7,
             actor: ActorId([5; 32]),
             actor_program: ProgramId([6; 32]),
             await_ordinal: 3,
-            pending_call: Some(CallId([7; 32])),
+            pending_call: Some(invocation.call_id(3)),
             kernel_snapshot: b"canonical JAR kernel snapshot".to_vec(),
         }
     }
@@ -216,5 +236,12 @@ mod tests {
         let mut empty_kernel = value;
         empty_kernel.kernel_snapshot.clear();
         assert_eq!(empty_kernel.validate(), Err(DecodeError::NonCanonical));
+
+        let mut forged_call = snapshot();
+        forged_call.pending_call = Some(CallId([7; 32]));
+        assert_eq!(
+            ContinuationSnapshotV2::decode(&forged_call.encode()),
+            Err(DecodeError::NonCanonical)
+        );
     }
 }

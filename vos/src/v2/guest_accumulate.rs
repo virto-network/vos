@@ -11,12 +11,12 @@ use alloc::vec::Vec;
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, CrdtChangeV2,
-    DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2, ProgramId,
-    PublishedEffectsV2, ServiceGenesisV2, ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2,
-    StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
-    crdt_change_storage_key, crdt_node_storage_key, dedup_storage_key, header_storage_key,
-    receipt_storage_key,
+    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationSnapshotV2, CrdtChangeV2, DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash,
+    MessageRecordV2, MethodPolicyV2, ProgramId, PublishedEffectsV2, ServiceGenesisV2,
+    ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, crdt_change_storage_key,
+    crdt_node_storage_key, dedup_storage_key, header_storage_key, receipt_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -26,6 +26,11 @@ pub trait GuestAccumulateStoreV2: StateTreeStore {
 
     /// Whether exact canonical actor PVM bytes are available to this service.
     fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error>;
+
+    /// Load and verify an already available content-addressed blob. Guest
+    /// Accumulate uses this for semantic validation of continuation headers;
+    /// the host never interprets them.
+    fn load_blob(&self, reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Stage bytes in the content-addressed store and return their canonical
     /// VOS reference. The staged blob becomes visible only with this same
@@ -300,24 +305,15 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     }
 
+    if let Some(rejection) = validate_continuation_change(tree.store_ref(), envelope)? {
+        return Ok(rejected(rejection));
+    }
+
     if let Some(rejection) = validate_durable_messages(&tree, transition)? {
         return Ok(rejected(rejection));
     }
     if contains_cycle(&transition.outbox) {
         return Ok(rejected(AccumulationRejectionV2::MessageCycle));
-    }
-    for change in &transition.continuations {
-        if tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(change.actor))?
-            .is_none()
-        {
-            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
-        }
-        let actual = tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(change.actor))?;
-        if actual.as_ref().map(|blob| blob.hash) != change.expected {
-            return Ok(rejected(AccumulationRejectionV2::ContinuationConflict(
-                change.actor,
-            )));
-        }
     }
     for message in &transition.inbox {
         if tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(message.to))?
@@ -679,6 +675,58 @@ fn valid_workflow_input<S: StateTreeStore>(
     })
 }
 
+fn validate_continuation_change<S: GuestAccumulateStoreV2>(
+    store: &S,
+    envelope: &AccumulationEnvelopeV2,
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    let work = &envelope.work;
+    let current = work
+        .imported_actors
+        .iter()
+        .find(|actor| actor.actor == work.target)
+        .and_then(|actor| actor.continuation.as_ref());
+    let change = match envelope.transition.continuations.as_slice() {
+        [] if current.is_none() => return Ok(None),
+        [] => {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+        [change] if change.actor == work.target => change,
+        _ => {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    };
+    if current.map(|reference| reference.hash) != change.expected {
+        return Ok(Some(AccumulationRejectionV2::ContinuationConflict(
+            work.target,
+        )));
+    }
+    let Some(replacement) = change.replacement.as_ref() else {
+        return Ok(None);
+    };
+    let bytes = match store
+        .load_blob(replacement)
+        .map_err(GuestAccumulateError::Storage)?
+    {
+        Some(bytes) => bytes,
+        None => {
+            return Ok(Some(AccumulationRejectionV2::MissingBlob(replacement.hash)));
+        }
+    };
+    if BlobRefV2::of_bytes(&bytes) != *replacement {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    };
+    if snapshot.validate_checkpoint_for(work).is_err() {
+        return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    Ok(None)
+}
+
 fn referenced_blobs<'a>(
     work: &'a super::WorkEnvelopeV2,
     transition: &'a super::TransitionV2,
@@ -930,6 +978,14 @@ mod tests {
                 .blobs
                 .get(&reference.hash)
                 .is_some_and(|bytes| reference.matches(bytes)))
+        }
+
+        fn load_blob(&self, reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self
+                .blobs
+                .get(&reference.hash)
+                .filter(|bytes| reference.matches(bytes))
+                .cloned())
         }
 
         fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error> {
@@ -1223,7 +1279,20 @@ mod tests {
         let mut store = MemStore::default();
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let first_work = linear_work(initial, install.resulting_state_root.unwrap());
-        let continuation_bytes = b"opaque canonical JAR snapshot".to_vec();
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: first_work.service.clone(),
+            invocation: first_work.invocation,
+            checkpoint_step: first_work.workflow_step,
+            actor: first_work.target,
+            actor_program: first_work.target_program,
+            await_ordinal: 0,
+            pending_call: None,
+            kernel_snapshot: vec![1],
+        }
+        .encode();
         let continuation = store.provide_blob(&continuation_bytes).unwrap();
         let mut checkpoint = linear_transition(&first_work, b"checkpoint");
         checkpoint.reply = None;
@@ -1233,6 +1302,27 @@ mod tests {
             replacement: Some(continuation.clone()),
         });
         checkpoint.exported_blobs.push(continuation.clone());
+        let mut wrong_snapshot = ContinuationSnapshotV2::decode(&continuation_bytes).unwrap();
+        wrong_snapshot.invocation = InvocationId([200; 32]);
+        let wrong_bytes = wrong_snapshot.encode();
+        let wrong = store.provide_blob(&wrong_bytes).unwrap();
+        let mut wrong_transition = checkpoint.clone();
+        wrong_transition.continuations[0].replacement = Some(wrong.clone());
+        wrong_transition.exported_blobs[0] = wrong.clone();
+        let before_wrong = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: first_work.clone(),
+                    transition: wrong_transition,
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before_wrong);
+
         let first = execute_guest_accumulate(
             &mut store,
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
