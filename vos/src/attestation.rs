@@ -403,6 +403,8 @@ pub trait AttestedMethod<T> {
     const METHOD: &'static str;
 
     fn claim_wire(claim: &T) -> Vec<u8>;
+
+    fn decode_claim_wire(wire: &[u8]) -> Option<T>;
 }
 
 impl<T, M> Attestation<T, M> {
@@ -451,6 +453,51 @@ impl<T, M> Attestation<T, M> {
     pub fn producer(&self) -> ProducerId {
         self.producer
     }
+
+    /// Strict portable application package. The preview is encoded with the
+    /// exact generated actor-reply codec, not a second generic serializer.
+    pub fn to_portable_bytes(&self) -> Vec<u8>
+    where
+        M: AttestedMethod<T>,
+    {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"VAT3");
+        bytes.extend_from_slice(&crate::v2::ABI_VERSION.to_le_bytes());
+        let mut encoder = Encoder(&mut bytes);
+        encoder.string(&self.producer_name);
+        encoder.fixed(&self.producer.0);
+        encoder.bytes(&self.statement.encode());
+        encoder.bytes(&M::claim_wire(&self.preview));
+        encoder.bytes(&self.proof);
+        bytes
+    }
+
+    pub fn from_portable_bytes(bytes: &[u8]) -> Result<Self, AttestationError>
+    where
+        M: AttestedMethod<T>,
+    {
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(4).map_err(invalid_package)? != b"VAT3"
+            || decoder.u16().map_err(invalid_package)? != crate::v2::ABI_VERSION
+        {
+            return Err(AttestationError::InvalidStatement);
+        }
+        let producer_name = decoder.string().map_err(invalid_package)?;
+        let producer = ProducerId(decoder.fixed().map_err(invalid_package)?);
+        let statement = AttestationStatementV3::decode(&decoder.bytes().map_err(invalid_package)?)
+            .map_err(invalid_package)?;
+        let preview = M::decode_claim_wire(&decoder.bytes().map_err(invalid_package)?)
+            .ok_or(AttestationError::ClaimCommitmentMismatch)?;
+        let proof = decoder.bytes().map_err(invalid_package)?;
+        if !decoder.exhausted() {
+            return Err(AttestationError::InvalidStatement);
+        }
+        Self::__from_runtime(producer_name, producer, statement, preview, proof)
+    }
+}
+
+fn invalid_package(_: DecodeError) -> AttestationError {
+    AttestationError::InvalidStatement
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -709,6 +756,10 @@ mod tests {
         fn claim_wire(claim: &u64) -> Vec<u8> {
             crate::value::Value::U64(*claim).encode()
         }
+
+        fn decode_claim_wire(wire: &[u8]) -> Option<u64> {
+            <crate::value::Value as crate::Decode>::try_decode(wire)?.as_u64()
+        }
     }
 
     enum OtherMethod {}
@@ -718,6 +769,10 @@ mod tests {
 
         fn claim_wire(claim: &u64) -> Vec<u8> {
             Method::claim_wire(claim)
+        }
+
+        fn decode_claim_wire(wire: &[u8]) -> Option<u64> {
+            Method::decode_claim_wire(wire)
         }
     }
 
@@ -881,6 +936,46 @@ mod tests {
                 package.proof,
             ),
             Err(AttestationError::WrongMethod)
+        ));
+    }
+
+    #[test]
+    fn portable_package_round_trips_and_rejects_trailing_or_tampered_claims() {
+        let package = package(27);
+        let bytes = package.to_portable_bytes();
+        let decoded = Attestation::<u64, Method>::from_portable_bytes(&bytes).unwrap();
+        assert_eq!(decoded.unverified_preview(), &27);
+        assert_eq!(decoded.statement(), package.statement());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            Attestation::<u64, Method>::from_portable_bytes(&trailing),
+            Err(AttestationError::InvalidStatement)
+        ));
+
+        let mut tampered = bytes;
+        let claim_position = tampered
+            .windows(Method::claim_wire(&27).len())
+            .position(|window| window == Method::claim_wire(&27))
+            .unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_ne!(claim_position, tampered.len() - 1, "proof was tampered");
+        assert!(
+            Attestation::<u64, Method>::from_portable_bytes(&tampered).is_ok(),
+            "proof bytes are opaque until verification"
+        );
+
+        let mut claim_tampered = package.to_portable_bytes();
+        let claim_wire = Method::claim_wire(&27);
+        let claim_position = claim_tampered
+            .windows(claim_wire.len())
+            .position(|window| window == claim_wire)
+            .unwrap();
+        claim_tampered[claim_position + claim_wire.len() - 1] ^= 1;
+        assert!(matches!(
+            Attestation::<u64, Method>::from_portable_bytes(&claim_tampered),
+            Err(AttestationError::ClaimCommitmentMismatch)
         ));
     }
 

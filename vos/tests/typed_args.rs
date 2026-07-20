@@ -242,6 +242,10 @@ fn attested_handle_returns_a_typed_package_not_a_bare_claim() {
     assert_eq!(package.unverified_preview(), &claim);
     assert_eq!(package.statement().method, "last_receipt");
     assert_eq!(package.producer(), ProducerId([15; 32]));
+    let portable = package.to_portable_bytes();
+    let decoded =
+        vos::Attestation::<Receipt, fixture::LastReceipt>::from_portable_bytes(&portable).unwrap();
+    assert_eq!(decoded.unverified_preview(), &claim);
 }
 
 #[test]

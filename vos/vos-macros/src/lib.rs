@@ -812,6 +812,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             };
+            let claim_value_ident = format_ident!("__claim_value");
+            let decode_claim = client_decode_body(&Some(claim_ty.clone()), &claim_value_ident);
             let method_name = method_name.to_string();
             attested_method_impls.push(quote! {
                 impl vos::AttestedMethod<#claim_ty> for #struct_name {
@@ -820,6 +822,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     fn claim_wire(claim: &#claim_ty) -> alloc::vec::Vec<u8> {
                         let value: vos::value::Value = #claim_to_value;
                         vos::Encode::encode(&value)
+                    }
+
+                    fn decode_claim_wire(wire: &[u8]) -> Option<#claim_ty> {
+                        let #claim_value_ident =
+                            <vos::value::Value as vos::Decode>::try_decode(wire)?;
+                        (#decode_claim).ok()
                     }
                 }
             });
