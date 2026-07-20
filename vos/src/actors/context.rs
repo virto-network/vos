@@ -528,6 +528,7 @@ impl<A: Actor> Context<A> {
                     to: target,
                     payload: payload.to_vec(),
                     authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                    proof_requested: false,
                     deadline_timeslot,
                 });
 
@@ -580,6 +581,148 @@ impl<A: Actor> Context<A> {
         {
             let _ = (target, payload, deadline_timeslot);
             super::run::Ask::ready_err(super::value::InvokeError::NotFound)
+        }
+    }
+
+    /// Issue a durable cross-root call whose committed reply must carry an
+    /// attestation package. Generated attested handle methods are the public
+    /// surface; this primitive exists so their `AttestationInvoker` impl can
+    /// preserve the exact suspension boundary.
+    #[doc(hidden)]
+    pub fn ask_actor_attested_raw(
+        &mut self,
+        target: crate::v2::ActorId,
+        payload: &[u8],
+        deadline_timeslot: Option<u64>,
+    ) -> super::client::AttestedAsk {
+        #[cfg(feature = "pvm")]
+        {
+            use super::client::{AttestedInvocationResult, ClientError};
+
+            if self.actor_id.is_none() || payload.is_empty() {
+                return super::client::AttestedAsk::ready(Err(ClientError::NotFound));
+            }
+            if self.actor_tree.iter().any(|actor| actor.actor == target) {
+                return super::client::AttestedAsk::ready(Err(ClientError::InvalidAttestation(
+                    crate::AttestationError::CannotSuspend,
+                )));
+            }
+            let await_ordinal = self.next_await_ordinal;
+            self.next_await_ordinal = self
+                .next_await_ordinal
+                .checked_add(1)
+                .expect("v2 actor await ordinal overflow");
+            self.pending_actor_calls
+                .push(crate::v2::ActorCallRequestV2 {
+                    await_ordinal,
+                    from: self.actor_id.expect("v2 actor identity was checked"),
+                    to: target,
+                    payload: payload.to_vec(),
+                    authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                    proof_requested: true,
+                    deadline_timeslot,
+                });
+
+            let mut response = [0u8; crate::v2::CHECKPOINT_TOKEN_CAPACITY];
+            let [resume_kind, response_len] = crate::abi::pvm::hostcalls::suspend_await(
+                &mut response,
+                await_ordinal,
+                crate::v2::AWAIT_SUSPEND_MAGIC,
+            );
+            match resume_kind {
+                0 => {
+                    let response_len = usize::try_from(response_len)
+                        .expect("await checkpoint payload length exceeds guest usize");
+                    assert!(
+                        response_len <= response.len(),
+                        "await checkpoint payload exceeds buffer"
+                    );
+                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
+                        &response[..response_len],
+                    )
+                    .expect("invalid v2 await checkpoint token");
+                    assert!(
+                        checkpoint.pending_call.is_some(),
+                        "await checkpoint is missing its stable CallId"
+                    );
+                    self.checkpoint = Some(checkpoint);
+                    self.self_schedule = false;
+                    super::client::AttestedAsk::checkpoint_pending()
+                }
+                2 => {
+                    let response_len = usize::try_from(response_len)
+                        .expect("await resume payload length exceeds guest usize");
+                    assert!(
+                        response_len <= response.len(),
+                        "await resume payload exceeds buffer"
+                    );
+                    let resume = <crate::v2::AwaitResumeV2 as crate::v2::V2Wire>::decode(
+                        &response[..response_len],
+                    )
+                    .expect("invalid v2 accumulated attestation reply");
+                    self.__resume_checkpoint_v2(&resume.checkpoint);
+                    self.checkpoint = Some(resume.checkpoint);
+                    self.self_schedule = false;
+                    let Some(attestation) = resume.attestation else {
+                        return super::client::AttestedAsk::ready(Err(
+                            ClientError::InvalidAttestation(
+                                crate::AttestationError::InvalidStatement,
+                            ),
+                        ));
+                    };
+                    let proof_offset = usize::try_from(attestation.proof_offset)
+                        .expect("attestation proof offset exceeds guest usize");
+                    let proof_len = usize::try_from(attestation.proof_len)
+                        .expect("attestation proof length exceeds guest usize");
+                    let Some(proof_end) = proof_offset.checked_add(proof_len) else {
+                        return super::client::AttestedAsk::ready(Err(
+                            ClientError::InvalidAttestation(crate::AttestationError::InvalidProof),
+                        ));
+                    };
+                    if proof_end > self.actor_ipc_capacity {
+                        return super::client::AttestedAsk::ready(Err(
+                            ClientError::InvalidAttestation(crate::AttestationError::InvalidProof),
+                        ));
+                    }
+                    let proof_address =
+                        crate::v2::ACTOR_IPC_BASE_PAGE as usize * 4096usize + proof_offset;
+                    // SAFETY: the invocation-owned IPC DATA capability is
+                    // mapped over `actor_ipc_capacity`; the descriptor was
+                    // bounds-checked above and the service writes it before
+                    // resuming this exact protocol call.
+                    let proof = unsafe {
+                        core::slice::from_raw_parts(proof_address as *const u8, proof_len).to_vec()
+                    };
+                    if !attestation.proof.proof_blob.matches(&proof) {
+                        return super::client::AttestedAsk::ready(Err(
+                            ClientError::InvalidAttestation(crate::AttestationError::InvalidProof),
+                        ));
+                    }
+                    let value = if resume.reply.result.is_empty() {
+                        super::value::Value::Unit
+                    } else {
+                        let Some(value) = <super::value::Value as super::codec::Decode>::try_decode(
+                            &resume.reply.result,
+                        ) else {
+                            return super::client::AttestedAsk::ready(Err(ClientError::Decode));
+                        };
+                        value
+                    };
+                    super::client::AttestedAsk::ready(Ok(AttestedInvocationResult {
+                        value,
+                        producer_name: attestation.producer_name,
+                        producer: attestation.producer,
+                        statement: attestation.statement,
+                        proof,
+                    }))
+                }
+                _ => panic!("invalid v2 attested await resume kind"),
+            }
+        }
+        #[cfg(not(feature = "pvm"))]
+        {
+            let _ = (target, payload, deadline_timeslot);
+            super::client::AttestedAsk::ready(Err(super::client::ClientError::Unreachable))
         }
     }
 

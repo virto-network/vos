@@ -1,10 +1,11 @@
+use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::attestation::AttestationPreparationV2;
+use crate::attestation::{AttestationPreparationV2, AttestationStatementV3};
 
 use super::identity::*;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
@@ -304,6 +305,9 @@ pub struct ActorCallRequestV2 {
     pub to: ActorId,
     pub payload: Vec<u8>,
     pub authorization: AuthorizationEvidenceV2,
+    /// The caller used an attested generated handle and therefore requires a
+    /// proof package, not merely the committed reply value.
+    pub proof_requested: bool,
     pub deadline_timeslot: Option<u64>,
 }
 
@@ -447,6 +451,7 @@ pub struct MessageRecordV2 {
     pub parent: Option<CallId>,
     pub payload: Vec<u8>,
     pub authorization: AuthorizationEvidenceV2,
+    pub proof_requested: bool,
     pub deadline_timeslot: Option<u64>,
 }
 
@@ -485,11 +490,59 @@ impl ReplyRecordV2 {
     }
 }
 
+/// Receipt-bound attestation metadata released with a committed reply. Proof
+/// bytes remain content addressed; the destination imports and verifies the
+/// exact blob before injecting it into a restored actor VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationDeliveryV2 {
+    pub producer_name: String,
+    pub producer: ProducerId,
+    pub statement: AttestationStatementV3,
+    pub proof: ProofCommitmentV2,
+}
+
 /// A reply released by another service only after its Accumulate commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccumulatedReplyV2 {
     pub reply: ReplyRecordV2,
     pub receipt: AccumulationReceiptV2,
+    pub attestation: Option<Box<AttestationDeliveryV2>>,
+}
+
+impl AccumulatedReplyV2 {
+    pub fn validate(&self) -> Result<(), crate::AttestationError> {
+        if self.receipt.reply_commitment != Some(self.reply.commitment()) {
+            return Err(crate::AttestationError::ReceiptMismatch);
+        }
+        if let Some(attestation) = &self.attestation {
+            if attestation.producer_name.is_empty() {
+                return Err(crate::AttestationError::WrongProducer);
+            }
+            validate_attestation_delivery(
+                &self.reply,
+                &self.receipt,
+                &attestation.statement,
+                &attestation.proof,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Attestation package placed in the guest-owned suspension buffer. The
+/// generic service resolves `proof.proof_blob` from Refine imports; native
+/// transport cannot inject unrelated proof bytes into the actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationResumeV2 {
+    pub producer_name: String,
+    pub producer: ProducerId,
+    pub statement: AttestationStatementV3,
+    pub proof: ProofCommitmentV2,
+    /// Byte window in the invocation-owned actor IPC capability. The generic
+    /// service writes the imported proof there before resuming JAR; only this
+    /// small descriptor crosses the bounded protocol-call stack buffer.
+    pub proof_offset: u32,
+    pub proof_len: u32,
 }
 
 /// Payload injected into the exact suspended protocol-call buffer after the
@@ -498,6 +551,26 @@ pub struct AccumulatedReplyV2 {
 pub struct AwaitResumeV2 {
     pub checkpoint: CheckpointTokenV2,
     pub reply: ReplyRecordV2,
+    pub attestation: Option<Box<AttestationResumeV2>>,
+}
+
+fn validate_attestation_delivery(
+    reply: &ReplyRecordV2,
+    receipt: &AccumulationReceiptV2,
+    statement: &AttestationStatementV3,
+    proof: &ProofCommitmentV2,
+) -> Result<(), crate::AttestationError> {
+    statement.validate()?;
+    if proof.proof_blob.len == 0
+        || statement.actor != reply.producer
+        || statement.accumulation_receipt != *receipt
+        || statement.claim_commitment != Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])
+        || proof.statement != statement.commitment()
+        || proof.statement_version != super::ATTESTATION_STATEMENT_VERSION
+    {
+        return Err(crate::AttestationError::InvalidStatement);
+    }
+    Ok(())
 }
 
 /// Exact public input passed to the platform's accumulation-receipt verifier.
@@ -1036,6 +1109,14 @@ impl RefineImportsV2 {
         for reference in &work.imported_blobs {
             self.require_blob(reference)?;
         }
+        if let Some(proof) = work
+            .awaited_reply
+            .as_ref()
+            .and_then(|reply| reply.attestation.as_ref())
+            .map(|attestation| &attestation.proof.proof_blob)
+        {
+            self.require_blob(proof)?;
+        }
         Ok(())
     }
 
@@ -1126,6 +1207,13 @@ impl V2Wire for WorkEnvelopeV2 {
             if !proof_requested || !present {
                 return Err(DecodeError::NonCanonical);
             }
+        }
+        if awaited_reply
+            .as_ref()
+            .and_then(|reply| reply.attestation.as_ref())
+            .is_some_and(|attestation| attestation.producer_name.is_empty())
+        {
+            return Err(DecodeError::NonCanonical);
         }
         for actor in &imported_actors {
             ensure_sorted_unique(&actor.causal_states, |state| state.hash.0)?;
@@ -1394,14 +1482,48 @@ impl V2Wire for AwaitResumeV2 {
         let mut e = Encoder(out);
         encode_checkpoint_token(&mut e, &self.checkpoint);
         encode_reply(&mut e, &self.reply);
+        e.option(&self.attestation, |e, attestation| {
+            e.string(&attestation.producer_name);
+            e.fixed(&attestation.producer.0);
+            e.bytes(&attestation.statement.encode());
+            encode_proof(e, &attestation.proof);
+            e.u32(attestation.proof_offset);
+            e.u32(attestation.proof_len);
+        });
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             checkpoint: decode_checkpoint_token(d)?,
             reply: decode_reply(d)?,
+            attestation: d.option(|d| {
+                Ok(Box::new(AttestationResumeV2 {
+                    producer_name: d.string()?,
+                    producer: ProducerId(d.fixed()?),
+                    statement: AttestationStatementV3::decode(&d.bytes()?)?,
+                    proof: decode_proof(d)?,
+                    proof_offset: d.u32()?,
+                    proof_len: d.u32()?,
+                }))
+            })?,
         };
-        if value.checkpoint.pending_call != Some(value.reply.call_id) {
+        if value.checkpoint.pending_call != Some(value.reply.call_id)
+            || value.attestation.as_ref().is_some_and(|attestation| {
+                attestation.producer_name.is_empty()
+                    || validate_attestation_delivery(
+                        &value.reply,
+                        &attestation.statement.accumulation_receipt,
+                        &attestation.statement,
+                        &attestation.proof,
+                    )
+                    .is_err()
+                    || attestation.proof.proof_blob.len != u64::from(attestation.proof_len)
+                    || attestation
+                        .proof_offset
+                        .checked_add(attestation.proof_len)
+                        .is_none()
+            })
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -1683,16 +1805,28 @@ impl V2Wire for AccumulatedReplyV2 {
         let mut e = Encoder(out);
         encode_reply(&mut e, &self.reply);
         e.bytes(&self.receipt.encode());
+        e.option(&self.attestation, |e, attestation| {
+            e.string(&attestation.producer_name);
+            e.fixed(&attestation.producer.0);
+            e.bytes(&attestation.statement.encode());
+            encode_proof(e, &attestation.proof);
+        });
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             reply: decode_reply(d)?,
             receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+            attestation: d.option(|d| {
+                Ok(Box::new(AttestationDeliveryV2 {
+                    producer_name: d.string()?,
+                    producer: ProducerId(d.fixed()?),
+                    statement: AttestationStatementV3::decode(&d.bytes()?)?,
+                    proof: decode_proof(d)?,
+                }))
+            })?,
         };
-        if value.receipt.reply_commitment != Some(value.reply.commitment()) {
-            return Err(DecodeError::NonCanonical);
-        }
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(value)
     }
 }
@@ -2884,6 +3018,7 @@ fn encode_actor_call(e: &mut Encoder<'_>, value: &ActorCallRequestV2) {
     e.fixed(&value.to.0);
     e.bytes(&value.payload);
     encode_auth(e, &value.authorization);
+    e.bool(value.proof_requested);
     e.option(&value.deadline_timeslot, |e, value| e.u64(*value));
 }
 
@@ -2894,6 +3029,7 @@ fn decode_actor_call(d: &mut Decoder<'_>) -> Result<ActorCallRequestV2, DecodeEr
         to: ActorId(d.fixed()?),
         payload: d.bytes()?,
         authorization: decode_auth(d)?,
+        proof_requested: d.bool()?,
         deadline_timeslot: d.option(Decoder::u64)?,
     })
 }
@@ -2915,6 +3051,7 @@ fn encode_message(e: &mut Encoder<'_>, value: &MessageRecordV2) {
     e.option(&value.parent, |e, id| e.fixed(&id.0));
     e.bytes(&value.payload);
     encode_auth(e, &value.authorization);
+    e.bool(value.proof_requested);
     e.option(&value.deadline_timeslot, |e, value| e.u64(*value));
 }
 
@@ -2928,6 +3065,7 @@ fn decode_message(d: &mut Decoder<'_>) -> Result<MessageRecordV2, DecodeError> {
         parent: d.option(|d| d.fixed().map(CallId))?,
         payload: d.bytes()?,
         authorization: decode_auth(d)?,
+        proof_requested: d.bool()?,
         deadline_timeslot: d.option(Decoder::u64)?,
     };
     if value.payload.is_empty()
@@ -3180,6 +3318,7 @@ mod tests {
                 to: ActorId([27; 32]),
                 payload: b"peer request".to_vec(),
                 authorization: AuthorizationEvidenceV2::Public,
+                proof_requested: false,
                 deadline_timeslot: Some(30),
             }],
             reply: b"ok".to_vec(),
@@ -3301,12 +3440,111 @@ mod tests {
                 producer: ActorId([28; 32]),
                 result: b"committed reply".to_vec(),
             },
+            attestation: None,
         };
         assert_eq!(AwaitResumeV2::decode(&resume.encode()).unwrap(), resume);
         let mut mismatched = resume;
         mismatched.reply.call_id = InvocationId([29; 32]).call_id(3);
         assert_eq!(
             AwaitResumeV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn attested_reply_wire_binds_receipt_claim_and_content_addressed_proof() {
+        let invocation = InvocationId([41; 32]);
+        let call = invocation.call_id(2);
+        let actor = ActorId([42; 32]);
+        let reply = ReplyRecordV2 {
+            call_id: call,
+            producer: actor,
+            result: b"adult".to_vec(),
+        };
+        let receipt = AccumulationReceiptV2 {
+            service: service(),
+            accepted_transition: Hash([43; 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([44; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 3,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let statement = AttestationStatementV3 {
+            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
+            space: receipt.service.space,
+            actor,
+            deployment: receipt.service.deployment,
+            actor_program: ProgramId([45; 32]),
+            method: "is_adult".into(),
+            schema: Hash([46; 32]),
+            invocation: InvocationId::for_call(call),
+            before: crate::attestation::StateCommitmentV3::Linear(Hash([47; 32])),
+            after: crate::attestation::StateCommitmentV3::Linear(Hash([44; 32])),
+            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),
+            input_commitment: Hash([48; 32]),
+            authorization_policy: Hash([49; 32]),
+            accumulation_receipt: receipt.clone(),
+        };
+        let proof_bytes = b"proof".to_vec();
+        let proof = ProofCommitmentV2 {
+            statement: statement.commitment(),
+            trace: Hash([50; 32]),
+            proof_blob: BlobRefV2::of_bytes(&proof_bytes),
+            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
+        };
+        let accumulated = AccumulatedReplyV2 {
+            reply: reply.clone(),
+            receipt: receipt.clone(),
+            attestation: Some(Box::new(AttestationDeliveryV2 {
+                producer_name: "private-age".into(),
+                producer: ProducerId([51; 32]),
+                statement: statement.clone(),
+                proof: proof.clone(),
+            })),
+        };
+        assert_eq!(
+            AccumulatedReplyV2::decode(&accumulated.encode()).unwrap(),
+            accumulated
+        );
+
+        let checkpoint = CheckpointTokenV2 {
+            input: WorkInputIdV2 {
+                invocation,
+                workflow_step: 1,
+            },
+            base: ConsistencyBaseV2::Linear {
+                revision: 2,
+                state_root: Hash([52; 32]),
+            },
+            base_causal_height: None,
+            change: None,
+            expected: Some(Hash([53; 32])),
+            replacement: None,
+            pending_call: Some(call),
+            previously_suspended: vec![ActorId([54; 32])],
+            suspended: vec![],
+        };
+        let resume = AwaitResumeV2 {
+            checkpoint,
+            reply,
+            attestation: Some(Box::new(AttestationResumeV2 {
+                producer_name: "private-age".into(),
+                producer: ProducerId([51; 32]),
+                statement,
+                proof,
+                proof_offset: 1024,
+                proof_len: proof_bytes.len() as u32,
+            })),
+        };
+        assert_eq!(AwaitResumeV2::decode(&resume.encode()).unwrap(), resume);
+
+        let mut tampered = resume;
+        tampered.attestation.as_mut().unwrap().proof_len += 1;
+        assert_eq!(
+            AwaitResumeV2::decode(&tampered.encode()),
             Err(DecodeError::NonCanonical)
         );
     }
@@ -3371,6 +3609,7 @@ mod tests {
                 credential_commitment: Hash([76; 32]),
                 bytes: vec![77],
             },
+            proof_requested: false,
             deadline_timeslot: Some(78),
         };
         assert_eq!(MessageRecordV2::decode(&message.encode()).unwrap(), message);
@@ -3478,6 +3717,7 @@ mod tests {
             parent: None,
             payload: vec![1],
             authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot: Some(9),
         };
         let source_outbox = vec![message.clone()];

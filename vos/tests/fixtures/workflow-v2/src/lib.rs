@@ -76,4 +76,30 @@ impl WorkflowV2 {
         }
         self.value
     }
+
+    #[msg]
+    async fn root_await_attested_peer(&mut self, ctx: &mut Context<Self>) -> bool {
+        match ctx
+            .ask_actor_attested_raw(
+                ActorId([44; 32]),
+                &{
+                    let encoded = Msg::new("peer_value").encode();
+                    let mut payload = alloc::vec::Vec::with_capacity(1 + encoded.len());
+                    payload.push(vos::value::TAG_DYNAMIC);
+                    payload.extend_from_slice(&encoded);
+                    payload
+                },
+                Some(100),
+            )
+            .await
+        {
+            Ok(package) => {
+                package.value == Value::U32(7)
+                    && package.producer_name == "private-age"
+                    && package.statement.method == "peer_value"
+                    && package.proof == b"peer-proof"
+            }
+            Err(_) => false,
+        }
+    }
 }

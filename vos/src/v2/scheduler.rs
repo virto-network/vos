@@ -303,7 +303,7 @@ impl LocalWorkSchedulerV2 {
                 parent_call: Some(message.call_id),
                 awaited_reply: None,
                 imported_blobs: Vec::new(),
-                proof_requested: false,
+                proof_requested: message.proof_requested,
             },
         )
     }
@@ -593,6 +593,14 @@ impl LocalWorkSchedulerV2 {
 
         for reference in &work.imported_blobs {
             import_blob(store, &mut blobs, reference)?;
+        }
+        if let Some(proof) = work
+            .awaited_reply
+            .as_ref()
+            .and_then(|reply| reply.attestation.as_ref())
+            .map(|attestation| &attestation.proof.proof_blob)
+        {
+            import_blob(store, &mut blobs, proof)?;
         }
         let imports = RefineImportsV2 {
             programs: programs.into_values().collect(),

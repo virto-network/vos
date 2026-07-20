@@ -289,7 +289,10 @@ pub struct ProducedAttestationProofV2 {
 
 impl ProducedAttestationProofV2 {
     pub fn validate(&self) -> Result<(), AttestationError> {
-        if self.trace == Hash::ZERO || self.proof.is_empty() {
+        if self.trace == Hash::ZERO
+            || self.proof.is_empty()
+            || self.proof.len() > crate::v2::MAX_ATTESTATION_PROOF_BYTES
+        {
             return Err(AttestationError::InvalidProof);
         }
         Ok(())
@@ -997,5 +1000,14 @@ mod tests {
             AttestationPreparationV2::decode(&mismatched.encode()),
             Err(DecodeError::NonCanonical)
         );
+    }
+
+    #[test]
+    fn produced_proofs_must_fit_the_durable_actor_resume_window() {
+        let proof = ProducedAttestationProofV2 {
+            trace: Hash([1; 32]),
+            proof: vec![0; crate::v2::MAX_ATTESTATION_PROOF_BYTES + 1],
+        };
+        assert_eq!(proof.validate(), Err(AttestationError::InvalidProof));
     }
 }

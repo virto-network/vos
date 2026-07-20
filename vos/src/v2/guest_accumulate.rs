@@ -1994,6 +1994,7 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
             .binary_search_by_key(&message.from, |actor| actor.actor)
             .is_err()
         || message.to != awaited.reply.producer
+        || message.proof_requested != awaited.attestation.is_some()
         || message
             .deadline_timeslot
             .is_some_and(|deadline| work.logical_timeslot >= deadline)
@@ -2946,6 +2947,7 @@ mod tests {
             parent: None,
             payload,
             authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot: Some(10),
         };
         let continuation_bytes = ContinuationSnapshotV2 {
@@ -3011,6 +3013,7 @@ mod tests {
         let awaited = super::super::AccumulatedReplyV2 {
             reply: remote_reply,
             receipt: remote_receipt,
+            attestation: None,
         };
         let mut resume = first_work;
         resume.workflow_step = 1;
@@ -3106,6 +3109,7 @@ mod tests {
             parent,
             payload,
             authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot,
         }
     }
@@ -3568,6 +3572,7 @@ mod tests {
             parent: None,
             payload: vec![1],
             authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
             deadline_timeslot: None,
         });
         let workflow = first.workflow_operations(&first_work);

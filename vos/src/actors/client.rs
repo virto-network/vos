@@ -18,7 +18,11 @@
 use super::context::ServiceId;
 use super::value::Value;
 use alloc::{string::String, vec::Vec};
-use core::future::Future;
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
 
 /// Deterministic failure returned by an actor execution or scheduler call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +153,35 @@ pub struct AttestedInvocationResult {
     pub proof: Vec<u8>,
 }
 
+/// One exact attested-await result. The pending form exists only in the
+/// transition-finalization fork; JAR restores the machine before this future
+/// is reconstructed with the committed package.
+#[doc(hidden)]
+pub struct AttestedAsk {
+    result: Option<Result<AttestedInvocationResult, ClientError>>,
+}
+
+impl AttestedAsk {
+    pub(crate) fn ready(result: Result<AttestedInvocationResult, ClientError>) -> Self {
+        Self {
+            result: Some(result),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn checkpoint_pending() -> Self {
+        Self { result: None }
+    }
+}
+
+impl Future for AttestedAsk {
+    type Output = Result<AttestedInvocationResult, ClientError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        self.result.take().map_or(Poll::Pending, Poll::Ready)
+    }
+}
+
 /// Separate transport capability for methods declared `#[msg(attested)]`.
 /// Ordinary invokers cannot accidentally receive an unproved value from an
 /// attested generated handle.
@@ -238,6 +271,24 @@ impl<A: super::Actor> Invoker for super::Context<A> {
                 .await
                 .map_err(ClientError::from)
         }
+    }
+}
+
+impl<A: super::Actor> AttestationInvoker for super::Context<A> {
+    fn invoke_attested(
+        &mut self,
+        _target: ServiceId,
+        _payload: Vec<u8>,
+    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
+        AttestedAsk::ready(Err(ClientError::Unreachable))
+    }
+
+    fn invoke_actor_attested(
+        &mut self,
+        target: crate::v2::ActorId,
+        payload: Vec<u8>,
+    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
+        self.ask_actor_attested_raw(target, &payload, None)
     }
 }
 

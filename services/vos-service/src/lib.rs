@@ -133,6 +133,7 @@ mod guest {
                 parent: work.parent_call,
                 payload: call.payload.clone(),
                 authorization: call.authorization.clone(),
+                proof_requested: call.proof_requested,
                 deadline_timeslot: call.deadline_timeslot,
             })
             .collect::<alloc::vec::Vec<_>>();

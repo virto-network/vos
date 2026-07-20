@@ -14,7 +14,7 @@ use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AllowPublic,
-    AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
+    AttestationDeliveryV2, AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
     CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
     CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
     ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash,
@@ -350,6 +350,7 @@ fn peer_reply(
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     }
 }
 
@@ -459,6 +460,13 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                     MethodPolicyV2 {
                         method: "call_child".into(),
                         schema: Hash([61; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                    MethodPolicyV2 {
+                        method: "root_await_attested_peer".into(),
+                        schema: Hash([86; 32]),
                         policy: public_policy_hash(),
                         public: true,
                         attested: false,
@@ -789,6 +797,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     };
     restarted
         .accumulate_host_mut()
@@ -1050,6 +1059,175 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                 work: after_second.work,
                 transition: finished.transition,
                 provided_blobs: finished.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let attested_invocation = InvocationId([87; 32]);
+    let mut attested_message = vec![vos::value::TAG_DYNAMIC];
+    attested_message.extend_from_slice(&Msg::new("root_await_attested_peer").encode());
+    let attested = LocalWorkSchedulerV2::prepare(
+        restarted.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: attested_invocation,
+            workflow_step: 0,
+            logical_timeslot: 7,
+            target: seed.target,
+            method: "root_await_attested_peer".into(),
+            arguments: attested_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let waiting_for_attestation = restarted
+        .refine_actor_tree(&attested.work, &attested.imports)
+        .expect("the attested handle checkpoints before observing a package");
+    let attested_call = attested_invocation.call_id(0);
+    assert_eq!(waiting_for_attestation.transition.outbox.len(), 1);
+    assert_eq!(
+        waiting_for_attestation.transition.outbox[0].call_id,
+        attested_call
+    );
+    assert!(waiting_for_attestation.transition.outbox[0].proof_requested);
+    for artifact in &waiting_for_attestation.exported_blobs {
+        assert_eq!(
+            restarted
+                .accumulate_host_mut()
+                .import_blob(artifact.bytes.clone()),
+            artifact.reference
+        );
+    }
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: attested.work,
+                transition: waiting_for_attestation.transition,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let attested_reply = ReplyRecordV2 {
+        call_id: attested_call,
+        producer: ActorId([44; 32]),
+        result: Value::U32(7).encode(),
+    };
+    let mut producer_service = seed.service.clone();
+    producer_service.root_service = RootServiceId([88; 32]);
+    producer_service.deployment = DeploymentId([89; 32]);
+    let producer_receipt = AccumulationReceiptV2 {
+        service: producer_service,
+        accepted_transition: Hash([90; 32]),
+        reply_commitment: Some(attested_reply.commitment()),
+        outbox_commitment: None,
+        resulting_state_root: Some(Hash([91; 32])),
+        resulting_crdt_heads: vec![],
+        sequence: 1,
+        checkpoint: 0,
+        consistency: ConsistencyModeV2::Local,
+    };
+    let statement = AttestationStatementV3 {
+        statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+        space: producer_receipt.service.space,
+        actor: attested_reply.producer,
+        deployment: producer_receipt.service.deployment,
+        actor_program: ProgramId([92; 32]),
+        method: "peer_value".into(),
+        schema: Hash([93; 32]),
+        invocation: InvocationId::for_call(attested_call),
+        before: vos::StateCommitmentV3::Linear(Hash([94; 32])),
+        after: vos::StateCommitmentV3::Linear(Hash([91; 32])),
+        claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&attested_reply.result]),
+        input_commitment: Hash([95; 32]),
+        authorization_policy: Hash([96; 32]),
+        accumulation_receipt: producer_receipt.clone(),
+    };
+    let proof_bytes = b"peer-proof".to_vec();
+    let proof = ProofCommitmentV2 {
+        statement: statement.commitment(),
+        trace: Hash([97; 32]),
+        proof_blob: BlobRefV2::of_bytes(&proof_bytes),
+        statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+    };
+    let accumulated = AccumulatedReplyV2 {
+        reply: attested_reply,
+        receipt: producer_receipt.clone(),
+        attestation: Some(Box::new(AttestationDeliveryV2 {
+            producer_name: "private-age".into(),
+            producer: ProducerId([98; 32]),
+            statement,
+            proof: proof.clone(),
+        })),
+    };
+    accumulated.validate().unwrap();
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_resume(
+            restarted.accumulate_host(),
+            attested_invocation,
+            8,
+            Some(accumulated.clone()),
+        ),
+        Err(ScheduleErrorV2::MissingBlob(proof.proof_blob.hash)),
+        "a proof commitment alone cannot resume the caller"
+    );
+    assert_eq!(
+        restarted
+            .accumulate_host_mut()
+            .import_blob(proof_bytes.clone()),
+        proof.proof_blob
+    );
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: producer_receipt,
+        });
+    let resumed_attestation = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        attested_invocation,
+        8,
+        Some(accumulated),
+    )
+    .expect("the scheduler imports the exact content-addressed proof");
+    assert!(
+        resumed_attestation
+            .imports
+            .blobs
+            .iter()
+            .any(|blob| blob.reference == proof.proof_blob && blob.bytes == proof_bytes)
+    );
+    let attested_finished = restarted
+        .refine_actor_tree(&resumed_attestation.work, &resumed_attestation.imports)
+        .expect("the restored generated attestation call receives the committed package");
+    assert_eq!(
+        attested_finished
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::Bool(true))
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: resumed_attestation.work,
+                transition: attested_finished.transition,
+                provided_blobs: attested_finished.exported_blobs,
             }))
             .unwrap()
             .result,
@@ -1718,6 +1896,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     };
     service
         .accumulate_host_mut()
@@ -2312,6 +2491,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             consistency: ConsistencyModeV2::Local,
         },
         reply,
+        attestation: None,
     };
     assert_eq!(
         LocalWorkSchedulerV2::prepare_resume(
@@ -2608,6 +2788,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         parent: None,
         payload: work.arguments.clone(),
         authorization: AuthorizationEvidenceV2::Public,
+        proof_requested: false,
         deadline_timeslot: Some(100),
     };
     let transition = TransitionV2 {
@@ -3140,6 +3321,25 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(
         application_package.statement(),
         &proved.preparation.statement
+    );
+    let (accumulated_reply, transported_proof) = proved
+        .clone()
+        .into_accumulated_reply("private-age".into(), ProducerId([112; 32]))
+        .expect("only a committed proof output becomes durable reply input");
+    assert_eq!(
+        Value::decode(&accumulated_reply.reply.result),
+        Value::Bytes(b"attested reply".to_vec())
+    );
+    assert_eq!(accumulated_reply.receipt, proved.preparation.receipt);
+    assert_eq!(transported_proof.reference, proved.proof.proof_blob);
+    assert_eq!(transported_proof.bytes, proof_bytes);
+    assert_eq!(
+        accumulated_reply
+            .attestation
+            .as_ref()
+            .expect("attested reply carries package metadata")
+            .statement,
+        proved.preparation.statement
     );
     let receipt = proved.preparation.receipt;
     let published = proved.published;
@@ -3840,6 +4040,7 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
         parent: None,
         payload: source_seed.arguments.clone(),
         authorization: AuthorizationEvidenceV2::Public,
+        proof_requested: false,
         deadline_timeslot: Some(10),
     };
     let transition = TransitionV2 {

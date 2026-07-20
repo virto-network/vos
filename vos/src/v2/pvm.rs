@@ -22,7 +22,7 @@ use super::{
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
-const MIN_ACTOR_OUTPUT_HEADROOM: usize = 16 * javm::PVM_PAGE_SIZE as usize;
+const MIN_ACTOR_OUTPUT_HEADROOM: usize = super::MAX_ATTESTATION_PROOF_BYTES;
 const RESULT_WHAT: u64 = u64::MAX - 1;
 const ACTOR_STACK_OBJECT_CAP: u64 = 65;
 
@@ -285,16 +285,37 @@ impl ServicePvmV2 {
             let (resume_kind, payload_len) =
                 match (continuation.pending_call, work.awaited_reply.as_ref()) {
                     (None, None) => (1, write_checkpoint_token(&mut kernel, &checkpoint)?),
-                    (Some(call), Some(awaited)) if awaited.reply.call_id == call => (
-                        2,
-                        write_await_resume(
-                            &mut kernel,
-                            &AwaitResumeV2 {
-                                checkpoint,
-                                reply: awaited.reply.clone(),
-                            },
-                        )?,
-                    ),
+                    (Some(call), Some(awaited)) if awaited.reply.call_id == call => {
+                        let attestation = awaited
+                            .attestation
+                            .as_ref()
+                            .map(|attestation| {
+                                let proof_bytes =
+                                    imported_blob_bytes(imports, &attestation.proof.proof_blob)?;
+                                let (proof_offset, proof_len) =
+                                    stage_attestation_proof(&mut kernel, proof_bytes)?;
+                                Ok(alloc::boxed::Box::new(super::AttestationResumeV2 {
+                                    producer_name: attestation.producer_name.clone(),
+                                    producer: attestation.producer,
+                                    statement: attestation.statement.clone(),
+                                    proof: attestation.proof.clone(),
+                                    proof_offset,
+                                    proof_len,
+                                }))
+                            })
+                            .transpose()?;
+                        (
+                            2,
+                            write_await_resume(
+                                &mut kernel,
+                                &AwaitResumeV2 {
+                                    checkpoint,
+                                    reply: awaited.reply.clone(),
+                                    attestation,
+                                },
+                            )?,
+                        )
+                    }
                     _ => return Err(ServicePvmErrorV2::ContinuationMismatch),
                 };
             kernel
@@ -613,6 +634,36 @@ fn write_await_resume(
     resume: &AwaitResumeV2,
 ) -> Result<u64, ServicePvmErrorV2> {
     write_suspension_payload(kernel, &resume.encode())
+}
+
+fn stage_attestation_proof(
+    kernel: &mut InvocationKernel,
+    proof: &[u8],
+) -> Result<(u32, u32), ServicePvmErrorV2> {
+    let capacity = match kernel.vm_arena.vm(kernel.active_vm).cap_table.get(0) {
+        Some(Cap::Data(data))
+            if data.base_offset == Some(ACTOR_IPC_BASE_PAGE) && data.access == Some(Access::RW) =>
+        {
+            data.mapped_page_count() as usize * javm::PVM_PAGE_SIZE as usize
+        }
+        _ => return Err(ServicePvmErrorV2::ActorIpcSetupFailed),
+    };
+    if proof.is_empty()
+        || proof.len() > super::MAX_ATTESTATION_PROOF_BYTES
+        || proof.len() > capacity
+    {
+        return Err(ServicePvmErrorV2::ActorIpcExhausted);
+    }
+    let offset = capacity - proof.len();
+    let address = ACTOR_IPC_BASE_PAGE as usize * javm::PVM_PAGE_SIZE as usize + offset;
+    let address = u32::try_from(address).map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?;
+    if !kernel.write_data_cap_window(address, proof) {
+        return Err(ServicePvmErrorV2::ActorIpcSetupFailed);
+    }
+    Ok((
+        u32::try_from(offset).map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?,
+        u32::try_from(proof.len()).map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?,
+    ))
 }
 
 fn write_suspension_payload(
