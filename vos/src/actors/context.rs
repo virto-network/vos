@@ -68,6 +68,8 @@ pub struct Context<A: Actor> {
     #[cfg(feature = "pvm")]
     actor_tree: Vec<crate::v2::ActorTreeImportV2>,
     #[cfg(feature = "pvm")]
+    active_actor_mask: u64,
+    #[cfg(feature = "pvm")]
     actor_change: Option<crate::v2::ChangeId>,
     #[cfg(feature = "pvm")]
     actor_ipc_capacity: usize,
@@ -121,6 +123,8 @@ impl<A: Actor> Context<A> {
             next_await_ordinal: 0,
             #[cfg(feature = "pvm")]
             actor_tree: Vec::new(),
+            #[cfg(feature = "pvm")]
+            active_actor_mask: 0,
             #[cfg(feature = "pvm")]
             actor_change: None,
             #[cfg(feature = "pvm")]
@@ -178,8 +182,10 @@ impl<A: Actor> Context<A> {
         change: Option<crate::v2::ChangeId>,
         ipc_capacity: usize,
         first_await_ordinal: u64,
+        active_actor_mask: u64,
     ) {
         self.actor_tree = actor_tree;
+        self.active_actor_mask = active_actor_mask;
         self.actor_change = change;
         self.actor_ipc_capacity = ipc_capacity;
         self.first_await_ordinal = first_await_ordinal;
@@ -594,14 +600,18 @@ impl<A: Actor> Context<A> {
         target: crate::v2::ActorId,
         payload: &[u8],
     ) -> Option<super::run::Ask> {
-        let caller = self.actor_id?;
+        self.actor_id?;
         let index = self
             .actor_tree
             .binary_search_by_key(&target, |actor| actor.actor)
             .ok()?;
         let imported = &self.actor_tree[index];
         let callable_slot = crate::v2::ACTOR_CALLABLE_BASE_SLOT.checked_add(index as u8)?;
-        if target == caller || imported.suspended || self.actor_change.is_some() {
+        let target_mask = 1u64 << index;
+        if self.active_actor_mask & target_mask != 0 {
+            return Some(super::run::Ask::ready_err(super::value::InvokeError::Cycle));
+        }
+        if imported.suspended || self.actor_change.is_some() {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::NotFound,
             ));

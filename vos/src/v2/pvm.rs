@@ -206,6 +206,7 @@ impl ActorRefineRuntimeV2 {
                 change: crdt_dispatch(work, 0),
                 state,
                 causal_states,
+                active_actor_mask: 0,
                 origin: work.origin,
                 space_role,
                 actor_role,
@@ -256,6 +257,28 @@ impl ActorRefineRuntimeV2 {
                         .get(&actor)
                         .cloned()
                         .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    let mut active_actor_mask = 0u64;
+                    for vm in kernel
+                        .call_stack
+                        .iter()
+                        .map(|frame| frame.caller_vm_id)
+                        .chain(core::iter::once(kernel.active_vm))
+                        .filter(|vm| *vm != 0)
+                    {
+                        let active_actor = self
+                            .actor_for_vm(vm)
+                            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                        let index = self
+                            .private_inputs
+                            .keys()
+                            .position(|candidate| *candidate == active_actor)
+                            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                        active_actor_mask |= 1u64 << index;
+                    }
+                    if active_actor_mask == 0 {
+                        return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                    }
+                    private.active_actor_mask = active_actor_mask;
                     if caller_vm == 0 {
                         if actor != self.target {
                             return Err(ServicePvmErrorV2::RefineHostRejected(slot));

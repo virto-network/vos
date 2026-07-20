@@ -213,6 +213,9 @@ pub struct ActorPrivateInputV2 {
     /// Additional canonical CRDT frontier materializations. The generated
     /// actor merger folds these into `state` before the message is observed.
     pub causal_states: Vec<Vec<u8>>,
+    /// Scheduler-derived actor-tree-indexed set of the active same-tree call
+    /// stack, including `actor`. Actor IPC cannot rewrite this value.
+    pub active_actor_mask: u64,
     pub origin: Origin,
     /// Authenticated role recovered from the disclosed credential or private
     /// witness before entering the canonical actor PVM.
@@ -1436,6 +1439,7 @@ impl V2Wire for ActorPrivateInputV2 {
         });
         e.bytes(&self.state);
         e.list(&self.causal_states, |e, state| e.bytes(state));
+        e.u64(self.active_actor_mask);
         encode_origin(&mut e, self.origin);
         e.option(&self.space_role, |e, role| e.u8(*role));
         e.option(&self.actor_role, |e, role| e.u8(*role));
@@ -1456,6 +1460,7 @@ impl V2Wire for ActorPrivateInputV2 {
             })?,
             state: d.bytes()?,
             causal_states: d.list(Decoder::bytes)?,
+            active_actor_mask: d.u64()?,
             origin: decode_origin(d)?,
             space_role: d.option(|d| {
                 let role = d.u8()?;
@@ -1465,7 +1470,11 @@ impl V2Wire for ActorPrivateInputV2 {
             })?,
             actor_role: d.option(Decoder::u8)?,
         };
-        if value.change.is_none() && !value.causal_states.is_empty() {
+        let valid_actor_mask = (1u64 << super::MAX_ROOT_TREE_ACTORS) - 1;
+        if value.active_actor_mask == 0
+            || value.active_actor_mask & !valid_actor_mask != 0
+            || (value.change.is_none() && !value.causal_states.is_empty())
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -3604,11 +3613,18 @@ mod tests {
             }),
             state: b"before".to_vec(),
             causal_states: vec![b"concurrent".to_vec()],
+            active_actor_mask: 1,
             origin: Origin::Actor(ActorId([22; 32])),
             space_role: Some(crate::SpaceRole::Developer.as_u8()),
             actor_role: Some(7),
         };
         assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
+        let mut invalid_active_set = private.clone();
+        invalid_active_set.active_actor_mask |= 1u64 << 63;
+        assert_eq!(
+            ActorPrivateInputV2::decode(&invalid_active_set.encode()),
+            Err(DecodeError::NonCanonical)
+        );
         assert_eq!(
             ActorPrivateInputV2::decode(&private.encode()).unwrap(),
             private

@@ -804,6 +804,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         change,
         state,
         causal_states,
+        active_actor_mask,
         origin,
         space_role,
         actor_role,
@@ -836,6 +837,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         change.map(|change| change.change),
         capacity,
         first_await_ordinal,
+        active_actor_mask,
     );
     ctx.__set_origin(origin);
     ctx.set_caller_roles(space_role, actor_role);
