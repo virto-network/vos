@@ -834,8 +834,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert!(snapshot_after_duplicate.same_service_state(&snapshot_after_apply));
     assert_eq!(
         service.accumulate_host().commit_sequence(),
-        3,
-        "a read-only duplicate transaction may commit"
+        2,
+        "a read-only duplicate transaction must not commit"
     );
 
     let restarted = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());

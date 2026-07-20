@@ -14,9 +14,10 @@ use javm::snapshot::KernelSnapshot;
 use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 
 use super::{
-    ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, ActorSliceInputV2, BlobRefV2,
-    CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, ImportedBlobV2, ProgramId,
-    REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
+    ActorSliceInputV2, BlobRefV2, CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2,
+    ImportedBlobV2, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire,
+    WorkEnvelopeV2,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -48,6 +49,7 @@ pub enum ServicePvmErrorV2 {
     RefineHostRejected(u8),
     AccumulateHostRejected(u8),
     AccumulateCommitRejected,
+    InvalidAccumulateOutput,
     InvalidProtocolResume,
     InvalidWorkEnvelope,
     InvalidRefineImports,
@@ -350,7 +352,18 @@ impl ServicePvmV2 {
                 KernelResult::Halt => {
                     let bytes = read_output(&kernel)?;
                     let gas_used = gas_limit.saturating_sub(kernel.active_gas());
-                    host.commit(transaction)?;
+                    let result = AccumulationResultV2::decode(&bytes)
+                        .map_err(|_| ServicePvmErrorV2::InvalidAccumulateOutput)?;
+                    if matches!(
+                        result,
+                        AccumulationResultV2::Installed(_)
+                            | AccumulationResultV2::Accepted {
+                                duplicate: false,
+                                ..
+                            }
+                    ) {
+                        host.commit(transaction)?;
+                    }
                     return Ok(ServicePvmOutputV2 {
                         bytes,
                         gas_used,
@@ -793,9 +806,29 @@ mod tests {
 
         let accumulate_body = code.len();
         if let Some(slot) = accumulate_call {
+            emit_instruction(
+                &mut code,
+                &mut bitmask,
+                &[100, (Reg::S0 as u8) | ((Reg::A0 as u8) << 4)],
+            );
+            emit_instruction(
+                &mut code,
+                &mut bitmask,
+                &[100, (Reg::S1 as u8) | ((Reg::A1 as u8) << 4)],
+            );
             let mut call = vec![10];
             call.extend_from_slice(&slot.to_le_bytes());
             emit_instruction(&mut code, &mut bitmask, &call);
+            emit_instruction(
+                &mut code,
+                &mut bitmask,
+                &[100, (Reg::A0 as u8) | ((Reg::S0 as u8) << 4)],
+            );
+            emit_instruction(
+                &mut code,
+                &mut bitmask,
+                &[100, (Reg::A1 as u8) | ((Reg::S1 as u8) << 4)],
+            );
         }
         if accumulate_panics {
             emit_instruction(&mut code, &mut bitmask, &[0]);
@@ -855,6 +888,39 @@ mod tests {
         }
     }
 
+    fn accumulate_result(commit: bool) -> Vec<u8> {
+        use crate::v2::{
+            AccumulationReceiptV2, ConsistencyModeV2, DeploymentId, Hash, RootServiceId,
+            ServiceIdentityV2,
+        };
+
+        let receipt = AccumulationReceiptV2 {
+            service: ServiceIdentityV2 {
+                root_service: RootServiceId([1; 32]),
+                deployment: DeploymentId([2; 32]),
+                service_program: ProgramId([3; 32]),
+                service_abi: crate::v2::ABI_VERSION,
+                execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            },
+            accepted_transition: Hash([4; 32]),
+            resulting_state_root: Some(Hash([5; 32])),
+            resulting_crdt_heads: Vec::new(),
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        if commit {
+            AccumulationResultV2::Accepted {
+                receipt,
+                published: crate::v2::PublishedEffectsV2::default(),
+                duplicate: false,
+            }
+        } else {
+            AccumulationResultV2::Prepared(receipt)
+        }
+        .encode()
+    }
+
     #[test]
     fn physical_refine_entry_is_deterministic_and_uses_gp_arguments() {
         let program = two_entry_program(None);
@@ -902,9 +968,37 @@ mod tests {
         let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
         let mut host = RecordingAccumulateHost::default();
 
-        let output = service.accumulate(&[], 1_000_000, &mut host).unwrap();
-        assert!(output.bytes.is_empty());
+        let expected = accumulate_result(true);
+        let output = service.accumulate(&expected, 1_000_000, &mut host).unwrap();
+        assert_eq!(output.bytes, expected);
         assert_eq!(host.committed_calls, 1);
+    }
+
+    #[test]
+    fn accumulate_discards_staging_for_prepared_and_rejected_results() {
+        let program = service_program(None, Some(crate::abi::hostcall::STORAGE_W), false);
+        let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
+        let mut host = RecordingAccumulateHost::default();
+
+        let prepared = accumulate_result(false);
+        assert_eq!(
+            service
+                .accumulate(&prepared, 1_000_000, &mut host)
+                .unwrap()
+                .bytes,
+            prepared,
+        );
+        let rejected =
+            AccumulationResultV2::Rejected(crate::v2::AccumulationRejectionV2::Unauthorized)
+                .encode();
+        assert_eq!(
+            service
+                .accumulate(&rejected, 1_000_000, &mut host)
+                .unwrap()
+                .bytes,
+            rejected,
+        );
+        assert_eq!(host.committed_calls, 0);
     }
 
     #[test]
@@ -923,7 +1017,7 @@ mod tests {
             ServicePvmV2::new(committing.clone(), ProgramId::of_pvm(&committing)).unwrap();
         host.reject_commit = true;
         assert_eq!(
-            service.accumulate(&[], 1_000_000, &mut host),
+            service.accumulate(&accumulate_result(true), 1_000_000, &mut host),
             Err(ServicePvmErrorV2::AccumulateCommitRejected)
         );
         assert_eq!(host.committed_calls, 0);
