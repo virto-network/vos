@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["counter", "shared-board"]
+members = ["counter", "shared-board", "workflow"]
 
 [workspace.package]
 version = "0.1.0"

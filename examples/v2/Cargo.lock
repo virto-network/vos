@@ -222,6 +222,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "v2-workflow"
+version = "0.1.0"
+dependencies = [
+ "vos",
+]
+
+[[package]]
 name = "vos"
 version = "0.1.0"
 dependencies = [
