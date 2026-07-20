@@ -662,8 +662,21 @@ impl ServicePvmV2 {
         gas_limit: u64,
         host: &mut H,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
-        let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
-            .map_err(map_kernel_initialization_error)?;
+        self.accumulate_with_backend(arguments, gas_limit, host, javm::PvmBackend::Default)
+    }
+
+    /// Conformance variant of [`Self::accumulate`] selecting a JAR backend.
+    /// Guest-owned state transitions must be identical under both engines.
+    pub fn accumulate_with_backend<H: AccumulateProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        gas_limit: u64,
+        host: &mut H,
+        backend: javm::PvmBackend,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        let mut kernel =
+            InvocationKernel::new_with_backend(&self.program, arguments, gas_limit, backend)
+                .map_err(map_kernel_initialization_error)?;
         kernel
             .vm_arena
             .vm_mut(kernel.active_vm)
@@ -1869,6 +1882,36 @@ mod tests {
             .unwrap();
         assert_eq!(output.bytes, expected);
         assert_eq!(host.committed_calls, 1);
+    }
+
+    #[test]
+    fn accumulate_is_identical_under_interpreter_and_recompiler() {
+        let program = service_program(None, Some(crate::abi::hostcall::STORAGE_W), false);
+        let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
+        let input = accumulate_result(true);
+        let mut interpreted_host = RecordingAccumulateHost::default();
+        let mut recompiled_host = RecordingAccumulateHost::default();
+
+        let interpreted = service
+            .accumulate_with_backend(
+                &input,
+                SYNTHETIC_SERVICE_GAS,
+                &mut interpreted_host,
+                javm::PvmBackend::ForceInterpreter,
+            )
+            .unwrap();
+        let recompiled = service
+            .accumulate_with_backend(
+                &input,
+                SYNTHETIC_SERVICE_GAS,
+                &mut recompiled_host,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap();
+
+        assert_eq!(interpreted, recompiled);
+        assert_eq!(interpreted_host.committed_calls, 1);
+        assert_eq!(recompiled_host.committed_calls, 1);
     }
 
     #[test]
