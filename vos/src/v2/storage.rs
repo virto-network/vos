@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
     AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, Hash, InvocationId,
-    ServiceIdentityV2, WorkInputIdV2,
+    ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
 pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 2;
@@ -245,6 +245,11 @@ pub struct WorkflowCheckpointV2 {
     pub input: WorkInputIdV2,
     /// Stable service/actor/caller binding shared by all continuation slices.
     pub workflow_identity: Hash,
+    /// Exact last admitted work. This is durable scheduler state, not a replay
+    /// instruction: the next slice reconstructs current base/state imports
+    /// from service storage while retaining the stable method, caller,
+    /// authorization, arguments, and application blob references here.
+    pub resume_work: WorkEnvelopeV2,
     pub work_hash: Hash,
     pub transition_commitment: Hash,
 }
@@ -256,17 +261,37 @@ impl V2Wire for WorkflowCheckpointV2 {
         let mut e = Encoder(out);
         encode_input(&mut e, self.input);
         e.fixed(&self.workflow_identity.0);
+        e.bytes(&self.resume_work.encode());
         e.fixed(&self.work_hash.0);
         e.fixed(&self.transition_commitment.0);
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
+        let value = Self {
             input: decode_input(d)?,
             workflow_identity: Hash(d.fixed()?),
+            resume_work: WorkEnvelopeV2::decode(&d.bytes()?)?,
             work_hash: Hash(d.fixed()?),
             transition_commitment: Hash(d.fixed()?),
-        })
+        };
+        if value.input != value.resume_work.input_id()
+            || value.workflow_identity != value.resume_work.workflow_identity()
+            || value.work_hash != value.resume_work.hash()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl WorkflowCheckpointV2 {
+    /// Stable inputs which must survive every exact continuation slice. The
+    /// timeslot, step, consistency base, awaited reply, and imported actor
+    /// state are intentionally rebuilt for the next scheduled execution.
+    pub fn matches_resume_work(&self, work: &WorkEnvelopeV2) -> bool {
+        self.workflow_identity == work.workflow_identity()
+            && self.resume_work.arguments == work.arguments
+            && self.resume_work.imported_blobs == work.imported_blobs
     }
 }
 

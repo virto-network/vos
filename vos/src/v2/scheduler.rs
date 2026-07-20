@@ -61,6 +61,8 @@ pub enum ScheduleErrorV2 {
     ActorBusy(ActorId),
     MissingContinuation(ActorId),
     InvalidContinuation(ActorId),
+    MissingAwaitedReply(CallId),
+    UnexpectedAwaitedReply(CallId),
     InvocationAlreadyCommitted(InvocationId),
     InvalidWorkflowStep(InvocationId),
     MissingInbox(super::CallId),
@@ -175,6 +177,49 @@ impl LocalWorkSchedulerV2 {
                 awaited_reply: None,
                 imported_blobs: Vec::new(),
                 proof_requested: false,
+            },
+        )
+    }
+
+    /// Reconstruct the next exact continuation slice from guest-committed
+    /// workflow state. The host supplies only the consensus timeslot and, for
+    /// an awaited call, the accumulated remote reply it received for
+    /// admission. No process-local copy of the original request is required.
+    pub fn prepare_resume(
+        store: &LocalJamStoreV2,
+        invocation: InvocationId,
+        logical_timeslot: u64,
+        awaited_reply: Option<AccumulatedReplyV2>,
+    ) -> Result<PreparedWorkV2, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let workflow = decode_row::<WorkflowCheckpointV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::Workflow(invocation),
+        )?
+        .ok_or(ScheduleErrorV2::InvalidWorkflowStep(invocation))?;
+        let workflow_step = workflow
+            .input
+            .workflow_step
+            .checked_add(1)
+            .ok_or(ScheduleErrorV2::InvalidWorkflowStep(invocation))?;
+        let template = workflow.resume_work;
+        Self::prepare(
+            store,
+            LocalWorkRequestV2 {
+                invocation,
+                workflow_step,
+                logical_timeslot,
+                target: template.target,
+                method: template.method,
+                arguments: template.arguments,
+                origin: template.origin,
+                authorization: template.authorization,
+                causal_parent: template.causal_parent,
+                parent_call: template.parent_call,
+                awaited_reply,
+                imported_blobs: template.imported_blobs,
+                proof_requested: template.proof_requested,
             },
         )
     }
@@ -301,7 +346,7 @@ impl LocalWorkSchedulerV2 {
         if request.workflow_step != 0
             && workflow
                 .as_ref()
-                .is_none_or(|checkpoint| checkpoint.workflow_identity != work.workflow_identity())
+                .is_none_or(|checkpoint| !checkpoint.matches_resume_work(&work))
         {
             return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
         }
@@ -352,6 +397,14 @@ impl LocalWorkSchedulerV2 {
             snapshot
                 .validate_resume_for(&work)
                 .map_err(|_| ScheduleErrorV2::InvalidContinuation(request.target))?;
+            match (snapshot.pending_call, work.awaited_reply.as_ref()) {
+                (None, None) => {}
+                (Some(call), None) => return Err(ScheduleErrorV2::MissingAwaitedReply(call)),
+                (Some(call), Some(reply)) if reply.reply.call_id == call => {}
+                (_, Some(reply)) => {
+                    return Err(ScheduleErrorV2::UnexpectedAwaitedReply(reply.reply.call_id));
+                }
+            }
         }
         imports
             .validate_for(&work)

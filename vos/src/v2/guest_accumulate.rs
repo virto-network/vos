@@ -509,6 +509,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     let workflow = WorkflowCheckpointV2 {
         input: work.input_id(),
         workflow_identity: work.workflow_identity(),
+        resume_work: work.clone(),
         work_hash,
         transition_commitment,
     };
@@ -867,7 +868,7 @@ fn valid_workflow_input<S: StateTreeStore>(
         (step, Some(checkpoint), Some(_)) => {
             checkpoint.input.invocation == work.invocation
                 && checkpoint.input.workflow_step.checked_add(1) == Some(step)
-                && checkpoint.workflow_identity == work.workflow_identity()
+                && checkpoint.matches_resume_work(work)
         }
         _ => false,
     })
