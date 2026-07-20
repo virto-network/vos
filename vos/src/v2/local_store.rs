@@ -10,7 +10,10 @@ use alloc::vec::Vec;
 
 use javm::kernel::InvocationKernel;
 
-use super::{AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ServicePvmErrorV2};
+use super::{
+    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId, ServicePvmErrorV2,
+    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError,
+};
 
 /// Recoverable committed image of a local v2 service account.
 ///
@@ -22,6 +25,7 @@ use super::{AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, Servic
 pub struct LocalJamStoreSnapshotV2 {
     rows: BTreeMap<Vec<u8>, Vec<u8>>,
     blobs: BTreeMap<[u8; 32], Vec<u8>>,
+    programs: BTreeMap<[u8; 32], Vec<u8>>,
     commit_sequence: u64,
 }
 
@@ -29,9 +33,23 @@ impl LocalJamStoreSnapshotV2 {
     /// Compare consensus-visible rows and blobs while ignoring the host-local
     /// count of completed transaction boundaries.
     pub fn same_service_state(&self, other: &Self) -> bool {
-        self.rows == other.rows && self.blobs == other.blobs
+        self.rows == other.rows && self.blobs == other.blobs && self.programs == other.programs
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalStoreReadErrorV2 {
+    InvalidHeader(StoreOpenError),
+    CorruptStateTree,
+}
+
+impl core::fmt::Display for LocalStoreReadErrorV2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "cannot read committed VOS v2 service state: {self:?}")
+    }
+}
+
+impl core::error::Error for LocalStoreReadErrorV2 {}
 
 /// In-memory implementation of the JAM storage boundary used by the local
 /// runtime and conformance tests.
@@ -51,6 +69,7 @@ impl LocalJamStoreV2 {
             committed: LocalJamStoreSnapshotV2 {
                 rows: BTreeMap::new(),
                 blobs: BTreeMap::new(),
+                programs: BTreeMap::new(),
                 commit_sequence: 0,
             },
         }
@@ -81,6 +100,10 @@ impl LocalJamStoreV2 {
         self.committed.blobs.len()
     }
 
+    pub fn program_count(&self) -> usize {
+        self.committed.programs.len()
+    }
+
     pub fn row(&self, key: &[u8]) -> Option<&[u8]> {
         self.committed.rows.get(key).map(Vec::as_slice)
     }
@@ -93,12 +116,63 @@ impl LocalJamStoreV2 {
             .map(Vec::as_slice)
     }
 
+    pub fn program(&self, program: ProgramId) -> Option<&[u8]> {
+        self.committed
+            .programs
+            .get(&program.0)
+            .filter(|bytes| ProgramId::of_pvm(bytes) == program)
+            .map(Vec::as_slice)
+    }
+
+    pub fn header(&self) -> Result<Option<StoreHeaderV2>, LocalStoreReadErrorV2> {
+        self.row(super::header_storage_key())
+            .map(StoreHeaderV2::open)
+            .transpose()
+            .map_err(LocalStoreReadErrorV2::InvalidHeader)
+    }
+
+    /// Read one authenticated logical row at a committed root. This private
+    /// adapter exposes no write method to callers; it exists so scheduling can
+    /// derive imports without adding a mutable host-side service model.
+    pub fn state_row(
+        &self,
+        root: super::Hash,
+        key: &StateKeyV2,
+    ) -> Result<Option<Vec<u8>>, LocalStoreReadErrorV2> {
+        let mut view = CommittedRows(&self.committed.rows);
+        ServiceStateTreeV2::new(&mut view, root)
+            .get(key)
+            .map_err(|_| LocalStoreReadErrorV2::CorruptStateTree)
+    }
+
     /// Make an installation input available to guest Accumulate. This is a
     /// content-addressed import operation, not a service-state mutation.
     pub fn import_blob(&mut self, bytes: Vec<u8>) -> BlobRefV2 {
         let reference = BlobRefV2::of_bytes(&bytes);
         self.committed.blobs.insert(reference.hash.0, bytes);
         reference
+    }
+
+    /// Register exact canonical actor PVM bytes. Program identity is checked
+    /// here and checked again when Refine validates its complete import set.
+    pub fn import_program(&mut self, pvm: Vec<u8>) -> ProgramId {
+        let program = ProgramId::of_pvm(&pvm);
+        self.committed.programs.insert(program.0, pvm);
+        program
+    }
+}
+
+struct CommittedRows<'a>(&'a BTreeMap<Vec<u8>, Vec<u8>>);
+
+impl StateTreeStore for CommittedRows<'_> {
+    type Error = core::convert::Infallible;
+
+    fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.get(key).cloned())
+    }
+
+    fn write(&mut self, _key: &[u8], _value: Option<&[u8]>) -> Result<(), Self::Error> {
+        unreachable!("committed scheduler view never mutates the service tree")
     }
 }
 
@@ -235,6 +309,7 @@ mod tests {
     fn snapshots_exclude_uncommitted_transactions() {
         let mut store = LocalJamStoreV2::new();
         let blob = store.import_blob(b"installation state".to_vec());
+        let program = store.import_program(b"canonical actor pvm".to_vec());
         let before = store.snapshot();
 
         let mut transaction = store.begin().unwrap();
@@ -250,6 +325,10 @@ mod tests {
 
         assert_eq!(store.snapshot(), before);
         assert_eq!(store.blob(&blob), Some(b"installation state".as_slice()));
+        assert_eq!(
+            store.program(program),
+            Some(b"canonical actor pvm".as_slice())
+        );
         assert_eq!(store.row(b"staged"), None);
     }
 

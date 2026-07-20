@@ -7,11 +7,12 @@ use std::path::PathBuf;
 use vos::v2::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     ActorWriteV2, AllowPublic, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2,
-    ConsistencyModeV2, DeploymentId, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InMemoryServiceState, InvocationId, JamServiceV2, LocalJamStoreV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2,
-    RefineOutputV2, ReplyRecordV2, RootServiceId, ServiceGenesisV2, ServiceIdentityV2,
-    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, GasAccountingV2,
+    Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
+    JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2,
+    RootServiceId, ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -648,12 +649,14 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         return;
     };
     let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
-    let actor_program = ProgramId([31; 32]);
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
@@ -695,11 +698,48 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(service.accumulate_host().commit_sequence(), 1);
     let installed_rows = service.accumulate_host().row_count();
 
-    let mut work = seed_work;
-    work.base = ConsistencyBaseV2::Linear {
-        revision: 0,
-        state_root: installed.resulting_state_root.unwrap(),
+    let request = LocalWorkRequestV2 {
+        invocation: seed_work.invocation,
+        workflow_step: 0,
+        target: seed_work.target,
+        method: seed_work.method.clone(),
+        arguments: seed_work.arguments.clone(),
+        origin: seed_work.origin,
+        authorization: seed_work.authorization.clone(),
+        causal_parent: None,
+        parent_call: None,
+        imported_blobs: vec![],
+        proof_requested: false,
     };
+    let prepared = LocalWorkSchedulerV2::prepare(service.accumulate_host(), request.clone())
+        .expect("scheduler reads the installed guest state");
+    assert_eq!(prepared.work.service, seed_work.service);
+    assert_eq!(prepared.work.target_program, actor_program);
+    assert_eq!(
+        prepared.work.base,
+        ConsistencyBaseV2::Linear {
+            revision: 0,
+            state_root: installed.resulting_state_root.unwrap(),
+        }
+    );
+    assert_eq!(prepared.work.imported_actors[0].state, initial);
+    assert_eq!(prepared.imports.programs[0].pvm, actor_pvm);
+    let work = prepared.work;
+    let continuation = ContinuationSnapshotV2 {
+        snapshot_version: vos::v2::SNAPSHOT_VERSION,
+        jar_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        vos_abi: vos::v2::ABI_VERSION,
+        service: work.service.clone(),
+        invocation: work.invocation,
+        checkpoint_step: 0,
+        actor: work.target,
+        actor_program,
+        await_ordinal: 0,
+        pending_call: None,
+        kernel_snapshot: vec![1],
+    };
+    let continuation_bytes = continuation.encode();
+    let continuation_ref = BlobRefV2::of_bytes(&continuation_bytes);
     let transition = TransitionV2 {
         service: work.service.clone(),
         consumed_input: work.input_id(),
@@ -711,22 +751,25 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             value: Some(b"committed actor state".to_vec()),
         }],
         crdt_change: None,
-        continuations: vec![],
+        continuations: vec![ContinuationChangeV2 {
+            actor: work.target,
+            expected: None,
+            replacement: Some(continuation_ref.clone()),
+        }],
         inbox: vec![],
         outbox: vec![],
-        reply: Some(ReplyRecordV2 {
-            call_id: work.invocation.root_reply_id(),
-            producer: work.target,
-            result: b"committed reply".to_vec(),
-        }),
-        exported_blobs: vec![],
+        reply: None,
+        exported_blobs: vec![continuation_ref.clone()],
         gas: GasAccountingV2::default(),
         proof: None,
     };
     let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-        work,
+        work: work.clone(),
         transition: transition.clone(),
-        provided_blobs: vec![],
+        provided_blobs: vec![ImportedBlobV2 {
+            reference: continuation_ref.clone(),
+            bytes: continuation_bytes,
+        }],
     });
     let applied_output = service.accumulate(&apply).expect("guest apply completes");
     let AccumulationResultV2::Accepted {
@@ -766,6 +809,35 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         service.accumulate_host().commit_sequence(),
         3,
         "a read-only duplicate transaction may commit"
+    );
+
+    let restarted = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
+    let mut queued = request.clone();
+    queued.invocation = InvocationId([99; 32]);
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare(&restarted, queued),
+        Err(ScheduleErrorV2::ActorBusy(work.target))
+    );
+
+    let mut resume = request;
+    resume.workflow_step = 1;
+    let resumed = LocalWorkSchedulerV2::prepare(&restarted, resume)
+        .expect("restart reconstructs the next exact continuation slice");
+    assert_eq!(
+        resumed.work.base,
+        ConsistencyBaseV2::Linear {
+            revision: 1,
+            state_root: receipt.resulting_state_root.unwrap(),
+        }
+    );
+    assert_eq!(
+        resumed.work.imported_actors[0].continuation,
+        Some(continuation_ref)
+    );
+    assert_eq!(
+        resumed.imports.blobs.len(),
+        2,
+        "state and continuation bytes are both imported after restart"
     );
 }
 
