@@ -315,6 +315,37 @@ mod guest {
             Ok(hostcalls::preimage_lookup(&reference.hash.0, &mut probe) == reference.len)
         }
 
+        fn load_blob(
+            &self,
+            reference: &BlobRefV2,
+        ) -> Result<Option<alloc::vec::Vec<u8>>, Self::Error> {
+            let mut probe = [0u8; STORAGE_PROBE_CAPACITY];
+            let len = hostcalls::preimage_lookup(&reference.hash.0, &mut probe);
+            if len == error::HOST_NONE {
+                return Ok(None);
+            }
+            if len != reference.len {
+                return Err(JamStoreError::ReadFailed);
+            }
+            let len = usize::try_from(len).map_err(|_| JamStoreError::ValueTooLarge)?;
+            let bytes = if len <= probe.len() {
+                probe[..len].to_vec()
+            } else {
+                if len > MAX_STORAGE_VALUE {
+                    return Err(JamStoreError::ValueTooLarge);
+                }
+                let mut bytes = alloc::vec![0u8; len];
+                if hostcalls::preimage_lookup(&reference.hash.0, &mut bytes) != len as u64 {
+                    return Err(JamStoreError::ReadFailed);
+                }
+                bytes
+            };
+            if BlobRefV2::of_bytes(&bytes) != *reference {
+                return Err(JamStoreError::ReadFailed);
+            }
+            Ok(Some(bytes))
+        }
+
         fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error> {
             let reference = BlobRefV2::of_bytes(bytes);
             if hostcalls::provide(&reference.hash.0, bytes) == error::HOST_OK {
