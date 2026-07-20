@@ -221,9 +221,17 @@ pub struct ActorWriteV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrdtOperationV2 {
     pub actor: ActorId,
+    /// Generated stable field tag, independent of the field's source order.
+    pub field: Hash,
+    pub ordinal: u32,
     pub id: OperationId,
-    pub causal_dependencies: Vec<Hash>,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrdtMaterializationV2 {
+    pub actor: ActorId,
+    pub state: BlobRefV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +258,50 @@ pub struct ReplyRecordV2 {
     pub result: Vec<u8>,
 }
 
+/// Fixed-schema workflow operations merged alongside application CRDT fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowOperationV2 {
+    Consumed(WorkInputIdV2),
+    Continuation(ContinuationChangeV2),
+    Inbox(MessageRecordV2),
+    Outbox(MessageRecordV2),
+    Reply(ReplyRecordV2),
+}
+
+/// One atomic CRDT DAG payload for an entire actor execution slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrdtChangeV2 {
+    pub id: ChangeId,
+    pub causal_dependencies: Vec<Hash>,
+    pub causal_height: u64,
+    pub operations: Vec<CrdtOperationV2>,
+    pub workflow: Vec<WorkflowOperationV2>,
+    pub materializations: Vec<CrdtMaterializationV2>,
+}
+
+impl CrdtChangeV2 {
+    pub fn derive_id(work: &WorkEnvelopeV2) -> Option<ChangeId> {
+        let ConsistencyBaseV2::Crdt { heads } = &work.base else {
+            return None;
+        };
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        e.fixed(&work.service.root_service.0);
+        e.fixed(&work.service.deployment.0);
+        e.fixed(&work.target.0);
+        e.fixed(&work.invocation.0);
+        e.u64(work.workflow_step);
+        e.list(heads, |e, head| e.fixed(&head.0));
+        Some(ChangeId(
+            Hash::digest(b"vos/crdt-change-id/v2", &[&bytes]).0,
+        ))
+    }
+
+    pub fn cid(&self) -> Hash {
+        Hash::digest(b"vos/crdt-dag-node/v2", &[&self.encode()])
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GasAccountingV2 {
     pub refine_used: u64,
@@ -271,8 +323,7 @@ pub struct TransitionV2 {
     pub target_program: ProgramId,
     pub base: ConsistencyBaseV2,
     pub writes: Vec<ActorWriteV2>,
-    pub crdt_operations: Vec<CrdtOperationV2>,
-    pub resulting_crdt_heads: Vec<Hash>,
+    pub crdt_change: Option<CrdtChangeV2>,
     pub continuations: Vec<ContinuationChangeV2>,
     pub inbox: Vec<MessageRecordV2>,
     pub outbox: Vec<MessageRecordV2>,
@@ -286,6 +337,27 @@ impl TransitionV2 {
     pub fn hash(&self) -> Hash {
         let encoded = self.encode();
         Hash::digest(b"vos/transition/v2", &[&encoded])
+    }
+
+    pub fn workflow_operations(&self) -> Vec<WorkflowOperationV2> {
+        let mut operations = Vec::with_capacity(
+            1 + self.continuations.len()
+                + self.inbox.len()
+                + self.outbox.len()
+                + usize::from(self.reply.is_some()),
+        );
+        operations.push(WorkflowOperationV2::Consumed(self.consumed_input));
+        operations.extend(
+            self.continuations
+                .iter()
+                .cloned()
+                .map(WorkflowOperationV2::Continuation),
+        );
+        operations.extend(self.inbox.iter().cloned().map(WorkflowOperationV2::Inbox));
+        operations.extend(self.outbox.iter().cloned().map(WorkflowOperationV2::Outbox));
+        operations.extend(self.reply.iter().cloned().map(WorkflowOperationV2::Reply));
+        operations.sort_by_key(workflow_operation_bytes);
+        operations
     }
 }
 
@@ -739,8 +811,7 @@ impl V2Wire for TransitionV2 {
         e.fixed(&self.target_program.0);
         encode_base(&mut e, &self.base);
         e.list(&self.writes, encode_write);
-        e.list(&self.crdt_operations, encode_crdt_op);
-        e.list(&self.resulting_crdt_heads, |e, h| e.fixed(&h.0));
+        e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
         e.list(&self.continuations, encode_continuation_change);
         e.list(&self.inbox, encode_message);
         e.list(&self.outbox, encode_message);
@@ -762,8 +833,7 @@ impl V2Wire for TransitionV2 {
             target_program: ProgramId(d.fixed()?),
             base: decode_base(d)?,
             writes: d.list(decode_write)?,
-            crdt_operations: d.list(decode_crdt_op)?,
-            resulting_crdt_heads: d.list(|d| d.fixed().map(Hash))?,
+            crdt_change: d.option(|d| CrdtChangeV2::decode(&d.bytes()?))?,
             continuations: d.list(decode_continuation_change)?,
             inbox: d.list(decode_message)?,
             outbox: d.list(decode_message)?,
@@ -776,9 +846,63 @@ impl V2Wire for TransitionV2 {
             },
             proof: d.option(decode_proof)?,
         };
-        ensure_sorted_unique(&result.resulting_crdt_heads, |h| h.0)?;
         ensure_sorted_unique(&result.exported_blobs, |b| b.hash.0)?;
         Ok(result)
+    }
+}
+
+impl V2Wire for CrdtChangeV2 {
+    const MAGIC: [u8; 4] = *b"VCG2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.id.0);
+        e.list(&self.causal_dependencies, |e, dependency| {
+            e.fixed(&dependency.0)
+        });
+        e.u64(self.causal_height);
+        e.list(&self.operations, encode_crdt_op);
+        e.list(&self.workflow, encode_workflow_operation);
+        e.list(&self.materializations, |e, materialization| {
+            e.fixed(&materialization.actor.0);
+            encode_blob_ref(e, &materialization.state);
+        });
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            id: ChangeId(d.fixed()?),
+            causal_dependencies: d.list(|d| d.fixed().map(Hash))?,
+            causal_height: d.u64()?,
+            operations: d.list(decode_crdt_op)?,
+            workflow: d.list(decode_workflow_operation)?,
+            materializations: d.list(|d| {
+                Ok(CrdtMaterializationV2 {
+                    actor: ActorId(d.fixed()?),
+                    state: decode_blob_ref(d)?,
+                })
+            })?,
+        };
+        ensure_sorted_unique(&value.causal_dependencies, |hash| hash.0)?;
+        ensure_sorted_unique(&value.operations, |operation| operation.id.0)?;
+        ensure_sorted_unique(&value.materializations, |materialization| {
+            materialization.actor.0
+        })?;
+        if value.causal_height == 0
+            || value.operations.iter().any(|operation| {
+                operation.payload.is_empty()
+                    || operation.id
+                        != value
+                            .id
+                            .operation(operation.actor, operation.field, operation.ordinal)
+            })
+            || value.workflow.windows(2).any(|pair| {
+                workflow_operation_bytes(&pair[0]) >= workflow_operation_bytes(&pair[1])
+            })
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -1073,6 +1197,23 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
     {
         return Err(DecodeError::NonCanonical);
     }
+    match (&value.work.base, &value.transition.crdt_change) {
+        (ConsistencyBaseV2::Crdt { heads }, Some(change))
+            if value.work.consistency == ConsistencyModeV2::Crdt
+                && value.transition.writes.is_empty()
+                && Some(change.id) == CrdtChangeV2::derive_id(&value.work)
+                && change.causal_dependencies.as_slice() == heads.as_slice()
+                && change.workflow == value.transition.workflow_operations() =>
+        {
+            Ok(())
+        }
+        (ConsistencyBaseV2::Linear { .. }, None)
+            if value.work.consistency != ConsistencyModeV2::Crdt =>
+        {
+            Ok(())
+        }
+        _ => Err(DecodeError::NonCanonical),
+    }?;
     Ok(())
 }
 
@@ -1360,20 +1501,68 @@ fn decode_write(d: &mut Decoder<'_>) -> Result<ActorWriteV2, DecodeError> {
 
 fn encode_crdt_op(e: &mut Encoder<'_>, value: &CrdtOperationV2) {
     e.fixed(&value.actor.0);
+    e.fixed(&value.field.0);
+    e.u32(value.ordinal);
     e.fixed(&value.id.0);
-    e.list(&value.causal_dependencies, |e, h| e.fixed(&h.0));
     e.bytes(&value.payload);
 }
 
 fn decode_crdt_op(d: &mut Decoder<'_>) -> Result<CrdtOperationV2, DecodeError> {
-    let value = CrdtOperationV2 {
+    Ok(CrdtOperationV2 {
         actor: ActorId(d.fixed()?),
+        field: Hash(d.fixed()?),
+        ordinal: d.u32()?,
         id: OperationId(d.fixed()?),
-        causal_dependencies: d.list(|d| d.fixed().map(Hash))?,
         payload: d.bytes()?,
-    };
-    ensure_sorted_unique(&value.causal_dependencies, |h| h.0)?;
-    Ok(value)
+    })
+}
+
+fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
+    match value {
+        WorkflowOperationV2::Consumed(input) => {
+            e.u8(0);
+            e.fixed(&input.invocation.0);
+            e.u64(input.workflow_step);
+        }
+        WorkflowOperationV2::Continuation(change) => {
+            e.u8(1);
+            encode_continuation_change(e, change);
+        }
+        WorkflowOperationV2::Inbox(message) => {
+            e.u8(2);
+            encode_message(e, message);
+        }
+        WorkflowOperationV2::Outbox(message) => {
+            e.u8(3);
+            encode_message(e, message);
+        }
+        WorkflowOperationV2::Reply(reply) => {
+            e.u8(4);
+            encode_reply(e, reply);
+        }
+    }
+}
+
+fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2, DecodeError> {
+    match d.u8()? {
+        0 => Ok(WorkflowOperationV2::Consumed(WorkInputIdV2 {
+            invocation: InvocationId(d.fixed()?),
+            workflow_step: d.u64()?,
+        })),
+        1 => Ok(WorkflowOperationV2::Continuation(
+            decode_continuation_change(d)?,
+        )),
+        2 => Ok(WorkflowOperationV2::Inbox(decode_message(d)?)),
+        3 => Ok(WorkflowOperationV2::Outbox(decode_message(d)?)),
+        4 => Ok(WorkflowOperationV2::Reply(decode_reply(d)?)),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn workflow_operation_bytes(value: &WorkflowOperationV2) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    encode_workflow_operation(&mut Encoder(&mut bytes), value);
+    bytes
 }
 
 fn encode_continuation_change(e: &mut Encoder<'_>, value: &ContinuationChangeV2) {
@@ -1669,8 +1858,7 @@ mod tests {
                 state_root: Hash::ZERO,
             },
             writes: vec![],
-            crdt_operations: vec![],
-            resulting_crdt_heads: vec![],
+            crdt_change: None,
             continuations: vec![],
             inbox: vec![],
             outbox: vec![],
@@ -1736,8 +1924,7 @@ mod tests {
             target_program: work.target_program,
             base: work.base.clone(),
             writes: vec![],
-            crdt_operations: vec![],
-            resulting_crdt_heads: vec![],
+            crdt_change: None,
             continuations: vec![],
             inbox: vec![],
             outbox: vec![],
@@ -1831,5 +2018,70 @@ mod tests {
         );
         assert!(AccumulationRejectionV2::StaleStateRoot.is_retryable());
         assert!(!AccumulationRejectionV2::DivergentDuplicate.is_retryable());
+    }
+
+    #[test]
+    fn one_crdt_change_binds_the_complete_execution_slice() {
+        let mut work = work();
+        work.consistency = ConsistencyModeV2::Crdt;
+        work.base = ConsistencyBaseV2::Crdt {
+            heads: vec![Hash([31; 32])],
+        };
+        let change_id = CrdtChangeV2::derive_id(&work).unwrap();
+        let field = Hash([32; 32]);
+        let transition = TransitionV2 {
+            service: work.service.clone(),
+            consumed_input: work.input_id(),
+            target_program: work.target_program,
+            base: work.base.clone(),
+            writes: vec![],
+            crdt_change: Some(CrdtChangeV2 {
+                id: change_id,
+                causal_dependencies: vec![Hash([31; 32])],
+                causal_height: 4,
+                operations: vec![CrdtOperationV2 {
+                    actor: work.target,
+                    field,
+                    ordinal: 0,
+                    id: change_id.operation(work.target, field, 0),
+                    payload: b"counter +1".to_vec(),
+                }],
+                workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
+                materializations: vec![CrdtMaterializationV2 {
+                    actor: work.target,
+                    state: BlobRefV2::of_bytes(b"materialized-state"),
+                }],
+            }),
+            continuations: vec![],
+            inbox: vec![],
+            outbox: vec![],
+            reply: None,
+            exported_blobs: vec![],
+            gas: GasAccountingV2::default(),
+            proof: None,
+        };
+        let envelope = AccumulationEnvelopeV2 { work, transition };
+        assert_eq!(
+            AccumulationEnvelopeV2::decode(&envelope.encode()).unwrap(),
+            envelope
+        );
+
+        let mut bad_id = envelope.clone();
+        bad_id.transition.crdt_change.as_mut().unwrap().operations[0].id = OperationId([99; 32]);
+        assert_eq!(
+            AccumulationEnvelopeV2::decode(&bad_id.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut missing_workflow_reply = envelope;
+        missing_workflow_reply.transition.reply = Some(ReplyRecordV2 {
+            call_id: CallId([44; 32]),
+            producer: ActorId([45; 32]),
+            result: b"done".to_vec(),
+        });
+        assert_eq!(
+            AccumulationEnvelopeV2::decode(&missing_workflow_reply.encode()),
+            Err(DecodeError::NonCanonical)
+        );
     }
 }

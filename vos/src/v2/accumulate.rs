@@ -24,6 +24,7 @@ pub enum AccumulateError {
     Unauthorized,
     MissingBlob(Hash),
     MissingProof,
+    ProofUnavailable,
     InvalidProof,
     StaleLinearWork {
         expected_revision: u64,
@@ -37,6 +38,7 @@ pub enum AccumulateError {
     InvalidWorkflowTransition,
     ContinuationConflict(ActorId),
     MessageCycle,
+    SequenceOverflow,
 }
 
 impl core::fmt::Display for AccumulateError {
@@ -112,7 +114,6 @@ pub struct InMemoryServiceState {
     identity: ServiceIdentityV2,
     consistency: ConsistencyModeV2,
     revision: u64,
-    checkpoint: u64,
     state_root: Hash,
     crdt_heads: BTreeSet<Hash>,
     causal_nodes: BTreeSet<Hash>,
@@ -123,6 +124,8 @@ pub struct InMemoryServiceState {
     outbox: Vec<MessageRecordV2>,
     blobs: BTreeSet<Hash>,
     operations: BTreeMap<OperationId, CrdtOperationV2>,
+    changes: BTreeMap<ChangeId, CrdtChangeV2>,
+    causal_heights: BTreeMap<Hash, u64>,
     receipts: BTreeMap<WorkInputIdV2, DedupRecord>,
 }
 
@@ -132,7 +135,6 @@ impl InMemoryServiceState {
             identity,
             consistency,
             revision: 0,
-            checkpoint: 0,
             state_root: Hash::ZERO,
             crdt_heads: BTreeSet::new(),
             causal_nodes: BTreeSet::new(),
@@ -143,6 +145,8 @@ impl InMemoryServiceState {
             outbox: Vec::new(),
             blobs: BTreeSet::new(),
             operations: BTreeMap::new(),
+            changes: BTreeMap::new(),
+            causal_heights: BTreeMap::new(),
             receipts: BTreeMap::new(),
         };
         state.state_root = state.compute_state_root();
@@ -194,6 +198,7 @@ impl InMemoryServiceState {
 
     pub fn add_causal_node(&mut self, hash: Hash) {
         self.causal_nodes.insert(hash);
+        self.causal_heights.entry(hash).or_insert(0);
         self.crdt_heads.insert(hash);
     }
 
@@ -235,11 +240,22 @@ impl InMemoryServiceState {
         // only the final assignment is the commit point.
         let mut next = self.clone();
         next.apply_transition(transition)?;
-        next.checkpoint = next.checkpoint.saturating_add(1);
         if next.consistency != ConsistencyModeV2::Crdt {
-            next.revision = next.revision.saturating_add(1);
+            next.revision = next
+                .revision
+                .checked_add(1)
+                .ok_or(AccumulateError::SequenceOverflow)?;
         }
         next.state_root = next.compute_state_root();
+
+        let sequence = match next.consistency {
+            ConsistencyModeV2::Crdt => transition
+                .crdt_change
+                .as_ref()
+                .map(|change| change.causal_height)
+                .ok_or(AccumulateError::InvalidConsistency)?,
+            _ => next.revision,
+        };
 
         let receipt = AccumulationReceiptV2 {
             service: next.identity.clone(),
@@ -247,8 +263,8 @@ impl InMemoryServiceState {
             resulting_state_root: (next.consistency != ConsistencyModeV2::Crdt)
                 .then_some(next.state_root),
             resulting_crdt_heads: next.crdt_heads.iter().copied().collect(),
-            sequence: next.revision,
-            checkpoint: next.checkpoint,
+            sequence,
+            checkpoint: work.workflow_step,
             consistency: next.consistency,
         };
         next.receipts.insert(
@@ -326,55 +342,71 @@ impl InMemoryServiceState {
                         .iter()
                         .filter_map(|change| change.replacement.as_ref()),
                 )
+                .chain(
+                    transition
+                        .crdt_change
+                        .iter()
+                        .flat_map(|change| change.materializations.iter())
+                        .map(|materialization| &materialization.state),
+                )
         {
             if !self.blobs.contains(&blob.hash) && !validator.blob_available(blob) {
                 return Err(AccumulateError::MissingBlob(blob.hash));
             }
         }
 
-        match (work.proof_requested, transition.proof.as_ref()) {
-            (true, None) => return Err(AccumulateError::MissingProof),
-            (_, Some(proof)) => {
-                if !self.blobs.contains(&proof.proof_blob.hash)
-                    && !validator.blob_available(&proof.proof_blob)
-                {
-                    return Err(AccumulateError::MissingBlob(proof.proof_blob.hash));
-                }
-                if !validator.verify_proof(work, transition, proof) {
-                    return Err(AccumulateError::InvalidProof);
-                }
-            }
-            (false, None) => {}
+        if work.proof_requested || transition.proof.is_some() {
+            return Err(AccumulateError::ProofUnavailable);
         }
 
         match self.consistency {
             ConsistencyModeV2::Crdt => {
-                if !transition.writes.is_empty() {
+                let Some(change) = transition.crdt_change.as_ref() else {
                     return Err(AccumulateError::InvalidConsistency);
+                };
+                if !transition.writes.is_empty()
+                    || Some(change.id) != CrdtChangeV2::derive_id(work)
+                    || change.workflow != transition.workflow_operations()
+                {
+                    return Err(AccumulateError::InvalidWorkflowTransition);
                 }
-                for operation in &transition.crdt_operations {
-                    for dependency in &operation.causal_dependencies {
-                        if !self.causal_nodes.contains(dependency) {
-                            return Err(AccumulateError::MissingCausalDependency(*dependency));
-                        }
+                let ConsistencyBaseV2::Crdt { heads } = &work.base else {
+                    return Err(AccumulateError::InvalidConsistency);
+                };
+                if change.causal_dependencies.as_slice() != heads.as_slice() {
+                    return Err(AccumulateError::InvalidWorkflowTransition);
+                }
+                for dependency in &change.causal_dependencies {
+                    if !self.causal_nodes.contains(dependency) {
+                        return Err(AccumulateError::MissingCausalDependency(*dependency));
                     }
+                }
+                let expected_height = change
+                    .causal_dependencies
+                    .iter()
+                    .filter_map(|dependency| self.causal_heights.get(dependency))
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(AccumulateError::SequenceOverflow)?;
+                if change.causal_height != expected_height {
+                    return Err(AccumulateError::InvalidWorkflowTransition);
+                }
+                if let Some(existing) = self.changes.get(&change.id)
+                    && existing != change
+                {
+                    return Err(AccumulateError::InvalidWorkflowTransition);
+                }
+                for operation in &change.operations {
                     if let Some(existing) = self.operations.get(&operation.id)
                         && existing != operation
                     {
                         return Err(AccumulateError::InvalidWorkflowTransition);
                     }
                 }
-                let declared: BTreeSet<_> =
-                    transition.resulting_crdt_heads.iter().copied().collect();
-                if declared.len() != transition.resulting_crdt_heads.len()
-                    || declared != self.expected_crdt_heads(transition)?
-                {
-                    return Err(AccumulateError::InvalidWorkflowTransition);
-                }
             }
-            _ if !transition.crdt_operations.is_empty()
-                || !transition.resulting_crdt_heads.is_empty() =>
-            {
+            _ if transition.crdt_change.is_some() => {
                 return Err(AccumulateError::InvalidConsistency);
             }
             _ => {}
@@ -432,15 +464,20 @@ impl InMemoryServiceState {
                 self.actor_rows.remove(&key);
             }
         }
-        for operation in &transition.crdt_operations {
-            if let Some(existing) = self.operations.get(&operation.id) {
-                if existing != operation {
-                    return Err(AccumulateError::InvalidWorkflowTransition);
+        if let Some(change) = &transition.crdt_change {
+            for operation in &change.operations {
+                if let Some(existing) = self.operations.get(&operation.id) {
+                    if existing != operation {
+                        return Err(AccumulateError::InvalidWorkflowTransition);
+                    }
+                } else {
+                    self.operations.insert(operation.id, operation.clone());
                 }
-            } else {
-                self.operations.insert(operation.id, operation.clone());
-                self.causal_nodes.insert(operation_hash(operation));
             }
+            let cid = change.cid();
+            self.changes.insert(change.id, change.clone());
+            self.causal_nodes.insert(cid);
+            self.causal_heights.insert(cid, change.causal_height);
         }
         if let Some(heads) = next_crdt_heads {
             self.crdt_heads = heads;
@@ -472,22 +509,20 @@ impl InMemoryServiceState {
         transition: &TransitionV2,
     ) -> Result<BTreeSet<Hash>, AccumulateError> {
         let mut heads = self.crdt_heads.clone();
-        let mut seen = BTreeSet::new();
-        for operation in &transition.crdt_operations {
-            if !seen.insert(operation.id) {
+        let change = transition
+            .crdt_change
+            .as_ref()
+            .ok_or(AccumulateError::InvalidConsistency)?;
+        if let Some(existing) = self.changes.get(&change.id) {
+            if existing != change {
                 return Err(AccumulateError::InvalidWorkflowTransition);
             }
-            if let Some(existing) = self.operations.get(&operation.id) {
-                if existing != operation {
-                    return Err(AccumulateError::InvalidWorkflowTransition);
-                }
-                continue;
-            }
-            for dependency in &operation.causal_dependencies {
-                heads.remove(dependency);
-            }
-            heads.insert(operation_hash(operation));
+            return Ok(heads);
         }
+        for dependency in &change.causal_dependencies {
+            heads.remove(dependency);
+        }
+        heads.insert(change.cid());
         Ok(heads)
     }
 
@@ -516,20 +551,6 @@ impl InMemoryServiceState {
         }
         Hash::digest(b"vos/service-state/v2", &[&bytes])
     }
-}
-
-fn encode_operation(operation: &CrdtOperationV2) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut e = Encoder(&mut out);
-    e.fixed(&operation.actor.0);
-    e.fixed(&operation.id.0);
-    e.list(&operation.causal_dependencies, |e, hash| e.fixed(&hash.0));
-    e.bytes(&operation.payload);
-    out
-}
-
-fn operation_hash(operation: &CrdtOperationV2) -> Hash {
-    Hash::digest(b"vos/crdt-operation/v2", &[&encode_operation(operation)])
 }
 
 fn contains_cycle(messages: &[MessageRecordV2]) -> bool {
@@ -618,8 +639,7 @@ mod tests {
                 key: b"count".to_vec(),
                 value: Some(1u64.to_le_bytes().to_vec()),
             }],
-            crdt_operations: vec![],
-            resulting_crdt_heads: vec![],
+            crdt_change: None,
             continuations: vec![],
             inbox: vec![],
             outbox: vec![],
@@ -737,8 +757,7 @@ mod tests {
                     target_program: work.target_program,
                     base: work.base.clone(),
                     writes: vec![],
-                    crdt_operations: vec![],
-                    resulting_crdt_heads: vec![],
+                    crdt_change: None,
                     continuations: vec![],
                     inbox: vec![],
                     outbox: vec![],
@@ -766,14 +785,6 @@ mod tests {
         let mut state = InMemoryServiceState::new(identity(), ConsistencyModeV2::Crdt);
         state.install_actor(actor, program);
         state.add_causal_node(left);
-        state.add_causal_node(concurrent);
-        let operation = CrdtOperationV2 {
-            actor,
-            id: OperationId([25; 32]),
-            causal_dependencies: vec![left],
-            payload: b"increment".to_vec(),
-        };
-        let emitted = operation_hash(&operation);
         let work = WorkEnvelopeV2 {
             service: identity(),
             invocation: InvocationId([26; 32]),
@@ -792,14 +803,33 @@ mod tests {
             imported_blobs: vec![],
             proof_requested: false,
         };
-        let mut transition = TransitionV2 {
+        // Another branch arrives after Refine observed `left`. CRDT Accumulate
+        // requires the observed dependency, not equality with current heads.
+        state.add_causal_node(concurrent);
+        let change_id = CrdtChangeV2::derive_id(&work).unwrap();
+        let operation = CrdtOperationV2 {
+            actor,
+            field: Hash([25; 32]),
+            ordinal: 0,
+            id: change_id.operation(actor, Hash([25; 32]), 0),
+            payload: b"increment".to_vec(),
+        };
+        let change = CrdtChangeV2 {
+            id: change_id,
+            causal_dependencies: vec![left],
+            causal_height: 1,
+            operations: vec![operation],
+            workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
+            materializations: vec![],
+        };
+        let emitted = change.cid();
+        let transition = TransitionV2 {
             service: identity(),
             consumed_input: work.input_id(),
             target_program: program,
             base: work.base.clone(),
             writes: vec![],
-            crdt_operations: vec![operation],
-            resulting_crdt_heads: vec![concurrent, emitted],
+            crdt_change: Some(change),
             continuations: vec![],
             inbox: vec![],
             outbox: vec![],
@@ -809,15 +839,14 @@ mod tests {
             proof: None,
         };
 
-        let invented = Hash([27; 32]);
-        transition.resulting_crdt_heads = vec![invented];
+        let mut divergent = transition.clone();
+        divergent.crdt_change.as_mut().unwrap().causal_dependencies = vec![Hash([27; 32])];
         assert_eq!(
-            state.accumulate(&work, &transition, &AllowPublic),
+            state.accumulate(&work, &divergent, &AllowPublic),
             Err(AccumulateError::InvalidWorkflowTransition)
         );
         assert_eq!(state.crdt_heads(), &BTreeSet::from([left, concurrent]));
 
-        transition.resulting_crdt_heads = vec![concurrent, emitted];
         state.accumulate(&work, &transition, &AllowPublic).unwrap();
         assert_eq!(state.crdt_heads(), &BTreeSet::from([concurrent, emitted]));
     }

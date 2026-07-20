@@ -52,6 +52,7 @@ id_type!(ProgramId, "ProgramId");
 id_type!(DeploymentId, "DeploymentId");
 id_type!(InvocationId, "InvocationId");
 id_type!(CallId, "CallId");
+id_type!(ChangeId, "ChangeId");
 id_type!(OperationId, "OperationId");
 id_type!(SystemCapabilityId, "SystemCapabilityId");
 
@@ -105,6 +106,16 @@ impl InvocationId {
     /// type instead of invoking a guest-side hashing precompile.
     pub const fn root_reply_id(self) -> CallId {
         CallId(self.0)
+    }
+}
+
+impl ChangeId {
+    /// Stable operation identity within one atomically batched CRDT change.
+    pub fn operation(self, actor: ActorId, field: Hash, ordinal: u32) -> OperationId {
+        OperationId(crate::crypto::blake2b_hash::<32>(
+            b"vos/crdt-operation-id/v2",
+            &[&self.0, &actor.0, &field.0, &ordinal.to_le_bytes()],
+        ))
     }
 }
 
