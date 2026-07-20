@@ -431,6 +431,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut msg_structs = Vec::new();
     let mut msg_impls = Vec::new();
+    let mut attested_method_impls = Vec::new();
     let mut enum_variants = Vec::new();
     let mut deliver_arms = Vec::new();
     let mut is_query_arms = Vec::new();
@@ -780,6 +781,49 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         };
+
+        if is_attested {
+            let claim_ty: syn::Type = success_after_result
+                .clone()
+                .unwrap_or_else(|| syn::parse_quote!(()));
+            let claim_to_value = if option_inner.is_some() {
+                quote! {
+                    match claim {
+                        None => vos::value::Value::Bytes(alloc::vec::Vec::new()),
+                        Some(value) => {
+                            let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(value)
+                                .expect("rkyv encode")
+                                .to_vec();
+                            vos::value::Value::Bytes(bytes)
+                        }
+                    }
+                }
+            } else if success_after_result.as_ref().is_some_and(is_byte_array) {
+                quote! { vos::value::Value::Bytes(claim.to_vec()) }
+            } else if PRIMITIVES.contains(&returns_str.as_str()) {
+                quote! { (*claim).clone().into() }
+            } else {
+                quote! {
+                    {
+                        let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(claim)
+                            .expect("rkyv encode")
+                            .to_vec();
+                        vos::value::Value::Bytes(bytes)
+                    }
+                }
+            };
+            let method_name = method_name.to_string();
+            attested_method_impls.push(quote! {
+                impl vos::AttestedMethod<#claim_ty> for #struct_name {
+                    const METHOD: &'static str = #method_name;
+
+                    fn claim_wire(claim: &#claim_ty) -> alloc::vec::Vec<u8> {
+                        let value: vos::value::Value = #claim_to_value;
+                        vos::Encode::encode(&value)
+                    }
+                }
+            });
+        }
 
         // M6 — pre-dispatch role check. Emitted at the very top
         // of the arm so it runs *before* the user's handler can
@@ -1528,6 +1572,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #( #msg_structs )*
         #aggregated_enum
         #( #msg_impls )*
+        #( #attested_method_impls )*
         #passthrough_impl
         #conn_build_impl
         #preamble

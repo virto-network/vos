@@ -5,18 +5,18 @@
 //! that deployment installs; the host supplies only imports and an atomic JAM
 //! storage transaction boundary.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::attestation::{
-    AttestationPreparationV2, AttestationProofHostV2, AttestationProofProducerV2,
-    AttestationProofRequestV2,
+    Attestation, AttestationError, AttestationPreparationV2, AttestationProofHostV2,
+    AttestationProofProducerV2, AttestationProofRequestV2, AttestedMethod,
 };
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, CommittedServiceImageHostV2, ImportedBlobV2,
-    LocalJamStoreSnapshotV2, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
+    LocalJamStoreSnapshotV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
     PublishedEffectsV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2,
     ServiceImageInstallErrorV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
     WorkEnvelopeV2,
@@ -45,6 +45,26 @@ pub struct CommittedAttestationOutputV2 {
     pub published: PublishedEffectsV2,
     pub prepare_gas_used: u64,
     pub accumulate_gas_used: u64,
+}
+
+impl CommittedAttestationOutputV2 {
+    /// Turn a committed runtime result into the portable application term.
+    /// The generated method marker checks both the method name and the exact
+    /// reply wire before the package can leave the runtime boundary.
+    pub fn into_attestation<T, M: AttestedMethod<T>>(
+        self,
+        producer_name: String,
+        producer: ProducerId,
+        preview: T,
+    ) -> Result<Attestation<T, M>, AttestationError> {
+        Attestation::__from_runtime(
+            producer_name,
+            producer,
+            self.preparation.statement,
+            preview,
+            self.proof_bytes,
+        )
+    }
 }
 
 struct ProvedAttestationV2 {
@@ -463,12 +483,7 @@ fn finish_committed_attestation<E, P>(
         }
         _ => return Err(AttestedServiceErrorV2::CommitMismatch),
     };
-    validate_committed_attestation(
-        &proved.preparation.receipt,
-        &proved.proof,
-        &receipt,
-        &published,
-    )?;
+    validate_committed_attestation(&proved.preparation, &proved.proof, &receipt, &published)?;
     Ok(CommittedAttestationOutputV2 {
         preparation: proved.preparation,
         proof: proved.proof,
@@ -480,14 +495,20 @@ fn finish_committed_attestation<E, P>(
 }
 
 fn validate_committed_attestation<E, P>(
-    prepared_receipt: &AccumulationReceiptV2,
+    preparation: &AttestationPreparationV2,
     proof: &ProofCommitmentV2,
     committed_receipt: &AccumulationReceiptV2,
     published: &PublishedEffectsV2,
 ) -> Result<(), AttestedServiceErrorV2<E, P>> {
-    if committed_receipt != prepared_receipt
+    let Some(reply) = published.reply.as_ref() else {
+        return Err(AttestedServiceErrorV2::CommitMismatch);
+    };
+    if preparation.validate().is_err()
+        || committed_receipt != &preparation.receipt
         || published.proof.as_ref() != Some(proof)
-        || published.reply.is_none()
+        || committed_receipt.reply_commitment != Some(reply.commitment())
+        || preparation.statement.claim_commitment
+            != super::Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])
     {
         return Err(AttestedServiceErrorV2::CommitMismatch);
     }

@@ -20,14 +20,24 @@ use vos::v2::{
     ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
     JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, ProofCommitmentV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProducerId, ProgramId, ProofCommitmentV2,
     ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
     ServicePvmV2, SpaceRoleCredentialV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
     public_policy_hash, space_role_policy_hash,
 };
-use vos::{Decode, Encode, value::Msg};
+use vos::{AttestedMethod, Decode, Encode, value::Msg};
+
+enum PrivateStart {}
+
+impl AttestedMethod<Vec<u8>> for PrivateStart {
+    const METHOD: &'static str = "private_start";
+
+    fn claim_wire(claim: &Vec<u8>) -> Vec<u8> {
+        claim.clone()
+    }
+}
 
 #[derive(Debug, Default)]
 struct FailableCommittedImages {
@@ -1843,6 +1853,19 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         )
         .expect("the driver proves before guest Accumulate commits");
     assert_eq!(producer.calls, 1);
+    let application_package = proved
+        .clone()
+        .into_attestation::<Vec<u8>, PrivateStart>(
+            "private-age".into(),
+            ProducerId([112; 32]),
+            b"attested reply".to_vec(),
+        )
+        .expect("a committed reply becomes the portable typed package");
+    assert_eq!(application_package.unverified_preview(), b"attested reply");
+    assert_eq!(
+        application_package.statement(),
+        &proved.preparation.statement
+    );
     let receipt = proved.preparation.receipt;
     let published = proved.published;
     assert_eq!(receipt, predicted);

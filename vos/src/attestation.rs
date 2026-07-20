@@ -397,6 +397,14 @@ pub struct Attestation<T, M> {
     _method: PhantomData<M>,
 }
 
+/// Generated binding between an attested method marker, its return type, and
+/// the exact actor reply wire committed by `TransitionV2`.
+pub trait AttestedMethod<T> {
+    const METHOD: &'static str;
+
+    fn claim_wire(claim: &T) -> Vec<u8>;
+}
+
 impl<T, M> Attestation<T, M> {
     #[doc(hidden)]
     pub fn __from_runtime(
@@ -405,15 +413,29 @@ impl<T, M> Attestation<T, M> {
         statement: AttestationStatementV3,
         preview: T,
         proof: Vec<u8>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AttestationError>
+    where
+        M: AttestedMethod<T>,
+    {
+        let package = Self {
             producer_name,
             producer,
             statement,
             preview,
             proof,
             _method: PhantomData,
+        };
+        if package.statement.method != M::METHOD {
+            return Err(AttestationError::WrongMethod);
         }
+        if Hash::digest(
+            b"vos/attestation-claim/v3",
+            &[&M::claim_wire(&package.preview)],
+        ) != package.statement.claim_commitment
+        {
+            return Err(AttestationError::ClaimCommitmentMismatch);
+        }
+        Ok(package)
     }
 
     /// UI/transport preview. Never use it for authorization or state changes.
@@ -457,6 +479,7 @@ pub enum AttestationError {
     WrongStatementVersion,
     InvalidStatement,
     WrongProducer,
+    WrongMethod,
     ClaimCommitmentMismatch,
     ReceiptMismatch,
     StateCommitmentMismatch,
@@ -505,19 +528,28 @@ pub struct AttestationReplayGuard {
 }
 
 /// Verify an already-produced package. This path never invokes the producer.
-pub fn verify_once<T: crate::Encode, M>(
+pub fn verify_once<T, M: AttestedMethod<T>>(
     package: Attestation<T, M>,
     expected_producer_name: &str,
+    expected_actor: ActorId,
     expected_producer: ProducerId,
     replay: &mut AttestationReplayGuard,
     verifier: &impl ProofVerifier,
 ) -> Result<Verified<T>, AttestationError> {
-    if package.producer_name != expected_producer_name || package.producer != expected_producer {
+    if package.producer_name != expected_producer_name
+        || package.statement.actor != expected_actor
+        || package.producer != expected_producer
+    {
         return Err(AttestationError::WrongProducer);
     }
     package.statement.validate()?;
-    if Hash::digest(b"vos/attestation-claim/v3", &[&package.preview.encode()])
-        != package.statement.claim_commitment
+    if package.statement.method != M::METHOD {
+        return Err(AttestationError::WrongMethod);
+    }
+    if Hash::digest(
+        b"vos/attestation-claim/v3",
+        &[&M::claim_wire(&package.preview)],
+    ) != package.statement.claim_commitment
     {
         return Err(AttestationError::ClaimCommitmentMismatch);
     }
@@ -552,6 +584,24 @@ mod tests {
 
     enum Method {}
 
+    impl AttestedMethod<u64> for Method {
+        const METHOD: &'static str = "is_adult";
+
+        fn claim_wire(claim: &u64) -> Vec<u8> {
+            crate::value::Value::U64(*claim).encode()
+        }
+    }
+
+    enum OtherMethod {}
+
+    impl AttestedMethod<u64> for OtherMethod {
+        const METHOD: &'static str = "other_method";
+
+        fn claim_wire(claim: &u64) -> Vec<u8> {
+            Method::claim_wire(claim)
+        }
+    }
+
     fn package(claim: u64) -> Attestation<u64, Method> {
         let deployment = DeploymentId([3; 32]);
         let receipt = AccumulationReceiptV2 {
@@ -583,7 +633,10 @@ mod tests {
             invocation: InvocationId([10; 32]),
             before: StateCommitmentV3::Linear(Hash([11; 32])),
             after: StateCommitmentV3::Linear(Hash([5; 32])),
-            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&claim.encode()]),
+            claim_commitment: Hash::digest(
+                b"vos/attestation-claim/v3",
+                &[&Method::claim_wire(&claim)],
+            ),
             input_commitment: Hash([13; 32]),
             authorization_policy: Hash([14; 32]),
             accumulation_receipt: receipt,
@@ -595,6 +648,7 @@ mod tests {
             claim,
             vec![1],
         )
+        .unwrap()
     }
 
     #[test]
@@ -605,6 +659,7 @@ mod tests {
             verify_once(
                 package(21),
                 "private-age",
+                ActorId([7; 32]),
                 ProducerId([15; 32]),
                 &mut replay,
                 &verifier,
@@ -617,6 +672,7 @@ mod tests {
             verify_once(
                 package(21),
                 "private-age",
+                ActorId([7; 32]),
                 ProducerId([15; 32]),
                 &mut replay,
                 &verifier,
@@ -630,6 +686,7 @@ mod tests {
             verify_once(
                 tampered,
                 "private-age",
+                ActorId([7; 32]),
                 ProducerId([15; 32]),
                 &mut AttestationReplayGuard::default(),
                 &verifier,
@@ -641,6 +698,7 @@ mod tests {
             verify_once(
                 package(22),
                 "private-age",
+                ActorId([7; 32]),
                 ProducerId([99; 32]),
                 &mut AttestationReplayGuard::default(),
                 &verifier,
@@ -654,12 +712,28 @@ mod tests {
             verify_once(
                 wrong_state,
                 "private-age",
+                ActorId([7; 32]),
                 ProducerId([15; 32]),
                 &mut AttestationReplayGuard::default(),
                 &verifier,
             ),
             Err(AttestationError::StateCommitmentMismatch),
         );
+    }
+
+    #[test]
+    fn runtime_constructor_rejects_the_wrong_generated_method_marker() {
+        let package = package(24);
+        assert!(matches!(
+            Attestation::<u64, OtherMethod>::__from_runtime(
+                "private-age".to_string(),
+                package.producer,
+                package.statement,
+                package.preview,
+                package.proof,
+            ),
+            Err(AttestationError::WrongMethod)
+        ));
     }
 
     #[test]

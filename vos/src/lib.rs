@@ -181,8 +181,8 @@ pub use actors::{
 pub use attestation::{
     Attestation, AttestationError, AttestationPreparationV2, AttestationProofHostV2,
     AttestationProofProducerV2, AttestationProofRequestV2, AttestationReplayGuard,
-    AttestationStatementV3, ProducedAttestationProofV2, ProofVerifier, StateCommitmentV3, Verified,
-    verify_once,
+    AttestationStatementV3, AttestedMethod, ProducedAttestationProofV2, ProofVerifier,
+    StateCommitmentV3, Verified, verify_once,
 };
 pub use v2::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};
 // Per-task future machinery for native extensions: the scheduler lives

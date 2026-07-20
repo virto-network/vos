@@ -189,6 +189,27 @@ fn attested_and_regular_method_policies_are_generated_together() {
 }
 
 #[test]
+fn attested_method_marker_binds_the_exact_committed_reply_wire() {
+    let claim = Receipt {
+        id: 7,
+        tag: [9; 32],
+    };
+    let wire = <fixture::LastReceipt as vos::AttestedMethod<Receipt>>::claim_wire(&claim);
+    assert_eq!(
+        <fixture::LastReceipt as vos::AttestedMethod<Receipt>>::METHOD,
+        "last_receipt"
+    );
+    assert_eq!(
+        <Value as vos::Decode>::decode(&wire),
+        Value::Bytes(
+            vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&claim)
+                .expect("rkyv encode")
+                .to_vec()
+        ),
+    );
+}
+
+#[test]
 fn attested_space_role_is_enforced_before_the_handler_runs() {
     let mut guest_actor = <Vault as vos::Actor>::create();
     let mut guest_ctx = vos::Context::new(ServiceId(7));
