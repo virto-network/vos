@@ -519,6 +519,7 @@ mod tests {
             receipt: AccumulationReceiptV2 {
                 service: service(13),
                 accepted_transition: Hash([12; 32]),
+                reply_commitment: None,
                 resulting_state_root: Some(Hash([14; 32])),
                 resulting_crdt_heads: vec![],
                 sequence: 9,

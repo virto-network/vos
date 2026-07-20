@@ -527,6 +527,10 @@ fn apply<S: GuestAccumulateStoreV2>(
     let receipt = AccumulationReceiptV2 {
         service: header.service.clone(),
         accepted_transition: transition_commitment,
+        reply_commitment: transition
+            .reply
+            .as_ref()
+            .map(super::ReplyRecordV2::commitment),
         resulting_state_root,
         resulting_crdt_heads,
         sequence,

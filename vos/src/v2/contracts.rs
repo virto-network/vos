@@ -315,6 +315,14 @@ pub struct ReplyRecordV2 {
     pub result: Vec<u8>,
 }
 
+impl ReplyRecordV2 {
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        encode_reply(&mut Encoder(&mut bytes), self);
+        Hash::digest(b"vos/reply/v2", &[&bytes])
+    }
+}
+
 /// Fixed-schema workflow operations merged alongside application CRDT fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowOperationV2 {
@@ -466,6 +474,10 @@ pub struct RefineOutputV2 {
 pub struct AccumulationReceiptV2 {
     pub service: ServiceIdentityV2,
     pub accepted_transition: Hash,
+    /// Direct commitment to the reply released after this commit. This lets a
+    /// caller validate a transported result without importing the full source
+    /// transition; `accepted_transition` continues to bind every other effect.
+    pub reply_commitment: Option<Hash>,
     pub resulting_state_root: Option<Hash>,
     pub resulting_crdt_heads: Vec<Hash>,
     pub sequence: u64,
@@ -1154,6 +1166,7 @@ impl V2Wire for AccumulationReceiptV2 {
         let mut e = Encoder(out);
         encode_service(&mut e, &self.service);
         e.fixed(&self.accepted_transition.0);
+        e.option(&self.reply_commitment, |e, hash| e.fixed(&hash.0));
         e.option(&self.resulting_state_root, |e, h| e.fixed(&h.0));
         e.list(&self.resulting_crdt_heads, |e, h| e.fixed(&h.0));
         e.u64(self.sequence);
@@ -1165,6 +1178,7 @@ impl V2Wire for AccumulationReceiptV2 {
         let value = Self {
             service: decode_service(d)?,
             accepted_transition: Hash(d.fixed()?),
+            reply_commitment: d.option(|d| d.fixed().map(Hash))?,
             resulting_state_root: d.option(|d| d.fixed().map(Hash))?,
             resulting_crdt_heads: d.list(|d| d.fixed().map(Hash))?,
             sequence: d.u64()?,
@@ -1356,6 +1370,12 @@ impl V2Wire for AccumulationResultV2 {
                 let published = PublishedEffectsV2::decode(&d.bytes()?)?;
                 let duplicate = d.bool()?;
                 if duplicate && published != PublishedEffectsV2::default() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                if !duplicate
+                    && published.reply.as_ref().map(ReplyRecordV2::commitment)
+                        != receipt.reply_commitment
+                {
                     return Err(DecodeError::NonCanonical);
                 }
                 Ok(Self::Accepted {
@@ -2434,6 +2454,7 @@ mod tests {
         let receipt = AccumulationReceiptV2 {
             service: service(),
             accepted_transition: Hash([12; 32]),
+            reply_commitment: None,
             resulting_state_root: Some(Hash([13; 32])),
             resulting_crdt_heads: vec![],
             sequence: 4,
@@ -2448,6 +2469,38 @@ mod tests {
         assert_eq!(
             AccumulationResultV2::decode(&accepted.encode()).unwrap(),
             accepted
+        );
+
+        let reply = ReplyRecordV2 {
+            call_id: CallId([14; 32]),
+            producer: ActorId([15; 32]),
+            result: b"committed reply".to_vec(),
+        };
+        let mut reply_receipt = receipt.clone();
+        reply_receipt.reply_commitment = Some(reply.commitment());
+        let with_reply = AccumulationResultV2::Accepted {
+            receipt: reply_receipt,
+            published: PublishedEffectsV2 {
+                reply: Some(reply.clone()),
+                ..PublishedEffectsV2::default()
+            },
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&with_reply.encode()).unwrap(),
+            with_reply
+        );
+        let mismatched = AccumulationResultV2::Accepted {
+            receipt: receipt.clone(),
+            published: PublishedEffectsV2 {
+                reply: Some(reply),
+                ..PublishedEffectsV2::default()
+            },
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let duplicate = AccumulationResultV2::Accepted {

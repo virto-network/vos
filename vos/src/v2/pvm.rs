@@ -906,6 +906,7 @@ mod tests {
                 execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
             },
             accepted_transition: Hash([4; 32]),
+            reply_commitment: None,
             resulting_state_root: Some(Hash([5; 32])),
             resulting_crdt_heads: Vec::new(),
             sequence: 1,
