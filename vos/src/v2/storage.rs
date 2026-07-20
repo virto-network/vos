@@ -127,6 +127,8 @@ impl V2Wire for StoreHeaderV2 {
 /// position.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StateKeyV2 {
+    /// Canonical, sorted membership of the complete root actor tree.
+    ActorDirectory,
     ActorDescriptor(ActorId),
     MethodPolicy {
         actor: ActorId,
@@ -153,6 +155,9 @@ impl V2Wire for StateKeyV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         match self {
+            Self::ActorDirectory => {
+                e.u8(9);
+            }
             Self::ActorDescriptor(actor) => {
                 e.u8(0);
                 e.fixed(&actor.0);
@@ -227,6 +232,7 @@ impl V2Wire for StateKeyV2 {
                 }
                 Ok(Self::ActorName { parent, name })
             }
+            9 => Ok(Self::ActorDirectory),
             _ => Err(DecodeError::InvalidTag),
         }
     }

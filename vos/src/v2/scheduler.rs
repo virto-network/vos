@@ -12,12 +12,13 @@ use core::convert::Infallible;
 use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::contracts::crdt_change_blob_references;
 use super::{
-    AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2,
-    CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2,
-    Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
-    WorkflowOperationV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
+    BlobRefV2, CallId, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
+    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
+    MessageRecordV2, Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2,
+    WorkflowCheckpointV2, WorkflowOperationV2, crdt_node_receipt_storage_key,
+    crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -360,6 +361,15 @@ impl LocalWorkSchedulerV2 {
             return Err(ScheduleErrorV2::EmptyMethod);
         }
         let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let directory = decode_row::<ActorDirectoryV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::ActorDirectory,
+        )?
+        .ok_or(ScheduleErrorV2::CorruptActorDirectory)?;
+        if directory.actors.binary_search(&request.target).is_err() {
+            return Err(ScheduleErrorV2::CorruptActorDirectory);
+        }
         let descriptor_key = StateKeyV2::ActorDescriptor(request.target);
         let descriptor = decode_row::<ActorGenesisV2>(store, header.service_root, &descriptor_key)?
             .ok_or(ScheduleErrorV2::MissingActor(request.target))?;
@@ -483,6 +493,82 @@ impl LocalWorkSchedulerV2 {
             causal_states: states.clone(),
             continuation: continuation.clone(),
         });
+
+        let mut programs = BTreeMap::new();
+        programs.insert(
+            descriptor.program,
+            ImportedProgramV2 {
+                program: descriptor.program,
+                pvm: program_bytes,
+            },
+        );
+        let mut blobs = BTreeMap::new();
+        import_blob(store, &mut blobs, &state)?;
+        for reference in &states {
+            import_blob(store, &mut blobs, reference)?;
+        }
+        if let Some(reference) = continuation.as_ref() {
+            import_blob(store, &mut blobs, reference)?;
+        }
+
+        // Refine owns the whole root tree. Import every sibling's exact code,
+        // state frontier, and continuation reference even when this message
+        // initially targets only one actor. Guest Accumulate independently
+        // checks this list against the installation directory.
+        for actor in directory
+            .actors
+            .iter()
+            .copied()
+            .filter(|actor| *actor != request.target)
+        {
+            let descriptor = decode_row::<ActorGenesisV2>(
+                store,
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(actor),
+            )?
+            .ok_or(ScheduleErrorV2::CorruptActorDirectory)?;
+            if descriptor.actor != actor {
+                return Err(ScheduleErrorV2::CorruptActorDirectory);
+            }
+            if descriptor.crdt != (header.consistency == ConsistencyModeV2::Crdt) {
+                return Err(ScheduleErrorV2::ActorConsistencyMismatch(actor));
+            }
+            let mut actor_states = actor_states(store, &header, &descriptor)?;
+            if actor_states.is_empty() {
+                return Err(ScheduleErrorV2::CorruptCausalDag);
+            }
+            let actor_state = actor_states.remove(0);
+            let actor_continuation = decode_row::<BlobRefV2>(
+                store,
+                header.service_root,
+                &StateKeyV2::Continuation(actor),
+            )?;
+            work.imported_actors.push(ImportedActorV2 {
+                actor,
+                program: descriptor.program,
+                state: actor_state.clone(),
+                causal_states: actor_states.clone(),
+                continuation: actor_continuation.clone(),
+            });
+            let pvm = store
+                .program(descriptor.program)
+                .ok_or(ScheduleErrorV2::MissingProgram(descriptor.program))?
+                .to_vec();
+            programs
+                .entry(descriptor.program)
+                .or_insert(ImportedProgramV2 {
+                    program: descriptor.program,
+                    pvm,
+                });
+            import_blob(store, &mut blobs, &actor_state)?;
+            for reference in &actor_states {
+                import_blob(store, &mut blobs, reference)?;
+            }
+            if let Some(reference) = actor_continuation.as_ref() {
+                import_blob(store, &mut blobs, reference)?;
+            }
+        }
+        work.imported_actors.sort_by_key(|actor| actor.actor);
         work.imported_blobs.sort_by_key(|blob| blob.hash);
         if work
             .imported_blobs
@@ -492,22 +578,11 @@ impl LocalWorkSchedulerV2 {
             return Err(ScheduleErrorV2::NonCanonicalImports);
         }
 
-        let mut blobs = BTreeMap::new();
-        import_blob(store, &mut blobs, &state)?;
-        for reference in &states {
-            import_blob(store, &mut blobs, reference)?;
-        }
-        if let Some(reference) = continuation.as_ref() {
-            import_blob(store, &mut blobs, reference)?;
-        }
         for reference in &work.imported_blobs {
             import_blob(store, &mut blobs, reference)?;
         }
         let imports = RefineImportsV2 {
-            programs: alloc::vec![ImportedProgramV2 {
-                program: descriptor.program,
-                pvm: program_bytes,
-            }],
+            programs: programs.into_values().collect(),
             blobs: blobs.into_values().collect(),
         };
 
@@ -537,6 +612,42 @@ impl LocalWorkSchedulerV2 {
             .map_err(|_| ScheduleErrorV2::NonCanonicalImports)?;
         Ok(PreparedWorkV2 { work, imports })
     }
+}
+
+fn actor_states(
+    store: &LocalJamStoreV2,
+    header: &super::StoreHeaderV2,
+    descriptor: &ActorGenesisV2,
+) -> Result<Vec<BlobRefV2>, ScheduleErrorV2> {
+    if header.consistency != ConsistencyModeV2::Crdt {
+        let state_key = StateKeyV2::ActorRow {
+            actor: descriptor.actor,
+            key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+        };
+        return decode_row(store, header.service_root, &state_key)?
+            .map(|state| alloc::vec![state])
+            .ok_or(ScheduleErrorV2::MissingState(descriptor.actor));
+    }
+
+    let frontier = load_causal_frontier(&header.crdt_heads, |cid| {
+        Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
+    });
+    let frontier = match frontier {
+        Ok(frontier) => frontier,
+        Err(CausalFrontierError::Missing(cid)) => {
+            return Err(ScheduleErrorV2::MissingCausalDependency(cid));
+        }
+        Err(CausalFrontierError::Corrupt) => return Err(ScheduleErrorV2::CorruptCausalDag),
+        Err(CausalFrontierError::Storage(error)) => match error {},
+    };
+    frontier
+        .actor_materializations::<Infallible>(descriptor, descriptor.actor)
+        .map_err(|error| match error {
+            CausalFrontierError::Corrupt | CausalFrontierError::Missing(_) => {
+                ScheduleErrorV2::CorruptCausalDag
+            }
+            CausalFrontierError::Storage(error) => match error {},
+        })
 }
 
 fn dynamic_method(payload: &[u8]) -> Option<String> {

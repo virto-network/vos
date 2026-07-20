@@ -1339,6 +1339,20 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         }
     );
     assert_eq!(prepared.work.imported_actors[0].state, initial);
+    assert_eq!(
+        prepared
+            .work
+            .imported_actors
+            .iter()
+            .map(|actor| actor.actor)
+            .collect::<Vec<_>>(),
+        vec![seed_work.target, ActorId([36; 32])]
+    );
+    assert_eq!(
+        prepared.imports.programs.len(),
+        1,
+        "program bytes are deduplicated when root and child share code"
+    );
     assert_eq!(prepared.imports.programs[0].pvm, actor_pvm);
     let work = prepared.work;
     let continuation = ContinuationSnapshotV2 {
@@ -1551,8 +1565,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     );
     assert_eq!(
         resumed.imports.blobs.len(),
-        2,
-        "state and continuation bytes are both imported after restart"
+        3,
+        "root state, child state, and continuation bytes are imported after restart"
     );
 
     let resumed_transition = TransitionV2 {

@@ -620,6 +620,16 @@ pub struct ActorGenesisV2 {
     pub methods: Vec<MethodPolicyV2>,
 }
 
+/// Canonical membership of the root actor tree committed at installation.
+///
+/// The directory is deliberately a guest-owned state row. A native scheduler
+/// may resolve names for convenience, but it cannot omit a sibling program or
+/// state from Refine without guest Accumulate detecting the partial import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorDirectoryV2 {
+    pub actors: Vec<ActorId>,
+}
+
 /// Clean-break initialization accepted only by an empty v2 service store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceGenesisV2 {
@@ -1417,6 +1427,25 @@ impl V2Wire for ActorGenesisV2 {
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_actor_genesis(d)
+    }
+}
+
+impl V2Wire for ActorDirectoryV2 {
+    const MAGIC: [u8; 4] = *b"VAD2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        Encoder(out).list(&self.actors, |e, actor| e.fixed(&actor.0));
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            actors: d.list(|d| d.fixed().map(ActorId))?,
+        };
+        if value.actors.is_empty() {
+            return Err(DecodeError::NonCanonical);
+        }
+        ensure_sorted_unique(&value.actors, |actor| actor.0)?;
+        Ok(value)
     }
 }
 
@@ -3086,6 +3115,29 @@ mod tests {
             ServiceGenesisV2::decode(&genesis.encode()),
             Err(DecodeError::NonCanonical)
         );
+    }
+
+    #[test]
+    fn actor_directory_requires_sorted_complete_membership() {
+        let directory = ActorDirectoryV2 {
+            actors: vec![ActorId([4; 32]), ActorId([5; 32])],
+        };
+        assert_eq!(
+            ActorDirectoryV2::decode(&directory.encode()).unwrap(),
+            directory
+        );
+
+        for actors in [
+            vec![],
+            vec![ActorId([5; 32]), ActorId([4; 32])],
+            vec![ActorId([4; 32]), ActorId([4; 32])],
+        ] {
+            let invalid = ActorDirectoryV2 { actors };
+            assert_eq!(
+                ActorDirectoryV2::decode(&invalid.encode()),
+                Err(DecodeError::NonCanonical)
+            );
+        }
     }
 
     #[test]

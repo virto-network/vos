@@ -198,6 +198,14 @@ fn install<S: GuestAccumulateStoreV2>(
     let mut header = StoreHeaderV2::current(genesis.service.clone(), genesis.consistency);
     {
         let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+        let directory = super::ActorDirectoryV2 {
+            actors: genesis.actors.iter().map(|actor| actor.actor).collect(),
+        };
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::ActorDirectory,
+            Some(&directory.encode()),
+        )?;
         for actor in &genesis.actors {
             tree_apply(
                 &mut tree,
@@ -959,6 +967,19 @@ fn apply<S: GuestAccumulateStoreV2>(
     };
 
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+    let Some(directory) =
+        tree_get_wire::<_, super::ActorDirectoryV2>(&tree, &StateKeyV2::ActorDirectory)?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+    };
+    if !directory
+        .actors
+        .iter()
+        .copied()
+        .eq(work.imported_actors.iter().map(|actor| actor.actor))
+    {
+        return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+    }
     let Some(actor) =
         tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(work.target))?
     else {
@@ -2393,6 +2414,69 @@ mod tests {
                 duplicate: true,
             }
         );
+    }
+
+    #[test]
+    fn accumulate_rejects_a_partial_root_tree_import() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"before").unwrap();
+        let child = ActorId([7; 32]);
+        let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![
+                ActorGenesisV2 {
+                    actor: actor(),
+                    name: "root".into(),
+                    parent: None,
+                    program: program(),
+                    initial_state: initial.clone(),
+                    crdt: false,
+                    methods: vec![MethodPolicyV2 {
+                        method: "set".into(),
+                        schema: Hash([6; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    }],
+                },
+                ActorGenesisV2 {
+                    actor: child,
+                    name: "child".into(),
+                    parent: Some(actor()),
+                    program: program(),
+                    initial_state: initial.clone(),
+                    crdt: false,
+                    methods: Vec::new(),
+                },
+            ],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResultV2::Installed(installed) =
+            execute_guest_accumulate(&mut store, &request).unwrap()
+        else {
+            panic!("install rejected")
+        };
+        let work = linear_work(initial, installed.resulting_state_root.unwrap());
+        let transition = linear_transition(&work, b"after");
+        let before = store.clone();
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work,
+                transition,
+                provided_blobs: Vec::new(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            AccumulationResultV2::Rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(store, before, "partial-tree work must stage no writes");
     }
 
     #[test]
