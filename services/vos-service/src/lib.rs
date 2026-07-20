@@ -13,9 +13,11 @@ mod guest {
     use core::arch::global_asm;
 
     use vos::abi::pvm::ecall;
+    use vos::abi::{error, pvm::hostcalls};
     use vos::v2::{
-        ActorSliceOutputV2, ContinuationChangeV2, GasAccountingV2, ReplyRecordV2, TransitionV2,
-        V2Wire, WorkEnvelopeV2,
+        AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
+        BlobRefV2, ContinuationChangeV2, GasAccountingV2, GuestAccumulateStoreV2, ReplyRecordV2,
+        StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2, execute_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -179,15 +181,103 @@ mod guest {
         }
     }
 
-    /// Accumulate remains fail-closed until the guest storage transaction logic is
-    /// implemented. Keeping the physical symbol present lets every build verify
-    /// the IC-5 entry without ever treating a no-op as a successful commit.
+    /// Validate and stage one v2 install/transition using only standard JAM
+    /// service storage and preimage capabilities. The outer JAR driver owns the
+    /// transaction: returning successfully commits all calls atomically, while
+    /// `fail_closed` makes it discard the entire staging area.
     #[unsafe(no_mangle)]
     extern "C" fn vos_service_accumulate(
-        _arguments: *const u8,
-        _arguments_len: usize,
+        arguments: *const u8,
+        arguments_len: usize,
     ) -> OutputWindow {
-        fail_closed()
+        // SAFETY: JAM initializes a readable argument window at (a0, a1).
+        let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
+        let result = match AccumulateRequestV2::decode(input) {
+            Ok(request) => execute_guest_accumulate(&mut JamAccumulateStore, &request)
+                .unwrap_or_else(|_| fail_closed()),
+            Err(_) => AccumulationResultV2::Rejected(AccumulationRejectionV2::NonCanonical),
+        };
+        output(&result.encode())
+    }
+
+    const STORAGE_PROBE_CAPACITY: usize = 4096;
+    const MAX_STORAGE_VALUE: usize = 64 * 1024 * 1024;
+
+    struct JamAccumulateStore;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum JamStoreError {
+        ValueTooLarge,
+        ReadFailed,
+        WriteFailed,
+        ProvideFailed,
+    }
+
+    impl StateTreeStore for JamAccumulateStore {
+        type Error = JamStoreError;
+
+        fn read(&self, key: &[u8]) -> Result<Option<alloc::vec::Vec<u8>>, Self::Error> {
+            let mut probe = [0u8; STORAGE_PROBE_CAPACITY];
+            let len = hostcalls::read(key, &mut probe);
+            if len == error::HOST_NONE {
+                return Ok(None);
+            }
+            let len = usize::try_from(len).map_err(|_| JamStoreError::ValueTooLarge)?;
+            if len <= probe.len() {
+                return Ok(Some(probe[..len].to_vec()));
+            }
+            if len > MAX_STORAGE_VALUE {
+                return Err(JamStoreError::ValueTooLarge);
+            }
+            let mut value = alloc::vec![0u8; len];
+            if hostcalls::read(key, &mut value) != len as u64 {
+                return Err(JamStoreError::ReadFailed);
+            }
+            Ok(Some(value))
+        }
+
+        fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<(), Self::Error> {
+            // JAM's zero-length STORAGE_W deletes the key. Logical empty
+            // values are wrapped in non-empty service-tree leaves.
+            let value = value.unwrap_or_default();
+            if hostcalls::write(key, value) == error::HOST_OK {
+                Ok(())
+            } else {
+                Err(JamStoreError::WriteFailed)
+            }
+        }
+    }
+
+    impl GuestAccumulateStoreV2 for JamAccumulateStore {
+        fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {
+            let mut probe = [0u8; 1];
+            Ok(hostcalls::preimage_lookup(&reference.hash.0, &mut probe) == reference.len)
+        }
+
+        fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error> {
+            let reference = BlobRefV2::of_bytes(bytes);
+            if hostcalls::provide(&reference.hash.0, bytes) == error::HOST_OK {
+                Ok(reference)
+            } else {
+                Err(JamStoreError::ProvideFailed)
+            }
+        }
+    }
+
+    fn output(encoded: &[u8]) -> OutputWindow {
+        if encoded.len() > TRANSITION_CAPACITY {
+            fail_closed();
+        }
+        let output_address = core::ptr::addr_of_mut!(TRANSITION_BUFFER).cast::<u8>();
+        // SAFETY: the PVM is single-threaded and the static output buffer is
+        // exclusively owned until the terminal halt reads it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(encoded.as_ptr(), output_address, encoded.len());
+        }
+        OutputWindow {
+            address: output_address as u64,
+            len: encoded.len() as u64,
+        }
     }
 
     #[cold]
