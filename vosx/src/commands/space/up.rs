@@ -1330,18 +1330,11 @@ fn agent_config_from_row(
     policies: &AgentPolicies,
 ) -> anyhow::Result<RowConfig> {
     let program_hash = BlobHash(a.program_hash);
-    let elf = match blob_store::cache_get(&program_hash)? {
+    let artifact = match blob_store::cache_get(&program_hash)? {
         Some(b) => b,
         None => return Ok(RowConfig::MissingBlob),
     };
-    // v2 stores canonical PVM bytes from the signed `.vos` package. The ELF
-    // fallback remains only for bundled infrastructure fixtures.
-    let blob = if elf.get(..3) == Some(b"JAR") {
-        elf
-    } else {
-        grey_transpiler::link_elf(&elf)
-            .map_err(|e| anyhow::anyhow!("transpile legacy {}: {e:?}", a.instance_name))?
-    };
+    let blob = actor_blob_from_catalog(artifact, &a.instance_name)?;
 
     let Some(consistency) = consistency_from_u8(a.consistency) else {
         return Ok(RowConfig::BadConsistency);
@@ -1401,6 +1394,43 @@ fn agent_config_from_row(
         }
     }
     Ok(RowConfig::Ready(Box::new(cfg)))
+}
+
+/// Recover executable bytes from one content-addressed catalog artifact.
+///
+/// Signed v2 packages are retained byte-for-byte by the registry/CAS and
+/// already contain the canonical actor PVM. Only pre-v2 infrastructure blobs
+/// may take the legacy ELF transpilation fallback.
+fn actor_blob_from_catalog(artifact: Vec<u8>, instance_name: &str) -> anyhow::Result<Vec<u8>> {
+    if artifact.get(..4) == Some(b"VOSP") {
+        use vos::v2::{V2Wire, VosPackageV2};
+
+        let package = VosPackageV2::decode(&artifact)
+            .map_err(|error| anyhow::anyhow!("decode {instance_name} .vos package: {error}"))?;
+        package
+            .validate()
+            .map_err(|error| anyhow::anyhow!("validate {instance_name} .vos package: {error}"))?;
+        let public_key = libp2p::identity::PublicKey::try_decode_protobuf(
+            &package.deployment_signature.public_key,
+        )
+        .map_err(|error| anyhow::anyhow!("decode {instance_name} deployment key: {error}"))?;
+        if !public_key.verify(
+            &package.signing_message(),
+            &package.deployment_signature.signature,
+        ) {
+            anyhow::bail!("{instance_name} deployment signature is invalid");
+        }
+        javm::program::parse_blob(&package.actor_pvm)
+            .ok_or_else(|| anyhow::anyhow!("{instance_name} package actor PVM is invalid"))?;
+        return Ok(package.actor_pvm);
+    }
+    if artifact.get(..3) == Some(b"JAR") {
+        javm::program::parse_blob(&artifact)
+            .ok_or_else(|| anyhow::anyhow!("{instance_name} canonical PVM is invalid"))?;
+        return Ok(artifact);
+    }
+    grey_transpiler::link_elf(&artifact)
+        .map_err(|error| anyhow::anyhow!("transpile legacy {instance_name}: {error:?}"))
 }
 
 /// Per-voter wait for a `RaftStatusReq` answer. Probes run on the
