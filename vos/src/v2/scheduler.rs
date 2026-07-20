@@ -49,6 +49,8 @@ pub enum ScheduleErrorV2 {
     StoreUninitialized,
     UnsupportedConsistency(ConsistencyModeV2),
     MissingActor(ActorId),
+    EmptyActorName,
+    CorruptActorDirectory,
     ActorConsistencyMismatch(ActorId),
     MissingProgram(super::ProgramId),
     MissingState(ActorId),
@@ -85,6 +87,54 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    pub fn resolve_root(
+        store: &LocalJamStoreV2,
+        name: &str,
+    ) -> Result<Option<ActorId>, ScheduleErrorV2> {
+        Self::resolve_owned(store, None, name)
+    }
+
+    pub fn resolve_child(
+        store: &LocalJamStoreV2,
+        parent: ActorId,
+        name: &str,
+    ) -> Result<Option<ActorId>, ScheduleErrorV2> {
+        Self::resolve_owned(store, Some(parent), name)
+    }
+
+    fn resolve_owned(
+        store: &LocalJamStoreV2,
+        parent: Option<ActorId>,
+        name: &str,
+    ) -> Result<Option<ActorId>, ScheduleErrorV2> {
+        if name.is_empty() {
+            return Err(ScheduleErrorV2::EmptyActorName);
+        }
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let directory_key = StateKeyV2::ActorName {
+            parent,
+            name: name.into(),
+        };
+        let Some(bytes) = store.state_row(header.service_root, &directory_key)? else {
+            return Ok(None);
+        };
+        let actor = ActorId(
+            bytes
+                .try_into()
+                .map_err(|_| ScheduleErrorV2::CorruptActorDirectory)?,
+        );
+        let descriptor = decode_row::<ActorGenesisV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::ActorDescriptor(actor),
+        )?
+        .ok_or(ScheduleErrorV2::CorruptActorDirectory)?;
+        if descriptor.parent != parent || descriptor.name != name {
+            return Err(ScheduleErrorV2::CorruptActorDirectory);
+        }
+        Ok(Some(actor))
+    }
+
     /// Reconstruct a target workflow directly from one committed durable inbox
     /// row. The row carries the original actor identity and authorization;
     /// neither is synthesized by the host scheduler.

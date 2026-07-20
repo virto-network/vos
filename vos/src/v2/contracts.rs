@@ -457,6 +457,9 @@ pub struct MethodPolicyV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorGenesisV2 {
     pub actor: ActorId,
+    /// Stable name within the parent's owned namespace. The one root actor's
+    /// name is unique in the service root namespace.
+    pub name: String,
     /// `None` identifies the single root actor; every child names an actor in
     /// the same genesis tree.
     pub parent: Option<ActorId>,
@@ -1331,6 +1334,7 @@ impl V2Wire for AccumulationResultV2 {
 
 fn encode_actor_genesis(e: &mut Encoder<'_>, value: &ActorGenesisV2) {
     e.fixed(&value.actor.0);
+    e.string(&value.name);
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
     e.fixed(&value.program.0);
     encode_blob_ref(e, &value.initial_state);
@@ -1347,6 +1351,7 @@ fn encode_actor_genesis(e: &mut Encoder<'_>, value: &ActorGenesisV2) {
 fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeError> {
     let value = ActorGenesisV2 {
         actor: ActorId(d.fixed()?),
+        name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
         program: ProgramId(d.fixed()?),
         initial_state: decode_blob_ref(d)?,
@@ -1361,7 +1366,8 @@ fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeErr
             })
         })?,
     };
-    if value.methods.iter().any(|method| method.method.is_empty())
+    if value.name.is_empty()
+        || value.methods.iter().any(|method| method.method.is_empty())
         || value
             .methods
             .windows(2)
@@ -1388,11 +1394,14 @@ fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
     }
     let root = roots[0];
     let known: BTreeSet<_> = value.actors.iter().map(|actor| actor.actor).collect();
+    let mut names = BTreeSet::new();
     for actor in &value.actors {
         if value.consistency == ConsistencyModeV2::Crdt && !actor.crdt {
             return Err(DecodeError::NonCanonical);
         }
-        if actor.parent == Some(actor.actor)
+        if actor.name.is_empty()
+            || !names.insert((actor.parent, actor.name.as_str()))
+            || actor.parent == Some(actor.actor)
             || actor.parent.is_some_and(|parent| !known.contains(&parent))
         {
             return Err(DecodeError::NonCanonical);
@@ -2232,6 +2241,7 @@ mod tests {
             actors: vec![
                 ActorGenesisV2 {
                     actor: ActorId([5; 32]),
+                    name: "root".into(),
                     parent: None,
                     program: ProgramId([6; 32]),
                     initial_state: BlobRefV2::of_bytes(b"root-state"),
@@ -2246,6 +2256,7 @@ mod tests {
                 },
                 ActorGenesisV2 {
                     actor: ActorId([9; 32]),
+                    name: "child".into(),
                     parent: Some(ActorId([5; 32])),
                     program: ProgramId([10; 32]),
                     initial_state: BlobRefV2::of_bytes(b"child-state"),
@@ -2324,6 +2335,7 @@ mod tests {
             consistency: ConsistencyModeV2::Crdt,
             actors: vec![ActorGenesisV2 {
                 actor: ActorId([5; 32]),
+                name: "root".into(),
                 parent: None,
                 program: ProgramId([6; 32]),
                 initial_state: BlobRefV2::of_bytes(b"state"),
@@ -2341,6 +2353,21 @@ mod tests {
         );
 
         genesis.consistency = ConsistencyModeV2::Local;
+        genesis.actors[0].parent = None;
+        let mut first_child = genesis.actors[0].clone();
+        first_child.actor = ActorId([8; 32]);
+        first_child.name = "child".into();
+        first_child.parent = Some(genesis.actors[0].actor);
+        let mut second_child = first_child.clone();
+        second_child.actor = ActorId([9; 32]);
+        genesis.actors.extend([first_child, second_child]);
+        assert_eq!(
+            ServiceGenesisV2::decode(&genesis.encode()),
+            Err(DecodeError::NonCanonical),
+            "siblings cannot share one durable directory name"
+        );
+
+        genesis.actors.truncate(1);
         genesis.actors[0].parent = Some(genesis.actors[0].actor);
         assert_eq!(
             ServiceGenesisV2::decode(&genesis.encode()),

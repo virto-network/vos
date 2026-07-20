@@ -121,6 +121,14 @@ fn install<S: GuestAccumulateStoreV2>(
                 &StateKeyV2::ActorDescriptor(actor.actor),
                 Some(&actor.encode()),
             )?;
+            tree_apply(
+                &mut tree,
+                &StateKeyV2::ActorName {
+                    parent: actor.parent,
+                    name: actor.name.clone(),
+                },
+                Some(&actor.actor.0),
+            )?;
             for method in &actor.methods {
                 tree_apply(
                     &mut tree,
@@ -1083,6 +1091,7 @@ mod tests {
             consistency,
             actors: vec![ActorGenesisV2 {
                 actor: actor(),
+                name: "root".into(),
                 parent: None,
                 program: program(),
                 initial_state: initial.clone(),

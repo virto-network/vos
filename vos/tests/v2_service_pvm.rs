@@ -221,6 +221,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         consistency: ConsistencyModeV2::Crdt,
         actors: vec![ActorGenesisV2 {
             actor: work.target,
+            name: "counter".into(),
             parent: None,
             program: actor_program,
             initial_state: initial.clone(),
@@ -686,20 +687,32 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
         service: seed_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
-        actors: vec![ActorGenesisV2 {
-            actor: seed_work.target,
-            parent: None,
-            program: actor_program,
-            initial_state: initial.clone(),
-            crdt: false,
-            methods: vec![MethodPolicyV2 {
-                method: "start".into(),
-                schema: Hash([32; 32]),
-                policy: Hash([33; 32]),
-                public: true,
-                attested: false,
-            }],
-        }],
+        actors: vec![
+            ActorGenesisV2 {
+                actor: seed_work.target,
+                name: "root".into(),
+                parent: None,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "start".into(),
+                    schema: Hash([32; 32]),
+                    policy: Hash([33; 32]),
+                    public: true,
+                    attested: false,
+                }],
+            },
+            ActorGenesisV2 {
+                actor: ActorId([36; 32]),
+                name: "child".into(),
+                parent: Some(seed_work.target),
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                methods: vec![],
+            },
+        ],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
             authenticator: vec![35],
@@ -712,6 +725,20 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         panic!("guest install rejected")
     };
     assert_eq!(service.accumulate_host().commit_sequence(), 1);
+    assert_eq!(
+        LocalWorkSchedulerV2::resolve_root(service.accumulate_host(), "root").unwrap(),
+        Some(seed_work.target)
+    );
+    assert_eq!(
+        LocalWorkSchedulerV2::resolve_child(service.accumulate_host(), seed_work.target, "child")
+            .unwrap(),
+        Some(ActorId([36; 32]))
+    );
+    assert_eq!(
+        LocalWorkSchedulerV2::resolve_root(service.accumulate_host(), "child").unwrap(),
+        None,
+        "a child name cannot escape into the root namespace"
+    );
     let installed_rows = service.accumulate_host().row_count();
 
     let request = LocalWorkRequestV2 {

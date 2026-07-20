@@ -125,13 +125,23 @@ impl V2Wire for StoreHeaderV2 {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StateKeyV2 {
     ActorDescriptor(ActorId),
-    MethodPolicy { actor: ActorId, method: String },
-    ActorRow { actor: ActorId, key: Vec<u8> },
+    MethodPolicy {
+        actor: ActorId,
+        method: String,
+    },
+    ActorRow {
+        actor: ActorId,
+        key: Vec<u8>,
+    },
     Continuation(ActorId),
     Inbox(CallId),
     Outbox(CallId),
     Workflow(InvocationId),
     CrdtMaterialization(ActorId),
+    ActorName {
+        parent: Option<ActorId>,
+        name: String,
+    },
 }
 
 impl V2Wire for StateKeyV2 {
@@ -174,6 +184,11 @@ impl V2Wire for StateKeyV2 {
                 e.u8(7);
                 e.fixed(&actor.0);
             }
+            Self::ActorName { parent, name } => {
+                e.u8(8);
+                e.option(parent, |e, parent| e.fixed(&parent.0));
+                e.string(name);
+            }
         }
     }
 
@@ -201,6 +216,14 @@ impl V2Wire for StateKeyV2 {
             5 => Ok(Self::Outbox(CallId(d.fixed()?))),
             6 => Ok(Self::Workflow(InvocationId(d.fixed()?))),
             7 => Ok(Self::CrdtMaterialization(ActorId(d.fixed()?))),
+            8 => {
+                let parent = d.option(|d| d.fixed().map(ActorId))?;
+                let name = d.string()?;
+                if name.is_empty() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(Self::ActorName { parent, name })
+            }
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -445,9 +468,15 @@ mod tests {
             actor,
             method: "increment".into(),
         };
+        let name = StateKeyV2::ActorName {
+            parent: Some(actor),
+            name: "child".into(),
+        };
         assert_eq!(StateKeyV2::decode(&row.encode()).unwrap(), row);
         assert_eq!(StateKeyV2::decode(&policy.encode()).unwrap(), policy);
+        assert_eq!(StateKeyV2::decode(&name.encode()).unwrap(), name);
         assert_ne!(row.encode(), policy.encode());
+        assert_ne!(row.encode(), name.encode());
 
         let invalid = StateKeyV2::ActorRow { actor, key: vec![] };
         assert_eq!(
