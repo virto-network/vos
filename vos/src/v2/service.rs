@@ -232,7 +232,7 @@ impl ServiceDispatchError {
             Self::Pvm(error) => matches!(
                 error,
                 ServicePvmErrorV2::InvalidProgram
-                    | ServicePvmErrorV2::Panic
+                    | ServicePvmErrorV2::Panic { .. }
                     | ServicePvmErrorV2::OutOfGas { .. }
                     | ServicePvmErrorV2::PageFault { .. }
                     | ServicePvmErrorV2::UnreadableOutput

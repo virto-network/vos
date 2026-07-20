@@ -1051,15 +1051,15 @@ fn canonical_guest_rejects_a_nested_actor_without_the_reply_abi() {
         private_blobs: vec![],
     };
 
-    assert_eq!(
+    assert!(matches!(
         service.refine_actor_tree(
             &work.encode(),
             &imports,
             10_000_000,
             &NoRefineProtocolHostV2,
         ),
-        Err(ServicePvmErrorV2::Panic)
-    );
+        Err(ServicePvmErrorV2::Panic { .. })
+    ));
 }
 
 #[test]
@@ -2452,6 +2452,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         await_ordinal: 0,
         pending_call: None,
         causal_context: work.causal_context.clone(),
+        suspended_actors: vec![work.target],
         kernel_snapshot: vec![1],
     };
     let continuation_bytes = continuation.encode();
@@ -2754,6 +2755,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         await_ordinal: 0,
         pending_call: None,
         causal_context: delivered.work.causal_context.clone(),
+        suspended_actors: vec![delivered.work.target],
         kernel_snapshot: vec![2],
     };
     let delivery_continuation_bytes = delivery_continuation.encode();
@@ -2915,6 +2917,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         await_ordinal: 0,
         pending_call: Some(awaited_call),
         causal_context: caller.work.causal_context.clone(),
+        suspended_actors: vec![caller.work.target],
         kernel_snapshot: vec![4],
     }
     .encode();
