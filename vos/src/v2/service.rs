@@ -48,6 +48,29 @@ pub struct CommittedAttestationOutputV2 {
 }
 
 impl CommittedAttestationOutputV2 {
+    /// Produce the transport record consumed by macro-generated attested
+    /// handles. Only the reply published by successful guest Accumulate is
+    /// decoded; prepare/proof output alone cannot construct this record.
+    pub fn into_invocation_result(
+        self,
+        producer_name: String,
+        producer: ProducerId,
+    ) -> Result<crate::actors::client::AttestedInvocationResult, AttestationError> {
+        let reply = self
+            .published
+            .reply
+            .ok_or(AttestationError::InvalidStatement)?;
+        let value = <crate::value::Value as crate::Decode>::try_decode(&reply.result)
+            .ok_or(AttestationError::InvalidStatement)?;
+        Ok(crate::actors::client::AttestedInvocationResult {
+            value,
+            producer_name,
+            producer,
+            statement: self.preparation.statement,
+            proof: self.proof_bytes,
+        })
+    }
+
     /// Turn a committed runtime result into the portable application term.
     /// The generated method marker checks both the method name and the exact
     /// reply wire before the package can leave the runtime boundary.

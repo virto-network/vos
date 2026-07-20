@@ -28,7 +28,10 @@ use vos::v2::{
     ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
     TransitionV2, V2Wire, WorkEnvelopeV2, public_policy_hash, space_role_policy_hash,
 };
-use vos::{AttestedMethod, Decode, Encode, value::Msg};
+use vos::{
+    AttestedMethod, Decode, Encode,
+    value::{Msg, Value},
+};
 
 enum StartMethod {}
 
@@ -36,7 +39,7 @@ impl AttestedMethod<Vec<u8>> for StartMethod {
     const METHOD: &'static str = "start";
 
     fn claim_wire(claim: &Vec<u8>) -> Vec<u8> {
-        claim.clone()
+        Value::Bytes(claim.clone()).encode()
     }
 }
 
@@ -3237,7 +3240,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         reply: Some(ReplyRecordV2 {
             call_id: prepared.work.invocation.root_reply_id(),
             producer: prepared.work.target,
-            result: b"attested claim".to_vec(),
+            result: Value::Bytes(b"attested claim".to_vec()).encode(),
         }),
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
@@ -3277,6 +3280,14 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         .accumulate_attested(envelope.clone(), &prepared.imports, &mut producer)
         .expect("proof is available before guest Accumulate commits");
     assert_eq!(producer.calls, 1);
+    let invocation_result = committed
+        .clone()
+        .into_invocation_result("attested-actor".into(), ProducerId([0xA8; 32]))
+        .expect("committed proof output becomes the generated-handle transport");
+    assert_eq!(
+        invocation_result.value,
+        Value::Bytes(b"attested claim".to_vec())
+    );
     let application_package = committed
         .clone()
         .into_attestation::<Vec<u8>, StartMethod>(

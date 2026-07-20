@@ -483,6 +483,7 @@ impl<T, M> Attestation<T, M> {
             proof,
             _method: PhantomData,
         };
+        package.statement.validate()?;
         if package.statement.method != M::METHOD {
             return Err(AttestationError::WrongMethod);
         }

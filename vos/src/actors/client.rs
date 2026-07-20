@@ -39,6 +39,9 @@ pub enum ClientError {
     NotFound,
     /// `Context::child` resolved an actor outside the caller's owned tree.
     NotOwnedChild,
+    /// The runtime returned an attestation package whose typed method, claim
+    /// wire, or statement did not match the committed reply.
+    InvalidAttestation(crate::AttestationError),
 }
 
 impl core::fmt::Display for ClientError {
@@ -50,6 +53,7 @@ impl core::fmt::Display for ClientError {
             Self::Forbidden => write!(f, "permission denied: caller lacks the required role"),
             Self::NotFound => write!(f, "client: actor name was not found"),
             Self::NotOwnedChild => write!(f, "client: actor is not an owned child"),
+            Self::InvalidAttestation(error) => write!(f, "client: {error}"),
         }
     }
 }
@@ -79,6 +83,29 @@ pub trait Invoker {
         target: ServiceId,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_;
+}
+
+/// Runtime result for an attested invocation. The generated client decodes
+/// `value` with the ordinary method reply codec and then binds that preview to
+/// `statement` before exposing an [`Attestation`](crate::Attestation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttestedInvocationResult {
+    pub value: Value,
+    pub producer_name: String,
+    pub producer: crate::v2::ProducerId,
+    pub statement: crate::AttestationStatementV3,
+    pub proof: Vec<u8>,
+}
+
+/// Separate transport capability for methods declared `#[msg(attested)]`.
+/// Ordinary invokers cannot accidentally receive an unproved value from an
+/// attested generated handle.
+pub trait AttestationInvoker: Invoker {
+    fn invoke_attested(
+        &mut self,
+        target: ServiceId,
+        payload: Vec<u8>,
+    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_;
 }
 
 /// Implemented by every macro-generated `{Actor}Ref`. It binds the route-only
