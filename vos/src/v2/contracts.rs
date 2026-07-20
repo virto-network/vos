@@ -203,6 +203,28 @@ impl WorkEnvelopeV2 {
     pub fn hash(&self) -> Hash {
         Hash::digest(b"vos/work/v2", &[&self.encode()])
     }
+
+    /// Stable identity shared by every slice of one suspended workflow.
+    /// Volatile scheduling inputs (step, timeslot, arguments, consistency
+    /// frontier, and imported state) are deliberately excluded; service,
+    /// actor/program, method, caller, authorization, and consistency mode are
+    /// not allowed to change while an exact continuation is live.
+    pub fn workflow_identity(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.invocation.0);
+        e.fixed(&self.target.0);
+        e.fixed(&self.target_program.0);
+        e.string(&self.method);
+        encode_origin(&mut e, self.origin);
+        encode_auth(&mut e, &self.authorization);
+        e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
+        e.option(&self.parent_call, |e, id| e.fixed(&id.0));
+        e.u8(self.consistency as u8);
+        e.bool(self.proof_requested);
+        Hash::digest(b"vos/workflow/v2", &[&bytes])
+    }
 }
 
 /// Exactly-once identity of one consumable workflow slice.

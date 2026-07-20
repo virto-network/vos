@@ -216,6 +216,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     if !authorized(work, &policy) {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
+    if !valid_workflow_input(&tree, work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
     if policy.attested || work.proof_requested {
         return Ok(rejected(if transition.proof.is_none() {
             AccumulationRejectionV2::MissingProof
@@ -409,6 +412,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
     let workflow = WorkflowCheckpointV2 {
         input: work.input_id(),
+        workflow_identity: work.workflow_identity(),
         work_hash,
         transition_hash,
     };
@@ -656,6 +660,25 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
     }
 }
 
+fn valid_workflow_input<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    work: &super::WorkEnvelopeV2,
+) -> GuestResult<bool, S::Error> {
+    let checkpoint =
+        tree_get_wire::<_, WorkflowCheckpointV2>(tree, &StateKeyV2::Workflow(work.invocation))?;
+    let continuation = tree_get_wire::<_, BlobRefV2>(tree, &StateKeyV2::Continuation(work.target))?;
+    Ok(match (work.workflow_step, checkpoint, continuation) {
+        (0, None, None) => true,
+        (0, _, _) => false,
+        (step, Some(checkpoint), Some(_)) => {
+            checkpoint.input.invocation == work.invocation
+                && checkpoint.input.workflow_step.checked_add(1) == Some(step)
+                && checkpoint.workflow_identity == work.workflow_identity()
+        }
+        _ => false,
+    })
+}
+
 fn referenced_blobs<'a>(
     work: &'a super::WorkEnvelopeV2,
     transition: &'a super::TransitionV2,
@@ -857,9 +880,9 @@ fn rejected(rejection: AccumulationRejectionV2) -> AccumulationResultV2 {
 mod tests {
     use super::*;
     use crate::v2::{
-        ActorWriteV2, CrdtMaterializationV2, CrdtOperationV2, DeploymentId, GasAccountingV2,
-        ImportedActorV2, InvocationId, OperationId, Origin, ProgramId, ReplyRecordV2,
-        RootServiceId, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
+        ActorWriteV2, ContinuationChangeV2, CrdtMaterializationV2, CrdtOperationV2, DeploymentId,
+        GasAccountingV2, ImportedActorV2, InvocationId, OperationId, Origin, ProgramId,
+        ReplyRecordV2, RootServiceId, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1193,6 +1216,120 @@ mod tests {
             store, before,
             "missing canonical actor code must stage no service changes"
         );
+    }
+
+    #[test]
+    fn continuation_slices_are_guest_bound_to_one_workflow_identity_and_next_step() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let first_work = linear_work(initial, install.resulting_state_root.unwrap());
+        let continuation_bytes = b"opaque canonical JAR snapshot".to_vec();
+        let continuation = store.provide_blob(&continuation_bytes).unwrap();
+        let mut checkpoint = linear_transition(&first_work, b"checkpoint");
+        checkpoint.reply = None;
+        checkpoint.continuations.push(ContinuationChangeV2 {
+            actor: first_work.target,
+            expected: None,
+            replacement: Some(continuation.clone()),
+        });
+        checkpoint.exported_blobs.push(continuation.clone());
+        let first = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: first_work.clone(),
+                transition: checkpoint,
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted { receipt, .. } = first else {
+            panic!("checkpoint rejected")
+        };
+
+        let mut resume = first_work;
+        resume.workflow_step = 1;
+        resume.base = ConsistencyBaseV2::Linear {
+            revision: receipt.sequence,
+            state_root: receipt.resulting_state_root.unwrap(),
+        };
+        resume.imported_actors[0].state = BlobRefV2::of_bytes(b"checkpoint");
+        resume.imported_actors[0].continuation = Some(continuation.clone());
+        let mut completed = linear_transition(&resume, b"done");
+        completed.continuations.push(ContinuationChangeV2 {
+            actor: resume.target,
+            expected: Some(continuation.hash),
+            replacement: None,
+        });
+
+        let mut reentrant = resume.clone();
+        reentrant.invocation = InvocationId([99; 32]);
+        reentrant.workflow_step = 0;
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    transition: linear_transition(&reentrant, b"reentrant"),
+                    work: reentrant,
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(
+            store, before,
+            "a fresh invocation cannot enter a suspended actor"
+        );
+
+        let mut changed_origin = resume.clone();
+        changed_origin.origin = Origin::Actor(ActorId([99; 32]));
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    transition: {
+                        let mut transition = completed.clone();
+                        transition.consumed_input = changed_origin.input_id();
+                        transition
+                    },
+                    work: changed_origin,
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
+
+        let mut skipped = resume.clone();
+        skipped.workflow_step = 2;
+        let mut skipped_transition = completed.clone();
+        skipped_transition.consumed_input = skipped.input_id();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: skipped,
+                    transition: skipped_transition,
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
+
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: resume,
+                    transition: completed,
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
     }
 
     fn message(
