@@ -43,7 +43,8 @@ impl StoreHeaderV2 {
             service,
             consistency,
             revision: 0,
-            state_root: (consistency != ConsistencyModeV2::Crdt).then_some(Hash::ZERO),
+            state_root: (consistency != ConsistencyModeV2::Crdt)
+                .then(super::state_tree::empty_state_root),
             crdt_heads: Vec::new(),
             snapshot_version: super::SNAPSHOT_VERSION,
         }
