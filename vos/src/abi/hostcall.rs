@@ -143,8 +143,8 @@ mod tests {
 
     #[test]
     fn v2_actor_handles_do_not_shadow_supplied_capabilities() {
-        let actor_handles =
-            crate::v2::TARGET_ACTOR_HANDLE_SLOT..crate::v2::TARGET_ACTOR_HANDLE_SLOT + 5;
+        let actor_handles = crate::v2::TARGET_ACTOR_HANDLE_SLOT
+            ..crate::v2::TARGET_ACTOR_HANDLE_SLOT + crate::v2::MAX_ROOT_TREE_ACTORS as u8;
         let occupied = [
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             GROW_HEAP as u8,
@@ -163,5 +163,12 @@ mod tests {
                 .into_iter()
                 .all(|slot| !actor_handles.contains(&slot))
         );
+        assert_eq!(actor_handles.end - actor_handles.start, 63);
+        assert!(
+            crate::v2::ACTOR_CALLABLE_BASE_SLOT
+                .checked_add(crate::v2::MAX_ROOT_TREE_ACTORS as u8 - 1)
+                .is_some_and(|last| last < crate::v2::ACTOR_IPC_CAP_SLOT)
+        );
+        assert!(crate::v2::ACTOR_IPC_CAP_SLOT < crate::v2::ACTOR_SAVED_ARGS_CAP_SLOT);
     }
 }

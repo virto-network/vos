@@ -11,14 +11,14 @@ use javm::cap::{Access, Cap, DataCap, ProtocolCap};
 use javm::kernel::{DispatchResult, DormantProgram, InvocationKernel, KernelResult};
 use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
 use javm::snapshot::KernelSnapshot;
-use javm::vm_pool::{MAX_CODE_CAPS, VmState};
+use javm::vm_pool::VmState;
 
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
     ActorSliceInputV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2,
-    ContinuationSnapshotV2, CrdtChangeV2, Hash, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC,
-    RefineImportsV2, SpaceRoleCredentialV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
-    space_role_for_policy,
+    ContinuationSnapshotV2, CrdtChangeV2, Hash, ImportedBlobV2, MAX_ROOT_TREE_ACTORS, ProgramId,
+    REFINE_ENTRY_IC, RefineImportsV2, SpaceRoleCredentialV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire,
+    WorkEnvelopeV2, space_role_for_policy,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -217,7 +217,7 @@ impl ServicePvmV2 {
         imports
             .validate_for(&work)
             .map_err(|_| ServicePvmErrorV2::InvalidRefineImports)?;
-        if work.imported_actors.len() >= MAX_CODE_CAPS {
+        if work.imported_actors.len() > MAX_ROOT_TREE_ACTORS {
             return Err(ServicePvmErrorV2::TooManyImportedActors);
         }
 

@@ -306,7 +306,14 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let actor_program = ProgramId::of_pvm(&actor);
     let state_bytes = Vec::new();
     let state = BlobRefV2::of_bytes(&state_bytes);
-    let work = work(actor_program, state.clone());
+    let mut work = work(actor_program, state.clone());
+    work.imported_actors.push(ImportedActorV2 {
+        actor: ActorId([6; 32]),
+        program: actor_program,
+        state: state.clone(),
+        causal_states: vec![],
+        continuation: None,
+    });
     let imports = RefineImportsV2 {
         programs: vec![ImportedProgramV2 {
             program: actor_program,

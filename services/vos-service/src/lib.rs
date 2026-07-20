@@ -56,7 +56,7 @@ mod guest {
     );
 
     /// Run one pure actor-tree slice through the target actor's owning JAR
-    /// HANDLE. Slot 80 is supplied at invocation setup; it is not a JAM
+    /// HANDLE. Slot 144 is supplied at invocation setup; it is not a JAM
     /// protocol capability and no host callback performs the actor execution.
     #[unsafe(no_mangle)]
     extern "C" fn vos_service_refine(
@@ -79,6 +79,8 @@ mod guest {
             fail_closed();
         }
 
+        provision_same_tree_callables(&work);
+
         // Actor manifests use slot 0 for their standalone argument window,
         // while JAR reserves slot 0 as the callee IPC slot. Preserve that
         // canonical manifest capability in a spare slot for the duration of
@@ -93,14 +95,13 @@ mod guest {
             fail_closed();
         }
 
-        let actor_output_len = ecall::ecall6(
-            vos::v2::TARGET_ACTOR_HANDLE_SLOT as u32,
+        let actor_output_len = ecall::call_cap(
+            ecall::local_cap_ref(vos::v2::TARGET_ACTOR_HANDLE_SLOT),
+            vos::v2::ACTOR_IPC_CAP_SLOT,
             vos::v2::ACTOR_IPC_BASE_PAGE as u64 * 4096,
             actor_input_len as u64,
             actor_ipc_capacity as u64,
             vos::v2::NESTED_ACTOR_CALL_MAGIC,
-            0,
-            vos::v2::ACTOR_IPC_CAP_SLOT as u64,
         ) as usize;
         if !ecall::move_cap(saved_actor_args, actor_args)
             || actor_output_len == 0
@@ -278,6 +279,53 @@ mod guest {
             address: output_address as u64,
             len: encoded.len() as u64,
         }
+    }
+
+    /// Give every actor a directory-indexed CALLABLE for each other idle actor
+    /// in its owned tree. The generic service retains the HANDLEs; DOWNGRADE
+    /// is the ordinary JAM/JAR authority-narrowing operation and does not add
+    /// a VOS-specific kernel call surface.
+    fn provision_same_tree_callables(work: &WorkEnvelopeV2) {
+        if work.imported_actors.len() > vos::v2::MAX_ROOT_TREE_ACTORS {
+            fail_closed();
+        }
+        for destination in &work.imported_actors {
+            let destination_handle = actor_handle_slot(work, destination.actor);
+            for (source_index, source) in work.imported_actors.iter().enumerate() {
+                if source.actor == destination.actor || source.continuation.is_some() {
+                    continue;
+                }
+                let source_handle = actor_handle_slot(work, source.actor);
+                let callable_slot = vos::v2::ACTOR_CALLABLE_BASE_SLOT
+                    .checked_add(source_index as u8)
+                    .unwrap_or_else(|| fail_closed());
+                if !ecall::downgrade_cap(
+                    ecall::local_cap_ref(source_handle),
+                    ecall::cap_ref_through_handle(destination_handle, callable_slot),
+                ) {
+                    fail_closed();
+                }
+            }
+        }
+    }
+
+    /// `ServicePvmV2` installs the target first and the remaining canonical
+    /// actor-ID order after it. Recompute that physical HANDLE slot from the
+    /// consensus work directory without trusting a native routing table.
+    fn actor_handle_slot(work: &WorkEnvelopeV2, actor: vos::v2::ActorId) -> u8 {
+        if actor == work.target {
+            return vos::v2::TARGET_ACTOR_HANDLE_SLOT;
+        }
+        let ordinal = work
+            .imported_actors
+            .iter()
+            .filter(|candidate| candidate.actor != work.target)
+            .position(|candidate| candidate.actor == actor)
+            .unwrap_or_else(|| fail_closed());
+        vos::v2::TARGET_ACTOR_HANDLE_SLOT
+            .checked_add(1)
+            .and_then(|slot| slot.checked_add(ordinal as u8))
+            .unwrap_or_else(|| fail_closed())
     }
 
     /// Validate and stage one v2 install/transition using only standard JAM

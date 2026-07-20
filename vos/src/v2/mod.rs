@@ -110,10 +110,18 @@ pub const ACCUMULATE_ENTRY_IC: u32 = 5;
 /// Owning HANDLE through which the generic service enters the target actor VM.
 /// This is a JAR capability-table slot supplied at invocation setup, not a JAM
 /// protocol capability or hostcall number.
-pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 80;
+pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 144;
+/// Maximum actor programs in one root tree. JAR invocation layouts admit at
+/// most 64 code capabilities including the generic service itself.
+pub const MAX_ROOT_TREE_ACTORS: usize = 63;
+
+/// First per-actor CALLABLE slot used for same-tree routes. The canonical
+/// actor directory index selects the exact slot in every actor CNode.
+pub const ACTOR_CALLABLE_BASE_SLOT: u8 = 128;
 
 /// Move-only DATA capability used for service↔actor slice input/output.
-pub const ACTOR_IPC_CAP_SLOT: u8 = 90;
+/// Kept above the complete root HANDLE window (144..=206).
+pub const ACTOR_IPC_CAP_SLOT: u8 = 240;
 /// Temporary actor-CNode slot used while CALL owns the reserved IPC slot 0.
 pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;
 /// High virtual page kept outside transpiler-owned actor memory layouts.
