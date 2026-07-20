@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use javm::kernel::InvocationKernel;
 
+use crate::attestation::AttestationProofHostV2;
+
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulationReceiptV2, BlobRefV2,
@@ -634,6 +636,22 @@ impl LocalJamStoreV2 {
     /// same guest boundary from consensus-authoritative deployment state.
     pub fn allow_install(&mut self, genesis: &ServiceGenesisV2) {
         self.install_allowlist.insert(install_hash(genesis));
+    }
+}
+
+impl AttestationProofHostV2 for LocalJamStoreV2 {
+    fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
+        if !request.proof_blob.matches(proof) {
+            return false;
+        }
+        self.allow_proof(request);
+        true
+    }
+}
+
+impl<B> AttestationProofHostV2 for DurableJamStoreV2<B> {
+    fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
+        self.local.make_proof_available(request, proof)
     }
 }
 

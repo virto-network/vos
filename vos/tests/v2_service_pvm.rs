@@ -8,6 +8,9 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use vos::attestation::{
+    AttestationProofProducerV2, AttestationProofRequestV2, ProducedAttestationProofV2,
+};
 use vos::network::RaftRpcHandler;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
@@ -30,6 +33,39 @@ use vos::{Decode, Encode, value::Msg};
 struct FailableCommittedImages {
     image: Option<Vec<u8>>,
     fail_next_commit: bool,
+}
+
+#[derive(Debug)]
+struct CanonicalTestProofProducer {
+    trace: Hash,
+    proof: Vec<u8>,
+    calls: usize,
+}
+
+impl AttestationProofProducerV2 for CanonicalTestProofProducer {
+    type Error = ();
+
+    fn prove(
+        &mut self,
+        request: &AttestationProofRequestV2<'_>,
+    ) -> Result<ProducedAttestationProofV2, Self::Error> {
+        request.validate().map_err(|_| ())?;
+        assert_eq!(
+            request
+                .imports
+                .programs
+                .iter()
+                .find(|program| program.program == request.work.target_program)
+                .map(|program| ProgramId::of_pvm(&program.pvm)),
+            Some(request.work.target_program),
+            "the proof request carries the live canonical actor PVM"
+        );
+        self.calls += 1;
+        Ok(ProducedAttestationProofV2 {
+            trace: self.trace,
+            proof: self.proof.clone(),
+        })
+    }
 }
 
 impl CommittedImageStoreV2 for FailableCommittedImages {
@@ -2873,6 +2909,149 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         }
     );
     assert_eq!(checkpoint_receipt.sequence + 1, header.revision);
+}
+
+#[test]
+fn attested_driver_proves_before_guest_accumulate_commits() {
+    let elf = service_elf();
+    let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = b"canonical attested actor bytes".to_vec();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"attested initial state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut seed = work(actor_program, initial.clone());
+    seed.service.service_program = service_program;
+
+    let genesis = ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: seed.method.clone(),
+                schema: Hash([0xA1; 32]),
+                policy: Hash([0xA2; 32]),
+                public: true,
+                attested: true,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([0xA3; 32]),
+            authenticator: vec![0xA4],
+        },
+    };
+    let install = AccumulateRequestV2::Install(genesis);
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let mut service = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    authorize_install(&mut service, &install);
+    let AccumulationResultV2::Installed(installed) = service.accumulate(&install).unwrap().result
+    else {
+        panic!("attested service install failed")
+    };
+
+    let prepared = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: seed.invocation,
+            workflow_step: 0,
+            logical_timeslot: seed.logical_timeslot,
+            target: seed.target,
+            method: seed.method,
+            arguments: seed.arguments,
+            origin: seed.origin,
+            authorization: seed.authorization,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: true,
+        },
+    )
+    .expect("attested work is schedulable");
+    assert_eq!(
+        prepared.work.base,
+        ConsistencyBaseV2::Linear {
+            revision: 0,
+            state_root: installed.resulting_state_root.unwrap(),
+        }
+    );
+    let transition = TransitionV2 {
+        service: prepared.work.service.clone(),
+        consumed_input: prepared.work.input_id(),
+        target_program: prepared.work.target_program,
+        base: prepared.work.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: prepared.work.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"attested state".to_vec()),
+        }],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: prepared.work.invocation.root_reply_id(),
+            producer: prepared.work.target,
+            result: b"attested claim".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let envelope = AccumulationEnvelopeV2 {
+        work: prepared.work,
+        transition,
+        provided_blobs: vec![],
+    };
+    let before = service.accumulate_host().snapshot();
+    let mut invalid = CanonicalTestProofProducer {
+        trace: Hash::ZERO,
+        proof: vec![],
+        calls: 0,
+    };
+    assert!(matches!(
+        service.accumulate_attested(envelope.clone(), &prepared.imports, &mut invalid),
+        Err(vos::v2::AttestedServiceErrorV2::InvalidProducedProof)
+    ));
+    assert_eq!(invalid.calls, 1);
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before),
+        "proof production failure cannot commit the prepared transition"
+    );
+
+    let proof_bytes = b"canonical attestation proof".to_vec();
+    let mut producer = CanonicalTestProofProducer {
+        trace: Hash([0xA5; 32]),
+        proof: proof_bytes.clone(),
+        calls: 0,
+    };
+    let committed = service
+        .accumulate_attested(envelope, &prepared.imports, &mut producer)
+        .expect("proof is available before guest Accumulate commits");
+    assert_eq!(producer.calls, 1);
+    assert_eq!(committed.proof_bytes, proof_bytes);
+    assert_eq!(committed.preparation.receipt.sequence, 1);
+    assert_eq!(committed.published.proof, Some(committed.proof));
+    assert_eq!(service.accumulate_host().commit_sequence(), 2);
 }
 
 #[test]
