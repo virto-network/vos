@@ -31,6 +31,7 @@ pub use contracts::{
     ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
     GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
     MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2, RefineError, RefineImportsV2,
+    RefineOutputV2,
     ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2,
     WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };

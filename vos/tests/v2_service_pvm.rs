@@ -12,6 +12,7 @@ use vos::v2::{
     BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, GasAccountingV2, Hash,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2, MethodPolicyV2,
     NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, ReplyRecordV2,
+    RefineOutputV2,
     RootServiceId, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
     TransitionV2, V2Wire, WorkEnvelopeV2,
 };
@@ -314,7 +315,9 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
             &NoRefineProtocolHostV2,
         )
         .expect("generic Refine completes");
-    let transition = TransitionV2::decode(&output.bytes).expect("Refine returns TransitionV2");
+    let transition = RefineOutputV2::decode(&output.bytes)
+        .expect("Refine returns RefineOutputV2")
+        .transition;
     assert_eq!(transition.service, work.service);
     assert_eq!(transition.consumed_input, work.input_id());
     assert_eq!(transition.target_program, work.target_program);
@@ -519,7 +522,12 @@ fn yielding_actor_restores_exactly_after_restart() {
         recompiled_first, first_output,
         "interpreter and recompiler checkpoints must be identical"
     );
-    let first = TransitionV2::decode(&first_output.bytes).unwrap();
+    let refined_first = RefineOutputV2::decode(&first_output.bytes).unwrap();
+    let first = refined_first.transition;
+    let mut first_candidate_blobs = refined_first.candidate_blobs;
+    first_candidate_blobs.extend(first_output.exported_blobs.clone());
+    first_candidate_blobs.sort_by_key(|blob| blob.reference.hash);
+    first_candidate_blobs.dedup();
     assert!(first.reply.is_none(), "yield must not publish a reply");
     assert_eq!(first.continuations.len(), 1);
     let first_continuation = first.continuations[0].replacement.clone().unwrap();
@@ -533,16 +541,11 @@ fn yielding_actor_restores_exactly_after_restart() {
         .and_then(|write| write.value.clone())
         .expect("checkpoint commits the mutation before await");
     assert_eq!(u32::decode(&checkpoint_state), 1);
-    for artifact in &first_output.exported_blobs {
-        committed
-            .accumulate_host_mut()
-            .preimages
-            .insert(artifact.reference.hash.0, artifact.bytes.clone());
-    }
     let checkpoint_outcome = committed
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: first_work.clone(),
             transition: first.clone(),
+            provided_blobs: first_candidate_blobs,
         }))
         .unwrap();
     let AccumulationResultV2::Accepted {
@@ -614,7 +617,12 @@ fn yielding_actor_restores_exactly_after_restart() {
         recompiled_resumed, resumed_output,
         "interpreter and recompiler resumes must be identical"
     );
-    let resumed = TransitionV2::decode(&resumed_output.bytes).unwrap();
+    let refined_resumed = RefineOutputV2::decode(&resumed_output.bytes).unwrap();
+    let resumed = refined_resumed.transition;
+    let mut resumed_candidate_blobs = refined_resumed.candidate_blobs;
+    resumed_candidate_blobs.extend(resumed_output.exported_blobs.clone());
+    resumed_candidate_blobs.sort_by_key(|blob| blob.reference.hash);
+    resumed_candidate_blobs.dedup();
     assert!(
         resumed.reply.is_some(),
         "handler completes after exact resume"
@@ -644,6 +652,7 @@ fn yielding_actor_restores_exactly_after_restart() {
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: resumed_work,
             transition: resumed.clone(),
+            provided_blobs: resumed_candidate_blobs,
         }))
         .unwrap();
     let AccumulationResultV2::Accepted {
@@ -756,6 +765,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
         work,
         transition: transition.clone(),
+        provided_blobs: vec![],
     });
     let applied_output = service.accumulate(&apply).expect("guest apply completes");
     let AccumulationResultV2::Accepted {

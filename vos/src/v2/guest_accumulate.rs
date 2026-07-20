@@ -250,6 +250,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(rejection) = validate_crdt(tree.store_ref(), &header, work, transition)? {
         return Ok(rejected(rejection));
     }
+    if header.consistency != ConsistencyModeV2::Crdt && header.revision == u64::MAX {
+        return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
+    }
 
     for imported in &work.imported_actors {
         if !tree
@@ -342,10 +345,24 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     }
     for reference in referenced_blobs(work, transition) {
-        if !blob_available(tree.store_ref(), reference)? {
+        let supplied = envelope
+            .provided_blobs
+            .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+            .ok()
+            .is_some_and(|index| envelope.provided_blobs[index].reference == *reference);
+        if !supplied && !blob_available(tree.store_ref(), reference)? {
             return Ok(rejected(AccumulationRejectionV2::MissingBlob(
                 reference.hash,
             )));
+        }
+    }
+    for candidate in &envelope.provided_blobs {
+        let actual = tree
+            .store_mut()
+            .provide_blob(&candidate.bytes)
+            .map_err(GuestAccumulateError::Storage)?;
+        if actual != candidate.reference {
+            return Err(GuestAccumulateError::CorruptStore);
         }
     }
 
@@ -436,10 +453,10 @@ fn apply<S: GuestAccumulateStoreV2>(
             header.crdt_heads = heads.into_iter().collect();
             (None, header.crdt_heads.clone(), change.causal_height)
         } else {
-            header.revision = match header.revision.checked_add(1) {
-                Some(revision) => revision,
-                None => return Ok(rejected(AccumulationRejectionV2::SequenceOverflow)),
-            };
+            header.revision = header
+                .revision
+                .checked_add(1)
+                .expect("linear sequence overflow was validated before staging");
             header.state_root = Some(header.service_root);
             (Some(header.service_root), Vec::new(), header.revision)
         };
@@ -619,7 +636,11 @@ fn canonical_transition_shape(
     let writes = transition.writes.iter().map(|write| {
         let mut key = write.actor.0.to_vec();
         key.extend_from_slice(&write.key);
-        (write.actor == work.target && !write.key.is_empty(), key)
+        let valid = write.actor == work.target
+            && !write.key.is_empty()
+            && (write.key.as_slice() != crate::actors::lifecycle::STATE_KEY_BYTES
+                || write.value.is_some());
+        (valid, key)
     });
     let mut previous = None;
     for (valid, key) in writes {
@@ -947,8 +968,8 @@ mod tests {
     use super::*;
     use crate::v2::{
         ActorWriteV2, ContinuationChangeV2, CrdtMaterializationV2, CrdtOperationV2, DeploymentId,
-        GasAccountingV2, ImportedActorV2, InvocationId, OperationId, Origin, ProgramId,
-        ReplyRecordV2, RootServiceId, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
+        GasAccountingV2, ImportedActorV2, ImportedBlobV2, InvocationId, OperationId, Origin,
+        ProgramId, ReplyRecordV2, RootServiceId, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1177,6 +1198,7 @@ mod tests {
         let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: work.clone(),
             transition: transition.clone(),
+            provided_blobs: Vec::new(),
         });
 
         let accepted = execute_guest_accumulate(&mut store, &request).unwrap();
@@ -1234,15 +1256,25 @@ mod tests {
         let first = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&work, b"after"),
             work,
+            provided_blobs: Vec::new(),
         });
         execute_guest_accumulate(&mut store, &first).unwrap();
 
         let current_state = BlobRefV2::of_bytes(b"after");
         let mut stale_work = linear_work(current_state, root);
         stale_work.invocation = InvocationId([11; 32]);
+        let candidate = ImportedBlobV2 {
+            reference: BlobRefV2::of_bytes(b"must-not-stage"),
+            bytes: b"must-not-stage".to_vec(),
+        };
+        let mut stale_transition = linear_transition(&stale_work, b"late");
+        stale_transition
+            .exported_blobs
+            .push(candidate.reference.clone());
         let stale = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-            transition: linear_transition(&stale_work, b"late"),
+            transition: stale_transition,
             work: stale_work,
+            provided_blobs: vec![candidate.clone()],
         });
         let before = store.clone();
         assert!(matches!(
@@ -1250,6 +1282,7 @@ mod tests {
             AccumulationResultV2::Rejected(AccumulationRejectionV2::StaleLinearWork { .. })
         ));
         assert_eq!(store, before);
+        assert!(!store.blobs.contains_key(&candidate.reference.hash));
 
         let AccumulateRequestV2::Apply(mut unauthorized) = stale else {
             unreachable!()
@@ -1281,7 +1314,11 @@ mod tests {
         assert_eq!(
             execute_guest_accumulate(
                 &mut store,
-                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition }),
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: Vec::new(),
+                }),
             )
             .unwrap(),
             rejected(AccumulationRejectionV2::WrongProgram)
@@ -1304,7 +1341,11 @@ mod tests {
         assert_eq!(
             execute_guest_accumulate(
                 &mut store,
-                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition }),
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: Vec::new(),
+                }),
             )
             .unwrap(),
             rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
@@ -1354,6 +1395,7 @@ mod tests {
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work: first_work.clone(),
                     transition: wrong_transition,
+                    provided_blobs: Vec::new(),
                 }),
             )
             .unwrap(),
@@ -1375,6 +1417,7 @@ mod tests {
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work: first_work.clone(),
                     transition: missing_outbox,
+                    provided_blobs: Vec::new(),
                 }),
             )
             .unwrap(),
@@ -1387,6 +1430,7 @@ mod tests {
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: first_work.clone(),
                 transition: checkpoint,
+                provided_blobs: Vec::new(),
             }),
         )
         .unwrap();
@@ -1419,6 +1463,7 @@ mod tests {
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     transition: linear_transition(&reentrant, b"reentrant"),
                     work: reentrant,
+                    provided_blobs: Vec::new(),
                 }),
             )
             .unwrap(),
@@ -1441,6 +1486,7 @@ mod tests {
                         transition
                     },
                     work: changed_origin,
+                    provided_blobs: Vec::new(),
                 }),
             )
             .unwrap(),
@@ -1458,6 +1504,7 @@ mod tests {
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work: skipped,
                     transition: skipped_transition,
+                    provided_blobs: Vec::new(),
                 }),
             )
             .unwrap(),
@@ -1471,6 +1518,7 @@ mod tests {
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work: resume,
                     transition: completed,
+                    provided_blobs: Vec::new(),
                 }),
             )
             .unwrap(),
@@ -1520,6 +1568,7 @@ mod tests {
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: valid_work,
                 transition: valid,
+                provided_blobs: Vec::new(),
             }),
         )
         .unwrap();
@@ -1536,7 +1585,11 @@ mod tests {
             let before = store.clone();
             let result = execute_guest_accumulate(
                 &mut store,
-                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition }),
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: Vec::new(),
+                }),
             )
             .unwrap();
             assert_eq!(store, before);
@@ -1580,6 +1633,7 @@ mod tests {
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work,
                     transition: collision,
+                    provided_blobs: Vec::new(),
                 }),
             )
             .unwrap(),
@@ -1665,7 +1719,7 @@ mod tests {
     fn crdt_nodes_heads_and_materializations_are_committed_by_the_guest() {
         let mut store = MemStore::default();
         let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
-        let materialized = store.provide_blob(b"one").unwrap();
+        let materialized = BlobRefV2::of_bytes(b"one");
         let work = crdt_work(initial, 20, Vec::new());
         let transition = crdt_transition(&work, materialized.clone(), 1);
         let cid = transition.crdt_change.as_ref().unwrap().cid();
@@ -1674,6 +1728,10 @@ mod tests {
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work,
                 transition: transition.clone(),
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: materialized.clone(),
+                    bytes: b"one".to_vec(),
+                }],
             }),
         )
         .unwrap();
@@ -1682,20 +1740,25 @@ mod tests {
         };
         assert_eq!(receipt.resulting_crdt_heads, vec![cid]);
         assert_eq!(receipt.sequence, 1);
+        assert_eq!(store.blobs.get(&materialized.hash), Some(&b"one".to_vec()));
         assert_eq!(
             CrdtChangeV2::decode(store.rows.get(&crdt_node_storage_key(cid)).unwrap()).unwrap(),
             transition.crdt_change.clone().unwrap()
         );
 
-        let next_materialized = store.provide_blob(b"two").unwrap();
+        let next_materialized = BlobRefV2::of_bytes(b"two");
         let next_work = crdt_work(materialized, 21, vec![cid]);
-        let next = crdt_transition(&next_work, next_materialized, 2);
+        let next = crdt_transition(&next_work, next_materialized.clone(), 2);
         let next_cid = next.crdt_change.as_ref().unwrap().cid();
         let accepted = execute_guest_accumulate(
             &mut store,
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: next_work,
                 transition: next,
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: next_materialized,
+                    bytes: b"two".to_vec(),
+                }],
             }),
         )
         .unwrap();
@@ -1715,6 +1778,7 @@ mod tests {
         let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&work, b"after"),
             work,
+            provided_blobs: Vec::new(),
         });
         let mut staging = committed.clone();
         staging.writes_before_failure = Some(3);
