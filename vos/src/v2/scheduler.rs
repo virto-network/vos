@@ -10,12 +10,14 @@ use alloc::vec::Vec;
 use core::convert::Infallible;
 
 use super::causal::{CausalFrontierError, load_causal_frontier};
+use super::contracts::crdt_change_blob_references;
 use super::{
     AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, DecodeError,
-    DeliveryEnvelopeV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
-    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2,
-    V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2, WorkflowOperationV2, crdt_node_storage_key,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2,
+    CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2,
+    Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
+    WorkflowOperationV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -69,6 +71,8 @@ pub enum ScheduleErrorV2 {
     InvalidInbox(super::CallId),
     DeadlineExpired(super::CallId),
     MissingCausalDependency(super::Hash),
+    MissingNodeReceipt(super::Hash),
+    InvalidNodeReceipt(super::Hash),
     CorruptCausalDag,
     InvalidDelivery,
     NonCanonicalImports,
@@ -91,6 +95,59 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    /// Export the complete authenticated causal DAG for another replica. This
+    /// is a read-only transport helper: the destination still submits the
+    /// envelope to physical IC-5, where guest Accumulate verifies every node
+    /// receipt, dependency, blob, and workflow operation before committing.
+    pub fn prepare_crdt_sync(
+        store: &LocalJamStoreV2,
+    ) -> Result<CrdtSyncEnvelopeV2, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        if header.consistency != ConsistencyModeV2::Crdt {
+            return Err(ScheduleErrorV2::UnsupportedConsistency(header.consistency));
+        }
+        if header.crdt_heads.is_empty() {
+            return Err(ScheduleErrorV2::CorruptCausalDag);
+        }
+        let frontier = match load_causal_frontier(&header.crdt_heads, |cid| {
+            Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(Vec::from))
+        }) {
+            Ok(frontier) => frontier,
+            Err(CausalFrontierError::Missing(cid)) => {
+                return Err(ScheduleErrorV2::MissingCausalDependency(cid));
+            }
+            Err(CausalFrontierError::Corrupt) => {
+                return Err(ScheduleErrorV2::CorruptCausalDag);
+            }
+            Err(CausalFrontierError::Storage(error)) => match error {},
+        };
+        let mut blobs = BTreeMap::new();
+        let mut nodes = Vec::new();
+        for (cid, change) in frontier.nodes_in_causal_order() {
+            let receipt_bytes = store
+                .row(&crdt_node_receipt_storage_key(cid))
+                .ok_or(ScheduleErrorV2::MissingNodeReceipt(cid))?;
+            let receipt = super::AccumulationReceiptV2::decode(receipt_bytes)
+                .map_err(|_| ScheduleErrorV2::InvalidNodeReceipt(cid))?;
+            for reference in crdt_change_blob_references(change) {
+                import_blob(store, &mut blobs, reference)?;
+            }
+            nodes.push(CrdtSyncNodeV2 {
+                change: change.clone(),
+                receipt,
+            });
+        }
+        nodes.sort_by_key(|node| node.change.cid());
+        let envelope = CrdtSyncEnvelopeV2 {
+            service: header.service,
+            advertised_heads: header.crdt_heads,
+            nodes,
+            provided_blobs: blobs.into_values().collect(),
+        };
+        CrdtSyncEnvelopeV2::decode(&envelope.encode())
+            .map_err(|_| ScheduleErrorV2::CorruptCausalDag)
+    }
+
     /// Build the exact destination Accumulate input for one finalized
     /// cross-root outbox record. This is read-only scheduling: only the
     /// physical service PVM may verify the source receipt and commit the inbox.

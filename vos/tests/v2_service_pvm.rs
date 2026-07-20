@@ -208,8 +208,8 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     work.base_causal_height = Some(0);
 
     let mut host = LocalJamStoreV2::default();
-    assert_eq!(host.import_blob(initial_bytes), initial);
-    assert_eq!(host.import_program(actor_pvm), actor_program);
+    assert_eq!(host.import_blob(initial_bytes.clone()), initial);
+    assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
@@ -304,6 +304,62 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     assert!(published.reply.is_some());
     assert!(
         service
+            .accumulate_host()
+            .blob(&refined.exported_blobs[0].reference)
+            .is_some()
+    );
+
+    // A second replica imports the authenticated DAG node through physical
+    // IC-5. The host only supplies receipt verification and atomic storage;
+    // the service guest validates and materializes the synced workflow.
+    let mut replica_host = LocalJamStoreV2::default();
+    assert_eq!(replica_host.import_blob(initial_bytes), initial);
+    assert_eq!(replica_host.import_program(actor_pvm), actor_program);
+    let mut replica = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        replica_host,
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let AccumulateRequestV2::Install(genesis) = &install else {
+        unreachable!()
+    };
+    replica.accumulate_host_mut().allow_install(genesis);
+    assert!(matches!(
+        replica.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+    replica
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: receipt.clone(),
+        });
+    let sync = AccumulateRequestV2::SyncCrdt(
+        LocalWorkSchedulerV2::prepare_crdt_sync(service.accumulate_host())
+            .expect("source scheduler exports the authenticated causal DAG"),
+    );
+    let synced = replica.accumulate(&sync).unwrap().result;
+    assert!(matches!(
+        synced,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        replica
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .unwrap()
+            .crdt_heads,
+        vec![cid]
+    );
+    assert!(
+        replica
             .accumulate_host()
             .blob(&refined.exported_blobs[0].reference)
             .is_some()

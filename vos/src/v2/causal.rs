@@ -19,6 +19,53 @@ pub(crate) struct CausalFrontierV2 {
 }
 
 impl CausalFrontierV2 {
+    /// Canonical frontier after removing advertised heads which are ancestors
+    /// of another advertised head. Concurrent branches are always preserved.
+    pub fn canonical_heads(&self) -> Vec<Hash> {
+        let dependencies = self
+            .nodes
+            .values()
+            .flat_map(|change| change.causal_dependencies.iter().copied())
+            .collect::<BTreeSet<_>>();
+        self.heads
+            .iter()
+            .copied()
+            .filter(|head| !dependencies.contains(head))
+            .collect()
+    }
+
+    /// Complete ancestry in deterministic parent-before-child order.
+    pub fn nodes_in_causal_order(&self) -> Vec<(Hash, &CrdtChangeV2)> {
+        let mut nodes = self
+            .nodes
+            .iter()
+            .map(|(cid, node)| (*cid, node))
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|(cid, node)| (node.causal_height, *cid));
+        nodes
+    }
+
+    pub fn contains_ancestor(&self, descendant: Hash, ancestor: Hash) -> bool {
+        if descendant == ancestor {
+            return true;
+        }
+        let mut pending = alloc::vec![descendant];
+        let mut visited = BTreeSet::new();
+        while let Some(cid) = pending.pop() {
+            if !visited.insert(cid) {
+                continue;
+            }
+            let Some(change) = self.nodes.get(&cid) else {
+                return false;
+            };
+            if change.causal_dependencies.contains(&ancestor) {
+                return true;
+            }
+            pending.extend(change.causal_dependencies.iter().copied());
+        }
+        false
+    }
+
     /// Select the nearest actor materialization on every concurrent branch.
     /// Each selected state already incorporates the ancestry below it; Refine
     /// folds all returned alternatives inside the canonical actor PVM.
@@ -89,6 +136,21 @@ pub(crate) fn load_causal_frontier<E>(
         }
         pending.extend(change.causal_dependencies.iter().copied());
         nodes.insert(cid, change);
+    }
+
+    for change in nodes.values() {
+        let expected_height = change
+            .causal_dependencies
+            .iter()
+            .filter_map(|dependency| nodes.get(dependency))
+            .map(|dependency| dependency.causal_height)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(CausalFrontierError::Corrupt)?;
+        if change.causal_height != expected_height {
+            return Err(CausalFrontierError::Corrupt);
+        }
     }
 
     let max_head_height = heads

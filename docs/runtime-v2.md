@@ -1,11 +1,10 @@
 # VOS runtime v2 contract
 
 > Implementation status: the versioned contracts, conformance service, package
-> tooling, actor APIs, and CRDT primitives described here are present. The
-> production node still contains the legacy native journal executor while the
-> generic `vos-service.pvm`, exact JAR backend restoration, and durable
-> scheduler integration are completed. Legacy host behavior is not evidence of
-> v2 conformance.
+> tooling, canonical `vos-service.pvm`, exact JAR restoration, durable local
+> scheduler, and guest-owned CRDT synchronization described here are present in
+> the v2 conformance runtime. The production node still contains legacy paths
+> awaiting cutover; legacy host behavior is not evidence of v2 conformance.
 
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
@@ -35,6 +34,18 @@ entry; the destination service guest verifies membership and finality,
 deduplicates by `CallId`, and atomically creates the inbox row. Local and Raft
 deliveries require the exact current revision. CRDT deliveries append a
 workflow-only causal change and preserve concurrent heads.
+
+CRDT anti-entropy also enters through physical Accumulate. A
+`CrdtSyncEnvelopeV2` carries advertised heads, canonical causal nodes, the
+content-addressed blobs they reference, and each node's finalized admission
+receipt. The guest verifies receipt/service identity, node CID, change-ID
+deduplication, exact causal height, complete ancestry, workflow rules, and blob
+hashes before staging anything. It unions heads without dropping concurrent
+branches, reconstructs continuation/inbox/outbox/workflow rows from the DAG,
+and commits nodes, receipts, blobs, materialized rows, and the new header in
+one transaction. A synced replica retains admission receipts so it can safely
+forward the same DAG; the read-only local scheduler merely packages those
+bytes and never applies them.
 
 ## Continuations
 
@@ -69,6 +80,13 @@ fields use explicit `vos::crdt` merge rules (`Value`, `Map`, `Set`, `List`,
 `Text`, `Counter`). Stable logical operation IDs and causal metadata replace
 wall clocks. The Merkle-DAG supplies causal transport and persistence, not
 convergence for arbitrary commands.
+
+Workflow operations are a built-in CRDT payload alongside application fields.
+Every actor slice records its complete `WorkEnvelopeV2`; synchronized peers can
+therefore reconstruct the exact workflow step without a process-local request
+cache. Concurrent identical messages are add-wins/deduplicated by stable
+`CallId`; divergent continuations, replies, or executions of the same workflow
+step are rejected instead of selecting an arbitrary branch.
 
 Concurrent scalar assignments retain alternatives through `conflicts()` while
 choosing the same visible value; counter increments, list and text operations

@@ -11,15 +11,17 @@ use alloc::vec::Vec;
 use crate::attestation::AttestationStatementV3;
 
 use super::causal::{CausalFrontierError, load_causal_frontier};
+use super::contracts::crdt_change_blob_references;
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtChangeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
-    EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2, ProofVerificationRequestV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
-    ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
-    V2Wire, WorkflowCheckpointV2, crdt_change_storage_key, crdt_node_storage_key,
+    ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2,
+    DeliveryRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2,
+    ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2,
+    ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2,
+    crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
     dedup_storage_key, delivery_storage_key, header_storage_key, receipt_storage_key,
 };
 
@@ -107,6 +109,7 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
             apply(store, &envelope, ApplyMode::PrepareAttested)
         }
         AccumulateRequestV2::Deliver(envelope) => deliver(store, &envelope),
+        AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, &envelope),
     }
 }
 
@@ -346,6 +349,9 @@ fn deliver<S: GuestAccumulateStoreV2>(
             header.state_root = Some(header.service_root);
             (Some(header.service_root), Vec::new(), header.revision)
         };
+    if header.consistency == ConsistencyModeV2::Crdt {
+        rematerialize_crdt_service(store, &mut header)?;
+    }
     let receipt = AccumulationReceiptV2 {
         service: header.service.clone(),
         accepted_transition: delivery_commitment,
@@ -364,11 +370,488 @@ fn deliver<S: GuestAccumulateStoreV2>(
     };
     write(store, header_storage_key(), Some(&header.encode()))?;
     write(store, &delivery_key, Some(&record.encode()))?;
+    if let Some(change) = envelope.crdt_change.as_ref() {
+        write_crdt_node_receipt(store, change.cid(), &receipt)?;
+    }
     Ok(AccumulationResultV2::Accepted {
         receipt,
         published: PublishedEffectsV2::default(),
         duplicate: false,
     })
+}
+
+#[derive(Debug, Clone)]
+struct CausalValueV2<T> {
+    cid: Hash,
+    value: T,
+}
+
+#[derive(Default)]
+struct WorkflowMaterializationV2 {
+    workflows: BTreeMap<super::InvocationId, Vec<CausalValueV2<WorkflowCheckpointV2>>>,
+    continuations: BTreeMap<ActorId, Vec<CausalValueV2<Option<BlobRefV2>>>>,
+    inbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
+    outbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
+    replies: BTreeMap<super::CallId, Vec<CausalValueV2<super::ReplyRecordV2>>>,
+    actor_states: BTreeMap<ActorId, Vec<CausalValueV2<BlobRefV2>>>,
+}
+
+fn sync_crdt<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    envelope: &CrdtSyncEnvelopeV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let Some(header_bytes) = read(store, header_storage_key())? else {
+        return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
+    };
+    let mut header = match StoreHeaderV2::open(&header_bytes) {
+        Ok(header) => header,
+        Err(StoreOpenError::WrongService) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongService));
+        }
+        Err(StoreOpenError::IncompatibleSemantics) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+        }
+        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
+    };
+    if envelope.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    if header.consistency != ConsistencyModeV2::Crdt {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+
+    let supplied_nodes = envelope
+        .nodes
+        .iter()
+        .map(|node| (node.change.cid(), &node.change))
+        .collect::<BTreeMap<_, _>>();
+    let mut changed = false;
+    for node in &envelope.nodes {
+        let cid = node.change.cid();
+        if let Some(existing) = read(store, &crdt_node_storage_key(cid))? {
+            if existing != node.change.encode() {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+        } else {
+            changed = true;
+            match store
+                .verify_receipt(&ReceiptVerificationRequestV2 {
+                    receipt: node.receipt.clone(),
+                })
+                .map_err(GuestAccumulateError::Storage)?
+            {
+                ReceiptVerificationV2::Valid => {}
+                ReceiptVerificationV2::Invalid => {
+                    return Ok(rejected(AccumulationRejectionV2::InvalidReceipt));
+                }
+                ReceiptVerificationV2::Unavailable => {
+                    return Ok(rejected(AccumulationRejectionV2::ReceiptUnavailable));
+                }
+            }
+        }
+        if let Some(existing) = read(store, &crdt_change_storage_key(node.change.id))?
+            && existing.as_slice() != cid.0
+        {
+            return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+        }
+    }
+
+    for reference in envelope
+        .nodes
+        .iter()
+        .flat_map(|node| crdt_change_blob_references(&node.change))
+    {
+        let supplied = envelope
+            .provided_blobs
+            .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+            .ok()
+            .is_some_and(|index| envelope.provided_blobs[index].reference == *reference);
+        if !supplied && !blob_available(store, reference)? {
+            return Ok(rejected(AccumulationRejectionV2::MissingBlob(
+                reference.hash,
+            )));
+        }
+    }
+    for blob in &envelope.provided_blobs {
+        if !blob_available(store, &blob.reference)? {
+            changed = true;
+        }
+    }
+
+    let mut combined_heads = header.crdt_heads.clone();
+    combined_heads.extend(envelope.advertised_heads.iter().copied());
+    combined_heads.sort();
+    combined_heads.dedup();
+    let frontier = match load_causal_frontier(&combined_heads, |cid| {
+        if let Some(change) = supplied_nodes.get(&cid) {
+            Ok(Some(change.encode()))
+        } else {
+            store.read(&crdt_node_storage_key(cid))
+        }
+    }) {
+        Ok(frontier) => frontier,
+        Err(CausalFrontierError::Storage(error)) => {
+            return Err(GuestAccumulateError::Storage(error));
+        }
+        Err(CausalFrontierError::Missing(cid)) => {
+            return Ok(rejected(AccumulationRejectionV2::MissingCausalDependency(
+                cid,
+            )));
+        }
+        Err(CausalFrontierError::Corrupt) => {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    };
+    let resulting_heads = frontier.canonical_heads();
+    changed |= resulting_heads != header.crdt_heads;
+    let materialized = match materialize_workflow_crdt(&frontier, &header.service) {
+        Ok(materialized) => materialized,
+        Err(rejection) => return Ok(rejected(rejection)),
+    };
+    {
+        let tree = ServiceStateTreeV2::new(store, header.service_root);
+        if !materialized_actors_exist(&tree, &materialized)? {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    }
+
+    let sync_commitment = envelope.commitment();
+    let receipt = AccumulationReceiptV2 {
+        service: header.service.clone(),
+        accepted_transition: sync_commitment,
+        reply_commitment: None,
+        outbox_commitment: None,
+        resulting_state_root: None,
+        resulting_crdt_heads: resulting_heads.clone(),
+        sequence: frontier.max_head_height,
+        checkpoint: 0,
+        consistency: ConsistencyModeV2::Crdt,
+    };
+    if !changed {
+        return Ok(AccumulationResultV2::Accepted {
+            receipt,
+            published: PublishedEffectsV2::default(),
+            duplicate: true,
+        });
+    }
+
+    for blob in &envelope.provided_blobs {
+        let actual = store
+            .provide_blob(&blob.bytes)
+            .map_err(GuestAccumulateError::Storage)?;
+        if actual != blob.reference {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+    }
+    for node in &envelope.nodes {
+        write_crdt_change(store, &node.change, node.change.cid())?;
+        write_crdt_node_receipt(store, node.change.cid(), &node.receipt)?;
+    }
+
+    let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+    apply_workflow_materialization(&mut tree, materialized)?;
+    header.service_root = tree.root();
+    header.crdt_heads = resulting_heads;
+    drop(tree);
+    write(store, header_storage_key(), Some(&header.encode()))?;
+    Ok(AccumulationResultV2::Accepted {
+        receipt,
+        published: PublishedEffectsV2::default(),
+        duplicate: false,
+    })
+}
+
+fn materialize_workflow_crdt(
+    frontier: &super::causal::CausalFrontierV2,
+    service: &super::ServiceIdentityV2,
+) -> Result<WorkflowMaterializationV2, AccumulationRejectionV2> {
+    let mut result = WorkflowMaterializationV2::default();
+    for (cid, change) in frontier.nodes_in_causal_order() {
+        let checkpoints = change
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::Checkpoint(work) => Some(work),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match checkpoints.as_slice() {
+            [work]
+                if work.service == *service
+                    && work.consistency == ConsistencyModeV2::Crdt
+                    && matches!(&work.base, ConsistencyBaseV2::Crdt { heads } if *heads == change.causal_dependencies)
+                    && work.base_causal_height == Some(change.causal_height - 1)
+                    && Some(change.id) == CrdtChangeV2::derive_id(work)
+                    && change
+                        .operations
+                        .iter()
+                        .all(|operation| operation.actor == work.target)
+                    && change
+                        .materializations
+                        .iter()
+                        .all(|materialization| materialization.actor == work.target) =>
+            {
+                let observed = result
+                    .workflows
+                    .get(&work.invocation)
+                    .into_iter()
+                    .flatten()
+                    .filter(|event| frontier.contains_ancestor(cid, event.cid))
+                    .collect::<Vec<_>>();
+                let valid_step = match (work.workflow_step, observed.as_slice()) {
+                    (0, []) => true,
+                    (step, [previous]) => {
+                        previous.value.input.workflow_step.checked_add(1) == Some(step)
+                            && previous.value.matches_resume_work(work)
+                    }
+                    _ => false,
+                };
+                if !valid_step {
+                    return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                }
+                let checkpoint = WorkflowCheckpointV2 {
+                    input: work.input_id(),
+                    workflow_identity: work.workflow_identity(),
+                    resume_work: (*work).clone(),
+                    work_hash: work.hash(),
+                    // CRDT workflow rows must be reconstructible from the DAG
+                    // without the outer Transition wire. The authenticated
+                    // node CID is their canonical slice commitment.
+                    transition_commitment: cid,
+                };
+                insert_causal_value(
+                    frontier,
+                    result.workflows.entry(work.invocation).or_default(),
+                    cid,
+                    checkpoint,
+                );
+            }
+            [] if change.operations.is_empty()
+                && change.materializations.is_empty()
+                && matches!(change.workflow.as_slice(), [WorkflowOperationV2::Inbox(message)]
+                    if change.id == CrdtChangeV2::derive_delivery_id(service, message.call_id, &change.causal_dependencies)) =>
+                {}
+            _ => return Err(AccumulationRejectionV2::InvalidWorkflowTransition),
+        }
+
+        for materialization in &change.materializations {
+            insert_causal_value(
+                frontier,
+                result
+                    .actor_states
+                    .entry(materialization.actor)
+                    .or_default(),
+                cid,
+                materialization.state.clone(),
+            );
+        }
+        for operation in &change.workflow {
+            match operation {
+                WorkflowOperationV2::Checkpoint(work) => {
+                    if let Some(call) = work.parent_call {
+                        insert_causal_value(
+                            frontier,
+                            result.inbox.entry(call).or_default(),
+                            cid,
+                            None,
+                        );
+                    }
+                    if let Some(awaited) = &work.awaited_reply {
+                        insert_causal_value(
+                            frontier,
+                            result.outbox.entry(awaited.reply.call_id).or_default(),
+                            cid,
+                            None,
+                        );
+                    }
+                }
+                WorkflowOperationV2::Continuation(change) => {
+                    let values = result.continuations.entry(change.actor).or_default();
+                    let mut observed = values
+                        .iter()
+                        .filter(|event| frontier.contains_ancestor(cid, event.cid))
+                        .map(|event| event.value.as_ref().map(|reference| reference.hash));
+                    let expected = observed.next().unwrap_or(None);
+                    if observed.any(|value| value != expected) || change.expected != expected {
+                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    }
+                    insert_causal_value(frontier, values, cid, change.replacement.clone());
+                }
+                WorkflowOperationV2::Inbox(message) => insert_causal_value(
+                    frontier,
+                    result.inbox.entry(message.call_id).or_default(),
+                    cid,
+                    Some(message.clone()),
+                ),
+                WorkflowOperationV2::Outbox(message) => insert_causal_value(
+                    frontier,
+                    result.outbox.entry(message.call_id).or_default(),
+                    cid,
+                    Some(message.clone()),
+                ),
+                WorkflowOperationV2::Reply(reply) => insert_causal_value(
+                    frontier,
+                    result.replies.entry(reply.call_id).or_default(),
+                    cid,
+                    reply.clone(),
+                ),
+            }
+        }
+    }
+    validate_strict_frontiers(result.workflows.values())?;
+    validate_strict_frontiers(result.continuations.values())?;
+    validate_strict_frontiers(result.replies.values())?;
+    for messages in result.inbox.values().chain(result.outbox.values()) {
+        let mut visible = messages.iter().filter_map(|event| event.value.as_ref());
+        if let Some(first) = visible.next()
+            && visible.any(|message| message != first)
+        {
+            return Err(AccumulationRejectionV2::DivergentDuplicate);
+        }
+    }
+    Ok(result)
+}
+
+fn insert_causal_value<T>(
+    frontier: &super::causal::CausalFrontierV2,
+    values: &mut Vec<CausalValueV2<T>>,
+    cid: Hash,
+    value: T,
+) {
+    if values
+        .iter()
+        .any(|existing| frontier.contains_ancestor(existing.cid, cid))
+    {
+        return;
+    }
+    values.retain(|existing| !frontier.contains_ancestor(cid, existing.cid));
+    values.push(CausalValueV2 { cid, value });
+    values.sort_by_key(|event| event.cid);
+}
+
+fn validate_strict_frontiers<'a, T: PartialEq + 'a>(
+    frontiers: impl Iterator<Item = &'a Vec<CausalValueV2<T>>>,
+) -> Result<(), AccumulationRejectionV2> {
+    for values in frontiers {
+        if let Some(first) = values.first()
+            && values
+                .iter()
+                .skip(1)
+                .any(|value| value.value != first.value)
+        {
+            return Err(AccumulationRejectionV2::DivergentDuplicate);
+        }
+    }
+    Ok(())
+}
+
+fn apply_workflow_materialization<S: StateTreeStore>(
+    tree: &mut ServiceStateTreeV2<'_, S>,
+    materialized: WorkflowMaterializationV2,
+) -> GuestResult<(), S::Error> {
+    for (invocation, values) in materialized.workflows {
+        let value = values
+            .first()
+            .expect("workflow frontier is never empty")
+            .value
+            .encode();
+        tree_apply(tree, &StateKeyV2::Workflow(invocation), Some(&value))?;
+    }
+    for (actor, values) in materialized.continuations {
+        require_actor(tree, actor)?;
+        let value = values
+            .first()
+            .expect("continuation frontier is never empty")
+            .value
+            .as_ref()
+            .map(V2Wire::encode);
+        tree_apply(tree, &StateKeyV2::Continuation(actor), value.as_deref())?;
+    }
+    for (call, values) in materialized.inbox {
+        let visible = values.iter().find_map(|event| event.value.as_ref());
+        if let Some(message) = visible {
+            require_actor(tree, message.to)?;
+        }
+        let value = visible.map(V2Wire::encode);
+        tree_apply(tree, &StateKeyV2::Inbox(call), value.as_deref())?;
+    }
+    for (call, values) in materialized.outbox {
+        let visible = values.iter().find_map(|event| event.value.as_ref());
+        if let Some(message) = visible {
+            require_actor(tree, message.from)?;
+        }
+        let value = visible.map(V2Wire::encode);
+        tree_apply(tree, &StateKeyV2::Outbox(call), value.as_deref())?;
+    }
+    for (actor, values) in materialized.actor_states {
+        require_actor(tree, actor)?;
+        let value = values
+            .iter()
+            .map(|event| &event.value)
+            .max_by_key(|reference| (reference.hash, reference.len))
+            .expect("actor-state frontier is never empty")
+            .encode();
+        tree_apply(tree, &StateKeyV2::CrdtMaterialization(actor), Some(&value))?;
+    }
+    Ok(())
+}
+
+fn materialized_actors_exist<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    materialized: &WorkflowMaterializationV2,
+) -> GuestResult<bool, S::Error> {
+    let mut actors = materialized
+        .workflows
+        .values()
+        .flatten()
+        .map(|event| event.value.resume_work.target)
+        .chain(materialized.continuations.keys().copied())
+        .chain(materialized.actor_states.keys().copied())
+        .chain(
+            materialized
+                .inbox
+                .values()
+                .flatten()
+                .filter_map(|event| event.value.as_ref())
+                .map(|message| message.to),
+        )
+        .chain(
+            materialized
+                .outbox
+                .values()
+                .flatten()
+                .filter_map(|event| event.value.as_ref())
+                .map(|message| message.from),
+        )
+        .chain(
+            materialized
+                .replies
+                .values()
+                .flatten()
+                .map(|event| event.value.producer),
+        )
+        .collect::<Vec<_>>();
+    actors.sort();
+    actors.dedup();
+    for actor in actors {
+        if tree_get_wire::<_, ActorGenesisV2>(tree, &StateKeyV2::ActorDescriptor(actor))?.is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn require_actor<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    actor: ActorId,
+) -> GuestResult<(), S::Error> {
+    if tree_get_wire::<_, ActorGenesisV2>(tree, &StateKeyV2::ActorDescriptor(actor))?.is_none() {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    Ok(())
 }
 
 fn apply<S: GuestAccumulateStoreV2>(
@@ -694,7 +1177,11 @@ fn apply<S: GuestAccumulateStoreV2>(
         workflow_identity: work.workflow_identity(),
         resume_work: work.clone(),
         work_hash,
-        transition_commitment,
+        transition_commitment: transition
+            .crdt_change
+            .as_ref()
+            .map(CrdtChangeV2::cid)
+            .unwrap_or(transition_commitment),
     };
     tree_apply(
         &mut tree,
@@ -727,6 +1214,9 @@ fn apply<S: GuestAccumulateStoreV2>(
             header.state_root = Some(header.service_root);
             (Some(header.service_root), Vec::new(), header.revision)
         };
+    if header.consistency == ConsistencyModeV2::Crdt {
+        rematerialize_crdt_service(store, &mut header)?;
+    }
 
     let receipt = AccumulationReceiptV2 {
         service: header.service.clone(),
@@ -796,6 +1286,9 @@ fn apply<S: GuestAccumulateStoreV2>(
         &dedup_storage_key(work.input_id()),
         Some(&record.encode()),
     )?;
+    if let Some(change) = transition.crdt_change.as_ref() {
+        write_crdt_node_receipt(store, change.cid(), &receipt)?;
+    }
 
     Ok(match mode {
         ApplyMode::PrepareAttested => AccumulationResultV2::Prepared(receipt),
@@ -935,6 +1428,48 @@ fn write_crdt_change<S: GuestAccumulateStoreV2>(
         write(store, &node_key, Some(&encoded))?;
     }
     write(store, &crdt_change_storage_key(change.id), Some(&cid.0))
+}
+
+fn write_crdt_node_receipt<S: StateTreeStore>(
+    store: &mut S,
+    cid: Hash,
+    receipt: &AccumulationReceiptV2,
+) -> GuestResult<(), S::Error> {
+    let key = crdt_node_receipt_storage_key(cid);
+    let encoded = receipt.encode();
+    if let Some(existing) = read(store, &key)? {
+        if existing != encoded {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        return Ok(());
+    }
+    write(store, &key, Some(&encoded))
+}
+
+fn rematerialize_crdt_service<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    header: &mut StoreHeaderV2,
+) -> GuestResult<(), S::Error> {
+    let frontier = match load_causal_frontier(&header.crdt_heads, |cid| {
+        store.read(&crdt_node_storage_key(cid))
+    }) {
+        Ok(frontier) => frontier,
+        Err(CausalFrontierError::Storage(error)) => {
+            return Err(GuestAccumulateError::Storage(error));
+        }
+        Err(CausalFrontierError::Missing(_) | CausalFrontierError::Corrupt) => {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+    };
+    let materialized = materialize_workflow_crdt(&frontier, &header.service)
+        .map_err(|_| GuestAccumulateError::CorruptStore)?;
+    let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+    if !materialized_actors_exist(&tree, &materialized)? {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    apply_workflow_materialization(&mut tree, materialized)?;
+    header.service_root = tree.root();
+    Ok(())
 }
 
 fn canonical_transition_shape(target: ActorId, transition: &super::TransitionV2) -> bool {
@@ -2628,6 +3163,216 @@ mod tests {
                 branches[0].0,
             ))
         );
+    }
+
+    #[test]
+    fn concurrent_crdt_commit_order_converges_the_guest_service_root() {
+        let mut left_first = MemStore::default();
+        let mut right_first = MemStore::default();
+        let (initial, _) = install_fixture(&mut left_first, ConsistencyModeV2::Crdt, b"before");
+        install_fixture(&mut right_first, ConsistencyModeV2::Crdt, b"before");
+
+        let left_work = crdt_work(initial.clone(), 70, vec![]);
+        let right_work = crdt_work(initial, 71, vec![]);
+        let left_state = BlobRefV2::of_bytes(b"left-branch");
+        let right_state = BlobRefV2::of_bytes(b"right-branch");
+        let left = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: left_work.clone(),
+            transition: crdt_transition(&left_work, left_state.clone(), 1),
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: left_state,
+                bytes: b"left-branch".to_vec(),
+            }],
+        });
+        let right = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: right_work.clone(),
+            transition: crdt_transition(&right_work, right_state.clone(), 1),
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: right_state,
+                bytes: b"right-branch".to_vec(),
+            }],
+        });
+        for request in [&left, &right] {
+            assert!(matches!(
+                execute_guest_accumulate(&mut left_first, request).unwrap(),
+                AccumulationResultV2::Accepted {
+                    duplicate: false,
+                    ..
+                }
+            ));
+        }
+        for request in [&right, &left] {
+            assert!(matches!(
+                execute_guest_accumulate(&mut right_first, request).unwrap(),
+                AccumulationResultV2::Accepted {
+                    duplicate: false,
+                    ..
+                }
+            ));
+        }
+        let left_header =
+            StoreHeaderV2::open(left_first.rows.get(header_storage_key()).unwrap()).unwrap();
+        let right_header =
+            StoreHeaderV2::open(right_first.rows.get(header_storage_key()).unwrap()).unwrap();
+        assert_eq!(left_header.crdt_heads, right_header.crdt_heads);
+        assert_eq!(left_header.service_root, right_header.service_root);
+    }
+
+    #[test]
+    fn guest_sync_authenticates_nodes_and_reconstructs_workflow_rows() {
+        let mut source = MemStore::default();
+        let mut destination = MemStore::default();
+        let (initial, _) = install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
+        install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
+
+        let work = crdt_work(initial, 61, vec![]);
+        let materialized = BlobRefV2::of_bytes(b"synced-state");
+        let transition = crdt_transition(&work, materialized.clone(), 1);
+        let change = transition.crdt_change.clone().unwrap();
+        let cid = change.cid();
+        let accepted = execute_guest_accumulate(
+            &mut source,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: work.clone(),
+                transition,
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: materialized.clone(),
+                    bytes: b"synced-state".to_vec(),
+                }],
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
+            panic!("source CRDT transition was rejected")
+        };
+        let sync = CrdtSyncEnvelopeV2 {
+            service: identity(),
+            advertised_heads: vec![cid],
+            nodes: vec![super::super::CrdtSyncNodeV2 {
+                change,
+                receipt: receipt.clone(),
+            }],
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: materialized.clone(),
+                bytes: b"synced-state".to_vec(),
+            }],
+        };
+
+        let before = destination.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut destination,
+                &AccumulateRequestV2::SyncCrdt(sync.clone()),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::ReceiptUnavailable)
+        );
+        assert_eq!(destination, before);
+
+        destination.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: receipt.clone(),
+            }
+            .hash(),
+        );
+        let synced = execute_guest_accumulate(
+            &mut destination,
+            &AccumulateRequestV2::SyncCrdt(sync.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            synced,
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let header =
+            StoreHeaderV2::open(destination.rows.get(header_storage_key()).unwrap()).unwrap();
+        assert_eq!(header.crdt_heads, vec![cid]);
+        assert_eq!(
+            destination.blobs.get(&materialized.hash),
+            Some(&b"synced-state".to_vec())
+        );
+        let tree = ServiceStateTreeV2::new(&mut destination, header.service_root);
+        let checkpoint = WorkflowCheckpointV2::decode(
+            &tree
+                .get(&StateKeyV2::Workflow(work.invocation))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(checkpoint.resume_work, work);
+        assert_eq!(checkpoint.transition_commitment, cid);
+        assert_eq!(
+            BlobRefV2::decode(
+                &tree
+                    .get(&StateKeyV2::CrdtMaterialization(actor()))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap(),
+            materialized
+        );
+        drop(tree);
+
+        let snapshot = destination.clone();
+        assert!(matches!(
+            execute_guest_accumulate(&mut destination, &AccumulateRequestV2::SyncCrdt(sync))
+                .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                ..
+            }
+        ));
+        assert_eq!(destination, snapshot);
+
+        let missing_parent = Hash([99; 32]);
+        let mut child_work = crdt_work(materialized, 62, vec![missing_parent]);
+        child_work.base_causal_height = Some(1);
+        let child_state = BlobRefV2::of_bytes(b"unavailable-child");
+        let child = crdt_transition(&child_work, child_state.clone(), 2)
+            .crdt_change
+            .unwrap();
+        let child_cid = child.cid();
+        let child_receipt = AccumulationReceiptV2 {
+            service: identity(),
+            accepted_transition: Hash([98; 32]),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: None,
+            resulting_crdt_heads: vec![child_cid],
+            sequence: 2,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Crdt,
+        };
+        destination.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: child_receipt.clone(),
+            }
+            .hash(),
+        );
+        let incomplete = CrdtSyncEnvelopeV2 {
+            service: identity(),
+            advertised_heads: vec![child_cid],
+            nodes: vec![super::super::CrdtSyncNodeV2 {
+                change: child,
+                receipt: child_receipt,
+            }],
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: child_state,
+                bytes: b"unavailable-child".to_vec(),
+            }],
+        };
+        let before_incomplete = destination.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut destination, &AccumulateRequestV2::SyncCrdt(incomplete),)
+                .unwrap(),
+            rejected(AccumulationRejectionV2::MissingCausalDependency(
+                missing_parent,
+            ))
+        );
+        assert_eq!(destination, before_incomplete);
     }
 
     #[test]
