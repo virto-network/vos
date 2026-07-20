@@ -60,13 +60,21 @@ impl ConsistencyBaseV2 {
 pub enum AuthorizationEvidenceV2 {
     /// Method policy explicitly allows anonymous invocation.
     Public,
-    /// Opaque credential and the generated policy it must satisfy. For an
-    /// attested method the credential is supplied to the prover privately;
-    /// only its commitment appears here.
+    /// Opaque credential disclosed to ordinary authorization validation and
+    /// the generated policy it must satisfy. Attested private roles use
+    /// [`Self::PrivateCredential`] instead.
     Credential {
         policy: Hash,
         credential_commitment: Hash,
         bytes: Vec<u8>,
+    },
+    /// Private attestation witness. Refine/proving receives the preimage as an
+    /// imported blob, while work and statement wires expose only this content
+    /// reference, the credential commitment, and the generated policy.
+    PrivateCredential {
+        policy: Hash,
+        credential_commitment: Hash,
+        witness: BlobRefV2,
     },
     /// Authenticated platform operation. This never bypasses the method's
     /// generated policy.
@@ -736,6 +744,15 @@ impl V2Wire for WorkEnvelopeV2 {
         let proof_requested = d.bool()?;
         ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
+        if let AuthorizationEvidenceV2::PrivateCredential { witness, .. } = &authorization {
+            let present = imported_blobs
+                .binary_search_by_key(&witness.hash, |blob| blob.hash)
+                .ok()
+                .is_some_and(|index| imported_blobs[index] == *witness);
+            if !proof_requested || !present {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
         for actor in &imported_actors {
             ensure_sorted_unique(&actor.causal_states, |state| state.hash.0)?;
             if actor
@@ -1723,6 +1740,16 @@ fn encode_auth(e: &mut Encoder<'_>, value: &AuthorizationEvidenceV2) {
             e.fixed(&capability.0);
             e.bytes(authenticator);
         }
+        AuthorizationEvidenceV2::PrivateCredential {
+            policy,
+            credential_commitment,
+            witness,
+        } => {
+            e.u8(3);
+            e.fixed(&policy.0);
+            e.fixed(&credential_commitment.0);
+            encode_blob_ref(e, witness);
+        }
     }
 }
 
@@ -1737,6 +1764,11 @@ fn decode_auth(d: &mut Decoder<'_>) -> Result<AuthorizationEvidenceV2, DecodeErr
         2 => Ok(AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId(d.fixed()?),
             authenticator: d.bytes()?,
+        }),
+        3 => Ok(AuthorizationEvidenceV2::PrivateCredential {
+            policy: Hash(d.fixed()?),
+            credential_commitment: Hash(d.fixed()?),
+            witness: decode_blob_ref(d)?,
         }),
         _ => Err(DecodeError::InvalidTag),
     }

@@ -79,6 +79,20 @@ impl AttestationStatementV3 {
                     .ok_or(AttestationError::InvalidStatement)?,
             ),
         };
+        let authorization_input = match &work.authorization {
+            crate::v2::AuthorizationEvidenceV2::Public => Hash::ZERO,
+            crate::v2::AuthorizationEvidenceV2::Credential {
+                credential_commitment,
+                ..
+            }
+            | crate::v2::AuthorizationEvidenceV2::PrivateCredential {
+                credential_commitment,
+                ..
+            } => *credential_commitment,
+            crate::v2::AuthorizationEvidenceV2::SystemCapability { capability, .. } => {
+                Hash(capability.0)
+            }
+        };
         let value = Self {
             statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
             space: work.service.space,
@@ -91,7 +105,10 @@ impl AttestationStatementV3 {
             before,
             after,
             claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),
-            input_commitment: Hash::digest(b"vos/attestation-input/v3", &[&work.arguments]),
+            input_commitment: Hash::digest(
+                b"vos/attestation-input/v3",
+                &[&work.arguments, &authorization_input.0],
+            ),
             authorization_policy: policy.policy,
             accumulation_receipt: receipt,
         };

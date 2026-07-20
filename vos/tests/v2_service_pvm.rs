@@ -14,7 +14,7 @@ use vos::v2::{
     MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, ProofCommitmentV2,
     ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2, RefineOutputV2, RootServiceId,
     ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
-    TransitionV2, V2Wire, WorkEnvelopeV2,
+    SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -982,8 +982,36 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(delivered.work.origin, Origin::Actor(inbox.from));
     assert_eq!(delivered.work.authorization, inbox.authorization);
 
-    let mut proof_work = delivered.work;
-    proof_work.proof_requested = true;
+    let private_credential = b"private member credential".to_vec();
+    let witness = service
+        .accumulate_host_mut()
+        .import_blob(private_credential.clone());
+    let credential_commitment =
+        Hash::digest(b"vos/credential-commitment/v2", &[&private_credential]);
+    let proof_work = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([110; 32]),
+            workflow_step: 0,
+            logical_timeslot: 51,
+            target: delivered.work.target,
+            method: delivered.work.method.clone(),
+            arguments: delivered.work.arguments.clone(),
+            origin: Origin::Member(SubjectId([111; 32])),
+            authorization: AuthorizationEvidenceV2::PrivateCredential {
+                policy: Hash([33; 32]),
+                credential_commitment,
+                witness: witness.clone(),
+            },
+            causal_parent: None,
+            parent_call: None,
+            imported_blobs: vec![witness],
+            proof_requested: true,
+        },
+    )
+    .expect("scheduler imports a private role witness without disclosing it")
+    .work;
+    let attested_call = proof_work.invocation.call_id(0);
     let mut proof_transition = TransitionV2 {
         service: proof_work.service.clone(),
         consumed_input: proof_work.input_id(),
@@ -995,7 +1023,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         inbox: vec![],
         outbox: vec![],
         reply: Some(vos::v2::ReplyRecordV2 {
-            call_id,
+            call_id: attested_call,
             producer: proof_work.target,
             result: b"attested reply".to_vec(),
         }),
@@ -1004,6 +1032,32 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         proof: None,
     };
     let before_prepare = service.accumulate_host().snapshot();
+    let mut denied_work = proof_work.clone();
+    let AuthorizationEvidenceV2::PrivateCredential { policy, .. } = &mut denied_work.authorization
+    else {
+        unreachable!()
+    };
+    *policy = Hash([200; 32]);
+    let denied = service
+        .accumulate(&AccumulateRequestV2::PrepareAttested(
+            AccumulationEnvelopeV2 {
+                work: denied_work,
+                transition: proof_transition.clone(),
+                provided_blobs: vec![],
+            },
+        ))
+        .expect("a private credential with the wrong policy is rejected");
+    assert_eq!(
+        denied.result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_prepare)
+    );
+
     let prepared = service
         .accumulate(&AccumulateRequestV2::PrepareAttested(
             AccumulationEnvelopeV2 {

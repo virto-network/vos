@@ -762,6 +762,24 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
                 && *credential_commitment == Hash::digest(b"vos/credential-commitment/v2", &[bytes])
                 && policy.policy == Hash::digest(b"vos/bearer-policy/v2", &[bytes])
         }
+        AuthorizationEvidenceV2::PrivateCredential {
+            policy: supplied_policy,
+            credential_commitment,
+            witness,
+        } => {
+            (policy.attested || work.proof_requested)
+                && matches!(
+                    work.origin,
+                    super::Origin::Member(_) | super::Origin::Actor(_)
+                )
+                && *supplied_policy == policy.policy
+                && *credential_commitment != Hash::ZERO
+                && work
+                    .imported_blobs
+                    .binary_search_by_key(&witness.hash, |blob| blob.hash)
+                    .ok()
+                    .is_some_and(|index| work.imported_blobs[index] == *witness)
+        }
         // A future statement version will bind platform authority keys. Until
         // then System is an identity class, never an authorization bypass.
         AuthorizationEvidenceV2::SystemCapability { .. } => false,
