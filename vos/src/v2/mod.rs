@@ -18,6 +18,7 @@ mod package;
 #[cfg(feature = "std")]
 mod pvm;
 mod service;
+mod state_tree;
 mod storage;
 pub(crate) mod wire;
 
@@ -49,6 +50,10 @@ pub use pvm::{
     RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
 };
 pub use service::{JamServiceV2, ServiceDispatchError, ServiceDispatchOutputV2};
+pub use state_tree::{
+    SERVICE_STATE_KEY_DOMAIN, SERVICE_STATE_LEAF_DOMAIN, SERVICE_STATE_NODE_DOMAIN,
+    ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,
+};
 pub use storage::{
     DedupRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError,
     crdt_node_storage_key, dedup_storage_key, header_storage_key, receipt_storage_key,
