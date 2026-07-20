@@ -8,16 +8,18 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use crate::attestation::AttestationStatementV3;
+
 use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, CrdtChangeV2,
     DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2,
-    PublishedEffectsV2, ServiceGenesisV2, ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2,
-    StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
-    crdt_change_storage_key, crdt_node_storage_key, dedup_storage_key, header_storage_key,
-    receipt_storage_key,
+    ProofVerificationRequestV2, PublishedEffectsV2, ServiceGenesisV2, ServiceInstallReceiptV2,
+    ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
+    V2Wire, WorkflowCheckpointV2, crdt_change_storage_key, crdt_node_storage_key,
+    dedup_storage_key, header_storage_key, receipt_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -29,6 +31,21 @@ pub trait GuestAccumulateStoreV2: StateTreeStore {
     /// VOS reference. The staged blob becomes visible only with this same
     /// Accumulate transaction.
     fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error>;
+
+    /// Validate the proof against the exact public inputs derived by guest
+    /// Accumulate. Implementations must fail closed when the verifier or proof
+    /// blob is unavailable.
+    fn verify_proof(
+        &self,
+        request: &ProofVerificationRequestV2,
+    ) -> Result<ProofVerificationV2, Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofVerificationV2 {
+    Valid,
+    Invalid,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +239,13 @@ fn apply<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     let proof_required = policy.attested || work.proof_requested;
+    if proof_required
+        && (!transition.continuations.is_empty()
+            || !transition.outbox.is_empty()
+            || transition.reply.is_none())
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
     match mode {
         ApplyMode::PrepareAttested => {
             if !proof_required || transition.proof.is_some() {
@@ -230,14 +254,14 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
         ApplyMode::Commit => {
             if proof_required {
-                return Ok(rejected(if transition.proof.is_none() {
-                    AccumulationRejectionV2::MissingProof
-                } else {
-                    AccumulationRejectionV2::ProofUnavailable
-                }));
+                if transition.proof.is_none() {
+                    return Ok(rejected(AccumulationRejectionV2::MissingProof));
+                }
             }
             if transition.proof.is_some() {
-                return Ok(rejected(AccumulationRejectionV2::ProofUnavailable));
+                if !proof_required {
+                    return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+                }
             }
         }
     }
@@ -482,6 +506,43 @@ fn apply<S: GuestAccumulateStoreV2>(
         checkpoint: work.workflow_step,
         consistency: header.consistency,
     };
+    if mode == ApplyMode::Commit && proof_required {
+        let proof = transition
+            .proof
+            .as_ref()
+            .expect("proof presence was validated");
+        let statement = match AttestationStatementV3::for_transition(
+            work,
+            transition,
+            &policy,
+            receipt.clone(),
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
+        };
+        if proof.statement != statement.commitment() {
+            return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+        }
+        let verification = ProofVerificationRequestV2 {
+            actor_program: work.target_program,
+            execution_semantics: work.service.execution_semantics,
+            statement: proof.statement,
+            trace: proof.trace,
+            proof_blob: proof.proof_blob.clone(),
+        };
+        match store
+            .verify_proof(&verification)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            ProofVerificationV2::Valid => {}
+            ProofVerificationV2::Invalid => {
+                return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+            }
+            ProofVerificationV2::Unavailable => {
+                return Ok(rejected(AccumulationRejectionV2::ProofUnavailable));
+            }
+        }
+    }
     let record = DedupRecordV2 {
         input: work.input_id(),
         work_hash,
@@ -743,6 +804,7 @@ fn referenced_blobs<'a>(
                 .flat_map(|change| change.materializations.iter())
                 .map(|materialization| &materialization.state),
         )
+        .chain(transition.proof.iter().map(|proof| &proof.proof_blob))
 }
 
 fn actor_state_key(consistency: ConsistencyModeV2, actor: ActorId) -> StateKeyV2 {
@@ -981,6 +1043,13 @@ mod tests {
             let reference = BlobRefV2::of_bytes(bytes);
             self.blobs.insert(reference.hash, bytes.to_vec());
             Ok(reference)
+        }
+
+        fn verify_proof(
+            &self,
+            _request: &ProofVerificationRequestV2,
+        ) -> Result<ProofVerificationV2, Self::Error> {
+            Ok(ProofVerificationV2::Unavailable)
         }
     }
 

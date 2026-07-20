@@ -183,6 +183,18 @@ pub fn provide(hash: &[u8; 32], data: &[u8]) -> u64 {
     )
 }
 
+/// Ask the service host's configured proof engine to validate canonical
+/// public-input bytes. The proof itself is fetched by its content address.
+#[cfg(feature = "service")]
+#[inline]
+pub fn verify_proof(request: &[u8]) -> u64 {
+    ecall2(
+        hostcall::PROOF_VERIFY,
+        request.as_ptr() as u64,
+        request.len() as u64,
+    )
+}
+
 /// Transfer to another service with a memo.
 #[cfg(feature = "service")]
 #[inline]

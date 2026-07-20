@@ -5,14 +5,15 @@
 //! apply [`super::TransitionV2`]: all validation and mutation semantics remain
 //! guest-owned at the IC-5 Accumulate entry.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use javm::kernel::InvocationKernel;
 
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId, ServicePvmErrorV2,
-    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
+    ProofVerificationRequestV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Recoverable committed image of a local v2 service account.
@@ -61,6 +62,7 @@ impl core::error::Error for LocalStoreReadErrorV2 {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
+    proof_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamStoreV2 {
@@ -72,6 +74,7 @@ impl LocalJamStoreV2 {
                 programs: BTreeMap::new(),
                 commit_sequence: 0,
             },
+            proof_allowlist: BTreeSet::new(),
         }
     }
 
@@ -79,6 +82,7 @@ impl LocalJamStoreV2 {
     pub fn from_snapshot(snapshot: LocalJamStoreSnapshotV2) -> Self {
         Self {
             committed: snapshot,
+            proof_allowlist: BTreeSet::new(),
         }
     }
 
@@ -160,6 +164,13 @@ impl LocalJamStoreV2 {
         self.committed.programs.insert(program.0, pvm);
         program
     }
+
+    /// Configure the local conformance host to accept one exact proof request.
+    /// Production hosts replace this allowlist seam with their pinned proof
+    /// verifier; it is intentionally excluded from persisted service state.
+    pub fn allow_proof(&mut self, request: &ProofVerificationRequestV2) {
+        self.proof_allowlist.insert(request.hash());
+    }
 }
 
 struct CommittedRows<'a>(&'a BTreeMap<Vec<u8>, Vec<u8>>);
@@ -179,6 +190,7 @@ impl StateTreeStore for CommittedRows<'_> {
 /// Private copy-on-write image for one physical IC-5 execution.
 pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
+    proof_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamTransactionV2 {
@@ -276,6 +288,24 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                 self.staged.blobs.insert(hash, value);
                 Ok([error::HOST_OK, 0])
             }
+            hostcall::PROOF_VERIFY => {
+                let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
+                let request = ProofVerificationRequestV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let proof_available = self
+                    .staged
+                    .blobs
+                    .get(&request.proof_blob.hash.0)
+                    .is_some_and(|bytes| request.proof_blob.matches(bytes));
+                Ok([
+                    if proof_available && self.proof_allowlist.contains(&request.hash()) {
+                        error::HOST_OK
+                    } else {
+                        error::HOST_NONE
+                    },
+                    0,
+                ])
+            }
             _ => Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
         }
     }
@@ -287,6 +317,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
         Ok(LocalJamTransactionV2 {
             staged: self.committed.clone(),
+            proof_allowlist: self.proof_allowlist.clone(),
         })
     }
 

@@ -40,12 +40,12 @@ pub use contracts::{
     AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2,
-    ProofCommitmentV2, PublishedEffectsV2, RefineError, RefineImportsV2, RefineOutputV2,
-    ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2,
-    WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2, RefineError,
+    RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
-    GuestAccumulateError, GuestAccumulateStoreV2, execute_guest_accumulate,
+    GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, execute_guest_accumulate,
 };
 pub use identity::{
     ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,

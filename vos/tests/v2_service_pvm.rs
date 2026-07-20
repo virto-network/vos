@@ -4,15 +4,17 @@
 //! `cd services/vos-service && cargo +nightly actor`.
 
 use std::path::PathBuf;
+use vos::attestation::AttestationStatementV3;
 use vos::v2::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     ActorWriteV2, AllowPublic, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2,
     ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, GasAccountingV2,
     Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
     JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2,
-    RefineOutputV2, RootServiceId, ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, ProofCommitmentV2,
+    ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2, RefineOutputV2, RootServiceId,
+    ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
+    TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -792,13 +794,12 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         proof: None,
     };
 
-    let before_prepare = service.accumulate_host().snapshot();
-    let mut proof_work = work.clone();
-    proof_work.proof_requested = true;
-    let prepared_attestation = service
+    let mut forbidden_attested_work = work.clone();
+    forbidden_attested_work.proof_requested = true;
+    let forbidden = service
         .accumulate(&AccumulateRequestV2::PrepareAttested(
             AccumulationEnvelopeV2 {
-                work: proof_work,
+                work: forbidden_attested_work,
                 transition: transition.clone(),
                 provided_blobs: vec![ImportedBlobV2 {
                     reference: continuation_ref.clone(),
@@ -806,17 +807,10 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 }],
             },
         ))
-        .expect("guest predicts the attested receipt without committing");
-    let AccumulationResultV2::Prepared(predicted) = prepared_attestation.result else {
-        panic!("guest did not prepare the attested transition")
-    };
-    assert_eq!(predicted.accepted_transition, transition.commitment());
-    assert_eq!(predicted.sequence, 1);
-    assert!(
-        service
-            .accumulate_host()
-            .snapshot()
-            .same_service_state(&before_prepare)
+        .expect("a suspending attested transition returns a stable rejection");
+    assert_eq!(
+        forbidden.result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::InvalidWorkflowTransition)
     );
     assert_eq!(service.accumulate_host().commit_sequence(), 1);
 
@@ -947,6 +941,149 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(delivered.work.causal_parent, Some(caller_invocation));
     assert_eq!(delivered.work.origin, Origin::Actor(inbox.from));
     assert_eq!(delivered.work.authorization, inbox.authorization);
+
+    let mut proof_work = delivered.work;
+    proof_work.proof_requested = true;
+    let mut proof_transition = TransitionV2 {
+        service: proof_work.service.clone(),
+        consumed_input: proof_work.input_id(),
+        target_program: proof_work.target_program,
+        base: proof_work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(vos::v2::ReplyRecordV2 {
+            call_id,
+            producer: proof_work.target,
+            result: b"attested reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let before_prepare = service.accumulate_host().snapshot();
+    let prepared = service
+        .accumulate(&AccumulateRequestV2::PrepareAttested(
+            AccumulationEnvelopeV2 {
+                work: proof_work.clone(),
+                transition: proof_transition.clone(),
+                provided_blobs: vec![],
+            },
+        ))
+        .expect("guest predicts the attested receipt without committing");
+    let AccumulationResultV2::Prepared(predicted) = prepared.result else {
+        panic!("guest did not prepare the attested transition")
+    };
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_prepare)
+    );
+
+    let policy = MethodPolicyV2 {
+        method: "start".into(),
+        schema: Hash([32; 32]),
+        policy: Hash([33; 32]),
+        public: true,
+        attested: false,
+    };
+    let statement = AttestationStatementV3::for_transition(
+        &proof_work,
+        &proof_transition,
+        &policy,
+        predicted.clone(),
+    )
+    .unwrap();
+    let proof_bytes = b"canonical proof bytes".to_vec();
+    let proof_blob = BlobRefV2::of_bytes(&proof_bytes);
+    let proof = ProofCommitmentV2 {
+        statement: statement.commitment(),
+        trace: Hash([101; 32]),
+        proof_blob: proof_blob.clone(),
+        statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+    };
+    let verification = ProofVerificationRequestV2 {
+        actor_program: proof_work.target_program,
+        execution_semantics: proof_work.service.execution_semantics,
+        statement: proof.statement,
+        trace: proof.trace,
+        proof_blob: proof_blob.clone(),
+    };
+    let before_invalid_proof = service.accumulate_host().snapshot();
+    let mut unavailable_transition = proof_transition.clone();
+    unavailable_transition.proof = Some(proof.clone());
+    let unavailable = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: proof_work.clone(),
+            transition: unavailable_transition,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: proof_blob.clone(),
+                bytes: proof_bytes.clone(),
+            }],
+        }))
+        .expect("an unavailable proof verifier fails closed");
+    assert_eq!(
+        unavailable.result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::ProofUnavailable)
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_invalid_proof)
+    );
+
+    service.accumulate_host_mut().allow_proof(&verification);
+    let mut tampered_transition = proof_transition.clone();
+    let mut tampered_proof = proof.clone();
+    tampered_proof.statement = Hash([102; 32]);
+    tampered_transition.proof = Some(tampered_proof);
+    let tampered = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: proof_work.clone(),
+            transition: tampered_transition,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: proof_blob.clone(),
+                bytes: proof_bytes.clone(),
+            }],
+        }))
+        .expect("a tampered statement returns a stable rejection");
+    assert_eq!(
+        tampered.result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::InvalidProof)
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_invalid_proof)
+    );
+
+    proof_transition.proof = Some(proof.clone());
+    let proved = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: proof_work,
+            transition: proof_transition,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: proof_blob,
+                bytes: proof_bytes,
+            }],
+        }))
+        .expect("guest validates the proof before committing");
+    let result = proved.result;
+    let AccumulationResultV2::Accepted {
+        receipt,
+        published,
+        duplicate: false,
+    } = result.clone()
+    else {
+        panic!("proved transition was not accepted: {result:?}")
+    };
+    assert_eq!(receipt, predicted);
+    assert_eq!(published.proof, Some(proof));
 }
 
 #[test]

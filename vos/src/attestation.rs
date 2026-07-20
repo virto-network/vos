@@ -7,8 +7,8 @@ use core::marker::PhantomData;
 
 use crate::v2::wire::{Decoder, Encoder};
 use crate::v2::{
-    AccumulationReceiptV2, ActorId, DecodeError, DeploymentId, Hash, InvocationId, ProducerId,
-    ProgramId, SpaceId, V2Wire,
+    AccumulationReceiptV2, ActorId, DecodeError, DeploymentId, Hash, InvocationId, MethodPolicyV2,
+    ProducerId, ProgramId, SpaceId, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,68 @@ pub struct AttestationStatementV3 {
 }
 
 impl AttestationStatementV3 {
+    /// Construct the one canonical statement for a prepared actor transition.
+    /// Both the prover and guest Accumulate use this function, preventing a
+    /// host from substituting different public inputs at proof time.
+    pub fn for_transition(
+        work: &WorkEnvelopeV2,
+        transition: &TransitionV2,
+        policy: &MethodPolicyV2,
+        receipt: AccumulationReceiptV2,
+    ) -> Result<Self, AttestationError> {
+        if work.service != transition.service
+            || work.service != receipt.service
+            || work.target_program != transition.target_program
+            || work.input_id() != transition.consumed_input
+            || work.base != transition.base
+            || work.method != policy.method
+            || receipt.accepted_transition != transition.commitment()
+            || receipt.checkpoint != work.workflow_step
+            || receipt.consistency != work.consistency
+        {
+            return Err(AttestationError::InvalidStatement);
+        }
+        let reply = transition
+            .reply
+            .as_ref()
+            .filter(|reply| reply.producer == work.target)
+            .ok_or(AttestationError::InvalidStatement)?;
+        let before = match &work.base {
+            crate::v2::ConsistencyBaseV2::Linear { state_root, .. } => {
+                StateCommitmentV3::Linear(*state_root)
+            }
+            crate::v2::ConsistencyBaseV2::Crdt { heads } => StateCommitmentV3::Crdt(heads.clone()),
+        };
+        let after = match receipt.consistency {
+            crate::v2::ConsistencyModeV2::Crdt => {
+                StateCommitmentV3::Crdt(receipt.resulting_crdt_heads.clone())
+            }
+            _ => StateCommitmentV3::Linear(
+                receipt
+                    .resulting_state_root
+                    .ok_or(AttestationError::InvalidStatement)?,
+            ),
+        };
+        let value = Self {
+            statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
+            space: work.service.space,
+            actor: work.target,
+            deployment: work.service.deployment,
+            actor_program: work.target_program,
+            method: work.method.clone(),
+            schema: policy.schema,
+            invocation: work.invocation,
+            before,
+            after,
+            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),
+            input_commitment: Hash::digest(b"vos/attestation-input/v3", &[&work.arguments]),
+            authorization_policy: policy.policy,
+            accumulation_receipt: receipt,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub fn commitment(&self) -> Hash {
         Hash::digest(b"vos/attestation-statement/v3", &[&self.encode()])
     }

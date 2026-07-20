@@ -97,6 +97,11 @@ pub const NOW_MS: u32 = 121;
 /// continues immediately after the source-level `.await`.
 pub const SUSPEND: u32 = 122;
 
+/// Validate an attestation proof against guest-derived public inputs.
+/// Installed only on the generic service's Accumulate entry; actor PVMs and
+/// Refine never receive this capability.
+pub const PROOF_VERIFY: u32 = 123;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +115,7 @@ mod tests {
             BOOT_CONTEXT,
             NOW_MS,
             SUSPEND,
+            PROOF_VERIFY,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
         for (index, slot) in supplied.iter().enumerate() {
@@ -137,6 +143,7 @@ mod tests {
             BOOT_CONTEXT as u8,
             NOW_MS as u8,
             SUSPEND as u8,
+            PROOF_VERIFY as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];
         assert!(
