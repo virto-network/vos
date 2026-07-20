@@ -239,6 +239,10 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             authenticator: vec![1],
         },
     });
+    let AccumulateRequestV2::Install(genesis) = &install else {
+        unreachable!()
+    };
+    service.accumulate_host_mut().allow_install(genesis);
     assert!(matches!(
         service.accumulate(&install).unwrap().result,
         AccumulationResultV2::Installed(_)
@@ -718,6 +722,15 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             authenticator: vec![35],
         },
     });
+    assert_eq!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    let AccumulateRequestV2::Install(genesis) = &install else {
+        unreachable!()
+    };
+    service.accumulate_host_mut().allow_install(genesis);
     let installed_output = service
         .accumulate(&install)
         .expect("guest install completes");

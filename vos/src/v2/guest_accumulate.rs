@@ -25,6 +25,10 @@ use super::{
 /// Extra content-addressed operations needed by guest Accumulate in addition
 /// to ordinary JAM service storage.
 pub trait GuestAccumulateStoreV2: StateTreeStore {
+    /// Authenticate the exact initial service tree against platform/deployment
+    /// authority before the store has a header to bind its identity.
+    fn authorize_install(&self, genesis: &ServiceGenesisV2) -> Result<bool, Self::Error>;
+
     fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error>;
 
     /// Stage bytes in the content-addressed store and return their canonical
@@ -103,6 +107,12 @@ fn install<S: GuestAccumulateStoreV2>(
     }
     if genesis.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+    }
+    if !store
+        .authorize_install(genesis)
+        .map_err(GuestAccumulateError::Storage)?
+    {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
     for actor in &genesis.actors {
         if !blob_available(store, &actor.initial_state)? {
@@ -1040,6 +1050,10 @@ mod tests {
     }
 
     impl GuestAccumulateStoreV2 for MemStore {
+        fn authorize_install(&self, _genesis: &ServiceGenesisV2) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
         fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {
             Ok(self
                 .blobs

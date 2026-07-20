@@ -102,6 +102,10 @@ pub const SUSPEND: u32 = 122;
 /// Refine never receive this capability.
 pub const PROOF_VERIFY: u32 = 123;
 
+/// Authenticate the exact v2 service-genesis bytes before an empty account is
+/// initialized. Installed only on the generic service's Accumulate entry.
+pub const INSTALL_AUTH_VERIFY: u32 = 124;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +120,7 @@ mod tests {
             NOW_MS,
             SUSPEND,
             PROOF_VERIFY,
+            INSTALL_AUTH_VERIFY,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
         for (index, slot) in supplied.iter().enumerate() {
@@ -144,6 +149,7 @@ mod tests {
             NOW_MS as u8,
             SUSPEND as u8,
             PROOF_VERIFY as u8,
+            INSTALL_AUTH_VERIFY as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];
         assert!(

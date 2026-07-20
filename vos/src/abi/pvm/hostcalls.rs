@@ -195,6 +195,18 @@ pub fn verify_proof(request: &[u8]) -> u64 {
     )
 }
 
+/// Authenticate exact service-genesis bytes against the platform account or
+/// deployment authority configured by the host.
+#[cfg(feature = "service")]
+#[inline]
+pub fn verify_install_authorization(genesis: &[u8]) -> u64 {
+    ecall2(
+        hostcall::INSTALL_AUTH_VERIFY,
+        genesis.as_ptr() as u64,
+        genesis.len() as u64,
+    )
+}
+
 /// Transfer to another service with a memo.
 #[cfg(feature = "service")]
 #[inline]

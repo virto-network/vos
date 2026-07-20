@@ -12,8 +12,8 @@ use javm::kernel::InvocationKernel;
 
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
-    ProofVerificationRequestV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
-    StoreHeaderV2, StoreOpenError, V2Wire,
+    ProofVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
+    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Recoverable committed image of a local v2 service account.
@@ -63,6 +63,7 @@ impl core::error::Error for LocalStoreReadErrorV2 {}
 pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
     proof_allowlist: BTreeSet<super::Hash>,
+    install_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamStoreV2 {
@@ -75,6 +76,7 @@ impl LocalJamStoreV2 {
                 commit_sequence: 0,
             },
             proof_allowlist: BTreeSet::new(),
+            install_allowlist: BTreeSet::new(),
         }
     }
 
@@ -83,6 +85,7 @@ impl LocalJamStoreV2 {
         Self {
             committed: snapshot,
             proof_allowlist: BTreeSet::new(),
+            install_allowlist: BTreeSet::new(),
         }
     }
 
@@ -171,6 +174,12 @@ impl LocalJamStoreV2 {
     pub fn allow_proof(&mut self, request: &ProofVerificationRequestV2) {
         self.proof_allowlist.insert(request.hash());
     }
+
+    /// Authorize one exact service genesis for the next physical install.
+    /// This host policy is not persisted as actor/service state.
+    pub fn allow_install(&mut self, genesis: &ServiceGenesisV2) {
+        self.install_allowlist.insert(install_hash(genesis));
+    }
 }
 
 struct CommittedRows<'a>(&'a BTreeMap<Vec<u8>, Vec<u8>>);
@@ -191,6 +200,7 @@ impl StateTreeStore for CommittedRows<'_> {
 pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
     proof_allowlist: BTreeSet<super::Hash>,
+    install_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamTransactionV2 {
@@ -306,6 +316,19 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                     0,
                 ])
             }
+            hostcall::INSTALL_AUTH_VERIFY => {
+                let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
+                let genesis = ServiceGenesisV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                Ok([
+                    if self.install_allowlist.contains(&install_hash(&genesis)) {
+                        error::HOST_OK
+                    } else {
+                        error::HOST_WHAT
+                    },
+                    0,
+                ])
+            }
             _ => Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
         }
     }
@@ -318,6 +341,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
         Ok(LocalJamTransactionV2 {
             staged: self.committed.clone(),
             proof_allowlist: self.proof_allowlist.clone(),
+            install_allowlist: self.install_allowlist.clone(),
         })
     }
 
@@ -330,6 +354,13 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
         self.committed = transaction.staged;
         Ok(())
     }
+}
+
+fn install_hash(genesis: &ServiceGenesisV2) -> super::Hash {
+    super::Hash::digest(
+        b"vos/service-install-authorization/v2",
+        &[&genesis.encode()],
+    )
 }
 
 #[cfg(test)]
