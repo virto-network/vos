@@ -105,6 +105,17 @@ impl InvocationId {
     pub const fn root_reply_id(self) -> CallId {
         CallId(self.0)
     }
+
+    /// Stable target-side workflow identity for a durable actor call. The
+    /// source invocation and await ordinal remain committed in the message;
+    /// this domain-separated ID names the callee's independently deduplicated
+    /// workflow.
+    pub fn for_call(call: CallId) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/call-invocation/v2",
+            &[&call.0],
+        ))
+    }
 }
 
 impl ChangeId {
@@ -138,6 +149,14 @@ mod tests {
         assert_eq!(invocation.call_id(3), invocation.call_id(3));
         assert_ne!(invocation.call_id(3), invocation.call_id(4));
         assert_eq!(invocation.root_reply_id().0, invocation.0);
+        assert_eq!(
+            InvocationId::for_call(invocation.call_id(3)),
+            InvocationId::for_call(invocation.call_id(3))
+        );
+        assert_ne!(
+            InvocationId::for_call(invocation.call_id(3)),
+            InvocationId::for_call(invocation.call_id(4))
+        );
     }
 
     #[test]

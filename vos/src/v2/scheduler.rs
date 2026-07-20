@@ -25,6 +25,7 @@ use super::{
 pub struct LocalWorkRequestV2 {
     pub invocation: InvocationId,
     pub workflow_step: u64,
+    pub logical_timeslot: u64,
     pub target: ActorId,
     pub method: String,
     pub arguments: Vec<u8>,
@@ -59,6 +60,9 @@ pub enum ScheduleErrorV2 {
     InvalidContinuation(ActorId),
     InvocationAlreadyCommitted(InvocationId),
     InvalidWorkflowStep(InvocationId),
+    MissingInbox(super::CallId),
+    InvalidInbox(super::CallId),
+    DeadlineExpired(super::CallId),
     MissingCausalDependency(super::Hash),
     CorruptCausalDag,
     NonCanonicalImports,
@@ -81,6 +85,48 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    /// Reconstruct a target workflow directly from one committed durable inbox
+    /// row. The row carries the original actor identity and authorization;
+    /// neither is synthesized by the host scheduler.
+    pub fn prepare_inbox(
+        store: &LocalJamStoreV2,
+        call: CallId,
+        logical_timeslot: u64,
+    ) -> Result<PreparedWorkV2, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let key = StateKeyV2::Inbox(call);
+        let message = decode_row::<super::MessageRecordV2>(store, header.service_root, &key)?
+            .ok_or(ScheduleErrorV2::MissingInbox(call))?;
+        if message.call_id != call {
+            return Err(ScheduleErrorV2::InvalidInbox(call));
+        }
+        if message
+            .deadline_timeslot
+            .is_some_and(|deadline| logical_timeslot >= deadline)
+        {
+            return Err(ScheduleErrorV2::DeadlineExpired(call));
+        }
+        let method = dynamic_method(&message.payload)
+            .ok_or(ScheduleErrorV2::InvalidInbox(message.call_id))?;
+        Self::prepare(
+            store,
+            LocalWorkRequestV2 {
+                invocation: InvocationId::for_call(message.call_id),
+                workflow_step: 0,
+                logical_timeslot,
+                target: message.to,
+                method,
+                arguments: message.payload,
+                origin: Origin::Actor(message.from),
+                authorization: message.authorization,
+                causal_parent: Some(message.caller_invocation),
+                parent_call: Some(message.call_id),
+                imported_blobs: Vec::new(),
+                proof_requested: false,
+            },
+        )
+    }
+
     /// Prepare one slice from the current committed linear revision or CRDT
     /// frontier. Both paths use the same guest-owned header and actor rows.
     pub fn prepare(
@@ -183,6 +229,7 @@ impl LocalWorkSchedulerV2 {
             service: header.service.clone(),
             invocation: request.invocation,
             workflow_step: request.workflow_step,
+            logical_timeslot: request.logical_timeslot,
             target: request.target,
             target_program: descriptor.program,
             method: request.method,
@@ -251,6 +298,13 @@ impl LocalWorkSchedulerV2 {
             .map_err(|_| ScheduleErrorV2::NonCanonicalImports)?;
         Ok(PreparedWorkV2 { work, imports })
     }
+}
+
+fn dynamic_method(payload: &[u8]) -> Option<String> {
+    if payload.first() != Some(&crate::value::TAG_DYNAMIC) {
+        return None;
+    }
+    <crate::value::Msg as crate::Decode>::try_decode(&payload[1..]).map(|message| message.name)
 }
 
 fn decode_row<T: V2Wire>(

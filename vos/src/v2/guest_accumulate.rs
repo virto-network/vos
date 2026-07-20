@@ -208,6 +208,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     if !authorized(work, &policy) {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
+    if !work_matches_durable_inbox(&tree, work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
     if policy.attested || work.proof_requested {
         return Ok(rejected(if transition.proof.is_none() {
             AccumulationRejectionV2::MissingProof
@@ -289,7 +292,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     }
 
-    if let Some(rejection) = validate_durable_messages(&tree, transition)? {
+    if let Some(rejection) = validate_durable_messages(&tree, work, transition)? {
         return Ok(rejected(rejection));
     }
     if contains_cycle(&transition.outbox) {
@@ -663,6 +666,35 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
     }
 }
 
+fn work_matches_durable_inbox<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    work: &super::WorkEnvelopeV2,
+) -> GuestResult<bool, S::Error> {
+    let Some(call) = work.parent_call else {
+        return Ok(work.causal_parent.is_none());
+    };
+    let Some(message) = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Inbox(call))? else {
+        return Ok(false);
+    };
+    let method = if message.payload.first() == Some(&crate::value::TAG_DYNAMIC) {
+        <crate::value::Msg as crate::Decode>::try_decode(&message.payload[1..])
+            .map(|message| message.name)
+    } else {
+        None
+    };
+    Ok(message.call_id == call
+        && message.to == work.target
+        && work.invocation == super::InvocationId::for_call(call)
+        && work.causal_parent == Some(message.caller_invocation)
+        && work.origin == super::Origin::Actor(message.from)
+        && work.authorization == message.authorization
+        && work.arguments == message.payload
+        && message
+            .deadline_timeslot
+            .is_none_or(|deadline| work.logical_timeslot < deadline)
+        && method.as_deref() == Some(work.method.as_str()))
+}
+
 fn referenced_blobs<'a>(
     work: &'a super::WorkEnvelopeV2,
     transition: &'a super::TransitionV2,
@@ -745,10 +777,17 @@ fn contains_cycle(messages: &[MessageRecordV2]) -> bool {
 /// cannot target an actor already present in its causal caller chain.
 fn validate_durable_messages<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
+    work: &super::WorkEnvelopeV2,
     transition: &super::TransitionV2,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     let mut staged = BTreeMap::<super::CallId, MessageRecordV2>::new();
     for message in transition.inbox.iter().chain(&transition.outbox) {
+        if message
+            .deadline_timeslot
+            .is_some_and(|deadline| work.logical_timeslot >= deadline)
+        {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
         if staged.insert(message.call_id, message.clone()).is_some() {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
@@ -981,6 +1020,7 @@ mod tests {
             service: identity(),
             invocation: InvocationId([10; 32]),
             workflow_step: 0,
+            logical_timeslot: 1,
             target: actor(),
             target_program: program(),
             method: "set".into(),
@@ -1154,12 +1194,19 @@ mod tests {
         parent: Option<super::super::CallId>,
         deadline_timeslot: Option<u64>,
     ) -> MessageRecordV2 {
+        let caller_invocation = InvocationId([call; 32]);
+        let await_ordinal = u64::from(call);
+        let mut payload = vec![crate::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&crate::Encode::encode(&crate::value::Msg::new("set")));
         MessageRecordV2 {
-            call_id: super::super::CallId([call; 32]),
+            call_id: caller_invocation.call_id(await_ordinal),
+            caller_invocation,
+            await_ordinal,
             from,
             to,
             parent,
-            payload: vec![call],
+            payload,
+            authorization: AuthorizationEvidenceV2::Public,
             deadline_timeslot,
         }
     }
@@ -1191,6 +1238,64 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(accepted, AccumulationResultV2::Accepted { .. }));
+
+        let committed_header =
+            StoreHeaderV2::open(installed.rows.get(header_storage_key()).unwrap()).unwrap();
+        let mut inbox_work = linear_work(
+            BlobRefV2::of_bytes(b"valid"),
+            committed_header.state_root.unwrap(),
+        );
+        inbox_work.invocation = InvocationId::for_call(incoming.call_id);
+        inbox_work.causal_parent = Some(incoming.caller_invocation);
+        inbox_work.parent_call = Some(incoming.call_id);
+        inbox_work.arguments = incoming.payload.clone();
+        inbox_work.origin = Origin::Actor(incoming.from);
+        inbox_work.authorization = incoming.authorization.clone();
+        inbox_work.base = ConsistencyBaseV2::Linear {
+            revision: 1,
+            state_root: committed_header.state_root.unwrap(),
+        };
+        let mut forged = inbox_work.clone();
+        forged.origin = Origin::Anonymous;
+        let before_forged = installed.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut installed,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    transition: linear_transition(&forged, b"forged"),
+                    work: forged,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(installed, before_forged);
+        let mut expired = inbox_work.clone();
+        expired.logical_timeslot = 10;
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut installed,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    transition: linear_transition(&expired, b"expired"),
+                    work: expired,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(installed, before_forged);
+        let delivered = execute_guest_accumulate(
+            &mut installed,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                transition: linear_transition(&inbox_work, b"delivered"),
+                work: inbox_work,
+                provided_blobs: vec![],
+            }),
+        )
+        .unwrap();
+        assert!(matches!(delivered, AccumulationResultV2::Accepted { .. }));
 
         let reject = |outgoing: MessageRecordV2| {
             let mut store = MemStore::default();
@@ -1233,7 +1338,7 @@ mod tests {
                 47,
                 actor(),
                 peer,
-                Some(super::super::CallId([99; 32])),
+                Some(InvocationId([99; 32]).call_id(99)),
                 Some(9),
             )),
             rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
@@ -1265,6 +1370,7 @@ mod tests {
             service: identity(),
             invocation: InvocationId([invocation; 32]),
             workflow_step: 0,
+            logical_timeslot: 1,
             target: actor(),
             target_program: program(),
             method: "set".into(),

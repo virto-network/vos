@@ -166,6 +166,7 @@ mod tests {
             service: snapshot.service,
             invocation: snapshot.invocation,
             workflow_step: snapshot.checkpoint_step + 1,
+            logical_timeslot: 9,
             target: snapshot.actor,
             target_program: snapshot.actor_program,
             method: "resume".to_string(),
