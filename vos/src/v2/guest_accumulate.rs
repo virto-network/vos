@@ -464,6 +464,14 @@ fn apply<S: GuestAccumulateStoreV2>(
                 .as_deref(),
         )?;
     }
+    // The durable inbox row is the authority for a cross-root invocation.
+    // Consume it in the same guest-owned state-tree update as the actor
+    // writes, continuation, reply, and dedup record. Exact retries return via
+    // the dedup row before reaching this point; divergent replays can no
+    // longer reuse a delivered call.
+    if let Some(call) = work.parent_call {
+        tree_apply(&mut tree, &StateKeyV2::Inbox(call), None)?;
+    }
     for message in &transition.inbox {
         tree_apply(
             &mut tree,
@@ -1424,12 +1432,37 @@ mod tests {
             &mut installed,
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 transition: linear_transition(&inbox_work, b"delivered"),
-                work: inbox_work,
+                work: inbox_work.clone(),
                 provided_blobs: vec![],
             }),
         )
         .unwrap();
         assert!(matches!(delivered, AccumulationResultV2::Accepted { .. }));
+        let delivered_header =
+            StoreHeaderV2::open(installed.rows.get(header_storage_key()).unwrap()).unwrap();
+        let delivered_tree = ServiceStateTreeV2::new(&mut installed, delivered_header.service_root);
+        assert_eq!(
+            delivered_tree
+                .get(&StateKeyV2::Inbox(incoming.call_id))
+                .unwrap(),
+            None,
+            "accepted delivery consumes its durable inbox row atomically"
+        );
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut installed,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    transition: linear_transition(&inbox_work, b"delivered"),
+                    work: inbox_work,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                ..
+            }
+        ));
 
         let reject = |outgoing: MessageRecordV2| {
             let mut store = MemStore::default();

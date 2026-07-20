@@ -981,6 +981,45 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(delivered.work.causal_parent, Some(caller_invocation));
     assert_eq!(delivered.work.origin, Origin::Actor(inbox.from));
     assert_eq!(delivered.work.authorization, inbox.authorization);
+    let delivered_transition = TransitionV2 {
+        service: delivered.work.service.clone(),
+        consumed_input: delivered.work.input_id(),
+        target_program: delivered.work.target_program,
+        base: delivered.work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(vos::v2::ReplyRecordV2 {
+            call_id,
+            producer: delivered.work.target,
+            result: b"durable inbox reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let delivered_result = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: delivered.work.clone(),
+            transition: delivered_transition,
+            provided_blobs: vec![],
+        }))
+        .expect("guest commits delivery and consumes the inbox atomically");
+    assert!(matches!(
+        delivered_result.result,
+        AccumulationResultV2::Accepted {
+            published: PublishedEffectsV2 { reply: Some(_), .. },
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_inbox(service.accumulate_host(), call_id, 51).unwrap_err(),
+        ScheduleErrorV2::MissingInbox(call_id),
+        "a committed delivery cannot be scheduled from its inbox again"
+    );
 
     let private_credential = b"private member credential".to_vec();
     let witness = service
