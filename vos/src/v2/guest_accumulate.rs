@@ -902,13 +902,13 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
 
     let work_hash = work.hash();
-    let transition_hash = transition.hash();
+    let transition_commitment = transition.commitment();
     if let Some(bytes) = read(store, &dedup_storage_key(work.input_id()))? {
         let record =
             DedupRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
         let exact_duplicate = record.input == work.input_id()
             && record.work_hash == work_hash
-            && record.transition_hash == transition_hash;
+            && record.transition_commitment == transition_commitment;
         if !exact_duplicate {
             return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
         }
@@ -1217,7 +1217,7 @@ fn apply<S: GuestAccumulateStoreV2>(
             .crdt_change
             .as_ref()
             .map(CrdtChangeV2::cid)
-            .unwrap_or(transition_hash),
+            .unwrap_or(transition_commitment),
     };
     tree_apply(
         &mut tree,
@@ -1280,7 +1280,7 @@ fn apply<S: GuestAccumulateStoreV2>(
 
     let receipt = AccumulationReceiptV2 {
         service: header.service.clone(),
-        accepted_transition: transition_hash,
+        accepted_transition: transition_commitment,
         reply_commitment: transition
             .reply
             .as_ref()
@@ -1295,7 +1295,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     let record = DedupRecordV2 {
         input: work.input_id(),
         work_hash,
-        transition_hash,
+        transition_commitment,
         receipt: receipt.clone(),
     };
     write(store, header_storage_key(), Some(&header.encode()))?;

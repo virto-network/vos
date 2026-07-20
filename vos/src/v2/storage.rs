@@ -214,7 +214,7 @@ impl V2Wire for StateKeyV2 {
 pub struct DedupRecordV2 {
     pub input: WorkInputIdV2,
     pub work_hash: Hash,
-    pub transition_hash: Hash,
+    pub transition_commitment: Hash,
     pub receipt: AccumulationReceiptV2,
 }
 
@@ -270,7 +270,8 @@ pub struct WorkflowCheckpointV2 {
     /// from service storage while retaining stable workflow inputs.
     pub resume_work: WorkEnvelopeV2,
     pub work_hash: Hash,
-    /// Linear transitions store their transition hash. CRDT checkpoints store
+    /// Linear transitions store their proof-independent execution commitment.
+    /// CRDT checkpoints store
     /// the causal node CID so the row can be rebuilt from the DAG without the
     /// outer transition wire.
     pub transition_hash: Hash,
@@ -323,7 +324,7 @@ impl V2Wire for DedupRecordV2 {
         let mut e = Encoder(out);
         encode_input(&mut e, self.input);
         e.fixed(&self.work_hash.0);
-        e.fixed(&self.transition_hash.0);
+        e.fixed(&self.transition_commitment.0);
         e.bytes(&self.receipt.encode());
     }
 
@@ -331,10 +332,10 @@ impl V2Wire for DedupRecordV2 {
         let value = Self {
             input: decode_input(d)?,
             work_hash: Hash(d.fixed()?),
-            transition_hash: Hash(d.fixed()?),
+            transition_commitment: Hash(d.fixed()?),
             receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
         };
-        if value.receipt.accepted_transition != value.transition_hash
+        if value.receipt.accepted_transition != value.transition_commitment
             || value.receipt.checkpoint != value.input.workflow_step
         {
             return Err(DecodeError::NonCanonical);
@@ -701,7 +702,7 @@ mod tests {
         let record = DedupRecordV2 {
             input,
             work_hash: Hash([11; 32]),
-            transition_hash: Hash([12; 32]),
+            transition_commitment: Hash([12; 32]),
             receipt: AccumulationReceiptV2 {
                 service: service(13),
                 accepted_transition: Hash([12; 32]),
