@@ -20,6 +20,8 @@ mod package;
 #[cfg(feature = "std")]
 mod pvm;
 #[cfg(feature = "std")]
+mod scheduler;
+#[cfg(feature = "std")]
 mod service;
 mod state_tree;
 mod storage;
@@ -44,7 +46,7 @@ pub use identity::{
     ProgramId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
 };
 #[cfg(feature = "std")]
-pub use local_store::{LocalJamStoreSnapshotV2, LocalJamStoreV2};
+pub use local_store::{LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalStoreReadErrorV2};
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2, VosPackageV2,
     artifact_hash,
@@ -55,6 +57,8 @@ pub use pvm::{
     RefineProtocolHostV2, SERVICE_ARGUMENT_PAGES_V2, ServicePvmErrorV2, ServicePvmOutputV2,
     ServicePvmV2, transpile_service_elf,
 };
+#[cfg(feature = "std")]
+pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};
 #[cfg(feature = "std")]
 pub use service::{
     AccumulatedServiceOutputV2, JamServiceV2, RefinedServiceOutputV2, ServiceDispatchError,

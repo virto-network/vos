@@ -10,11 +10,12 @@ use std::path::PathBuf;
 use vos::v2::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
-    DeploymentId, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InvocationId, JamServiceV2, LocalJamStoreV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
-    WorkEnvelopeV2,
+    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, GasAccountingV2, Hash,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2,
+    LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2,
+    RootServiceId, ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -679,7 +680,7 @@ fn yielding_actor_restores_exactly_after_restart() {
     assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
     assert_eq!(host.import_program(actor.clone()), actor_program);
     let mut committed = JamServiceV2::new(
-        service_pvm,
+        service_pvm.clone(),
         service_program,
         NoRefineProtocolHostV2,
         host,
@@ -713,20 +714,30 @@ fn yielding_actor_restores_exactly_after_restart() {
     let AccumulationResultV2::Installed(installed) = installed.result else {
         panic!("guest install rejected")
     };
-    first_work.base = ConsistencyBaseV2::Linear {
-        revision: 0,
-        state_root: installed.resulting_state_root.unwrap(),
+    let request = LocalWorkRequestV2 {
+        invocation: first_work.invocation,
+        workflow_step: 0,
+        target: first_work.target,
+        method: first_work.method,
+        arguments: first_work.arguments,
+        origin: first_work.origin,
+        authorization: first_work.authorization,
+        causal_parent: first_work.causal_parent,
+        parent_call: first_work.parent_call,
+        imported_blobs: first_work.imported_blobs,
+        proof_requested: first_work.proof_requested,
     };
-    let first_imports = RefineImportsV2 {
-        programs: vec![ImportedProgramV2 {
-            program: actor_program,
-            pvm: actor.clone(),
-        }],
-        blobs: vec![ImportedBlobV2 {
-            reference: initial_state_ref,
-            bytes: initial_state,
-        }],
-    };
+    let prepared = LocalWorkSchedulerV2::prepare(committed.accumulate_host(), request.clone())
+        .expect("scheduler reconstructs initial work from guest-owned state");
+    first_work = prepared.work;
+    let first_imports = prepared.imports;
+    assert_eq!(
+        first_work.base,
+        ConsistencyBaseV2::Linear {
+            revision: 0,
+            state_root: installed.resulting_state_root.unwrap(),
+        }
+    );
 
     let first_output = service
         .refine_actor_tree_with_backend(
@@ -806,32 +817,44 @@ fn yielding_actor_restores_exactly_after_restart() {
         "guest Accumulate must durably record the checkpoint state"
     );
 
-    // Simulate a process restart after Accumulate committed slice 0. Only
-    // canonical programs, the committed state, and the continuation blob are
-    // supplied to the next Refine invocation.
-    let mut resumed_work = first_work.clone();
-    resumed_work.workflow_step = 1;
-    resumed_work.base = ConsistencyBaseV2::Linear {
-        revision: checkpoint_receipt.sequence,
-        state_root: checkpoint_receipt.resulting_state_root.unwrap(),
-    };
-    resumed_work.imported_actors[0].state = checkpoint_state_ref.clone();
-    resumed_work.imported_actors[0].continuation = Some(first_continuation.clone());
-    let mut resumed_blobs = vec![
-        ImportedBlobV2 {
-            reference: checkpoint_state_ref,
-            bytes: checkpoint_state,
-        },
-        first_output.exported_blobs[0].clone(),
-    ];
-    resumed_blobs.sort_by_key(|blob| blob.reference.hash);
-    let resumed_imports = RefineImportsV2 {
-        programs: vec![ImportedProgramV2 {
-            program: actor_program,
-            pvm: actor,
-        }],
-        blobs: resumed_blobs,
-    };
+    // Simulate a process restart after Accumulate committed slice 0. The
+    // scheduler must recover the exact program, actor state, and continuation
+    // from the committed service image rather than from this test's locals.
+    let restarted = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
+    let mut resume_request = request;
+    resume_request.workflow_step = 1;
+    let mut changed_identity = resume_request.clone();
+    changed_identity.origin = Origin::System;
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare(&restarted, changed_identity),
+        Err(ScheduleErrorV2::InvalidWorkflowStep(first_work.invocation)),
+        "a continuation cannot resume under a different caller identity"
+    );
+    let prepared = LocalWorkSchedulerV2::prepare(&restarted, resume_request)
+        .expect("scheduler reconstructs the exact next continuation slice");
+    let resumed_work = prepared.work;
+    let resumed_imports = prepared.imports;
+    assert_eq!(
+        resumed_work.base,
+        ConsistencyBaseV2::Linear {
+            revision: checkpoint_receipt.sequence,
+            state_root: checkpoint_receipt.resulting_state_root.unwrap(),
+        }
+    );
+    assert_eq!(resumed_work.imported_actors[0].state, checkpoint_state_ref);
+    assert_eq!(
+        resumed_work.imported_actors[0].continuation,
+        Some(first_continuation.clone())
+    );
+    let mut committed = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        restarted,
+        100_000_000,
+        5_000_000_000,
+    )
+    .expect("restart reopens the canonical service PVM over committed state");
 
     let resumed_output = service
         .refine_actor_tree_with_backend(
@@ -928,7 +951,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let seed_work = work(actor_program, initial.clone());
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
-    assert_eq!(host.import_program(actor_pvm), actor_program);
+    assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
@@ -970,11 +993,48 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(service.accumulate_host().commit_sequence(), 1);
     let installed_rows = service.accumulate_host().row_count();
 
-    let mut work = seed_work;
-    work.base = ConsistencyBaseV2::Linear {
-        revision: 0,
-        state_root: installed.resulting_state_root.unwrap(),
+    let request = LocalWorkRequestV2 {
+        invocation: seed_work.invocation,
+        workflow_step: 0,
+        target: seed_work.target,
+        method: seed_work.method.clone(),
+        arguments: seed_work.arguments.clone(),
+        origin: seed_work.origin,
+        authorization: seed_work.authorization.clone(),
+        causal_parent: None,
+        parent_call: None,
+        imported_blobs: vec![],
+        proof_requested: false,
     };
+    let prepared = LocalWorkSchedulerV2::prepare(service.accumulate_host(), request.clone())
+        .expect("scheduler reads the installed guest state");
+    assert_eq!(prepared.work.service, seed_work.service);
+    assert_eq!(prepared.work.target_program, actor_program);
+    assert_eq!(
+        prepared.work.base,
+        ConsistencyBaseV2::Linear {
+            revision: 0,
+            state_root: installed.resulting_state_root.unwrap(),
+        }
+    );
+    assert_eq!(prepared.work.imported_actors[0].state, initial);
+    assert_eq!(prepared.imports.programs[0].pvm, actor_pvm);
+    let work = prepared.work;
+    let continuation = ContinuationSnapshotV2 {
+        snapshot_version: vos::v2::SNAPSHOT_VERSION,
+        jar_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        vos_abi: vos::v2::ABI_VERSION,
+        service: work.service.clone(),
+        invocation: work.invocation,
+        checkpoint_step: 0,
+        actor: work.target,
+        actor_program,
+        await_ordinal: 0,
+        pending_call: None,
+        kernel_snapshot: vec![1],
+    };
+    let continuation_bytes = continuation.encode();
+    let continuation_ref = BlobRefV2::of_bytes(&continuation_bytes);
     let transition = TransitionV2 {
         service: work.service.clone(),
         consumed_input: work.input_id(),
@@ -986,22 +1046,25 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             value: Some(b"committed actor state".to_vec()),
         }],
         crdt_change: None,
-        continuations: vec![],
+        continuations: vec![ContinuationChangeV2 {
+            actor: work.target,
+            expected: None,
+            replacement: Some(continuation_ref.clone()),
+        }],
         inbox: vec![],
         outbox: vec![],
-        reply: Some(ReplyRecordV2 {
-            call_id: work.invocation.root_reply_id(),
-            producer: work.target,
-            result: b"committed reply".to_vec(),
-        }),
-        exported_blobs: vec![],
+        reply: None,
+        exported_blobs: vec![continuation_ref.clone()],
         gas: GasAccountingV2::default(),
         proof: None,
     };
     let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-        work,
+        work: work.clone(),
         transition: transition.clone(),
-        provided_blobs: vec![],
+        provided_blobs: vec![ImportedBlobV2 {
+            reference: continuation_ref.clone(),
+            bytes: continuation_bytes,
+        }],
     });
     let applied_output = service.accumulate(&apply).expect("guest apply completes");
     let AccumulationResultV2::Accepted {
@@ -1045,6 +1108,35 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         service.accumulate_host().commit_sequence(),
         2,
         "a read-only duplicate transaction must not commit"
+    );
+
+    let restarted = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
+    let mut queued = request.clone();
+    queued.invocation = InvocationId([99; 32]);
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare(&restarted, queued),
+        Err(ScheduleErrorV2::ActorBusy(work.target))
+    );
+
+    let mut resume = request;
+    resume.workflow_step = 1;
+    let resumed = LocalWorkSchedulerV2::prepare(&restarted, resume)
+        .expect("restart reconstructs the next exact continuation slice");
+    assert_eq!(
+        resumed.work.base,
+        ConsistencyBaseV2::Linear {
+            revision: 1,
+            state_root: receipt.resulting_state_root.unwrap(),
+        }
+    );
+    assert_eq!(
+        resumed.work.imported_actors[0].continuation,
+        Some(continuation_ref)
+    );
+    assert_eq!(
+        resumed.imports.blobs.len(),
+        2,
+        "state and continuation bytes are both imported after restart"
     );
 }
 
