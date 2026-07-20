@@ -14,6 +14,8 @@ mod continuation;
 mod contracts;
 mod guest_accumulate;
 mod identity;
+#[cfg(feature = "std")]
+mod local_store;
 mod package;
 #[cfg(feature = "std")]
 mod pvm;
@@ -41,6 +43,8 @@ pub use identity::{
     ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,
     ProgramId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
 };
+#[cfg(feature = "std")]
+pub use local_store::{LocalJamStoreSnapshotV2, LocalJamStoreV2};
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2, VosPackageV2,
     artifact_hash,

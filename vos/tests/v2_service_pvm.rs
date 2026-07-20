@@ -6,17 +6,15 @@
 //! Missing guests are hard failures: these tests are a consensus-path gate,
 //! not optional smoke tests.
 
-use std::{collections::BTreeMap, path::PathBuf};
-
-use javm::kernel::InvocationKernel;
+use std::path::PathBuf;
 use vos::v2::{
-    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulateTransactionV2, AccumulationEnvelopeV2,
-    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
-    BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, GasAccountingV2, Hash,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2,
-    ReplyRecordV2, RootServiceId, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationResultV2, ActorGenesisV2, ActorId,
+    ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
+    DeploymentId, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    InvocationId, JamServiceV2, LocalJamStoreV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
+    ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
+    WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -151,142 +149,6 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     }
 }
 
-#[derive(Clone, Default)]
-struct DurableAccumulateHost {
-    rows: BTreeMap<Vec<u8>, Vec<u8>>,
-    preimages: BTreeMap<[u8; 32], Vec<u8>>,
-    programs: BTreeMap<[u8; 32], Vec<u8>>,
-    commits: usize,
-}
-
-struct DurableTransaction {
-    rows: BTreeMap<Vec<u8>, Vec<u8>>,
-    preimages: BTreeMap<[u8; 32], Vec<u8>>,
-    programs: BTreeMap<[u8; 32], Vec<u8>>,
-}
-
-impl AccumulateTransactionV2 for DurableTransaction {
-    fn handle(
-        &mut self,
-        slot: u8,
-        registers: &[u64; 13],
-        kernel: &mut InvocationKernel,
-    ) -> Result<[u64; 2], ServicePvmErrorV2> {
-        use vos::abi::{error, hostcall};
-
-        let read = |kernel: &InvocationKernel, address: u64, len: u64| {
-            let address = u32::try_from(address).ok()?;
-            let len = u32::try_from(len).ok()?;
-            kernel.read_data_cap_window(address, len)
-        };
-        match slot as u32 {
-            hostcall::STORAGE_R => {
-                let key = read(kernel, registers[7], registers[8])
-                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                let Some(value) = self.rows.get(&key) else {
-                    return Ok([error::HOST_NONE, 0]);
-                };
-                let capacity = usize::try_from(registers[10])
-                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                let copy_len = value.len().min(capacity);
-                if copy_len != 0
-                    && !kernel.write_data_cap_window(
-                        u32::try_from(registers[9])
-                            .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?,
-                        &value[..copy_len],
-                    )
-                {
-                    return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
-                }
-                Ok([value.len() as u64, 0])
-            }
-            hostcall::STORAGE_W => {
-                let key = read(kernel, registers[7], registers[8])
-                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                let value = read(kernel, registers[9], registers[10])
-                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                if value.is_empty() {
-                    self.rows.remove(&key);
-                } else {
-                    self.rows.insert(key, value);
-                }
-                Ok([error::HOST_OK, 0])
-            }
-            hostcall::PREIMAGE_LOOKUP => {
-                let hash: [u8; 32] = read(kernel, registers[7], 32)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                let Some(value) = self.preimages.get(&hash) else {
-                    return Ok([error::HOST_NONE, 0]);
-                };
-                let capacity = usize::try_from(registers[9])
-                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                let copy_len = value.len().min(capacity);
-                if copy_len != 0
-                    && !kernel.write_data_cap_window(
-                        u32::try_from(registers[8])
-                            .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?,
-                        &value[..copy_len],
-                    )
-                {
-                    return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
-                }
-                Ok([value.len() as u64, 0])
-            }
-            hostcall::PREIMAGE_PROVIDE => {
-                let hash: [u8; 32] = read(kernel, registers[7], 32)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                let value = read(kernel, registers[8], registers[9])
-                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                if BlobRefV2::of_bytes(&value).hash.0 != hash {
-                    return Ok([error::HOST_WHAT, 0]);
-                }
-                self.preimages.insert(hash, value);
-                Ok([error::HOST_OK, 0])
-            }
-            hostcall::PROGRAM_LOOKUP => {
-                let program: [u8; 32] = read(kernel, registers[7], 32)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or(ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                Ok([
-                    if self
-                        .programs
-                        .get(&program)
-                        .is_some_and(|pvm| ProgramId::of_pvm(pvm).0 == program)
-                    {
-                        error::HOST_OK
-                    } else {
-                        error::HOST_NONE
-                    },
-                    0,
-                ])
-            }
-            _ => Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
-        }
-    }
-}
-
-impl AccumulateProtocolHostV2 for DurableAccumulateHost {
-    type Transaction = DurableTransaction;
-
-    fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
-        Ok(DurableTransaction {
-            rows: self.rows.clone(),
-            preimages: self.preimages.clone(),
-            programs: self.programs.clone(),
-        })
-    }
-
-    fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2> {
-        self.rows = transaction.rows;
-        self.preimages = transaction.preimages;
-        self.programs = transaction.programs;
-        self.commits += 1;
-        Ok(())
-    }
-}
-
 #[test]
 fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let elf = service_elf();
@@ -403,9 +265,9 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             bytes: initial_bytes.clone(),
         }],
     };
-    let mut host = DurableAccumulateHost::default();
-    host.preimages.insert(initial.hash.0, initial_bytes);
-    host.programs.insert(actor_program.0, actor_pvm.clone());
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
@@ -474,8 +336,8 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     assert!(
         service
             .accumulate_host()
-            .preimages
-            .contains_key(&refined.exported_blobs[0].reference.hash.0)
+            .blob(&refined.exported_blobs[0].reference)
+            .is_some()
     );
 
     let duplicate = service.accumulate(&apply).unwrap().result;
@@ -596,9 +458,9 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
             bytes: initial_bytes.clone(),
         }],
     };
-    let mut host = DurableAccumulateHost::default();
-    host.preimages.insert(initial.hash.0, initial_bytes);
-    host.programs.insert(actor_program.0, actor_pvm.clone());
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
@@ -813,10 +675,9 @@ fn yielding_actor_restores_exactly_after_restart() {
     ping.extend_from_slice(&Msg::new("ping").encode());
     first_work.method = "ping".into();
     first_work.arguments = ping;
-    let mut host = DurableAccumulateHost::default();
-    host.preimages
-        .insert(initial_state_ref.hash.0, initial_state.clone());
-    host.programs.insert(actor_program.0, actor.clone());
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
+    assert_eq!(host.import_program(actor.clone()), actor_program);
     let mut committed = JamServiceV2::new(
         service_pvm,
         service_program,
@@ -938,19 +799,16 @@ fn yielding_actor_restores_exactly_after_restart() {
     };
     assert!(!duplicate);
     assert!(published.reply.is_none());
-    assert!(
-        committed
-            .accumulate_host()
-            .preimages
-            .values()
-            .any(|bytes| bytes == &checkpoint_state),
+    let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
+    assert_eq!(
+        committed.accumulate_host().blob(&checkpoint_state_ref),
+        Some(checkpoint_state.as_slice()),
         "guest Accumulate must durably record the checkpoint state"
     );
 
     // Simulate a process restart after Accumulate committed slice 0. Only
     // canonical programs, the committed state, and the continuation blob are
     // supplied to the next Refine invocation.
-    let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
     let mut resumed_work = first_work.clone();
     resumed_work.workflow_step = 1;
     resumed_work.base = ConsistencyBaseV2::Linear {
@@ -1027,7 +885,7 @@ fn yielding_actor_restores_exactly_after_restart() {
         1,
         "code before .await must not execute again"
     );
-    let committed_rows_before_resume = committed.accumulate_host().rows.clone();
+    let committed_before_resume = committed.accumulate_host().snapshot();
     let completed = committed
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: resumed_work,
@@ -1046,16 +904,16 @@ fn yielding_actor_restores_exactly_after_restart() {
     assert!(!duplicate);
     assert_eq!(receipt.sequence, checkpoint_receipt.sequence + 1);
     assert_eq!(published.reply, resumed.reply);
-    assert_ne!(
-        committed.accumulate_host().rows,
-        committed_rows_before_resume
-    );
     assert!(
-        committed
+        !committed
             .accumulate_host()
-            .preimages
-            .values()
-            .any(|bytes| bytes == resumed_state)
+            .snapshot()
+            .same_service_state(&committed_before_resume)
+    );
+    let resumed_state_ref = BlobRefV2::of_bytes(resumed_state);
+    assert_eq!(
+        committed.accumulate_host().blob(&resumed_state_ref),
+        Some(resumed_state.as_slice())
     );
 }
 
@@ -1068,9 +926,9 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
-    let mut host = DurableAccumulateHost::default();
-    host.preimages.insert(initial.hash.0, initial_bytes);
-    host.programs.insert(actor_program.0, actor_pvm);
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
     let mut service = JamServiceV2::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
@@ -1109,8 +967,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let AccumulationResultV2::Installed(installed) = installed_output.result else {
         panic!("guest install rejected")
     };
-    assert_eq!(service.accumulate_host().commits, 1);
-    let installed_rows = service.accumulate_host().rows.len();
+    assert_eq!(service.accumulate_host().commit_sequence(), 1);
+    let installed_rows = service.accumulate_host().row_count();
 
     let mut work = seed_work;
     work.base = ConsistencyBaseV2::Linear {
@@ -1157,18 +1015,15 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert!(!duplicate);
     assert_eq!(receipt.sequence, 1);
     assert_eq!(published.reply, transition.reply);
-    assert!(service.accumulate_host().rows.len() > installed_rows);
-    assert_eq!(service.accumulate_host().commits, 2);
-    assert!(
-        service
-            .accumulate_host()
-            .preimages
-            .values()
-            .any(|bytes| bytes == b"committed actor state")
+    assert!(service.accumulate_host().row_count() > installed_rows);
+    assert_eq!(service.accumulate_host().commit_sequence(), 2);
+    let committed_state = BlobRefV2::of_bytes(b"committed actor state");
+    assert_eq!(
+        service.accumulate_host().blob(&committed_state),
+        Some(b"committed actor state".as_slice())
     );
 
-    let rows_after_apply = service.accumulate_host().rows.clone();
-    let preimages_after_apply = service.accumulate_host().preimages.clone();
+    let snapshot_after_apply = service.accumulate_host().snapshot();
     let duplicate_output = service.accumulate(&apply).expect("guest retry completes");
     let AccumulationResultV2::Accepted {
         published,
@@ -1180,10 +1035,14 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     };
     assert!(duplicate);
     assert_eq!(published, PublishedEffectsV2::default());
-    assert_eq!(service.accumulate_host().rows, rows_after_apply);
-    assert_eq!(service.accumulate_host().preimages, preimages_after_apply);
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&snapshot_after_apply)
+    );
     assert_eq!(
-        service.accumulate_host().commits,
+        service.accumulate_host().commit_sequence(),
         2,
         "a read-only duplicate transaction must not commit"
     );
@@ -1197,8 +1056,8 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
-    let mut host = DurableAccumulateHost::default();
-    host.preimages.insert(initial.hash.0, initial_bytes);
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
     let mut service = JamServiceV2::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
@@ -1238,8 +1097,8 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
             .result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::WrongProgram)
     );
-    assert_eq!(service.accumulate_host().commits, 0);
-    assert!(service.accumulate_host().rows.is_empty());
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    assert_eq!(service.accumulate_host().row_count(), 0);
 }
 
 #[test]
@@ -1255,8 +1114,8 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
             len: u64::MAX,
         },
     );
-    let mut host = DurableAccumulateHost::default();
-    host.programs.insert(actor_program.0, actor_pvm);
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_program(actor_pvm), actor_program);
     let mut service = JamServiceV2::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
@@ -1290,9 +1149,9 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
             .result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::NonCanonical)
     );
-    assert_eq!(service.accumulate_host().commits, 0);
-    assert!(service.accumulate_host().rows.is_empty());
-    assert!(service.accumulate_host().preimages.is_empty());
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    assert_eq!(service.accumulate_host().row_count(), 0);
+    assert_eq!(service.accumulate_host().blob_count(), 0);
 }
 
 #[test]
@@ -1300,7 +1159,7 @@ fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
     let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
-    let mut host = DurableAccumulateHost::default();
+    let mut host = LocalJamStoreV2::default();
 
     let output = service
         .accumulate(b"not a v2 request", 10_000_000, &mut host)
@@ -1309,6 +1168,6 @@ fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
         AccumulationResultV2::decode(&output.bytes).unwrap(),
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::NonCanonical)
     );
-    assert!(host.rows.is_empty());
-    assert!(host.preimages.is_empty());
+    assert_eq!(host.row_count(), 0);
+    assert_eq!(host.blob_count(), 0);
 }
