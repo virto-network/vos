@@ -16,8 +16,9 @@ mod guest {
     use vos::abi::{error, pvm::hostcalls};
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
-        BlobRefV2, ContinuationChangeV2, GasAccountingV2, GuestAccumulateStoreV2, ReplyRecordV2,
-        StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2, execute_guest_accumulate,
+        BlobRefV2, ContinuationChangeV2, GasAccountingV2, GuestAccumulateStoreV2, RefineOutputV2,
+        ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+        execute_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -164,7 +165,11 @@ mod guest {
             gas: GasAccountingV2::default(),
             proof: None,
         };
-        let encoded = transition.encode();
+        let encoded = RefineOutputV2 {
+            transition,
+            candidate_blobs: alloc::vec::Vec::new(),
+        }
+        .encode();
         if encoded.len() > TRANSITION_CAPACITY {
             fail_closed();
         }

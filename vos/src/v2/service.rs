@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 
 use super::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulationResultV2, ImportedBlobV2, ProgramId,
-    RefineImportsV2, RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
-    WorkEnvelopeV2,
+    RefineImportsV2, RefineOutputV2, RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmV2,
+    TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,12 +99,22 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
             .pvm
             .refine_actor_tree(&work.encode(), imports, self.refine_gas, &self.refine_host)
             .map_err(ServiceDispatchError::Pvm)?;
-        let transition = TransitionV2::decode(&output.bytes)
+        let refined = RefineOutputV2::decode(&output.bytes)
             .map_err(|_| ServiceDispatchError::InvalidRefineOutput)?;
+        let mut exported_blobs = refined.candidate_blobs;
+        exported_blobs.extend(output.exported_blobs);
+        exported_blobs.sort_by_key(|blob| blob.reference.hash);
+        if exported_blobs
+            .windows(2)
+            .any(|pair| pair[0].reference.hash == pair[1].reference.hash && pair[0] != pair[1])
+        {
+            return Err(ServiceDispatchError::InvalidRefineOutput);
+        }
+        exported_blobs.dedup();
         Ok(RefinedServiceOutputV2 {
-            transition,
+            transition: refined.transition,
             gas_used: output.gas_used,
-            exported_blobs: output.exported_blobs,
+            exported_blobs,
         })
     }
 

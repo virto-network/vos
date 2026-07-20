@@ -369,6 +369,15 @@ impl TransitionV2 {
     }
 }
 
+/// Pure physical Refine output. Candidate blob bytes are carried alongside
+/// the transition instead of being written through a protocol capability;
+/// Accumulate must independently validate and stage them before commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefineOutputV2 {
+    pub transition: TransitionV2,
+    pub candidate_blobs: Vec<ImportedBlobV2>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccumulationReceiptV2 {
     pub service: ServiceIdentityV2,
@@ -418,6 +427,10 @@ pub struct ServiceGenesisV2 {
 pub struct AccumulationEnvelopeV2 {
     pub work: WorkEnvelopeV2,
     pub transition: TransitionV2,
+    /// Candidate content-addressed bytes produced by Refine or its exact JAR
+    /// snapshot boundary. They remain unobservable unless this Accumulate
+    /// transaction commits.
+    pub provided_blobs: Vec<ImportedBlobV2>,
 }
 
 /// Physical IC-5 request. `PrepareAttested` is wire-reserved now so adding the
@@ -856,6 +869,33 @@ impl V2Wire for TransitionV2 {
     }
 }
 
+impl V2Wire for RefineOutputV2 {
+    const MAGIC: [u8; 4] = *b"VRO2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.bytes(&self.transition.encode());
+        e.list(&self.candidate_blobs, |e, blob| {
+            encode_blob_ref(e, &blob.reference);
+            e.bytes(&blob.bytes);
+        });
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            transition: TransitionV2::decode(&d.bytes()?)?,
+            candidate_blobs: d.list(|d| {
+                Ok(ImportedBlobV2 {
+                    reference: decode_blob_ref(d)?,
+                    bytes: d.bytes()?,
+                })
+            })?,
+        };
+        validate_candidate_blobs(&value.transition, &value.candidate_blobs)?;
+        Ok(value)
+    }
+}
+
 impl V2Wire for CrdtChangeV2 {
     const MAGIC: [u8; 4] = *b"VCG2";
 
@@ -1038,12 +1078,22 @@ impl V2Wire for AccumulationEnvelopeV2 {
         let mut e = Encoder(out);
         e.bytes(&self.work.encode());
         e.bytes(&self.transition.encode());
+        e.list(&self.provided_blobs, |e, blob| {
+            encode_blob_ref(e, &blob.reference);
+            e.bytes(&blob.bytes);
+        });
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             work: WorkEnvelopeV2::decode(&d.bytes()?)?,
             transition: TransitionV2::decode(&d.bytes()?)?,
+            provided_blobs: d.list(|d| {
+                Ok(ImportedBlobV2 {
+                    reference: decode_blob_ref(d)?,
+                    bytes: d.bytes()?,
+                })
+            })?,
         };
         validate_accumulation_envelope(&value)?;
         Ok(value)
@@ -1282,7 +1332,43 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
         }
         _ => Err(DecodeError::NonCanonical),
     }?;
+    validate_candidate_blobs(&value.transition, &value.provided_blobs)?;
     Ok(())
+}
+
+fn validate_candidate_blobs(
+    transition: &TransitionV2,
+    candidates: &[ImportedBlobV2],
+) -> Result<(), DecodeError> {
+    ensure_sorted_unique(candidates, |blob| blob.reference.hash.0)?;
+    for candidate in candidates {
+        if !candidate.reference.matches(&candidate.bytes)
+            || !transition_blob_references(transition)
+                .any(|reference| reference == &candidate.reference)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    Ok(())
+}
+
+fn transition_blob_references(transition: &TransitionV2) -> impl Iterator<Item = &BlobRefV2> {
+    transition
+        .exported_blobs
+        .iter()
+        .chain(
+            transition
+                .continuations
+                .iter()
+                .filter_map(|change| change.replacement.as_ref()),
+        )
+        .chain(
+            transition
+                .crdt_change
+                .iter()
+                .flat_map(|change| change.materializations.iter())
+                .map(|materialization| &materialization.state),
+        )
 }
 
 fn encode_install_receipt(e: &mut Encoder<'_>, value: &ServiceInstallReceiptV2) {
@@ -1990,6 +2076,10 @@ mod tests {
         );
 
         let work = work();
+        let artifact = ImportedBlobV2 {
+            reference: BlobRefV2::of_bytes(b"candidate artifact"),
+            bytes: b"candidate artifact".to_vec(),
+        };
         let transition = TransitionV2 {
             service: work.service.clone(),
             consumed_input: work.input_id(),
@@ -2001,11 +2091,20 @@ mod tests {
             inbox: vec![],
             outbox: vec![],
             reply: None,
-            exported_blobs: vec![],
+            exported_blobs: vec![artifact.reference.clone()],
             gas: GasAccountingV2::default(),
             proof: None,
         };
-        let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition });
+        let refined = RefineOutputV2 {
+            transition: transition.clone(),
+            candidate_blobs: vec![artifact.clone()],
+        };
+        assert_eq!(RefineOutputV2::decode(&refined.encode()).unwrap(), refined);
+        let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work,
+            transition,
+            provided_blobs: vec![artifact],
+        });
         assert_eq!(AccumulateRequestV2::decode(&apply.encode()).unwrap(), apply);
 
         let AccumulateRequestV2::Apply(mut divergent) = apply else {
@@ -2014,6 +2113,17 @@ mod tests {
         divergent.transition.consumed_input.workflow_step += 1;
         assert_eq!(
             AccumulationEnvelopeV2::decode(&divergent.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut unexpected = divergent;
+        unexpected.transition.consumed_input = unexpected.work.input_id();
+        unexpected.provided_blobs[0] = ImportedBlobV2 {
+            reference: BlobRefV2::of_bytes(b"not referenced"),
+            bytes: b"not referenced".to_vec(),
+        };
+        assert_eq!(
+            AccumulationEnvelopeV2::decode(&unexpected.encode()),
             Err(DecodeError::NonCanonical)
         );
     }
@@ -2132,7 +2242,11 @@ mod tests {
             gas: GasAccountingV2::default(),
             proof: None,
         };
-        let envelope = AccumulationEnvelopeV2 { work, transition };
+        let envelope = AccumulationEnvelopeV2 {
+            work,
+            transition,
+            provided_blobs: vec![],
+        };
         assert_eq!(
             AccumulationEnvelopeV2::decode(&envelope.encode()).unwrap(),
             envelope
