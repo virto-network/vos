@@ -62,7 +62,6 @@ pub struct Context<A: Actor> {
     first_await_ordinal: u64,
     #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
-    #[cfg(feature = "pvm")]
     actor_tree: Vec<crate::v2::ActorTreeImportV2>,
     #[cfg(feature = "pvm")]
     active_actor_mask: u64,
@@ -125,7 +124,6 @@ impl<A: Actor> Context<A> {
             first_await_ordinal: 0,
             #[cfg(feature = "pvm")]
             next_await_ordinal: 0,
-            #[cfg(feature = "pvm")]
             actor_tree: Vec::new(),
             #[cfg(feature = "pvm")]
             active_actor_mask: 0,
@@ -161,6 +159,17 @@ impl<A: Actor> Context<A> {
     /// therefore return `None`.
     pub fn actor_id(&self) -> Option<crate::v2::ActorId> {
         self.actor_id
+    }
+
+    fn resolve_owned_actor_v2(
+        &self,
+        parent: Option<crate::v2::ActorId>,
+        name: &str,
+    ) -> Option<crate::v2::ActorId> {
+        self.actor_tree
+            .iter()
+            .find(|actor| actor.parent == parent && actor.name == name)
+            .map(|actor| actor.actor)
     }
 
     #[doc(hidden)]
@@ -850,20 +859,34 @@ impl<A: Actor> Context<A> {
         &'a mut self,
         name: impl Into<alloc::string::String>,
     ) -> Result<R::Handle<'a, Self>, super::client::ClientError> {
+        let name = name.into();
+        if self.actor_id.is_some() {
+            let actor = self
+                .resolve_owned_actor_v2(None, &name)
+                .ok_or(super::client::ClientError::NotFound)?;
+            return Ok(R::bind(actor, self));
+        }
         let id = self.resolve(name).await;
         if id == 0 {
             return Err(super::client::ClientError::NotFound);
         }
-        Ok(R::bind(ServiceId(id), self))
+        Ok(R::bind_service(ServiceId(id), self))
     }
 
-    /// Resolve an existing actor owned by this root tree. The legacy service
-    /// host can only enforce node locality; the v2 root-tree scheduler performs
-    /// the authoritative ownership check before dispatch.
+    /// Resolve an existing actor directly owned by the current actor. Under v2
+    /// this consults only the authenticated root-tree import; a same-node
+    /// service route cannot masquerade as an owned child.
     pub async fn child<'a, R: super::client::ActorReference + 'a>(
         &'a mut self,
         name: impl Into<alloc::string::String>,
     ) -> Result<R::Handle<'a, Self>, super::client::ClientError> {
+        let name = name.into();
+        if let Some(parent) = self.actor_id {
+            let actor = self
+                .resolve_owned_actor_v2(Some(parent), &name)
+                .ok_or(super::client::ClientError::NotOwnedChild)?;
+            return Ok(R::bind(actor, self));
+        }
         let id = self.resolve(name).await;
         if id == 0 {
             return Err(super::client::ClientError::NotFound);
@@ -872,7 +895,7 @@ impl<A: Actor> Context<A> {
         if target.node_prefix() != self.id.node_prefix() {
             return Err(super::client::ClientError::NotOwnedChild);
         }
-        Ok(R::bind(target, self))
+        Ok(R::bind_service(target, self))
     }
 
     /// Create and initialize an owned child. This is the only beginner API
@@ -895,7 +918,7 @@ impl<A: Actor> Context<A> {
             Ok(super::value::Value::U32(id)) if id != 0 => id,
             _ => return Err(super::client::ClientError::Unreachable),
         };
-        Ok(R::bind(ServiceId(id), self))
+        Ok(R::bind_service(ServiceId(id), self))
     }
 
     // --- Host I/O (worker mode) ---
@@ -1649,6 +1672,43 @@ mod tests {
         ctx.__set_actor_id(actor);
         assert_eq!(ctx.actor_id(), Some(actor));
         assert_eq!(ctx.id(), ServiceId(0));
+    }
+
+    #[test]
+    fn v2_child_resolution_requires_the_exact_parent_identity() {
+        let root = crate::v2::ActorId([1; 32]);
+        let child = crate::v2::ActorId([2; 32]);
+        let sibling_child = crate::v2::ActorId([3; 32]);
+        let other_root = crate::v2::ActorId([4; 32]);
+        let program = crate::v2::ProgramId([9; 32]);
+        let actor = |actor, name: &str, parent| crate::v2::ActorTreeImportV2 {
+            actor,
+            name: name.into(),
+            parent,
+            program,
+            state: alloc::vec![],
+            causal_states: alloc::vec![],
+            next_crdt_ordinal: 0,
+            suspended: false,
+        };
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        ctx.__set_actor_id(root);
+        ctx.actor_tree = alloc::vec![
+            actor(root, "root", None),
+            actor(child, "worker", Some(root)),
+            actor(sibling_child, "worker", Some(other_root)),
+            actor(other_root, "other", None),
+        ];
+
+        assert_eq!(
+            ctx.resolve_owned_actor_v2(Some(root), "worker"),
+            Some(child)
+        );
+        assert_eq!(
+            ctx.resolve_owned_actor_v2(Some(other_root), "worker"),
+            Some(sibling_child)
+        );
+        assert_eq!(ctx.resolve_owned_actor_v2(Some(root), "other"), None);
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

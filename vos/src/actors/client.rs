@@ -8,9 +8,12 @@
 //! [`Context<A>`](super::Context) is the invoker) and from host
 //! code (where `&VosNode` is the invoker, gated on `std`).
 //!
-//! Refs hold only a [`ServiceId`](super::context::ServiceId) and
-//! are cheap to construct — keep them as locals next to the call
-//! site, or as fields on a long-lived host struct.
+//! Application code normally receives a bound handle from
+//! [`Context::actor`](super::Context::actor) or
+//! [`Context::child`](super::Context::child). Those handles carry the full
+//! [`ActorId`](crate::v2::ActorId) used by the v2 scheduler. Raw refs retain a
+//! route-only [`ServiceId`](super::context::ServiceId) constructor solely as
+//! an advanced adapter for legacy hosts.
 
 use super::context::ServiceId;
 use super::value::Value;
@@ -83,6 +86,17 @@ pub trait Invoker {
         target: ServiceId,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_;
+
+    /// Invoke a canonical v2 actor identity. Host-only legacy invokers do not
+    /// acquire an implicit ActorId-to-ServiceId mapping; they must override
+    /// this method or report the target as unreachable.
+    fn invoke_actor(
+        &mut self,
+        _target: crate::v2::ActorId,
+        _payload: Vec<u8>,
+    ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
+        core::future::ready(Err(ClientError::Unreachable))
+    }
 }
 
 /// Runtime result for an attested invocation. The generated client decodes
@@ -106,17 +120,52 @@ pub trait AttestationInvoker: Invoker {
         target: ServiceId,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_;
+
+    /// Attested counterpart of [`Invoker::invoke_actor`]. The default rejects
+    /// the call so an adapter cannot accidentally return an unproved legacy
+    /// value for a canonical actor identity.
+    fn invoke_actor_attested(
+        &mut self,
+        _target: crate::v2::ActorId,
+        _payload: Vec<u8>,
+    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
+        core::future::ready(Err(ClientError::Unreachable))
+    }
 }
 
-/// Implemented by every macro-generated `{Actor}Ref`. It binds the route-only
-/// reference to an invoker and returns the generated handle whose methods no
-/// longer need an extra `ctx` argument.
+/// Identity carried by a generated bound handle.
+///
+/// `Actor` is the application-facing v2 form. `Service` exists only so the
+/// legacy host/runtime adapter can keep driving raw service routes during the
+/// clean-break rollout; it is intentionally absent from the application
+/// prelude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ActorTarget {
+    Actor(crate::v2::ActorId),
+    Service(ServiceId),
+}
+
+/// Implemented by every macro-generated `{Actor}Ref`. It binds a canonical
+/// actor identity to an invoker and returns a handle whose methods need no
+/// extra `ctx` argument.
 pub trait ActorReference: Copy {
     type Handle<'a, I: Invoker + 'a>: 'a
     where
         Self: 'a;
 
-    fn bind<'a, I: Invoker + 'a>(target: ServiceId, invoker: &'a mut I) -> Self::Handle<'a, I>;
+    fn bind<'a, I: Invoker + 'a>(
+        target: crate::v2::ActorId,
+        invoker: &'a mut I,
+    ) -> Self::Handle<'a, I>;
+
+    /// Advanced legacy-host adapter. Application code should resolve actors
+    /// through `Context` and receive an ActorId-bound handle instead.
+    #[doc(hidden)]
+    fn bind_service<'a, I: Invoker + 'a>(
+        target: ServiceId,
+        invoker: &'a mut I,
+    ) -> Self::Handle<'a, I>;
 }
 
 /// Generic spelling for a bound macro-generated actor handle.
@@ -135,6 +184,19 @@ impl<A: super::Actor> Invoker for super::Context<A> {
     ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
         async move {
             self.ask_raw(target, &payload)
+                .await
+                .map_err(|_| ClientError::Unreachable)
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn invoke_actor(
+        &mut self,
+        target: crate::v2::ActorId,
+        payload: Vec<u8>,
+    ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
+        async move {
+            self.ask_actor_raw(target, &payload, None)
                 .await
                 .map_err(|_| ClientError::Unreachable)
         }

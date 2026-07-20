@@ -323,12 +323,40 @@ fn attested_space_role_is_enforced_before_the_handler_runs() {
 fn bound_handle_methods_do_not_take_an_invoker_argument() {
     use vos::ActorReference;
 
-    let mut invoker = MockInvoker {
+    let actor = ActorId([7; 32]);
+    let mut invoker = BoundMockInvoker {
         reply: Value::U64(42),
+        actor: None,
     };
-    let mut handle = VaultRef::bind(ServiceId(7), &mut invoker);
+    let mut handle = VaultRef::bind(actor, &mut invoker);
+    assert_eq!(handle.actor_id(), Some(actor));
     let value = vos::block_on(handle.deposit(42)).unwrap();
     assert_eq!(value, 42);
+    assert_eq!(invoker.actor, Some(actor));
+}
+
+struct BoundMockInvoker {
+    reply: Value,
+    actor: Option<ActorId>,
+}
+
+impl Invoker for BoundMockInvoker {
+    fn invoke(
+        &mut self,
+        _target: ServiceId,
+        _payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
+        core::future::ready(Err(ClientError::Unreachable))
+    }
+
+    fn invoke_actor(
+        &mut self,
+        target: ActorId,
+        _payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
+        self.actor = Some(target);
+        core::future::ready(Ok(self.reply.clone()))
+    }
 }
 
 impl Invoker for MockInvoker {
