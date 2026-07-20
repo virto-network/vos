@@ -100,9 +100,10 @@ fn first_doc_paragraph(attrs: &[syn::Attribute]) -> String {
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as ItemStruct);
     let parsed = parse_actor_attrs(attr);
-    if let Err(error) = prepare_crdt_fields(&mut input, parsed.crdt) {
-        return error.to_compile_error().into();
-    }
+    let crdt_fields = match prepare_crdt_fields(&mut input, parsed.crdt) {
+        Ok(fields) => fields,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let storage_fields = extract_storage_fields(&mut input);
     let name = &input.ident;
     let msg_enum = format_ident!("{}Msg", name);
@@ -250,6 +251,24 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let init_crdt_fields = if crdt_fields.is_empty() {
+        quote! {}
+    } else {
+        let actor_name = name.to_string();
+        let inits = crdt_fields.iter().map(|ident| {
+            let field_name = ident.to_string();
+            quote! {
+                vos::crdt::Field::__vos_init(&mut self.#ident, #actor_name, #field_name);
+            }
+        });
+        quote! {
+            #[doc(hidden)]
+            fn __init_crdt_fields(&mut self) {
+                #( #inits )*
+            }
+        }
+    };
+
     // `#[storage(committed)]` fields: fold their SMT roots (declaration
     // order — part of the upgrade contract) with the state-blob hash
     // into the composite root `anchor_kind 0x02` anchors. Actors with
@@ -311,6 +330,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #init_storage
+
+            #init_crdt_fields
 
             #committed_root
 
@@ -1690,7 +1711,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
 /// Strip and validate `#[crdt(const)]` / `#[crdt(skip)]` field annotations.
 /// Plain mutable fields on a CRDT actor are rejected with application-facing
 /// guidance instead of silently becoming last-writer-wins command replay.
-fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<()> {
+fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<Vec<syn::Ident>> {
     let syn::Fields::Named(named) = &mut input.fields else {
         if is_crdt && !matches!(input.fields, syn::Fields::Unit) {
             return Err(syn::Error::new_spanned(
@@ -1698,9 +1719,10 @@ fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<()>
                 "#[actor(crdt)] requires named fields so each replicated field has explicit semantics",
             ));
         }
-        return Ok(());
+        return Ok(Vec::new());
     };
 
+    let mut replicated = Vec::new();
     for field in &mut named.named {
         let mut is_const = false;
         let mut is_skip = false;
@@ -1758,8 +1780,11 @@ fn prepare_crdt_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<()>
                 ),
             ));
         }
+        if is_crdt && !is_const && !is_skip {
+            replicated.push(field.ident.clone().expect("named CRDT field"));
+        }
     }
-    Ok(())
+    Ok(replicated)
 }
 
 fn is_crdt_field_type(ty: &syn::Type) -> bool {

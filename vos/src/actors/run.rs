@@ -795,16 +795,26 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let checkpoint = ctx.__take_checkpoint_v2();
     let new_state = actor.encode();
     let state_changed = input.state.is_empty() || new_state != input.state;
+    let (crdt_operations, crdt_materialization) = match input.change {
+        Some(change) => (
+            crate::crdt::take_operations(input.actor, change)
+                .expect("nested CRDT actor must return its completed field operations"),
+            Some(new_state.clone()),
+        ),
+        None => (alloc::vec::Vec::new(), None),
+    };
     let writes = ctx
         .__drain_actor_writes_v2(
             input.actor,
             super::storage::end_dispatch(),
-            state_changed.then_some(new_state),
+            (!A::CRDT && state_changed).then_some(new_state),
         )
         .expect("nested actor emitted an unsupported v2 effect");
     let encoded = ActorSliceOutputV2 {
         actor: input.actor,
         writes,
+        crdt_operations,
+        crdt_materialization,
         reply,
         yielded,
         forbidden,

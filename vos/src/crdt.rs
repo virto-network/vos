@@ -8,15 +8,32 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ChangeScope {
     change: ChangeId,
     next_ordinal: u32,
+    operations: Vec<PendingOperation>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOperation {
+    field: crate::v2::Hash,
+    id: OpId,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedChange {
+    change: ChangeId,
+    operations: Vec<PendingOperation>,
 }
 
 #[cfg(feature = "std")]
 std::thread_local! {
     static CHANGE_SCOPE: core::cell::RefCell<Option<ChangeScope>> = const {
+        core::cell::RefCell::new(None)
+    };
+    static COMPLETED_CHANGE: core::cell::RefCell<Option<CompletedChange>> = const {
         core::cell::RefCell::new(None)
     };
 }
@@ -29,6 +46,31 @@ unsafe impl Sync for GuestChangeScope {}
 
 #[cfg(not(feature = "std"))]
 static CHANGE_SCOPE: GuestChangeScope = GuestChangeScope(core::cell::UnsafeCell::new(None));
+
+#[cfg(not(feature = "std"))]
+struct GuestCompletedChange(core::cell::UnsafeCell<Option<CompletedChange>>);
+
+#[cfg(not(feature = "std"))]
+unsafe impl Sync for GuestCompletedChange {}
+
+#[cfg(not(feature = "std"))]
+static COMPLETED_CHANGE: GuestCompletedChange =
+    GuestCompletedChange(core::cell::UnsafeCell::new(None));
+
+/// Runtime identity assigned by generated `#[actor(crdt)]` glue. The tag is
+/// deliberately absent from archived actor state: it is reconstructed from
+/// the actor and field names after every create/restore.
+#[doc(hidden)]
+pub trait Field {
+    fn __vos_init(&mut self, actor: &str, field: &str);
+}
+
+fn field_tag(actor: &str, field: &str) -> crate::v2::Hash {
+    crate::v2::Hash::digest(
+        b"vos/crdt-field-tag/v2",
+        &[actor.as_bytes(), field.as_bytes()],
+    )
+}
 
 #[derive(
     rkyv::Archive,
@@ -102,6 +144,8 @@ pub enum Error {
     NoChangeScope,
     NestedChangeScope,
     OperationOverflow,
+    NoCompletedChange,
+    ChangeMismatch,
 }
 
 impl core::fmt::Display for Error {
@@ -119,6 +163,12 @@ impl core::fmt::Display for Error {
             }
             Self::OperationOverflow => {
                 f.write_str("one CRDT execution slice emitted too many operations")
+            }
+            Self::NoCompletedChange => {
+                f.write_str("the CRDT execution slice did not produce a completed change")
+            }
+            Self::ChangeMismatch => {
+                f.write_str("the completed CRDT change does not match the actor slice")
             }
         }
     }
@@ -139,7 +189,11 @@ pub fn with_change<R>(change: ChangeId, f: impl FnOnce() -> Result<R, Error>) ->
         }
     }
     let _reset = Reset;
-    f()
+    let result = f();
+    if result.is_ok() {
+        complete_change();
+    }
+    result
 }
 
 #[cfg(feature = "std")]
@@ -152,7 +206,9 @@ fn begin_change(change: ChangeId) -> Result<(), Error> {
         *scope = Some(ChangeScope {
             change,
             next_ordinal: 0,
+            operations: Vec::new(),
         });
+        COMPLETED_CHANGE.with(|completed| *completed.borrow_mut() = None);
         Ok(())
     })
 }
@@ -169,8 +225,41 @@ fn begin_change(change: ChangeId) -> Result<(), Error> {
     *scope = Some(ChangeScope {
         change,
         next_ordinal: 0,
+        operations: Vec::new(),
     });
+    // SAFETY: the guest is single-threaded and this slot is paired with the
+    // active change scope above.
+    unsafe { *COMPLETED_CHANGE.0.get() = None };
     Ok(())
+}
+
+#[cfg(feature = "std")]
+fn complete_change() {
+    CHANGE_SCOPE.with(|scope| {
+        let Some(scope) = scope.borrow_mut().take() else {
+            return;
+        };
+        COMPLETED_CHANGE.with(|completed| {
+            *completed.borrow_mut() = Some(CompletedChange {
+                change: scope.change,
+                operations: scope.operations,
+            });
+        });
+    });
+}
+
+#[cfg(not(feature = "std"))]
+fn complete_change() {
+    // SAFETY: see `begin_change`; both slots are guest-local and serialized.
+    let Some(scope) = (unsafe { &mut *CHANGE_SCOPE.0.get() }).take() else {
+        return;
+    };
+    unsafe {
+        *COMPLETED_CHANGE.0.get() = Some(CompletedChange {
+            change: scope.change,
+            operations: scope.operations,
+        });
+    }
 }
 
 #[cfg(feature = "std")]
@@ -203,6 +292,107 @@ fn next_operation_from(scope: Option<&mut ChangeScope>) -> Result<OpId, Error> {
     Ok(scope.change.operation(ordinal))
 }
 
+fn record_operation(field: crate::v2::Hash, id: OpId, payload: Vec<u8>) -> Result<(), Error> {
+    debug_assert!(!payload.is_empty());
+    #[cfg(feature = "std")]
+    {
+        CHANGE_SCOPE
+            .with(|scope| record_operation_in(scope.borrow_mut().as_mut(), field, id, payload))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // SAFETY: see `begin_change`; actor mutation is single-threaded.
+        let scope = unsafe { &mut *CHANGE_SCOPE.0.get() };
+        record_operation_in(scope.as_mut(), field, id, payload)
+    }
+}
+
+fn record_operation_in(
+    scope: Option<&mut ChangeScope>,
+    field: crate::v2::Hash,
+    id: OpId,
+    payload: Vec<u8>,
+) -> Result<(), Error> {
+    let scope = scope.ok_or(Error::NoChangeScope)?;
+    if id.change != scope.change {
+        return Err(Error::ChangeMismatch);
+    }
+    scope
+        .operations
+        .push(PendingOperation { field, id, payload });
+    Ok(())
+}
+
+/// Take the concrete operations emitted by the last successful actor slice.
+/// The returned order is canonical by consensus operation id.
+#[doc(hidden)]
+pub fn take_operations(
+    actor: crate::v2::ActorId,
+    change: crate::v2::ChangeId,
+) -> Result<Vec<crate::v2::CrdtOperationV2>, Error> {
+    #[cfg(feature = "std")]
+    let completed = COMPLETED_CHANGE.with(|completed| completed.borrow_mut().take());
+    #[cfg(not(feature = "std"))]
+    // SAFETY: see `begin_change`; the actor entrypoint consumes this once.
+    let completed = unsafe { (&mut *COMPLETED_CHANGE.0.get()).take() };
+
+    let completed = completed.ok_or(Error::NoCompletedChange)?;
+    if completed.change.0 != change.0 {
+        return Err(Error::ChangeMismatch);
+    }
+    let mut operations = completed
+        .operations
+        .into_iter()
+        .map(|operation| crate::v2::CrdtOperationV2 {
+            actor,
+            field: operation.field,
+            ordinal: operation.id.ordinal,
+            id: change.operation(actor, operation.field, operation.id.ordinal),
+            payload: operation.payload,
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by_key(|operation| operation.id);
+    if operations.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return Err(Error::ChangeMismatch);
+    }
+    Ok(operations)
+}
+
+fn operation_payload(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(tag);
+    payload.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    for part in parts {
+        payload.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        payload.extend_from_slice(part);
+    }
+    payload
+}
+
+fn encode_op_ids(ids: impl IntoIterator<Item = OpId>) -> Vec<u8> {
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let mut encoded = Vec::with_capacity(4 + ids.len() * 36);
+    encoded.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
+        encoded.extend_from_slice(&id.change.0);
+        encoded.extend_from_slice(&id.ordinal.to_le_bytes());
+    }
+    encoded
+}
+
+fn encode_optional_op_id(id: Option<OpId>) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(37);
+    match id {
+        Some(id) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&id.change.0);
+            encoded.extend_from_slice(&id.ordinal.to_le_bytes());
+        }
+        None => encoded.push(0),
+    }
+    encoded
+}
+
 /// Multi-value register. The visible value is selected deterministically by
 /// operation id; concurrent alternatives remain available through
 /// [`conflicts`](Self::conflicts).
@@ -211,6 +401,8 @@ fn next_operation_from(scope: Option<&mut ChangeScope>) -> Result<OpId, Error> {
 pub struct Value<T> {
     values: BTreeMap<OpId, T>,
     removed: BTreeSet<OpId>,
+    #[rkyv(with = rkyv::with::Skip)]
+    field: crate::v2::Hash,
 }
 
 impl<T> Default for Value<T> {
@@ -218,7 +410,14 @@ impl<T> Default for Value<T> {
         Self {
             values: BTreeMap::new(),
             removed: BTreeSet::new(),
+            field: crate::v2::Hash::ZERO,
         }
+    }
+}
+
+impl<T> Field for Value<T> {
+    fn __vos_init(&mut self, actor: &str, field: &str) {
+        self.field = field_tag(actor, field);
     }
 }
 
@@ -278,8 +477,24 @@ impl<T: Clone + PartialEq> Value<T> {
     /// Assign a value, superseding every version observed by this replica.
     /// Reusing an operation ID with identical contents is an idempotent retry;
     /// reusing it with different contents is rejected.
-    pub fn set(&mut self, value: T) -> Result<(), Error> {
-        self.set_with_id(next_operation()?, value)
+    pub fn set(&mut self, value: T) -> Result<(), Error>
+    where
+        T: crate::Encode,
+    {
+        let id = next_operation()?;
+        let observed = encode_op_ids(
+            self.values
+                .keys()
+                .filter(|observed| !self.removed.contains(observed))
+                .copied(),
+        );
+        let encoded_value = crate::Encode::encode(&value);
+        self.set_with_id(id, value)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(0, &[&observed, &encoded_value]),
+        )
     }
 
     #[doc(hidden)]
@@ -326,6 +541,8 @@ impl<T: Clone + PartialEq> Value<T> {
 pub struct Map<K, V> {
     entries: BTreeMap<K, Value<V>>,
     operation_keys: BTreeMap<OpId, K>,
+    #[rkyv(with = rkyv::with::Skip)]
+    field: crate::v2::Hash,
 }
 
 impl<K, V> Default for Map<K, V> {
@@ -333,16 +550,39 @@ impl<K, V> Default for Map<K, V> {
         Self {
             entries: BTreeMap::new(),
             operation_keys: BTreeMap::new(),
+            field: crate::v2::Hash::ZERO,
         }
+    }
+}
+
+impl<K, V> Field for Map<K, V> {
+    fn __vos_init(&mut self, actor: &str, field: &str) {
+        self.field = field_tag(actor, field);
     }
 }
 
 impl<K: Ord, V: Clone + PartialEq> Map<K, V> {
     pub fn insert(&mut self, key: K, value: V) -> Result<(), Error>
     where
-        K: Clone + PartialEq,
+        K: Clone + PartialEq + crate::Encode,
+        V: crate::Encode,
     {
-        self.insert_with_id(next_operation()?, key, value)
+        let id = next_operation()?;
+        let observed = encode_op_ids(
+            self.entries
+                .get(&key)
+                .into_iter()
+                .flat_map(Value::versions)
+                .map(|(id, _)| id),
+        );
+        let encoded_key = crate::Encode::encode(&key);
+        let encoded_value = crate::Encode::encode(&value);
+        self.insert_with_id(id, key, value)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(1, &[&observed, &encoded_key, &encoded_value]),
+        )
     }
 
     #[doc(hidden)]
@@ -376,13 +616,28 @@ impl<K: Ord, V> Map<K, V> {
         self.entries.get(key).into_iter().flat_map(Value::conflicts)
     }
 
-    pub fn remove(&mut self, key: &K) -> bool {
+    pub fn remove(&mut self, key: &K) -> Result<bool, Error>
+    where
+        K: crate::Encode,
+    {
         let Some(value) = self.entries.get_mut(key) else {
-            return false;
+            return Ok(false);
         };
-        let existed = !value.is_empty();
+        let observed_ids = value.versions().map(|(id, _)| id).collect::<Vec<_>>();
+        let existed = !observed_ids.is_empty();
+        if !existed {
+            return Ok(false);
+        }
+        let id = next_operation()?;
+        let observed = encode_op_ids(observed_ids);
+        let encoded_key = crate::Encode::encode(key);
         value.remove_observed();
-        existed
+        record_operation(
+            self.field,
+            id,
+            operation_payload(2, &[&observed, &encoded_key]),
+        )?;
+        Ok(true)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
@@ -435,6 +690,8 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Map<K, V> {
 pub struct Set<T> {
     operations: BTreeMap<OpId, T>,
     removed: BTreeSet<OpId>,
+    #[rkyv(with = rkyv::with::Skip)]
+    field: crate::v2::Hash,
 }
 
 impl<T> Default for Set<T> {
@@ -442,13 +699,27 @@ impl<T> Default for Set<T> {
         Self {
             operations: BTreeMap::new(),
             removed: BTreeSet::new(),
+            field: crate::v2::Hash::ZERO,
         }
     }
 }
 
+impl<T> Field for Set<T> {
+    fn __vos_init(&mut self, actor: &str, field: &str) {
+        self.field = field_tag(actor, field);
+    }
+}
+
 impl<T: Ord + Clone + PartialEq> Set<T> {
-    pub fn insert(&mut self, value: T) -> Result<bool, Error> {
-        self.insert_with_id(next_operation()?, value)
+    pub fn insert(&mut self, value: T) -> Result<bool, Error>
+    where
+        T: crate::Encode,
+    {
+        let id = next_operation()?;
+        let encoded_value = crate::Encode::encode(&value);
+        let inserted = self.insert_with_id(id, value)?;
+        record_operation(self.field, id, operation_payload(3, &[&encoded_value]))?;
+        Ok(inserted)
     }
 
     #[doc(hidden)]
@@ -464,7 +735,34 @@ impl<T: Ord + Clone + PartialEq> Set<T> {
         Ok(true)
     }
 
-    pub fn remove(&mut self, value: &T) -> bool {
+    pub fn remove(&mut self, value: &T) -> Result<bool, Error>
+    where
+        T: crate::Encode,
+    {
+        let observed: Vec<_> = self
+            .operations
+            .iter()
+            .filter(|(id, candidate)| !self.removed.contains(id) && *candidate == value)
+            .map(|(id, _)| *id)
+            .collect();
+        let existed = !observed.is_empty();
+        if !existed {
+            return Ok(false);
+        }
+        let id = next_operation()?;
+        let encoded_observed = encode_op_ids(observed.iter().copied());
+        let encoded_value = crate::Encode::encode(value);
+        self.removed.extend(observed);
+        record_operation(
+            self.field,
+            id,
+            operation_payload(4, &[&encoded_observed, &encoded_value]),
+        )?;
+        Ok(true)
+    }
+
+    #[doc(hidden)]
+    pub fn remove_observed(&mut self, value: &T) -> bool {
         let observed: Vec<_> = self
             .operations
             .iter()
@@ -532,6 +830,8 @@ struct ListElement<T> {
 pub struct List<T> {
     elements: BTreeMap<OpId, ListElement<T>>,
     removed: BTreeSet<OpId>,
+    #[rkyv(with = rkyv::with::Skip)]
+    field: crate::v2::Hash,
 }
 
 impl<T> Default for List<T> {
@@ -539,13 +839,32 @@ impl<T> Default for List<T> {
         Self {
             elements: BTreeMap::new(),
             removed: BTreeSet::new(),
+            field: crate::v2::Hash::ZERO,
         }
     }
 }
 
+impl<T> Field for List<T> {
+    fn __vos_init(&mut self, actor: &str, field: &str) {
+        self.field = field_tag(actor, field);
+    }
+}
+
 impl<T: PartialEq> List<T> {
-    pub fn push(&mut self, value: T) -> Result<(), Error> {
-        self.push_with_id(next_operation()?, value)
+    pub fn push(&mut self, value: T) -> Result<(), Error>
+    where
+        T: crate::Encode,
+    {
+        let id = next_operation()?;
+        let after = self.ordered_ids().last().copied();
+        let encoded_after = encode_optional_op_id(after);
+        let encoded_value = crate::Encode::encode(&value);
+        self.insert_after_with_id(id, after, value)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(5, &[&encoded_after, &encoded_value]),
+        )
     }
 
     #[doc(hidden)]
@@ -554,8 +873,24 @@ impl<T: PartialEq> List<T> {
         self.insert_after_with_id(id, after, value)
     }
 
-    pub fn insert(&mut self, index: usize, value: T) -> Result<(), Error> {
-        self.insert_with_id(index, next_operation()?, value)
+    pub fn insert(&mut self, index: usize, value: T) -> Result<(), Error>
+    where
+        T: crate::Encode,
+    {
+        let visible = self.visible_ids();
+        if index > visible.len() {
+            return Err(Error::IndexOutOfBounds);
+        }
+        let id = next_operation()?;
+        let after = index.checked_sub(1).and_then(|i| visible.get(i).copied());
+        let encoded_after = encode_optional_op_id(after);
+        let encoded_value = crate::Encode::encode(&value);
+        self.insert_after_with_id(id, after, value)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(5, &[&encoded_after, &encoded_value]),
+        )
     }
 
     #[doc(hidden)]
@@ -577,7 +912,10 @@ impl<T: PartialEq> List<T> {
             .get(index)
             .copied()
             .ok_or(Error::IndexOutOfBounds)?;
+        let removal = next_operation()?;
+        let target = encode_op_ids([id]);
         self.removed.insert(id);
+        record_operation(self.field, removal, operation_payload(6, &[&target]))?;
         Ok(self.elements[&id].value.clone())
     }
 
@@ -687,6 +1025,14 @@ impl<T: Clone + PartialEq> List<T> {
 #[rkyv(crate = rkyv)]
 pub struct Text {
     chars: List<char>,
+    #[rkyv(with = rkyv::with::Skip)]
+    field: crate::v2::Hash,
+}
+
+impl Field for Text {
+    fn __vos_init(&mut self, actor: &str, field: &str) {
+        self.field = field_tag(actor, field);
+    }
 }
 
 impl Text {
@@ -696,7 +1042,21 @@ impl Text {
         }
         let mut staged = self.clone();
         for (offset, ch) in text.chars().enumerate() {
-            staged.chars.insert(index + offset, ch)?;
+            let visible = staged.chars.visible_ids();
+            let insert_at = index + offset;
+            let after = insert_at
+                .checked_sub(1)
+                .and_then(|i| visible.get(i).copied());
+            let id = next_operation()?;
+            let encoded_after = encode_optional_op_id(after);
+            let mut utf8 = [0; 4];
+            let encoded_char = ch.encode_utf8(&mut utf8).as_bytes();
+            staged.chars.insert_after_with_id(id, after, ch)?;
+            record_operation(
+                self.field,
+                id,
+                operation_payload(7, &[&encoded_after, encoded_char]),
+            )?;
         }
         *self = staged;
         Ok(())
@@ -726,9 +1086,24 @@ impl Text {
         if index.checked_add(count).is_none_or(|end| end > self.len()) {
             return Err(Error::IndexOutOfBounds);
         }
+        let mut staged = self.clone();
         for _ in 0..count {
-            self.chars.remove(index)?;
+            let target = staged
+                .chars
+                .visible_ids()
+                .get(index)
+                .copied()
+                .ok_or(Error::IndexOutOfBounds)?;
+            let removal = next_operation()?;
+            staged.chars.removed.insert(target);
+            let encoded_target = encode_op_ids([target]);
+            record_operation(
+                self.field,
+                removal,
+                operation_payload(8, &[&encoded_target]),
+            )?;
         }
+        *self = staged;
         Ok(())
     }
 
@@ -763,11 +1138,25 @@ impl core::fmt::Display for Text {
 #[rkyv(crate = rkyv)]
 pub struct Counter {
     operations: BTreeMap<OpId, i128>,
+    #[rkyv(with = rkyv::with::Skip)]
+    field: crate::v2::Hash,
+}
+
+impl Field for Counter {
+    fn __vos_init(&mut self, actor: &str, field: &str) {
+        self.field = field_tag(actor, field);
+    }
 }
 
 impl Counter {
     pub fn increment(&mut self, amount: u64) -> Result<(), Error> {
-        self.increment_with_id(next_operation()?, amount)
+        let id = next_operation()?;
+        self.increment_with_id(id, amount)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(9, &[&(amount as i128).to_le_bytes()]),
+        )
     }
 
     #[doc(hidden)]
@@ -776,7 +1165,13 @@ impl Counter {
     }
 
     pub fn decrement(&mut self, amount: u64) -> Result<(), Error> {
-        self.decrement_with_id(next_operation()?, amount)
+        let id = next_operation()?;
+        self.decrement_with_id(id, amount)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(9, &[&(-(amount as i128)).to_le_bytes()]),
+        )
     }
 
     #[doc(hidden)]
@@ -785,7 +1180,13 @@ impl Counter {
     }
 
     pub fn add(&mut self, delta: i64) -> Result<(), Error> {
-        self.add_with_id(next_operation()?, delta)
+        let id = next_operation()?;
+        self.add_with_id(id, delta)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(9, &[&(delta as i128).to_le_bytes()]),
+        )
     }
 
     #[doc(hidden)]
@@ -888,8 +1289,45 @@ mod tests {
         );
 
         let mut value = Value::default();
-        with_change(change(4), || value.set("ready")).unwrap();
+        with_change(change(4), || value.set(String::from("ready"))).unwrap();
         assert_eq!(value.visible_id(), Some(change(4).operation(0)));
+    }
+
+    #[test]
+    fn completed_slice_exposes_field_scoped_consensus_operations() {
+        let mut counter = Counter::default();
+        Field::__vos_init(&mut counter, "Board", "edits");
+        let actor = crate::v2::ActorId([4; 32]);
+        let change = crate::v2::ChangeId([7; 32]);
+
+        with_change(ChangeId(change.0), || {
+            counter.increment(2)?;
+            counter.decrement(1)?;
+            Ok(())
+        })
+        .unwrap();
+        let operations = take_operations(actor, change).unwrap();
+
+        let field = field_tag("Board", "edits");
+        assert_eq!(operations.len(), 2);
+        assert!(operations.iter().all(|operation| operation.field == field));
+        assert!(operations.windows(2).all(|pair| pair[0].id < pair[1].id));
+        let mut ordinals = operations
+            .iter()
+            .map(|operation| {
+                assert_eq!(
+                    operation.id,
+                    change.operation(actor, field, operation.ordinal)
+                );
+                operation.ordinal
+            })
+            .collect::<Vec<_>>();
+        ordinals.sort_unstable();
+        assert_eq!(ordinals, vec![0, 1]);
+        assert_eq!(
+            take_operations(actor, change),
+            Err(Error::NoCompletedChange)
+        );
     }
 
     #[test]
@@ -931,7 +1369,7 @@ mod tests {
         let mut a = Set::default();
         a.insert_with_id(change(1).operation(0), "task").unwrap();
         let mut b = a.clone();
-        a.remove(&"task");
+        a.remove_observed(&"task");
         b.insert_with_id(change(2).operation(0), "task").unwrap();
         a.merge(&b).unwrap();
         b.merge(&a).unwrap();
@@ -1116,7 +1554,7 @@ mod tests {
             .insert_with_id(change(4).operation(0), "x")
             .unwrap();
         let mut sets = [base_set.clone(), base_set.clone(), base_set];
-        sets[0].remove(&"x");
+        sets[0].remove_observed(&"x");
         sets[1].insert_with_id(change(5).operation(0), "x").unwrap();
         sets[2].insert_with_id(change(6).operation(0), "y").unwrap();
         let mut expected_set = None;

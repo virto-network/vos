@@ -100,6 +100,7 @@ pub fn load_or_create<A: Actor>(state: Option<&[u8]>) -> A {
         _ => A::create(),
     };
     actor.__init_storage();
+    actor.__init_crdt_fields();
     actor
 }
 
