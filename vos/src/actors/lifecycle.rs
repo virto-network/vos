@@ -493,16 +493,17 @@ pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -
         raw
     };
 
-    // Decode message: if first byte is TAG_DYNAMIC, decode as dynamic Msg → FromDynamic;
-    // otherwise decode as typed A::Message directly.
-    let msg = if !raw.is_empty() && raw[0] == TAG_DYNAMIC {
-        let dynamic: super::value::Msg = Decode::decode(&raw[1..]);
-        match A::Message::from_dynamic(&dynamic) {
-            Some(m) => m,
-            None => return DispatchResult::Skipped,
-        }
-    } else {
-        A::Message::decode(raw)
+    // VOS v2 has one application message wire: TAG_DYNAMIC followed by Msg.
+    // The old typed-enum rkyv fallback made generated message fields part of
+    // the public ABI and prevented portable proof packages from being passed
+    // as arguments.
+    if raw.first() != Some(&TAG_DYNAMIC) {
+        return DispatchResult::Skipped;
+    }
+    let dynamic: super::value::Msg = Decode::decode(&raw[1..]);
+    let msg = match A::Message::from_dynamic(&dynamic) {
+        Some(m) => m,
+        None => return DispatchResult::Skipped,
     };
 
     match actor.dispatch(msg, ctx) {

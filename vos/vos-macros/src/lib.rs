@@ -643,20 +643,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // uses dynamic Msg via ctx.tell() instead of typed encoding.
         let msg_struct = if field_names.is_empty() {
             quote! {
-                #[derive(
-                    vos::rkyv::Archive,
-                    vos::rkyv::Deserialize,
-                )]
-                #[rkyv(crate = vos::rkyv)]
                 pub struct #struct_name;
             }
         } else {
             quote! {
-                #[derive(
-                    vos::rkyv::Archive,
-                    vos::rkyv::Deserialize,
-                )]
-                #[rkyv(crate = vos::rkyv)]
                 pub struct #struct_name {
                     #( pub #field_names: #field_types ),*
                 }
@@ -1089,11 +1079,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate the aggregated enum
     let aggregated_enum = quote! {
-        #[derive(
-            vos::rkyv::Archive,
-            vos::rkyv::Deserialize,
-        )]
-        #[rkyv(crate = vos::rkyv)]
         pub enum #enum_name {
             #( #enum_variants ),*
         }
@@ -2312,6 +2297,14 @@ fn whitelist_accessor(ty: &syn::Type) -> Option<proc_macro2::TokenStream> {
 /// rather than mis-dispatched.
 fn from_msg_arg(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
     let name_str = name.to_string();
+    if is_attestation_type(ty) {
+        return quote! {
+            let #name: #ty = <#ty>::from_portable_bytes(
+                msg.args.get(#name_str)?.as_bytes()?,
+            )
+            .ok()?;
+        };
+    }
     if let Some(accessor) = whitelist_accessor(ty) {
         return quote! { let #name: #ty = msg.args.#accessor(#name_str)?; };
     }
@@ -2337,6 +2330,14 @@ fn from_msg_arg(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
 /// keep working.
 fn ref_arg_with(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
     let name_str = name.to_string();
+    if is_attestation_type(ty) {
+        return quote! {
+            .with(
+                #name_str,
+                vos::value::Value::Bytes(#name.to_portable_bytes()),
+            )
+        };
+    }
     if is_primitive_ty(ty) {
         return quote! { .with(#name_str, #name) };
     }
@@ -2353,6 +2354,14 @@ fn ref_arg_with(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
             ),
         )
     }
+}
+
+fn is_attestation_type(ty: &syn::Type) -> bool {
+    matches!(
+        ty,
+        syn::Type::Path(path)
+            if path.path.segments.last().is_some_and(|segment| segment.ident == "Attestation")
+    )
 }
 
 /// Map a Rust type to the corresponding `InitArgs` accessor method.

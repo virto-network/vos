@@ -106,8 +106,29 @@ mod fixture {
             Ok(3)
         }
     }
+
+    pub mod gate {
+        use super::{LastReceipt, Receipt};
+        use vos::prelude::*;
+
+        #[actor]
+        pub struct Gate;
+
+        #[messages]
+        impl Gate {
+            fn new() -> Self {
+                Gate
+            }
+
+            #[msg]
+            fn admit(&self, package: Attestation<Receipt, LastReceipt>) -> u64 {
+                package.unverified_preview().id
+            }
+        }
+    }
 }
 
+use fixture::gate::{GateMsg, GateRef};
 use fixture::{Receipt, Vault, VaultMsg, VaultRef};
 
 mod crdt_fixture {
@@ -532,6 +553,28 @@ fn custom_struct_arg_round_trips_ref_to_from_msg() {
         panic!("expected Record variant");
     };
     assert_eq!(inner.receipt, receipt);
+}
+
+#[test]
+fn portable_attestation_round_trips_as_a_generated_actor_argument() {
+    let claim = Receipt {
+        id: 101,
+        tag: [11; 32],
+    };
+    let mut producer = MockAttestationInvoker {
+        result: Some(attested_receipt_result(&claim)),
+    };
+    let package = vos::block_on(VaultRef::at(ServiceId(5)).last_receipt(&mut producer)).unwrap();
+
+    let mut gate_invoker = CapturingInvoker {
+        reply: Some(Value::U64(101)),
+        ..Default::default()
+    };
+    let admitted =
+        vos::block_on(GateRef::at(ServiceId(6)).admit(&mut gate_invoker, package)).unwrap();
+    assert_eq!(admitted, 101);
+    let GateMsg::Admit(message) = GateMsg::from_msg(&gate_invoker.captured_msg()).unwrap();
+    assert_eq!(message.package.unverified_preview(), &claim);
 }
 
 #[test]

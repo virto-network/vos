@@ -45,7 +45,7 @@ pub trait Actor: Sized + Encode + Decode {
     type Error: core::fmt::Debug;
 
     /// The message enum dispatched to this actor.
-    type Message: Decode + super::value::FromDynamic;
+    type Message: super::value::FromDynamic;
 
     /// The actor's own role hierarchy — the domain-specific tiers
     /// `#[msg(role = X)]` references and `ctx.ensure_role` checks

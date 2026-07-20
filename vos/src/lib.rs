@@ -562,16 +562,15 @@ macro_rules! __vos_emit_worker_glue {
                 let ws = unsafe { &mut *(state as *mut WorkerState) };
                 let raw = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
 
-                let msg = if !raw.is_empty() && raw[0] == $crate::value::TAG_DYNAMIC {
-                    let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
-                    match <$enum_name as $crate::value::FromDynamic>::from_dynamic(&dynamic) {
-                        Some(m) => m,
-                        // Unknown method → no future built; return 0 so the host
-                        // maps it to an error (the POLL_ERR_NO_FUTURE behaviour).
-                        None => return 0,
-                    }
-                } else {
-                    $crate::Decode::decode(raw)
+                if raw.first() != Some(&$crate::value::TAG_DYNAMIC) {
+                    return 0;
+                }
+                let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
+                let msg = match <$enum_name as $crate::value::FromDynamic>::from_dynamic(&dynamic) {
+                    Some(m) => m,
+                    // Unknown method → no future built; return 0 so the host
+                    // maps it to an error (the POLL_ERR_NO_FUTURE behaviour).
+                    None => return 0,
                 };
 
                 // Raw pointer into the actor's OWN heap allocation (Box<actor>),
@@ -899,14 +898,13 @@ macro_rules! __vos_emit_wasm_glue {
                 let raw =
                     unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, msg_len as usize) };
 
-                let msg = if !raw.is_empty() && raw[0] == $crate::value::TAG_DYNAMIC {
-                    let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
-                    match <$enum_name as $crate::value::FromDynamic>::from_dynamic(&dynamic) {
-                        Some(m) => m,
-                        None => return,
-                    }
-                } else {
-                    $crate::Decode::decode(raw)
+                if raw.first() != Some(&$crate::value::TAG_DYNAMIC) {
+                    return;
+                }
+                let dynamic: $crate::value::Msg = $crate::Decode::decode(&raw[1..]);
+                let msg = match <$enum_name as $crate::value::FromDynamic>::from_dynamic(&dynamic) {
+                    Some(m) => m,
+                    None => return,
                 };
 
                 let actor_ptr = &mut ws.actor as *mut $actor_name;
