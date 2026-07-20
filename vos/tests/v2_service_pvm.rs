@@ -7,11 +7,11 @@ use std::path::PathBuf;
 
 use javm::kernel::InvocationKernel;
 use vos::v2::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, ActorId, AuthorizationEvidenceV2, BlobRefV2,
-    ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, Hash, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InvocationId, NoRefineProtocolHostV2, Origin, ProgramId, RefineImportsV2,
-    RootServiceId, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
-    WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, ActorId, AllowPublic,
+    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, Hash,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
+    NoRefineProtocolHostV2, Origin, ProgramId, RefineImportsV2, RootServiceId, ServiceIdentityV2,
+    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -285,6 +285,11 @@ fn yielding_actor_restores_exactly_after_restart() {
     ping.extend_from_slice(&Msg::new("ping").encode());
     first_work.method = "ping".into();
     first_work.arguments = ping;
+    let mut committed =
+        InMemoryServiceState::new(first_work.service.clone(), ConsistencyModeV2::Local);
+    committed.install_actor(first_work.target, actor_program);
+    committed.make_blob_available(initial_state_ref.hash);
+    first_work.base = committed.current_base();
     let first_imports = RefineImportsV2 {
         programs: vec![ImportedProgramV2 {
             program: actor_program,
@@ -345,17 +350,35 @@ fn yielding_actor_restores_exactly_after_restart() {
         .and_then(|write| write.value.clone())
         .expect("checkpoint commits the mutation before await");
     assert_eq!(u32::decode(&checkpoint_state), 1);
+    assert_eq!(
+        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
+        None
+    );
+    assert_eq!(committed.continuation(first_work.target), None);
+    for artifact in &first_output.exported_blobs {
+        committed.make_blob_available(artifact.reference.hash);
+    }
+    let checkpoint_outcome = committed
+        .accumulate(&first_work, &first, &AllowPublic)
+        .unwrap();
+    assert!(checkpoint_outcome.published.reply.is_none());
+    assert_eq!(
+        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
+        Some(checkpoint_state.as_slice())
+    );
+    assert_eq!(
+        committed.continuation(first_work.target),
+        Some(&first_continuation)
+    );
 
     // Simulate a process restart after Accumulate committed slice 0. Only
     // canonical programs, the committed state, and the continuation blob are
     // supplied to the next Refine invocation.
     let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
+    committed.make_blob_available(checkpoint_state_ref.hash);
     let mut resumed_work = first_work.clone();
     resumed_work.workflow_step = 1;
-    resumed_work.base = ConsistencyBaseV2::Linear {
-        revision: 1,
-        state_root: Hash([9; 32]),
-    };
+    resumed_work.base = committed.current_base();
     resumed_work.imported_actors[0].state = checkpoint_state_ref.clone();
     resumed_work.imported_actors[0].continuation = Some(first_continuation.clone());
     let mut resumed_blobs = vec![
@@ -420,6 +443,20 @@ fn yielding_actor_restores_exactly_after_restart() {
         u32::decode(resumed_state),
         1,
         "code before .await must not execute again"
+    );
+    assert_eq!(
+        committed.continuation(first_work.target),
+        Some(&first_continuation),
+        "Refine cannot delete durable continuation state"
+    );
+    let completed = committed
+        .accumulate(&resumed_work, &resumed, &AllowPublic)
+        .unwrap();
+    assert_eq!(completed.published.reply, resumed.reply);
+    assert_eq!(committed.continuation(first_work.target), None);
+    assert_eq!(
+        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
+        Some(resumed_state.as_slice())
     );
 }
 
