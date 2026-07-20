@@ -25,6 +25,7 @@ struct PendingOperation {
 #[derive(Debug, Clone)]
 struct CompletedChange {
     change: ChangeId,
+    next_ordinal: u32,
     operations: Vec<PendingOperation>,
 }
 
@@ -211,7 +212,19 @@ impl core::error::Error for Error {}
 /// tests and advanced materializers can exercise the same deterministic API.
 #[doc(hidden)]
 pub fn with_change<R>(change: ChangeId, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
-    begin_change(change)?;
+    with_change_from(change, 0, f)
+}
+
+/// Continue operation allocation for another same-tree call made by the same
+/// actor in one execution slice. The owning scheduler supplies the exact next
+/// ordinal returned by the actor's preceding inline call.
+#[doc(hidden)]
+pub fn with_change_from<R>(
+    change: ChangeId,
+    first_ordinal: u32,
+    f: impl FnOnce() -> Result<R, Error>,
+) -> Result<R, Error> {
+    begin_change(change, first_ordinal)?;
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -227,7 +240,7 @@ pub fn with_change<R>(change: ChangeId, f: impl FnOnce() -> Result<R, Error>) ->
 }
 
 #[cfg(feature = "std")]
-fn begin_change(change: ChangeId) -> Result<(), Error> {
+fn begin_change(change: ChangeId, first_ordinal: u32) -> Result<(), Error> {
     CHANGE_SCOPE.with(|scope| {
         let mut scope = scope.borrow_mut();
         if scope.is_some() {
@@ -235,7 +248,7 @@ fn begin_change(change: ChangeId) -> Result<(), Error> {
         }
         *scope = Some(ChangeScope {
             change,
-            next_ordinal: 0,
+            next_ordinal: first_ordinal,
             operations: Vec::new(),
         });
         COMPLETED_CHANGE.with(|completed| *completed.borrow_mut() = None);
@@ -244,7 +257,7 @@ fn begin_change(change: ChangeId) -> Result<(), Error> {
 }
 
 #[cfg(not(feature = "std"))]
-fn begin_change(change: ChangeId) -> Result<(), Error> {
+fn begin_change(change: ChangeId, first_ordinal: u32) -> Result<(), Error> {
     // SAFETY: PVM guests are single-threaded and actor dispatch never nests a
     // change scope. The explicit occupied check turns accidental nesting into
     // a deterministic error.
@@ -254,7 +267,7 @@ fn begin_change(change: ChangeId) -> Result<(), Error> {
     }
     state.active = Some(ChangeScope {
         change,
-        next_ordinal: 0,
+        next_ordinal: first_ordinal,
         operations: Vec::new(),
     });
     state.completed = None;
@@ -270,6 +283,7 @@ fn complete_change() {
         COMPLETED_CHANGE.with(|completed| {
             *completed.borrow_mut() = Some(CompletedChange {
                 change: scope.change,
+                next_ordinal: scope.next_ordinal,
                 operations: scope.operations,
             });
         });
@@ -285,6 +299,7 @@ fn complete_change() {
     };
     state.completed = Some(CompletedChange {
         change: scope.change,
+        next_ordinal: scope.next_ordinal,
         operations: scope.operations,
     });
 }
@@ -357,6 +372,17 @@ pub fn take_operations(
     actor: crate::v2::ActorId,
     change: crate::v2::ChangeId,
 ) -> Result<Vec<crate::v2::CrdtOperationV2>, Error> {
+    take_operation_batch(actor, change).map(|(operations, _)| operations)
+}
+
+/// Consume the completed operation batch together with the first unused
+/// ordinal, allowing repeated inline calls to one actor to remain collision
+/// free within the same CRDT change.
+#[doc(hidden)]
+pub fn take_operation_batch(
+    actor: crate::v2::ActorId,
+    change: crate::v2::ChangeId,
+) -> Result<(Vec<crate::v2::CrdtOperationV2>, u32), Error> {
     #[cfg(feature = "std")]
     let completed = COMPLETED_CHANGE.with(|completed| completed.borrow_mut().take());
     #[cfg(not(feature = "std"))]
@@ -382,7 +408,7 @@ pub fn take_operations(
     if operations.windows(2).any(|pair| pair[0].id == pair[1].id) {
         return Err(Error::ChangeMismatch);
     }
-    Ok(operations)
+    Ok((operations, completed.next_ordinal))
 }
 
 fn operation_payload(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
@@ -1355,6 +1381,15 @@ mod tests {
             take_operations(actor, change),
             Err(Error::NoCompletedChange)
         );
+
+        with_change_from(ChangeId(change.0), 2, || {
+            counter.increment(1)?;
+            Ok(())
+        })
+        .unwrap();
+        let (continued, next_ordinal) = take_operation_batch(actor, change).unwrap();
+        assert_eq!(continued[0].ordinal, 2);
+        assert_eq!(next_ordinal, 3);
     }
 
     #[test]

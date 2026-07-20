@@ -225,8 +225,7 @@ mod guest {
         });
         let (writes, crdt_change, candidate_blobs) = match (&work.base, work.base_causal_height) {
             (ConsistencyBaseV2::Linear { .. }, None) => {
-                if !actor_output.crdt_operations.is_empty()
-                    || actor_output.crdt_materialization.is_some()
+                if !actor_output.crdt_operations.is_empty() || !actor_output.crdt_states.is_empty()
                 {
                     fail_closed();
                 }
@@ -236,19 +235,41 @@ mod guest {
                 if !actor_output.writes.is_empty() {
                     fail_closed();
                 }
-                let materialized = actor_output
-                    .crdt_materialization
-                    .unwrap_or_else(|| fail_closed());
+                if actor_output.crdt_states.is_empty()
+                    || actor_output
+                        .crdt_states
+                        .iter()
+                        .any(|state| !imported(state.actor))
+                {
+                    fail_closed();
+                }
                 let id = CrdtChangeV2::derive_id(&work).unwrap_or_else(|| fail_closed());
                 if actor_output.crdt_operations.iter().any(|operation| {
-                    operation.actor != work.target
+                    !imported(operation.actor)
                         || operation.id
                             != id.operation(operation.actor, operation.field, operation.ordinal)
                 }) {
                     fail_closed();
                 }
                 let causal_height = base_height.checked_add(1).unwrap_or_else(|| fail_closed());
-                let reference = BlobRefV2::of_bytes(&materialized);
+                let mut candidates = alloc::collections::BTreeMap::new();
+                let materializations = actor_output
+                    .crdt_states
+                    .into_iter()
+                    .map(|state| {
+                        let reference = BlobRefV2::of_bytes(&state.state);
+                        candidates
+                            .entry(reference.hash)
+                            .or_insert_with(|| ImportedBlobV2 {
+                                reference: reference.clone(),
+                                bytes: state.state,
+                            });
+                        CrdtMaterializationV2 {
+                            actor: state.actor,
+                            state: reference,
+                        }
+                    })
+                    .collect();
                 (
                     alloc::vec::Vec::new(),
                     Some(CrdtChangeV2 {
@@ -257,15 +278,9 @@ mod guest {
                         causal_height,
                         operations: actor_output.crdt_operations,
                         workflow: alloc::vec::Vec::new(),
-                        materializations: alloc::vec![CrdtMaterializationV2 {
-                            actor: work.target,
-                            state: reference.clone(),
-                        }],
+                        materializations,
                     }),
-                    alloc::vec![ImportedBlobV2 {
-                        reference,
-                        bytes: materialized,
-                    }],
+                    candidates.into_values().collect(),
                 )
             }
             _ => fail_closed(),

@@ -145,9 +145,21 @@ pub struct ActorTreeImportV2 {
     pub program: ProgramId,
     pub state: Vec<u8>,
     pub causal_states: Vec<Vec<u8>>,
+    /// First unused operation ordinal for this actor in the current CRDT
+    /// execution slice. Linear actor trees keep this at zero.
+    pub next_crdt_ordinal: u32,
     /// A suspended actor remains visible for name/ownership resolution but no
     /// new CALLABLE is granted until its exact continuation drains.
     pub suspended: bool,
+}
+
+/// Actor-local CRDT state returned through nested JAR CALL/REPLY. One outer
+/// Refine slice aggregates these into content-addressed materializations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorCrdtStateV2 {
+    pub actor: ActorId,
+    pub state: Vec<u8>,
+    pub next_ordinal: u32,
 }
 
 /// Canonical code supplied to Refine. An ELF, JIT image, or proving artifact
@@ -243,10 +255,10 @@ pub struct ActorSliceOutputV2 {
     /// Concrete field operations emitted by one `#[actor(crdt)]` execution
     /// slice. Ordinary actors always leave this empty.
     pub crdt_operations: Vec<CrdtOperationV2>,
-    /// Canonical archived actor state after applying `crdt_operations` to the
-    /// imported causal materialization. This is transported as a candidate
-    /// blob; Refine never persists it directly.
-    pub crdt_materialization: Option<Vec<u8>>,
+    /// Canonical archived states after applying `crdt_operations` across the
+    /// complete inline actor call tree. Refine content-addresses these
+    /// candidates but never persists them directly.
+    pub crdt_states: Vec<ActorCrdtStateV2>,
     /// Cross-root calls emitted by this slice. The owning service derives each
     /// stable `CallId` from the work invocation and `await_ordinal`.
     pub outbox: Vec<ActorCallRequestV2>,
@@ -1192,10 +1204,9 @@ impl V2Wire for ActorSliceInputV2 {
             || self_import.causal_states != value.causal_states
             || (value.change.is_none()
                 && (!value.causal_states.is_empty()
-                    || value
-                        .actor_tree
-                        .iter()
-                        .any(|actor| !actor.causal_states.is_empty())))
+                    || value.actor_tree.iter().any(|actor| {
+                        !actor.causal_states.is_empty() || actor.next_crdt_ordinal != 0
+                    })))
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -1213,7 +1224,11 @@ impl V2Wire for ActorSliceOutputV2 {
         e.u64(self.next_await_ordinal);
         e.list(&self.writes, encode_write);
         e.list(&self.crdt_operations, encode_crdt_op);
-        e.option(&self.crdt_materialization, |e, state| e.bytes(state));
+        e.list(&self.crdt_states, |e, state| {
+            e.fixed(&state.actor.0);
+            e.bytes(&state.state);
+            e.u32(state.next_ordinal);
+        });
         e.list(&self.outbox, encode_actor_call);
         e.bytes(&self.reply);
         e.bool(self.yielded);
@@ -1228,7 +1243,13 @@ impl V2Wire for ActorSliceOutputV2 {
             next_await_ordinal: d.u64()?,
             writes: d.list(decode_write)?,
             crdt_operations: d.list(decode_crdt_op)?,
-            crdt_materialization: d.option(Decoder::bytes)?,
+            crdt_states: d.list(|d| {
+                Ok(ActorCrdtStateV2 {
+                    actor: ActorId(d.fixed()?),
+                    state: d.bytes()?,
+                    next_ordinal: d.u32()?,
+                })
+            })?,
             outbox: d.list(decode_actor_call)?,
             reply: d.bytes()?,
             yielded: d.bool()?,
@@ -1243,10 +1264,16 @@ impl V2Wire for ActorSliceOutputV2 {
             || value.writes.windows(2).any(|pair| {
                 (pair[0].actor, pair[0].key.as_slice()) >= (pair[1].actor, pair[1].key.as_slice())
             })
-            || value
-                .crdt_operations
-                .iter()
-                .any(|operation| operation.actor != value.actor || operation.payload.is_empty())
+            || value.crdt_operations.iter().any(|operation| {
+                operation.payload.is_empty()
+                    || value
+                        .crdt_states
+                        .binary_search_by_key(&operation.actor, |state| state.actor)
+                        .ok()
+                        .is_none_or(|index| {
+                            operation.ordinal >= value.crdt_states[index].next_ordinal
+                        })
+            })
             || value
                 .crdt_operations
                 .windows(2)
@@ -1256,7 +1283,12 @@ impl V2Wire for ActorSliceOutputV2 {
                 .windows(2)
                 .any(|pair| pair[0].await_ordinal >= pair[1].await_ordinal)
             || value.outbox.iter().any(|call| call.payload.is_empty())
-            || (!value.crdt_operations.is_empty() && value.crdt_materialization.is_none())
+            || value
+                .crdt_states
+                .windows(2)
+                .any(|pair| pair[0].actor >= pair[1].actor)
+            || value.crdt_states.iter().any(|state| state.state.is_empty())
+            || (!value.crdt_operations.is_empty() && value.crdt_states.is_empty())
             || (value.yielded
                 && value
                     .checkpoint
@@ -2618,6 +2650,7 @@ fn encode_actor_tree_import(e: &mut Encoder<'_>, value: &ActorTreeImportV2) {
     e.fixed(&value.program.0);
     e.bytes(&value.state);
     e.list(&value.causal_states, |e, state| e.bytes(state));
+    e.u32(value.next_crdt_ordinal);
     e.bool(value.suspended);
 }
 
@@ -2629,6 +2662,7 @@ fn decode_actor_tree_import(d: &mut Decoder<'_>) -> Result<ActorTreeImportV2, De
         program: ProgramId(d.fixed()?),
         state: d.bytes()?,
         causal_states: d.list(Decoder::bytes)?,
+        next_crdt_ordinal: d.u32()?,
         suspended: d.bool()?,
     };
     if value.name.is_empty() || value.parent == Some(value.actor) {
@@ -3022,6 +3056,7 @@ mod tests {
                     program: ProgramId([24; 32]),
                     state: b"before".to_vec(),
                     causal_states: vec![b"concurrent".to_vec()],
+                    next_crdt_ordinal: 0,
                     suspended: false,
                 },
                 ActorTreeImportV2 {
@@ -3031,6 +3066,7 @@ mod tests {
                     program: ProgramId([25; 32]),
                     state: b"child".to_vec(),
                     causal_states: vec![],
+                    next_crdt_ordinal: 0,
                     suspended: false,
                 },
             ],
@@ -3067,7 +3103,7 @@ mod tests {
                 value: Some(b"after".to_vec()),
             }],
             crdt_operations: vec![],
-            crdt_materialization: None,
+            crdt_states: vec![],
             outbox: vec![ActorCallRequestV2 {
                 await_ordinal: 7,
                 from: ActorId([21; 32]),
@@ -3084,6 +3120,49 @@ mod tests {
         assert_eq!(
             ActorSliceOutputV2::decode(&output.encode()).unwrap(),
             output
+        );
+
+        let change = ChangeId([31; 32]);
+        let field = Hash([32; 32]);
+        let crdt_output = ActorSliceOutputV2 {
+            actor: ActorId([21; 32]),
+            first_await_ordinal: 0,
+            next_await_ordinal: 0,
+            writes: vec![],
+            crdt_operations: vec![CrdtOperationV2 {
+                actor: ActorId([22; 32]),
+                field,
+                ordinal: 3,
+                id: change.operation(ActorId([22; 32]), field, 3),
+                payload: vec![1],
+            }],
+            crdt_states: vec![
+                ActorCrdtStateV2 {
+                    actor: ActorId([21; 32]),
+                    state: vec![1],
+                    next_ordinal: 0,
+                },
+                ActorCrdtStateV2 {
+                    actor: ActorId([22; 32]),
+                    state: vec![2],
+                    next_ordinal: 4,
+                },
+            ],
+            outbox: vec![],
+            reply: vec![],
+            yielded: false,
+            forbidden: false,
+            checkpoint: None,
+        };
+        assert_eq!(
+            ActorSliceOutputV2::decode(&crdt_output.encode()).unwrap(),
+            crdt_output
+        );
+        let mut missing_actor_state = crdt_output;
+        missing_actor_state.crdt_states.pop();
+        assert_eq!(
+            ActorSliceOutputV2::decode(&missing_actor_state.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let mut duplicate_write = output;
@@ -3123,7 +3202,7 @@ mod tests {
             next_await_ordinal: 7,
             writes: vec![],
             crdt_operations: vec![],
-            crdt_materialization: None,
+            crdt_states: vec![],
             outbox: vec![],
             reply: vec![],
             yielded: true,

@@ -1196,6 +1196,16 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let mut work = work(actor_program, initial.clone());
     work.imported_actors[0].name = "counter".into();
+    let child = ActorId([36; 32]);
+    work.imported_actors.push(ImportedActorV2 {
+        actor: child,
+        name: "child".into(),
+        parent: Some(work.target),
+        program: actor_program,
+        state: initial.clone(),
+        causal_states: vec![],
+        continuation: None,
+    });
     work.method = "increment".into();
     let mut message = vec![vos::value::TAG_DYNAMIC];
     message.extend_from_slice(&Msg::new("increment").with("amount", 2u64).encode());
@@ -1219,21 +1229,47 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
         service: work.service.clone(),
         consistency: ConsistencyModeV2::Crdt,
-        actors: vec![ActorGenesisV2 {
-            actor: work.target,
-            name: "counter".into(),
-            parent: None,
-            program: actor_program,
-            initial_state: initial.clone(),
-            crdt: true,
-            methods: vec![MethodPolicyV2 {
-                method: "increment".into(),
-                schema: Hash([44; 32]),
-                policy: public_policy_hash(),
-                public: true,
-                attested: false,
-            }],
-        }],
+        actors: vec![
+            ActorGenesisV2 {
+                actor: work.target,
+                name: "counter".into(),
+                parent: None,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: true,
+                methods: vec![
+                    MethodPolicyV2 {
+                        method: "increment".into(),
+                        schema: Hash([44; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                    MethodPolicyV2 {
+                        method: "increment_child_twice".into(),
+                        schema: Hash([49; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                ],
+            },
+            ActorGenesisV2 {
+                actor: child,
+                name: "child".into(),
+                parent: Some(work.target),
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: true,
+                methods: vec![MethodPolicyV2 {
+                    method: "increment".into(),
+                    schema: Hash([50; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                }],
+            },
+        ],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([46; 32]),
             authenticator: vec![1],
@@ -1427,7 +1463,11 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     assert_eq!(merge_work.base, ConsistencyBaseV2::Crdt { heads });
     assert_eq!(merge_work.base_causal_height, Some(1));
     assert_eq!(merge_work.imported_actors[0].causal_states.len(), 1);
-    assert_eq!(merge_imports.blobs.len(), 2);
+    assert_eq!(
+        merge_imports.blobs.len(),
+        3,
+        "both root branches and the child's unchanged base are imported"
+    );
     let merged = service
         .refine_actor_tree(&merge_work, &merge_imports)
         .unwrap();
@@ -1446,6 +1486,80 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         panic!("merged CRDT child rejected")
     };
     assert_eq!(receipt.resulting_crdt_heads, vec![merged_cid]);
+
+    let mut nested_message = vec![vos::value::TAG_DYNAMIC];
+    nested_message.extend_from_slice(
+        &Msg::new("increment_child_twice")
+            .with("amount", 3u64)
+            .encode(),
+    );
+    let nested = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([51; 32]),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: work.target,
+            method: "increment_child_twice".into(),
+            arguments: nested_message,
+            origin: work.origin,
+            authorization: work.authorization,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let nested_refined = service
+        .refine_actor_tree(&nested.work, &nested.imports)
+        .expect("one CRDT slice calls the same child twice inline");
+    let nested_change = nested_refined.transition.crdt_change.as_ref().unwrap();
+    assert_eq!(nested_change.operations.len(), 2);
+    assert!(
+        nested_change
+            .operations
+            .iter()
+            .all(|operation| operation.actor == child)
+    );
+    let mut child_ordinals = nested_change
+        .operations
+        .iter()
+        .map(|operation| operation.ordinal)
+        .collect::<Vec<_>>();
+    child_ordinals.sort_unstable();
+    assert_eq!(child_ordinals, vec![0, 1]);
+    assert_eq!(
+        nested_change
+            .materializations
+            .iter()
+            .map(|materialization| materialization.actor)
+            .collect::<Vec<_>>(),
+        vec![work.target, child]
+    );
+    assert_eq!(
+        nested_refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::I64(6))
+    );
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: nested.work,
+                transition: nested_refined.transition,
+                provided_blobs: nested_refined.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
 }
 
 #[test]

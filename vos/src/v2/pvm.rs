@@ -334,6 +334,7 @@ impl ServicePvmV2 {
                             imported_blob_bytes(imports, reference).map(<[u8]>::to_vec)
                         })
                         .collect::<Result<Vec<_>, ServicePvmErrorV2>>()?,
+                    next_crdt_ordinal: 0,
                     suspended: actor.continuation.is_some(),
                 })
             })

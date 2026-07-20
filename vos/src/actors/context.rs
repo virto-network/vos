@@ -74,6 +74,10 @@ pub struct Context<A: Actor> {
     nested_writes: BTreeMap<(crate::v2::ActorId, Vec<u8>), Option<Vec<u8>>>,
     #[cfg(feature = "pvm")]
     nested_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
+    #[cfg(feature = "pvm")]
+    nested_crdt_operations: Vec<crate::v2::CrdtOperationV2>,
+    #[cfg(feature = "pvm")]
+    nested_crdt_states: BTreeMap<crate::v2::ActorId, crate::v2::ActorCrdtStateV2>,
 
     // Reply data (rkyv-encoded Value, included in refine output)
     reply: Option<Vec<u8>>,
@@ -133,6 +137,10 @@ impl<A: Actor> Context<A> {
             nested_writes: BTreeMap::new(),
             #[cfg(feature = "pvm")]
             nested_actor_calls: Vec::new(),
+            #[cfg(feature = "pvm")]
+            nested_crdt_operations: Vec::new(),
+            #[cfg(feature = "pvm")]
+            nested_crdt_states: BTreeMap::new(),
             reply: None,
             self_schedule: false,
             #[cfg(feature = "pvm")]
@@ -583,7 +591,7 @@ impl<A: Actor> Context<A> {
         if self.active_actor_mask & target_mask != 0 {
             return Some(super::run::Ask::ready_err(super::value::InvokeError::Cycle));
         }
-        if imported.suspended || self.actor_change.is_some() {
+        if imported.suspended {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::NotFound,
             ));
@@ -591,9 +599,9 @@ impl<A: Actor> Context<A> {
 
         let child_input = crate::v2::ActorSliceInputV2 {
             actor: target,
-            change: None,
+            change: self.actor_change,
             state: imported.state,
-            causal_states: Vec::new(),
+            causal_states: imported.causal_states,
             actor_tree: self.actor_tree.clone(),
             active_actor_mask: self.active_actor_mask | target_mask,
             first_await_ordinal: self.next_await_ordinal,
@@ -643,14 +651,31 @@ impl<A: Actor> Context<A> {
         if output.actor != target
             || output.first_await_ordinal != self.next_await_ordinal
             || output.forbidden
-            || !output.crdt_operations.is_empty()
-            || output.crdt_materialization.is_some()
+            || (self.actor_change.is_none()
+                && (!output.crdt_operations.is_empty() || !output.crdt_states.is_empty()))
+            || (self.actor_change.is_some()
+                && (output.crdt_states.is_empty() || !output.writes.is_empty()))
         {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::Panicked,
             ));
         }
         self.next_await_ordinal = output.next_await_ordinal;
+        self.nested_crdt_operations.extend(output.crdt_operations);
+        for state in output.crdt_states {
+            let Ok(index) = self
+                .actor_tree
+                .binary_search_by_key(&state.actor, |actor| actor.actor)
+            else {
+                return Some(super::run::Ask::ready_err(
+                    super::value::InvokeError::Panicked,
+                ));
+            };
+            self.actor_tree[index].state = state.state.clone();
+            self.actor_tree[index].causal_states.clear();
+            self.actor_tree[index].next_crdt_ordinal = state.next_ordinal;
+            self.nested_crdt_states.insert(state.actor, state);
+        }
         for write in output.writes {
             if write.key.as_slice() == crate::lifecycle::STATE_KEY_BYTES
                 && let Some(state) = write.value.as_ref()
@@ -1267,6 +1292,22 @@ impl<A: Actor> Context<A> {
             .into_iter()
             .map(|((actor, key), value)| crate::v2::ActorWriteV2 { actor, key, value })
             .collect()
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __drain_nested_crdt_v2(
+        &mut self,
+    ) -> (
+        Vec<crate::v2::CrdtOperationV2>,
+        Vec<crate::v2::ActorCrdtStateV2>,
+    ) {
+        (
+            core::mem::take(&mut self.nested_crdt_operations),
+            core::mem::take(&mut self.nested_crdt_states)
+                .into_values()
+                .collect(),
+        )
     }
 
     #[cfg(feature = "pvm")]

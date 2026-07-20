@@ -641,14 +641,16 @@ fn materialize_workflow_crdt(
                     && matches!(&work.base, ConsistencyBaseV2::Crdt { heads } if *heads == change.causal_dependencies)
                     && work.base_causal_height == Some(change.causal_height - 1)
                     && Some(change.id) == CrdtChangeV2::derive_id(work)
-                    && change
-                        .operations
-                        .iter()
-                        .all(|operation| operation.actor == work.target)
-                    && change
-                        .materializations
-                        .iter()
-                        .all(|materialization| materialization.actor == work.target) =>
+                    && change.operations.iter().all(|operation| {
+                        work.imported_actors
+                            .binary_search_by_key(&operation.actor, |actor| actor.actor)
+                            .is_ok()
+                    })
+                    && change.materializations.iter().all(|materialization| {
+                        work.imported_actors
+                            .binary_search_by_key(&materialization.actor, |actor| actor.actor)
+                            .is_ok()
+                    }) =>
             {
                 let observed = result
                     .workflows
@@ -1475,6 +1477,20 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
         || Some(change.id) != CrdtChangeV2::derive_id(work)
         || change.causal_dependencies.as_slice() != heads.as_slice()
         || change.workflow != transition.workflow_operations(work)
+        || change.operations.iter().any(|operation| {
+            work.imported_actors
+                .binary_search_by_key(&operation.actor, |actor| actor.actor)
+                .is_err()
+                || change
+                    .materializations
+                    .binary_search_by_key(&operation.actor, |state| state.actor)
+                    .is_err()
+        })
+        || change.materializations.iter().any(|materialization| {
+            work.imported_actors
+                .binary_search_by_key(&materialization.actor, |actor| actor.actor)
+                .is_err()
+        })
     {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     }

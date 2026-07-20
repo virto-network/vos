@@ -775,6 +775,10 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // complete input. The service does not regain this cap until REPLY.
     let bytes = unsafe { core::slice::from_raw_parts(input_address as *const u8, input_len) };
     let input = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
+    let first_crdt_ordinal = input
+        .actor_import(input.actor)
+        .expect("actor slice input omitted its active actor")
+        .next_crdt_ordinal;
     let mut actor = lifecycle::load_or_create::<A>(Some(&input.state));
     for state in &input.causal_states {
         let other = lifecycle::load_or_create::<A>(Some(state));
@@ -803,13 +807,17 @@ pub fn run_nested_actor_service<A: super::Actor>(
         "actor CRDT metadata does not match the service consistency mode"
     );
     let dispatch = match input.change {
-        Some(change) => crate::crdt::with_change(crate::crdt::ChangeId(change.0), || {
-            Ok(lifecycle::dispatch_one::<A>(
-                &input.message,
-                &mut actor,
-                &mut ctx,
-            ))
-        })
+        Some(change) => crate::crdt::with_change_from(
+            crate::crdt::ChangeId(change.0),
+            first_crdt_ordinal,
+            || {
+                Ok(lifecycle::dispatch_one::<A>(
+                    &input.message,
+                    &mut actor,
+                    &mut ctx,
+                ))
+            },
+        )
         .expect("nested CRDT actor dispatch must establish one change scope"),
         None => lifecycle::dispatch_one::<A>(&input.message, &mut actor, &mut ctx),
     };
@@ -823,14 +831,36 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let checkpoint = ctx.__take_checkpoint_v2();
     let new_state = actor.encode();
     let state_changed = input.state.is_empty() || new_state != input.state;
-    let (crdt_operations, crdt_materialization) = match input.change {
-        Some(change) => (
-            crate::crdt::take_operations(input.actor, change)
-                .expect("nested CRDT actor must return its completed field operations"),
-            Some(new_state.clone()),
-        ),
-        None => (alloc::vec::Vec::new(), None),
+    let (mut crdt_operations, mut crdt_states) = match input.change {
+        Some(change) => {
+            let (operations, next_ordinal) = crate::crdt::take_operation_batch(input.actor, change)
+                .expect("nested CRDT actor must return its completed field operations");
+            (
+                operations,
+                alloc::vec![crate::v2::ActorCrdtStateV2 {
+                    actor: input.actor,
+                    state: new_state.clone(),
+                    next_ordinal,
+                }],
+            )
+        }
+        None => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
     };
+    let (nested_operations, nested_states) = ctx.__drain_nested_crdt_v2();
+    crdt_operations.extend(nested_operations);
+    crdt_operations.sort_by_key(|operation| operation.id);
+    assert!(
+        crdt_operations
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id)
+    );
+    crdt_states.extend(nested_states);
+    crdt_states.sort_by_key(|state| state.actor);
+    assert!(
+        crdt_states
+            .windows(2)
+            .all(|pair| pair[0].actor < pair[1].actor)
+    );
     let mut writes = ctx
         .__drain_actor_writes_v2(
             input.actor,
@@ -851,7 +881,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         next_await_ordinal,
         writes,
         crdt_operations,
-        crdt_materialization,
+        crdt_states,
         outbox,
         reply,
         yielded,
@@ -869,7 +899,15 @@ pub fn run_nested_actor_service<A: super::Actor>(
     unsafe {
         core::ptr::copy_nonoverlapping(encoded.as_ptr(), input_address as *mut u8, encoded.len());
     }
-    crate::abi::pvm::ecall::reply(encoded.len() as u64)
+    let output_len = encoded.len() as u64;
+    // REPLY is a machine boundary and never unwinds Rust frames. Release every
+    // guest allocation explicitly so a later CALL of this now-idle actor sees
+    // the allocator in the same clean state as a fresh invocation.
+    drop(encoded);
+    drop(ctx);
+    drop(actor);
+    drop(input);
+    crate::abi::pvm::ecall::reply(output_len)
 }
 
 #[cfg(feature = "service")]
