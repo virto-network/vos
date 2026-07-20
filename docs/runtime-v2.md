@@ -28,6 +28,14 @@ operations, continuations, inbox/outbox rows and the receipt atomically.
 Replies, outbound calls and proof packages become visible only after that
 commit. A stale linear transition is rejected intact for rescheduling.
 
+Cross-root transport is also guest-owned. The source receipt commits to the
+complete canonical outbox published by its accepted transition. A destination
+submits that finalized receipt and outbox through the physical Accumulate
+entry; the destination service guest verifies membership and finality,
+deduplicates by `CallId`, and atomically creates the inbox row. Local and Raft
+deliveries require the exact current revision. CRDT deliveries append a
+workflow-only causal change and preserve concurrent heads.
+
 ## Continuations
 
 An await checkpoint stores the exact nested kernel: each VM's program hash,

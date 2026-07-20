@@ -331,6 +331,26 @@ pub struct MessageRecordV2 {
     pub deadline_timeslot: Option<u64>,
 }
 
+impl MessageRecordV2 {
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        encode_message(&mut Encoder(&mut bytes), self);
+        Hash::digest(b"vos/message/v2", &[&bytes])
+    }
+
+    /// Commitment carried by the source accumulation receipt. Delivery sends
+    /// the complete canonical outbox, allowing destination Accumulate to
+    /// authenticate membership without trusting native transport state.
+    pub fn outbox_commitment(messages: &[Self]) -> Option<Hash> {
+        if messages.is_empty() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        Encoder(&mut bytes).list(messages, encode_message);
+        Some(Hash::digest(b"vos/outbox/v2", &[&bytes]))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyRecordV2 {
     pub call_id: CallId,
@@ -410,6 +430,20 @@ impl CrdtChangeV2 {
         Some(ChangeId(
             Hash::digest(b"vos/crdt-change-id/v2", &[&bytes]).0,
         ))
+    }
+
+    pub fn derive_delivery_id(
+        service: &ServiceIdentityV2,
+        call: CallId,
+        heads: &[Hash],
+    ) -> ChangeId {
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        e.fixed(&service.root_service.0);
+        e.fixed(&service.deployment.0);
+        e.fixed(&call.0);
+        e.list(heads, |e, head| e.fixed(&head.0));
+        ChangeId(Hash::digest(b"vos/crdt-delivery-id/v2", &[&bytes]).0)
     }
 
     pub fn cid(&self) -> Hash {
@@ -528,6 +562,10 @@ pub struct AccumulationReceiptV2 {
     /// caller validate a transported result without importing the full source
     /// transition; `accepted_transition` continues to bind every other effect.
     pub reply_commitment: Option<Hash>,
+    /// Commitment to the complete canonical outbox released after this
+    /// transition committed. Cross-root delivery supplies those exact records
+    /// and a finalized receipt to destination Accumulate.
+    pub outbox_commitment: Option<Hash>,
     pub resulting_state_root: Option<Hash>,
     pub resulting_crdt_heads: Vec<Hash>,
     pub sequence: u64,
@@ -582,13 +620,37 @@ pub struct AccumulationEnvelopeV2 {
     pub provided_blobs: Vec<ImportedBlobV2>,
 }
 
-/// Physical IC-5 request. `PrepareAttested` is wire-reserved now so adding the
-/// proof-before-commit flow does not silently reinterpret an Apply payload.
+/// Authenticated cross-root admission input. The destination service guest,
+/// not the native transport, validates the finalized source receipt and
+/// atomically creates the durable inbox row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryEnvelopeV2 {
+    pub service: ServiceIdentityV2,
+    pub logical_timeslot: u64,
+    pub base: ConsistencyBaseV2,
+    pub base_causal_height: Option<u64>,
+    pub message: MessageRecordV2,
+    pub source_outbox: Vec<MessageRecordV2>,
+    pub source_receipt: AccumulationReceiptV2,
+    /// Workflow-only causal node for CRDT services. Linear services require
+    /// this to be absent.
+    pub crdt_change: Option<CrdtChangeV2>,
+}
+
+impl DeliveryEnvelopeV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/delivery/v2", &[&self.encode()])
+    }
+}
+
+/// Physical IC-5 request. Every service-state mutation, including external
+/// message admission, passes through one of these guest-owned operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulateRequestV2 {
     Install(ServiceGenesisV2),
     Apply(AccumulationEnvelopeV2),
     PrepareAttested(AccumulationEnvelopeV2),
+    Deliver(DeliveryEnvelopeV2),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1275,6 +1337,7 @@ impl V2Wire for AccumulationReceiptV2 {
         encode_service(&mut e, &self.service);
         e.fixed(&self.accepted_transition.0);
         e.option(&self.reply_commitment, |e, hash| e.fixed(&hash.0));
+        e.option(&self.outbox_commitment, |e, hash| e.fixed(&hash.0));
         e.option(&self.resulting_state_root, |e, h| e.fixed(&h.0));
         e.list(&self.resulting_crdt_heads, |e, h| e.fixed(&h.0));
         e.u64(self.sequence);
@@ -1287,6 +1350,7 @@ impl V2Wire for AccumulationReceiptV2 {
             service: decode_service(d)?,
             accepted_transition: Hash(d.fixed()?),
             reply_commitment: d.option(|d| d.fixed().map(Hash))?,
+            outbox_commitment: d.option(|d| d.fixed().map(Hash))?,
             resulting_state_root: d.option(|d| d.fixed().map(Hash))?,
             resulting_crdt_heads: d.list(|d| d.fixed().map(Hash))?,
             sequence: d.u64()?,
@@ -1396,6 +1460,63 @@ impl V2Wire for AccumulationEnvelopeV2 {
     }
 }
 
+impl V2Wire for DeliveryEnvelopeV2 {
+    const MAGIC: [u8; 4] = *b"VDL2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.u64(self.logical_timeslot);
+        encode_base(&mut e, &self.base);
+        e.option(&self.base_causal_height, |e, height| e.u64(*height));
+        encode_message(&mut e, &self.message);
+        e.list(&self.source_outbox, encode_message);
+        e.bytes(&self.source_receipt.encode());
+        e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            logical_timeslot: d.u64()?,
+            base: decode_base(d)?,
+            base_causal_height: d.option(Decoder::u64)?,
+            message: decode_message(d)?,
+            source_outbox: d.list(decode_message)?,
+            source_receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+            crdt_change: d.option(|d| CrdtChangeV2::decode(&d.bytes()?))?,
+        };
+        ensure_sorted_unique(&value.source_outbox, |message| message.call_id.0)?;
+        if value
+            .source_outbox
+            .binary_search_by_key(&value.message.call_id, |message| message.call_id)
+            .ok()
+            .is_none_or(|index| value.source_outbox[index] != value.message)
+            || value.source_receipt.outbox_commitment
+                != MessageRecordV2::outbox_commitment(&value.source_outbox)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        match (&value.base, value.base_causal_height, &value.crdt_change) {
+            (ConsistencyBaseV2::Linear { .. }, None, None) => {}
+            (ConsistencyBaseV2::Crdt { heads }, Some(height), Some(change))
+                if change.id
+                    == CrdtChangeV2::derive_delivery_id(
+                        &value.service,
+                        value.message.call_id,
+                        heads,
+                    )
+                    && change.causal_dependencies == *heads
+                    && height.checked_add(1) == Some(change.causal_height)
+                    && change.operations.is_empty()
+                    && change.materializations.is_empty()
+                    && change.workflow == [WorkflowOperationV2::Inbox(value.message.clone())] => {}
+            _ => return Err(DecodeError::NonCanonical),
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for AccumulateRequestV2 {
     const MAGIC: [u8; 4] = *b"VAC2";
 
@@ -1414,6 +1535,10 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(2);
                 e.bytes(&envelope.encode());
             }
+            Self::Deliver(envelope) => {
+                e.u8(3);
+                e.bytes(&envelope.encode());
+            }
         }
     }
 
@@ -1424,6 +1549,7 @@ impl V2Wire for AccumulateRequestV2 {
             2 => Ok(Self::PrepareAttested(AccumulationEnvelopeV2::decode(
                 &d.bytes()?,
             )?)),
+            3 => Ok(Self::Deliver(DeliveryEnvelopeV2::decode(&d.bytes()?)?)),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -1495,8 +1621,10 @@ impl V2Wire for AccumulationResultV2 {
                     return Err(DecodeError::NonCanonical);
                 }
                 if !duplicate
-                    && published.reply.as_ref().map(ReplyRecordV2::commitment)
+                    && (published.reply.as_ref().map(ReplyRecordV2::commitment)
                         != receipt.reply_commitment
+                        || MessageRecordV2::outbox_commitment(&published.outbox)
+                            != receipt.outbox_commitment)
                 {
                     return Err(DecodeError::NonCanonical);
                 }
@@ -2564,6 +2692,49 @@ mod tests {
         });
         assert_eq!(AccumulateRequestV2::decode(&apply.encode()).unwrap(), apply);
 
+        let caller_invocation = InvocationId([20; 32]);
+        let message = MessageRecordV2 {
+            call_id: caller_invocation.call_id(0),
+            caller_invocation,
+            await_ordinal: 0,
+            from: ActorId([21; 32]),
+            to: ActorId([5; 32]),
+            parent: None,
+            payload: vec![1],
+            authorization: AuthorizationEvidenceV2::Public,
+            deadline_timeslot: Some(9),
+        };
+        let source_outbox = vec![message.clone()];
+        let mut source_service = service();
+        source_service.root_service = RootServiceId([22; 32]);
+        let delivery = AccumulateRequestV2::Deliver(DeliveryEnvelopeV2 {
+            service: service(),
+            logical_timeslot: 8,
+            base: ConsistencyBaseV2::Linear {
+                revision: 7,
+                state_root: Hash([8; 32]),
+            },
+            base_causal_height: None,
+            message,
+            source_outbox: source_outbox.clone(),
+            source_receipt: AccumulationReceiptV2 {
+                service: source_service,
+                accepted_transition: Hash([23; 32]),
+                reply_commitment: None,
+                outbox_commitment: MessageRecordV2::outbox_commitment(&source_outbox),
+                resulting_state_root: Some(Hash([24; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 1,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
+            crdt_change: None,
+        });
+        assert_eq!(
+            AccumulateRequestV2::decode(&delivery.encode()).unwrap(),
+            delivery
+        );
+
         let AccumulateRequestV2::Apply(mut divergent) = apply else {
             unreachable!()
         };
@@ -2638,6 +2809,7 @@ mod tests {
             service: service(),
             accepted_transition: Hash([12; 32]),
             reply_commitment: None,
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([13; 32])),
             resulting_crdt_heads: vec![],
             sequence: 4,

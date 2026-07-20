@@ -261,6 +261,7 @@ impl InMemoryServiceState {
             service: next.identity.clone(),
             accepted_transition: transition_commitment,
             reply_commitment: transition.reply.as_ref().map(ReplyRecordV2::commitment),
+            outbox_commitment: MessageRecordV2::outbox_commitment(&transition.outbox),
             resulting_state_root: (next.consistency != ConsistencyModeV2::Crdt)
                 .then_some(next.state_root),
             resulting_crdt_heads: next.crdt_heads.iter().copied().collect(),

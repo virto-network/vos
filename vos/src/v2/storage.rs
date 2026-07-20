@@ -21,6 +21,7 @@ pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 2;
 const HEADER_STORAGE_KEY: &[u8] = b"\0vos/v2/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
+const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
 
@@ -237,6 +238,13 @@ pub struct DedupRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRecordV2 {
+    pub call_id: CallId,
+    pub delivery_commitment: Hash,
+    pub receipt: AccumulationReceiptV2,
+}
+
 /// Non-recursive workflow row covered by the service tree. Receipts live in
 /// the physical bookkeeping namespace because including their resulting root
 /// in this row would make the commitment circular.
@@ -322,6 +330,32 @@ impl V2Wire for DedupRecordV2 {
     }
 }
 
+impl V2Wire for DeliveryRecordV2 {
+    const MAGIC: [u8; 4] = *b"VDR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.call_id.0);
+        e.fixed(&self.delivery_commitment.0);
+        e.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            call_id: CallId(d.fixed()?),
+            delivery_commitment: Hash(d.fixed()?),
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        if value.receipt.accepted_transition != value.delivery_commitment
+            || value.receipt.reply_commitment.is_some()
+            || value.receipt.outbox_commitment.is_some()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 pub const fn header_storage_key() -> &'static [u8] {
     HEADER_STORAGE_KEY
 }
@@ -332,6 +366,13 @@ pub fn dedup_storage_key(input: WorkInputIdV2) -> Vec<u8> {
 
 pub fn receipt_storage_key(input: WorkInputIdV2) -> Vec<u8> {
     input_storage_key(RECEIPT_STORAGE_PREFIX, input)
+}
+
+pub fn delivery_storage_key(call: CallId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(DELIVERY_STORAGE_PREFIX.len() + call.0.len());
+    key.extend_from_slice(DELIVERY_STORAGE_PREFIX);
+    key.extend_from_slice(&call.0);
+    key
 }
 
 pub fn crdt_node_storage_key(cid: Hash) -> Vec<u8> {
@@ -522,7 +563,10 @@ mod tests {
         };
         let dedup = dedup_storage_key(input);
         let receipt = receipt_storage_key(input);
+        let delivery = delivery_storage_key(CallId([7; 32]));
         assert_ne!(dedup, receipt);
+        assert_ne!(delivery, receipt);
+        assert_ne!(delivery, dedup);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(
@@ -545,6 +589,7 @@ mod tests {
                 service: service(13),
                 accepted_transition: Hash([12; 32]),
                 reply_commitment: None,
+                outbox_commitment: None,
                 resulting_state_root: Some(Hash([14; 32])),
                 resulting_crdt_heads: vec![],
                 sequence: 9,
@@ -559,6 +604,26 @@ mod tests {
         assert_eq!(
             DedupRecordV2::decode(&divergent.encode()),
             Err(DecodeError::NonCanonical)
+        );
+
+        let delivery = DeliveryRecordV2 {
+            call_id: CallId([15; 32]),
+            delivery_commitment: Hash([16; 32]),
+            receipt: AccumulationReceiptV2 {
+                service: service(17),
+                accepted_transition: Hash([16; 32]),
+                reply_commitment: None,
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([18; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 10,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
+        };
+        assert_eq!(
+            DeliveryRecordV2::decode(&delivery.encode()).unwrap(),
+            delivery
         );
     }
 }

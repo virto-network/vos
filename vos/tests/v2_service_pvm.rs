@@ -861,6 +861,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             service: remote_service,
             accepted_transition: Hash([47; 32]),
             reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([48; 32])),
             resulting_crdt_heads: vec![],
             sequence: 3,
@@ -1567,4 +1568,202 @@ fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
     );
     assert_eq!(host.row_count(), 0);
     assert_eq!(host.blob_count(), 0);
+}
+
+#[test]
+fn physical_guest_accumulate_authenticates_cross_root_delivery() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+
+    let mut source_seed = work(actor_program, initial.clone());
+    source_seed.method = "start".into();
+    let mut destination_identity = source_seed.service.clone();
+    destination_identity.root_service = RootServiceId([60; 32]);
+    destination_identity.deployment = DeploymentId([61; 32]);
+    let destination_actor = ActorId([62; 32]);
+
+    let make_service = |identity: ServiceIdentityV2, actor: ActorId| {
+        let mut store = LocalJamStoreV2::default();
+        assert_eq!(store.import_blob(initial_bytes.clone()), initial);
+        assert_eq!(store.import_program(actor_pvm.clone()), actor_program);
+        let mut service = JamServiceV2::new(
+            service_pvm.clone(),
+            service_program,
+            NoRefineProtocolHostV2,
+            store,
+            100_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            service: identity,
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor,
+                name: "root".into(),
+                parent: None,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "start".into(),
+                    schema: Hash([63; 32]),
+                    policy: Hash([64; 32]),
+                    public: true,
+                    attested: false,
+                }],
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: vos::v2::SystemCapabilityId([65; 32]),
+                authenticator: vec![66],
+            },
+        });
+        let AccumulateRequestV2::Install(genesis) = &install else {
+            unreachable!()
+        };
+        service.accumulate_host_mut().allow_install(genesis);
+        assert!(matches!(
+            service.accumulate(&install).unwrap().result,
+            AccumulationResultV2::Installed(_)
+        ));
+        service
+    };
+
+    let mut source = make_service(source_seed.service.clone(), source_seed.target);
+    let mut destination = make_service(destination_identity, destination_actor);
+    let prepared = LocalWorkSchedulerV2::prepare(
+        source.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: source_seed.invocation,
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: source_seed.target,
+            method: "start".into(),
+            arguments: source_seed.arguments.clone(),
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let caller_invocation = prepared.work.invocation;
+    let message = MessageRecordV2 {
+        call_id: caller_invocation.call_id(0),
+        caller_invocation,
+        await_ordinal: 0,
+        from: prepared.work.target,
+        to: destination_actor,
+        parent: None,
+        payload: source_seed.arguments.clone(),
+        authorization: AuthorizationEvidenceV2::Public,
+        deadline_timeslot: Some(10),
+    };
+    let transition = TransitionV2 {
+        service: prepared.work.service.clone(),
+        consumed_input: prepared.work.input_id(),
+        target_program: prepared.work.target_program,
+        base: prepared.work.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: prepared.work.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(initial_bytes),
+        }],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![message.clone()],
+        reply: None,
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let source_result = source
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: prepared.work,
+            transition,
+            provided_blobs: vec![],
+        }))
+        .unwrap();
+    let AccumulationResultV2::Accepted {
+        receipt: source_receipt,
+        published,
+        duplicate: false,
+    } = source_result.result
+    else {
+        panic!("source outbox transition was rejected")
+    };
+    assert_eq!(published.outbox, vec![message.clone()]);
+    assert_eq!(
+        source_receipt.outbox_commitment,
+        MessageRecordV2::outbox_commitment(&published.outbox)
+    );
+
+    let delivery = LocalWorkSchedulerV2::prepare_delivery(
+        destination.accumulate_host(),
+        2,
+        message.clone(),
+        published.outbox,
+        source_receipt.clone(),
+    )
+    .unwrap();
+    let before = destination.accumulate_host().snapshot();
+    assert_eq!(
+        destination
+            .accumulate(&AccumulateRequestV2::Deliver(delivery.clone()))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::ReceiptUnavailable)
+    );
+    assert!(
+        destination
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before)
+    );
+
+    destination
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: source_receipt,
+        });
+    let accepted = destination
+        .accumulate(&AccumulateRequestV2::Deliver(delivery.clone()))
+        .unwrap();
+    assert!(matches!(
+        accepted.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let prepared_inbox =
+        LocalWorkSchedulerV2::prepare_inbox(destination.accumulate_host(), message.call_id, 3)
+            .expect("destination scheduler reads the guest-committed inbox");
+    assert_eq!(prepared_inbox.work.target, destination_actor);
+    assert_eq!(prepared_inbox.work.parent_call, Some(message.call_id));
+    assert_eq!(prepared_inbox.work.origin, Origin::Actor(message.from));
+
+    let sequence = destination.accumulate_host().commit_sequence();
+    assert!(matches!(
+        destination
+            .accumulate(&AccumulateRequestV2::Deliver(delivery))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: true,
+            ..
+        }
+    ));
+    assert_eq!(destination.accumulate_host().commit_sequence(), sequence);
 }

@@ -12,10 +12,10 @@ use core::convert::Infallible;
 use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::{
     AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, DecodeError, ImportedActorV2,
-    ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
-    Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
-    crdt_node_storage_key,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, DecodeError,
+    DeliveryEnvelopeV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
+    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2,
+    V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2, WorkflowOperationV2, crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -70,6 +70,7 @@ pub enum ScheduleErrorV2 {
     DeadlineExpired(super::CallId),
     MissingCausalDependency(super::Hash),
     CorruptCausalDag,
+    InvalidDelivery,
     NonCanonicalImports,
 }
 
@@ -90,6 +91,74 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    /// Build the exact destination Accumulate input for one finalized
+    /// cross-root outbox record. This is read-only scheduling: only the
+    /// physical service PVM may verify the source receipt and commit the inbox.
+    pub fn prepare_delivery(
+        store: &LocalJamStoreV2,
+        logical_timeslot: u64,
+        message: MessageRecordV2,
+        source_outbox: Vec<MessageRecordV2>,
+        source_receipt: super::AccumulationReceiptV2,
+    ) -> Result<DeliveryEnvelopeV2, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let (base, base_causal_height, crdt_change) =
+            if header.consistency == ConsistencyModeV2::Crdt {
+                let heads = header.crdt_heads.clone();
+                let frontier = match load_causal_frontier(&heads, |cid| {
+                    Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(Vec::from))
+                }) {
+                    Ok(frontier) => frontier,
+                    Err(CausalFrontierError::Missing(dependency)) => {
+                        return Err(ScheduleErrorV2::MissingCausalDependency(dependency));
+                    }
+                    Err(CausalFrontierError::Corrupt) => {
+                        return Err(ScheduleErrorV2::CorruptCausalDag);
+                    }
+                    Err(CausalFrontierError::Storage(error)) => match error {},
+                };
+                let height = frontier.max_head_height;
+                let change = CrdtChangeV2 {
+                    id: CrdtChangeV2::derive_delivery_id(&header.service, message.call_id, &heads),
+                    causal_dependencies: heads.clone(),
+                    causal_height: height
+                        .checked_add(1)
+                        .ok_or(ScheduleErrorV2::InvalidDelivery)?,
+                    operations: Vec::new(),
+                    workflow: alloc::vec![WorkflowOperationV2::Inbox(message.clone())],
+                    materializations: Vec::new(),
+                };
+                (
+                    ConsistencyBaseV2::Crdt { heads },
+                    Some(height),
+                    Some(change),
+                )
+            } else {
+                let state_root = header
+                    .state_root
+                    .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?;
+                (
+                    ConsistencyBaseV2::Linear {
+                        revision: header.revision,
+                        state_root,
+                    },
+                    None,
+                    None,
+                )
+            };
+        let envelope = DeliveryEnvelopeV2 {
+            service: header.service,
+            logical_timeslot,
+            base,
+            base_causal_height,
+            message,
+            source_outbox,
+            source_receipt,
+            crdt_change,
+        };
+        DeliveryEnvelopeV2::decode(&envelope.encode()).map_err(|_| ScheduleErrorV2::InvalidDelivery)
+    }
+
     pub fn resolve_root(
         store: &LocalJamStoreV2,
         name: &str,
