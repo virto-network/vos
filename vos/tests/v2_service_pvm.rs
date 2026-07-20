@@ -90,6 +90,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     message.extend_from_slice(&Msg::new("start").encode());
     WorkEnvelopeV2 {
         service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0; 32]),
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: ProgramId([3; 32]),

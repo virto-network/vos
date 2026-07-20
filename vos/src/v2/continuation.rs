@@ -106,6 +106,7 @@ impl V2Wire for ContinuationSnapshotV2 {
 }
 
 fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
+    e.fixed(&value.space.0);
     e.fixed(&value.root_service.0);
     e.fixed(&value.deployment.0);
     e.fixed(&value.service_program.0);
@@ -115,6 +116,7 @@ fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
 
 fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
     Ok(ServiceIdentityV2 {
+        space: super::SpaceId(d.fixed()?),
         root_service: super::RootServiceId(d.fixed()?),
         deployment: super::DeploymentId(d.fixed()?),
         service_program: ProgramId(d.fixed()?),
@@ -136,6 +138,7 @@ mod tests {
 
     fn service() -> ServiceIdentityV2 {
         ServiceIdentityV2 {
+            space: crate::v2::SpaceId([0; 32]),
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: ProgramId([3; 32]),

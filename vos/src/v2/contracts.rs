@@ -9,6 +9,7 @@ use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceIdentityV2 {
+    pub space: SpaceId,
     pub root_service: RootServiceId,
     pub deployment: DeploymentId,
     pub service_program: ProgramId,
@@ -1565,6 +1566,7 @@ fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejectionV2, Deco
 }
 
 fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
+    e.fixed(&value.space.0);
     e.fixed(&value.root_service.0);
     e.fixed(&value.deployment.0);
     e.fixed(&value.service_program.0);
@@ -1574,6 +1576,7 @@ fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
 
 fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
     let value = ServiceIdentityV2 {
+        space: SpaceId(d.fixed()?),
         root_service: RootServiceId(d.fixed()?),
         deployment: DeploymentId(d.fixed()?),
         service_program: ProgramId(d.fixed()?),
@@ -1908,6 +1911,7 @@ mod tests {
 
     fn service() -> ServiceIdentityV2 {
         ServiceIdentityV2 {
+            space: SpaceId([0; 32]),
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: ProgramId([3; 32]),

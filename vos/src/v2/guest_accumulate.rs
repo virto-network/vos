@@ -986,6 +986,7 @@ mod tests {
 
     fn identity() -> ServiceIdentityV2 {
         ServiceIdentityV2 {
+            space: super::super::SpaceId([0; 32]),
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: ProgramId([3; 32]),

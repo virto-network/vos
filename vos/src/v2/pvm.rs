@@ -896,6 +896,7 @@ mod tests {
 
         let receipt = AccumulationReceiptV2 {
             service: ServiceIdentityV2 {
+                space: crate::v2::SpaceId([0; 32]),
                 root_service: RootServiceId([1; 32]),
                 deployment: DeploymentId([2; 32]),
                 service_program: ProgramId([3; 32]),

@@ -52,7 +52,8 @@ impl AttestationStatementV3 {
         {
             return Err(AttestationError::InvalidStatement);
         }
-        if self.deployment != self.accumulation_receipt.service.deployment
+        if self.space != self.accumulation_receipt.service.space
+            || self.deployment != self.accumulation_receipt.service.deployment
             || self.accumulation_receipt.accepted_transition == Hash::ZERO
         {
             return Err(AttestationError::ReceiptMismatch);
@@ -320,6 +321,7 @@ mod tests {
         let deployment = DeploymentId([3; 32]);
         let receipt = AccumulationReceiptV2 {
             service: ServiceIdentityV2 {
+                space: SpaceId([6; 32]),
                 root_service: RootServiceId([1; 32]),
                 deployment,
                 service_program: ProgramId([2; 32]),
