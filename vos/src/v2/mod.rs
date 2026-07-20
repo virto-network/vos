@@ -54,8 +54,9 @@ pub use identity::{
 #[cfg(feature = "std")]
 pub use local_store::{LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalStoreReadErrorV2};
 pub use package::{
-    DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2, VosPackageV2,
-    artifact_hash,
+    DeploymentRegistryV2, DeploymentSignatureV2, DeploymentSignatureVerifierV2,
+    PackageDiagnosticsV2, PackageError, PackageManifestV2, PackageRegistrationErrorV2,
+    VosPackageV2, artifact_hash,
 };
 #[cfg(feature = "std")]
 pub use pvm::{

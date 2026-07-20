@@ -4,6 +4,7 @@
 //! maps are optional diagnostics and are deliberately excluded from
 //! [`DeploymentId`] so a registry never has a reason to retranspile them.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -62,6 +63,116 @@ pub enum PackageError {
     SchemaHashMismatch,
     MissingSignature,
     ProducerIdMismatch,
+}
+
+/// Signature seam used by deployment registries. Implementations are pinned
+/// host infrastructure; package validation itself remains `no_std` and does
+/// not select a cryptographic library.
+pub trait DeploymentSignatureVerifierV2 {
+    fn verify(&self, public_key: &[u8], message: &[u8; 32], signature: &[u8]) -> bool;
+}
+
+impl<F> DeploymentSignatureVerifierV2 for F
+where
+    F: Fn(&[u8], &[u8; 32], &[u8]) -> bool,
+{
+    fn verify(&self, public_key: &[u8], message: &[u8; 32], signature: &[u8]) -> bool {
+        self(public_key, message, signature)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageRegistrationErrorV2 {
+    NonCanonicalPackage,
+    InvalidPackage(PackageError),
+    WrongServiceProgram,
+    InvalidSignature,
+    TagConflict,
+    DivergentDeploymentBytes,
+}
+
+impl core::fmt::Display for PackageRegistrationErrorV2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "cannot register .vos v2 deployment: {self:?}")
+    }
+}
+
+impl core::error::Error for PackageRegistrationErrorV2 {}
+
+/// Exact-byte registry for signed v2 deployments.
+///
+/// A registry never accepts an ELF and never retranspiles. The canonical actor
+/// PVM can be read from the retained package, while JIT/proving derivatives are
+/// external caches keyed by its `ProgramId`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeploymentRegistryV2 {
+    exact_packages: BTreeMap<DeploymentId, Vec<u8>>,
+    tags: BTreeMap<(String, String), DeploymentId>,
+}
+
+impl DeploymentRegistryV2 {
+    pub fn register(
+        &mut self,
+        exact_bytes: &[u8],
+        expected_service_program: ProgramId,
+        verifier: &impl DeploymentSignatureVerifierV2,
+    ) -> Result<DeploymentId, PackageRegistrationErrorV2> {
+        let package = VosPackageV2::decode(exact_bytes)
+            .map_err(|_| PackageRegistrationErrorV2::NonCanonicalPackage)?;
+        package
+            .validate()
+            .map_err(PackageRegistrationErrorV2::InvalidPackage)?;
+        if package.encode() != exact_bytes {
+            return Err(PackageRegistrationErrorV2::NonCanonicalPackage);
+        }
+        if package.manifest.service_program != expected_service_program {
+            return Err(PackageRegistrationErrorV2::WrongServiceProgram);
+        }
+        if !verifier.verify(
+            &package.deployment_signature.public_key,
+            &package.signing_message(),
+            &package.deployment_signature.signature,
+        ) {
+            return Err(PackageRegistrationErrorV2::InvalidSignature);
+        }
+
+        let deployment = package.deployment_id();
+        let tag = (
+            package.manifest.name.clone(),
+            package.manifest.version.clone(),
+        );
+        if let Some(existing) = self.tags.get(&tag)
+            && *existing != deployment
+        {
+            return Err(PackageRegistrationErrorV2::TagConflict);
+        }
+        if let Some(existing) = self.exact_packages.get(&deployment) {
+            if existing.as_slice() != exact_bytes {
+                return Err(PackageRegistrationErrorV2::DivergentDeploymentBytes);
+            }
+            return Ok(deployment);
+        }
+
+        self.exact_packages.insert(deployment, exact_bytes.to_vec());
+        self.tags.insert(tag, deployment);
+        Ok(deployment)
+    }
+
+    pub fn exact_package(&self, deployment: DeploymentId) -> Option<&[u8]> {
+        self.exact_packages.get(&deployment).map(Vec::as_slice)
+    }
+
+    pub fn resolve(&self, name: &str, version: &str) -> Option<DeploymentId> {
+        self.tags
+            .get(&(String::from(name), String::from(version)))
+            .copied()
+    }
+
+    pub fn actor_pvm(&self, deployment: DeploymentId) -> Option<Vec<u8>> {
+        VosPackageV2::decode(self.exact_package(deployment)?)
+            .ok()
+            .map(|package| package.actor_pvm)
+    }
 }
 
 impl core::fmt::Display for PackageError {
@@ -274,5 +385,70 @@ mod tests {
         package.actor_pvm.push(5);
         assert_eq!(package.validate(), Err(PackageError::ProgramIdMismatch));
         assert_ne!(id, package.deployment_id());
+    }
+
+    #[test]
+    fn registry_retains_exact_signed_bytes_and_never_accepts_an_elf() {
+        let package = package();
+        let bytes = package.encode();
+        let service_program = package.manifest.service_program;
+        let verifier = |key: &[u8], message: &[u8; 32], signature: &[u8]| {
+            key == b"key" && *message == package.signing_message() && signature == [8; 64]
+        };
+        let mut registry = DeploymentRegistryV2::default();
+        let deployment = registry
+            .register(&bytes, service_program, &verifier)
+            .unwrap();
+        assert_eq!(registry.exact_package(deployment), Some(bytes.as_slice()));
+        assert_eq!(
+            registry.actor_pvm(deployment),
+            Some(package.actor_pvm.clone())
+        );
+        assert_eq!(registry.resolve("counter", "2.0.0"), Some(deployment));
+        assert_eq!(
+            registry.register(&bytes, service_program, &verifier),
+            Ok(deployment),
+            "an exact retry is idempotent"
+        );
+        assert_eq!(
+            registry.register(b"ELF bytes", service_program, &verifier),
+            Err(PackageRegistrationErrorV2::NonCanonicalPackage)
+        );
+    }
+
+    #[test]
+    fn registry_rejects_bad_signatures_tags_and_same_id_byte_drift() {
+        let package = package();
+        let service_program = package.manifest.service_program;
+        let accepts = |_: &[u8], _: &[u8; 32], signature: &[u8]| signature == [8; 64];
+        let rejects = |_: &[u8], _: &[u8; 32], _: &[u8]| false;
+        let mut registry = DeploymentRegistryV2::default();
+        assert_eq!(
+            registry.register(&package.encode(), service_program, &rejects),
+            Err(PackageRegistrationErrorV2::InvalidSignature)
+        );
+        let deployment = registry
+            .register(&package.encode(), service_program, &accepts)
+            .unwrap();
+
+        let mut diagnostic_drift = package.clone();
+        diagnostic_drift.diagnostics = Some(PackageDiagnosticsV2 {
+            elf: Some(vec![99]),
+            source_map: None,
+        });
+        assert_eq!(diagnostic_drift.deployment_id(), deployment);
+        assert_eq!(
+            registry.register(&diagnostic_drift.encode(), service_program, &accepts),
+            Err(PackageRegistrationErrorV2::DivergentDeploymentBytes)
+        );
+
+        let mut conflicting = package;
+        conflicting.actor_pvm.push(5);
+        conflicting.manifest.actor_program = ProgramId::of_pvm(&conflicting.actor_pvm);
+        conflicting.deployment_signature.signature = vec![8; 64];
+        assert_eq!(
+            registry.register(&conflicting.encode(), service_program, &accepts),
+            Err(PackageRegistrationErrorV2::TagConflict)
+        );
     }
 }
