@@ -31,14 +31,15 @@ pub use contracts::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
     AccumulationResultV2, ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2,
     AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2,
-    Refine, RefineError, RefineImportsV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2,
+    ProofCommitmentV2, PublishedEffectsV2, Refine, RefineError, RefineImportsV2, ReplyRecordV2,
+    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
+    WorkInputIdV2, WorkflowOperationV2,
 };
 pub use identity::{
-    ActorId, CallId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId, ProgramId,
-    RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
+    ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,
+    ProgramId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
 };
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2, VosPackageV2,
