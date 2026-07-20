@@ -101,7 +101,10 @@ mod guest {
         };
         let actor_output =
             ActorSliceOutputV2::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
-        if actor_output.actor != work.target || actor_output.forbidden {
+        if actor_output.actor != work.target
+            || actor_output.first_await_ordinal != 0
+            || actor_output.forbidden
+        {
             fail_closed();
         }
         let imported = |actor: vos::v2::ActorId| {

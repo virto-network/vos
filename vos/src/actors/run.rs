@@ -787,7 +787,12 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // in Context and all v2 scheduler effects use that value.
     let mut ctx = super::Context::new(ServiceId(0));
     ctx.__set_actor_id(input.actor);
-    ctx.__set_actor_tree_v2(input.actor_tree.clone(), input.change, capacity);
+    ctx.__set_actor_tree_v2(
+        input.actor_tree.clone(),
+        input.change,
+        capacity,
+        input.first_await_ordinal,
+    );
     ctx.__set_origin(input.origin);
     ctx.set_caller_roles(input.space_role, None);
 
@@ -838,8 +843,11 @@ pub fn run_nested_actor_service<A: super::Actor>(
         (pair[0].actor, pair[0].key.as_slice()) < (pair[1].actor, pair[1].key.as_slice())
     }));
     let outbox = ctx.__drain_actor_calls_v2();
+    let (first_await_ordinal, next_await_ordinal) = ctx.__await_ordinal_range_v2();
     let encoded = ActorSliceOutputV2 {
         actor: input.actor,
+        first_await_ordinal,
+        next_await_ordinal,
         writes,
         crdt_operations,
         crdt_materialization,

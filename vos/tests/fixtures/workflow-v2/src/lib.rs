@@ -57,4 +57,30 @@ impl WorkflowV2 {
         }
         self.value
     }
+
+    #[msg]
+    async fn child_two_awaits(&mut self, ctx: &mut Context<Self>) -> u32 {
+        self.value += 1;
+        for _ in 0..2 {
+            if let Ok(Value::U32(value)) = ctx
+                .ask_actor(ActorId([44; 32]), &Msg::new("peer_value"), Some(100))
+                .await
+            {
+                self.value += value;
+            }
+        }
+        self.value
+    }
+
+    #[msg]
+    async fn root_child_two_awaits(&mut self, ctx: &mut Context<Self>) -> u32 {
+        self.value += 10;
+        if let Ok(Value::U32(value)) = ctx
+            .ask_actor(ActorId([36; 32]), &Msg::new("child_two_awaits"), None)
+            .await
+        {
+            self.value += value;
+        }
+        self.value
+    }
 }

@@ -344,6 +344,7 @@ impl ServicePvmV2 {
             state: target_state.to_vec(),
             causal_states,
             actor_tree,
+            first_await_ordinal: 0,
             message: work.arguments.clone(),
             origin: work.origin,
             space_role: authorization_space_role(work.origin, &work.authorization, imports)?,

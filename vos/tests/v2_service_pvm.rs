@@ -308,6 +308,36 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     }
 }
 
+fn peer_reply(
+    service: &ServiceIdentityV2,
+    call_id: CallId,
+    value: u32,
+    discriminator: u8,
+) -> AccumulatedReplyV2 {
+    let reply = ReplyRecordV2 {
+        call_id,
+        producer: ActorId([44; 32]),
+        result: Value::U32(value).encode(),
+    };
+    let mut producer_service = service.clone();
+    producer_service.root_service = RootServiceId([discriminator; 32]);
+    producer_service.deployment = DeploymentId([discriminator.wrapping_add(1); 32]);
+    AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: producer_service,
+            accepted_transition: Hash([discriminator.wrapping_add(2); 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([discriminator.wrapping_add(3); 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply,
+    }
+}
+
 #[test]
 fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let Some(elf) = service_elf() else {
@@ -425,6 +455,13 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                         public: true,
                         attested: false,
                     },
+                    MethodPolicyV2 {
+                        method: "root_child_two_awaits".into(),
+                        schema: Hash([73; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
                 ],
             },
             ActorGenesisV2 {
@@ -438,6 +475,13 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                     MethodPolicyV2 {
                         method: "child_await_peer".into(),
                         schema: Hash([66; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    },
+                    MethodPolicyV2 {
+                        method: "child_two_awaits".into(),
+                        schema: Hash([74; 32]),
                         policy: public_policy_hash(),
                         public: true,
                         attested: false,
@@ -828,6 +872,177 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
         LocalWorkSchedulerV2::prepare(restarted.accumulate_host(), child_request).is_ok(),
         "completion unlocks every actor from the exact suspended stack"
     );
+
+    let second_invocation = InvocationId([75; 32]);
+    let mut twice_message = vec![vos::value::TAG_DYNAMIC];
+    twice_message.extend_from_slice(&Msg::new("root_child_two_awaits").encode());
+    let twice = LocalWorkSchedulerV2::prepare(
+        restarted.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: second_invocation,
+            workflow_step: 0,
+            logical_timeslot: 4,
+            target: seed.target,
+            method: "root_child_two_awaits".into(),
+            arguments: twice_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let first_wait = restarted
+        .refine_actor_tree(&twice.work, &twice.imports)
+        .expect("the nested child reaches its first peer await");
+    let first_call = second_invocation.call_id(0);
+    assert_eq!(
+        first_wait
+            .transition
+            .outbox
+            .first()
+            .map(|message| message.call_id),
+        Some(first_call)
+    );
+    for artifact in &first_wait.exported_blobs {
+        assert_eq!(
+            restarted
+                .accumulate_host_mut()
+                .import_blob(artifact.bytes.clone()),
+            artifact.reference
+        );
+    }
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: twice.work,
+                transition: first_wait.transition,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let first_reply = peer_reply(&seed.service, first_call, 1, 76);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: first_reply.receipt.clone(),
+        });
+    let after_first = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        second_invocation,
+        5,
+        Some(first_reply),
+    )
+    .unwrap();
+    let second_wait = restarted
+        .refine_actor_tree(&after_first.work, &after_first.imports)
+        .expect("the restored child advances to its second peer await");
+    let second_call = second_invocation.call_id(1);
+    assert_eq!(second_wait.transition.reply, None);
+    assert_eq!(second_wait.transition.outbox.len(), 1);
+    assert_eq!(second_wait.transition.outbox[0].call_id, second_call);
+    assert_ne!(first_call, second_call);
+    assert_eq!(
+        second_wait
+            .transition
+            .writes
+            .iter()
+            .map(|write| u32::decode(write.value.as_ref().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![40, 11]
+    );
+    let second_continuation = second_wait.transition.continuations[0]
+        .replacement
+        .clone()
+        .expect("the second await replaces the first exact snapshot");
+    assert!(
+        second_wait
+            .transition
+            .continuations
+            .iter()
+            .all(|change| change.expected.is_some()
+                && change.replacement.as_ref() == Some(&second_continuation))
+    );
+    for artifact in &second_wait.exported_blobs {
+        assert_eq!(
+            restarted
+                .accumulate_host_mut()
+                .import_blob(artifact.bytes.clone()),
+            artifact.reference
+        );
+    }
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: after_first.work,
+                transition: second_wait.transition,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let second_reply = peer_reply(&seed.service, second_call, 2, 80);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: second_reply.receipt.clone(),
+        });
+    let after_second = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        second_invocation,
+        6,
+        Some(second_reply),
+    )
+    .unwrap();
+    let finished = restarted
+        .refine_actor_tree(&after_second.work, &after_second.imports)
+        .expect("the second reply completes the original root handler");
+    assert!(finished.transition.outbox.is_empty());
+    assert_eq!(
+        finished
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(53))
+    );
+    assert_eq!(
+        finished
+            .transition
+            .writes
+            .iter()
+            .map(|write| u32::decode(write.value.as_ref().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![53, 13]
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: after_second.work,
+                transition: finished.transition,
+                provided_blobs: finished.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
 }
 
 #[test]

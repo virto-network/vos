@@ -59,6 +59,8 @@ pub struct Context<A: Actor> {
     #[cfg(feature = "pvm")]
     pending_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
     #[cfg(feature = "pvm")]
+    first_await_ordinal: u64,
+    #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
     #[cfg(feature = "pvm")]
     actor_tree: Vec<crate::v2::ActorTreeImportV2>,
@@ -114,6 +116,8 @@ impl<A: Actor> Context<A> {
             #[cfg(feature = "pvm")]
             pending_actor_calls: Vec::new(),
             #[cfg(feature = "pvm")]
+            first_await_ordinal: 0,
+            #[cfg(feature = "pvm")]
             next_await_ordinal: 0,
             #[cfg(feature = "pvm")]
             actor_tree: Vec::new(),
@@ -159,10 +163,13 @@ impl<A: Actor> Context<A> {
         actor_tree: Vec<crate::v2::ActorTreeImportV2>,
         change: Option<crate::v2::ChangeId>,
         ipc_capacity: usize,
+        first_await_ordinal: u64,
     ) {
         self.actor_tree = actor_tree;
         self.actor_change = change;
         self.actor_ipc_capacity = ipc_capacity;
+        self.first_await_ordinal = first_await_ordinal;
+        self.next_await_ordinal = first_await_ordinal;
     }
 
     /// Who invoked the currently-running handler. The host writes
@@ -578,6 +585,7 @@ impl<A: Actor> Context<A> {
             state: imported.state,
             causal_states: Vec::new(),
             actor_tree: self.actor_tree.clone(),
+            first_await_ordinal: self.next_await_ordinal,
             message: payload.to_vec(),
             origin: crate::v2::Origin::Actor(caller),
             space_role: None,
@@ -622,6 +630,7 @@ impl<A: Actor> Context<A> {
             ));
         };
         if output.actor != target
+            || output.first_await_ordinal != self.next_await_ordinal
             || output.forbidden
             || !output.crdt_operations.is_empty()
             || output.crdt_materialization.is_some()
@@ -630,6 +639,7 @@ impl<A: Actor> Context<A> {
                 super::value::InvokeError::Panicked,
             ));
         }
+        self.next_await_ordinal = output.next_await_ordinal;
         for write in output.writes {
             if write.key.as_slice() == crate::lifecycle::STATE_KEY_BYTES
                 && let Some(state) = write.value.as_ref()
@@ -1246,6 +1256,12 @@ impl<A: Actor> Context<A> {
             .into_iter()
             .map(|((actor, key), value)| crate::v2::ActorWriteV2 { actor, key, value })
             .collect()
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __await_ordinal_range_v2(&self) -> (u64, u64) {
+        (self.first_await_ordinal, self.next_await_ordinal)
     }
 }
 

@@ -1744,27 +1744,6 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         )));
     }
 
-    let previous = if let Some(reference) = current {
-        let Some(bytes) = store
-            .load_blob(reference)
-            .map_err(GuestAccumulateError::Storage)?
-        else {
-            return Ok(Some(AccumulationRejectionV2::MissingBlob(reference.hash)));
-        };
-        if BlobRefV2::of_bytes(&bytes) != *reference {
-            return Err(GuestAccumulateError::CorruptStore);
-        }
-        let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
-            Ok(snapshot) if snapshot.validate_resume_for(work).is_ok() => snapshot,
-            _ => {
-                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
-            }
-        };
-        Some(snapshot)
-    } else {
-        None
-    };
-
     let replacement = target_change.replacement.as_ref();
     let next = if let Some(reference) = replacement {
         let candidate = envelope
@@ -1799,15 +1778,25 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         None
     };
 
-    let previous_actors = previous
-        .as_ref()
-        .map(|snapshot| snapshot.suspended_actors.as_slice())
+    // The complete work import was already checked byte-for-byte against the
+    // guest-owned tree. Actors carrying the target's current continuation are
+    // therefore the authenticated previous lock set. The awaited-reply check
+    // below validates that old continuation envelope once; avoid decoding its
+    // multi-megabyte kernel snapshot a second time here.
+    let previous_actors = current
+        .map(|current| {
+            work.imported_actors
+                .iter()
+                .filter(|actor| actor.continuation.as_ref() == Some(current))
+                .map(|actor| actor.actor)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let next_actors = next
         .as_ref()
         .map(|snapshot| snapshot.suspended_actors.as_slice())
         .unwrap_or_default();
-    let mut changed = previous_actors.to_vec();
+    let mut changed = previous_actors.clone();
     changed.extend_from_slice(next_actors);
     changed.sort_unstable();
     changed.dedup();
