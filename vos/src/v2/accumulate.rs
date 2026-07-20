@@ -221,10 +221,10 @@ impl InMemoryServiceState {
         validator: &V,
     ) -> Result<AccumulationOutcome, AccumulateError> {
         let work_hash = work.hash();
-        let transition_hash = transition.hash();
+        let transition_commitment = transition.commitment();
 
         if let Some(existing) = self.receipts.get(&work.input_id()) {
-            if existing.work != work_hash || existing.transition != transition_hash {
+            if existing.work != work_hash || existing.transition != transition_commitment {
                 return Err(AccumulateError::DivergentDuplicate);
             }
             return Ok(AccumulationOutcome {
@@ -259,7 +259,7 @@ impl InMemoryServiceState {
 
         let receipt = AccumulationReceiptV2 {
             service: next.identity.clone(),
-            accepted_transition: transition_hash,
+            accepted_transition: transition_commitment,
             resulting_state_root: (next.consistency != ConsistencyModeV2::Crdt)
                 .then_some(next.state_root),
             resulting_crdt_heads: next.crdt_heads.iter().copied().collect(),
@@ -271,7 +271,7 @@ impl InMemoryServiceState {
             work.input_id(),
             DedupRecord {
                 work: work_hash,
-                transition: transition_hash,
+                transition: transition_commitment,
                 receipt: receipt.clone(),
             },
         );

@@ -165,13 +165,13 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
 
     let work_hash = work.hash();
-    let transition_hash = transition.hash();
+    let transition_commitment = transition.commitment();
     if let Some(bytes) = read(store, &dedup_storage_key(work.input_id()))? {
         let record =
             DedupRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
         return if record.input == work.input_id()
             && record.work_hash == work_hash
-            && record.transition_hash == transition_hash
+            && record.transition_commitment == transition_commitment
         {
             Ok(AccumulationResultV2::Accepted {
                 receipt: record.receipt,
@@ -419,7 +419,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     let workflow = WorkflowCheckpointV2 {
         input: work.input_id(),
         work_hash,
-        transition_hash,
+        transition_commitment,
     };
     tree_apply(
         &mut tree,
@@ -455,7 +455,7 @@ fn apply<S: GuestAccumulateStoreV2>(
 
     let receipt = AccumulationReceiptV2 {
         service: header.service.clone(),
-        accepted_transition: transition_hash,
+        accepted_transition: transition_commitment,
         resulting_state_root,
         resulting_crdt_heads,
         sequence,
@@ -465,7 +465,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     let record = DedupRecordV2 {
         input: work.input_id(),
         work_hash,
-        transition_hash,
+        transition_commitment,
         receipt: receipt.clone(),
     };
     write(store, header_storage_key(), Some(&header.encode()))?;

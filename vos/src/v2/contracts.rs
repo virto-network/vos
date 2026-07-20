@@ -360,9 +360,25 @@ pub struct TransitionV2 {
 }
 
 impl TransitionV2 {
+    /// Hash of the complete transport value, including an attached proof.
+    /// This is useful for blob/cache identity but is deliberately not the
+    /// value accepted by an accumulation receipt.
     pub fn hash(&self) -> Hash {
         let encoded = self.encode();
-        Hash::digest(b"vos/transition/v2", &[&encoded])
+        Hash::digest(b"vos/transition-wire/v2", &[&encoded])
+    }
+
+    /// Consensus commitment to the actor execution before proof attachment.
+    ///
+    /// An attestation proves a statement containing the predicted accumulation
+    /// receipt. The receipt therefore cannot commit to proof bytes which are
+    /// generated from that same statement. Accumulate accepts this projection,
+    /// while independently requiring and validating the proof for attested
+    /// methods.
+    pub fn commitment(&self) -> Hash {
+        let mut candidate = self.clone();
+        candidate.proof = None;
+        Hash::digest(b"vos/transition/v2", &[&candidate.encode()])
     }
 
     pub fn workflow_operations(&self) -> Vec<WorkflowOperationV2> {
@@ -2081,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_hash_excludes_nothing() {
+    fn transition_commitment_binds_execution_but_not_attached_proof() {
         let base = TransitionV2 {
             service: service(),
             consumed_input: WorkInputIdV2 {
@@ -2110,6 +2126,16 @@ mod tests {
             result: b"ok".to_vec(),
         });
         assert_ne!(base.hash(), changed.hash());
+        assert_ne!(base.commitment(), changed.commitment());
+
+        let mut proved = changed.clone();
+        proved.proof = Some(ProofCommitmentV2 {
+            trace: Hash([13; 32]),
+            proof_blob: BlobRefV2::of_bytes(b"proof"),
+            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
+        });
+        assert_ne!(proved.hash(), changed.hash());
+        assert_eq!(proved.commitment(), changed.commitment());
         assert_eq!(TransitionV2::decode(&changed.encode()).unwrap(), changed);
     }
 
