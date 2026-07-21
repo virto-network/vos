@@ -124,6 +124,21 @@ impl AttestationProofProducerV2 for CanonicalTestProofProducer {
     }
 }
 
+#[derive(Debug)]
+struct FailingTestProofProducer;
+
+impl AttestationProofProducerV2 for FailingTestProofProducer {
+    type Error = ();
+
+    fn prove(
+        &mut self,
+        request: &AttestationProofRequestV2<'_>,
+    ) -> Result<ProducedAttestationProofV2, Self::Error> {
+        request.validate().map_err(|_| ())?;
+        Err(())
+    }
+}
+
 impl CommittedImageStoreV2 for FailableCommittedImages {
     type Error = ();
 
@@ -956,6 +971,72 @@ fn guest_spawned_child_survives_restart_and_joins_the_owned_scheduler() {
 }
 
 #[test]
+fn root_tree_proves_attested_refine_before_guest_commit() {
+    let Some((config, _, actor, _)) = workflow_root_configs() else {
+        return;
+    };
+    let mut service =
+        LocalRootTreeServiceV2::open(config, FailableCommittedImages::default()).unwrap();
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([108; 32]),
+        workflow_step: 0,
+        logical_timeslot: 1,
+        target: actor,
+        method: "attested_value".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: true,
+    };
+
+    assert!(matches!(
+        service.invoke(request.clone()),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired)
+    ));
+    let before_failure = service.store().snapshot();
+    assert!(matches!(
+        service.invoke_attested(request.clone(), &mut FailingTestProofProducer),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::ProofProductionFailed)
+    ));
+    assert!(service
+        .store()
+        .snapshot()
+        .same_service_state(&before_failure));
+
+    let proof_bytes = b"root-tree canonical proof".to_vec();
+    let mut producer = CanonicalTestProofProducer {
+        trace: Hash([109; 32]),
+        proof: proof_bytes.clone(),
+        calls: 0,
+    };
+    let committed = service
+        .invoke_attested(request, &mut producer)
+        .expect("the root owner proves and then commits the exact Refine output");
+    assert_eq!(producer.calls, 1);
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(0))
+    );
+    let proof = committed.published.proof.as_ref().unwrap();
+    assert_eq!(proof.trace, Hash([109; 32]));
+    assert!(proof.proof_blob.matches(&proof_bytes));
+    let publication = committed
+        .publication
+        .expect("proof and reply stay guest-owned until acknowledged");
+    assert_eq!(publication.published, committed.published);
+}
+
+#[test]
 fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
     let Some((mut config, _, actor, _)) = workflow_root_configs() else {
         return;
@@ -1017,10 +1098,54 @@ fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
     );
     assert!(!service.acknowledge_publication(&publication).unwrap());
 
+    let mut attested_arguments = vec![vos::value::TAG_DYNAMIC];
+    attested_arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let attested_request = LocalWorkRequestV2 {
+        invocation: InvocationId([110; 32]),
+        workflow_step: 0,
+        logical_timeslot: 2,
+        target: actor,
+        method: "attested_value".into(),
+        arguments: attested_arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: true,
+    };
+    assert!(!service.admit_ingress(&attested_request).unwrap());
+    let before_failed_proof = service.store().snapshot();
+    assert!(matches!(
+        service.invoke_admitted_attested(
+            attested_request.invocation,
+            &mut FailingTestProofProducer,
+        ),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::ProofProductionFailed)
+    ));
+    assert!(service
+        .store()
+        .snapshot()
+        .same_service_state(&before_failed_proof));
+    let mut producer = CanonicalTestProofProducer {
+        trace: Hash([111; 32]),
+        proof: b"raft root-tree proof".to_vec(),
+        calls: 0,
+    };
+    let attested = service
+        .invoke_admitted_attested(attested_request.invocation, &mut producer)
+        .expect("only the proved Apply is ordered after the admitted ingress");
+    assert_eq!(producer.calls, 1);
+    assert!(attested.published.proof.is_some());
+    assert!(!service
+        .acknowledge_publication(&attested.publication.unwrap())
+        .unwrap());
+
     let backend = service.into_backend();
     let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
-    assert_eq!(log.applied_index().unwrap(), 4);
-    assert!(log.committed_after(4).unwrap().entries.is_empty());
+    assert_eq!(log.applied_index().unwrap(), 7);
+    assert!(log.committed_after(7).unwrap().entries.is_empty());
     let reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
         .expect("the root tree reopens at the durable Raft apply cursor");
     assert_eq!(

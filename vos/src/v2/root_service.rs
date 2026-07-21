@@ -10,19 +10,21 @@ use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::attestation::AttestationProofProducerV2;
+
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
-    AuthorizationEvidenceV2, BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2, DurableJamStoreV2,
-    DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
-    LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PreparedWorkV2,
-    ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
-    WorkflowCheckpointV2,
+    AttestedServiceErrorV2, AuthorizationEvidenceV2, BlobRefV2, CommittedAttestationOutputV2,
+    CommittedImageStoreV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtSyncEnvelopeV2,
+    DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
+    ExternalActorDirectoryV2, JamServiceV2, LocalJamStoreV2, LocalStoreReadErrorV2,
+    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefinedServiceOutputV2,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
+    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
 };
 
 #[cfg(feature = "storage")]
@@ -360,6 +362,12 @@ pub enum LocalRootTreeOpenErrorV2<E> {
 #[derive(Debug)]
 pub enum LocalRootTreeInvokeErrorV2 {
     ProofProducerRequired,
+    ProofModeMismatch,
+    AttestationPreparationFailed,
+    ProofProductionFailed,
+    InvalidProducedProof,
+    ProofUnavailable,
+    AttestationCommitMismatch,
     Schedule(ScheduleErrorV2),
     Service(ServiceDispatchError),
     #[cfg(feature = "storage")]
@@ -525,11 +533,77 @@ impl<B: CommittedImageStoreV2> RootTreeServiceDriverV2<B> {
         }
     }
 
+    fn accumulate_attested<P: AttestationProofProducerV2>(
+        &mut self,
+        envelope: AccumulationEnvelopeV2,
+        imports: &super::RefineImportsV2,
+        producer: &mut P,
+    ) -> Result<CommittedAttestationOutputV2, LocalRootTreeInvokeErrorV2> {
+        match self {
+            Self::Direct(service) => service
+                .accumulate_attested(envelope, imports, producer)
+                .map_err(map_direct_attested_error),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate_attested(envelope, imports, producer)
+                .map_err(map_raft_attested_error),
+        }
+    }
+
     fn into_store(self) -> DurableJamStoreV2<B> {
         match self {
             Self::Direct(service) => service.into_hosts().1,
             #[cfg(feature = "storage")]
             Self::Raft(service) => service.into_parts().0.into_hosts().1,
+        }
+    }
+}
+
+fn map_direct_attested_error<P>(
+    error: AttestedServiceErrorV2<ServiceDispatchError, P>,
+) -> LocalRootTreeInvokeErrorV2 {
+    match error {
+        AttestedServiceErrorV2::Service(error) => LocalRootTreeInvokeErrorV2::Service(error),
+        AttestedServiceErrorV2::Rejected(error) => LocalRootTreeInvokeErrorV2::Rejected(error),
+        AttestedServiceErrorV2::InvalidPreparation => {
+            LocalRootTreeInvokeErrorV2::AttestationPreparationFailed
+        }
+        AttestedServiceErrorV2::Producer(_) => {
+            LocalRootTreeInvokeErrorV2::ProofProductionFailed
+        }
+        AttestedServiceErrorV2::InvalidProducedProof => {
+            LocalRootTreeInvokeErrorV2::InvalidProducedProof
+        }
+        AttestedServiceErrorV2::ProofUnavailable => {
+            LocalRootTreeInvokeErrorV2::ProofUnavailable
+        }
+        AttestedServiceErrorV2::CommitMismatch => {
+            LocalRootTreeInvokeErrorV2::AttestationCommitMismatch
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+fn map_raft_attested_error<P>(
+    error: AttestedServiceErrorV2<ReplicatedServiceErrorV2<CommitError>, P>,
+) -> LocalRootTreeInvokeErrorV2 {
+    match error {
+        AttestedServiceErrorV2::Service(error) => LocalRootTreeInvokeErrorV2::Replication(error),
+        AttestedServiceErrorV2::Rejected(error) => LocalRootTreeInvokeErrorV2::Rejected(error),
+        AttestedServiceErrorV2::InvalidPreparation => {
+            LocalRootTreeInvokeErrorV2::AttestationPreparationFailed
+        }
+        AttestedServiceErrorV2::Producer(_) => {
+            LocalRootTreeInvokeErrorV2::ProofProductionFailed
+        }
+        AttestedServiceErrorV2::InvalidProducedProof => {
+            LocalRootTreeInvokeErrorV2::InvalidProducedProof
+        }
+        AttestedServiceErrorV2::ProofUnavailable => {
+            LocalRootTreeInvokeErrorV2::ProofUnavailable
+        }
+        AttestedServiceErrorV2::CommitMismatch => {
+            LocalRootTreeInvokeErrorV2::AttestationCommitMismatch
         }
     }
 }
@@ -1271,6 +1345,23 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.invoke_prepared(prepared)
     }
 
+    /// Execute one single-slice attested invocation. The exact live Refine
+    /// output is prepared by guest Accumulate, handed to `producer`, and only
+    /// then committed through physical Accumulate with the produced proof.
+    pub fn invoke_attested<P: AttestationProofProducerV2>(
+        &mut self,
+        request: LocalWorkRequestV2,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        if !request.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofModeMismatch);
+        }
+        let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        self.invoke_prepared_attested(prepared, producer)
+    }
+
     /// Execute a message only after destination Accumulate has admitted its
     /// finalized source outbox record into the guest-owned inbox.
     pub fn invoke_inbox(
@@ -1289,6 +1380,52 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
         self.invoke_prepared(prepared)
+    }
+
+    /// Execute a guest-admitted attested inbox message with a configured proof
+    /// producer. This is used for cross-root calls to attested methods.
+    pub fn invoke_inbox_attested<P: AttestationProofProducerV2>(
+        &mut self,
+        call: super::CallId,
+        logical_timeslot: u64,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        let prepared = LocalWorkSchedulerV2::prepare_inbox(
+            self.service.accumulate_host(),
+            call,
+            logical_timeslot,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if !prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofModeMismatch);
+        }
+        self.invoke_prepared_attested(prepared, producer)
+    }
+
+    /// Schedule a previously guest-admitted attested direct invocation.
+    pub fn invoke_admitted_attested<P: AttestationProofProducerV2>(
+        &mut self,
+        invocation: super::InvocationId,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        let record = self
+            .service
+            .accumulate_host()
+            .ingress_record(invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
+        if record.consumed {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+        }
+        let request = request_from_direct_ingress(record.ingress);
+        if !request.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofModeMismatch);
+        }
+        let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        self.invoke_prepared_attested(prepared, producer)
     }
 
     /// Resume the exact committed machine snapshot for an invocation. The
@@ -1453,6 +1590,9 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         &mut self,
         prepared: PreparedWorkV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        if prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
         let refined = self
             .service
             .refine_actor_tree(&prepared.work, &prepared.imports)
@@ -1495,6 +1635,53 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             duplicate,
             refine_gas_used: refined.gas_used,
             accumulate_gas_used: accumulated.gas_used,
+        })
+    }
+
+    fn invoke_prepared_attested<P: AttestationProofProducerV2>(
+        &mut self,
+        prepared: PreparedWorkV2,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        if !prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofModeMismatch);
+        }
+        let refined = self
+            .service
+            .refine_actor_tree(&prepared.work, &prepared.imports)
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        let input = prepared.work.input_id();
+        let committed = self.service.accumulate_attested(
+            AccumulationEnvelopeV2 {
+                work: prepared.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            },
+            &prepared.imports,
+            producer,
+        )?;
+        let receipt = committed.preparation.receipt;
+        let published = committed.published;
+        let publication = self
+            .service
+            .accumulate_host()
+            .pending_publications()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .into_iter()
+            .find(|publication| publication.input == input);
+        if publication.is_none() {
+            return Err(LocalRootTreeInvokeErrorV2::MissingPublication);
+        }
+        Ok(CommittedRootTreeSliceV2 {
+            input,
+            receipt,
+            published,
+            publication,
+            duplicate: false,
+            refine_gas_used: refined.gas_used,
+            accumulate_gas_used: committed
+                .prepare_gas_used
+                .saturating_add(committed.accumulate_gas_used),
         })
     }
 
