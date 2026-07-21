@@ -318,8 +318,26 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             causal_states: vec![],
             continuation: None,
         }],
+        external_actors: vec![],
         imported_blobs: vec![],
         proof_requested: false,
+    }
+}
+
+fn bound_peer_service(service: &ServiceIdentityV2) -> ServiceIdentityV2 {
+    let mut peer = service.clone();
+    peer.root_service = RootServiceId([45; 32]);
+    peer.deployment = DeploymentId([46; 32]);
+    peer
+}
+
+fn private_age_binding(service: &ServiceIdentityV2) -> vos::v2::ExternalActorBindingV2 {
+    vos::v2::ExternalActorBindingV2 {
+        name: "private-age".into(),
+        service: bound_peer_service(service),
+        actor: ActorId([44; 32]),
+        producer: ProducerId([98; 32]),
+        program: ProgramId([92; 32]),
     }
 }
 
@@ -334,9 +352,7 @@ fn peer_reply(
         producer: ActorId([44; 32]),
         result: Value::U32(value).encode(),
     };
-    let mut producer_service = service.clone();
-    producer_service.root_service = RootServiceId([discriminator; 32]);
-    producer_service.deployment = DeploymentId([discriminator.wrapping_add(1); 32]);
+    let producer_service = bound_peer_service(service);
     AccumulatedReplyV2 {
         receipt: AccumulationReceiptV2 {
             service: producer_service,
@@ -521,6 +537,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                 ],
             },
         ],
+        external_actors: vec![private_age_binding(&seed.service)],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([63; 32]),
             authenticator: vec![64],
@@ -783,9 +800,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
         producer: ActorId([44; 32]),
         result: Value::U32(7).encode(),
     };
-    let mut peer_service = seed.service.clone();
-    peer_service.root_service = RootServiceId([68; 32]);
-    peer_service.deployment = DeploymentId([69; 32]);
+    let peer_service = bound_peer_service(&seed.service);
     let awaited_reply = AccumulatedReplyV2 {
         receipt: AccumulationReceiptV2 {
             service: peer_service,
@@ -1130,9 +1145,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
         producer: ActorId([44; 32]),
         result: Value::U32(7).encode(),
     };
-    let mut producer_service = seed.service.clone();
-    producer_service.root_service = RootServiceId([88; 32]);
-    producer_service.deployment = DeploymentId([89; 32]);
+    let producer_service = bound_peer_service(&seed.service);
     let producer_receipt = AccumulationReceiptV2 {
         service: producer_service,
         accepted_transition: Hash([90; 32]),
@@ -1302,6 +1315,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
                 }],
             },
         ],
+        external_actors: vec![],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([83; 32]),
             authenticator: vec![84],
@@ -1395,6 +1409,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     work.consistency = ConsistencyModeV2::Crdt;
     work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
     work.base_causal_height = Some(0);
+    work.external_actors = vec![private_age_binding(&work.service)];
 
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes.clone()), initial);
@@ -1477,6 +1492,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
                 ],
             },
         ],
+        external_actors: vec![private_age_binding(&work.service)],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([46; 32]),
             authenticator: vec![1],
@@ -1886,9 +1902,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         producer: ActorId([44; 32]),
         result: Value::U32(0).encode(),
     };
-    let mut remote_service = around.work.service.clone();
-    remote_service.root_service = RootServiceId([54; 32]);
-    remote_service.deployment = DeploymentId([55; 32]);
+    let remote_service = bound_peer_service(&around.work.service);
     let awaited = AccumulatedReplyV2 {
         receipt: AccumulationReceiptV2 {
             service: remote_service,
@@ -2365,6 +2379,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
                 attested: false,
             }],
         }],
+        external_actors: vec![private_age_binding(&seed_work.service)],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([52; 32]),
             authenticator: vec![53],
@@ -2690,6 +2705,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 methods: vec![],
             },
         ],
+        external_actors: vec![],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
             authenticator: vec![35],
@@ -3397,6 +3413,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
                 attested: false,
             }],
         }],
+        external_actors: vec![],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([123; 32]),
             authenticator: vec![124],
@@ -3623,6 +3640,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
                 attested: true,
             }],
         }],
+        external_actors: vec![],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([133; 32]),
             authenticator: vec![134],
@@ -3789,6 +3807,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
                 attested: false,
             }],
         }],
+        external_actors: vec![],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([129; 32]),
             authenticator: vec![130],
@@ -3974,56 +3993,71 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
     destination_identity.deployment = DeploymentId([61; 32]);
     let destination_actor = ActorId([62; 32]);
 
-    let make_service = |identity: ServiceIdentityV2, actor: ActorId| {
-        let mut store = LocalJamStoreV2::default();
-        assert_eq!(store.import_blob(initial_bytes.clone()), initial);
-        assert_eq!(store.import_program(actor_pvm.clone()), actor_program);
-        let mut service = JamServiceV2::new(
-            service_pvm.clone(),
-            service_program,
-            NoRefineProtocolHostV2,
-            store,
-            100_000_000,
-            5_000_000_000,
-        )
-        .unwrap();
-        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
-            service: identity,
-            consistency: ConsistencyModeV2::Local,
-            actors: vec![ActorGenesisV2 {
-                actor,
-                name: "root".into(),
-                parent: None,
-                producer: ProducerId([64; 32]),
-                program: actor_program,
-                initial_state: initial.clone(),
-                crdt: false,
-                methods: vec![MethodPolicyV2 {
-                    method: "start".into(),
-                    schema: Hash([63; 32]),
-                    policy: public_policy_hash(),
-                    public: true,
-                    attested: false,
+    let make_service =
+        |identity: ServiceIdentityV2,
+         actor: ActorId,
+         external_actors: Vec<vos::v2::ExternalActorBindingV2>| {
+            let mut store = LocalJamStoreV2::default();
+            assert_eq!(store.import_blob(initial_bytes.clone()), initial);
+            assert_eq!(store.import_program(actor_pvm.clone()), actor_program);
+            let mut service = JamServiceV2::new(
+                service_pvm.clone(),
+                service_program,
+                NoRefineProtocolHostV2,
+                store,
+                100_000_000,
+                5_000_000_000,
+            )
+            .unwrap();
+            let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+                service: identity,
+                consistency: ConsistencyModeV2::Local,
+                actors: vec![ActorGenesisV2 {
+                    actor,
+                    name: "root".into(),
+                    parent: None,
+                    producer: ProducerId([64; 32]),
+                    program: actor_program,
+                    initial_state: initial.clone(),
+                    crdt: false,
+                    methods: vec![MethodPolicyV2 {
+                        method: "start".into(),
+                        schema: Hash([63; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                    }],
                 }],
-            }],
-            authorization: AuthorizationEvidenceV2::SystemCapability {
-                capability: vos::v2::SystemCapabilityId([65; 32]),
-                authenticator: vec![66],
-            },
-        });
-        let AccumulateRequestV2::Install(genesis) = &install else {
-            unreachable!()
+                external_actors,
+                authorization: AuthorizationEvidenceV2::SystemCapability {
+                    capability: vos::v2::SystemCapabilityId([65; 32]),
+                    authenticator: vec![66],
+                },
+            });
+            let AccumulateRequestV2::Install(genesis) = &install else {
+                unreachable!()
+            };
+            service.accumulate_host_mut().allow_install(genesis);
+            assert!(matches!(
+                service.accumulate(&install).unwrap().result,
+                AccumulationResultV2::Installed(_)
+            ));
+            service
         };
-        service.accumulate_host_mut().allow_install(genesis);
-        assert!(matches!(
-            service.accumulate(&install).unwrap().result,
-            AccumulationResultV2::Installed(_)
-        ));
-        service
-    };
 
-    let mut source = make_service(source_seed.service.clone(), source_seed.target);
-    let mut destination = make_service(destination_identity, destination_actor);
+    let destination_binding = vos::v2::ExternalActorBindingV2 {
+        name: "destination".into(),
+        service: destination_identity.clone(),
+        actor: destination_actor,
+        producer: ProducerId([64; 32]),
+        program: actor_program,
+    };
+    let mut source = make_service(
+        source_seed.service.clone(),
+        source_seed.target,
+        vec![destination_binding],
+    );
+    let mut destination = make_service(destination_identity, destination_actor, vec![]);
     let prepared = LocalWorkSchedulerV2::prepare(
         source.accumulate_host(),
         LocalWorkRequestV2 {

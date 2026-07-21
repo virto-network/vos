@@ -330,6 +330,7 @@ mod tests {
                 causal_states: vec![],
                 continuation: None,
             }],
+            external_actors: vec![],
             imported_blobs: vec![],
             proof_requested: false,
         }

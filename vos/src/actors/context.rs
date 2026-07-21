@@ -63,6 +63,7 @@ pub struct Context<A: Actor> {
     #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
     actor_tree: Vec<crate::v2::ActorTreeImportV2>,
+    external_actors: Vec<crate::v2::ExternalActorBindingV2>,
     #[cfg(feature = "pvm")]
     active_actor_mask: u64,
     #[cfg(feature = "pvm")]
@@ -125,6 +126,7 @@ impl<A: Actor> Context<A> {
             #[cfg(feature = "pvm")]
             next_await_ordinal: 0,
             actor_tree: Vec::new(),
+            external_actors: Vec::new(),
             #[cfg(feature = "pvm")]
             active_actor_mask: 0,
             #[cfg(feature = "pvm")]
@@ -172,6 +174,13 @@ impl<A: Actor> Context<A> {
             .map(|actor| actor.actor)
     }
 
+    fn resolve_external_actor_v2(&self, name: &str) -> Option<crate::v2::ActorId> {
+        self.external_actors
+            .binary_search_by(|actor| actor.name.as_str().cmp(name))
+            .ok()
+            .map(|index| self.external_actors[index].actor)
+    }
+
     #[doc(hidden)]
     pub fn __set_actor_id(&mut self, actor: crate::v2::ActorId) {
         self.actor_id = Some(actor);
@@ -182,12 +191,14 @@ impl<A: Actor> Context<A> {
     pub fn __set_actor_tree_v2(
         &mut self,
         actor_tree: Vec<crate::v2::ActorTreeImportV2>,
+        external_actors: Vec<crate::v2::ExternalActorBindingV2>,
         change: Option<crate::v2::ChangeId>,
         ipc_capacity: usize,
         first_await_ordinal: u64,
         active_actor_mask: u64,
     ) {
         self.actor_tree = actor_tree;
+        self.external_actors = external_actors;
         self.active_actor_mask = active_actor_mask;
         self.actor_change = change;
         self.actor_ipc_capacity = ipc_capacity;
@@ -516,6 +527,13 @@ impl<A: Actor> Context<A> {
             if self.actor_tree.iter().any(|actor| actor.actor == target) {
                 return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
             }
+            if self
+                .external_actors
+                .iter()
+                .all(|actor| actor.actor != target)
+            {
+                return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
+            }
             let await_ordinal = self.next_await_ordinal;
             self.next_await_ordinal = self
                 .next_await_ordinal
@@ -606,6 +624,13 @@ impl<A: Actor> Context<A> {
                 return super::client::AttestedAsk::ready(Err(ClientError::InvalidAttestation(
                     crate::AttestationError::CannotSuspend,
                 )));
+            }
+            if self
+                .external_actors
+                .iter()
+                .all(|actor| actor.actor != target)
+            {
+                return super::client::AttestedAsk::ready(Err(ClientError::NotFound));
             }
             let await_ordinal = self.next_await_ordinal;
             self.next_await_ordinal = self
@@ -755,6 +780,7 @@ impl<A: Actor> Context<A> {
             state: imported.state,
             causal_states: imported.causal_states,
             actor_tree: self.actor_tree.clone(),
+            external_actors: self.external_actors.clone(),
             active_actor_mask: self.active_actor_mask | target_mask,
             first_await_ordinal: self.next_await_ordinal,
             message: payload.to_vec(),
@@ -1006,6 +1032,7 @@ impl<A: Actor> Context<A> {
         if self.actor_id.is_some() {
             let actor = self
                 .resolve_owned_actor_v2(None, &name)
+                .or_else(|| self.resolve_external_actor_v2(&name))
                 .ok_or(super::client::ClientError::NotFound)?;
             return Ok(R::bind(actor, self));
         }
@@ -1852,6 +1879,30 @@ mod tests {
             Some(sibling_child)
         );
         assert_eq!(ctx.resolve_owned_actor_v2(Some(root), "other"), None);
+    }
+
+    #[test]
+    fn v2_external_resolution_uses_only_install_time_bindings() {
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        let actor = crate::v2::ActorId([41; 32]);
+        ctx.__set_actor_id(crate::v2::ActorId([1; 32]));
+        ctx.external_actors = alloc::vec![crate::v2::ExternalActorBindingV2 {
+            name: "private-age".into(),
+            service: crate::v2::ServiceIdentityV2 {
+                space: crate::v2::SpaceId([2; 32]),
+                root_service: crate::v2::RootServiceId([3; 32]),
+                deployment: crate::v2::DeploymentId([4; 32]),
+                service_program: crate::v2::ProgramId([5; 32]),
+                service_abi: crate::v2::ABI_VERSION,
+                execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            },
+            actor,
+            producer: crate::v2::ProducerId([6; 32]),
+            program: crate::v2::ProgramId([7; 32]),
+        }];
+
+        assert_eq!(ctx.resolve_external_actor_v2("private-age"), Some(actor));
+        assert_eq!(ctx.resolve_external_actor_v2("package-label"), None);
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

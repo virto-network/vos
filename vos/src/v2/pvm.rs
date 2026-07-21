@@ -370,6 +370,7 @@ impl ServicePvmV2 {
             state: target_state.to_vec(),
             causal_states,
             actor_tree,
+            external_actors: work.external_actors.clone(),
             active_actor_mask: 1u64 << active_actor_index,
             first_await_ordinal: 0,
             message: work.arguments.clone(),

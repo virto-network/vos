@@ -129,6 +129,8 @@ impl V2Wire for StoreHeaderV2 {
 pub enum StateKeyV2 {
     /// Canonical, sorted membership of the complete root actor tree.
     ActorDirectory,
+    /// Canonical install-time bindings to actors owned by other root trees.
+    ExternalActorDirectory,
     ActorDescriptor(ActorId),
     MethodPolicy {
         actor: ActorId,
@@ -157,6 +159,9 @@ impl V2Wire for StateKeyV2 {
         match self {
             Self::ActorDirectory => {
                 e.u8(9);
+            }
+            Self::ExternalActorDirectory => {
+                e.u8(10);
             }
             Self::ActorDescriptor(actor) => {
                 e.u8(0);
@@ -233,6 +238,7 @@ impl V2Wire for StateKeyV2 {
                 Ok(Self::ActorName { parent, name })
             }
             9 => Ok(Self::ActorDirectory),
+            10 => Ok(Self::ExternalActorDirectory),
             _ => Err(DecodeError::InvalidTag),
         }
     }

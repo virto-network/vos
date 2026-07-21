@@ -793,6 +793,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     ctx.__set_actor_id(input.actor);
     ctx.__set_actor_tree_v2(
         input.actor_tree.clone(),
+        input.external_actors.clone(),
         input.change,
         capacity,
         input.first_await_ordinal,

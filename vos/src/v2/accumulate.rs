@@ -634,6 +634,7 @@ mod tests {
             base: base.clone(),
             base_causal_height: None,
             imported_actors: vec![],
+            external_actors: vec![],
             imported_blobs: vec![],
             proof_requested: false,
         };
@@ -778,6 +779,7 @@ mod tests {
             base: state.current_base(),
             base_causal_height: Some(1),
             imported_actors: vec![],
+            external_actors: vec![],
             imported_blobs: vec![],
             proof_requested: false,
         };
