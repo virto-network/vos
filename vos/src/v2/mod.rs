@@ -74,7 +74,7 @@ pub use package::{
 #[cfg(feature = "std")]
 pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
-    RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
+    RefineProtocolHostV2, RefineTraceV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
     SERVICE_ARGUMENT_PAGES_V2, transpile_service_elf,
 };
 #[cfg(feature = "std")]

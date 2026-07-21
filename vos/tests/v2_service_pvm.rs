@@ -2197,27 +2197,52 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
     .expect("the completed inline invocation leaves both actors idle");
     let runner = ServicePvmV2::new(service_pvm.clone(), ProgramId::of_pvm(&service_pvm)).unwrap();
     let first_bytes = runner
+        .refine_actor_tree_traced(
+            &nested.work.encode(),
+            &nested.imports,
+            1_000_000_000,
+            &NoRefineProtocolHostV2,
+        )
+        .expect("the child suspends inside the root's nested CALL");
+    assert_eq!(
+        runner
+            .refine_actor_tree_traced(
+                &nested.work.encode(),
+                &nested.imports,
+                1_000_000_000,
+                &NoRefineProtocolHostV2,
+            )
+            .unwrap(),
+        first_bytes,
+        "the exact nested trace must be deterministic"
+    );
+    let trace = first_bytes
+        .trace
+        .as_ref()
+        .expect("traced Refine returns its execution commitment");
+    assert!(trace.instruction_count > 0);
+    assert!(trace.protocol_call_count > 0);
+    assert!(trace.vm_switch_count >= 2);
+    assert!(
+        trace.code_hashes.len() >= 2,
+        "the trace covers both the service and actor code"
+    );
+    let recompiled = runner
         .refine_actor_tree_with_backend(
             &nested.work.encode(),
             &nested.imports,
             1_000_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            javm::PvmBackend::ForceRecompiler,
         )
-        .expect("the child suspends inside the root's nested CALL");
+        .unwrap();
+    assert_eq!(recompiled.bytes, first_bytes.bytes);
+    assert_eq!(recompiled.gas_used, first_bytes.gas_used);
     assert_eq!(
-        runner
-            .refine_actor_tree_with_backend(
-                &nested.work.encode(),
-                &nested.imports,
-                1_000_000_000,
-                &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
-            )
-            .unwrap(),
-        first_bytes,
+        recompiled.exported_blobs, first_bytes.exported_blobs,
         "nested JAR checkpoints must be backend-independent"
     );
+    assert!(recompiled.trace.is_none());
     let first_output = RefineOutputV2::decode(&first_bytes.bytes).unwrap();
     let first = first_output.transition;
     assert!(first.reply.is_none());

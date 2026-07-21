@@ -5,10 +5,13 @@
 //! Refine the host surface is read-only and persistent JAM protocol calls are
 //! rejected before a handler can observe them.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use javm::cap::{Access, Cap, DataCap, ProtocolCap};
-use javm::kernel::{DispatchResult, DormantProgram, InvocationKernel, KernelResult};
+use javm::kernel::{
+    DispatchResult, DormantProgram, InvocationKernel, KernelInstructionObservation, KernelResult,
+};
 use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
 use javm::snapshot::KernelSnapshot;
 use javm::vm_pool::VmState;
@@ -47,6 +50,25 @@ pub struct ServicePvmOutputV2 {
     /// make these bytes available before submitting the transition to
     /// Accumulate; publication still occurs only after commit.
     pub exported_blobs: Vec<ImportedBlobV2>,
+    /// Exact canonical-interpreter commitment for a traced Refine slice.
+    /// Ordinary Refine and every Accumulate execution leave this absent.
+    pub trace: Option<RefineTraceV2>,
+}
+
+/// Compact commitment to one complete nested Refine execution slice.
+///
+/// The commitment follows every service and actor instruction across JAR
+/// CALL/REPLY VM switches and binds host protocol-call requests and injected
+/// results. A prover can reproduce the full witness by replaying the canonical
+/// work/import bytes under the pinned execution-semantics identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefineTraceV2 {
+    pub commitment: Hash,
+    pub instruction_count: u64,
+    pub protocol_call_count: u64,
+    pub vm_switch_count: u64,
+    /// Canonical JAR CODE-sub-blob hashes observed during this slice.
+    pub code_hashes: Vec<Hash>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +86,7 @@ pub enum ServicePvmErrorV2 {
     AccumulateCommitRejected,
     InvalidAccumulateOutput,
     InvalidProtocolResume,
+    TraceBackendRequired,
     InvalidWorkEnvelope,
     InvalidRefineImports,
     InvalidAuthorization,
@@ -75,6 +98,164 @@ pub enum ServicePvmErrorV2 {
     ActorIpcExhausted,
     ActorIpcSetupFailed,
     InvalidVmLifecycle,
+}
+
+struct RefineTraceRecorderV2 {
+    state: blake2b_simd::State,
+    instruction_count: u64,
+    protocol_call_count: u64,
+    vm_switch_count: u64,
+    previous_vm: Option<u16>,
+    code_hashes: BTreeSet<[u8; 32]>,
+}
+
+impl RefineTraceRecorderV2 {
+    fn new(service_program: ProgramId, work: &WorkEnvelopeV2, imports: &RefineImportsV2) -> Self {
+        let mut recorder = Self {
+            state: blake2b_simd::Params::new().hash_length(32).to_state(),
+            instruction_count: 0,
+            protocol_call_count: 0,
+            vm_switch_count: 0,
+            previous_vm: None,
+            code_hashes: BTreeSet::new(),
+        };
+        recorder.bytes(b"vos/refine-trace/v2");
+        recorder.bytes(&super::EXECUTION_SEMANTICS_ID.0);
+        recorder.bytes(&service_program.0);
+        recorder.bytes(&work.hash().0);
+        recorder.bytes(&Hash::digest(b"vos/refine-imports/v2", &[&imports.encode()]).0);
+        recorder
+    }
+
+    fn instruction(&mut self, event: KernelInstructionObservation<'_>) {
+        self.state.update(&[0]);
+        self.u64(self.instruction_count);
+        self.instruction_count = self.instruction_count.saturating_add(1);
+        if self.previous_vm != Some(event.active_vm) {
+            if self.previous_vm.is_some() {
+                self.vm_switch_count = self.vm_switch_count.saturating_add(1);
+            }
+            self.previous_vm = Some(event.active_vm);
+        }
+        self.code_hashes.insert(event.program_hash);
+        self.u16(event.active_vm);
+        self.u16(event.code_cap_id);
+        self.bytes(&event.program_hash);
+        self.u64(event.call_depth as u64);
+        self.u32(event.instruction.pc_before);
+        self.state.update(&[event.instruction.opcode_byte]);
+        for register in event.instruction.registers_before {
+            self.u64(register);
+        }
+        self.u64(event.instruction.gas_before);
+        self.state
+            .update(&[u8::from(event.instruction.need_gas_charge_before)]);
+        self.exit(event.instruction.exit);
+        for register in event.instruction.machine_after.registers {
+            self.u64(register);
+        }
+        self.u64(event.instruction.machine_after.gas);
+        self.u32(event.instruction.machine_after.pc);
+        self.u32(event.instruction.machine_after.heap_base);
+        self.u32(event.instruction.machine_after.heap_top);
+        self.state
+            .update(&[u8::from(event.instruction.machine_after.need_gas_charge)]);
+    }
+
+    fn protocol_call(&mut self, slot: u8, kernel: &InvocationKernel) {
+        self.state.update(&[1, slot]);
+        self.protocol_call_count = self.protocol_call_count.saturating_add(1);
+        self.u16(kernel.active_vm);
+        self.u64(kernel.call_stack.len() as u64);
+        for index in 0..13 {
+            self.u64(kernel.active_reg(index));
+        }
+        self.u64(kernel.active_gas());
+    }
+
+    fn protocol_resume(&mut self, slot: u8, result0: u64, result1: u64) {
+        self.state.update(&[2, slot]);
+        self.u64(result0);
+        self.u64(result1);
+    }
+
+    fn checkpoint(&mut self, artifact: &ImportedBlobV2) {
+        self.state.update(&[3]);
+        self.bytes(&artifact.reference.hash.0);
+        self.u64(artifact.reference.len);
+    }
+
+    fn output(&mut self, bytes: &[u8], gas_used: u64, exported_blobs: &[ImportedBlobV2]) {
+        self.state.update(&[4]);
+        self.bytes(bytes);
+        self.u64(gas_used);
+        self.u64(exported_blobs.len() as u64);
+        for artifact in exported_blobs {
+            self.bytes(&artifact.reference.hash.0);
+            self.u64(artifact.reference.len);
+        }
+    }
+
+    fn finish(self) -> RefineTraceV2 {
+        let digest = self.state.finalize();
+        let mut commitment = [0; 32];
+        commitment.copy_from_slice(digest.as_bytes());
+        RefineTraceV2 {
+            commitment: Hash(commitment),
+            instruction_count: self.instruction_count,
+            protocol_call_count: self.protocol_call_count,
+            vm_switch_count: self.vm_switch_count,
+            code_hashes: self.code_hashes.into_iter().map(Hash).collect(),
+        }
+    }
+
+    fn exit(&mut self, exit: Option<&javm::ExitReason>) {
+        match exit {
+            None => {
+                self.state.update(&[0]);
+            }
+            Some(javm::ExitReason::Halt) => {
+                self.state.update(&[1]);
+            }
+            Some(javm::ExitReason::Trap) => {
+                self.state.update(&[2]);
+            }
+            Some(javm::ExitReason::Panic) => {
+                self.state.update(&[3]);
+            }
+            Some(javm::ExitReason::OutOfGas) => {
+                self.state.update(&[4]);
+            }
+            Some(javm::ExitReason::PageFault(address)) => {
+                self.state.update(&[5]);
+                self.u32(*address);
+            }
+            Some(javm::ExitReason::HostCall(id)) => {
+                self.state.update(&[6]);
+                self.u32(*id);
+            }
+            Some(javm::ExitReason::Ecall) => {
+                self.state.update(&[7]);
+            }
+        }
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.u64(bytes.len() as u64);
+        self.state.update(bytes);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.state.update(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.state.update(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.state.update(&value.to_le_bytes());
+    }
 }
 
 impl core::fmt::Display for ServicePvmErrorV2 {
@@ -188,6 +369,7 @@ impl ServicePvmV2 {
             None,
             Vec::new(),
             Vec::new(),
+            None,
         )
     }
 
@@ -225,6 +407,39 @@ impl ServicePvmV2 {
         host: &H,
         backend: javm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        self.refine_actor_tree_internal(arguments, imports, gas_limit, host, backend, false)
+    }
+
+    /// Execute the exact live actor-tree Refine path while committing every
+    /// canonical interpreter instruction and scheduler protocol boundary.
+    /// The returned transition is byte-identical to an ordinary interpreter
+    /// or recompiler execution for the same input.
+    pub fn refine_actor_tree_traced<H: RefineProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        imports: &RefineImportsV2,
+        gas_limit: u64,
+        host: &H,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        self.refine_actor_tree_internal(
+            arguments,
+            imports,
+            gas_limit,
+            host,
+            javm::PvmBackend::ForceInterpreter,
+            true,
+        )
+    }
+
+    fn refine_actor_tree_internal<H: RefineProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        imports: &RefineImportsV2,
+        gas_limit: u64,
+        host: &H,
+        backend: javm::PvmBackend,
+        traced: bool,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let work = WorkEnvelopeV2::decode(arguments)
             .map_err(|_| ServicePvmErrorV2::InvalidWorkEnvelope)?;
         imports
@@ -233,6 +448,7 @@ impl ServicePvmV2 {
         if work.imported_actors.len() > MAX_ROOT_TREE_ACTORS {
             return Err(ServicePvmErrorV2::TooManyImportedActors);
         }
+        let trace = traced.then(|| RefineTraceRecorderV2::new(self.program_id, &work, imports));
 
         let mut actors = Vec::with_capacity(work.imported_actors.len());
         let target = work
@@ -348,6 +564,7 @@ impl ServicePvmV2 {
                 Some((&self.program, &dormant)),
                 continuation.suspended_actors,
                 Vec::new(),
+                trace,
             );
         }
 
@@ -421,6 +638,7 @@ impl ServicePvmV2 {
             Some((&self.program, &dormant)),
             Vec::new(),
             Vec::new(),
+            trace,
         )
     }
 
@@ -490,6 +708,7 @@ impl ServicePvmV2 {
                         bytes,
                         gas_used,
                         exported_blobs: Vec::new(),
+                        trace: None,
                     });
                 }
                 KernelResult::Panic => {
@@ -800,6 +1019,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
     invocation_layout: Option<(&[u8], &[DormantProgram<'_>])>,
     previously_suspended: Vec<super::ActorId>,
     mut exported_blobs: Vec<ImportedBlobV2>,
+    mut trace: Option<RefineTraceRecorderV2>,
 ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
     if fresh {
         kernel
@@ -812,13 +1032,26 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
     let starting_gas = kernel.active_gas();
 
     loop {
-        match kernel.run() {
+        let result = if let Some(recorder) = trace.as_mut() {
+            kernel
+                .run_observed(|event| recorder.instruction(event))
+                .map_err(|_| ServicePvmErrorV2::TraceBackendRequired)?
+        } else {
+            kernel.run()
+        };
+        match result {
             KernelResult::Halt => {
                 let bytes = read_output(&kernel)?;
+                let gas_used = starting_gas.saturating_sub(kernel.active_gas());
+                let trace = trace.map(|mut recorder| {
+                    recorder.output(&bytes, gas_used, &exported_blobs);
+                    recorder.finish()
+                });
                 return Ok(ServicePvmOutputV2 {
                     bytes,
-                    gas_used: starting_gas.saturating_sub(kernel.active_gas()),
+                    gas_used,
                     exported_blobs,
+                    trace,
                 });
             }
             KernelResult::Panic => {
@@ -840,6 +1073,9 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 });
             }
             KernelResult::ProtocolCall { slot } => {
+                if let Some(recorder) = trace.as_mut() {
+                    recorder.protocol_call(slot, &kernel);
+                }
                 if !refine_protocol_call_is_pure(slot) {
                     return Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(slot));
                 }
@@ -879,6 +1115,10 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                         finalization
                             .resume_protocol_call(0, token_len)
                             .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                        if let Some(recorder) = trace.as_mut() {
+                            recorder.checkpoint(&artifact);
+                            recorder.protocol_resume(slot, 0, token_len);
+                        }
                         kernel = finalization;
                         exported_blobs.push(artifact);
                         continue;
@@ -889,6 +1129,9 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                     kernel
                         .resume_protocol_call(result0, result1)
                         .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                    if let Some(recorder) = trace.as_mut() {
+                        recorder.protocol_resume(slot, result0, result1);
+                    }
                     continue;
                 }
                 let mut registers = [0; 13];
@@ -899,6 +1142,9 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 kernel
                     .resume_protocol_call(result0, result1)
                     .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                if let Some(recorder) = trace.as_mut() {
+                    recorder.protocol_resume(slot, result0, result1);
+                }
             }
         }
     }
