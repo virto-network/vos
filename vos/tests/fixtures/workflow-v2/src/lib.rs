@@ -63,6 +63,17 @@ impl WorkflowV2 {
     }
 
     #[msg]
+    async fn await_peer_child(&mut self, ctx: &mut Context<Self>) -> u32 {
+        match ctx
+            .ask_actor(ActorId([45; 32]), &Msg::new("peer_value"), Some(100))
+            .await
+        {
+            Ok(Value::U32(value)) => value,
+            _ => 0,
+        }
+    }
+
+    #[msg]
     async fn root_child_await(&mut self, ctx: &mut Context<Self>) -> u32 {
         self.value += 10;
         if let Ok(mut child) = ctx.child::<WorkflowV2Ref>("child").await

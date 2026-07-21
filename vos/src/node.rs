@@ -4336,12 +4336,24 @@ where
             }
         }
         let ingress = match crate::v2::RootTreeInvocationV2::decode(&request.msg) {
-            Ok(ingress) if ingress.target == service.root_actor() => ingress,
-            _ => {
+            Ok(ingress) => ingress,
+            Err(_) => {
                 send_v2_status(request.reply, crate::actors::run::STATUS_NOT_FOUND, id);
                 continue;
             }
         };
+        match service.owns_actor(ingress.target) {
+            Ok(true) => {}
+            Ok(false) => {
+                send_v2_status(request.reply, crate::actors::run::STATUS_NOT_FOUND, id);
+                continue;
+            }
+            Err(error) => {
+                error!(%id, ?error, "v2 actor-directory lookup failed");
+                send_v2_status(request.reply, crate::actors::run::STATUS_PANICKED, id);
+                continue;
+            }
+        }
         let message = if ingress.arguments.first() == Some(&crate::value::TAG_DYNAMIC) {
             <crate::value::Msg as crate::Decode>::try_decode(&ingress.arguments[1..])
         } else {
@@ -4353,14 +4365,14 @@ where
             send_v2_status(request.reply, crate::actors::run::STATUS_NOT_FOUND, id);
             continue;
         }
-        let policy = match service.root_method_policy(&ingress.method) {
+        let policy = match service.actor_method_policy(ingress.target, &ingress.method) {
             Ok(Some(policy)) => policy,
             Ok(None) => {
                 send_v2_status(request.reply, crate::actors::run::STATUS_NOT_FOUND, id);
                 continue;
             }
             Err(error) => {
-                error!(%id, ?error, "v2 root method-policy lookup failed");
+                error!(%id, ?error, "v2 actor method-policy lookup failed");
                 send_v2_status(request.reply, crate::actors::run::STATUS_PANICKED, id);
                 continue;
             }
@@ -4600,8 +4612,14 @@ fn handle_v2_transport<B>(
             message,
         } => {
             debug!(%id, from = %envelope.from, call = ?message.call_id, "received v2 outbox delivery");
-            if message.to != service.root_actor()
-                || v2_actor_route(actor_routes, message.from) != Some(envelope.from.0)
+            let owns_target = match service.owns_actor(message.to) {
+                Ok(owns_target) => owns_target,
+                Err(error) => {
+                    warn!(%id, ?error, "v2 delivery target directory lookup failed");
+                    return;
+                }
+            };
+            if !owns_target || v2_actor_route(actor_routes, message.from) != Some(envelope.from.0)
             {
                 warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected misrouted v2 outbox delivery");
                 return;

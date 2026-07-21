@@ -906,10 +906,14 @@ fn guest_spawned_child_survives_restart_and_joins_the_owned_scheduler() {
     let mut node = VosNode::new();
     node.register_v2_root_at_id("spawn-root".into(), restarted, ServiceId(197), true)
         .expect("registration binds the complete committed directory");
+    assert!(matches!(
+        node.bind_v2_actor_route(child, ServiceId(198)),
+        Err(vos::node::V2NodeRegistrationError::ActorRouteOccupied(actor)) if actor == child
+    ));
+    let handle = node.invoke_handle();
     let mut call_arguments = vec![vos::value::TAG_DYNAMIC];
     call_arguments.extend_from_slice(&Msg::new("call_dynamic").encode());
-    let reply = node
-        .invoke_handle()
+    let reply = handle
         .invoke_with_timeout(
             ServiceId(197),
             vos::v2::RootTreeInvocationV2 {
@@ -925,6 +929,25 @@ fn guest_spawned_child_survives_restart_and_joins_the_owned_scheduler() {
         )
         .expect("the restarted root calls the dynamically committed child inline");
     assert_eq!(Value::try_decode(&reply), Some(Value::U32(6)));
+
+    let mut child_arguments = vec![vos::value::TAG_DYNAMIC];
+    child_arguments.extend_from_slice(&Msg::new("increment").with("amount", 4u32).encode());
+    let child_reply = handle
+        .invoke_with_timeout(
+            ServiceId(197),
+            vos::v2::RootTreeInvocationV2 {
+                invocation: InvocationId([99; 32]),
+                logical_timeslot: 3,
+                target: child,
+                method: "increment".into(),
+                arguments: child_arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .expect("strict ingress schedules a dynamically committed child directly");
+    assert_eq!(Value::try_decode(&child_reply), Some(Value::U32(10)));
     node.shutdown();
     assert!(node.collect().into_iter().all(|result| result.is_ok()));
 }
@@ -1287,6 +1310,63 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     let results = router.join().unwrap();
     assert!(results.into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
+fn node_routes_cross_root_call_to_an_owned_child() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("vos=debug")
+        .with_test_writer()
+        .try_init();
+    let Some((mut source_config, mut peer_config, source_actor, peer_actor)) =
+        workflow_root_configs()
+    else {
+        return;
+    };
+    let peer_child = ActorId([45; 32]);
+    source_config.external_actors[0].actor = peer_child;
+    peer_config.owned_actors.push(OwnedActorInstallV2 {
+        actor: peer_child,
+        name: "remote-child".into(),
+        parent: peer_actor,
+        initial_state: vec![],
+    });
+    let source =
+        LocalRootTreeServiceV2::open(source_config, FailableCommittedImages::default()).unwrap();
+    let peer =
+        LocalRootTreeServiceV2::open(peer_config, FailableCommittedImages::default()).unwrap();
+    let mut node = VosNode::new();
+    let source_route = ServiceId(221);
+    node.register_v2_root_at_id("child-source".into(), source, source_route, true)
+        .unwrap();
+    node.register_v2_root_at_id("child-peer".into(), peer, ServiceId(222), true)
+        .unwrap();
+    let handle = node.invoke_handle();
+    let shutdown = node.shutdown_handle();
+    let router = std::thread::spawn(move || {
+        node.run_forever();
+        node.collect()
+    });
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("await_peer_child").encode());
+    let reply = handle
+        .invoke_with_timeout(
+            source_route,
+            vos::v2::RootTreeInvocationV2 {
+                invocation: InvocationId([130; 32]),
+                logical_timeslot: 1,
+                target: source_actor,
+                method: "await_peer_child".into(),
+                arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .expect("the destination service admits a durable call addressed to its child");
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(7)));
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(router.join().unwrap().into_iter().all(|result| result.is_ok()));
 }
 
 #[test]

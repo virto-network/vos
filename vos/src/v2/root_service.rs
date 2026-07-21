@@ -825,6 +825,10 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)
     }
 
+    pub fn owns_actor(&self, actor: ActorId) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        Ok(self.actor_ids()?.binary_search(&actor).is_ok())
+    }
+
     pub const fn consistency(&self) -> ConsistencyModeV2 {
         self.consistency
     }
@@ -1067,10 +1071,14 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         Ok(true)
     }
 
-    pub fn root_method_policy(
+    pub fn actor_method_policy(
         &self,
+        actor: ActorId,
         method: &str,
     ) -> Result<Option<MethodPolicyV2>, LocalRootTreeInvokeErrorV2> {
+        if !self.owns_actor(actor)? {
+            return Ok(None);
+        }
         let header = self
             .service
             .accumulate_host()
@@ -1082,7 +1090,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .accumulate_host()
             .state_row(
                 header.service_root,
-                &StateKeyV2::ActorDescriptor(self.root_actor),
+                &StateKeyV2::ActorDescriptor(actor),
             )
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
