@@ -5,11 +5,12 @@
 > APIs, and CRDT primitives described here are present. The local v2 harness
 > executes both phases through that PVM and commits only an accepted guest
 > result; it has no native transition-apply shortcut. `VosNode` can attach an
-> explicitly opened Local v2 root and route ordinary public calls, durable
+> explicitly opened Local or Raft v2 root and route ordinary public calls, durable
 > cross-root outbox delivery, inbox execution, exact reply/timeout resume, and
 > restart retries through it. Signed v2 catalog rows use this root service when the
 > daemon is started with the exact service PVM. Role-authorized, attested,
-> Raft, and CRDT network transport remain fail-closed. Legacy node behavior is
+> CRDT anti-entropy, role-authorized calls, and attested network transport remain
+> fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
 
 The local conformance scheduler can admit one guest-committed durable inbox
@@ -629,8 +630,10 @@ Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
-catalog artifacts and opens each ordinary Local deployment as one durable
-root-tree service. It verifies the package signature, capability layout, and
+catalog artifacts and opens each ordinary Local or Raft deployment as one
+durable root-tree service. Raft rows resolve membership only after their exact
+package and root configuration pass validation, then order genesis and every
+mutation as canonical IC-5 request bytes. It verifies the package signature, capability layout, and
 protocol-pinned service `ProgramId`; it never extracts the actor PVM into the
 legacy runtime or retranspiles an ELF. Missing or invalid service artifacts
 skip only the affected row, so an installed package cannot prevent the rest of
@@ -643,8 +646,10 @@ reinstalling under the required fresh replication id creates a fresh actor and
 deduplication domain. On the next boot, images and proof side-CAS directories
 whose incarnation is no longer present move to recoverable trash.
 
-V2 Raft and CRDT rows remain fail-closed until their request-log and
-anti-entropy drivers are attached to the daemon. For Local roots, ordinary
+V2 CRDT rows remain fail-closed until anti-entropy can authenticate receipt
+finality independently of the peer-supplied sync envelope. Local root transport
+remains Local-only; Raft effects require their consensus-aware routing path.
+For Local roots, ordinary
 public cross-root calls are emitted as guest-owned publications, routed over
 canonical node envelopes, admitted through destination IC-5, and resumed from
 the caller's exact saved machine after the committed reply returns. The node
@@ -694,7 +699,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 25, continuation snapshot version 6, and platform ABI version 4
+Store schema 26, continuation snapshot version 6, and platform ABI version 5
 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and

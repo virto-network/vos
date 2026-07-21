@@ -93,6 +93,24 @@ impl std::fmt::Display for V2NodeRegistrationError {
 
 impl std::error::Error for V2NodeRegistrationError {}
 
+#[cfg(all(feature = "storage", feature = "network"))]
+#[derive(Debug)]
+pub enum V2RaftNodeRegistrationError<E> {
+    Log(crate::commit::CommitError),
+    Open(crate::v2::LocalRootTreeOpenErrorV2<E>),
+    Registration(V2NodeRegistrationError),
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+impl<E: core::fmt::Debug> core::fmt::Display for V2RaftNodeRegistrationError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "cannot register Raft VOS v2 root tree: {self:?}")
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+impl<E: core::fmt::Debug> core::error::Error for V2RaftNodeRegistrationError<E> {}
+
 impl AgentResult {
     /// Did the agent finish cleanly (no PVM panics, no host errors)?
     pub fn is_ok(&self) -> bool {
@@ -2893,6 +2911,88 @@ impl VosNode {
             })),
         });
         Ok(id)
+    }
+
+    /// Attach one Raft-backed v2 root tree to the node. The worker orders
+    /// canonical `AccumulateRequestV2` bytes; the root thread applies the
+    /// committed log through the same physical service PVM as local roots.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id<B>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+    {
+        let replication_id = raft_config.replication_id;
+        let network = self
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let (apply_tx, apply_rx) = mpsc::channel::<u64>();
+        let worker = crate::raft::RaftWorker::spawn(
+            db.clone(),
+            crate::raft::WorkerConfig {
+                me: raft_config.me,
+                members: raft_config.members.clone(),
+                replication_id,
+                election_timeout_ms: raft_config.election_timeout_ms,
+                heartbeat_interval_ms: raft_config.heartbeat_interval_ms,
+            },
+            network.clone(),
+            Some(apply_tx),
+        );
+        if let Some(network) = network.as_ref() {
+            network.register_raft_handler(replication_id, Arc::new(worker.handler()));
+        }
+        self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
+
+        let cleanup = |node: &Self| {
+            if let Some(network) = network.as_ref() {
+                network.unregister_raft_handler(&replication_id);
+            }
+            node.raft_hosts.lock().unwrap().remove(&id.0);
+        };
+        let log = match crate::raft::RaftAccumulateLogV2::from_worker(
+            db,
+            raft_config,
+            worker,
+            apply_rx,
+        ) {
+            Ok(log) => log,
+            Err(error) => {
+                cleanup(self);
+                return Err(V2RaftNodeRegistrationError::Log(error));
+            }
+        };
+        let service = match crate::v2::LocalRootTreeServiceV2::open_raft(config, backend, log) {
+            Ok(service) => service,
+            Err(error) => {
+                cleanup(self);
+                return Err(V2RaftNodeRegistrationError::Open(error));
+            }
+        };
+        match self.register_v2_root_at_id(name, service, id, network_reachable) {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                cleanup(self);
+                Err(V2RaftNodeRegistrationError::Registration(error))
+            }
+        }
     }
 
     /// Bind an externally owned v2 actor to an authenticated physical route.
