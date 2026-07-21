@@ -69,6 +69,8 @@ pub enum V2NodeRegistrationError {
     StoreUninitialized,
     ServiceRouteOccupied(ServiceId),
     ActorRouteOccupied(crate::v2::ActorId),
+    InvalidConsistency(crate::v2::ConsistencyModeV2),
+    ReplicationGroupOccupied([u8; 32]),
 }
 
 impl core::fmt::Display for V2NodeRegistrationError {
@@ -951,6 +953,11 @@ pub struct VosNode {
     /// their writes against each other.
     #[cfg(all(feature = "network", feature = "storage"))]
     pub(crate) crdt_replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    /// V2 CRDT groups expose guest-exported causal packets and return peer
+    /// deltas to the root owner for physical SyncCrdt. They never share the
+    /// legacy EffectLog/redb materializer above.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    v2_crdt_replicas: Arc<Mutex<HashMap<[u8; 32], V2CrdtReplicaSlot>>>,
     /// Map: ServiceId word → replication group, for agents running
     /// the multi-mode Raft worker. Shared into every extension
     /// thread (via [`RaftFwd`]) so the ask path can recognize a
@@ -1045,6 +1052,36 @@ pub(crate) struct ReplicaSlot {
     /// must live here, not just on the agent thread's strategy. `None`
     /// accepts all peer nodes.
     pub node_validator: Option<crate::commit::NodeValidator>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Clone, Default)]
+struct V2CrdtExport {
+    heads: Vec<[u8; 32]>,
+    nodes: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2CrdtSyncRequest {
+    envelope: crate::v2::CrdtSyncEnvelopeV2,
+    reply: mpsc::Sender<bool>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Clone)]
+struct V2CrdtReplicaSlot {
+    name: String,
+    export: Arc<RwLock<V2CrdtExport>>,
+    sync_tx: mpsc::Sender<V2CrdtSyncRequest>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2CrdtRootHooks {
+    replication_id: [u8; 32],
+    export: Arc<RwLock<V2CrdtExport>>,
+    sync_rx: mpsc::Receiver<V2CrdtSyncRequest>,
+    shared_network: SharedNetwork,
+    observed_commit_sequence: Option<u64>,
 }
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
@@ -1258,6 +1295,8 @@ struct NodeService {
     agent_info: AgentInfos,
     #[cfg(feature = "storage")]
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    #[cfg(feature = "storage")]
+    v2_replicas: Arc<Mutex<HashMap<[u8; 32], V2CrdtReplicaSlot>>>,
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     proof_blobs: ProofBlobStore,
     proof_blobs_dir: Option<std::path::PathBuf>,
@@ -1987,11 +2026,28 @@ impl crate::network::NetworkService for NodeService {
         caller_peer_id: Option<libp2p::PeerId>,
         replication_id: &[u8; 32],
     ) -> Option<Vec<[u8; 32]>> {
-        let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        if let Some(slot) = self
+            .replicas
+            .lock()
+            .ok()?
+            .get(replication_id)
+            .cloned()
+        {
+            if !self.sync_serve_allowed(caller_peer_id.as_ref(), &slot.name) {
+                return None;
+            }
+            return crate::commit::read_roots(&slot.db).ok();
+        }
+        let slot = self
+            .v2_replicas
+            .lock()
+            .ok()?
+            .get(replication_id)
+            .cloned()?;
         if !self.sync_serve_allowed(caller_peer_id.as_ref(), &slot.name) {
             return None;
         }
-        crate::commit::read_roots(&slot.db).ok()
+        slot.export.read().ok().map(|export| export.heads.clone())
     }
 
     #[cfg(feature = "storage")]
@@ -2001,11 +2057,28 @@ impl crate::network::NetworkService for NodeService {
         replication_id: &[u8; 32],
         cid: &[u8; 32],
     ) -> Option<Vec<u8>> {
-        let slot = self.replicas.lock().ok()?.get(replication_id).cloned()?;
+        if let Some(slot) = self
+            .replicas
+            .lock()
+            .ok()?
+            .get(replication_id)
+            .cloned()
+        {
+            if !self.sync_serve_allowed(caller_peer_id.as_ref(), &slot.name) {
+                return None;
+            }
+            return crate::commit::read_dag_node(&slot.db, cid).ok().flatten();
+        }
+        let slot = self
+            .v2_replicas
+            .lock()
+            .ok()?
+            .get(replication_id)
+            .cloned()?;
         if !self.sync_serve_allowed(caller_peer_id.as_ref(), &slot.name) {
             return None;
         }
-        crate::commit::read_dag_node(&slot.db, cid).ok().flatten()
+        slot.export.read().ok()?.nodes.get(cid).cloned()
     }
 
     fn manifest(&self) -> Option<crate::network::ManifestReply> {
@@ -2262,6 +2335,13 @@ const SYNC_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(all(feature = "network", feature = "storage"))]
 const SYNC_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Physical SyncCrdt executes the canonical service PVM and may take longer
+/// than a network point fetch, especially while other PVMs are proving or
+/// refining concurrently. Keep the peer I/O deadline tight, but give the
+/// owning root thread the same class of budget as a normal actor invocation.
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_SYNC_ACCUMULATE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Every Nth sync tick we re-probe all connected peers (not
 /// just known group members) so newly-joined replicas of an
 /// existing group get discovered. Picked to be a small
@@ -2470,6 +2550,138 @@ fn sync_with_peer(
     })
 }
 
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_sync_loop(
+    replication_id: [u8; 32],
+    shared_network: SharedNetwork,
+    slot: V2CrdtReplicaSlot,
+    shutdown: Arc<AtomicBool>,
+) {
+    let (hint_tx, hint_rx) = mpsc::channel::<libp2p::PeerId>();
+    let mut subscribed = false;
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(SYNC_INTERVAL);
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(network) = shared_network.lock().ok().and_then(|guard| guard.clone()) else {
+            continue;
+        };
+        if !subscribed {
+            network.join_replication(replication_id, hint_tx.clone());
+            subscribed = true;
+        }
+        while hint_rx.try_recv().is_ok() {}
+        let local = network.peer_id();
+        for peer in network
+            .connected_peers()
+            .into_iter()
+            .filter(|peer| peer != &local)
+        {
+            if let Err(error) = v2_sync_with_peer(&network, peer, replication_id, &slot) {
+                warn!(%error, "v2 CRDT sync cycle failed");
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_sync_with_peer(
+    network: &crate::network::Network,
+    peer: libp2p::PeerId,
+    replication_id: [u8; 32],
+    slot: &V2CrdtReplicaSlot,
+) -> Result<(), &'static str> {
+    use crate::v2::V2Wire;
+
+    let remote_heads = network
+        .send_fetch_heads(peer, replication_id)
+        .recv_timeout(SYNC_FETCH_TIMEOUT)
+        .map_err(|_| "head fetch timed out")?;
+    if remote_heads.is_empty() {
+        return Ok(());
+    }
+    let local_nodes = slot
+        .export
+        .read()
+        .map_err(|_| "local export lock is poisoned")?
+        .nodes
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut pending = remote_heads.clone();
+    let mut fetched = std::collections::BTreeMap::new();
+    let mut blobs = std::collections::BTreeMap::new();
+    let mut service = None;
+    while let Some(cid) = pending.pop() {
+        if local_nodes.contains(&cid) || fetched.contains_key(&cid) {
+            continue;
+        }
+        let bytes = network
+            .send_fetch_node(peer, replication_id, cid)
+            .recv_timeout(SYNC_FETCH_TIMEOUT)
+            .map_err(|_| "causal node fetch timed out")?
+            .ok_or("peer omitted an advertised causal node")?;
+        let fragment = crate::v2::CrdtSyncEnvelopeV2::decode(&bytes)
+            .map_err(|_| "peer returned a non-canonical v2 causal packet")?;
+        if fragment.advertised_heads != [crate::v2::Hash(cid)]
+            || fragment.nodes.len() != 1
+            || fragment.nodes[0].change.cid().0 != cid
+            || service
+                .as_ref()
+                .is_some_and(|expected| expected != &fragment.service)
+        {
+            return Err("peer returned a mismatched v2 causal packet");
+        }
+        service.get_or_insert_with(|| fragment.service.clone());
+        let node = fragment.nodes.into_iter().next().unwrap();
+        pending.extend(
+            node.change
+                .causal_dependencies
+                .iter()
+                .map(|dependency| dependency.0),
+        );
+        for blob in fragment.provided_blobs {
+            if let Some(existing) = blobs.insert(blob.reference.hash.0, blob.clone())
+                && existing != blob
+            {
+                return Err("peer returned divergent content-addressed blobs");
+            }
+        }
+        fetched.insert(cid, node);
+    }
+    if fetched.is_empty() {
+        return Ok(());
+    }
+    let mut advertised_heads = remote_heads
+        .into_iter()
+        .map(crate::v2::Hash)
+        .collect::<Vec<_>>();
+    advertised_heads.sort();
+    advertised_heads.dedup();
+    let envelope = crate::v2::CrdtSyncEnvelopeV2 {
+        service: service.ok_or("peer supplied no service identity")?,
+        advertised_heads,
+        nodes: fetched.into_values().collect(),
+        provided_blobs: blobs.into_values().collect(),
+    };
+    let envelope = crate::v2::CrdtSyncEnvelopeV2::decode(&envelope.encode())
+        .map_err(|_| "assembled v2 sync delta is not canonical")?;
+    let (reply_tx, reply_rx) = mpsc::channel();
+    slot.sync_tx
+        .send(V2CrdtSyncRequest {
+            envelope,
+            reply: reply_tx,
+        })
+        .map_err(|_| "v2 root owner stopped")?;
+    let accepted = reply_rx
+        .recv_timeout(V2_SYNC_ACCUMULATE_TIMEOUT)
+        .map_err(|_| "v2 root sync Accumulate timed out")?;
+    accepted
+        .then_some(())
+        .ok_or("guest rejected the v2 sync delta")
+}
+
 /// Shared "last activity" instant, bumped on every dispatch. The
 /// node uses it as a global idle signal that — unlike outbox-only
 /// monitoring — also accounts for invoke traffic, which doesn't
@@ -2508,6 +2720,8 @@ impl VosNode {
             operator_signer: None,
             #[cfg(all(feature = "network", feature = "storage"))]
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            v2_crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "network")]
@@ -2675,6 +2889,8 @@ impl VosNode {
             agent_info: self.agent_info.clone(),
             #[cfg(feature = "storage")]
             replicas: self.crdt_replicas.clone(),
+            #[cfg(feature = "storage")]
+            v2_replicas: self.v2_crdt_replicas.clone(),
             manifest: self.manifest.clone(),
             proof_blobs: self.proof_blobs.clone(),
             proof_blobs_dir: self.proof_blobs_dir.clone(),
@@ -2798,6 +3014,29 @@ impl VosNode {
     where
         B: crate::v2::CommittedImageStoreV2 + Send + 'static,
     {
+        self.register_v2_root_inner(
+            name,
+            service,
+            id,
+            network_reachable,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            None,
+        )
+    }
+
+    fn register_v2_root_inner<B>(
+        &mut self,
+        name: String,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        id: ServiceId,
+        network_reachable: bool,
+        #[cfg(all(feature = "network", feature = "storage"))] sync_hooks: Option<
+            V2CrdtRootHooks,
+        >,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+    {
         if self.invoke_routes.lock().unwrap().contains_key(&id.0)
             || self.routes.contains_key(&id.0)
         {
@@ -2847,12 +3086,88 @@ impl VosNode {
                 invoke_rx,
                 outbox,
                 actor_routes,
+                #[cfg(all(feature = "network", feature = "storage"))]
+                sync_hooks,
                 shutdown,
                 activity,
             )
         });
         self.agents.push(AgentHandle { join: Some(join) });
         Ok(id)
+    }
+
+    /// Register a CRDT root whose causal transport serves guest-exported
+    /// packets and feeds peer deltas back to physical SyncCrdt on the owning
+    /// service thread.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub fn register_v2_crdt_root_at_id<B>(
+        &mut self,
+        name: String,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        replication_id: [u8; 32],
+        id: ServiceId,
+        network_reachable: bool,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+    {
+        if service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
+            return Err(V2NodeRegistrationError::InvalidConsistency(
+                service.consistency(),
+            ));
+        }
+        if self
+            .crdt_replicas
+            .lock()
+            .unwrap()
+            .contains_key(&replication_id)
+            || self
+                .v2_crdt_replicas
+                .lock()
+                .unwrap()
+                .contains_key(&replication_id)
+        {
+            return Err(V2NodeRegistrationError::ReplicationGroupOccupied(
+                replication_id,
+            ));
+        }
+        let export = Arc::new(RwLock::new(V2CrdtExport::default()));
+        let (sync_tx, sync_rx) = mpsc::channel();
+        let slot = V2CrdtReplicaSlot {
+            name: name.clone(),
+            export: export.clone(),
+            sync_tx,
+        };
+        self.v2_crdt_replicas
+            .lock()
+            .unwrap()
+            .insert(replication_id, slot.clone());
+        let hooks = V2CrdtRootHooks {
+            replication_id,
+            export,
+            sync_rx,
+            shared_network: self.shared_network.clone(),
+            observed_commit_sequence: None,
+        };
+        match self.register_v2_root_inner(
+            name,
+            service,
+            id,
+            network_reachable,
+            Some(hooks),
+        ) {
+            Ok(id) => {
+                self.spawn_v2_sync_thread(replication_id, slot);
+                Ok(id)
+            }
+            Err(error) => {
+                self.v2_crdt_replicas
+                    .lock()
+                    .unwrap()
+                    .remove(&replication_id);
+                Err(error)
+            }
+        }
     }
 
     /// Attach one Raft-backed v2 root tree to the node. The worker owns only
@@ -3552,6 +3867,20 @@ impl VosNode {
         self.sync_threads.push(join);
     }
 
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn spawn_v2_sync_thread(
+        &mut self,
+        replication_id: [u8; 32],
+        slot: V2CrdtReplicaSlot,
+    ) {
+        let shared_network = self.shared_network.clone();
+        let shutdown = self.shutdown.clone();
+        let join = thread::spawn(move || {
+            v2_sync_loop(replication_id, shared_network, slot, shutdown)
+        });
+        self.sync_threads.push(join);
+    }
+
     /// Install a synchronous-invoke responder under a fresh
     /// ServiceId. The handler runs on a helper thread; each
     /// inbound `InvokeRequest` is fed its `msg` bytes and the
@@ -3791,6 +4120,7 @@ impl VosNode {
         #[cfg(all(feature = "network", feature = "storage"))]
         {
             self.crdt_replicas.lock().unwrap().clear();
+            self.v2_crdt_replicas.lock().unwrap().clear();
         }
 
         let agent_results: Vec<AgentResult> = self
@@ -3818,6 +4148,62 @@ impl Default for VosNode {
 
 // ── Agent thread ─────────────────────────────────────────────────────
 
+#[cfg(all(feature = "network", feature = "storage"))]
+fn refresh_v2_crdt_export<B>(
+    id: ServiceId,
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    hooks: &mut V2CrdtRootHooks,
+)
+where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    use crate::v2::V2Wire;
+
+    let sequence = service.store().commit_sequence();
+    if hooks.observed_commit_sequence == Some(sequence) {
+        return;
+    }
+    let envelope = match service.crdt_sync_envelope() {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            warn!(%id, ?error, "cannot export committed v2 CRDT frontier");
+            return;
+        }
+    };
+    let mut export = V2CrdtExport::default();
+    if let Some(envelope) = envelope {
+        export.heads = envelope
+            .advertised_heads
+            .iter()
+            .map(|head| head.0)
+            .collect();
+        for node in &envelope.nodes {
+            let cid = node.change.cid();
+            let Some(fragment) = envelope.node_fragment(cid) else {
+                warn!(%id, ?cid, "cannot fragment committed v2 CRDT node");
+                return;
+            };
+            export.nodes.insert(cid.0, fragment.encode());
+        }
+    }
+    if let Ok(mut current) = hooks.export.write() {
+        *current = export.clone();
+    } else {
+        warn!(%id, "v2 CRDT export lock is poisoned");
+        return;
+    }
+    hooks.observed_commit_sequence = Some(sequence);
+    if !export.heads.is_empty()
+        && let Some(network) = hooks
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    {
+        network.publish_heads(hooks.replication_id, export.heads);
+    }
+}
+
 fn v2_root_service_thread<B>(
     id: ServiceId,
     mut service: crate::v2::LocalRootTreeServiceV2<B>,
@@ -3825,6 +4211,7 @@ fn v2_root_service_thread<B>(
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
+    #[cfg(all(feature = "network", feature = "storage"))] mut sync_hooks: Option<V2CrdtRootHooks>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult
@@ -3840,6 +4227,10 @@ where
         Ok(false) => info!(%id, "v2 Raft root is waiting for committed service genesis"),
         Err(error) => warn!(%id, ?error, "v2 root-tree startup catch-up failed"),
     }
+    #[cfg(all(feature = "network", feature = "storage"))]
+    if let Some(hooks) = sync_hooks.as_mut() {
+        refresh_v2_crdt_export(id, &service, hooks);
+    }
     if let Ok(pending) = service.pending_publications()
         && !pending.is_empty()
     {
@@ -3850,6 +4241,21 @@ where
         );
     }
     while !shutdown.load(Ordering::Relaxed) {
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if let Some(hooks) = sync_hooks.as_mut() {
+            while let Ok(request) = hooks.sync_rx.try_recv() {
+                *activity.lock().unwrap() = Instant::now();
+                let accepted = match service.sync_finalized_crdt(request.envelope) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        warn!(%id, ?error, "guest rejected v2 CRDT sync delta");
+                        false
+                    }
+                };
+                let _ = request.reply.send(accepted);
+            }
+            refresh_v2_crdt_export(id, &service, hooks);
+        }
         while let Ok(envelope) = inbox_rx.try_recv() {
             *activity.lock().unwrap() = Instant::now();
             handle_v2_transport(
@@ -10395,6 +10801,8 @@ mod tests {
             agent_info: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "storage")]
             replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "storage")]
+            v2_replicas: Arc::new(Mutex::new(HashMap::new())),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
@@ -10891,6 +11299,8 @@ mod tests {
             agent_info: info,
             #[cfg(feature = "storage")]
             replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "storage")]
+            v2_replicas: Arc::new(Mutex::new(HashMap::new())),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,

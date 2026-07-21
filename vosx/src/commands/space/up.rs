@@ -1533,10 +1533,7 @@ fn v2_config_from_row(
              install it as local or raft",
             row.instance_name
         ),
-        (true, Consistency::Crdt) => anyhow::bail!(
-            "{} requires the v2 CRDT anti-entropy driver, which is not attached to space up yet",
-            row.instance_name
-        ),
+        (true, Consistency::Crdt) => {}
         (true, Consistency::Raft) => anyhow::bail!(
             "{} is #[actor(crdt)] and must be installed with CRDT consistency",
             row.instance_name
@@ -1590,6 +1587,7 @@ fn v2_config_from_row(
             actor_name: row.instance_name.clone(),
             consistency: match consistency {
                 Consistency::Local => vos::v2::ConsistencyModeV2::Local,
+                Consistency::Crdt => vos::v2::ConsistencyModeV2::Crdt,
                 Consistency::Raft => vos::v2::ConsistencyModeV2::Raft,
                 _ => unreachable!("v2 consistency was validated above"),
             },
@@ -1659,8 +1657,19 @@ fn register_v2_root_from_row(
 
     let service = vos::v2::LocalRootTreeServiceV2::open(config, backend)
         .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error:?}"))?;
-    node.register_v2_root_at_id(instance_name, service, svc_id, network_reachable)
-        .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))
+    if service.consistency() == vos::v2::ConsistencyModeV2::Crdt {
+        node.register_v2_crdt_root_at_id(
+            instance_name,
+            service,
+            replication_id,
+            svc_id,
+            network_reachable,
+        )
+        .map_err(|error| anyhow::anyhow!("register v2 CRDT root tree: {error}"))
+    } else {
+        node.register_v2_root_at_id(instance_name, service, svc_id, network_reachable)
+            .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))
+    }
 }
 
 fn raft_db_path(data_dir: &Path, svc_id: ServiceId) -> PathBuf {
@@ -2411,13 +2420,14 @@ mod tests {
         crdt: false,
     };
 
-    fn signed_v2_package(service_program: ProgramId) -> VosPackageV2 {
+    fn signed_v2_package(service_program: ProgramId, crdt: bool) -> VosPackageV2 {
         let mut assembler = grey_transpiler::assembler::Assembler::new();
         assembler
             .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
             .ecalli(0);
         let actor_pvm = assembler.build();
-        let (buffer, length) = vos::metadata::encode::<512>(&V2_META);
+        let metadata = ActorMeta { crdt, ..V2_META };
+        let (buffer, length) = vos::metadata::encode::<512>(&metadata);
         let schemas = buffer[..length].to_vec();
         let metadata = vos::metadata::decode(&schemas).unwrap();
         let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
@@ -2434,7 +2444,7 @@ mod tests {
                 execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
                 service_program,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
-                crdt: false,
+                crdt,
                 interfaces_hash: artifact_hash(b"interfaces", &[]),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
@@ -2473,7 +2483,7 @@ mod tests {
             .ecalli(0);
         let service_pvm = assembler.build();
         let service_program = ProgramId::of_pvm(&service_pvm);
-        let package = signed_v2_package(service_program);
+        let package = signed_v2_package(service_program, false);
         let row = vos::registry::AgentRow {
             instance_name: "counter".into(),
             program_hash: [1; 32],
@@ -2504,6 +2514,47 @@ mod tests {
             panic!("v2 package fell through to the legacy runtime")
         };
         assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Raft);
+    }
+
+    #[test]
+    fn signed_crdt_v2_packages_select_guest_owned_anti_entropy() {
+        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        assembler
+            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .ecalli(0);
+        let service_pvm = assembler.build();
+        let service_program = ProgramId::of_pvm(&service_pvm);
+        let package = signed_v2_package(service_program, true);
+        let row = vos::registry::AgentRow {
+            instance_name: "counter".into(),
+            program_hash: [4; 32],
+            program_name: "counter".into(),
+            program_version: "2.0.0".into(),
+            replication_id: [5; 32],
+            consistency: Consistency::Crdt as u8,
+            network_reachable: true,
+            sync_role: vos::registry::SyncFloor::Public,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let pinned = PinnedV2Service {
+            pvm: std::sync::Arc::new(service_pvm),
+            program: service_program,
+        };
+        let resolved = v2_config_from_row(
+            Path::new("/tmp/vos-v2-crdt-config-test"),
+            [6; 32],
+            &row,
+            &AgentPolicies::new(),
+            Consistency::Crdt,
+            package.encode(),
+            Some(&pinned),
+        )
+        .expect("a signed #[actor(crdt)] v2 package may select CRDT");
+        let RowConfig::V2 { config, .. } = resolved else {
+            panic!("v2 package fell through to the legacy runtime")
+        };
+        assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Crdt);
     }
 
     #[test]

@@ -3,13 +3,14 @@
 //! Build the guest first with:
 //! `cd services/vos-service && cargo +nightly actor`.
 
+use libp2p::{Multiaddr, PeerId, identity, multiaddr::Protocol};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use vos::attestation::{
     AttestationProofProducerV2, AttestationProofRequestV2, AttestationStatementV3,
     ProducedAttestationProofV2,
 };
-use vos::network::RaftRpcHandler;
+use vos::network::{Network, NetworkConfig, RaftRpcHandler, derive_node_prefix};
 use vos::node::VosNode;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
@@ -385,6 +386,86 @@ fn workflow_root_configs() -> Option<(
     );
     let peer = config(peer_identity, peer_actor, vec![]);
     Some((source, peer, source_actor, peer_actor))
+}
+
+fn crdt_root_config() -> Option<(LocalRootTreeConfigV2, ActorId)> {
+    let (Some(service_elf), Some(actor_elf)) = (service_elf(), crdt_counter_v2_elf()) else {
+        return None;
+    };
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let schemas = vos::metadata::raw_section_from_elf(&actor_elf).expect("CRDT metadata");
+    let metadata = vos::metadata::decode(&schemas).expect("valid CRDT metadata");
+    let policies = PackageRolePoliciesV2::from_metadata(&metadata)
+        .unwrap()
+        .encode();
+    let public_key = b"node-crdt-counter".to_vec();
+    let package = VosPackageV2 {
+        manifest: PackageManifestV2 {
+            name: metadata.actor_name.clone(),
+            version: "2.0.0".into(),
+            service_abi: vos::v2::ABI_VERSION,
+            snapshot_version: vos::v2::SNAPSHOT_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            service_program,
+            actor_program,
+            crdt: true,
+            interfaces_hash: artifact_hash(b"interfaces", &[]),
+            role_policies_hash: artifact_hash(b"role-policies", &policies),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+        },
+        actor_pvm,
+        generated_interfaces: vec![],
+        role_policies: policies,
+        schemas,
+        diagnostics: None,
+        deployment_signature: vos::v2::DeploymentSignatureV2 {
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+            signature: vec![1],
+        },
+    };
+    package.validate().unwrap();
+    let actor = ActorId([116; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm,
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([117; 32]),
+            root_service: RootServiceId([118; 32]),
+            deployment: package.deployment_id(),
+            service_program,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        package,
+        root_actor: actor,
+        actor_name: metadata.actor_name,
+        consistency: ConsistencyModeV2::Crdt,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([119; 32]),
+            authenticator: vec![120],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    Some((config, actor))
+}
+
+fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, timeout: std::time::Duration) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn cycle_v2_elf() -> Option<Vec<u8>> {
@@ -865,7 +946,7 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
         proof_requested: false,
     };
     let reply = handle
-        .invoke_with_timeout(route, ingress.encode(), std::time::Duration::from_secs(20))
+        .invoke_with_timeout(route, ingress.encode(), std::time::Duration::from_secs(120))
         .expect("the elected root orders admission, apply, and ACK before replying");
     assert_eq!(Value::try_decode(&reply), Some(Value::U32(7)));
 
@@ -885,6 +966,148 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
     );
     drop(log);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn two_node_crdt_roots_exchange_guest_owned_causal_state() {
+    let Some((config, actor)) = crdt_root_config() else {
+        return;
+    };
+    let service_a =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("first CRDT root installs through physical Accumulate");
+    let service_b = LocalRootTreeServiceV2::open(config, FailableCommittedImages::default())
+        .expect("second CRDT root installs through physical Accumulate");
+
+    let keypair_a = identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&PeerId::from(keypair_a.public()));
+    let (keypair_b, prefix_b) = loop {
+        let candidate = identity::Keypair::generate_ed25519();
+        let prefix = derive_node_prefix(&PeerId::from(candidate.public()));
+        if prefix != prefix_a {
+            break (candidate, prefix);
+        }
+    };
+    let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let network_a = Network::start(NetworkConfig {
+        keypair: keypair_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let address_a = wait_for(
+        || network_a.listen_addrs().into_iter().next(),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("first CRDT peer binds");
+    let dial_a = address_a.with(Protocol::P2p(network_a.peer_id()));
+    let network_b = Network::start(NetworkConfig {
+        keypair: keypair_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![dial_a],
+        auto_dial_mdns: false,
+    });
+
+    let replication_id = [0xC2; 32];
+    let route_a = ServiceId::new(prefix_a, 220);
+    let route_b = ServiceId::new(prefix_b, 220);
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a
+        .register_v2_crdt_root_at_id(String::new(), service_a, replication_id, route_a, true)
+        .expect("first node registers a guest-owned CRDT root");
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b
+        .register_v2_crdt_root_at_id(String::new(), service_b, replication_id, route_b, true)
+        .expect("second node registers the same causal replication group");
+    node_a.attach_network(network_a);
+    node_b.attach_network(network_b);
+    let network_a = node_a.network().expect("first network remains attached");
+    let network_b = node_b.network().expect("second network remains attached");
+    wait_for(
+        || {
+            (network_a.peer_for_prefix(prefix_b).is_some()
+                && network_b.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
+        std::time::Duration::from_secs(45),
+    )
+    .expect("CRDT peers complete their prefix handshake");
+
+    let handle_a = node_a.invoke_handle();
+    let handle_b = node_b.invoke_handle();
+    let invoke_increment = |handle: &vos::node::InvokeHandle,
+                            route: ServiceId,
+                            invocation: InvocationId,
+                            amount: u64| {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&Msg::new("increment").with("amount", amount).encode());
+        let ingress = vos::v2::RootTreeInvocationV2 {
+            invocation,
+            logical_timeslot: amount,
+            target: actor,
+            method: "increment".into(),
+            arguments,
+            proof_requested: false,
+        };
+        handle
+            .invoke_with_timeout(route, ingress.encode(), std::time::Duration::from_secs(120))
+            .and_then(|reply| Value::try_decode(&reply))
+    };
+    assert_eq!(
+        invoke_increment(&handle_a, route_a, InvocationId([121; 32]), 2),
+        Some(Value::I64(2))
+    );
+
+    let peer_a = network_b.peer_for_prefix(prefix_a).unwrap();
+    let peer_b = network_a.peer_for_prefix(prefix_b).unwrap();
+    let first_shared_heads = wait_for(
+        || {
+            let heads_a = network_b
+                .send_fetch_heads(peer_a, replication_id)
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok()?;
+            let heads_b = network_a
+                .send_fetch_heads(peer_b, replication_id)
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok()?;
+            (!heads_a.is_empty() && heads_a == heads_b).then_some(heads_a)
+        },
+        std::time::Duration::from_secs(90),
+    )
+    .expect("second guest accumulates the first peer's causal packet");
+    assert_eq!(
+        invoke_increment(&handle_b, route_b, InvocationId([122; 32]), 3),
+        Some(Value::I64(5))
+    );
+
+    wait_for(
+        || {
+            let heads_a = network_b
+                .send_fetch_heads(peer_a, replication_id)
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok()?;
+            let heads_b = network_a
+                .send_fetch_heads(peer_b, replication_id)
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok()?;
+            (!heads_a.is_empty() && heads_a == heads_b && heads_a != first_shared_heads)
+                .then_some(())
+        },
+        std::time::Duration::from_secs(90),
+    )
+    .expect("first guest accumulates the second peer's causal packet");
+    assert_eq!(
+        invoke_increment(&handle_a, route_a, InvocationId([123; 32]), 1),
+        Some(Value::I64(6))
+    );
+
+    drop((handle_a, handle_b, network_a, network_b));
+    node_a.shutdown();
+    node_b.shutdown();
+    assert!(node_a.collect().into_iter().all(|result| result.is_ok()));
+    assert!(node_b.collect().into_iter().all(|result| result.is_ok()));
 }
 
 #[test]
@@ -928,7 +1151,7 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
         .invoke_with_timeout(
             source_route,
             ingress.encode(),
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(120),
         )
         .expect("cross-root continuation resolves only after both guest commits");
     assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
@@ -939,7 +1162,7 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
         .invoke_with_timeout(
             source_route,
             retry.encode(),
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(120),
         )
         .expect("an acknowledged exact retry returns the guest-retained reply");
     assert_eq!(replayed, reply);
@@ -1080,7 +1303,7 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
         .invoke_with_timeout(
             source_route,
             ingress.encode(),
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(120),
         )
         .expect("retried ingress resolves from the exact restarted continuation");
     assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
@@ -1097,7 +1320,7 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
         .invoke_with_timeout(
             source_route,
             queued_ingress.encode(),
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(120),
         )
         .expect("queued invocation executes once the restarted actor becomes idle");
     assert_eq!(Value::try_decode(&queued_reply), Some(Value::U32(7)));

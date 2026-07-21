@@ -1096,6 +1096,25 @@ impl CrdtSyncEnvelopeV2 {
     pub fn commitment(&self) -> Hash {
         Hash::digest(b"vos/crdt-sync/v2", &[&self.encode()])
     }
+
+    /// Point-fetch packet for one causal node. Only blobs referenced by that
+    /// node are included. A receiver combines all fetched packets and submits
+    /// one complete-ancestry envelope to guest Accumulate.
+    pub fn node_fragment(&self, cid: Hash) -> Option<Self> {
+        let node = self.nodes.iter().find(|node| node.change.cid() == cid)?;
+        let references = crdt_change_blob_references(&node.change);
+        Some(Self {
+            service: self.service.clone(),
+            advertised_heads: alloc::vec![cid],
+            nodes: alloc::vec![node.clone()],
+            provided_blobs: self
+                .provided_blobs
+                .iter()
+                .filter(|blob| references.contains(&&blob.reference))
+                .cloned()
+                .collect(),
+        })
+    }
 }
 
 /// Guest-owned acknowledgement that one committed publication has been

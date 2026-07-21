@@ -206,15 +206,17 @@ accepts the transition. Raw ELF/PVM inputs still use the explicitly legacy
 single-actor runner while the production daemon is being cut over.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
-catalog artifacts and opens each Local or Raft deployment as one durable
+catalog artifacts and opens each Local, Raft, or CRDT deployment as one durable
 root-tree service. It validates the package signature and exact pinned service
 `ProgramId`; it never extracts the actor PVM into `VosNode`'s legacy runtime or
 retranspiles an ELF. Normal actors installed as CRDT are refused. V2 Raft rows
 use the existing voter discovery, join, election, and RPC-handler path,
 but their log payload is the canonical `AccumulateRequestV2`, not an
-`EffectLog`. V2 CRDT rows remain fail-closed until their anti-entropy driver,
-including causal replication of direct-ingress admissions, is attached to the daemon;
-legacy ELF/PVM rows continue on the old host only during this staged cutover.
+`EffectLog`. V2 CRDT rows serve point-fetched guest-exported causal packets;
+the receiver assembles complete ancestry and submits it to physical
+`SyncCrdt` Accumulate on the owning root thread. Native sync never writes or
+materializes v2 actor state. Legacy ELF/PVM rows continue on the old host only
+during this staged cutover.
 
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.
