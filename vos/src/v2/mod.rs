@@ -80,7 +80,7 @@ pub use root_service::{
     CommittedCrdtSyncV2, CommittedDeliveryV2, CommittedRootTreeSliceV2,
     LocalRootTreeConfigErrorV2,
     LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2,
-    LocalRootTreeServiceV2, RootTreeIngressRecoveryV2, RootTreeInvocationV2,
+    LocalRootTreeServiceV2, OwnedActorInstallV2, RootTreeIngressRecoveryV2, RootTreeInvocationV2,
     RootTreeTransportV2,
 };
 #[cfg(feature = "std")]

@@ -1592,6 +1592,7 @@ fn v2_config_from_row(
                 _ => unreachable!("v2 consistency was validated above"),
             },
             initial_state: vec![],
+            owned_actors: vec![],
             external_actors: vec![],
             install_authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
                 capability: vos::v2::SystemCapabilityId(

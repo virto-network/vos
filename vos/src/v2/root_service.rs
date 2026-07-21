@@ -6,6 +6,7 @@
 //! The host prepares Refine imports from committed guest state and persists
 //! the resulting complete service image at the configured atomic boundary.
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -293,6 +294,19 @@ fn request_from_direct_ingress(ingress: DirectIngressV2) -> LocalWorkRequestV2 {
     }
 }
 
+/// One owned descendant installed with a locally hosted root tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedActorInstallV2 {
+    /// Stable actor identity allocated by the deployment controller.
+    pub actor: ActorId,
+    /// Stable name within `parent`'s owned namespace.
+    pub name: String,
+    /// Existing root-tree member which owns this actor.
+    pub parent: ActorId,
+    /// Canonical initial state bytes committed by guest Accumulate.
+    pub initial_state: Vec<u8>,
+}
+
 /// Complete immutable installation input for one locally hosted root tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRootTreeConfigV2 {
@@ -303,6 +317,10 @@ pub struct LocalRootTreeConfigV2 {
     pub actor_name: String,
     pub consistency: ConsistencyModeV2,
     pub initial_state: Vec<u8>,
+    /// Owned descendants installed atomically with the root. Every member
+    /// executes the package's one canonical actor PVM; actor IDs and initial
+    /// state are instance data and therefore do not alter `DeploymentId`.
+    pub owned_actors: Vec<OwnedActorInstallV2>,
     pub external_actors: Vec<ExternalActorBindingV2>,
     pub install_authorization: AuthorizationEvidenceV2,
     pub refine_gas: u64,
@@ -318,6 +336,8 @@ pub enum LocalRootTreeConfigErrorV2 {
     WrongServiceAbi,
     WrongExecutionSemantics,
     InvalidConsistency,
+    InvalidOwnedActorTree,
+    TooManyOwnedActors,
     ReplicationDriverRequired,
     ZeroGas,
 }
@@ -520,7 +540,7 @@ pub struct LocalRootTreeServiceV2<B> {
     root_actor: ActorId,
     consistency: ConsistencyModeV2,
     genesis: ServiceGenesisV2,
-    expected_root: ActorGenesisV2,
+    expected_actors: Vec<ActorGenesisV2>,
     expected_external_actors: Vec<ExternalActorBindingV2>,
 }
 
@@ -531,6 +551,9 @@ impl LocalRootTreeConfigV2 {
             .map_err(LocalRootTreeConfigErrorV2::InvalidPackage)?;
         if self.actor_name.is_empty() {
             return Err(LocalRootTreeConfigErrorV2::EmptyActorName);
+        }
+        if self.root_actor == ActorId::ZERO {
+            return Err(LocalRootTreeConfigErrorV2::InvalidOwnedActorTree);
         }
         if self.service.deployment != self.package.deployment_id() {
             return Err(LocalRootTreeConfigErrorV2::WrongDeployment);
@@ -553,6 +576,41 @@ impl LocalRootTreeConfigV2 {
         }
         if self.package.manifest.crdt != (self.consistency == ConsistencyModeV2::Crdt) {
             return Err(LocalRootTreeConfigErrorV2::InvalidConsistency);
+        }
+        if self.owned_actors.len().saturating_add(1) > super::MAX_ROOT_TREE_ACTORS {
+            return Err(LocalRootTreeConfigErrorV2::TooManyOwnedActors);
+        }
+        let mut known = BTreeSet::from([self.root_actor]);
+        let mut names = BTreeSet::from([(None, self.actor_name.as_str())]);
+        for actor in &self.owned_actors {
+            if actor.actor == ActorId::ZERO
+                || actor.actor == self.root_actor
+                || actor.name.is_empty()
+                || !known.insert(actor.actor)
+                || !names.insert((Some(actor.parent), actor.name.as_str()))
+            {
+                return Err(LocalRootTreeConfigErrorV2::InvalidOwnedActorTree);
+            }
+        }
+        for actor in &self.owned_actors {
+            if !known.contains(&actor.parent) {
+                return Err(LocalRootTreeConfigErrorV2::InvalidOwnedActorTree);
+            }
+            let mut cursor = actor.actor;
+            for _ in 0..known.len() {
+                if cursor == self.root_actor {
+                    break;
+                }
+                cursor = self
+                    .owned_actors
+                    .iter()
+                    .find(|candidate| candidate.actor == cursor)
+                    .map(|candidate| candidate.parent)
+                    .ok_or(LocalRootTreeConfigErrorV2::InvalidOwnedActorTree)?;
+            }
+            if cursor != self.root_actor {
+                return Err(LocalRootTreeConfigErrorV2::InvalidOwnedActorTree);
+            }
         }
         if self.refine_gas == 0 || self.accumulate_gas == 0 {
             return Err(LocalRootTreeConfigErrorV2::ZeroGas);
@@ -600,20 +658,40 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         config
             .validate()
             .map_err(LocalRootTreeOpenErrorV2::InvalidConfig)?;
-        let initial_state = BlobRefV2::of_bytes(&config.initial_state);
+        let root_initial_state = BlobRefV2::of_bytes(&config.initial_state);
         let expected_root = config
             .package
             .actor_genesis(
                 config.root_actor,
                 config.actor_name.clone(),
                 None,
-                initial_state.clone(),
+                root_initial_state.clone(),
             )
             .map_err(|error| {
                 LocalRootTreeOpenErrorV2::InvalidConfig(LocalRootTreeConfigErrorV2::InvalidPackage(
                     error,
                 ))
             })?;
+        let mut expected_actors = Vec::with_capacity(config.owned_actors.len() + 1);
+        expected_actors.push(expected_root);
+        for actor in &config.owned_actors {
+            expected_actors.push(
+                config
+                    .package
+                    .actor_genesis(
+                        actor.actor,
+                        actor.name.clone(),
+                        Some(actor.parent),
+                        BlobRefV2::of_bytes(&actor.initial_state),
+                    )
+                    .map_err(|error| {
+                        LocalRootTreeOpenErrorV2::InvalidConfig(
+                            LocalRootTreeConfigErrorV2::InvalidPackage(error),
+                        )
+                    })?,
+            );
+        }
+        expected_actors.sort_by_key(|actor| actor.actor);
         let store = DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
         let needs_imports = store
             .header()
@@ -632,11 +710,20 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
 
         let actor_program = config.package.manifest.actor_program;
         if needs_imports {
-            let initial = service
+            let root_initial = service
                 .accumulate_host_mut()
                 .import_blob(config.initial_state);
-            if initial != initial_state {
+            if root_initial != root_initial_state {
                 return Err(LocalRootTreeOpenErrorV2::ExistingActorMismatch);
+            }
+            for actor in config.owned_actors {
+                let expected = BlobRefV2::of_bytes(&actor.initial_state);
+                let imported = service
+                    .accumulate_host_mut()
+                    .import_blob(actor.initial_state);
+                if imported != expected {
+                    return Err(LocalRootTreeOpenErrorV2::ExistingActorMismatch);
+                }
             }
             let imported_program = service
                 .accumulate_host_mut()
@@ -650,7 +737,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         let genesis = ServiceGenesisV2 {
             service: config.service.clone(),
             consistency: config.consistency,
-            actors: vec![expected_root.clone()],
+            actors: expected_actors.clone(),
             external_actors: config.external_actors.clone(),
             authorization: config.install_authorization,
         };
@@ -669,7 +756,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             root_actor: config.root_actor,
             consistency: config.consistency,
             genesis,
-            expected_root,
+            expected_actors,
             expected_external_actors: config.external_actors,
         };
         root.ensure_installed().map_err(|error| match error {
@@ -778,14 +865,15 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         if header.service != self.identity || header.consistency != self.consistency {
             return Err(LocalRootTreeInvokeErrorV2::ExistingServiceMismatch);
         }
+        let expected_program = self.expected_actors[0].program;
         if self
             .service
             .accumulate_host()
-            .program(self.expected_root.program)
+            .program(expected_program)
             .is_none()
         {
             return Err(LocalRootTreeInvokeErrorV2::MissingInstalledProgram(
-                self.expected_root.program,
+                expected_program,
             ));
         }
         let directory = self
@@ -794,32 +882,40 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .state_row(header.service_root, &StateKeyV2::ActorDirectory)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .and_then(|bytes| ActorDirectoryV2::decode(&bytes).ok());
+        let expected_directory = self
+            .expected_actors
+            .iter()
+            .map(|actor| actor.actor)
+            .collect::<Vec<_>>();
         if directory
             .as_ref()
-            .is_none_or(|directory| directory.actors.binary_search(&self.root_actor).is_err())
+            .is_none_or(|directory| directory.actors != expected_directory)
         {
             return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
         }
-        let descriptor = self
-            .service
-            .accumulate_host()
-            .state_row(
-                header.service_root,
-                &StateKeyV2::ActorDescriptor(self.root_actor),
-            )
-            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
-            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok());
+        for expected in &self.expected_actors {
+            let descriptor = self
+                .service
+                .accumulate_host()
+                .state_row(
+                    header.service_root,
+                    &StateKeyV2::ActorDescriptor(expected.actor),
+                )
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok());
+            if descriptor.as_ref() != Some(expected) {
+                return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+            }
+        }
         let external = self
             .service
             .accumulate_host()
             .state_row(header.service_root, &StateKeyV2::ExternalActorDirectory)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .and_then(|bytes| ExternalActorDirectoryV2::decode(&bytes).ok());
-        if descriptor.as_ref() != Some(&self.expected_root)
-            || external.as_ref().is_none_or(|directory| {
-                directory.actors.as_slice() != self.expected_external_actors.as_slice()
-            })
-        {
+        if external.as_ref().is_none_or(|directory| {
+            directory.actors.as_slice() != self.expected_external_actors.as_slice()
+        }) {
             return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
         }
         Ok(true)

@@ -82,6 +82,7 @@ fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u6
             actor_name: package_name(package_path),
             consistency,
             initial_state: Vec::new(),
+            owned_actors: vec![],
             external_actors: vec![],
             install_authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId(

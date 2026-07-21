@@ -15,20 +15,20 @@ use vos::node::VosNode;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AttestationDeliveryV2,
-    AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
+    AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, ActorWriteV2,
+    AttestationDeliveryV2, AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
     CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
     CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2,
     Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2,
     LocalJamStoreV2, LocalRootTreeConfigV2, LocalRootTreeServiceV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofCommitmentV2,
-    ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
-    RootTreeIngressRecoveryV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2,
-    SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
+    OwnedActorInstallV2, PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId,
+    ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
+    ReplyRecordV2, RootServiceId, RootTreeIngressRecoveryV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2,
+    StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
     WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
@@ -85,7 +85,7 @@ impl AttestedMethod<AgeClaimFixture> for IsAdultFixture {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct FailableCommittedImages {
     image: Option<Vec<u8>>,
     fail_next_commit: bool,
@@ -364,6 +364,7 @@ fn workflow_root_configs() -> Option<(
             actor_name: metadata.actor_name.clone(),
             consistency: ConsistencyModeV2::Local,
             initial_state: vec![],
+            owned_actors: vec![],
             external_actors,
             install_authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId([104; 32]),
@@ -444,6 +445,7 @@ fn crdt_root_config() -> Option<(LocalRootTreeConfigV2, ActorId)> {
         actor_name: metadata.actor_name,
         consistency: ConsistencyModeV2::Crdt,
         initial_state: vec![],
+        owned_actors: vec![],
         external_actors: vec![],
         install_authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId([119; 32]),
@@ -714,6 +716,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
     };
     let actor = ActorId([93; 32]);
+    let child = ActorId([90; 32]);
     let config = LocalRootTreeConfigV2 {
         service_pvm,
         package,
@@ -722,6 +725,12 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         actor_name: metadata.actor_name,
         consistency: ConsistencyModeV2::Local,
         initial_state: vec![],
+        owned_actors: vec![OwnedActorInstallV2 {
+            actor: child,
+            name: "child".into(),
+            parent: actor,
+            initial_state: vec![],
+        }],
         external_actors: vec![],
         install_authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId([94; 32]),
@@ -734,6 +743,27 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     let mut service =
         LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
             .expect("fresh service installs through physical Accumulate");
+    let header = service.store().header().unwrap().unwrap();
+    let directory = service
+        .store()
+        .state_row(header.service_root, &StateKeyV2::ActorDirectory)
+        .unwrap()
+        .and_then(|bytes| ActorDirectoryV2::decode(&bytes).ok())
+        .expect("guest Accumulate commits the complete actor directory");
+    assert_eq!(directory.actors, vec![child, actor]);
+
+    let mut cycle = config.clone();
+    cycle.owned_actors.push(OwnedActorInstallV2 {
+        actor: ActorId([89; 32]),
+        name: "grandchild".into(),
+        parent: child,
+        initial_state: vec![],
+    });
+    cycle.owned_actors[0].parent = ActorId([89; 32]);
+    assert_eq!(
+        cycle.validate(),
+        Err(vos::v2::LocalRootTreeConfigErrorV2::InvalidOwnedActorTree)
+    );
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("start").encode());
     let request = LocalWorkRequestV2 {
@@ -760,6 +790,12 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     assert_eq!(service.store().header().unwrap().unwrap().revision, 1);
 
     let backend = service.into_backend();
+    let mut mismatched = config.clone();
+    mismatched.owned_actors[0].name = "other-child".into();
+    assert!(matches!(
+        LocalRootTreeServiceV2::open(mismatched, backend.clone()),
+        Err(vos::v2::LocalRootTreeOpenErrorV2::ExistingActorMismatch)
+    ));
     let mut restarted = LocalRootTreeServiceV2::open(config.clone(), backend)
         .expect("exact service image restores without reinstalling");
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
