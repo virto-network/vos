@@ -1523,7 +1523,7 @@ mod test_trace {
                 data_len: 0,
             },
         ];
-        build_blob(4, 64, &caps, &code_data)
+        build_blob(4, 64, 0, &caps, &code_data)
     }
 }
 
