@@ -772,6 +772,10 @@ pub enum WorkflowOperationV2 {
     /// child's initial materialization is carried by the same CRDT node, so a
     /// peer can reconstruct the descriptor and directory from DAG ancestry.
     Spawn(ActorSpawnV2),
+    /// Causal package-metadata replacement for one actor. The canonical PVM
+    /// is transported separately by `CrdtSyncEnvelopeV2`; this operation
+    /// commits only its exact content identity and generated policy surface.
+    Upgrade(ActorUpgradeV2),
 }
 
 /// Stable caller-controlled portion of a causal direct-ingress admission.
@@ -855,6 +859,21 @@ impl CrdtChangeV2 {
         e.fixed(&ingress.target.0);
         e.list(heads, |e, head| e.fixed(&head.0));
         ChangeId(Hash::digest(b"vos/crdt-ingress-id/v2", &[&bytes]).0)
+    }
+
+    pub fn derive_upgrade_id(upgrade: &ActorUpgradeV2) -> Option<ChangeId> {
+        let ConsistencyBaseV2::Crdt { heads } = &upgrade.base else {
+            return None;
+        };
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        encode_service(&mut e, &upgrade.service);
+        e.fixed(&upgrade.actor.0);
+        e.fixed(&upgrade.hash().0);
+        e.list(heads, |e, head| e.fixed(&head.0));
+        Some(ChangeId(
+            Hash::digest(b"vos/crdt-upgrade-id/v2", &[&bytes]).0,
+        ))
     }
 
     pub fn cid(&self) -> Hash {
@@ -1272,6 +1291,10 @@ pub struct CrdtSyncEnvelopeV2 {
     pub advertised_heads: Vec<Hash>,
     pub nodes: Vec<CrdtSyncNodeV2>,
     pub provided_blobs: Vec<ImportedBlobV2>,
+    /// Canonical actor PVMs needed by causal upgrade operations. They are
+    /// imported into the destination program cache only if the same guest
+    /// Accumulate transaction accepts the complete sync envelope.
+    pub provided_programs: Vec<ImportedProgramV2>,
 }
 
 impl CrdtSyncEnvelopeV2 {
@@ -1293,6 +1316,14 @@ impl CrdtSyncEnvelopeV2 {
                 .provided_blobs
                 .iter()
                 .filter(|blob| references.contains(&&blob.reference))
+                .cloned()
+                .collect(),
+            provided_programs: self
+                .provided_programs
+                .iter()
+                .filter(|program| {
+                    crdt_change_program_references(&node.change).contains(&program.program)
+                })
                 .cloned()
                 .collect(),
         })
@@ -2830,6 +2861,10 @@ impl V2Wire for CrdtSyncEnvelopeV2 {
             encode_blob_ref(e, &blob.reference);
             e.bytes(&blob.bytes);
         });
+        e.list(&self.provided_programs, |e, program| {
+            e.fixed(&program.program.0);
+            e.bytes(&program.pvm);
+        });
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2848,6 +2883,12 @@ impl V2Wire for CrdtSyncEnvelopeV2 {
                     bytes: d.bytes()?,
                 })
             })?,
+            provided_programs: d.list(|d| {
+                Ok(ImportedProgramV2 {
+                    program: ProgramId(d.fixed()?),
+                    pvm: d.bytes()?,
+                })
+            })?,
         };
         ensure_sorted_unique(&value.advertised_heads, |head| head.0)?;
         if value.advertised_heads.is_empty()
@@ -2859,6 +2900,7 @@ impl V2Wire for CrdtSyncEnvelopeV2 {
             return Err(DecodeError::NonCanonical);
         }
         ensure_sorted_unique(&value.provided_blobs, |blob| blob.reference.hash.0)?;
+        ensure_sorted_unique(&value.provided_programs, |program| program.program.0)?;
         for node in &value.nodes {
             let cid = node.change.cid();
             if node.receipt.service != value.service
@@ -2880,6 +2922,16 @@ impl V2Wire for CrdtSyncEnvelopeV2 {
                     crdt_change_blob_references(&node.change)
                         .into_iter()
                         .any(|reference| reference == &blob.reference)
+                })
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        for program in &value.provided_programs {
+            if program.pvm.is_empty()
+                || ProgramId::of_pvm(&program.pvm) != program.program
+                || !value.nodes.iter().any(|node| {
+                    crdt_change_program_references(&node.change).contains(&program.program)
                 })
             {
                 return Err(DecodeError::NonCanonical);
@@ -3471,6 +3523,7 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
                 references.extend(ingress.imported_blobs.iter());
             }
             WorkflowOperationV2::Spawn(spawn) => references.push(&spawn.initial_state),
+            WorkflowOperationV2::Upgrade(_) => {}
             WorkflowOperationV2::Inbox(_)
             | WorkflowOperationV2::Outbox(_)
             | WorkflowOperationV2::ConsumeOutbox(_)
@@ -3479,6 +3532,20 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
         }
     }
     references
+}
+
+pub(crate) fn crdt_change_program_references(change: &CrdtChangeV2) -> Vec<ProgramId> {
+    let mut programs = change
+        .workflow
+        .iter()
+        .filter_map(|operation| match operation {
+            WorkflowOperationV2::Upgrade(upgrade) => Some(upgrade.replacement_program),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    programs.sort_unstable();
+    programs.dedup();
+    programs
 }
 
 fn encode_install_receipt(e: &mut Encoder<'_>, value: &ServiceInstallReceiptV2) {
@@ -3945,6 +4012,10 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
             e.u8(7);
             encode_actor_spawn(e, spawn);
         }
+        WorkflowOperationV2::Upgrade(upgrade) => {
+            e.u8(9);
+            e.bytes(&upgrade.encode());
+        }
     }
 }
 
@@ -3965,6 +4036,9 @@ fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2,
         )?)),
         6 => Ok(WorkflowOperationV2::Ingress(decode_crdt_ingress(d)?)),
         7 => Ok(WorkflowOperationV2::Spawn(decode_actor_spawn(d)?)),
+        9 => Ok(WorkflowOperationV2::Upgrade(ActorUpgradeV2::decode(
+            &d.bytes()?,
+        )?)),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -5026,6 +5100,47 @@ mod tests {
             upgrade_request
         );
         assert_ne!(upgrade.hash(), Hash::ZERO);
+
+        let canonical_pvm = b"canonical-upgrade-pvm".to_vec();
+        let mut causal_upgrade = upgrade.clone();
+        causal_upgrade.replacement_program = ProgramId::of_pvm(&canonical_pvm);
+        causal_upgrade.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+        let change = CrdtChangeV2 {
+            id: CrdtChangeV2::derive_upgrade_id(&causal_upgrade).unwrap(),
+            causal_dependencies: vec![],
+            causal_height: 1,
+            operations: vec![],
+            workflow: vec![WorkflowOperationV2::Upgrade(causal_upgrade.clone())],
+            materializations: vec![],
+        };
+        let cid = change.cid();
+        let causal_receipt = AccumulationReceiptV2 {
+            service: service(),
+            accepted_transition: causal_upgrade.hash(),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: None,
+            resulting_crdt_heads: vec![cid],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Crdt,
+        };
+        let sync = CrdtSyncEnvelopeV2 {
+            service: service(),
+            advertised_heads: vec![cid],
+            nodes: vec![CrdtSyncNodeV2 {
+                change,
+                receipt: causal_receipt,
+            }],
+            provided_blobs: vec![],
+            provided_programs: vec![ImportedProgramV2 {
+                program: causal_upgrade.replacement_program,
+                pvm: canonical_pvm,
+            }],
+        };
+        assert_eq!(CrdtSyncEnvelopeV2::decode(&sync.encode()).unwrap(), sync);
+        assert_eq!(sync.node_fragment(cid).unwrap(), sync);
+
         let upgrade_receipt = AccumulationReceiptV2 {
             service: service(),
             accepted_transition: upgrade.hash(),

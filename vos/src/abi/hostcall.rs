@@ -115,6 +115,11 @@ pub const RECEIPT_VERIFY: u32 = 125;
 /// replacement program bytes available.
 pub const UPGRADE_AUTH_VERIFY: u32 = 126;
 
+/// Query or stage one canonical actor PVM by `ProgramId` inside the current
+/// Accumulate transaction. A zero-length PVM is a read-only availability
+/// probe; non-empty bytes are committed only if the service entry succeeds.
+pub const PROGRAM_IMPORT: u32 = 127;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +137,7 @@ mod tests {
             INSTALL_AUTH_VERIFY,
             RECEIPT_VERIFY,
             UPGRADE_AUTH_VERIFY,
+            PROGRAM_IMPORT,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
         for (index, slot) in supplied.iter().enumerate() {
@@ -163,6 +169,7 @@ mod tests {
             INSTALL_AUTH_VERIFY as u8,
             RECEIPT_VERIFY as u8,
             UPGRADE_AUTH_VERIFY as u8,
+            PROGRAM_IMPORT as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];
         assert!(

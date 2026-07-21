@@ -17,8 +17,8 @@ mod guest {
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
         BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2,
-        GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, RefineOutputV2,
-        ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+        GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, ProgramId,
+        RefineOutputV2, ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
         execute_canonical_guest_accumulate,
     };
 
@@ -604,6 +604,18 @@ mod guest {
             } else {
                 Err(JamStoreError::ProvideFailed)
             }
+        }
+
+        fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error> {
+            Ok(hostcalls::program_available(&program.0) == error::HOST_OK)
+        }
+
+        fn provide_program(&mut self, pvm: &[u8]) -> Result<ProgramId, Self::Error> {
+            let program = ProgramId::of_pvm(pvm);
+            if hostcalls::provide_program(&program.0, pvm) != error::HOST_OK {
+                return Err(JamStoreError::ProvideFailed);
+            }
+            Ok(program)
         }
 
         fn verify_proof(

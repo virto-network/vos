@@ -15,7 +15,7 @@ use super::{
     WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 12;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 13;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -136,6 +136,10 @@ pub enum StateKeyV2 {
     ActorDirectory,
     /// Canonical install-time bindings to actors owned by other root trees.
     ExternalActorDirectory,
+    /// Immutable package/policy descriptor from installation (or causal
+    /// spawn). CRDT peers replay metadata upgrades from this common baseline
+    /// instead of trusting whichever visible winner their tree has now.
+    ActorInstallDescriptor(ActorId),
     ActorDescriptor(ActorId),
     MethodPolicy {
         actor: ActorId,
@@ -173,6 +177,10 @@ impl V2Wire for StateKeyV2 {
             }
             Self::ExternalActorDirectory => {
                 e.u8(10);
+            }
+            Self::ActorInstallDescriptor(actor) => {
+                e.u8(12);
+                e.fixed(&actor.0);
             }
             Self::AttestationReplay { actor, invocation } => {
                 e.u8(11);
@@ -259,6 +267,7 @@ impl V2Wire for StateKeyV2 {
                 actor: ActorId(d.fixed()?),
                 invocation: InvocationId(d.fixed()?),
             }),
+            12 => Ok(Self::ActorInstallDescriptor(ActorId(d.fixed()?))),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -449,14 +458,22 @@ impl V2Wire for ActorUpgradeRecordV2 {
             program: ProgramId(d.fixed()?),
             receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
         };
+        let valid_commitment = match value.receipt.consistency {
+            ConsistencyModeV2::Crdt => {
+                value.receipt.resulting_state_root.is_none()
+                    && !value.receipt.resulting_crdt_heads.is_empty()
+            }
+            ConsistencyModeV2::Ephemeral | ConsistencyModeV2::Local | ConsistencyModeV2::Raft => {
+                value.receipt.resulting_state_root.is_some()
+                    && value.receipt.resulting_crdt_heads.is_empty()
+            }
+        };
         if value.previous_deployment == value.deployment
             || value.receipt.accepted_transition != value.upgrade
             || value.receipt.reply_commitment.is_some()
             || value.receipt.outbox_commitment.is_some()
-            || value.receipt.resulting_state_root.is_none()
-            || !value.receipt.resulting_crdt_heads.is_empty()
-            || value.receipt.consistency == ConsistencyModeV2::Crdt
             || value.receipt.checkpoint != 0
+            || !valid_commitment
         {
             return Err(DecodeError::NonCanonical);
         }

@@ -20,7 +20,7 @@ use super::{
     ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, DirectIngressV2,
     EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2, MessageRecordV2,
-    MethodPolicyV2, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
+    MethodPolicyV2, ProgramId, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
     PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
     ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError, StateTreeStore,
     StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2,
@@ -54,6 +54,14 @@ pub trait GuestAccumulateStoreV2: StateTreeStore {
     /// VOS reference. The staged blob becomes visible only with this same
     /// Accumulate transaction.
     fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error>;
+
+    /// Whether exact canonical actor PVM bytes are already available in the
+    /// program cache owned by this service image.
+    fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error>;
+
+    /// Stage one canonical actor PVM in this Accumulate transaction. The
+    /// returned identity must be derived from the exact supplied bytes.
+    fn provide_program(&mut self, pvm: &[u8]) -> Result<ProgramId, Self::Error>;
 
     /// Validate the proof against the exact public inputs derived by guest
     /// Accumulate. Implementations must fail closed when the verifier or proof
@@ -627,6 +635,11 @@ fn install<S: GuestAccumulateStoreV2>(
             ),
         )?;
         for actor in &genesis.actors {
+            tree_apply(
+                &mut tree,
+                &StateKeyV2::ActorInstallDescriptor(actor.actor),
+                Some(&actor.encode()),
+            )?;
             tree_apply(
                 &mut tree,
                 &StateKeyV2::ActorDescriptor(actor.actor),
@@ -1509,6 +1522,7 @@ fn materialize_workflow_crdt(
                     cid,
                     spawn.clone(),
                 ),
+                WorkflowOperationV2::Upgrade(_) => {}
             }
         }
     }
@@ -1625,6 +1639,11 @@ fn apply_spawn_materialization<S: StateTreeStore>(
             {
                 return Err(GuestAccumulateError::CorruptStore);
             }
+            tree_apply(
+                tree,
+                &StateKeyV2::ActorInstallDescriptor(spawn.actor),
+                Some(&descriptor.encode()),
+            )?;
             tree_apply(
                 tree,
                 &StateKeyV2::ActorDescriptor(spawn.actor),
@@ -3570,6 +3589,7 @@ mod tests {
     struct MemStore {
         rows: BTreeMap<Vec<u8>, Vec<u8>>,
         blobs: BTreeMap<Hash, Vec<u8>>,
+        programs: BTreeMap<ProgramId, Vec<u8>>,
         proof_allowlist: BTreeSet<Hash>,
         invalid_proof_allowlist: BTreeSet<Hash>,
         receipt_allowlist: BTreeSet<Hash>,
@@ -3631,6 +3651,19 @@ mod tests {
             let reference = BlobRefV2::of_bytes(bytes);
             self.blobs.insert(reference.hash, bytes.to_vec());
             Ok(reference)
+        }
+
+        fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error> {
+            Ok(self
+                .programs
+                .get(&program)
+                .is_some_and(|pvm| ProgramId::of_pvm(pvm) == program))
+        }
+
+        fn provide_program(&mut self, pvm: &[u8]) -> Result<ProgramId, Self::Error> {
+            let program = ProgramId::of_pvm(pvm);
+            self.programs.insert(program, pvm.to_vec());
+            Ok(program)
         }
 
         fn verify_proof(
@@ -4481,6 +4514,7 @@ mod tests {
                 advertised_heads: vec![cid],
                 nodes: vec![super::super::CrdtSyncNodeV2 { change, receipt }],
                 provided_blobs: vec![],
+                provided_programs: vec![],
             }),
         )
         .unwrap();
@@ -5701,6 +5735,7 @@ mod tests {
                     advertised_heads: vec![expiration_cid],
                     nodes,
                     provided_blobs: checkpoint_blobs,
+                    provided_programs: vec![],
                 })
             )
             .unwrap(),
@@ -6416,6 +6451,7 @@ mod tests {
                     advertised_heads: vec![cid],
                     nodes: vec![super::super::CrdtSyncNodeV2 { change, receipt }],
                     provided_blobs: blobs,
+                    provided_programs: vec![],
                 }),
             )
             .unwrap(),
@@ -6487,6 +6523,7 @@ mod tests {
                     advertised_heads,
                     nodes,
                     provided_blobs,
+                    provided_programs: vec![],
                 }),
             )
             .unwrap()
@@ -6809,6 +6846,7 @@ mod tests {
                     reference: materialized,
                     bytes: state_bytes.to_vec(),
                 }],
+                provided_programs: vec![],
             });
         }
 
@@ -6916,6 +6954,7 @@ mod tests {
             advertised_heads,
             nodes: nodes.into_iter().map(|(node, _)| node).collect(),
             provided_blobs,
+            provided_programs: vec![],
         };
         let before = destination.clone();
         assert_eq!(
@@ -6972,6 +7011,7 @@ mod tests {
                 reference: materialized.clone(),
                 bytes: b"synced-state".to_vec(),
             }],
+            provided_programs: vec![],
         };
 
         let before = destination.clone();
@@ -7080,6 +7120,7 @@ mod tests {
                 reference: child_state,
                 bytes: b"unavailable-child".to_vec(),
             }],
+            provided_programs: vec![],
         };
         let before_incomplete = destination.clone();
         assert_eq!(

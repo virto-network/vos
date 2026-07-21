@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::convert::Infallible;
 
 use super::causal::{CausalFrontierError, CausalFrontierV2, load_causal_frontier};
-use super::contracts::crdt_change_blob_references;
+use super::contracts::{crdt_change_blob_references, crdt_change_program_references};
 use super::{
     AccumulatedReplyV2, AccumulatedTimeoutV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CallExpirationEnvelopeV2, CallId, CallTimeoutV2, ConsistencyBaseV2,
@@ -211,6 +211,7 @@ impl LocalWorkSchedulerV2 {
             Err(CausalFrontierError::Storage(error)) => match error {},
         };
         let mut blobs = BTreeMap::new();
+        let mut programs = BTreeMap::new();
         let mut nodes = Vec::new();
         for (cid, change) in frontier.nodes_in_causal_order() {
             let receipt_bytes = store
@@ -220,6 +221,15 @@ impl LocalWorkSchedulerV2 {
                 .map_err(|_| ScheduleErrorV2::InvalidNodeReceipt(cid))?;
             for reference in crdt_change_blob_references(change) {
                 import_blob(store, &mut blobs, reference)?;
+            }
+            for program in crdt_change_program_references(change) {
+                let pvm = store
+                    .program(program)
+                    .ok_or(ScheduleErrorV2::MissingProgram(program))?
+                    .to_vec();
+                programs
+                    .entry(program)
+                    .or_insert(ImportedProgramV2 { program, pvm });
             }
             nodes.push(CrdtSyncNodeV2 {
                 change: change.clone(),
@@ -232,6 +242,7 @@ impl LocalWorkSchedulerV2 {
             advertised_heads: header.crdt_heads,
             nodes,
             provided_blobs: blobs.into_values().collect(),
+            provided_programs: programs.into_values().collect(),
         };
         CrdtSyncEnvelopeV2::decode(&envelope.encode())
             .map_err(|_| ScheduleErrorV2::CorruptCausalDag)

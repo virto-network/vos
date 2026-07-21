@@ -233,6 +233,25 @@ pub fn verify_upgrade_authorization(request: &[u8]) -> u64 {
     )
 }
 
+/// Probe the service image for one exact canonical actor PVM.
+#[cfg(feature = "service")]
+#[inline]
+pub fn program_available(program: &[u8; 32]) -> u64 {
+    ecall3(hostcall::PROGRAM_IMPORT, program.as_ptr() as u64, 0, 0)
+}
+
+/// Stage exact canonical actor PVM bytes in the current Accumulate image.
+#[cfg(feature = "service")]
+#[inline]
+pub fn provide_program(program: &[u8; 32], pvm: &[u8]) -> u64 {
+    ecall3(
+        hostcall::PROGRAM_IMPORT,
+        program.as_ptr() as u64,
+        pvm.as_ptr() as u64,
+        pvm.len() as u64,
+    )
+}
+
 /// Validate a committed external accumulation receipt used to resume an
 /// awaited cross-root call.
 #[cfg(feature = "service")]

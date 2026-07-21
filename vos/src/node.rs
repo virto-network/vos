@@ -2613,6 +2613,7 @@ fn v2_sync_with_peer(
     let mut pending = remote_heads.clone();
     let mut fetched = std::collections::BTreeMap::new();
     let mut blobs = std::collections::BTreeMap::new();
+    let mut programs = std::collections::BTreeMap::new();
     let mut service = None;
     while let Some(cid) = pending.pop() {
         if local_nodes.contains(&cid) || fetched.contains_key(&cid) {
@@ -2649,6 +2650,13 @@ fn v2_sync_with_peer(
                 return Err("peer returned divergent content-addressed blobs");
             }
         }
+        for program in fragment.provided_programs {
+            if let Some(existing) = programs.insert(program.program.0, program.clone())
+                && existing != program
+            {
+                return Err("peer returned divergent canonical actor programs");
+            }
+        }
         fetched.insert(cid, node);
     }
     if fetched.is_empty() {
@@ -2665,6 +2673,7 @@ fn v2_sync_with_peer(
         advertised_heads,
         nodes: fetched.into_values().collect(),
         provided_blobs: blobs.into_values().collect(),
+        provided_programs: programs.into_values().collect(),
     };
     let envelope = crate::v2::CrdtSyncEnvelopeV2::decode(&envelope.encode())
         .map_err(|_| "assembled v2 sync delta is not canonical")?;

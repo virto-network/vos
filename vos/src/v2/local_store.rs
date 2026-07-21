@@ -958,6 +958,37 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                     0,
                 ])
             }
+            hostcall::PROGRAM_IMPORT => {
+                let program: [u8; 32] = Self::read_guest_bytes(kernel, registers[7], 32, slot)?
+                    .try_into()
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                if registers[9] == 0 {
+                    return Ok([
+                        if self
+                            .staged
+                            .programs
+                            .get(&program)
+                            .is_some_and(|pvm| ProgramId::of_pvm(pvm).0 == program)
+                        {
+                            error::HOST_OK
+                        } else {
+                            error::HOST_NONE
+                        },
+                        0,
+                    ]);
+                }
+                let pvm = Self::read_guest_bytes(kernel, registers[8], registers[9], slot)?;
+                if ProgramId::of_pvm(&pvm).0 != program {
+                    return Ok([error::HOST_WHAT, 0]);
+                }
+                if let Some(existing) = self.staged.programs.get(&program)
+                    && existing != &pvm
+                {
+                    return Ok([error::HOST_WHAT, 0]);
+                }
+                self.staged.programs.insert(program, pvm);
+                Ok([error::HOST_OK, 0])
+            }
             hostcall::RECEIPT_VERIFY => {
                 let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
                 let request = ReceiptVerificationRequestV2::decode(&bytes)
