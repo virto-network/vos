@@ -21,7 +21,7 @@ use vos::v2::{
     CommittedAttestationOutputV2, CommittedImageStoreV2, CommittedServiceSnapshotV2,
     ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
     DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InvocationId, JamServiceV2, LocalJamStoreV2, LocalRootTreeConfigV2,
+    ImportedProgramV2, IngressEnvelopeV2, InvocationId, JamServiceV2, LocalJamStoreV2, LocalRootTreeConfigV2,
     LocalRootTreeServiceV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
     MethodPolicyV2, NoRefineProtocolHostV2, Origin, OwnedActorInstallV2, PackageManifestV2,
     PackageRolePoliciesV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
@@ -1340,6 +1340,10 @@ fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
 
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("peer_value").encode());
+    let ingress_blob = ImportedBlobV2 {
+        reference: BlobRefV2::of_bytes(b"raft ingress input"),
+        bytes: b"raft ingress input".to_vec(),
+    };
     let request = LocalWorkRequestV2 {
         invocation: InvocationId([109; 32]),
         workflow_step: 0,
@@ -1353,10 +1357,19 @@ fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
         parent_call: None,
         awaited_reply: None,
         awaited_timeout: None,
-        imported_blobs: vec![],
+        imported_blobs: vec![ingress_blob.reference.clone()],
         proof_requested: false,
     };
-    assert!(!service.admit_ingress(&request).unwrap());
+    assert!(
+        !service
+            .admit_ingress_with_blobs(&request, vec![ingress_blob.clone()])
+            .unwrap()
+    );
+    assert_eq!(
+        service.store().blob(&ingress_blob.reference),
+        Some(ingress_blob.bytes.as_slice()),
+        "the canonical Raft request carries every newly referenced ingress blob"
+    );
     let committed = service.invoke_admitted(request.invocation).unwrap();
     let publication = committed.publication.unwrap();
     assert_eq!(
@@ -3911,7 +3924,10 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     .expect("scheduler binds direct ingress to the current causal frontier");
     let admission_cid = admission.crdt_change.as_ref().unwrap().cid();
     let admitted = service
-        .accumulate(&AccumulateRequestV2::AdmitIngress(admission))
+        .accumulate(&AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+            ingress: admission,
+            provided_blobs: Vec::new(),
+        }))
         .unwrap()
         .result;
     assert!(matches!(
@@ -5406,28 +5422,50 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     };
     let (private_authorization, private_witness) =
         private_credential.private_evidence(private_policy);
-    let witness = service
-        .accumulate_host_mut()
-        .import_blob(private_witness.bytes);
-    assert_eq!(witness, private_witness.reference);
+    let private_request = LocalWorkRequestV2 {
+        invocation: InvocationId([110; 32]),
+        workflow_step: 0,
+        logical_timeslot: 51,
+        target: delivered.work.target,
+        method: "private_start".into(),
+        arguments: delivered.work.arguments.clone(),
+        origin: private_origin,
+        authorization: private_authorization,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![private_witness.reference.clone()],
+        proof_requested: true,
+    };
+    let service_identity = service.accumulate_host().header().unwrap().unwrap().service;
+    let private_ingress = LocalWorkSchedulerV2::prepare_direct_ingress(
+        service.accumulate_host(),
+        &service_identity,
+        &private_request,
+    )
+    .expect("scheduler binds private ingress to committed guest state");
+    let private_admission = service
+        .accumulate(&AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+            ingress: private_ingress,
+            provided_blobs: vec![private_witness.clone()],
+        }))
+        .expect("physical Accumulate admits and stages the private witness")
+        .result;
+    assert!(matches!(
+        private_admission,
+        AccumulationResultV2::IngressAdmitted {
+            duplicate: false,
+            ..
+        }
+    ), "private admission rejected: {private_admission:?}");
+    assert_eq!(
+        service.accumulate_host().blob(&private_witness.reference),
+        Some(private_witness.bytes.as_slice())
+    );
     let prepared_proof_work = LocalWorkSchedulerV2::prepare(
         service.accumulate_host(),
-        LocalWorkRequestV2 {
-            invocation: InvocationId([110; 32]),
-            workflow_step: 0,
-            logical_timeslot: 51,
-            target: delivered.work.target,
-            method: "private_start".into(),
-            arguments: delivered.work.arguments.clone(),
-            origin: private_origin,
-            authorization: private_authorization,
-            causal_parent: None,
-            parent_call: None,
-            awaited_reply: None,
-            awaited_timeout: None,
-            imported_blobs: vec![witness],
-            proof_requested: true,
-        },
+        private_request,
     )
     .expect("scheduler imports a private role witness without disclosing it");
     let proof_work = prepared_proof_work.work;

@@ -22,7 +22,7 @@ use super::{
     CommittedAttestationPackageV2, CommittedImageStoreV2, ConsistencyModeV2,
     ConsistencyBaseV2, ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2,
     DeploymentId, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
-    ExternalActorDirectoryV2, ImportedBlobV2, JamServiceV2, LocalJamStoreV2,
+    ExternalActorDirectoryV2, ImportedBlobV2, IngressEnvelopeV2, JamServiceV2, LocalJamStoreV2,
     LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
     MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, PreparedWorkV2,
     ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
@@ -1543,12 +1543,27 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         &mut self,
         request: &LocalWorkRequestV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.admit_ingress_with_blobs(request, Vec::new())
+    }
+
+    /// Persist one direct invocation together with exact content-addressed
+    /// inputs that are not yet available to the service. The bytes live in
+    /// the canonical Accumulate request, so Raft followers replay and import
+    /// them in the same transaction as the ingress record.
+    pub fn admit_ingress_with_blobs(
+        &mut self,
+        request: &LocalWorkRequestV2,
+        provided_blobs: Vec<ImportedBlobV2>,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
         self.require_installed()?;
         let ingress =
             direct_ingress_from_request(self.service.accumulate_host(), &self.identity, request)?;
         let accumulated = self
             .service
-            .accumulate(&AccumulateRequestV2::AdmitIngress(ingress))
+            .accumulate(&AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                ingress,
+                provided_blobs,
+            }))
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
             AccumulationResultV2::IngressAdmitted {

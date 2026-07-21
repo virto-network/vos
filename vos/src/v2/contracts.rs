@@ -1234,6 +1234,19 @@ impl DirectIngressV2 {
     }
 }
 
+/// Complete guest-owned admission input for one direct invocation.
+///
+/// `DirectIngressV2` retains only content references so its commitment and
+/// retry identity do not depend on whether a transport retry has to resend
+/// bytes already available to the service. New content-addressed inputs are
+/// nevertheless carried inside the physical Accumulate request so replicated
+/// followers can stage the same bytes atomically with the ingress record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressEnvelopeV2 {
+    pub ingress: DirectIngressV2,
+    pub provided_blobs: Vec<ImportedBlobV2>,
+}
+
 /// Authenticated cross-root admission input. The destination service guest,
 /// not the native transport, validates the finalized source receipt and
 /// atomically creates the durable inbox row.
@@ -1345,7 +1358,7 @@ pub struct PublicationAckV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulateRequestV2 {
     Install(ServiceGenesisV2),
-    AdmitIngress(DirectIngressV2),
+    AdmitIngress(IngressEnvelopeV2),
     Apply(AccumulationEnvelopeV2),
     PrepareAttested(AccumulationEnvelopeV2),
     Deliver(DeliveryEnvelopeV2),
@@ -2846,6 +2859,45 @@ impl V2Wire for DirectIngressV2 {
     }
 }
 
+impl V2Wire for IngressEnvelopeV2 {
+    const MAGIC: [u8; 4] = *b"VIE2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.bytes(&self.ingress.encode());
+        e.list(&self.provided_blobs, |e, blob| {
+            encode_blob_ref(e, &blob.reference);
+            e.bytes(&blob.bytes);
+        });
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            ingress: DirectIngressV2::decode(&d.bytes()?)?,
+            provided_blobs: d.list(|d| {
+                Ok(ImportedBlobV2 {
+                    reference: decode_blob_ref(d)?,
+                    bytes: d.bytes()?,
+                })
+            })?,
+        };
+        ensure_sorted_unique(&value.provided_blobs, |blob| blob.reference.hash.0)?;
+        for blob in &value.provided_blobs {
+            if !blob.reference.matches(&blob.bytes)
+                || value
+                    .ingress
+                    .imported_blobs
+                    .binary_search_by_key(&blob.reference.hash, |reference| reference.hash)
+                    .ok()
+                    .is_none_or(|index| value.ingress.imported_blobs[index] != blob.reference)
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for CrdtSyncEnvelopeV2 {
     const MAGIC: [u8; 4] = *b"VCS2";
 
@@ -3008,7 +3060,7 @@ impl V2Wire for AccumulateRequestV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         match d.u8()? {
             0 => Ok(Self::Install(ServiceGenesisV2::decode(&d.bytes()?)?)),
-            6 => Ok(Self::AdmitIngress(DirectIngressV2::decode(&d.bytes()?)?)),
+            6 => Ok(Self::AdmitIngress(IngressEnvelopeV2::decode(&d.bytes()?)?)),
             1 => Ok(Self::Apply(AccumulationEnvelopeV2::decode(&d.bytes()?)?)),
             2 => Ok(Self::PrepareAttested(AccumulationEnvelopeV2::decode(
                 &d.bytes()?,
@@ -5037,28 +5089,77 @@ mod tests {
         });
         assert_eq!(AccumulateRequestV2::decode(&apply.encode()).unwrap(), apply);
 
-        let admission = AccumulateRequestV2::AdmitIngress(DirectIngressV2 {
-            service: service(),
-            invocation: InvocationId([18; 32]),
-            logical_timeslot: 7,
-            target: ActorId([5; 32]),
-            method: "set".into(),
-            arguments: vec![1],
-            origin: Origin::Anonymous,
-            authorization: AuthorizationEvidenceV2::Public,
-            imported_blobs: vec![],
-            proof_requested: false,
-            base: ConsistencyBaseV2::Linear {
-                revision: 1,
-                state_root: Hash([19; 32]),
+        let admission = AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+            ingress: DirectIngressV2 {
+                service: service(),
+                invocation: InvocationId([18; 32]),
+                logical_timeslot: 7,
+                target: ActorId([5; 32]),
+                method: "set".into(),
+                arguments: vec![1],
+                origin: Origin::Anonymous,
+                authorization: AuthorizationEvidenceV2::Public,
+                imported_blobs: vec![],
+                proof_requested: false,
+                base: ConsistencyBaseV2::Linear {
+                    revision: 1,
+                    state_root: Hash([19; 32]),
+                },
+                base_causal_height: None,
+                crdt_change: None,
             },
-            base_causal_height: None,
-            crdt_change: None,
+            provided_blobs: Vec::new(),
         });
         assert_eq!(
             AccumulateRequestV2::decode(&admission.encode()).unwrap(),
             admission
         );
+
+        let witness = ImportedBlobV2 {
+            reference: BlobRefV2::of_bytes(b"private role witness"),
+            bytes: b"private role witness".to_vec(),
+        };
+        let private_admission = AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+            ingress: DirectIngressV2 {
+                service: service(),
+                invocation: InvocationId([20; 32]),
+                logical_timeslot: 8,
+                target: ActorId([5; 32]),
+                method: "attested".into(),
+                arguments: vec![1],
+                origin: Origin::Member(SubjectId([21; 32])),
+                authorization: AuthorizationEvidenceV2::PrivateCredential {
+                    policy: Hash([22; 32]),
+                    credential_commitment: Hash([23; 32]),
+                    witness: witness.reference.clone(),
+                },
+                imported_blobs: vec![witness.reference.clone()],
+                proof_requested: true,
+                base: ConsistencyBaseV2::Linear {
+                    revision: 1,
+                    state_root: Hash([19; 32]),
+                },
+                base_causal_height: None,
+                crdt_change: None,
+            },
+            provided_blobs: vec![witness.clone()],
+        });
+        assert_eq!(
+            AccumulateRequestV2::decode(&private_admission.encode()).unwrap(),
+            private_admission
+        );
+        let AccumulateRequestV2::AdmitIngress(mut malformed) = private_admission else {
+            unreachable!()
+        };
+        malformed.provided_blobs[0].bytes.push(0);
+        assert!(IngressEnvelopeV2::decode(&malformed.encode()).is_err());
+
+        let unexpected = ImportedBlobV2 {
+            reference: BlobRefV2::of_bytes(b"unreferenced"),
+            bytes: b"unreferenced".to_vec(),
+        };
+        malformed.provided_blobs = vec![unexpected];
+        assert!(IngressEnvelopeV2::decode(&malformed.encode()).is_err());
 
         let acknowledgement = AccumulateRequestV2::AcknowledgePublication(PublicationAckV2 {
             service: service(),

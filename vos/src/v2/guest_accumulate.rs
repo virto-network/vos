@@ -19,13 +19,13 @@ use super::{
     CallExpirationEnvelopeV2, CallTimeoutV2,
     ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, DirectIngressV2,
-    EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2, MessageRecordV2,
-    MethodPolicyV2, ProgramId, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
-    ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError, StateTreeStore,
-    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2,
-    actor_upgrade_storage_key, attestation_archive_storage_key, call_expiration_storage_key,
-    crdt_change_storage_key,
+    EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressEnvelopeV2, IngressRecordV2,
+    MessageRecordV2, MethodPolicyV2, ProgramId, ProofVerificationRequestV2, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2,
+    ServiceInstallReceiptV2, ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2,
+    StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
+    WorkflowOperationV2, actor_upgrade_storage_key, attestation_archive_storage_key,
+    call_expiration_storage_key, crdt_change_storage_key,
     crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key,
     delivery_storage_key, header_storage_key, ingress_storage_key, public_policy_hash,
     publication_storage_key, receipt_storage_key, space_role_for_policy,
@@ -134,7 +134,7 @@ pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
 ) -> GuestResult<AccumulationResultV2, S::Error> {
     match request {
         AccumulateRequestV2::Install(genesis) => install(store, &genesis),
-        AccumulateRequestV2::AdmitIngress(ingress) => admit_ingress(store, &ingress),
+        AccumulateRequestV2::AdmitIngress(envelope) => admit_ingress(store, envelope),
         AccumulateRequestV2::Apply(envelope) => apply(store, &envelope, ApplyMode::Commit),
         AccumulateRequestV2::PrepareAttested(envelope) => {
             apply(store, &envelope, ApplyMode::PrepareAttested)
@@ -463,8 +463,9 @@ fn upgrade_actor_crdt<S: GuestAccumulateStoreV2>(
 
 fn admit_ingress<S: GuestAccumulateStoreV2>(
     store: &mut S,
-    ingress: &DirectIngressV2,
+    envelope: &IngressEnvelopeV2,
 ) -> GuestResult<AccumulationResultV2, S::Error> {
+    let ingress = &envelope.ingress;
     let Some(header_bytes) = read(store, header_storage_key())? else {
         return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
     };
@@ -579,9 +580,40 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
     {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
+    if let AuthorizationEvidenceV2::PrivateCredential {
+        credential_commitment,
+        witness,
+        ..
+    } = &ingress.authorization
+    {
+        let Some(bytes) =
+            candidate_blob(tree.store_ref(), &envelope.provided_blobs, witness)?
+        else {
+            return Ok(rejected(AccumulationRejectionV2::MissingBlob(witness.hash)));
+        };
+        let credential = match SpaceRoleCredentialV2::decode(&bytes) {
+            Ok(credential) => credential,
+            Err(_) => return Ok(rejected(AccumulationRejectionV2::Unauthorized)),
+        };
+        let Some(required_role) = space_role_for_policy(policy.policy) else {
+            return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+        };
+        if !witness.matches(&bytes)
+            || credential.holder != ingress.origin
+            || credential.role < required_role
+            || *credential_commitment != credential.commitment()
+        {
+            return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+        }
+    }
     drop(tree);
     for reference in &ingress.imported_blobs {
-        if !blob_available(store, reference)? {
+        let supplied = envelope
+            .provided_blobs
+            .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+            .ok()
+            .is_some_and(|index| envelope.provided_blobs[index].reference == *reference);
+        if !supplied && !blob_available(store, reference)? {
             return Ok(rejected(AccumulationRejectionV2::MissingBlob(
                 reference.hash,
             )));
@@ -611,6 +643,14 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
         checkpoint: 0,
         consistency: header.consistency,
     };
+    for blob in &envelope.provided_blobs {
+        let actual = store
+            .provide_blob(&blob.bytes)
+            .map_err(GuestAccumulateError::Storage)?;
+        if actual != blob.reference {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+    }
     if let Some(change) = ingress.crdt_change.as_ref() {
         write_crdt_change(store, change, change.cid())?;
         write_crdt_node_receipt(store, change.cid(), &receipt)?;
@@ -5341,7 +5381,10 @@ mod tests {
         let header_before = store.rows.get(header_storage_key()).unwrap().clone();
         let admitted = execute_guest_accumulate(
             &mut store,
-            &AccumulateRequestV2::AdmitIngress(ingress.clone()),
+            &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                ingress: ingress.clone(),
+                provided_blobs: Vec::new(),
+            }),
         )
         .unwrap();
         let AccumulationResultV2::IngressAdmitted {
@@ -5368,8 +5411,14 @@ mod tests {
         let mut retry = record.ingress.clone();
         retry.logical_timeslot += 10;
         assert_eq!(
-            execute_guest_accumulate(&mut store, &AccumulateRequestV2::AdmitIngress(retry))
-                .unwrap(),
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                    ingress: retry,
+                    provided_blobs: Vec::new(),
+                }),
+            )
+            .unwrap(),
             AccumulationResultV2::IngressAdmitted {
                 invocation: work.invocation,
                 receipt,
@@ -5379,8 +5428,14 @@ mod tests {
         let mut divergent = record.ingress;
         divergent.method = "other".into();
         assert_eq!(
-            execute_guest_accumulate(&mut store, &AccumulateRequestV2::AdmitIngress(divergent),)
-                .unwrap(),
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                    ingress: divergent,
+                    provided_blobs: Vec::new(),
+                }),
+            )
+            .unwrap(),
             rejected(AccumulationRejectionV2::DivergentDuplicate)
         );
 
@@ -5427,7 +5482,12 @@ mod tests {
         let mut destination = MemStore::default();
         let (initial, _) = install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
         install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
-        let work = crdt_work(initial, 67, vec![]);
+        let mut work = crdt_work(initial, 67, vec![]);
+        let ingress_blob = ImportedBlobV2 {
+            reference: BlobRefV2::of_bytes(b"syncable ingress input"),
+            bytes: b"syncable ingress input".to_vec(),
+        };
+        work.imported_blobs.push(ingress_blob.reference.clone());
         let mut ingress = DirectIngressV2 {
             service: work.service.clone(),
             invocation: work.invocation,
@@ -5461,7 +5521,10 @@ mod tests {
             ..
         } = execute_guest_accumulate(
             &mut source,
-            &AccumulateRequestV2::AdmitIngress(ingress.clone()),
+            &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                ingress: ingress.clone(),
+                provided_blobs: vec![ingress_blob.clone()],
+            }),
         )
         .unwrap()
         else {
@@ -5492,7 +5555,7 @@ mod tests {
                 service: identity(),
                 advertised_heads: vec![cid],
                 nodes: vec![super::super::CrdtSyncNodeV2 { change, receipt }],
-                provided_blobs: vec![],
+                provided_blobs: vec![ingress_blob.clone()],
                 provided_programs: vec![],
             }),
         )
@@ -5513,6 +5576,10 @@ mod tests {
         .unwrap();
         assert_eq!(restored.ingress, ingress);
         assert!(!restored.consumed);
+        assert_eq!(
+            destination.blobs.get(&ingress_blob.reference.hash),
+            Some(&ingress_blob.bytes)
+        );
     }
 
     #[test]
@@ -6042,6 +6109,166 @@ mod tests {
             rejected(AccumulationRejectionV2::Unauthorized)
         );
         assert_eq!(store, before);
+    }
+
+    #[test]
+    fn private_role_witness_is_validated_and_staged_with_ingress() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"before").unwrap();
+        let required_policy =
+            super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
+                program: program(),
+                initial_state: initial,
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "set".into(),
+                    schema: Hash([6; 32]),
+                    policy: required_policy,
+                    public: false,
+                    attested: true,
+                }],
+            }],
+            external_actors: external_bindings(),
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResultV2::Installed(receipt) =
+            execute_guest_accumulate(&mut store, &install).unwrap()
+        else {
+            panic!("install rejected")
+        };
+        let origin = super::super::Origin::Member(super::super::SubjectId([40; 32]));
+        let base = ConsistencyBaseV2::Linear {
+            revision: 0,
+            state_root: receipt.resulting_state_root.unwrap(),
+        };
+
+        let guest = SpaceRoleCredentialV2 {
+            holder: origin,
+            role: crate::SpaceRole::Guest,
+            authenticator: b"guest grant".to_vec(),
+        };
+        let (guest_evidence, guest_witness) = guest.private_evidence(required_policy);
+        let denied_ingress = DirectIngressV2 {
+            service: identity(),
+            invocation: InvocationId([41; 32]),
+            logical_timeslot: 1,
+            target: actor(),
+            method: "set".into(),
+            arguments: vec![1],
+            origin,
+            authorization: guest_evidence,
+            imported_blobs: vec![guest_witness.reference.clone()],
+            proof_requested: true,
+            base: base.clone(),
+            base_causal_height: None,
+            crdt_change: None,
+        };
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                    ingress: denied_ingress,
+                    provided_blobs: vec![guest_witness.clone()],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized)
+        );
+        assert_eq!(store, before);
+        assert!(!store.blobs.contains_key(&guest_witness.reference.hash));
+
+        let member = SpaceRoleCredentialV2 {
+            holder: origin,
+            role: crate::SpaceRole::Member,
+            authenticator: b"member grant".to_vec(),
+        };
+        let (member_evidence, member_witness) = member.private_evidence(required_policy);
+        let admitted_ingress = DirectIngressV2 {
+            service: identity(),
+            invocation: InvocationId([42; 32]),
+            logical_timeslot: 2,
+            target: actor(),
+            method: "set".into(),
+            arguments: vec![1],
+            origin,
+            authorization: member_evidence,
+            imported_blobs: vec![member_witness.reference.clone()],
+            proof_requested: true,
+            base,
+            base_causal_height: None,
+            crdt_change: None,
+        };
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                    ingress: admitted_ingress.clone(),
+                    provided_blobs: Vec::new(),
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::MissingBlob(
+                member_witness.reference.hash
+            ))
+        );
+        assert_eq!(store, before);
+
+        let mut tampered_witness = member_witness.clone();
+        tampered_witness.bytes.push(0);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                    ingress: admitted_ingress.clone(),
+                    provided_blobs: vec![tampered_witness],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::NonCanonical)
+        );
+        assert_eq!(store, before);
+
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::AdmitIngress(IngressEnvelopeV2 {
+                ingress: admitted_ingress.clone(),
+                provided_blobs: vec![member_witness.clone()],
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            AccumulationResultV2::IngressAdmitted {
+                invocation,
+                duplicate: false,
+                ..
+            } if invocation == InvocationId([42; 32])
+        ));
+        assert_eq!(
+            store.blobs.get(&member_witness.reference.hash),
+            Some(&member_witness.bytes)
+        );
+        let record = IngressRecordV2::decode(
+            store
+                .rows
+                .get(&ingress_storage_key(admitted_ingress.invocation))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.ingress, admitted_ingress);
     }
 
     #[test]

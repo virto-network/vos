@@ -125,13 +125,17 @@ logical timeslot, exact actor, method, arguments, and proof mode. The service
 thread derives typed origin and authorization from the authenticated transport,
 checks them against the signed method policy, and rejects a retry whose durable
 workflow identity differs. For Local/Raft roots, every fresh direct call first
-enters physical Accumulate as `DirectIngressV2`; the guest validates its typed
-origin, authorization, actor, and signed method policy before storing the queue
-record. Refine runs only from that stored input. If the actor is suspended, the
-record survives restart and is consumed atomically with its eventual first
-slice; retry timeslots do not replace the originally admitted scheduling
-timeslot. A reply-only publication is acknowledged only after the consumer
-channel accepts it. For locally routed roots, a committed outbox publication is
+enters physical Accumulate as an `IngressEnvelopeV2` containing
+`DirectIngressV2` and any newly supplied content-addressed input bytes. The
+guest validates its typed origin, authorization, actor, signed method policy,
+and every supplied blob before atomically importing those bytes and storing the
+queue record. An attested role credential is carried as a private witness blob;
+the durable ingress and later attestation statement expose only its reference
+and commitment. Refine runs only from that stored input. If the actor is
+suspended, the record survives restart and is consumed atomically with its
+eventual first slice; retry timeslots do not replace the originally admitted
+scheduling timeslot. A reply-only publication is acknowledged only after the
+consumer channel accepts it. For locally routed roots, a committed outbox publication is
 sent as `RootTreeTransportV2`, admitted through destination
 physical Accumulate, executed from the guest inbox, returned only after the
 callee's Refine/Accumulate commit, and injected at the caller's exact JAR
@@ -181,9 +185,10 @@ The remaining production gap is a proof backend that consumes or reproduces the
 full witness behind this commitment; it is not a second attestation-only actor
 binary.
 
-Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
-continuation/blob byte required by that request. It does not replicate an
-`EffectLog` or a leader-produced post-state image. `ReplicatedJamServiceV2`
+Raft orders canonical `AccumulateRequestV2` bytes, including private ingress
+witnesses and every referenced continuation/blob byte required by that request.
+It does not replicate an `EffectLog` or a leader-produced post-state image.
+`ReplicatedJamServiceV2`
 waits for the request's log position to commit, then applies it through the
 physical service-PVM Accumulate entry before advancing the replica's applied
 cursor. Followers and a newly elected leader use the same catch-up path;

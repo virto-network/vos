@@ -4616,7 +4616,7 @@ where
             send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
             continue;
         }
-        let Some((origin, authorization)) =
+        let Some(authorization) =
             v2_work_authorization(&request, &policy, &actor_routes)
         else {
             send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
@@ -4629,13 +4629,13 @@ where
             target: ingress.target,
             method: ingress.method,
             arguments: ingress.arguments,
-            origin,
-            authorization,
+            origin: authorization.origin,
+            authorization: authorization.evidence,
             causal_parent: None,
             parent_call: None,
             awaited_reply: None,
             awaited_timeout: None,
-            imported_blobs: vec![],
+            imported_blobs: authorization.imported_blobs,
             proof_requested: ingress.proof_requested,
         };
         if work.proof_requested && !proof_producer.is_configured() {
@@ -4755,7 +4755,7 @@ where
                 continue;
             }
         }
-        match service.admit_ingress(&work) {
+        match service.admit_ingress_with_blobs(&work, authorization.provided_blobs) {
             Ok(_) => {
                 state.logical_timeslot = state.logical_timeslot.max(work.logical_timeslot);
                 state
@@ -5641,11 +5641,18 @@ fn acknowledge_v2_transport_publication<B>(
     }
 }
 
+struct V2WorkAuthorization {
+    origin: crate::v2::Origin,
+    evidence: crate::v2::AuthorizationEvidenceV2,
+    imported_blobs: Vec<crate::v2::BlobRefV2>,
+    provided_blobs: Vec<crate::v2::ImportedBlobV2>,
+}
+
 fn v2_work_authorization(
     request: &InvokeRequest,
     policy: &crate::v2::MethodPolicyV2,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
-) -> Option<(crate::v2::Origin, crate::v2::AuthorizationEvidenceV2)> {
+) -> Option<V2WorkAuthorization> {
     let (origin, authenticator) = match &request.caller {
         crate::actors::Caller::Unauthenticated => (crate::v2::Origin::Anonymous, Vec::new()),
         crate::actors::Caller::System => (crate::v2::Origin::System, Vec::new()),
@@ -5665,7 +5672,12 @@ fn v2_work_authorization(
         }
     };
     if policy.public {
-        return Some((origin, crate::v2::AuthorizationEvidenceV2::Public));
+        return Some(V2WorkAuthorization {
+            origin,
+            evidence: crate::v2::AuthorizationEvidenceV2::Public,
+            imported_blobs: Vec::new(),
+            provided_blobs: Vec::new(),
+        });
     }
     let role = crate::SpaceRole::from_u8(request.space_role?)?;
     let mut authenticated = crate::v2::Hash::digest(
@@ -5680,7 +5692,22 @@ fn v2_work_authorization(
         role,
         authenticator: authenticated,
     };
-    Some((origin, credential.disclosed_evidence(policy.policy)))
+    if policy.attested {
+        let (evidence, witness) = credential.private_evidence(policy.policy);
+        Some(V2WorkAuthorization {
+            origin,
+            evidence,
+            imported_blobs: vec![witness.reference.clone()],
+            provided_blobs: vec![witness],
+        })
+    } else {
+        Some(V2WorkAuthorization {
+            origin,
+            evidence: credential.disclosed_evidence(policy.policy),
+            imported_blobs: Vec::new(),
+            provided_blobs: Vec::new(),
+        })
+    }
 }
 
 fn send_v2_status(reply: ReplyChannel, status: u8, id: ServiceId) {
@@ -9128,6 +9155,74 @@ mod tests {
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn attested_role_authorization_keeps_the_credential_in_a_blob() {
+        use crate::v2::V2Wire;
+
+        let policy_hash =
+            crate::v2::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
+        let policy = crate::v2::MethodPolicyV2 {
+            method: "is_adult".into(),
+            schema: crate::v2::Hash([7; 32]),
+            policy: policy_hash,
+            public: false,
+            attested: true,
+        };
+        let (reply, _rx) = mpsc::channel();
+        let request = InvokeRequest {
+            caller: crate::actors::Caller::Peer(b"authenticated peer".to_vec()),
+            space_role: Some(crate::SpaceRole::Member.as_u8()),
+            actor_local_role: None,
+            msg: vec![1],
+            reply: ReplyChannel::Sync(reply),
+            chain: Vec::new(),
+        };
+        let authorization =
+            v2_work_authorization(&request, &policy, &RwLock::new(HashMap::new())).unwrap();
+        let crate::v2::AuthorizationEvidenceV2::PrivateCredential {
+            policy: supplied_policy,
+            credential_commitment,
+            witness,
+        } = authorization.evidence
+        else {
+            panic!("attested role must use private authorization evidence")
+        };
+        assert_eq!(supplied_policy, policy_hash);
+        assert_ne!(credential_commitment, crate::v2::Hash::ZERO);
+        assert_eq!(authorization.imported_blobs, vec![witness.clone()]);
+        assert_eq!(authorization.provided_blobs.len(), 1);
+        assert_eq!(authorization.provided_blobs[0].reference, witness);
+        let credential =
+            crate::v2::SpaceRoleCredentialV2::decode(&authorization.provided_blobs[0].bytes)
+                .unwrap();
+        assert_eq!(credential.holder, authorization.origin);
+        assert_eq!(credential.role, crate::SpaceRole::Member);
+
+        let mut ordinary_policy = policy;
+        ordinary_policy.attested = false;
+        let (reply, _rx) = mpsc::channel();
+        let ordinary_request = InvokeRequest {
+            caller: crate::actors::Caller::Peer(b"authenticated peer".to_vec()),
+            space_role: Some(crate::SpaceRole::Member.as_u8()),
+            actor_local_role: None,
+            msg: vec![1],
+            reply: ReplyChannel::Sync(reply),
+            chain: Vec::new(),
+        };
+        let ordinary = v2_work_authorization(
+            &ordinary_request,
+            &ordinary_policy,
+            &RwLock::new(HashMap::new()),
+        )
+        .unwrap();
+        assert!(matches!(
+            ordinary.evidence,
+            crate::v2::AuthorizationEvidenceV2::Credential { .. }
+        ));
+        assert!(ordinary.imported_blobs.is_empty());
+        assert!(ordinary.provided_blobs.is_empty());
     }
 
     /// The extension-facing proof-blob CAS round trip: `EFFECT_BLOB_PUT`
