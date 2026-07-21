@@ -19,8 +19,8 @@ use super::{
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestationDeliveryV2,
     CommittedServiceImageHostV2, ImportedBlobV2, LocalJamStoreSnapshotV2, ProducerId, ProgramId,
     ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2,
-    RefineOutputV2, RefineProtocolHostV2, ServiceImageInstallErrorV2, ServicePvmErrorV2,
-    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    RefineOutputV2, RefineProtocolHostV2, RefineTraceV2, ServiceImageInstallErrorV2,
+    ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,7 @@ pub struct RefinedServiceOutputV2 {
     pub transition: TransitionV2,
     pub gas_used: u64,
     pub exported_blobs: Vec<ImportedBlobV2>,
+    pub trace: Option<RefineTraceV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,23 +369,19 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
             .pvm
             .refine_actor_tree(&work.encode(), imports, self.refine_gas, &self.refine_host)
             .map_err(ServiceDispatchError::Pvm)?;
-        let refined = RefineOutputV2::decode(&output.bytes)
-            .map_err(|_| ServiceDispatchError::InvalidRefineOutput)?;
-        let mut exported_blobs = refined.candidate_blobs;
-        exported_blobs.extend(output.exported_blobs);
-        exported_blobs.sort_by_key(|blob| blob.reference.hash);
-        if exported_blobs
-            .windows(2)
-            .any(|pair| pair[0].reference.hash == pair[1].reference.hash && pair[0] != pair[1])
-        {
-            return Err(ServiceDispatchError::InvalidRefineOutput);
-        }
-        exported_blobs.dedup();
-        Ok(RefinedServiceOutputV2 {
-            transition: refined.transition,
-            gas_used: output.gas_used,
-            exported_blobs,
-        })
+        decode_refined_service_output(output)
+    }
+
+    fn refine_actor_tree_traced(
+        &self,
+        work: &WorkEnvelopeV2,
+        imports: &RefineImportsV2,
+    ) -> Result<RefinedServiceOutputV2, ServiceDispatchError> {
+        let output = self
+            .pvm
+            .refine_actor_tree_traced(&work.encode(), imports, self.refine_gas, &self.refine_host)
+            .map_err(ServiceDispatchError::Pvm)?;
+        decode_refined_service_output(output)
     }
 
     pub fn accumulate(
@@ -406,6 +403,29 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
             gas_used: output.gas_used,
         })
     }
+}
+
+fn decode_refined_service_output(
+    output: ServicePvmOutputV2,
+) -> Result<RefinedServiceOutputV2, ServiceDispatchError> {
+    let refined = RefineOutputV2::decode(&output.bytes)
+        .map_err(|_| ServiceDispatchError::InvalidRefineOutput)?;
+    let mut exported_blobs = refined.candidate_blobs;
+    exported_blobs.extend(output.exported_blobs);
+    exported_blobs.sort_by_key(|blob| blob.reference.hash);
+    if exported_blobs
+        .windows(2)
+        .any(|pair| pair[0].reference.hash == pair[1].reference.hash && pair[0] != pair[1])
+    {
+        return Err(ServiceDispatchError::InvalidRefineOutput);
+    }
+    exported_blobs.dedup();
+    Ok(RefinedServiceOutputV2 {
+        transition: refined.transition,
+        gas_used: output.gas_used,
+        exported_blobs,
+        trace: output.trace,
+    })
 }
 
 impl<R, A> JamServiceV2<R, A>
@@ -453,6 +473,19 @@ where
         preparation: AttestationPreparationV2,
         producer: &mut P,
     ) -> Result<ProvedAttestationV2, AttestationBuildErrorV2<P::Error>> {
+        let replay = self
+            .refine_actor_tree_traced(&envelope.work, imports)
+            .map_err(|_| AttestationBuildErrorV2::InvalidPreparation)?;
+        if replay.transition != envelope.transition
+            || replay.exported_blobs != envelope.provided_blobs
+        {
+            return Err(AttestationBuildErrorV2::InvalidPreparation);
+        }
+        let refine_trace = replay
+            .trace
+            .as_ref()
+            .ok_or(AttestationBuildErrorV2::InvalidPreparation)?
+            .commitment;
         let produced = {
             let request = AttestationProofRequestV2 {
                 canonical_service_pvm: self.pvm.canonical_pvm(),
@@ -460,6 +493,7 @@ where
                 imports,
                 transition: &envelope.transition,
                 preparation: &preparation,
+                refine_trace,
             };
             request
                 .validate()
@@ -469,7 +503,7 @@ where
                 .map_err(AttestationBuildErrorV2::Producer)?
         };
         produced
-            .validate()
+            .validate_for(refine_trace)
             .map_err(|_| AttestationBuildErrorV2::InvalidProducedProof)?;
 
         let proof_blob = super::BlobRefV2::of_bytes(&produced.proof);

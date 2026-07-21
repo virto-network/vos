@@ -266,12 +266,16 @@ pub struct AttestationProofRequestV2<'a> {
     pub imports: &'a RefineImportsV2,
     pub transition: &'a TransitionV2,
     pub preparation: &'a AttestationPreparationV2,
+    /// Commitment produced by observing the service's exact canonical
+    /// interpreter replay of `work`, `imports`, and `transition`.
+    pub refine_trace: Hash,
 }
 
 impl AttestationProofRequestV2<'_> {
     pub fn validate(&self) -> Result<(), AttestationError> {
         if ProgramId::of_pvm(self.canonical_service_pvm) != self.work.service.service_program
             || self.imports.validate_for(self.work).is_err()
+            || self.refine_trace == Hash::ZERO
         {
             return Err(AttestationError::InvalidStatement);
         }
@@ -293,6 +297,14 @@ impl ProducedAttestationProofV2 {
             || self.proof.is_empty()
             || self.proof.len() > crate::v2::MAX_ATTESTATION_PROOF_BYTES
         {
+            return Err(AttestationError::InvalidProof);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, refine_trace: Hash) -> Result<(), AttestationError> {
+        self.validate()?;
+        if self.trace != refine_trace {
             return Err(AttestationError::InvalidProof);
         }
         Ok(())
@@ -1065,5 +1077,18 @@ mod tests {
             ),
             Err(AttestationError::InvalidProof)
         ));
+    }
+
+    #[test]
+    fn produced_proof_must_bind_the_live_refine_trace() {
+        let proof = ProducedAttestationProofV2 {
+            trace: Hash([1; 32]),
+            proof: vec![2],
+        };
+        assert_eq!(proof.validate_for(Hash([1; 32])), Ok(()));
+        assert_eq!(
+            proof.validate_for(Hash([3; 32])),
+            Err(AttestationError::InvalidProof)
+        );
     }
 }

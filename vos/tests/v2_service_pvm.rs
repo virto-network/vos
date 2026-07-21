@@ -18,17 +18,18 @@ use vos::v2::{
     AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, ActorWriteV2,
     AttestationDeliveryV2, AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
     CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
-    CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2,
-    Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2,
-    LocalJamStoreV2, LocalRootTreeConfigV2, LocalRootTreeServiceV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    OwnedActorInstallV2, PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId,
-    ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
-    ReplyRecordV2, RootServiceId, RootTreeIngressRecoveryV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2,
-    StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
+    CommittedAttestationOutputV2, CommittedImageStoreV2, CommittedServiceSnapshotV2,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
+    DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, InvocationId, JamServiceV2, LocalJamStoreV2, LocalRootTreeConfigV2,
+    LocalRootTreeServiceV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, Origin, OwnedActorInstallV2, PackageManifestV2,
+    PackageRolePoliciesV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
+    PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
+    RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
+    RootTreeIngressRecoveryV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2,
+    SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
     WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
@@ -93,7 +94,6 @@ struct FailableCommittedImages {
 
 #[derive(Debug)]
 struct CanonicalTestProofProducer {
-    trace: Hash,
     proof: Vec<u8>,
     calls: usize,
 }
@@ -118,7 +118,7 @@ impl AttestationProofProducerV2 for CanonicalTestProofProducer {
         );
         self.calls += 1;
         Ok(ProducedAttestationProofV2 {
-            trace: self.trace,
+            trace: request.refine_trace,
             proof: self.proof.clone(),
         })
     }
@@ -136,6 +136,26 @@ impl AttestationProofProducerV2 for FailingTestProofProducer {
     ) -> Result<ProducedAttestationProofV2, Self::Error> {
         request.validate().map_err(|_| ())?;
         Err(())
+    }
+}
+
+#[derive(Debug)]
+struct MismatchedTraceProofProducer;
+
+impl AttestationProofProducerV2 for MismatchedTraceProofProducer {
+    type Error = ();
+
+    fn prove(
+        &mut self,
+        request: &AttestationProofRequestV2<'_>,
+    ) -> Result<ProducedAttestationProofV2, Self::Error> {
+        request.validate().map_err(|_| ())?;
+        let mut trace = request.refine_trace;
+        trace.0[0] ^= 1;
+        Ok(ProducedAttestationProofV2 {
+            trace,
+            proof: b"proof for the wrong trace".to_vec(),
+        })
     }
 }
 
@@ -1018,9 +1038,21 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
         .snapshot()
         .same_service_state(&before_failure));
 
+    let before_mismatched_trace = service.store().snapshot();
+    assert!(matches!(
+        service.invoke_attested(request.clone(), &mut MismatchedTraceProofProducer),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::InvalidProducedProof)
+    ));
+    assert!(
+        service
+            .store()
+            .snapshot()
+            .same_service_state(&before_mismatched_trace),
+        "a proof for any trace other than the canonical Refine replay cannot commit"
+    );
+
     let proof_bytes = b"root-tree canonical proof".to_vec();
     let mut producer = CanonicalTestProofProducer {
-        trace: Hash([109; 32]),
         proof: proof_bytes.clone(),
         calls: 0,
     };
@@ -1037,7 +1069,7 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
         Some(Value::U32(0))
     );
     let proof = committed.published.proof.as_ref().unwrap();
-    assert_eq!(proof.trace, Hash([109; 32]));
+    assert_ne!(proof.trace, Hash::ZERO);
     assert!(proof.proof_blob.matches(&proof_bytes));
     let statement = committed.published.statement.as_ref().unwrap();
     assert_eq!(statement.accumulation_receipt, committed.receipt);
@@ -1074,7 +1106,6 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
         ServiceId(108),
         true,
         CanonicalTestProofProducer {
-            trace: Hash([110; 32]),
             proof: b"node canonical proof".to_vec(),
             calls: 0,
         },
@@ -1089,7 +1120,7 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
     assert_eq!(result.producer_name, producer_name);
     assert_eq!(result.statement.actor, actor);
     assert_eq!(result.statement.actor_program, actor_program);
-    assert_eq!(result.trace, Hash([110; 32]));
+    assert_ne!(result.trace, Hash::ZERO);
     assert_eq!(result.proof, b"node canonical proof");
 
     let mut retry_arguments = vec![vos::value::TAG_DYNAMIC];
@@ -1219,7 +1250,6 @@ fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
         .snapshot()
         .same_service_state(&before_failed_proof));
     let mut producer = CanonicalTestProofProducer {
-        trace: Hash([111; 32]),
         proof: b"raft root-tree proof".to_vec(),
         calls: 0,
     };
@@ -1539,7 +1569,6 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
         ServiceId(202),
         true,
         CanonicalTestProofProducer {
-            trace: Hash([107; 32]),
             proof: b"peer-proof".to_vec(),
             calls: 0,
         },
@@ -5261,7 +5290,6 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let proof_input = proof_work.input_id();
     let before_empty_proof = service.accumulate_host().snapshot();
     let mut empty_producer = CanonicalTestProofProducer {
-        trace: Hash::ZERO,
         proof: vec![],
         calls: 0,
     };
@@ -5275,34 +5303,45 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             &proof_imports,
             &mut empty_producer,
         ),
-        Err(vos::v2::AttestedServiceErrorV2::InvalidProducedProof)
+        Err(vos::v2::AttestedServiceErrorV2::InvalidPreparation)
     ));
-    assert_eq!(empty_producer.calls, 1);
+    assert_eq!(empty_producer.calls, 0);
     assert!(
         service
             .accumulate_host()
             .snapshot()
             .same_service_state(&before_empty_proof),
-        "proof production failure cannot reach committing Apply"
+        "a transition not produced by exact Refine cannot reach the producer or committing Apply"
     );
 
-    let mut producer = CanonicalTestProofProducer {
-        trace: proof.trace,
-        proof: proof_bytes.clone(),
-        calls: 0,
+    let mut proved_transition = proof_transition;
+    proved_transition.proof = Some(proof.clone());
+    let committed = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: proof_work,
+            transition: proved_transition,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: proof_blob,
+                bytes: proof_bytes.clone(),
+            }],
+        }))
+        .expect("the physical guest accepts the available proof");
+    let AccumulationResultV2::Accepted {
+        published,
+        duplicate: false,
+        ..
+    } = committed.result
+    else {
+        panic!("guest did not commit the proved attested transition")
     };
-    let proved = service
-        .accumulate_attested(
-            AccumulationEnvelopeV2 {
-                work: proof_work,
-                transition: proof_transition,
-                provided_blobs: vec![],
-            },
-            &proof_imports,
-            &mut producer,
-        )
-        .expect("the driver proves before guest Accumulate commits");
-    assert_eq!(producer.calls, 1);
+    let proved = CommittedAttestationOutputV2 {
+        preparation,
+        proof: proof.clone(),
+        proof_bytes: proof_bytes.clone(),
+        published,
+        prepare_gas_used: prepared.gas_used,
+        accumulate_gas_used: committed.gas_used,
+    };
     let invocation_result = proved
         .clone()
         .into_invocation_result("private-age".into(), ProducerId([112; 32]))
@@ -5998,7 +6037,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
 }
 
 #[test]
-fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
+fn raft_refuses_an_untraced_attested_apply_before_log_proposal() {
     let Some(elf) = service_elf() else {
         return;
     };
@@ -6114,16 +6153,15 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         reply: Some(ReplyRecordV2 {
             call_id: prepared.work.invocation.root_reply_id(),
             producer: prepared.work.target,
-            result: b"raft attested reply".to_vec(),
+            result: b"fabricated raft attested reply".to_vec(),
         }),
         attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,
     };
-    let input = prepared.work.input_id();
+    let before = leader.service().accumulate_host().snapshot();
     let mut producer = CanonicalTestProofProducer {
-        trace: Hash([136; 32]),
         proof: b"raft canonical proof".to_vec(),
         calls: 0,
     };
@@ -6132,22 +6170,26 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         transition,
         provided_blobs: vec![],
     };
-    let committed = leader
-        .accumulate_attested(envelope, &prepared.imports, &mut producer)
-        .expect("leader proves before proposing Apply");
-    assert_eq!(producer.calls, 1);
-    assert_eq!(committed.published.proof, Some(committed.proof.clone()));
+    assert!(matches!(
+        leader.accumulate_attested(envelope, &prepared.imports, &mut producer),
+        Err(vos::v2::AttestedServiceErrorV2::InvalidPreparation)
+    ));
+    assert_eq!(producer.calls, 0);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before)
+    );
 
     let entries = shared_log.lock().unwrap().entries.clone();
-    assert_eq!(entries.len(), 2, "PrepareAttested must not enter Raft");
-    let AccumulateRequestV2::Apply(logged) =
-        AccumulateRequestV2::decode(&entries[1].request).unwrap()
-    else {
-        panic!("the second Raft entry was not the proved Apply")
-    };
-    assert_eq!(logged.transition.proof, Some(committed.proof));
-
-    assert_eq!(follower.catch_up().unwrap(), 2);
+    assert_eq!(
+        entries.len(),
+        1,
+        "neither read-only preparation nor an untraced Apply may enter Raft"
+    );
+    assert_eq!(follower.catch_up().unwrap(), 1);
     assert!(
         leader
             .service()
@@ -6155,17 +6197,13 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
             .snapshot()
             .same_service_state(&follower.service().accumulate_host().snapshot())
     );
-    let follower_publication = follower
-        .service()
-        .accumulate_host()
-        .pending_publications()
-        .unwrap()
-        .into_iter()
-        .find(|publication| publication.input == input)
-        .expect("follower verifies and commits the recoverable proof publication");
-    assert_eq!(
-        follower_publication.published.proof,
-        logged.transition.proof
+    assert!(
+        follower
+            .service()
+            .accumulate_host()
+            .pending_publications()
+            .unwrap()
+            .is_empty()
     );
 }
 
