@@ -66,6 +66,37 @@ impl CausalFrontierV2 {
         false
     }
 
+    /// Restrict this already-validated DAG to the complete ancestry of a
+    /// causal snapshot. No storage is consulted and every requested head must
+    /// belong to the original frontier.
+    pub fn at_heads(&self, heads: &[Hash]) -> Option<Self> {
+        let mut nodes = BTreeMap::new();
+        let mut pending = heads.to_vec();
+        while let Some(cid) = pending.pop() {
+            if nodes.contains_key(&cid) {
+                continue;
+            }
+            let change = self.nodes.get(&cid)?.clone();
+            pending.extend(change.causal_dependencies.iter().copied());
+            nodes.insert(cid, change);
+        }
+        let max_head_height = heads
+            .iter()
+            .filter_map(|head| nodes.get(head))
+            .map(|change| change.causal_height)
+            .max()
+            .unwrap_or(0);
+        Some(Self {
+            heads: heads.to_vec(),
+            nodes,
+            max_head_height,
+        })
+    }
+
+    pub fn node(&self, cid: Hash) -> Option<&CrdtChangeV2> {
+        self.nodes.get(&cid)
+    }
+
     /// Select the nearest actor materialization on every concurrent branch.
     /// Each selected state already incorporates the ancestry below it; Refine
     /// folds all returned alternatives inside the canonical actor PVM.

@@ -222,9 +222,17 @@ continuation references drain, and conservative cache retention keeps the old
 bytes available afterward. Queued ingress may use the new program only after
 the upgrade commits.
 
-CRDT actor upgrades currently fail closed with `InvalidConsistency`. Program
-metadata needs an explicit causal operation and complete-ancestry activation;
-the runtime does not pretend that a linear descriptor rewrite is a CRDT merge.
+For CRDT services, an upgrade is a standalone workflow-DAG operation whose
+change ID binds the exact request and causal heads. Each replica validates the
+expected package against the descriptor visible at those heads, checks every
+continuation visible there for the old package, and activates the node only
+after its complete ancestry and canonical replacement PVM are available.
+Sync receipts bind the exact upgrade hash and causal node; PVM imports, DAG
+rows, receipts, deduplication records, and descriptor materialization share one
+Accumulate transaction. Concurrent upgrades remain as separate DAG branches.
+The visible package is selected deterministically by `DeploymentId` (then CID),
+while a later upgrade observing all heads causally supersedes those alternatives.
+This winner applies only to the package register; no CRDT branch is discarded.
 
 The local root-tree controller exposes the deployment sequence explicitly:
 `prepare_actor_upgrade` derives one exact request from committed guest state,
@@ -313,11 +321,12 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 12 and continuation snapshot version 5 are therefore a clean
+Store schema 13 and continuation snapshot version 5 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
-cross-root proof bindings, plus the complete dormant actor-program layout to
-each continuation.
+cross-root proof bindings, the immutable install descriptor used to replay
+causal package metadata, plus the complete dormant actor-program layout in each
+continuation.
 
 ## CRDT boundary
 

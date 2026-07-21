@@ -178,12 +178,10 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
     }
-    if header.consistency == ConsistencyModeV2::Crdt
-        || !matches!(&upgrade.base, ConsistencyBaseV2::Linear { .. })
-        || !upgrade.base.mode_compatible(header.consistency)
+    if !upgrade.base.mode_compatible(header.consistency)
+        || matches!(header.consistency, ConsistencyModeV2::Crdt)
+            != matches!(&upgrade.base, ConsistencyBaseV2::Crdt { .. })
     {
-        // Program metadata needs its own causal operation before CRDT peers
-        // can merge upgrades safely. Linear services use exact-base commit.
         return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
     }
     if !store
@@ -219,6 +217,9 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     }
     if let Some(rejection) = validate_base(store, &header, &upgrade.base)? {
         return Ok(rejected(rejection));
+    }
+    if header.consistency == ConsistencyModeV2::Crdt {
+        return upgrade_actor_crdt(store, header, upgrade, upgrade_hash, upgrade_key);
     }
     if header.revision == u64::MAX {
         return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
@@ -334,6 +335,128 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
         deployment: upgrade.replacement_deployment,
         program: upgrade.replacement_program,
         receipt,
+        duplicate: false,
+    })
+}
+
+fn upgrade_actor_crdt<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    mut header: StoreHeaderV2,
+    upgrade: &ActorUpgradeV2,
+    upgrade_hash: Hash,
+    upgrade_key: Vec<u8>,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let ConsistencyBaseV2::Crdt { heads } = &upgrade.base else {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    };
+    let base_frontier = match load_causal_frontier(heads, |cid| {
+        store.read(&crdt_node_storage_key(cid))
+    }) {
+        Ok(frontier) => frontier,
+        Err(CausalFrontierError::Storage(error)) => {
+            return Err(GuestAccumulateError::Storage(error));
+        }
+        Err(CausalFrontierError::Missing(cid)) => {
+            return Ok(rejected(AccumulationRejectionV2::MissingCausalDependency(cid)));
+        }
+        Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
+    };
+    let Some(causal_height) = base_frontier.max_head_height.checked_add(1) else {
+        return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
+    };
+    let change = CrdtChangeV2 {
+        id: CrdtChangeV2::derive_upgrade_id(upgrade)
+            .expect("CRDT upgrade base was selected above"),
+        causal_dependencies: heads.clone(),
+        causal_height,
+        operations: Vec::new(),
+        workflow: alloc::vec![WorkflowOperationV2::Upgrade(upgrade.clone())],
+        materializations: Vec::new(),
+    };
+    let cid = change.cid();
+    if let Some(existing) = read(store, &crdt_change_storage_key(change.id))?
+        && existing.as_slice() != cid.0
+    {
+        return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+    }
+
+    let mut combined_heads = header.crdt_heads.clone();
+    combined_heads.push(cid);
+    combined_heads.sort_unstable();
+    combined_heads.dedup();
+    let frontier = match load_causal_frontier(&combined_heads, |candidate| {
+        if candidate == cid {
+            Ok(Some(change.encode()))
+        } else {
+            store.read(&crdt_node_storage_key(candidate))
+        }
+    }) {
+        Ok(frontier) => frontier,
+        Err(CausalFrontierError::Storage(error)) => {
+            return Err(GuestAccumulateError::Storage(error));
+        }
+        Err(CausalFrontierError::Missing(dependency)) => {
+            return Ok(rejected(AccumulationRejectionV2::MissingCausalDependency(
+                dependency,
+            )));
+        }
+        Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
+    };
+    let resulting_heads = frontier.canonical_heads();
+    let mut materialized = match materialize_workflow_crdt(&frontier, &header.service) {
+        Ok(materialized) => materialized,
+        Err(rejection) => return Ok(rejected(rejection)),
+    };
+    {
+        let tree = ServiceStateTreeV2::new(store, header.service_root);
+        if !materialized_actors_exist(&tree, &materialized)? {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+        if let Some(rejection) = validate_crdt_upgrades(
+            tree.store_ref(),
+            &tree,
+            &frontier,
+            &mut materialized,
+            &[],
+            &[],
+        )? {
+            return Ok(rejected(rejection));
+        }
+    }
+
+    let receipt = AccumulationReceiptV2 {
+        service: header.service.clone(),
+        accepted_transition: upgrade_hash,
+        reply_commitment: None,
+        outbox_commitment: None,
+        resulting_state_root: None,
+        resulting_crdt_heads: resulting_heads.clone(),
+        sequence: causal_height,
+        checkpoint: 0,
+        consistency: ConsistencyModeV2::Crdt,
+    };
+    write_crdt_change(store, &change, cid)?;
+    write_crdt_node_receipt(store, cid, &receipt)?;
+    write_crdt_upgrade_records(store, &materialized)?;
+    apply_ingress_materialization(store, &materialized)?;
+    apply_expiration_materialization(store, &header.service, &materialized)?;
+    let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+    apply_workflow_materialization(&mut tree, materialized)?;
+    header.service_root = tree.root();
+    header.crdt_heads = resulting_heads;
+    drop(tree);
+    write(store, header_storage_key(), Some(&header.encode()))?;
+
+    let record_bytes = read(store, &upgrade_key)?.ok_or(GuestAccumulateError::CorruptStore)?;
+    let record = ActorUpgradeRecordV2::decode(&record_bytes)
+        .map_err(|_| GuestAccumulateError::CorruptStore)?;
+    Ok(AccumulationResultV2::ActorUpgraded {
+        actor: upgrade.actor,
+        previous_deployment: upgrade.expected_deployment,
+        previous_program: upgrade.expected_program,
+        deployment: upgrade.replacement_deployment,
+        program: upgrade.replacement_program,
+        receipt: record.receipt,
         duplicate: false,
     })
 }
@@ -1086,6 +1209,12 @@ struct WorkflowMaterializationV2 {
     expirations: BTreeMap<super::CallId, Vec<CausalValueV2<CallTimeoutV2>>>,
     replies: BTreeMap<super::CallId, Vec<CausalValueV2<super::ReplyRecordV2>>>,
     spawns: BTreeMap<ActorId, Vec<CausalValueV2<ActorSpawnV2>>>,
+    /// Full causal history is retained for package registers. Validation of a
+    /// branch must still see an ancestor that a concurrently processed branch
+    /// has superseded in its own frontier.
+    upgrades: BTreeMap<ActorId, Vec<CausalValueV2<ActorUpgradeV2>>>,
+    spawn_install_descriptors: BTreeMap<ActorId, ActorGenesisV2>,
+    visible_upgrade_descriptors: BTreeMap<ActorId, ActorGenesisV2>,
     actor_states: BTreeMap<ActorId, Vec<CausalValueV2<BlobRefV2>>>,
 }
 
@@ -1218,6 +1347,14 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
             changed = true;
         }
     }
+    for program in &envelope.provided_programs {
+        if !store
+            .program_available(program.program)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            changed = true;
+        }
+    }
 
     let mut combined_heads = header.crdt_heads.clone();
     combined_heads.extend(envelope.advertised_heads.iter().copied());
@@ -1245,7 +1382,7 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
     };
     let resulting_heads = frontier.canonical_heads();
     changed |= resulting_heads != header.crdt_heads;
-    let materialized = match materialize_workflow_crdt(&frontier, &header.service) {
+    let mut materialized = match materialize_workflow_crdt(&frontier, &header.service) {
         Ok(materialized) => materialized,
         Err(rejection) => return Ok(rejected(rejection)),
     };
@@ -1253,6 +1390,21 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
         let tree = ServiceStateTreeV2::new(store, header.service_root);
         if !materialized_actors_exist(&tree, &materialized)? {
             return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+        if let Some(rejection) = validate_crdt_upgrades(
+            tree.store_ref(),
+            &tree,
+            &frontier,
+            &mut materialized,
+            &envelope.provided_blobs,
+            &envelope.provided_programs,
+        )? {
+            return Ok(rejected(rejection));
+        }
+        if let Some(rejection) =
+            validate_crdt_upgrade_receipts(tree.store_ref(), &frontier, &materialized, &envelope.nodes)?
+        {
+            return Ok(rejected(rejection));
         }
     }
 
@@ -1284,10 +1436,19 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
             return Err(GuestAccumulateError::CorruptStore);
         }
     }
+    for program in &envelope.provided_programs {
+        let actual = store
+            .provide_program(&program.pvm)
+            .map_err(GuestAccumulateError::Storage)?;
+        if actual != program.program {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+    }
     for node in &envelope.nodes {
         write_crdt_change(store, &node.change, node.change.cid())?;
         write_crdt_node_receipt(store, node.change.cid(), &node.receipt)?;
     }
+    write_crdt_upgrade_records(store, &materialized)?;
 
     apply_ingress_materialization(store, &materialized)?;
     apply_expiration_materialization(store, &header.service, &materialized)?;
@@ -1339,6 +1500,10 @@ fn materialize_workflow_crdt(
                             .is_ok()
                     })
                     && valid_crdt_spawn_materializations(work, change)
+                    && change
+                        .workflow
+                        .iter()
+                        .all(|operation| !matches!(operation, WorkflowOperationV2::Upgrade(_)))
                     && replies.len() <= 1
                     && replies.first().is_none_or(|reply| {
                         reply.producer == work.target
@@ -1408,6 +1573,14 @@ fn materialize_workflow_crdt(
                         timeout,
                         &change.causal_dependencies,
                     )) =>
+                {}
+            [] if change.operations.is_empty()
+                && change.materializations.is_empty()
+                && matches!(change.workflow.as_slice(), [WorkflowOperationV2::Upgrade(upgrade)]
+                    if upgrade.service == *service
+                        && matches!(&upgrade.base, ConsistencyBaseV2::Crdt { heads }
+                            if *heads == change.causal_dependencies)
+                        && Some(change.id) == CrdtChangeV2::derive_upgrade_id(upgrade)) =>
                 {}
             _ => return Err(AccumulationRejectionV2::InvalidWorkflowTransition),
         }
@@ -1522,7 +1695,16 @@ fn materialize_workflow_crdt(
                     cid,
                     spawn.clone(),
                 ),
-                WorkflowOperationV2::Upgrade(_) => {}
+                WorkflowOperationV2::Upgrade(upgrade) => {
+                    result
+                        .upgrades
+                        .entry(upgrade.actor)
+                        .or_default()
+                        .push(CausalValueV2 {
+                            cid,
+                            value: upgrade.clone(),
+                        });
+                }
             }
         }
     }
@@ -1532,6 +1714,9 @@ fn materialize_workflow_crdt(
     validate_strict_frontiers(result.replies.values())?;
     validate_strict_frontiers(result.expirations.values())?;
     validate_strict_frontiers(result.spawns.values())?;
+    for upgrades in result.upgrades.values_mut() {
+        upgrades.sort_by_key(|event| event.cid);
+    }
     for messages in result.inbox.values().chain(result.outbox.values()) {
         let mut visible = messages.iter().filter_map(|event| event.value.as_ref());
         if let Some(first) = visible.next()
@@ -1576,9 +1761,364 @@ fn validate_strict_frontiers<'a, T: PartialEq + 'a>(
     Ok(())
 }
 
+fn same_upgrade_package(left: &ActorUpgradeV2, right: &ActorUpgradeV2) -> bool {
+    left.replacement_deployment == right.replacement_deployment
+        && left.replacement_program == right.replacement_program
+        && left.producer == right.producer
+        && left.methods == right.methods
+}
+
+fn visible_upgrade<'a>(
+    frontier: &super::causal::CausalFrontierV2,
+    events: Option<&'a Vec<CausalValueV2<ActorUpgradeV2>>>,
+    descendant: Option<Hash>,
+) -> Result<Option<&'a CausalValueV2<ActorUpgradeV2>>, AccumulationRejectionV2> {
+    let candidates = events
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            descendant.is_none_or(|cid| {
+                event.cid != cid && frontier.contains_ancestor(cid, event.cid)
+            })
+        })
+        .collect::<Vec<_>>();
+    let maximal = candidates
+        .iter()
+        .copied()
+        .filter(|event| {
+            !candidates.iter().any(|other| {
+                other.cid != event.cid && frontier.contains_ancestor(other.cid, event.cid)
+            })
+        })
+        .collect::<Vec<_>>();
+    for (index, event) in maximal.iter().enumerate() {
+        if maximal.iter().skip(index + 1).any(|other| {
+            event.value.replacement_deployment == other.value.replacement_deployment
+                && !same_upgrade_package(&event.value, &other.value)
+        }) {
+            return Err(AccumulationRejectionV2::DivergentDuplicate);
+        }
+    }
+    Ok(maximal
+        .into_iter()
+        .max_by_key(|event| (event.value.replacement_deployment, event.cid)))
+}
+
+fn spawn_event_at<'a>(
+    frontier: &super::causal::CausalFrontierV2,
+    materialized: &'a WorkflowMaterializationV2,
+    actor: ActorId,
+    descendant: Option<Hash>,
+) -> Option<&'a CausalValueV2<ActorSpawnV2>> {
+    materialized.spawns.get(&actor)?.iter().find(|event| {
+        descendant.is_none_or(|cid| frontier.contains_ancestor(cid, event.cid))
+    })
+}
+
+fn install_descriptor_at(
+    frontier: &super::causal::CausalFrontierV2,
+    materialized: &WorkflowMaterializationV2,
+    baselines: &BTreeMap<ActorId, ActorGenesisV2>,
+    actor: ActorId,
+    descendant: Option<Hash>,
+    visiting: &mut BTreeSet<ActorId>,
+) -> Result<Option<ActorGenesisV2>, AccumulationRejectionV2> {
+    if let Some(descriptor) = baselines.get(&actor) {
+        return Ok(Some(descriptor.clone()));
+    }
+    if !visiting.insert(actor) {
+        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+    }
+    let Some(event) = spawn_event_at(frontier, materialized, actor, descendant) else {
+        visiting.remove(&actor);
+        return Ok(None);
+    };
+    let spawn = &event.value;
+    let Some(mut descriptor) = descriptor_at(
+        frontier,
+        materialized,
+        baselines,
+        spawn.parent,
+        Some(event.cid),
+        visiting,
+    )? else {
+        visiting.remove(&actor);
+        return Ok(None);
+    };
+    descriptor.actor = spawn.actor;
+    descriptor.name = spawn.name.clone();
+    descriptor.parent = Some(spawn.parent);
+    descriptor.initial_state = spawn.initial_state.clone();
+    visiting.remove(&actor);
+    Ok(Some(descriptor))
+}
+
+fn descriptor_at(
+    frontier: &super::causal::CausalFrontierV2,
+    materialized: &WorkflowMaterializationV2,
+    baselines: &BTreeMap<ActorId, ActorGenesisV2>,
+    actor: ActorId,
+    descendant: Option<Hash>,
+    visiting: &mut BTreeSet<ActorId>,
+) -> Result<Option<ActorGenesisV2>, AccumulationRejectionV2> {
+    let Some(mut descriptor) = install_descriptor_at(
+        frontier,
+        materialized,
+        baselines,
+        actor,
+        descendant,
+        visiting,
+    )? else {
+        return Ok(None);
+    };
+    if let Some(event) = visible_upgrade(frontier, materialized.upgrades.get(&actor), descendant)? {
+        descriptor.deployment = event.value.replacement_deployment;
+        descriptor.program = event.value.replacement_program;
+        descriptor.producer = event.value.producer;
+        descriptor.methods = event.value.methods.clone();
+    }
+    Ok(Some(descriptor))
+}
+
+fn candidate_blob<S: GuestAccumulateStoreV2>(
+    store: &S,
+    provided: &[super::ImportedBlobV2],
+    reference: &BlobRefV2,
+) -> GuestResult<Option<Vec<u8>>, S::Error> {
+    if let Ok(index) = provided.binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+        && provided[index].reference == *reference
+    {
+        return Ok(Some(provided[index].bytes.clone()));
+    }
+    store
+        .load_blob(reference)
+        .map_err(GuestAccumulateError::Storage)
+}
+
+fn validate_crdt_upgrades<S: GuestAccumulateStoreV2>(
+    store: &S,
+    tree: &ServiceStateTreeV2<'_, S>,
+    frontier: &super::causal::CausalFrontierV2,
+    materialized: &mut WorkflowMaterializationV2,
+    provided_blobs: &[super::ImportedBlobV2],
+    provided_programs: &[super::ImportedProgramV2],
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    let Some(directory) =
+        tree_get_wire::<_, super::ActorDirectoryV2>(tree, &StateKeyV2::ActorDirectory)?
+    else {
+        return Err(GuestAccumulateError::CorruptStore);
+    };
+    let mut baselines = BTreeMap::new();
+    for actor in directory.actors {
+        let Some(descriptor) = tree_get_wire::<_, ActorGenesisV2>(
+            tree,
+            &StateKeyV2::ActorInstallDescriptor(actor),
+        )? else {
+            return Err(GuestAccumulateError::CorruptStore);
+        };
+        baselines.insert(actor, descriptor);
+    }
+    for actor in materialized.spawns.keys().copied() {
+        let mut ancestry_baselines = baselines.clone();
+        ancestry_baselines.remove(&actor);
+        let descriptor = match install_descriptor_at(
+            frontier,
+            materialized,
+            &ancestry_baselines,
+            actor,
+            None,
+            &mut BTreeSet::new(),
+        ) {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+            Err(rejection) => return Ok(Some(rejection)),
+        };
+        if let Some(existing) = baselines.get(&actor)
+            && existing != &descriptor
+        {
+            return Ok(Some(AccumulationRejectionV2::DivergentDuplicate));
+        }
+        materialized
+            .spawn_install_descriptors
+            .insert(actor, descriptor);
+    }
+
+    for (actor, events) in &materialized.upgrades {
+        for event in events {
+            let upgrade = &event.value;
+            let before = match descriptor_at(
+                frontier,
+                materialized,
+                &baselines,
+                *actor,
+                Some(event.cid),
+                &mut BTreeSet::new(),
+            ) {
+                Ok(Some(descriptor)) => descriptor,
+                Ok(None) => return Ok(Some(AccumulationRejectionV2::WrongProgram)),
+                Err(rejection) => return Ok(Some(rejection)),
+            };
+            if upgrade.actor != *actor
+                || upgrade.expected_deployment != before.deployment
+                || upgrade.expected_program != before.program
+            {
+                return Ok(Some(AccumulationRejectionV2::WrongProgram));
+            }
+            let supplied = provided_programs
+                .binary_search_by_key(&upgrade.replacement_program, |program| program.program)
+                .is_ok();
+            if !supplied
+                && !store
+                    .program_available(upgrade.replacement_program)
+                    .map_err(GuestAccumulateError::Storage)?
+            {
+                return Ok(Some(AccumulationRejectionV2::WrongProgram));
+            }
+
+            let ConsistencyBaseV2::Crdt { heads } = &upgrade.base else {
+                return Ok(Some(AccumulationRejectionV2::InvalidConsistency));
+            };
+            let Some(base_frontier) = frontier.at_heads(heads) else {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            };
+            let base = match materialize_workflow_crdt(&base_frontier, &upgrade.service) {
+                Ok(base) => base,
+                Err(rejection) => return Ok(Some(rejection)),
+            };
+            for values in base.continuations.values() {
+                let Some(reference) = values.first().and_then(|event| event.value.as_ref()) else {
+                    continue;
+                };
+                let Some(bytes) = candidate_blob(store, provided_blobs, reference)? else {
+                    return Ok(Some(AccumulationRejectionV2::MissingBlob(reference.hash)));
+                };
+                if BlobRefV2::of_bytes(&bytes) != *reference {
+                    return Err(GuestAccumulateError::CorruptStore);
+                }
+                let continuation = ContinuationSnapshotV2::decode_metadata(&bytes)
+                    .map_err(|_| GuestAccumulateError::CorruptStore)?;
+                if continuation.programs.iter().any(|binding| {
+                    binding.actor == upgrade.actor
+                        && binding.deployment == upgrade.expected_deployment
+                        && binding.program == upgrade.expected_program
+                }) {
+                    return Ok(Some(AccumulationRejectionV2::ActorBusy(upgrade.actor)));
+                }
+            }
+        }
+        let visible = match descriptor_at(
+            frontier,
+            materialized,
+            &baselines,
+            *actor,
+            None,
+            &mut BTreeSet::new(),
+        ) {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => return Ok(Some(AccumulationRejectionV2::WrongProgram)),
+            Err(rejection) => return Ok(Some(rejection)),
+        };
+        materialized
+            .visible_upgrade_descriptors
+            .insert(*actor, visible);
+    }
+    Ok(None)
+}
+
+fn validate_crdt_upgrade_receipts<S: StateTreeStore>(
+    store: &S,
+    frontier: &super::causal::CausalFrontierV2,
+    materialized: &WorkflowMaterializationV2,
+    supplied: &[super::CrdtSyncNodeV2],
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    for events in materialized.upgrades.values() {
+        for event in events {
+            let supplied_receipt = supplied
+                .iter()
+                .find(|node| node.change.cid() == event.cid)
+                .map(|node| node.receipt.clone());
+            let receipt = if let Some(receipt) = supplied_receipt.as_ref() {
+                receipt.clone()
+            } else {
+                let Some(bytes) = read(store, &crdt_node_receipt_storage_key(event.cid))? else {
+                    return Err(GuestAccumulateError::CorruptStore);
+                };
+                AccumulationReceiptV2::decode(&bytes)
+                    .map_err(|_| GuestAccumulateError::CorruptStore)?
+            };
+            let Some(change) = frontier.node(event.cid) else {
+                return Err(GuestAccumulateError::CorruptStore);
+            };
+            let heads_valid = frontier
+                .at_heads(&receipt.resulting_crdt_heads)
+                .is_some_and(|receipt_frontier| {
+                    receipt_frontier.canonical_heads() == receipt.resulting_crdt_heads
+                        && receipt_frontier.max_head_height == receipt.sequence
+                });
+            if receipt.service != event.value.service
+                || receipt.accepted_transition != event.value.hash()
+                || receipt.reply_commitment.is_some()
+                || receipt.outbox_commitment.is_some()
+                || receipt.resulting_state_root.is_some()
+                || receipt
+                    .resulting_crdt_heads
+                    .binary_search(&event.cid)
+                    .is_err()
+                || receipt.sequence != change.causal_height
+                || receipt.checkpoint != 0
+                || receipt.consistency != ConsistencyModeV2::Crdt
+                || !heads_valid
+            {
+                if supplied_receipt.is_some() {
+                    return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
+                }
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn write_crdt_upgrade_records<S: StateTreeStore>(
+    store: &mut S,
+    materialized: &WorkflowMaterializationV2,
+) -> GuestResult<(), S::Error> {
+    for events in materialized.upgrades.values() {
+        for event in events {
+            let receipt_bytes = read(store, &crdt_node_receipt_storage_key(event.cid))?
+                .ok_or(GuestAccumulateError::CorruptStore)?;
+            let receipt = AccumulationReceiptV2::decode(&receipt_bytes)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?;
+            let upgrade = &event.value;
+            let record = ActorUpgradeRecordV2 {
+                upgrade: upgrade.hash(),
+                actor: upgrade.actor,
+                previous_deployment: upgrade.expected_deployment,
+                previous_program: upgrade.expected_program,
+                deployment: upgrade.replacement_deployment,
+                program: upgrade.replacement_program,
+                receipt,
+            };
+            let key = actor_upgrade_storage_key(record.upgrade);
+            let encoded = record.encode();
+            if let Some(existing) = read(store, &key)? {
+                if existing != encoded {
+                    return Err(GuestAccumulateError::CorruptStore);
+                }
+            } else {
+                write(store, &key, Some(&encoded))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_spawn_materialization<S: StateTreeStore>(
     tree: &mut ServiceStateTreeV2<'_, S>,
     spawns: &BTreeMap<ActorId, Vec<CausalValueV2<ActorSpawnV2>>>,
+    install_descriptors: &BTreeMap<ActorId, ActorGenesisV2>,
 ) -> GuestResult<(), S::Error> {
     let Some(mut directory) =
         tree_get_wire::<_, super::ActorDirectoryV2>(tree, &StateKeyV2::ActorDirectory)?
@@ -1608,25 +2148,40 @@ fn apply_spawn_materialization<S: StateTreeStore>(
         let mut index = 0;
         while index < pending.len() {
             let spawn = &pending[index];
-            let Some(parent) = tree_get_wire::<_, ActorGenesisV2>(
+            if tree_get_wire::<_, ActorGenesisV2>(
                 tree,
                 &StateKeyV2::ActorDescriptor(spawn.parent),
-            )? else {
+            )?
+            .is_none()
+            {
                 index += 1;
                 continue;
+            }
+            let Some(descriptor) = install_descriptors.get(&spawn.actor) else {
+                return Err(GuestAccumulateError::CorruptStore);
             };
-            let mut descriptor = parent;
-            descriptor.actor = spawn.actor;
-            descriptor.name = spawn.name.clone();
-            descriptor.parent = Some(spawn.parent);
-            descriptor.initial_state = spawn.initial_state.clone();
 
             if let Some(existing) = tree_get_wire::<_, ActorGenesisV2>(
                 tree,
-                &StateKeyV2::ActorDescriptor(spawn.actor),
-            )? && existing != descriptor
+                &StateKeyV2::ActorInstallDescriptor(spawn.actor),
+            )? && &existing != descriptor
             {
                 return Err(GuestAccumulateError::CorruptStore);
+            }
+            if let Some(current) = tree_get_wire::<_, ActorGenesisV2>(
+                tree,
+                &StateKeyV2::ActorDescriptor(spawn.actor),
+            )? {
+                for policy in current.methods {
+                    tree_apply(
+                        tree,
+                        &StateKeyV2::MethodPolicy {
+                            actor: spawn.actor,
+                            method: policy.method,
+                        },
+                        None,
+                    )?;
+                }
             }
             let name_key = StateKeyV2::ActorName {
                 parent: Some(spawn.parent),
@@ -1677,11 +2232,55 @@ fn apply_spawn_materialization<S: StateTreeStore>(
     )
 }
 
+fn apply_upgrade_materialization<S: StateTreeStore>(
+    tree: &mut ServiceStateTreeV2<'_, S>,
+    descriptors: &BTreeMap<ActorId, ActorGenesisV2>,
+) -> GuestResult<(), S::Error> {
+    for (actor, replacement) in descriptors {
+        let Some(current) =
+            tree_get_wire::<_, ActorGenesisV2>(tree, &StateKeyV2::ActorDescriptor(*actor))?
+        else {
+            return Err(GuestAccumulateError::CorruptStore);
+        };
+        for policy in &current.methods {
+            tree_apply(
+                tree,
+                &StateKeyV2::MethodPolicy {
+                    actor: *actor,
+                    method: policy.method.clone(),
+                },
+                None,
+            )?;
+        }
+        for policy in &replacement.methods {
+            tree_apply(
+                tree,
+                &StateKeyV2::MethodPolicy {
+                    actor: *actor,
+                    method: policy.method.clone(),
+                },
+                Some(&policy.encode()),
+            )?;
+        }
+        tree_apply(
+            tree,
+            &StateKeyV2::ActorDescriptor(*actor),
+            Some(&replacement.encode()),
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_workflow_materialization<S: StateTreeStore>(
     tree: &mut ServiceStateTreeV2<'_, S>,
     materialized: WorkflowMaterializationV2,
 ) -> GuestResult<(), S::Error> {
-    apply_spawn_materialization(tree, &materialized.spawns)?;
+    apply_spawn_materialization(
+        tree,
+        &materialized.spawns,
+        &materialized.spawn_install_descriptors,
+    )?;
+    apply_upgrade_materialization(tree, &materialized.visible_upgrade_descriptors)?;
     for (invocation, values) in materialized.workflows {
         let value = values
             .first()
@@ -1869,6 +2468,7 @@ fn materialized_actors_exist<S: StateTreeStore>(
                 .map(|event| event.value.producer),
         )
         .chain(materialized.spawns.values().flatten().map(|event| event.value.parent))
+        .chain(materialized.upgrades.keys().copied())
         .collect::<Vec<_>>();
     actors.sort();
     actors.dedup();
@@ -2781,12 +3381,24 @@ fn rematerialize_crdt_service<S: GuestAccumulateStoreV2>(
             return Err(GuestAccumulateError::CorruptStore);
         }
     };
-    let materialized = materialize_workflow_crdt(&frontier, &header.service)
+    let mut materialized = materialize_workflow_crdt(&frontier, &header.service)
         .map_err(|_| GuestAccumulateError::CorruptStore)?;
     apply_ingress_materialization(store, &materialized)?;
     apply_expiration_materialization(store, &header.service, &materialized)?;
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
     if !materialized_actors_exist(&tree, &materialized)? {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    if validate_crdt_upgrades(
+        tree.store_ref(),
+        &tree,
+        &frontier,
+        &mut materialized,
+        &[],
+        &[],
+    )?
+    .is_some()
+    {
         return Err(GuestAccumulateError::CorruptStore);
     }
     apply_workflow_materialization(&mut tree, materialized)?;
@@ -4155,16 +4767,373 @@ mod tests {
     }
 
     #[test]
-    fn crdt_actor_upgrade_fails_closed_until_metadata_operations_exist() {
+    fn crdt_actor_upgrade_commits_causal_metadata_exactly_once() {
         let mut store = MemStore::default();
         install_fixture(&mut store, ConsistencyModeV2::Crdt, b"state");
         let mut upgrade = upgrade_fixture(Hash::ZERO);
         upgrade.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+        let pvm = b"crdt-upgrade-pvm".to_vec();
+        upgrade.replacement_program = store.provide_program(&pvm).unwrap();
+        store.upgrade_allowlist.insert(upgrade.hash());
+
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+        )
+        .unwrap();
+        let AccumulationResultV2::ActorUpgraded {
+            receipt,
+            duplicate,
+            ..
+        } = result
+        else {
+            panic!("causal upgrade was rejected")
+        };
+        assert!(!duplicate);
+        assert_eq!(receipt.accepted_transition, upgrade.hash());
+        assert_eq!(receipt.sequence, 1);
+        assert_eq!(receipt.resulting_crdt_heads.len(), 1);
+        let cid = receipt.resulting_crdt_heads[0];
+        let change = CrdtChangeV2::decode(
+            store.rows.get(&crdt_node_storage_key(cid)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            change.workflow,
+            [WorkflowOperationV2::Upgrade(upgrade.clone())]
+        );
+        assert_eq!(change.id, CrdtChangeV2::derive_upgrade_id(&upgrade).unwrap());
+        let header = store_header(&store);
+        assert_eq!(header.crdt_heads, vec![cid]);
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        let descriptor = tree_get_wire::<_, ActorGenesisV2>(
+            &tree,
+            &StateKeyV2::ActorDescriptor(actor()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(descriptor.deployment, upgrade.replacement_deployment);
+        assert_eq!(descriptor.program, upgrade.replacement_program);
+        let baseline = tree_get_wire::<_, ActorGenesisV2>(
+            &tree,
+            &StateKeyV2::ActorInstallDescriptor(actor()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(baseline.deployment, upgrade.expected_deployment);
+        assert_eq!(baseline.program, upgrade.expected_program);
+        drop(tree);
+
+        let before_retry = store.clone();
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::UpgradeActor(upgrade),
+            )
+            .unwrap(),
+            AccumulationResultV2::ActorUpgraded {
+                duplicate: true,
+                ..
+            }
+        ));
+        assert_eq!(store, before_retry);
+    }
+
+    #[test]
+    fn concurrent_crdt_actor_upgrades_converge_and_retain_both_branches() {
+        fn branch(
+            deployment: u8,
+            pvm: &'static [u8],
+        ) -> (MemStore, CrdtSyncEnvelopeV2, ActorUpgradeV2) {
+            let mut store = MemStore::default();
+            install_fixture(&mut store, ConsistencyModeV2::Crdt, b"state");
+            let mut upgrade = upgrade_fixture(Hash::ZERO);
+            upgrade.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+            upgrade.replacement_deployment = DeploymentId([deployment; 32]);
+            upgrade.replacement_program = store.provide_program(pvm).unwrap();
+            upgrade.producer = super::super::ProducerId([deployment.wrapping_add(1); 32]);
+            upgrade.methods[0].schema = Hash([deployment.wrapping_add(2); 32]);
+            store.upgrade_allowlist.insert(upgrade.hash());
+            let result = execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+            )
+            .unwrap();
+            let AccumulationResultV2::ActorUpgraded { receipt, .. } = result else {
+                panic!("branch upgrade was rejected")
+            };
+            let cid = receipt.resulting_crdt_heads[0];
+            let change = CrdtChangeV2::decode(
+                store.rows.get(&crdt_node_storage_key(cid)).unwrap(),
+            )
+            .unwrap();
+            let envelope = CrdtSyncEnvelopeV2 {
+                service: identity(),
+                advertised_heads: vec![cid],
+                nodes: vec![super::super::CrdtSyncNodeV2 { change, receipt }],
+                provided_blobs: vec![],
+                provided_programs: vec![super::super::ImportedProgramV2 {
+                    program: upgrade.replacement_program,
+                    pvm: pvm.to_vec(),
+                }],
+            };
+            (store, envelope, upgrade)
+        }
+
+        let (mut left, left_envelope, left_upgrade) = branch(30, b"left-upgrade-pvm");
+        let (mut right, right_envelope, right_upgrade) = branch(40, b"right-upgrade-pvm");
+
+        let mut tampered = right_envelope.clone();
+        tampered.nodes[0].receipt.accepted_transition = Hash([99; 32]);
+        left.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: tampered.nodes[0].receipt.clone(),
+            }
+            .hash(),
+        );
+        let before = left.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut left, &AccumulateRequestV2::SyncCrdt(tampered))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidReceipt)
+        );
+        assert_eq!(left, before, "a receipt must bind the exact upgrade hash");
+
+        let mut missing_program = right_envelope.clone();
+        missing_program.provided_programs.clear();
+        left.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: missing_program.nodes[0].receipt.clone(),
+            }
+            .hash(),
+        );
+        let before = left.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut left,
+                &AccumulateRequestV2::SyncCrdt(missing_program),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(left, before, "a missing package must stage no DAG state");
+
+        left.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: right_envelope.nodes[0].receipt.clone(),
+            }
+            .hash(),
+        );
+        right.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: left_envelope.nodes[0].receipt.clone(),
+            }
+            .hash(),
+        );
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut left,
+                &AccumulateRequestV2::SyncCrdt(right_envelope.clone()),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut right,
+                &AccumulateRequestV2::SyncCrdt(left_envelope.clone()),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+
+        let left_header = store_header(&left);
+        let right_header = store_header(&right);
+        assert_eq!(left_header.crdt_heads, right_header.crdt_heads);
+        assert_eq!(left_header.crdt_heads.len(), 2);
+        let left_tree = ServiceStateTreeV2::new(&mut left, left_header.service_root);
+        let left_descriptor = tree_get_wire::<_, ActorGenesisV2>(
+            &left_tree,
+            &StateKeyV2::ActorDescriptor(actor()),
+        )
+        .unwrap()
+        .unwrap();
+        drop(left_tree);
+        let right_tree = ServiceStateTreeV2::new(&mut right, right_header.service_root);
+        let right_descriptor = tree_get_wire::<_, ActorGenesisV2>(
+            &right_tree,
+            &StateKeyV2::ActorDescriptor(actor()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(left_descriptor, right_descriptor);
+        assert_eq!(
+            left_descriptor.deployment,
+            right_upgrade.replacement_deployment
+        );
+        assert_eq!(left_descriptor.program, right_upgrade.replacement_program);
+        assert!(
+            left.rows
+                .contains_key(&actor_upgrade_storage_key(left_upgrade.hash()))
+        );
+        assert!(
+            left.rows
+                .contains_key(&actor_upgrade_storage_key(right_upgrade.hash()))
+        );
+        assert!(
+            right
+                .rows
+                .contains_key(&actor_upgrade_storage_key(left_upgrade.hash()))
+        );
+        assert!(
+            right
+                .rows
+                .contains_key(&actor_upgrade_storage_key(right_upgrade.hash()))
+        );
+
+        let mut resolution = upgrade_fixture(Hash::ZERO);
+        resolution.expected_deployment = right_upgrade.replacement_deployment;
+        resolution.expected_program = right_upgrade.replacement_program;
+        resolution.replacement_deployment = DeploymentId([50; 32]);
+        resolution.replacement_program = left.provide_program(b"resolved-upgrade-pvm").unwrap();
+        resolution.base = ConsistencyBaseV2::Crdt {
+            heads: left_header.crdt_heads,
+        };
+        left.upgrade_allowlist.insert(resolution.hash());
+        let resolved = execute_guest_accumulate(
+            &mut left,
+            &AccumulateRequestV2::UpgradeActor(resolution.clone()),
+        )
+        .unwrap();
+        let AccumulationResultV2::ActorUpgraded {
+            receipt: resolved_receipt,
+            ..
+        } = resolved
+        else {
+            panic!("causal conflict resolution was rejected")
+        };
+        assert_eq!(resolved_receipt.sequence, 2);
+        assert_eq!(resolved_receipt.resulting_crdt_heads.len(), 1);
+        let resolved_cid = resolved_receipt.resulting_crdt_heads[0];
+        let resolved_change = CrdtChangeV2::decode(
+            left.rows.get(&crdt_node_storage_key(resolved_cid)).unwrap(),
+        )
+        .unwrap();
+        let resolved_envelope = CrdtSyncEnvelopeV2 {
+            service: identity(),
+            advertised_heads: vec![resolved_cid],
+            nodes: vec![super::super::CrdtSyncNodeV2 {
+                change: resolved_change,
+                receipt: resolved_receipt.clone(),
+            }],
+            provided_blobs: vec![],
+            provided_programs: vec![super::super::ImportedProgramV2 {
+                program: resolution.replacement_program,
+                pvm: b"resolved-upgrade-pvm".to_vec(),
+            }],
+        };
+        right.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: resolved_receipt,
+            }
+            .hash(),
+        );
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut right,
+                &AccumulateRequestV2::SyncCrdt(resolved_envelope),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted { .. }
+        ));
+        let right_header = store_header(&right);
+        assert_eq!(right_header.crdt_heads, vec![resolved_cid]);
+        let right_tree = ServiceStateTreeV2::new(&mut right, right_header.service_root);
+        let right_descriptor = tree_get_wire::<_, ActorGenesisV2>(
+            &right_tree,
+            &StateKeyV2::ActorDescriptor(actor()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(right_descriptor.deployment, resolution.replacement_deployment);
+        assert_eq!(right_descriptor.program, resolution.replacement_program);
+    }
+
+    #[test]
+    fn crdt_actor_upgrade_waits_for_continuations_visible_at_its_causal_base() {
+        let mut store = MemStore::default();
+        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"before");
+        let work = crdt_work(initial, 29, vec![]);
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: work.service.clone(),
+            invocation: work.invocation,
+            checkpoint_step: work.workflow_step,
+            actor: work.target,
+            actor_deployment: work.target_deployment,
+            actor_program: work.target_program,
+            programs: continuation_programs(&work),
+            await_ordinal: 0,
+            pending_call: None,
+            suspended_actors: vec![work.target],
+            kernel_snapshot: vec![1],
+        }
+        .encode();
+        let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+        let state_bytes = b"checkpoint".to_vec();
+        let state = BlobRefV2::of_bytes(&state_bytes);
+        let mut transition = crdt_transition(&work, state.clone(), 1);
+        transition.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: None,
+            replacement: Some(continuation.clone()),
+        });
+        transition.exported_blobs.push(continuation.clone());
+        let workflow = transition.workflow_operations(&work);
+        transition.crdt_change.as_mut().unwrap().workflow = workflow;
+        let mut provided_blobs = vec![
+            ImportedBlobV2 {
+                reference: state,
+                bytes: state_bytes,
+            },
+            ImportedBlobV2 {
+                reference: continuation,
+                bytes: continuation_bytes,
+            },
+        ];
+        provided_blobs.sort_by_key(|blob| blob.reference.hash);
+        let checkpoint = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work,
+                transition,
+                provided_blobs,
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted { receipt, .. } = checkpoint else {
+            panic!("causal checkpoint was rejected")
+        };
+
+        let mut upgrade = upgrade_fixture(Hash::ZERO);
+        upgrade.base = ConsistencyBaseV2::Crdt {
+            heads: receipt.resulting_crdt_heads,
+        };
+        upgrade.replacement_program = store.provide_program(b"busy-upgrade-pvm").unwrap();
+        store.upgrade_allowlist.insert(upgrade.hash());
         let before = store.clone();
         assert_eq!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
                 .unwrap(),
-            rejected(AccumulationRejectionV2::InvalidConsistency)
+            rejected(AccumulationRejectionV2::ActorBusy(actor()))
         );
         assert_eq!(store, before);
     }
