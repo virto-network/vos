@@ -796,6 +796,13 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.root_actor
     }
 
+    /// Canonical identities of every actor owned by this physical service
+    /// route. Transport authentication binds the complete tree, since an
+    /// inline child may be the producer of a durable cross-root message.
+    pub fn actor_ids(&self) -> impl Iterator<Item = ActorId> + '_ {
+        self.expected_actors.iter().map(|actor| actor.actor)
+    }
+
     pub const fn consistency(&self) -> ConsistencyModeV2 {
         self.consistency
     }

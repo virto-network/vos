@@ -3066,12 +3066,17 @@ impl VosNode {
         {
             return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
         }
-        let root_actor = service.root_actor();
+        let actor_ids = service.actor_ids().collect::<Vec<_>>();
         {
-            let routes = self.v2_actor_routes.read().unwrap();
-            if routes.contains_key(&root_actor) {
-                return Err(V2NodeRegistrationError::ActorRouteOccupied(root_actor));
+            let mut routes = self.v2_actor_routes.write().unwrap();
+            if let Some(actor) = actor_ids
+                .iter()
+                .find(|actor| routes.contains_key(actor))
+                .copied()
+            {
+                return Err(V2NodeRegistrationError::ActorRouteOccupied(actor));
             }
+            routes.extend(actor_ids.into_iter().map(|actor| (actor, id.0)));
         }
         let consistency = match service.consistency() {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
@@ -3083,10 +3088,6 @@ impl VosNode {
         let (invoke_tx, invoke_rx) = mpsc::channel();
         self.routes.insert(id.0, inbox_tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
-        self.v2_actor_routes
-            .write()
-            .unwrap()
-            .insert(root_actor, id.0);
         self.record_agent_name(id, Some(name.clone()));
         self.agent_info.write().unwrap().insert(
             id.0,

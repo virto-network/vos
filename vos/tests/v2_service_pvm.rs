@@ -374,7 +374,7 @@ fn workflow_root_configs() -> Option<(
             accumulate_gas: 5_000_000_000,
         }
     };
-    let source = config(
+    let mut source = config(
         source_identity,
         source_actor,
         vec![vos::v2::ExternalActorBindingV2 {
@@ -385,6 +385,12 @@ fn workflow_root_configs() -> Option<(
             program: actor_program,
         }],
     );
+    source.owned_actors.push(OwnedActorInstallV2 {
+        actor: ActorId([42; 32]),
+        name: "child".into(),
+        parent: source_actor,
+        initial_state: vec![],
+    });
     let peer = config(peer_identity, peer_actor, vec![]);
     Some((source, peer, source_actor, peer_actor))
 }
@@ -1174,12 +1180,12 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
     });
 
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
-    arguments.extend_from_slice(&Msg::new("child_await_peer").encode());
+    arguments.extend_from_slice(&Msg::new("root_child_await").encode());
     let ingress = vos::v2::RootTreeInvocationV2 {
         invocation: InvocationId([106; 32]),
         logical_timeslot: 1,
         target: source_actor,
-        method: "child_await_peer".into(),
+        method: "root_child_await".into(),
         arguments,
         proof_requested: false,
     };
@@ -1190,7 +1196,7 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
             std::time::Duration::from_secs(120),
         )
         .expect("cross-root continuation resolves only after both guest commits");
-    assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(18)));
 
     let mut retry = ingress;
     retry.logical_timeslot = 99;
@@ -1277,6 +1283,9 @@ fn two_nodes_route_cross_root_await_by_canonical_actor_identity() {
     node_b
         .bind_v2_actor_route(source_actor, source_route)
         .expect("peer host binds the authenticated source actor route");
+    node_b
+        .bind_v2_actor_route(ActorId([42; 32]), source_route)
+        .expect("peer host binds the authenticated source child to its owning route");
     node_a.attach_network(network_a);
     node_b.attach_network(network_b);
     let network_a = node_a.network().expect("source network remains attached");
@@ -1304,12 +1313,12 @@ fn two_nodes_route_cross_root_await_by_canonical_actor_identity() {
     });
 
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
-    arguments.extend_from_slice(&Msg::new("child_await_peer").encode());
+    arguments.extend_from_slice(&Msg::new("root_child_await").encode());
     let ingress = vos::v2::RootTreeInvocationV2 {
         invocation: InvocationId([0xD1; 32]),
         logical_timeslot: 1,
         target: source_actor,
-        method: "child_await_peer".into(),
+        method: "root_child_await".into(),
         arguments,
         proof_requested: false,
     };
@@ -1320,7 +1329,7 @@ fn two_nodes_route_cross_root_await_by_canonical_actor_identity() {
             std::time::Duration::from_secs(120),
         )
         .expect("the remote peer reply resumes the exact source continuation");
-    assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(18)));
 
     let mut retry = ingress;
     retry.logical_timeslot = 99;
@@ -1370,13 +1379,13 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
             .expect("peer root installs");
 
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
-    arguments.extend_from_slice(&Msg::new("child_await_peer").encode());
+    arguments.extend_from_slice(&Msg::new("root_child_await").encode());
     let request = LocalWorkRequestV2 {
         invocation: InvocationId([107; 32]),
         workflow_step: 0,
         logical_timeslot: 1,
         target: source_actor,
-        method: "child_await_peer".into(),
+        method: "root_child_await".into(),
         arguments: arguments.clone(),
         origin: Origin::System,
         authorization: AuthorizationEvidenceV2::Public,
@@ -1487,7 +1496,7 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
             std::time::Duration::from_secs(120),
         )
         .expect("retried ingress resolves from the exact restarted continuation");
-    assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(18)));
 
     let queued_ingress = vos::v2::RootTreeInvocationV2 {
         invocation: queued_retry.invocation,
