@@ -4806,6 +4806,7 @@ fn handle_v2_transport<B>(
             logical_timeslot,
             caller_invocation,
             publication,
+            attestation,
         } => {
             let Some(reply) = publication.published.reply.clone() else {
                 return;
@@ -4815,10 +4816,18 @@ fn handle_v2_transport<B>(
                 warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted v2 reply");
                 return;
             }
-            let accumulated = crate::v2::AccumulatedReplyV2 {
-                reply: reply.clone(),
-                receipt: publication.receipt.clone(),
-                attestation: None,
+            let accumulated = if let Some(package) = attestation {
+                if let Err(error) = service.stage_finalized_attestation(&package) {
+                    warn!(%id, call = ?reply.call_id, ?error, "rejected v2 attestation package");
+                    return;
+                }
+                package.reply
+            } else {
+                crate::v2::AccumulatedReplyV2 {
+                    reply: reply.clone(),
+                    receipt: publication.receipt.clone(),
+                    attestation: None,
+                }
             };
             match service.reply_already_accumulated(caller_invocation, &accumulated) {
                 Ok(true) => {
@@ -4949,6 +4958,7 @@ fn publish_v2_slice<B>(
         } else if let Some(return_call) = state.return_calls.get(&invocation).copied() {
             delivered = queue_v2_reply(
                 id,
+                service,
                 return_call,
                 &publication,
                 logical_timeslot,
@@ -5000,6 +5010,7 @@ fn queue_v2_outbox(
 
 fn queue_v2_reply(
     id: ServiceId,
+    service: &crate::v2::LocalRootTreeServiceV2<impl crate::v2::CommittedImageStoreV2>,
     return_call: V2ReturnCall,
     publication: &crate::v2::PublicationRecordV2,
     logical_timeslot: u64,
@@ -5010,10 +5021,20 @@ fn queue_v2_reply(
     if publication.published.reply.is_none()
         || !publication.published.outbox.is_empty()
         || !publication.published.exported_blobs.is_empty()
-        || publication.published.proof.is_some()
     {
         return false;
     }
+    let attestation = if publication.published.proof.is_some() {
+        match service.committed_attestation_package(publication) {
+            Ok(package) => Some(package),
+            Err(error) => {
+                warn!(%id, ?error, "committed v2 reply attestation is unavailable");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
     outbox
         .send(Envelope {
             from: id,
@@ -5022,6 +5043,7 @@ fn queue_v2_reply(
                 logical_timeslot,
                 caller_invocation: return_call.caller_invocation,
                 publication: publication.clone(),
+                attestation,
             }
             .encode(),
         })
@@ -5191,6 +5213,7 @@ fn retry_v2_work<B>(
             {
                 let _ = queue_v2_reply(
                     id,
+                    service,
                     return_call,
                     &publication,
                     logical_timeslot,
@@ -5209,6 +5232,7 @@ fn retry_v2_work<B>(
                                 .insert(publication.input.invocation, return_call);
                             let _ = queue_v2_reply(
                                 id,
+                                service,
                                 return_call,
                                 &publication,
                                 logical_timeslot,

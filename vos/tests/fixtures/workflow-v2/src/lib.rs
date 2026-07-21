@@ -24,6 +24,11 @@ impl WorkflowV2 {
     }
 
     #[msg(attested)]
+    fn attested_peer_value(&self) -> u32 {
+        7
+    }
+
+    #[msg(attested)]
     fn attested_value(&self) -> u32 {
         self.value
     }
@@ -120,7 +125,7 @@ impl WorkflowV2 {
             .ask_actor_attested_raw(
                 ActorId([44; 32]),
                 &{
-                    let encoded = Msg::new("peer_value").encode();
+                    let encoded = Msg::new("attested_peer_value").encode();
                     let mut payload = alloc::vec::Vec::with_capacity(1 + encoded.len());
                     payload.push(vos::value::TAG_DYNAMIC);
                     payload.extend_from_slice(&encoded);
@@ -133,7 +138,7 @@ impl WorkflowV2 {
             Ok(package) => {
                 package.value == Value::U32(7)
                     && package.producer_name == "private-age"
-                    && package.statement.method == "peer_value"
+                    && package.statement.method == "attested_peer_value"
                     && package.proof == b"peer-proof"
             }
             Err(_) => false,

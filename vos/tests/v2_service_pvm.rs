@@ -1471,9 +1471,11 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
         .with_env_filter("vos=debug")
         .with_test_writer()
         .try_init();
-    let Some((source_config, peer_config, source_actor, _)) = workflow_root_configs() else {
+    let Some((mut source_config, mut peer_config, source_actor, _)) = workflow_root_configs() else {
         return;
     };
+    source_config.external_actors[0].name = "private-age".into();
+    peer_config.actor_name = "private-age".into();
     let source = LocalRootTreeServiceV2::open(source_config, FailableCommittedImages::default())
         .expect("source root installs");
     let peer = LocalRootTreeServiceV2::open(peer_config, FailableCommittedImages::default())
@@ -1483,8 +1485,18 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
     let source_route = ServiceId(201);
     node.register_v2_root_at_id("source".into(), source, source_route, true)
         .unwrap();
-    node.register_v2_root_at_id("peer".into(), peer, ServiceId(202), true)
-        .unwrap();
+    node.register_v2_root_at_id_with_producer(
+        "peer".into(),
+        peer,
+        ServiceId(202),
+        true,
+        CanonicalTestProofProducer {
+            trace: Hash([107; 32]),
+            proof: b"peer-proof".to_vec(),
+            calls: 0,
+        },
+    )
+    .unwrap();
     let handle = node.invoke_handle();
     let shutdown = node.shutdown_handle();
     let router = std::thread::spawn(move || {
@@ -1510,6 +1522,25 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
         )
         .expect("cross-root continuation resolves only after both guest commits");
     assert_eq!(Value::try_decode(&reply), Some(Value::U32(18)));
+
+    let mut attested_arguments = vec![vos::value::TAG_DYNAMIC];
+    attested_arguments.extend_from_slice(&Msg::new("root_await_attested_peer").encode());
+    let attested_reply = handle
+        .invoke_with_timeout(
+            source_route,
+            vos::v2::RootTreeInvocationV2 {
+                invocation: InvocationId([108; 32]),
+                logical_timeslot: 3,
+                target: source_actor,
+                method: "root_await_attested_peer".into(),
+                arguments: attested_arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .expect("the committed cross-root proof package resumes the source continuation");
+    assert_eq!(Value::try_decode(&attested_reply), Some(Value::Bool(true)));
 
     let mut retry = ingress;
     retry.logical_timeslot = 99;
@@ -2617,7 +2648,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
         actor: attested_reply.producer,
         deployment: producer_receipt.service.deployment,
         actor_program: ProgramId([92; 32]),
-        method: "peer_value".into(),
+        method: "attested_peer_value".into(),
         schema: Hash([93; 32]),
         invocation: InvocationId::for_call(attested_call),
         before: vos::StateCommitmentV3::Linear(Hash([94; 32])),

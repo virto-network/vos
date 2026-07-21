@@ -97,6 +97,7 @@ pub enum RootTreeTransportV2 {
         logical_timeslot: u64,
         caller_invocation: super::InvocationId,
         publication: PublicationRecordV2,
+        attestation: Option<CommittedAttestationPackageV2>,
     },
     PublicationAccepted {
         input: WorkInputIdV2,
@@ -125,11 +126,15 @@ impl V2Wire for RootTreeTransportV2 {
                 logical_timeslot,
                 caller_invocation,
                 publication,
+                attestation,
             } => {
                 encoder.u8(1);
                 encoder.u64(*logical_timeslot);
                 encoder.fixed(&caller_invocation.0);
                 encoder.bytes(&publication.encode());
+                encoder.option(attestation, |encoder, package| {
+                    encoder.bytes(&package.encode());
+                });
             }
             Self::PublicationAccepted {
                 input,
@@ -156,6 +161,9 @@ impl V2Wire for RootTreeTransportV2 {
                 logical_timeslot: decoder.u64()?,
                 caller_invocation: super::InvocationId(decoder.fixed()?),
                 publication: PublicationRecordV2::decode(&decoder.bytes()?)?,
+                attestation: decoder.option(|decoder| {
+                    CommittedAttestationPackageV2::decode(&decoder.bytes()?)
+                })?,
             },
             2 => Self::PublicationAccepted {
                 input: WorkInputIdV2 {
@@ -193,13 +201,34 @@ impl RootTreeTransportV2 {
             Self::Reply {
                 caller_invocation,
                 publication,
+                attestation,
                 ..
             } => {
                 *caller_invocation != super::InvocationId::ZERO
-                    && publication.published.reply.is_some()
                     && publication.published.outbox.is_empty()
                     && publication.published.exported_blobs.is_empty()
-                    && publication.published.proof.is_none()
+                    && match (
+                        publication.published.reply.as_ref(),
+                        publication.published.statement.as_ref(),
+                        publication.published.proof.as_ref(),
+                        attestation.as_ref(),
+                    ) {
+                        (Some(_), None, None, None) => true,
+                        (Some(reply), Some(statement), Some(proof), Some(package)) => {
+                            package.validate().is_ok()
+                                && package.reply.reply == *reply
+                                && package.reply.receipt == publication.receipt
+                                && package
+                                    .reply
+                                    .attestation
+                                    .as_ref()
+                                    .is_some_and(|delivery| {
+                                        delivery.statement == *statement
+                                            && delivery.proof == *proof
+                                    })
+                        }
+                        _ => false,
+                    }
             }
             Self::PublicationAccepted {
                 input,
@@ -1464,6 +1493,60 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .allow_receipt(&ReceiptVerificationRequestV2 {
                 receipt: receipt.clone(),
             });
+    }
+
+    /// Stage proof bytes received from another root in the content-addressed
+    /// blob cache used to construct Refine imports. This is only an early
+    /// transport filter: resumed guest Accumulate rechecks the exact package,
+    /// receipt, pending call, and installed external-actor binding before any
+    /// workflow state can commit.
+    pub(crate) fn stage_finalized_attestation(
+        &mut self,
+        package: &CommittedAttestationPackageV2,
+    ) -> Result<(), LocalRootTreeInvokeErrorV2> {
+        package
+            .validate()
+            .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        let delivery = package
+            .reply
+            .attestation
+            .as_ref()
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
+        let binding = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::ExternalActorDirectory)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ExternalActorDirectoryV2::decode(&bytes).ok())
+            .and_then(|directory| {
+                directory
+                    .actors
+                    .into_iter()
+                    .find(|binding| binding.actor == package.reply.reply.producer)
+            })
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        if binding.name != delivery.producer_name
+            || binding.service != package.reply.receipt.service
+            || binding.actor != delivery.statement.actor
+            || binding.producer != delivery.producer
+            || binding.program != delivery.statement.actor_program
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication);
+        }
+        let imported = self
+            .service
+            .accumulate_host_mut()
+            .import_blob(package.proof_blob.bytes.clone());
+        if imported != package.proof_blob.reference {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication);
+        }
+        Ok(())
     }
 
     /// Export the complete authenticated causal DAG from committed guest
