@@ -1129,6 +1129,7 @@ impl<A: Actor> Context<A> {
             .find(|actor| actor.parent.is_none() && actor.name == source_name);
         if let Some(actor) = local {
             if requirement.statement.actor != actor.actor
+                || requirement.statement.deployment != actor.deployment
                 || requirement.statement.actor_program != actor.program
             {
                 return Err(crate::AttestationError::WrongProducer);
@@ -1141,6 +1142,7 @@ impl<A: Actor> Context<A> {
                 .map(|index| &self.external_actors[index])
                 .ok_or(crate::AttestationError::WrongProducer)?;
             if requirement.statement.actor != binding.actor
+                || requirement.statement.deployment != binding.actor_deployment
                 || requirement.statement.actor_program != binding.program
                 || requirement.producer != binding.producer
                 || requirement.statement.accumulation_receipt.service != binding.service
@@ -2143,6 +2145,7 @@ mod tests {
             actor,
             name: name.into(),
             parent,
+            deployment: crate::v2::DeploymentId([8; 32]),
             program,
             state: alloc::vec![],
             causal_states: alloc::vec![],
@@ -2190,6 +2193,7 @@ mod tests {
             actor: root,
             name: "root".into(),
             parent: None,
+            deployment: crate::v2::DeploymentId([8; 32]),
             program: crate::v2::ProgramId([9; 32]),
             state: alloc::vec![],
             causal_states: alloc::vec![],
@@ -2226,6 +2230,7 @@ mod tests {
             },
             actor,
             producer: crate::v2::ProducerId([6; 32]),
+            actor_deployment: crate::v2::DeploymentId([8; 32]),
             program: crate::v2::ProgramId([7; 32]),
         }];
 
@@ -2249,6 +2254,7 @@ mod tests {
             },
             actor: crate::v2::ActorId([41; 32]),
             producer: crate::v2::ProducerId([6; 32]),
+            actor_deployment: crate::v2::DeploymentId([8; 32]),
             program: crate::v2::ProgramId([7; 32]),
         };
         ctx.external_actors = alloc::vec![binding.clone()];
@@ -2258,7 +2264,7 @@ mod tests {
                 statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
                 space: binding.service.space,
                 actor: binding.actor,
-                deployment: binding.service.deployment,
+                deployment: binding.actor_deployment,
                 actor_program: binding.program,
                 method: "is_adult".into(),
                 schema: crate::v2::Hash([9; 32]),

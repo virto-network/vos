@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use super::contracts::{ServiceIdentityV2, WorkEnvelopeV2};
-use super::identity::{ActorId, CallId, InvocationId, ProgramId};
+use super::identity::{ActorId, CallId, DeploymentId, InvocationId, ProgramId};
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 
 /// Durable actor-tree checkpoint. `kernel_snapshot` is the canonical
@@ -24,6 +24,7 @@ pub struct ContinuationSnapshotV2 {
     /// Work slice whose mutations are committed alongside this checkpoint.
     pub checkpoint_step: u64,
     pub actor: ActorId,
+    pub actor_deployment: DeploymentId,
     pub actor_program: ProgramId,
     /// Ordinal used to derive a stable `CallId` for an awaited call.
     pub await_ordinal: u64,
@@ -47,6 +48,7 @@ pub(crate) struct ContinuationMetadataV2 {
     invocation: InvocationId,
     checkpoint_step: u64,
     actor: ActorId,
+    actor_deployment: DeploymentId,
     actor_program: ProgramId,
     pub(crate) await_ordinal: u64,
     pub pending_call: Option<CallId>,
@@ -92,6 +94,7 @@ impl ContinuationSnapshotV2 {
             || self.invocation != work.invocation
             || self.checkpoint_step != work.workflow_step
             || self.actor != work.target
+            || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
         {
             return Err(DecodeError::NonCanonical);
@@ -107,6 +110,7 @@ impl ContinuationSnapshotV2 {
             || self.invocation != work.invocation
             || self.checkpoint_step.checked_add(1) != Some(work.workflow_step)
             || self.actor != work.target
+            || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
         {
             return Err(DecodeError::NonCanonical);
@@ -130,6 +134,7 @@ impl ContinuationSnapshotV2 {
             invocation: InvocationId(d.fixed()?),
             checkpoint_step: d.u64()?,
             actor: ActorId(d.fixed()?),
+            actor_deployment: DeploymentId(d.fixed()?),
             actor_program: ProgramId(d.fixed()?),
             await_ordinal: d.u64()?,
             pending_call: d.option(|d| d.fixed().map(CallId))?,
@@ -176,6 +181,7 @@ impl ContinuationMetadataV2 {
             || self.invocation != work.invocation
             || self.checkpoint_step != work.workflow_step
             || self.actor != work.target
+            || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
         {
             return Err(DecodeError::NonCanonical);
@@ -189,6 +195,7 @@ impl ContinuationMetadataV2 {
             || self.invocation != work.invocation
             || self.checkpoint_step.checked_add(1) != Some(work.workflow_step)
             || self.actor != work.target
+            || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
         {
             return Err(DecodeError::NonCanonical);
@@ -209,6 +216,7 @@ impl V2Wire for ContinuationSnapshotV2 {
         e.fixed(&self.invocation.0);
         e.u64(self.checkpoint_step);
         e.fixed(&self.actor.0);
+        e.fixed(&self.actor_deployment.0);
         e.fixed(&self.actor_program.0);
         e.u64(self.await_ordinal);
         e.option(&self.pending_call, |e, call| e.fixed(&call.0));
@@ -225,6 +233,7 @@ impl V2Wire for ContinuationSnapshotV2 {
             invocation: InvocationId(d.fixed()?),
             checkpoint_step: d.u64()?,
             actor: ActorId(d.fixed()?),
+            actor_deployment: DeploymentId(d.fixed()?),
             actor_program: ProgramId(d.fixed()?),
             await_ordinal: d.u64()?,
             pending_call: d.option(|d| d.fixed().map(CallId))?,
@@ -288,6 +297,7 @@ mod tests {
             invocation,
             checkpoint_step: 7,
             actor: ActorId([5; 32]),
+            actor_deployment: DeploymentId([7; 32]),
             actor_program: ProgramId([6; 32]),
             await_ordinal: 3,
             pending_call: Some(invocation.call_id(3)),
@@ -304,6 +314,7 @@ mod tests {
             workflow_step: snapshot.checkpoint_step + 1,
             logical_timeslot: 9,
             target: snapshot.actor,
+            target_deployment: snapshot.actor_deployment,
             target_program: snapshot.actor_program,
             method: "resume".to_string(),
             arguments: vec![],
@@ -323,6 +334,7 @@ mod tests {
                 actor: snapshot.actor,
                 name: "root".into(),
                 parent: None,
+                deployment: snapshot.actor_deployment,
                 program: snapshot.actor_program,
                 state: crate::v2::BlobRefV2 {
                     hash: Hash([9; 32]),

@@ -214,6 +214,7 @@ mod tests {
             name: "root".into(),
             parent: None,
             producer: super::super::ProducerId([6; 32]),
+            deployment: super::super::DeploymentId([5; 32]),
             program: super::super::ProgramId([8; 32]),
             initial_state: BlobRefV2::of_bytes(b"initial"),
             crdt: true,

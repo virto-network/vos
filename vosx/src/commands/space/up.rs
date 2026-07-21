@@ -1745,6 +1745,7 @@ fn resolve_v2_external_actors_with(
             },
             actor: v2_root_actor_id(root_service, name),
             producer: package.deployment_signature.producer,
+            actor_deployment: package.deployment_id(),
             program: package.manifest.actor_program,
         });
     }

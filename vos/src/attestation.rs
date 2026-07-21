@@ -89,11 +89,12 @@ impl AttestationPreparationV2 {
             || work.service != receipt.service
             || work.input_id() != transition.consumed_input
             || work.base != transition.base
+            || work.target_deployment != transition.target_deployment
             || work.target_program != transition.target_program
             || receipt.accepted_transition != transition.commitment()
             || statement.space != work.service.space
             || statement.actor != work.target
-            || statement.deployment != work.service.deployment
+            || statement.deployment != work.target_deployment
             || statement.actor_program != work.target_program
             || statement.method != work.method
             || statement.invocation != work.invocation
@@ -142,6 +143,7 @@ impl AttestationStatementV3 {
     ) -> Result<Self, AttestationError> {
         if work.service != transition.service
             || work.service != receipt.service
+            || work.target_deployment != transition.target_deployment
             || work.target_program != transition.target_program
             || work.input_id() != transition.consumed_input
             || work.base != transition.base
@@ -178,7 +180,7 @@ impl AttestationStatementV3 {
             statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
             space: work.service.space,
             actor: work.target,
-            deployment: work.service.deployment,
+            deployment: work.target_deployment,
             actor_program: work.target_program,
             method: work.method.clone(),
             schema: policy.schema,
@@ -213,7 +215,6 @@ impl AttestationStatementV3 {
             return Err(AttestationError::InvalidStatement);
         }
         if self.space != self.accumulation_receipt.service.space
-            || self.deployment != self.accumulation_receipt.service.deployment
             || self.accumulation_receipt.accepted_transition == Hash::ZERO
         {
             return Err(AttestationError::ReceiptMismatch);
@@ -832,12 +833,13 @@ mod tests {
     }
 
     fn package(claim: u64) -> Attestation<u64, Method> {
-        let deployment = DeploymentId([3; 32]);
+        let service_deployment = DeploymentId([3; 32]);
+        let actor_deployment = DeploymentId([30; 32]);
         let receipt = AccumulationReceiptV2 {
             service: ServiceIdentityV2 {
                 space: SpaceId([6; 32]),
                 root_service: RootServiceId([1; 32]),
-                deployment,
+                deployment: service_deployment,
                 service_program: ProgramId([2; 32]),
                 service_abi: crate::v2::ABI_VERSION,
                 execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
@@ -855,7 +857,7 @@ mod tests {
             statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor: ActorId([7; 32]),
-            deployment,
+            deployment: actor_deployment,
             actor_program: ProgramId([8; 32]),
             method: "is_adult".to_string(),
             schema: Hash([9; 32]),

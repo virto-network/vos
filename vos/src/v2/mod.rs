@@ -114,7 +114,7 @@ pub use wire::{DecodeError, V2Wire};
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
 pub const ABI_VERSION: u16 = 2;
 /// Portable continuation format version.
-pub const SNAPSHOT_VERSION: u16 = 3;
+pub const SNAPSHOT_VERSION: u16 = 4;
 /// Attestation statement version required by runtime v2.
 pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 

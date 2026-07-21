@@ -21,7 +21,7 @@ use super::{
     AttestedServiceErrorV2, AuthorizationEvidenceV2, BlobRefV2, CommittedAttestationOutputV2,
     CommittedAttestationPackageV2, CommittedImageStoreV2, ConsistencyModeV2,
     ConsistencyBaseV2, ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2,
-    DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
+    DeploymentId, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
     ExternalActorDirectoryV2, ImportedBlobV2, JamServiceV2, LocalJamStoreV2,
     LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
     MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, PreparedWorkV2,
@@ -467,7 +467,9 @@ pub struct CommittedCrdtSyncV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedActorUpgradeV2 {
     pub actor: ActorId,
+    pub previous_deployment: DeploymentId,
     pub previous_program: ProgramId,
+    pub deployment: DeploymentId,
     pub program: ProgramId,
     pub receipt: AccumulationReceiptV2,
     pub duplicate: bool,
@@ -996,7 +998,8 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         let descriptor = self.installed_actor_descriptor(&header, actor)?;
         let policies = PackageRolePoliciesV2::decode(&package.role_policies)
             .map_err(|_| LocalRootTreeInvokeErrorV2::UpgradePackageMismatch)?;
-        if descriptor.program == package.manifest.actor_program {
+        let replacement_deployment = package.deployment_id();
+        if descriptor.deployment == replacement_deployment {
             return Err(LocalRootTreeInvokeErrorV2::UpgradePackageMismatch);
         }
         let base = match header.consistency {
@@ -1015,7 +1018,9 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         Ok(ActorUpgradeV2 {
             service: self.identity.clone(),
             actor,
+            expected_deployment: descriptor.deployment,
             expected_program: descriptor.program,
+            replacement_deployment,
             replacement_program: package.manifest.actor_program,
             producer: package.deployment_signature.producer,
             methods: policies.methods,
@@ -1039,6 +1044,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         let policies = PackageRolePoliciesV2::decode(&package.role_policies)
             .map_err(|_| LocalRootTreeInvokeErrorV2::UpgradePackageMismatch)?;
         if upgrade.service != self.identity
+            || upgrade.replacement_deployment != package.deployment_id()
             || upgrade.replacement_program != package.manifest.actor_program
             || upgrade.producer != package.deployment_signature.producer
             || upgrade.methods != policies.methods
@@ -1074,13 +1080,17 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         match accumulated.result {
             AccumulationResultV2::ActorUpgraded {
                 actor,
+                previous_deployment,
                 previous_program,
+                deployment,
                 program,
                 receipt,
                 duplicate,
             } => Ok(CommittedActorUpgradeV2 {
                 actor,
+                previous_deployment,
                 previous_program,
+                deployment,
                 program,
                 receipt,
                 duplicate,
@@ -1822,6 +1832,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             || binding.service != package.reply.receipt.service
             || binding.actor != delivery.statement.actor
             || binding.producer != delivery.producer
+            || binding.actor_deployment != delivery.statement.deployment
             || binding.program != delivery.statement.actor_program
         {
             return Err(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication);
@@ -2164,6 +2175,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
             .ok_or(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
         if descriptor.actor != statement.actor
+            || descriptor.deployment != statement.deployment
             || descriptor.program != statement.actor_program
             || reply.producer != descriptor.actor
         {
@@ -2362,6 +2374,7 @@ mod tests {
             workflow_step: 0,
             logical_timeslot: 9,
             target: callee,
+            target_deployment: DeploymentId([29; 32]),
             target_program: ProgramId([25; 32]),
             method: "value".into(),
             arguments: vec![26],
@@ -2381,6 +2394,7 @@ mod tests {
                 actor: callee,
                 name: "callee".into(),
                 parent: None,
+                deployment: DeploymentId([29; 32]),
                 program: ProgramId([25; 32]),
                 state,
                 causal_states: vec![],

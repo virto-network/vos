@@ -418,6 +418,7 @@ fn workflow_root_configs() -> Option<(
             service: peer_identity.clone(),
             actor: peer_actor,
             producer: package.deployment_signature.producer,
+            actor_deployment: package.deployment_id(),
             program: actor_program,
         }],
     );
@@ -568,6 +569,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         workflow_step: 0,
         logical_timeslot: 1,
         target: ActorId([5; 32]),
+        target_deployment: DeploymentId([2; 32]),
         target_program: actor_program,
         method: "start".into(),
         arguments: message,
@@ -587,6 +589,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             actor: ActorId([5; 32]),
             name: "root".into(),
             parent: None,
+            deployment: DeploymentId([2; 32]),
             program: actor_program,
             state,
             causal_states: vec![],
@@ -611,6 +614,7 @@ fn private_age_binding(service: &ServiceIdentityV2) -> vos::v2::ExternalActorBin
         service: bound_peer_service(service),
         actor: ActorId([44; 32]),
         producer: ProducerId([98; 32]),
+        actor_deployment: DeploymentId([99; 32]),
         program: ProgramId([92; 32]),
     }
 }
@@ -664,6 +668,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         actor: ActorId([6; 32]),
         name: "child".into(),
         parent: Some(work.target),
+        deployment: work.target_deployment,
         program: actor_program,
         state: state.clone(),
         causal_states: vec![],
@@ -900,6 +905,7 @@ fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
         return;
     };
     let initial_program = config.package.manifest.actor_program;
+    let initial_deployment = config.package.deployment_id();
     let initial_pvm = config.package.actor_pvm.clone();
     let mut replacement = config.package.clone();
     replacement.manifest.version = "2.1.0".into();
@@ -911,6 +917,7 @@ fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
     replacement.deployment_signature.signature = vec![2];
     replacement.validate().unwrap();
     let replacement_program = replacement.manifest.actor_program;
+    let replacement_deployment = replacement.deployment_id();
 
     let mut service =
         LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
@@ -926,7 +933,9 @@ fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
         )
         .expect("the controller derives the exact current base and signed policies");
     assert_eq!(upgrade.expected_program, initial_program);
+    assert_eq!(upgrade.expected_deployment, initial_deployment);
     assert_eq!(upgrade.replacement_program, replacement_program);
+    assert_eq!(upgrade.replacement_deployment, replacement_deployment);
     assert_eq!(upgrade.producer, replacement.deployment_signature.producer);
 
     let mut forged = upgrade.clone();
@@ -945,7 +954,9 @@ fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
         .commit_actor_upgrade(&upgrade)
         .expect("guest Accumulate commits the staged idle upgrade");
     assert_eq!(committed.actor, root);
+    assert_eq!(committed.previous_deployment, initial_deployment);
     assert_eq!(committed.previous_program, initial_program);
+    assert_eq!(committed.deployment, replacement_deployment);
     assert_eq!(committed.program, replacement_program);
     assert_eq!(committed.receipt.sequence, 1);
     assert!(!committed.duplicate);
@@ -965,6 +976,32 @@ fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
         service.store().program(replacement_program),
         Some(replacement.actor_pvm.as_slice())
     );
+
+    let mut policy_only = replacement.clone();
+    policy_only.manifest.version = "2.2.0".into();
+    let policy_only_deployment = policy_only.deployment_id();
+    assert_ne!(policy_only_deployment, replacement_deployment);
+    assert_eq!(policy_only.manifest.actor_program, replacement_program);
+    let policy_only_upgrade = service
+        .prepare_actor_upgrade(
+            root,
+            &policy_only,
+            AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([144; 32]),
+                authenticator: vec![145],
+            },
+        )
+        .expect("a new signed package may retain the same canonical PVM");
+    service
+        .stage_actor_upgrade(&policy_only, &policy_only_upgrade)
+        .unwrap();
+    let policy_only_commit = service
+        .commit_actor_upgrade(&policy_only_upgrade)
+        .unwrap();
+    assert_eq!(policy_only_commit.previous_deployment, replacement_deployment);
+    assert_eq!(policy_only_commit.previous_program, replacement_program);
+    assert_eq!(policy_only_commit.deployment, policy_only_deployment);
+    assert_eq!(policy_only_commit.program, replacement_program);
 
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("start").encode());
@@ -986,6 +1023,7 @@ fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
     };
     let prepared = LocalWorkSchedulerV2::prepare(service.store(), request.clone())
         .expect("new work resolves the committed replacement program");
+    assert_eq!(prepared.work.target_deployment, policy_only_deployment);
     assert_eq!(prepared.work.target_program, replacement_program);
     assert_eq!(
         prepared
@@ -1002,8 +1040,9 @@ fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
         .expect("mutable descriptor fields validate from guest state after restart");
     let prepared = LocalWorkSchedulerV2::prepare(restarted.store(), request)
         .expect("the replacement remains schedulable after restart");
+    assert_eq!(prepared.work.target_deployment, policy_only_deployment);
     assert_eq!(prepared.work.target_program, replacement_program);
-    assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+    assert_eq!(restarted.store().header().unwrap().unwrap().revision, 2);
     assert!(restarted.store().program(initial_program).is_some());
     assert!(restarted.store().program(replacement_program).is_some());
 }
@@ -1143,10 +1182,11 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
         Err(vos::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired)
     ));
     let before_failure = service.store().snapshot();
+    let failed = service.invoke_attested(request.clone(), &mut FailingTestProofProducer);
     assert!(matches!(
-        service.invoke_attested(request.clone(), &mut FailingTestProofProducer),
+        &failed,
         Err(vos::v2::LocalRootTreeInvokeErrorV2::ProofProductionFailed)
-    ));
+    ), "unexpected pre-proof result: {failed:?}");
     assert!(service
         .store()
         .snapshot()
@@ -2178,6 +2218,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                 name: "root".into(),
                 parent: None,
                 producer: ProducerId([54; 32]),
+                deployment: seed.target_deployment,
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
@@ -2217,6 +2258,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
                 name: "child".into(),
                 parent: Some(seed.target),
                 producer: ProducerId([54; 32]),
+                deployment: seed.target_deployment,
                 program: actor_program,
                 initial_state: initial,
                 crdt: false,
@@ -2899,7 +2941,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
         statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
         space: producer_receipt.service.space,
         actor: attested_reply.producer,
-        deployment: producer_receipt.service.deployment,
+        deployment: DeploymentId([99; 32]),
         actor_program: ProgramId([92; 32]),
         method: "attested_peer_value".into(),
         schema: Hash([93; 32]),
@@ -3025,6 +3067,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
                 name: "root".into(),
                 parent: None,
                 producer: ProducerId([83; 32]),
+                deployment: seed.target_deployment,
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
@@ -3041,6 +3084,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
                 name: "child".into(),
                 parent: Some(seed.target),
                 producer: ProducerId([83; 32]),
+                deployment: seed.target_deployment,
                 program: actor_program,
                 initial_state: initial,
                 crdt: false,
@@ -3136,6 +3180,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         actor: child,
         name: "child".into(),
         parent: Some(work.target),
+        deployment: work.target_deployment,
         program: actor_program,
         state: initial.clone(),
         causal_states: vec![],
@@ -3171,6 +3216,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
                 name: "counter".into(),
                 parent: None,
                 producer: ProducerId([53; 32]),
+                deployment: work.target_deployment,
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: true,
@@ -3210,6 +3256,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
                 name: "child".into(),
                 parent: Some(work.target),
                 producer: ProducerId([53; 32]),
+                deployment: work.target_deployment,
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: true,
@@ -3969,6 +4016,7 @@ fn yielding_actor_restores_exactly_after_restart() {
             name: "root".into(),
             parent: None,
             producer: ProducerId([51; 32]),
+            deployment: seed_work.target_deployment,
             program: actor_program,
             initial_state: initial_state_ref,
             crdt: false,
@@ -4304,6 +4352,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             name: "awaiting-probe".into(),
             parent: None,
             producer: ProducerId([51; 32]),
+            deployment: seed_work.target_deployment,
             program: actor_program,
             initial_state: initial_state_ref,
             crdt: false,
@@ -4815,6 +4864,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 name: "root".into(),
                 parent: None,
                 producer: ProducerId([31; 32]),
+                deployment: seed_work.target_deployment,
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
@@ -4840,6 +4890,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 name: "child".into(),
                 parent: Some(seed_work.target),
                 producer: ProducerId([31; 32]),
+                deployment: seed_work.target_deployment,
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
@@ -4936,6 +4987,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         invocation: work.invocation,
         checkpoint_step: 0,
         actor: work.target,
+        actor_deployment: work.target_deployment,
         actor_program,
         await_ordinal: 0,
         pending_call: None,
@@ -4961,6 +5013,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let transition = TransitionV2 {
         service: work.service.clone(),
         consumed_input: work.input_id(),
+        target_deployment: work.target_deployment,
         target_program: work.target_program,
         base: work.base.clone(),
         writes: vec![ActorWriteV2 {
@@ -5149,6 +5202,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let resumed_transition = TransitionV2 {
         service: resumed.work.service.clone(),
         consumed_input: resumed.work.input_id(),
+        target_deployment: resumed.work.target_deployment,
         target_program: resumed.work.target_program,
         base: resumed.work.base.clone(),
         writes: vec![],
@@ -5193,6 +5247,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let delivered_transition = TransitionV2 {
         service: delivered.work.service.clone(),
         consumed_input: delivered.work.input_id(),
+        target_deployment: delivered.work.target_deployment,
         target_program: delivered.work.target_program,
         base: delivered.work.base.clone(),
         writes: vec![],
@@ -5270,6 +5325,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let proof_transition = TransitionV2 {
         service: proof_work.service.clone(),
         consumed_input: proof_work.input_id(),
+        target_deployment: proof_work.target_deployment,
         target_program: proof_work.target_program,
         base: proof_work.base.clone(),
         writes: vec![],
@@ -5580,6 +5636,7 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
             name: "root".into(),
             parent: None,
             producer: ProducerId([31; 32]),
+            deployment: seed.target_deployment,
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
@@ -5615,7 +5672,9 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
     let upgrade = ActorUpgradeV2 {
         service: seed.service.clone(),
         actor: seed.target,
+        expected_deployment: seed.target_deployment,
         expected_program: actor_program,
+        replacement_deployment: DeploymentId([37; 32]),
         replacement_program,
         producer: ProducerId([35; 32]),
         methods: vec![MethodPolicyV2 {
@@ -5757,6 +5816,7 @@ fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
             name: "root".into(),
             parent: None,
             producer: ProducerId([113; 32]),
+            deployment: seed.target_deployment,
             program: actor_program,
             initial_state: initial,
             crdt: false,
@@ -5807,7 +5867,7 @@ fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
         statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
         space: source.service.space,
         actor: source.actor,
-        deployment: source.service.deployment,
+        deployment: source.actor_deployment,
         actor_program: source.program,
         method: "is_adult".into(),
         schema: Hash([119; 32]),
@@ -5848,6 +5908,7 @@ fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
     let transition_for = |work: &WorkEnvelopeV2, state: &[u8]| TransitionV2 {
         service: work.service.clone(),
         consumed_input: work.input_id(),
+        target_deployment: work.target_deployment,
         target_program: work.target_program,
         base: work.base.clone(),
         writes: vec![ActorWriteV2 {
@@ -5955,6 +6016,7 @@ fn age_gate_guest_emits_the_proof_requirement_and_accumulate_enforces_once() {
             name: "age-gate".into(),
             parent: None,
             producer: ProducerId([128; 32]),
+            deployment: seed.target_deployment,
             program: gate_program,
             initial_state: initial,
             crdt: false,
@@ -5999,7 +6061,7 @@ fn age_gate_guest_emits_the_proof_requirement_and_accumulate_enforces_once() {
         statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
         space: source.service.space,
         actor: source.actor,
-        deployment: source.service.deployment,
+        deployment: source.actor_deployment,
         actor_program: source.program,
         method: IsAdultFixture::METHOD.into(),
         schema: Hash([134; 32]),
@@ -6148,6 +6210,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             name: "root".into(),
             parent: None,
             producer: ProducerId([122; 32]),
+            deployment: seed.target_deployment,
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
@@ -6241,6 +6304,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     let first_transition = TransitionV2 {
         service: first.service.clone(),
         consumed_input: first.input_id(),
+        target_deployment: first.target_deployment,
         target_program: first.target_program,
         base: first.base.clone(),
         writes: vec![ActorWriteV2 {
@@ -6312,6 +6376,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     let second_transition = TransitionV2 {
         service: second.service.clone(),
         consumed_input: second.input_id(),
+        target_deployment: second.target_deployment,
         target_program: second.target_program,
         base: second.base.clone(),
         writes: vec![ActorWriteV2 {
@@ -6381,6 +6446,7 @@ fn raft_refuses_an_untraced_attested_apply_before_log_proposal() {
             name: "root".into(),
             parent: None,
             producer: ProducerId([132; 32]),
+            deployment: seed.target_deployment,
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
@@ -6466,6 +6532,7 @@ fn raft_refuses_an_untraced_attested_apply_before_log_proposal() {
     let transition = TransitionV2 {
         service: prepared.work.service.clone(),
         consumed_input: prepared.work.input_id(),
+        target_deployment: prepared.work.target_deployment,
         target_program: prepared.work.target_program,
         base: prepared.work.base.clone(),
         writes: vec![],
@@ -6550,6 +6617,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
             name: "root".into(),
             parent: None,
             producer: ProducerId([128; 32]),
+            deployment: seed.target_deployment,
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
@@ -6764,13 +6832,14 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
             )
             .unwrap();
             let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
-                service: identity,
+                service: identity.clone(),
                 consistency: ConsistencyModeV2::Local,
                 actors: vec![ActorGenesisV2 {
                     actor,
                     name: "root".into(),
                     parent: None,
                     producer: ProducerId([64; 32]),
+                    deployment: identity.deployment,
                     program: actor_program,
                     initial_state: initial.clone(),
                     crdt: false,
@@ -6804,6 +6873,7 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
         service: destination_identity.clone(),
         actor: destination_actor,
         producer: ProducerId([64; 32]),
+        actor_deployment: DeploymentId([61; 32]),
         program: actor_program,
     };
     let mut source = make_service(
@@ -6848,6 +6918,7 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
     let transition = TransitionV2 {
         service: prepared.work.service.clone(),
         consumed_input: prepared.work.input_id(),
+        target_deployment: prepared.work.target_deployment,
         target_program: prepared.work.target_program,
         base: prepared.work.base.clone(),
         writes: vec![ActorWriteV2 {

@@ -10,11 +10,12 @@ use alloc::vec::Vec;
 
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
-    AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, DirectIngressV2, Hash, InvocationId,
-    ProgramId, PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, DeploymentId, DirectIngressV2, Hash,
+    InvocationId, ProgramId, PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2,
+    WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 10;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 11;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -278,7 +279,9 @@ pub struct DedupRecordV2 {
 pub struct ActorUpgradeRecordV2 {
     pub upgrade: Hash,
     pub actor: ActorId,
+    pub previous_deployment: DeploymentId,
     pub previous_program: ProgramId,
+    pub deployment: DeploymentId,
     pub program: ProgramId,
     pub receipt: AccumulationReceiptV2,
 }
@@ -429,7 +432,9 @@ impl V2Wire for ActorUpgradeRecordV2 {
         let mut e = Encoder(out);
         e.fixed(&self.upgrade.0);
         e.fixed(&self.actor.0);
+        e.fixed(&self.previous_deployment.0);
         e.fixed(&self.previous_program.0);
+        e.fixed(&self.deployment.0);
         e.fixed(&self.program.0);
         e.bytes(&self.receipt.encode());
     }
@@ -438,11 +443,13 @@ impl V2Wire for ActorUpgradeRecordV2 {
         let value = Self {
             upgrade: Hash(d.fixed()?),
             actor: ActorId(d.fixed()?),
+            previous_deployment: DeploymentId(d.fixed()?),
             previous_program: ProgramId(d.fixed()?),
+            deployment: DeploymentId(d.fixed()?),
             program: ProgramId(d.fixed()?),
             receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
         };
-        if value.previous_program == value.program
+        if value.previous_deployment == value.deployment
             || value.receipt.accepted_transition != value.upgrade
             || value.receipt.reply_commitment.is_some()
             || value.receipt.outbox_commitment.is_some()

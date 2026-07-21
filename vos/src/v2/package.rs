@@ -306,6 +306,7 @@ impl VosPackageV2 {
             name,
             parent,
             producer: self.deployment_signature.producer,
+            deployment: self.deployment_id(),
             program: self.manifest.actor_program,
             initial_state,
             crdt: self.manifest.crdt,
@@ -665,6 +666,7 @@ mod tests {
         let policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
         assert_eq!(genesis.actor, actor);
         assert_eq!(genesis.producer, package.deployment_signature.producer);
+        assert_eq!(genesis.deployment, package.deployment_id());
         assert_eq!(genesis.program, package.manifest.actor_program);
         assert_eq!(genesis.initial_state, state);
         assert_eq!(genesis.methods, policies.methods);

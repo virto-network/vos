@@ -191,7 +191,9 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
             .map_err(|_| GuestAccumulateError::CorruptStore)?;
         if record.upgrade != upgrade_hash
             || record.actor != upgrade.actor
+            || record.previous_deployment != upgrade.expected_deployment
             || record.previous_program != upgrade.expected_program
+            || record.deployment != upgrade.replacement_deployment
             || record.program != upgrade.replacement_program
             || record.receipt.service != header.service
         {
@@ -199,7 +201,9 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
         }
         return Ok(AccumulationResultV2::ActorUpgraded {
             actor: record.actor,
+            previous_deployment: record.previous_deployment,
             previous_program: record.previous_program,
+            deployment: record.deployment,
             program: record.program,
             receipt: record.receipt,
             duplicate: true,
@@ -219,7 +223,9 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     )? else {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     };
-    if descriptor.program != upgrade.expected_program {
+    if descriptor.deployment != upgrade.expected_deployment
+        || descriptor.program != upgrade.expected_program
+    {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     }
     if tree
@@ -230,6 +236,7 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::ActorBusy(upgrade.actor)));
     }
 
+    let previous_deployment = descriptor.deployment;
     let previous_program = descriptor.program;
     for policy in &descriptor.methods {
         tree_apply(
@@ -251,6 +258,7 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
             Some(&policy.encode()),
         )?;
     }
+    descriptor.deployment = upgrade.replacement_deployment;
     descriptor.program = upgrade.replacement_program;
     descriptor.producer = upgrade.producer;
     descriptor.methods = upgrade.methods.clone();
@@ -281,7 +289,9 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     let record = ActorUpgradeRecordV2 {
         upgrade: upgrade_hash,
         actor: upgrade.actor,
+        previous_deployment,
         previous_program,
+        deployment: upgrade.replacement_deployment,
         program: upgrade.replacement_program,
         receipt: receipt.clone(),
     };
@@ -289,7 +299,9 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     write(store, &upgrade_key, Some(&record.encode()))?;
     Ok(AccumulationResultV2::ActorUpgraded {
         actor: upgrade.actor,
+        previous_deployment,
         previous_program,
+        deployment: upgrade.replacement_deployment,
         program: upgrade.replacement_program,
         receipt,
         duplicate: false,
@@ -1929,7 +1941,11 @@ fn apply<S: GuestAccumulateStoreV2>(
     else {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     };
-    if actor.program != work.target_program || transition.target_program != actor.program {
+    if actor.deployment != work.target_deployment
+        || transition.target_deployment != actor.deployment
+        || actor.program != work.target_program
+        || transition.target_program != actor.program
+    {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     }
     if actor.crdt != (header.consistency == ConsistencyModeV2::Crdt) {
@@ -2035,7 +2051,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         else {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
         };
-        if descriptor.program != imported.program {
+        if descriptor.deployment != imported.deployment || descriptor.program != imported.program {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
         }
         if descriptor.name != imported.name || descriptor.parent != imported.parent {
@@ -3165,6 +3181,7 @@ fn validate_awaited_outcome<S: GuestAccumulateStoreV2>(
         attestation.producer_name == external.name
             && attestation.producer == external.producer
             && attestation.statement.actor == external.actor
+            && attestation.statement.deployment == external.actor_deployment
             && attestation.statement.actor_program == external.program
             && attestation.statement.accumulation_receipt.service == external.service
             && awaited.validate().is_ok()
@@ -3258,11 +3275,12 @@ fn validate_attestation_verifications<S: GuestAccumulateStoreV2>(
                 break;
             }
         }
-        let (service, actor, producer, program) = if let Some(descriptor) = local {
+        let (service, actor, producer, deployment, program) = if let Some(descriptor) = local {
             (
                 transition.service.clone(),
                 descriptor.actor,
                 descriptor.producer,
+                descriptor.deployment,
                 descriptor.program,
             )
         } else {
@@ -3278,11 +3296,13 @@ fn validate_attestation_verifications<S: GuestAccumulateStoreV2>(
                 binding.service.clone(),
                 binding.actor,
                 binding.producer,
+                binding.actor_deployment,
                 binding.program,
             )
         };
         if verification.producer != producer
             || verification.statement.actor != actor
+            || verification.statement.deployment != deployment
             || verification.statement.actor_program != program
             || verification.statement.accumulation_receipt.service != service
             || verification.statement.validate().is_err()
@@ -3650,6 +3670,7 @@ mod tests {
                 service,
                 actor,
                 producer: super::super::ProducerId([byte; 32]),
+                actor_deployment: DeploymentId([byte.wrapping_add(1); 32]),
                 program: program(),
             }
         })
@@ -3670,6 +3691,7 @@ mod tests {
                 name: "root".into(),
                 parent: None,
                 producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
                 program: program(),
                 initial_state: initial.clone(),
                 crdt: consistency == ConsistencyModeV2::Crdt,
@@ -3703,7 +3725,9 @@ mod tests {
         ActorUpgradeV2 {
             service: identity(),
             actor: actor(),
+            expected_deployment: identity().deployment,
             expected_program: program(),
+            replacement_deployment: DeploymentId([14; 32]),
             replacement_program: ProgramId([15; 32]),
             producer: super::super::ProducerId([16; 32]),
             methods: vec![MethodPolicyV2 {
@@ -3738,7 +3762,9 @@ mod tests {
         .unwrap();
         let AccumulationResultV2::ActorUpgraded {
             actor: upgraded_actor,
+            previous_deployment,
             previous_program,
+            deployment,
             program: replacement,
             receipt,
             duplicate,
@@ -3747,7 +3773,9 @@ mod tests {
             panic!("idle actor upgrade was rejected")
         };
         assert_eq!(upgraded_actor, actor());
+        assert_eq!(previous_deployment, upgrade.expected_deployment);
         assert_eq!(previous_program, program());
+        assert_eq!(deployment, upgrade.replacement_deployment);
         assert_eq!(replacement, upgrade.replacement_program);
         assert!(!duplicate);
         assert_eq!(receipt.accepted_transition, upgrade.hash());
@@ -3764,6 +3792,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(descriptor.program, upgrade.replacement_program);
+        assert_eq!(descriptor.deployment, upgrade.replacement_deployment);
         assert_eq!(descriptor.producer, upgrade.producer);
         assert_eq!(descriptor.methods, upgrade.methods);
         assert_eq!(
@@ -3815,6 +3844,45 @@ mod tests {
     }
 
     #[test]
+    fn package_only_actor_upgrade_commits_a_new_deployment_identity() {
+        let mut store = MemStore::default();
+        let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
+        let mut upgrade = upgrade_fixture(install.resulting_state_root.unwrap());
+        upgrade.replacement_program = upgrade.expected_program;
+        store.upgrade_allowlist.insert(upgrade.hash());
+
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            AccumulationResultV2::ActorUpgraded {
+                previous_deployment,
+                previous_program,
+                deployment,
+                program: replacement_program,
+                duplicate: false,
+                ..
+            } if previous_deployment == upgrade.expected_deployment
+                && previous_program == upgrade.expected_program
+                && deployment == upgrade.replacement_deployment
+                && replacement_program == upgrade.replacement_program
+        ));
+        let header = store_header(&store);
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        let descriptor = tree_get_wire::<_, ActorGenesisV2>(
+            &tree,
+            &StateKeyV2::ActorDescriptor(actor()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(descriptor.deployment, upgrade.replacement_deployment);
+        assert_eq!(descriptor.program, program());
+    }
+
+    #[test]
     fn actor_upgrade_rejects_suspended_actor_without_mutation() {
         let mut store = MemStore::default();
         let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
@@ -3847,7 +3915,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_upgrade_rejects_unauthorized_stale_and_wrong_program_inputs() {
+    fn actor_upgrade_rejects_unauthorized_stale_and_wrong_package_inputs() {
         let mut store = MemStore::default();
         let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
         let base_root = install.resulting_state_root.unwrap();
@@ -3879,6 +3947,17 @@ mod tests {
                 expected_revision: 1,
                 actual_revision: 0,
             })
+        );
+        assert_eq!(store, before);
+
+        let mut wrong = upgrade.clone();
+        wrong.expected_deployment = DeploymentId([21; 32]);
+        store.upgrade_allowlist.insert(wrong.hash());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(wrong))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
         );
         assert_eq!(store, before);
 
@@ -3916,6 +3995,7 @@ mod tests {
             workflow_step: 0,
             logical_timeslot: 1,
             target: actor(),
+            target_deployment: identity().deployment,
             target_program: program(),
             method: "set".into(),
             arguments: vec![1],
@@ -3935,6 +4015,7 @@ mod tests {
                 actor: actor(),
                 name: "root".into(),
                 parent: None,
+                deployment: identity().deployment,
                 program: program(),
                 state: initial,
                 causal_states: vec![],
@@ -3950,6 +4031,7 @@ mod tests {
         TransitionV2 {
             service: work.service.clone(),
             consumed_input: work.input_id(),
+            target_deployment: work.target_deployment,
             target_program: work.target_program,
             base: work.base.clone(),
             writes: vec![ActorWriteV2 {
@@ -4318,7 +4400,7 @@ mod tests {
             statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
             space: binding.service.space,
             actor: binding.actor,
-            deployment: binding.service.deployment,
+            deployment: binding.actor_deployment,
             actor_program: binding.program,
             method: "is_adult".into(),
             schema: Hash([73; 32]),
@@ -4598,6 +4680,7 @@ mod tests {
                     name: "root".into(),
                     parent: None,
                     producer: super::super::ProducerId([4; 32]),
+                    deployment: identity().deployment,
                     program: program(),
                     initial_state: initial.clone(),
                     crdt: false,
@@ -4614,6 +4697,7 @@ mod tests {
                     name: "child".into(),
                     parent: Some(actor()),
                     producer: super::super::ProducerId([4; 32]),
+                    deployment: identity().deployment,
                     program: program(),
                     initial_state: initial.clone(),
                     crdt: false,
@@ -4719,6 +4803,7 @@ mod tests {
                 name: "root".into(),
                 parent: None,
                 producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
                 program: program(),
                 initial_state: initial.clone(),
                 crdt: false,
@@ -4800,6 +4885,7 @@ mod tests {
             invocation: first_work.invocation,
             checkpoint_step: first_work.workflow_step,
             actor: first_work.target,
+            actor_deployment: first_work.target_deployment,
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: None,
@@ -4957,6 +5043,7 @@ mod tests {
             invocation: first_work.invocation,
             checkpoint_step: 0,
             actor: first_work.target,
+            actor_deployment: first_work.target_deployment,
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: Some(call),
@@ -5138,6 +5225,7 @@ mod tests {
             invocation: work.invocation,
             checkpoint_step: 0,
             actor: work.target,
+            actor_deployment: work.target_deployment,
             actor_program: work.target_program,
             await_ordinal: 0,
             pending_call: Some(call),
@@ -5330,6 +5418,7 @@ mod tests {
             invocation: work.invocation,
             checkpoint_step: 0,
             actor: work.target,
+            actor_deployment: work.target_deployment,
             actor_program: work.target_program,
             await_ordinal: 0,
             pending_call: Some(call),
@@ -5974,6 +6063,7 @@ mod tests {
             workflow_step: 0,
             logical_timeslot: 1,
             target: actor(),
+            target_deployment: identity().deployment,
             target_program: program(),
             method: "set".into(),
             arguments: vec![2],
@@ -5990,6 +6080,7 @@ mod tests {
                 actor: actor(),
                 name: "root".into(),
                 parent: None,
+                deployment: identity().deployment,
                 program: program(),
                 state: initial,
                 causal_states: vec![],
@@ -6011,6 +6102,7 @@ mod tests {
         let mut transition = TransitionV2 {
             service: work.service.clone(),
             consumed_input: work.input_id(),
+            target_deployment: work.target_deployment,
             target_program: work.target_program,
             base: work.base.clone(),
             writes: Vec::new(),

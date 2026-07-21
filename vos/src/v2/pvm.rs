@@ -582,6 +582,7 @@ impl ServicePvmV2 {
                     actor: actor.actor,
                     name: actor.name.clone(),
                     parent: actor.parent,
+                    deployment: actor.deployment,
                     program: actor.program,
                     state: imported_blob_bytes(imports, &actor.state)?.to_vec(),
                     causal_states: actor
@@ -969,6 +970,7 @@ fn capture_checkpoint(
         invocation: work.invocation,
         checkpoint_step: work.workflow_step,
         actor: work.target,
+        actor_deployment: work.target_deployment,
         actor_program: work.target_program,
         await_ordinal,
         pending_call,

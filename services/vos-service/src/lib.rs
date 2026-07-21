@@ -343,6 +343,7 @@ mod guest {
         let mut transition = TransitionV2 {
             service: work.service.clone(),
             consumed_input,
+            target_deployment: work.target_deployment,
             target_program: work.target_program,
             base,
             writes,
