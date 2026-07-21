@@ -629,6 +629,7 @@ impl LocalWorkSchedulerV2 {
             workflow_step: request.workflow_step,
             logical_timeslot: request.logical_timeslot,
             target: request.target,
+            target_deployment: descriptor.deployment,
             target_program: descriptor.program,
             method: request.method,
             arguments: if request.workflow_step == 0 {
@@ -683,6 +684,7 @@ impl LocalWorkSchedulerV2 {
             actor: request.target,
             name: descriptor.name.clone(),
             parent: descriptor.parent,
+            deployment: descriptor.deployment,
             program: descriptor.program,
             state: state.clone(),
             causal_states: states.clone(),
@@ -747,6 +749,7 @@ impl LocalWorkSchedulerV2 {
                 actor,
                 name: descriptor.name.clone(),
                 parent: descriptor.parent,
+                deployment: descriptor.deployment,
                 program: descriptor.program,
                 state: sibling_state.clone(),
                 causal_states: sibling_states.clone(),

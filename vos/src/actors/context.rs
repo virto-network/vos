@@ -1942,6 +1942,7 @@ mod tests {
             actor,
             name: name.into(),
             parent,
+            deployment: crate::v2::DeploymentId([8; 32]),
             program,
         };
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
@@ -1981,6 +1982,7 @@ mod tests {
             },
             actor,
             producer: crate::v2::ProducerId([6; 32]),
+            actor_deployment: crate::v2::DeploymentId([8; 32]),
             program: crate::v2::ProgramId([7; 32]),
         }];
 

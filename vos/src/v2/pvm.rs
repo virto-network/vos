@@ -1082,6 +1082,7 @@ fn actor_tree_from_work(work: &WorkEnvelopeV2) -> Vec<ActorTreeImportV2> {
             actor: actor.actor,
             name: actor.name.clone(),
             parent: actor.parent,
+            deployment: actor.deployment,
             program: actor.program,
         })
         .collect()
@@ -1414,6 +1415,7 @@ fn capture_checkpoint(
         invocation: work.invocation,
         checkpoint_step: work.workflow_step,
         actor: work.target,
+        actor_deployment: work.target_deployment,
         actor_program: work.target_program,
         await_ordinal,
         pending_call,
@@ -1822,6 +1824,7 @@ mod tests {
             workflow_step: 0,
             logical_timeslot: 1,
             target: super::super::ActorId([6; 32]),
+            target_deployment: super::super::DeploymentId([3; 32]),
             target_program: ProgramId([7; 32]),
             method: "check".into(),
             arguments: vec![8],

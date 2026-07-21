@@ -443,15 +443,17 @@ parent-recipient equals child-sender rule.
 
 `UpgradeActor` is a guest-owned Accumulate operation, not a native descriptor
 rewrite. The canonical request binds the service and actor, expected and
-replacement `ProgramId`, replacement producer and generated method policies,
-an exact consistency base, and an authenticated system capability. The host
+replacement actor `DeploymentId` and `ProgramId`, replacement producer and
+generated method policies, an exact consistency base, and an authenticated
+system capability. The host
 must authorize those exact physical request bytes and already possess canonical
 replacement PVM bytes matching the requested `ProgramId`.
 
 For Ephemeral, Local, and Raft services, guest Accumulate requires the exact
 current revision and state root. It rejects an actor with a durable continuation
-as `ActorBusy`, replaces only that actor's program/producer/policy rows, and
-preserves identity, ownership, consistency kind, and application state. A
+as `ActorBusy`, replaces only that actor's package/program/producer/policy
+rows, and preserves instance identity, ownership, consistency kind, and
+application state. A
 physical upgrade record makes an exact retry read-only. The old program remains
 in the content-addressed program store, so any already committed continuation
 can retain its exact code until later reference-counted collection is added.
@@ -480,6 +482,15 @@ cannot change quorum membership. Production daemon installation remains
 disabled until that loader drives the pinned `vos-service.pvm`; this explicit
 refusal replaces silent execution through `RefinePayload`/`EffectLog`.
 
+The service identity retains the root package `DeploymentId` selected when
+the root tree is installed; it is the stable service/routing identity. Every
+actor descriptor separately retains the exact current package `DeploymentId`.
+Refine work, continuations, transitions, external dependency bindings, and
+attestation statements bind that actor deployment together with its
+`ProgramId`. Guest-owned upgrades change the actor package identity without
+rewriting the service identity, including policy/schema-only upgrades whose
+canonical PVM bytes are unchanged.
+
 The infrastructure PVM is committed at
 `services/vos-service/vos-service.pvm`; its identity is
 `VOS_SERVICE_PROGRAM_ID`. To reproduce it, build and validate the guest:
@@ -506,7 +517,10 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 14 is therefore a clean break from earlier experimental v2 images.
+Store schema 15 and continuation snapshot version 4 are therefore a clean
+break from earlier experimental v2 images. They add exact actor-package
+identity to descriptors, work, checkpoints, transitions, upgrades, and
+cross-root proof bindings.
 
 ## CRDT boundary
 

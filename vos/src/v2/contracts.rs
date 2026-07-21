@@ -129,6 +129,8 @@ pub struct ImportedActorV2 {
     pub actor: ActorId,
     pub name: String,
     pub parent: Option<ActorId>,
+    /// Exact signed package supplying this actor's code and policy surface.
+    pub deployment: DeploymentId,
     pub program: ProgramId,
     /// First canonical state materialization for this actor at the work base.
     /// Linear work has exactly this state. CRDT work may additionally import
@@ -148,6 +150,7 @@ pub struct ActorTreeImportV2 {
     pub actor: ActorId,
     pub name: String,
     pub parent: Option<ActorId>,
+    pub deployment: DeploymentId,
     pub program: ProgramId,
 }
 
@@ -175,6 +178,7 @@ pub struct ExternalActorBindingV2 {
     pub service: ServiceIdentityV2,
     pub actor: ActorId,
     pub producer: ProducerId,
+    pub actor_deployment: DeploymentId,
     pub program: ProgramId,
 }
 
@@ -411,6 +415,7 @@ pub struct WorkEnvelopeV2 {
     /// a wall clock.
     pub logical_timeslot: u64,
     pub target: ActorId,
+    pub target_deployment: DeploymentId,
     pub target_program: ProgramId,
     pub method: String,
     pub arguments: Vec<u8>,
@@ -497,6 +502,7 @@ impl WorkEnvelopeV2 {
         encode_service(&mut e, &self.service);
         e.fixed(&self.invocation.0);
         e.fixed(&self.target.0);
+        e.fixed(&self.target_deployment.0);
         e.fixed(&self.target_program.0);
         e.string(&self.method);
         encode_origin(&mut e, self.origin);
@@ -963,6 +969,7 @@ impl RoleCredentialVerificationRequestV2 {
 pub struct TransitionV2 {
     pub service: ServiceIdentityV2,
     pub consumed_input: WorkInputIdV2,
+    pub target_deployment: DeploymentId,
     pub target_program: ProgramId,
     pub base: ConsistencyBaseV2,
     pub writes: Vec<ActorWriteV2>,
@@ -1005,6 +1012,7 @@ impl TransitionV2 {
         Self {
             service: self.service.clone(),
             consumed_input: self.consumed_input,
+            target_deployment: self.target_deployment,
             target_program: self.target_program,
             base: self.base.clone(),
             writes: self.writes.clone(),
@@ -1117,6 +1125,10 @@ pub struct ActorGenesisV2 {
     /// installed. Guest-owned state retains this identity so later proof
     /// verification never has to trust a producer label carried by a package.
     pub producer: ProducerId,
+    /// Exact signed package from which the current actor code, schemas, and
+    /// generated policy surface were installed. This may change only through
+    /// guest-owned `UpgradeActor`; the root service deployment stays stable.
+    pub deployment: DeploymentId,
     pub program: ProgramId,
     pub initial_state: BlobRefV2,
     pub crdt: bool,
@@ -1153,7 +1165,9 @@ pub struct ServiceGenesisV2 {
 pub struct ActorUpgradeV2 {
     pub service: ServiceIdentityV2,
     pub actor: ActorId,
+    pub expected_deployment: DeploymentId,
     pub expected_program: ProgramId,
+    pub replacement_deployment: DeploymentId,
     pub replacement_program: ProgramId,
     pub producer: ProducerId,
     /// Exact canonical policy artifact from the signed replacement package.
@@ -1382,7 +1396,9 @@ pub enum AccumulationResultV2 {
     },
     ActorUpgraded {
         actor: ActorId,
+        previous_deployment: DeploymentId,
         previous_program: ProgramId,
+        deployment: DeploymentId,
         program: ProgramId,
         receipt: AccumulationReceiptV2,
         duplicate: bool,
@@ -1476,7 +1492,7 @@ impl RefineImportsV2 {
             .iter()
             .find(|actor| actor.actor == work.target)
             .ok_or(RefineError::MissingImport(Hash(work.target.0)))?;
-        if target.program != work.target_program {
+        if target.deployment != work.target_deployment || target.program != work.target_program {
             return Err(RefineError::InvalidImport(Hash(target.program.0)));
         }
 
@@ -1547,6 +1563,7 @@ impl V2Wire for WorkEnvelopeV2 {
         e.u64(self.workflow_step);
         e.u64(self.logical_timeslot);
         e.fixed(&self.target.0);
+        e.fixed(&self.target_deployment.0);
         e.fixed(&self.target_program.0);
         e.string(&self.method);
         e.bytes(&self.arguments);
@@ -1574,6 +1591,7 @@ impl V2Wire for WorkEnvelopeV2 {
         let workflow_step = d.u64()?;
         let logical_timeslot = d.u64()?;
         let target = ActorId(d.fixed()?);
+        let target_deployment = DeploymentId(d.fixed()?);
         let target_program = ProgramId(d.fixed()?);
         let method = d.string()?;
         if method.is_empty() {
@@ -1622,7 +1640,7 @@ impl V2Wire for WorkEnvelopeV2 {
         ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
         ensure_external_actors_canonical(&external_actors)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
-        validate_imported_actor_tree(&imported_actors, target, target_program)?;
+        validate_imported_actor_tree(&imported_actors, target, target_deployment, target_program)?;
         if let AuthorizationEvidenceV2::PrivateCredential { witness, .. } = &authorization {
             let leaked_into_public_imports = imported_blobs
                 .binary_search_by_key(&witness.hash, |blob| blob.hash)
@@ -1680,6 +1698,7 @@ impl V2Wire for WorkEnvelopeV2 {
             workflow_step,
             logical_timeslot,
             target,
+            target_deployment,
             target_program,
             method,
             arguments,
@@ -2100,6 +2119,7 @@ impl V2Wire for TransitionV2 {
         encode_service(&mut e, &self.service);
         e.fixed(&self.consumed_input.invocation.0);
         e.u64(self.consumed_input.workflow_step);
+        e.fixed(&self.target_deployment.0);
         e.fixed(&self.target_program.0);
         encode_base(&mut e, &self.base);
         e.list(&self.writes, encode_write);
@@ -2122,6 +2142,7 @@ impl V2Wire for TransitionV2 {
                 invocation: InvocationId(d.fixed()?),
                 workflow_step: d.u64()?,
             },
+            target_deployment: DeploymentId(d.fixed()?),
             target_program: ProgramId(d.fixed()?),
             base: decode_base(d)?,
             writes: d.list(decode_write)?,
@@ -2694,7 +2715,9 @@ impl V2Wire for ActorUpgradeV2 {
         let mut e = Encoder(out);
         encode_service(&mut e, &self.service);
         e.fixed(&self.actor.0);
+        e.fixed(&self.expected_deployment.0);
         e.fixed(&self.expected_program.0);
+        e.fixed(&self.replacement_deployment.0);
         e.fixed(&self.replacement_program.0);
         e.fixed(&self.producer.0);
         e.bytes(&self.role_policies);
@@ -2706,7 +2729,9 @@ impl V2Wire for ActorUpgradeV2 {
         let value = Self {
             service: decode_service(d)?,
             actor: ActorId(d.fixed()?),
+            expected_deployment: DeploymentId(d.fixed()?),
             expected_program: ProgramId(d.fixed()?),
+            replacement_deployment: DeploymentId(d.fixed()?),
             replacement_program: ProgramId(d.fixed()?),
             producer: ProducerId(d.fixed()?),
             role_policies: d.bytes()?,
@@ -2714,7 +2739,7 @@ impl V2Wire for ActorUpgradeV2 {
             authorization: decode_auth(d)?,
         };
         if value.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
-            || value.expected_program == value.replacement_program
+            || value.expected_deployment == value.replacement_deployment
             || super::PackageRolePoliciesV2::decode(&value.role_policies).is_err()
             || !matches!(
                 &value.authorization,
@@ -3054,14 +3079,18 @@ impl V2Wire for AccumulationResultV2 {
             }
             Self::ActorUpgraded {
                 actor,
+                previous_deployment,
                 previous_program,
+                deployment,
                 program,
                 receipt,
                 duplicate,
             } => {
                 e.u8(7);
                 e.fixed(&actor.0);
+                e.fixed(&previous_deployment.0);
                 e.fixed(&previous_program.0);
+                e.fixed(&deployment.0);
                 e.fixed(&program.0);
                 e.bytes(&receipt.encode());
                 e.bool(*duplicate);
@@ -3118,11 +3147,13 @@ impl V2Wire for AccumulationResultV2 {
             }
             7 => {
                 let actor = ActorId(d.fixed()?);
+                let previous_deployment = DeploymentId(d.fixed()?);
                 let previous_program = ProgramId(d.fixed()?);
+                let deployment = DeploymentId(d.fixed()?);
                 let program = ProgramId(d.fixed()?);
                 let receipt = AccumulationReceiptV2::decode(&d.bytes()?)?;
                 let duplicate = d.bool()?;
-                if previous_program == program
+                if previous_deployment == deployment
                     || receipt.reply_commitment.is_some()
                     || receipt.outbox_commitment.is_some()
                     || receipt.checkpoint != 0
@@ -3131,7 +3162,9 @@ impl V2Wire for AccumulationResultV2 {
                 }
                 Ok(Self::ActorUpgraded {
                     actor,
+                    previous_deployment,
                     previous_program,
+                    deployment,
                     program,
                     receipt,
                     duplicate,
@@ -3147,6 +3180,7 @@ fn encode_actor_genesis(e: &mut Encoder<'_>, value: &ActorGenesisV2) {
     e.string(&value.name);
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
     e.fixed(&value.producer.0);
+    e.fixed(&value.deployment.0);
     e.fixed(&value.program.0);
     encode_blob_ref(e, &value.initial_state);
     e.bool(value.crdt);
@@ -3159,6 +3193,7 @@ fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeErr
         name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
         producer: ProducerId(d.fixed()?),
+        deployment: DeploymentId(d.fixed()?),
         program: ProgramId(d.fixed()?),
         initial_state: decode_blob_ref(d)?,
         crdt: d.bool()?,
@@ -3250,6 +3285,7 @@ fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
 fn validate_imported_actor_tree(
     actors: &[ImportedActorV2],
     target: ActorId,
+    target_deployment: DeploymentId,
     target_program: ProgramId,
 ) -> Result<(), DecodeError> {
     if actors.is_empty() || actors.len() > super::MAX_ROOT_TREE_ACTORS {
@@ -3271,7 +3307,9 @@ fn validate_imported_actor_tree(
     let target_matches = actors
         .binary_search_by_key(&target, |actor| actor.actor)
         .ok()
-        .is_some_and(|index| actors[index].program == target_program);
+        .is_some_and(|index| {
+            actors[index].deployment == target_deployment && actors[index].program == target_program
+        });
     if roots != 1 || !target_matches {
         return Err(DecodeError::NonCanonical);
     }
@@ -3346,6 +3384,7 @@ fn validate_actor_slice_tree(actors: &[ActorTreeImportV2]) -> Result<(), DecodeE
 fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), DecodeError> {
     if value.work.service != value.transition.service
         || value.work.input_id() != value.transition.consumed_input
+        || value.work.target_deployment != value.transition.target_deployment
         || value.work.target_program != value.transition.target_program
         || value.work.base != value.transition.base
         || !value.work.base.mode_compatible(value.work.consistency)
@@ -3722,6 +3761,7 @@ fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
     e.fixed(&value.actor.0);
     e.string(&value.name);
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
+    e.fixed(&value.deployment.0);
     e.fixed(&value.program.0);
     encode_blob_ref(e, &value.state);
     e.list(&value.causal_states, encode_blob_ref);
@@ -3733,6 +3773,7 @@ fn decode_imported_actor(d: &mut Decoder<'_>) -> Result<ImportedActorV2, DecodeE
         actor: ActorId(d.fixed()?),
         name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
+        deployment: DeploymentId(d.fixed()?),
         program: ProgramId(d.fixed()?),
         state: decode_blob_ref(d)?,
         causal_states: d.list(decode_blob_ref)?,
@@ -3744,6 +3785,7 @@ fn encode_actor_tree_import(e: &mut Encoder<'_>, value: &ActorTreeImportV2) {
     e.fixed(&value.actor.0);
     e.string(&value.name);
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
+    e.fixed(&value.deployment.0);
     e.fixed(&value.program.0);
 }
 
@@ -3752,6 +3794,7 @@ fn decode_actor_tree_import(d: &mut Decoder<'_>) -> Result<ActorTreeImportV2, De
         actor: ActorId(d.fixed()?),
         name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
+        deployment: DeploymentId(d.fixed()?),
         program: ProgramId(d.fixed()?),
     };
     if value.name.is_empty()
@@ -3768,6 +3811,7 @@ fn encode_external_actor(e: &mut Encoder<'_>, value: &ExternalActorBindingV2) {
     encode_service(e, &value.service);
     e.fixed(&value.actor.0);
     e.fixed(&value.producer.0);
+    e.fixed(&value.actor_deployment.0);
     e.fixed(&value.program.0);
 }
 
@@ -3777,6 +3821,7 @@ fn decode_external_actor(d: &mut Decoder<'_>) -> Result<ExternalActorBindingV2, 
         service: decode_service(d)?,
         actor: ActorId(d.fixed()?),
         producer: ProducerId(d.fixed()?),
+        actor_deployment: DeploymentId(d.fixed()?),
         program: ProgramId(d.fixed()?),
     };
     if value.name.is_empty() || value.service.execution_semantics != super::EXECUTION_SEMANTICS_ID {
@@ -4132,6 +4177,7 @@ mod tests {
             workflow_step: 0,
             logical_timeslot: 5,
             target: ActorId([5; 32]),
+            target_deployment: DeploymentId([9; 32]),
             target_program: ProgramId([6; 32]),
             method: "increment".into(),
             arguments: vec![1, 2],
@@ -4152,6 +4198,7 @@ mod tests {
                 actor: ActorId([5; 32]),
                 name: "root".into(),
                 parent: None,
+                deployment: DeploymentId([9; 32]),
                 program: ProgramId([6; 32]),
                 state: BlobRefV2::of_bytes(b"state"),
                 causal_states: vec![],
@@ -4309,6 +4356,7 @@ mod tests {
             actor: work.target,
             name: "root".into(),
             parent: None,
+            deployment: work.target_deployment,
             program,
             state: state.clone(),
             causal_states: vec![],
@@ -4335,6 +4383,7 @@ mod tests {
             service: external_service,
             actor: ActorId([33; 32]),
             producer: ProducerId([34; 32]),
+            actor_deployment: DeploymentId([36; 32]),
             program: ProgramId([35; 32]),
         }];
         let imports = RefineImportsV2 {
@@ -4345,6 +4394,13 @@ mod tests {
         imports.validate_for(&work).unwrap();
         let encoded = imports.encode();
         assert_eq!(RefineImportsV2::decode(&encoded).unwrap(), imports);
+
+        let mut wrong_deployment = work.clone();
+        wrong_deployment.target_deployment = DeploymentId([37; 32]);
+        assert_eq!(
+            WorkEnvelopeV2::decode(&wrong_deployment.encode()),
+            Err(DecodeError::NonCanonical)
+        );
 
         let mut missing = imports.clone();
         missing
@@ -4377,12 +4433,14 @@ mod tests {
                     actor: ActorId([21; 32]),
                     name: "root".into(),
                     parent: None,
+                    deployment: DeploymentId([23; 32]),
                     program: ProgramId([24; 32]),
                 },
                 ActorTreeImportV2 {
                     actor: ActorId([22; 32]),
                     name: "child".into(),
                     parent: Some(ActorId([21; 32])),
+                    deployment: DeploymentId([23; 32]),
                     program: ProgramId([25; 32]),
                 },
             ],
@@ -4391,6 +4449,7 @@ mod tests {
                 service: service(),
                 actor: ActorId([26; 32]),
                 producer: ProducerId([27; 32]),
+                actor_deployment: DeploymentId([29; 32]),
                 program: ProgramId([28; 32]),
             }],
             input: WorkInputIdV2 {
@@ -4753,6 +4812,7 @@ mod tests {
                 invocation: InvocationId([9; 32]),
                 workflow_step: 0,
             },
+            target_deployment: DeploymentId([15; 32]),
             target_program: ProgramId([10; 32]),
             base: ConsistencyBaseV2::Linear {
                 revision: 0,
@@ -4838,6 +4898,7 @@ mod tests {
                     name: "root".into(),
                     parent: None,
                     producer: ProducerId([4; 32]),
+                    deployment: DeploymentId([2; 32]),
                     program: ProgramId([6; 32]),
                     initial_state: BlobRefV2::of_bytes(b"root-state"),
                     crdt: false,
@@ -4856,6 +4917,7 @@ mod tests {
                     name: "child".into(),
                     parent: Some(ActorId([5; 32])),
                     producer: ProducerId([4; 32]),
+                    deployment: DeploymentId([12; 32]),
                     program: ProgramId([10; 32]),
                     initial_state: BlobRefV2::of_bytes(b"child-state"),
                     crdt: false,
@@ -4882,6 +4944,7 @@ mod tests {
         let transition = TransitionV2 {
             service: work.service.clone(),
             consumed_input: work.input_id(),
+            target_deployment: work.target_deployment,
             target_program: work.target_program,
             base: work.base.clone(),
             writes: vec![],
@@ -4930,7 +4993,9 @@ mod tests {
         let upgrade = ActorUpgradeV2 {
             service: service(),
             actor: ActorId([5; 32]),
+            expected_deployment: DeploymentId([2; 32]),
             expected_program: ProgramId([6; 32]),
+            replacement_deployment: DeploymentId([20; 32]),
             replacement_program: ProgramId([20; 32]),
             producer: ProducerId([21; 32]),
             role_policies: role_policies(vec![MethodPolicyV2 {
@@ -4959,7 +5024,9 @@ mod tests {
         assert_ne!(upgrade.hash(), Hash::ZERO);
         let upgraded = AccumulationResultV2::ActorUpgraded {
             actor: upgrade.actor,
+            previous_deployment: upgrade.expected_deployment,
             previous_program: upgrade.expected_program,
+            deployment: upgrade.replacement_deployment,
             program: upgrade.replacement_program,
             receipt: AccumulationReceiptV2 {
                 service: service(),
@@ -5016,6 +5083,7 @@ mod tests {
                 name: "root".into(),
                 parent: None,
                 producer: ProducerId([4; 32]),
+                deployment: DeploymentId([2; 32]),
                 program: ProgramId([6; 32]),
                 initial_state: BlobRefV2::of_bytes(b"state"),
                 crdt: false,
@@ -5055,6 +5123,7 @@ mod tests {
                     service: service(),
                     actor,
                     producer: ProducerId([22; 32]),
+                    actor_deployment: DeploymentId([28; 32]),
                     program: ProgramId([23; 32]),
                 },
                 ExternalActorBindingV2 {
@@ -5066,6 +5135,7 @@ mod tests {
                     },
                     actor,
                     producer: ProducerId([26; 32]),
+                    actor_deployment: DeploymentId([29; 32]),
                     program: ProgramId([27; 32]),
                 },
             ],
@@ -5432,6 +5502,7 @@ mod tests {
         let transition = TransitionV2 {
             service: work.service.clone(),
             consumed_input: work.input_id(),
+            target_deployment: work.target_deployment,
             target_program: work.target_program,
             base: work.base.clone(),
             writes: vec![],
