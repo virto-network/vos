@@ -875,6 +875,8 @@ pub fn run_nested_actor_service<A: super::Actor>(
         (pair[0].actor, pair[0].key.as_slice()) < (pair[1].actor, pair[1].key.as_slice())
     }));
     let outbox = ctx.__drain_actor_calls_v2();
+    let (attestation_verifications, verification_blobs) =
+        ctx.__drain_attestation_verifications_v2();
     let (first_await_ordinal, next_await_ordinal) = ctx.__await_ordinal_range_v2();
     let encoded = ActorSliceOutputV2 {
         actor: input.actor,
@@ -884,6 +886,8 @@ pub fn run_nested_actor_service<A: super::Actor>(
         crdt_operations,
         crdt_states,
         outbox,
+        attestation_verifications,
+        verification_blobs,
         reply,
         yielded,
         forbidden,

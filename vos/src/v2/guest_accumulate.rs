@@ -1168,6 +1168,14 @@ fn apply<S: GuestAccumulateStoreV2>(
     if external_directory.actors != work.external_actors {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
+    if header.consistency == ConsistencyModeV2::Crdt
+        && !transition.attestation_verifications.is_empty()
+    {
+        // Once-only admission requires a linearizable service transaction.
+        // CRDT applications must use an application-specific conflict-free
+        // construction instead of claiming global replay exclusion.
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
 
     if let Some(rejection) = validate_continuation_change(tree.store_ref(), envelope)? {
         return Ok(rejected(rejection));
@@ -1240,6 +1248,21 @@ fn apply<S: GuestAccumulateStoreV2>(
         if actual != candidate.reference {
             return Err(GuestAccumulateError::CorruptStore);
         }
+    }
+    if let Some(rejection) =
+        validate_attestation_verifications(&mut tree, &directory, &external_directory, transition)?
+    {
+        return Ok(rejected(rejection));
+    }
+    for verification in &transition.attestation_verifications {
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::AttestationReplay {
+                actor: verification.statement.actor,
+                invocation: verification.statement.invocation,
+            },
+            Some(&verification.encode()),
+        )?;
     }
 
     if header.consistency == ConsistencyModeV2::Crdt {
@@ -1691,6 +1714,9 @@ fn canonical_transition_shape(
     is_sorted_unique_by(&transition.continuations, |change| change.actor.0)
         && is_sorted_unique_by(&transition.inbox, |message| message.call_id.0)
         && is_sorted_unique_by(&transition.outbox, |message| message.call_id.0)
+        && is_sorted_unique_by(&transition.attestation_verifications, |verification| {
+            verification.replay_key()
+        })
         && transition
             .reply
             .as_ref()
@@ -2087,7 +2113,101 @@ fn referenced_blobs<'a>(
                 .flat_map(|change| change.materializations.iter())
                 .map(|materialization| &materialization.state),
         )
+        .chain(
+            transition
+                .attestation_verifications
+                .iter()
+                .map(|verification| &verification.proof_blob),
+        )
         .chain(transition.proof.iter().map(|proof| &proof.proof_blob))
+}
+
+fn validate_attestation_verifications<S: GuestAccumulateStoreV2>(
+    tree: &mut ServiceStateTreeV2<'_, S>,
+    directory: &super::ActorDirectoryV2,
+    external: &ExternalActorDirectoryV2,
+    transition: &super::TransitionV2,
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    for verification in &transition.attestation_verifications {
+        let mut local = None;
+        for actor in &directory.actors {
+            let descriptor =
+                tree_get_wire::<_, ActorGenesisV2>(tree, &StateKeyV2::ActorDescriptor(*actor))?
+                    .ok_or(GuestAccumulateError::CorruptStore)?;
+            if descriptor.parent.is_none() && descriptor.name == verification.source_name {
+                local = Some(descriptor);
+                break;
+            }
+        }
+        let (service, actor, producer, program) = if let Some(descriptor) = local {
+            (
+                transition.service.clone(),
+                descriptor.actor,
+                descriptor.producer,
+                descriptor.program,
+            )
+        } else {
+            let Some(binding) = external
+                .actors
+                .binary_search_by(|binding| binding.name.cmp(&verification.source_name))
+                .ok()
+                .map(|index| &external.actors[index])
+            else {
+                return Ok(Some(AccumulationRejectionV2::InvalidProof));
+            };
+            (
+                binding.service.clone(),
+                binding.actor,
+                binding.producer,
+                binding.program,
+            )
+        };
+        if verification.producer != producer
+            || verification.statement.actor != actor
+            || verification.statement.actor_program != program
+            || verification.statement.accumulation_receipt.service != service
+            || verification.statement.validate().is_err()
+        {
+            return Ok(Some(AccumulationRejectionV2::InvalidProof));
+        }
+        let replay_key = StateKeyV2::AttestationReplay {
+            actor,
+            invocation: verification.statement.invocation,
+        };
+        if tree
+            .get(&replay_key)
+            .map_err(GuestAccumulateError::StateTree)?
+            .is_some()
+        {
+            return Ok(Some(AccumulationRejectionV2::AttestationReplay));
+        }
+        if !blob_available(tree.store_ref(), &verification.proof_blob)? {
+            return Ok(Some(AccumulationRejectionV2::MissingBlob(
+                verification.proof_blob.hash,
+            )));
+        }
+        let request = ProofVerificationRequestV2 {
+            actor_program: program,
+            execution_semantics: service.execution_semantics,
+            statement: verification.statement.commitment(),
+            trace: verification.trace,
+            proof_blob: verification.proof_blob.clone(),
+        };
+        match tree
+            .store_mut()
+            .verify_proof(&request)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            ProofVerificationV2::Valid => {}
+            ProofVerificationV2::Invalid => {
+                return Ok(Some(AccumulationRejectionV2::InvalidProof));
+            }
+            ProofVerificationV2::Unavailable => {
+                return Ok(Some(AccumulationRejectionV2::ProofUnavailable));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn actor_state_key(consistency: ConsistencyModeV2, actor: ActorId) -> StateKeyV2 {
@@ -2272,10 +2392,12 @@ mod tests {
     use core::convert::Infallible;
 
     use super::*;
+    use crate::attestation::{AttestationStatementV3, StateCommitmentV3};
     use crate::v2::{
-        ActorWriteV2, ContinuationChangeV2, CrdtMaterializationV2, CrdtOperationV2, DeploymentId,
-        GasAccountingV2, ImportedActorV2, ImportedBlobV2, InvocationId, OperationId, Origin,
-        ProgramId, ReplyRecordV2, RootServiceId, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
+        ActorWriteV2, AttestationVerificationV2, ContinuationChangeV2, CrdtMaterializationV2,
+        CrdtOperationV2, DeploymentId, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
+        InvocationId, OperationId, Origin, ProgramId, ReplyRecordV2, RootServiceId,
+        ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2287,6 +2409,8 @@ mod tests {
     struct MemStore {
         rows: BTreeMap<Vec<u8>, Vec<u8>>,
         blobs: BTreeMap<Hash, Vec<u8>>,
+        proof_allowlist: BTreeSet<Hash>,
+        invalid_proof_allowlist: BTreeSet<Hash>,
         receipt_allowlist: BTreeSet<Hash>,
         writes_before_failure: Option<usize>,
     }
@@ -2345,9 +2469,15 @@ mod tests {
 
         fn verify_proof(
             &self,
-            _request: &ProofVerificationRequestV2,
+            request: &ProofVerificationRequestV2,
         ) -> Result<ProofVerificationV2, Self::Error> {
-            Ok(ProofVerificationV2::Unavailable)
+            Ok(if self.invalid_proof_allowlist.contains(&request.hash()) {
+                ProofVerificationV2::Invalid
+            } else if self.proof_allowlist.contains(&request.hash()) {
+                ProofVerificationV2::Valid
+            } else {
+                ProofVerificationV2::Unavailable
+            })
         }
 
         fn verify_receipt(
@@ -2497,6 +2627,7 @@ mod tests {
                 producer: actor(),
                 result: b"ok".to_vec(),
             }),
+            attestation_verifications: Vec::new(),
             exported_blobs: Vec::new(),
             gas: GasAccountingV2::default(),
             proof: None,
@@ -2546,6 +2677,160 @@ mod tests {
         assert_ne!(
             staging, before,
             "receipt prediction executes against an isolated staging transaction"
+        );
+    }
+
+    #[test]
+    fn verifier_proof_and_replay_key_commit_atomically() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let binding = external_bindings().remove(0);
+        let after = Hash([72; 32]);
+        let statement = AttestationStatementV3 {
+            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
+            space: binding.service.space,
+            actor: binding.actor,
+            deployment: binding.service.deployment,
+            actor_program: binding.program,
+            method: "is_adult".into(),
+            schema: Hash([73; 32]),
+            invocation: InvocationId([74; 32]),
+            before: StateCommitmentV3::Linear(Hash([75; 32])),
+            after: StateCommitmentV3::Linear(after),
+            claim_commitment: Hash([76; 32]),
+            input_commitment: Hash([77; 32]),
+            authorization_policy: Hash([78; 32]),
+            accumulation_receipt: AccumulationReceiptV2 {
+                service: binding.service.clone(),
+                accepted_transition: Hash([79; 32]),
+                reply_commitment: None,
+                outbox_commitment: None,
+                resulting_state_root: Some(after),
+                resulting_crdt_heads: vec![],
+                sequence: 1,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
+        };
+        let proof = b"verified peer proof".to_vec();
+        let proof_blob = BlobRefV2::of_bytes(&proof);
+        let verification = AttestationVerificationV2 {
+            source_name: binding.name,
+            producer: binding.producer,
+            statement,
+            trace: Hash([80; 32]),
+            proof_blob: proof_blob.clone(),
+        };
+        let proof_request = ProofVerificationRequestV2 {
+            actor_program: binding.program,
+            execution_semantics: binding.service.execution_semantics,
+            statement: verification.statement.commitment(),
+            trace: verification.trace,
+            proof_blob: proof_blob.clone(),
+        };
+        let mut transition = linear_transition(&work, b"after");
+        transition
+            .attestation_verifications
+            .push(verification.clone());
+        let candidate = ImportedBlobV2 {
+            reference: proof_blob,
+            bytes: proof,
+        };
+        let mut invalid_store = store.clone();
+        invalid_store
+            .invalid_proof_allowlist
+            .insert(proof_request.hash());
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut invalid_store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: work.clone(),
+                    transition: transition.clone(),
+                    provided_blobs: vec![candidate.clone()],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidProof)
+        );
+
+        store.proof_allowlist.insert(proof_request.hash());
+        let accepted = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work,
+                transition,
+                provided_blobs: vec![candidate.clone()],
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
+            panic!("valid verifier transition was rejected")
+        };
+        let header = StoreHeaderV2::open(
+            &store
+                .read(header_storage_key())
+                .unwrap()
+                .expect("committed header"),
+        )
+        .unwrap();
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        assert!(
+            tree.get(&StateKeyV2::AttestationReplay {
+                actor: verification.statement.actor,
+                invocation: verification.statement.invocation,
+            })
+            .unwrap()
+            .is_some()
+        );
+        drop(tree);
+
+        let mut replay_work = linear_work(
+            BlobRefV2::of_bytes(b"after"),
+            receipt.resulting_state_root.unwrap(),
+        );
+        replay_work.invocation = InvocationId([81; 32]);
+        replay_work.base = ConsistencyBaseV2::Linear {
+            revision: receipt.sequence,
+            state_root: receipt.resulting_state_root.unwrap(),
+        };
+        let mut replay_transition = linear_transition(&replay_work, b"later");
+        replay_transition
+            .attestation_verifications
+            .push(verification.clone());
+        let before_replay = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: replay_work,
+                    transition: replay_transition,
+                    provided_blobs: vec![candidate],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::AttestationReplay)
+        );
+        assert_eq!(store, before_replay);
+
+        let mut crdt_store = MemStore::default();
+        let (crdt_initial, _) =
+            install_fixture(&mut crdt_store, ConsistencyModeV2::Crdt, b"crdt before");
+        let crdt_work = crdt_work(crdt_initial, 82, vec![]);
+        let materialized = BlobRefV2::of_bytes(b"crdt after");
+        let mut crdt_transition = crdt_transition(&crdt_work, materialized, 1);
+        crdt_transition.attestation_verifications.push(verification);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut crdt_store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: crdt_work,
+                    transition: crdt_transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidConsistency)
         );
     }
 
@@ -3664,6 +3949,7 @@ mod tests {
             inbox: Vec::new(),
             outbox: Vec::new(),
             reply: None,
+            attestation_verifications: Vec::new(),
             exported_blobs: Vec::new(),
             gas: GasAccountingV2::default(),
             proof: None,

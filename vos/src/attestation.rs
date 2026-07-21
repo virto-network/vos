@@ -466,6 +466,35 @@ impl<T, M> Attestation<T, M> {
         self.producer
     }
 
+    pub(crate) fn into_guest_verification(
+        self,
+        source_name: String,
+    ) -> Result<
+        (
+            crate::v2::AttestationVerificationV2,
+            crate::v2::ImportedBlobV2,
+            Verified<T>,
+        ),
+        AttestationError,
+    > {
+        if source_name != self.producer_name {
+            return Err(AttestationError::WrongProducer);
+        }
+        let proof_blob = crate::v2::BlobRefV2::of_bytes(&self.proof);
+        let requirement = crate::v2::AttestationVerificationV2 {
+            source_name,
+            producer: self.producer,
+            statement: self.statement,
+            trace: self.trace,
+            proof_blob: proof_blob.clone(),
+        };
+        let candidate = crate::v2::ImportedBlobV2 {
+            reference: proof_blob,
+            bytes: self.proof,
+        };
+        Ok((requirement, candidate, Verified(self.preview)))
+    }
+
     /// Strict portable application package. The preview is encoded with the
     /// exact generated actor-reply codec, not a second generic serializer.
     pub fn to_portable_bytes(&self) -> Vec<u8>

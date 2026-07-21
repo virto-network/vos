@@ -1,7 +1,7 @@
 use super::Actor;
 use super::auth::{Caller, Forbidden, RoleByte, SpaceRole};
-#[cfg(feature = "pvm")]
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Execution context passed to message handlers.
@@ -78,6 +78,8 @@ pub struct Context<A: Actor> {
     nested_crdt_operations: Vec<crate::v2::CrdtOperationV2>,
     #[cfg(feature = "pvm")]
     nested_crdt_states: BTreeMap<crate::v2::ActorId, crate::v2::ActorCrdtStateV2>,
+    pending_attestation_verifications: Vec<crate::v2::AttestationVerificationV2>,
+    pending_verification_blobs: BTreeMap<crate::v2::Hash, crate::v2::ImportedBlobV2>,
 
     // Reply data (rkyv-encoded Value, included in refine output)
     reply: Option<Vec<u8>>,
@@ -141,6 +143,8 @@ impl<A: Actor> Context<A> {
             nested_crdt_operations: Vec::new(),
             #[cfg(feature = "pvm")]
             nested_crdt_states: BTreeMap::new(),
+            pending_attestation_verifications: Vec::new(),
+            pending_verification_blobs: BTreeMap::new(),
             reply: None,
             self_schedule: false,
             #[cfg(feature = "pvm")]
@@ -856,6 +860,35 @@ impl<A: Actor> Context<A> {
                     .expect("checked nested checkpoint presence"),
             );
         }
+        for requirement in &output.attestation_verifications {
+            let key = requirement.replay_key();
+            let index = match self
+                .pending_attestation_verifications
+                .binary_search_by_key(&key, |verification| verification.replay_key())
+            {
+                Ok(_) => {
+                    return Some(super::run::Ask::ready_err(
+                        super::value::InvokeError::Panicked,
+                    ));
+                }
+                Err(index) => index,
+            };
+            self.pending_attestation_verifications
+                .insert(index, requirement.clone());
+        }
+        for candidate in &output.verification_blobs {
+            if self
+                .pending_verification_blobs
+                .get(&candidate.reference.hash)
+                .is_some_and(|existing| existing != candidate)
+            {
+                return Some(super::run::Ask::ready_err(
+                    super::value::InvokeError::Panicked,
+                ));
+            }
+            self.pending_verification_blobs
+                .insert(candidate.reference.hash, candidate.clone());
+        }
         self.next_await_ordinal = output.next_await_ordinal;
         self.nested_crdt_operations.extend(output.crdt_operations);
         for state in output.crdt_states {
@@ -1020,6 +1053,79 @@ impl<A: Actor> Context<A> {
             Ok(super::value::Value::U32(n)) => n,
             _ => 0,
         }
+    }
+
+    /// Consume a previously produced proof package without invoking its
+    /// producer. The returned value is transactionally verified: actor code
+    /// may use it during this slice, but no writes, messages, or reply become
+    /// observable unless guest Accumulate validates the proof and atomically
+    /// admits its once-only replay key.
+    pub fn verify<T, M>(
+        &mut self,
+        package: crate::Attestation<T, M>,
+    ) -> GuestVerifyAttestation<'_, A, T, M> {
+        GuestVerifyAttestation {
+            context: self,
+            package,
+        }
+    }
+
+    fn admit_attestation_verification<T, M>(
+        &mut self,
+        package: crate::Attestation<T, M>,
+        source_name: String,
+    ) -> Result<crate::Verified<T>, crate::AttestationError>
+    where
+        M: crate::AttestedMethod<T>,
+    {
+        let (requirement, candidate, verified) =
+            package.into_guest_verification(source_name.clone())?;
+        let local = self
+            .actor_tree
+            .iter()
+            .find(|actor| actor.parent.is_none() && actor.name == source_name);
+        if let Some(actor) = local {
+            if requirement.statement.actor != actor.actor
+                || requirement.statement.actor_program != actor.program
+            {
+                return Err(crate::AttestationError::WrongProducer);
+            }
+        } else {
+            let binding = self
+                .external_actors
+                .binary_search_by(|actor| actor.name.as_str().cmp(&source_name))
+                .ok()
+                .map(|index| &self.external_actors[index])
+                .ok_or(crate::AttestationError::WrongProducer)?;
+            if requirement.statement.actor != binding.actor
+                || requirement.statement.actor_program != binding.program
+                || requirement.producer != binding.producer
+                || requirement.statement.accumulation_receipt.service != binding.service
+            {
+                return Err(crate::AttestationError::WrongProducer);
+            }
+        }
+
+        let key = requirement.replay_key();
+        let index = match self
+            .pending_attestation_verifications
+            .binary_search_by_key(&key, |verification| verification.replay_key())
+        {
+            Ok(_) => return Err(crate::AttestationError::Replay),
+            Err(index) => index,
+        };
+        if self
+            .pending_verification_blobs
+            .get(&candidate.reference.hash)
+            .is_some_and(|existing| existing != &candidate)
+        {
+            return Err(crate::AttestationError::InvalidProof);
+        }
+        self.pending_attestation_verifications
+            .insert(index, requirement);
+        self.pending_verification_blobs
+            .insert(candidate.reference.hash, candidate);
+        Ok(verified)
     }
 
     /// Resolve an installed root actor by name and bind its generated typed
@@ -1542,8 +1648,58 @@ impl<A: Actor> Context<A> {
 
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
+    pub fn __drain_attestation_verifications_v2(
+        &mut self,
+    ) -> (
+        Vec<crate::v2::AttestationVerificationV2>,
+        Vec<crate::v2::ImportedBlobV2>,
+    ) {
+        (
+            core::mem::take(&mut self.pending_attestation_verifications),
+            core::mem::take(&mut self.pending_verification_blobs)
+                .into_values()
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
     pub fn __await_ordinal_range_v2(&self) -> (u64, u64) {
         (self.first_await_ordinal, self.next_await_ordinal)
+    }
+}
+
+/// First guest-verifier builder state. A source name is mandatory so the
+/// package cannot nominate its own trusted identity.
+pub struct GuestVerifyAttestation<'ctx, A: Actor, T, M> {
+    context: &'ctx mut Context<A>,
+    package: crate::Attestation<T, M>,
+}
+
+impl<'ctx, A: Actor, T, M> GuestVerifyAttestation<'ctx, A, T, M> {
+    pub fn from(self, source_name: impl Into<String>) -> GuestVerifyAttestationFrom<'ctx, A, T, M> {
+        GuestVerifyAttestationFrom {
+            context: self.context,
+            package: self.package,
+            source_name: source_name.into(),
+        }
+    }
+}
+
+/// Guest-verifier builder with an authenticated installation label selected.
+pub struct GuestVerifyAttestationFrom<'ctx, A: Actor, T, M> {
+    context: &'ctx mut Context<A>,
+    package: crate::Attestation<T, M>,
+    source_name: String,
+}
+
+impl<A: Actor, T, M> GuestVerifyAttestationFrom<'_, A, T, M>
+where
+    M: crate::AttestedMethod<T>,
+{
+    pub async fn once(self) -> Result<crate::Verified<T>, crate::AttestationError> {
+        self.context
+            .admit_attestation_verification(self.package, self.source_name)
     }
 }
 
@@ -1803,6 +1959,20 @@ mod tests {
         }
     }
 
+    enum TestClaimMethod {}
+
+    impl crate::AttestedMethod<u64> for TestClaimMethod {
+        const METHOD: &'static str = "is_adult";
+
+        fn claim_wire(claim: &u64) -> Vec<u8> {
+            crate::Encode::encode(&crate::value::Value::U64(*claim))
+        }
+
+        fn decode_claim_wire(wire: &[u8]) -> Option<u64> {
+            <crate::value::Value as crate::Decode>::try_decode(wire)?.as_u64()
+        }
+    }
+
     #[test]
     fn context_new_defaults_caller_to_unauthenticated() {
         // Fresh Context starts with no caller — the host writes
@@ -1904,6 +2074,77 @@ mod tests {
 
         assert_eq!(ctx.resolve_external_actor_v2("private-age"), Some(actor));
         assert_eq!(ctx.resolve_external_actor_v2("package-label"), None);
+    }
+
+    #[test]
+    fn guest_verify_emits_an_accumulate_owned_proof_requirement() {
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        ctx.__set_actor_id(crate::v2::ActorId([1; 32]));
+        let binding = crate::v2::ExternalActorBindingV2 {
+            name: "private-age".into(),
+            service: crate::v2::ServiceIdentityV2 {
+                space: crate::v2::SpaceId([2; 32]),
+                root_service: crate::v2::RootServiceId([3; 32]),
+                deployment: crate::v2::DeploymentId([4; 32]),
+                service_program: crate::v2::ProgramId([5; 32]),
+                service_abi: crate::v2::ABI_VERSION,
+                execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            },
+            actor: crate::v2::ActorId([41; 32]),
+            producer: crate::v2::ProducerId([6; 32]),
+            program: crate::v2::ProgramId([7; 32]),
+        };
+        ctx.external_actors = alloc::vec![binding.clone()];
+        let package = || {
+            let after = crate::v2::Hash([8; 32]);
+            let statement = crate::AttestationStatementV3 {
+                statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
+                space: binding.service.space,
+                actor: binding.actor,
+                deployment: binding.service.deployment,
+                actor_program: binding.program,
+                method: "is_adult".into(),
+                schema: crate::v2::Hash([9; 32]),
+                invocation: crate::v2::InvocationId([10; 32]),
+                before: crate::StateCommitmentV3::Linear(crate::v2::Hash([11; 32])),
+                after: crate::StateCommitmentV3::Linear(after),
+                claim_commitment: crate::v2::Hash::digest(
+                    b"vos/attestation-claim/v3",
+                    &[&<TestClaimMethod as crate::AttestedMethod<u64>>::claim_wire(&21)],
+                ),
+                input_commitment: crate::v2::Hash([12; 32]),
+                authorization_policy: crate::v2::Hash([13; 32]),
+                accumulation_receipt: crate::v2::AccumulationReceiptV2 {
+                    service: binding.service.clone(),
+                    accepted_transition: crate::v2::Hash([14; 32]),
+                    reply_commitment: None,
+                    outbox_commitment: None,
+                    resulting_state_root: Some(after),
+                    resulting_crdt_heads: alloc::vec![],
+                    sequence: 1,
+                    checkpoint: 0,
+                    consistency: crate::v2::ConsistencyModeV2::Local,
+                },
+            };
+            crate::Attestation::<u64, TestClaimMethod>::__from_runtime(
+                binding.name.clone(),
+                binding.producer,
+                statement,
+                crate::v2::Hash([15; 32]),
+                21,
+                alloc::vec![16],
+            )
+            .unwrap()
+        };
+
+        let verified = crate::block_on(ctx.verify(package()).from("private-age").once()).unwrap();
+        assert_eq!(verified.into_inner(), 21);
+        assert_eq!(ctx.pending_attestation_verifications.len(), 1);
+        assert_eq!(ctx.pending_verification_blobs.len(), 1);
+        assert_eq!(
+            crate::block_on(ctx.verify(package()).from("private-age").once()),
+            Err(crate::AttestationError::Replay)
+        );
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

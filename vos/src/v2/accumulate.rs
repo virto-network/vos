@@ -353,13 +353,22 @@ impl InMemoryServiceState {
                     .flat_map(|change| change.materializations.iter())
                     .map(|materialization| &materialization.state),
             )
+            .chain(
+                transition
+                    .attestation_verifications
+                    .iter()
+                    .map(|verification| &verification.proof_blob),
+            )
         {
             if !self.blobs.contains(&blob.hash) && !validator.blob_available(blob) {
                 return Err(AccumulateError::MissingBlob(blob.hash));
             }
         }
 
-        if work.proof_requested || transition.proof.is_some() {
+        if work.proof_requested
+            || transition.proof.is_some()
+            || !transition.attestation_verifications.is_empty()
+        {
             return Err(AccumulateError::ProofUnavailable);
         }
 
@@ -657,6 +666,7 @@ mod tests {
                 producer: actor,
                 result: b"one".to_vec(),
             }),
+            attestation_verifications: vec![],
             exported_blobs: vec![],
             gas: GasAccountingV2::default(),
             proof: None,
@@ -814,6 +824,7 @@ mod tests {
             inbox: vec![],
             outbox: vec![],
             reply: None,
+            attestation_verifications: vec![],
             exported_blobs: vec![],
             gas: GasAccountingV2::default(),
             proof: None,

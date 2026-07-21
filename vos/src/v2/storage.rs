@@ -14,7 +14,7 @@ use super::{
     PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 2;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 3;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -144,6 +144,12 @@ pub enum StateKeyV2 {
     Inbox(CallId),
     Outbox(CallId),
     Workflow(InvocationId),
+    /// Once-only verifier admission. Its value is the exact canonical proof
+    /// obligation accepted atomically with the authorized actor effects.
+    AttestationReplay {
+        actor: ActorId,
+        invocation: InvocationId,
+    },
     CrdtMaterialization(ActorId),
     ActorName {
         parent: Option<ActorId>,
@@ -162,6 +168,11 @@ impl V2Wire for StateKeyV2 {
             }
             Self::ExternalActorDirectory => {
                 e.u8(10);
+            }
+            Self::AttestationReplay { actor, invocation } => {
+                e.u8(11);
+                e.fixed(&actor.0);
+                e.fixed(&invocation.0);
             }
             Self::ActorDescriptor(actor) => {
                 e.u8(0);
@@ -239,6 +250,10 @@ impl V2Wire for StateKeyV2 {
             }
             9 => Ok(Self::ActorDirectory),
             10 => Ok(Self::ExternalActorDirectory),
+            11 => Ok(Self::AttestationReplay {
+                actor: ActorId(d.fixed()?),
+                invocation: InvocationId(d.fixed()?),
+            }),
             _ => Err(DecodeError::InvalidTag),
         }
     }

@@ -285,6 +285,14 @@ pub struct ActorSliceOutputV2 {
     /// Cross-root calls emitted by this slice. The owning service derives each
     /// stable `CallId` from the work invocation and `await_ordinal`.
     pub outbox: Vec<ActorCallRequestV2>,
+    /// Proof packages consumed by `Context::verify(...).once()`. Refine only
+    /// carries these requirements; guest Accumulate performs verification and
+    /// atomically admits their replay keys.
+    pub attestation_verifications: Vec<AttestationVerificationV2>,
+    /// Content-addressed proof bytes referenced by
+    /// `attestation_verifications`. These remain transaction candidates and
+    /// are not published as actor effects.
+    pub verification_blobs: Vec<ImportedBlobV2>,
     pub reply: Vec<u8>,
     pub yielded: bool,
     pub forbidden: bool,
@@ -704,6 +712,24 @@ pub struct ProofVerificationRequestV2 {
     pub proof_blob: BlobRefV2,
 }
 
+/// One verifier-side proof obligation emitted by an actor execution slice.
+/// The source label and producer identity are checked against guest-owned
+/// installation state; no identity carried by the package is trusted alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationVerificationV2 {
+    pub source_name: String,
+    pub producer: ProducerId,
+    pub statement: AttestationStatementV3,
+    pub trace: Hash,
+    pub proof_blob: BlobRefV2,
+}
+
+impl AttestationVerificationV2 {
+    pub fn replay_key(&self) -> (ActorId, InvocationId) {
+        (self.statement.actor, self.statement.invocation)
+    }
+}
+
 impl ProofVerificationRequestV2 {
     pub fn hash(&self) -> Hash {
         Hash::digest(b"vos/proof-verification/v2", &[&self.encode()])
@@ -722,6 +748,7 @@ pub struct TransitionV2 {
     pub inbox: Vec<MessageRecordV2>,
     pub outbox: Vec<MessageRecordV2>,
     pub reply: Option<ReplyRecordV2>,
+    pub attestation_verifications: Vec<AttestationVerificationV2>,
     pub exported_blobs: Vec<BlobRefV2>,
     pub gas: GasAccountingV2,
     pub proof: Option<ProofCommitmentV2>,
@@ -764,6 +791,7 @@ impl TransitionV2 {
             inbox: self.inbox.clone(),
             outbox: self.outbox.clone(),
             reply: self.reply.clone(),
+            attestation_verifications: self.attestation_verifications.clone(),
             exported_blobs: self.exported_blobs.clone(),
             gas: self.gas.clone(),
             proof: None,
@@ -1021,6 +1049,7 @@ pub enum AccumulationRejectionV2 {
     NonCanonical,
     ReceiptUnavailable,
     InvalidReceipt,
+    AttestationReplay,
 }
 
 impl AccumulationRejectionV2 {
@@ -1434,6 +1463,14 @@ impl V2Wire for ActorSliceOutputV2 {
             e.u32(state.next_ordinal);
         });
         e.list(&self.outbox, encode_actor_call);
+        e.list(
+            &self.attestation_verifications,
+            encode_attestation_verification,
+        );
+        e.list(&self.verification_blobs, |e, blob| {
+            encode_blob_ref(e, &blob.reference);
+            e.bytes(&blob.bytes);
+        });
         e.bytes(&self.reply);
         e.bool(self.yielded);
         e.bool(self.forbidden);
@@ -1455,6 +1492,13 @@ impl V2Wire for ActorSliceOutputV2 {
                 })
             })?,
             outbox: d.list(decode_actor_call)?,
+            attestation_verifications: d.list(decode_attestation_verification)?,
+            verification_blobs: d.list(|d| {
+                Ok(ImportedBlobV2 {
+                    reference: decode_blob_ref(d)?,
+                    bytes: d.bytes()?,
+                })
+            })?,
             reply: d.bytes()?,
             yielded: d.bool()?,
             forbidden: d.bool()?,
@@ -1487,6 +1531,12 @@ impl V2Wire for ActorSliceOutputV2 {
                 .windows(2)
                 .any(|pair| pair[0].await_ordinal >= pair[1].await_ordinal)
             || value.outbox.iter().any(|call| call.payload.is_empty())
+            || ensure_attestation_verifications_canonical(&value.attestation_verifications).is_err()
+            || validate_verification_blobs(
+                &value.attestation_verifications,
+                &value.verification_blobs,
+            )
+            .is_err()
             || value
                 .crdt_states
                 .windows(2)
@@ -1596,6 +1646,10 @@ impl V2Wire for TransitionV2 {
         e.list(&self.inbox, encode_message);
         e.list(&self.outbox, encode_message);
         e.option(&self.reply, encode_reply);
+        e.list(
+            &self.attestation_verifications,
+            encode_attestation_verification,
+        );
         e.list(&self.exported_blobs, encode_blob_ref);
         e.u64(self.gas.refine_used);
         e.u64(self.gas.proof_used);
@@ -1618,6 +1672,7 @@ impl V2Wire for TransitionV2 {
             inbox: d.list(decode_message)?,
             outbox: d.list(decode_message)?,
             reply: d.option(decode_reply)?,
+            attestation_verifications: d.list(decode_attestation_verification)?,
             exported_blobs: d.list(decode_blob_ref)?,
             gas: GasAccountingV2 {
                 refine_used: d.u64()?,
@@ -1626,6 +1681,7 @@ impl V2Wire for TransitionV2 {
             },
             proof: d.option(decode_proof)?,
         };
+        ensure_attestation_verifications_canonical(&result.attestation_verifications)?;
         ensure_sorted_unique(&result.exported_blobs, |b| b.hash.0)?;
         Ok(result)
     }
@@ -1973,6 +2029,18 @@ impl V2Wire for ProofVerificationRequestV2 {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
+    }
+}
+
+impl V2Wire for AttestationVerificationV2 {
+    const MAGIC: [u8; 4] = *b"VVF2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        encode_attestation_verification(&mut Encoder(out), self);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_attestation_verification(d)
     }
 }
 
@@ -2610,6 +2678,12 @@ fn transition_blob_references(transition: &TransitionV2) -> impl Iterator<Item =
                 .flat_map(|change| change.materializations.iter())
                 .map(|materialization| &materialization.state),
         )
+        .chain(
+            transition
+                .attestation_verifications
+                .iter()
+                .map(|verification| &verification.proof_blob),
+        )
         .chain(transition.proof.iter().map(|proof| &proof.proof_blob))
 }
 
@@ -2718,6 +2792,7 @@ fn encode_rejection(e: &mut Encoder<'_>, value: &AccumulationRejectionV2) {
         R::NonCanonical => e.u8(23),
         R::ReceiptUnavailable => e.u8(24),
         R::InvalidReceipt => e.u8(25),
+        R::AttestationReplay => e.u8(26),
     }
 }
 
@@ -2753,6 +2828,7 @@ fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejectionV2, Deco
         23 => Ok(R::NonCanonical),
         24 => Ok(R::ReceiptUnavailable),
         25 => Ok(R::InvalidReceipt),
+        26 => Ok(R::AttestationReplay),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -3223,6 +3299,73 @@ fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitmentV2, DecodeError> {
     Ok(value)
 }
 
+fn encode_attestation_verification(e: &mut Encoder<'_>, value: &AttestationVerificationV2) {
+    e.string(&value.source_name);
+    e.fixed(&value.producer.0);
+    e.bytes(&value.statement.encode());
+    e.fixed(&value.trace.0);
+    encode_blob_ref(e, &value.proof_blob);
+}
+
+fn decode_attestation_verification(
+    d: &mut Decoder<'_>,
+) -> Result<AttestationVerificationV2, DecodeError> {
+    let value = AttestationVerificationV2 {
+        source_name: d.string()?,
+        producer: ProducerId(d.fixed()?),
+        statement: AttestationStatementV3::decode(&d.bytes()?)?,
+        trace: Hash(d.fixed()?),
+        proof_blob: decode_blob_ref(d)?,
+    };
+    if value.source_name.is_empty()
+        || value.trace == Hash::ZERO
+        || value.proof_blob.len == 0
+        || value.proof_blob.len > super::MAX_ATTESTATION_PROOF_BYTES as u64
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
+fn ensure_attestation_verifications_canonical(
+    values: &[AttestationVerificationV2],
+) -> Result<(), DecodeError> {
+    if values
+        .windows(2)
+        .any(|pair| pair[0].replay_key() >= pair[1].replay_key())
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn validate_verification_blobs(
+    requirements: &[AttestationVerificationV2],
+    candidates: &[ImportedBlobV2],
+) -> Result<(), DecodeError> {
+    ensure_sorted_unique(candidates, |candidate| candidate.reference.hash.0)?;
+    if candidates
+        .iter()
+        .any(|candidate| !candidate.reference.matches(&candidate.bytes))
+        || candidates.iter().any(|candidate| {
+            requirements
+                .iter()
+                .all(|requirement| requirement.proof_blob != candidate.reference)
+        })
+        || requirements.iter().any(|requirement| {
+            candidates
+                .binary_search_by_key(&requirement.proof_blob.hash, |candidate| {
+                    candidate.reference.hash
+                })
+                .ok()
+                .is_none_or(|index| candidates[index].reference != requirement.proof_blob)
+        })
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
 fn ensure_external_actors_canonical(actors: &[ExternalActorBindingV2]) -> Result<(), DecodeError> {
     if actors.windows(2).any(|pair| pair[0].name >= pair[1].name) {
         return Err(DecodeError::NonCanonical);
@@ -3456,6 +3599,8 @@ mod tests {
                 proof_requested: false,
                 deadline_timeslot: Some(30),
             }],
+            attestation_verifications: vec![],
+            verification_blobs: vec![],
             reply: b"ok".to_vec(),
             yielded: false,
             forbidden: false,
@@ -3493,6 +3638,8 @@ mod tests {
                 },
             ],
             outbox: vec![],
+            attestation_verifications: vec![],
+            verification_blobs: vec![],
             reply: vec![],
             yielded: false,
             forbidden: false,
@@ -3549,6 +3696,8 @@ mod tests {
             crdt_operations: vec![],
             crdt_states: vec![],
             outbox: vec![],
+            attestation_verifications: vec![],
+            verification_blobs: vec![],
             reply: vec![],
             yielded: true,
             forbidden: false,
@@ -3644,6 +3793,43 @@ mod tests {
             AccumulatedReplyV2::decode(&accumulated.encode()).unwrap(),
             accumulated
         );
+        let verification = AttestationVerificationV2 {
+            source_name: "private-age".into(),
+            producer: ProducerId([51; 32]),
+            statement: statement.clone(),
+            trace: proof.trace,
+            proof_blob: proof.proof_blob.clone(),
+        };
+        assert_eq!(
+            AttestationVerificationV2::decode(&verification.encode()).unwrap(),
+            verification
+        );
+        let proof_candidate = ImportedBlobV2 {
+            reference: proof.proof_blob.clone(),
+            bytes: proof_bytes.clone(),
+        };
+        let slice = ActorSliceOutputV2 {
+            actor,
+            first_await_ordinal: 0,
+            next_await_ordinal: 0,
+            writes: vec![],
+            crdt_operations: vec![],
+            crdt_states: vec![],
+            outbox: vec![],
+            attestation_verifications: vec![verification],
+            verification_blobs: vec![proof_candidate],
+            reply: vec![],
+            yielded: false,
+            forbidden: false,
+            checkpoint: None,
+        };
+        assert_eq!(ActorSliceOutputV2::decode(&slice.encode()).unwrap(), slice);
+        let mut missing_proof = slice.clone();
+        missing_proof.verification_blobs.clear();
+        assert_eq!(
+            ActorSliceOutputV2::decode(&missing_proof.encode()),
+            Err(DecodeError::NonCanonical)
+        );
 
         let checkpoint = CheckpointTokenV2 {
             input: WorkInputIdV2 {
@@ -3703,6 +3889,7 @@ mod tests {
             inbox: vec![],
             outbox: vec![],
             reply: None,
+            attestation_verifications: vec![],
             exported_blobs: vec![],
             gas: GasAccountingV2::default(),
             proof: None,
@@ -3819,6 +4006,7 @@ mod tests {
             inbox: vec![],
             outbox: vec![],
             reply: None,
+            attestation_verifications: vec![],
             exported_blobs: vec![artifact.reference.clone()],
             gas: GasAccountingV2::default(),
             proof: None,
@@ -4108,6 +4296,7 @@ mod tests {
             inbox: vec![],
             outbox: vec![],
             reply: None,
+            attestation_verifications: vec![],
             exported_blobs: vec![],
             gas: GasAccountingV2::default(),
             proof: None,

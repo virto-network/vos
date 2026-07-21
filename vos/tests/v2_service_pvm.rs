@@ -14,11 +14,11 @@ use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AllowPublic,
-    AttestationDeliveryV2, AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
-    CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
-    CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
-    ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
+    AttestationDeliveryV2, AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
+    CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
+    CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2,
+    Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
     JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
     MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProducerId, ProgramId, ProofCommitmentV2,
     ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
@@ -28,7 +28,7 @@ use vos::v2::{
     WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
-    AttestedMethod, Decode, Encode,
+    AttestedMethod, Decode, Encode, StateCommitmentV3,
     value::{Msg, Value},
 };
 
@@ -2835,6 +2835,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         inbox: vec![inbox.clone()],
         outbox: vec![],
         reply: None,
+        attestation_verifications: vec![],
         exported_blobs: vec![continuation_ref.clone()],
         gas: GasAccountingV2::default(),
         proof: None,
@@ -3023,6 +3024,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         inbox: vec![],
         outbox: vec![],
         reply: None,
+        attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,
@@ -3059,6 +3061,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             producer: delivered.work.target,
             result: b"durable inbox reply".to_vec(),
         }),
+        attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,
@@ -3134,6 +3137,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             producer: proof_work.target,
             result: Value::Bytes(b"attested reply".to_vec()).encode(),
         }),
+        attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,
@@ -3384,6 +3388,202 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
 }
 
 #[test]
+fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"gate initial state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut seed = work(actor_program, initial.clone());
+    seed.service.service_program = ProgramId::of_pvm(&service_pvm);
+    let source = private_age_binding(&seed.service);
+
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let mut service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let genesis = ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([113; 32]),
+            program: actor_program,
+            initial_state: initial,
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([114; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+            }],
+        }],
+        external_actors: vec![source.clone()],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([115; 32]),
+            authenticator: vec![116],
+        },
+    };
+    service.accumulate_host_mut().allow_install(&genesis);
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let prepare = |invocation| LocalWorkRequestV2 {
+        invocation,
+        workflow_step: 0,
+        logical_timeslot: 10,
+        target: seed.target,
+        method: "start".into(),
+        arguments: seed.arguments.clone(),
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let prepared =
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), prepare(InvocationId([117; 32])))
+            .unwrap();
+    let source_after = Hash([118; 32]);
+    let statement = AttestationStatementV3 {
+        statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+        space: source.service.space,
+        actor: source.actor,
+        deployment: source.service.deployment,
+        actor_program: source.program,
+        method: "is_adult".into(),
+        schema: Hash([119; 32]),
+        invocation: InvocationId([120; 32]),
+        before: StateCommitmentV3::Linear(Hash([121; 32])),
+        after: StateCommitmentV3::Linear(source_after),
+        claim_commitment: Hash([122; 32]),
+        input_commitment: Hash([123; 32]),
+        authorization_policy: Hash([124; 32]),
+        accumulation_receipt: AccumulationReceiptV2 {
+            service: source.service.clone(),
+            accepted_transition: Hash([125; 32]),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: Some(source_after),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+    };
+    let proof_bytes = b"consumed attestation proof".to_vec();
+    let proof_blob = BlobRefV2::of_bytes(&proof_bytes);
+    let verification = AttestationVerificationV2 {
+        source_name: source.name,
+        producer: source.producer,
+        statement,
+        trace: Hash([126; 32]),
+        proof_blob: proof_blob.clone(),
+    };
+    let request = ProofVerificationRequestV2 {
+        actor_program: source.program,
+        execution_semantics: source.service.execution_semantics,
+        statement: verification.statement.commitment(),
+        trace: verification.trace,
+        proof_blob: proof_blob.clone(),
+    };
+    let transition_for = |work: &WorkEnvelopeV2, state: &[u8]| TransitionV2 {
+        service: work.service.clone(),
+        consumed_input: work.input_id(),
+        target_program: work.target_program,
+        base: work.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: work.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(state.to_vec()),
+        }],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: work.invocation.root_reply_id(),
+            producer: work.target,
+            result: b"admitted".to_vec(),
+        }),
+        attestation_verifications: vec![verification.clone()],
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let candidate = ImportedBlobV2 {
+        reference: proof_blob,
+        bytes: proof_bytes,
+    };
+    let before_unavailable = service.accumulate_host().snapshot();
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                transition: transition_for(&prepared.work, b"must not commit"),
+                work: prepared.work.clone(),
+                provided_blobs: vec![candidate.clone()],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::ProofUnavailable,)
+    );
+    assert_eq!(service.accumulate_host().snapshot(), before_unavailable);
+    service.accumulate_host_mut().allow_proof(&request);
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                transition: transition_for(&prepared.work, b"admitted state"),
+                work: prepared.work,
+                provided_blobs: vec![candidate.clone()],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let commits = service.accumulate_host().commit_sequence();
+
+    let replay =
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), prepare(InvocationId([127; 32])))
+            .unwrap();
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                transition: transition_for(&replay.work, b"must not commit"),
+                work: replay.work,
+                provided_blobs: vec![candidate],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::AttestationReplay,)
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), commits);
+}
+
+#[test]
 fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     let Some(elf) = service_elf() else {
         return;
@@ -3510,6 +3710,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             producer: first.target,
             result: b"leader reply".to_vec(),
         }),
+        attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,
@@ -3578,6 +3779,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             producer: second.target,
             result: b"failover reply".to_vec(),
         }),
+        attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,
@@ -3725,6 +3927,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
             producer: prepared.work.target,
             result: b"raft attested reply".to_vec(),
         }),
+        attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,
@@ -4105,6 +4308,7 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
         inbox: vec![],
         outbox: vec![message.clone()],
         reply: None,
+        attestation_verifications: vec![],
         exported_blobs: vec![],
         gas: GasAccountingV2::default(),
         proof: None,

@@ -166,6 +166,8 @@ mod guest {
                 .then_some(checkpoint.pending_call)
                 .flatten()
         });
+        let attestation_verifications = actor_output.attestation_verifications;
+        let verification_blobs = actor_output.verification_blobs;
 
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();
@@ -234,7 +236,8 @@ mod guest {
             producer: work.target,
             result: actor_output.reply,
         });
-        let (writes, crdt_change, candidate_blobs) = match (&work.base, work.base_causal_height) {
+        let (writes, crdt_change, mut candidate_blobs) = match (&work.base, work.base_causal_height)
+        {
             (ConsistencyBaseV2::Linear { .. }, None) => {
                 if !actor_output.crdt_operations.is_empty() || !actor_output.crdt_states.is_empty()
                 {
@@ -296,6 +299,15 @@ mod guest {
             }
             _ => fail_closed(),
         };
+        candidate_blobs.extend(verification_blobs);
+        candidate_blobs.sort_by_key(|blob| blob.reference.hash);
+        if candidate_blobs
+            .windows(2)
+            .any(|pair| pair[0].reference.hash == pair[1].reference.hash && pair[0] != pair[1])
+        {
+            fail_closed();
+        }
+        candidate_blobs.dedup();
         let mut transition = TransitionV2 {
             service: work.service.clone(),
             consumed_input,
@@ -307,6 +319,7 @@ mod guest {
             inbox: alloc::vec::Vec::new(),
             outbox,
             reply,
+            attestation_verifications,
             exported_blobs,
             gas: GasAccountingV2::default(),
             proof: None,
