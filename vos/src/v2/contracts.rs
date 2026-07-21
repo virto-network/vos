@@ -1176,7 +1176,34 @@ pub struct PublishedEffectsV2 {
     pub reply: Option<ReplyRecordV2>,
     pub outbox: Vec<MessageRecordV2>,
     pub exported_blobs: Vec<BlobRefV2>,
+    pub statement: Option<AttestationStatementV3>,
     pub proof: Option<ProofCommitmentV2>,
+}
+
+impl PublishedEffectsV2 {
+    fn attestation_is_self_consistent(&self) -> bool {
+        match (&self.statement, &self.proof) {
+            (None, None) => true,
+            (Some(statement), Some(proof)) => {
+                let Some(reply) = self.reply.as_ref() else {
+                    return false;
+                };
+                statement.commitment() == proof.statement
+                    && statement.statement_version == proof.statement_version
+                    && statement.claim_commitment
+                        == Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn attestation_matches_receipt(&self, receipt: &AccumulationReceiptV2) -> bool {
+        self.attestation_is_self_consistent()
+            && self
+                .statement
+                .as_ref()
+                .is_none_or(|statement| statement.accumulation_receipt == *receipt)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2572,6 +2599,9 @@ impl V2Wire for PublishedEffectsV2 {
         e.option(&self.reply, encode_reply);
         e.list(&self.outbox, encode_message);
         e.list(&self.exported_blobs, encode_blob_ref);
+        e.option(&self.statement, |e, statement| {
+            e.bytes(&statement.encode())
+        });
         e.option(&self.proof, encode_proof);
     }
 
@@ -2580,10 +2610,14 @@ impl V2Wire for PublishedEffectsV2 {
             reply: d.option(decode_reply)?,
             outbox: d.list(decode_message)?,
             exported_blobs: d.list(decode_blob_ref)?,
+            statement: d.option(|d| AttestationStatementV3::decode(&d.bytes()?))?,
             proof: d.option(decode_proof)?,
         };
         ensure_sorted_unique(&value.outbox, |message| message.call_id.0)?;
         ensure_sorted_unique(&value.exported_blobs, |blob| blob.hash.0)?;
+        if !value.attestation_is_self_consistent() {
+            return Err(DecodeError::NonCanonical);
+        }
         Ok(value)
     }
 }
@@ -2661,7 +2695,8 @@ impl V2Wire for AccumulationResultV2 {
                     && (published.reply.as_ref().map(ReplyRecordV2::commitment)
                         != receipt.reply_commitment
                         || MessageRecordV2::outbox_commitment(&published.outbox)
-                            != receipt.outbox_commitment)
+                            != receipt.outbox_commitment
+                        || !published.attestation_matches_receipt(&receipt))
                 {
                     return Err(DecodeError::NonCanonical);
                 }
@@ -4172,6 +4207,32 @@ mod tests {
         assert_eq!(
             AccumulatedReplyV2::decode(&accumulated.encode()).unwrap(),
             accumulated
+        );
+        let published = PublishedEffectsV2 {
+            reply: Some(reply.clone()),
+            statement: Some(statement.clone()),
+            proof: Some(proof.clone()),
+            ..PublishedEffectsV2::default()
+        };
+        let accepted = AccumulationResultV2::Accepted {
+            receipt: receipt.clone(),
+            published: published.clone(),
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&accepted.encode()).unwrap(),
+            accepted
+        );
+        let mut mismatched = published;
+        mismatched.statement.as_mut().unwrap().claim_commitment = Hash([52; 32]);
+        let mismatched = AccumulationResultV2::Accepted {
+            receipt: receipt.clone(),
+            published: mismatched,
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
         );
         let verification = AttestationVerificationV2 {
             source_name: "private-age".into(),

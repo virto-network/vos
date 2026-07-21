@@ -492,6 +492,9 @@ impl V2Wire for PublicationRecordV2 {
                 != value.receipt.reply_commitment
             || super::MessageRecordV2::outbox_commitment(&value.published.outbox)
                 != value.receipt.outbox_commitment
+            || !value
+                .published
+                .attestation_matches_receipt(&value.receipt)
         {
             return Err(DecodeError::NonCanonical);
         }

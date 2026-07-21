@@ -975,8 +975,11 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
     let Some((config, _, actor, _)) = workflow_root_configs() else {
         return;
     };
-    let mut service =
-        LocalRootTreeServiceV2::open(config, FailableCommittedImages::default()).unwrap();
+    let mut service = LocalRootTreeServiceV2::open(
+        config.clone(),
+        FailableCommittedImages::default(),
+    )
+    .unwrap();
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("attested_value").encode());
     let request = LocalWorkRequestV2 {
@@ -1030,10 +1033,21 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
     let proof = committed.published.proof.as_ref().unwrap();
     assert_eq!(proof.trace, Hash([109; 32]));
     assert!(proof.proof_blob.matches(&proof_bytes));
+    let statement = committed.published.statement.as_ref().unwrap();
+    assert_eq!(statement.accumulation_receipt, committed.receipt);
+    assert_eq!(statement.commitment(), proof.statement);
     let publication = committed
         .publication
         .expect("proof and reply stay guest-owned until acknowledged");
     assert_eq!(publication.published, committed.published);
+
+    let backend = service.into_backend();
+    let restarted = LocalRootTreeServiceV2::open(config, backend)
+        .expect("the complete attestation package survives a root restart");
+    assert_eq!(
+        restarted.pending_publications().unwrap(),
+        vec![publication]
+    );
 }
 
 #[test]

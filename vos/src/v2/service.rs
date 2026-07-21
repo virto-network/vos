@@ -566,6 +566,7 @@ fn validate_committed_attestation<E, P>(
     };
     if preparation.validate().is_err()
         || committed_receipt != &preparation.receipt
+        || published.statement.as_ref() != Some(&preparation.statement)
         || published.proof.as_ref() != Some(proof)
         || committed_receipt.reply_commitment != Some(reply.commitment())
         || preparation.statement.claim_commitment

@@ -2009,6 +2009,13 @@ fn apply<S: GuestAccumulateStoreV2>(
         reply: transition.reply.clone(),
         outbox: transition.outbox.clone(),
         exported_blobs: transition.exported_blobs.clone(),
+        statement: attached_proof.map(|_| {
+            preparation
+                .as_ref()
+                .expect("proof preparation was constructed")
+                .statement
+                .clone()
+        }),
         proof: attached_proof.cloned(),
     };
     write(store, header_storage_key(), Some(&header.encode()))?;
