@@ -68,6 +68,9 @@ pub enum ClientError {
     NotFound,
     /// `Context::child` resolved an actor outside the caller's owned tree.
     NotOwnedChild,
+    /// V2 child creation cannot fall back to the legacy registry service.
+    /// The guest-owned spawn transition has not been committed.
+    SpawnUnavailable,
     /// The runtime returned an attestation package whose typed method, claim
     /// wire, or statement did not match the committed reply.
     InvalidAttestation(crate::AttestationError),
@@ -84,6 +87,10 @@ impl core::fmt::Display for ClientError {
             Self::Forbidden => write!(f, "permission denied: caller lacks the required role"),
             Self::NotFound => write!(f, "client: actor name was not found"),
             Self::NotOwnedChild => write!(f, "client: actor is not an owned child"),
+            Self::SpawnUnavailable => write!(
+                f,
+                "client: child creation requires the guest-owned v2 spawn transition"
+            ),
             Self::InvalidAttestation(error) => write!(f, "client: {error}"),
             Self::Call(error) => write!(f, "client: {error}"),
         }

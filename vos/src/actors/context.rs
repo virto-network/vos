@@ -1187,6 +1187,12 @@ impl<A: Actor> Context<A> {
         T: super::codec::Encode,
     {
         let name = name.into();
+        if self.actor_id.is_some() {
+            // A v2 actor must never escape into the route-only v1 registry
+            // protocol. Child creation will be enabled only by a typed spawn
+            // record validated and committed by guest Accumulate.
+            return Err(super::client::ClientError::SpawnUnavailable);
+        }
         let request = super::value::Msg::new("spawn_child")
             .with("owner", self.id.0)
             .with("name", name)
@@ -1933,6 +1939,25 @@ mod tests {
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     struct TestMsg;
 
+    #[derive(Clone, Copy)]
+    struct TestRef;
+
+    impl crate::actors::client::ActorReference for TestRef {
+        type Handle<'a, I: crate::actors::client::Invoker + 'a> = ();
+
+        fn bind<'a, I: crate::actors::client::Invoker + 'a>(
+            _target: crate::v2::ActorId,
+            _invoker: &'a mut I,
+        ) -> Self::Handle<'a, I> {
+        }
+
+        fn bind_service<'a, I: crate::actors::client::Invoker + 'a>(
+            _target: ServiceId,
+            _invoker: &'a mut I,
+        ) -> Self::Handle<'a, I> {
+        }
+    }
+
     impl crate::actors::value::FromDynamic for TestMsg {
         fn from_dynamic(_d: &crate::actors::value::Msg) -> Option<Self> {
             None
@@ -2050,6 +2075,17 @@ mod tests {
             Some(sibling_child)
         );
         assert_eq!(ctx.resolve_owned_actor_v2(Some(root), "other"), None);
+    }
+
+    #[test]
+    fn v2_spawn_never_falls_back_to_the_legacy_registry_route() {
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        ctx.__set_actor_id(crate::v2::ActorId([1; 32]));
+
+        assert!(matches!(
+            crate::block_on(ctx.spawn::<TestRef, _>("child", &TestMsg)),
+            Err(crate::ClientError::SpawnUnavailable)
+        ));
     }
 
     #[test]
