@@ -22,6 +22,9 @@ fn main() {
         let source = fs::read_to_string(&path).expect("read Cargo.lock");
         validate_lock(&path, &source, &mut errors);
     }
+    let runtime_revision = root.join("vos/src/v2/mod.rs");
+    let source = fs::read_to_string(&runtime_revision).expect("read VOS v2 runtime constants");
+    validate_runtime_revision(&runtime_revision, &source, &mut errors);
 
     if !errors.is_empty() {
         eprintln!("mixed JAR execution semantics are forbidden:");
@@ -64,7 +67,7 @@ fn validate_manifest(path: &Path, source: &str, errors: &mut Vec<String>) {
         if line.starts_with('#') || !line.contains("jar.git") {
             continue;
         }
-        if !line.contains(&format!("rev = \"{EXPECTED}\"")) {
+        if dependency_revision(line) != Some(EXPECTED) {
             errors.push(format!(
                 "{}:{} has an unpinned or different JAR revision",
                 path.display(),
@@ -83,13 +86,42 @@ fn validate_manifest(path: &Path, source: &str, errors: &mut Vec<String>) {
 
 fn validate_lock(path: &Path, source: &str, errors: &mut Vec<String>) {
     for (index, line) in source.lines().enumerate() {
-        if line.contains("/jar.git") && !line.contains(EXPECTED) {
+        if !line.contains("/jar.git") {
+            continue;
+        }
+        let requested = line
+            .split_once("?rev=")
+            .and_then(|(_, tail)| tail.split_once('#'));
+        if !matches!(requested, Some((revision, resolved)) if revision == EXPECTED && resolved.trim_end_matches('"') == EXPECTED)
+        {
             errors.push(format!(
-                "{}:{} resolves a different JAR commit",
+                "{}:{} does not request and resolve the exact JAR commit",
                 path.display(),
                 index + 1,
             ));
         }
+    }
+}
+
+fn dependency_revision(line: &str) -> Option<&str> {
+    let (_, tail) = line.split_once("rev = \"")?;
+    tail.split_once('"').map(|(revision, _)| revision)
+}
+
+fn validate_runtime_revision(path: &Path, source: &str, errors: &mut Vec<String>) {
+    let revisions = source
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("pub const JAR_REVISION: &str = \"")
+                .and_then(|tail| tail.strip_suffix("\";"))
+        })
+        .collect::<Vec<_>>();
+    if revisions != [EXPECTED] {
+        errors.push(format!(
+            "{} must expose exactly JAR_REVISION = {EXPECTED}",
+            path.display(),
+        ));
     }
 }
 
@@ -127,6 +159,35 @@ mod tests {
         validate_lock(
             Path::new("nested/Cargo.lock"),
             "source = \"git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168\"",
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_lock_whose_requested_and_resolved_revisions_differ() {
+        let mut errors = Vec::new();
+        validate_lock(
+            Path::new("Cargo.lock"),
+            &format!("source = \"git+https://github.com/olanod/jar.git?rev={EXPECTED}#deadbeef\""),
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn accepts_only_the_matching_runtime_revision_constant() {
+        let mut errors = Vec::new();
+        validate_runtime_revision(
+            Path::new("vos/src/v2/mod.rs"),
+            &format!("pub const JAR_REVISION: &str = \"{EXPECTED}\";"),
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+
+        validate_runtime_revision(
+            Path::new("vos/src/v2/mod.rs"),
+            "pub const JAR_REVISION: &str = \"deadbeef\";",
             &mut errors,
         );
         assert_eq!(errors.len(), 1);
