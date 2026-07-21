@@ -20,9 +20,9 @@ use super::{
     AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CHECKPOINT_TOKEN_CAPACITY,
     CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     CrdtDispatchV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
-    EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2, ProgramId,
-    ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialV2,
+    EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, MessageRecordV2, MethodPolicyV2,
+    ProgramId, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
     ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
     V2Wire, WorkflowCheckpointV2, WorkflowOperationV2, crdt_change_storage_key,
@@ -188,6 +188,16 @@ fn install<S: GuestAccumulateStoreV2>(
             &mut tree,
             &StateKeyV2::ActorDirectory,
             Some(&directory.encode()),
+        )?;
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::ExternalActorDirectory,
+            Some(
+                &ExternalActorDirectoryV2 {
+                    actors: genesis.external_actors.clone(),
+                }
+                .encode(),
+            ),
         )?;
         for actor in &genesis.actors {
             tree_apply(
@@ -1230,6 +1240,12 @@ fn apply<S: GuestAccumulateStoreV2>(
             }
         }
     }
+    let external_directory =
+        tree_get_wire::<_, ExternalActorDirectoryV2>(&tree, &StateKeyV2::ExternalActorDirectory)?
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+    if external_directory.actors != work.external_actors {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
 
     if let Some(rejection) = validate_continuation_change(tree.store_ref(), envelope)? {
         return Ok(rejected(rejection));
@@ -1254,6 +1270,10 @@ fn apply<S: GuestAccumulateStoreV2>(
     for message in &transition.outbox {
         if tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(message.from))?
             .is_none()
+            || external_directory
+                .actors
+                .iter()
+                .all(|binding| binding.actor != message.to)
         {
             return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
@@ -2111,6 +2131,25 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
     let Some(message) = message else {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     };
+    let Some(external) =
+        tree_get_wire::<_, ExternalActorDirectoryV2>(tree, &StateKeyV2::ExternalActorDirectory)?
+            .and_then(|directory| {
+                directory
+                    .actors
+                    .into_iter()
+                    .find(|binding| binding.actor == message.to)
+            })
+    else {
+        return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
+    };
+    let attestation_matches_binding = awaited.attestation.as_ref().is_none_or(|attestation| {
+        attestation.producer_name == external.name
+            && attestation.producer == external.producer
+            && attestation.statement.actor == external.actor
+            && attestation.statement.actor_program == external.program
+            && attestation.statement.accumulation_receipt.service == external.service
+            && awaited.validate().is_ok()
+    });
     if message.call_id != call
         || message.caller_invocation != work.invocation
         || message.await_ordinal != snapshot.await_ordinal
@@ -2124,6 +2163,8 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
         || awaited.receipt.service.service_abi != ABI_VERSION
         || awaited.receipt.service.execution_semantics != EXECUTION_SEMANTICS_ID
         || awaited.receipt.service.root_service == work.service.root_service
+        || awaited.receipt.service != external.service
+        || !attestation_matches_binding
     {
         return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
     }
@@ -2560,6 +2601,27 @@ mod tests {
         ProgramId::of_pvm(FIXTURE_ACTOR_PVM)
     }
 
+    fn external_bindings() -> Vec<super::super::ExternalActorBindingV2> {
+        [
+            ("peer-41", ActorId([41; 32]), 42u8),
+            ("peer-44", ActorId([44; 32]), 45u8),
+        ]
+        .into_iter()
+        .map(|(name, actor, byte)| {
+            let mut service = identity();
+            service.root_service = RootServiceId([byte; 32]);
+            service.deployment = DeploymentId([byte.wrapping_add(1); 32]);
+            super::super::ExternalActorBindingV2 {
+                name: name.into(),
+                service,
+                actor,
+                producer: super::super::ProducerId([byte; 32]),
+                program: program(),
+            }
+        })
+        .collect()
+    }
+
     fn install_fixture(
         store: &mut MemStore,
         consistency: ConsistencyModeV2,
@@ -2568,6 +2630,7 @@ mod tests {
         let initial = store.provide_blob(initial).unwrap();
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            external_actors: external_bindings(),
             service: identity(),
             consistency,
             actors: vec![ActorGenesisV2 {
@@ -2609,6 +2672,7 @@ mod tests {
         };
         let initial = BlobRefV2::of_bytes(b"unavailable state");
         let genesis = ServiceGenesisV2 {
+            external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
@@ -2650,6 +2714,7 @@ mod tests {
             ..MemStore::default()
         };
         let genesis = ServiceGenesisV2 {
+            external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
@@ -2680,6 +2745,7 @@ mod tests {
         let mut store = MemStore::default();
         let initial = store.provide_blob(b"state").unwrap();
         let genesis = ServiceGenesisV2 {
+            external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
@@ -2716,6 +2782,7 @@ mod tests {
 
     fn linear_work(initial: BlobRefV2, base_root: Hash) -> WorkEnvelopeV2 {
         WorkEnvelopeV2 {
+            external_actors: external_bindings(),
             service: identity(),
             invocation: InvocationId([10; 32]),
             workflow_step: 0,
@@ -3044,6 +3111,7 @@ mod tests {
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let child = ActorId([7; 32]);
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
             actors: vec![
@@ -3249,6 +3317,7 @@ mod tests {
         let required_policy =
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
@@ -4247,6 +4316,7 @@ mod tests {
     fn crdt_work(initial: BlobRefV2, invocation: u8, heads: Vec<Hash>) -> WorkEnvelopeV2 {
         let base_causal_height = Some(u64::from(!heads.is_empty()));
         WorkEnvelopeV2 {
+            external_actors: external_bindings(),
             service: identity(),
             invocation: InvocationId([invocation; 32]),
             workflow_step: 0,

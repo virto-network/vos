@@ -801,6 +801,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let ActorPrivateInputV2 {
         actor: actor_id,
         actor_tree,
+        external_actors,
         input: work_input,
         change,
         state,
@@ -834,6 +835,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     ctx.__set_actor_id(actor_id);
     ctx.__set_actor_tree_v2(
         actor_tree,
+        external_actors,
         change.map(|change| change.change),
         capacity,
         first_await_ordinal,

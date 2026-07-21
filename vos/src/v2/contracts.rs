@@ -166,6 +166,24 @@ pub struct ImportedBlobV2 {
     pub bytes: Vec<u8>,
 }
 
+/// Install-time authenticated binding to an actor owned by another root
+/// service. Application code resolves `name`; the remaining identities are
+/// consensus inputs and never come from an attestation package itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalActorBindingV2 {
+    pub name: String,
+    pub service: ServiceIdentityV2,
+    pub actor: ActorId,
+    pub producer: ProducerId,
+    pub program: ProgramId,
+}
+
+/// Canonical guest-owned dependency directory installed with one root tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalActorDirectoryV2 {
+    pub actors: Vec<ExternalActorBindingV2>,
+}
+
 /// Complete immutable import set for one Refine execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefineImportsV2 {
@@ -202,6 +220,10 @@ pub struct ActorPrivateInputV2 {
     /// caller-controlled actor IPC, so a nested caller cannot remap another
     /// actor's directory-indexed CALLABLE slots.
     pub actor_tree: Vec<ActorTreeImportV2>,
+    /// Install-time authenticated cross-root dependencies. This directory is
+    /// host-private for the same reason as `actor_tree`: a nested caller must
+    /// not substitute a different recipient or producer identity.
+    pub external_actors: Vec<ExternalActorBindingV2>,
     /// Canonical identity of the workflow slice executing this actor.
     pub input: WorkInputIdV2,
     /// Batch identity and scheduler dispatch ordinal allocated by the generic
@@ -407,6 +429,10 @@ pub struct WorkEnvelopeV2 {
     /// the child change.
     pub base_causal_height: Option<u64>,
     pub imported_actors: Vec<ImportedActorV2>,
+    /// Complete install-time authenticated cross-root dependency directory.
+    /// Accumulate compares it byte-for-byte with guest-owned state, so Refine
+    /// cannot substitute a different name or producer binding.
+    pub external_actors: Vec<ExternalActorBindingV2>,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
 }
@@ -464,6 +490,7 @@ impl WorkEnvelopeV2 {
         e.string(&self.method);
         encode_origin(&mut e, self.origin);
         encode_auth(&mut e, &self.authorization);
+        e.list(&self.external_actors, encode_external_actor);
         e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
         e.option(&self.parent_call, |e, id| e.fixed(&id.0));
         e.option(&self.causal_context, encode_causal_context);
@@ -1012,6 +1039,7 @@ pub struct ServiceGenesisV2 {
     pub service: ServiceIdentityV2,
     pub consistency: ConsistencyModeV2,
     pub actors: Vec<ActorGenesisV2>,
+    pub external_actors: Vec<ExternalActorBindingV2>,
     pub authorization: AuthorizationEvidenceV2,
 }
 
@@ -1383,6 +1411,7 @@ impl V2Wire for WorkEnvelopeV2 {
         encode_base(&mut e, &self.base);
         e.option(&self.base_causal_height, |e, height| e.u64(*height));
         e.list(&self.imported_actors, encode_imported_actor);
+        e.list(&self.external_actors, encode_external_actor);
         e.list(&self.imported_blobs, encode_blob_ref);
         e.bool(self.proof_requested);
     }
@@ -1431,9 +1460,11 @@ impl V2Wire for WorkEnvelopeV2 {
             _ => return Err(DecodeError::NonCanonical),
         }
         let imported_actors = d.list(decode_imported_actor)?;
+        let external_actors = d.list(decode_external_actor)?;
         let imported_blobs = d.list(decode_blob_ref)?;
         let proof_requested = d.bool()?;
         ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
+        ensure_external_actors_canonical(&external_actors)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
         validate_imported_actor_tree(&imported_actors, target, target_program)?;
         if let AuthorizationEvidenceV2::PrivateCredential { witness, .. } = &authorization {
@@ -1467,6 +1498,18 @@ impl V2Wire for WorkEnvelopeV2 {
                 return Err(DecodeError::NonCanonical);
             }
         }
+        if external_actors.iter().any(|external| {
+            external.service == service
+                || external.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+                || imported_actors
+                    .iter()
+                    .any(|local| local.actor == external.actor)
+                || imported_actors
+                    .iter()
+                    .any(|local| local.parent.is_none() && local.name == external.name)
+        }) {
+            return Err(DecodeError::NonCanonical);
+        }
         Ok(Self {
             service,
             invocation,
@@ -1486,6 +1529,7 @@ impl V2Wire for WorkEnvelopeV2 {
             base,
             base_causal_height,
             imported_actors,
+            external_actors,
             imported_blobs,
             proof_requested,
         })
@@ -1585,6 +1629,7 @@ impl V2Wire for ActorPrivateInputV2 {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
         e.list(&self.actor_tree, encode_actor_tree_import);
+        e.list(&self.external_actors, encode_external_actor);
         e.fixed(&self.input.invocation.0);
         e.u64(self.input.workflow_step);
         e.option(&self.change, |e, dispatch| {
@@ -1603,6 +1648,7 @@ impl V2Wire for ActorPrivateInputV2 {
         let value = Self {
             actor: ActorId(d.fixed()?),
             actor_tree: d.list(decode_actor_tree_import)?,
+            external_actors: d.list(decode_external_actor)?,
             input: WorkInputIdV2 {
                 invocation: InvocationId(d.fixed()?),
                 workflow_step: d.u64()?,
@@ -1626,6 +1672,7 @@ impl V2Wire for ActorPrivateInputV2 {
             actor_role: d.option(Decoder::u8)?,
         };
         ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
+        ensure_external_actors_canonical(&value.external_actors)?;
         validate_actor_slice_tree(&value.actor_tree)?;
         let Some(self_index) = value
             .actor_tree
@@ -2168,6 +2215,22 @@ impl V2Wire for ActorDirectoryV2 {
     }
 }
 
+impl V2Wire for ExternalActorDirectoryV2 {
+    const MAGIC: [u8; 4] = *b"VEX2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        Encoder(out).list(&self.actors, encode_external_actor);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            actors: d.list(decode_external_actor)?,
+        };
+        ensure_external_actors_canonical(&value.actors)?;
+        Ok(value)
+    }
+}
+
 impl V2Wire for MessageRecordV2 {
     const MAGIC: [u8; 4] = *b"VMR2";
 
@@ -2338,6 +2401,7 @@ impl V2Wire for ServiceGenesisV2 {
         encode_service(&mut e, &self.service);
         e.u8(self.consistency as u8);
         e.list(&self.actors, encode_actor_genesis);
+        e.list(&self.external_actors, encode_external_actor);
         encode_auth(&mut e, &self.authorization);
     }
 
@@ -2346,6 +2410,7 @@ impl V2Wire for ServiceGenesisV2 {
             service: decode_service(d)?,
             consistency: ConsistencyModeV2::decode(d)?,
             actors: d.list(decode_actor_genesis)?,
+            external_actors: d.list(decode_external_actor)?,
             authorization: decode_auth(d)?,
         };
         validate_genesis(&value)?;
@@ -2764,6 +2829,24 @@ fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
             cursor = parent;
         }
         if cursor != root {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    ensure_external_actors_canonical(&value.external_actors)?;
+    let root_names = value
+        .actors
+        .iter()
+        .filter(|actor| actor.parent.is_none())
+        .map(|actor| actor.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for external in &value.external_actors {
+        if external.name.is_empty()
+            || external.service == value.service
+            || external.service.service_abi != super::ABI_VERSION
+            || external.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+            || known.contains(&external.actor)
+            || root_names.contains(external.name.as_str())
+        {
             return Err(DecodeError::NonCanonical);
         }
     }
@@ -3287,6 +3370,28 @@ fn decode_actor_tree_import(d: &mut Decoder<'_>) -> Result<ActorTreeImportV2, De
     Ok(value)
 }
 
+fn encode_external_actor(e: &mut Encoder<'_>, value: &ExternalActorBindingV2) {
+    e.string(&value.name);
+    encode_service(e, &value.service);
+    e.fixed(&value.actor.0);
+    e.fixed(&value.producer.0);
+    e.fixed(&value.program.0);
+}
+
+fn decode_external_actor(d: &mut Decoder<'_>) -> Result<ExternalActorBindingV2, DecodeError> {
+    let value = ExternalActorBindingV2 {
+        name: d.string()?,
+        service: decode_service(d)?,
+        actor: ActorId(d.fixed()?),
+        producer: ProducerId(d.fixed()?),
+        program: ProgramId(d.fixed()?),
+    };
+    if value.name.is_empty() || value.service.execution_semantics != super::EXECUTION_SEMANTICS_ID {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
 fn encode_write(e: &mut Encoder<'_>, value: &ActorWriteV2) {
     e.fixed(&value.actor.0);
     e.bytes(&value.key);
@@ -3575,6 +3680,13 @@ fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitmentV2, DecodeError> {
     Ok(value)
 }
 
+fn ensure_external_actors_canonical(actors: &[ExternalActorBindingV2]) -> Result<(), DecodeError> {
+    if actors.windows(2).any(|pair| pair[0].name >= pair[1].name) {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
 fn ensure_sorted_unique<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> Result<(), DecodeError> {
     if values.windows(2).any(|pair| key(&pair[0]) >= key(&pair[1])) {
         return Err(DecodeError::NonCanonical);
@@ -3632,6 +3744,7 @@ mod tests {
                 causal_states: vec![],
                 continuation: None,
             }],
+            external_actors: vec![],
             imported_blobs: vec![],
             proof_requested: false,
         }
@@ -3800,6 +3913,16 @@ mod tests {
             },
         ];
         blobs.sort_by_key(|blob| blob.reference.hash);
+        let mut external_service = work.service.clone();
+        external_service.root_service = RootServiceId([31; 32]);
+        external_service.deployment = DeploymentId([32; 32]);
+        work.external_actors = vec![ExternalActorBindingV2 {
+            name: "peer".into(),
+            service: external_service,
+            actor: ActorId([33; 32]),
+            producer: ProducerId([34; 32]),
+            program: ProgramId([35; 32]),
+        }];
         let imports = RefineImportsV2 {
             programs: vec![ImportedProgramV2 { program, pvm }],
             blobs,
@@ -3849,6 +3972,13 @@ mod tests {
                     program: ProgramId([25; 32]),
                 },
             ],
+            external_actors: vec![ExternalActorBindingV2 {
+                name: "peer".into(),
+                service: service(),
+                actor: ActorId([26; 32]),
+                producer: ProducerId([27; 32]),
+                program: ProgramId([28; 32]),
+            }],
             input: WorkInputIdV2 {
                 invocation: InvocationId([23; 32]),
                 workflow_step: 7,
@@ -4314,6 +4444,7 @@ mod tests {
                     role_policies: role_policies(vec![]),
                 },
             ],
+            external_actors: vec![],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId([11; 32]),
                 authenticator: b"platform-authenticator".to_vec(),
@@ -4414,6 +4545,7 @@ mod tests {
                 crdt: false,
                 role_policies: role_policies(vec![]),
             }],
+            external_actors: vec![],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId([7; 32]),
                 authenticator: vec![1],

@@ -205,6 +205,7 @@ impl ActorRefineRuntimeV2 {
             let private = ActorPrivateInputV2 {
                 actor: actor.actor,
                 actor_tree: actor_tree.clone(),
+                external_actors: work.external_actors.clone(),
                 input: work.input_id(),
                 change: crdt_dispatch(work, 0),
                 state,
@@ -1500,6 +1501,7 @@ mod tests {
     fn disclosed_and_private_role_credentials_feed_the_same_actor_role() {
         let origin = super::super::Origin::Member(super::super::SubjectId([41; 32]));
         let mut work = WorkEnvelopeV2 {
+            external_actors: vec![],
             service: super::super::ServiceIdentityV2 {
                 space: super::super::SpaceId([1; 32]),
                 root_service: super::super::RootServiceId([2; 32]),

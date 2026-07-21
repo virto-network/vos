@@ -348,6 +348,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     let mut message = vec![vos::value::TAG_DYNAMIC];
     message.extend_from_slice(&Msg::new("start").encode());
     WorkEnvelopeV2 {
+        external_actors: vec![],
         service: ServiceIdentityV2 {
             space: vos::v2::SpaceId([0; 32]),
             root_service: RootServiceId([1; 32]),
@@ -505,6 +506,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![
@@ -1604,6 +1606,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![
@@ -1807,6 +1810,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: work.service.clone(),
         consistency: ConsistencyModeV2::Crdt,
         actors: vec![ActorGenesisV2 {
@@ -2064,6 +2068,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Crdt,
         actors: vec![
@@ -2736,6 +2741,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: first_work.service.clone(),
         consistency: ConsistencyModeV2::Crdt,
         actors: vec![ActorGenesisV2 {
@@ -2968,6 +2974,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: first_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
@@ -3290,6 +3297,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     )
     .unwrap();
     let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
@@ -3580,6 +3588,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
     )
     .unwrap();
     let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: identity.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![
@@ -4152,6 +4161,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
 
     let child = ActorId([36; 32]);
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![
@@ -5016,6 +5026,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
     let policy = space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap();
 
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: work.service.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
@@ -5194,6 +5205,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         private_credential.private_evidence(private_policy);
 
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
@@ -5400,6 +5412,7 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
     )
     .unwrap();
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed_work.service,
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
@@ -5461,6 +5474,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
     )
     .unwrap();
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed_work.service,
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
@@ -5513,6 +5527,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         )
         .unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            external_actors: vec![],
             service: identity,
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
@@ -5870,6 +5885,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
@@ -6159,6 +6175,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service,
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
@@ -6336,6 +6353,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     let mut seed = work(actor_program, initial.clone());
     seed.service.service_program = service_program;
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
@@ -6516,6 +6534,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
     let genesis = ServiceGenesisV2 {
+        external_actors: vec![],
         service: seed.service,
         consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {

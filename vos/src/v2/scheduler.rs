@@ -18,9 +18,10 @@ use super::{
     AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CallId, CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationSnapshotV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2,
-    LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2, V2Wire,
-    WorkEnvelopeV2, WorkflowCheckpointV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
+    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2,
+    V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2, crdt_node_receipt_storage_key,
+    crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -291,6 +292,12 @@ impl LocalWorkSchedulerV2 {
             &StateKeyV2::ActorDirectory,
         )?
         .ok_or(ScheduleErrorV2::CorruptActorDirectory)?;
+        let external_directory = decode_row::<ExternalActorDirectoryV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::ExternalActorDirectory,
+        )?
+        .ok_or(ScheduleErrorV2::CorruptActorDirectory)?;
         if directory.actors.binary_search(&request.target).is_err() {
             return Err(ScheduleErrorV2::CorruptActorDirectory);
         }
@@ -434,6 +441,7 @@ impl LocalWorkSchedulerV2 {
             base,
             base_causal_height,
             imported_actors: Vec::new(),
+            external_actors: external_directory.actors,
             imported_blobs: request.imported_blobs,
             proof_requested: request.proof_requested,
         };
