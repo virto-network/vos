@@ -11,10 +11,10 @@ use alloc::vec::Vec;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
     AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, DirectIngressV2, Hash, InvocationId,
-    PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    ProgramId, PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 9;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 10;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -26,6 +26,7 @@ const ATTESTATION_ARCHIVE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/attestation-archive
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const INGRESS_STORAGE_PREFIX: &[u8] = b"\0vos/v2/ingress/";
 const CALL_EXPIRATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/call-expiration/";
+const ACTOR_UPGRADE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/actor-upgrade/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
@@ -270,6 +271,18 @@ pub struct DedupRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+/// Physical exactly-once record for an accepted actor upgrade. It is kept
+/// outside the service tree because its receipt commits to the resulting tree
+/// root. The actor descriptor and generated policies remain inside the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorUpgradeRecordV2 {
+    pub upgrade: Hash,
+    pub actor: ActorId,
+    pub previous_program: ProgramId,
+    pub program: ProgramId,
+    pub receipt: AccumulationReceiptV2,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryRecordV2 {
     pub call_id: CallId,
@@ -402,6 +415,41 @@ impl V2Wire for DedupRecordV2 {
         };
         if value.receipt.accepted_transition != value.transition_commitment
             || value.receipt.checkpoint != value.input.workflow_step
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for ActorUpgradeRecordV2 {
+    const MAGIC: [u8; 4] = *b"VUR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.upgrade.0);
+        e.fixed(&self.actor.0);
+        e.fixed(&self.previous_program.0);
+        e.fixed(&self.program.0);
+        e.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            upgrade: Hash(d.fixed()?),
+            actor: ActorId(d.fixed()?),
+            previous_program: ProgramId(d.fixed()?),
+            program: ProgramId(d.fixed()?),
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        if value.previous_program == value.program
+            || value.receipt.accepted_transition != value.upgrade
+            || value.receipt.reply_commitment.is_some()
+            || value.receipt.outbox_commitment.is_some()
+            || value.receipt.resulting_state_root.is_none()
+            || !value.receipt.resulting_crdt_heads.is_empty()
+            || value.receipt.consistency == ConsistencyModeV2::Crdt
+            || value.receipt.checkpoint != 0
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -554,6 +602,13 @@ pub fn call_expiration_storage_key(call: CallId) -> Vec<u8> {
     let mut key = Vec::with_capacity(CALL_EXPIRATION_STORAGE_PREFIX.len() + call.0.len());
     key.extend_from_slice(CALL_EXPIRATION_STORAGE_PREFIX);
     key.extend_from_slice(&call.0);
+    key
+}
+
+pub fn actor_upgrade_storage_key(upgrade: Hash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ACTOR_UPGRADE_STORAGE_PREFIX.len() + upgrade.0.len());
+    key.extend_from_slice(ACTOR_UPGRADE_STORAGE_PREFIX);
+    key.extend_from_slice(&upgrade.0);
     key
 }
 
@@ -761,6 +816,7 @@ mod tests {
         let attestation = attestation_archive_storage_key(input);
         let delivery = delivery_storage_key(CallId([7; 32]));
         let ingress = ingress_storage_key(input.invocation);
+        let upgrade = actor_upgrade_storage_key(Hash([8; 32]));
         assert_ne!(dedup, receipt);
         assert_ne!(publication, receipt);
         assert_ne!(publication, dedup);
@@ -771,6 +827,8 @@ mod tests {
         assert_ne!(delivery, dedup);
         assert_ne!(ingress, delivery);
         assert_ne!(ingress, publication);
+        assert_ne!(upgrade, ingress);
+        assert_ne!(upgrade, receipt);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(

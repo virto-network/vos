@@ -15,7 +15,8 @@ use super::contracts::crdt_change_blob_references;
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulatedTimeoutV2, AccumulationEnvelopeV2,
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    ActorSpawnV2, AuthorizationEvidenceV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2,
+    ActorSpawnV2, ActorUpgradeRecordV2, ActorUpgradeV2, AuthorizationEvidenceV2, BlobRefV2,
+    CallExpirationEnvelopeV2, CallTimeoutV2,
     ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, DirectIngressV2,
     EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2, MessageRecordV2,
@@ -23,7 +24,8 @@ use super::{
     PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
     ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError, StateTreeStore,
     StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2,
-    attestation_archive_storage_key, call_expiration_storage_key, crdt_change_storage_key,
+    actor_upgrade_storage_key, attestation_archive_storage_key, call_expiration_storage_key,
+    crdt_change_storage_key,
     crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key,
     delivery_storage_key, header_storage_key, ingress_storage_key, public_policy_hash,
     publication_storage_key, receipt_storage_key, space_role_for_policy,
@@ -35,6 +37,11 @@ pub trait GuestAccumulateStoreV2: StateTreeStore {
     /// Authenticate the exact initial service tree against platform/deployment
     /// authority before the store has a header to bind its identity.
     fn authorize_install(&self, genesis: &ServiceGenesisV2) -> Result<bool, Self::Error>;
+
+    /// Authenticate one exact program/policy replacement against platform
+    /// package authority. A successful host response also asserts that the
+    /// replacement canonical PVM bytes are available by `ProgramId`.
+    fn authorize_upgrade(&self, upgrade: &ActorUpgradeV2) -> Result<bool, Self::Error>;
 
     fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error>;
 
@@ -130,10 +137,163 @@ pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
         AccumulateRequestV2::AcknowledgePublication(acknowledgement) => {
             acknowledge_publication(store, &acknowledgement)
         }
-        // The wire is frozen before the guest-owned state mutation lands so
-        // mixed service binaries fail closed during the cutover.
-        AccumulateRequestV2::UpgradeActor(_) => Ok(rejected(AccumulationRejectionV2::NonCanonical)),
+        AccumulateRequestV2::UpgradeActor(upgrade) => upgrade_actor(store, upgrade),
     }
+}
+
+#[inline(never)]
+fn upgrade_actor<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    upgrade: &ActorUpgradeV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let Some(header_bytes) = read(store, header_storage_key())? else {
+        return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
+    };
+    let mut header = match StoreHeaderV2::open(&header_bytes) {
+        Ok(header) => header,
+        Err(StoreOpenError::WrongService) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongService));
+        }
+        Err(StoreOpenError::IncompatibleSemantics) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+        }
+        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
+    };
+    if upgrade.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    if header.service.service_abi != ABI_VERSION {
+        return Ok(rejected(AccumulationRejectionV2::WrongAbi));
+    }
+    if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
+        return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+    }
+    if header.consistency == ConsistencyModeV2::Crdt
+        || !matches!(&upgrade.base, ConsistencyBaseV2::Linear { .. })
+        || !upgrade.base.mode_compatible(header.consistency)
+    {
+        // Program metadata needs its own causal operation before CRDT peers
+        // can merge upgrades safely. Linear services use exact-base commit.
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+    if !store
+        .authorize_upgrade(upgrade)
+        .map_err(GuestAccumulateError::Storage)?
+    {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    }
+    let upgrade_hash = upgrade.hash();
+    let upgrade_key = actor_upgrade_storage_key(upgrade_hash);
+    if let Some(bytes) = read(store, &upgrade_key)? {
+        let record = ActorUpgradeRecordV2::decode(&bytes)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if record.upgrade != upgrade_hash
+            || record.actor != upgrade.actor
+            || record.previous_program != upgrade.expected_program
+            || record.program != upgrade.replacement_program
+            || record.receipt.service != header.service
+        {
+            return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+        }
+        return Ok(AccumulationResultV2::ActorUpgraded {
+            actor: record.actor,
+            previous_program: record.previous_program,
+            program: record.program,
+            receipt: record.receipt,
+            duplicate: true,
+        });
+    }
+    if let Some(rejection) = validate_base(store, &header, &upgrade.base)? {
+        return Ok(rejected(rejection));
+    }
+    if header.revision == u64::MAX {
+        return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
+    }
+
+    let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+    let Some(mut descriptor) = tree_get_wire::<_, ActorGenesisV2>(
+        &tree,
+        &StateKeyV2::ActorDescriptor(upgrade.actor),
+    )? else {
+        return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+    };
+    if descriptor.program != upgrade.expected_program {
+        return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+    }
+    if tree
+        .get(&StateKeyV2::Continuation(upgrade.actor))
+        .map_err(GuestAccumulateError::StateTree)?
+        .is_some()
+    {
+        return Ok(rejected(AccumulationRejectionV2::ActorBusy(upgrade.actor)));
+    }
+
+    let previous_program = descriptor.program;
+    for policy in &descriptor.methods {
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::MethodPolicy {
+                actor: upgrade.actor,
+                method: policy.method.clone(),
+            },
+            None,
+        )?;
+    }
+    for policy in &upgrade.methods {
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::MethodPolicy {
+                actor: upgrade.actor,
+                method: policy.method.clone(),
+            },
+            Some(&policy.encode()),
+        )?;
+    }
+    descriptor.program = upgrade.replacement_program;
+    descriptor.producer = upgrade.producer;
+    descriptor.methods = upgrade.methods.clone();
+    tree_apply(
+        &mut tree,
+        &StateKeyV2::ActorDescriptor(upgrade.actor),
+        Some(&descriptor.encode()),
+    )?;
+    header.service_root = tree.root();
+    drop(tree);
+    header.revision = header
+        .revision
+        .checked_add(1)
+        .expect("linear upgrade sequence overflow was validated before staging");
+    header.state_root = Some(header.service_root);
+
+    let receipt = AccumulationReceiptV2 {
+        service: header.service.clone(),
+        accepted_transition: upgrade_hash,
+        reply_commitment: None,
+        outbox_commitment: None,
+        resulting_state_root: Some(header.service_root),
+        resulting_crdt_heads: Vec::new(),
+        sequence: header.revision,
+        checkpoint: 0,
+        consistency: header.consistency,
+    };
+    let record = ActorUpgradeRecordV2 {
+        upgrade: upgrade_hash,
+        actor: upgrade.actor,
+        previous_program,
+        program: upgrade.replacement_program,
+        receipt: receipt.clone(),
+    };
+    write(store, header_storage_key(), Some(&header.encode()))?;
+    write(store, &upgrade_key, Some(&record.encode()))?;
+    Ok(AccumulationResultV2::ActorUpgraded {
+        actor: upgrade.actor,
+        previous_program,
+        program: upgrade.replacement_program,
+        receipt,
+        duplicate: false,
+    })
 }
 
 fn admit_ingress<S: GuestAccumulateStoreV2>(
@@ -3371,6 +3531,7 @@ mod tests {
         proof_allowlist: BTreeSet<Hash>,
         invalid_proof_allowlist: BTreeSet<Hash>,
         receipt_allowlist: BTreeSet<Hash>,
+        upgrade_allowlist: BTreeSet<Hash>,
         writes_before_failure: Option<usize>,
     }
 
@@ -3403,6 +3564,10 @@ mod tests {
     impl GuestAccumulateStoreV2 for MemStore {
         fn authorize_install(&self, _genesis: &ServiceGenesisV2) -> Result<bool, Self::Error> {
             Ok(true)
+        }
+
+        fn authorize_upgrade(&self, upgrade: &ActorUpgradeV2) -> Result<bool, Self::Error> {
+            Ok(self.upgrade_allowlist.contains(&upgrade.hash()))
         }
 
         fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {
@@ -3528,6 +3693,220 @@ mod tests {
             panic!("install rejected")
         };
         (initial, receipt)
+    }
+
+    fn store_header(store: &MemStore) -> StoreHeaderV2 {
+        StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap()
+    }
+
+    fn upgrade_fixture(base_root: Hash) -> ActorUpgradeV2 {
+        ActorUpgradeV2 {
+            service: identity(),
+            actor: actor(),
+            expected_program: program(),
+            replacement_program: ProgramId([15; 32]),
+            producer: super::super::ProducerId([16; 32]),
+            methods: vec![MethodPolicyV2 {
+                method: "get".into(),
+                schema: Hash([17; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+            }],
+            base: ConsistencyBaseV2::Linear {
+                revision: 0,
+                state_root: base_root,
+            },
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([18; 32]),
+                authenticator: vec![19],
+            },
+        }
+    }
+
+    #[test]
+    fn idle_actor_upgrade_is_atomic_exactly_once_and_preserves_state() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
+        let upgrade = upgrade_fixture(install.resulting_state_root.unwrap());
+        store.upgrade_allowlist.insert(upgrade.hash());
+
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+        )
+        .unwrap();
+        let AccumulationResultV2::ActorUpgraded {
+            actor: upgraded_actor,
+            previous_program,
+            program: replacement,
+            receipt,
+            duplicate,
+        } = result
+        else {
+            panic!("idle actor upgrade was rejected")
+        };
+        assert_eq!(upgraded_actor, actor());
+        assert_eq!(previous_program, program());
+        assert_eq!(replacement, upgrade.replacement_program);
+        assert!(!duplicate);
+        assert_eq!(receipt.accepted_transition, upgrade.hash());
+        assert_eq!(receipt.sequence, 1);
+
+        let header = store_header(&store);
+        assert_eq!(header.revision, 1);
+        assert_eq!(header.state_root, Some(header.service_root));
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        let descriptor = tree_get_wire::<_, ActorGenesisV2>(
+            &tree,
+            &StateKeyV2::ActorDescriptor(actor()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(descriptor.program, upgrade.replacement_program);
+        assert_eq!(descriptor.producer, upgrade.producer);
+        assert_eq!(descriptor.methods, upgrade.methods);
+        assert_eq!(
+            tree_get_wire::<_, BlobRefV2>(
+                &tree,
+                &StateKeyV2::ActorRow {
+                    actor: actor(),
+                    key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+                },
+            )
+            .unwrap(),
+            Some(initial)
+        );
+        assert!(
+            tree.get(&StateKeyV2::MethodPolicy {
+                actor: actor(),
+                method: "set".into(),
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            tree_get_wire::<_, MethodPolicyV2>(
+                &tree,
+                &StateKeyV2::MethodPolicy {
+                    actor: actor(),
+                    method: "get".into(),
+                },
+            )
+            .unwrap(),
+            Some(upgrade.methods[0].clone())
+        );
+        drop(tree);
+
+        let before_retry = store.clone();
+        let duplicate = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::UpgradeActor(upgrade),
+        )
+        .unwrap();
+        assert!(matches!(
+            duplicate,
+            AccumulationResultV2::ActorUpgraded {
+                duplicate: true,
+                ..
+            }
+        ));
+        assert_eq!(store, before_retry, "an exact retry must stage no writes");
+    }
+
+    #[test]
+    fn actor_upgrade_rejects_suspended_actor_without_mutation() {
+        let mut store = MemStore::default();
+        let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
+        let mut header = store_header(&store);
+        let continuation = BlobRefV2::of_bytes(b"checkpoint");
+        let mut tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::Continuation(actor()),
+            Some(&continuation.encode()),
+        )
+        .unwrap();
+        header.service_root = tree.root();
+        header.state_root = Some(header.service_root);
+        drop(tree);
+        store
+            .rows
+            .insert(header_storage_key().to_vec(), header.encode());
+
+        let upgrade = upgrade_fixture(header.service_root);
+        store.upgrade_allowlist.insert(upgrade.hash());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::ActorBusy(actor()))
+        );
+        assert_eq!(store, before);
+        assert_ne!(header.service_root, install.resulting_state_root.unwrap());
+    }
+
+    #[test]
+    fn actor_upgrade_rejects_unauthorized_stale_and_wrong_program_inputs() {
+        let mut store = MemStore::default();
+        let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
+        let base_root = install.resulting_state_root.unwrap();
+        let upgrade = upgrade_fixture(base_root);
+
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized)
+        );
+        assert_eq!(store, before);
+
+        store.upgrade_allowlist.insert(upgrade.hash());
+        let mut stale = upgrade.clone();
+        stale.base = ConsistencyBaseV2::Linear {
+            revision: 1,
+            state_root: base_root,
+        };
+        store.upgrade_allowlist.insert(stale.hash());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(stale))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::StaleLinearWork {
+                expected_revision: 1,
+                actual_revision: 0,
+            })
+        );
+        assert_eq!(store, before);
+
+        let mut wrong = upgrade;
+        wrong.expected_program = ProgramId([20; 32]);
+        store.upgrade_allowlist.insert(wrong.hash());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(wrong))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
+    fn crdt_actor_upgrade_fails_closed_until_metadata_operations_exist() {
+        let mut store = MemStore::default();
+        install_fixture(&mut store, ConsistencyModeV2::Crdt, b"state");
+        let mut upgrade = upgrade_fixture(Hash::ZERO);
+        upgrade.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidConsistency)
+        );
+        assert_eq!(store, before);
     }
 
     fn linear_work(initial: BlobRefV2, base_root: Hash) -> WorkEnvelopeV2 {

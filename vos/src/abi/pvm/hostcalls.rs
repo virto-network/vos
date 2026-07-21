@@ -209,15 +209,27 @@ pub fn verify_proof(request: &[u8]) -> u64 {
     )
 }
 
-/// Authenticate exact service-genesis bytes against the platform account or
-/// deployment authority configured by the host.
+/// Authenticate one exact canonical physical install request against the
+/// platform account or deployment authority configured by the host.
 #[cfg(feature = "service")]
 #[inline]
-pub fn verify_install_authorization(genesis: &[u8]) -> u64 {
+pub fn verify_install_authorization(request: &[u8]) -> u64 {
     ecall2(
         hostcall::INSTALL_AUTH_VERIFY,
-        genesis.as_ptr() as u64,
-        genesis.len() as u64,
+        request.as_ptr() as u64,
+        request.len() as u64,
+    )
+}
+
+/// Authenticate one exact canonical physical actor-upgrade request against
+/// the platform package authority configured by the service host.
+#[cfg(feature = "service")]
+#[inline]
+pub fn verify_upgrade_authorization(request: &[u8]) -> u64 {
+    ecall2(
+        hostcall::UPGRADE_AUTH_VERIFY,
+        request.as_ptr() as u64,
+        request.len() as u64,
     )
 }
 

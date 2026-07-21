@@ -701,6 +701,10 @@ impl ServicePvmV2 {
                                 duplicate: false,
                                 ..
                             }
+                            | AccumulationResultV2::ActorUpgraded {
+                                duplicate: false,
+                                ..
+                            }
                     ) {
                         host.commit(transaction)?;
                     }
@@ -1196,6 +1200,7 @@ fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
         crate::abi::hostcall::PROOF_VERIFY as u8,
         crate::abi::hostcall::INSTALL_AUTH_VERIFY as u8,
         crate::abi::hostcall::RECEIPT_VERIFY as u8,
+        crate::abi::hostcall::UPGRADE_AUTH_VERIFY as u8,
     ] {
         kernel
             .vm_arena

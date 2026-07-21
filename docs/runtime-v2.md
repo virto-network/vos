@@ -195,6 +195,28 @@ later slice fails, so multi-await handlers have saga semantics. Same-tree calls
 may execute inline. Cross-root calls always use durable outbox/inbox rows and a
 `CallId` derived from `(InvocationId, await ordinal)`.
 
+## Actor upgrades
+
+`UpgradeActor` is a guest-owned Accumulate operation, not a native descriptor
+rewrite. The canonical request binds the service and actor, expected and
+replacement `ProgramId`, replacement producer and generated method policies,
+an exact consistency base, and an authenticated system capability. The host
+must authorize those exact physical request bytes and already possess canonical
+replacement PVM bytes matching the requested `ProgramId`.
+
+For Ephemeral, Local, and Raft services, guest Accumulate requires the exact
+current revision and state root. It rejects an actor with a durable continuation
+as `ActorBusy`, replaces only that actor's program/producer/policy rows, and
+preserves identity, ownership, consistency kind, and application state. A
+physical upgrade record makes an exact retry read-only. The old program remains
+in the content-addressed program store, so any already committed continuation
+can retain its exact code until later reference-counted collection is added.
+Queued ingress may use the new program only after the upgrade commits.
+
+CRDT actor upgrades currently fail closed with `InvalidConsistency`. Program
+metadata needs an explicit causal operation and complete-ancestry activation;
+the runtime does not pretend that a linear descriptor rewrite is a CRDT merge.
+
 ## Packages and identity
 
 `.vos` v2 packages bind the service ABI, execution-semantics ID, canonical
@@ -262,7 +284,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 8 is therefore a clean break from earlier experimental v2 images.
+Store schema 10 is therefore a clean break from earlier experimental v2 images.
 
 ## CRDT boundary
 

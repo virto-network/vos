@@ -101,9 +101,10 @@ pub use state_tree::{
     ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,
 };
 pub use storage::{
-    DedupRecordV2, DeliveryRecordV2, IngressRecordV2, PublicationRecordV2,
+    ActorUpgradeRecordV2, DedupRecordV2, DeliveryRecordV2, IngressRecordV2, PublicationRecordV2,
     SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2,
-    attestation_archive_storage_key, call_expiration_storage_key, crdt_change_storage_key,
+    actor_upgrade_storage_key, attestation_archive_storage_key, call_expiration_storage_key,
+    crdt_change_storage_key,
     crdt_node_receipt_storage_key,
     crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
     ingress_storage_key, publication_storage_key, receipt_storage_key,

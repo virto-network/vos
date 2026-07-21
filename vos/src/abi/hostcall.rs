@@ -102,13 +102,18 @@ pub const SUSPEND: u32 = 122;
 /// Refine never receive this capability.
 pub const PROOF_VERIFY: u32 = 123;
 
-/// Authenticate the exact v2 service-genesis bytes before an empty account is
-/// initialized. Installed only on the generic service's Accumulate entry.
+/// Authenticate the exact canonical physical install request before an empty
+/// account is initialized. Installed only on the service Accumulate entry.
 pub const INSTALL_AUTH_VERIFY: u32 = 124;
 
 /// Validate an external service's exact accumulation receipt before a
 /// committed reply is admitted as continuation input. Accumulate-only.
 pub const RECEIPT_VERIFY: u32 = 125;
+
+/// Authenticate one exact canonical physical idle-actor upgrade request
+/// against package authority. Accumulate-only; the host must also have the
+/// replacement program bytes available.
+pub const UPGRADE_AUTH_VERIFY: u32 = 126;
 
 #[cfg(test)]
 mod tests {
@@ -126,6 +131,7 @@ mod tests {
             PROOF_VERIFY,
             INSTALL_AUTH_VERIFY,
             RECEIPT_VERIFY,
+            UPGRADE_AUTH_VERIFY,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
         for (index, slot) in supplied.iter().enumerate() {
@@ -156,6 +162,7 @@ mod tests {
             PROOF_VERIFY as u8,
             INSTALL_AUTH_VERIFY as u8,
             RECEIPT_VERIFY as u8,
+            UPGRADE_AUTH_VERIFY as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];
         assert!(

@@ -15,7 +15,7 @@ use vos::node::VosNode;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, ActorWriteV2,
+    AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, ActorUpgradeV2, ActorWriteV2,
     AttestationDeliveryV2, AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
     CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
     CommittedAttestationOutputV2, CommittedImageStoreV2, CommittedServiceSnapshotV2,
@@ -5397,6 +5397,186 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         .expect("proof package remains recoverable until external acknowledgement");
     assert_eq!(pending_proof.receipt, receipt);
     assert_eq!(pending_proof.published, published);
+}
+
+#[test]
+fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let service_pvm =
+        vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let initial_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&initial_pvm);
+    let replacement_pvm = actor_pvm(1);
+    let replacement_program = ProgramId::of_pvm(&replacement_pvm);
+    let initial_bytes = b"state survives upgrade".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut seed = work(actor_program, initial.clone());
+    seed.service.service_program = service_program;
+
+    let mut store = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
+    assert_eq!(store.import_blob(initial_bytes), initial);
+    assert_eq!(store.import_program(initial_pvm.clone()), actor_program);
+    let mut service = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([31; 32]),
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([32; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+            }],
+        }],
+        external_actors: vec![],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([33; 32]),
+            authenticator: vec![34],
+        },
+    });
+    let AccumulateRequestV2::Install(genesis) = &install else {
+        unreachable!()
+    };
+    service.accumulate_host_mut().allow_install(genesis);
+    let AccumulationResultV2::Installed(installed) = service.accumulate(&install).unwrap().result
+    else {
+        panic!("service install rejected")
+    };
+    assert_eq!(
+        service
+            .accumulate_host_mut()
+            .import_program(replacement_pvm.clone()),
+        replacement_program
+    );
+
+    let upgrade = ActorUpgradeV2 {
+        service: seed.service.clone(),
+        actor: seed.target,
+        expected_program: actor_program,
+        replacement_program,
+        producer: ProducerId([35; 32]),
+        methods: vec![MethodPolicyV2 {
+            method: "next".into(),
+            schema: Hash([36; 32]),
+            policy: public_policy_hash(),
+            public: true,
+            attested: false,
+        }],
+        base: ConsistencyBaseV2::Linear {
+            revision: 0,
+            state_root: installed.resulting_state_root.unwrap(),
+        },
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([37; 32]),
+            authenticator: vec![38],
+        },
+    };
+    let before = service.accumulate_host().snapshot();
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone()))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
+    );
+    assert_eq!(service.accumulate_host().snapshot(), before);
+
+    assert!(service.accumulate_host_mut().allow_upgrade(&upgrade));
+    let before_failed_commit = service.accumulate_host().snapshot();
+    service
+        .accumulate_host_mut()
+        .backend_mut()
+        .fail_next_commit = true;
+    assert!(matches!(
+        service.accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone())),
+        Err(ServiceDispatchError::Pvm(
+            ServicePvmErrorV2::AccumulateCommitRejected
+        ))
+    ));
+    assert_eq!(service.accumulate_host().snapshot(), before_failed_commit);
+
+    let upgraded = service
+        .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone()))
+        .unwrap();
+    let AccumulationResultV2::ActorUpgraded {
+        previous_program,
+        program,
+        receipt,
+        duplicate,
+        ..
+    } = upgraded.result
+    else {
+        panic!("authorized idle upgrade rejected")
+    };
+    assert_eq!(previous_program, actor_program);
+    assert_eq!(program, replacement_program);
+    assert_eq!(receipt.sequence, 1);
+    assert!(!duplicate);
+    assert_eq!(service.accumulate_host().commit_sequence(), 2);
+    assert_eq!(
+        service.accumulate_host().program(actor_program),
+        Some(initial_pvm.as_slice())
+    );
+    assert_eq!(
+        service.accumulate_host().program(replacement_program),
+        Some(replacement_pvm.as_slice())
+    );
+
+    let prepared = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([39; 32]),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: seed.target,
+            method: "next".into(),
+            arguments: seed.arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("scheduler loads the replacement descriptor and PVM");
+    assert_eq!(prepared.work.target_program, replacement_program);
+    assert_eq!(prepared.imports.programs[0].pvm, replacement_pvm);
+    assert_eq!(prepared.work.imported_actors[0].state, initial);
+
+    let before_retry = service.accumulate_host().snapshot();
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade))
+            .unwrap()
+            .result,
+        AccumulationResultV2::ActorUpgraded {
+            duplicate: true,
+            ..
+        }
+    ));
+    assert_eq!(service.accumulate_host().snapshot(), before_retry);
 }
 
 #[test]

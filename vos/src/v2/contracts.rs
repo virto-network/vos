@@ -1407,9 +1407,9 @@ impl AccumulationRejectionV2 {
     }
 }
 
-/// Guest output. New installs, ingress admissions, accepted transitions, and
-/// publication acknowledgements authorize a commit when non-duplicate;
-/// `Prepared` and `Rejected` are read-only.
+/// Guest output. New installs, ingress admissions, accepted transitions,
+/// actor upgrades, and publication acknowledgements authorize a commit when
+/// non-duplicate; `Prepared` and `Rejected` are read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulationResultV2 {
     Installed(ServiceInstallReceiptV2),

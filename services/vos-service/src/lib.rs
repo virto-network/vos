@@ -466,8 +466,29 @@ mod guest {
         // SAFETY: JAM initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
         let result = match AccumulateRequestV2::decode(input) {
-            Ok(request) => execute_canonical_guest_accumulate(&mut JamAccumulateStore, &request)
-                .unwrap_or_else(|_| fail_closed()),
+            Ok(request) => {
+                // The physical service VM is invocation-scoped; its complete
+                // memory image is discarded at HALT. Keep the large decoded
+                // request alive until that boundary instead of running deep
+                // Rust collection drop glue after the result is finalized.
+                let request = core::mem::ManuallyDrop::new(request);
+                // Authenticate the already-canonical physical request bytes.
+                // This avoids re-encoding a large decoded package merely to
+                // present the same commitment to platform authority.
+                let install_authorized = matches!(&*request, AccumulateRequestV2::Install(_))
+                    && hostcalls::verify_install_authorization(input) == error::HOST_OK;
+                let upgrade_authorized =
+                    matches!(&*request, AccumulateRequestV2::UpgradeActor(_))
+                    && hostcalls::verify_upgrade_authorization(input) == error::HOST_OK;
+                execute_canonical_guest_accumulate(
+                    &mut JamAccumulateStore {
+                        install_authorized,
+                        upgrade_authorized,
+                    },
+                    &request,
+                )
+                .unwrap_or_else(|_| fail_closed())
+            }
             Err(_) => AccumulationResultV2::Rejected(AccumulationRejectionV2::NonCanonical),
         };
         output(&result.encode())
@@ -476,7 +497,10 @@ mod guest {
     const STORAGE_PROBE_CAPACITY: usize = 4096;
     const MAX_STORAGE_VALUE: usize = 64 * 1024 * 1024;
 
-    struct JamAccumulateStore;
+    struct JamAccumulateStore {
+        install_authorized: bool,
+        upgrade_authorized: bool,
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum JamStoreError {
@@ -524,9 +548,16 @@ mod guest {
     impl GuestAccumulateStoreV2 for JamAccumulateStore {
         fn authorize_install(
             &self,
-            genesis: &vos::v2::ServiceGenesisV2,
+            _genesis: &vos::v2::ServiceGenesisV2,
         ) -> Result<bool, Self::Error> {
-            Ok(hostcalls::verify_install_authorization(&genesis.encode()) == error::HOST_OK)
+            Ok(self.install_authorized)
+        }
+
+        fn authorize_upgrade(
+            &self,
+            _upgrade: &vos::v2::ActorUpgradeV2,
+        ) -> Result<bool, Self::Error> {
+            Ok(self.upgrade_authorized)
         }
 
         fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {

@@ -16,8 +16,8 @@ use crate::attestation::AttestationProofHostV2;
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, BlobRefV2,
-    DeliveryRecordV2, DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, ActorUpgradeV2,
+    BlobRefV2, DeliveryRecordV2, DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId,
     ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
     ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
     StoreHeaderV2, StoreOpenError, V2Wire,
@@ -290,6 +290,7 @@ pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
     proof_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
+    upgrade_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
 }
 
@@ -351,6 +352,7 @@ impl LocalJamStoreV2 {
             },
             proof_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
+            upgrade_allowlist: BTreeSet::new(),
             receipt_allowlist: BTreeSet::new(),
         }
     }
@@ -361,6 +363,7 @@ impl LocalJamStoreV2 {
             committed: snapshot,
             proof_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
+            upgrade_allowlist: BTreeSet::new(),
             receipt_allowlist: BTreeSet::new(),
         }
     }
@@ -716,6 +719,16 @@ impl LocalJamStoreV2 {
         self.install_allowlist.insert(install_hash(genesis));
     }
 
+    /// Authorize one exact actor upgrade. The replacement program must have
+    /// been imported first; authorization cannot manufacture package bytes.
+    pub fn allow_upgrade(&mut self, upgrade: &ActorUpgradeV2) -> bool {
+        if !self.committed.programs.contains_key(&upgrade.replacement_program.0) {
+            return false;
+        }
+        self.upgrade_allowlist.insert(upgrade.hash());
+        true
+    }
+
     /// Configure the conformance host to accept one exact finalized receipt.
     /// Production hosts replace this allowlist with their JAM receipt/finality
     /// verifier.
@@ -791,6 +804,7 @@ pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
     proof_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
+    upgrade_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
 }
 
@@ -909,10 +923,34 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
             }
             hostcall::INSTALL_AUTH_VERIFY => {
                 let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
-                let genesis = ServiceGenesisV2::decode(&bytes)
+                let request = super::AccumulateRequestV2::decode(&bytes)
                     .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let super::AccumulateRequestV2::Install(genesis) = request else {
+                    return Ok([error::HOST_WHAT, 0]);
+                };
                 Ok([
                     if self.install_allowlist.contains(&install_hash(&genesis)) {
+                        error::HOST_OK
+                    } else {
+                        error::HOST_WHAT
+                    },
+                    0,
+                ])
+            }
+            hostcall::UPGRADE_AUTH_VERIFY => {
+                let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
+                let request = super::AccumulateRequestV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                let super::AccumulateRequestV2::UpgradeActor(upgrade) = request else {
+                    return Ok([error::HOST_WHAT, 0]);
+                };
+                Ok([
+                    if self.upgrade_allowlist.contains(&upgrade.hash())
+                        && self
+                            .staged
+                            .programs
+                            .contains_key(&upgrade.replacement_program.0)
+                    {
                         error::HOST_OK
                     } else {
                         error::HOST_WHAT
@@ -946,6 +984,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
             staged: self.committed.clone(),
             proof_allowlist: self.proof_allowlist.clone(),
             install_allowlist: self.install_allowlist.clone(),
+            upgrade_allowlist: self.upgrade_allowlist.clone(),
             receipt_allowlist: self.receipt_allowlist.clone(),
         })
     }
