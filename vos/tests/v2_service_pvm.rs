@@ -616,9 +616,151 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     let reply = node
         .invoke_actor(actor, arguments)
         .expect("bound actor identity routes through strict v2 ingress");
-    assert!(reply.is_empty(), "unit replies retain the established host ABI");
+    assert!(
+        reply.is_empty(),
+        "unit replies retain the established host ABI"
+    );
     node.shutdown();
     assert!(node.collect().into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
+fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("vos=debug")
+        .with_test_writer()
+        .try_init();
+    let (Some(service_elf), Some(actor_elf)) = (service_elf(), workflow_v2_elf()) else {
+        return;
+    };
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let schemas = vos::metadata::raw_section_from_elf(&actor_elf).expect("workflow metadata");
+    let metadata = vos::metadata::decode(&schemas).expect("valid workflow metadata");
+    let policies = PackageRolePoliciesV2::from_metadata(&metadata)
+        .unwrap()
+        .encode();
+    let public_key = b"node-cross-root-workflow".to_vec();
+    let package = VosPackageV2 {
+        manifest: PackageManifestV2 {
+            name: metadata.actor_name.clone(),
+            version: "2.0.0".into(),
+            service_abi: vos::v2::ABI_VERSION,
+            snapshot_version: vos::v2::SNAPSHOT_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            service_program,
+            actor_program,
+            crdt: false,
+            interfaces_hash: artifact_hash(b"interfaces", &[]),
+            role_policies_hash: artifact_hash(b"role-policies", &policies),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+        },
+        actor_pvm,
+        generated_interfaces: vec![],
+        role_policies: policies,
+        schemas,
+        diagnostics: None,
+        deployment_signature: vos::v2::DeploymentSignatureV2 {
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+            signature: vec![1],
+        },
+    };
+    package.validate().unwrap();
+    let deployment = package.deployment_id();
+    let space = vos::v2::SpaceId([101; 32]);
+    let source_actor = ActorId([43; 32]);
+    let peer_actor = ActorId([44; 32]);
+    let source_identity = ServiceIdentityV2 {
+        space,
+        root_service: RootServiceId([102; 32]),
+        deployment,
+        service_program,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let peer_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([103; 32]),
+        ..source_identity.clone()
+    };
+    let config = |identity: ServiceIdentityV2,
+                  actor: ActorId,
+                  external_actors: Vec<vos::v2::ExternalActorBindingV2>| {
+        LocalRootTreeConfigV2 {
+            service_pvm: service_pvm.clone(),
+            package: package.clone(),
+            service: identity,
+            root_actor: actor,
+            actor_name: metadata.actor_name.clone(),
+            consistency: ConsistencyModeV2::Local,
+            initial_state: vec![],
+            external_actors,
+            install_authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([104; 32]),
+                authenticator: vec![105],
+            },
+            refine_gas: 1_000_000_000,
+            accumulate_gas: 5_000_000_000,
+        }
+    };
+    let source = LocalRootTreeServiceV2::open(
+        config(
+            source_identity,
+            source_actor,
+            vec![vos::v2::ExternalActorBindingV2 {
+                name: "peer".into(),
+                service: peer_identity.clone(),
+                actor: peer_actor,
+                producer: package.deployment_signature.producer,
+                program: actor_program,
+            }],
+        ),
+        FailableCommittedImages::default(),
+    )
+    .expect("source root installs");
+    let peer = LocalRootTreeServiceV2::open(
+        config(peer_identity, peer_actor, vec![]),
+        FailableCommittedImages::default(),
+    )
+    .expect("peer root installs");
+
+    let mut node = VosNode::new();
+    let source_route = ServiceId(201);
+    node.register_v2_root_at_id("source".into(), source, source_route, true)
+        .unwrap();
+    node.register_v2_root_at_id("peer".into(), peer, ServiceId(202), true)
+        .unwrap();
+    let handle = node.invoke_handle();
+    let shutdown = node.shutdown_handle();
+    let router = std::thread::spawn(move || {
+        node.run_forever();
+        node.collect()
+    });
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("child_await_peer").encode());
+    let ingress = vos::v2::RootTreeInvocationV2 {
+        invocation: InvocationId([106; 32]),
+        logical_timeslot: 1,
+        target: source_actor,
+        method: "child_await_peer".into(),
+        arguments,
+        proof_requested: false,
+    };
+    let reply = handle
+        .invoke_with_timeout(
+            source_route,
+            ingress.encode(),
+            std::time::Duration::from_secs(20),
+        )
+        .expect("cross-root continuation resolves only after both guest commits");
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    let results = router.join().unwrap();
+    assert!(results.into_iter().all(|result| result.is_ok()));
 }
 
 #[test]

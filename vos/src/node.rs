@@ -2780,7 +2780,9 @@ impl VosNode {
     where
         B: crate::v2::CommittedImageStoreV2 + Send + 'static,
     {
-        if self.invoke_routes.lock().unwrap().contains_key(&id.0) {
+        if self.invoke_routes.lock().unwrap().contains_key(&id.0)
+            || self.routes.contains_key(&id.0)
+        {
             return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
         }
         let root_actor = service.root_actor();
@@ -2802,7 +2804,9 @@ impl VosNode {
             crate::v2::ConsistencyModeV2::Raft => Consistency::Raft,
             crate::v2::ConsistencyModeV2::Crdt => Consistency::Crdt,
         };
+        let (inbox_tx, inbox_rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
+        self.routes.insert(id.0, inbox_tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
         self.v2_actor_routes
             .write()
@@ -2822,8 +2826,18 @@ impl VosNode {
         let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
         let actor_routes = self.v2_actor_routes.clone();
+        let outbox = self.outbox_tx.clone();
         let join = thread::spawn(move || {
-            v2_root_service_thread(id, service, invoke_rx, actor_routes, shutdown, activity)
+            v2_root_service_thread(
+                id,
+                service,
+                inbox_rx,
+                invoke_rx,
+                outbox,
+                actor_routes,
+                shutdown,
+                activity,
+            )
         });
         self.agents.push(AgentHandle { join: Some(join) });
         Ok(id)
@@ -3720,7 +3734,9 @@ impl Default for VosNode {
 fn v2_root_service_thread<B>(
     id: ServiceId,
     mut service: crate::v2::LocalRootTreeServiceV2<B>,
+    inbox_rx: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
+    outbox: mpsc::Sender<Envelope>,
     actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
@@ -3730,6 +3746,8 @@ where
 {
     use crate::v2::V2Wire;
 
+    let mut state = V2RootThreadState::default();
+    let mut last_publication_retry = Instant::now();
     if let Ok(pending) = service.pending_publications()
         && !pending.is_empty()
     {
@@ -3740,6 +3758,27 @@ where
         );
     }
     while !shutdown.load(Ordering::Relaxed) {
+        while let Ok(envelope) = inbox_rx.try_recv() {
+            *activity.lock().unwrap() = Instant::now();
+            handle_v2_transport(
+                id,
+                &mut service,
+                envelope,
+                &outbox,
+                &actor_routes,
+                &mut state,
+            );
+        }
+        if last_publication_retry.elapsed() >= Duration::from_millis(250) {
+            retry_v2_work(
+                id,
+                &mut service,
+                &outbox,
+                &actor_routes,
+                &mut state,
+            );
+            last_publication_retry = Instant::now();
+        }
         let request = match invoke_rx.recv_timeout(Duration::from_millis(10)) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -3808,13 +3847,18 @@ where
         };
         match service.recover_publication(&work) {
             Ok(Some(publication)) => {
-                let fully_delivered =
-                    deliver_v2_effects(request.reply, &publication.published, id);
-                if fully_delivered
-                    && let Err(error) = service.acknowledge_publication(&publication)
-                {
-                    warn!(%id, ?error, "v2 retry reply delivered but acknowledgement failed");
-                }
+                publish_v2_slice(
+                    id,
+                    &mut service,
+                    work.invocation,
+                    publication.published.clone(),
+                    Some(publication),
+                    Some(request.reply),
+                    ingress.logical_timeslot,
+                    &outbox,
+                    &actor_routes,
+                    &mut state,
+                );
                 continue;
             }
             Ok(None) => {}
@@ -3831,13 +3875,25 @@ where
         }
         match service.invoke(work) {
             Ok(committed) => {
-                let fully_delivered = deliver_v2_effects(request.reply, &committed.published, id);
-                if fully_delivered
-                    && let Some(publication) = committed.publication.as_ref()
-                    && let Err(error) = service.acknowledge_publication(publication)
-                {
-                    warn!(%id, ?error, "v2 committed reply delivered but acknowledgement failed");
-                }
+                debug!(
+                    %id,
+                    invocation = ?ingress.invocation,
+                    outbox = committed.published.outbox.len(),
+                    replied = committed.published.reply.is_some(),
+                    "v2 root-tree slice committed"
+                );
+                publish_v2_slice(
+                    id,
+                    &mut service,
+                    ingress.invocation,
+                    committed.published,
+                    committed.publication,
+                    Some(request.reply),
+                    ingress.logical_timeslot,
+                    &outbox,
+                    &actor_routes,
+                    &mut state,
+                );
             }
             Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
                 crate::v2::AccumulationRejectionV2::Unauthorized,
@@ -3860,6 +3916,469 @@ where
         id,
         panics: 0,
         error: None,
+    }
+}
+
+#[derive(Default)]
+struct V2RootThreadState {
+    pending_callers: HashMap<crate::v2::InvocationId, Vec<ReplyChannel>>,
+    return_calls: HashMap<crate::v2::InvocationId, V2ReturnCall>,
+    admitted_calls: HashMap<crate::v2::CallId, u64>,
+    accepted_outbox:
+        HashMap<crate::v2::Hash, std::collections::BTreeSet<crate::v2::CallId>>,
+}
+
+#[derive(Clone, Copy)]
+struct V2ReturnCall {
+    route: u32,
+    caller_invocation: crate::v2::InvocationId,
+}
+
+fn v2_actor_route(
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    actor: crate::v2::ActorId,
+) -> Option<u32> {
+    actor_routes.read().ok()?.get(&actor).copied()
+}
+
+fn handle_v2_transport<B>(
+    id: ServiceId,
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    envelope: Envelope,
+    outbox: &mpsc::Sender<Envelope>,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    state: &mut V2RootThreadState,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    use crate::v2::V2Wire;
+
+    let transport = match crate::v2::RootTreeTransportV2::decode(&envelope.payload) {
+        Ok(transport) => transport,
+        Err(error) => {
+            warn!(%id, from = %envelope.from, ?error, "rejected non-canonical v2 transport");
+            return;
+        }
+    };
+    match transport {
+        crate::v2::RootTreeTransportV2::OutboxDelivery {
+            logical_timeslot,
+            publication,
+            message,
+        } => {
+            debug!(%id, from = %envelope.from, call = ?message.call_id, "received v2 outbox delivery");
+            if message.to != service.root_actor()
+                || v2_actor_route(actor_routes, message.from) != Some(envelope.from.0)
+            {
+                warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected misrouted v2 outbox delivery");
+                return;
+            }
+            let publication_commitment = publication.commitment();
+            let call = message.call_id;
+            let callee_invocation = crate::v2::InvocationId::for_call(call);
+            match service.deliver_finalized(
+                logical_timeslot,
+                message.clone(),
+                publication.published.outbox.clone(),
+                publication.receipt,
+            ) {
+                Ok(_) => {
+                    state.return_calls.insert(
+                        callee_invocation,
+                        V2ReturnCall {
+                            route: envelope.from.0,
+                            caller_invocation: message.caller_invocation,
+                        },
+                    );
+                    state.admitted_calls.insert(call, logical_timeslot);
+                    let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
+                        input: publication.input,
+                        publication: publication_commitment,
+                        call,
+                    };
+                    let _ = outbox.send(Envelope {
+                        from: id,
+                        to: envelope.from,
+                        payload: accepted.encode(),
+                    });
+                    run_v2_admitted_call(
+                        id,
+                        service,
+                        call,
+                        logical_timeslot,
+                        outbox,
+                        actor_routes,
+                        state,
+                    );
+                }
+                Err(error) => {
+                    warn!(%id, call = ?call, ?error, "destination guest rejected v2 delivery");
+                }
+            }
+        }
+        crate::v2::RootTreeTransportV2::Reply {
+            logical_timeslot,
+            caller_invocation,
+            publication,
+        } => {
+            let Some(reply) = publication.published.reply.clone() else {
+                return;
+            };
+            debug!(%id, from = %envelope.from, call = ?reply.call_id, "received v2 accumulated reply");
+            if v2_actor_route(actor_routes, reply.producer) != Some(envelope.from.0) {
+                warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted v2 reply");
+                return;
+            }
+            let accumulated = crate::v2::AccumulatedReplyV2 {
+                reply: reply.clone(),
+                receipt: publication.receipt.clone(),
+                attestation: None,
+            };
+            match service.reply_already_accumulated(caller_invocation, &accumulated) {
+                Ok(true) => {
+                    let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
+                        input: publication.input,
+                        publication: publication.commitment(),
+                        call: reply.call_id,
+                    };
+                    let _ = outbox.send(Envelope {
+                        from: id,
+                        to: envelope.from,
+                        payload: accepted.encode(),
+                    });
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(%id, invocation = ?caller_invocation, ?error, "could not inspect durable v2 reply admission");
+                    return;
+                }
+            }
+            service.allow_finalized_receipt(&accumulated.receipt);
+            match service.resume(caller_invocation, logical_timeslot, Some(accumulated)) {
+                Ok(committed) => {
+                    debug!(
+                        %id,
+                        invocation = ?caller_invocation,
+                        outbox = committed.published.outbox.len(),
+                        replied = committed.published.reply.is_some(),
+                        "v2 root-tree continuation committed"
+                    );
+                    let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
+                        input: publication.input,
+                        publication: publication.commitment(),
+                        call: reply.call_id,
+                    };
+                    let _ = outbox.send(Envelope {
+                        from: id,
+                        to: envelope.from,
+                        payload: accepted.encode(),
+                    });
+                    publish_v2_slice(
+                        id,
+                        service,
+                        caller_invocation,
+                        committed.published,
+                        committed.publication,
+                        None,
+                        logical_timeslot,
+                        outbox,
+                        actor_routes,
+                        state,
+                    );
+                }
+                Err(error) => {
+                    warn!(%id, invocation = ?caller_invocation, ?error, "source guest rejected finalized v2 reply");
+                }
+            }
+        }
+        crate::v2::RootTreeTransportV2::PublicationAccepted {
+            input,
+            publication,
+            call,
+        } => acknowledge_v2_transport_publication(
+            id,
+            service,
+            envelope.from,
+            input,
+            publication,
+            call,
+            actor_routes,
+            state,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_v2_slice<B>(
+    id: ServiceId,
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    invocation: crate::v2::InvocationId,
+    published: crate::v2::PublishedEffectsV2,
+    publication: Option<crate::v2::PublicationRecordV2>,
+    caller: Option<ReplyChannel>,
+    logical_timeslot: u64,
+    outbox: &mpsc::Sender<Envelope>,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    state: &mut V2RootThreadState,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    if let Some(caller) = caller {
+        state
+            .pending_callers
+            .entry(invocation)
+            .or_default()
+            .push(caller);
+    }
+    let Some(publication) = publication else {
+        return;
+    };
+    if !publication.published.outbox.is_empty() {
+        queue_v2_outbox(id, &publication, logical_timeslot, outbox, actor_routes);
+    }
+    if let Some(reply) = published.reply.as_ref() {
+        let mut delivered = false;
+        if let Some(callers) = state.pending_callers.remove(&invocation) {
+            for caller in callers {
+                delivered |= send_reply_capped(
+                    caller,
+                    encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply.result),
+                    id,
+                );
+            }
+        } else if let Some(return_call) = state.return_calls.get(&invocation).copied() {
+            delivered = queue_v2_reply(
+                id,
+                return_call,
+                &publication,
+                logical_timeslot,
+                outbox,
+            );
+        }
+        if delivered
+            && published.outbox.is_empty()
+            && published.exported_blobs.is_empty()
+            && published.proof.is_none()
+            && state.return_calls.get(&invocation).is_none()
+            && let Err(error) = service.acknowledge_publication(&publication)
+        {
+            warn!(%id, ?error, "v2 reply delivered but publication acknowledgement failed");
+        }
+    }
+}
+
+fn queue_v2_outbox(
+    id: ServiceId,
+    publication: &crate::v2::PublicationRecordV2,
+    logical_timeslot: u64,
+    outbox: &mpsc::Sender<Envelope>,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+) {
+    use crate::v2::V2Wire;
+
+    if publication.published.reply.is_some()
+        || publication.published.proof.is_some()
+    {
+        return;
+    }
+    for message in &publication.published.outbox {
+        let Some(route) = v2_actor_route(actor_routes, message.to) else {
+            continue;
+        };
+        let transport = crate::v2::RootTreeTransportV2::OutboxDelivery {
+            logical_timeslot,
+            publication: publication.clone(),
+            message: message.clone(),
+        };
+        let _ = outbox.send(Envelope {
+            from: id,
+            to: ServiceId(route),
+            payload: transport.encode(),
+        });
+    }
+}
+
+fn queue_v2_reply(
+    id: ServiceId,
+    return_call: V2ReturnCall,
+    publication: &crate::v2::PublicationRecordV2,
+    logical_timeslot: u64,
+    outbox: &mpsc::Sender<Envelope>,
+) -> bool {
+    use crate::v2::V2Wire;
+
+    if publication.published.reply.is_none()
+        || !publication.published.outbox.is_empty()
+        || !publication.published.exported_blobs.is_empty()
+        || publication.published.proof.is_some()
+    {
+        return false;
+    }
+    outbox
+        .send(Envelope {
+            from: id,
+            to: ServiceId(return_call.route),
+            payload: crate::v2::RootTreeTransportV2::Reply {
+                logical_timeslot,
+                caller_invocation: return_call.caller_invocation,
+                publication: publication.clone(),
+            }
+            .encode(),
+        })
+        .is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_v2_admitted_call<B>(
+    id: ServiceId,
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    call: crate::v2::CallId,
+    logical_timeslot: u64,
+    outbox: &mpsc::Sender<Envelope>,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    state: &mut V2RootThreadState,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    match service.invoke_inbox(call, logical_timeslot.saturating_add(1)) {
+        Ok(committed) => {
+            state.admitted_calls.remove(&call);
+            publish_v2_slice(
+                id,
+                service,
+                crate::v2::InvocationId::for_call(call),
+                committed.published,
+                committed.publication,
+                None,
+                logical_timeslot.saturating_add(1),
+                outbox,
+                actor_routes,
+                state,
+            );
+        }
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
+            crate::v2::ScheduleErrorV2::ActorBusy(_),
+        )) => {}
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
+            crate::v2::ScheduleErrorV2::MissingInbox(_),
+        )) => {
+            state.admitted_calls.remove(&call);
+        }
+        Err(error) => warn!(%id, ?call, ?error, "v2 admitted inbox execution failed"),
+    }
+}
+
+fn retry_v2_work<B>(
+    id: ServiceId,
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    outbox: &mpsc::Sender<Envelope>,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    state: &mut V2RootThreadState,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    if let Ok(publications) = service.pending_publications() {
+        for publication in publications {
+            let logical_timeslot = match service.publication_logical_timeslot(&publication) {
+                Ok(logical_timeslot) => logical_timeslot,
+                Err(error) => {
+                    warn!(%id, input = ?publication.input, ?error, "v2 publication retry lost its committed work checkpoint");
+                    continue;
+                }
+            };
+            queue_v2_outbox(
+                id,
+                &publication,
+                logical_timeslot,
+                outbox,
+                actor_routes,
+            );
+            if let Some(return_call) = state
+                .return_calls
+                .get(&publication.input.invocation)
+                .copied()
+            {
+                let _ = queue_v2_reply(
+                    id,
+                    return_call,
+                    &publication,
+                    logical_timeslot,
+                    outbox,
+                );
+            }
+        }
+    }
+    let admitted = state
+        .admitted_calls
+        .iter()
+        .map(|(call, timeslot)| (*call, *timeslot))
+        .collect::<Vec<_>>();
+    for (call, timeslot) in admitted {
+        run_v2_admitted_call(id, service, call, timeslot, outbox, actor_routes, state);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acknowledge_v2_transport_publication<B>(
+    id: ServiceId,
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    from: ServiceId,
+    input: crate::v2::WorkInputIdV2,
+    commitment: crate::v2::Hash,
+    call: crate::v2::CallId,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    state: &mut V2RootThreadState,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    let publication = match service.pending_publications().ok().and_then(|pending| {
+        pending
+            .into_iter()
+            .find(|candidate| candidate.input == input && candidate.commitment() == commitment)
+    }) {
+        Some(publication) => publication,
+        None => return,
+    };
+    if let Some(reply) = publication.published.reply.as_ref() {
+        let expected = state.return_calls.get(&input.invocation).copied();
+        if reply.call_id != call || expected.is_none_or(|expected| expected.route != from.0) {
+            return;
+        }
+        match service.acknowledge_publication(&publication) {
+            Ok(_) => {
+                state.return_calls.remove(&input.invocation);
+            }
+            Err(error) => warn!(%id, ?error, "v2 reply publication acknowledgement failed"),
+        }
+        return;
+    }
+    let Some(message) = publication
+        .published
+        .outbox
+        .iter()
+        .find(|message| message.call_id == call)
+    else {
+        return;
+    };
+    if v2_actor_route(actor_routes, message.to) != Some(from.0) {
+        return;
+    }
+    let accepted = state.accepted_outbox.entry(commitment).or_default();
+    accepted.insert(call);
+    if publication
+        .published
+        .outbox
+        .iter()
+        .all(|message| accepted.contains(&message.call_id))
+        && publication.published.proof.is_none()
+    {
+        match service.acknowledge_publication(&publication) {
+            Ok(_) => {
+                state.accepted_outbox.remove(&commitment);
+            }
+            Err(error) => warn!(%id, ?error, "v2 outbox publication acknowledgement failed"),
+        }
     }
 }
 
@@ -3903,33 +4422,6 @@ fn v2_work_authorization(
         authenticator: authenticated,
     };
     Some((origin, credential.disclosed_evidence(policy.policy)))
-}
-
-fn deliver_v2_effects(
-    reply: ReplyChannel,
-    effects: &crate::v2::PublishedEffectsV2,
-    id: ServiceId,
-) -> bool {
-    let reply_delivered = match effects.reply.as_ref() {
-        Some(committed) => send_reply_capped(
-            reply,
-            encode_invoke_envelope(
-                crate::actors::run::STATUS_DONE,
-                &[],
-                &committed.result,
-            ),
-            id,
-        ),
-        None => send_reply_capped(
-            reply,
-            encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &[]),
-            id,
-        ),
-    };
-    reply_delivered
-        && effects.outbox.is_empty()
-        && effects.exported_blobs.is_empty()
-        && effects.proof.is_none()
 }
 
 fn send_v2_status(reply: ReplyChannel, status: u8, id: ServiceId) {

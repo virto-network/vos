@@ -169,7 +169,6 @@ impl RootTreeTransportV2 {
             } => {
                 publication.published.reply.is_none()
                     && publication.published.proof.is_none()
-                    && publication.published.exported_blobs.is_empty()
                     && publication
                         .published
                         .outbox
@@ -586,6 +585,37 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.invoke_prepared(prepared)
     }
 
+    /// Make one exact platform-finalized receipt available to the next guest
+    /// Accumulate verification. This changes host verifier policy only; it is
+    /// excluded from the committed service image.
+    pub(crate) fn allow_finalized_receipt(&mut self, receipt: &AccumulationReceiptV2) {
+        self.service
+            .accumulate_host_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                receipt: receipt.clone(),
+            });
+    }
+
+    /// Whether this exact accumulated reply already advanced the durable
+    /// workflow. This lets transport resend its acknowledgement after an ACK
+    /// loss without restoring or executing the continuation a second time.
+    pub(crate) fn reply_already_accumulated(
+        &self,
+        invocation: super::InvocationId,
+        reply: &super::AccumulatedReplyV2,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        Ok(checkpoint.is_some_and(|checkpoint| {
+            checkpoint.input.invocation == invocation
+                && checkpoint.input.workflow_step > 0
+                && checkpoint.resume_work.awaited_reply.as_ref() == Some(reply)
+        }))
+    }
+
     /// Admit one finalized source outbox record through destination physical
     /// Accumulate. The host policy makes only this exact receipt available;
     /// membership, service identity, base freshness and deduplication remain
@@ -597,12 +627,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         source_outbox: Vec<MessageRecordV2>,
         source_receipt: AccumulationReceiptV2,
     ) -> Result<CommittedDeliveryV2, LocalRootTreeInvokeErrorV2> {
-        let verification = ReceiptVerificationRequestV2 {
-            receipt: source_receipt.clone(),
-        };
-        self.service
-            .accumulate_host_mut()
-            .allow_receipt(&verification);
+        self.allow_finalized_receipt(&source_receipt);
         let delivery = LocalWorkSchedulerV2::prepare_delivery(
             self.service.accumulate_host(),
             logical_timeslot,
@@ -715,6 +740,26 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
     }
 
+    /// Recover the exact logical timeslot committed with a pending
+    /// publication. Transport retries must reproduce the original delivery
+    /// bytes; substituting a host clock would turn an exact retry into a
+    /// divergent duplicate at destination Accumulate.
+    pub(crate) fn publication_logical_timeslot(
+        &self,
+        publication: &PublicationRecordV2,
+    ) -> Result<u64, LocalRootTreeInvokeErrorV2> {
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(publication.input.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::DivergentReplay)?;
+        if checkpoint.input != publication.input {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+        }
+        Ok(checkpoint.resume_work.logical_timeslot)
+    }
+
     pub fn into_backend(self) -> B {
         let (_, store) = self.service.into_hosts();
         let (_, backend) = store.into_parts();
@@ -811,6 +856,22 @@ mod tests {
         assert_eq!(
             RootTreeTransportV2::decode(&delivery.encode()).unwrap(),
             delivery
+        );
+
+        let mut checkpoint_publication = publication.clone();
+        checkpoint_publication
+            .published
+            .exported_blobs
+            .push(super::super::BlobRefV2::of_bytes(b"source continuation"));
+        let checkpoint_delivery = RootTreeTransportV2::OutboxDelivery {
+            logical_timeslot: 11,
+            publication: checkpoint_publication,
+            message: message.clone(),
+        };
+        assert_eq!(
+            RootTreeTransportV2::decode(&checkpoint_delivery.encode()).unwrap(),
+            checkpoint_delivery,
+            "source-owned checkpoint blobs may coexist with a durable outbox record"
         );
 
         let accepted = RootTreeTransportV2::PublicationAccepted {

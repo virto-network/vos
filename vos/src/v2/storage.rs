@@ -270,6 +270,7 @@ pub struct DedupRecordV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryRecordV2 {
     pub call_id: CallId,
+    pub retry_identity: Hash,
     pub delivery_commitment: Hash,
     pub receipt: AccumulationReceiptV2,
 }
@@ -381,6 +382,7 @@ impl V2Wire for DeliveryRecordV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.call_id.0);
+        e.fixed(&self.retry_identity.0);
         e.fixed(&self.delivery_commitment.0);
         e.bytes(&self.receipt.encode());
     }
@@ -388,10 +390,12 @@ impl V2Wire for DeliveryRecordV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             call_id: CallId(d.fixed()?),
+            retry_identity: Hash(d.fixed()?),
             delivery_commitment: Hash(d.fixed()?),
             receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
         };
-        if value.receipt.accepted_transition != value.delivery_commitment
+        if value.retry_identity == Hash::ZERO
+            || value.receipt.accepted_transition != value.delivery_commitment
             || value.receipt.reply_commitment.is_some()
             || value.receipt.outbox_commitment.is_some()
         {
@@ -709,6 +713,7 @@ mod tests {
 
         let delivery = DeliveryRecordV2 {
             call_id: CallId([15; 32]),
+            retry_identity: Hash([14; 32]),
             delivery_commitment: Hash([16; 32]),
             receipt: AccumulationReceiptV2 {
                 service: service(17),

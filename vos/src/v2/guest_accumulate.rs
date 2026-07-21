@@ -294,12 +294,13 @@ fn deliver<S: GuestAccumulateStoreV2>(
     }
 
     let delivery_commitment = envelope.commitment();
+    let retry_identity = envelope.retry_identity();
     let delivery_key = delivery_storage_key(envelope.message.call_id);
     if let Some(bytes) = read(store, &delivery_key)? {
         let record =
             DeliveryRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
         return if record.call_id == envelope.message.call_id
-            && record.delivery_commitment == delivery_commitment
+            && record.retry_identity == retry_identity
         {
             Ok(AccumulationResultV2::Accepted {
                 receipt: record.receipt,
@@ -432,6 +433,7 @@ fn deliver<S: GuestAccumulateStoreV2>(
     };
     let record = DeliveryRecordV2 {
         call_id: envelope.message.call_id,
+        retry_identity,
         delivery_commitment,
         receipt: receipt.clone(),
     };
@@ -3626,6 +3628,25 @@ mod tests {
         let after_duplicate =
             StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         assert_eq!(after_duplicate, committed);
+
+        let retry_after_advance = delivery(&committed, incoming, envelope.source_receipt.clone());
+        assert_eq!(
+            retry_after_advance.retry_identity(),
+            envelope.retry_identity()
+        );
+        assert_ne!(retry_after_advance.commitment(), envelope.commitment());
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Deliver(retry_after_advance),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                published,
+                ..
+            } if published == PublishedEffectsV2::default()
+        ));
 
         let mut divergent = envelope;
         divergent.logical_timeslot += 1;

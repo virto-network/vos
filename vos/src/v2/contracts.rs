@@ -950,6 +950,21 @@ impl DeliveryEnvelopeV2 {
     pub fn commitment(&self) -> Hash {
         Hash::digest(b"vos/delivery/v2", &[&self.encode()])
     }
+
+    /// Stable identity of the finalized source delivery. Destination base and
+    /// CRDT frontier are intentionally excluded: after the first admission,
+    /// executing the inbox advances them, but a retry of the same finalized
+    /// source record must still deduplicate to the original receipt.
+    pub fn retry_identity(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        encode_service(&mut e, &self.service);
+        e.u64(self.logical_timeslot);
+        e.bytes(&self.message.encode());
+        e.list(&self.source_outbox, |e, message| e.bytes(&message.encode()));
+        e.bytes(&self.source_receipt.encode());
+        Hash::digest(b"vos/delivery-retry/v2", &[&bytes])
+    }
 }
 
 /// One causal node imported from another replica of the same CRDT service.

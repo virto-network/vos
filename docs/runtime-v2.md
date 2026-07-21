@@ -2,9 +2,10 @@
 
 > Implementation status: the versioned contracts, conformance service, package
 > tooling, canonical `vos-service.pvm`, exact JAR restoration, durable local
-> scheduler, and guest-owned CRDT synchronization described here are present in
-> the v2 conformance runtime. The production node still contains legacy paths
-> awaiting cutover; legacy host behavior is not evidence of v2 conformance.
+> scheduler, local cross-root delivery/resume, and guest-owned CRDT
+> synchronization described here are present in the v2 conformance runtime.
+> The production node still contains legacy paths awaiting cutover; legacy host
+> behavior is not evidence of v2 conformance.
 
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
@@ -13,6 +14,14 @@ Accumulate at instruction counter 5. Registers `φ[7]`/`φ[8]` remain the
 standard argument pointer/length window; they are never VOS phase selectors.
 Actor packages contain application PVMs, not application-written Refine or
 Accumulate functions.
+
+The generic service deliberately declares an 8 MiB standard slot-0 argument
+capability and an 8 MiB infrastructure-only allocator. Complete continuation
+and Accumulate wires can be much larger than an application message. Ordinary
+actor PVMs retain JAR's one-page argument capability and VOS's compact actor
+heap; enlarging the infrastructure guest does not silently change application
+manifests. A service PVM with the old undersized argument capability is rejected
+at installation rather than failing partway through guest Accumulate.
 
 Refine is pure. A `WorkEnvelopeV2` imports the exact deployment, program,
 state, continuation pages, authorization evidence, causal base and referenced
@@ -42,6 +51,13 @@ entry; the destination service guest verifies membership and finality,
 deduplicates by `CallId`, and atomically creates the inbox row. Local and Raft
 deliveries require the exact current revision. CRDT deliveries append a
 workflow-only causal change and preserve concurrent heads.
+
+Delivery retries compare a stable source identity containing the destination
+service, logical timeslot, message, complete source outbox, and finalized source
+receipt. The destination base/frontier remains part of the first accepted
+delivery commitment but is excluded from retry identity: executing the inbox
+legitimately advances that base before an ACK retry arrives. A changed source
+record is still a divergent duplicate.
 
 CRDT anti-entropy also enters through physical Accumulate. A
 `CrdtSyncEnvelopeV2` carries advertised heads, canonical causal nodes, the
@@ -90,9 +106,17 @@ logical timeslot, exact actor, method, arguments, and proof mode. The service
 thread derives typed origin and authorization from the authenticated transport,
 checks them against the signed method policy, and rejects a retry whose durable
 workflow identity differs. A reply-only publication is acknowledged only after
-the consumer channel accepts it; outbox/blob/proof publications stay durable
-for their dedicated delivery paths. Attested ingress currently fails closed
-unless a proof producer is configured.
+the consumer channel accepts it. For locally routed roots, a committed outbox
+publication is sent as `RootTreeTransportV2`, admitted through destination
+physical Accumulate, executed from the guest inbox, returned only after the
+callee's Refine/Accumulate commit, and injected at the caller's exact JAR
+snapshot boundary. The source outbox and callee reply publications are removed
+only after commitment-bound acknowledgements; retries recover their original
+logical timeslot from guest workflow state. Continuation blob references may
+coexist with an outbox record because those pages are already committed in the
+source content store and never become destination state. Cross-node actor-route
+discovery and proof/blob publication drivers remain to be attached. Attested
+ingress currently fails closed unless a proof producer is configured.
 
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an
