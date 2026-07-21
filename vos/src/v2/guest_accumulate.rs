@@ -1391,20 +1391,25 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
         if !materialized_actors_exist(&tree, &materialized)? {
             return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
-        if let Some(rejection) = validate_crdt_upgrades(
-            tree.store_ref(),
-            &tree,
-            &frontier,
-            &mut materialized,
-            &envelope.provided_blobs,
-            &envelope.provided_programs,
-        )? {
-            return Ok(rejected(rejection));
-        }
-        if let Some(rejection) =
-            validate_crdt_upgrade_receipts(tree.store_ref(), &frontier, &materialized, &envelope.nodes)?
-        {
-            return Ok(rejected(rejection));
+        if !materialized.upgrades.is_empty() || !materialized.spawns.is_empty() {
+            if let Some(rejection) = validate_crdt_upgrades(
+                tree.store_ref(),
+                &tree,
+                &frontier,
+                &mut materialized,
+                &envelope.provided_blobs,
+                &envelope.provided_programs,
+            )? {
+                return Ok(rejected(rejection));
+            }
+            if let Some(rejection) = validate_crdt_upgrade_receipts(
+                tree.store_ref(),
+                &frontier,
+                &materialized,
+                &envelope.nodes,
+            )? {
+                return Ok(rejected(rejection));
+            }
         }
     }
 
@@ -1500,10 +1505,6 @@ fn materialize_workflow_crdt(
                             .is_ok()
                     })
                     && valid_crdt_spawn_materializations(work, change)
-                    && change
-                        .workflow
-                        .iter()
-                        .all(|operation| !matches!(operation, WorkflowOperationV2::Upgrade(_)))
                     && replies.len() <= 1
                     && replies.first().is_none_or(|reply| {
                         reply.producer == work.target
@@ -1696,6 +1697,9 @@ fn materialize_workflow_crdt(
                     spawn.clone(),
                 ),
                 WorkflowOperationV2::Upgrade(upgrade) => {
+                    if !checkpoints.is_empty() {
+                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    }
                     result
                         .upgrades
                         .entry(upgrade.actor)
@@ -1903,6 +1907,9 @@ fn validate_crdt_upgrades<S: GuestAccumulateStoreV2>(
     provided_blobs: &[super::ImportedBlobV2],
     provided_programs: &[super::ImportedProgramV2],
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    if materialized.upgrades.is_empty() && materialized.spawns.is_empty() {
+        return Ok(None);
+    }
     let Some(directory) =
         tree_get_wire::<_, super::ActorDirectoryV2>(tree, &StateKeyV2::ActorDirectory)?
     else {
@@ -2280,7 +2287,9 @@ fn apply_workflow_materialization<S: StateTreeStore>(
         &materialized.spawns,
         &materialized.spawn_install_descriptors,
     )?;
-    apply_upgrade_materialization(tree, &materialized.visible_upgrade_descriptors)?;
+    if !materialized.visible_upgrade_descriptors.is_empty() {
+        apply_upgrade_materialization(tree, &materialized.visible_upgrade_descriptors)?;
+    }
     for (invocation, values) in materialized.workflows {
         let value = values
             .first()
@@ -3389,15 +3398,16 @@ fn rematerialize_crdt_service<S: GuestAccumulateStoreV2>(
     if !materialized_actors_exist(&tree, &materialized)? {
         return Err(GuestAccumulateError::CorruptStore);
     }
-    if validate_crdt_upgrades(
-        tree.store_ref(),
-        &tree,
-        &frontier,
-        &mut materialized,
-        &[],
-        &[],
-    )?
-    .is_some()
+    if (!materialized.upgrades.is_empty() || !materialized.spawns.is_empty())
+        && validate_crdt_upgrades(
+            tree.store_ref(),
+            &tree,
+            &frontier,
+            &mut materialized,
+            &[],
+            &[],
+        )?
+        .is_some()
     {
         return Err(GuestAccumulateError::CorruptStore);
     }
@@ -7584,6 +7594,30 @@ mod tests {
         let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
         assert_eq!(materialized.outbox[&call].len(), 1);
         assert!(materialized.outbox[&call][0].value.is_none());
+    }
+
+    #[test]
+    fn workflow_dag_rejects_an_upgrade_mixed_into_an_actor_checkpoint() {
+        let initial = BlobRefV2::of_bytes(b"initial");
+        let work = crdt_work(initial, 18, vec![]);
+        let mut transition = crdt_transition(&work, BlobRefV2::of_bytes(b"next"), 1);
+        let change = transition.crdt_change.as_mut().unwrap();
+        let mut upgrade = upgrade_fixture(Hash::ZERO);
+        upgrade.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+        change
+            .workflow
+            .push(WorkflowOperationV2::Upgrade(upgrade));
+        let cid = change.cid();
+        let nodes = BTreeMap::from([(cid, change.encode())]);
+        let frontier = load_causal_frontier(&[cid], |candidate| {
+            Ok::<_, Infallible>(nodes.get(&candidate).cloned())
+        })
+        .unwrap();
+
+        assert!(matches!(
+            materialize_workflow_crdt(&frontier, &identity()),
+            Err(AccumulationRejectionV2::InvalidWorkflowTransition)
+        ));
     }
 
     #[test]

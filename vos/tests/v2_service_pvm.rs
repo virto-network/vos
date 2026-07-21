@@ -5837,6 +5837,194 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
 }
 
 #[test]
+fn physical_crdt_upgrade_syncs_its_canonical_program_and_visible_descriptor() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let service_pvm =
+        vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let initial_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&initial_pvm);
+    let replacement_pvm = actor_pvm(2);
+    let replacement_program = ProgramId::of_pvm(&replacement_pvm);
+    let initial_bytes = b"causal upgrade state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut seed = work(actor_program, initial.clone());
+    seed.service.service_program = service_program;
+    let genesis = ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Crdt,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([61; 32]),
+            deployment: seed.target_deployment,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: true,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([62; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+            }],
+        }],
+        external_actors: vec![],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([63; 32]),
+            authenticator: vec![64],
+        },
+    };
+    let install = AccumulateRequestV2::Install(genesis.clone());
+
+    let mut source_store = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
+    assert_eq!(source_store.import_blob(initial_bytes.clone()), initial);
+    assert_eq!(source_store.import_program(initial_pvm.clone()), actor_program);
+    source_store.allow_install(&genesis);
+    let mut source = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        source_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    assert!(matches!(
+        source.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+    assert_eq!(
+        source
+            .accumulate_host_mut()
+            .import_program(replacement_pvm.clone()),
+        replacement_program
+    );
+    let upgrade = ActorUpgradeV2 {
+        service: seed.service.clone(),
+        actor: seed.target,
+        expected_deployment: seed.target_deployment,
+        expected_program: actor_program,
+        replacement_deployment: DeploymentId([65; 32]),
+        replacement_program,
+        producer: ProducerId([66; 32]),
+        methods: vec![MethodPolicyV2 {
+            method: "next".into(),
+            schema: Hash([67; 32]),
+            policy: public_policy_hash(),
+            public: true,
+            attested: false,
+        }],
+        base: ConsistencyBaseV2::Crdt { heads: vec![] },
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([68; 32]),
+            authenticator: vec![69],
+        },
+    };
+    assert!(source.accumulate_host_mut().allow_upgrade(&upgrade));
+    let upgrade_result = source
+        .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone()))
+        .unwrap()
+        .result;
+    let AccumulationResultV2::ActorUpgraded { receipt, .. } = upgrade_result
+    else {
+        panic!("physical causal upgrade was rejected: {upgrade_result:?}")
+    };
+    assert_eq!(receipt.sequence, 1);
+    assert_eq!(receipt.resulting_crdt_heads.len(), 1);
+    let envelope = LocalWorkSchedulerV2::prepare_crdt_sync(source.accumulate_host())
+        .expect("source exports its authenticated causal package node");
+    assert_eq!(envelope.nodes.len(), 1);
+    assert_eq!(envelope.nodes[0].receipt, receipt);
+    assert_eq!(envelope.provided_programs.len(), 1);
+    assert_eq!(envelope.provided_programs[0].program, replacement_program);
+    assert_eq!(envelope.provided_programs[0].pvm, replacement_pvm);
+
+    let mut destination_store =
+        DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
+    assert_eq!(destination_store.import_blob(initial_bytes), initial);
+    assert_eq!(destination_store.import_program(initial_pvm), actor_program);
+    destination_store.allow_install(&genesis);
+    let mut destination = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        destination_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    assert!(matches!(
+        destination.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+    destination
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: receipt.clone(),
+        });
+
+    let mut missing_program = envelope.clone();
+    missing_program.provided_programs.clear();
+    let before_missing = destination.accumulate_host().snapshot();
+    assert_eq!(
+        destination
+            .accumulate(&AccumulateRequestV2::SyncCrdt(missing_program))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::WrongProgram)
+    );
+    assert_eq!(destination.accumulate_host().snapshot(), before_missing);
+
+    let synced = destination
+        .accumulate(&AccumulateRequestV2::SyncCrdt(envelope.clone()))
+        .unwrap();
+    assert!(matches!(
+        synced.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        destination.accumulate_host().program(replacement_program),
+        Some(envelope.provided_programs[0].pvm.as_slice())
+    );
+    let header = destination.accumulate_host().header().unwrap().unwrap();
+    assert_eq!(header.crdt_heads, receipt.resulting_crdt_heads);
+    let descriptor = ActorGenesisV2::decode(
+        &destination
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(seed.target),
+            )
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(descriptor.deployment, upgrade.replacement_deployment);
+    assert_eq!(descriptor.program, replacement_program);
+    assert_eq!(descriptor.methods, upgrade.methods);
+
+    let before_retry = destination.accumulate_host().snapshot();
+    assert!(matches!(
+        destination
+            .accumulate(&AccumulateRequestV2::SyncCrdt(envelope))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: true,
+            ..
+        }
+    ));
+    assert_eq!(destination.accumulate_host().snapshot(), before_retry);
+}
+
+#[test]
 fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
     let Some(elf) = service_elf() else {
         return;
