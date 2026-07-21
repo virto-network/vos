@@ -11,11 +11,11 @@ use alloc::vec::Vec;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
     AccumulatedReplyV2, AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, DeploymentId,
-    Hash, InvocationId, ProgramId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2,
-    WorkInputIdV2,
+    DirectIngressV2, Hash, InvocationId, ProgramId, PublishedEffectsV2, ServiceIdentityV2,
+    WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 18;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 19;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -24,6 +24,7 @@ const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
+const INGRESS_STORAGE_PREFIX: &[u8] = b"\0vos/v2/ingress/";
 const REPLY_ADMISSION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/reply-admission/";
 const CALL_EXPIRATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/call-expiration/";
 const PENDING_CALL_DEADLINE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/pending-deadline/";
@@ -261,6 +262,15 @@ pub struct ActorUpgradeRecordV2 {
     pub program: ProgramId,
     pub receipt: AccumulationReceiptV2,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressRecordV2 {
+    pub ingress: DirectIngressV2,
+    /// Set atomically with the initial actor slice. The original admission is
+    /// retained as the permanent invocation deduplication identity.
+    pub consumed: bool,
+}
+
 /// Recoverable effects created by one committed actor slice. The host may
 /// expose them only after the surrounding service transaction commits, then
 /// removes the row through guest Accumulate acknowledgement.
@@ -505,6 +515,23 @@ impl V2Wire for DeliveryRecordV2 {
     }
 }
 
+impl V2Wire for IngressRecordV2 {
+    const MAGIC: [u8; 4] = *b"VIR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.bytes(&self.ingress.encode());
+        e.bool(self.consumed);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            ingress: DirectIngressV2::decode(&d.bytes()?)?,
+            consumed: d.bool()?,
+        })
+    }
+}
+
 impl V2Wire for ReplyAdmissionRecordV2 {
     const MAGIC: [u8; 4] = *b"VRD2";
 
@@ -624,6 +651,18 @@ pub(crate) const fn pending_call_deadline_storage_prefix() -> &'static [u8] {
 #[cfg(feature = "std")]
 pub(crate) const fn delivery_storage_prefix() -> &'static [u8] {
     DELIVERY_STORAGE_PREFIX
+}
+
+pub fn ingress_storage_key(invocation: InvocationId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(INGRESS_STORAGE_PREFIX.len() + invocation.0.len());
+    key.extend_from_slice(INGRESS_STORAGE_PREFIX);
+    key.extend_from_slice(&invocation.0);
+    key
+}
+
+#[cfg(feature = "std")]
+pub(crate) const fn ingress_storage_prefix() -> &'static [u8] {
+    INGRESS_STORAGE_PREFIX
 }
 
 pub fn crdt_node_storage_key(cid: Hash) -> Vec<u8> {
@@ -819,6 +858,7 @@ mod tests {
         let receipt = receipt_storage_key(input);
         let publication = publication_storage_key(input);
         let delivery = delivery_storage_key(CallId([4; 32]));
+        let ingress = ingress_storage_key(input.invocation);
         let reply_admission = reply_admission_storage_key(CallId([4; 32]));
         let expiration = call_expiration_storage_key(CallId([4; 32]));
         let deadline = pending_call_deadline_storage_key(CallId([4; 32]));
@@ -834,6 +874,8 @@ mod tests {
         assert_ne!(deadline, delivery);
         assert_ne!(upgrade, receipt);
         assert_ne!(upgrade, publication);
+        assert_ne!(ingress, delivery);
+        assert_ne!(ingress, publication);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(
@@ -957,6 +999,26 @@ mod tests {
             DeliveryRecordV2::decode(&bad_delivery.encode()),
             Err(DecodeError::NonCanonical)
         );
+    }
+
+    #[test]
+    fn ingress_record_round_trips() {
+        let ingress = IngressRecordV2 {
+            ingress: DirectIngressV2 {
+                service: service(18),
+                invocation: InvocationId([19; 32]),
+                logical_timeslot: 11,
+                target: ActorId([20; 32]),
+                method: "value".into(),
+                arguments: vec![1],
+                origin: super::super::Origin::Anonymous,
+                authorization: super::super::AuthorizationEvidenceV2::Public,
+                imported_blobs: vec![],
+                proof_requested: false,
+            },
+            consumed: false,
+        };
+        assert_eq!(IngressRecordV2::decode(&ingress.encode()).unwrap(), ingress);
     }
 
     #[test]

@@ -17,6 +17,11 @@ first accepted slice. Its logical timeslot is an explicit harness input;
 production integration must bind that value to the consensus JAM timeslot
 rather than accept a caller-selected value. Actor-side cross-root CALL now
 emits a durable outbox row and captures the exact pending protocol boundary.
+Fresh Local/Raft root invocations likewise enter physical Accumulate as a
+guest-authenticated direct-ingress row before Refine executes. The guest binds
+the typed origin, authorization, actor, signed method policy, imported blobs,
+and original logical timeslot. A busy actor leaves that row queued across
+restart, and the eventual first accepted slice consumes it atomically.
 For linear services the guest-owned workflow row reconstructs every later
 slice after restart without a process-local copy of the original request.
 It can also rediscover a suspended outbound call, submit one canonical
@@ -112,8 +117,9 @@ the actor PVM into the legacy runtime. Its strict `RootTreeInvocationV2` keeps
 the full `ActorId`, `InvocationId`, method, arguments, and proof mode intact
 until the service builds work from guest-owned state. Logical time is not an
 external field: the node stamps a trusted, monotone admission slot at the
-scheduler boundary. Exact retries are reattached through the committed
-workflow and dedup records, which retain the original admitted slot. The
+scheduler boundary. The invocation is then guest-admitted before actor Refine;
+exact retries reattach through the ingress, workflow, and dedup records, which
+retain the original admitted slot. The
 guest-owned store header advances a durable admission-timeslot high-water in
 the same transaction as each newly accepted slice, delivery, or timeout.
 Registration restores the node-wide allocator strictly above every opened
@@ -623,7 +629,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 18 and continuation snapshot version 5 are therefore a clean
+Store schema 19 and continuation snapshot version 5 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, the complete dormant actor-program layout to each

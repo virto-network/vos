@@ -14,14 +14,14 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
-    AuthorizationEvidenceV2, BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, CrdtChangeV2,
-    DedupRecordV2, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
-    ExternalActorDirectoryV2, JamServiceV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
-    PackageRolePoliciesV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
-    WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    AuthorizationEvidenceV2, BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2,
+    ContinuationSnapshotV2, CrdtChangeV2, DedupRecordV2, DirectIngressV2, DurableJamStoreV2,
+    DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
+    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, ProgramId, ProofArtifactStoreV2,
+    PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
+    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -74,6 +74,53 @@ impl V2Wire for RootTreeInvocationV2 {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
+    }
+}
+
+fn direct_ingress_from_request(
+    service: &ServiceIdentityV2,
+    request: &LocalWorkRequestV2,
+) -> Result<DirectIngressV2, LocalRootTreeInvokeErrorV2> {
+    if request.workflow_step != 0
+        || request.causal_parent.is_some()
+        || request.parent_call.is_some()
+        || request.causal_context.is_some()
+        || request.awaited_reply.is_some()
+        || request.awaited_timeout.is_some()
+    {
+        return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
+    }
+    Ok(DirectIngressV2 {
+        service: service.clone(),
+        invocation: request.invocation,
+        logical_timeslot: request.logical_timeslot,
+        target: request.target,
+        method: request.method.clone(),
+        arguments: request.arguments.clone(),
+        origin: request.origin,
+        authorization: request.authorization.clone(),
+        imported_blobs: request.imported_blobs.clone(),
+        proof_requested: request.proof_requested,
+    })
+}
+
+fn request_from_direct_ingress(ingress: DirectIngressV2) -> LocalWorkRequestV2 {
+    LocalWorkRequestV2 {
+        invocation: ingress.invocation,
+        workflow_step: 0,
+        logical_timeslot: ingress.logical_timeslot,
+        target: ingress.target,
+        method: ingress.method,
+        arguments: ingress.arguments,
+        origin: ingress.origin,
+        authorization: ingress.authorization,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: ingress.imported_blobs,
+        proof_requested: ingress.proof_requested,
     }
 }
 
@@ -174,6 +221,23 @@ pub struct CommittedRootTreeSliceV2 {
     pub duplicate: bool,
     pub refine_gas_used: u64,
     pub accumulate_gas_used: u64,
+}
+
+/// Durable disposition of a retried direct root invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootTreeIngressRecoveryV2 {
+    Fresh,
+    Queued {
+        logical_timeslot: u64,
+    },
+    Suspended,
+    PendingPublication {
+        publication: PublicationRecordV2,
+        logical_timeslot: u64,
+    },
+    /// The invocation finished and its externally accepted publication has
+    /// already been acknowledged. Its actor execution must not be replayed.
+    Completed,
 }
 
 enum RootTreeServiceDriverV2<B> {
@@ -683,6 +747,98 @@ where
         self.service.accumulate_host_mut()
     }
 
+    /// Classify a direct invocation retry from guest-authenticated ingress,
+    /// workflow, publication, and continuation state.
+    pub fn recover_ingress(
+        &self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<RootTreeIngressRecoveryV2, LocalRootTreeInvokeErrorV2> {
+        let candidate = direct_ingress_from_request(&self.identity, request)?;
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(request.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        let ingress = self
+            .service
+            .accumulate_host()
+            .ingress_record(request.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+
+        if checkpoint.is_none() {
+            return match ingress {
+                None => Ok(RootTreeIngressRecoveryV2::Fresh),
+                Some(record) if !record.consumed && record.ingress.matches_retry(&candidate) => {
+                    Ok(RootTreeIngressRecoveryV2::Queued {
+                        logical_timeslot: record.ingress.logical_timeslot,
+                    })
+                }
+                Some(_) => Err(LocalRootTreeInvokeErrorV2::DivergentInvocation),
+            };
+        }
+        if ingress
+            .as_ref()
+            .is_none_or(|record| !record.consumed || !record.ingress.matches_retry(&candidate))
+        {
+            return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+        }
+
+        let committed = self
+            .recover_committed_invocation(request)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let checkpoint = checkpoint.expect("checked above");
+        if let Some(publication) = committed.publication {
+            return Ok(RootTreeIngressRecoveryV2::PendingPublication {
+                publication,
+                logical_timeslot: checkpoint.resume_work.logical_timeslot,
+            });
+        }
+
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let continuation = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::Continuation(request.target),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .map(|bytes| BlobRefV2::decode(&bytes))
+            .transpose()
+            .map_err(|_| {
+                LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::InvalidContinuation(
+                    request.target,
+                ))
+            })?;
+        let Some(continuation) = continuation else {
+            return Ok(RootTreeIngressRecoveryV2::Completed);
+        };
+        let bytes = self.service.accumulate_host().blob(&continuation).ok_or(
+            LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::MissingBlob(continuation.hash)),
+        )?;
+        let snapshot = ContinuationSnapshotV2::decode(bytes).map_err(|_| {
+            LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::InvalidContinuation(
+                request.target,
+            ))
+        })?;
+        if snapshot.invocation != request.invocation {
+            return Ok(RootTreeIngressRecoveryV2::Completed);
+        }
+        snapshot
+            .validate_checkpoint_for(&checkpoint.resume_work)
+            .map_err(|_| {
+                LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::InvalidContinuation(
+                    request.target,
+                ))
+            })?;
+        Ok(RootTreeIngressRecoveryV2::Suspended)
+    }
+
     /// Apply every committed Raft request not yet present in this replica's
     /// physical service image. Direct Local/CRDT owners are already current.
     /// A follower may remain uninstalled until the leader commits genesis.
@@ -865,11 +1021,77 @@ where
         self.invoke_after_admission_barrier(request)
     }
 
-    /// Execute ingress after [`Self::prepare_admission_barrier`] returned and
-    /// the caller allocated a slot above its high-water. This path performs no
-    /// catch-up before Refine or proposal, preserving the atomic ordering:
-    /// current-term barrier → catch-up → clock restore/allocation → proposal.
+    /// Admit and execute ingress after [`Self::prepare_admission_barrier`]
+    /// returned and the caller allocated a slot above its high-water.
     pub(crate) fn invoke_after_admission_barrier(
+        &mut self,
+        request: LocalWorkRequestV2,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        if let Some(committed) = self.recover_committed_invocation(&request)? {
+            return Ok(committed);
+        }
+        let invocation = request.invocation;
+        self.admit_ingress_after_barrier(&request)?;
+        self.invoke_admitted_after_barrier(invocation)
+    }
+
+    /// Persist one direct invocation through guest Accumulate before Refine.
+    pub fn admit_ingress(
+        &mut self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.prepare_admission_barrier()?;
+        self.admit_ingress_after_barrier(request)
+    }
+
+    pub(crate) fn admit_ingress_after_barrier(
+        &mut self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        let ingress = direct_ingress_from_request(&self.identity, request)?;
+        let accumulated = self
+            .service
+            .accumulate_after_barrier(&AccumulateRequestV2::AdmitIngress(ingress))
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        match accumulated.result {
+            AccumulationResultV2::IngressAdmitted {
+                invocation,
+                duplicate,
+            } if invocation == request.invocation => Ok(duplicate),
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
+    }
+
+    /// Schedule a previously guest-admitted direct invocation from its exact
+    /// persisted input. A busy actor leaves the record untouched for retry.
+    pub fn invoke_admitted(
+        &mut self,
+        invocation: super::InvocationId,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.prepare_admission_barrier()?;
+        self.invoke_admitted_after_barrier(invocation)
+    }
+
+    pub(crate) fn invoke_admitted_after_barrier(
+        &mut self,
+        invocation: super::InvocationId,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        let record = self
+            .service
+            .accumulate_host()
+            .ingress_record(invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        if record.consumed {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
+        }
+        self.execute_admitted_after_barrier(request_from_direct_ingress(record.ingress))
+    }
+
+    fn execute_admitted_after_barrier(
         &mut self,
         request: LocalWorkRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
@@ -958,6 +1180,15 @@ where
         self.service
             .accumulate_host()
             .pending_publications()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    pub(crate) fn pending_ingresses(
+        &self,
+    ) -> Result<Vec<DirectIngressV2>, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .pending_ingresses()
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
     }
 

@@ -44,11 +44,11 @@ pub use contracts::{
     AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2,
     CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
-    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, ExternalActorBindingV2,
-    ExternalActorDirectoryV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
-    PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError,
-    RefineImportsV2, RefineOutputV2, ReplyRecordV2, RoleCredentialV2,
+    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, DirectIngressV2,
+    ExternalActorBindingV2, ExternalActorDirectoryV2, GasAccountingV2, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
+    ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
     ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
@@ -81,7 +81,7 @@ pub use pvm::{
 pub use root_service::{
     CommittedRootTreeSliceV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
     LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2,
-    RootTreeInvocationV2,
+    RootTreeIngressRecoveryV2, RootTreeInvocationV2,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};
@@ -97,13 +97,13 @@ pub use state_tree::{
     ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,
 };
 pub use storage::{
-    ActorUpgradeRecordV2, DedupRecordV2, DeliveryRecordV2, PendingCallDeadlineV2,
+    ActorUpgradeRecordV2, DedupRecordV2, DeliveryRecordV2, IngressRecordV2, PendingCallDeadlineV2,
     PublicationRecordV2, ReplyAdmissionRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2,
     StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2, actor_upgrade_storage_key,
     call_expiration_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
     crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    pending_call_deadline_storage_key, publication_storage_key, receipt_storage_key,
-    reply_admission_storage_key,
+    ingress_storage_key, pending_call_deadline_storage_key, publication_storage_key,
+    receipt_storage_key, reply_admission_storage_key,
 };
 #[cfg(feature = "std")]
 pub use transport::{

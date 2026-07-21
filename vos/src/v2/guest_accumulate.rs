@@ -21,18 +21,18 @@ use super::{
     ActorUpgradeRecordV2, ActorUpgradeV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
     CHECKPOINT_TOKEN_CAPACITY, CallExpirationEnvelopeV2, CallTimeoutV2, CheckpointTokenV2,
     ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2,
-    CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
-    EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, MessageRecordV2, MethodPolicyV2,
-    PendingCallDeadlineV2, ProgramId, ProofVerificationRequestV2, PublicationAckV2,
+    CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, DirectIngressV2,
+    EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2, MessageRecordV2,
+    MethodPolicyV2, PendingCallDeadlineV2, ProgramId, ProofVerificationRequestV2, PublicationAckV2,
     PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
     RoleCredentialV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
     ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
     StoreHeaderV2, StoreOpenError, V2Wire, WorkInputIdV2, WorkflowCheckpointV2,
     WorkflowOperationV2, actor_upgrade_storage_key, call_expiration_storage_key,
     crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
-    dedup_storage_key, delivery_storage_key, header_storage_key, method_role_policy_hash,
-    pending_call_deadline_storage_key, public_policy_hash, publication_storage_key,
-    receipt_storage_key, reply_admission_storage_key,
+    dedup_storage_key, delivery_storage_key, header_storage_key, ingress_storage_key,
+    method_role_policy_hash, pending_call_deadline_storage_key, public_policy_hash,
+    publication_storage_key, receipt_storage_key, reply_admission_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -146,6 +146,7 @@ pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
 ) -> GuestResult<AccumulationResultV2, S::Error> {
     match request {
         AccumulateRequestV2::Install(genesis) => install(store, genesis),
+        AccumulateRequestV2::AdmitIngress(ingress) => admit_ingress(store, ingress),
         AccumulateRequestV2::Apply(envelope) => apply(store, envelope, ApplyMode::Commit),
         AccumulateRequestV2::PrepareAttested(envelope) => {
             apply(store, envelope, ApplyMode::PrepareAttested)
@@ -351,6 +352,135 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
         deployment: upgrade.replacement_deployment,
         program: upgrade.replacement_program,
         receipt,
+        duplicate: false,
+    })
+}
+fn admit_ingress<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    ingress: &DirectIngressV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let Some(header_bytes) = read(store, header_storage_key())? else {
+        return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
+    };
+    let mut header = match StoreHeaderV2::open(&header_bytes) {
+        Ok(header) => header,
+        Err(StoreOpenError::IncompatibleSemantics) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+        }
+        Err(StoreOpenError::WrongService) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongService));
+        }
+        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
+    };
+    if ingress.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    if header.service.service_abi != ABI_VERSION {
+        return Ok(rejected(AccumulationRejectionV2::WrongAbi));
+    }
+    if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
+        return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+    }
+    if header.consistency == ConsistencyModeV2::Crdt {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+
+    let key = ingress_storage_key(ingress.invocation);
+    if let Some(bytes) = read(store, &key)? {
+        let record =
+            IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+        return if record.ingress.matches_retry(ingress) {
+            Ok(AccumulationResultV2::IngressAdmitted {
+                invocation: ingress.invocation,
+                duplicate: true,
+            })
+        } else {
+            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
+        };
+    }
+
+    let tree = ServiceStateTreeV2::new(store, header.service_root);
+    let Some(actor) =
+        tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(ingress.target))?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+    };
+    if actor.crdt {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+    let Some(policy) = tree_get_wire::<_, MethodPolicyV2>(
+        &tree,
+        &StateKeyV2::MethodPolicy {
+            actor: ingress.target,
+            method: ingress.method.clone(),
+        },
+    )?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    };
+    let Some(state_root) = header.state_root else {
+        return Err(GuestAccumulateError::CorruptStore);
+    };
+    let authorization_work = super::WorkEnvelopeV2 {
+        service: ingress.service.clone(),
+        invocation: ingress.invocation,
+        workflow_step: 0,
+        logical_timeslot: ingress.logical_timeslot,
+        target: ingress.target,
+        target_deployment: actor.deployment,
+        target_program: actor.program,
+        method: ingress.method.clone(),
+        arguments: ingress.arguments.clone(),
+        origin: ingress.origin,
+        authorization: ingress.authorization.clone(),
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        consistency: header.consistency,
+        base: ConsistencyBaseV2::Linear {
+            revision: header.revision,
+            state_root,
+        },
+        base_causal_height: None,
+        imported_actors: Vec::new(),
+        external_actors: Vec::new(),
+        imported_blobs: ingress.imported_blobs.clone(),
+        proof_requested: ingress.proof_requested,
+    };
+    if policy.attested != ingress.proof_requested
+        || !authorized(&authorization_work, &policy, tree.store_ref())?
+    {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    }
+    drop(tree);
+    for reference in &ingress.imported_blobs {
+        if !blob_available(store, reference)? {
+            return Ok(rejected(AccumulationRejectionV2::MissingBlob(
+                reference.hash,
+            )));
+        }
+    }
+    header.admission_timeslot_high_water = header
+        .admission_timeslot_high_water
+        .max(ingress.logical_timeslot);
+    write(store, header_storage_key(), Some(&header.encode()))?;
+    write(
+        store,
+        &key,
+        Some(
+            &IngressRecordV2 {
+                ingress: ingress.clone(),
+                consumed: false,
+            }
+            .encode(),
+        ),
+    )?;
+    Ok(AccumulationResultV2::IngressAdmitted {
+        invocation: ingress.invocation,
         duplicate: false,
     })
 }
@@ -1750,6 +1880,9 @@ fn apply<S: GuestAccumulateStoreV2>(
         preparation.committed_proof = Some(proof);
         return Ok(AccumulationResultV2::Prepared(preparation));
     }
+    if !work_matches_durable_ingress(tree.store_ref(), work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
 
     if transition.consumed_input != work.input_id() {
         return Ok(rejected(AccumulationRejectionV2::TransitionInputMismatch));
@@ -2151,6 +2284,18 @@ fn apply<S: GuestAccumulateStoreV2>(
             }
             delivery.consumed = true;
             write(store, &key, Some(&delivery.encode()))?;
+        }
+    }
+    if work.workflow_step == 0 && work.parent_call.is_none() {
+        let key = ingress_storage_key(work.invocation);
+        if let Some(bytes) = read(store, &key)? {
+            let mut ingress =
+                IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+            if ingress.consumed || !ingress.ingress.matches_work(work) {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+            ingress.consumed = true;
+            write(store, &key, Some(&ingress.encode()))?;
         }
     }
 
@@ -2665,6 +2810,22 @@ fn work_matches_durable_inbox<S: StateTreeStore>(
             .deadline_timeslot
             .is_none_or(|deadline| work.logical_timeslot < deadline)
         && method.as_deref() == Some(work.method.as_str()))
+}
+
+fn work_matches_durable_ingress<S: StateTreeStore>(
+    store: &S,
+    work: &super::WorkEnvelopeV2,
+) -> GuestResult<bool, S::Error> {
+    if work.workflow_step != 0 || work.parent_call.is_some() {
+        return Ok(true);
+    }
+    let Some(bytes) = read(store, &ingress_storage_key(work.invocation))? else {
+        // Lower-level conformance callers may submit a complete WorkEnvelope
+        // directly. Production node ingress always admits through IC-5 first.
+        return Ok(true);
+    };
+    let record = IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+    Ok(!record.consumed && record.ingress.matches_work(work))
 }
 
 fn valid_workflow_input<S: StateTreeStore>(
@@ -4391,6 +4552,98 @@ mod tests {
         outgoing.caller_invocation = work.invocation;
         outgoing.await_ordinal = 0;
         outgoing
+    }
+
+    #[test]
+    fn direct_ingress_is_guest_admitted_deduplicated_and_consumed_atomically() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let ingress = DirectIngressV2 {
+            service: work.service.clone(),
+            invocation: work.invocation,
+            logical_timeslot: work.logical_timeslot,
+            target: work.target,
+            method: work.method.clone(),
+            arguments: work.arguments.clone(),
+            origin: work.origin,
+            authorization: work.authorization.clone(),
+            imported_blobs: work.imported_blobs.clone(),
+            proof_requested: work.proof_requested,
+        };
+        let header_before = store_header(&store);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AdmitIngress(ingress.clone()),
+            )
+            .unwrap(),
+            AccumulationResultV2::IngressAdmitted {
+                invocation: work.invocation,
+                duplicate: false,
+            }
+        );
+        let header_after = store_header(&store);
+        assert_eq!(header_after.service_root, header_before.service_root);
+        assert_eq!(header_after.revision, header_before.revision);
+        assert_eq!(
+            header_after.admission_timeslot_high_water,
+            header_before
+                .admission_timeslot_high_water
+                .max(ingress.logical_timeslot)
+        );
+        let record = IngressRecordV2::decode(
+            store
+                .rows
+                .get(&ingress_storage_key(work.invocation))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.ingress, ingress);
+        assert!(!record.consumed);
+
+        let mut retry = record.ingress.clone();
+        retry.logical_timeslot += 10;
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::AdmitIngress(retry))
+                .unwrap(),
+            AccumulationResultV2::IngressAdmitted {
+                invocation: work.invocation,
+                duplicate: true,
+            }
+        );
+        let mut divergent = record.ingress;
+        divergent.method = "other".into();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::AdmitIngress(divergent),)
+                .unwrap(),
+            rejected(AccumulationRejectionV2::DivergentDuplicate)
+        );
+
+        let transition = linear_transition(&work, b"after");
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: work.clone(),
+                    transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let consumed = IngressRecordV2::decode(
+            store
+                .rows
+                .get(&ingress_storage_key(work.invocation))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(consumed.consumed);
     }
 
     #[test]

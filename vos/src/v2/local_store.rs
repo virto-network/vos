@@ -17,11 +17,11 @@ use crate::attestation::AttestationProofHostV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, AccumulationReceiptV2,
-    ActorUpgradeV2, BlobRefV2, DedupRecordV2, DeliveryRecordV2, ImportedBlobV2, MessageRecordV2,
-    ProgramId, ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
-    ReplyAdmissionRecordV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
-    ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2,
-    StoreOpenError, V2Wire,
+    ActorUpgradeV2, BlobRefV2, DedupRecordV2, DeliveryRecordV2, DirectIngressV2, ImportedBlobV2,
+    IngressRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2, PublicationRecordV2,
+    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialVerificationRequestV2,
+    ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Cloneable in-memory image of a committed local v2 service account.
@@ -356,6 +356,7 @@ pub enum LocalStoreReadErrorV2 {
     CorruptStateTree,
     CorruptPublication,
     CorruptDelivery,
+    CorruptIngress,
     CorruptReplyRoute,
     CorruptExpiration,
     CorruptPendingDeadline,
@@ -678,6 +679,49 @@ impl LocalJamStoreV2 {
         Ok(pending)
     }
 
+    pub fn ingress_record(
+        &self,
+        invocation: super::InvocationId,
+    ) -> Result<Option<IngressRecordV2>, LocalStoreReadErrorV2> {
+        self.row(&super::ingress_storage_key(invocation))
+            .map(IngressRecordV2::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptIngress)
+            .and_then(|record| {
+                if record
+                    .as_ref()
+                    .is_some_and(|record| record.ingress.invocation != invocation)
+                {
+                    Err(LocalStoreReadErrorV2::CorruptIngress)
+                } else {
+                    Ok(record)
+                }
+            })
+    }
+
+    /// Canonical invocation-id order for every guest-admitted direct call not
+    /// yet consumed by an actor slice.
+    pub fn pending_ingresses(&self) -> Result<Vec<DirectIngressV2>, LocalStoreReadErrorV2> {
+        let prefix = super::storage::ingress_storage_prefix();
+        let mut pending = Vec::new();
+        for (key, bytes) in self
+            .committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            let record = IngressRecordV2::decode(bytes)
+                .map_err(|_| LocalStoreReadErrorV2::CorruptIngress)?;
+            if super::ingress_storage_key(record.ingress.invocation).as_slice() != key.as_slice() {
+                return Err(LocalStoreReadErrorV2::CorruptIngress);
+            }
+            if !record.consumed {
+                pending.push(record.ingress);
+            }
+        }
+        Ok(pending)
+    }
+
     /// Load the caller-owned durable request which an accumulated reply must
     /// consume. Absence means this service has no pending route for the call.
     pub fn outbox_message(
@@ -695,6 +739,24 @@ impl LocalJamStoreV2 {
                     return Err(LocalStoreReadErrorV2::CorruptReplyRoute);
                 }
                 Ok(message)
+            })
+            .transpose()
+    }
+
+    /// Recover the guest-committed identity of an invocation for transport
+    /// retry validation. The returned checkpoint is read-only authenticated
+    /// service state; hosts cannot insert or rewrite it directly.
+    pub fn workflow_checkpoint(
+        &self,
+        invocation: super::InvocationId,
+    ) -> Result<Option<super::WorkflowCheckpointV2>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(None);
+        };
+        self.state_row(header.service_root, &StateKeyV2::Workflow(invocation))?
+            .map(|bytes| {
+                super::WorkflowCheckpointV2::decode(&bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptStateTree)
             })
             .transpose()
     }

@@ -804,9 +804,29 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         imported_blobs: vec![],
         proof_requested: false,
     };
+    assert!(
+        !service
+            .admit_ingress(&request)
+            .expect("direct ingress commits before Refine")
+    );
+    let queued = service
+        .store()
+        .ingress_record(request.invocation)
+        .unwrap()
+        .expect("guest owns the admitted request");
+    assert!(!queued.consumed);
+    assert_eq!(queued.ingress.logical_timeslot, request.logical_timeslot);
     let first = service
-        .invoke(request.clone())
-        .expect("slice commits through physical Accumulate");
+        .invoke_admitted(request.invocation)
+        .expect("slice consumes ingress through physical Accumulate");
+    assert!(
+        service
+            .store()
+            .ingress_record(request.invocation)
+            .unwrap()
+            .expect("consumed ingress remains a durable retry guard")
+            .consumed
+    );
     assert_eq!(
         first.published.reply.as_ref().map(|reply| &reply.result),
         Some(&Value::Unit.encode())

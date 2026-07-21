@@ -1054,6 +1054,10 @@ impl ServicePvmV2 {
                     if matches!(
                         result,
                         AccumulationResultV2::Installed(_)
+                            | AccumulationResultV2::IngressAdmitted {
+                                duplicate: false,
+                                ..
+                            }
                             | AccumulationResultV2::Accepted {
                                 duplicate: false,
                                 ..
