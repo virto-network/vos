@@ -2792,13 +2792,7 @@ impl VosNode {
                 return Err(V2NodeRegistrationError::ActorRouteOccupied(root_actor));
             }
         }
-        let consistency = service
-            .store()
-            .header()
-            .map_err(V2NodeRegistrationError::CorruptStore)?
-            .ok_or(V2NodeRegistrationError::StoreUninitialized)?
-            .consistency;
-        let consistency = match consistency {
+        let consistency = match service.consistency() {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
             crate::v2::ConsistencyModeV2::Local => Consistency::Local,
             crate::v2::ConsistencyModeV2::Raft => Consistency::Raft,
@@ -3748,6 +3742,11 @@ where
 
     let mut state = V2RootThreadState::default();
     let mut last_publication_retry = Instant::now();
+    match service.catch_up() {
+        Ok(true) => {}
+        Ok(false) => info!(%id, "v2 Raft root is waiting for committed service genesis"),
+        Err(error) => warn!(%id, ?error, "v2 root-tree startup catch-up failed"),
+    }
     if let Ok(pending) = service.pending_publications()
         && !pending.is_empty()
     {
@@ -3770,6 +3769,18 @@ where
             );
         }
         if last_publication_retry.elapsed() >= Duration::from_millis(250) {
+            match service.catch_up() {
+                Ok(true) => {}
+                Ok(false) => {
+                    last_publication_retry = Instant::now();
+                    continue;
+                }
+                Err(error) => {
+                    warn!(%id, ?error, "v2 root-tree periodic catch-up failed");
+                    last_publication_retry = Instant::now();
+                    continue;
+                }
+            }
             retry_v2_work(
                 id,
                 &mut service,

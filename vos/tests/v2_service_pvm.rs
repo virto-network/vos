@@ -732,6 +732,84 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
 }
 
 #[test]
+fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
+    let Some((mut config, _, actor, _)) = workflow_root_configs() else {
+        return;
+    };
+    config.consistency = ConsistencyModeV2::Raft;
+    assert!(matches!(
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default()),
+        Err(vos::v2::LocalRootTreeOpenErrorV2::InvalidConfig(
+            vos::v2::LocalRootTreeConfigErrorV2::ReplicationDriverRequired
+        ))
+    ));
+
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-root-raft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft(config.clone(), FailableCommittedImages::default(), log)
+            .expect("Raft root genesis is ordered and applied through physical Accumulate");
+    assert_eq!(
+        service.store().header().unwrap().unwrap().consistency,
+        ConsistencyModeV2::Raft
+    );
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("peer_value").encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([109; 32]),
+        workflow_step: 0,
+        logical_timeslot: 1,
+        target: actor,
+        method: "peer_value".into(),
+        arguments,
+        origin: Origin::System,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    assert!(!service.admit_ingress(&request).unwrap());
+    let committed = service.invoke_admitted(request.invocation).unwrap();
+    let publication = committed.publication.unwrap();
+    assert_eq!(
+        publication
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(7))
+    );
+    assert!(!service.acknowledge_publication(&publication).unwrap());
+
+    let backend = service.into_backend();
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(log.applied_index().unwrap(), 4);
+    assert!(log.committed_after(4).unwrap().entries.is_empty());
+    let reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
+        .expect("the root tree reopens at the durable Raft apply cursor");
+    assert_eq!(
+        reopened.recover_ingress(&request).unwrap(),
+        RootTreeIngressRecoveryV2::Completed {
+            reply: publication.published.reply.unwrap(),
+        }
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("vos=debug")

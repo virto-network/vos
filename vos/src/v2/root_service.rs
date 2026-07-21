@@ -11,16 +11,24 @@ use alloc::vec::Vec;
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
-    AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
-    BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, ContinuationSnapshotV2, DirectIngressV2,
-    DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
-    JamServiceV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId,
-    PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
+    AccumulationRejectionV2, AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
+    AuthorizationEvidenceV2, BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2,
+    ContinuationSnapshotV2, DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
+    ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2, LocalStoreReadErrorV2,
+    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefinedServiceOutputV2,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
     VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
 };
+
+#[cfg(feature = "storage")]
+use super::{ReplicatedJamServiceV2, ReplicatedServiceErrorV2};
+#[cfg(feature = "storage")]
+use crate::commit::CommitError;
+#[cfg(feature = "storage")]
+use crate::raft::RaftAccumulateLogV2;
 
 /// Strict host/network ingress for one direct root-tree invocation. Origin and
 /// authorization are deliberately absent: the receiving host derives them
@@ -318,6 +326,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     WrongServiceAbi,
     WrongExecutionSemantics,
     InvalidConsistency,
+    ReplicationDriverRequired,
     ZeroGas,
 }
 
@@ -327,6 +336,8 @@ pub enum LocalRootTreeOpenErrorV2<E> {
     Store(DurableStoreOpenErrorV2<E>),
     CorruptStore(LocalStoreReadErrorV2),
     Service(ServiceDispatchError),
+    #[cfg(feature = "storage")]
+    Replication(ReplicatedServiceErrorV2<CommitError>),
     InstallRejected(AccumulationRejectionV2),
     UnexpectedInstallResult,
     ExistingServiceMismatch,
@@ -339,11 +350,17 @@ pub enum LocalRootTreeInvokeErrorV2 {
     ProofProducerRequired,
     Schedule(ScheduleErrorV2),
     Service(ServiceDispatchError),
+    #[cfg(feature = "storage")]
+    Replication(ReplicatedServiceErrorV2<CommitError>),
     Rejected(AccumulationRejectionV2),
     UnexpectedResult,
     CorruptStore(LocalStoreReadErrorV2),
     MissingPublication,
     DivergentReplay,
+    ServiceNotInstalled,
+    ExistingServiceMismatch,
+    ExistingActorMismatch,
+    MissingInstalledProgram(ProgramId),
 }
 
 /// Result made visible only after physical Accumulate committed the durable
@@ -393,10 +410,118 @@ pub enum RootTreeIngressRecoveryV2 {
 }
 
 /// A durable local host for exactly one logical JAM service/root actor tree.
+enum RootTreeServiceDriverV2<B> {
+    Direct(JamServiceV2<NoRefineProtocolHostV2, DurableJamStoreV2<B>>),
+    #[cfg(feature = "storage")]
+    Raft(ReplicatedJamServiceV2<NoRefineProtocolHostV2, DurableJamStoreV2<B>, RaftAccumulateLogV2>),
+}
+
+enum RootTreeDriverConfigV2 {
+    Direct,
+    #[cfg(feature = "storage")]
+    Raft(RaftAccumulateLogV2),
+}
+
+enum RootTreeDriverErrorV2 {
+    Direct(ServiceDispatchError),
+    #[cfg(feature = "storage")]
+    Raft(ReplicatedServiceErrorV2<CommitError>),
+}
+
+impl RootTreeDriverErrorV2 {
+    fn into_invoke(self) -> LocalRootTreeInvokeErrorV2 {
+        match self {
+            Self::Direct(error) => LocalRootTreeInvokeErrorV2::Service(error),
+            #[cfg(feature = "storage")]
+            Self::Raft(error) => LocalRootTreeInvokeErrorV2::Replication(error),
+        }
+    }
+}
+
+impl<B: CommittedImageStoreV2> RootTreeServiceDriverV2<B> {
+    fn accumulate_host(&self) -> &DurableJamStoreV2<B> {
+        match self {
+            Self::Direct(service) => service.accumulate_host(),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service.service().accumulate_host(),
+        }
+    }
+
+    fn accumulate_host_mut(&mut self) -> &mut DurableJamStoreV2<B> {
+        match self {
+            Self::Direct(service) => service.accumulate_host_mut(),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service.service_mut().accumulate_host_mut(),
+        }
+    }
+
+    fn catch_up(&mut self) -> Result<(), RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .catch_up()
+                .map(|_| ())
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
+    fn is_writable(&self) -> bool {
+        match self {
+            Self::Direct(_) => true,
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service.log().is_writable(),
+        }
+    }
+
+    fn refine_actor_tree(
+        &mut self,
+        work: &super::WorkEnvelopeV2,
+        imports: &super::RefineImportsV2,
+    ) -> Result<RefinedServiceOutputV2, RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(service) => service
+                .refine_actor_tree(work, imports)
+                .map_err(RootTreeDriverErrorV2::Direct),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .refine_actor_tree(work, imports)
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
+    fn accumulate(
+        &mut self,
+        request: &AccumulateRequestV2,
+    ) -> Result<AccumulatedServiceOutputV2, RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(service) => service
+                .accumulate(request)
+                .map_err(RootTreeDriverErrorV2::Direct),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate(request)
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
+    fn into_store(self) -> DurableJamStoreV2<B> {
+        match self {
+            Self::Direct(service) => service.into_hosts().1,
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service.into_parts().0.into_hosts().1,
+        }
+    }
+}
+
 pub struct LocalRootTreeServiceV2<B> {
-    service: JamServiceV2<NoRefineProtocolHostV2, DurableJamStoreV2<B>>,
+    service: RootTreeServiceDriverV2<B>,
     identity: ServiceIdentityV2,
     root_actor: ActorId,
+    consistency: ConsistencyModeV2,
+    genesis: ServiceGenesisV2,
+    expected_root: ActorGenesisV2,
+    expected_external_actors: Vec<ExternalActorBindingV2>,
 }
 
 impl LocalRootTreeConfigV2 {
@@ -443,6 +568,35 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         config: LocalRootTreeConfigV2,
         backend: B,
     ) -> Result<Self, LocalRootTreeOpenErrorV2<B::Error>> {
+        if config.consistency == ConsistencyModeV2::Raft {
+            return Err(LocalRootTreeOpenErrorV2::InvalidConfig(
+                LocalRootTreeConfigErrorV2::ReplicationDriverRequired,
+            ));
+        }
+        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Direct)
+    }
+
+    /// Open a Raft root tree whose every mutating request, including genesis,
+    /// is quorum-ordered before the canonical service guest executes IC-5.
+    #[cfg(feature = "storage")]
+    pub fn open_raft(
+        config: LocalRootTreeConfigV2,
+        backend: B,
+        log: RaftAccumulateLogV2,
+    ) -> Result<Self, LocalRootTreeOpenErrorV2<B::Error>> {
+        if config.consistency != ConsistencyModeV2::Raft {
+            return Err(LocalRootTreeOpenErrorV2::InvalidConfig(
+                LocalRootTreeConfigErrorV2::InvalidConsistency,
+            ));
+        }
+        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Raft(log))
+    }
+
+    fn open_with_driver(
+        config: LocalRootTreeConfigV2,
+        backend: B,
+        driver: RootTreeDriverConfigV2,
+    ) -> Result<Self, LocalRootTreeOpenErrorV2<B::Error>> {
         config
             .validate()
             .map_err(LocalRootTreeOpenErrorV2::InvalidConfig)?;
@@ -461,9 +615,10 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                 ))
             })?;
         let store = DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
-        let header = store
+        let needs_imports = store
             .header()
-            .map_err(LocalRootTreeOpenErrorV2::CorruptStore)?;
+            .map_err(LocalRootTreeOpenErrorV2::CorruptStore)?
+            .is_none();
         let expected_program = config.service.service_program;
         let mut service = JamServiceV2::new(
             config.service_pvm,
@@ -475,51 +630,8 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         )
         .map_err(LocalRootTreeOpenErrorV2::Service)?;
 
-        if let Some(header) = header {
-            if header.service != config.service || header.consistency != config.consistency {
-                return Err(LocalRootTreeOpenErrorV2::ExistingServiceMismatch);
-            }
-            if service
-                .accumulate_host()
-                .program(config.package.manifest.actor_program)
-                .is_none()
-            {
-                return Err(LocalRootTreeOpenErrorV2::MissingInstalledProgram(
-                    config.package.manifest.actor_program,
-                ));
-            }
-            let directory = service
-                .accumulate_host()
-                .state_row(header.service_root, &StateKeyV2::ActorDirectory)
-                .map_err(LocalRootTreeOpenErrorV2::CorruptStore)?
-                .and_then(|bytes| ActorDirectoryV2::decode(&bytes).ok());
-            if directory
-                .as_ref()
-                .is_none_or(|directory| directory.actors.binary_search(&config.root_actor).is_err())
-            {
-                return Err(LocalRootTreeOpenErrorV2::ExistingActorMismatch);
-            }
-            let descriptor = service
-                .accumulate_host()
-                .state_row(
-                    header.service_root,
-                    &StateKeyV2::ActorDescriptor(config.root_actor),
-                )
-                .map_err(LocalRootTreeOpenErrorV2::CorruptStore)?
-                .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok());
-            let external = service
-                .accumulate_host()
-                .state_row(header.service_root, &StateKeyV2::ExternalActorDirectory)
-                .map_err(LocalRootTreeOpenErrorV2::CorruptStore)?
-                .and_then(|bytes| ExternalActorDirectoryV2::decode(&bytes).ok());
-            if descriptor.as_ref() != Some(&expected_root)
-                || external.as_ref().is_none_or(|directory| {
-                    directory.actors.as_slice() != config.external_actors.as_slice()
-                })
-            {
-                return Err(LocalRootTreeOpenErrorV2::ExistingActorMismatch);
-            }
-        } else {
+        let actor_program = config.package.manifest.actor_program;
+        if needs_imports {
             let initial = service
                 .accumulate_host_mut()
                 .import_blob(config.initial_state);
@@ -528,38 +640,65 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             }
             let imported_program = service
                 .accumulate_host_mut()
-                .import_program(config.package.actor_pvm.clone());
-            if imported_program != config.package.manifest.actor_program {
+                .import_program(config.package.actor_pvm);
+            if imported_program != actor_program {
                 return Err(LocalRootTreeOpenErrorV2::InvalidConfig(
                     LocalRootTreeConfigErrorV2::InvalidPackage(PackageError::ProgramIdMismatch),
                 ));
             }
-            let genesis = ServiceGenesisV2 {
-                service: config.service.clone(),
-                consistency: config.consistency,
-                actors: vec![expected_root],
-                external_actors: config.external_actors,
-                authorization: config.install_authorization,
-            };
-            service.accumulate_host_mut().allow_install(&genesis);
-            match service
-                .accumulate(&AccumulateRequestV2::Install(genesis))
-                .map_err(LocalRootTreeOpenErrorV2::Service)?
-                .result
-            {
-                AccumulationResultV2::Installed(_) => {}
-                AccumulationResultV2::Rejected(rejection) => {
-                    return Err(LocalRootTreeOpenErrorV2::InstallRejected(rejection));
-                }
-                _ => return Err(LocalRootTreeOpenErrorV2::UnexpectedInstallResult),
-            }
         }
+        let genesis = ServiceGenesisV2 {
+            service: config.service.clone(),
+            consistency: config.consistency,
+            actors: vec![expected_root.clone()],
+            external_actors: config.external_actors.clone(),
+            authorization: config.install_authorization,
+        };
+        service.accumulate_host_mut().allow_install(&genesis);
+        let service = match driver {
+            RootTreeDriverConfigV2::Direct => RootTreeServiceDriverV2::Direct(service),
+            #[cfg(feature = "storage")]
+            RootTreeDriverConfigV2::Raft(log) => {
+                RootTreeServiceDriverV2::Raft(ReplicatedJamServiceV2::new(service, log))
+            }
+        };
 
-        Ok(Self {
+        let mut root = Self {
             service,
             identity: config.service,
             root_actor: config.root_actor,
-        })
+            consistency: config.consistency,
+            genesis,
+            expected_root,
+            expected_external_actors: config.external_actors,
+        };
+        root.ensure_installed().map_err(|error| match error {
+            LocalRootTreeInvokeErrorV2::Service(error) => LocalRootTreeOpenErrorV2::Service(error),
+            #[cfg(feature = "storage")]
+            LocalRootTreeInvokeErrorV2::Replication(error) => {
+                LocalRootTreeOpenErrorV2::Replication(error)
+            }
+            LocalRootTreeInvokeErrorV2::Rejected(error) => {
+                LocalRootTreeOpenErrorV2::InstallRejected(error)
+            }
+            LocalRootTreeInvokeErrorV2::UnexpectedResult => {
+                LocalRootTreeOpenErrorV2::UnexpectedInstallResult
+            }
+            LocalRootTreeInvokeErrorV2::CorruptStore(error) => {
+                LocalRootTreeOpenErrorV2::CorruptStore(error)
+            }
+            LocalRootTreeInvokeErrorV2::ExistingServiceMismatch => {
+                LocalRootTreeOpenErrorV2::ExistingServiceMismatch
+            }
+            LocalRootTreeInvokeErrorV2::ExistingActorMismatch => {
+                LocalRootTreeOpenErrorV2::ExistingActorMismatch
+            }
+            LocalRootTreeInvokeErrorV2::MissingInstalledProgram(program) => {
+                LocalRootTreeOpenErrorV2::MissingInstalledProgram(program)
+            }
+            _ => LocalRootTreeOpenErrorV2::UnexpectedInstallResult,
+        })?;
+        Ok(root)
     }
 
     pub fn identity(&self) -> &ServiceIdentityV2 {
@@ -570,12 +709,120 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.root_actor
     }
 
+    pub const fn consistency(&self) -> ConsistencyModeV2 {
+        self.consistency
+    }
+
     pub fn store(&self) -> &DurableJamStoreV2<B> {
         self.service.accumulate_host()
     }
 
     pub fn store_mut(&mut self) -> &mut DurableJamStoreV2<B> {
         self.service.accumulate_host_mut()
+    }
+
+    /// Apply every newly committed Raft request to this replica's physical
+    /// service image. A direct Local/CRDT conformance owner is already current.
+    /// Followers may remain uninstalled until the leader's genesis request is
+    /// committed; callers must not schedule actor work while this returns
+    /// `false`.
+    pub fn catch_up(&mut self) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.ensure_installed()
+    }
+
+    fn ensure_installed(&mut self) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .catch_up()
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        if self.validate_installed()? {
+            return Ok(true);
+        }
+        if !self.service.is_writable() {
+            return Ok(false);
+        }
+        let result = self
+            .service
+            .accumulate(&AccumulateRequestV2::Install(self.genesis.clone()))
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        match result.result {
+            AccumulationResultV2::Installed(_) => {}
+            AccumulationResultV2::Rejected(rejection) => {
+                return Err(LocalRootTreeInvokeErrorV2::Rejected(rejection));
+            }
+            _ => return Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
+        if self.validate_installed()? {
+            Ok(true)
+        } else {
+            Err(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)
+        }
+    }
+
+    fn require_installed(&mut self) -> Result<(), LocalRootTreeInvokeErrorV2> {
+        if self.ensure_installed()? {
+            Ok(())
+        } else {
+            Err(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)
+        }
+    }
+
+    fn validate_installed(&self) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        let Some(header) = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+        else {
+            return Ok(false);
+        };
+        if header.service != self.identity || header.consistency != self.consistency {
+            return Err(LocalRootTreeInvokeErrorV2::ExistingServiceMismatch);
+        }
+        if self
+            .service
+            .accumulate_host()
+            .program(self.expected_root.program)
+            .is_none()
+        {
+            return Err(LocalRootTreeInvokeErrorV2::MissingInstalledProgram(
+                self.expected_root.program,
+            ));
+        }
+        let directory = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::ActorDirectory)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorDirectoryV2::decode(&bytes).ok());
+        if directory
+            .as_ref()
+            .is_none_or(|directory| directory.actors.binary_search(&self.root_actor).is_err())
+        {
+            return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+        }
+        let descriptor = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(self.root_actor),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok());
+        let external = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::ExternalActorDirectory)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ExternalActorDirectoryV2::decode(&bytes).ok());
+        if descriptor.as_ref() != Some(&self.expected_root)
+            || external.as_ref().is_none_or(|directory| {
+                directory.actors.as_slice() != self.expected_external_actors.as_slice()
+            })
+        {
+            return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+        }
+        Ok(true)
     }
 
     pub fn root_method_policy(
@@ -716,11 +963,12 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         &mut self,
         request: &LocalWorkRequestV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
         let ingress = direct_ingress_from_request(&self.identity, request)?;
         let accumulated = self
             .service
             .accumulate(&AccumulateRequestV2::AdmitIngress(ingress))
-            .map_err(LocalRootTreeInvokeErrorV2::Service)?;
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
             AccumulationResultV2::IngressAdmitted {
                 invocation,
@@ -739,6 +987,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         &mut self,
         invocation: super::InvocationId,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
         let record = self
             .service
             .accumulate_host()
@@ -757,6 +1006,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         &mut self,
         request: LocalWorkRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
         if request.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
@@ -772,6 +1022,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         call: super::CallId,
         logical_timeslot: u64,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
         let prepared = LocalWorkSchedulerV2::prepare_inbox(
             self.service.accumulate_host(),
             call,
@@ -793,6 +1044,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         logical_timeslot: u64,
         awaited_reply: Option<super::AccumulatedReplyV2>,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
         let prepared = LocalWorkSchedulerV2::prepare_resume(
             self.service.accumulate_host(),
             invocation,
@@ -848,6 +1100,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         source_outbox: Vec<MessageRecordV2>,
         source_receipt: AccumulationReceiptV2,
     ) -> Result<CommittedDeliveryV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
         self.allow_finalized_receipt(&source_receipt);
         let delivery = LocalWorkSchedulerV2::prepare_delivery(
             self.service.accumulate_host(),
@@ -860,7 +1113,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         let accumulated = self
             .service
             .accumulate(&AccumulateRequestV2::Deliver(delivery))
-            .map_err(LocalRootTreeInvokeErrorV2::Service)?;
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
             AccumulationResultV2::Accepted {
                 receipt,
@@ -885,7 +1138,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         let refined = self
             .service
             .refine_actor_tree(&prepared.work, &prepared.imports)
-            .map_err(LocalRootTreeInvokeErrorV2::Service)?;
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
         let input = prepared.work.input_id();
         let accumulated = self
             .service
@@ -894,7 +1147,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                 transition: refined.transition,
                 provided_blobs: refined.exported_blobs,
             }))
-            .map_err(LocalRootTreeInvokeErrorV2::Service)?;
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
         let (receipt, published, duplicate) = match accumulated.result {
             AccumulationResultV2::Accepted {
                 receipt,
@@ -933,6 +1186,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         &mut self,
         publication: &PublicationRecordV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
         let result = self
             .service
             .accumulate(&AccumulateRequestV2::AcknowledgePublication(
@@ -942,7 +1196,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                     publication: publication.commitment(),
                 },
             ))
-            .map_err(LocalRootTreeInvokeErrorV2::Service)?;
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match result.result {
             AccumulationResultV2::PublicationAcknowledged { duplicate, .. } => Ok(duplicate),
             AccumulationResultV2::Rejected(rejection) => {
@@ -1022,7 +1276,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
     }
 
     pub fn into_backend(self) -> B {
-        let (_, store) = self.service.into_hosts();
+        let store = self.service.into_store();
         let (_, backend) = store.into_parts();
         backend
     }

@@ -102,7 +102,11 @@ service, root actor, program, policy, initial-state, or external-binding
 mismatch. Its ordinary invocation path schedules exclusively from committed
 guest state. Non-empty replies, outbox records, blobs, and proofs remain in the
 guest-owned publication table until the host submits their exact commitment to
-physical Accumulate for acknowledgement.
+physical Accumulate for acknowledgement. `open_raft` composes the same owner
+with `ReplicatedJamServiceV2`: genesis, direct ingress, delivery, actor apply,
+and publication acknowledgement enter the canonical Raft request log before
+IC-5 mutates the local service image. Followers catch up the exact request log
+and committed service snapshot; they never apply native actor commands.
 
 `VosNode::register_v2_root_at_id` attaches that owner to the existing node
 transport without converting its `ActorId` into a route identifier. Direct v2
