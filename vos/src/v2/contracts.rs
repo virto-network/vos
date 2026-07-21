@@ -1996,6 +1996,18 @@ impl V2Wire for MessageRecordV2 {
     }
 }
 
+impl V2Wire for ReplyRecordV2 {
+    const MAGIC: [u8; 4] = *b"VRR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        encode_reply(&mut Encoder(out), self);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_reply(d)
+    }
+}
+
 impl V2Wire for AccumulatedReplyV2 {
     const MAGIC: [u8; 4] = *b"VRP2";
 

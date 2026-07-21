@@ -11,10 +11,10 @@ use alloc::vec::Vec;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
     AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, DirectIngressV2, Hash, InvocationId,
-    PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 5;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 6;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -321,6 +321,9 @@ pub struct WorkflowCheckpointV2 {
     pub resume_work: WorkEnvelopeV2,
     pub work_hash: Hash,
     pub transition_commitment: Hash,
+    /// Canonical completed reply retained after its transient publication is
+    /// acknowledged, so an exact invocation retry can recover the result.
+    pub reply: Option<ReplyRecordV2>,
 }
 
 impl V2Wire for WorkflowCheckpointV2 {
@@ -333,6 +336,7 @@ impl V2Wire for WorkflowCheckpointV2 {
         e.bytes(&self.resume_work.encode());
         e.fixed(&self.work_hash.0);
         e.fixed(&self.transition_commitment.0);
+        e.option(&self.reply, |e, reply| e.bytes(&reply.encode()));
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -342,10 +346,19 @@ impl V2Wire for WorkflowCheckpointV2 {
             resume_work: WorkEnvelopeV2::decode(&d.bytes()?)?,
             work_hash: Hash(d.fixed()?),
             transition_commitment: Hash(d.fixed()?),
+            reply: d.option(|d| ReplyRecordV2::decode(&d.bytes()?))?,
         };
         if value.input != value.resume_work.input_id()
             || value.workflow_identity != value.resume_work.workflow_identity()
             || value.work_hash != value.resume_work.hash()
+            || value.reply.as_ref().is_some_and(|reply| {
+                reply.producer != value.resume_work.target
+                    || reply.call_id
+                        != value
+                            .resume_work
+                            .parent_call
+                            .unwrap_or_else(|| value.resume_work.invocation.root_reply_id())
+            })
         {
             return Err(DecodeError::NonCanonical);
         }

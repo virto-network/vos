@@ -752,6 +752,14 @@ fn materialize_workflow_crdt(
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let replies = change
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::Reply(reply) => Some(reply),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         match checkpoints.as_slice() {
             [work]
                 if work.service == *service
@@ -768,6 +776,14 @@ fn materialize_workflow_crdt(
                         work.imported_actors
                             .binary_search_by_key(&materialization.actor, |actor| actor.actor)
                             .is_ok()
+                    })
+                    && replies.len() <= 1
+                    && replies.first().is_none_or(|reply| {
+                        reply.producer == work.target
+                            && reply.call_id
+                                == work
+                                    .parent_call
+                                    .unwrap_or_else(|| work.invocation.root_reply_id())
                     }) =>
             {
                 let observed = result
@@ -797,6 +813,7 @@ fn materialize_workflow_crdt(
                     // without the outer Transition wire. The authenticated
                     // node CID is their canonical slice commitment.
                     transition_commitment: cid,
+                    reply: replies.first().map(|reply| (*reply).clone()),
                 };
                 insert_causal_value(
                     frontier,
@@ -1457,6 +1474,7 @@ fn apply<S: GuestAccumulateStoreV2>(
             .as_ref()
             .map(CrdtChangeV2::cid)
             .unwrap_or(transition_commitment),
+        reply: transition.reply.clone(),
     });
     tree_apply(
         &mut tree,
@@ -1853,10 +1871,13 @@ fn canonical_transition_shape(
         && is_sorted_unique_by(&transition.attestation_verifications, |verification| {
             verification.replay_key()
         })
-        && transition
-            .reply
-            .as_ref()
-            .is_none_or(|reply| reply.producer == work.target)
+        && transition.reply.as_ref().is_none_or(|reply| {
+            reply.producer == work.target
+                && reply.call_id
+                    == work
+                        .parent_call
+                        .unwrap_or_else(|| work.invocation.root_reply_id())
+        })
 }
 
 fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
@@ -2787,7 +2808,9 @@ mod tests {
             inbox: Vec::new(),
             outbox: Vec::new(),
             reply: Some(ReplyRecordV2 {
-                call_id: work.invocation.root_reply_id(),
+                call_id: work
+                    .parent_call
+                    .unwrap_or_else(|| work.invocation.root_reply_id()),
                 producer: actor(),
                 result: b"ok".to_vec(),
             }),
@@ -2857,6 +2880,7 @@ mod tests {
         );
 
         let transition = linear_transition(&work, b"after");
+        let expected_reply = transition.reply.clone();
         assert!(matches!(
             execute_guest_accumulate(
                 &mut store,
@@ -2880,6 +2904,16 @@ mod tests {
         )
         .unwrap();
         assert!(consumed.consumed);
+        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        let checkpoint = WorkflowCheckpointV2::decode(
+            &tree
+                .get(&StateKeyV2::Workflow(work.invocation))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(checkpoint.reply, expected_reply);
     }
 
     #[test]
@@ -3094,6 +3128,23 @@ mod tests {
             transition: transition.clone(),
             provided_blobs: Vec::new(),
         });
+
+        let mut wrong_reply = transition.clone();
+        wrong_reply.reply.as_mut().unwrap().call_id = work.invocation.call_id(1);
+        let before_wrong_reply = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: work.clone(),
+                    transition: wrong_reply,
+                    provided_blobs: Vec::new(),
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before_wrong_reply);
 
         let accepted = execute_guest_accumulate(&mut store, &request).unwrap();
         let AccumulationResultV2::Accepted {
@@ -4697,7 +4748,15 @@ mod tests {
 
         let work = crdt_work(initial, 61, vec![]);
         let materialized = BlobRefV2::of_bytes(b"synced-state");
-        let transition = crdt_transition(&work, materialized.clone(), 1);
+        let mut transition = crdt_transition(&work, materialized.clone(), 1);
+        let expected_reply = ReplyRecordV2 {
+            call_id: work.invocation.root_reply_id(),
+            producer: work.target,
+            result: b"synced reply".to_vec(),
+        };
+        transition.reply = Some(expected_reply.clone());
+        let workflow = transition.workflow_operations(&work);
+        transition.crdt_change.as_mut().unwrap().workflow = workflow;
         let change = transition.crdt_change.clone().unwrap();
         let cid = change.cid();
         let accepted = execute_guest_accumulate(
@@ -4774,6 +4833,7 @@ mod tests {
         .unwrap();
         assert_eq!(checkpoint.resume_work, work.workflow_checkpoint());
         assert_eq!(checkpoint.transition_commitment, cid);
+        assert_eq!(checkpoint.reply, Some(expected_reply));
         assert_eq!(
             BlobRefV2::decode(
                 &tree

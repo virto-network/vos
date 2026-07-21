@@ -387,7 +387,9 @@ pub enum RootTreeIngressRecoveryV2 {
     },
     /// The invocation finished and its externally accepted publication has
     /// already been acknowledged. Its actor execution must not be replayed.
-    Completed,
+    Completed {
+        reply: super::ReplyRecordV2,
+    },
 }
 
 /// A durable local host for exactly one logical JAM service/root actor tree.
@@ -679,7 +681,10 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                 ))
             })?;
         let Some(continuation) = continuation else {
-            return Ok(RootTreeIngressRecoveryV2::Completed);
+            let reply = checkpoint
+                .reply
+                .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
+            return Ok(RootTreeIngressRecoveryV2::Completed { reply });
         };
         let bytes = self.service.accumulate_host().blob(&continuation).ok_or(
             LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::MissingBlob(continuation.hash)),
@@ -690,7 +695,10 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             ))
         })?;
         if snapshot.invocation != request.invocation {
-            return Ok(RootTreeIngressRecoveryV2::Completed);
+            let reply = checkpoint
+                .reply
+                .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
+            return Ok(RootTreeIngressRecoveryV2::Completed { reply });
         }
         snapshot
             .validate_checkpoint_for(&checkpoint.resume_work)
@@ -1162,7 +1170,7 @@ mod tests {
                 consistency: ConsistencyModeV2::Local,
             },
             published: PublishedEffectsV2 {
-                reply: Some(reply),
+                reply: Some(reply.clone()),
                 ..PublishedEffectsV2::default()
             },
         };
@@ -1172,6 +1180,7 @@ mod tests {
             work_hash: work.hash(),
             transition_commitment: publication.receipt.accepted_transition,
             resume_work: work,
+            reply: Some(reply),
         };
 
         assert_eq!(

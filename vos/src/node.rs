@@ -3904,13 +3904,21 @@ where
                 );
                 continue;
             }
-            Ok(crate::v2::RootTreeIngressRecoveryV2::Completed) => {
-                warn!(
+            Ok(crate::v2::RootTreeIngressRecoveryV2::Completed { reply }) => {
+                debug!(
                     %id,
                     invocation = ?work.invocation,
-                    "refused replay of completed v2 invocation without a pending publication"
+                    "replayed guest-retained reply for completed v2 invocation"
                 );
-                send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
+                let _ = send_reply_capped(
+                    request.reply,
+                    encode_invoke_envelope(
+                        crate::actors::run::STATUS_DONE,
+                        &[],
+                        &reply.result,
+                    ),
+                    id,
+                );
                 continue;
             }
             Ok(crate::v2::RootTreeIngressRecoveryV2::Fresh) => {}

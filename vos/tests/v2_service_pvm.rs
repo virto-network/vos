@@ -704,7 +704,9 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     assert!(!restarted.acknowledge_publication(&publication).unwrap());
     assert_eq!(
         restarted.recover_ingress(&request).unwrap(),
-        RootTreeIngressRecoveryV2::Completed
+        RootTreeIngressRecoveryV2::Completed {
+            reply: publication.published.reply.clone().unwrap(),
+        }
     );
 
     let backend = restarted.into_backend();
@@ -774,6 +776,17 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
         )
         .expect("cross-root continuation resolves only after both guest commits");
     assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
+
+    let mut retry = ingress;
+    retry.logical_timeslot = 99;
+    let replayed = handle
+        .invoke_with_timeout(
+            source_route,
+            retry.encode(),
+            std::time::Duration::from_secs(20),
+        )
+        .expect("an acknowledged exact retry returns the guest-retained reply");
+    assert_eq!(replayed, reply);
 
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     let results = router.join().unwrap();
@@ -3736,7 +3749,6 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     .expect("scheduler imports a private role witness without disclosing it");
     let proof_work = prepared_proof_work.work;
     let proof_imports = prepared_proof_work.imports;
-    let attested_call = proof_work.invocation.call_id(0);
     let proof_transition = TransitionV2 {
         service: proof_work.service.clone(),
         consumed_input: proof_work.input_id(),
@@ -3748,7 +3760,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         inbox: vec![],
         outbox: vec![],
         reply: Some(vos::v2::ReplyRecordV2 {
-            call_id: attested_call,
+            call_id: proof_work.invocation.root_reply_id(),
             producer: proof_work.target,
             result: Value::Bytes(b"attested reply".to_vec()).encode(),
         }),

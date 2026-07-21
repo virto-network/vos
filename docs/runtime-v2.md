@@ -132,9 +132,10 @@ it reattaches its caller channel to a suspended machine without replaying slice
 zero, or publishes the pending effect from the latest completed slice using
 that slice's committed timeslot. The retry timeslot is not part of stable
 ingress identity; actor, method, arguments, origin, authorization, causal
-binding, application blob references, and proof mode are. A completed workflow
-whose publication was already externally accepted is refused rather than
-executed again. Continuation blob references may coexist with an outbox record
+binding, application blob references, and proof mode are. After its publication
+is acknowledged, a completed workflow returns the canonical reply retained in
+guest workflow state without executing the actor again. Continuation blob
+references may coexist with an outbox record
 because those pages are already committed in the source content store and
 never become destination state. Cross-node actor-route discovery and proof/blob
 publication drivers remain to be attached. Attested ingress currently fails
