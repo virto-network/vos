@@ -895,6 +895,120 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
 }
 
 #[test]
+fn root_actor_upgrade_uses_exact_packages_and_survives_restart() {
+    let Some((config, _, root, _)) = workflow_root_configs() else {
+        return;
+    };
+    let initial_program = config.package.manifest.actor_program;
+    let initial_pvm = config.package.actor_pvm.clone();
+    let mut replacement = config.package.clone();
+    replacement.manifest.version = "2.1.0".into();
+    replacement.actor_pvm = actor_pvm(77);
+    replacement.manifest.actor_program = ProgramId::of_pvm(&replacement.actor_pvm);
+    replacement.deployment_signature.public_key = b"root-upgrade-package".to_vec();
+    replacement.deployment_signature.producer =
+        ProducerId::of_public_key(&replacement.deployment_signature.public_key);
+    replacement.deployment_signature.signature = vec![2];
+    replacement.validate().unwrap();
+    let replacement_program = replacement.manifest.actor_program;
+
+    let mut service =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("root tree installs before its first upgrade");
+    let upgrade = service
+        .prepare_actor_upgrade(
+            root,
+            &replacement,
+            AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([141; 32]),
+                authenticator: vec![142],
+            },
+        )
+        .expect("the controller derives the exact current base and signed policies");
+    assert_eq!(upgrade.expected_program, initial_program);
+    assert_eq!(upgrade.replacement_program, replacement_program);
+    assert_eq!(upgrade.producer, replacement.deployment_signature.producer);
+
+    let mut forged = upgrade.clone();
+    forged.methods.clear();
+    let before_forged = service.store().snapshot();
+    assert!(matches!(
+        service.stage_actor_upgrade(&replacement, &forged),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::UpgradePackageMismatch)
+    ));
+    assert_eq!(service.store().snapshot(), before_forged);
+
+    service
+        .stage_actor_upgrade(&replacement, &upgrade)
+        .expect("the exact replacement PVM is staged before Accumulate");
+    let committed = service
+        .commit_actor_upgrade(&upgrade)
+        .expect("guest Accumulate commits the staged idle upgrade");
+    assert_eq!(committed.actor, root);
+    assert_eq!(committed.previous_program, initial_program);
+    assert_eq!(committed.program, replacement_program);
+    assert_eq!(committed.receipt.sequence, 1);
+    assert!(!committed.duplicate);
+
+    let before_retry = service.store().snapshot();
+    let duplicate = service
+        .commit_actor_upgrade(&upgrade)
+        .expect("the retained exact request deduplicates");
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.receipt, committed.receipt);
+    assert_eq!(service.store().snapshot(), before_retry);
+    assert_eq!(
+        service.store().program(initial_program),
+        Some(initial_pvm.as_slice())
+    );
+    assert_eq!(
+        service.store().program(replacement_program),
+        Some(replacement.actor_pvm.as_slice())
+    );
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([143; 32]),
+        workflow_step: 0,
+        logical_timeslot: 2,
+        target: root,
+        method: "start".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let prepared = LocalWorkSchedulerV2::prepare(service.store(), request.clone())
+        .expect("new work resolves the committed replacement program");
+    assert_eq!(prepared.work.target_program, replacement_program);
+    assert_eq!(
+        prepared
+            .imports
+            .programs
+            .iter()
+            .find(|program| program.program == replacement_program)
+            .map(|program| program.pvm.as_slice()),
+        Some(replacement.actor_pvm.as_slice())
+    );
+
+    let backend = service.into_backend();
+    let restarted = LocalRootTreeServiceV2::open(config, backend)
+        .expect("mutable descriptor fields validate from guest state after restart");
+    let prepared = LocalWorkSchedulerV2::prepare(restarted.store(), request)
+        .expect("the replacement remains schedulable after restart");
+    assert_eq!(prepared.work.target_program, replacement_program);
+    assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+    assert!(restarted.store().program(initial_program).is_some());
+    assert!(restarted.store().program(replacement_program).is_some());
+}
+
+#[test]
 fn guest_spawned_child_survives_restart_and_joins_the_owned_scheduler() {
     let Some((mut config, _, root, _)) = workflow_root_configs() else {
         return;
@@ -1262,12 +1376,42 @@ fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
         .acknowledge_publication(&attested.publication.unwrap())
         .unwrap());
 
+    let mut replacement = config.package.clone();
+    replacement.manifest.version = "2.1.0-raft".into();
+    replacement.actor_pvm = actor_pvm(78);
+    replacement.manifest.actor_program = ProgramId::of_pvm(&replacement.actor_pvm);
+    replacement.deployment_signature.public_key = b"raft-root-upgrade-package".to_vec();
+    replacement.deployment_signature.producer =
+        ProducerId::of_public_key(&replacement.deployment_signature.public_key);
+    replacement.deployment_signature.signature = vec![3];
+    replacement.validate().unwrap();
+    let replacement_program = replacement.manifest.actor_program;
+    let upgrade = service
+        .prepare_actor_upgrade(
+            actor,
+            &replacement,
+            AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([144; 32]),
+                authenticator: vec![145],
+            },
+        )
+        .expect("the Raft leader derives an exact current upgrade base");
+    service
+        .stage_actor_upgrade(&replacement, &upgrade)
+        .expect("the replacement package is available before log proposal");
+    let upgraded = service
+        .commit_actor_upgrade(&upgrade)
+        .expect("the exact upgrade is ordered before guest Accumulate");
+    assert_eq!(upgraded.program, replacement_program);
+    assert!(!upgraded.duplicate);
+
     let backend = service.into_backend();
     let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
-    assert_eq!(log.applied_index().unwrap(), 7);
-    assert!(log.committed_after(7).unwrap().entries.is_empty());
+    assert_eq!(log.applied_index().unwrap(), 8);
+    assert!(log.committed_after(8).unwrap().entries.is_empty());
     let reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
         .expect("the root tree reopens at the durable Raft apply cursor");
+    assert!(reopened.store().program(replacement_program).is_some());
     assert_eq!(
         reopened.recover_ingress(&request).unwrap(),
         RootTreeIngressRecoveryV2::Completed {

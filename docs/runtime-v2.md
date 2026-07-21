@@ -217,6 +217,17 @@ CRDT actor upgrades currently fail closed with `InvalidConsistency`. Program
 metadata needs an explicit causal operation and complete-ancestry activation;
 the runtime does not pretend that a linear descriptor rewrite is a CRDT merge.
 
+The local root-tree controller exposes the deployment sequence explicitly:
+`prepare_actor_upgrade` derives one exact request from committed guest state,
+`stage_actor_upgrade` validates the replacement `.vos`, imports its canonical
+PVM, and authorizes only that request, and `commit_actor_upgrade` submits it to
+physical Accumulate. Keep the prepared request for retries. For Raft, stage the
+same signed package and request on every replica before the leader commits its
+log entry; followers then apply the canonical request during catch-up. Reopen
+validation accepts only the descriptor fields that `UpgradeActor` may change
+and continues to require stable actor identity, ownership, state kind, and
+initial-state reference. Both old and replacement PVM bytes survive restart.
+
 ## Packages and identity
 
 `.vos` v2 packages bind the service ABI, execution-semantics ID, canonical

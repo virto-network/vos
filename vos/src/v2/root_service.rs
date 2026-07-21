@@ -17,17 +17,18 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, AccumulatedReplyV2, AccumulatedTimeoutV2,
-    ActorDirectoryV2, ActorGenesisV2, ActorId, AttestationDeliveryV2, AttestedServiceErrorV2,
-    AuthorizationEvidenceV2, BlobRefV2, CommittedAttestationOutputV2,
+    ActorDirectoryV2, ActorGenesisV2, ActorId, ActorUpgradeV2, AttestationDeliveryV2,
+    AttestedServiceErrorV2, AuthorizationEvidenceV2, BlobRefV2, CommittedAttestationOutputV2,
     CommittedAttestationPackageV2, CommittedImageStoreV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2, DurableJamStoreV2,
-    DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, ImportedBlobV2,
-    JamServiceV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
-    PreparedWorkV2, ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
+    ConsistencyBaseV2, ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2,
+    DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
+    ExternalActorDirectoryV2, ImportedBlobV2, JamServiceV2, LocalJamStoreV2,
+    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, PreparedWorkV2,
+    ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
-    WorkflowCheckpointV2,
+    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, StoreHeaderV2, V2Wire, VosPackageV2,
+    WorkInputIdV2, WorkflowCheckpointV2,
 };
 
 #[cfg(feature = "storage")]
@@ -417,6 +418,8 @@ pub enum LocalRootTreeInvokeErrorV2 {
     ExistingServiceMismatch,
     ExistingActorMismatch,
     MissingInstalledProgram(ProgramId),
+    InvalidUpgradePackage(PackageError),
+    UpgradePackageMismatch,
 }
 
 /// Result made visible only after physical Accumulate committed the durable
@@ -454,6 +457,18 @@ pub struct CommittedCallExpirationV2 {
 /// Result of importing an authenticated causal delta through physical IC-5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedCrdtSyncV2 {
+    pub receipt: AccumulationReceiptV2,
+    pub duplicate: bool,
+    pub accumulate_gas_used: u64,
+}
+
+/// Exact actor-program replacement made visible only after guest Accumulate
+/// commits its descriptor, policy, receipt, revision, and deduplication row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedActorUpgradeV2 {
+    pub actor: ActorId,
+    pub previous_program: ProgramId,
+    pub program: ProgramId,
     pub receipt: AccumulationReceiptV2,
     pub duplicate: bool,
     pub accumulate_gas_used: u64,
@@ -965,6 +980,155 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.service.accumulate_host_mut()
     }
 
+    /// Build the exact upgrade request against the currently committed actor
+    /// descriptor and consistency base. Deployment controllers should retain
+    /// this value across retries; changing the base or authorization creates a
+    /// different operation rather than an exactly-once retry.
+    pub fn prepare_actor_upgrade(
+        &mut self,
+        actor: ActorId,
+        package: &VosPackageV2,
+        authorization: AuthorizationEvidenceV2,
+    ) -> Result<ActorUpgradeV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        self.validate_upgrade_package(package)?;
+        let header = self.installed_header()?;
+        let descriptor = self.installed_actor_descriptor(&header, actor)?;
+        let policies = PackageRolePoliciesV2::decode(&package.role_policies)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::UpgradePackageMismatch)?;
+        if descriptor.program == package.manifest.actor_program {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradePackageMismatch);
+        }
+        let base = match header.consistency {
+            ConsistencyModeV2::Crdt => ConsistencyBaseV2::Crdt {
+                heads: header.crdt_heads,
+            },
+            ConsistencyModeV2::Ephemeral
+            | ConsistencyModeV2::Local
+            | ConsistencyModeV2::Raft => ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root: header
+                    .state_root
+                    .ok_or(LocalRootTreeInvokeErrorV2::ExistingServiceMismatch)?,
+            },
+        };
+        Ok(ActorUpgradeV2 {
+            service: self.identity.clone(),
+            actor,
+            expected_program: descriptor.program,
+            replacement_program: package.manifest.actor_program,
+            producer: package.deployment_signature.producer,
+            methods: policies.methods,
+            base,
+            authorization,
+        })
+    }
+
+    /// Make one exact signed replacement package and authorization available
+    /// to the local physical service host without committing actor state.
+    ///
+    /// Raft operators call this on every replica before the leader appends the
+    /// matching request. The program cache becomes durable with the same
+    /// service-image commit that accepts the upgrade.
+    pub fn stage_actor_upgrade(
+        &mut self,
+        package: &VosPackageV2,
+        upgrade: &ActorUpgradeV2,
+    ) -> Result<(), LocalRootTreeInvokeErrorV2> {
+        self.validate_upgrade_package(package)?;
+        let policies = PackageRolePoliciesV2::decode(&package.role_policies)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::UpgradePackageMismatch)?;
+        if upgrade.service != self.identity
+            || upgrade.replacement_program != package.manifest.actor_program
+            || upgrade.producer != package.deployment_signature.producer
+            || upgrade.methods != policies.methods
+        {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradePackageMismatch);
+        }
+        let imported = self
+            .service
+            .accumulate_host_mut()
+            .import_program(package.actor_pvm.clone());
+        if imported != upgrade.replacement_program
+            || !self
+                .service
+                .accumulate_host_mut()
+                .allow_upgrade(upgrade)
+        {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradePackageMismatch);
+        }
+        Ok(())
+    }
+
+    /// Submit one previously staged exact request through physical IC-5.
+    /// Exact retries return the original receipt without advancing state.
+    pub fn commit_actor_upgrade(
+        &mut self,
+        upgrade: &ActorUpgradeV2,
+    ) -> Result<CommittedActorUpgradeV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        let accumulated = self
+            .service
+            .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone()))
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        match accumulated.result {
+            AccumulationResultV2::ActorUpgraded {
+                actor,
+                previous_program,
+                program,
+                receipt,
+                duplicate,
+            } => Ok(CommittedActorUpgradeV2 {
+                actor,
+                previous_program,
+                program,
+                receipt,
+                duplicate,
+                accumulate_gas_used: accumulated.gas_used,
+            }),
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
+    }
+
+    fn validate_upgrade_package(
+        &self,
+        package: &VosPackageV2,
+    ) -> Result<(), LocalRootTreeInvokeErrorV2> {
+        package
+            .validate()
+            .map_err(LocalRootTreeInvokeErrorV2::InvalidUpgradePackage)?;
+        if package.manifest.service_program != self.identity.service_program
+            || package.manifest.crdt != (self.consistency == ConsistencyModeV2::Crdt)
+        {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradePackageMismatch);
+        }
+        Ok(())
+    }
+
+    fn installed_header(&self) -> Result<StoreHeaderV2, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)
+    }
+
+    fn installed_actor_descriptor(
+        &self,
+        header: &StoreHeaderV2,
+        actor: ActorId,
+    ) -> Result<ActorGenesisV2, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::ActorDescriptor(actor))
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeErrorV2::ExistingActorMismatch)
+    }
+
     /// Apply every newly committed Raft request to this replica's physical
     /// service image. A direct Local/CRDT conformance owner is already current.
     /// Followers may remain uninstalled until the leader's genesis request is
@@ -1144,7 +1308,16 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                 .iter()
                 .find(|expected| expected.actor == descriptor.actor)
             {
-                if descriptor != expected {
+                // Program, producer, and generated method policies are the
+                // actor fields changed by guest-owned UpgradeActor. Stable
+                // instance identity, ownership, state kind, and install blob
+                // must still match the signed genesis configuration exactly.
+                if descriptor.actor != expected.actor
+                    || descriptor.name != expected.name
+                    || descriptor.parent != expected.parent
+                    || descriptor.initial_state != expected.initial_state
+                    || descriptor.crdt != expected.crdt
+                {
                     return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
                 }
             } else {
@@ -1158,10 +1331,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                     return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
                 };
                 if descriptor.actor != ActorId::owned_child(parent_id, &descriptor.name)
-                    || descriptor.producer != parent.producer
-                    || descriptor.program != parent.program
                     || descriptor.crdt != parent.crdt
-                    || descriptor.methods != parent.methods
                 {
                     return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
                 }

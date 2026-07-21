@@ -80,8 +80,8 @@ pub use pvm::{
 };
 #[cfg(feature = "std")]
 pub use root_service::{
-    CommittedCallExpirationV2, CommittedCrdtSyncV2, CommittedDeliveryV2,
-    CommittedRootTreeSliceV2,
+    CommittedActorUpgradeV2, CommittedCallExpirationV2, CommittedCrdtSyncV2,
+    CommittedDeliveryV2, CommittedRootTreeSliceV2,
     LocalRootTreeConfigErrorV2,
     LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2,
     LocalRootTreeServiceV2, OwnedActorInstallV2, RootTreeIngressRecoveryV2, RootTreeInvocationV2,
