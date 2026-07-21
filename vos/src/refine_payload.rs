@@ -48,15 +48,6 @@
 //! - [`ANCHOR_SMT_ROOT`] (`0x02`) — reserved for SMT state roots; not
 //!   emitted yet, rejected on decode until it is.
 //!
-//! ## Version 2 (legacy decode)
-//!
-//! Already-installed actor blobs emit the v2 layout, which carries the
-//! state as an explicit `[state_len: u32 LE][state_bytes]` field between
-//! the flags and the reply. The v2 decoder synthesizes that field into a
-//! final `Effect::Write { STATE_KEY }` (when non-empty) so every consumer
-//! applies one semantic; anchor checks are skipped ([`RefinePayload::version`]
-//! tells the host which rules apply). v2 keeps its inherited lax decode.
-//!
 //! `continue_next` is set by the guest framework when a handler called
 //! `ctx.yield_now()` / `ctx.sleep(_)` — scheduling metadata only; the
 //! suspended task itself is data, never execution state.
@@ -74,9 +65,6 @@
 //!   effect), rejected on decode.
 
 use alloc::vec::Vec;
-
-/// Legacy wire version accepted for already-installed actor blobs.
-pub const REFINE_PAYLOAD_V2: u8 = 0x02;
 
 /// Current wire version — what the guest framework emits.
 pub const REFINE_PAYLOAD_VERSION: u8 = 0x03;
@@ -149,10 +137,8 @@ pub enum Effect {
 /// A complete refine output ready to encode/decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinePayload {
-    /// Wire version this payload was decoded from (or will encode as —
-    /// [`encode`](Self::encode) always emits v3). The host dispatches
-    /// apply rules on it: anchor checks and the effect-bearing
-    /// durable-node rule apply to v3; v2 gets legacy handling.
+    /// Wire version this payload was decoded from. VOS accepts only the
+    /// canonical v3 format; older stores and actor blobs must be reinstalled.
     pub version: u8,
     /// Commitment kind for the state this refine ran against.
     pub anchor_kind: u8,
@@ -212,18 +198,13 @@ impl RefinePayload {
         out
     }
 
-    /// Decode from the wire, dispatching on the leading version byte:
-    /// v3 with the strict canonical rules, v2 with legacy handling (the
-    /// explicit state field is synthesized into a final `Write{STATE_KEY}`
-    /// when non-empty). Returns `None` on malformed input or an unknown
-    /// version — callers must treat that as a hard failure, not fall
-    /// through to defaults.
+    /// Decode the strict canonical v3 wire. Older versions are a hard failure,
+    /// not a migration input or a signal to fall through to defaults.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        match bytes.first()? {
-            &REFINE_PAYLOAD_VERSION => Self::decode_v3(bytes),
-            &REFINE_PAYLOAD_V2 => Self::decode_v2(bytes),
-            _ => None,
+        if bytes.first() != Some(&REFINE_PAYLOAD_VERSION) {
+            return None;
         }
+        Self::decode_v3(bytes)
     }
 
     fn decode_v3(bytes: &[u8]) -> Option<Self> {
@@ -263,41 +244,6 @@ impl RefinePayload {
             version,
             anchor_kind,
             anchor,
-            reply,
-            effects,
-            continue_next: flags & FLAG_CONTINUE_NEXT != 0,
-            forbidden: flags & FLAG_FORBIDDEN != 0,
-        })
-    }
-
-    /// Legacy v2 decode. Keeps the inherited lax rules (no cursor
-    /// exhaustion checks) so already-installed blobs keep working, and
-    /// synthesizes the explicit state field into a final
-    /// `Write{STATE_KEY}` — order-equivalent to the old host's
-    /// absorb-then-push — so consumers apply one semantic.
-    fn decode_v2(bytes: &[u8]) -> Option<Self> {
-        let mut c = Cursor::new(bytes);
-        let version = c.read_u8()?;
-        let flags = c.read_u8()?;
-        let state_len = c.read_u32()? as usize;
-        let state = c.read_bytes(state_len)?.to_vec();
-        let reply_len = c.read_u32()? as usize;
-        let reply = c.read_bytes(reply_len)?.to_vec();
-        let effects_count = c.read_u16()? as usize;
-        let mut effects = Vec::with_capacity(effects_count);
-        for _ in 0..effects_count {
-            effects.push(decode_effect(&mut c, false)?);
-        }
-        if !state.is_empty() {
-            effects.push(Effect::Write {
-                key: crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-                value: state,
-            });
-        }
-        Some(RefinePayload {
-            version,
-            anchor_kind: ANCHOR_GENESIS,
-            anchor: [0u8; 32],
             reply,
             effects,
             continue_next: flags & FLAG_CONTINUE_NEXT != 0,
@@ -384,37 +330,6 @@ pub fn folded_public(
     out.extend_from_slice(anchor);
     out.extend_from_slice(transition_digest);
     out.extend_from_slice(app_public);
-    out
-}
-
-/// Encode the legacy v2 wire. The guest framework no longer emits it;
-/// this pins the format already-installed blobs speak so host-compat
-/// paths (version dispatch, state-field synthesis) stay testable.
-pub fn encode_v2(
-    state: &[u8],
-    reply: &[u8],
-    effects: &[Effect],
-    continue_next: bool,
-    forbidden: bool,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push(REFINE_PAYLOAD_V2);
-    let mut flags: u8 = 0;
-    if continue_next {
-        flags |= FLAG_CONTINUE_NEXT;
-    }
-    if forbidden {
-        flags |= FLAG_FORBIDDEN;
-    }
-    out.push(flags);
-    push_u32(&mut out, state.len() as u32);
-    out.extend_from_slice(state);
-    push_u32(&mut out, reply.len() as u32);
-    out.extend_from_slice(reply);
-    push_u16(&mut out, effects.len() as u16);
-    for eff in effects {
-        encode_effect(&mut out, eff);
-    }
     out
 }
 
@@ -779,41 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn v2_decode_synthesizes_state_write() {
-        // The v2 state field becomes the FINAL effect — a Write on
-        // STATE_KEY — so one apply semantic covers both versions.
-        let bytes = encode_v2(
-            b"legacy-state",
-            b"reply",
-            &[Effect::Transfer {
-                target: 9,
-                memo: b"m".to_vec(),
-            }],
-            false,
-            false,
-        );
-        let p = RefinePayload::decode(&bytes).unwrap();
-        assert_eq!(p.version, REFINE_PAYLOAD_V2);
-        assert_eq!(p.reply, b"reply");
-        assert_eq!(p.effects.len(), 2);
-        assert_eq!(
-            p.effects[1],
-            Effect::Write {
-                key: state_key(),
-                value: b"legacy-state".to_vec(),
-            }
-        );
-    }
-
-    #[test]
-    fn v2_decode_empty_state_synthesizes_nothing() {
-        // v2 guests emit empty state for "nothing changed"; that must
-        // not become an empty STATE_KEY write (which would wipe state
-        // under last-wins).
-        let bytes = encode_v2(b"", b"", &[], true, false);
-        let p = RefinePayload::decode(&bytes).unwrap();
-        assert!(p.effects.is_empty());
-        assert!(p.continue_next);
+    fn v2_payloads_require_reset_and_reinstall() {
+        let legacy = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(RefinePayload::decode(&legacy).is_none());
     }
 
     #[test]

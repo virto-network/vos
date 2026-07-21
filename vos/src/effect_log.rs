@@ -19,9 +19,8 @@
 
 use alloc::vec::Vec;
 
-/// `anchor_kind` sentinel for a log whose dispatch recorded no anchor:
-/// logs written before anchors existed, and v2 dispatches (no anchor on
-/// that wire). Replay divergence detection skips these. Distinct from
+/// `anchor_kind` sentinel for a recording session which has not yet been
+/// completed. Durable logs must be stamped before commit. Distinct from
 /// `ANCHOR_GENESIS` (0x00), which is a real, comparable anchor.
 pub const ANCHOR_UNRECORDED: u8 = 0xFF;
 
@@ -35,10 +34,8 @@ pub const ANCHOR_UNRECORDED: u8 = 0xFF;
 /// rebuilt state from the committed history.
 pub type CallerPrefix = [u8; 5];
 
-/// The trusted-System caller prefix — the replay identity for logs
-/// recorded before caller prefixes existed (those dispatches were
-/// replayed as System historically; keeping that default preserves
-/// their behavior).
+/// Default caller prefix for a recording session before the authenticated
+/// dispatch identity is stamped.
 pub const CALLER_SYSTEM: CallerPrefix = [1, 0, 0, 0, 0];
 
 /// Default size cap for a single `ctx.ask` reply, in bytes.
@@ -94,7 +91,7 @@ pub struct EffectLog {
     pub anchor: [u8; 32],
     /// The caller-prefix bytes this dispatch ran under; replay wraps
     /// the message with exactly these so gate decisions reproduce
-    /// (see [`CallerPrefix`]). [`CALLER_SYSTEM`] for legacy logs.
+    /// (see [`CallerPrefix`]).
     pub caller_prefix: CallerPrefix,
     /// Side effects invoked children absorbed into the journal, keyed
     /// to the reply they rode with. Empty for dispatches whose invokes
@@ -164,11 +161,6 @@ impl EffectLog {
     /// ( [reply_idx:u64 LE][svc_id:u32 LE][len:u64 LE][effects] )*
     /// ```
     ///
-    /// The invoke-effects section is a trailing extension: it is
-    /// omitted entirely when empty, and decoders treat its absence as
-    /// empty — logs recorded before the section existed keep their
-    /// CIDs and replay with their historical semantics.
-    ///
     /// The encoding is deterministic and unambiguous, so two
     /// replicas observing the same dispatch produce the same bytes
     /// (and thus the same CID) without coordination.
@@ -186,25 +178,19 @@ impl EffectLog {
         buf.push(self.anchor_kind);
         buf.extend_from_slice(&self.anchor);
         buf.extend_from_slice(&self.caller_prefix);
-        if !self.invoke_effects.is_empty() {
-            buf.extend_from_slice(&(self.invoke_effects.len() as u64).to_le_bytes());
-            for rec in &self.invoke_effects {
-                buf.extend_from_slice(&rec.reply_idx.to_le_bytes());
-                buf.extend_from_slice(&rec.svc_id.to_le_bytes());
-                buf.extend_from_slice(&(rec.effects.len() as u64).to_le_bytes());
-                buf.extend_from_slice(&rec.effects);
-            }
+        buf.extend_from_slice(&(self.invoke_effects.len() as u64).to_le_bytes());
+        for rec in &self.invoke_effects {
+            buf.extend_from_slice(&rec.reply_idx.to_le_bytes());
+            buf.extend_from_slice(&rec.svc_id.to_le_bytes());
+            buf.extend_from_slice(&(rec.effects.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&rec.effects);
         }
         buf
     }
 
     /// Deserialize from bytes produced by [`to_bytes`]. Returns
-    /// `None` if the buffer is malformed, truncated, or has
-    /// trailing garbage. Bytes ending right after the replies are the
-    /// pre-anchor encoding — accepted, decoding as
-    /// [`ANCHOR_UNRECORDED`] + [`CALLER_SYSTEM`] so stored DAGs keep
-    /// replaying with their historical semantics (no anchor to compare,
-    /// trusted-System replay identity).
+    /// `None` if the buffer is malformed, truncated, has trailing garbage,
+    /// or uses a retired pre-anchor/pre-invoke-effects encoding.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut pos = 0;
         let msg_len = read_u64(bytes, &mut pos)? as usize;
@@ -217,41 +203,29 @@ impl EffectLog {
             replies.push(take(bytes, &mut pos, len)?.to_vec());
         }
 
-        let (anchor_kind, anchor, caller_prefix, invoke_effects) = if pos == bytes.len() {
-            (ANCHOR_UNRECORDED, [0u8; 32], CALLER_SYSTEM, Vec::new())
-        } else {
-            let kind = *bytes.get(pos)?;
-            pos += 1;
-            let mut anchor = [0u8; 32];
-            anchor.copy_from_slice(take(bytes, &mut pos, 32)?);
-            let mut prefix = [0u8; 5];
-            prefix.copy_from_slice(take(bytes, &mut pos, 5)?);
-            // Trailing invoke-effects section; absent = empty (logs
-            // recorded before the section existed keep their CIDs).
-            let effects = if pos == bytes.len() {
-                Vec::new()
-            } else {
-                let n = read_u64(bytes, &mut pos)? as usize;
-                let mut records = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let reply_idx = read_u64(bytes, &mut pos)?;
-                    let svc_bytes = take(bytes, &mut pos, 4)?;
-                    let svc_id = u32::from_le_bytes(svc_bytes.try_into().ok()?);
-                    let len = read_u64(bytes, &mut pos)? as usize;
-                    let effects = take(bytes, &mut pos, len)?.to_vec();
-                    records.push(InvokeEffects {
-                        reply_idx,
-                        svc_id,
-                        effects,
-                    });
-                }
-                if pos != bytes.len() {
-                    return None;
-                }
-                records
-            };
-            (kind, anchor, prefix, effects)
-        };
+        let anchor_kind = *bytes.get(pos)?;
+        pos += 1;
+        let mut anchor = [0u8; 32];
+        anchor.copy_from_slice(take(bytes, &mut pos, 32)?);
+        let mut caller_prefix = [0u8; 5];
+        caller_prefix.copy_from_slice(take(bytes, &mut pos, 5)?);
+        let n = read_u64(bytes, &mut pos)? as usize;
+        let mut invoke_effects = Vec::with_capacity(n);
+        for _ in 0..n {
+            let reply_idx = read_u64(bytes, &mut pos)?;
+            let svc_bytes = take(bytes, &mut pos, 4)?;
+            let svc_id = u32::from_le_bytes(svc_bytes.try_into().ok()?);
+            let len = read_u64(bytes, &mut pos)? as usize;
+            let effects = take(bytes, &mut pos, len)?.to_vec();
+            invoke_effects.push(InvokeEffects {
+                reply_idx,
+                svc_id,
+                effects,
+            });
+        }
+        if pos != bytes.len() {
+            return None;
+        }
         Some(Self {
             msg,
             replies,
@@ -672,20 +646,17 @@ mod tests {
     }
 
     #[test]
-    fn invoke_effects_section_is_a_trailing_extension() {
-        // A log without invoke effects encodes WITHOUT the section —
-        // byte-identical to the pre-section encoding, so existing DAG
-        // CIDs stand. A truncated section rejects.
+    fn invoke_effects_count_is_always_present() {
         let mut log = EffectLog::for_msg(b"m".to_vec());
         log.record_reply(b"r".to_vec());
         let plain = log.to_bytes();
+        assert_eq!(&plain[plain.len() - 8..], &0u64.to_le_bytes());
         log.invoke_effects.push(InvokeEffects {
             reply_idx: 0,
             svc_id: 3,
             effects: b"fx".to_vec(),
         });
         let extended = log.to_bytes();
-        assert_eq!(&extended[..plain.len()], &plain[..], "prefix-stable");
         assert!(extended.len() > plain.len());
         assert!(EffectLog::from_bytes(&extended[..extended.len() - 1]).is_none());
     }
@@ -695,14 +666,7 @@ mod tests {
         let mut log = EffectLog::for_msg(b"xx".to_vec());
         log.record_reply(b"yy".to_vec());
         let bytes = log.to_bytes();
-        // Cutting at exactly the pre-anchor boundary is the accepted
-        // legacy encoding (see pre_anchor_encoding_decodes_as_unrecorded);
-        // every other truncation must fail.
-        let legacy_boundary = bytes.len() - 38;
         for cut in 0..bytes.len() {
-            if cut == legacy_boundary {
-                continue;
-            }
             assert!(
                 EffectLog::from_bytes(&bytes[..cut]).is_none(),
                 "truncated at {cut} should fail",
@@ -738,22 +702,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_anchor_encoding_decodes_as_unrecorded() {
-        // Bytes from before the anchor suffix existed (msg + replies
-        // only) must keep decoding so stored DAGs replay; they surface
-        // as ANCHOR_UNRECORDED, which divergence detection skips.
+    fn pre_anchor_encoding_requires_reset_and_reinstall() {
         let mut log = EffectLog::for_msg(b"legacy".to_vec());
         log.record_reply(b"r".to_vec());
         let with_suffix = log.to_bytes();
-        let legacy = &with_suffix[..with_suffix.len() - 38];
-        let decoded = EffectLog::from_bytes(legacy).expect("legacy decodes");
-        assert_eq!(decoded.msg, b"legacy");
-        assert_eq!(decoded.replies, alloc::vec![b"r".to_vec()]);
-        assert_eq!(decoded.anchor_kind, ANCHOR_UNRECORDED);
-        assert_eq!(decoded.caller_prefix, CALLER_SYSTEM);
-
-        // But a partial suffix is still malformed.
-        assert!(EffectLog::from_bytes(&with_suffix[..with_suffix.len() - 1]).is_none());
+        let pre_anchor_len = 8 + log.msg.len() + 8 + 8 + log.replies[0].len();
+        assert!(EffectLog::from_bytes(&with_suffix[..pre_anchor_len]).is_none());
+        assert!(EffectLog::from_bytes(&with_suffix[..with_suffix.len() - 8]).is_none());
     }
 
     #[test]
