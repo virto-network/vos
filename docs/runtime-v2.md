@@ -89,8 +89,13 @@ statement from committed service state, the exact work and transition, the
 installed method policy, and the installed actor's producer identity; the host
 does not reconstruct or relabel those public inputs.
 The proof producer receives that preparation together with the canonical
-service PVM and Refine imports, and the final Apply carries the proof bytes as
-a content-addressed verifier/CAS input. Proof bytes do not enter the
+service PVM and Refine imports. Before invoking it, the service replays the
+exact work through the canonical interpreter observer, including nested
+`CALL`/`REPLY` execution, protocol requests and injected results, checkpoints,
+the transition, artifacts, and gas. The replayed transition and artifacts
+must equal the proposed envelope, and the producer must return the resulting
+nonzero trace commitment. The final Apply carries the proof bytes as a
+content-addressed verifier/CAS input. Proof bytes do not enter the
 recoverable service image or its retained Raft snapshots. A durable host
 writes them to a separate content-addressed proof store before proved
 Accumulate can publish their commitment, so reply routing can refetch the
@@ -245,12 +250,14 @@ complete role threshold and injects the authenticated roles into `Context`.
 Private credentials cannot use the disclosed-credential
 `ROLE_CREDENTIAL_VERIFY` hostcall because guest Accumulate intentionally
 cannot read their witness bytes. Their issuer/authenticator check is therefore
-part of Refine and is not consensus-authoritative until the canonical Refine
-trace and private-policy predicate are bound into the accepted proof.
+part of Refine. The exact canonical Refine replay and private-policy execution
+are now bound to the proof producer's trace commitment, but the check is not
+consensus-authoritative until the production proof backend proves and verifies
+that complete witness.
 The local credential-verification allowlist is only a conformance stand-in.
 Production admission therefore remains gated on a consensus-authoritative
-issuer/verifier authenticating the exact scoped credential bytes, and on the
-canonical Refine trace being bound into the proof for private credentials.
+issuer/verifier authenticating the exact scoped credential bytes and on a
+proof backend that consumes the bound canonical Refine witness.
 
 The current legacy `vosx space publish` path does not activate this v2 Install
 entry. Production v2 installation must resolve a signature-verified `.vos`
@@ -315,8 +322,9 @@ consensus-authoritative receipt finality rather than its local conformance
 allowlist, and every delivery, deadline, and expiration observation must come
 from the JAM slot. `PROOF_VERIFY`
 must use the workspace-pinned verifier and execution-semantics identity rather
-than the local proof allowlist, and the canonical Refine trace must be bound
-into the generated proof before attested execution becomes a production path.
+than the local proof allowlist. Its proof backend must consume or reproduce
+the canonical Refine trace committed by the proof request before attested
+execution becomes a production path.
 Replicated service identity must also bind the gas schedule before `OutOfGas`
 is treated as a deterministic cross-replica result.
 Production routing must recover and retry guest publication, delivery and

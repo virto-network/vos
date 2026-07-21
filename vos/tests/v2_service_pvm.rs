@@ -34,26 +34,9 @@ use vos::v2::{
     public_policy_hash, space_role_policy_hash,
 };
 use vos::{
-    AttestedMethod, Decode, Encode,
+    Decode, Encode,
     value::{Msg, Value},
 };
-
-enum StartMethod {}
-
-impl AttestedMethod<Vec<u8>> for StartMethod {
-    const METHOD: &'static str = "start";
-
-    fn claim_wire(claim: &Vec<u8>) -> Vec<u8> {
-        Value::Bytes(claim.clone()).encode()
-    }
-
-    fn decode_claim_wire(wire: &[u8]) -> Option<Vec<u8>> {
-        match <Value as Decode>::try_decode(wire)? {
-            Value::Bytes(value) => Some(value),
-            _ => None,
-        }
-    }
-}
 
 fn role_policies(mut methods: Vec<MethodPolicyV2>) -> Vec<u8> {
     methods.sort_by(|left, right| left.method.cmp(&right.method));
@@ -70,7 +53,6 @@ struct FailableCommittedImages {
 
 #[derive(Debug)]
 struct CanonicalTestProofProducer {
-    trace: Hash,
     proof: Vec<u8>,
     calls: usize,
 }
@@ -95,8 +77,28 @@ impl AttestationProofProducerV2 for CanonicalTestProofProducer {
         );
         self.calls += 1;
         Ok(ProducedAttestationProofV2 {
-            trace: self.trace,
+            trace: request.refine_trace,
             proof: self.proof.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MismatchedTraceProofProducer;
+
+impl AttestationProofProducerV2 for MismatchedTraceProofProducer {
+    type Error = ();
+
+    fn prove(
+        &mut self,
+        request: &AttestationProofRequestV2<'_>,
+    ) -> Result<ProducedAttestationProofV2, Self::Error> {
+        request.validate().map_err(|_| ())?;
+        let mut trace = request.refine_trace;
+        trace.0[0] ^= 1;
+        Ok(ProducedAttestationProofV2 {
+            trace,
+            proof: b"proof for the wrong trace".to_vec(),
         })
     }
 }
@@ -5668,7 +5670,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
 }
 
 #[test]
-fn attested_driver_proves_before_guest_accumulate_commits() {
+fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service_program = ProgramId::of_pvm(&service_pvm);
@@ -5807,74 +5809,20 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     };
     let before = service.accumulate_host().snapshot();
     let mut invalid = CanonicalTestProofProducer {
-        trace: Hash::ZERO,
         proof: vec![],
         calls: 0,
     };
     assert!(matches!(
         service.accumulate_attested(envelope.clone(), &prepared.imports, &mut invalid),
-        Err(vos::v2::AttestedServiceErrorV2::InvalidProducedProof)
+        Err(vos::v2::AttestedServiceErrorV2::InvalidPreparation)
     ));
-    assert_eq!(invalid.calls, 1);
+    assert_eq!(invalid.calls, 0);
     assert!(
         service
             .accumulate_host()
             .snapshot()
             .same_service_state(&before),
-        "proof production failure cannot commit the prepared transition"
-    );
-
-    let proof_bytes = vec![0xA6; vos::v2::MAX_ATTESTATION_PROOF_BYTES];
-    let mut producer = CanonicalTestProofProducer {
-        trace: Hash([0xA5; 32]),
-        proof: proof_bytes.clone(),
-        calls: 0,
-    };
-    let committed = service
-        .accumulate_attested(envelope.clone(), &prepared.imports, &mut producer)
-        .expect("proof is available before guest Accumulate commits");
-    assert_eq!(producer.calls, 1);
-    let invocation_result = committed
-        .clone()
-        .into_invocation_result()
-        .expect("committed proof output becomes the generated-handle transport");
-    assert_eq!(
-        invocation_result.value,
-        Value::Bytes(b"attested claim".to_vec())
-    );
-    let application_package = committed
-        .clone()
-        .into_attestation::<Vec<u8>, StartMethod>(b"attested claim".to_vec())
-        .expect("a committed reply becomes the portable typed package");
-    assert_eq!(application_package.unverified_preview(), b"attested claim");
-    assert_eq!(application_package.producer(), ProducerId([53; 32]));
-    assert_eq!(committed.preparation.statement.producer_name, "root");
-    assert_eq!(
-        application_package.statement(),
-        &committed.preparation.statement
-    );
-    assert_eq!(committed.proof_bytes, proof_bytes);
-    assert_eq!(committed.preparation.receipt.sequence, 1);
-    assert_eq!(committed.published.proof, Some(committed.proof.clone()));
-    assert_eq!(service.accumulate_host().commit_sequence(), 2);
-    assert_eq!(
-        service.accumulate_host().blob_count(),
-        installed_blob_count,
-        "a megabyte proof remains outside the recoverable service image"
-    );
-
-    let retried = service
-        .accumulate_attested(envelope, &prepared.imports, &mut producer)
-        .expect("an exact retry recovers the committed proof publication");
-    assert_eq!(producer.calls, 1, "the cached proof is not regenerated");
-    assert_eq!(retried.proof, committed.proof);
-    assert_eq!(retried.proof_bytes, committed.proof_bytes);
-    assert_eq!(retried.published, committed.published);
-    assert_eq!(retried.accumulate_gas_used, 0);
-    assert_eq!(
-        service.accumulate_host().commit_sequence(),
-        2,
-        "the duplicate preparation neither reapplies nor commits"
+        "a transition not produced by exact Refine cannot reach the prover or commit"
     );
     assert_eq!(service.accumulate_host().blob_count(), installed_blob_count);
 }
@@ -6140,8 +6088,25 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         .pop()
         .unwrap();
     LocalTransportV2::deliver(&source, &mut destination, &source_publication, call, 2).unwrap();
+    let before_mismatched_trace = destination.accumulate_host().snapshot();
+    assert!(matches!(
+        LocalTransportV2::drain_pending_attested(
+            &mut destination,
+            3,
+            &mut MismatchedTraceProofProducer,
+        ),
+        Err(vos::v2::AttestedTransportErrorV2::Attested(
+            vos::v2::AttestedServiceErrorV2::InvalidProducedProof
+        ))
+    ));
+    assert!(
+        destination
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_mismatched_trace),
+        "a proof for a different Refine trace cannot commit"
+    );
     let mut proof_producer = CanonicalTestProofProducer {
-        trace: Hash([210; 32]),
         proof: b"peer-proof".to_vec(),
         calls: 0,
     };
@@ -7095,9 +7060,9 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service_program = ProgramId::of_pvm(&service_pvm);
-    let actor_pvm = actor_pvm(0);
+    let actor_pvm = grey_transpiler::link_elf(&greeter_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
-    let initial_bytes = b"raft attested initial state".to_vec();
+    let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let mut seed = work(actor_program, initial.clone());
     seed.service.service_program = service_program;
@@ -7198,35 +7163,19 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         },
     )
     .unwrap();
-    let transition = TransitionV2 {
-        service: prepared.work.service.clone(),
-        consumed_input: prepared.work.input_id(),
-        target_program: prepared.work.target_program,
-        base: prepared.work.base.clone(),
-        writes: vec![],
-        crdt_change: None,
-        continuations: vec![],
-        inbox: vec![],
-        outbox: vec![],
-        reply: Some(ReplyRecordV2 {
-            call_id: prepared.work.invocation.root_reply_id(),
-            producer: prepared.work.target,
-            result: b"raft attested reply".to_vec(),
-        }),
-        exported_blobs: vec![],
-        gas: GasAccountingV2::default(),
-        proof: None,
-    };
+    let refined = leader
+        .service()
+        .refine_actor_tree(&prepared.work, &prepared.imports)
+        .expect("the leader obtains the exact Refine transition before proving it");
     let input = prepared.work.input_id();
     let mut producer = CanonicalTestProofProducer {
-        trace: Hash([136; 32]),
         proof: b"raft canonical proof".to_vec(),
         calls: 0,
     };
     let envelope = AccumulationEnvelopeV2 {
         work: prepared.work,
-        transition,
-        provided_blobs: vec![],
+        transition: refined.transition,
+        provided_blobs: refined.exported_blobs,
     };
     let committed = leader
         .accumulate_attested(envelope.clone(), &prepared.imports, &mut producer)
