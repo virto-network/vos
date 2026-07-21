@@ -579,6 +579,8 @@ pub struct AccumulatedReplyV2 {
 pub struct CallTimeoutV2 {
     pub call_id: CallId,
     pub caller_invocation: InvocationId,
+    /// Actor workflow slice whose durable checkpoint is waiting on this call.
+    pub checkpoint_step: u64,
     pub await_ordinal: u64,
     pub deadline_timeslot: u64,
     pub expired_at: u64,
@@ -621,6 +623,7 @@ impl AccumulatedTimeoutV2 {
     pub fn validate(&self) -> Result<(), DecodeError> {
         if self.receipt.service != self.expiration.service
             || self.receipt.accepted_transition != self.expiration.commitment()
+            || self.receipt.checkpoint != self.expiration.timeout.checkpoint_step
             || self.receipt.reply_commitment.is_some()
             || self.receipt.outbox_commitment.is_some()
         {
@@ -1603,6 +1606,8 @@ impl V2Wire for WorkEnvelopeV2 {
         if awaited_timeout.as_ref().is_some_and(|timeout| {
             timeout.expiration.service != service
                 || timeout.expiration.timeout.caller_invocation != invocation
+                || timeout.expiration.timeout.checkpoint_step.checked_add(1)
+                    != Some(workflow_step)
                 || logical_timeslot < timeout.expiration.timeout.expired_at
         }) {
             return Err(DecodeError::NonCanonical);
@@ -2315,6 +2320,7 @@ impl V2Wire for CallTimeoutV2 {
         let mut e = Encoder(out);
         e.fixed(&self.call_id.0);
         e.fixed(&self.caller_invocation.0);
+        e.u64(self.checkpoint_step);
         e.u64(self.await_ordinal);
         e.u64(self.deadline_timeslot);
         e.u64(self.expired_at);
@@ -2324,12 +2330,13 @@ impl V2Wire for CallTimeoutV2 {
         let value = Self {
             call_id: CallId(d.fixed()?),
             caller_invocation: InvocationId(d.fixed()?),
+            checkpoint_step: d.u64()?,
             await_ordinal: d.u64()?,
             deadline_timeslot: d.u64()?,
             expired_at: d.u64()?,
         };
         if value.call_id != value.caller_invocation.call_id(value.await_ordinal)
-            || value.expired_at < value.deadline_timeslot
+            || value.expired_at != value.deadline_timeslot
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -4826,6 +4833,7 @@ mod tests {
         let timeout = CallTimeoutV2 {
             call_id: caller_invocation.call_id(0),
             caller_invocation,
+            checkpoint_step: 0,
             await_ordinal: 0,
             deadline_timeslot: 9,
             expired_at: 9,

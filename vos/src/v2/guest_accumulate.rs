@@ -13,20 +13,20 @@ use crate::attestation::AttestationPreparationV2;
 use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::contracts::crdt_change_blob_references;
 use super::{
-    ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId, ActorSpawnV2,
-    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2,
-    DeliveryRecordV2, DirectIngressV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash,
-    IngressRecordV2, MessageRecordV2, MethodPolicyV2, ProofVerificationRequestV2, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2,
-    ServiceInstallReceiptV2, ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError,
-    StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
-    WorkflowOperationV2, crdt_change_storage_key, crdt_node_receipt_storage_key,
-    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    attestation_archive_storage_key, ingress_storage_key, public_policy_hash,
-    publication_storage_key, receipt_storage_key,
-    space_role_for_policy,
+    ABI_VERSION, AccumulateRequestV2, AccumulatedTimeoutV2, AccumulationEnvelopeV2,
+    AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
+    ActorSpawnV2, AuthorizationEvidenceV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
+    CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, DirectIngressV2,
+    EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2, MessageRecordV2,
+    MethodPolicyV2, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
+    ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2,
+    attestation_archive_storage_key, call_expiration_storage_key, crdt_change_storage_key,
+    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key,
+    delivery_storage_key, header_storage_key, ingress_storage_key, public_policy_hash,
+    publication_storage_key, receipt_storage_key, space_role_for_policy,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -114,9 +114,7 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
             apply(store, &envelope, ApplyMode::PrepareAttested)
         }
         AccumulateRequestV2::Deliver(envelope) => deliver(store, &envelope),
-        AccumulateRequestV2::ExpireCall(_) => {
-            Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition))
-        }
+        AccumulateRequestV2::ExpireCall(envelope) => expire_call(store, &envelope),
         AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, &envelope),
         AccumulateRequestV2::AcknowledgePublication(acknowledgement) => {
             acknowledge_publication(store, &acknowledgement)
@@ -463,6 +461,200 @@ fn install<S: GuestAccumulateStoreV2>(
     }))
 }
 
+fn expire_call<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    envelope: &CallExpirationEnvelopeV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let Some(header_bytes) = read(store, header_storage_key())? else {
+        return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
+    };
+    let mut header = match StoreHeaderV2::open(&header_bytes) {
+        Ok(header) => header,
+        Err(StoreOpenError::WrongService) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongService));
+        }
+        Err(StoreOpenError::IncompatibleSemantics) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+        }
+        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
+    };
+    if envelope.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    if header.service.service_abi != ABI_VERSION {
+        return Ok(rejected(AccumulationRejectionV2::WrongAbi));
+    }
+    if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
+        return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+    }
+    if !envelope.base.mode_compatible(header.consistency)
+        || (header.consistency == ConsistencyModeV2::Crdt) != envelope.crdt_change.is_some()
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+
+    let expiration_key = call_expiration_storage_key(envelope.timeout.call_id);
+    if let Some(bytes) = read(store, &expiration_key)? {
+        let accumulated = AccumulatedTimeoutV2::decode(&bytes)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        return if accumulated.expiration == *envelope {
+            Ok(AccumulationResultV2::CallExpired {
+                timeout: accumulated,
+                duplicate: true,
+            })
+        } else {
+            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
+        };
+    }
+    if let Some(rejection) = validate_base(store, &header, &envelope.base)? {
+        return Ok(rejected(rejection));
+    }
+    if header.consistency != ConsistencyModeV2::Crdt && header.revision == u64::MAX {
+        return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
+    }
+    if let Some(change) = envelope.crdt_change.as_ref() {
+        let ConsistencyBaseV2::Crdt { heads } = &envelope.base else {
+            unreachable!("expiration wire validation binds CRDT change to a CRDT base")
+        };
+        let frontier = match load_causal_frontier(heads, |cid| {
+            store.read(&crdt_node_storage_key(cid))
+        }) {
+            Ok(frontier) => frontier,
+            Err(CausalFrontierError::Storage(error)) => {
+                return Err(GuestAccumulateError::Storage(error));
+            }
+            Err(CausalFrontierError::Missing(cid)) => {
+                return Ok(rejected(AccumulationRejectionV2::MissingCausalDependency(
+                    cid,
+                )));
+            }
+            Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
+        };
+        if envelope.base_causal_height != Some(frontier.max_head_height)
+            || frontier.max_head_height.checked_add(1) != Some(change.causal_height)
+        {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+        if let Some(existing) = read(store, &crdt_change_storage_key(change.id))?
+            && existing.as_slice() != change.cid().0
+        {
+            return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+        }
+    }
+
+    let (message, workflow, continuation_ref) = {
+        let tree = ServiceStateTreeV2::new(store, header.service_root);
+        let Some(message) = tree_get_wire::<_, MessageRecordV2>(
+            &tree,
+            &StateKeyV2::Outbox(envelope.timeout.call_id),
+        )? else {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        };
+        let Some(workflow) = tree_get_wire::<_, WorkflowCheckpointV2>(
+            &tree,
+            &StateKeyV2::Workflow(envelope.timeout.caller_invocation),
+        )? else {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        };
+        let Some(continuation_ref) = tree_get_wire::<_, BlobRefV2>(
+            &tree,
+            &StateKeyV2::Continuation(workflow.resume_work.target),
+        )? else {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        };
+        (message, workflow, continuation_ref)
+    };
+    if message.caller_invocation != envelope.timeout.caller_invocation
+        || message.await_ordinal != envelope.timeout.await_ordinal
+        || message.deadline_timeslot != Some(envelope.timeout.deadline_timeslot)
+        || workflow.input.invocation != envelope.timeout.caller_invocation
+        || workflow.input.workflow_step != envelope.timeout.checkpoint_step
+        || workflow.reply.is_some()
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    let Some(continuation_bytes) = store
+        .load_blob(&continuation_ref)
+        .map_err(GuestAccumulateError::Storage)?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::MissingBlob(
+            continuation_ref.hash,
+        )));
+    };
+    if !continuation_ref.matches(&continuation_bytes) {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    let continuation = ContinuationSnapshotV2::decode(&continuation_bytes)
+        .map_err(|_| GuestAccumulateError::CorruptStore)?;
+    if continuation.validate_checkpoint_for(&workflow.resume_work).is_err()
+        || continuation.pending_call != Some(envelope.timeout.call_id)
+        || continuation.await_ordinal != envelope.timeout.await_ordinal
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+
+    header.service_root = {
+        let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+        for actor in &continuation.suspended_actors {
+            if tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(*actor))?
+                != Some(continuation_ref.clone())
+            {
+                return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+        }
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::Outbox(envelope.timeout.call_id),
+            None,
+        )?;
+        tree.root()
+    };
+
+    let (resulting_state_root, resulting_crdt_heads, sequence) =
+        if let Some(change) = envelope.crdt_change.as_ref() {
+            let cid = change.cid();
+            write_crdt_change(store, change, cid)?;
+            let mut heads = BTreeSet::from_iter(header.crdt_heads.iter().copied());
+            for dependency in &change.causal_dependencies {
+                heads.remove(dependency);
+            }
+            heads.insert(cid);
+            header.crdt_heads = heads.into_iter().collect();
+            (None, header.crdt_heads.clone(), change.causal_height)
+        } else {
+            header.revision += 1;
+            header.state_root = Some(header.service_root);
+            (Some(header.service_root), Vec::new(), header.revision)
+        };
+    let receipt = AccumulationReceiptV2 {
+        service: header.service.clone(),
+        accepted_transition: envelope.commitment(),
+        reply_commitment: None,
+        outbox_commitment: None,
+        resulting_state_root,
+        resulting_crdt_heads,
+        sequence,
+        checkpoint: envelope.timeout.checkpoint_step,
+        consistency: header.consistency,
+    };
+    if let Some(change) = envelope.crdt_change.as_ref() {
+        write_crdt_node_receipt(store, change.cid(), &receipt)?;
+        rematerialize_crdt_service(store, &mut header)?;
+    }
+    let accumulated = AccumulatedTimeoutV2 {
+        expiration: envelope.clone(),
+        receipt,
+    };
+    write(store, header_storage_key(), Some(&header.encode()))?;
+    write(store, &expiration_key, Some(&accumulated.encode()))?;
+    Ok(AccumulationResultV2::CallExpired {
+        timeout: accumulated,
+        duplicate: false,
+    })
+}
+
 fn deliver<S: GuestAccumulateStoreV2>(
     store: &mut S,
     envelope: &DeliveryEnvelopeV2,
@@ -670,6 +862,7 @@ struct WorkflowMaterializationV2 {
     continuations: BTreeMap<ActorId, Vec<CausalValueV2<Option<BlobRefV2>>>>,
     inbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
     outbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
+    expirations: BTreeMap<super::CallId, Vec<CausalValueV2<CallTimeoutV2>>>,
     replies: BTreeMap<super::CallId, Vec<CausalValueV2<super::ReplyRecordV2>>>,
     spawns: BTreeMap<ActorId, Vec<CausalValueV2<ActorSpawnV2>>>,
     actor_states: BTreeMap<ActorId, Vec<CausalValueV2<BlobRefV2>>>,
@@ -876,6 +1069,7 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
     }
 
     apply_ingress_materialization(store, &materialized)?;
+    apply_expiration_materialization(store, &header.service, &materialized)?;
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
     apply_workflow_materialization(&mut tree, materialized)?;
     header.service_root = tree.root();
@@ -985,6 +1179,15 @@ fn materialize_workflow_crdt(
                 && matches!(change.workflow.as_slice(), [WorkflowOperationV2::Inbox(message)]
                     if change.id == CrdtChangeV2::derive_delivery_id(service, message.call_id, &change.causal_dependencies)) =>
                 {}
+            [] if change.operations.is_empty()
+                && change.materializations.is_empty()
+                && matches!(change.workflow.as_slice(), [WorkflowOperationV2::ExpireCall(timeout)]
+                    if change.id == CrdtChangeV2::derive_expiration_id(
+                        service,
+                        timeout,
+                        &change.causal_dependencies,
+                    )) =>
+                {}
             _ => return Err(AccumulationRejectionV2::InvalidWorkflowTransition),
         }
 
@@ -1041,8 +1244,44 @@ fn materialize_workflow_crdt(
                     cid,
                     None,
                 ),
-                WorkflowOperationV2::ExpireCall(_) => {
-                    return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                WorkflowOperationV2::ExpireCall(timeout) => {
+                    let mut workflows = result
+                        .workflows
+                        .get(&timeout.caller_invocation)
+                        .into_iter()
+                        .flatten()
+                        .filter(|event| frontier.contains_ancestor(cid, event.cid));
+                    let Some(workflow) = workflows.next() else {
+                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    };
+                    if workflows.any(|candidate| candidate.value != workflow.value)
+                        || workflow.value.input.workflow_step != timeout.checkpoint_step
+                        || workflow.value.reply.is_some()
+                    {
+                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    }
+                    let values = result.outbox.entry(timeout.call_id).or_default();
+                    let mut observed = values
+                        .iter()
+                        .filter(|event| frontier.contains_ancestor(cid, event.cid))
+                        .filter_map(|event| event.value.as_ref());
+                    let Some(message) = observed.next() else {
+                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    };
+                    if observed.any(|candidate| candidate != message)
+                        || message.caller_invocation != timeout.caller_invocation
+                        || message.await_ordinal != timeout.await_ordinal
+                        || message.deadline_timeslot != Some(timeout.deadline_timeslot)
+                    {
+                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    }
+                    insert_causal_value(frontier, values, cid, None);
+                    insert_causal_value(
+                        frontier,
+                        result.expirations.entry(timeout.call_id).or_default(),
+                        cid,
+                        timeout.clone(),
+                    );
                 }
                 WorkflowOperationV2::Reply(reply) => insert_causal_value(
                     frontier,
@@ -1069,6 +1308,7 @@ fn materialize_workflow_crdt(
     validate_strict_frontiers(result.workflows.values())?;
     validate_strict_frontiers(result.continuations.values())?;
     validate_strict_frontiers(result.replies.values())?;
+    validate_strict_frontiers(result.expirations.values())?;
     validate_strict_frontiers(result.spawns.values())?;
     for messages in result.inbox.values().chain(result.outbox.values()) {
         let mut visible = messages.iter().filter_map(|event| event.value.as_ref());
@@ -1307,6 +1547,53 @@ fn apply_ingress_materialization<S: GuestAccumulateStoreV2>(
             store,
             &ingress_storage_key(*invocation),
             Some(&record.encode()),
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_expiration_materialization<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    service: &super::ServiceIdentityV2,
+    materialized: &WorkflowMaterializationV2,
+) -> GuestResult<(), S::Error> {
+    for (call, values) in &materialized.expirations {
+        let event = values
+            .first()
+            .expect("expiration frontier is never empty");
+        let change_bytes = read(store, &crdt_node_storage_key(event.cid))?
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+        let change =
+            CrdtChangeV2::decode(&change_bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if change.cid() != event.cid
+            || change.workflow != [WorkflowOperationV2::ExpireCall(event.value.clone())]
+        {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        let receipt_bytes = read(store, &crdt_node_receipt_storage_key(event.cid))?
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+        let receipt = AccumulationReceiptV2::decode(&receipt_bytes)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        let expiration = CallExpirationEnvelopeV2 {
+            service: service.clone(),
+            timeout: event.value.clone(),
+            base: ConsistencyBaseV2::Crdt {
+                heads: change.causal_dependencies.clone(),
+            },
+            base_causal_height: change.causal_height.checked_sub(1),
+            crdt_change: Some(change),
+        };
+        let accumulated = AccumulatedTimeoutV2 {
+            expiration,
+            receipt,
+        };
+        accumulated
+            .validate()
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        write(
+            store,
+            &call_expiration_storage_key(*call),
+            Some(&accumulated.encode()),
         )?;
     }
     Ok(())
@@ -1645,7 +1932,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(rejection) = validate_continuation_change(tree.store_ref(), envelope)? {
         return Ok(rejected(rejection));
     }
-    if let Some(rejection) = validate_awaited_reply(&tree, work)? {
+    if let Some(rejection) = validate_awaited_outcome(&tree, work)? {
         return Ok(rejected(rejection));
     }
 
@@ -2266,6 +2553,7 @@ fn rematerialize_crdt_service<S: GuestAccumulateStoreV2>(
     let materialized = materialize_workflow_crdt(&frontier, &header.service)
         .map_err(|_| GuestAccumulateError::CorruptStore)?;
     apply_ingress_materialization(store, &materialized)?;
+    apply_expiration_materialization(store, &header.service, &materialized)?;
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
     if !materialized_actors_exist(&tree, &materialized)? {
         return Err(GuestAccumulateError::CorruptStore);
@@ -2616,7 +2904,7 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
     Ok(None)
 }
 
-fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
+fn validate_awaited_outcome<S: GuestAccumulateStoreV2>(
     tree: &ServiceStateTreeV2<'_, S>,
     work: &super::WorkEnvelopeV2,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
@@ -2626,9 +2914,7 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
         .find(|actor| actor.actor == work.target)
         .and_then(|actor| actor.continuation.as_ref());
     let Some(current) = current else {
-        return Ok(work
-            .awaited_reply
-            .is_some()
+        return Ok((work.awaited_reply.is_some() || work.awaited_timeout.is_some())
             .then_some(AccumulationRejectionV2::InvalidWorkflowTransition));
     };
     let Some(bytes) = tree
@@ -2647,13 +2933,45 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
     };
-    let (call, awaited) = match (snapshot.pending_call, work.awaited_reply.as_ref()) {
-        (None, None) => return Ok(None),
-        (Some(call), Some(awaited)) if awaited.reply.call_id == call => (call, awaited),
+    let call = match (
+        snapshot.pending_call,
+        work.awaited_reply.as_ref(),
+        work.awaited_timeout.as_ref(),
+    ) {
+        (None, None, None) => return Ok(None),
+        (Some(call), Some(awaited), None) if awaited.reply.call_id == call => call,
+        (Some(call), None, Some(awaited))
+            if awaited.expiration.timeout.call_id == call =>
+        {
+            let key = call_expiration_storage_key(call);
+            let Some(bytes) = tree
+                .store_ref()
+                .read(&key)
+                .map_err(GuestAccumulateError::Storage)?
+            else {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            };
+            let committed = AccumulatedTimeoutV2::decode(&bytes)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?;
+            if committed != *awaited
+                || awaited.validate().is_err()
+                || awaited.expiration.service != work.service
+                || awaited.expiration.timeout.caller_invocation != work.invocation
+                || awaited.expiration.timeout.await_ordinal != snapshot.await_ordinal
+                || tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?.is_some()
+            {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+            return Ok(None);
+        }
         _ => {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
     };
+    let awaited = work
+        .awaited_reply
+        .as_ref()
+        .expect("reply outcome was selected above");
     let Some(message) = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?
     else {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -4397,6 +4715,370 @@ mod tests {
         let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
         assert_eq!(tree.get(&StateKeyV2::Outbox(call)).unwrap(), None);
+    }
+
+    #[test]
+    fn logical_timeout_is_guest_committed_atomic_and_deduplicated() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let call = work.invocation.call_id(0);
+        let mut payload = vec![crate::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&crate::Encode::encode(&crate::value::Msg::new("set")));
+        let message = MessageRecordV2 {
+            call_id: call,
+            caller_invocation: work.invocation,
+            await_ordinal: 0,
+            from: work.target,
+            to: ActorId([44; 32]),
+            parent: None,
+            payload,
+            authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
+            deadline_timeslot: Some(10),
+        };
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: work.service.clone(),
+            invocation: work.invocation,
+            checkpoint_step: 0,
+            actor: work.target,
+            actor_program: work.target_program,
+            await_ordinal: 0,
+            pending_call: Some(call),
+            suspended_actors: vec![work.target],
+            kernel_snapshot: vec![1],
+        }
+        .encode();
+        let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+        let mut transition = linear_transition(&work, b"checkpoint");
+        transition.reply = None;
+        transition.continuations.push(ContinuationChangeV2 {
+            actor: work.target,
+            expected: None,
+            replacement: Some(continuation.clone()),
+        });
+        transition.outbox.push(message);
+        transition.exported_blobs.push(continuation.clone());
+        let AccumulationResultV2::Accepted { receipt, .. } = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: work.clone(),
+                transition,
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: continuation.clone(),
+                    bytes: continuation_bytes,
+                }],
+            }),
+        )
+        .unwrap()
+        else {
+            panic!("await checkpoint rejected")
+        };
+        let expiration = CallExpirationEnvelopeV2 {
+            service: work.service.clone(),
+            timeout: CallTimeoutV2 {
+                call_id: call,
+                caller_invocation: work.invocation,
+                checkpoint_step: 0,
+                await_ordinal: 0,
+                deadline_timeslot: 10,
+                expired_at: 10,
+            },
+            base: ConsistencyBaseV2::Linear {
+                revision: receipt.sequence,
+                state_root: receipt.resulting_state_root.unwrap(),
+            },
+            base_causal_height: None,
+            crdt_change: None,
+        };
+
+        let mut stale = expiration.clone();
+        stale.base = work.base.clone();
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::ExpireCall(stale)).unwrap(),
+            rejected(AccumulationRejectionV2::StaleLinearWork {
+                expected_revision: 0,
+                actual_revision: 1,
+            })
+        );
+        assert_eq!(store, before);
+
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::ExpireCall(expiration.clone()),
+        )
+        .unwrap();
+        let AccumulationResultV2::CallExpired {
+            timeout,
+            duplicate: false,
+        } = result
+        else {
+            panic!("logical timeout was not committed")
+        };
+        assert_eq!(timeout.expiration, expiration);
+        timeout.validate().unwrap();
+        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        assert_eq!(header.revision, 2);
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        assert_eq!(tree.get(&StateKeyV2::Outbox(call)).unwrap(), None);
+        assert_eq!(
+            tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(work.target)).unwrap(),
+            Some(continuation.clone())
+        );
+        drop(tree);
+        assert_eq!(
+            AccumulatedTimeoutV2::decode(
+                store
+                    .rows
+                    .get(&call_expiration_storage_key(call))
+                    .unwrap()
+            )
+            .unwrap(),
+            timeout
+        );
+        let accumulated = timeout.clone();
+
+        let committed = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::ExpireCall(expiration.clone())
+            )
+            .unwrap(),
+            AccumulationResultV2::CallExpired {
+                timeout: timeout.clone(),
+                duplicate: true,
+            }
+        );
+        assert_eq!(store, committed);
+        let mut divergent = expiration;
+        divergent.timeout.deadline_timeslot = 11;
+        divergent.timeout.expired_at = 11;
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::ExpireCall(divergent)
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::DivergentDuplicate)
+        );
+        assert_eq!(store, committed);
+
+        let mut resume = work.clone();
+        resume.workflow_step = 1;
+        resume.logical_timeslot = 10;
+        resume.base = ConsistencyBaseV2::Linear {
+            revision: accumulated.receipt.sequence,
+            state_root: accumulated.receipt.resulting_state_root.unwrap(),
+        };
+        resume.imported_actors[0].state = BlobRefV2::of_bytes(b"checkpoint");
+        resume.imported_actors[0].continuation = Some(continuation.clone());
+        resume.awaited_timeout = Some(accumulated);
+        let mut completed = linear_transition(&resume, b"after timeout");
+        completed.continuations.push(ContinuationChangeV2 {
+            actor: resume.target,
+            expected: Some(continuation.hash),
+            replacement: None,
+        });
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: resume,
+                    transition: completed,
+                    provided_blobs: vec![],
+                })
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        assert_eq!(
+            tree.get(&StateKeyV2::Continuation(work.target)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn crdt_timeout_sync_reconstructs_outbox_removal_and_durable_outcome() {
+        let mut source = MemStore::default();
+        let mut destination = MemStore::default();
+        let (initial, _) = install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
+        install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
+        let work = crdt_work(initial, 29, vec![]);
+        let call = work.invocation.call_id(0);
+        let mut payload = vec![crate::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&crate::Encode::encode(&crate::value::Msg::new("set")));
+        let message = MessageRecordV2 {
+            call_id: call,
+            caller_invocation: work.invocation,
+            await_ordinal: 0,
+            from: work.target,
+            to: ActorId([44; 32]),
+            parent: None,
+            payload,
+            authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
+            deadline_timeslot: Some(20),
+        };
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: work.service.clone(),
+            invocation: work.invocation,
+            checkpoint_step: 0,
+            actor: work.target,
+            actor_program: work.target_program,
+            await_ordinal: 0,
+            pending_call: Some(call),
+            suspended_actors: vec![work.target],
+            kernel_snapshot: vec![2],
+        }
+        .encode();
+        let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+        let state_bytes = b"crdt checkpoint".to_vec();
+        let state = BlobRefV2::of_bytes(&state_bytes);
+        let mut transition = crdt_transition(&work, state.clone(), 1);
+        transition.continuations.push(ContinuationChangeV2 {
+            actor: work.target,
+            expected: None,
+            replacement: Some(continuation.clone()),
+        });
+        transition.outbox.push(message);
+        transition.exported_blobs.push(continuation.clone());
+        transition.crdt_change.as_mut().unwrap().workflow = transition.workflow_operations(&work);
+        let checkpoint_change = transition.crdt_change.clone().unwrap();
+        let mut checkpoint_blobs = vec![
+            ImportedBlobV2 {
+                reference: continuation,
+                bytes: continuation_bytes,
+            },
+            ImportedBlobV2 {
+                reference: state,
+                bytes: state_bytes,
+            },
+        ];
+        checkpoint_blobs.sort_by_key(|blob| blob.reference.hash);
+        let AccumulationResultV2::Accepted {
+            receipt: checkpoint_receipt,
+            ..
+        } = execute_guest_accumulate(
+            &mut source,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: work.clone(),
+                transition,
+                provided_blobs: checkpoint_blobs.clone(),
+            }),
+        )
+        .unwrap()
+        else {
+            panic!("CRDT await checkpoint rejected")
+        };
+        let heads = checkpoint_receipt.resulting_crdt_heads.clone();
+        let timeout = CallTimeoutV2 {
+            call_id: call,
+            caller_invocation: work.invocation,
+            checkpoint_step: 0,
+            await_ordinal: 0,
+            deadline_timeslot: 20,
+            expired_at: 20,
+        };
+        let expiration_change = CrdtChangeV2 {
+            id: CrdtChangeV2::derive_expiration_id(&work.service, &timeout, &heads),
+            causal_dependencies: heads.clone(),
+            causal_height: 2,
+            operations: vec![],
+            workflow: vec![WorkflowOperationV2::ExpireCall(timeout.clone())],
+            materializations: vec![],
+        };
+        let expiration = CallExpirationEnvelopeV2 {
+            service: work.service.clone(),
+            timeout,
+            base: ConsistencyBaseV2::Crdt { heads },
+            base_causal_height: Some(1),
+            crdt_change: Some(expiration_change.clone()),
+        };
+        let AccumulationResultV2::CallExpired {
+            timeout: accumulated,
+            duplicate: false,
+        } = execute_guest_accumulate(
+            &mut source,
+            &AccumulateRequestV2::ExpireCall(expiration),
+        )
+        .unwrap()
+        else {
+            panic!("CRDT timeout rejected")
+        };
+        let expiration_receipt = accumulated.receipt.clone();
+        let expiration_cid = expiration_change.cid();
+        assert_eq!(
+            expiration_receipt.resulting_crdt_heads,
+            vec![expiration_cid]
+        );
+
+        destination.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: checkpoint_receipt.clone(),
+            }
+            .hash(),
+        );
+        destination.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: expiration_receipt.clone(),
+            }
+            .hash(),
+        );
+        let mut nodes = vec![
+            super::super::CrdtSyncNodeV2 {
+                change: checkpoint_change,
+                receipt: checkpoint_receipt,
+            },
+            super::super::CrdtSyncNodeV2 {
+                change: expiration_change,
+                receipt: expiration_receipt,
+            },
+        ];
+        nodes.sort_by_key(|node| node.change.cid());
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut destination,
+                &AccumulateRequestV2::SyncCrdt(CrdtSyncEnvelopeV2 {
+                    service: work.service,
+                    advertised_heads: vec![expiration_cid],
+                    nodes,
+                    provided_blobs: checkpoint_blobs,
+                })
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let header = StoreHeaderV2::open(destination.rows.get(header_storage_key()).unwrap())
+            .unwrap();
+        let tree = ServiceStateTreeV2::new(&mut destination, header.service_root);
+        assert_eq!(tree.get(&StateKeyV2::Outbox(call)).unwrap(), None);
+        drop(tree);
+        assert_eq!(
+            AccumulatedTimeoutV2::decode(
+                destination
+                    .rows
+                    .get(&call_expiration_storage_key(call))
+                    .unwrap()
+            )
+            .unwrap(),
+            accumulated
+        );
     }
 
     fn message(
