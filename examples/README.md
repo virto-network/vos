@@ -25,6 +25,15 @@ cargo +nightly actor -p v2-age-gate
 cargo +nightly actor -p v2-shared-board
 ```
 
+Once the generic service ELF has been converted with `vosx service-pvm`, the
+repository recipe packages every scenario from its project directory. This
+also exercises Cargo target discovery for libraries whose explicit `[lib]`
+name differs from the package name:
+
+```sh
+just package-examples dist/vos-service.pvm dist/examples
+```
+
 From the repository root, package the verifier with its cross-root producer
 declared explicitly:
 

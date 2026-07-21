@@ -154,7 +154,7 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     let manifest_path = input.join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("read actor manifest {}", manifest_path.display()))?;
-    let package_name = package_name_from_manifest(&manifest)?;
+    let (package_name, actor_target_name) = actor_names_from_manifest(&manifest)?;
     let build_root = actor_build_root(input)?;
     let mut command = Command::new("cargo");
     command.args(["+nightly", "actor"]);
@@ -173,7 +173,7 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     }
     let elf = build_root
         .join("target/riscv64em-javm/release")
-        .join(format!("{}.elf", package_name.replace('-', "_")));
+        .join(format!("{actor_target_name}.elf"));
     if !elf.is_file() {
         bail!(
             "actor build succeeded but did not produce {}; ensure the project uses the VOS cargo actor configuration",
@@ -199,17 +199,25 @@ fn actor_build_root(project: &Path) -> anyhow::Result<PathBuf> {
         })
 }
 
-fn package_name_from_manifest(manifest: &str) -> anyhow::Result<String> {
+fn actor_names_from_manifest(manifest: &str) -> anyhow::Result<(String, String)> {
     let manifest: toml::Value = manifest
         .parse()
         .map_err(|error| anyhow!("parse actor Cargo.toml: {error}"))?;
-    manifest
+    let package_name = manifest
         .get("package")
         .and_then(|package| package.get("name"))
         .and_then(toml::Value::as_str)
         .filter(|name| !name.is_empty())
         .map(String::from)
-        .ok_or_else(|| anyhow!("actor Cargo.toml needs a non-empty [package].name"))
+        .ok_or_else(|| anyhow!("actor Cargo.toml needs a non-empty [package].name"))?;
+    let target_name = manifest
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| package_name.replace('-', "_"));
+    Ok((package_name, target_name))
 }
 
 fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
@@ -245,9 +253,23 @@ mod tests {
     }
 
     #[test]
-    fn project_output_uses_the_cargo_package_name() {
+    fn project_output_uses_the_cargo_target_name() {
         assert_eq!(
-            package_name_from_manifest(
+            actor_names_from_manifest(
+                r#"
+                    [package]
+                    name = "private-age"
+                    version = "0.1.0"
+
+                    [lib]
+                    name = "private_age_actor"
+                "#,
+            )
+            .unwrap(),
+            ("private-age".into(), "private_age_actor".into())
+        );
+        assert_eq!(
+            actor_names_from_manifest(
                 r#"
                     [package]
                     name = "private-age"
@@ -255,9 +277,9 @@ mod tests {
                 "#,
             )
             .unwrap(),
-            "private-age"
+            ("private-age".into(), "private_age".into())
         );
-        assert!(package_name_from_manifest("[workspace]").is_err());
+        assert!(actor_names_from_manifest("[workspace]").is_err());
     }
 
     #[test]
