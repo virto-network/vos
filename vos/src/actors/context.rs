@@ -604,6 +604,22 @@ impl<A: Actor> Context<A> {
                     self.self_schedule = false;
                     super::run::Ask::ready(resume.reply.result)
                 }
+                3 => {
+                    let response_len = usize::try_from(response_len)
+                        .expect("timeout resume payload length exceeds guest usize");
+                    assert!(
+                        response_len <= response.len(),
+                        "timeout resume payload exceeds buffer"
+                    );
+                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
+                        &response[..response_len],
+                    )
+                    .expect("invalid v2 accumulated timeout");
+                    self.__resume_checkpoint_v2(&checkpoint);
+                    self.checkpoint = Some(checkpoint);
+                    self.self_schedule = false;
+                    super::run::Ask::ready_err(super::value::InvokeError::Timeout)
+                }
                 _ => panic!("invalid v2 await resume kind"),
             }
         }
@@ -753,6 +769,24 @@ impl<A: Actor> Context<A> {
                         trace: attestation.proof.trace,
                         proof,
                     }))
+                }
+                3 => {
+                    let response_len = usize::try_from(response_len)
+                        .expect("timeout resume payload length exceeds guest usize");
+                    assert!(
+                        response_len <= response.len(),
+                        "timeout resume payload exceeds buffer"
+                    );
+                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
+                        &response[..response_len],
+                    )
+                    .expect("invalid v2 accumulated timeout");
+                    self.__resume_checkpoint_v2(&checkpoint);
+                    self.checkpoint = Some(checkpoint);
+                    self.self_schedule = false;
+                    super::client::AttestedAsk::ready(Err(ClientError::Call(
+                        super::client::CallError::Timeout,
+                    )))
                 }
                 _ => panic!("invalid v2 attested await resume kind"),
             }

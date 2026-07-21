@@ -294,42 +294,48 @@ impl ServicePvmV2 {
                 previously_suspended: continuation.suspended_actors.clone(),
                 suspended: Vec::new(),
             };
-            let (resume_kind, payload_len) =
-                match (continuation.pending_call, work.awaited_reply.as_ref()) {
-                    (None, None) => (1, write_checkpoint_token(&mut kernel, &checkpoint)?),
-                    (Some(call), Some(awaited)) if awaited.reply.call_id == call => {
-                        let attestation = awaited
-                            .attestation
-                            .as_ref()
-                            .map(|attestation| {
-                                let proof_bytes =
-                                    imported_blob_bytes(imports, &attestation.proof.proof_blob)?;
-                                let (proof_offset, proof_len) =
-                                    stage_attestation_proof(&mut kernel, proof_bytes)?;
-                                Ok(alloc::boxed::Box::new(super::AttestationResumeV2 {
-                                    producer_name: attestation.producer_name.clone(),
-                                    producer: attestation.producer,
-                                    statement: attestation.statement.clone(),
-                                    proof: attestation.proof.clone(),
-                                    proof_offset,
-                                    proof_len,
-                                }))
-                            })
-                            .transpose()?;
-                        (
-                            2,
-                            write_await_resume(
-                                &mut kernel,
-                                &AwaitResumeV2 {
-                                    checkpoint,
-                                    reply: awaited.reply.clone(),
-                                    attestation,
-                                },
-                            )?,
-                        )
-                    }
-                    _ => return Err(ServicePvmErrorV2::ContinuationMismatch),
-                };
+            let (resume_kind, payload_len) = match (
+                continuation.pending_call,
+                work.awaited_reply.as_ref(),
+                work.awaited_timeout.as_ref(),
+            ) {
+                (None, None, None) => (1, write_checkpoint_token(&mut kernel, &checkpoint)?),
+                (Some(call), Some(awaited), None) if awaited.reply.call_id == call => {
+                    let attestation = awaited
+                        .attestation
+                        .as_ref()
+                        .map(|attestation| {
+                            let proof_bytes =
+                                imported_blob_bytes(imports, &attestation.proof.proof_blob)?;
+                            let (proof_offset, proof_len) =
+                                stage_attestation_proof(&mut kernel, proof_bytes)?;
+                            Ok(alloc::boxed::Box::new(super::AttestationResumeV2 {
+                                producer_name: attestation.producer_name.clone(),
+                                producer: attestation.producer,
+                                statement: attestation.statement.clone(),
+                                proof: attestation.proof.clone(),
+                                proof_offset,
+                                proof_len,
+                            }))
+                        })
+                        .transpose()?;
+                    (
+                        2,
+                        write_await_resume(
+                            &mut kernel,
+                            &AwaitResumeV2 {
+                                checkpoint,
+                                reply: awaited.reply.clone(),
+                                attestation,
+                            },
+                        )?,
+                    )
+                }
+                (Some(call), None, Some(timeout)) if timeout.expiration.timeout.call_id == call => {
+                    (3, write_checkpoint_token(&mut kernel, &checkpoint)?)
+                }
+                _ => return Err(ServicePvmErrorV2::ContinuationMismatch),
+            };
             kernel
                 .resume_protocol_call(resume_kind, payload_len)
                 .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
@@ -470,6 +476,10 @@ impl ServicePvmV2 {
                                 ..
                             }
                             | AccumulationResultV2::PublicationAcknowledged {
+                                duplicate: false,
+                                ..
+                            }
+                            | AccumulationResultV2::CallExpired {
                                 duplicate: false,
                                 ..
                             }
@@ -1258,6 +1268,54 @@ mod tests {
         .encode()
     }
 
+    fn call_expired_result(duplicate: bool) -> Vec<u8> {
+        let service = crate::v2::ServiceIdentityV2 {
+            space: crate::v2::SpaceId([0; 32]),
+            root_service: crate::v2::RootServiceId([1; 32]),
+            deployment: crate::v2::DeploymentId([2; 32]),
+            service_program: ProgramId([3; 32]),
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+        };
+        let invocation = crate::v2::InvocationId([6; 32]);
+        let expiration = crate::v2::CallExpirationEnvelopeV2 {
+            service: service.clone(),
+            timeout: crate::v2::CallTimeoutV2 {
+                call_id: invocation.call_id(0),
+                caller_invocation: invocation,
+                checkpoint_step: 0,
+                await_ordinal: 0,
+                deadline_timeslot: 9,
+                expired_at: 9,
+            },
+            base: crate::v2::ConsistencyBaseV2::Linear {
+                revision: 0,
+                state_root: crate::v2::Hash([7; 32]),
+            },
+            base_causal_height: None,
+            crdt_change: None,
+        };
+        let receipt = crate::v2::AccumulationReceiptV2 {
+            service,
+            accepted_transition: expiration.commitment(),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: Some(crate::v2::Hash([8; 32])),
+            resulting_crdt_heads: Vec::new(),
+            sequence: 1,
+            checkpoint: 0,
+            consistency: crate::v2::ConsistencyModeV2::Local,
+        };
+        AccumulationResultV2::CallExpired {
+            timeout: crate::v2::AccumulatedTimeoutV2 {
+                expiration,
+                receipt,
+            },
+            duplicate,
+        }
+        .encode()
+    }
+
     #[test]
     fn physical_refine_entry_is_deterministic_and_uses_gp_arguments() {
         let program = two_entry_program(None);
@@ -1333,6 +1391,13 @@ mod tests {
             .unwrap();
         assert_eq!(output.bytes, expected);
         assert_eq!(host.committed_calls, 1);
+
+        let timeout = call_expired_result(false);
+        let output = service
+            .accumulate(&timeout, SERVICE_TEST_GAS, &mut host)
+            .unwrap();
+        assert_eq!(output.bytes, timeout);
+        assert_eq!(host.committed_calls, 2);
     }
 
     #[test]
@@ -1388,6 +1453,16 @@ mod tests {
                 .unwrap()
                 .bytes,
             rejected,
+        );
+        assert_eq!(host.committed_calls, 0);
+
+        let duplicate_timeout = call_expired_result(true);
+        assert_eq!(
+            service
+                .accumulate(&duplicate_timeout, SERVICE_TEST_GAS, &mut host)
+                .unwrap()
+                .bytes,
+            duplicate_timeout,
         );
         assert_eq!(host.committed_calls, 0);
     }

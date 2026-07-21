@@ -393,7 +393,10 @@ pub struct WorkEnvelopeV2 {
     /// cross-root outbox record at a consensus logical timeslot. Like a reply,
     /// this is injected at the captured protocol-call boundary rather than
     /// replaying the actor handler.
-    pub awaited_timeout: Option<AccumulatedTimeoutV2>,
+    /// Heap-backed so adding the complete receipt-bound timeout does not
+    /// enlarge every work envelope and workflow operation on the bounded
+    /// service-PVM stack. The canonical wire remains unchanged.
+    pub awaited_timeout: Option<Box<AccumulatedTimeoutV2>>,
     pub consistency: ConsistencyModeV2,
     pub base: ConsistencyBaseV2,
     /// Maximum causal height among `base` heads. Present only for CRDT work;
@@ -1560,7 +1563,8 @@ impl V2Wire for WorkEnvelopeV2 {
         let causal_parent = d.option(|d| d.fixed().map(InvocationId))?;
         let parent_call = d.option(|d| d.fixed().map(CallId))?;
         let awaited_reply = d.option(|d| AccumulatedReplyV2::decode(&d.bytes()?))?;
-        let awaited_timeout = d.option(|d| AccumulatedTimeoutV2::decode(&d.bytes()?))?;
+        let awaited_timeout =
+            d.option(|d| AccumulatedTimeoutV2::decode(&d.bytes()?).map(Box::new))?;
         if (awaited_reply.is_some() || awaited_timeout.is_some()) && workflow_step == 0
             || awaited_reply.is_some() && awaited_timeout.is_some()
         {

@@ -19,7 +19,7 @@ mod guest {
         BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2,
         GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, RefineOutputV2,
         ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
-        execute_guest_accumulate,
+        execute_canonical_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -466,7 +466,7 @@ mod guest {
         // SAFETY: JAM initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
         let result = match AccumulateRequestV2::decode(input) {
-            Ok(request) => execute_guest_accumulate(&mut JamAccumulateStore, &request)
+            Ok(request) => execute_canonical_guest_accumulate(&mut JamAccumulateStore, &request)
                 .unwrap_or_else(|_| fail_closed()),
             Err(_) => AccumulationResultV2::Rejected(AccumulationRejectionV2::NonCanonical),
         };

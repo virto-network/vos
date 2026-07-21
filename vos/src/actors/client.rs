@@ -29,6 +29,7 @@ use core::{
 pub enum CallError {
     Panicked,
     Cycle,
+    Timeout,
     OutOfGas,
     ReplyTooBig,
     Unknown(u8),
@@ -39,6 +40,7 @@ impl core::fmt::Display for CallError {
         match self {
             Self::Panicked => f.write_str("target actor panicked"),
             Self::Cycle => f.write_str("causal actor-call cycle"),
+            Self::Timeout => f.write_str("actor-call logical-timeslot deadline expired"),
             Self::OutOfGas => f.write_str("target actor ran out of gas"),
             Self::ReplyTooBig => f.write_str("actor reply exceeds the caller buffer"),
             Self::Unknown(status) => write!(f, "unknown actor-call status 0x{status:02x}"),
@@ -104,6 +106,7 @@ impl From<super::value::InvokeError> for ClientError {
             super::value::InvokeError::NotFound => Self::NotFound,
             super::value::InvokeError::Panicked => Self::Call(CallError::Panicked),
             super::value::InvokeError::Cycle => Self::Call(CallError::Cycle),
+            super::value::InvokeError::Timeout => Self::Call(CallError::Timeout),
             super::value::InvokeError::OutOfGas => Self::Call(CallError::OutOfGas),
             super::value::InvokeError::TooBig => Self::Call(CallError::ReplyTooBig),
             super::value::InvokeError::Unknown(status) => Self::Call(CallError::Unknown(status)),

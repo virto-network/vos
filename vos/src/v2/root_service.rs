@@ -16,8 +16,8 @@ use crate::attestation::AttestationProofProducerV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, AccumulatedReplyV2, ActorDirectoryV2,
-    ActorGenesisV2, ActorId, AttestationDeliveryV2, AttestedServiceErrorV2,
+    AccumulationRejectionV2, AccumulationResultV2, AccumulatedReplyV2, AccumulatedTimeoutV2,
+    ActorDirectoryV2, ActorGenesisV2, ActorId, AttestationDeliveryV2, AttestedServiceErrorV2,
     AuthorizationEvidenceV2, BlobRefV2, CommittedAttestationOutputV2,
     CommittedAttestationPackageV2, CommittedImageStoreV2, ConsistencyModeV2,
     ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2, DurableJamStoreV2,
@@ -283,6 +283,7 @@ fn direct_ingress_matches_checkpoint(
         && request.causal_parent.is_none()
         && request.parent_call.is_none()
         && request.awaited_reply.is_none()
+        && request.awaited_timeout.is_none()
         && work.target == request.target
         && work.method == request.method
         && work.arguments == request.arguments
@@ -303,6 +304,7 @@ fn direct_ingress_from_request(
         || request.causal_parent.is_some()
         || request.parent_call.is_some()
         || request.awaited_reply.is_some()
+        || request.awaited_timeout.is_some()
     {
         return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
     }
@@ -436,6 +438,15 @@ pub struct CommittedRootTreeSliceV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedDeliveryV2 {
     pub receipt: AccumulationReceiptV2,
+    pub duplicate: bool,
+    pub accumulate_gas_used: u64,
+}
+
+/// Guest-committed deterministic timeout for one suspended outbound call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedCallExpirationV2 {
+    pub invocation: super::InvocationId,
+    pub timeout: AccumulatedTimeoutV2,
     pub duplicate: bool,
     pub accumulate_gas_used: u64,
 }
@@ -1512,6 +1523,84 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.invoke_prepared(prepared)
     }
 
+    /// Commit every due outbound-call timeout through physical Accumulate.
+    /// The scan is reconstructed from guest bookkeeping, so a process restart
+    /// does not need a native timer table.
+    pub fn expire_due_calls(
+        &mut self,
+        logical_timeslot: u64,
+    ) -> Result<Vec<CommittedCallExpirationV2>, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        let invocations = self
+            .service
+            .accumulate_host()
+            .known_workflow_invocations()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        let mut expired = Vec::new();
+        for invocation in invocations {
+            let Some(envelope) = LocalWorkSchedulerV2::prepare_call_expiration(
+                self.service.accumulate_host(),
+                invocation,
+                logical_timeslot,
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?
+            else {
+                continue;
+            };
+            let accumulated = self
+                .service
+                .accumulate(&AccumulateRequestV2::ExpireCall(envelope))
+                .map_err(RootTreeDriverErrorV2::into_invoke)?;
+            match accumulated.result {
+                AccumulationResultV2::CallExpired { timeout, duplicate } => {
+                    expired.push(CommittedCallExpirationV2 {
+                        invocation,
+                        timeout,
+                        duplicate,
+                        accumulate_gas_used: accumulated.gas_used,
+                    });
+                }
+                AccumulationResultV2::Rejected(rejection) => {
+                    return Err(LocalRootTreeInvokeErrorV2::Rejected(rejection));
+                }
+                _ => return Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+            }
+        }
+        Ok(expired)
+    }
+
+    /// Resume every continuation whose timeout was already committed. This
+    /// deliberately runs as a separate pass so a crash between expiration and
+    /// actor execution is recovered without manufacturing a host error value.
+    pub fn resume_expired_calls(
+        &mut self,
+        logical_timeslot: u64,
+    ) -> Result<Vec<CommittedRootTreeSliceV2>, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        let invocations = self
+            .service
+            .accumulate_host()
+            .known_workflow_invocations()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        let mut resumed = Vec::new();
+        for invocation in invocations {
+            let Some(prepared) = LocalWorkSchedulerV2::prepare_timeout_resume(
+                self.service.accumulate_host(),
+                invocation,
+                logical_timeslot,
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?
+            else {
+                continue;
+            };
+            if prepared.work.proof_requested {
+                return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+            }
+            resumed.push(self.invoke_prepared(prepared)?);
+        }
+        Ok(resumed)
+    }
+
     /// Make one exact platform-finalized receipt available to the next guest
     /// Accumulate verification. This changes host verifier policy only; it is
     /// excluded from the committed service image.
@@ -1832,6 +1921,20 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.service
             .accumulate_host()
             .pending_publications()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    /// Whether guest state still permits transport to expose this outbox
+    /// effect. Expiration and reply admission remove the live row even though
+    /// the immutable publication receipt may remain for retry bookkeeping.
+    pub(crate) fn outbox_call_is_pending(
+        &self,
+        call: super::CallId,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .outbox_message(call)
+            .map(|message| message.is_some())
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
     }
 

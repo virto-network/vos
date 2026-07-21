@@ -13,12 +13,13 @@ use super::causal::{CausalFrontierError, CausalFrontierV2, load_causal_frontier}
 use super::contracts::crdt_change_blob_references;
 use super::{
     AccumulatedReplyV2, AccumulatedTimeoutV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
-    BlobRefV2, CallId, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
-    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, DirectIngressV2,
-    ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
-    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2,
-    ServiceIdentityV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
-    WorkflowOperationV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    BlobRefV2, CallExpirationEnvelopeV2, CallId, CallTimeoutV2, ConsistencyBaseV2,
+    ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
+    DecodeError, DeliveryEnvelopeV2, DirectIngressV2, ExternalActorDirectoryV2, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
+    MessageRecordV2, Origin, RefineImportsV2, ServiceIdentityV2, StateKeyV2, V2Wire,
+    WorkEnvelopeV2, WorkflowCheckpointV2, WorkflowOperationV2, crdt_node_receipt_storage_key,
+    crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -396,6 +397,118 @@ impl LocalWorkSchedulerV2 {
         )
     }
 
+    /// Construct the canonical guest Accumulate input for a due outbound call.
+    /// `logical_timeslot` is authenticated scheduler input; the recorded
+    /// outcome itself uses the deadline as its deterministic effective time so
+    /// replicas observing the same due call produce the same timeout value.
+    pub fn prepare_call_expiration(
+        store: &LocalJamStoreV2,
+        invocation: InvocationId,
+        logical_timeslot: u64,
+    ) -> Result<Option<CallExpirationEnvelopeV2>, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let Some(workflow) = decode_row::<WorkflowCheckpointV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::Workflow(invocation),
+        )?
+        else {
+            return Ok(None);
+        };
+        if workflow.reply.is_some() {
+            return Ok(None);
+        }
+        let continuation = decode_row::<BlobRefV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::Continuation(workflow.resume_work.target),
+        )?;
+        let Some(continuation) = continuation else {
+            return Ok(None);
+        };
+        let bytes = store
+            .blob(&continuation)
+            .ok_or(ScheduleErrorV2::MissingBlob(continuation.hash))?;
+        let snapshot = ContinuationSnapshotV2::decode(bytes)
+            .map_err(|_| ScheduleErrorV2::InvalidContinuation(workflow.resume_work.target))?;
+        snapshot
+            .validate_checkpoint_for(&workflow.resume_work)
+            .map_err(|_| ScheduleErrorV2::InvalidContinuation(workflow.resume_work.target))?;
+        let Some(call) = snapshot.pending_call else {
+            return Ok(None);
+        };
+        if store.call_expiration(call)?.is_some() {
+            return Ok(None);
+        }
+        let message =
+            decode_row::<MessageRecordV2>(store, header.service_root, &StateKeyV2::Outbox(call))?
+                .ok_or(ScheduleErrorV2::MissingAwaitedReply(call))?;
+        let Some(deadline_timeslot) = message.deadline_timeslot else {
+            return Ok(None);
+        };
+        if logical_timeslot < deadline_timeslot {
+            return Ok(None);
+        }
+        let timeout = CallTimeoutV2 {
+            call_id: call,
+            caller_invocation: invocation,
+            checkpoint_step: workflow.input.workflow_step,
+            await_ordinal: snapshot.await_ordinal,
+            deadline_timeslot,
+            expired_at: deadline_timeslot,
+        };
+        let (base, base_causal_height, crdt_change) =
+            if header.consistency == ConsistencyModeV2::Crdt {
+                let heads = header.crdt_heads.clone();
+                let frontier = match load_causal_frontier(&heads, |cid| {
+                    Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(Vec::from))
+                }) {
+                    Ok(frontier) => frontier,
+                    Err(CausalFrontierError::Missing(cid)) => {
+                        return Err(ScheduleErrorV2::MissingCausalDependency(cid));
+                    }
+                    Err(CausalFrontierError::Storage(never)) => match never {},
+                    Err(CausalFrontierError::Corrupt) => {
+                        return Err(ScheduleErrorV2::CorruptCausalDag);
+                    }
+                };
+                let height = frontier.max_head_height;
+                let change = CrdtChangeV2 {
+                    id: CrdtChangeV2::derive_expiration_id(&header.service, &timeout, &heads),
+                    causal_dependencies: heads.clone(),
+                    causal_height: height
+                        .checked_add(1)
+                        .ok_or(ScheduleErrorV2::CorruptCausalDag)?,
+                    operations: Vec::new(),
+                    workflow: alloc::vec![WorkflowOperationV2::ExpireCall(timeout.clone())],
+                    materializations: Vec::new(),
+                };
+                (
+                    ConsistencyBaseV2::Crdt { heads },
+                    Some(height),
+                    Some(change),
+                )
+            } else {
+                (
+                    ConsistencyBaseV2::Linear {
+                        revision: header.revision,
+                        state_root: header
+                            .state_root
+                            .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?,
+                    },
+                    None,
+                    None,
+                )
+            };
+        Ok(Some(CallExpirationEnvelopeV2 {
+            service: header.service,
+            timeout,
+            base,
+            base_causal_height,
+            crdt_change,
+        }))
+    }
+
     /// Reconstruct the next exact continuation slice from guest-committed
     /// workflow state. The host supplies only the consensus timeslot and, for
     /// an awaited call, the accumulated remote reply it received for
@@ -405,6 +518,62 @@ impl LocalWorkSchedulerV2 {
         invocation: InvocationId,
         logical_timeslot: u64,
         awaited_reply: Option<AccumulatedReplyV2>,
+    ) -> Result<PreparedWorkV2, ScheduleErrorV2> {
+        Self::prepare_resume_outcome(store, invocation, logical_timeslot, awaited_reply, None)
+    }
+
+    /// Reconstruct a timed-out continuation solely from guest-owned workflow
+    /// and expiration records. This is restart-safe and accepts no host-made
+    /// error payload.
+    pub fn prepare_timeout_resume(
+        store: &LocalJamStoreV2,
+        invocation: InvocationId,
+        logical_timeslot: u64,
+    ) -> Result<Option<PreparedWorkV2>, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let Some(workflow) = decode_row::<WorkflowCheckpointV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::Workflow(invocation),
+        )?
+        else {
+            return Ok(None);
+        };
+        if workflow.reply.is_some() {
+            return Ok(None);
+        }
+        let Some(continuation) = decode_row::<BlobRefV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::Continuation(workflow.resume_work.target),
+        )?
+        else {
+            return Ok(None);
+        };
+        let bytes = store
+            .blob(&continuation)
+            .ok_or(ScheduleErrorV2::MissingBlob(continuation.hash))?;
+        let snapshot = ContinuationSnapshotV2::decode(bytes)
+            .map_err(|_| ScheduleErrorV2::InvalidContinuation(workflow.resume_work.target))?;
+        snapshot
+            .validate_checkpoint_for(&workflow.resume_work)
+            .map_err(|_| ScheduleErrorV2::InvalidContinuation(workflow.resume_work.target))?;
+        let Some(call) = snapshot.pending_call else {
+            return Ok(None);
+        };
+        let Some(timeout) = store.call_expiration(call)? else {
+            return Ok(None);
+        };
+        Self::prepare_resume_outcome(store, invocation, logical_timeslot, None, Some(timeout))
+            .map(Some)
+    }
+
+    fn prepare_resume_outcome(
+        store: &LocalJamStoreV2,
+        invocation: InvocationId,
+        logical_timeslot: u64,
+        awaited_reply: Option<AccumulatedReplyV2>,
+        awaited_timeout: Option<AccumulatedTimeoutV2>,
     ) -> Result<PreparedWorkV2, ScheduleErrorV2> {
         let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
         let workflow = decode_row::<WorkflowCheckpointV2>(
@@ -433,7 +602,7 @@ impl LocalWorkSchedulerV2 {
                 causal_parent: template.causal_parent,
                 parent_call: template.parent_call,
                 awaited_reply,
-                awaited_timeout: None,
+                awaited_timeout,
                 imported_blobs: template.imported_blobs,
                 proof_requested: template.proof_requested,
             },
@@ -572,7 +741,7 @@ impl LocalWorkSchedulerV2 {
             causal_parent: request.causal_parent,
             parent_call: request.parent_call,
             awaited_reply: request.awaited_reply,
-            awaited_timeout: request.awaited_timeout,
+            awaited_timeout: request.awaited_timeout.map(Box::new),
             consistency: header.consistency,
             base,
             base_causal_height,
@@ -716,12 +885,25 @@ impl LocalWorkSchedulerV2 {
             snapshot
                 .validate_resume_for(&work)
                 .map_err(|_| ScheduleErrorV2::InvalidContinuation(request.target))?;
-            match (snapshot.pending_call, work.awaited_reply.as_ref()) {
-                (None, None) => {}
-                (Some(call), None) => return Err(ScheduleErrorV2::MissingAwaitedReply(call)),
-                (Some(call), Some(reply)) if reply.reply.call_id == call => {}
-                (_, Some(reply)) => {
+            match (
+                snapshot.pending_call,
+                work.awaited_reply.as_ref(),
+                work.awaited_timeout.as_ref(),
+            ) {
+                (None, None, None) => {}
+                (Some(call), Some(reply), None) if reply.reply.call_id == call => {}
+                (Some(call), None, Some(timeout)) if timeout.expiration.timeout.call_id == call => {
+                }
+                (Some(call), None, None) => {
+                    return Err(ScheduleErrorV2::MissingAwaitedReply(call));
+                }
+                (_, Some(reply), _) => {
                     return Err(ScheduleErrorV2::UnexpectedAwaitedReply(reply.reply.call_id));
+                }
+                (_, _, Some(timeout)) => {
+                    return Err(ScheduleErrorV2::UnexpectedAwaitedReply(
+                        timeout.expiration.timeout.call_id,
+                    ));
                 }
             }
         }

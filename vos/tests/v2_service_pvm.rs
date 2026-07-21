@@ -4219,6 +4219,144 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     // Simulate a complete process restart. The only retained workflow inputs
     // are now the guest-owned service rows and content-addressed blobs.
     let persisted = committed_service.accumulate_host().snapshot_bytes();
+
+    // The timeout branch commits its deterministic outcome before restoring
+    // the actor. A second restart at that exact boundary must rediscover the
+    // outcome and inject an error after the original protocol call without
+    // replaying the mutation before `.await`.
+    let timeout_store = LocalJamStoreV2::from_snapshot_bytes(&persisted)
+        .expect("the checkpoint image starts an independent timeout branch");
+    let mut timeout_service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        timeout_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_call_expiration(
+            timeout_service.accumulate_host(),
+            first_work.invocation,
+            99,
+        ),
+        Ok(None),
+        "a logical timeslot before the deadline cannot expire the call"
+    );
+    let expiration = LocalWorkSchedulerV2::prepare_call_expiration(
+        timeout_service.accumulate_host(),
+        first_work.invocation,
+        100,
+    )
+    .expect("the committed checkpoint is a valid expiration candidate")
+    .expect("the deadline is due");
+    let expired = timeout_service
+        .accumulate(&AccumulateRequestV2::ExpireCall(expiration))
+        .expect("physical guest Accumulate commits the timeout");
+    let AccumulationResultV2::CallExpired {
+        timeout,
+        duplicate: false,
+    } = expired.result
+    else {
+        panic!("due call expiration was rejected")
+    };
+    assert_eq!(timeout.expiration.timeout.call_id, call_id);
+    assert_eq!(
+        timeout_service
+            .accumulate_host()
+            .outbox_message(call_id)
+            .unwrap(),
+        None,
+        "expiration atomically retires the live transport effect"
+    );
+
+    let timeout_persisted = timeout_service.accumulate_host().snapshot_bytes();
+    let timeout_restarted_store = LocalJamStoreV2::from_snapshot_bytes(&timeout_persisted)
+        .expect("the expiration outcome survives a second process restart");
+    let mut timeout_restarted_service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        timeout_restarted_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let timed_out = LocalWorkSchedulerV2::prepare_timeout_resume(
+        timeout_restarted_service.accumulate_host(),
+        first_work.invocation,
+        100,
+    )
+    .expect("guest-owned expiration state is readable")
+    .expect("the exact suspended workflow is ready to resume");
+    assert_eq!(timed_out.work.awaited_timeout.as_deref(), Some(&timeout));
+    assert!(timed_out.work.awaited_reply.is_none());
+    let timed_out_output = service
+        .refine_actor_tree_with_backend(
+            &timed_out.work.encode(),
+            &timed_out.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .expect("the interpreter injects the committed timeout");
+    let recompiled_timeout = service
+        .refine_actor_tree_with_backend(
+            &timed_out.work.encode(),
+            &timed_out.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceRecompiler,
+        )
+        .expect("the recompiler injects the same committed timeout");
+    assert_eq!(timed_out_output, recompiled_timeout);
+    let timed_out_transition = RefineOutputV2::decode(&timed_out_output.bytes)
+        .unwrap()
+        .transition;
+    let timed_out_state = timed_out_transition
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .expect("the timed-out handler returns its checkpointed state");
+    assert_eq!(
+        u32::decode(timed_out_state),
+        1,
+        "code before the timed-out await executes exactly once"
+    );
+    assert_eq!(
+        timed_out_transition
+            .reply
+            .as_ref()
+            .map(|reply| vos::value::Value::decode(&reply.result)),
+        Some(vos::value::Value::U32(1))
+    );
+    let timed_out_work = timed_out.work;
+    let completed_timeout = timeout_restarted_service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: timed_out_work.clone(),
+            transition: timed_out_transition,
+            provided_blobs: timed_out_output.exported_blobs,
+        }))
+        .expect("guest Accumulate accepts only the committed timeout outcome");
+    assert!(matches!(
+        completed_timeout.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_timeout_resume(
+            timeout_restarted_service.accumulate_host(),
+            first_work.invocation,
+            101,
+        ),
+        Ok(None),
+        "the completed continuation cannot consume the timeout twice"
+    );
+
     let restarted_store = LocalJamStoreV2::from_snapshot_bytes(&persisted)
         .expect("canonical committed image survives process restart");
     let mut restarted_service = JamServiceV2::new(
@@ -4377,6 +4515,72 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         Err(ScheduleErrorV2::MissingContinuation(first_work.target)),
         "a committed completion cannot be resumed again"
     );
+}
+
+#[test]
+fn root_service_recovers_nested_call_timeout_after_expiration_restart() {
+    let Some((source_config, _, source_actor, _)) = workflow_root_configs() else {
+        return;
+    };
+    let restart_config = source_config.clone();
+    let mut source =
+        LocalRootTreeServiceV2::open(source_config, FailableCommittedImages::default())
+            .expect("source root installs");
+    let invocation = InvocationId([154; 32]);
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("root_child_await").encode());
+    let request = LocalWorkRequestV2 {
+        invocation,
+        workflow_step: 0,
+        logical_timeslot: 1,
+        target: source_actor,
+        method: "root_child_await".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    assert!(!source.admit_ingress(&request).unwrap());
+    let suspended = source
+        .invoke_admitted(invocation)
+        .expect("root and child suspend on one durable peer call");
+    assert!(suspended.published.reply.is_none());
+    assert_eq!(suspended.published.outbox.len(), 1);
+    let call = suspended.published.outbox[0].call_id;
+    assert_eq!(suspended.published.outbox[0].deadline_timeslot, Some(100));
+    assert!(source.expire_due_calls(99).unwrap().is_empty());
+    let expired = source.expire_due_calls(100).unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].invocation, invocation);
+    assert_eq!(expired[0].timeout.expiration.timeout.call_id, call);
+    assert!(!expired[0].duplicate);
+    assert_eq!(source.store().outbox_message(call).unwrap(), None);
+
+    // Crash after the guest commits expiration but before Refine restores the
+    // nested root/child machine stack.
+    let backend = source.into_backend();
+    let mut restarted = LocalRootTreeServiceV2::open(restart_config, backend)
+        .expect("the root service reopens at the committed expiration boundary");
+    let resumed = restarted
+        .resume_expired_calls(100)
+        .expect("restart discovers and injects the guest-owned timeout");
+    assert_eq!(resumed.len(), 1);
+    assert!(resumed[0].published.outbox.is_empty());
+    assert_eq!(
+        resumed[0]
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(11)),
+        "the child catches the timeout and both pre-await mutations execute once"
+    );
+    assert!(restarted.resume_expired_calls(101).unwrap().is_empty());
 }
 
 #[test]

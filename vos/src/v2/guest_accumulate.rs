@@ -106,6 +106,17 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
         Ok(request) => request,
         Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
     };
+    execute_canonical_guest_accumulate(store, &request)
+}
+
+/// Execute a request already accepted by the canonical v2 wire decoder.
+/// The service guest owns that decoded value and transfers it here directly,
+/// avoiding a second full request allocation inside its bounded PVM heap.
+#[doc(hidden)]
+pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    request: &AccumulateRequestV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
     match request {
         AccumulateRequestV2::Install(genesis) => install(store, &genesis),
         AccumulateRequestV2::AdmitIngress(ingress) => admit_ingress(store, &ingress),
@@ -2953,7 +2964,7 @@ fn validate_awaited_outcome<S: GuestAccumulateStoreV2>(
             };
             let committed = AccumulatedTimeoutV2::decode(&bytes)
                 .map_err(|_| GuestAccumulateError::CorruptStore)?;
-            if committed != *awaited
+            if committed != **awaited
                 || awaited.validate().is_err()
                 || awaited.expiration.service != work.service
                 || awaited.expiration.timeout.caller_invocation != work.invocation
@@ -4877,7 +4888,7 @@ mod tests {
         };
         resume.imported_actors[0].state = BlobRefV2::of_bytes(b"checkpoint");
         resume.imported_actors[0].continuation = Some(continuation.clone());
-        resume.awaited_timeout = Some(accumulated);
+        resume.awaited_timeout = Some(Box::new(accumulated));
         let mut completed = linear_transition(&resume, b"after timeout");
         completed.continuations.push(ContinuationChangeV2 {
             actor: resume.target,

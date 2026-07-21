@@ -4493,6 +4493,7 @@ where
                 publication,
                 logical_timeslot,
             }) => {
+                state.logical_timeslot = state.logical_timeslot.max(logical_timeslot);
                 publish_v2_slice(
                     id,
                     &mut service,
@@ -4521,6 +4522,7 @@ where
                 continue;
             }
             Ok(crate::v2::RootTreeIngressRecoveryV2::Queued { logical_timeslot }) => {
+                state.logical_timeslot = state.logical_timeslot.max(logical_timeslot);
                 debug!(
                     %id,
                     invocation = ?work.invocation,
@@ -4600,6 +4602,7 @@ where
         }
         match service.admit_ingress(&work) {
             Ok(_) => {
+                state.logical_timeslot = state.logical_timeslot.max(work.logical_timeslot);
                 state
                     .pending_callers
                     .entry(work.invocation)
@@ -4670,6 +4673,9 @@ fn refresh_v2_owned_actor_routes<B>(
 
 #[derive(Default)]
 struct V2RootThreadState {
+    /// Highest admitted logical timeslot observed by this service host.
+    /// The periodic retry timer never advances it from wall-clock time.
+    logical_timeslot: u64,
     pending_callers: HashMap<crate::v2::InvocationId, Vec<ReplyChannel>>,
     return_calls: HashMap<crate::v2::InvocationId, V2ReturnCall>,
     accepted_outbox:
@@ -4795,6 +4801,7 @@ fn handle_v2_transport<B>(
                 publication.receipt,
             ) {
                 Ok(_) => {
+                    state.logical_timeslot = state.logical_timeslot.max(logical_timeslot);
                     state.return_calls.insert(
                         callee_invocation,
                         V2ReturnCall {
@@ -4857,6 +4864,7 @@ fn handle_v2_transport<B>(
             };
             match service.reply_already_accumulated(caller_invocation, &accumulated) {
                 Ok(true) => {
+                    state.logical_timeslot = state.logical_timeslot.max(logical_timeslot);
                     let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
                         input: publication.input,
                         publication: publication.commitment(),
@@ -4878,6 +4886,7 @@ fn handle_v2_transport<B>(
             service.allow_finalized_receipt(&accumulated.receipt);
             match service.resume(caller_invocation, logical_timeslot, Some(accumulated)) {
                 Ok(committed) => {
+                    state.logical_timeslot = state.logical_timeslot.max(logical_timeslot);
                     debug!(
                         %id,
                         invocation = ?caller_invocation,
@@ -4958,7 +4967,14 @@ fn publish_v2_slice<B>(
         return;
     };
     if !publication.published.outbox.is_empty() {
-        queue_v2_outbox(id, &publication, logical_timeslot, outbox, actor_routes);
+        queue_v2_outbox(
+            id,
+            service,
+            &publication,
+            logical_timeslot,
+            outbox,
+            actor_routes,
+        );
     }
     if let Some(reply) = published.reply.as_ref() {
         let reply_bytes = if published.proof.is_some() {
@@ -5002,13 +5018,16 @@ fn publish_v2_slice<B>(
     }
 }
 
-fn queue_v2_outbox(
+fn queue_v2_outbox<B>(
     id: ServiceId,
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
     publication: &crate::v2::PublicationRecordV2,
     logical_timeslot: u64,
     outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
-) {
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
     use crate::v2::V2Wire;
 
     if publication.published.reply.is_some()
@@ -5017,6 +5036,14 @@ fn queue_v2_outbox(
         return;
     }
     for message in &publication.published.outbox {
+        match service.outbox_call_is_pending(message.call_id) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                warn!(%id, call = ?message.call_id, ?error, "cannot inspect live v2 outbox row");
+                continue;
+            }
+        }
         let Some(route) = v2_actor_route(actor_routes, message.to) else {
             continue;
         };
@@ -5215,8 +5242,87 @@ fn retry_v2_work<B>(
 ) where
     B: crate::v2::CommittedImageStoreV2,
 {
+    match service.expire_due_calls(state.logical_timeslot) {
+        Ok(expired) => {
+            for expiration in expired {
+                debug!(
+                    %id,
+                    invocation = ?expiration.invocation,
+                    call = ?expiration.timeout.expiration.timeout.call_id,
+                    "v2 outbound-call timeout committed"
+                );
+            }
+        }
+        Err(error) => warn!(%id, ?error, "v2 durable call expiration failed"),
+    }
+    match service.resume_expired_calls(state.logical_timeslot) {
+        Ok(resumed) => {
+            for committed in resumed {
+                let invocation = committed.input.invocation;
+                debug!(
+                    %id,
+                    ?invocation,
+                    outbox = committed.published.outbox.len(),
+                    replied = committed.published.reply.is_some(),
+                    "v2 timed-out continuation committed"
+                );
+                publish_v2_slice(
+                    id,
+                    service,
+                    invocation,
+                    committed.published,
+                    committed.publication,
+                    None,
+                    state.logical_timeslot,
+                    outbox,
+                    actor_routes,
+                    state,
+                );
+            }
+        }
+        Err(error) => warn!(%id, ?error, "v2 durable timeout resume failed"),
+    }
     if let Ok(publications) = service.pending_publications() {
         for publication in publications {
+            let commitment = publication.commitment();
+            let mut outbox_state_valid = true;
+            for message in &publication.published.outbox {
+                match service.outbox_call_is_pending(message.call_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        state
+                            .accepted_outbox
+                            .entry(commitment)
+                            .or_default()
+                            .insert(message.call_id);
+                    }
+                    Err(error) => {
+                        outbox_state_valid = false;
+                        warn!(%id, call = ?message.call_id, ?error, "v2 publication retry could not inspect its live outbox row");
+                    }
+                }
+            }
+            if outbox_state_valid
+                && !publication.published.outbox.is_empty()
+                && publication.published.proof.is_none()
+                && state.accepted_outbox.get(&commitment).is_some_and(|accepted| {
+                    publication
+                        .published
+                        .outbox
+                        .iter()
+                        .all(|message| accepted.contains(&message.call_id))
+                })
+            {
+                match service.acknowledge_publication(&publication) {
+                    Ok(_) => {
+                        state.accepted_outbox.remove(&commitment);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%id, ?error, "terminal v2 outbox publication acknowledgement failed");
+                    }
+                }
+            }
             let logical_timeslot = match service.publication_logical_timeslot(&publication) {
                 Ok(logical_timeslot) => logical_timeslot,
                 Err(error) => {
@@ -5226,6 +5332,7 @@ fn retry_v2_work<B>(
             };
             queue_v2_outbox(
                 id,
+                service,
                 &publication,
                 logical_timeslot,
                 outbox,

@@ -53,7 +53,7 @@ pub use contracts::{
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
-    execute_guest_accumulate,
+    execute_canonical_guest_accumulate, execute_guest_accumulate,
 };
 pub use identity::{
     ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,
@@ -79,7 +79,8 @@ pub use pvm::{
 };
 #[cfg(feature = "std")]
 pub use root_service::{
-    CommittedCrdtSyncV2, CommittedDeliveryV2, CommittedRootTreeSliceV2,
+    CommittedCallExpirationV2, CommittedCrdtSyncV2, CommittedDeliveryV2,
+    CommittedRootTreeSliceV2,
     LocalRootTreeConfigErrorV2,
     LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2,
     LocalRootTreeServiceV2, OwnedActorInstallV2, RootTreeIngressRecoveryV2, RootTreeInvocationV2,

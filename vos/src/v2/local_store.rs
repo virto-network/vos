@@ -16,10 +16,11 @@ use crate::attestation::AttestationProofHostV2;
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, DeliveryRecordV2,
-    DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2,
-    PublicationRecordV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2,
-    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, BlobRefV2,
+    DeliveryRecordV2, DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId,
+    ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
+    ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Recoverable committed image of a local v2 service account.
@@ -266,6 +267,7 @@ pub enum LocalStoreReadErrorV2 {
     CorruptPublication,
     CorruptDelivery,
     CorruptIngress,
+    CorruptExpiration,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -558,6 +560,90 @@ impl LocalJamStoreV2 {
                     Ok(record)
                 }
             })
+    }
+
+    pub fn call_expiration(
+        &self,
+        call: super::CallId,
+    ) -> Result<Option<AccumulatedTimeoutV2>, LocalStoreReadErrorV2> {
+        self.row(&super::call_expiration_storage_key(call))
+            .map(AccumulatedTimeoutV2::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptExpiration)
+            .and_then(|timeout| {
+                if timeout
+                    .as_ref()
+                    .is_some_and(|timeout| timeout.expiration.timeout.call_id != call)
+                {
+                    Err(LocalStoreReadErrorV2::CorruptExpiration)
+                } else {
+                    Ok(timeout)
+                }
+            })
+    }
+
+    pub fn outbox_message(
+        &self,
+        call: super::CallId,
+    ) -> Result<Option<MessageRecordV2>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(None);
+        };
+        self.state_row(header.service_root, &StateKeyV2::Outbox(call))?
+            .map(|bytes| MessageRecordV2::decode(&bytes))
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptPublication)
+            .and_then(|message| {
+                if message
+                    .as_ref()
+                    .is_some_and(|message| message.call_id != call)
+                {
+                    Err(LocalStoreReadErrorV2::CorruptPublication)
+                } else {
+                    Ok(message)
+                }
+            })
+    }
+
+    /// Every workflow identity recoverable from guest-owned ingress or
+    /// delivery bookkeeping. Completed records remain durable, allowing a
+    /// restarted host to rediscover suspended outbound calls without a
+    /// process-local timer table.
+    pub fn known_workflow_invocations(
+        &self,
+    ) -> Result<Vec<super::InvocationId>, LocalStoreReadErrorV2> {
+        let mut invocations = Vec::new();
+        let ingress_prefix = super::storage::ingress_storage_prefix();
+        for (key, bytes) in self
+            .committed
+            .rows
+            .range(ingress_prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(ingress_prefix))
+        {
+            let record = IngressRecordV2::decode(bytes)
+                .map_err(|_| LocalStoreReadErrorV2::CorruptIngress)?;
+            if super::ingress_storage_key(record.ingress.invocation).as_slice() != key.as_slice() {
+                return Err(LocalStoreReadErrorV2::CorruptIngress);
+            }
+            invocations.push(record.ingress.invocation);
+        }
+        let delivery_prefix = super::storage::delivery_storage_prefix();
+        for (key, bytes) in self
+            .committed
+            .rows
+            .range(delivery_prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(delivery_prefix))
+        {
+            let record = DeliveryRecordV2::decode(bytes)
+                .map_err(|_| LocalStoreReadErrorV2::CorruptDelivery)?;
+            if super::delivery_storage_key(record.call_id).as_slice() != key.as_slice() {
+                return Err(LocalStoreReadErrorV2::CorruptDelivery);
+            }
+            invocations.push(super::InvocationId::for_call(record.call_id));
+        }
+        invocations.sort_unstable();
+        invocations.dedup();
+        Ok(invocations)
     }
 
     /// Canonical invocation-id order for every guest-admitted direct call not
