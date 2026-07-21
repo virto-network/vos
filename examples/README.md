@@ -25,6 +25,20 @@ cargo +nightly actor -p v2-age-gate
 cargo +nightly actor -p v2-shared-board
 ```
 
+From the repository root, package the verifier with its cross-root producer
+declared explicitly:
+
+```sh
+cargo run -p vosx -- build examples/actors/private-age \
+  --service-pvm dist/vos-service.pvm
+cargo run -p vosx -- build examples/actors/age-gate \
+  --service-pvm dist/vos-service.pvm \
+  --external-actor private-age
+```
+
+The dependency name is signed into the verifier package. A space resolves it
+to the exact installed producer deployment; it is not an ambient route lookup.
+
 [`extensions`](extensions/) and [`wasm`](wasm/) contain native and WASM API
 examples. They are separate from the canonical actor-PVM examples above.
 

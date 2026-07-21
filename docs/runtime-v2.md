@@ -4,8 +4,9 @@
 > tooling, canonical `vos-service.pvm`, exact JAR restoration, durable local
 > scheduler, local cross-root delivery/resume, and guest-owned CRDT
 > synchronization described here are present in the v2 conformance runtime.
-> The production node still contains legacy paths awaiting cutover; legacy host
-> behavior is not evidence of v2 conformance.
+> The production node now opens signed `.vos` rows through the same root-tree
+> services. Raw ELF/PVM registry rows still use legacy paths during cutover;
+> legacy host behavior is not evidence of v2 conformance.
 
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
@@ -145,9 +146,10 @@ never become destination state. An authenticated operator/runtime may bind a
 canonical `ActorId` to an immutable physical `ServiceId` with
 `VosNode::bind_v2_actor_route`; the same guest-owned delivery, reply, and
 acknowledgement protocol then runs across connected libp2p nodes. Registry-backed
-automatic route discovery and proof/blob publication drivers remain to be
-attached. Attested ingress currently fails closed unless a proof producer is
-configured.
+package resolution now derives exact external actor identities from signed
+`.vos` rows. Cross-node physical route discovery and proof/blob publication
+drivers remain to be attached. Attested ingress currently fails closed unless
+a proof producer is configured.
 
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an
@@ -185,6 +187,17 @@ and signatures but includes the authoritative manifest and PVM bytes.
 Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
+Cross-root dependencies are declared by install-time actor name in the signed
+manifest. `vosx build --external-actor <name>` is repeatable; names are sorted
+and become part of the `DeploymentId` and deployment signature. At `space up`,
+the daemon resolves every name to an exact signed `.vos` registry row in the
+same space and derives its `ServiceIdentityV2`, root `ActorId`, producer, and
+actor `ProgramId`. A missing row defers the consumer, and a missing package
+blob is fetched before retry. Legacy artifacts, invalid signatures, mixed
+service PVMs, and invalid consistency modes fail closed. Bindings do not float
+to a later dependency deployment: upgrade the consumer package when changing
+an external actor deployment.
+
 Build the infrastructure artifact once with the pinned workspace and JAR
 revision, then give those exact bytes to every application package build:
 
@@ -196,6 +209,9 @@ cargo run -p vosx -- service-pvm \
   --out dist/vos-service.pvm
 cargo run -p vosx -- build examples/actors/counter \
   --service-pvm dist/vos-service.pvm
+cargo run -p vosx -- build examples/actors/age-gate \
+  --service-pvm dist/vos-service.pvm \
+  --external-actor private-age
 cargo run -p vosx -- run dist/Counter.vos \
   --service-pvm dist/vos-service.pvm \
   --method value

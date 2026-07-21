@@ -22,6 +22,18 @@ cargo +nightly actor -p v2-age-gate
 cargo +nightly actor -p v2-shared-board
 ```
 
+From the repository root, package the producer and verifier with the same
+pinned service PVM. The verifier's external dependency is part of its signed
+deployment identity:
+
+```sh
+cargo run -p vosx -- build examples/actors/private-age \
+  --service-pvm dist/vos-service.pvm
+cargo run -p vosx -- build examples/actors/age-gate \
+  --service-pvm dist/vos-service.pvm \
+  --external-actor private-age
+```
+
 Run the host-side convergence gate:
 
 ```sh

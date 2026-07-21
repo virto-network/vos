@@ -42,6 +42,11 @@ cargo run -p vosx -- service-pvm \
 cargo run -p vosx -- build examples/actors/counter \
   --service-pvm dist/vos-service.pvm
 
+# Cross-root names are signed package dependencies, not ambient routes.
+cargo run -p vosx -- build examples/actors/age-gate \
+  --service-pvm dist/vos-service.pvm \
+  --external-actor private-age
+
 # The local conformance runner installs and executes the same service PVM.
 cargo run -p vosx -- run dist/Counter.vos \
   --service-pvm dist/vos-service.pvm \
@@ -136,6 +141,10 @@ let n = counter.get().await?;
 `vosx new counter` creates the target configuration that injects `no_std` and
 `no_main` plus the required `core,alloc,compiler_builtins` build-std flags.
 Use `vosx new shared-board --crdt` for an explicit CRDT template.
+Declare every cross-root dependency with repeatable `vosx build
+--external-actor <installed-name>` flags. These names are covered by the
+package signature and resolve to exact signed deployments when the space
+starts; upgrading a dependency therefore requires rebuilding the consumer.
 
 ## Writing an extension
 
