@@ -11,7 +11,7 @@ use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::attestation::AttestationProofProducerV2;
+use crate::attestation::{AttestationError, AttestationProofProducerV2};
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
@@ -399,6 +399,7 @@ pub enum LocalRootTreeOpenErrorV2<E> {
 pub enum LocalRootTreeInvokeErrorV2 {
     ProofProducerRequired,
     ProofModeMismatch,
+    Attestation(AttestationError),
     AttestationPreparationFailed,
     ProofProductionFailed,
     InvalidProducedProof,
@@ -632,6 +633,9 @@ fn map_direct_attested_error<P>(
     match error {
         AttestedServiceErrorV2::Service(error) => LocalRootTreeInvokeErrorV2::Service(error),
         AttestedServiceErrorV2::Rejected(error) => LocalRootTreeInvokeErrorV2::Rejected(error),
+        AttestedServiceErrorV2::Attestation(error) => {
+            LocalRootTreeInvokeErrorV2::Attestation(error)
+        }
         AttestedServiceErrorV2::InvalidPreparation => {
             LocalRootTreeInvokeErrorV2::AttestationPreparationFailed
         }
@@ -657,6 +661,9 @@ fn map_raft_attested_error<P>(
     match error {
         AttestedServiceErrorV2::Service(error) => LocalRootTreeInvokeErrorV2::Replication(error),
         AttestedServiceErrorV2::Rejected(error) => LocalRootTreeInvokeErrorV2::Rejected(error),
+        AttestedServiceErrorV2::Attestation(error) => {
+            LocalRootTreeInvokeErrorV2::Attestation(error)
+        }
         AttestedServiceErrorV2::InvalidPreparation => {
             LocalRootTreeInvokeErrorV2::AttestationPreparationFailed
         }

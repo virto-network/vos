@@ -33,7 +33,7 @@ use vos::v2::{
     WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
-    Attestation, AttestedMethod, Decode, Encode, StateCommitmentV3,
+    Attestation, AttestationError, AttestedMethod, Decode, Encode, StateCommitmentV3,
     abi::service::ServiceId,
     value::{Msg, Value},
 };
@@ -5096,6 +5096,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     );
     assert_eq!(prepared.imports.programs[0].pvm, actor_pvm);
     let work = prepared.work;
+    let imports = prepared.imports;
     let continuation = ContinuationSnapshotV2 {
         snapshot_version: vos::v2::SNAPSHOT_VERSION,
         jar_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
@@ -5165,16 +5166,36 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
 
     let mut forbidden_attested_work = work.clone();
     forbidden_attested_work.proof_requested = true;
+    let suspending_envelope = AccumulationEnvelopeV2 {
+        work: forbidden_attested_work.clone(),
+        transition: transition.clone(),
+        provided_blobs: vec![ImportedBlobV2 {
+            reference: continuation_ref.clone(),
+            bytes: continuation_bytes.clone(),
+        }],
+    };
+    let before_attested_rejection = service.accumulate_host().snapshot();
+    let mut producer = CanonicalTestProofProducer {
+        proof: b"must not be produced".to_vec(),
+        calls: 0,
+    };
+    assert!(matches!(
+        service.accumulate_attested(suspending_envelope.clone(), &imports, &mut producer),
+        Err(vos::v2::AttestedServiceErrorV2::Attestation(
+            AttestationError::CannotSuspend
+        ))
+    ));
+    assert_eq!(producer.calls, 0, "a suspending method is never proved");
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_attested_rejection),
+        "typed CannotSuspend rejection commits nothing"
+    );
     let forbidden = service
         .accumulate(&AccumulateRequestV2::PrepareAttested(
-            AccumulationEnvelopeV2 {
-                work: forbidden_attested_work,
-                transition: transition.clone(),
-                provided_blobs: vec![ImportedBlobV2 {
-                    reference: continuation_ref.clone(),
-                    bytes: continuation_bytes.clone(),
-                }],
-            },
+            suspending_envelope,
         ))
         .expect("a suspending attested transition returns a stable rejection");
     assert_eq!(

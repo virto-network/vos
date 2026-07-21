@@ -181,6 +181,12 @@ producer. CRDT proof generation precedes its causal Apply, and Raft proof
 generation precedes proposal of the exact Apply request to the accumulation
 log.
 
+An attested Refine result containing a continuation, durable outbox, or no
+final reply is returned as `AttestationError::CannotSuspend` before the proof
+producer or physical Accumulate runs. Deterministic same-tree calls that finish
+inline leave none of those artifacts and remain part of the single traced
+slice. Guest Accumulate repeats the shape check so a host cannot bypass it.
+
 The remaining production gap is a proof backend that consumes or reproduces the
 full witness behind this commitment; it is not a second attestation-only actor
 binary.

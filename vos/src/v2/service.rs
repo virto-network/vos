@@ -147,6 +147,7 @@ enum AttestationBuildErrorV2<P> {
 pub enum AttestedServiceErrorV2<E, P> {
     Service(E),
     Rejected(AccumulationRejectionV2),
+    Attestation(AttestationError),
     InvalidPreparation,
     Producer(P),
     InvalidProducedProof,
@@ -161,6 +162,20 @@ impl<E: core::fmt::Debug, P: core::fmt::Debug> core::fmt::Display for AttestedSe
 }
 
 impl<E: core::fmt::Debug, P: core::fmt::Debug> core::error::Error for AttestedServiceErrorV2<E, P> {}
+
+fn require_single_slice_attestation<E, P>(
+    envelope: &AccumulationEnvelopeV2,
+) -> Result<(), AttestedServiceErrorV2<E, P>> {
+    if !envelope.transition.continuations.is_empty()
+        || !envelope.transition.outbox.is_empty()
+        || envelope.transition.reply.is_none()
+    {
+        return Err(AttestedServiceErrorV2::Attestation(
+            AttestationError::CannotSuspend,
+        ));
+    }
+    Ok(())
+}
 
 /// One canonical Accumulate request whose Raft log position is committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +461,10 @@ where
         producer: &mut P,
     ) -> Result<CommittedAttestationOutputV2, AttestedServiceErrorV2<ServiceDispatchError, P::Error>>
     {
+        // Reject a multi-slice attested execution before proof construction or
+        // any Accumulate call. Inline nested actors leave no continuation or
+        // durable outbox and therefore remain valid single-slice proofs.
+        require_single_slice_attestation(&envelope)?;
         let prepared = self
             .accumulate(&AccumulateRequestV2::PrepareAttested(envelope.clone()))
             .map_err(AttestedServiceErrorV2::Service)?;
@@ -766,6 +785,9 @@ where
         CommittedAttestationOutputV2,
         AttestedServiceErrorV2<ReplicatedServiceErrorV2<L::Error>, P::Error>,
     > {
+        // Keep the same preflight on the replicated driver so a suspending
+        // transition cannot invoke a producer or enter the Raft log.
+        require_single_slice_attestation(&envelope)?;
         let prepared = self
             .accumulate(&AccumulateRequestV2::PrepareAttested(envelope.clone()))
             .map_err(AttestedServiceErrorV2::Service)?;
