@@ -738,6 +738,7 @@ impl<A: Actor> Context<A> {
                         producer_name: attestation.producer_name,
                         producer: attestation.producer,
                         statement: attestation.statement,
+                        trace: attestation.proof.trace,
                         proof,
                     }))
                 }

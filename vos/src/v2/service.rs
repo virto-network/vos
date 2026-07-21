@@ -103,6 +103,7 @@ impl CommittedAttestationOutputV2 {
             producer_name,
             producer,
             statement: self.preparation.statement,
+            trace: self.proof.trace,
             proof: self.proof_bytes,
         })
     }
@@ -120,6 +121,7 @@ impl CommittedAttestationOutputV2 {
             producer_name,
             producer,
             self.preparation.statement,
+            self.proof.trace,
             preview,
             self.proof_bytes,
         )

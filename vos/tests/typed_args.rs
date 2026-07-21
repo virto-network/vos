@@ -439,6 +439,7 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             authorization_policy: Hash([14; 32]),
             accumulation_receipt: receipt,
         },
+        trace: Hash([16; 32]),
         proof: vec![1],
         value,
     }

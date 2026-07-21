@@ -103,6 +103,7 @@ mod tests {
             "private-age".into(),
             ProducerId([15; 32]),
             statement,
+            Hash([16; 32]),
             claim,
             vec![1],
         )

@@ -150,6 +150,7 @@ pub struct AttestedInvocationResult {
     pub producer_name: String,
     pub producer: crate::v2::ProducerId,
     pub statement: crate::AttestationStatementV3,
+    pub trace: crate::v2::Hash,
     pub proof: Vec<u8>,
 }
 
