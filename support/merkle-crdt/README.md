@@ -14,24 +14,32 @@ connectivity, and if it goes down the whole system stalls.
 This crate implements [Merkle-CRDTs](https://arxiv.org/abs/2004.00107), which eliminate the
 need for a leader entirely. Every participant keeps their own copy and edits freely — even
 offline. When two participants reconnect, they sync by exchanging a single hash (a "root CID")
-and fetching only what they're missing. The data structure guarantees everyone converges to the
-same state regardless of sync order, timing, or network topology.
+and fetching only what they're missing. When the payload itself has CRDT merge
+semantics, replicas converge to the same state regardless of sync order,
+timing, or network topology.
 
 This works because of two ideas combined:
 
 - **CRDTs** (Conflict-free Replicated Data Types) — data structures designed so that concurrent
   edits always merge cleanly without conflicts.
 - **Merkle-DAGs** (hash-linked graphs) — every edit is hashed and linked to previous edits,
-  creating a tamper-proof history where you can efficiently find what's new.
+creating a content-authenticated history where you can efficiently find what's
+new.
 
-The hash-linked history acts as a logical clock that replaces version vectors, leader election,
-and consensus protocols.
+The hash-linked history acts as a logical clock that replaces version vectors
+for causal synchronization. It does not make an arbitrary payload convergent:
+`Payload::apply` must still implement a CRDT operation or a state join whose
+result is independent of delivery order. Applications that need uniqueness,
+overdraft prevention, or irreversible global ordering still need consensus or
+a purpose-built conflict-free construction.
 
 ## Properties
 
 - **No leader, no coordination** — every replica is equal, edits locally, syncs when convenient
 - **Works over any transport** — TCP, UDP, Bluetooth, USB stick, carrier pigeon
-- **Self-verifying** — data can be fetched from untrusted sources, the hash proves correctness
+- **Content-authenticated** — fetched nodes are rejected when their bytes do
+  not match the advertised CID; an application validator must separately
+  authenticate authors and payload policy
 - **Efficient sync** — only missing pieces are transferred, shared history is skipped
 - **`no_std`** — runs on embedded devices, WASM, or servers with zero required dependencies
 
@@ -83,7 +91,7 @@ assert_eq!(phone.state(), laptop.state());
 | `Hasher` | Pluggable hash function (SHA-256, BLAKE3, etc.) |
 | `Encode` | Deterministic serialization for content addressing |
 | `Store` | Where nodes live (memory, disk, IPFS, network) |
-| `Payload` | Your CRDT logic (what an edit does to the state) |
+| `Payload` | Your convergent CRDT operation or state join |
 | `MerkleClock` | Low-level DAG clock — tracks roots, records events, merges |
 | `MerkleCrdt` | High-level wrapper — clock + store + automatic state tracking |
 | `sync::fetch_missing` | Anti-entropy algorithm — find and fetch what's missing |

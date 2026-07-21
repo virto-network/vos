@@ -43,8 +43,12 @@ the consumed workflow input. A process restart drains these committed records;
 an exact retry returns no duplicate effects but cannot erase the pending row.
 After the external consumer accepts the reply, outbox batch, or proof package,
 the host submits a commitment-bound acknowledgement through physical
-Accumulate. That acknowledgement deletes the record atomically and is itself
-idempotent.
+Accumulate. That acknowledgement deletes the pending record atomically and is
+itself idempotent. Proof-bearing publications move in the same transaction to
+a guest-owned physical archive outside the actor state root. This avoids a
+receipt/root commitment cycle while allowing an exact direct-invocation retry
+to return the identical statement, receipt, trace commitment, and proof bytes
+without replaying or reproving the actor.
 
 Cross-root transport is also guest-owned. The source receipt commits to the
 complete canonical outbox published by its accepted transition. A destination
@@ -148,8 +152,14 @@ canonical `ActorId` to an immutable physical `ServiceId` with
 acknowledgement protocol then runs across connected libp2p nodes. Registry-backed
 package resolution now derives exact external actor identities from signed
 `.vos` rows. Cross-node physical route discovery and proof/blob publication
-drivers remain to be attached. Attested ingress currently fails closed unless
-a proof producer is configured.
+discovery still requires an authenticated route binding. Proof-bearing replies
+already use the same committed root transport locally and across bound network
+routes: canonical decoding binds the complete package to the source
+publication, and destination guest Accumulate rechecks the pending call,
+receipt, proof expectation, and signed external-actor identity. Attested
+ingress fails closed unless a proof producer is configured; the remaining
+production gap is an exact nested-kernel tracer/prover rather than another
+attestation-only actor binary.
 
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an
@@ -245,7 +255,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 7 is therefore a clean break from earlier experimental v2 images.
+Store schema 8 is therefore a clean break from earlier experimental v2 images.
 
 ## CRDT boundary
 
