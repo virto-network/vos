@@ -1479,7 +1479,7 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
     let member = 0xA109;
     let route = ServiceId::new(member, 209);
     let mut node = VosNode::new();
-    node.register_v2_raft_root_at_id(
+    node.register_v2_raft_root_at_id_with_producer(
         "raft-root".into(),
         config,
         FailableCommittedImages::default(),
@@ -1494,8 +1494,22 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
         },
         route,
         true,
+        CanonicalTestProofProducer {
+            proof: b"node raft proof".to_vec(),
+            calls: 0,
+        },
     )
     .expect("node attaches the v2 Raft worker and root-tree owner");
+
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let mut attested_arguments = vec![vos::value::TAG_DYNAMIC];
+    attested_arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let attested = node
+        .invoke_actor_attested(actor, attested_arguments)
+        .expect("the Raft root proves before proposing its guest Apply");
+    assert_eq!(attested.value, Value::U32(0));
+    assert_eq!(attested.proof, b"node raft proof");
+
     let handle = node.invoke_handle();
     let shutdown = node.shutdown_handle();
     let router = std::thread::spawn(move || {
@@ -1503,7 +1517,6 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
         node.collect()
     });
 
-    std::thread::sleep(std::time::Duration::from_millis(350));
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("peer_value").encode());
     let ingress = vos::v2::RootTreeInvocationV2 {
@@ -1530,8 +1543,8 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
     let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
     assert_eq!(
         log.applied_index().unwrap(),
-        5,
-        "the elected worker's empty leader no-op precedes four IC-5 requests"
+        8,
+        "the leader no-op precedes attested admission/proved Apply/ACK and ordinary admission/Apply/ACK"
     );
     drop(log);
     std::fs::remove_dir_all(directory).unwrap();
@@ -1629,12 +1642,23 @@ fn two_node_crdt_roots_exchange_guest_owned_causal_state() {
     let route_b = ServiceId::new(prefix_b, 220);
     let mut node_a = VosNode::with_prefix(prefix_a);
     node_a
-        .register_v2_crdt_root_at_id(String::new(), service_a, replication_id, route_a, true)
+        .register_v2_crdt_root_at_id_with_producer(
+            String::new(),
+            service_a,
+            replication_id,
+            route_a,
+            true,
+            CanonicalTestProofProducer {
+                proof: b"node crdt proof".to_vec(),
+                calls: 0,
+            },
+        )
         .expect("first node registers a guest-owned CRDT root");
     let mut node_b = VosNode::with_prefix(prefix_b);
     node_b
         .register_v2_crdt_root_at_id(String::new(), service_b, replication_id, route_b, true)
         .expect("second node registers the same causal replication group");
+
     node_a.attach_network(network_a);
     node_b.attach_network(network_b);
     let network_a = node_a.network().expect("first network remains attached");
@@ -1716,6 +1740,30 @@ fn two_node_crdt_roots_exchange_guest_owned_causal_state() {
         invoke_increment(&handle_a, route_a, InvocationId([123; 32]), 1),
         Some(Value::I64(6))
     );
+
+    let mut attested_arguments = vec![vos::value::TAG_DYNAMIC];
+    attested_arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let package = handle_a
+        .invoke_with_timeout(
+            route_a,
+            vos::v2::RootTreeInvocationV2 {
+                invocation: InvocationId([124; 32]),
+                logical_timeslot: 4,
+                target: actor,
+                method: "attested_value".into(),
+                arguments: attested_arguments,
+                proof_requested: true,
+            }
+            .encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .and_then(|bytes| vos::v2::CommittedAttestationPackageV2::decode(&bytes).ok())
+        .expect("the CRDT root proves before applying its causal transition");
+    assert_eq!(
+        Value::try_decode(&package.reply.reply.result),
+        Some(Value::I64(6))
+    );
+    assert_eq!(package.proof_blob.bytes, b"node crdt proof");
 
     drop((handle_a, handle_b, network_a, network_b));
     node_a.shutdown();

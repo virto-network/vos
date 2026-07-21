@@ -171,7 +171,13 @@ must exactly match the Refine envelope. The producer receives the exact target
 actor PVM separately from the complete canonical import set, plus the live
 instruction/protocol/switch counts and observed code hashes; its trace must
 equal that live commitment before proof availability or Apply is attempted. The
-remaining production gap is a proof backend that consumes or reproduces the
+Local, CRDT, and Raft node registration APIs each have an explicit
+`*_with_producer` form; the ordinary forms deliberately install no fallback
+producer. CRDT proof generation precedes its causal Apply, and Raft proof
+generation precedes proposal of the exact Apply request to the accumulation
+log.
+
+The remaining production gap is a proof backend that consumes or reproduces the
 full witness behind this commitment; it is not a second attestation-only actor
 binary.
 

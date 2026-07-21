@@ -21,6 +21,11 @@ impl CrdtCounterV2 {
         self.count.value()
     }
 
+    #[msg(attested)]
+    fn attested_value(&self) -> i64 {
+        self.count.value()
+    }
+
     #[msg]
     async fn spawn_dynamic(&mut self, ctx: &mut Context<Self>) -> bool {
         ctx.spawn::<CrdtCounterV2Ref, _>(

@@ -3177,6 +3177,56 @@ impl VosNode {
     where
         B: crate::v2::CommittedImageStoreV2 + Send + 'static,
     {
+        self.register_v2_crdt_root_inner(
+            name,
+            service,
+            replication_id,
+            id,
+            network_reachable,
+            V2ProofProducerSlot::unavailable(),
+        )
+    }
+
+    /// Register a CRDT root with the proof producer used for attested
+    /// methods. Causal sync remains guest-owned; the producer is invoked only
+    /// for the exact traced Refine transition before its CRDT Apply.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub fn register_v2_crdt_root_at_id_with_producer<B, P>(
+        &mut self,
+        name: String,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        replication_id: [u8; 32],
+        id: ServiceId,
+        network_reachable: bool,
+        producer: P,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+    {
+        self.register_v2_crdt_root_inner(
+            name,
+            service,
+            replication_id,
+            id,
+            network_reachable,
+            V2ProofProducerSlot::configured(producer),
+        )
+    }
+
+    #[cfg(all(feature = "storage", feature = "network"))]
+    fn register_v2_crdt_root_inner<B>(
+        &mut self,
+        name: String,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        replication_id: [u8; 32],
+        id: ServiceId,
+        network_reachable: bool,
+        proof_producer: V2ProofProducerSlot,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+    {
         if service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
             return Err(V2NodeRegistrationError::InvalidConsistency(
                 service.consistency(),
@@ -3220,7 +3270,7 @@ impl VosNode {
             service,
             id,
             network_reachable,
-            V2ProofProducerSlot::unavailable(),
+            proof_producer,
             Some(hooks),
         ) {
             Ok(id) => {
@@ -3251,6 +3301,66 @@ impl VosNode {
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
+    ) -> Result<ServiceId, V2RaftNodeRegistrationError<B::Error>>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+    {
+        self.register_v2_raft_root_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            V2ProofProducerSlot::unavailable(),
+        )
+    }
+
+    /// Attach a Raft-backed v2 root with the proof producer used for attested
+    /// methods. Proof generation completes before the exact Apply request is
+    /// proposed to the canonical Raft accumulation log.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_with_producer<B, P>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        producer: P,
+    ) -> Result<ServiceId, V2RaftNodeRegistrationError<B::Error>>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+    {
+        self.register_v2_raft_root_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            V2ProofProducerSlot::configured(producer),
+        )
+    }
+
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_v2_raft_root_inner<B>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        proof_producer: V2ProofProducerSlot,
     ) -> Result<ServiceId, V2RaftNodeRegistrationError<B::Error>>
     where
         B: crate::v2::CommittedImageStoreV2 + Send + 'static,
@@ -3303,7 +3413,14 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Open(error));
             }
         };
-        match self.register_v2_root_at_id(name, service, id, network_reachable) {
+        match self.register_v2_root_inner(
+            name,
+            service,
+            id,
+            network_reachable,
+            proof_producer,
+            None,
+        ) {
             Ok(id) => Ok(id),
             Err(error) => {
                 cleanup(self);
