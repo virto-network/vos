@@ -74,6 +74,15 @@ The filesystem backend flushes a sibling file, atomically renames it, and syncs
 the parent directory. A backend rejection leaves the previous in-process image
 visible and the same work may be retried exactly.
 
+`LocalRootTreeServiceV2` is the reusable local ownership boundary used by
+hosts. It validates the package/service/deployment tuple, installs an empty
+backing image through physical Accumulate, and on restart rejects any stored
+service, root actor, program, policy, initial-state, or external-binding
+mismatch. Its ordinary invocation path schedules exclusively from committed
+guest state. Non-empty replies, outbox records, blobs, and proofs remain in the
+guest-owned publication table until the host submits their exact commitment to
+physical Accumulate for acknowledgement.
+
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an
 `EffectLog` or a leader-produced post-state image. `ReplicatedJamServiceV2`

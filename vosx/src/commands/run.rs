@@ -9,11 +9,10 @@ use std::path::{Path, PathBuf};
 
 use vos::runtime::{GasConfig, VosRuntime};
 use vos::v2::{
-    AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationResultV2, ActorId,
-    AuthorizationEvidenceV2, BlobRefV2, ConsistencyModeV2, DeploymentId, Hash, InvocationId,
-    JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    NoRefineProtocolHostV2, Origin, ProgramId, PublicationAckV2, RootServiceId, ServiceGenesisV2,
-    ServiceIdentityV2, SpaceId, SystemCapabilityId, V2Wire, VosPackageV2,
+    ActorId, AuthorizationEvidenceV2, ConsistencyModeV2, DeploymentId, Hash, InvocationId,
+    LocalRootTreeConfigV2, LocalRootTreeServiceV2, LocalWorkRequestV2, MemoryCommittedImageStoreV2,
+    Origin, ProgramId, RootServiceId, ServiceIdentityV2, SpaceId, SystemCapabilityId, V2Wire,
+    VosPackageV2,
 };
 use vos::value::{Msg, TAG_DYNAMIC, Value};
 use vos::{Decode, Encode};
@@ -74,51 +73,28 @@ fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u6
     } else {
         ConsistencyModeV2::Local
     };
-    let initial_bytes = Vec::new();
-    let initial = BlobRefV2::of_bytes(&initial_bytes);
-    let actor_genesis = package
-        .actor_genesis(actor, package.manifest.name.clone(), None, initial.clone())
-        .unwrap_or_else(|error| die(&format!("building actor installation: {error}")));
-
-    let mut host = LocalJamStoreV2::default();
-    if host.import_blob(initial_bytes) != initial
-        || host.import_program(package.actor_pvm.clone()) != package.manifest.actor_program
-    {
-        die("package content identity changed while importing it");
-    }
-    let mut service = JamServiceV2::new(
-        canonical_service,
-        service_program,
-        NoRefineProtocolHostV2,
-        host,
-        gas,
-        gas.saturating_mul(10),
-    )
-    .unwrap_or_else(|error| die(&format!("starting generic service: {error}")));
-    let genesis = ServiceGenesisV2 {
-        service: identity.clone(),
-        consistency,
-        actors: vec![actor_genesis],
-        external_actors: vec![],
-        authorization: AuthorizationEvidenceV2::SystemCapability {
-            capability: SystemCapabilityId(
-                Hash::digest(b"vosx/local-install-capability/v2", &[&deployment.0]).0,
-            ),
-            authenticator: package.deployment_signature.signature.clone(),
+    let mut service = LocalRootTreeServiceV2::open(
+        LocalRootTreeConfigV2 {
+            service_pvm: canonical_service,
+            package,
+            service: identity,
+            root_actor: actor,
+            actor_name: package_name(package_path),
+            consistency,
+            initial_state: Vec::new(),
+            external_actors: vec![],
+            install_authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId(
+                    Hash::digest(b"vosx/local-install-capability/v2", &[&deployment.0]).0,
+                ),
+                authenticator: deployment.0.to_vec(),
+            },
+            refine_gas: gas,
+            accumulate_gas: gas.saturating_mul(10),
         },
-    };
-    service.accumulate_host_mut().allow_install(&genesis);
-    match service
-        .accumulate(&AccumulateRequestV2::Install(genesis))
-        .unwrap_or_else(|error| die(&format!("installing root tree: {error}")))
-        .result
-    {
-        AccumulationResultV2::Installed(_) => {}
-        AccumulationResultV2::Rejected(rejection) => die(&format!(
-            "guest rejected root-tree installation: {rejection:?}"
-        )),
-        _ => die("generic service returned a non-install result for installation"),
-    }
+        MemoryCommittedImageStoreV2::default(),
+    )
+    .unwrap_or_else(|error| die(&format!("opening local root-tree service: {error:?}")));
 
     for (ordinal, arguments) in items.into_iter().enumerate() {
         let method = method_from_payload(&arguments)
@@ -131,9 +107,8 @@ fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u6
             )
             .0,
         );
-        let prepared = LocalWorkSchedulerV2::prepare(
-            service.accumulate_host(),
-            LocalWorkRequestV2 {
+        let committed = service
+            .invoke(LocalWorkRequestV2 {
                 invocation,
                 workflow_step: 0,
                 logical_timeslot: ordinal as u64,
@@ -147,77 +122,43 @@ fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u6
                 awaited_reply: None,
                 imported_blobs: vec![],
                 proof_requested: false,
-            },
-        )
-        .unwrap_or_else(|error| die(&format!("scheduling v2 work: {error}")));
-        let refined = service
-            .refine_actor_tree(&prepared.work, &prepared.imports)
-            .unwrap_or_else(|error| die(&format!("refining actor tree: {error}")));
-        let input = prepared.work.input_id();
-        let applied = service
-            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-                work: prepared.work,
-                transition: refined.transition,
-                provided_blobs: refined.exported_blobs,
-            }))
-            .unwrap_or_else(|error| die(&format!("accumulating transition: {error}")));
-        let (receipt, published) = match applied.result {
-            AccumulationResultV2::Accepted {
-                receipt,
-                published,
-                duplicate: false,
-            } => (receipt, published),
-            AccumulationResultV2::Accepted {
-                duplicate: true, ..
-            } => die("fresh local invocation was unexpectedly deduplicated"),
-            AccumulationResultV2::Rejected(rejection) => {
-                die(&format!("guest rejected transition: {rejection:?}"))
-            }
-            _ => die("generic service returned a non-apply result for actor work"),
-        };
+            })
+            .unwrap_or_else(|error| die(&format!("executing v2 work: {error:?}")));
 
-        if let Some(reply) = &published.reply {
+        if let Some(reply) = &committed.published.reply {
             match Value::try_decode(&reply.result) {
                 Some(value) => println!("{value:?}"),
                 None => println!("0x{}", hex::encode(&reply.result)),
             }
         }
-        if !published.outbox.is_empty() {
+        if !committed.published.outbox.is_empty() {
             println!(
                 "checkpointed {} durable outbound call(s) at sequence {}",
-                published.outbox.len(),
-                receipt.sequence
+                committed.published.outbox.len(),
+                committed.receipt.sequence
             );
         }
-
-        let publication = service
-            .accumulate_host()
-            .pending_publications()
-            .unwrap_or_else(|error| die(&format!("reading committed publications: {error}")))
-            .into_iter()
-            .find(|publication| publication.input == input)
-            .unwrap_or_else(|| die("accepted transition did not retain its publication row"));
-        match service
-            .accumulate(&AccumulateRequestV2::AcknowledgePublication(
-                PublicationAckV2 {
-                    service: identity.clone(),
-                    input,
-                    publication: publication.commitment(),
-                },
-            ))
-            .unwrap_or_else(|error| die(&format!("acknowledging publication: {error}")))
-            .result
-        {
-            AccumulationResultV2::PublicationAcknowledged {
-                duplicate: false, ..
-            } => {}
-            other => die(&format!(
-                "guest rejected publication acknowledgement: {other:?}"
-            )),
+        if let Some(publication) = committed.publication.as_ref() {
+            let duplicate = service
+                .acknowledge_publication(publication)
+                .unwrap_or_else(|error| {
+                    die(&format!("acknowledging committed publication: {error:?}"))
+                });
+            if duplicate {
+                die("fresh publication acknowledgement was unexpectedly deduplicated");
+            }
         }
     }
 
     eprintln!("\nvosx: done");
+}
+
+fn package_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("root")
+        .to_string()
 }
 
 fn verify_deployment_signature(package: &VosPackageV2) {

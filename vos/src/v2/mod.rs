@@ -21,6 +21,8 @@ mod package;
 #[cfg(feature = "std")]
 mod pvm;
 #[cfg(feature = "std")]
+mod root_service;
+#[cfg(feature = "std")]
 mod scheduler;
 #[cfg(feature = "std")]
 mod service;
@@ -59,7 +61,7 @@ pub use identity::{
 pub use local_store::{
     CommittedImageStoreV2, CommittedServiceImageHostV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
     FileCommittedImageStoreV2, LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalStoreReadErrorV2,
-    ServiceImageInstallErrorV2,
+    MemoryCommittedImageStoreV2, ServiceImageInstallErrorV2,
 };
 pub use package::{
     DeploymentRegistryV2, DeploymentSignatureV2, DeploymentSignatureVerifierV2,
@@ -71,6 +73,11 @@ pub use package::{
 pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
     RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
+};
+#[cfg(feature = "std")]
+pub use root_service::{
+    CommittedRootTreeSliceV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
+    LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};

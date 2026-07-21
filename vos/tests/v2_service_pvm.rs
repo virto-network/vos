@@ -19,13 +19,15 @@ use vos::v2::{
     CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2,
     Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2,
-    LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, ProducerId, ProgramId, ProofCommitmentV2,
+    LocalJamStoreV2, LocalRootTreeConfigV2, LocalRootTreeServiceV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
+    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofCommitmentV2,
     ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2, SubjectId, TransitionV2, V2Wire,
-    WorkEnvelopeV2, WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
+    ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2,
+    V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash,
+    space_role_policy_hash,
 };
 use vos::{
     Attestation, AttestedMethod, Decode, Encode, StateCommitmentV3,
@@ -481,6 +483,117 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         transition.reply.as_ref().map(|reply| reply.call_id),
         Some(work.invocation.root_reply_id())
     );
+}
+
+#[test]
+fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
+    let (Some(service_elf), Some(actor_elf)) = (service_elf(), greeter_elf()) else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let schemas = vos::metadata::raw_section_from_elf(&actor_elf).expect("greeter metadata");
+    let metadata = vos::metadata::decode(&schemas).expect("valid greeter metadata");
+    let policies = PackageRolePoliciesV2::from_metadata(&metadata)
+        .unwrap()
+        .encode();
+    let public_key = b"root-tree-host-test-key".to_vec();
+    let package = VosPackageV2 {
+        manifest: PackageManifestV2 {
+            name: metadata.actor_name.clone(),
+            version: "2.0.0".into(),
+            service_abi: vos::v2::ABI_VERSION,
+            snapshot_version: vos::v2::SNAPSHOT_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            service_program,
+            actor_program: ProgramId::of_pvm(&actor_pvm),
+            crdt: false,
+            interfaces_hash: artifact_hash(b"interfaces", &[]),
+            role_policies_hash: artifact_hash(b"role-policies", &policies),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+        },
+        actor_pvm,
+        generated_interfaces: vec![],
+        role_policies: policies,
+        schemas,
+        diagnostics: None,
+        deployment_signature: vos::v2::DeploymentSignatureV2 {
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+            signature: vec![1],
+        },
+    };
+    package.validate().unwrap();
+    let deployment = package.deployment_id();
+    let identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([91; 32]),
+        root_service: RootServiceId([92; 32]),
+        deployment,
+        service_program,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let actor = ActorId([93; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm,
+        package,
+        service: identity,
+        root_actor: actor,
+        actor_name: metadata.actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([94; 32]),
+            authenticator: vec![95],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+
+    let mut service =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("fresh service installs through physical Accumulate");
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    let first = service
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([96; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: actor,
+            method: "start".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("slice commits through physical Accumulate");
+    let publication = first
+        .publication
+        .expect("committed reply remains recoverable until acknowledgement");
+    assert_eq!(service.store().header().unwrap().unwrap().revision, 1);
+
+    let backend = service.into_backend();
+    let mut restarted = LocalRootTreeServiceV2::open(config.clone(), backend)
+        .expect("exact service image restores without reinstalling");
+    assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+    assert_eq!(
+        restarted.pending_publications().unwrap(),
+        vec![publication.clone()]
+    );
+    assert!(!restarted.acknowledge_publication(&publication).unwrap());
+
+    let backend = restarted.into_backend();
+    let restarted = LocalRootTreeServiceV2::open(config, backend)
+        .expect("acknowledged image restores through the same service identity");
+    assert!(restarted.pending_publications().unwrap().is_empty());
+    assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
 }
 
 #[test]

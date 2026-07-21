@@ -142,6 +142,33 @@ pub trait CommittedImageStoreV2 {
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// Process-local committed-image sink for one-shot hosts and conformance
+/// tests. It exercises the same durable-host transaction ordering without
+/// claiming crash persistence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryCommittedImageStoreV2 {
+    image: Option<Vec<u8>>,
+}
+
+impl MemoryCommittedImageStoreV2 {
+    pub fn image(&self) -> Option<&[u8]> {
+        self.image.as_deref()
+    }
+}
+
+impl CommittedImageStoreV2 for MemoryCommittedImageStoreV2 {
+    type Error = core::convert::Infallible;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.image.clone())
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.image = Some(image.to_vec());
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceImageInstallErrorV2 {
     InvalidSnapshot,
