@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EXPECTED: &str = "66065e3808d43d86b3506ee2e79d8ee6768caa16";
+const EXPECTED: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 const JAR_GIT: &str = "https://github.com/olanod/jar.git";
 const JAR_PACKAGES: &[&str] = &[
     "javm",
