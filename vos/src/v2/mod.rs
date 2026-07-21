@@ -43,8 +43,8 @@ pub use contracts::{
     ActorTreeImportV2, ActorUpgradeV2, ActorWriteV2, AttestationDeliveryV2, AttestationResumeV2,
     AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2,
     CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
-    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, DirectIngressV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtIngressV2, CrdtMaterializationV2,
+    CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, DirectIngressV2,
     ExternalActorBindingV2, ExternalActorDirectoryV2, GasAccountingV2, ImportedActorV2,
     ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
     ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
@@ -79,9 +79,9 @@ pub use pvm::{
 };
 #[cfg(feature = "std")]
 pub use root_service::{
-    CommittedRootTreeSliceV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
-    LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2,
-    RootTreeIngressRecoveryV2, RootTreeInvocationV2,
+    CommittedCrdtSyncV2, CommittedRootTreeSliceV2, LocalRootTreeConfigErrorV2,
+    LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2,
+    LocalRootTreeServiceV2, RootTreeIngressRecoveryV2, RootTreeInvocationV2,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};
@@ -124,8 +124,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0xe3, 0xa9, 0xcb, 0xff, 0x37, 0x2e, 0x8a, 0x92, 0x90, 0x04, 0xd2, 0x37, 0x13, 0x8e, 0x8b, 0xf3,
-    0xe8, 0xce, 0xdd, 0x03, 0xf3, 0x5e, 0xeb, 0x5c, 0x00, 0x1f, 0xc2, 0x57, 0xc4, 0xb7, 0xe0, 0xf2,
+    0xa0, 0xa3, 0x77, 0x96, 0x97, 0x0f, 0x5a, 0x53, 0xbc, 0x0b, 0x8d, 0xe9, 0x46, 0x46, 0x4d, 0x7d,
+    0xa7, 0xdf, 0xf8, 0x7f, 0xf0, 0xe9, 0x8b, 0x96, 0x04, 0xf8, 0x4c, 0x66, 0xbe, 0xad, 0x60, 0x03,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

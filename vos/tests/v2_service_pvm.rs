@@ -827,6 +827,29 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
             .expect("consumed ingress remains a durable retry guard")
             .consumed
     );
+    let committed_header = service.store().header().unwrap().unwrap();
+    let committed_checkpoint = vos::v2::WorkflowCheckpointV2::decode(
+        &service
+            .store()
+            .state_row(
+                committed_header.service_root,
+                &StateKeyV2::Workflow(request.invocation),
+            )
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let committed_dedup = vos::v2::DedupRecordV2::decode(
+        service
+            .store()
+            .row(&vos::v2::dedup_storage_key(committed_checkpoint.input))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        committed_checkpoint.transition_hash, committed_dedup.transition_commitment,
+        "linear retry recovery must bind the workflow checkpoint to its dedup record"
+    );
     assert_eq!(
         first.published.reply.as_ref().map(|reply| &reply.result),
         Some(&Value::Unit.encode())
@@ -992,8 +1015,8 @@ fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
 
     let backend = service.into_backend();
     let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
-    assert_eq!(log.applied_index().unwrap(), 3);
-    assert!(log.committed_after(3).unwrap().entries.is_empty());
+    assert_eq!(log.applied_index().unwrap(), 4);
+    assert!(log.committed_after(4).unwrap().entries.is_empty());
     let mut reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
         .expect("root reopens at the durable Raft apply cursor");
     assert!(reopened.catch_up().unwrap());
@@ -1089,7 +1112,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
     let mut source_log =
         RaftAccumulateLogV2::open(&source_log_path, RaftConfig::default()).unwrap();
     let source_index = source_log.applied_index().unwrap();
-    assert_eq!(source_index, 2);
+    assert_eq!(source_index, 3);
     drop(source_log);
 
     // Start a real non-writable worker with no committed genesis. Opening the
@@ -3173,6 +3196,85 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         panic!("merged CRDT child rejected")
     };
     assert_eq!(receipt.resulting_crdt_heads, vec![merged_cid]);
+
+    let admission_request = LocalWorkRequestV2 {
+        invocation: InvocationId([59; 32]),
+        workflow_step: 0,
+        logical_timeslot: 6,
+        target: work.target,
+        method: "increment".into(),
+        arguments: {
+            let mut arguments = vec![vos::value::TAG_DYNAMIC];
+            arguments.extend_from_slice(&Msg::new("increment").with("amount", 1u64).encode());
+            arguments
+        },
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let admission = LocalWorkSchedulerV2::prepare_direct_ingress(
+        service.accumulate_host(),
+        &work.service,
+        &admission_request,
+    )
+    .expect("scheduler binds direct ingress to the current causal frontier");
+    let admission_cid = admission.crdt_change.as_ref().unwrap().cid();
+    let admitted = service
+        .accumulate(&AccumulateRequestV2::AdmitIngress(admission))
+        .unwrap()
+        .result;
+    assert!(matches!(
+        admitted,
+        AccumulationResultV2::IngressAdmitted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        service
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .unwrap()
+            .crdt_heads
+            .contains(&admission_cid)
+    );
+
+    let sync = LocalWorkSchedulerV2::prepare_crdt_sync(service.accumulate_host())
+        .expect("the exported DAG includes the causal ingress admission");
+    for node in &sync.nodes {
+        replica
+            .accumulate_host_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: node.change.expected_producer().unwrap(),
+                receipt: node.receipt.clone(),
+            });
+    }
+    let synced = replica
+        .accumulate(&AccumulateRequestV2::SyncCrdt(sync))
+        .unwrap()
+        .result;
+    assert!(matches!(
+        synced,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        !replica
+            .accumulate_host()
+            .ingress_record(admission_request.invocation)
+            .unwrap()
+            .expect("synced admission is rematerialized as queued input")
+            .consumed
+    );
 }
 
 #[test]

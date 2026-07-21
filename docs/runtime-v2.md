@@ -629,12 +629,11 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 19 and continuation snapshot version 5 are therefore a clean
+Store schema 20 and continuation snapshot version 5 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, the complete dormant actor-program layout to each
 continuation, and guest-owned atomic same-package child creation.
-
 ## CRDT boundary
 
 Only `#[actor(crdt)]` packages may select CRDT consistency. Their replicated

@@ -863,6 +863,38 @@ pub enum WorkflowOperationV2 {
     /// logical-timeslot outcome for exact continuation resumption.
     ExpireCall(CallTimeoutV2),
     Reply(ReplyRecordV2),
+    /// Direct caller input admitted before actor execution. CRDT services
+    /// carry this as its own causal node so a busy or restarted replica can
+    /// recover the queued invocation without relying on host memory.
+    Ingress(CrdtIngressV2),
+}
+
+/// Stable caller-controlled portion of a causal direct-ingress admission.
+/// The surrounding [`DirectIngressV2`] supplies the observed causal base and
+/// the exact change which contains this operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrdtIngressV2 {
+    pub service: ServiceIdentityV2,
+    pub invocation: InvocationId,
+    pub logical_timeslot: u64,
+    pub target: ActorId,
+    pub method: String,
+    pub arguments: Vec<u8>,
+    pub origin: Origin,
+    pub authorization: AuthorizationEvidenceV2,
+    pub imported_blobs: Vec<BlobRefV2>,
+    pub proof_requested: bool,
+}
+
+impl CrdtIngressV2 {
+    /// Commitment shared by the admitted ingress record and its causal DAG
+    /// node. It binds every stable caller input while leaving causal ancestry
+    /// to the surrounding [`CrdtChangeV2`].
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        encode_crdt_ingress(&mut Encoder(&mut bytes), self);
+        Hash::digest(b"vos/crdt-ingress/v2", &[&bytes])
+    }
 }
 
 /// One atomic CRDT DAG payload for an entire actor execution slice.
@@ -912,6 +944,37 @@ impl CrdtChangeV2 {
         e.bytes(&timeout.encode());
         e.list(heads, |e, head| e.fixed(&head.0));
         ChangeId(Hash::digest(b"vos/crdt-expiration-id/v2", &[&bytes]).0)
+    }
+
+    pub fn derive_ingress_id(ingress: &CrdtIngressV2, heads: &[Hash]) -> ChangeId {
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        encode_service(&mut e, &ingress.service);
+        e.fixed(&ingress.invocation.0);
+        e.fixed(&ingress.target.0);
+        e.list(heads, |e, head| e.fixed(&head.0));
+        ChangeId(Hash::digest(b"vos/crdt-ingress-id/v2", &[&bytes]).0)
+    }
+
+    /// Actor whose finalized service receipt authenticates this causal node.
+    /// Platform-only ingress and expiration nodes name their actor directly;
+    /// an execution slice must contain exactly one checkpoint producer.
+    pub fn expected_producer(&self) -> Option<ActorId> {
+        if let [WorkflowOperationV2::ExpireCall(timeout)] = self.workflow.as_slice() {
+            return Some(timeout.caller_actor);
+        }
+        if let [WorkflowOperationV2::Ingress(ingress)] = self.workflow.as_slice() {
+            return Some(ingress.target);
+        }
+        let mut checkpoints = self.workflow.iter().filter_map(|operation| {
+            if let WorkflowOperationV2::Checkpoint(work) = operation {
+                Some(work.target)
+            } else {
+                None
+            }
+        });
+        let producer = checkpoints.next()?;
+        checkpoints.next().is_none().then_some(producer)
     }
 }
 
@@ -1238,6 +1301,9 @@ pub struct DirectIngressV2 {
     pub authorization: AuthorizationEvidenceV2,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
+    pub base: ConsistencyBaseV2,
+    pub base_causal_height: Option<u64>,
+    pub crdt_change: Option<CrdtChangeV2>,
 }
 
 impl DirectIngressV2 {
@@ -1257,6 +1323,21 @@ impl DirectIngressV2 {
             && self.authorization == candidate.authorization
             && self.imported_blobs == candidate.imported_blobs
             && self.proof_requested == candidate.proof_requested
+    }
+
+    pub fn crdt_operation(&self) -> CrdtIngressV2 {
+        CrdtIngressV2 {
+            service: self.service.clone(),
+            invocation: self.invocation,
+            logical_timeslot: self.logical_timeslot,
+            target: self.target,
+            method: self.method.clone(),
+            arguments: self.arguments.clone(),
+            origin: self.origin,
+            authorization: self.authorization.clone(),
+            imported_blobs: self.imported_blobs.clone(),
+            proof_requested: self.proof_requested,
+        }
     }
 
     pub fn matches_work(&self, work: &WorkEnvelopeV2) -> bool {
@@ -1465,6 +1546,7 @@ pub enum AccumulationResultV2 {
     Installed(ServiceInstallReceiptV2),
     IngressAdmitted {
         invocation: InvocationId,
+        receipt: AccumulationReceiptV2,
         duplicate: bool,
     },
     Accepted {
@@ -2970,6 +3052,9 @@ impl V2Wire for DirectIngressV2 {
         encode_auth(&mut e, &self.authorization);
         e.list(&self.imported_blobs, encode_blob_ref);
         e.bool(self.proof_requested);
+        encode_base(&mut e, &self.base);
+        e.option(&self.base_causal_height, |e, height| e.u64(*height));
+        e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2984,6 +3069,9 @@ impl V2Wire for DirectIngressV2 {
             authorization: decode_auth(d)?,
             imported_blobs: d.list(decode_blob_ref)?,
             proof_requested: d.bool()?,
+            base: decode_base(d)?,
+            base_causal_height: d.option(Decoder::u64)?,
+            crdt_change: d.option(|d| CrdtChangeV2::decode(&d.bytes()?))?,
         };
         ensure_sorted_unique(&value.imported_blobs, |blob| blob.hash.0)?;
         if value.invocation == InvocationId::ZERO
@@ -2992,6 +3080,19 @@ impl V2Wire for DirectIngressV2 {
             || value.arguments.is_empty()
         {
             return Err(DecodeError::NonCanonical);
+        }
+        match (&value.base, value.base_causal_height, &value.crdt_change) {
+            (ConsistencyBaseV2::Linear { .. }, None, None) => {}
+            (ConsistencyBaseV2::Crdt { heads }, Some(height), Some(change))
+                if change.id == CrdtChangeV2::derive_ingress_id(&value.crdt_operation(), heads)
+                    && change.work_hash == value.crdt_operation().commitment()
+                    && change.causal_dependencies == *heads
+                    && height.checked_add(1) == Some(change.causal_height)
+                    && change.operations.is_empty()
+                    && change.materializations.is_empty()
+                    && change.workflow
+                        == [WorkflowOperationV2::Ingress(value.crdt_operation())] => {}
+            _ => return Err(DecodeError::NonCanonical),
         }
         Ok(value)
     }
@@ -3203,10 +3304,12 @@ impl V2Wire for AccumulationResultV2 {
             }
             Self::IngressAdmitted {
                 invocation,
+                receipt,
                 duplicate,
             } => {
                 e.u8(5);
                 e.fixed(&invocation.0);
+                e.bytes(&receipt.encode());
                 e.bool(*duplicate);
             }
             Self::Accepted {
@@ -3264,12 +3367,14 @@ impl V2Wire for AccumulationResultV2 {
             0 => Ok(Self::Installed(decode_install_receipt(d)?)),
             5 => {
                 let invocation = InvocationId(d.fixed()?);
+                let receipt = AccumulationReceiptV2::decode(&d.bytes()?)?;
                 let duplicate = d.bool()?;
-                if invocation == InvocationId::ZERO {
+                if invocation == InvocationId::ZERO || receipt.checkpoint != 0 {
                     return Err(DecodeError::NonCanonical);
                 }
                 Ok(Self::IngressAdmitted {
                     invocation,
+                    receipt,
                     duplicate,
                 })
             }
@@ -3637,6 +3742,9 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
             }
             WorkflowOperationV2::Continuation(change) => {
                 references.extend(change.replacement.iter());
+            }
+            WorkflowOperationV2::Ingress(ingress) => {
+                references.extend(ingress.imported_blobs.iter());
             }
             WorkflowOperationV2::Inbox(_)
             | WorkflowOperationV2::Outbox(_)
@@ -4107,6 +4215,10 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
             e.u8(8);
             e.bytes(&timeout.encode());
         }
+        WorkflowOperationV2::Ingress(ingress) => {
+            e.u8(6);
+            encode_crdt_ingress(e, ingress);
+        }
     }
 }
 
@@ -4122,11 +4234,49 @@ fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2,
         3 => Ok(WorkflowOperationV2::Outbox(decode_message(d)?)),
         4 => Ok(WorkflowOperationV2::Reply(decode_reply(d)?)),
         5 => Ok(WorkflowOperationV2::ConsumeOutbox(CallId(d.fixed()?))),
+        6 => Ok(WorkflowOperationV2::Ingress(decode_crdt_ingress(d)?)),
         8 => Ok(WorkflowOperationV2::ExpireCall(CallTimeoutV2::decode(
             &d.bytes()?,
         )?)),
         _ => Err(DecodeError::InvalidTag),
     }
+}
+
+fn encode_crdt_ingress(e: &mut Encoder<'_>, value: &CrdtIngressV2) {
+    encode_service(e, &value.service);
+    e.fixed(&value.invocation.0);
+    e.u64(value.logical_timeslot);
+    e.fixed(&value.target.0);
+    e.string(&value.method);
+    e.bytes(&value.arguments);
+    encode_origin(e, value.origin);
+    encode_auth(e, &value.authorization);
+    e.list(&value.imported_blobs, encode_blob_ref);
+    e.bool(value.proof_requested);
+}
+
+fn decode_crdt_ingress(d: &mut Decoder<'_>) -> Result<CrdtIngressV2, DecodeError> {
+    let value = CrdtIngressV2 {
+        service: decode_service(d)?,
+        invocation: InvocationId(d.fixed()?),
+        logical_timeslot: d.u64()?,
+        target: ActorId(d.fixed()?),
+        method: d.string()?,
+        arguments: d.bytes()?,
+        origin: decode_origin(d)?,
+        authorization: decode_auth(d)?,
+        imported_blobs: d.list(decode_blob_ref)?,
+        proof_requested: d.bool()?,
+    };
+    ensure_sorted_unique(&value.imported_blobs, |blob| blob.hash.0)?;
+    if value.invocation == InvocationId::ZERO
+        || value.target == ActorId::ZERO
+        || value.method.is_empty()
+        || value.arguments.is_empty()
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 fn workflow_operation_bytes(value: &WorkflowOperationV2) -> Vec<u8> {
@@ -5232,6 +5382,12 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             imported_blobs: vec![],
             proof_requested: false,
+            base: ConsistencyBaseV2::Linear {
+                revision: 1,
+                state_root: Hash([19; 32]),
+            },
+            base_causal_height: None,
+            crdt_change: None,
         });
         assert_eq!(
             AccumulateRequestV2::decode(&admission.encode()).unwrap(),
@@ -5447,8 +5603,20 @@ mod tests {
 
     #[test]
     fn accumulation_results_are_commit_decisions_on_the_wire() {
+        let receipt = AccumulationReceiptV2 {
+            service: service(),
+            accepted_transition: Hash([10; 32]),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([9; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 3,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
         let admitted = AccumulationResultV2::IngressAdmitted {
             invocation: InvocationId([11; 32]),
+            receipt,
             duplicate: false,
         };
         assert_eq!(
