@@ -219,6 +219,12 @@ legacy ELF/PVM rows continue on the old host only during this staged cutover.
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.
 
+CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
+exact causal base, stable invocation identity, authorization input, and
+accumulation receipt replicate before actor Refine runs; synchronized replicas
+rematerialize the same queued/consumed ingress record through physical IC-5.
+Store schema 7 is therefore a clean break from earlier experimental v2 images.
+
 ## CRDT boundary
 
 Only `#[actor(crdt)]` packages may select CRDT consistency. Their replicated

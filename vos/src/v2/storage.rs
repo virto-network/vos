@@ -14,7 +14,7 @@ use super::{
     PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 6;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 7;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -288,6 +288,9 @@ pub struct IngressRecordV2 {
     /// Set atomically with the initial actor slice. The original admission is
     /// retained as the permanent invocation deduplication identity.
     pub consumed: bool,
+    /// Exact guest receipt for the admission node. CRDT peers verify this
+    /// before importing the queued invocation through SyncCrdt.
+    pub receipt: AccumulationReceiptV2,
 }
 
 /// Recoverable effects created by one committed actor slice. The host may
@@ -444,13 +447,22 @@ impl V2Wire for IngressRecordV2 {
         let mut e = Encoder(out);
         e.bytes(&self.ingress.encode());
         e.bool(self.consumed);
+        e.bytes(&self.receipt.encode());
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
+        let value = Self {
             ingress: DirectIngressV2::decode(&d.bytes()?)?,
             consumed: d.bool()?,
-        })
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        if value.receipt.service != value.ingress.service
+            || value.receipt.accepted_transition != value.ingress.commitment()
+            || value.receipt.checkpoint != 0
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -815,9 +827,28 @@ mod tests {
                 authorization: super::super::AuthorizationEvidenceV2::Public,
                 imported_blobs: vec![],
                 proof_requested: false,
+                base: super::super::ConsistencyBaseV2::Linear {
+                    revision: 10,
+                    state_root: Hash([18; 32]),
+                },
+                base_causal_height: None,
+                crdt_change: None,
             },
             consumed: false,
+            receipt: AccumulationReceiptV2 {
+                service: service(18),
+                accepted_transition: Hash::ZERO,
+                reply_commitment: None,
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([18; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 10,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
         };
+        let mut ingress = ingress;
+        ingress.receipt.accepted_transition = ingress.ingress.commitment();
         assert_eq!(IngressRecordV2::decode(&ingress.encode()).unwrap(), ingress);
 
         let reply = ReplyRecordV2 {

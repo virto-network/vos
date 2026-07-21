@@ -2705,6 +2705,82 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             .map(|reply| Value::decode(&reply.result)),
         Some(Value::I64(34))
     );
+
+    let admission_request = LocalWorkRequestV2 {
+        invocation: InvocationId([59; 32]),
+        workflow_step: 0,
+        logical_timeslot: 6,
+        target: work.target,
+        method: "increment".into(),
+        arguments: {
+            let mut arguments = vec![vos::value::TAG_DYNAMIC];
+            arguments.extend_from_slice(&Msg::new("increment").with("amount", 1u64).encode());
+            arguments
+        },
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let admission = LocalWorkSchedulerV2::prepare_direct_ingress(
+        service.accumulate_host(),
+        &work.service,
+        &admission_request,
+    )
+    .expect("scheduler binds direct ingress to the current causal frontier");
+    let admission_cid = admission.crdt_change.as_ref().unwrap().cid();
+    let admitted = service
+        .accumulate(&AccumulateRequestV2::AdmitIngress(admission))
+        .unwrap()
+        .result;
+    assert!(matches!(
+        admitted,
+        AccumulationResultV2::IngressAdmitted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        service
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .unwrap()
+            .crdt_heads
+            .contains(&admission_cid)
+    );
+
+    let sync = LocalWorkSchedulerV2::prepare_crdt_sync(service.accumulate_host())
+        .expect("the exported DAG includes the causal ingress admission");
+    for node in &sync.nodes {
+        replica
+            .accumulate_host_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                receipt: node.receipt.clone(),
+            });
+    }
+    let synced = replica
+        .accumulate(&AccumulateRequestV2::SyncCrdt(sync))
+        .unwrap()
+        .result;
+    assert!(matches!(
+        synced,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        !replica
+            .accumulate_host()
+            .ingress_record(admission_request.invocation)
+            .unwrap()
+            .expect("synced admission is rematerialized as queued input")
+            .consumed
+    );
 }
 
 #[test]

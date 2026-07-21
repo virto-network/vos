@@ -40,7 +40,7 @@ pub use contracts::{
     ActorWriteV2, AttestationDeliveryV2, AttestationResumeV2, AttestationVerificationV2,
     AuthorizationEvidenceV2,
     AwaitResumeV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2, CrdtOperationV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtIngressV2, CrdtMaterializationV2, CrdtOperationV2,
     CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, DirectIngressV2,
     ExternalActorBindingV2, ExternalActorDirectoryV2, GasAccountingV2, ImportedActorV2,
     ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
@@ -77,7 +77,8 @@ pub use pvm::{
 };
 #[cfg(feature = "std")]
 pub use root_service::{
-    CommittedDeliveryV2, CommittedRootTreeSliceV2, LocalRootTreeConfigErrorV2,
+    CommittedCrdtSyncV2, CommittedDeliveryV2, CommittedRootTreeSliceV2,
+    LocalRootTreeConfigErrorV2,
     LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2,
     LocalRootTreeServiceV2, RootTreeIngressRecoveryV2, RootTreeInvocationV2,
     RootTreeTransportV2,

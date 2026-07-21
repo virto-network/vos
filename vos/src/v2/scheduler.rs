@@ -14,11 +14,11 @@ use super::contracts::crdt_change_blob_references;
 use super::{
     AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CallId, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
-    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, ExternalActorDirectoryV2,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2,
-    LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2, V2Wire,
-    WorkEnvelopeV2, WorkflowCheckpointV2, WorkflowOperationV2, crdt_node_receipt_storage_key,
-    crdt_node_storage_key,
+    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, DirectIngressV2,
+    ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
+    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2,
+    ServiceIdentityV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
+    WorkflowOperationV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -96,6 +96,91 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    /// Bind stable caller input to the service's exact current linear revision
+    /// or causal frontier. CRDT admission becomes a workflow DAG node before
+    /// Refine runs; constructing this input is read-only.
+    pub fn prepare_direct_ingress(
+        store: &LocalJamStoreV2,
+        service: &ServiceIdentityV2,
+        request: &LocalWorkRequestV2,
+    ) -> Result<DirectIngressV2, ScheduleErrorV2> {
+        if request.workflow_step != 0
+            || request.causal_parent.is_some()
+            || request.parent_call.is_some()
+            || request.awaited_reply.is_some()
+        {
+            return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
+        }
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        if header.service != *service {
+            return Err(ScheduleErrorV2::StoreUninitialized);
+        }
+        let initial_base = if header.consistency == ConsistencyModeV2::Crdt {
+            ConsistencyBaseV2::Crdt {
+                heads: header.crdt_heads.clone(),
+            }
+        } else {
+            ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root: header
+                    .state_root
+                    .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?,
+            }
+        };
+        let mut ingress = DirectIngressV2 {
+            service: service.clone(),
+            invocation: request.invocation,
+            logical_timeslot: request.logical_timeslot,
+            target: request.target,
+            method: request.method.clone(),
+            arguments: request.arguments.clone(),
+            origin: request.origin,
+            authorization: request.authorization.clone(),
+            imported_blobs: request.imported_blobs.clone(),
+            proof_requested: request.proof_requested,
+            base: initial_base,
+            base_causal_height: None,
+            crdt_change: None,
+        };
+        if header.consistency == ConsistencyModeV2::Crdt {
+            let heads = header.crdt_heads;
+            let frontier = match load_causal_frontier(&heads, |cid| {
+                Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(Vec::from))
+            }) {
+                Ok(frontier) => frontier,
+                Err(CausalFrontierError::Missing(dependency)) => {
+                    return Err(ScheduleErrorV2::MissingCausalDependency(dependency));
+                }
+                Err(CausalFrontierError::Corrupt) => {
+                    return Err(ScheduleErrorV2::CorruptCausalDag);
+                }
+                Err(CausalFrontierError::Storage(error)) => match error {},
+            };
+            let height = frontier.max_head_height;
+            ingress.base = ConsistencyBaseV2::Crdt {
+                heads: heads.clone(),
+            };
+            ingress.base_causal_height = Some(height);
+            let operation = ingress.crdt_operation();
+            ingress.crdt_change = Some(CrdtChangeV2 {
+                id: CrdtChangeV2::derive_ingress_id(&operation, &heads),
+                causal_dependencies: heads,
+                causal_height: height
+                    .checked_add(1)
+                    .ok_or(ScheduleErrorV2::CorruptCausalDag)?,
+                operations: Vec::new(),
+                workflow: alloc::vec![WorkflowOperationV2::Ingress(operation)],
+                materializations: Vec::new(),
+            });
+        } else if !matches!(
+            header.consistency,
+            ConsistencyModeV2::Local | ConsistencyModeV2::Raft
+        ) {
+            return Err(ScheduleErrorV2::UnsupportedConsistency(header.consistency));
+        }
+        DirectIngressV2::decode(&ingress.encode()).map_err(|_| ScheduleErrorV2::NonCanonicalImports)
+    }
+
     /// Export the complete authenticated causal DAG for another replica. This
     /// is a read-only transport helper: the destination still submits the
     /// envelope to physical IC-5, where guest Accumulate verifies every node

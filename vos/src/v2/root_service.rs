@@ -14,13 +14,14 @@ use super::{
     AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
     AuthorizationEvidenceV2, BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
-    ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2, LocalStoreReadErrorV2,
-    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefinedServiceOutputV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
+    ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2, DurableJamStoreV2,
+    DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
+    LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PreparedWorkV2,
+    ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
+    WorkflowCheckpointV2,
 };
 
 #[cfg(feature = "storage")]
@@ -259,6 +260,7 @@ fn direct_ingress_matches_checkpoint(
 }
 
 fn direct_ingress_from_request(
+    store: &LocalJamStoreV2,
     service: &ServiceIdentityV2,
     request: &LocalWorkRequestV2,
 ) -> Result<DirectIngressV2, LocalRootTreeInvokeErrorV2> {
@@ -269,18 +271,8 @@ fn direct_ingress_from_request(
     {
         return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
     }
-    Ok(DirectIngressV2 {
-        service: service.clone(),
-        invocation: request.invocation,
-        logical_timeslot: request.logical_timeslot,
-        target: request.target,
-        method: request.method.clone(),
-        arguments: request.arguments.clone(),
-        origin: request.origin,
-        authorization: request.authorization.clone(),
-        imported_blobs: request.imported_blobs.clone(),
-        proof_requested: request.proof_requested,
-    })
+    LocalWorkSchedulerV2::prepare_direct_ingress(store, service, request)
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)
 }
 
 fn request_from_direct_ingress(ingress: DirectIngressV2) -> LocalWorkRequestV2 {
@@ -381,6 +373,14 @@ pub struct CommittedRootTreeSliceV2 {
 /// The inbox is visible only after physical Accumulate commits this receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedDeliveryV2 {
+    pub receipt: AccumulationReceiptV2,
+    pub duplicate: bool,
+    pub accumulate_gas_used: u64,
+}
+
+/// Result of importing an authenticated causal delta through physical IC-5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedCrdtSyncV2 {
     pub receipt: AccumulationReceiptV2,
     pub duplicate: bool,
     pub accumulate_gas_used: u64,
@@ -880,7 +880,11 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             else {
                 return Ok(RootTreeIngressRecoveryV2::Fresh);
             };
-            let candidate = direct_ingress_from_request(&self.identity, request)?;
+            let candidate = direct_ingress_from_request(
+                self.service.accumulate_host(),
+                &self.identity,
+                request,
+            )?;
             if record.consumed || !record.ingress.matches_retry(&candidate) {
                 return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
             }
@@ -964,7 +968,8 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         request: &LocalWorkRequestV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
         self.require_installed()?;
-        let ingress = direct_ingress_from_request(&self.identity, request)?;
+        let ingress =
+            direct_ingress_from_request(self.service.accumulate_host(), &self.identity, request)?;
         let accumulated = self
             .service
             .accumulate(&AccumulateRequestV2::AdmitIngress(ingress))
@@ -972,6 +977,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         match accumulated.result {
             AccumulationResultV2::IngressAdmitted {
                 invocation,
+                receipt: _,
                 duplicate,
             } if invocation == request.invocation => Ok(duplicate),
             AccumulationResultV2::Rejected(rejection) => {
@@ -1067,6 +1073,68 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .allow_receipt(&ReceiptVerificationRequestV2 {
                 receipt: receipt.clone(),
             });
+    }
+
+    /// Export the complete authenticated causal DAG from committed guest
+    /// state. An empty freshly-installed CRDT has no transport envelope yet.
+    pub fn crdt_sync_envelope(
+        &self,
+    ) -> Result<Option<CrdtSyncEnvelopeV2>, LocalRootTreeInvokeErrorV2> {
+        if self.consistency != ConsistencyModeV2::Crdt {
+            return Err(LocalRootTreeInvokeErrorV2::Schedule(
+                ScheduleErrorV2::UnsupportedConsistency(self.consistency),
+            ));
+        }
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
+        if header.crdt_heads.is_empty() {
+            return Ok(None);
+        }
+        LocalWorkSchedulerV2::prepare_crdt_sync(self.service.accumulate_host())
+            .map(Some)
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)
+    }
+
+    /// Import finalized peer nodes only through the canonical guest's
+    /// SyncCrdt Accumulate request. The local conformance harness supplies the
+    /// exact receipt-verification availability; all identity, ancestry, CID,
+    /// blob, and workflow validation remains guest-owned.
+    pub fn sync_finalized_crdt(
+        &mut self,
+        envelope: CrdtSyncEnvelopeV2,
+    ) -> Result<CommittedCrdtSyncV2, LocalRootTreeInvokeErrorV2> {
+        self.require_installed()?;
+        if self.consistency != ConsistencyModeV2::Crdt || envelope.service != self.identity {
+            return Err(LocalRootTreeInvokeErrorV2::Rejected(
+                AccumulationRejectionV2::InvalidConsistency,
+            ));
+        }
+        for node in &envelope.nodes {
+            self.allow_finalized_receipt(&node.receipt);
+        }
+        let accumulated = self
+            .service
+            .accumulate(&AccumulateRequestV2::SyncCrdt(envelope))
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        match accumulated.result {
+            AccumulationResultV2::Accepted {
+                receipt,
+                published,
+                duplicate,
+            } if published == PublishedEffectsV2::default() => Ok(CommittedCrdtSyncV2 {
+                receipt,
+                duplicate,
+                accumulate_gas_used: accumulated.gas_used,
+            }),
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
     }
 
     /// Whether this exact accumulated reply already advanced the durable
