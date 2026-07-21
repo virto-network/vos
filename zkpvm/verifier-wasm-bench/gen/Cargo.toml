@@ -11,7 +11,7 @@ zkpvm = { path = "../.." }
 # Native cross-check verify uses the exact same code path the wasm build runs.
 zkpvm-verifier = { path = "../../verifier" }
 # Same pin as the vos workspace so the git cache is reused.
-javm = { git = "https://github.com/olanod/jar.git", rev = "ef641647b6610ff82a32a108db6a7966371407cb" }
+javm = { git = "https://github.com/olanod/jar.git", rev = "66065e3808d43d86b3506ee2e79d8ee6768caa16" }
 postcard = { version = "1", features = ["alloc"] }
 
 [features]

@@ -26,7 +26,7 @@ fn canonical_service_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
     if elf.is_empty() {
         bail!("service ELF is empty")
     }
-    let pvm = grey_transpiler::link_elf(elf)
+    let pvm = vos::v2::transpile_service_elf(elf)
         .map_err(|error| anyhow!("transpile generic service ELF: {error:?}"))?;
     let program = ProgramId::of_pvm(&pvm);
     ServicePvmV2::new(pvm.clone(), program).map_err(|error| {

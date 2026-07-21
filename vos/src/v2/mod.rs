@@ -73,6 +73,7 @@ pub use package::{
 pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
     RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
+    SERVICE_ARGUMENT_PAGES_V2, transpile_service_elf,
 };
 #[cfg(feature = "std")]
 pub use root_service::{
@@ -166,7 +167,7 @@ impl ServiceFunction {
 
 /// Revision shared by JAVM, the transpiler, proof tracer, verifier, and fuzz
 /// targets. `just check-jar-revisions` verifies that every manifest uses it.
-pub const JAR_REVISION: &str = "ef641647b6610ff82a32a108db6a7966371407cb";
+pub const JAR_REVISION: &str = "66065e3808d43d86b3506ee2e79d8ee6768caa16";
 
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did

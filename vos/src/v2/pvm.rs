@@ -26,6 +26,18 @@ const MIN_ACTOR_OUTPUT_HEADROOM: usize = super::MAX_ATTESTATION_PROOF_BYTES;
 const RESULT_WHAT: u64 = u64::MAX - 1;
 const ACTOR_STACK_OBJECT_CAP: u64 = 65;
 
+/// Canonical generic-service argument window. Refine inputs and guest-owned
+/// Accumulate requests may contain a complete continuation or CRDT batch, so
+/// the infrastructure PVM deliberately opts into more than the transpiler's
+/// one-page application default while retaining the standard slot-0 DATA ABI.
+pub const SERVICE_ARGUMENT_PAGES_V2: u32 = 2048;
+
+/// Transpile the protocol infrastructure ELF with the v2 standard argument
+/// window. Application actor ELFs continue to use `grey_transpiler::link_elf`.
+pub fn transpile_service_elf(elf: &[u8]) -> Result<Vec<u8>, grey_transpiler::TranspileError> {
+    grey_transpiler::link_elf_with_argument_pages(elf, SERVICE_ARGUMENT_PAGES_V2)
+}
+
 /// Result of one completed service-PVM execution slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicePvmOutputV2 {
@@ -965,6 +977,14 @@ fn handle_mechanical_call(slot: u8, kernel: &mut InvocationKernel) -> Option<[u6
 
 fn validate_service_entries(program: &[u8]) -> Result<(), ServicePvmErrorV2> {
     let parsed = parse_blob(program).ok_or(ServicePvmErrorV2::InvalidProgram)?;
+    let argument_cap = parsed
+        .caps
+        .iter()
+        .find(|cap| cap.cap_index == 0 && cap.cap_type == CapEntryType::Data)
+        .ok_or(ServicePvmErrorV2::InvalidServiceEntries)?;
+    if argument_cap.page_count < SERVICE_ARGUMENT_PAGES_V2 {
+        return Err(ServicePvmErrorV2::InvalidServiceEntries);
+    }
     let code_cap = parsed
         .caps
         .iter()
@@ -1017,6 +1037,8 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SERVICE_TEST_GAS: u64 = 10_000_000;
     use grey_transpiler::assembler::Reg;
 
     #[test]
@@ -1118,7 +1140,17 @@ mod tests {
         code[1..5].copy_from_slice(&(refine_body as i32).to_le_bytes());
         code[6..10].copy_from_slice(&((accumulate_body as i32) - 5).to_le_bytes());
 
-        grey_transpiler::emitter::build_service_program(&code, &bitmask, &[], &[], &[], 1, 0, 4)
+        grey_transpiler::emitter::build_service_program_with_args_pages(
+            &code,
+            &bitmask,
+            &[],
+            &[],
+            &[],
+            1,
+            0,
+            4,
+            SERVICE_ARGUMENT_PAGES_V2,
+        )
     }
 
     fn two_entry_program(refine_call: Option<u32>) -> Vec<u8> {
@@ -1227,10 +1259,10 @@ mod tests {
         let program = two_entry_program(None);
         let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
         let first = service
-            .refine(b"work-envelope", 1_000_000, &NoRefineProtocolHostV2)
+            .refine(b"work-envelope", SERVICE_TEST_GAS, &NoRefineProtocolHostV2)
             .unwrap();
         let second = service
-            .refine(b"work-envelope", 1_000_000, &NoRefineProtocolHostV2)
+            .refine(b"work-envelope", SERVICE_TEST_GAS, &NoRefineProtocolHostV2)
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.bytes, b"work-envelope");
@@ -1241,7 +1273,7 @@ mod tests {
         let program = two_entry_program(Some(crate::abi::hostcall::STORAGE_W));
         let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
         assert_eq!(
-            service.refine(&[], 1_000_000, &NoRefineProtocolHostV2),
+            service.refine(&[], SERVICE_TEST_GAS, &NoRefineProtocolHostV2),
             Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(
                 crate::abi::hostcall::STORAGE_W as u8,
             ))
@@ -1264,13 +1296,37 @@ mod tests {
     }
 
     #[test]
+    fn service_rejects_an_argument_window_too_small_for_v2_wires() {
+        let mut code = vec![40, 10, 0, 0, 0, 40, 15, 0, 0, 0];
+        let mut bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        emit_halt(&mut code, &mut bitmask);
+        emit_halt(&mut code, &mut bitmask);
+        let program = grey_transpiler::emitter::build_service_program(
+            &code,
+            &bitmask,
+            &[],
+            &[],
+            &[],
+            1,
+            0,
+            4,
+        );
+        assert!(matches!(
+            ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)),
+            Err(ServicePvmErrorV2::InvalidServiceEntries)
+        ));
+    }
+
+    #[test]
     fn accumulate_commits_staged_calls_only_after_ic5_halts() {
         let program = service_program(None, Some(crate::abi::hostcall::STORAGE_W), false);
         let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
         let mut host = RecordingAccumulateHost::default();
 
         let expected = accumulate_result(true);
-        let output = service.accumulate(&expected, 1_000_000, &mut host).unwrap();
+        let output = service
+            .accumulate(&expected, SERVICE_TEST_GAS, &mut host)
+            .unwrap();
         assert_eq!(output.bytes, expected);
         assert_eq!(host.committed_calls, 1);
     }
@@ -1286,7 +1342,7 @@ mod tests {
         let interpreted = service
             .accumulate_with_backend(
                 &input,
-                1_000_000,
+                SERVICE_TEST_GAS,
                 &mut interpreted_host,
                 javm::PvmBackend::ForceInterpreter,
             )
@@ -1294,7 +1350,7 @@ mod tests {
         let recompiled = service
             .accumulate_with_backend(
                 &input,
-                1_000_000,
+                SERVICE_TEST_GAS,
                 &mut recompiled_host,
                 javm::PvmBackend::ForceRecompiler,
             )
@@ -1314,7 +1370,7 @@ mod tests {
         let prepared = accumulate_result(false);
         assert_eq!(
             service
-                .accumulate(&prepared, 1_000_000, &mut host)
+                .accumulate(&prepared, SERVICE_TEST_GAS, &mut host)
                 .unwrap()
                 .bytes,
             prepared,
@@ -1324,7 +1380,7 @@ mod tests {
                 .encode();
         assert_eq!(
             service
-                .accumulate(&rejected, 1_000_000, &mut host)
+                .accumulate(&rejected, SERVICE_TEST_GAS, &mut host)
                 .unwrap()
                 .bytes,
             rejected,
@@ -1338,7 +1394,7 @@ mod tests {
         let service = ServicePvmV2::new(panicking.clone(), ProgramId::of_pvm(&panicking)).unwrap();
         let mut host = RecordingAccumulateHost::default();
         assert!(matches!(
-            service.accumulate(&[], 1_000_000, &mut host),
+            service.accumulate(&[], SERVICE_TEST_GAS, &mut host),
             Err(ServicePvmErrorV2::Panic { vm: 0, .. })
         ));
         assert_eq!(host.committed_calls, 0);
@@ -1348,7 +1404,7 @@ mod tests {
             ServicePvmV2::new(committing.clone(), ProgramId::of_pvm(&committing)).unwrap();
         host.reject_commit = true;
         assert_eq!(
-            service.accumulate(&accumulate_result(true), 1_000_000, &mut host),
+            service.accumulate(&accumulate_result(true), SERVICE_TEST_GAS, &mut host),
             Err(ServicePvmErrorV2::AccumulateCommitRejected)
         );
         assert_eq!(host.committed_calls, 0);

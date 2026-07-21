@@ -11,5 +11,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         }
     }
     let _ = write!(PanicWriter, "panic: {}\n", info);
-    loop {}
+    // A guest panic is a terminal PVM condition. RISC-V EBREAK transpiles to
+    // the GP trap opcode, so the invocation fails immediately and
+    // deterministically instead of consuming its remaining gas in a loop.
+    unsafe {
+        core::arch::asm!("ebreak", options(noreturn, nostack));
+    }
 }

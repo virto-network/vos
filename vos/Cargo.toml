@@ -17,6 +17,7 @@ std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
+service-runtime = ["service"]
 # NOTE: the ZK actor-IO binding is tagless (`vos::zk`) — the io-hash
 # primitive `compute_io_hash` is pure and always available (guest +
 # host).  Proof *verification* (STARK validity ∧ io-binding) lives in

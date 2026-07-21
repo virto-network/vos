@@ -1088,7 +1088,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "grey-crypto"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=ef641647b6610ff82a32a108db6a7966371407cb#ef641647b6610ff82a32a108db6a7966371407cb"
+source = "git+https://github.com/olanod/jar.git?rev=66065e3808d43d86b3506ee2e79d8ee6768caa16#66065e3808d43d86b3506ee2e79d8ee6768caa16"
 dependencies = [
  "ark-vrf",
  "blake2",
@@ -1103,7 +1103,7 @@ dependencies = [
 [[package]]
 name = "grey-types"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=ef641647b6610ff82a32a108db6a7966371407cb#ef641647b6610ff82a32a108db6a7966371407cb"
+source = "git+https://github.com/olanod/jar.git?rev=66065e3808d43d86b3506ee2e79d8ee6768caa16#66065e3808d43d86b3506ee2e79d8ee6768caa16"
 dependencies = [
  "hex",
  "scale",
@@ -1294,7 +1294,7 @@ dependencies = [
 [[package]]
 name = "javm"
 version = "0.4.0"
-source = "git+https://github.com/olanod/jar.git?rev=ef641647b6610ff82a32a108db6a7966371407cb#ef641647b6610ff82a32a108db6a7966371407cb"
+source = "git+https://github.com/olanod/jar.git?rev=66065e3808d43d86b3506ee2e79d8ee6768caa16#66065e3808d43d86b3506ee2e79d8ee6768caa16"
 dependencies = [
  "grey-crypto",
  "libc",
@@ -1749,7 +1749,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "scale"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=ef641647b6610ff82a32a108db6a7966371407cb#ef641647b6610ff82a32a108db6a7966371407cb"
+source = "git+https://github.com/olanod/jar.git?rev=66065e3808d43d86b3506ee2e79d8ee6768caa16#66065e3808d43d86b3506ee2e79d8ee6768caa16"
 dependencies = [
  "scale-derive",
  "thiserror 2.0.18",
@@ -1758,7 +1758,7 @@ dependencies = [
 [[package]]
 name = "scale-derive"
 version = "0.1.0"
-source = "git+https://github.com/olanod/jar.git?rev=ef641647b6610ff82a32a108db6a7966371407cb#ef641647b6610ff82a32a108db6a7966371407cb"
+source = "git+https://github.com/olanod/jar.git?rev=66065e3808d43d86b3506ee2e79d8ee6768caa16#66065e3808d43d86b3506ee2e79d8ee6768caa16"
 dependencies = [
  "proc-macro2",
  "quote",
