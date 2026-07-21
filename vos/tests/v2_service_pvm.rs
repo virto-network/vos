@@ -4558,6 +4558,51 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         )
         .expect("the recompiler injects the same committed timeout");
     assert_eq!(timed_out_output, recompiled_timeout);
+
+    // A different runnable actor may have spawned a child while this kernel
+    // was suspended. The current work import must include the complete newer
+    // directory, while JAR restoration still uses only the exact dormant
+    // program layout captured by the continuation.
+    let mut expanded = timed_out.clone();
+    let new_child = ActorId::owned_child(first_work.target, "late-child");
+    let new_child_state_bytes = b"late child state".to_vec();
+    let new_child_state = BlobRefV2::of_bytes(&new_child_state_bytes);
+    expanded
+        .work
+        .imported_actors
+        .push(vos::v2::ImportedActorV2 {
+            actor: new_child,
+            name: "late-child".into(),
+            parent: Some(first_work.target),
+            deployment: first_work.target_deployment,
+            program: actor_program,
+            state: new_child_state.clone(),
+            causal_states: vec![],
+            continuation: None,
+        });
+    expanded
+        .work
+        .imported_actors
+        .sort_by_key(|actor| actor.actor);
+    expanded.imports.blobs.push(ImportedBlobV2 {
+        reference: new_child_state,
+        bytes: new_child_state_bytes,
+    });
+    expanded
+        .imports
+        .blobs
+        .sort_by_key(|blob| blob.reference.hash);
+    let expanded_timeout = service
+        .refine_actor_tree_with_backend(
+            &expanded.work.encode(),
+            &expanded.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .expect("a newer tree directory does not rewrite the suspended JAR layout");
+    assert_eq!(expanded_timeout, timed_out_output);
+
     let timed_out_transition = RefineOutputV2::decode(&timed_out_output.bytes)
         .unwrap()
         .transition;
@@ -4989,6 +5034,15 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor: work.target,
         actor_deployment: work.target_deployment,
         actor_program,
+        programs: work
+            .imported_actors
+            .iter()
+            .map(|actor| vos::v2::ContinuationProgramV2 {
+                actor: actor.actor,
+                deployment: actor.deployment,
+                program: actor.program,
+            })
+            .collect(),
         await_ordinal: 0,
         pending_call: None,
         suspended_actors: vec![work.target],

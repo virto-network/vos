@@ -492,6 +492,40 @@ impl ServicePvmV2 {
             if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
                 return Err(ServicePvmErrorV2::InvalidContinuation);
             }
+            // Restore the exact dormant-program layout captured by this
+            // continuation. The current service directory may contain actors
+            // spawned after the checkpoint, but adding their handles would
+            // change JAR's invocation-layout commitment.
+            let mut pinned = Vec::with_capacity(continuation.programs.len());
+            let target_binding = continuation
+                .programs
+                .binary_search_by_key(&work.target, |binding| binding.actor)
+                .ok()
+                .map(|index| &continuation.programs[index])
+                .ok_or(ServicePvmErrorV2::ContinuationMismatch)?;
+            pinned.push(target_binding);
+            pinned.extend(
+                continuation
+                    .programs
+                    .iter()
+                    .filter(|binding| binding.actor != work.target),
+            );
+            let mut dormant = Vec::with_capacity(pinned.len());
+            for (ordinal, binding) in pinned.into_iter().enumerate() {
+                let imported = imports
+                    .programs
+                    .binary_search_by_key(&binding.program, |program| program.program)
+                    .ok()
+                    .map(|index| &imports.programs[index])
+                    .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
+                let handle_slot = TARGET_ACTOR_HANDLE_SLOT
+                    .checked_add(ordinal as u8)
+                    .ok_or(ServicePvmErrorV2::TooManyImportedActors)?;
+                dormant.push(DormantProgram {
+                    blob: &imported.pvm,
+                    handle_slot,
+                });
+            }
             let mut kernel = InvocationKernel::restore_with_dormant_programs(
                 &self.program,
                 &dormant,
@@ -972,6 +1006,15 @@ fn capture_checkpoint(
         actor: work.target,
         actor_deployment: work.target_deployment,
         actor_program: work.target_program,
+        programs: work
+            .imported_actors
+            .iter()
+            .map(|actor| super::ContinuationProgramV2 {
+                actor: actor.actor,
+                deployment: actor.deployment,
+                program: actor.program,
+            })
+            .collect(),
         await_ordinal,
         pending_call,
         suspended_actors: suspended_actors.clone(),

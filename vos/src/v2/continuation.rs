@@ -12,6 +12,16 @@ use super::contracts::{ServiceIdentityV2, WorkEnvelopeV2};
 use super::identity::{ActorId, CallId, DeploymentId, InvocationId, ProgramId};
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 
+/// Exact package/program layout from which a suspended invocation kernel was
+/// constructed. The list in a continuation is sorted by `actor` and remains
+/// authoritative even if the owned tree later gains more actors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinuationProgramV2 {
+    pub actor: ActorId,
+    pub deployment: DeploymentId,
+    pub program: ProgramId,
+}
+
 /// Durable actor-tree checkpoint. `kernel_snapshot` is the canonical
 /// `javm::snapshot::KernelSnapshot::to_bytes()` representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +36,10 @@ pub struct ContinuationSnapshotV2 {
     pub actor: ActorId,
     pub actor_deployment: DeploymentId,
     pub actor_program: ProgramId,
+    /// Complete actor-program layout present when this kernel was created.
+    /// New actors may be added to the service while it is suspended, but an
+    /// existing binding cannot change until this continuation drains.
+    pub programs: Vec<ContinuationProgramV2>,
     /// Ordinal used to derive a stable `CallId` for an awaited call.
     pub await_ordinal: u64,
     /// `None` for an explicit scheduler yield; `Some` for an awaited call.
@@ -50,6 +64,7 @@ pub(crate) struct ContinuationMetadataV2 {
     actor: ActorId,
     actor_deployment: DeploymentId,
     actor_program: ProgramId,
+    pub(crate) programs: Vec<ContinuationProgramV2>,
     pub(crate) await_ordinal: u64,
     pub pending_call: Option<CallId>,
     pub suspended_actors: Vec<ActorId>,
@@ -71,6 +86,12 @@ impl ContinuationSnapshotV2 {
             return Err(DecodeError::InvalidVersion);
         }
         if self.kernel_snapshot.is_empty()
+            || !valid_program_layout(
+                &self.programs,
+                self.actor,
+                self.actor_deployment,
+                self.actor_program,
+            )
             || self.suspended_actors.is_empty()
             || self.suspended_actors.binary_search(&self.actor).is_err()
             || self
@@ -96,6 +117,7 @@ impl ContinuationSnapshotV2 {
             || self.actor != work.target
             || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
+            || !program_layout_matches_checkpoint(&self.programs, work)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -112,6 +134,7 @@ impl ContinuationSnapshotV2 {
             || self.actor != work.target
             || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
+            || !program_layout_matches_resume(&self.programs, work)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -136,6 +159,7 @@ impl ContinuationSnapshotV2 {
             actor: ActorId(d.fixed()?),
             actor_deployment: DeploymentId(d.fixed()?),
             actor_program: ProgramId(d.fixed()?),
+            programs: decode_programs(&mut d)?,
             await_ordinal: d.u64()?,
             pending_call: d.option(|d| d.fixed().map(CallId))?,
             suspended_actors: d.list(|d| d.fixed().map(ActorId))?,
@@ -160,6 +184,12 @@ impl ContinuationMetadataV2 {
             return Err(DecodeError::InvalidVersion);
         }
         if self.kernel_snapshot_len == 0
+            || !valid_program_layout(
+                &self.programs,
+                self.actor,
+                self.actor_deployment,
+                self.actor_program,
+            )
             || self.suspended_actors.is_empty()
             || self.suspended_actors.binary_search(&self.actor).is_err()
             || self
@@ -183,6 +213,7 @@ impl ContinuationMetadataV2 {
             || self.actor != work.target
             || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
+            || !program_layout_matches_checkpoint(&self.programs, work)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -197,6 +228,7 @@ impl ContinuationMetadataV2 {
             || self.actor != work.target
             || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
+            || !program_layout_matches_resume(&self.programs, work)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -218,6 +250,7 @@ impl V2Wire for ContinuationSnapshotV2 {
         e.fixed(&self.actor.0);
         e.fixed(&self.actor_deployment.0);
         e.fixed(&self.actor_program.0);
+        encode_programs(&mut e, &self.programs);
         e.u64(self.await_ordinal);
         e.option(&self.pending_call, |e, call| e.fixed(&call.0));
         e.list(&self.suspended_actors, |e, actor| e.fixed(&actor.0));
@@ -235,6 +268,7 @@ impl V2Wire for ContinuationSnapshotV2 {
             actor: ActorId(d.fixed()?),
             actor_deployment: DeploymentId(d.fixed()?),
             actor_program: ProgramId(d.fixed()?),
+            programs: decode_programs(d)?,
             await_ordinal: d.u64()?,
             pending_call: d.option(|d| d.fixed().map(CallId))?,
             suspended_actors: d.list(|d| d.fixed().map(ActorId))?,
@@ -243,6 +277,79 @@ impl V2Wire for ContinuationSnapshotV2 {
         value.validate()?;
         Ok(value)
     }
+}
+
+fn valid_program_layout(
+    programs: &[ContinuationProgramV2],
+    actor: ActorId,
+    deployment: DeploymentId,
+    program: ProgramId,
+) -> bool {
+    !programs.is_empty()
+        && programs.len() <= super::MAX_ROOT_TREE_ACTORS
+        && !programs
+            .windows(2)
+            .any(|pair| pair[0].actor >= pair[1].actor)
+        && programs
+            .binary_search_by_key(&actor, |binding| binding.actor)
+            .ok()
+            .is_some_and(|index| {
+                programs[index].deployment == deployment && programs[index].program == program
+            })
+}
+
+fn program_layout_matches_checkpoint(
+    programs: &[ContinuationProgramV2],
+    work: &WorkEnvelopeV2,
+) -> bool {
+    programs.len() == work.imported_actors.len()
+        && programs
+            .iter()
+            .zip(&work.imported_actors)
+            .all(|(binding, actor)| {
+                binding.actor == actor.actor
+                    && binding.deployment == actor.deployment
+                    && binding.program == actor.program
+            })
+}
+
+fn program_layout_matches_resume(
+    programs: &[ContinuationProgramV2],
+    work: &WorkEnvelopeV2,
+) -> bool {
+    programs.iter().all(|binding| {
+        work.imported_actors
+            .binary_search_by_key(&binding.actor, |actor| actor.actor)
+            .ok()
+            .is_some_and(|index| {
+                work.imported_actors[index].deployment == binding.deployment
+                    && work.imported_actors[index].program == binding.program
+            })
+    })
+}
+
+fn encode_programs(e: &mut Encoder<'_>, programs: &[ContinuationProgramV2]) {
+    e.list(programs, |e, binding| {
+        e.fixed(&binding.actor.0);
+        e.fixed(&binding.deployment.0);
+        e.fixed(&binding.program.0);
+    });
+}
+
+fn decode_programs(d: &mut Decoder<'_>) -> Result<Vec<ContinuationProgramV2>, DecodeError> {
+    let len = d.u32()? as usize;
+    if len > super::MAX_ROOT_TREE_ACTORS {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut programs = Vec::with_capacity(len);
+    for _ in 0..len {
+        programs.push(ContinuationProgramV2 {
+            actor: ActorId(d.fixed()?),
+            deployment: DeploymentId(d.fixed()?),
+            program: ProgramId(d.fixed()?),
+        });
+    }
+    Ok(programs)
 }
 
 fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
@@ -299,6 +406,11 @@ mod tests {
             actor: ActorId([5; 32]),
             actor_deployment: DeploymentId([7; 32]),
             actor_program: ProgramId([6; 32]),
+            programs: vec![ContinuationProgramV2 {
+                actor: ActorId([5; 32]),
+                deployment: DeploymentId([7; 32]),
+                program: ProgramId([6; 32]),
+            }],
             await_ordinal: 3,
             pending_call: Some(invocation.call_id(3)),
             suspended_actors: vec![ActorId([5; 32])],
@@ -379,6 +491,58 @@ mod tests {
     }
 
     #[test]
+    fn resume_keeps_the_captured_layout_but_allows_new_tree_members() {
+        let snapshot = snapshot();
+        let mut work = resume_work();
+        work.imported_actors.push(ImportedActorV2 {
+            actor: ActorId([8; 32]),
+            name: "new-child".into(),
+            parent: Some(snapshot.actor),
+            deployment: DeploymentId([9; 32]),
+            program: ProgramId([10; 32]),
+            state: crate::v2::BlobRefV2 {
+                hash: Hash([11; 32]),
+                len: 1,
+            },
+            causal_states: vec![],
+            continuation: None,
+        });
+        snapshot.validate_resume_for(&work).unwrap();
+
+        work.imported_actors[0].program = ProgramId([12; 32]);
+        assert_eq!(
+            snapshot.validate_resume_for(&work),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn emitted_checkpoint_must_bind_every_imported_actor_program() {
+        let snapshot = snapshot();
+        let mut work = resume_work();
+        work.workflow_step = snapshot.checkpoint_step;
+        snapshot.validate_checkpoint_for(&work).unwrap();
+
+        work.imported_actors.push(ImportedActorV2 {
+            actor: ActorId([8; 32]),
+            name: "omitted-child".into(),
+            parent: Some(snapshot.actor),
+            deployment: DeploymentId([9; 32]),
+            program: ProgramId([10; 32]),
+            state: crate::v2::BlobRefV2 {
+                hash: Hash([11; 32]),
+                len: 1,
+            },
+            causal_states: vec![],
+            continuation: None,
+        });
+        assert_eq!(
+            snapshot.validate_checkpoint_for(&work),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
     fn resume_binding_rejects_pc_zero_reconstruction_and_wrong_slice() {
         let value = snapshot();
         let mut work = resume_work();
@@ -397,6 +561,13 @@ mod tests {
         assert_eq!(
             ContinuationSnapshotV2::decode(&forged_call.encode()),
             Err(DecodeError::NonCanonical)
+        );
+
+        let mut oversized = snapshot();
+        oversized.programs = vec![oversized.programs[0]; crate::v2::MAX_ROOT_TREE_ACTORS + 1];
+        assert_eq!(
+            ContinuationSnapshotV2::decode(&oversized.encode()),
+            Err(DecodeError::LimitExceeded)
         );
     }
 }

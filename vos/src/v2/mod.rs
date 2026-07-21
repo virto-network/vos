@@ -32,7 +32,7 @@ pub(crate) mod wire;
 
 pub use crate::attestation::AttestationPreparationV2;
 
-pub use continuation::ContinuationSnapshotV2;
+pub use continuation::{ContinuationProgramV2, ContinuationSnapshotV2};
 pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulatedTimeoutV2, AccumulationEnvelopeV2,
     AccumulationReceiptV2,
@@ -114,7 +114,7 @@ pub use wire::{DecodeError, V2Wire};
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
 pub const ABI_VERSION: u16 = 2;
 /// Portable continuation format version.
-pub const SNAPSHOT_VERSION: u16 = 4;
+pub const SNAPSHOT_VERSION: u16 = 5;
 /// Attestation statement version required by runtime v2.
 pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 

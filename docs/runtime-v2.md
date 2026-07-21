@@ -86,9 +86,14 @@ bytes and never applies them.
 An await checkpoint stores the exact nested kernel: each VM's program hash,
 PC, registers, heap bounds, gas and lifecycle, mutable capabilities, dirty
 page hashes, active/runnable scheduler state, nested call stack and the pending
-protocol boundary. Resume consumes the checkpoint, injects one result into its
-declared registers and continues at `resume_pc`. It never restarts the handler
-at PC 0. Suspended actors are non-reentrant; later messages remain queued.
+protocol boundary. Its VOS envelope also records the canonical
+actor/`DeploymentId`/`ProgramId` layout used to create every dormant handle.
+Resume consumes the checkpoint, reconstructs that exact layout, injects one
+result into its declared registers and continues at `resume_pc`. Actors spawned
+after the checkpoint remain in the complete current work import but do not
+rewrite the older JAR invocation-layout commitment. Resume never restarts the
+handler at PC 0. Suspended actors are non-reentrant; later messages remain
+queued.
 
 The local conformance host persists the complete committed service image as a
 canonical `LocalJamStoreSnapshotV2` wire. Restore verifies every blob and
@@ -206,14 +211,16 @@ must authorize those exact physical request bytes and already possess canonical
 replacement PVM bytes matching the requested `ProgramId`.
 
 For Ephemeral, Local, and Raft services, guest Accumulate requires the exact
-current revision and state root. It rejects an actor with a durable continuation
-as `ActorBusy`, replaces only that actor's package/program/producer/policy
-rows, and preserves instance identity, ownership, consistency kind, and
-application state. A
+current revision and state root. It rejects an actor as `ActorBusy` while any
+durable continuation in the root tree still binds that actor's package/program
+in its dormant JAR layout. It replaces only that actor's
+package/program/producer/policy rows, and preserves instance identity,
+ownership, consistency kind, and application state. A
 physical upgrade record makes an exact retry read-only. The old program remains
-in the content-addressed program store, so any already committed continuation
-can retain its exact code until later reference-counted collection is added.
-Queued ingress may use the new program only after the upgrade commits.
+in the content-addressed program store; activation cannot occur until its
+continuation references drain, and conservative cache retention keeps the old
+bytes available afterward. Queued ingress may use the new program only after
+the upgrade commits.
 
 CRDT actor upgrades currently fail closed with `InvalidConsistency`. Program
 metadata needs an explicit causal operation and complete-ancestry activation;
@@ -306,10 +313,11 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 11 and continuation snapshot version 4 are therefore a clean
+Store schema 12 and continuation snapshot version 5 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
-cross-root proof bindings.
+cross-root proof bindings, plus the complete dormant actor-program layout to
+each continuation.
 
 ## CRDT boundary
 

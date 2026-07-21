@@ -217,10 +217,14 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     }
 
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
-    let Some(mut descriptor) = tree_get_wire::<_, ActorGenesisV2>(
-        &tree,
-        &StateKeyV2::ActorDescriptor(upgrade.actor),
-    )? else {
+    let Some(directory) =
+        tree_get_wire::<_, super::ActorDirectoryV2>(&tree, &StateKeyV2::ActorDirectory)?
+    else {
+        return Err(GuestAccumulateError::CorruptStore);
+    };
+    let Some(mut descriptor) =
+        tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(upgrade.actor))?
+    else {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     };
     if descriptor.deployment != upgrade.expected_deployment
@@ -228,12 +232,30 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     }
-    if tree
-        .get(&StateKeyV2::Continuation(upgrade.actor))
-        .map_err(GuestAccumulateError::StateTree)?
-        .is_some()
-    {
-        return Ok(rejected(AccumulationRejectionV2::ActorBusy(upgrade.actor)));
+    // A JAR continuation binds every dormant actor program in its invocation
+    // layout, not only the actor whose message produced the checkpoint. Do
+    // not activate replacement code while any durable kernel can still call
+    // the old package through one of those handles.
+    for suspended in directory.actors {
+        let Some(reference) =
+            tree_get_wire::<_, BlobRefV2>(&tree, &StateKeyV2::Continuation(suspended))?
+        else {
+            continue;
+        };
+        let bytes = tree
+            .store_ref()
+            .load_blob(&reference)
+            .map_err(GuestAccumulateError::Storage)?
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+        let continuation = ContinuationSnapshotV2::decode_metadata(&bytes)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if continuation.programs.iter().any(|binding| {
+            binding.actor == upgrade.actor
+                && binding.deployment == upgrade.expected_deployment
+                && binding.program == upgrade.expected_program
+        }) {
+            return Ok(rejected(AccumulationRejectionV2::ActorBusy(upgrade.actor)));
+        }
     }
 
     let previous_deployment = descriptor.deployment;
@@ -3885,9 +3907,28 @@ mod tests {
     #[test]
     fn actor_upgrade_rejects_suspended_actor_without_mutation() {
         let mut store = MemStore::default();
-        let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"state");
         let mut header = store_header(&store);
-        let continuation = BlobRefV2::of_bytes(b"checkpoint");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: work.service.clone(),
+            invocation: work.invocation,
+            checkpoint_step: work.workflow_step,
+            actor: work.target,
+            actor_deployment: work.target_deployment,
+            actor_program: work.target_program,
+            programs: continuation_programs(&work),
+            await_ordinal: 0,
+            pending_call: None,
+            suspended_actors: vec![work.target],
+            kernel_snapshot: vec![1],
+        }
+        .encode();
+        let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+        store.blobs.insert(continuation.hash, continuation_bytes);
         let mut tree = ServiceStateTreeV2::new(&mut store, header.service_root);
         tree_apply(
             &mut tree,
@@ -3912,6 +3953,113 @@ mod tests {
         );
         assert_eq!(store, before);
         assert_ne!(header.service_root, install.resulting_state_root.unwrap());
+    }
+
+    #[test]
+    fn actor_upgrade_waits_for_peer_continuations_that_pin_its_program() {
+        let mut store = MemStore::default();
+        let root_state = store.provide_blob(b"root").unwrap();
+        let child_state = store.provide_blob(b"child").unwrap();
+        let child = ActorId([7; 32]);
+        let policy = MethodPolicyV2 {
+            method: "set".into(),
+            schema: Hash([6; 32]),
+            policy: public_policy_hash(),
+            public: true,
+            attested: false,
+        };
+        let genesis = ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![
+                ActorGenesisV2 {
+                    actor: actor(),
+                    name: "root".into(),
+                    parent: None,
+                    producer: super::super::ProducerId([4; 32]),
+                    deployment: identity().deployment,
+                    program: program(),
+                    initial_state: root_state,
+                    crdt: false,
+                    methods: vec![policy.clone()],
+                },
+                ActorGenesisV2 {
+                    actor: child,
+                    name: "child".into(),
+                    parent: Some(actor()),
+                    producer: super::super::ProducerId([4; 32]),
+                    deployment: identity().deployment,
+                    program: program(),
+                    initial_state: child_state,
+                    crdt: false,
+                    methods: vec![policy],
+                },
+            ],
+            external_actors: external_bindings(),
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        };
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis)).unwrap(),
+            AccumulationResultV2::Installed(_)
+        ));
+
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: identity(),
+            invocation: InvocationId([22; 32]),
+            checkpoint_step: 0,
+            actor: actor(),
+            actor_deployment: identity().deployment,
+            actor_program: program(),
+            programs: vec![
+                super::super::ContinuationProgramV2 {
+                    actor: actor(),
+                    deployment: identity().deployment,
+                    program: program(),
+                },
+                super::super::ContinuationProgramV2 {
+                    actor: child,
+                    deployment: identity().deployment,
+                    program: program(),
+                },
+            ],
+            await_ordinal: 0,
+            pending_call: None,
+            suspended_actors: vec![actor()],
+            kernel_snapshot: vec![1],
+        }
+        .encode();
+        let continuation = store.provide_blob(&continuation_bytes).unwrap();
+        let mut header = store_header(&store);
+        let mut tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::Continuation(actor()),
+            Some(&continuation.encode()),
+        )
+        .unwrap();
+        header.service_root = tree.root();
+        header.state_root = Some(header.service_root);
+        drop(tree);
+        store
+            .rows
+            .insert(header_storage_key().to_vec(), header.encode());
+
+        let mut upgrade = upgrade_fixture(header.service_root);
+        upgrade.actor = child;
+        store.upgrade_allowlist.insert(upgrade.hash());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::ActorBusy(child))
+        );
+        assert_eq!(store, before);
     }
 
     #[test]
@@ -4025,6 +4173,17 @@ mod tests {
             imported_blobs: Vec::new(),
             proof_requested: false,
         }
+    }
+
+    fn continuation_programs(work: &WorkEnvelopeV2) -> Vec<super::super::ContinuationProgramV2> {
+        work.imported_actors
+            .iter()
+            .map(|actor| super::super::ContinuationProgramV2 {
+                actor: actor.actor,
+                deployment: actor.deployment,
+                program: actor.program,
+            })
+            .collect()
     }
 
     fn linear_transition(work: &WorkEnvelopeV2, state: &[u8]) -> TransitionV2 {
@@ -4887,6 +5046,7 @@ mod tests {
             actor: first_work.target,
             actor_deployment: first_work.target_deployment,
             actor_program: first_work.target_program,
+            programs: continuation_programs(&first_work),
             await_ordinal: 0,
             pending_call: None,
             suspended_actors: vec![first_work.target],
@@ -5045,6 +5205,7 @@ mod tests {
             actor: first_work.target,
             actor_deployment: first_work.target_deployment,
             actor_program: first_work.target_program,
+            programs: continuation_programs(&first_work),
             await_ordinal: 0,
             pending_call: Some(call),
             suspended_actors: vec![first_work.target],
@@ -5227,6 +5388,7 @@ mod tests {
             actor: work.target,
             actor_deployment: work.target_deployment,
             actor_program: work.target_program,
+            programs: continuation_programs(&work),
             await_ordinal: 0,
             pending_call: Some(call),
             suspended_actors: vec![work.target],
@@ -5420,6 +5582,7 @@ mod tests {
             actor: work.target,
             actor_deployment: work.target_deployment,
             actor_program: work.target_program,
+            programs: continuation_programs(&work),
             await_ordinal: 0,
             pending_call: Some(call),
             suspended_actors: vec![work.target],
