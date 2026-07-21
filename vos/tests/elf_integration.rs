@@ -5,6 +5,45 @@
 
 use vos::runtime::VosRuntime;
 
+/// Explicit role evidence for local host-driven setup in legacy regression
+/// tests. `Caller::System` records origin only in v2 and no longer grants an
+/// ambient role, so privileged setup must name the role it is exercising.
+struct LocalRoleInvoker<'a> {
+    node: &'a vos::node::VosNode,
+    role: vos::SpaceRole,
+}
+
+fn local_admin(node: &vos::node::VosNode) -> LocalRoleInvoker<'_> {
+    LocalRoleInvoker {
+        node,
+        role: vos::SpaceRole::Admin,
+    }
+}
+
+impl vos::actors::client::Invoker for LocalRoleInvoker<'_> {
+    fn invoke(
+        &mut self,
+        target: vos::abi::service::ServiceId,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<
+        Output = Result<vos::value::Value, vos::actors::client::ClientError>,
+    > + '_ {
+        let outcome = self.node.invoke_local_with_space_role(
+            target,
+            payload,
+            self.role,
+            std::time::Duration::from_secs(10),
+        );
+        async move {
+            match outcome {
+                Some(bytes) if bytes.is_empty() => Ok(vos::value::Value::Unit),
+                Some(bytes) => Ok(<vos::value::Value as vos::Decode>::decode(&bytes)),
+                None => Err(vos::actors::client::ClientError::Unreachable),
+            }
+        }
+    }
+}
+
 /// Resolve the path to a pre-built example ELF.
 fn example_elf(name: &str) -> Vec<u8> {
     let workspace = env!("CARGO_MANIFEST_DIR");
@@ -5524,7 +5563,7 @@ fn crdt_registry_writes_and_deletes_converge_across_replicas() {
         let peer = node_peer(seed);
         assert_eq!(
             vos::block_on(reg.add_node(
-                &mut &node_a,
+                &mut local_admin(&node_a),
                 prefix,
                 peer.clone(),
                 NODE_ROLE_VOTER,
@@ -5548,7 +5587,8 @@ fn crdt_registry_writes_and_deletes_converge_across_replicas() {
 
     // ── Delete: remove one node on A ───────────────────────────
     assert_eq!(
-        vos::block_on(reg.remove_node(&mut &node_a, 7, remove_auth(7))).expect("remove_node"),
+        vos::block_on(reg.remove_node(&mut local_admin(&node_a), 7, remove_auth(7)))
+            .expect("remove_node"),
         space_registry::Status::Ok,
     );
 
@@ -5708,7 +5748,7 @@ fn registry_authority_survives_state_blob_drift() {
     );
     assert_eq!(
         vos::block_on(reg.grant_role(
-            &mut &node,
+            &mut local_admin(&node),
             admin_peer.clone(),
             AUTH_ROLE_ADMIN,
             epoch,
@@ -5722,8 +5762,13 @@ fn registry_authority_survives_state_blob_drift() {
         AUTH_ROLE_ADMIN,
     );
     assert_eq!(
-        vos::block_on(reg.revoke_role(&mut &node, admin_peer.clone(), epoch, revoke_auth))
-            .expect("revoke_role"),
+        vos::block_on(reg.revoke_role(
+            &mut local_admin(&node),
+            admin_peer.clone(),
+            epoch,
+            revoke_auth,
+        ))
+        .expect("revoke_role"),
         space_registry::Status::Ok,
     );
     assert_eq!(
@@ -5831,7 +5876,13 @@ fn members_pager_terminates_one_row_at_a_time() {
         );
         let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
         assert_eq!(
-            vos::block_on(reg.add_node(&mut &node, prefix, peer, NODE_ROLE_VOTER, auth))
+            vos::block_on(reg.add_node(
+                &mut local_admin(&node),
+                prefix,
+                peer,
+                NODE_ROLE_VOTER,
+                auth,
+            ))
                 .expect("add_node"),
             space_registry::Status::Ok,
         );
@@ -5845,7 +5896,7 @@ fn members_pager_terminates_one_row_at_a_time() {
         let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
         assert_eq!(
             vos::block_on(reg.add_identity(
-                &mut &node,
+                &mut local_admin(&node),
                 pk,
                 PROOF_KIND_MERKLE_INCLUSION,
                 Vec::new(),
@@ -5865,7 +5916,7 @@ fn members_pager_terminates_one_row_at_a_time() {
         let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
         assert_eq!(
             vos::block_on(reg.add_identity(
-                &mut &node,
+                &mut local_admin(&node),
                 Vec::new(),
                 PROOF_KIND_MERKLE_INCLUSION,
                 Vec::new(),
@@ -6256,7 +6307,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let ts: u64 = 1_000_000;
 
     // Pre-bootstrap: create_account fails with NOT_BOOTSTRAPPED.
-    let pre = vos::block_on(ledger.create_account(&mut &node, Vec::new(), ts))
+    let pre = vos::block_on(ledger.create_account(&mut local_admin(&node), Vec::new(), ts))
         .expect("invoke create_account pre-bootstrap");
     assert_eq!(pre, Status::NotBootstrapped);
 
@@ -6265,7 +6316,8 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // vouchers, so the actor signals "not ready" with a 0-length
     // Vec instead.
     let root_pre =
-        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root pre-bootstrap");
+        vos::block_on(ledger.state_root(&mut local_admin(&node)))
+            .expect("invoke state_root pre-bootstrap");
     assert!(
         root_pre.is_empty(),
         "state_root must return empty Vec before bootstrap, got {} bytes",
@@ -6277,7 +6329,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let registrar = Keypair::generate();
     let journal = JournalId::random();
     let status = vos::block_on(ledger.bootstrap(
-        &mut &node,
+        &mut local_admin(&node),
         journal.0,
         registrar.public.0,
         1u32,
@@ -6290,7 +6342,8 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // accounts_smt + empty transfers_smt + 1-leaf journals_smt).
     // Pin it as non-zero — voucher signatures anchor here.
     let root_after_bootstrap =
-        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root post-bootstrap");
+        vos::block_on(ledger.state_root(&mut local_admin(&node)))
+            .expect("invoke state_root post-bootstrap");
     assert_eq!(
         root_after_bootstrap.len(),
         32,
@@ -6310,7 +6363,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_alice)
         .expect("rkyv encode")
         .to_vec();
-    let status = vos::block_on(ledger.create_account(&mut &node, bytes.clone(), ts))
+    let status = vos::block_on(ledger.create_account(&mut local_admin(&node), bytes.clone(), ts))
         .expect("invoke create_account");
     assert_eq!(status, Status::Ok, "first create_account should succeed");
 
@@ -6322,7 +6375,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // event_ts == seed), so the stored account differs from the
     // submitted one in exactly the timestamp field — assert the
     // rest is byte-identical and check the timestamp explicitly.
-    let stored = vos::block_on(ledger.account(&mut &node, alice_id))
+    let stored = vos::block_on(ledger.account(&mut local_admin(&node), alice_id))
         .expect("invoke account")
         .expect("alice should be on file");
     assert_eq!(stored.timestamp, ts, "kernel must stamp event_ts on accept");
@@ -6336,7 +6389,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // Root must advance after a state-changing accept. If it didn't,
     // a voucher signed against root_before == root_after would be a
     // forgery — pin the property loudly so any regression surfaces.
-    let root_after_alice = vos::block_on(ledger.state_root(&mut &node))
+    let root_after_alice = vos::block_on(ledger.state_root(&mut local_admin(&node)))
         .expect("invoke state_root post-create_account");
     assert_eq!(root_after_alice.len(), 32);
     assert_ne!(
@@ -6346,7 +6399,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
 
     // Idempotency check: re-submitting the same create returns
     // ACCOUNT_EXISTS.
-    let status = vos::block_on(ledger.create_account(&mut &node, bytes, ts))
+    let status = vos::block_on(ledger.create_account(&mut local_admin(&node), bytes, ts))
         .expect("invoke create_account (dup)");
     assert_eq!(status, Status::IdAlreadyExists);
 
@@ -6364,7 +6417,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let bob_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_bob)
         .expect("rkyv encode")
         .to_vec();
-    let status = vos::block_on(ledger.create_account(&mut &node, bob_bytes, ts))
+    let status = vos::block_on(ledger.create_account(&mut local_admin(&node), bob_bytes, ts))
         .expect("invoke create_account (wrong journal)");
     assert_eq!(status, Status::WrongJournal);
 
@@ -6380,7 +6433,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let carol_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_carol)
         .expect("rkyv encode")
         .to_vec();
-    let status = vos::block_on(ledger.create_account(&mut &node, carol_bytes, ts))
+    let status = vos::block_on(ledger.create_account(&mut local_admin(&node), carol_bytes, ts))
         .expect("invoke create_account (bad sig)");
     assert_eq!(status, Status::SignatureInvalid);
 
@@ -6396,7 +6449,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let dave_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_dave)
         .expect("rkyv encode")
         .to_vec();
-    let status = vos::block_on(ledger.create_account(&mut &node, dave_bytes, ts))
+    let status = vos::block_on(ledger.create_account(&mut local_admin(&node), dave_bytes, ts))
         .expect("invoke create_account (tampered timestamp)");
     assert_eq!(
         status,
@@ -6422,7 +6475,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let eve_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create_eve)
         .expect("rkyv encode")
         .to_vec();
-    let status = vos::block_on(ledger.create_account(&mut &node, eve_bytes, ts))
+    let status = vos::block_on(ledger.create_account(&mut local_admin(&node), eve_bytes, ts))
         .expect("invoke create_account (non-zero balance)");
     assert_eq!(
         status,
@@ -6444,7 +6497,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let pool_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&pool_create)
         .expect("rkyv encode")
         .to_vec();
-    let status = vos::block_on(ledger.create_account(&mut &node, pool_bytes, ts))
+    let status = vos::block_on(ledger.create_account(&mut local_admin(&node), pool_bytes, ts))
         .expect("invoke create_account pool");
     assert_eq!(status, Status::Ok);
 
@@ -6474,9 +6527,10 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // can later cross-check the (root_before, root_after) anchor
     // pair that apply_transfer is supposed to record.
     let host_observed_root_before =
-        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root pre-transfer");
+        vos::block_on(ledger.state_root(&mut local_admin(&node)))
+            .expect("invoke state_root pre-transfer");
     let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
+        &mut local_admin(&node),
         transfer_bytes,
         openings_bytes,
         transfer_ts,
@@ -6488,15 +6542,16 @@ fn clerk_ledger_bootstrap_and_create_account() {
         "transfer should land cleanly (got status {status:?})",
     );
     let host_observed_root_after =
-        vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root post-transfer");
+        vos::block_on(ledger.state_root(&mut local_admin(&node)))
+            .expect("invoke state_root post-transfer");
 
     // Verify the kernel updated alice's Settled debit and pool's
     // Settled credit by exactly `amt`. (Starting from BalancePair::ZERO,
     // the Pedersen sum after one entry is the entry's own commit.)
-    let alice_after = vos::block_on(ledger.account(&mut &node, alice_id))
+    let alice_after = vos::block_on(ledger.account(&mut local_admin(&node), alice_id))
         .expect("alice account read")
         .expect("alice exists");
-    let pool_after = vos::block_on(ledger.account(&mut &node, pool_id))
+    let pool_after = vos::block_on(ledger.account(&mut local_admin(&node), pool_id))
         .expect("pool account read")
         .expect("pool exists");
     let settled = cipher_clerk::types::Layer::Settled.as_index();
@@ -6520,7 +6575,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     );
 
     // Transfer is persisted with the kernel-stamped event_ts.
-    let stored_transfer = vos::block_on(ledger.transfer(&mut &node, transfer_id))
+    let stored_transfer = vos::block_on(ledger.transfer(&mut local_admin(&node), transfer_id))
         .expect("transfer read")
         .expect("transfer exists");
     assert_eq!(stored_transfer.id.0, transfer_id);
@@ -6534,7 +6589,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // (the bank constructs a voucher anchored to these roots;
     // the receiving bank checks them against the wire payload).
     let (root_before, root_after) =
-        vos::block_on(ledger.transfer_state_roots(&mut &node, transfer_id))
+        vos::block_on(ledger.transfer_state_roots(&mut local_admin(&node), transfer_id))
             .expect("invoke transfer_state_roots")
             .expect("recorded for accepted transfer");
     assert_eq!(
@@ -6561,13 +6616,21 @@ fn clerk_ledger_bootstrap_and_create_account() {
     );
 
     // Unknown transfer id → None.
-    let missing = vos::block_on(ledger.transfer_state_roots(&mut &node, [0u8; 16]))
+    let missing = vos::block_on(ledger.transfer_state_roots(
+        &mut local_admin(&node),
+        [0u8; 16],
+    ))
         .expect("invoke transfer_state_roots (missing)");
     assert!(missing.is_none(), "unknown transfer id must yield None");
 
     // Garbage bytes are rejected by the decode step.
     let status =
-        vos::block_on(ledger.apply_transfer(&mut &node, vec![0xFFu8; 7], vec![], ts + 200))
+        vos::block_on(ledger.apply_transfer(
+            &mut local_admin(&node),
+            vec![0xFFu8; 7],
+            vec![],
+            ts + 200,
+        ))
             .expect("invoke apply_transfer (garbage)");
     assert_eq!(status, Status::BadInput);
 
@@ -6580,7 +6643,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
         .expect("rkyv encode openings (replay)")
         .to_vec();
     let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
+        &mut local_admin(&node),
         replay_transfer_bytes,
         replay_openings_bytes,
         transfer_ts + 100,
@@ -6620,7 +6683,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
         .expect("rkyv encode openings (bad sig)")
         .to_vec();
     let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
+        &mut local_admin(&node),
         bad_sig_bytes,
         bad_sig_openings_bytes,
         transfer_ts + 200,
@@ -6656,7 +6719,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
             .expect("rkyv encode openings (unsigned)")
             .to_vec();
     let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
+        &mut local_admin(&node),
         unsigned_bytes,
         unsigned_openings_bytes,
         transfer_ts + 300,
@@ -6695,7 +6758,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
         .expect("rkyv encode openings (ghost)")
         .to_vec();
     let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
+        &mut local_admin(&node),
         ghost_bytes,
         ghost_openings_bytes,
         transfer_ts + 400,
@@ -6751,7 +6814,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
         .expect("rkyv encode empty openings")
         .to_vec();
     let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
+        &mut local_admin(&node),
         imposter_pp_bytes,
         empty_openings_bytes,
         transfer_ts + 500,
@@ -7365,7 +7428,7 @@ fn clerk_ledger_two_bank_federation() {
     //      only through the bridge (§5), never a direct peer read.
     //   4. Per-bank state isolation: bank A's clerk-ledger does NOT
     //      have Bob (he was only created on B). A LOCAL read on A
-    //      (operator-authority, System caller) returns None, not a
+    //      (operator-authority, explicit local Admin role) returns None, not a
     //      stale cross-bank hit.
     //   5. Cross-bank voucher round-trip: bank A applies a same-bank
     //      transfer, queries transfer_state_roots, builds + signs a
@@ -7698,7 +7761,7 @@ fn clerk_ledger_two_bank_federation() {
     let ts: u64 = 2_000_000;
     assert_eq!(
         vos::block_on(ledger_a.bootstrap(
-            &mut &node_a,
+            &mut local_admin(&node_a),
             journal_a.0,
             registrar_a.public.0,
             1u32,
@@ -7708,7 +7771,7 @@ fn clerk_ledger_two_bank_federation() {
     );
     assert_eq!(
         vos::block_on(ledger_b.bootstrap(
-            &mut &node_b,
+            &mut local_admin(&node_b),
             journal_b.0,
             registrar_b.public.0,
             1u32,
@@ -7729,7 +7792,11 @@ fn clerk_ledger_two_bank_federation() {
     .expect("rkyv encode CreateAccount(alice)")
     .to_vec();
     assert_eq!(
-        vos::block_on(ledger_a.create_account(&mut &node_a, alice_bytes, ts))
+        vos::block_on(ledger_a.create_account(
+            &mut local_admin(&node_a),
+            alice_bytes,
+            ts,
+        ))
             .expect("create alice on A"),
         Status::Ok
     );
@@ -7744,7 +7811,11 @@ fn clerk_ledger_two_bank_federation() {
     .expect("rkyv encode CreateAccount(bob)")
     .to_vec();
     assert_eq!(
-        vos::block_on(ledger_b.create_account(&mut &node_b, bob_bytes, ts))
+        vos::block_on(ledger_b.create_account(
+            &mut local_admin(&node_b),
+            bob_bytes,
+            ts,
+        ))
             .expect("create bob on B"),
         Status::Ok
     );
@@ -7802,13 +7873,13 @@ fn clerk_ledger_two_bank_federation() {
     // caller, bypasses the ACL) returns None, not a stale hit
     // propagated through some shared state. (clerk-ledger has
     // Consistency::Local, no replication.)
-    let bob_on_a = vos::block_on(ledger_a.account(&mut &node_a, bob_id))
+    let bob_on_a = vos::block_on(ledger_a.account(&mut local_admin(&node_a), bob_id))
         .expect("local account(bob) on A");
     assert!(
         bob_on_a.is_none(),
         "bob must NOT appear on A — confidential ledger state is per-bank"
     );
-    let alice_on_b = vos::block_on(ledger_b.account(&mut &node_b, alice_id))
+    let alice_on_b = vos::block_on(ledger_b.account(&mut local_admin(&node_b), alice_id))
         .expect("local account(alice) on B");
     assert!(
         alice_on_b.is_none(),
@@ -7849,7 +7920,11 @@ fn clerk_ledger_two_bank_federation() {
     .expect("rkyv encode CreateAccount(vault_a)")
     .to_vec();
     assert_eq!(
-        vos::block_on(ledger_a.create_account(&mut &node_a, vault_a_bytes, ts))
+        vos::block_on(ledger_a.create_account(
+            &mut local_admin(&node_a),
+            vault_a_bytes,
+            ts,
+        ))
             .expect("create vault_a on A"),
         Status::Ok,
     );
@@ -7880,7 +7955,7 @@ fn clerk_ledger_two_bank_federation() {
         .to_vec();
     assert_eq!(
         vos::block_on(ledger_a.apply_transfer(
-            &mut &node_a,
+            &mut local_admin(&node_a),
             transfer_bytes,
             openings_bytes,
             ts + 100,
@@ -7891,7 +7966,10 @@ fn clerk_ledger_two_bank_federation() {
 
     // Read back the anchor pair clerk-ledger captured on accept.
     let (root_before_vec, root_after_vec) =
-        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id))
+        vos::block_on(ledger_a.transfer_state_roots(
+            &mut local_admin(&node_a),
+            transfer_id,
+        ))
             .expect("invoke transfer_state_roots")
             .expect("anchor recorded for accepted transfer");
     let root_before: [u8; 32] = root_before_vec.try_into().expect("32-byte root_before");
@@ -8008,14 +8086,18 @@ fn clerk_ledger_two_bank_federation() {
     .expect("rkyv encode CreateAccount(inflow_b)")
     .to_vec();
     assert_eq!(
-        vos::block_on(ledger_b.create_account(&mut &node_b, inflow_b_bytes, ts))
+        vos::block_on(ledger_b.create_account(
+            &mut local_admin(&node_b),
+            inflow_b_bytes,
+            ts,
+        ))
             .expect("create inflow_b on B"),
         Status::Ok,
     );
 
     // Snapshot bank B's state root before the inflow transfer so
     // we can assert the inflow accept moves the root.
-    let root_b_before_inflow = vos::block_on(ledger_b.state_root(&mut &node_b))
+    let root_b_before_inflow = vos::block_on(ledger_b.state_root(&mut local_admin(&node_b)))
         .expect("invoke state_root on B pre-inflow");
 
     // The inflow Amount commit equals the voucher's amount_commit
@@ -8081,7 +8163,7 @@ fn clerk_ledger_two_bank_federation() {
         .to_vec();
     assert_eq!(
         vos::block_on(ledger_b.apply_transfer(
-            &mut &node_b,
+            &mut local_admin(&node_b),
             inflow_transfer_bytes,
             inflow_openings_bytes,
             ts + 200,
@@ -8094,7 +8176,7 @@ fn clerk_ledger_two_bank_federation() {
     // Bob's Settled credit balance MUST equal the voucher's
     // amount_commit — the cross-bank value transfer is now
     // visible on bank B's books.
-    let bob_after = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
+    let bob_after = vos::block_on(ledger_b.account(&mut local_admin(&node_b), bob_id))
         .expect("read bob on B")
         .expect("bob exists");
     let settled = Layer::Settled.as_index();
@@ -8111,7 +8193,7 @@ fn clerk_ledger_two_bank_federation() {
     // Bank B's state root must have advanced — the inflow transfer
     // changed B's local state. A future round-trip can anchor
     // anti-replay against this new root.
-    let root_b_after_inflow = vos::block_on(ledger_b.state_root(&mut &node_b))
+    let root_b_after_inflow = vos::block_on(ledger_b.state_root(&mut local_admin(&node_b)))
         .expect("invoke state_root on B post-inflow");
     assert_ne!(
         root_b_before_inflow, root_b_after_inflow,
@@ -8139,7 +8221,7 @@ fn clerk_ledger_two_bank_federation() {
         .expect("rkyv encode replay openings")
         .to_vec();
     let replay_status = vos::block_on(ledger_b.apply_transfer(
-        &mut &node_b,
+        &mut local_admin(&node_b),
         replay_bytes,
         replay_openings_bytes,
         ts + 300,
@@ -8155,7 +8237,7 @@ fn clerk_ledger_two_bank_federation() {
     // — a rejected transfer doesn't mutate state. Belt + braces:
     // catches any future regression that returns the failure
     // status but still committed.
-    let bob_after_replay = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
+    let bob_after_replay = vos::block_on(ledger_b.account(&mut local_admin(&node_b), bob_id))
         .expect("read bob on B post-replay")
         .expect("bob exists");
     assert_eq!(
@@ -8217,7 +8299,7 @@ fn clerk_ledger_two_bank_federation() {
             .to_vec();
     assert_eq!(
         vos::block_on(ledger_b.apply_transfer(
-            &mut &node_b,
+            &mut local_admin(&node_b),
             resign_attack_bytes,
             resign_attack_openings_bytes,
             ts + 400,
@@ -8270,27 +8352,33 @@ fn clerk_ledger_two_bank_federation() {
         .expect("Note::commitment must succeed for canonical blinding");
 
     // Pre-insert: pool is empty on bank B.
-    let pool_size_before = vos::block_on(ledger_b.note_commitment_count(&mut &node_b))
+    let pool_size_before = vos::block_on(
+        ledger_b.note_commitment_count(&mut local_admin(&node_b)),
+    )
         .expect("invoke note_commitment_count");
     assert_eq!(pool_size_before, 0, "notes pool must start empty on B");
 
-    let submit_status =
-        vos::block_on(ledger_b.submit_note_commitment(&mut &node_b, bob_note_commit.0.to_vec()))
-            .expect("invoke submit_note_commitment");
+    let submit_status = vos::block_on(ledger_b.submit_note_commitment(
+        &mut local_admin(&node_b),
+        bob_note_commit.0.to_vec(),
+    ))
+    .expect("invoke submit_note_commitment");
     assert_eq!(
         submit_status,
         Status::Ok,
         "submit_note_commitment must accept a 32-byte Pedersen point"
     );
 
-    let pool_size_after = vos::block_on(ledger_b.note_commitment_count(&mut &node_b))
+    let pool_size_after = vos::block_on(
+        ledger_b.note_commitment_count(&mut local_admin(&node_b)),
+    )
         .expect("invoke note_commitment_count post-submit");
     assert_eq!(
         pool_size_after, 1,
         "submit must append exactly one commitment to the pool"
     );
 
-    let stored = vos::block_on(ledger_b.note_commitment_at(&mut &node_b, 0))
+    let stored = vos::block_on(ledger_b.note_commitment_at(&mut local_admin(&node_b), 0))
         .expect("invoke note_commitment_at");
     assert_eq!(
         stored.as_slice(),
@@ -8313,8 +8401,10 @@ fn clerk_ledger_two_bank_federation() {
     // 32 are structurally invalid Pedersen points; the actor
     // checks length, the kernel/verifier would check point
     // validity in a future zkVM-anchored spend.)
-    let bad_status = vos::block_on(ledger_b.submit_note_commitment(&mut &node_b, vec![0u8; 8]))
-        .expect("invoke submit_note_commitment (short)");
+    let bad_status = vos::block_on(
+        ledger_b.submit_note_commitment(&mut local_admin(&node_b), vec![0u8; 8]),
+    )
+    .expect("invoke submit_note_commitment (short)");
     assert_eq!(
         bad_status,
         clerk_ledger::Status::BadInput,
@@ -8634,7 +8724,7 @@ fn clerk_ledger_two_bank_federation() {
         .to_vec();
     assert_eq!(
         vos::block_on(ledger_a.apply_transfer(
-            &mut &node_a,
+            &mut local_admin(&node_a),
             transfer_bytes_2,
             openings_bytes_2,
             ts + 500,
@@ -8643,7 +8733,10 @@ fn clerk_ledger_two_bank_federation() {
         Status::Ok,
     );
     let (root_before_2_vec, root_after_2_vec) =
-        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_2))
+        vos::block_on(ledger_a.transfer_state_roots(
+            &mut local_admin(&node_a),
+            transfer_id_2,
+        ))
             .expect("invoke transfer_state_roots T2")
             .expect("anchor recorded for T2");
     let root_before_2: [u8; 32] = root_before_2_vec.try_into().expect("32-byte root_before_2");
@@ -8692,7 +8785,7 @@ fn clerk_ledger_two_bank_federation() {
 
     // Snapshot Bob's current Settled.cr commit and the bridge's
     // dedup count so we can pin the deltas.
-    let bob_before = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
+    let bob_before = vos::block_on(ledger_b.account(&mut local_admin(&node_b), bob_id))
         .expect("read bob pre-redeem")
         .expect("bob exists");
     let dedup_before = vos::block_on(bridge_actor.redeemed_count(&mut &node_b))
@@ -8729,7 +8822,7 @@ fn clerk_ledger_two_bank_federation() {
         Status::Ok as u8,
         "ledger must accept the bridge-dispatched inflow (ledger=OK)"
     );
-    let bob_after_redeem = vos::block_on(ledger_b.account(&mut &node_b, bob_id))
+    let bob_after_redeem = vos::block_on(ledger_b.account(&mut local_admin(&node_b), bob_id))
         .expect("read bob post-redeem")
         .expect("bob exists");
     assert_ne!(
@@ -8812,7 +8905,7 @@ fn clerk_ledger_two_bank_federation() {
         .to_vec();
     assert_eq!(
         vos::block_on(ledger_a.apply_transfer(
-            &mut &node_a,
+            &mut local_admin(&node_a),
             transfer_bytes_3,
             openings_bytes_3,
             ts + 800,
@@ -8821,7 +8914,10 @@ fn clerk_ledger_two_bank_federation() {
         Status::Ok,
     );
     let (root_before_3_vec, root_after_3_vec) =
-        vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_3))
+        vos::block_on(ledger_a.transfer_state_roots(
+            &mut local_admin(&node_a),
+            transfer_id_3,
+        ))
             .expect("transfer_state_roots T3")
             .expect("anchor recorded for T3");
     let envelope_3 = EncryptedEnvelope::seal(value3, &blinding3, &bank_b_ivk_pk).unwrap();
@@ -9387,7 +9483,7 @@ fn clerk_ledger_two_bank_federation() {
             .to_vec();
         assert_eq!(
             vos::block_on(ledger_a.apply_transfer(
-                &mut &node_a,
+                &mut local_admin(&node_a),
                 transfer_bytes_4,
                 openings_bytes_4,
                 ts + 1200,
@@ -9396,7 +9492,10 @@ fn clerk_ledger_two_bank_federation() {
             Status::Ok,
         );
         let (root_before_4_vec, root_after_4_vec) =
-            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_4))
+            vos::block_on(ledger_a.transfer_state_roots(
+                &mut local_admin(&node_a),
+                transfer_id_4,
+            ))
                 .expect("transfer_state_roots T4")
                 .expect("anchor for T4");
         let root_before_4: [u8; 32] = root_before_4_vec.try_into().expect("32-byte");
@@ -9469,7 +9568,7 @@ fn clerk_ledger_two_bank_federation() {
             .to_vec();
         assert_eq!(
             vos::block_on(ledger_a.apply_transfer(
-                &mut &node_a,
+                &mut local_admin(&node_a),
                 transfer_bytes_5,
                 openings_bytes_5,
                 ts + 1300,
@@ -9478,7 +9577,10 @@ fn clerk_ledger_two_bank_federation() {
             Status::Ok,
         );
         let (root_before_5_vec, root_after_5_vec) =
-            vos::block_on(ledger_a.transfer_state_roots(&mut &node_a, transfer_id_5))
+            vos::block_on(ledger_a.transfer_state_roots(
+                &mut local_admin(&node_a),
+                transfer_id_5,
+            ))
                 .expect("transfer_state_roots T5")
                 .expect("anchor for T5");
         let envelope_v5 =
@@ -9523,10 +9625,13 @@ fn clerk_ledger_two_bank_federation() {
     );
 
     // S2: rotating the settlement window advances the peer's operational
-    // bracket. The bank operator drives it locally (Caller::System), so the
-    // Operator gate is bypassed; a non-operator peer would be refused.
+    // bracket. The bank operator drives it locally with explicit Admin
+    // evidence; a non-operator peer is refused.
     assert_eq!(
-        vos::block_on(bridge_actor.window_rotate(&mut &node_b, b"bank-a".to_vec()))
+        vos::block_on(bridge_actor.window_rotate(
+            &mut local_admin(&node_b),
+            b"bank-a".to_vec(),
+        ))
             .expect("invoke window_rotate"),
         BridgeStatus::Ok,
     );
@@ -9537,13 +9642,16 @@ fn clerk_ledger_two_bank_federation() {
         "window_rotate opens the next bracket",
     );
     assert_eq!(
-        vos::block_on(bridge_actor.window_rotate(&mut &node_b, b"bank-z".to_vec()))
+        vos::block_on(bridge_actor.window_rotate(
+            &mut local_admin(&node_b),
+            b"bank-z".to_vec(),
+        ))
             .expect("invoke window_rotate unknown"),
         BridgeStatus::UnknownPeer,
     );
 
     // Cross-node Operator-gate enforcement. Every window_rotate / anchor_reset
-    // above drove the bridge locally (Caller::System bypasses the gate). A
+    // above drove the bridge locally with an explicit Admin role. A
     // cross-node invoke from bank A's node authenticates as node A's peer,
     // which holds no role in bank B's space-registry, so the Operator gate
     // refuses it — the gate that stops a peer bank from steering bank B's
@@ -9901,8 +10009,8 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
     // ── 2) Grant both voter node peers AUTH_ROLE_ADMIN ──────────
     //
     // A fresh operator key anchors the registry's genesis root and signs
-    // the grants. The grant op is authored System-side (bypassing the
-    // registry's own Admin gate) but still carries a root signature that
+    // the grants. The grant op carries an explicit local Admin role and a
+    // root signature that
     // `authorize_op` verifies — so the grant is a real, replay-safe row,
     // not a test backdoor.
     let root_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -9932,7 +10040,7 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
     for who in [&follower_peer, &leader_peer] {
         assert_eq!(
             vos::block_on(registry.grant_role(
-                &mut &node_a,
+                &mut local_admin(&node_a),
                 who.clone(),
                 AUTH_ROLE_ADMIN,
                 1u64,
@@ -10030,10 +10138,10 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
 
     // ── 4) Both replicas converge on one non-empty state root ────
     //
-    // Local reads (`Caller::System`, Member gate bypassed) so we observe
-    // each replica's own committed state directly.
+    // Local reads carry an explicit Admin role so we observe each replica's
+    // own committed state without restoring the retired System bypass.
     let read_root = |node: &VosNode, id: ServiceId| -> Option<Vec<u8>> {
-        vos::block_on(ClerkLedgerRef::at(id).state_root(&mut &*node)).ok()
+        vos::block_on(ClerkLedgerRef::at(id).state_root(&mut local_admin(node))).ok()
     };
     let converged_root = wait_for(
         || {
@@ -10360,7 +10468,7 @@ fn raft_clerk_settle_bilateral_settlement() {
     for who in [&follower_peer, &leader_peer] {
         assert_eq!(
             vos::block_on(registry.grant_role(
-                &mut &node_a,
+                &mut local_admin(&node_a),
                 who.clone(),
                 AUTH_ROLE_ADMIN,
                 1u64,
@@ -10900,12 +11008,18 @@ fn multi_node_three_space_settlement_capstone() {
 
     // ── Quiesce: rotate both bridges' windows (closing window 0). ─
     assert_eq!(
-        vos::block_on(bridge_a.window_rotate(&mut &node_a1, b"bank-b".to_vec()))
+        vos::block_on(bridge_a.window_rotate(
+            &mut local_admin(&node_a1),
+            b"bank-b".to_vec(),
+        ))
             .expect("rotate bridge-a"),
         BridgeStatus::Ok,
     );
     assert_eq!(
-        vos::block_on(bridge_b.window_rotate(&mut &node_b1, b"bank-a".to_vec()))
+        vos::block_on(bridge_b.window_rotate(
+            &mut local_admin(&node_b1),
+            b"bank-a".to_vec(),
+        ))
             .expect("rotate bridge-b"),
         BridgeStatus::Ok,
     );
@@ -10955,7 +11069,11 @@ fn multi_node_three_space_settlement_capstone() {
         (b"bank-b".to_vec(), bank_b_clerk.public.0),
     ] {
         assert_eq!(
-            vos::block_on(venue.register_bank(&mut &*venue_leader_node, name, pk))
+            vos::block_on(venue.register_bank(
+                &mut local_admin(venue_leader_node),
+                name,
+                pk,
+            ))
                 .expect("register_bank"),
             SettleStatus::Ok,
         );
@@ -11010,7 +11128,7 @@ fn multi_node_three_space_settlement_capstone() {
     // ── settle_window at the leader → zero-sum → replicates. ────
     assert_eq!(
         vos::block_on(venue.settle_window(
-            &mut &*venue_leader_node,
+            &mut local_admin(venue_leader_node),
             b"bank-a".to_vec(),
             b"bank-b".to_vec(),
             DEMO_CURRENCY,
@@ -11053,7 +11171,11 @@ fn multi_node_three_space_settlement_capstone() {
         "a non-chaining voucher wedges the channel"
     );
     assert_eq!(
-        vos::block_on(bridge_a.anchor_reset(&mut &node_a1, b"bank-b".to_vec(), wedge_before))
+        vos::block_on(bridge_a.anchor_reset(
+            &mut local_admin(&node_a1),
+            b"bank-b".to_vec(),
+            wedge_before,
+        ))
             .expect("anchor_reset"),
         BridgeStatus::Ok,
     );
@@ -11997,7 +12119,7 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
     let registrar = Keypair::generate();
     let journal = JournalId::random();
     let status = vos::block_on(ledger.bootstrap(
-        &mut &node,
+        &mut local_admin(&node),
         journal.0,
         registrar.public.0,
         1,
@@ -12024,7 +12146,11 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
                 bytes.len() < vos::lifecycle::BUF_SIZE,
                 "batch must fit the message cap"
             );
-            let statuses = vos::block_on(ledger.create_accounts(&mut &node, bytes, ts))
+            let statuses = vos::block_on(ledger.create_accounts(
+                &mut local_admin(&node),
+                bytes,
+                ts,
+            ))
                 .expect("create_accounts");
             assert_eq!(statuses.len(), pending_batch.len(), "one status per item");
             assert!(
@@ -12039,23 +12165,26 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
         started.elapsed()
     );
     assert_eq!(
-        vos::block_on(ledger.account_count(&mut &node)).expect("account_count"),
+        vos::block_on(ledger.account_count(&mut local_admin(&node))).expect("account_count"),
         ACCOUNTS as u32,
     );
 
     // Spot reads across the keyspace — point rows, no cache help.
     for probe in [0, ACCOUNTS / 2, ACCOUNTS - 1] {
-        let acct = vos::block_on(ledger.account(&mut &node, ids[probe]))
+        let acct = vos::block_on(ledger.account(&mut local_admin(&node), ids[probe]))
             .expect("account read")
             .expect("account on file");
         assert_eq!(acct.id.0, ids[probe]);
     }
 
     // ── A transfer at 10k accounts ──────────────────────────────
-    let debtor = vos::block_on(ledger.account(&mut &node, ids[17]))
+    let debtor = vos::block_on(ledger.account(&mut local_admin(&node), ids[17]))
         .expect("read")
         .expect("on file");
-    let creditor = vos::block_on(ledger.account(&mut &node, ids[ACCOUNTS - 3]))
+    let creditor = vos::block_on(ledger.account(
+        &mut local_admin(&node),
+        ids[ACCOUNTS - 3],
+    ))
         .expect("read")
         .expect("on file");
     let blinding = cipher_clerk::crypto::Blinding([1u8; 32]);
@@ -12077,11 +12206,12 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
         .expect("encode openings")
         .to_vec();
 
-    let root_before = vos::block_on(ledger.state_root(&mut &node)).expect("state_root");
+    let root_before =
+        vos::block_on(ledger.state_root(&mut local_admin(&node))).expect("state_root");
     assert_eq!(root_before.len(), 32);
     let transfer_started = std::time::Instant::now();
     let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
+        &mut local_admin(&node),
         transfer_bytes,
         openings_bytes,
         ts + 7,
@@ -12092,9 +12222,13 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
         "capstone: transfer at {ACCOUNTS} accounts in {:?}",
         transfer_started.elapsed()
     );
-    let root_after = vos::block_on(ledger.state_root(&mut &node)).expect("state_root");
+    let root_after =
+        vos::block_on(ledger.state_root(&mut local_admin(&node))).expect("state_root");
     assert_ne!(root_after, root_before, "the transfer must move the root");
-    let anchors = vos::block_on(ledger.transfer_state_roots(&mut &node, transfer_id))
+    let anchors = vos::block_on(ledger.transfer_state_roots(
+        &mut local_admin(&node),
+        transfer_id,
+    ))
         .expect("transfer_state_roots")
         .expect("anchors recorded");
     assert_eq!(anchors.0, root_before, "recorded root_before must match");
