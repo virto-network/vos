@@ -2202,6 +2202,13 @@ fn replay_dag_into_runtime(
                 replay.was_exhausted(),
             ));
         }
+        // Reply bytes and role-gate status are dispatch-local outputs. A
+        // replayed handler may have produced either (including FORBIDDEN for
+        // a correctly rejected forged operation), but no caller exists to
+        // consume them. Leaving them behind makes the first live invocation
+        // inherit the final replayed dispatch's result.
+        let _ = runtime.take_last_reply(svc_id);
+        let _ = runtime.take_last_status(svc_id);
         let replayed_anchor = runtime.take_dispatch_anchor(svc_id);
         let _ = runtime.take_dispatch_delta(svc_id);
         if recorded_anchor.0 != crate::effect_log::ANCHOR_UNRECORDED
@@ -9317,9 +9324,9 @@ mod tests {
         // author a byte-consistent registry `CrdtEvent`, and an honest
         // node WILL merge it — `insert_node` only checks the CID, not
         // the author. The defense is at replay: `replay_dag_into_runtime`
-        // feeds each merged op back through the actor as `Caller::System`
-        // (the `#[msg(role)]` gate a no-op), where `authorize_op`
-        // re-verifies the embedded signature.
+        // restores the recorded role evidence, then `authorize_op`
+        // independently re-verifies the embedded signature. A malicious
+        // author can forge the former in its own DAG node, but not the latter.
         //
         // We hand-build a registry DAG exactly as a peer's sync would
         // deliver it — genesis `set_root`, then root-signed ops (the
@@ -9374,7 +9381,10 @@ mod tests {
         let ver = "1";
         let hash = vec![7u8; 32];
         let rep = vec![9u8; 32];
-        let consistency = Consistency::Crdt.as_u8();
+        // This fixture publishes no actor metadata, so install an ordinary
+        // Local actor. Selecting CRDT here would correctly fail the newer
+        // source-level `#[actor(crdt)]` opt-in check before creating a row.
+        let consistency = Consistency::Local.as_u8();
 
         // ── Registry op messages (bare `[TAG_DYNAMIC][Msg]`, the shape
         //    `EffectLog.msg` records — replay re-adds the caller prefix) ─
@@ -9478,7 +9488,14 @@ mod tests {
             let mut db = CrdtCommit::open(&redb_path, origin).unwrap();
             let mut prev: Option<merkle_crdt::Cid<Blake2b>> = None;
             for (seq, msg) in ops.into_iter().enumerate() {
-                let event = CrdtEvent::new(origin, seq as u64, EffectLog::for_msg(msg));
+                let mut log = EffectLog::for_msg(msg);
+                // Model an operation which reached the handler with an
+                // explicit Admin grant. System/Actor origins no longer bypass
+                // role checks; a hostile DAG author can still claim these
+                // untrusted prefix bytes, so the embedded signature remains
+                // the security boundary this regression exercises.
+                log.set_caller_prefix([0, 1, ADMIN, 0, 0]);
+                let event = CrdtEvent::new(origin, seq as u64, log);
                 let children: BTreeSet<merkle_crdt::Cid<Blake2b>> = prev.into_iter().collect();
                 let dag_node: DagNode<Blake2b, CrdtEvent> = DagNode::new(event, children);
                 let cid = dag_node.cid();
@@ -9529,8 +9546,8 @@ mod tests {
             "root-signed install must materialize an AgentRow on replay",
         );
 
-        // The headline: forged ops were refused by authorize_op on the
-        // System replay path, so neither row ever materializes.
+        // The headline: even with a claimed Admin grant, forged ops were
+        // refused by authorize_op, so neither row ever materializes.
         assert_eq!(
             role_of(&attacker_peer),
             0,
