@@ -28,7 +28,7 @@ use vos::v2::{
     WorkEnvelopeV2, WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
-    AttestedMethod, Decode, Encode, StateCommitmentV3,
+    Attestation, AttestedMethod, Decode, Encode, StateCommitmentV3,
     value::{Msg, Value},
 };
 
@@ -46,6 +46,37 @@ impl AttestedMethod<Vec<u8>> for PrivateStart {
             Value::Bytes(value) => Some(value),
             _ => None,
         }
+    }
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Debug, Clone, PartialEq,
+)]
+#[rkyv(crate = vos::rkyv)]
+struct AgeClaimFixture {
+    minimum_age: u8,
+    adult: bool,
+}
+
+enum IsAdultFixture {}
+
+impl AttestedMethod<AgeClaimFixture> for IsAdultFixture {
+    const METHOD: &'static str = "is_adult";
+
+    fn claim_wire(claim: &AgeClaimFixture) -> Vec<u8> {
+        Value::Bytes(
+            vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(claim)
+                .expect("fixture claim encodes")
+                .to_vec(),
+        )
+        .encode()
+    }
+
+    fn decode_claim_wire(wire: &[u8]) -> Option<AgeClaimFixture> {
+        let Value::Bytes(bytes) = Value::try_decode(wire)? else {
+            return None;
+        };
+        vos::rkyv::from_bytes::<AgeClaimFixture, vos::rkyv::rancor::Error>(&bytes).ok()
     }
 }
 
@@ -264,6 +295,22 @@ fn cycle_v2_elf() -> Option<Vec<u8>> {
         Err(_) => {
             eprintln!(
                 "skipping: build the v2 cycle fixture with `cd vos/tests/fixtures/cycle-v2 && cargo +nightly actor` ({})",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn age_gate_v2_elf() -> Option<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/v2/target/riscv64em-javm/release/v2_age_gate.elf");
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            eprintln!(
+                "skipping: build the v2 age-gate example with \
+                 `cd examples/v2 && cargo +nightly actor -p v2-age-gate` ({})",
                 path.display()
             );
             None
@@ -3694,6 +3741,213 @@ fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::AttestationReplay,)
     );
     assert_eq!(service.accumulate_host().commit_sequence(), commits);
+}
+
+#[test]
+fn age_gate_guest_emits_the_proof_requirement_and_accumulate_enforces_once() {
+    let (Some(service_elf), Some(gate_elf)) = (service_elf(), age_gate_v2_elf()) else {
+        return;
+    };
+    let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
+    let gate_pvm = grey_transpiler::link_elf(&gate_elf).unwrap();
+    let gate_program = ProgramId::of_pvm(&gate_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut seed = work(gate_program, initial.clone());
+    seed.service.service_program = ProgramId::of_pvm(&service_pvm);
+    let source = private_age_binding(&seed.service);
+
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(gate_pvm), gate_program);
+    let mut service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        host,
+        1_000_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let genesis = ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            name: "age-gate".into(),
+            parent: None,
+            producer: ProducerId([128; 32]),
+            program: gate_program,
+            initial_state: initial,
+            crdt: false,
+            methods: vec![
+                MethodPolicyV2 {
+                    method: "admit".into(),
+                    schema: Hash([129; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                },
+                MethodPolicyV2 {
+                    method: "admitted".into(),
+                    schema: Hash([130; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                },
+            ],
+        }],
+        external_actors: vec![source.clone()],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([131; 32]),
+            authenticator: vec![132],
+        },
+    };
+    service.accumulate_host_mut().allow_install(&genesis);
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let claim = AgeClaimFixture {
+        minimum_age: 18,
+        adult: true,
+    };
+    let source_after = Hash([133; 32]);
+    let statement = AttestationStatementV3 {
+        statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+        space: source.service.space,
+        actor: source.actor,
+        deployment: source.service.deployment,
+        actor_program: source.program,
+        method: IsAdultFixture::METHOD.into(),
+        schema: Hash([134; 32]),
+        invocation: InvocationId([135; 32]),
+        before: StateCommitmentV3::Linear(Hash([136; 32])),
+        after: StateCommitmentV3::Linear(source_after),
+        claim_commitment: Hash::digest(
+            b"vos/attestation-claim/v3",
+            &[&IsAdultFixture::claim_wire(&claim)],
+        ),
+        input_commitment: Hash([137; 32]),
+        authorization_policy: Hash([138; 32]),
+        accumulation_receipt: AccumulationReceiptV2 {
+            service: source.service.clone(),
+            accepted_transition: Hash([139; 32]),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: Some(source_after),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+    };
+    let proof = b"age proof produced by the canonical actor trace".to_vec();
+    let trace = Hash([140; 32]);
+    let package = Attestation::<AgeClaimFixture, IsAdultFixture>::__from_runtime(
+        source.name.clone(),
+        source.producer,
+        statement.clone(),
+        trace,
+        claim,
+        proof.clone(),
+    )
+    .unwrap();
+    let mut message = vec![vos::value::TAG_DYNAMIC];
+    message.extend_from_slice(
+        &Msg::new("admit")
+            .with("package", Value::Bytes(package.to_portable_bytes()))
+            .encode(),
+    );
+
+    let prepare = |invocation| LocalWorkRequestV2 {
+        invocation,
+        workflow_step: 0,
+        logical_timeslot: 10,
+        target: seed.target,
+        method: "admit".into(),
+        arguments: message.clone(),
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let prepared =
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), prepare(InvocationId([141; 32])))
+            .unwrap();
+    let refined = service
+        .refine_actor_tree(&prepared.work, &prepared.imports)
+        .expect("real gate guest verifies without invoking the producer");
+    assert_eq!(
+        refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(refined.transition.attestation_verifications.len(), 1);
+    let requirement = &refined.transition.attestation_verifications[0];
+    assert_eq!(requirement.source_name, "private-age");
+    assert_eq!(requirement.producer, source.producer);
+    assert_eq!(requirement.statement, statement);
+    assert_eq!(requirement.trace, trace);
+    assert_eq!(refined.exported_blobs.len(), 1);
+    assert_eq!(refined.exported_blobs[0].bytes, proof);
+    assert_eq!(refined.exported_blobs[0].reference, requirement.proof_blob);
+
+    service
+        .accumulate_host_mut()
+        .allow_proof(&ProofVerificationRequestV2 {
+            actor_program: source.program,
+            execution_semantics: source.service.execution_semantics,
+            statement: requirement.statement.commitment(),
+            trace: requirement.trace,
+            proof_blob: requirement.proof_blob.clone(),
+        });
+    let accepted = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: prepared.work,
+            transition: refined.transition,
+            provided_blobs: refined.exported_blobs,
+        }))
+        .unwrap();
+    assert!(matches!(
+        accepted.result,
+        AccumulationResultV2::Accepted {
+            published: PublishedEffectsV2 { reply: Some(_), .. },
+            duplicate: false,
+            ..
+        }
+    ));
+    let committed = service.accumulate_host().snapshot();
+
+    let replay_work =
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), prepare(InvocationId([142; 32])))
+            .unwrap();
+    let replay_refined = service
+        .refine_actor_tree(&replay_work.work, &replay_work.imports)
+        .expect("Refine remains pure and deterministic against committed gate state");
+    assert_eq!(replay_refined.transition.attestation_verifications.len(), 1);
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: replay_work.work,
+                transition: replay_refined.transition,
+                provided_blobs: replay_refined.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::AttestationReplay,)
+    );
+    assert_eq!(service.accumulate_host().snapshot(), committed);
 }
 
 #[test]

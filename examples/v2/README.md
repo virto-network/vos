@@ -18,6 +18,7 @@ Build the canonical actor ELFs:
 cargo actor -p v2-counter
 cargo actor -p v2-workflow
 cargo actor -p v2-private-age
+cargo actor -p v2-age-gate
 cargo actor -p v2-shared-board
 ```
 
