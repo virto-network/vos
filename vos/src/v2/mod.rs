@@ -38,6 +38,7 @@ pub use contracts::{
     AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorCrdtStateV2,
     ActorDirectoryV2, ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorSpawnRequestV2,
+    ActorUpgradeV2,
     ActorSpawnV2, ActorTreeImportV2, ActorWriteV2, AttestationDeliveryV2, AttestationResumeV2,
     AttestationVerificationV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
     CallExpirationEnvelopeV2, CallTimeoutV2, CheckpointTokenV2, CommittedAttestationPackageV2,

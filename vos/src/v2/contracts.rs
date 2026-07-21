@@ -1092,6 +1092,29 @@ pub struct ServiceGenesisV2 {
     pub authorization: AuthorizationEvidenceV2,
 }
 
+/// Guest-authorized replacement for one installed actor's canonical program
+/// and generated policy surface. Identity, ownership, consistency kind, and
+/// materialized application state remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorUpgradeV2 {
+    pub service: ServiceIdentityV2,
+    pub actor: ActorId,
+    pub expected_program: ProgramId,
+    pub replacement_program: ProgramId,
+    pub producer: ProducerId,
+    pub methods: Vec<MethodPolicyV2>,
+    pub base: ConsistencyBaseV2,
+    /// Authenticated platform/package-registry authority. `System` remains an
+    /// identity class only; the exact capability is verified as work input.
+    pub authorization: AuthorizationEvidenceV2,
+}
+
+impl ActorUpgradeV2 {
+    pub fn hash(&self) -> Hash {
+        Hash::digest(b"vos/actor-upgrade/v2", &[&self.encode()])
+    }
+}
+
 /// Complete input required by guest-owned Accumulate to validate a Refine
 /// result. The host does not supply a journal or a native apply plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,6 +1307,7 @@ pub enum AccumulateRequestV2 {
     ExpireCall(CallExpirationEnvelopeV2),
     SyncCrdt(CrdtSyncEnvelopeV2),
     AcknowledgePublication(PublicationAckV2),
+    UpgradeActor(ActorUpgradeV2),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1362,6 +1386,7 @@ pub enum AccumulationRejectionV2 {
     ReceiptUnavailable,
     InvalidReceipt,
     AttestationReplay,
+    ActorBusy(ActorId),
 }
 
 impl AccumulationRejectionV2 {
@@ -1377,6 +1402,7 @@ impl AccumulationRejectionV2 {
                 | Self::StorageFull
                 | Self::ProofUnavailable
                 | Self::ReceiptUnavailable
+                | Self::ActorBusy(_)
         )
     }
 }
@@ -1405,6 +1431,13 @@ pub enum AccumulationResultV2 {
     Rejected(AccumulationRejectionV2),
     PublicationAcknowledged {
         input: WorkInputIdV2,
+        duplicate: bool,
+    },
+    ActorUpgraded {
+        actor: ActorId,
+        previous_program: ProgramId,
+        program: ProgramId,
+        receipt: AccumulationReceiptV2,
         duplicate: bool,
     },
 }
@@ -2547,6 +2580,65 @@ impl V2Wire for ServiceGenesisV2 {
     }
 }
 
+impl V2Wire for ActorUpgradeV2 {
+    const MAGIC: [u8; 4] = *b"VAU2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.actor.0);
+        e.fixed(&self.expected_program.0);
+        e.fixed(&self.replacement_program.0);
+        e.fixed(&self.producer.0);
+        e.list(&self.methods, |e, method| {
+            e.string(&method.method);
+            e.fixed(&method.schema.0);
+            e.fixed(&method.policy.0);
+            e.bool(method.public);
+            e.bool(method.attested);
+        });
+        encode_base(&mut e, &self.base);
+        encode_auth(&mut e, &self.authorization);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            actor: ActorId(d.fixed()?),
+            expected_program: ProgramId(d.fixed()?),
+            replacement_program: ProgramId(d.fixed()?),
+            producer: ProducerId(d.fixed()?),
+            methods: d.list(|d| {
+                Ok(MethodPolicyV2 {
+                    method: d.string()?,
+                    schema: Hash(d.fixed()?),
+                    policy: Hash(d.fixed()?),
+                    public: d.bool()?,
+                    attested: d.bool()?,
+                })
+            })?,
+            base: decode_base(d)?,
+            authorization: decode_auth(d)?,
+        };
+        if value.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+            || value.expected_program == value.replacement_program
+            || value.methods.iter().any(|method| method.method.is_empty())
+            || value
+                .methods
+                .windows(2)
+                .any(|pair| pair[0].method >= pair[1].method)
+            || !matches!(
+                &value.authorization,
+                AuthorizationEvidenceV2::SystemCapability { authenticator, .. }
+                    if !authenticator.is_empty()
+            )
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for AccumulationEnvelopeV2 {
     const MAGIC: [u8; 4] = *b"VAE2";
 
@@ -2824,6 +2916,10 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(5);
                 e.bytes(&acknowledgement.encode());
             }
+            Self::UpgradeActor(upgrade) => {
+                e.u8(8);
+                e.bytes(&upgrade.encode());
+            }
         }
     }
 
@@ -2843,6 +2939,7 @@ impl V2Wire for AccumulateRequestV2 {
             5 => Ok(Self::AcknowledgePublication(PublicationAckV2::decode(
                 &d.bytes()?,
             )?)),
+            8 => Ok(Self::UpgradeActor(ActorUpgradeV2::decode(&d.bytes()?)?)),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -2925,6 +3022,20 @@ impl V2Wire for AccumulationResultV2 {
                 encode_work_input(&mut e, *input);
                 e.bool(*duplicate);
             }
+            Self::ActorUpgraded {
+                actor,
+                previous_program,
+                program,
+                receipt,
+                duplicate,
+            } => {
+                e.u8(7);
+                e.fixed(&actor.0);
+                e.fixed(&previous_program.0);
+                e.fixed(&program.0);
+                e.bytes(&receipt.encode());
+                e.bool(*duplicate);
+            }
         }
     }
 
@@ -2978,6 +3089,27 @@ impl V2Wire for AccumulationResultV2 {
                 input: decode_work_input(d)?,
                 duplicate: d.bool()?,
             }),
+            7 => {
+                let actor = ActorId(d.fixed()?);
+                let previous_program = ProgramId(d.fixed()?);
+                let program = ProgramId(d.fixed()?);
+                let receipt = AccumulationReceiptV2::decode(&d.bytes()?)?;
+                let duplicate = d.bool()?;
+                if previous_program == program
+                    || receipt.reply_commitment.is_some()
+                    || receipt.outbox_commitment.is_some()
+                    || receipt.checkpoint != 0
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(Self::ActorUpgraded {
+                    actor,
+                    previous_program,
+                    program,
+                    receipt,
+                    duplicate,
+                })
+            }
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -3387,6 +3519,10 @@ fn encode_rejection(e: &mut Encoder<'_>, value: &AccumulationRejectionV2) {
         R::ReceiptUnavailable => e.u8(24),
         R::InvalidReceipt => e.u8(25),
         R::AttestationReplay => e.u8(26),
+        R::ActorBusy(actor) => {
+            e.u8(27);
+            e.fixed(&actor.0);
+        }
     }
 }
 
@@ -3423,6 +3559,7 @@ fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejectionV2, Deco
         24 => Ok(R::ReceiptUnavailable),
         25 => Ok(R::InvalidReceipt),
         26 => Ok(R::AttestationReplay),
+        27 => Ok(R::ActorBusy(ActorId(d.fixed()?))),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -4788,6 +4925,63 @@ mod tests {
         assert_eq!(
             AccumulateRequestV2::decode(&acknowledgement.encode()).unwrap(),
             acknowledgement
+        );
+
+        let upgrade = ActorUpgradeV2 {
+            service: service(),
+            actor: ActorId([5; 32]),
+            expected_program: ProgramId([6; 32]),
+            replacement_program: ProgramId([20; 32]),
+            producer: ProducerId([21; 32]),
+            methods: vec![MethodPolicyV2 {
+                method: "set".into(),
+                schema: Hash([22; 32]),
+                policy: Hash([26; 32]),
+                public: true,
+                attested: false,
+            }],
+            base: ConsistencyBaseV2::Linear {
+                revision: 7,
+                state_root: Hash([8; 32]),
+            },
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([23; 32]),
+                authenticator: vec![24],
+            },
+        };
+        let upgrade_request = AccumulateRequestV2::UpgradeActor(upgrade.clone());
+        assert_eq!(
+            AccumulateRequestV2::decode(&upgrade_request.encode()).unwrap(),
+            upgrade_request
+        );
+        assert_ne!(upgrade.hash(), Hash::ZERO);
+        let upgrade_receipt = AccumulationReceiptV2 {
+            service: service(),
+            accepted_transition: upgrade.hash(),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([25; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 8,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let upgraded = AccumulationResultV2::ActorUpgraded {
+            actor: upgrade.actor,
+            previous_program: upgrade.expected_program,
+            program: upgrade.replacement_program,
+            receipt: upgrade_receipt,
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&upgraded.encode()).unwrap(),
+            upgraded
+        );
+        let mut invalid_upgrade = upgrade;
+        invalid_upgrade.authorization = AuthorizationEvidenceV2::Public;
+        assert_eq!(
+            ActorUpgradeV2::decode(&invalid_upgrade.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let caller_invocation = InvocationId([20; 32]);
