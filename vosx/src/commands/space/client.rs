@@ -14,11 +14,12 @@
 //! `vos::block_on(reg.X(&mut &node))` boilerplate.
 
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use vos::abi::service::ServiceId;
-use vos::registry::{AgentRow, MemberRow, ProgramRow, RegistryRef, Status};
 use vos::node::VosNode;
+use vos::registry::{AgentRow, MemberRow, ProgramRow, RegistryRef, Status};
 
 use crate::commands::space::common::instance_service_id;
 use crate::commands::space::endpoint;
@@ -58,6 +59,35 @@ pub struct DaemonClient {
     /// file.
     pub endpoint: endpoint::Endpoint,
     daemon_prefix: u16,
+    v2_targets: Mutex<std::collections::HashMap<u32, V2Target>>,
+}
+
+#[derive(Clone)]
+struct V2Target {
+    actor: vos::v2::ActorId,
+    attested_methods: std::collections::HashSet<String>,
+}
+
+fn encode_v2_invocation(
+    target: &V2Target,
+    invocation: vos::v2::InvocationId,
+    msg: &vos::value::Msg,
+    arguments: Vec<u8>,
+) -> Vec<u8> {
+    use vos::v2::V2Wire;
+
+    vos::v2::RootTreeInvocationV2 {
+        invocation,
+        // Logical time is supplied by the transport protocol. The local
+        // daemon transport has no JAM timeslot source yet, so it uses the
+        // genesis slot rather than deriving consensus time from a wall clock.
+        logical_timeslot: 0,
+        target: target.actor,
+        method: msg.name.clone(),
+        arguments,
+        proof_requested: target.attested_methods.contains(&msg.name),
+    }
+    .encode()
 }
 
 impl DaemonClient {
@@ -154,6 +184,7 @@ impl DaemonClient {
             entry,
             daemon_prefix: ep.prefix,
             endpoint: ep,
+            v2_targets: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -236,7 +267,11 @@ impl DaemonClient {
         }
         if let Some(agent) = self.agent(target)? {
             debug_assert_eq!(agent.instance_name, target);
-            return Ok(instance_service_id(target, self.daemon_prefix));
+            let route = instance_service_id(target, self.daemon_prefix);
+            if let Some(v2_target) = self.v2_target_for_agent(&agent)? {
+                self.v2_targets.lock().unwrap().insert(route.0, v2_target);
+            }
+            return Ok(route);
         }
         // Not an installed agent — try the extension fallback.
         // `meta_for_instance` returns non-empty bytes for any
@@ -298,6 +333,21 @@ impl DaemonClient {
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
 
+        let payload =
+            if let Some(v2_target) = self.v2_targets.lock().unwrap().get(&target.0).cloned() {
+                let mut nonce = [0; 32];
+                getrandom::getrandom(&mut nonce)
+                    .map_err(|error| anyhow::anyhow!("mint v2 invocation ID: {error}"))?;
+                encode_v2_invocation(
+                    &v2_target,
+                    vos::v2::InvocationId::derive(b"vosx/daemon-invocation/v2", &nonce),
+                    msg,
+                    payload,
+                )
+            } else {
+                payload
+            };
+
         self.node
             .invoke_with_timeout(target, payload, timeout)
             .ok_or_else(|| {
@@ -305,6 +355,40 @@ impl DaemonClient {
                     "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
                 )
             })
+    }
+
+    fn v2_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<Option<V2Target>> {
+        use vos::v2::V2Wire;
+
+        let hash = crate::blob_store::BlobHash(agent.program_hash);
+        let Some(exact_package) = crate::blob_store::cache_get(&hash)? else {
+            return Ok(None);
+        };
+        if exact_package.get(..4) != Some(b"VOSP") {
+            return Ok(None);
+        }
+        let package = vos::v2::VosPackageV2::decode(&exact_package)
+            .map_err(|error| anyhow::anyhow!("decode installed v2 package: {error}"))?;
+        package
+            .validate()
+            .map_err(|error| anyhow::anyhow!("validate installed v2 package: {error}"))?;
+        let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
+            .map_err(|error| anyhow::anyhow!("decode installed v2 policies: {error}"))?;
+        let space = vos::v2::SpaceId(
+            self.entry
+                .id_bytes()
+                .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))?,
+        );
+        let service =
+            crate::commands::space::common::v2_root_service_id(space, &agent.instance_name);
+        Ok(Some(V2Target {
+            actor: crate::commands::space::common::v2_root_actor_id(service, &agent.instance_name),
+            attested_methods: policies
+                .methods
+                .into_iter()
+                .filter_map(|policy| policy.attested.then_some(policy.method))
+                .collect(),
+        }))
     }
 
     /// Tear down the libp2p peer. Always call before exiting
@@ -365,7 +449,10 @@ impl DaemonClient {
             .network()
             .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
         let peer = net.peer_for_prefix(self.daemon_prefix).ok_or_else(|| {
-            anyhow::anyhow!("daemon peer (prefix {:#06x}) not connected", self.daemon_prefix)
+            anyhow::anyhow!(
+                "daemon peer (prefix {:#06x}) not connected",
+                self.daemon_prefix
+            )
         })?;
         net.send_raft_status_req(peer, replication_id)
             .recv_timeout(invoke_timeout())
@@ -409,7 +496,11 @@ impl DaemonClient {
     /// schema-aware dynamic dispatch) resolves for agents installed off
     /// this program. Mirrors what the recipe reconciler does; empty
     /// `auth` is signed on relay by the daemon's operator key.
-    pub fn register_meta(&self, program_hash: Vec<u8>, meta_blob: Vec<u8>) -> anyhow::Result<Status> {
+    pub fn register_meta(
+        &self,
+        program_hash: Vec<u8>,
+        meta_blob: Vec<u8>,
+    ) -> anyhow::Result<Status> {
         vos::block_on(self.registry().register_meta(
             &mut &self.node,
             program_hash,
@@ -468,10 +559,13 @@ impl DaemonClient {
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
         // (a replayed/superseded upgrade can't roll the version back).
-        let from_hash = vos::block_on(self.registry().agent(&mut &self.node, instance_name.clone()))
-            .map_err(|e| anyhow::anyhow!("registry.agent(): {e}"))?
-            .map(|row| row.program_hash.to_vec())
-            .ok_or_else(|| anyhow::anyhow!("upgrade: instance '{instance_name}' is not installed"))?;
+        let from_hash = vos::block_on(
+            self.registry()
+                .agent(&mut &self.node, instance_name.clone()),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.agent(): {e}"))?
+        .map(|row| row.program_hash.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("upgrade: instance '{instance_name}' is not installed"))?;
         vos::block_on(self.registry().upgrade(
             &mut &self.node,
             instance_name,
@@ -534,8 +628,11 @@ impl DaemonClient {
 
     pub fn remove_identity(&self, public_key: Vec<u8>) -> anyhow::Result<Status> {
         let auth = op_auth(&self.signer, "remove_identity", &[&public_key])?;
-        vos::block_on(self.registry().remove_identity(&mut &self.node, public_key, auth))
-            .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
+        vos::block_on(
+            self.registry()
+                .remove_identity(&mut &self.node, public_key, auth),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
     }
 
     // ── Auth grants ────────────────────────────────────
@@ -656,26 +753,42 @@ impl DaemonClient {
         let auth = op_auth(
             &self.signer,
             "grant_actor_role",
-            &[&peer_id, agent_name.as_bytes(), &[role], &epoch.to_le_bytes()],
+            &[
+                &peer_id,
+                agent_name.as_bytes(),
+                &[role],
+                &epoch.to_le_bytes(),
+            ],
         )?;
-        vos::block_on(
-            self.registry()
-                .grant_actor_role(&mut &self.node, peer_id, agent_name, role, epoch, auth),
-        )
+        vos::block_on(self.registry().grant_actor_role(
+            &mut &self.node,
+            peer_id,
+            agent_name,
+            role,
+            epoch,
+            auth,
+        ))
         .map_err(|e| anyhow::anyhow!("registry.grant_actor_role(): {e}"))
     }
 
-    pub fn revoke_actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<Status> {
+    pub fn revoke_actor_role(
+        &self,
+        peer_id: Vec<u8>,
+        agent_name: String,
+    ) -> anyhow::Result<Status> {
         let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,
             "revoke_actor_role",
             &[&peer_id, agent_name.as_bytes(), &epoch.to_le_bytes()],
         )?;
-        vos::block_on(
-            self.registry()
-                .revoke_actor_role(&mut &self.node, peer_id, agent_name, epoch, auth),
-        )
+        vos::block_on(self.registry().revoke_actor_role(
+            &mut &self.node,
+            peer_id,
+            agent_name,
+            epoch,
+            auth,
+        ))
         .map_err(|e| anyhow::anyhow!("registry.revoke_actor_role(): {e}"))
     }
 
@@ -701,5 +814,48 @@ impl DaemonClient {
             after_agent = page.next_agent;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos::v2::V2Wire;
+
+    #[test]
+    fn v2_ingress_preserves_typed_identity_and_signed_proof_mode() {
+        let target = V2Target {
+            actor: vos::v2::ActorId([0x41; 32]),
+            attested_methods: ["prove".to_string()].into_iter().collect(),
+        };
+        let invocation = vos::v2::InvocationId([0x17; 32]);
+        let msg = vos::value::Msg::new("prove").with("minimum", 18u8);
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&vos::Encode::encode(&msg));
+
+        let encoded = encode_v2_invocation(&target, invocation, &msg, arguments.clone());
+        let decoded = vos::v2::RootTreeInvocationV2::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.invocation, invocation);
+        assert_eq!(decoded.target, target.actor);
+        assert_eq!(decoded.method, "prove");
+        assert_eq!(decoded.arguments, arguments);
+        assert!(decoded.proof_requested);
+    }
+
+    #[test]
+    fn regular_v2_method_does_not_request_a_proof() {
+        let target = V2Target {
+            actor: vos::v2::ActorId([0x42; 32]),
+            attested_methods: ["prove".to_string()].into_iter().collect(),
+        };
+        let msg = vos::value::Msg::new("value");
+        let arguments = vec![vos::value::TAG_DYNAMIC, 1];
+
+        let encoded =
+            encode_v2_invocation(&target, vos::v2::InvocationId([0x18; 32]), &msg, arguments);
+        let decoded = vos::v2::RootTreeInvocationV2::decode(&encoded).unwrap();
+
+        assert!(!decoded.proof_requested);
     }
 }

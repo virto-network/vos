@@ -18,6 +18,7 @@ use vos::registry::{RegistryRef, Status};
 use crate::blob_store::{self, BlobHash};
 use crate::commands::space::common::{
     consistency_from_u8, derive_hyperspace_id, instance_service_id, registry_replication_id,
+    v2_root_actor_id, v2_root_service_id,
 };
 use crate::commands::space::{payload_codec, reconcile, subscriptions};
 use crate::spaces_index;
@@ -29,6 +30,29 @@ pub struct Args {
     pub once: bool,
     pub listen: Vec<String>,
     pub connect: Vec<String>,
+    pub service_pvm: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct PinnedV2Service {
+    pvm: std::sync::Arc<Vec<u8>>,
+    program: vos::v2::ProgramId,
+}
+
+fn load_pinned_v2_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedV2Service>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let pvm = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("read pinned service PVM {}: {error}", path.display()))?;
+    javm::program::parse_blob(&pvm)
+        .ok_or_else(|| anyhow::anyhow!("{} is not a canonical JAR PVM", path.display()))?;
+    vos::v2::ServicePvmV2::new(pvm.clone(), vos::v2::ProgramId::of_pvm(&pvm))
+        .map_err(|error| anyhow::anyhow!("invalid generic service PVM: {error}"))?;
+    Ok(Some(PinnedV2Service {
+        program: vos::v2::ProgramId::of_pvm(&pvm),
+        pvm: std::sync::Arc::new(pvm),
+    }))
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -75,6 +99,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let mut pending_token = load_pending_token(&data_dir)?;
+    let pinned_v2_service = load_pinned_v2_service(args.service_pvm.as_deref())?;
 
     // Verify the genesis CrdtEvent against the advertised
     // space_id BEFORE registering the agent (which opens the
@@ -183,7 +208,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .with_name(vos::node::REGISTRY_AGENT_NAME)
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
-        .with_node_validator(crate::commands::space::common::genesis_node_validator(space_id))
+        .with_node_validator(crate::commands::space::common::genesis_node_validator(
+            space_id,
+        ))
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
@@ -240,7 +267,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // half) and projects its node-local half into `local.toml`, then
     // clears the marker so a later bare `space up` doesn't re-apply.
     if !entry.pending_recipe.is_empty() {
-        genesis_apply(&mut node, &entry.pending_recipe, local_prefix, &space_id, &data_dir)?;
+        genesis_apply(
+            &mut node,
+            &entry.pending_recipe,
+            local_prefix,
+            &space_id,
+            &data_dir,
+        )?;
         clear_pending_recipe(&entry.id)?;
     }
 
@@ -256,7 +289,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Register node-local `.so` extensions from `local.toml`, returning
     // each one's effective relay caps for the endpoint descriptor
     // (`space describe` / `space caps`).
-    let extension_caps = register_extensions_from_local(&mut node, &local_cfg, &data_dir, local_prefix)?;
+    let extension_caps =
+        register_extensions_from_local(&mut node, &local_cfg, &data_dir, local_prefix)?;
 
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
@@ -264,9 +298,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     spawn_installed_agents(
         &mut node,
         &data_dir,
+        space_id,
         local_prefix,
         hyperspace.is_some(),
         &agent_policies,
+        pinned_v2_service.as_ref(),
     )?;
 
     // Provision device-local secret seeds for agents that declared
@@ -324,9 +360,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let mut boot_grace = BootGrace::new();
         // Program-blob fetches in flight, shared with the background fetch
         // tasks the reconcile pass spawns for uncached rows.
-        let in_flight: InFlightBlobs = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashSet::new(),
-        ));
+        let in_flight: InFlightBlobs =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let mut query_warned = false;
         let mut last_pass = std::time::Instant::now();
         // chronos clock/randomness feed (`vos::chronos_feed::ChronosFeeder`): a
@@ -388,6 +423,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             match reconcile_installed_agents(
                 n,
                 &data_dir,
+                space_id,
                 local_prefix,
                 has_hyperspace,
                 &local_cfg,
@@ -395,6 +431,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &mut boot_grace,
                 &in_flight,
                 &agent_policies,
+                pinned_v2_service.as_ref(),
             ) {
                 Ok(()) => query_warned = false,
                 // Usually a stopped/wedged registry; the condition
@@ -881,13 +918,13 @@ fn build_network_for_daemon(
     }))
 }
 
-
 /// Node-local per-agent policy from the recipe (never replicated): the
 /// periodic `tick_ms` and the parsed `intra_caps` relay bound.
 #[derive(Default, Clone)]
 struct AgentLocalPolicy {
     tick_ms: Option<u64>,
     intra_caps: Vec<vos::IntraCap>,
+    device_secret: bool,
 }
 
 type AgentPolicies = std::collections::BTreeMap<String, AgentLocalPolicy>;
@@ -906,8 +943,15 @@ fn agent_policies_from_local(cfg: &subscriptions::LocalConfig) -> anyhow::Result
             );
         }
         let tick_ms = a.tick_ms.filter(|ms| *ms > 0);
-        if tick_ms.is_some() || !intra_caps.is_empty() {
-            map.insert(name.clone(), AgentLocalPolicy { tick_ms, intra_caps });
+        if tick_ms.is_some() || !intra_caps.is_empty() || a.device_secret {
+            map.insert(
+                name.clone(),
+                AgentLocalPolicy {
+                    tick_ms,
+                    intra_caps,
+                    device_secret: a.device_secret,
+                },
+            );
         }
     }
     Ok(map)
@@ -931,7 +975,12 @@ fn device_secret_agents_from_local(cfg: &subscriptions::LocalConfig) -> Vec<Stri
 /// that bypasses the auth gate). Idempotent: the agent persists the seed in
 /// its Local redb, so a re-send on a later boot is a no-op. Best-effort — a
 /// failure to seed is logged, not fatal.
-fn provision_device_seeds(node: &VosNode, agents: &[String], data_dir: &std::path::Path, daemon_prefix: u16) {
+fn provision_device_seeds(
+    node: &VosNode,
+    agents: &[String],
+    data_dir: &std::path::Path,
+    daemon_prefix: u16,
+) {
     for name in agents {
         let svc_id = crate::commands::space::common::instance_service_id(name, daemon_prefix);
         let seed = match load_or_mint_device_seed(data_dir, svc_id) {
@@ -958,7 +1007,10 @@ fn provision_device_seeds(node: &VosNode, agents: &[String], data_dir: &std::pat
 
 /// Load an agent's 32-byte device seed from its node-local sidecar, minting
 /// fresh OS entropy (persisted `0600`) on first boot.
-fn load_or_mint_device_seed(data_dir: &std::path::Path, svc_id: ServiceId) -> anyhow::Result<Vec<u8>> {
+fn load_or_mint_device_seed(
+    data_dir: &std::path::Path,
+    svc_id: ServiceId,
+) -> anyhow::Result<Vec<u8>> {
     let dir = data_dir.join("agents");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{:08x}.seed", svc_id.0));
@@ -969,7 +1021,8 @@ fn load_or_mint_device_seed(data_dir: &std::path::Path, svc_id: ServiceId) -> an
         tracing::warn!(?path, "device seed sidecar has wrong length; re-minting");
     }
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("OS entropy for device seed: {e}"))?;
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| anyhow::anyhow!("OS entropy for device seed: {e}"))?;
     write_secret_file(&path, &seed)?;
     Ok(seed.to_vec())
 }
@@ -1041,12 +1094,14 @@ fn publish_endpoint(
 fn spawn_installed_agents(
     node: &mut VosNode,
     data_dir: &std::path::Path,
+    space_id: [u8; 32],
     local_prefix: u16,
     has_hyperspace: bool,
     policies: &AgentPolicies,
+    pinned_v2_service: Option<&PinnedV2Service>,
 ) -> anyhow::Result<()> {
-    use vos::registry::{RegistryRef, Status};
     use std::collections::HashSet;
+    use vos::registry::{RegistryRef, Status};
 
     let local_cfg = crate::commands::space::subscriptions::load(data_dir).unwrap_or_default();
     if local_cfg.is_filtering() {
@@ -1102,33 +1157,36 @@ fn spawn_installed_agents(
         }
         // Raft rows resolve their member seed first — see the
         // runtime reconciler for the full rationale.
-        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
-            if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
-                tracing::warn!(
-                    "skipping agent '{}' — program blob {} not in local cache",
-                    a.instance_name,
-                    BlobHash(a.program_hash),
-                );
-                continue;
-            }
-            match raft_members_for_row(node, data_dir, &a, local_prefix, &mut boot_grace) {
-                Ok(RaftSeed::Members(m)) => Some(m),
-                Ok(RaftSeed::Defer(reason)) => {
-                    tracing::info!(
-                        "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
+        let is_v2_package = blob_store::cache_get(&BlobHash(a.program_hash))?
+            .is_some_and(|artifact| artifact.get(..4) == Some(b"VOSP"));
+        let raft_members =
+            if consistency_from_u8(a.consistency) == Some(Consistency::Raft) && !is_v2_package {
+                if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
+                    tracing::warn!(
+                        "skipping agent '{}' — program blob {} not in local cache",
                         a.instance_name,
+                        BlobHash(a.program_hash),
                     );
                     continue;
                 }
-                Err(e) => {
-                    tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
-                    continue;
+                match raft_members_for_row(node, data_dir, &a, local_prefix, &mut boot_grace) {
+                    Ok(RaftSeed::Members(m)) => Some(m),
+                    Ok(RaftSeed::Defer(reason)) => {
+                        tracing::info!(
+                            "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
+                            a.instance_name,
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
+                        continue;
+                    }
                 }
-            }
-        } else {
-            None
-        };
-        match agent_config_from_row(data_dir, &a, policies)? {
+            } else {
+                None
+            };
+        match agent_config_from_row(data_dir, space_id, &a, policies, pinned_v2_service)? {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
                 if let Some(members) = raft_members {
@@ -1141,6 +1199,29 @@ fn spawn_installed_agents(
                     a.instance_name,
                     crate::commands::space::common::consistency_name(a.consistency),
                 );
+            }
+            RowConfig::V2 {
+                config,
+                state_path,
+                network_reachable,
+            } => {
+                let service = vos::v2::LocalRootTreeServiceV2::open(
+                    *config,
+                    vos::v2::FileCommittedImageStoreV2::new(state_path),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("open v2 root tree '{}': {error:?}", a.instance_name)
+                })?;
+                let svc_id = instance_service_id(&a.instance_name, local_prefix);
+                let id = node
+                    .register_v2_root_at_id(
+                        a.instance_name.clone(),
+                        service,
+                        svc_id,
+                        network_reachable,
+                    )
+                    .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))?;
+                tracing::info!("v2 root tree '{}' as {id} (local)", a.instance_name);
             }
             RowConfig::MissingBlob => {
                 tracing::warn!(
@@ -1311,6 +1392,11 @@ const CHRONOS_FEED_EVERY: std::time::Duration = std::time::Duration::from_secs(1
 /// [`AgentConfig`].
 enum RowConfig {
     Ready(Box<AgentConfig>),
+    V2 {
+        config: Box<vos::v2::LocalRootTreeConfigV2>,
+        state_path: PathBuf,
+        network_reachable: bool,
+    },
     /// Program blob not in the local cache. On a joiner the row
     /// can arrive via registry sync before the operator has the
     /// blob, so this is retryable, not fatal.
@@ -1326,19 +1412,31 @@ enum RowConfig {
 /// `reconcile_installed_agents` pass so both spawn identically.
 fn agent_config_from_row(
     data_dir: &std::path::Path,
+    space_id: [u8; 32],
     a: &vos::registry::AgentRow,
     policies: &AgentPolicies,
+    pinned_v2_service: Option<&PinnedV2Service>,
 ) -> anyhow::Result<RowConfig> {
     let program_hash = BlobHash(a.program_hash);
     let artifact = match blob_store::cache_get(&program_hash)? {
         Some(b) => b,
         None => return Ok(RowConfig::MissingBlob),
     };
-    let blob = actor_blob_from_catalog(artifact, &a.instance_name)?;
-
     let Some(consistency) = consistency_from_u8(a.consistency) else {
         return Ok(RowConfig::BadConsistency);
     };
+    if artifact.get(..4) == Some(b"VOSP") {
+        return v2_config_from_row(
+            data_dir,
+            space_id,
+            a,
+            policies,
+            consistency,
+            artifact,
+            pinned_v2_service,
+        );
+    }
+    let blob = actor_blob_from_catalog(artifact, &a.instance_name)?;
 
     let needs_persistence = matches!(
         consistency,
@@ -1394,6 +1492,142 @@ fn agent_config_from_row(
         }
     }
     Ok(RowConfig::Ready(Box::new(cfg)))
+}
+
+fn v2_config_from_row(
+    data_dir: &Path,
+    space_id: [u8; 32],
+    row: &vos::registry::AgentRow,
+    policies: &AgentPolicies,
+    consistency: Consistency,
+    exact_package: Vec<u8>,
+    pinned: Option<&PinnedV2Service>,
+) -> anyhow::Result<RowConfig> {
+    use vos::v2::V2Wire;
+
+    let pinned = pinned.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is a VOS v2 package; restart `space up` with \
+             --service-pvm <exact-vos-service.pvm>",
+            row.instance_name
+        )
+    })?;
+    let package = vos::v2::VosPackageV2::decode(&exact_package)
+        .map_err(|error| anyhow::anyhow!("decode {} package: {error}", row.instance_name))?;
+    package
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate {} package: {error}", row.instance_name))?;
+    if package.encode() != exact_package {
+        anyhow::bail!("{} package wire is not canonical", row.instance_name);
+    }
+    verify_v2_package_signature(&package, &row.instance_name)?;
+    if package.manifest.service_program != pinned.program {
+        anyhow::bail!(
+            "{} is pinned to service ProgramId {}, but the daemon loaded {}",
+            row.instance_name,
+            hex::encode(package.manifest.service_program.0),
+            hex::encode(pinned.program.0),
+        );
+    }
+    match (package.manifest.crdt, consistency) {
+        (false, Consistency::Crdt) => anyhow::bail!(
+            "{} is an ordinary #[actor] package and cannot select CRDT consistency; \
+             install it as local or raft",
+            row.instance_name
+        ),
+        (true, Consistency::Crdt) => anyhow::bail!(
+            "{} requires the v2 CRDT anti-entropy driver, which is not attached to space up yet",
+            row.instance_name
+        ),
+        (_, Consistency::Raft) => anyhow::bail!(
+            "{} requires the v2 Raft request-log driver, which is not attached to space up yet",
+            row.instance_name
+        ),
+        (_, Consistency::Ephemeral) => anyhow::bail!(
+            "{} v2 ephemeral hosting is not enabled; install it with local consistency",
+            row.instance_name
+        ),
+        (true, Consistency::Local) => anyhow::bail!(
+            "{} is #[actor(crdt)] and must be installed with CRDT consistency",
+            row.instance_name
+        ),
+        (false, Consistency::Local) => {}
+    }
+    if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
+        anyhow::bail!(
+            "{} uses legacy install args/on_start payloads; v2 initialization must be an explicit actor invocation",
+            row.instance_name
+        );
+    }
+    if policies
+        .get(&row.instance_name)
+        .is_some_and(|policy| {
+            policy.tick_ms.is_some() || !policy.intra_caps.is_empty() || policy.device_secret
+        })
+    {
+        anyhow::bail!(
+            "{} uses legacy tick/intra_caps/device_secret policy; v2 timers, calls, and secrets use explicit durable inputs",
+            row.instance_name
+        );
+    }
+
+    let space = vos::v2::SpaceId(space_id);
+    let root_service = v2_root_service_id(space, &row.instance_name);
+    let root_actor = v2_root_actor_id(root_service, &row.instance_name);
+    let deployment = package.deployment_id();
+    let state_path = data_dir
+        .join("v2-services")
+        .join(format!("{}.image", hex::encode(root_service.0)));
+    let install_authenticator = package.deployment_signature.signature.clone();
+    Ok(RowConfig::V2 {
+        config: Box::new(vos::v2::LocalRootTreeConfigV2 {
+            service_pvm: pinned.pvm.as_ref().clone(),
+            package,
+            service: vos::v2::ServiceIdentityV2 {
+                space,
+                root_service,
+                deployment,
+                service_program: pinned.program,
+                service_abi: vos::v2::ABI_VERSION,
+                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            },
+            root_actor,
+            actor_name: row.instance_name.clone(),
+            consistency: vos::v2::ConsistencyModeV2::Local,
+            initial_state: vec![],
+            external_actors: vec![],
+            install_authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
+                capability: vos::v2::SystemCapabilityId(
+                    vos::v2::Hash::digest(
+                        b"vos/space-install-capability/v2",
+                        &[&space_id, &deployment.0],
+                    )
+                    .0,
+                ),
+                authenticator: install_authenticator,
+            },
+            refine_gas: 1_000_000_000,
+            accumulate_gas: 5_000_000_000,
+        }),
+        state_path,
+        network_reachable: row.network_reachable,
+    })
+}
+
+fn verify_v2_package_signature(
+    package: &vos::v2::VosPackageV2,
+    instance_name: &str,
+) -> anyhow::Result<()> {
+    let public_key =
+        libp2p::identity::PublicKey::try_decode_protobuf(&package.deployment_signature.public_key)
+            .map_err(|error| anyhow::anyhow!("decode {instance_name} deployment key: {error}"))?;
+    if !public_key.verify(
+        &package.signing_message(),
+        &package.deployment_signature.signature,
+    ) {
+        anyhow::bail!("{instance_name} deployment signature is invalid");
+    }
+    Ok(())
 }
 
 /// Recover executable bytes from one content-addressed catalog artifact.
@@ -1851,6 +2085,7 @@ fn node_is_member(node: &VosNode, reg: &vos::registry::RegistryRef, local_prefix
 fn reconcile_installed_agents(
     node: &mut VosNode,
     data_dir: &std::path::Path,
+    space_id: [u8; 32],
     local_prefix: u16,
     has_hyperspace: bool,
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
@@ -1858,6 +2093,7 @@ fn reconcile_installed_agents(
     boot_grace: &mut BootGrace,
     in_flight: &InFlightBlobs,
     policies: &AgentPolicies,
+    pinned_v2_service: Option<&PinnedV2Service>,
 ) -> anyhow::Result<()> {
     use vos::registry::{RegistryRef, Status};
 
@@ -1918,7 +2154,11 @@ fn reconcile_installed_agents(
         // fire when the spawn follows it. The blob probe comes
         // first for the same reason — joining a group we can't
         // spawn into would stall its quorum.
-        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
+        let is_v2_package = blob_store::cache_get(&BlobHash(a.program_hash))?
+            .is_some_and(|artifact| artifact.get(..4) == Some(b"VOSP"));
+        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft)
+            && !is_v2_package
+        {
             if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
                 spawn_program_blob_fetch(node, a.program_hash, in_flight);
                 if damped.insert(key(RowNote::AwaitingBlob)) {
@@ -1954,7 +2194,7 @@ fn reconcile_installed_agents(
         } else {
             None
         };
-        match agent_config_from_row(data_dir, &a, policies) {
+        match agent_config_from_row(data_dir, space_id, &a, policies, pinned_v2_service) {
             Ok(RowConfig::Ready(cfg)) => {
                 let mut cfg = *cfg;
                 if let Some(members) = raft_members {
@@ -1983,6 +2223,46 @@ fn reconcile_installed_agents(
                             "hyperspace: register_remote('{}') failed: {e}",
                             a.instance_name,
                         ),
+                    }
+                }
+            }
+            Ok(RowConfig::V2 {
+                config,
+                state_path,
+                network_reachable,
+            }) => {
+                let service = match vos::v2::LocalRootTreeServiceV2::open(
+                    *config,
+                    vos::v2::FileCommittedImageStoreV2::new(state_path),
+                ) {
+                    Ok(service) => service,
+                    Err(error) => {
+                        if damped.insert(key(RowNote::Failed)) {
+                            tracing::warn!(
+                                "agent '{}' v2 service failed to open: {error:?}",
+                                a.instance_name
+                            );
+                        }
+                        continue;
+                    }
+                };
+                match node.register_v2_root_at_id(
+                    a.instance_name.clone(),
+                    service,
+                    svc_id,
+                    network_reachable,
+                ) {
+                    Ok(id) => {
+                        spawned_this_pass += 1;
+                        tracing::info!("v2 root tree '{}' spawned as {id}", a.instance_name);
+                    }
+                    Err(error) => {
+                        if damped.insert(key(RowNote::Failed)) {
+                            tracing::warn!(
+                                "agent '{}' v2 route failed to register: {error}",
+                                a.instance_name
+                            );
+                        }
                     }
                 }
             }

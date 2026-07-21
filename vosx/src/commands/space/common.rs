@@ -39,6 +39,31 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
     ServiceId(vos::registry::instance_service_id(instance_name, prefix))
 }
 
+/// Stable logical service identity for one installed v2 root tree. It is
+/// independent of the node-local compatibility route and deployment version.
+pub fn v2_root_service_id(space: vos::v2::SpaceId, instance: &str) -> vos::v2::RootServiceId {
+    vos::v2::RootServiceId(
+        vos::v2::Hash::digest(
+            b"vos/installed-root-service/v2",
+            &[&space.0, instance.as_bytes()],
+        )
+        .0,
+    )
+}
+
+/// Stable application identity of the root actor owned by an installed
+/// logical service. Upgrades retain this identity while changing deployment
+/// and program identities only through the idle activation protocol.
+pub fn v2_root_actor_id(service: vos::v2::RootServiceId, instance: &str) -> vos::v2::ActorId {
+    vos::v2::ActorId(
+        vos::v2::Hash::digest(
+            b"vos/installed-root-actor/v2",
+            &[&service.0, instance.as_bytes()],
+        )
+        .0,
+    )
+}
+
 /// Map a registry-stored `consistency` u8 to the host enum.
 /// `space_registry` defines the numeric assignments (Ephemeral
 /// = 0, Local = 1, Crdt = 2, Raft = 3); `vos::node::Consistency`
@@ -255,6 +280,29 @@ mod tests {
     }
 
     #[test]
+    fn v2_root_tree_identity_is_stable_and_space_scoped() {
+        let first = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter");
+        let same = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter");
+        let other_space = v2_root_service_id(vos::v2::SpaceId([2; 32]), "counter");
+        let other_name = v2_root_service_id(vos::v2::SpaceId([1; 32]), "ledger");
+
+        assert_eq!(first, same);
+        assert_ne!(first, other_space);
+        assert_ne!(first, other_name);
+        assert_ne!(first, vos::v2::RootServiceId::ZERO);
+    }
+
+    #[test]
+    fn v2_root_actor_identity_is_stable_across_deployments() {
+        let service = v2_root_service_id(vos::v2::SpaceId([3; 32]), "counter");
+        let actor = v2_root_actor_id(service, "counter");
+
+        assert_eq!(actor, v2_root_actor_id(service, "counter"));
+        assert_ne!(actor, v2_root_actor_id(service, "counter-child"));
+        assert_ne!(actor, vos::v2::ActorId::ZERO);
+    }
+
+    #[test]
     fn genesis_validator_binds_set_root_to_space_id() {
         use vos::Encode;
         // A DagNode wire ([payload_len:u64][CrdtEvent][n_children:u64])
@@ -263,8 +311,11 @@ mod tests {
             let m = vos::value::Msg::new(name).with("root", vec![0xAAu8; 38]);
             let mut msg = vec![vos::value::TAG_DYNAMIC];
             msg.extend_from_slice(&m.encode());
-            let event =
-                vos::effect_log::CrdtEvent::new([0u8; 32], 0, vos::effect_log::EffectLog::for_msg(msg));
+            let event = vos::effect_log::CrdtEvent::new(
+                [0u8; 32],
+                0,
+                vos::effect_log::EffectLog::for_msg(msg),
+            );
             let payload = event.to_bytes();
             let mut node = (payload.len() as u64).to_le_bytes().to_vec();
             node.extend_from_slice(&payload);
@@ -298,8 +349,11 @@ mod tests {
             let m = vos::value::Msg::new("set_space_id").with("space_id", value.to_vec());
             let mut msg = vec![vos::value::TAG_DYNAMIC];
             msg.extend_from_slice(&m.encode());
-            let event =
-                vos::effect_log::CrdtEvent::new([0u8; 32], 0, vos::effect_log::EffectLog::for_msg(msg));
+            let event = vos::effect_log::CrdtEvent::new(
+                [0u8; 32],
+                0,
+                vos::effect_log::EffectLog::for_msg(msg),
+            );
             let payload = event.to_bytes();
             let mut node = (payload.len() as u64).to_le_bytes().to_vec();
             node.extend_from_slice(&payload);
@@ -310,7 +364,10 @@ mod tests {
         let space_id = [0x5au8; 32];
         let v = genesis_node_validator(space_id);
         // The genuine anchor (this space's id) is accepted — CID irrelevant.
-        assert!(v(&[1u8; 32], &set_space_id_node(&space_id)), "genuine space_id accepted");
+        assert!(
+            v(&[1u8; 32], &set_space_id_node(&space_id)),
+            "genuine space_id accepted"
+        );
         // A forged set_space_id carrying a sibling space's id (or a bogus
         // one) is rejected at ingest — so a member can't grind a concurrent
         // node that sorts first on replay and poisons the anchor.
