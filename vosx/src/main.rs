@@ -113,6 +113,9 @@ enum Command {
         /// For raw PVM input only; ELF builds derive this from `#[actor(crdt)]`.
         #[arg(long)]
         crdt: bool,
+        /// Install-time name of an actor in another root tree (repeatable).
+        #[arg(long = "external-actor")]
+        external_actors: Vec<String>,
     },
     /// Transpile and validate the protocol-pinned generic service PVM.
     ServicePvm {
@@ -280,6 +283,7 @@ fn main() {
             source_map,
             include_elf,
             crdt,
+            external_actors,
         }) => {
             if let Err(error) = commands::build::run(commands::build::Args {
                 program,
@@ -293,6 +297,7 @@ fn main() {
                 source_map,
                 include_elf,
                 crdt,
+                external_actors,
             }) {
                 report_error(error);
             }

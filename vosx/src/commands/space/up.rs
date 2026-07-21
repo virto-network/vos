@@ -2446,6 +2446,7 @@ mod tests {
                 service_program,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
                 crdt,
+                external_actors: vec![],
                 interfaces_hash: artifact_hash(b"interfaces", &[]),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),

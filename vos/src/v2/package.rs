@@ -24,6 +24,10 @@ pub struct PackageManifestV2 {
     pub service_program: ProgramId,
     pub actor_program: ProgramId,
     pub crdt: bool,
+    /// Install-time names of actors in other root trees. The daemon resolves
+    /// these names to exact signed deployment bindings before guest genesis;
+    /// they are never late-bound by an application PVM.
+    pub external_actors: Vec<String>,
     pub interfaces_hash: Hash,
     pub role_policies_hash: Hash,
     pub schemas_hash: Hash,
@@ -78,6 +82,7 @@ pub enum PackageError {
     InvalidRolePolicies,
     PolicySchemaMismatch,
     CrdtMetadataMismatch,
+    InvalidExternalActors,
     MissingSignature,
     ProducerIdMismatch,
 }
@@ -240,6 +245,19 @@ impl VosPackageV2 {
         }
         if self.manifest.crdt != metadata.crdt {
             return Err(PackageError::CrdtMetadataMismatch);
+        }
+        if self
+            .manifest
+            .external_actors
+            .iter()
+            .any(String::is_empty)
+            || self
+                .manifest
+                .external_actors
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(PackageError::InvalidExternalActors);
         }
         if self.deployment_signature.signature.is_empty() {
             return Err(PackageError::MissingSignature);
@@ -454,6 +472,9 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifestV2) {
     encoder.fixed(&manifest.service_program.0);
     encoder.fixed(&manifest.actor_program.0);
     encoder.bool(manifest.crdt);
+    encoder.list(&manifest.external_actors, |encoder, name| {
+        encoder.string(name)
+    });
     encoder.fixed(&manifest.interfaces_hash.0);
     encoder.fixed(&manifest.role_policies_hash.0);
     encoder.fixed(&manifest.schemas_hash.0);
@@ -469,6 +490,7 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifestV2, Decod
         service_program: ProgramId(decoder.fixed()?),
         actor_program: ProgramId(decoder.fixed()?),
         crdt: decoder.bool()?,
+        external_actors: decoder.list(Decoder::string)?,
         interfaces_hash: Hash(decoder.fixed()?),
         role_policies_hash: Hash(decoder.fixed()?),
         schemas_hash: Hash(decoder.fixed()?),
@@ -541,6 +563,7 @@ mod tests {
                 service_program: ProgramId([9; 32]),
                 actor_program: ProgramId::of_pvm(&pvm),
                 crdt: false,
+                external_actors: vec![],
                 interfaces_hash: artifact_hash(b"interfaces", &interfaces),
                 role_policies_hash: artifact_hash(b"role-policies", &policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
@@ -567,6 +590,35 @@ mod tests {
         assert_eq!(decoded, package);
         assert_eq!(decoded.encode(), bytes);
         assert_eq!(decoded.deployment_id(), package.deployment_id());
+    }
+
+    #[test]
+    fn external_actor_names_are_canonical_and_part_of_deployment_identity() {
+        let package = package();
+        let deployment = package.deployment_id();
+
+        let mut bound = package.clone();
+        bound.manifest.external_actors = vec!["age-gate".into(), "private-age".into()];
+        bound.validate().unwrap();
+        assert_ne!(bound.deployment_id(), deployment);
+        assert_eq!(VosPackageV2::decode(&bound.encode()).unwrap(), bound);
+
+        let mut invalid = package.clone();
+        invalid.manifest.external_actors = vec!["private-age".into(), "age-gate".into()];
+        assert_eq!(
+            invalid.validate(),
+            Err(PackageError::InvalidExternalActors)
+        );
+        invalid.manifest.external_actors = vec!["private-age".into(), "private-age".into()];
+        assert_eq!(
+            invalid.validate(),
+            Err(PackageError::InvalidExternalActors)
+        );
+        invalid.manifest.external_actors = vec![String::new()];
+        assert_eq!(
+            invalid.validate(),
+            Err(PackageError::InvalidExternalActors)
+        );
     }
 
     #[test]

@@ -51,6 +51,9 @@ fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u6
     package
         .validate()
         .unwrap_or_else(|error| die(&format!("validating {}: {error}", package_path.display())));
+    if !package.manifest.external_actors.is_empty() {
+        die("vosx run cannot resolve package external actors; install this package in a space");
+    }
     verify_deployment_signature(&package);
 
     let canonical_service = load_file(service_path);

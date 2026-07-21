@@ -21,6 +21,7 @@ pub struct Args {
     pub source_map: Option<PathBuf>,
     pub include_elf: bool,
     pub crdt: bool,
+    pub external_actors: Vec<String>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -81,6 +82,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .with_context(|| format!("read pinned service PVM {}", args.service_pvm.display()))?;
     let service_program = service_program_id(&service_pvm)?;
     let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let mut external_actors = args.external_actors;
+    if external_actors.iter().any(String::is_empty) {
+        bail!("--external-actor names must not be empty");
+    }
+    external_actors.sort();
+    if external_actors.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("--external-actor names must be unique");
+    }
 
     let keypair = crate::identity::load_or_create()?;
     let public_key = keypair.public().encode_protobuf();
@@ -95,6 +104,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             service_program,
             actor_program,
             crdt,
+            external_actors,
             interfaces_hash: artifact_hash(b"interfaces", &interfaces),
             role_policies_hash: artifact_hash(b"role-policies", &role_policies),
             schemas_hash: artifact_hash(b"schemas", &schemas),
