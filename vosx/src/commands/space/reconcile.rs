@@ -213,6 +213,50 @@ fn default_consistency() -> String {
     "crdt".to_string()
 }
 
+/// Reject host-owned v1 lifecycle hooks before a signed v2 package reaches
+/// the cache, catalog, or node-local configuration. V2 initialization and
+/// scheduling are ordinary durable actor inputs owned by the generic service.
+pub(crate) fn validate_v2_recipe_lifecycle(
+    agent: &AgentDef,
+    is_v2_package: bool,
+) -> anyhow::Result<()> {
+    if !is_v2_package {
+        return Ok(());
+    }
+
+    let mut legacy_fields = Vec::new();
+    if !agent.init.is_empty() {
+        legacy_fields.push("init");
+    }
+    if !agent.on_start.is_empty() {
+        legacy_fields.push("on_start");
+    }
+    if agent.tick_ms.is_some() {
+        legacy_fields.push("tick_ms");
+    }
+    if !agent.intra_caps.is_empty() {
+        legacy_fields.push("intra_caps");
+    }
+    if agent.device_secret {
+        legacy_fields.push("device_secret");
+    }
+    if legacy_fields.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "agent '{}': signed .vos v2 packages cannot use legacy recipe field(s) {}; initialize \
+         through explicit actor invocations and supply timers, calls, secrets, and authorization \
+         as typed durable work inputs",
+        agent.name,
+        legacy_fields
+            .into_iter()
+            .map(|field| format!("`{field}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 /// Resolve an extension's `.so` path against the recipe dir,
 /// build init args (rkyv `Args`), and hand off to
 /// `node.register_extension`. Logs the load + each init arg so
@@ -688,6 +732,7 @@ fn reconcile_one(
             source_hash,
             artifact_bytes,
         )?;
+    validate_v2_recipe_lifecycle(agent, package_metadata.is_some())?;
     let cached = blob_store::cache_put(&artifact_bytes)
         .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
     debug_assert_eq!(cached, hash);
@@ -1160,6 +1205,28 @@ pub(crate) fn validate_recipe_names(recipe: &Recipe) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_recipe_rejects_host_owned_lifecycle_fields_before_install() {
+        let source = r#"
+            name = "counter"
+            path = "counter.vos"
+            consistency = "local"
+            init = { value = 1 }
+            on_start = [{ msg = "increment" }]
+            tick_ms = 1000
+            intra_caps = ["peer:member"]
+            device_secret = true
+        "#;
+        let agent: AgentDef = toml::from_str(source).expect("agent parses");
+
+        let error = validate_v2_recipe_lifecycle(&agent, true).unwrap_err();
+        let message = error.to_string();
+        for field in ["init", "on_start", "tick_ms", "intra_caps", "device_secret"] {
+            assert!(message.contains(&format!("`{field}`")), "{message}");
+        }
+        assert!(validate_v2_recipe_lifecycle(&agent, false).is_ok());
+    }
 
     #[test]
     fn clerk_acceptance_recipes_install_only_matching_v2_packages() {

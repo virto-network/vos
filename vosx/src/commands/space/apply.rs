@@ -255,6 +255,7 @@ fn preflight_one(
             source_hash,
             bytes,
         )?;
+        reconcile::validate_v2_recipe_lifecycle(agent, package_metadata.is_some())?;
         let metadata = package_metadata
             .or_else(|| vos::metadata::raw_section_from_elf(&bytes));
         (hash.0, Some(bytes), metadata)
