@@ -6,6 +6,7 @@
 //! The host prepares Refine imports from committed guest state and persists
 //! the resulting complete service image at the configured atomic boundary.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -15,16 +16,18 @@ use crate::attestation::AttestationProofProducerV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
-    AttestedServiceErrorV2, AuthorizationEvidenceV2, BlobRefV2, CommittedAttestationOutputV2,
-    CommittedImageStoreV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtSyncEnvelopeV2,
-    DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
-    ExternalActorDirectoryV2, JamServiceV2, LocalJamStoreV2, LocalStoreReadErrorV2,
-    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefinedServiceOutputV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
+    AccumulationRejectionV2, AccumulationResultV2, AccumulatedReplyV2, ActorDirectoryV2,
+    ActorGenesisV2, ActorId, AttestationDeliveryV2, AttestedServiceErrorV2,
+    AuthorizationEvidenceV2, BlobRefV2, CommittedAttestationOutputV2,
+    CommittedAttestationPackageV2, CommittedImageStoreV2, ConsistencyModeV2,
+    ContinuationSnapshotV2, CrdtSyncEnvelopeV2, DirectIngressV2, DurableJamStoreV2,
+    DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, ImportedBlobV2,
+    JamServiceV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
+    PreparedWorkV2, ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
+    WorkflowCheckpointV2,
 };
 
 #[cfg(feature = "storage")]
@@ -368,6 +371,7 @@ pub enum LocalRootTreeInvokeErrorV2 {
     InvalidProducedProof,
     ProofUnavailable,
     AttestationCommitMismatch,
+    InvalidAttestationPublication,
     Schedule(ScheduleErrorV2),
     Service(ServiceDispatchError),
     #[cfg(feature = "storage")]
@@ -1718,6 +1722,91 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .accumulate_host()
             .pending_publications()
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    /// Reconstruct a complete committed attestation package from guest-owned
+    /// publication state and its content-addressed proof bytes. This remains
+    /// available after restart until the caller acknowledges the publication.
+    pub fn committed_attestation_package(
+        &self,
+        publication: &PublicationRecordV2,
+    ) -> Result<CommittedAttestationPackageV2, LocalRootTreeInvokeErrorV2> {
+        let canonical = PublicationRecordV2::decode(&publication.encode())
+            .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        if canonical != *publication
+            || !self
+                .pending_publications()?
+                .iter()
+                .any(|candidate| candidate == publication)
+        {
+            return Err(LocalRootTreeInvokeErrorV2::MissingPublication);
+        }
+        let statement = publication
+            .published
+            .statement
+            .clone()
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        let proof = publication
+            .published
+            .proof
+            .clone()
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        let proof_reference = proof.proof_blob.clone();
+        let reply = publication
+            .published
+            .reply
+            .clone()
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
+        let descriptor = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(statement.actor),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        if descriptor.actor != statement.actor
+            || descriptor.program != statement.actor_program
+            || reply.producer != descriptor.actor
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidAttestationPublication);
+        }
+        let proof_bytes = self
+            .service
+            .accumulate_host()
+            .blob(&proof.proof_blob)
+            .ok_or(LocalRootTreeInvokeErrorV2::Schedule(
+                ScheduleErrorV2::MissingBlob(proof.proof_blob.hash),
+            ))?
+            .to_vec();
+        let package = CommittedAttestationPackageV2 {
+            reply: AccumulatedReplyV2 {
+                reply,
+                receipt: publication.receipt.clone(),
+                attestation: Some(Box::new(AttestationDeliveryV2 {
+                    producer_name: descriptor.name,
+                    producer: descriptor.producer,
+                    statement,
+                    proof,
+                })),
+            },
+            proof_blob: ImportedBlobV2 {
+                reference: proof_reference,
+                bytes: proof_bytes,
+            },
+        };
+        package
+            .validate()
+            .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
+        Ok(package)
     }
 
     /// Finalized cross-root calls still present in the guest inbox. This is a

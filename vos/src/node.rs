@@ -3044,6 +3044,33 @@ impl VosNode {
             service,
             id,
             network_reachable,
+            V2ProofProducerSlot::unavailable(),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            None,
+        )
+    }
+
+    /// Register a v2 root with the proof producer used for attested methods.
+    /// The producer receives the exact Refine replay request and stays owned
+    /// by the root service thread; ordinary roots use `register_v2_root_at_id`.
+    pub fn register_v2_root_at_id_with_producer<B, P>(
+        &mut self,
+        name: String,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        id: ServiceId,
+        network_reachable: bool,
+        producer: P,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+    {
+        self.register_v2_root_inner(
+            name,
+            service,
+            id,
+            network_reachable,
+            V2ProofProducerSlot::configured(producer),
             #[cfg(all(feature = "network", feature = "storage"))]
             None,
         )
@@ -3055,6 +3082,7 @@ impl VosNode {
         service: crate::v2::LocalRootTreeServiceV2<B>,
         id: ServiceId,
         network_reachable: bool,
+        proof_producer: V2ProofProducerSlot,
         #[cfg(all(feature = "network", feature = "storage"))] sync_hooks: Option<
             V2CrdtRootHooks,
         >,
@@ -3114,6 +3142,7 @@ impl VosNode {
                 invoke_rx,
                 outbox,
                 actor_routes,
+                proof_producer,
                 #[cfg(all(feature = "network", feature = "storage"))]
                 sync_hooks,
                 shutdown,
@@ -3182,6 +3211,7 @@ impl VosNode {
             service,
             id,
             network_reachable,
+            V2ProofProducerSlot::unavailable(),
             Some(hooks),
         ) {
             Ok(id) => {
@@ -3957,6 +3987,42 @@ impl VosNode {
         target: crate::v2::ActorId,
         arguments: Vec<u8>,
     ) -> Option<Vec<u8>> {
+        self.invoke_actor_with_proof_mode(target, arguments, false)
+    }
+
+    /// Invoke an attested v2 method and decode only the complete package that
+    /// guest Accumulate committed. A plain reply can never satisfy this path.
+    pub fn invoke_actor_attested(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+    ) -> Option<crate::actors::client::AttestedInvocationResult> {
+        use crate::v2::V2Wire;
+
+        let bytes = self.invoke_actor_with_proof_mode(target, arguments, true)?;
+        let package = crate::v2::CommittedAttestationPackageV2::decode(&bytes).ok()?;
+        let attestation = package.reply.attestation?;
+        let value = if package.reply.reply.result.is_empty() {
+            crate::value::Value::Unit
+        } else {
+            <crate::value::Value as crate::Decode>::try_decode(&package.reply.reply.result)?
+        };
+        Some(crate::actors::client::AttestedInvocationResult {
+            value,
+            producer_name: attestation.producer_name,
+            producer: attestation.producer,
+            statement: attestation.statement,
+            trace: attestation.proof.trace,
+            proof: package.proof_blob.bytes,
+        })
+    }
+
+    fn invoke_actor_with_proof_mode(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+        proof_requested: bool,
+    ) -> Option<Vec<u8>> {
         use crate::v2::V2Wire;
 
         if arguments.first() != Some(&crate::value::TAG_DYNAMIC) {
@@ -3986,7 +4052,7 @@ impl VosNode {
             target,
             method: message.name,
             arguments,
-            proof_requested: false,
+            proof_requested,
         };
         self.invoke(ServiceId(route), ingress.encode())
     }
@@ -4239,6 +4305,7 @@ fn v2_root_service_thread<B>(
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
+    mut proof_producer: V2ProofProducerSlot,
     #[cfg(all(feature = "network", feature = "storage"))] mut sync_hooks: Option<V2CrdtRootHooks>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
@@ -4293,6 +4360,7 @@ where
             handle_v2_transport(
                 id,
                 &mut service,
+                &mut proof_producer,
                 envelope,
                 &outbox,
                 &actor_routes,
@@ -4313,7 +4381,14 @@ where
                     continue;
                 }
             }
-            retry_v2_work(id, &mut service, &outbox, &actor_routes, &mut state);
+            retry_v2_work(
+                id,
+                &mut service,
+                &mut proof_producer,
+                &outbox,
+                &actor_routes,
+                &mut state,
+            );
             refresh_v2_owned_actor_routes(id, &service, &actor_routes);
             last_publication_retry = Instant::now();
         }
@@ -4407,7 +4482,7 @@ where
             imported_blobs: vec![],
             proof_requested: ingress.proof_requested,
         };
-        if work.proof_requested {
+        if work.proof_requested && !proof_producer.is_configured() {
             warn!(%id, "attested v2 ingress has no configured proof producer");
             send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
             continue;
@@ -4458,6 +4533,7 @@ where
                 run_v2_admitted_ingress(
                     id,
                     &mut service,
+                    &mut proof_producer,
                     work.invocation,
                     logical_timeslot,
                     &outbox,
@@ -4506,6 +4582,7 @@ where
                 run_v2_admitted_ingress(
                     id,
                     &mut service,
+                    &mut proof_producer,
                     work.invocation,
                     work.logical_timeslot,
                     &outbox,
@@ -4573,6 +4650,59 @@ struct V2RootThreadState {
         HashMap<crate::v2::Hash, std::collections::BTreeSet<crate::v2::CallId>>,
 }
 
+trait ErasedV2ProofProducer: Send {
+    fn prove(
+        &mut self,
+        request: &crate::AttestationProofRequestV2<'_>,
+    ) -> Result<crate::ProducedAttestationProofV2, ()>;
+}
+
+impl<P> ErasedV2ProofProducer for P
+where
+    P: crate::AttestationProofProducerV2 + Send,
+{
+    fn prove(
+        &mut self,
+        request: &crate::AttestationProofRequestV2<'_>,
+    ) -> Result<crate::ProducedAttestationProofV2, ()> {
+        crate::AttestationProofProducerV2::prove(self, request).map_err(|_| ())
+    }
+}
+
+struct V2ProofProducerSlot {
+    inner: Option<Box<dyn ErasedV2ProofProducer>>,
+}
+
+impl V2ProofProducerSlot {
+    fn unavailable() -> Self {
+        Self { inner: None }
+    }
+
+    fn configured<P>(producer: P) -> Self
+    where
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+    {
+        Self {
+            inner: Some(Box::new(producer)),
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        self.inner.is_some()
+    }
+}
+
+impl crate::AttestationProofProducerV2 for V2ProofProducerSlot {
+    type Error = ();
+
+    fn prove(
+        &mut self,
+        request: &crate::AttestationProofRequestV2<'_>,
+    ) -> Result<crate::ProducedAttestationProofV2, Self::Error> {
+        self.inner.as_mut().ok_or(())?.prove(request)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct V2ReturnCall {
     route: u32,
@@ -4589,6 +4719,7 @@ fn v2_actor_route(
 fn handle_v2_transport<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    proof_producer: &mut V2ProofProducerSlot,
     envelope: Envelope,
     outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
@@ -4624,6 +4755,10 @@ fn handle_v2_transport<B>(
                 warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected misrouted v2 outbox delivery");
                 return;
             }
+            if message.proof_requested && !proof_producer.is_configured() {
+                warn!(%id, call = ?message.call_id, "attested v2 delivery has no configured proof producer");
+                return;
+            }
             let publication_commitment = publication.commitment();
             let call = message.call_id;
             let callee_invocation = crate::v2::InvocationId::for_call(call);
@@ -4654,6 +4789,7 @@ fn handle_v2_transport<B>(
                     run_v2_admitted_call(
                         id,
                         service,
+                        proof_producer,
                         call,
                         logical_timeslot,
                         outbox,
@@ -4774,6 +4910,8 @@ fn publish_v2_slice<B>(
 ) where
     B: crate::v2::CommittedImageStoreV2,
 {
+    use crate::v2::V2Wire;
+
     if let Some(caller) = caller {
         state
             .pending_callers
@@ -4788,12 +4926,23 @@ fn publish_v2_slice<B>(
         queue_v2_outbox(id, &publication, logical_timeslot, outbox, actor_routes);
     }
     if let Some(reply) = published.reply.as_ref() {
+        let reply_bytes = if published.proof.is_some() {
+            match service.committed_attestation_package(&publication) {
+                Ok(package) => package.encode(),
+                Err(error) => {
+                    warn!(%id, ?error, "committed v2 attestation package is unavailable");
+                    return;
+                }
+            }
+        } else {
+            reply.result.clone()
+        };
         let mut delivered = false;
         if let Some(callers) = state.pending_callers.remove(&invocation) {
             for caller in callers {
                 delivered |= send_reply_capped(
                     caller,
-                    encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply.result),
+                    encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &reply_bytes),
                     id,
                 );
             }
@@ -4883,6 +5032,7 @@ fn queue_v2_reply(
 fn run_v2_admitted_ingress<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    proof_producer: &mut V2ProofProducerSlot,
     invocation: crate::v2::InvocationId,
     logical_timeslot: u64,
     outbox: &mpsc::Sender<Envelope>,
@@ -4891,7 +5041,15 @@ fn run_v2_admitted_ingress<B>(
 ) where
     B: crate::v2::CommittedImageStoreV2,
 {
-    match service.invoke_admitted(invocation) {
+    let result = match service.invoke_admitted(invocation) {
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired)
+            if proof_producer.is_configured() =>
+        {
+            service.invoke_admitted_attested(invocation, proof_producer)
+        }
+        result => result,
+    };
+    match result {
         Ok(committed) => {
             debug!(
                 %id,
@@ -4957,6 +5115,7 @@ fn send_v2_pending_status(
 fn run_v2_admitted_call<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    proof_producer: &mut V2ProofProducerSlot,
     call: crate::v2::CallId,
     logical_timeslot: u64,
     outbox: &mpsc::Sender<Envelope>,
@@ -4965,7 +5124,16 @@ fn run_v2_admitted_call<B>(
 ) where
     B: crate::v2::CommittedImageStoreV2,
 {
-    match service.invoke_inbox(call, logical_timeslot.saturating_add(1)) {
+    let execution_timeslot = logical_timeslot.saturating_add(1);
+    let result = match service.invoke_inbox(call, execution_timeslot) {
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired)
+            if proof_producer.is_configured() =>
+        {
+            service.invoke_inbox_attested(call, execution_timeslot, proof_producer)
+        }
+        result => result,
+    };
+    match result {
         Ok(committed) => {
             publish_v2_slice(
                 id,
@@ -4993,6 +5161,7 @@ fn run_v2_admitted_call<B>(
 fn retry_v2_work<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    proof_producer: &mut V2ProofProducerSlot,
     outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
     state: &mut V2RootThreadState,
@@ -5061,7 +5230,16 @@ fn retry_v2_work<B>(
     match service.pending_inbox_calls() {
         Ok(pending) => {
             for (call, timeslot) in pending {
-                run_v2_admitted_call(id, service, call, timeslot, outbox, actor_routes, state);
+                run_v2_admitted_call(
+                    id,
+                    service,
+                    proof_producer,
+                    call,
+                    timeslot,
+                    outbox,
+                    actor_routes,
+                    state,
+                );
             }
         }
         Err(error) => {
@@ -5074,6 +5252,7 @@ fn retry_v2_work<B>(
                 run_v2_admitted_ingress(
                     id,
                     service,
+                    proof_producer,
                     ingress.invocation,
                     ingress.logical_timeslot,
                     outbox,

@@ -975,6 +975,8 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
     let Some((config, _, actor, _)) = workflow_root_configs() else {
         return;
     };
+    let producer_name = config.actor_name.clone();
+    let actor_program = config.package.manifest.actor_program;
     let mut service = LocalRootTreeServiceV2::open(
         config.clone(),
         FailableCommittedImages::default(),
@@ -1048,6 +1050,33 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
         restarted.pending_publications().unwrap(),
         vec![publication]
     );
+
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id_with_producer(
+        "attested-root".into(),
+        restarted,
+        ServiceId(108),
+        true,
+        CanonicalTestProofProducer {
+            trace: Hash([110; 32]),
+            proof: b"node canonical proof".to_vec(),
+            calls: 0,
+        },
+    )
+    .expect("the node owns the configured producer with the root service");
+    let mut node_arguments = vec![vos::value::TAG_DYNAMIC];
+    node_arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let result = node
+        .invoke_actor_attested(actor, node_arguments)
+        .expect("the node releases only the complete committed package");
+    assert_eq!(result.value, Value::U32(0));
+    assert_eq!(result.producer_name, producer_name);
+    assert_eq!(result.statement.actor, actor);
+    assert_eq!(result.statement.actor_program, actor_program);
+    assert_eq!(result.trace, Hash([110; 32]));
+    assert_eq!(result.proof, b"node canonical proof");
+    node.shutdown();
+    assert!(node.collect().into_iter().all(|result| result.is_ok()));
 }
 
 #[test]

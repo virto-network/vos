@@ -247,7 +247,9 @@ pub fn block_on<F: core::future::Future>(fut: F) -> F::Output {
 #[cfg(feature = "std")]
 mod host_invoker {
     use crate::Decode;
-    use crate::actors::client::{ClientError, Invoker};
+    use crate::actors::client::{
+        AttestationInvoker, AttestedInvocationResult, ClientError, Invoker,
+    };
     use crate::actors::context::ServiceId;
     use crate::actors::value::Value;
     use crate::node::VosNode;
@@ -291,6 +293,25 @@ mod host_invoker {
                     None => Err(ClientError::Unreachable),
                 }
             }
+        }
+    }
+
+    impl AttestationInvoker for &VosNode {
+        fn invoke_attested(
+            &mut self,
+            _target: ServiceId,
+            _payload: Vec<u8>,
+        ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
+            async { Err(ClientError::Unreachable) }
+        }
+
+        fn invoke_actor_attested(
+            &mut self,
+            target: crate::v2::ActorId,
+            payload: Vec<u8>,
+        ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
+            let outcome = VosNode::invoke_actor_attested(self, target, payload);
+            async move { outcome.ok_or(ClientError::Unreachable) }
         }
     }
 

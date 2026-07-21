@@ -567,6 +567,34 @@ pub struct AccumulatedReplyV2 {
     pub attestation: Option<Box<AttestationDeliveryV2>>,
 }
 
+/// Complete committed attestation transport. The proof blob is carried next
+/// to its content-addressed reference so a direct caller or another root can
+/// reconstruct the portable application package after a process restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedAttestationPackageV2 {
+    pub reply: AccumulatedReplyV2,
+    pub proof_blob: ImportedBlobV2,
+}
+
+impl CommittedAttestationPackageV2 {
+    pub fn validate(&self) -> Result<(), crate::AttestationError> {
+        self.reply.validate()?;
+        let attestation = self
+            .reply
+            .attestation
+            .as_ref()
+            .ok_or(crate::AttestationError::InvalidProof)?;
+        if attestation.proof.proof_blob != self.proof_blob.reference
+            || !self.proof_blob.reference.matches(&self.proof_blob.bytes)
+            || self.proof_blob.bytes.is_empty()
+            || self.proof_blob.bytes.len() > super::MAX_ATTESTATION_PROOF_BYTES
+        {
+            return Err(crate::AttestationError::InvalidProof);
+        }
+        Ok(())
+    }
+}
+
 impl AccumulatedReplyV2 {
     pub fn validate(&self) -> Result<(), crate::AttestationError> {
         if self.receipt.reply_commitment != Some(self.reply.commitment()) {
@@ -2175,6 +2203,29 @@ impl V2Wire for AccumulatedReplyV2 {
                     proof: decode_proof(d)?,
                 }))
             })?,
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+impl V2Wire for CommittedAttestationPackageV2 {
+    const MAGIC: [u8; 4] = *b"VCP2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.bytes(&self.reply.encode());
+        encode_blob_ref(&mut e, &self.proof_blob.reference);
+        e.bytes(&self.proof_blob.bytes);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            reply: AccumulatedReplyV2::decode(&d.bytes()?)?,
+            proof_blob: ImportedBlobV2 {
+                reference: decode_blob_ref(d)?,
+                bytes: d.bytes()?,
+            },
         };
         value.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(value)
@@ -4207,6 +4258,23 @@ mod tests {
         assert_eq!(
             AccumulatedReplyV2::decode(&accumulated.encode()).unwrap(),
             accumulated
+        );
+        let package = CommittedAttestationPackageV2 {
+            reply: accumulated.clone(),
+            proof_blob: ImportedBlobV2 {
+                reference: proof.proof_blob.clone(),
+                bytes: proof_bytes.clone(),
+            },
+        };
+        assert_eq!(
+            CommittedAttestationPackageV2::decode(&package.encode()).unwrap(),
+            package
+        );
+        let mut tampered_package = package;
+        tampered_package.proof_blob.bytes.push(0);
+        assert_eq!(
+            CommittedAttestationPackageV2::decode(&tampered_package.encode()),
+            Err(DecodeError::NonCanonical)
         );
         let published = PublishedEffectsV2 {
             reply: Some(reply.clone()),
