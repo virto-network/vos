@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, anyhow, bail};
 use vos::v2::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageManifestV2, PackageRolePoliciesV2,
-    ProducerId, ProgramId, V2Wire, VosPackageV2, artifact_hash,
+    ProducerId, ProgramId, ServicePvmV2, V2Wire, VosPackageV2, artifact_hash,
 };
 
 pub struct Args {
@@ -220,10 +220,13 @@ fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
 }
 
 fn service_program_id(bytes: &[u8]) -> anyhow::Result<ProgramId> {
-    if bytes.is_empty() || javm::program::parse_blob(bytes).is_none() {
-        bail!("--service-pvm must contain one canonical JAR program")
-    }
-    Ok(ProgramId::of_pvm(bytes))
+    let program = ProgramId::of_pvm(bytes);
+    ServicePvmV2::new(bytes.to_vec(), program).map_err(|error| {
+        anyhow!(
+            "--service-pvm must contain the canonical generic service with valid JAM Refine/Accumulate entries: {error}"
+        )
+    })?;
+    Ok(program)
 }
 
 #[cfg(test)]
@@ -231,13 +234,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_program_is_derived_from_valid_canonical_bytes() {
+    fn service_program_rejects_actor_only_and_malformed_pvms() {
         let mut assembler = grey_transpiler::assembler::Assembler::new();
         assembler
             .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
             .ecalli(0);
-        let pvm = assembler.build();
-        assert_eq!(service_program_id(&pvm).unwrap(), ProgramId::of_pvm(&pvm));
+        assert!(service_program_id(&assembler.build()).is_err());
         assert!(service_program_id(&[]).is_err());
         assert!(service_program_id(b"not a JAR program").is_err());
     }
