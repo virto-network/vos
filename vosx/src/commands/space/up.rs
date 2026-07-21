@@ -1141,7 +1141,7 @@ fn spawn_installed_agents(
     // requires membership are narrowed out on a non-member. The runtime
     // reconciler re-evaluates each pass, so a row spawns if a grant lands later.
     let is_member = node_is_member(node, &reg, local_prefix);
-    for a in agents {
+    for a in &agents {
         if !local_cfg.should_spawn(&a.instance_name) {
             tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
             continue;
@@ -1183,7 +1183,14 @@ fn spawn_installed_agents(
         } else {
             None
         };
-        match agent_config_from_row(data_dir, space_id, &a, policies, pinned_v2_service)? {
+        match agent_config_from_row(
+            data_dir,
+            space_id,
+            a,
+            &agents,
+            policies,
+            pinned_v2_service,
+        )? {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
                 if let Some(members) = raft_members {
@@ -1221,12 +1228,15 @@ fn spawn_installed_agents(
                     crate::commands::space::common::consistency_name(a.consistency),
                 );
             }
-            RowConfig::MissingBlob => {
+            RowConfig::MissingBlob(program_hash) => {
                 tracing::warn!(
                     "skipping agent '{}' — program blob {} not in local cache",
                     a.instance_name,
-                    BlobHash(a.program_hash),
+                    BlobHash(program_hash),
                 );
+            }
+            RowConfig::Deferred(reason) => {
+                tracing::warn!("agent '{}' deferred: {reason}", a.instance_name);
             }
             RowConfig::BadConsistency => {
                 tracing::warn!(
@@ -1398,7 +1408,10 @@ enum RowConfig {
     /// Program blob not in the local cache. On a joiner the row
     /// can arrive via registry sync before the operator has the
     /// blob, so this is retryable, not fatal.
-    MissingBlob,
+    MissingBlob([u8; 32]),
+    /// A declared external actor is not installed yet. Registry reconciliation
+    /// retries the row after later catalog changes.
+    Deferred(String),
     /// Unrecognized consistency discriminant.
     BadConsistency,
 }
@@ -1412,13 +1425,14 @@ fn agent_config_from_row(
     data_dir: &std::path::Path,
     space_id: [u8; 32],
     a: &vos::registry::AgentRow,
+    installed_agents: &[vos::registry::AgentRow],
     policies: &AgentPolicies,
     pinned_v2_service: Option<&PinnedV2Service>,
 ) -> anyhow::Result<RowConfig> {
     let program_hash = BlobHash(a.program_hash);
     let artifact = match blob_store::cache_get(&program_hash)? {
         Some(b) => b,
-        None => return Ok(RowConfig::MissingBlob),
+        None => return Ok(RowConfig::MissingBlob(a.program_hash)),
     };
     let Some(consistency) = consistency_from_u8(a.consistency) else {
         return Ok(RowConfig::BadConsistency);
@@ -1428,6 +1442,7 @@ fn agent_config_from_row(
             data_dir,
             space_id,
             a,
+            installed_agents,
             policies,
             consistency,
             artifact,
@@ -1496,13 +1511,12 @@ fn v2_config_from_row(
     data_dir: &Path,
     space_id: [u8; 32],
     row: &vos::registry::AgentRow,
+    installed_agents: &[vos::registry::AgentRow],
     policies: &AgentPolicies,
     consistency: Consistency,
     exact_package: Vec<u8>,
     pinned: Option<&PinnedV2Service>,
 ) -> anyhow::Result<RowConfig> {
-    use vos::v2::V2Wire;
-
     let pinned = pinned.ok_or_else(|| {
         anyhow::anyhow!(
             "{} is a VOS v2 package; restart `space up` with \
@@ -1510,44 +1524,8 @@ fn v2_config_from_row(
             row.instance_name
         )
     })?;
-    let package = vos::v2::VosPackageV2::decode(&exact_package)
-        .map_err(|error| anyhow::anyhow!("decode {} package: {error}", row.instance_name))?;
-    package
-        .validate()
-        .map_err(|error| anyhow::anyhow!("validate {} package: {error}", row.instance_name))?;
-    if package.encode() != exact_package {
-        anyhow::bail!("{} package wire is not canonical", row.instance_name);
-    }
-    verify_v2_package_signature(&package, &row.instance_name)?;
-    if package.manifest.service_program != pinned.program {
-        anyhow::bail!(
-            "{} is pinned to service ProgramId {}, but the daemon loaded {}",
-            row.instance_name,
-            hex::encode(package.manifest.service_program.0),
-            hex::encode(pinned.program.0),
-        );
-    }
-    match (package.manifest.crdt, consistency) {
-        (false, Consistency::Crdt) => anyhow::bail!(
-            "{} is an ordinary #[actor] package and cannot select CRDT consistency; \
-             install it as local or raft",
-            row.instance_name
-        ),
-        (true, Consistency::Crdt) => {}
-        (true, Consistency::Raft) => anyhow::bail!(
-            "{} is #[actor(crdt)] and must be installed with CRDT consistency",
-            row.instance_name
-        ),
-        (_, Consistency::Ephemeral) => anyhow::bail!(
-            "{} v2 ephemeral hosting is not enabled; install it with local consistency",
-            row.instance_name
-        ),
-        (true, Consistency::Local) => anyhow::bail!(
-            "{} is #[actor(crdt)] and must be installed with CRDT consistency",
-            row.instance_name
-        ),
-        (false, Consistency::Local | Consistency::Raft) => {}
-    }
+    let package = validate_exact_v2_package(&exact_package, &row.instance_name, pinned)?;
+    validate_v2_consistency(&row.instance_name, &package, consistency)?;
     if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
         anyhow::bail!(
             "{} uses legacy install args/on_start payloads; v2 initialization must be an explicit actor invocation",
@@ -1562,6 +1540,24 @@ fn v2_config_from_row(
             row.instance_name
         );
     }
+
+    let external_actors = match resolve_v2_external_actors(
+        space_id,
+        row,
+        &package,
+        installed_agents,
+        pinned,
+    )? {
+        ExternalActorResolution::Ready(bindings) => bindings,
+        ExternalActorResolution::MissingBlob(program_hash) => {
+            return Ok(RowConfig::MissingBlob(program_hash));
+        }
+        ExternalActorResolution::MissingAgent(name) => {
+            return Ok(RowConfig::Deferred(format!(
+                "declared external actor '{name}' is not installed"
+            )));
+        }
+    };
 
     let space = vos::v2::SpaceId(space_id);
     let root_service = v2_root_service_id(space, &row.instance_name);
@@ -1593,7 +1589,7 @@ fn v2_config_from_row(
             },
             initial_state: vec![],
             owned_actors: vec![],
-            external_actors: vec![],
+            external_actors,
             install_authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
                 capability: vos::v2::SystemCapabilityId(
                     vos::v2::Hash::digest(
@@ -1610,6 +1606,149 @@ fn v2_config_from_row(
         state_path,
         network_reachable: row.network_reachable,
     })
+}
+
+fn validate_v2_consistency(
+    instance_name: &str,
+    package: &vos::v2::VosPackageV2,
+    consistency: Consistency,
+) -> anyhow::Result<()> {
+    match (package.manifest.crdt, consistency) {
+        (false, Consistency::Crdt) => anyhow::bail!(
+            "{} is an ordinary #[actor] package and cannot select CRDT consistency; \
+             install it as local or raft",
+            instance_name
+        ),
+        (true, Consistency::Crdt) => {}
+        (true, Consistency::Raft) => anyhow::bail!(
+            "{} is #[actor(crdt)] and must be installed with CRDT consistency",
+            instance_name
+        ),
+        (_, Consistency::Ephemeral) => anyhow::bail!(
+            "{} v2 ephemeral hosting is not enabled; install it with local consistency",
+            instance_name
+        ),
+        (true, Consistency::Local) => anyhow::bail!(
+            "{} is #[actor(crdt)] and must be installed with CRDT consistency",
+            instance_name
+        ),
+        (false, Consistency::Local | Consistency::Raft) => {}
+    }
+    Ok(())
+}
+
+fn validate_exact_v2_package(
+    exact_package: &[u8],
+    instance_name: &str,
+    pinned: &PinnedV2Service,
+) -> anyhow::Result<vos::v2::VosPackageV2> {
+    use vos::v2::V2Wire;
+
+    let package = vos::v2::VosPackageV2::decode(exact_package)
+        .map_err(|error| anyhow::anyhow!("decode {instance_name} package: {error}"))?;
+    package
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate {instance_name} package: {error}"))?;
+    if package.encode() != exact_package {
+        anyhow::bail!("{instance_name} package wire is not canonical");
+    }
+    verify_v2_package_signature(&package, instance_name)?;
+    if package.manifest.service_program != pinned.program {
+        anyhow::bail!(
+            "{instance_name} is pinned to service ProgramId {}, but the daemon loaded {}",
+            hex::encode(package.manifest.service_program.0),
+            hex::encode(pinned.program.0),
+        );
+    }
+    Ok(package)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalActorResolution {
+    Ready(Vec<vos::v2::ExternalActorBindingV2>),
+    MissingBlob([u8; 32]),
+    MissingAgent(String),
+}
+
+fn resolve_v2_external_actors(
+    space_id: [u8; 32],
+    consumer_row: &vos::registry::AgentRow,
+    consumer_package: &vos::v2::VosPackageV2,
+    installed_agents: &[vos::registry::AgentRow],
+    pinned: &PinnedV2Service,
+) -> anyhow::Result<ExternalActorResolution> {
+    resolve_v2_external_actors_with(
+        space_id,
+        consumer_row,
+        consumer_package,
+        installed_agents,
+        pinned,
+        |program_hash| blob_store::cache_get(&BlobHash(program_hash)).map_err(Into::into),
+    )
+}
+
+fn resolve_v2_external_actors_with(
+    space_id: [u8; 32],
+    consumer_row: &vos::registry::AgentRow,
+    consumer_package: &vos::v2::VosPackageV2,
+    installed_agents: &[vos::registry::AgentRow],
+    pinned: &PinnedV2Service,
+    mut load_package: impl FnMut([u8; 32]) -> anyhow::Result<Option<Vec<u8>>>,
+) -> anyhow::Result<ExternalActorResolution> {
+    let space = vos::v2::SpaceId(space_id);
+    let mut bindings = Vec::with_capacity(consumer_package.manifest.external_actors.len());
+    for name in &consumer_package.manifest.external_actors {
+        if name == &consumer_row.instance_name {
+            anyhow::bail!("{} cannot declare itself as an external actor", name);
+        }
+        let Some(row) = installed_agents
+            .iter()
+            .find(|candidate| candidate.instance_name == *name)
+        else {
+            return Ok(ExternalActorResolution::MissingAgent(name.clone()));
+        };
+        let Some(consistency) = consistency_from_u8(row.consistency) else {
+            anyhow::bail!(
+                "declared external actor '{}' has unknown consistency {}",
+                name,
+                row.consistency,
+            );
+        };
+        let Some(exact_package) = load_package(row.program_hash)? else {
+            return Ok(ExternalActorResolution::MissingBlob(row.program_hash));
+        };
+        if exact_package.get(..4) != Some(b"VOSP") {
+            anyhow::bail!(
+                "declared external actor '{}' is not installed from a signed VOS v2 package",
+                name,
+            );
+        }
+        let package = validate_exact_v2_package(&exact_package, name, pinned)?;
+        validate_v2_consistency(name, &package, consistency)?;
+        if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
+            anyhow::bail!(
+                "declared external actor '{}' uses legacy install args/on_start payloads; \
+                 reinstall it as a v2 actor before binding it",
+                name,
+            );
+        }
+        let root_service = v2_root_service_id(space, name);
+        bindings.push(vos::v2::ExternalActorBindingV2 {
+            name: name.clone(),
+            service: vos::v2::ServiceIdentityV2 {
+                space,
+                root_service,
+                deployment: package.deployment_id(),
+                service_program: pinned.program,
+                service_abi: vos::v2::ABI_VERSION,
+                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            },
+            actor: v2_root_actor_id(root_service, name),
+            producer: package.deployment_signature.producer,
+            program: package.manifest.actor_program,
+        });
+    }
+    Ok(ExternalActorResolution::Ready(bindings))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2060,6 +2199,9 @@ enum RowNote {
     /// cache probe keeps retrying, so the row spawns if the blob
     /// appears later.
     AwaitingBlob,
+    /// A signed v2 package names another root actor whose registry row has not
+    /// arrived yet. Rechecked on every pass and warned once.
+    DependencyWaiting,
     /// Raft row whose membership protocol deferred the spawn
     /// (not a voter yet, group not located, join in progress…).
     /// Warned once with the current reason; later passes log the
@@ -2168,7 +2310,7 @@ fn reconcile_installed_agents(
     // whose sync floor requires membership are narrowed out below.
     let is_member = node_is_member(node, &reg, local_prefix);
     let mut spawned_this_pass = 0usize;
-    for a in agents {
+    for a in &agents {
         if spawned_this_pass >= MAX_SPAWNS_PER_PASS {
             break;
         }
@@ -2253,7 +2395,14 @@ fn reconcile_installed_agents(
         } else {
             None
         };
-        match agent_config_from_row(data_dir, space_id, &a, policies, pinned_v2_service) {
+        match agent_config_from_row(
+            data_dir,
+            space_id,
+            a,
+            &agents,
+            policies,
+            pinned_v2_service,
+        ) {
             Ok(RowConfig::Ready(cfg)) => {
                 let mut cfg = *cfg;
                 if let Some(members) = raft_members {
@@ -2316,15 +2465,20 @@ fn reconcile_installed_agents(
                     }
                 }
             }
-            Ok(RowConfig::MissingBlob) => {
-                spawn_program_blob_fetch(node, a.program_hash, in_flight);
+            Ok(RowConfig::MissingBlob(program_hash)) => {
+                spawn_program_blob_fetch(node, program_hash, in_flight);
                 if damped.insert(key(RowNote::AwaitingBlob)) {
                     tracing::warn!(
                         "agent '{}' pending — program blob {} not in the local cache; \
                          fetching from peers, it spawns when the blob appears",
                         a.instance_name,
-                        BlobHash(a.program_hash),
+                        BlobHash(program_hash),
                     );
+                }
+            }
+            Ok(RowConfig::Deferred(reason)) => {
+                if damped.insert(key(RowNote::DependencyWaiting)) {
+                    tracing::warn!("agent '{}' deferred: {reason}", a.instance_name);
                 }
             }
             Ok(RowConfig::BadConsistency) => {
@@ -2422,6 +2576,14 @@ mod tests {
     };
 
     fn signed_v2_package(service_program: ProgramId, crdt: bool) -> VosPackageV2 {
+        signed_v2_package_with_externals(service_program, crdt, vec![])
+    }
+
+    fn signed_v2_package_with_externals(
+        service_program: ProgramId,
+        crdt: bool,
+        external_actors: Vec<String>,
+    ) -> VosPackageV2 {
         let mut assembler = grey_transpiler::assembler::Assembler::new();
         assembler
             .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
@@ -2446,7 +2608,7 @@ mod tests {
                 service_program,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
                 crdt,
-                external_actors: vec![],
+                external_actors,
                 interfaces_hash: artifact_hash(b"interfaces", &[]),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
@@ -2506,6 +2668,7 @@ mod tests {
             Path::new("/tmp/vos-v2-config-test"),
             [3; 32],
             &row,
+            std::slice::from_ref(&row),
             &AgentPolicies::new(),
             Consistency::Raft,
             package.encode(),
@@ -2547,6 +2710,7 @@ mod tests {
             Path::new("/tmp/vos-v2-crdt-config-test"),
             [6; 32],
             &row,
+            std::slice::from_ref(&row),
             &AgentPolicies::new(),
             Consistency::Crdt,
             package.encode(),
@@ -2557,6 +2721,114 @@ mod tests {
             panic!("v2 package fell through to the legacy runtime")
         };
         assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Crdt);
+    }
+
+    #[test]
+    fn signed_external_names_resolve_to_exact_registry_deployments() {
+        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        assembler
+            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .ecalli(0);
+        let service_pvm = assembler.build();
+        let service_program = ProgramId::of_pvm(&service_pvm);
+        let pinned = PinnedV2Service {
+            pvm: std::sync::Arc::new(service_pvm),
+            program: service_program,
+        };
+        let consumer = signed_v2_package_with_externals(
+            service_program,
+            false,
+            vec!["private-age".into()],
+        );
+        let producer = signed_v2_package(service_program, false);
+        let consumer_row = vos::registry::AgentRow {
+            instance_name: "age-gate".into(),
+            program_hash: [31; 32],
+            program_name: "age-gate".into(),
+            program_version: "2.0.0".into(),
+            replication_id: [32; 32],
+            consistency: Consistency::Local as u8,
+            network_reachable: false,
+            sync_role: vos::registry::SyncFloor::Member,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let producer_row = vos::registry::AgentRow {
+            instance_name: "private-age".into(),
+            program_hash: [33; 32],
+            program_name: "private-age".into(),
+            program_version: "2.0.0".into(),
+            replication_id: [34; 32],
+            consistency: Consistency::Local as u8,
+            network_reachable: false,
+            sync_role: vos::registry::SyncFloor::Member,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let rows = vec![consumer_row.clone(), producer_row.clone()];
+        let exact_producer = producer.encode();
+        let space_id = [35; 32];
+        let resolution = resolve_v2_external_actors_with(
+            space_id,
+            &consumer_row,
+            &consumer,
+            &rows,
+            &pinned,
+            |hash| Ok((hash == producer_row.program_hash).then(|| exact_producer.clone())),
+        )
+        .unwrap();
+        let ExternalActorResolution::Ready(bindings) = resolution else {
+            panic!("installed signed dependency did not resolve")
+        };
+        assert_eq!(bindings.len(), 1);
+        let binding = &bindings[0];
+        let space = vos::v2::SpaceId(space_id);
+        let root_service = v2_root_service_id(space, "private-age");
+        assert_eq!(binding.name, "private-age");
+        assert_eq!(binding.service.space, space);
+        assert_eq!(binding.service.root_service, root_service);
+        assert_eq!(binding.service.deployment, producer.deployment_id());
+        assert_eq!(binding.actor, v2_root_actor_id(root_service, "private-age"));
+        assert_eq!(binding.producer, producer.deployment_signature.producer);
+        assert_eq!(binding.program, producer.manifest.actor_program);
+
+        assert!(matches!(
+            resolve_v2_external_actors_with(
+                space_id,
+                &consumer_row,
+                &consumer,
+                std::slice::from_ref(&consumer_row),
+                &pinned,
+                |_| Ok(None),
+            )
+            .unwrap(),
+            ExternalActorResolution::MissingAgent(name) if name == "private-age"
+        ));
+        assert_eq!(
+            resolve_v2_external_actors_with(
+                space_id,
+                &consumer_row,
+                &consumer,
+                &rows,
+                &pinned,
+                |_| Ok(None),
+            )
+            .unwrap(),
+            ExternalActorResolution::MissingBlob(producer_row.program_hash)
+        );
+
+        let mut legacy_rows = rows;
+        legacy_rows[1].install_args = b"legacy".to_vec();
+        let error = resolve_v2_external_actors_with(
+            space_id,
+            &consumer_row,
+            &consumer,
+            &legacy_rows,
+            &pinned,
+            |hash| Ok((hash == producer_row.program_hash).then(|| exact_producer.clone())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy install args/on_start"));
     }
 
     #[test]
