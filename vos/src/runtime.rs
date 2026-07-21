@@ -42,12 +42,9 @@
 //! When on-chain bridging lands, journaled cross-service transfers will
 //! be routed to a pallet submission instead of `pending_transfers`.
 //!
-//! Version negotiation: the host dispatches on the payload's leading
-//! version byte. `0x02` blobs (already installed) get legacy handling —
-//! the decoder synthesizes their state field into a final
-//! `Write{STATE_KEY}` and anchor checks are skipped. `0x03` is what the
-//! framework emits. Unknown versions and malformed payloads fail loud
-//! (treated like a trapped dispatch), never silently as defaults.
+//! Only canonical `RefinePayload` v3 is accepted. Older blobs require reset
+//! and reinstall; unknown versions and malformed payloads fail loud (treated
+//! like a trapped dispatch), never silently as defaults.
 //!
 //! Self-directed transfers (a service sending to itself) become fresh
 //! **intra-round invocations** after the current handler is idle, capped by
@@ -408,20 +405,18 @@ struct AbsorbedWorkResult {
     continue_next: bool,
     forbidden: bool,
     reply: Vec<u8>,
-    /// v3 payload carried at least one effect. Input to the durable-node
+    /// The payload carried at least one effect. Input to the durable-node
     /// rule: an effect-bearing dispatch must produce a durable log node
-    /// even when the state blob is unchanged. Always `false` for v2
-    /// (those guests emit their full state unconditionally, so the rule
-    /// is evaluated by value comparison at the commit strategy instead).
+    /// even when the state blob is unchanged.
     effect_bearing: bool,
     /// The `(kind, anchor)` the work-result declared and the host
-    /// verified. `None` for v2 payloads (no anchor on that wire).
+    /// verified.
     anchor: Option<(u8, [u8; 32])>,
 }
 
 /// Verify and absorb one decoded work-result into the journal — the
 /// single applier the native drain, the intra-tick anchor chain, and the
-/// v2/v3 parity tests all go through.
+/// strict v3 tests all go through.
 ///
 /// The anchor is checked against the **effective** state: the last
 /// `Write{STATE_KEY}` absorbed from previously accepted work-results in
@@ -434,16 +429,15 @@ fn absorb_work_result(
     svc_id: u32,
     payload: RefinePayload,
 ) -> Result<AbsorbedWorkResult, WorkResultError> {
-    let anchor = if payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION {
-        let expected = expected_anchor(journal, storage, svc_id);
-        if (payload.anchor_kind, payload.anchor) != expected {
-            return Err(WorkResultError::AnchorMismatch);
-        }
-        Some((payload.anchor_kind, payload.anchor))
-    } else {
-        None
-    };
-    let effect_bearing = anchor.is_some() && !payload.effects.is_empty();
+    if payload.version != crate::refine_payload::REFINE_PAYLOAD_VERSION {
+        return Err(WorkResultError::Malformed);
+    }
+    let expected = expected_anchor(journal, storage, svc_id);
+    if (payload.anchor_kind, payload.anchor) != expected {
+        return Err(WorkResultError::AnchorMismatch);
+    }
+    let anchor = Some((payload.anchor_kind, payload.anchor));
+    let effect_bearing = !payload.effects.is_empty();
     journal.absorb_effects(payload.effects, svc_id);
     Ok(AbsorbedWorkResult {
         continue_next: payload.continue_next,
@@ -491,11 +485,7 @@ fn expected_anchor(
 /// head, and 0x03+ statuses only appear in sub-5-byte error envelopes
 /// the invoke path packs host-side.
 fn claims_refine_payload(bytes: &[u8]) -> bool {
-    matches!(
-        bytes.first(),
-        Some(&crate::refine_payload::REFINE_PAYLOAD_V2)
-            | Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
-    )
+    bytes.first() == Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
 }
 
 // --- Per-service storage ---
@@ -2019,7 +2009,7 @@ fn run_task_invoke(
     // Tasks are v3-native — run_task_service is the only entry that can
     // produce this halt shape; anything else is a mis-built blob.
     let payload = match RefinePayload::decode(&raw_output) {
-        Some(p) if p.version == crate::refine_payload::REFINE_PAYLOAD_VERSION => p,
+        Some(p) => p,
         _ => {
             error!(
                 parent_svc_id,
@@ -2831,12 +2821,9 @@ mod tests {
         assert_eq!(rt.blob_by_hash.get(&blob_hash(&a)), Some(&idx));
     }
 
-    // ── Work-result apply parity (v2 vs v3) ─────────────────────────
+    // ── Strict v3 work-result application ───────────────────────────
     //
-    // The one property the version negotiation must hold: a v2 payload
-    // and the v3 payload describing the same logical transition absorb
-    // into byte-identical journal contents. These drive the same
-    // `absorb_work_result` the tick loop uses.
+    // These drive the same `absorb_work_result` the tick loop uses.
 
     fn state_key() -> Vec<u8> {
         crate::lifecycle::STATE_KEY_BYTES.to_vec()
@@ -2849,72 +2836,6 @@ mod tests {
                 None => storage.delete(ServiceId(svc), &key),
             }
         }
-    }
-
-    #[test]
-    fn v2_and_v3_absorb_identically() {
-        use crate::refine_payload::{self, Effect, RefinePayload, anchor_for};
-
-        let svc = 7u32;
-        let prior_state = b"prior".to_vec();
-        let new_state = b"new-state".to_vec();
-        let effects = vec![
-            Effect::Write {
-                key: b"row".to_vec(),
-                value: vec![1, 2],
-            },
-            Effect::Transfer {
-                target: 9,
-                memo: b"memo".to_vec(),
-            },
-        ];
-
-        // v2: state as an explicit field on the wire.
-        let v2_bytes = refine_payload::encode_v2(&new_state, b"reply", &effects, false, false);
-
-        // v3: state as the final Write{STATE_KEY} + a verified anchor.
-        let (anchor_kind, anchor) = anchor_for(Some(&prior_state));
-        let mut v3_effects = effects.clone();
-        v3_effects.push(Effect::Write {
-            key: state_key(),
-            value: new_state.clone(),
-        });
-        let v3_bytes = RefinePayload {
-            anchor_kind,
-            anchor,
-            reply: b"reply".to_vec(),
-            effects: v3_effects,
-            ..RefinePayload::new()
-        }
-        .encode();
-
-        let run = |bytes: &[u8]| {
-            let mut storage = ServiceStorage::new();
-            storage.write(
-                ServiceId(svc),
-                crate::lifecycle::STATE_KEY_BYTES,
-                &prior_state,
-            );
-            let mut journal = RefineJournal::default();
-            let payload = RefinePayload::decode(bytes).expect("decodes");
-            let absorbed =
-                absorb_work_result(&mut journal, &storage, svc, payload).expect("applies");
-            let writes = journal.writes.clone();
-            let transfers = journal.transfers.clone();
-            drain_to_storage(&mut journal, &mut storage);
-            let end_state = storage
-                .read(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES)
-                .map(|v| v.to_vec());
-            (writes, transfers, end_state, absorbed.reply)
-        };
-
-        let (w2, t2, s2, r2) = run(&v2_bytes);
-        let (w3, t3, s3, r3) = run(&v3_bytes);
-        assert_eq!(w2, w3, "journal writes must match across versions");
-        assert_eq!(t2, t3, "journal transfers must match across versions");
-        assert_eq!(s2, s3, "end-of-tick state must match across versions");
-        assert_eq!(s2.as_deref(), Some(new_state.as_slice()));
-        assert_eq!(r2, r3);
     }
 
     #[test]
@@ -3155,28 +3076,6 @@ mod tests {
         empty_row.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"");
         absorb_work_result(&mut journal, &empty_row, svc, RefinePayload::new())
             .expect("genesis against empty state applies");
-    }
-
-    #[test]
-    fn v2_payloads_skip_anchor_checks() {
-        use crate::refine_payload::{self, RefinePayload};
-
-        // A v2 guest knows nothing about anchors; its payload applies
-        // against any prior state.
-        let svc = 5u32;
-        let mut storage = ServiceStorage::new();
-        storage.write(
-            ServiceId(svc),
-            crate::lifecycle::STATE_KEY_BYTES,
-            b"whatever",
-        );
-        let mut journal = RefineJournal::default();
-        let bytes = refine_payload::encode_v2(b"next", b"", &[], false, false);
-        let payload = RefinePayload::decode(&bytes).unwrap();
-        let absorbed =
-            absorb_work_result(&mut journal, &storage, svc, payload).expect("v2 applies");
-        assert_eq!(absorbed.anchor, None);
-        assert!(!absorbed.effect_bearing, "v2 never sets effect_bearing");
     }
 
     #[test]
