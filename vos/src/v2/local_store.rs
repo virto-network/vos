@@ -16,10 +16,10 @@ use crate::attestation::AttestationProofHostV2;
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
-    ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
-    ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
-    StoreHeaderV2, StoreOpenError, V2Wire,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, DeliveryRecordV2,
+    MessageRecordV2, ProgramId, ProofVerificationRequestV2, PublicationRecordV2,
+    ReceiptVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
+    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Recoverable committed image of a local v2 service account.
@@ -264,6 +264,7 @@ pub enum LocalStoreReadErrorV2 {
     InvalidHeader(StoreOpenError),
     CorruptStateTree,
     CorruptPublication,
+    CorruptDelivery,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -477,6 +478,43 @@ impl LocalJamStoreV2 {
                 Ok(publication)
             })
             .collect()
+    }
+
+    /// Recover finalized inbox admissions which have not yet been consumed by
+    /// actor execution. Delivery records are physical guest bookkeeping, so
+    /// their original logical timeslot remains available after host restart.
+    pub fn pending_inbox_calls(&self) -> Result<Vec<(super::CallId, u64)>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(Vec::new());
+        };
+        let prefix = super::storage::delivery_storage_prefix();
+        let mut pending = Vec::new();
+        for (key, bytes) in self
+            .committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            let delivery = DeliveryRecordV2::decode(bytes)
+                .map_err(|_| LocalStoreReadErrorV2::CorruptDelivery)?;
+            if super::delivery_storage_key(delivery.call_id).as_slice() != key.as_slice() {
+                return Err(LocalStoreReadErrorV2::CorruptDelivery);
+            }
+            if delivery.consumed {
+                continue;
+            }
+            let message = self
+                .state_row(header.service_root, &StateKeyV2::Inbox(delivery.call_id))?
+                .map(|bytes| MessageRecordV2::decode(&bytes))
+                .transpose()
+                .map_err(|_| LocalStoreReadErrorV2::CorruptDelivery)?
+                .ok_or(LocalStoreReadErrorV2::CorruptDelivery)?;
+            if message.call_id != delivery.call_id {
+                return Err(LocalStoreReadErrorV2::CorruptDelivery);
+            }
+            pending.push((delivery.call_id, delivery.logical_timeslot));
+        }
+        Ok(pending)
     }
 
     /// Recover the guest-committed identity of an invocation for transport

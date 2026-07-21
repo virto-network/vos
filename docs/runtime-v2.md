@@ -57,7 +57,11 @@ service, logical timeslot, message, complete source outbox, and finalized source
 receipt. The destination base/frontier remains part of the first accepted
 delivery commitment but is excluded from retry identity: executing the inbox
 legitimately advances that base before an ACK retry arrives. A changed source
-record is still a divergent duplicate.
+record is still a divergent duplicate. The guest's physical delivery record
+also retains the admitted logical timeslot and whether actor execution consumed
+the inbox row. A restarted local host drains every unconsumed admission from
+those records; the consuming actor slice marks the record and removes the inbox
+atomically, while retaining delivery identity for duplicate acknowledgements.
 
 CRDT anti-entropy also enters through physical Accumulate. A
 `CrdtSyncEnvelopeV2` carries advertised heads, canonical causal nodes, the

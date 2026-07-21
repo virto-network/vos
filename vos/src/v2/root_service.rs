@@ -852,6 +852,18 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
     }
 
+    /// Finalized cross-root calls still present in the guest inbox. This is a
+    /// read-only scheduling view; execution consumes the row and marks its
+    /// delivery record through the physical Accumulate transaction.
+    pub(crate) fn pending_inbox_calls(
+        &self,
+    ) -> Result<Vec<(super::CallId, u64)>, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .pending_inbox_calls()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
     /// Recover the exact logical timeslot committed with a pending
     /// publication. Transport retries must reproduce the original delivery
     /// bytes; substituting a host clock would turn an exact retry into a

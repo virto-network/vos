@@ -300,6 +300,7 @@ fn deliver<S: GuestAccumulateStoreV2>(
         let record =
             DeliveryRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
         return if record.call_id == envelope.message.call_id
+            && record.logical_timeslot == envelope.logical_timeslot
             && record.retry_identity == retry_identity
         {
             Ok(AccumulationResultV2::Accepted {
@@ -433,6 +434,8 @@ fn deliver<S: GuestAccumulateStoreV2>(
     };
     let record = DeliveryRecordV2 {
         call_id: envelope.message.call_id,
+        logical_timeslot: envelope.logical_timeslot,
+        consumed: false,
         retry_identity,
         delivery_commitment,
         receipt: receipt.clone(),
@@ -1356,6 +1359,19 @@ fn apply<S: GuestAccumulateStoreV2>(
     )?;
     header.service_root = tree.root();
     drop(tree);
+
+    if let Some(call) = work.parent_call {
+        let key = delivery_storage_key(call);
+        if let Some(bytes) = read(store, &key)? {
+            let mut delivery =
+                DeliveryRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+            if delivery.call_id != call || delivery.consumed {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+            delivery.consumed = true;
+            write(store, &key, Some(&delivery.encode()))?;
+        }
+    }
 
     let (resulting_state_root, resulting_crdt_heads, sequence) =
         if header.consistency == ConsistencyModeV2::Crdt {
@@ -3553,7 +3569,7 @@ mod tests {
     #[test]
     fn finalized_cross_root_delivery_is_guest_owned_atomic_and_deduplicated() {
         let mut store = MemStore::default();
-        install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         let incoming = message(70, ActorId([71; 32]), actor(), None, Some(10));
         let outbox = vec![incoming.clone()];
@@ -3609,6 +3625,15 @@ mod tests {
         assert_eq!(receipt.accepted_transition, envelope.commitment());
         assert_eq!(receipt.sequence, 1);
         assert_eq!(published, PublishedEffectsV2::default());
+        let delivery_record = DeliveryRecordV2::decode(
+            store
+                .rows
+                .get(&delivery_storage_key(incoming.call_id))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delivery_record.logical_timeslot, envelope.logical_timeslot);
+        assert!(!delivery_record.consumed);
         let committed = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         let tree = ServiceStateTreeV2::new(&mut store, committed.service_root);
         assert_eq!(
@@ -3629,7 +3654,11 @@ mod tests {
             StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         assert_eq!(after_duplicate, committed);
 
-        let retry_after_advance = delivery(&committed, incoming, envelope.source_receipt.clone());
+        let retry_after_advance = delivery(
+            &committed,
+            incoming.clone(),
+            envelope.source_receipt.clone(),
+        );
         assert_eq!(
             retry_after_advance.retry_identity(),
             envelope.retry_identity()
@@ -3647,6 +3676,54 @@ mod tests {
                 ..
             } if published == PublishedEffectsV2::default()
         ));
+
+        let mut inbox_work = linear_work(initial, committed.state_root.unwrap());
+        inbox_work.invocation = InvocationId::for_call(incoming.call_id);
+        inbox_work.logical_timeslot = envelope.logical_timeslot + 1;
+        inbox_work.arguments = incoming.payload.clone();
+        inbox_work.origin = Origin::Actor(incoming.from);
+        inbox_work.authorization = incoming.authorization.clone();
+        inbox_work.causal_parent = Some(incoming.caller_invocation);
+        inbox_work.parent_call = Some(incoming.call_id);
+        inbox_work.base = ConsistencyBaseV2::Linear {
+            revision: committed.revision,
+            state_root: committed.state_root.unwrap(),
+        };
+        let mut inbox_transition = linear_transition(&inbox_work, b"after inbox");
+        inbox_transition.reply.as_mut().unwrap().call_id = incoming.call_id;
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: inbox_work,
+                    transition: inbox_transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let consumed = DeliveryRecordV2::decode(
+            store
+                .rows
+                .get(&delivery_storage_key(incoming.call_id))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(consumed.consumed);
+        let consumed_header =
+            StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let consumed_tree = ServiceStateTreeV2::new(&mut store, consumed_header.service_root);
+        assert_eq!(
+            consumed_tree
+                .get(&StateKeyV2::Inbox(incoming.call_id))
+                .unwrap(),
+            None
+        );
+        drop(consumed_tree);
 
         let mut divergent = envelope;
         divergent.logical_timeslot += 1;

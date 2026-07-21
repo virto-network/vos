@@ -3948,7 +3948,6 @@ where
 struct V2RootThreadState {
     pending_callers: HashMap<crate::v2::InvocationId, Vec<ReplyChannel>>,
     return_calls: HashMap<crate::v2::InvocationId, V2ReturnCall>,
-    admitted_calls: HashMap<crate::v2::CallId, u64>,
     accepted_outbox:
         HashMap<crate::v2::Hash, std::collections::BTreeSet<crate::v2::CallId>>,
 }
@@ -4015,7 +4014,6 @@ fn handle_v2_transport<B>(
                             caller_invocation: message.caller_invocation,
                         },
                     );
-                    state.admitted_calls.insert(call, logical_timeslot);
                     let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
                         input: publication.input,
                         publication: publication_commitment,
@@ -4268,7 +4266,6 @@ fn run_v2_admitted_call<B>(
 {
     match service.invoke_inbox(call, logical_timeslot.saturating_add(1)) {
         Ok(committed) => {
-            state.admitted_calls.remove(&call);
             publish_v2_slice(
                 id,
                 service,
@@ -4287,9 +4284,7 @@ fn run_v2_admitted_call<B>(
         )) => {}
         Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
             crate::v2::ScheduleErrorV2::MissingInbox(_),
-        )) => {
-            state.admitted_calls.remove(&call);
-        }
+        )) => {}
         Err(error) => warn!(%id, ?call, ?error, "v2 admitted inbox execution failed"),
     }
 }
@@ -4362,13 +4357,15 @@ fn retry_v2_work<B>(
             }
         }
     }
-    let admitted = state
-        .admitted_calls
-        .iter()
-        .map(|(call, timeslot)| (*call, *timeslot))
-        .collect::<Vec<_>>();
-    for (call, timeslot) in admitted {
-        run_v2_admitted_call(id, service, call, timeslot, outbox, actor_routes, state);
+    match service.pending_inbox_calls() {
+        Ok(pending) => {
+            for (call, timeslot) in pending {
+                run_v2_admitted_call(id, service, call, timeslot, outbox, actor_routes, state);
+            }
+        }
+        Err(error) => {
+            warn!(%id, ?error, "v2 durable inbox recovery failed");
+        }
     }
 }
 

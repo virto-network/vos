@@ -830,17 +830,12 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
             .acknowledge_publication(&source_publication)
             .expect("source guest acknowledges destination acceptance")
     );
-    let peer_slice = peer
-        .invoke_inbox(message.call_id, 1)
-        .expect("peer executes after durable inbox admission");
-    assert!(
-        peer_slice.publication.is_some(),
-        "peer reply remains durable"
-    );
-
     let source_backend = source.into_backend();
     let source = LocalRootTreeServiceV2::open(source_config, source_backend)
         .expect("source reopens its exact suspended continuation");
+    let peer_backend = peer.into_backend();
+    let peer = LocalRootTreeServiceV2::open(peer_config, peer_backend)
+        .expect("peer reopens its finalized but unexecuted inbox");
     let mut retry = request;
     retry.logical_timeslot = 99;
     assert_eq!(
