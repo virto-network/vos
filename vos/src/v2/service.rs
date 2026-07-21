@@ -484,16 +484,26 @@ where
         let refine_trace = replay
             .trace
             .as_ref()
-            .ok_or(AttestationBuildErrorV2::InvalidPreparation)?
-            .commitment;
+            .ok_or(AttestationBuildErrorV2::InvalidPreparation)?;
+        let canonical_actor_pvm = imports
+            .programs
+            .binary_search_by_key(&envelope.work.target_program, |program| program.program)
+            .ok()
+            .map(|index| imports.programs[index].pvm.as_slice())
+            .ok_or(AttestationBuildErrorV2::InvalidPreparation)?;
         let produced = {
             let request = AttestationProofRequestV2 {
                 canonical_service_pvm: self.pvm.canonical_pvm(),
+                canonical_actor_pvm,
                 work: &envelope.work,
                 imports,
                 transition: &envelope.transition,
                 preparation: &preparation,
-                refine_trace,
+                refine_trace: refine_trace.commitment,
+                refine_instruction_count: refine_trace.instruction_count,
+                refine_protocol_call_count: refine_trace.protocol_call_count,
+                refine_vm_switch_count: refine_trace.vm_switch_count,
+                refine_code_hashes: &refine_trace.code_hashes,
             };
             request
                 .validate()
@@ -503,7 +513,7 @@ where
                 .map_err(AttestationBuildErrorV2::Producer)?
         };
         produced
-            .validate_for(refine_trace)
+            .validate_for(refine_trace.commitment)
             .map_err(|_| AttestationBuildErrorV2::InvalidProducedProof)?;
 
         let proof_blob = super::BlobRefV2::of_bytes(&produced.proof);

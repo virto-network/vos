@@ -107,15 +107,12 @@ impl AttestationProofProducerV2 for CanonicalTestProofProducer {
     ) -> Result<ProducedAttestationProofV2, Self::Error> {
         request.validate().map_err(|_| ())?;
         assert_eq!(
-            request
-                .imports
-                .programs
-                .iter()
-                .find(|program| program.program == request.work.target_program)
-                .map(|program| ProgramId::of_pvm(&program.pvm)),
-            Some(request.work.target_program),
+            ProgramId::of_pvm(request.canonical_actor_pvm),
+            request.work.target_program,
             "the proof request carries the live canonical actor PVM"
         );
+        assert!(request.refine_instruction_count > 0);
+        assert!(!request.refine_code_hashes.is_empty());
         self.calls += 1;
         Ok(ProducedAttestationProofV2 {
             trace: request.refine_trace,

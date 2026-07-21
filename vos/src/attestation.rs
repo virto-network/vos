@@ -263,20 +263,38 @@ fn authorization_input(authorization: &crate::v2::AuthorizationEvidenceV2) -> Ha
 /// the live work input/output, and the guest-derived public statement.
 pub struct AttestationProofRequestV2<'a> {
     pub canonical_service_pvm: &'a [u8],
+    /// Exact target actor bytes used by the nested live Refine execution.
+    /// Inline child programs remain available through `imports`.
+    pub canonical_actor_pvm: &'a [u8],
     pub work: &'a WorkEnvelopeV2,
     pub imports: &'a RefineImportsV2,
     pub transition: &'a TransitionV2,
     pub preparation: &'a AttestationPreparationV2,
-    /// Commitment produced by observing the service's exact canonical
-    /// interpreter replay of `work`, `imports`, and `transition`.
+    /// Commitment and portable metadata produced by observing the service's
+    /// exact canonical interpreter replay of `work`, `imports`, and
+    /// `transition`.
     pub refine_trace: Hash,
+    pub refine_instruction_count: u64,
+    pub refine_protocol_call_count: u64,
+    pub refine_vm_switch_count: u64,
+    pub refine_code_hashes: &'a [Hash],
 }
 
 impl AttestationProofRequestV2<'_> {
     pub fn validate(&self) -> Result<(), AttestationError> {
+        let imported_actor = self
+            .imports
+            .programs
+            .binary_search_by_key(&self.work.target_program, |program| program.program)
+            .ok()
+            .map(|index| &self.imports.programs[index]);
         if ProgramId::of_pvm(self.canonical_service_pvm) != self.work.service.service_program
+            || ProgramId::of_pvm(self.canonical_actor_pvm) != self.work.target_program
+            || imported_actor.is_none_or(|program| program.pvm != self.canonical_actor_pvm)
             || self.imports.validate_for(self.work).is_err()
             || self.refine_trace == Hash::ZERO
+            || self.refine_instruction_count == 0
+            || self.refine_code_hashes.is_empty()
         {
             return Err(AttestationError::InvalidStatement);
         }

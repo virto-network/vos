@@ -167,8 +167,10 @@ is called, the service deterministically replays the submitted work with JAR's
 canonical interpreter observer, follows every nested CALL/REPLY VM switch, and
 commits instruction state, protocol-call requests/results, checkpoint
 artifacts, transition bytes, and gas. The replayed transition and artifacts
-must exactly match the Refine envelope, and the producer's trace must equal
-that live commitment before proof availability or Apply is attempted. The
+must exactly match the Refine envelope. The producer receives the exact target
+actor PVM separately from the complete canonical import set, plus the live
+instruction/protocol/switch counts and observed code hashes; its trace must
+equal that live commitment before proof availability or Apply is attempted. The
 remaining production gap is a proof backend that consumes or reproduces the
 full witness behind this commitment; it is not a second attestation-only actor
 binary.
