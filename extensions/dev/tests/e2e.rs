@@ -337,8 +337,8 @@ struct TestClient {
 }
 
 impl TestClient {
-    fn connect(data_dir: &Path) -> Self {
-        let ep = read_endpoint(data_dir);
+    fn connect(daemon: &Daemon) -> Self {
+        let ep = read_endpoint(daemon.data_dir());
         let bootstrap_str = format!(
             "{}/p2p/{}",
             ep.multiaddrs.first().expect("at least one multiaddr"),
@@ -347,7 +347,15 @@ impl TestClient {
         let bootstrap = Multiaddr::from_str(&bootstrap_str)
             .unwrap_or_else(|e| panic!("parse daemon multiaddr '{bootstrap_str}': {e}"));
 
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let identity_path = daemon
+            .config_home
+            .path()
+            .join("vosx")
+            .join("identity.key");
+        let identity = fs::read(&identity_path)
+            .unwrap_or_else(|e| panic!("read operator identity {}: {e}", identity_path.display()));
+        let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&identity)
+            .unwrap_or_else(|e| panic!("decode operator identity {}: {e}", identity_path.display()));
         let peer_id = libp2p::PeerId::from(keypair.public());
         let local_prefix = vos::network::derive_node_prefix(&peer_id);
 
@@ -602,7 +610,7 @@ fn provision_project(daemon: &Daemon, name: &str) {
 /// args for a project. Reconnects a short-lived client just to read the
 /// head (instance ids are deterministic from the name).
 fn dyn_target(daemon: &Daemon, name: &str, branch: &str) -> (String, String) {
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(daemon);
     let sid = client.resolve_instance(name);
     let head = hex::encode(current_head(&client, sid, branch));
     (format!("project_id={}", sid.0), format!("commit={head}"))
@@ -653,7 +661,7 @@ fn dev_publish(daemon: &Daemon, name: &str, prog: &str, version: &str) {
 /// Resolve `(project_id=<id>, build_commit=<builds head hex>)` for a
 /// dynamic `dev publish`.
 fn dyn_publish_target(daemon: &Daemon, name: &str) -> (String, String) {
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(daemon);
     let sid = client.resolve_instance(name);
     let head = hex::encode(current_head(&client, sid, "builds"));
     (format!("project_id={}", sid.0), format!("build_commit={head}"))
@@ -673,7 +681,7 @@ fn dev_compile_publish_install_invoke() {
     //    test gates.
     provision_project(&daemon, "myproject");
 
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
 
     // 2. Resolve the project's ServiceId so we can talk to it.
     let project_id = client.resolve_instance("myproject");
@@ -787,7 +795,7 @@ fn dev_publish_admin_succeeds_member_refused() {
     // Admin provisions + compiles a project. The spawn-reconcile
     // brings the agent up mid-run; put_source polls through it.
     provision_project(&daemon, "authproj");
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
     let project_id = client.resolve_instance("authproj");
     let src_hash = put_source(&client, project_id, "put_blob", COUNTER_SOURCE.as_bytes());
     commit_source(&client, project_id, &src_hash);
@@ -880,7 +888,7 @@ fn compile_via_ast_matches_raw_artifact() {
     provision_project(&daemon, "proj-raw");
     provision_project(&daemon, "proj-ast");
 
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
     let raw_id = client.resolve_instance("proj-raw");
     let ast_id = client.resolve_instance("proj-ast");
 
@@ -1101,7 +1109,7 @@ fn cross_project_deps_compile_resolves_lib() {
 
     provision_project(&daemon, "proj-b");
     provision_project(&daemon, "proj-a");
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
 
     let proj_b_id = client.resolve_instance("proj-b");
     let proj_a_id = client.resolve_instance("proj-a");
@@ -1164,7 +1172,7 @@ fn cross_project_deps_self_cycle_errors_loudly() {
     let daemon = boot_daemon();
 
     provision_project(&daemon, "proj-cycle");
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
 
     let proj_id = client.resolve_instance("proj-cycle");
     let src_hash = put_source(&client, proj_id, "put_blob", COUNTER_SOURCE.as_bytes());
@@ -1252,7 +1260,7 @@ fn dev_compile_surfaces_cargo_failure() {
     let daemon = boot_daemon();
 
     provision_project(&daemon, "proj-broken");
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
 
     let project_id = client.resolve_instance("proj-broken");
     let src_hash = put_source(&client, project_id, "put_blob", BROKEN_SOURCE.as_bytes());
@@ -1295,7 +1303,7 @@ fn dev_show_tree_and_file() {
     let daemon = boot_daemon();
 
     provision_project(&daemon, "showproj");
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
     let project_id = client.resolve_instance("showproj");
 
     // Seed src/lib.rs with the counter source on main.
@@ -1360,7 +1368,7 @@ fn dev_merge_ff_advances_main() {
     let daemon = boot_daemon();
 
     provision_project(&daemon, "mergeproj");
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
     let project_id = client.resolve_instance("mergeproj");
 
     // Seed main with a base commit.
@@ -1425,7 +1433,7 @@ fn dev_merge_missing_into_errors_clearly() {
     let daemon = boot_daemon();
 
     provision_project(&daemon, "mergeproj2");
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
     let project_id = client.resolve_instance("mergeproj2");
 
     // Seed a side branch but NOT main, so --into main is missing.
@@ -1492,7 +1500,7 @@ fn dev_project_main_branch_survives_daemon_restart() {
 
     provision_project(&daemon, "restartproj");
 
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
     let project_id = client.resolve_instance("restartproj");
 
     // Put a blob and commit on `main`.
@@ -1525,7 +1533,7 @@ fn dev_project_main_branch_survives_daemon_restart() {
     // the daemon's PID change.
     drop(client);
     daemon.restart();
-    let client = TestClient::connect(daemon.data_dir());
+    let client = TestClient::connect(&daemon);
 
     let head_after = current_head(&client, project_id, "main");
     assert_eq!(
