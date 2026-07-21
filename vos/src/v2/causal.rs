@@ -213,6 +213,7 @@ mod tests {
             actor: ActorId([7; 32]),
             name: "root".into(),
             parent: None,
+            producer: super::super::ProducerId([6; 32]),
             program: super::super::ProgramId([8; 32]),
             initial_state: BlobRefV2::of_bytes(b"initial"),
             crdt: true,

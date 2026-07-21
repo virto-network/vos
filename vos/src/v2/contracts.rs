@@ -832,6 +832,10 @@ pub struct ActorGenesisV2 {
     /// `None` identifies the single root actor; every child names an actor in
     /// the same genesis tree.
     pub parent: Option<ActorId>,
+    /// Signer of the exact canonical package from which this actor was
+    /// installed. Guest-owned state retains this identity so later proof
+    /// verification never has to trust a producer label carried by a package.
+    pub producer: ProducerId,
     pub program: ProgramId,
     pub initial_state: BlobRefV2,
     pub crdt: bool,
@@ -2263,6 +2267,7 @@ fn encode_actor_genesis(e: &mut Encoder<'_>, value: &ActorGenesisV2) {
     e.fixed(&value.actor.0);
     e.string(&value.name);
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
+    e.fixed(&value.producer.0);
     e.fixed(&value.program.0);
     encode_blob_ref(e, &value.initial_state);
     e.bool(value.crdt);
@@ -2280,6 +2285,7 @@ fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeErr
         actor: ActorId(d.fixed()?),
         name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
+        producer: ProducerId(d.fixed()?),
         program: ProgramId(d.fixed()?),
         initial_state: decode_blob_ref(d)?,
         crdt: d.bool()?,
@@ -3632,6 +3638,7 @@ mod tests {
                     actor: ActorId([5; 32]),
                     name: "root".into(),
                     parent: None,
+                    producer: ProducerId([4; 32]),
                     program: ProgramId([6; 32]),
                     initial_state: BlobRefV2::of_bytes(b"root-state"),
                     crdt: false,
@@ -3647,6 +3654,7 @@ mod tests {
                     actor: ActorId([9; 32]),
                     name: "child".into(),
                     parent: Some(ActorId([5; 32])),
+                    producer: ProducerId([4; 32]),
                     program: ProgramId([10; 32]),
                     initial_state: BlobRefV2::of_bytes(b"child-state"),
                     crdt: false,
@@ -3781,6 +3789,7 @@ mod tests {
                 actor: ActorId([5; 32]),
                 name: "root".into(),
                 parent: None,
+                producer: ProducerId([4; 32]),
                 program: ProgramId([6; 32]),
                 initial_state: BlobRefV2::of_bytes(b"state"),
                 crdt: false,
