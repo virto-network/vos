@@ -3845,6 +3845,11 @@ where
             imported_blobs: vec![],
             proof_requested: ingress.proof_requested,
         };
+        if work.proof_requested {
+            warn!(%id, "attested v2 ingress has no configured proof producer");
+            send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
+            continue;
+        }
         match service.recover_ingress(&work) {
             Ok(crate::v2::RootTreeIngressRecoveryV2::PendingPublication {
                 publication,
@@ -3877,6 +3882,28 @@ where
                     .push(request.reply);
                 continue;
             }
+            Ok(crate::v2::RootTreeIngressRecoveryV2::Queued { logical_timeslot }) => {
+                debug!(
+                    %id,
+                    invocation = ?work.invocation,
+                    "reattached caller to durable queued v2 invocation"
+                );
+                state
+                    .pending_callers
+                    .entry(work.invocation)
+                    .or_default()
+                    .push(request.reply);
+                run_v2_admitted_ingress(
+                    id,
+                    &mut service,
+                    work.invocation,
+                    logical_timeslot,
+                    &outbox,
+                    &actor_routes,
+                    &mut state,
+                );
+                continue;
+            }
             Ok(crate::v2::RootTreeIngressRecoveryV2::Completed) => {
                 warn!(
                     %id,
@@ -3898,23 +3925,18 @@ where
                 continue;
             }
         }
-        match service.invoke(work) {
-            Ok(committed) => {
-                debug!(
-                    %id,
-                    invocation = ?ingress.invocation,
-                    outbox = committed.published.outbox.len(),
-                    replied = committed.published.reply.is_some(),
-                    "v2 root-tree slice committed"
-                );
-                publish_v2_slice(
+        match service.admit_ingress(&work) {
+            Ok(_) => {
+                state
+                    .pending_callers
+                    .entry(work.invocation)
+                    .or_default()
+                    .push(request.reply);
+                run_v2_admitted_ingress(
                     id,
                     &mut service,
-                    ingress.invocation,
-                    committed.published,
-                    committed.publication,
-                    Some(request.reply),
-                    ingress.logical_timeslot,
+                    work.invocation,
+                    work.logical_timeslot,
                     &outbox,
                     &actor_routes,
                     &mut state,
@@ -3923,12 +3945,8 @@ where
             Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
                 crate::v2::AccumulationRejectionV2::Unauthorized,
             )) => send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id),
-            Err(crate::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired) => {
-                warn!(%id, "attested v2 ingress has no configured proof producer");
-                send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
-            }
             Err(error) => {
-                error!(%id, ?error, "v2 root-tree invocation failed");
+                error!(%id, ?error, "v2 root-tree ingress admission failed");
                 send_v2_status(request.reply, crate::actors::run::STATUS_PANICKED, id);
             }
         }
@@ -4253,6 +4271,80 @@ fn queue_v2_reply(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_v2_admitted_ingress<B>(
+    id: ServiceId,
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    invocation: crate::v2::InvocationId,
+    logical_timeslot: u64,
+    outbox: &mpsc::Sender<Envelope>,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    state: &mut V2RootThreadState,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    match service.invoke_admitted(invocation) {
+        Ok(committed) => {
+            debug!(
+                %id,
+                invocation = ?invocation,
+                outbox = committed.published.outbox.len(),
+                replied = committed.published.reply.is_some(),
+                "v2 guest-admitted root-tree slice committed"
+            );
+            publish_v2_slice(
+                id,
+                service,
+                invocation,
+                committed.published,
+                committed.publication,
+                None,
+                logical_timeslot,
+                outbox,
+                actor_routes,
+                state,
+            );
+        }
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
+            crate::v2::ScheduleErrorV2::ActorBusy(_),
+        )) => {}
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
+            crate::v2::AccumulationRejectionV2::Unauthorized,
+        ))
+        | Err(crate::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired) => {
+            warn!(%id, invocation = ?invocation, "guest-admitted v2 invocation is not executable");
+            send_v2_pending_status(
+                state,
+                invocation,
+                crate::actors::run::STATUS_FORBIDDEN,
+                id,
+            );
+        }
+        Err(error) => {
+            warn!(%id, invocation = ?invocation, ?error, "guest-admitted v2 invocation failed");
+            send_v2_pending_status(
+                state,
+                invocation,
+                crate::actors::run::STATUS_PANICKED,
+                id,
+            );
+        }
+    }
+}
+
+fn send_v2_pending_status(
+    state: &mut V2RootThreadState,
+    invocation: crate::v2::InvocationId,
+    status: u8,
+    id: ServiceId,
+) {
+    if let Some(callers) = state.pending_callers.remove(&invocation) {
+        for caller in callers {
+            send_v2_status(caller, status, id);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_v2_admitted_call<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
@@ -4365,6 +4457,24 @@ fn retry_v2_work<B>(
         }
         Err(error) => {
             warn!(%id, ?error, "v2 durable inbox recovery failed");
+        }
+    }
+    match service.pending_ingresses() {
+        Ok(pending) => {
+            for ingress in pending {
+                run_v2_admitted_ingress(
+                    id,
+                    service,
+                    ingress.invocation,
+                    ingress.logical_timeslot,
+                    outbox,
+                    actor_routes,
+                    state,
+                );
+            }
+        }
+        Err(error) => {
+            warn!(%id, ?error, "v2 durable direct-ingress recovery failed");
         }
     }
 }

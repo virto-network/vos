@@ -32,7 +32,8 @@ semantics produce an identical transition.
 Accumulate validates service and ABI identity, the canonical actor
 `ProgramId`, authorization, base revision or causal dependencies, blob and
 proof availability, and invocation deduplication. It commits state or CRDT
-operations, continuations, inbox/outbox rows and the receipt atomically.
+operations, direct-ingress admissions, continuations, inbox/outbox rows and the
+receipt atomically.
 Replies, outbound calls and proof packages become visible only after that
 commit. A stale linear transition is rejected intact for rescheduling.
 
@@ -109,9 +110,15 @@ calls use `RootTreeInvocationV2`, which carries the stable `InvocationId`,
 logical timeslot, exact actor, method, arguments, and proof mode. The service
 thread derives typed origin and authorization from the authenticated transport,
 checks them against the signed method policy, and rejects a retry whose durable
-workflow identity differs. A reply-only publication is acknowledged only after
-the consumer channel accepts it. For locally routed roots, a committed outbox
-publication is sent as `RootTreeTransportV2`, admitted through destination
+workflow identity differs. For Local/Raft roots, every fresh direct call first
+enters physical Accumulate as `DirectIngressV2`; the guest validates its typed
+origin, authorization, actor, and signed method policy before storing the queue
+record. Refine runs only from that stored input. If the actor is suspended, the
+record survives restart and is consumed atomically with its eventual first
+slice; retry timeslots do not replace the originally admitted scheduling
+timeslot. A reply-only publication is acknowledged only after the consumer
+channel accepts it. For locally routed roots, a committed outbox publication is
+sent as `RootTreeTransportV2`, admitted through destination
 physical Accumulate, executed from the guest inbox, returned only after the
 callee's Refine/Accumulate commit, and injected at the caller's exact JAR
 snapshot boundary. The source outbox and callee reply publications are removed
@@ -199,8 +206,9 @@ service. It validates the package signature and exact pinned service
 `ProgramId`; it never extracts the actor PVM into `VosNode`'s legacy runtime or
 retranspiles an ELF. Normal actors installed as CRDT are refused. V2 Raft and
 CRDT rows also remain fail-closed until their request-log and anti-entropy
-drivers are attached to the daemon; legacy ELF/PVM rows continue on the old
-host only during this staged cutover.
+drivers—including causal replication of direct-ingress admissions—are attached
+to the daemon; legacy ELF/PVM rows continue on the old host only during this
+staged cutover.
 
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.

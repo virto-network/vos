@@ -17,9 +17,9 @@ use crate::attestation::AttestationProofHostV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, DeliveryRecordV2,
-    MessageRecordV2, ProgramId, ProofVerificationRequestV2, PublicationRecordV2,
-    ReceiptVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
-    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2,
+    PublicationRecordV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2,
+    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Recoverable committed image of a local v2 service account.
@@ -265,6 +265,7 @@ pub enum LocalStoreReadErrorV2 {
     CorruptStateTree,
     CorruptPublication,
     CorruptDelivery,
+    CorruptIngress,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -513,6 +514,49 @@ impl LocalJamStoreV2 {
                 return Err(LocalStoreReadErrorV2::CorruptDelivery);
             }
             pending.push((delivery.call_id, delivery.logical_timeslot));
+        }
+        Ok(pending)
+    }
+
+    pub fn ingress_record(
+        &self,
+        invocation: super::InvocationId,
+    ) -> Result<Option<IngressRecordV2>, LocalStoreReadErrorV2> {
+        self.row(&super::ingress_storage_key(invocation))
+            .map(IngressRecordV2::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptIngress)
+            .and_then(|record| {
+                if record
+                    .as_ref()
+                    .is_some_and(|record| record.ingress.invocation != invocation)
+                {
+                    Err(LocalStoreReadErrorV2::CorruptIngress)
+                } else {
+                    Ok(record)
+                }
+            })
+    }
+
+    /// Canonical invocation-id order for every guest-admitted direct call not
+    /// yet consumed by an actor slice.
+    pub fn pending_ingresses(&self) -> Result<Vec<DirectIngressV2>, LocalStoreReadErrorV2> {
+        let prefix = super::storage::ingress_storage_prefix();
+        let mut pending = Vec::new();
+        for (key, bytes) in self
+            .committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            let record = IngressRecordV2::decode(bytes)
+                .map_err(|_| LocalStoreReadErrorV2::CorruptIngress)?;
+            if super::ingress_storage_key(record.ingress.invocation).as_slice() != key.as_slice() {
+                return Err(LocalStoreReadErrorV2::CorruptIngress);
+            }
+            if !record.consumed {
+                pending.push(record.ingress);
+            }
         }
         Ok(pending)
     }

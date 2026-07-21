@@ -17,14 +17,15 @@ use super::{
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2,
-    DeliveryRecordV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, MessageRecordV2,
-    MethodPolicyV2, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
-    ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError, StateTreeStore,
-    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, WorkflowOperationV2,
-    crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
-    dedup_storage_key, delivery_storage_key, header_storage_key, public_policy_hash,
-    publication_storage_key, receipt_storage_key, space_role_for_policy,
+    DeliveryRecordV2, DirectIngressV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash,
+    IngressRecordV2, MessageRecordV2, MethodPolicyV2, ProofVerificationRequestV2, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2,
+    ServiceInstallReceiptV2, ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError,
+    StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
+    WorkflowOperationV2, crdt_change_storage_key, crdt_node_receipt_storage_key,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
+    ingress_storage_key, public_policy_hash, publication_storage_key, receipt_storage_key,
+    space_role_for_policy,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -106,6 +107,7 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
     };
     match request {
         AccumulateRequestV2::Install(genesis) => install(store, &genesis),
+        AccumulateRequestV2::AdmitIngress(ingress) => admit_ingress(store, &ingress),
         AccumulateRequestV2::Apply(envelope) => apply(store, &envelope, ApplyMode::Commit),
         AccumulateRequestV2::PrepareAttested(envelope) => {
             apply(store, &envelope, ApplyMode::PrepareAttested)
@@ -116,6 +118,107 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
             acknowledge_publication(store, &acknowledgement)
         }
     }
+}
+
+fn admit_ingress<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    ingress: &DirectIngressV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let Some(header_bytes) = read(store, header_storage_key())? else {
+        return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
+    };
+    let header = match StoreHeaderV2::open(&header_bytes) {
+        Ok(header) => header,
+        Err(StoreOpenError::IncompatibleSemantics) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+        }
+        Err(StoreOpenError::WrongService) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongService));
+        }
+        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
+    };
+    if ingress.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    if header.service.service_abi != ABI_VERSION {
+        return Ok(rejected(AccumulationRejectionV2::WrongAbi));
+    }
+    if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
+        return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+    }
+    if header.consistency == ConsistencyModeV2::Crdt {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+
+    let key = ingress_storage_key(ingress.invocation);
+    if let Some(bytes) = read(store, &key)? {
+        let record =
+            IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+        return if record.ingress.matches_retry(ingress) {
+            Ok(AccumulationResultV2::IngressAdmitted {
+                invocation: ingress.invocation,
+                duplicate: true,
+            })
+        } else {
+            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
+        };
+    }
+
+    let tree = ServiceStateTreeV2::new(store, header.service_root);
+    let Some(actor) =
+        tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(ingress.target))?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+    };
+    if actor.crdt {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+    let Some(policy) = tree_get_wire::<_, MethodPolicyV2>(
+        &tree,
+        &StateKeyV2::MethodPolicy {
+            actor: ingress.target,
+            method: ingress.method.clone(),
+        },
+    )?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    };
+    if policy.attested != ingress.proof_requested
+        || !authorized_input(
+            ingress.origin,
+            &ingress.authorization,
+            &ingress.imported_blobs,
+            ingress.proof_requested,
+            &policy,
+        )
+    {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    }
+    drop(tree);
+    for reference in &ingress.imported_blobs {
+        if !blob_available(store, reference)? {
+            return Ok(rejected(AccumulationRejectionV2::MissingBlob(
+                reference.hash,
+            )));
+        }
+    }
+    write(
+        store,
+        &key,
+        Some(
+            &IngressRecordV2 {
+                ingress: ingress.clone(),
+                consumed: false,
+            }
+            .encode(),
+        ),
+    )?;
+    Ok(AccumulationResultV2::IngressAdmitted {
+        invocation: ingress.invocation,
+        duplicate: false,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1086,6 +1189,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     if !work_matches_durable_inbox(&tree, work)? {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
+    if !work_matches_durable_ingress(tree.store_ref(), work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
 
     if transition.consumed_input != work.input_id() {
         return Ok(rejected(AccumulationRejectionV2::TransitionInputMismatch));
@@ -1370,6 +1476,18 @@ fn apply<S: GuestAccumulateStoreV2>(
             }
             delivery.consumed = true;
             write(store, &key, Some(&delivery.encode()))?;
+        }
+    }
+    if work.workflow_step == 0 && work.parent_call.is_none() {
+        let key = ingress_storage_key(work.invocation);
+        if let Some(bytes) = read(store, &key)? {
+            let mut ingress =
+                IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+            if ingress.consumed || !ingress.ingress.matches_work(work) {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+            ingress.consumed = true;
+            write(store, &key, Some(&ingress.encode()))?;
         }
     }
 
@@ -1742,7 +1860,23 @@ fn canonical_transition_shape(
 }
 
 fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
-    match &work.authorization {
+    authorized_input(
+        work.origin,
+        &work.authorization,
+        &work.imported_blobs,
+        work.proof_requested,
+        policy,
+    )
+}
+
+fn authorized_input(
+    origin: super::Origin,
+    authorization: &AuthorizationEvidenceV2,
+    imported_blobs: &[BlobRefV2],
+    proof_requested: bool,
+    policy: &MethodPolicyV2,
+) -> bool {
+    match authorization {
         AuthorizationEvidenceV2::Public => policy.public && policy.policy == public_policy_hash(),
         AuthorizationEvidenceV2::Credential {
             policy: supplied_policy,
@@ -1752,7 +1886,7 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
             .ok()
             .is_some_and(|credential| {
                 !policy.public
-                    && credential.holder == work.origin
+                    && credential.holder == origin
                     && space_role_for_policy(policy.policy)
                         .is_some_and(|required| credential.role >= required)
                     && *supplied_policy == policy.policy
@@ -1764,19 +1898,15 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
             witness,
         } => {
             !policy.public
-                && (policy.attested || work.proof_requested)
+                && (policy.attested || proof_requested)
                 && space_role_for_policy(policy.policy).is_some()
-                && matches!(
-                    work.origin,
-                    super::Origin::Member(_) | super::Origin::Actor(_)
-                )
+                && matches!(origin, super::Origin::Member(_) | super::Origin::Actor(_))
                 && *supplied_policy == policy.policy
                 && *credential_commitment != Hash::ZERO
-                && work
-                    .imported_blobs
+                && imported_blobs
                     .binary_search_by_key(&witness.hash, |blob| blob.hash)
                     .ok()
-                    .is_some_and(|index| work.imported_blobs[index] == *witness)
+                    .is_some_and(|index| imported_blobs[index] == *witness)
         }
         // A future statement version will bind platform authority keys. Until
         // then System is an identity class, never an authorization bypass.
@@ -1817,6 +1947,22 @@ fn work_matches_durable_inbox<S: StateTreeStore>(
             .deadline_timeslot
             .is_none_or(|deadline| work.logical_timeslot < deadline)
         && method.as_deref() == Some(work.method.as_str()))
+}
+
+fn work_matches_durable_ingress<S: StateTreeStore>(
+    store: &S,
+    work: &super::WorkEnvelopeV2,
+) -> GuestResult<bool, S::Error> {
+    if work.workflow_step != 0 || work.parent_call.is_some() {
+        return Ok(true);
+    }
+    let Some(bytes) = read(store, &ingress_storage_key(work.invocation))? else {
+        // Lower-level conformance callers may submit a complete WorkEnvelope
+        // directly. Production node ingress always admits through IC-5 first.
+        return Ok(true);
+    };
+    let record = IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+    Ok(!record.consumed && record.ingress.matches_work(work))
 }
 
 fn valid_workflow_input<S: StateTreeStore>(
@@ -2650,6 +2796,90 @@ mod tests {
             gas: GasAccountingV2::default(),
             proof: None,
         }
+    }
+
+    #[test]
+    fn direct_ingress_is_guest_admitted_deduplicated_and_consumed_atomically() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let ingress = DirectIngressV2 {
+            service: work.service.clone(),
+            invocation: work.invocation,
+            logical_timeslot: work.logical_timeslot,
+            target: work.target,
+            method: work.method.clone(),
+            arguments: work.arguments.clone(),
+            origin: work.origin,
+            authorization: work.authorization.clone(),
+            imported_blobs: work.imported_blobs.clone(),
+            proof_requested: work.proof_requested,
+        };
+        let header_before = store.rows.get(header_storage_key()).unwrap().clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AdmitIngress(ingress.clone()),
+            )
+            .unwrap(),
+            AccumulationResultV2::IngressAdmitted {
+                invocation: work.invocation,
+                duplicate: false,
+            }
+        );
+        assert_eq!(store.rows.get(header_storage_key()), Some(&header_before));
+        let record = IngressRecordV2::decode(
+            store
+                .rows
+                .get(&ingress_storage_key(work.invocation))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.ingress, ingress);
+        assert!(!record.consumed);
+
+        let mut retry = record.ingress.clone();
+        retry.logical_timeslot += 10;
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::AdmitIngress(retry))
+                .unwrap(),
+            AccumulationResultV2::IngressAdmitted {
+                invocation: work.invocation,
+                duplicate: true,
+            }
+        );
+        let mut divergent = record.ingress;
+        divergent.method = "other".into();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::AdmitIngress(divergent),)
+                .unwrap(),
+            rejected(AccumulationRejectionV2::DivergentDuplicate)
+        );
+
+        let transition = linear_transition(&work, b"after");
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: work.clone(),
+                    transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let consumed = IngressRecordV2::decode(
+            store
+                .rows
+                .get(&ingress_storage_key(work.invocation))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(consumed.consumed);
     }
 
     #[test]

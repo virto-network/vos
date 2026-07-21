@@ -10,11 +10,11 @@ use alloc::vec::Vec;
 
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
-    AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, Hash, InvocationId,
+    AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, DirectIngressV2, Hash, InvocationId,
     PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 4;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 5;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -23,6 +23,7 @@ const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
+const INGRESS_STORAGE_PREFIX: &[u8] = b"\0vos/v2/ingress/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
@@ -281,6 +282,14 @@ pub struct DeliveryRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressRecordV2 {
+    pub ingress: DirectIngressV2,
+    /// Set atomically with the initial actor slice. The original admission is
+    /// retained as the permanent invocation deduplication identity.
+    pub consumed: bool,
+}
+
 /// Recoverable effects created by one committed actor slice. The host may
 /// expose these bytes only after the surrounding service transaction commits,
 /// then removes the row through guest Accumulate acknowledgement.
@@ -415,6 +424,23 @@ impl V2Wire for DeliveryRecordV2 {
     }
 }
 
+impl V2Wire for IngressRecordV2 {
+    const MAGIC: [u8; 4] = *b"VIR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.bytes(&self.ingress.encode());
+        e.bool(self.consumed);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            ingress: DirectIngressV2::decode(&d.bytes()?)?,
+            consumed: d.bool()?,
+        })
+    }
+}
+
 impl V2Wire for PublicationRecordV2 {
     const MAGIC: [u8; 4] = *b"VPB2";
 
@@ -479,6 +505,18 @@ pub fn delivery_storage_key(call: CallId) -> Vec<u8> {
 #[cfg(feature = "std")]
 pub(crate) const fn delivery_storage_prefix() -> &'static [u8] {
     DELIVERY_STORAGE_PREFIX
+}
+
+pub fn ingress_storage_key(invocation: InvocationId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(INGRESS_STORAGE_PREFIX.len() + invocation.0.len());
+    key.extend_from_slice(INGRESS_STORAGE_PREFIX);
+    key.extend_from_slice(&invocation.0);
+    key
+}
+
+#[cfg(feature = "std")]
+pub(crate) const fn ingress_storage_prefix() -> &'static [u8] {
+    INGRESS_STORAGE_PREFIX
 }
 
 pub fn crdt_node_storage_key(cid: Hash) -> Vec<u8> {
@@ -678,11 +716,14 @@ mod tests {
         let receipt = receipt_storage_key(input);
         let publication = publication_storage_key(input);
         let delivery = delivery_storage_key(CallId([7; 32]));
+        let ingress = ingress_storage_key(input.invocation);
         assert_ne!(dedup, receipt);
         assert_ne!(publication, receipt);
         assert_ne!(publication, dedup);
         assert_ne!(delivery, receipt);
         assert_ne!(delivery, dedup);
+        assert_ne!(ingress, delivery);
+        assert_ne!(ingress, publication);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(
@@ -749,9 +790,26 @@ mod tests {
             delivery
         );
 
+        let ingress = IngressRecordV2 {
+            ingress: DirectIngressV2 {
+                service: service(18),
+                invocation: InvocationId([19; 32]),
+                logical_timeslot: 11,
+                target: ActorId([20; 32]),
+                method: "value".into(),
+                arguments: vec![1],
+                origin: super::super::Origin::Anonymous,
+                authorization: super::super::AuthorizationEvidenceV2::Public,
+                imported_blobs: vec![],
+                proof_requested: false,
+            },
+            consumed: false,
+        };
+        assert_eq!(IngressRecordV2::decode(&ingress.encode()).unwrap(), ingress);
+
         let reply = ReplyRecordV2 {
-            call_id: CallId([19; 32]),
-            producer: ActorId([20; 32]),
+            call_id: CallId([21; 32]),
+            producer: ActorId([22; 32]),
             result: b"committed reply".to_vec(),
         };
         let publication = PublicationRecordV2 {

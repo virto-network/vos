@@ -813,8 +813,13 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
         imported_blobs: vec![],
         proof_requested: false,
     };
+    assert!(
+        !source
+            .admit_ingress(&request)
+            .expect("source direct ingress commits before Refine")
+    );
     let first = source
-        .invoke(request.clone())
+        .invoke_admitted(request.invocation)
         .expect("source checkpoint commits before awaiting its peer");
     let source_publication = first.publication.expect("source outbox is durable");
     let message = source_publication.published.outbox[0].clone();
@@ -830,6 +835,34 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
             .acknowledge_publication(&source_publication)
             .expect("source guest acknowledges destination acceptance")
     );
+    let mut queued_arguments = vec![vos::value::TAG_DYNAMIC];
+    queued_arguments.extend_from_slice(&Msg::new("peer_value").encode());
+    let queued = LocalWorkRequestV2 {
+        invocation: InvocationId([108; 32]),
+        workflow_step: 0,
+        logical_timeslot: 2,
+        target: source_actor,
+        method: "peer_value".into(),
+        arguments: queued_arguments,
+        origin: Origin::System,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    assert!(
+        !source
+            .admit_ingress(&queued)
+            .expect("a second direct invocation is durably queued")
+    );
+    assert!(matches!(
+        source.invoke_admitted(queued.invocation),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::Schedule(
+            ScheduleErrorV2::ActorBusy(actor)
+        )) if actor == source_actor
+    ));
     let source_backend = source.into_backend();
     let source = LocalRootTreeServiceV2::open(source_config, source_backend)
         .expect("source reopens its exact suspended continuation");
@@ -842,6 +875,15 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
         source.recover_ingress(&retry).unwrap(),
         RootTreeIngressRecoveryV2::Suspended,
         "the continuation, not process-local state, owns retry reattachment"
+    );
+    let mut queued_retry = queued;
+    queued_retry.logical_timeslot = 100;
+    assert_eq!(
+        source.recover_ingress(&queued_retry).unwrap(),
+        RootTreeIngressRecoveryV2::Queued {
+            logical_timeslot: 2,
+        },
+        "the second invocation remains guest-owned while the actor is suspended"
     );
 
     let mut node = VosNode::new();
@@ -873,6 +915,23 @@ fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
         )
         .expect("retried ingress resolves from the exact restarted continuation");
     assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
+
+    let queued_ingress = vos::v2::RootTreeInvocationV2 {
+        invocation: queued_retry.invocation,
+        logical_timeslot: queued_retry.logical_timeslot,
+        target: queued_retry.target,
+        method: queued_retry.method,
+        arguments: queued_retry.arguments,
+        proof_requested: false,
+    };
+    let queued_reply = handle
+        .invoke_with_timeout(
+            source_route,
+            queued_ingress.encode(),
+            std::time::Duration::from_secs(20),
+        )
+        .expect("queued invocation executes once the restarted actor becomes idle");
+    assert_eq!(Value::try_decode(&queued_reply), Some(Value::U32(7)));
 
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     let results = router.join().unwrap();

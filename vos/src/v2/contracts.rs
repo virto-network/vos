@@ -929,6 +929,61 @@ pub struct AccumulationEnvelopeV2 {
     pub provided_blobs: Vec<ImportedBlobV2>,
 }
 
+/// Authenticated direct invocation admitted through guest Accumulate before
+/// Refine may execute it. Unlike a `WorkEnvelopeV2`, this record contains only
+/// stable caller input; the scheduler derives the current program, state, and
+/// consistency base when the actor becomes idle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectIngressV2 {
+    pub service: ServiceIdentityV2,
+    pub invocation: InvocationId,
+    pub logical_timeslot: u64,
+    pub target: ActorId,
+    pub method: String,
+    pub arguments: Vec<u8>,
+    pub origin: Origin,
+    pub authorization: AuthorizationEvidenceV2,
+    pub imported_blobs: Vec<BlobRefV2>,
+    pub proof_requested: bool,
+}
+
+impl DirectIngressV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/direct-ingress/v2", &[&self.encode()])
+    }
+
+    /// A transport retry may carry a newer observation timeslot, but every
+    /// caller-controlled input must match the guest-admitted invocation.
+    pub fn matches_retry(&self, candidate: &Self) -> bool {
+        self.service == candidate.service
+            && self.invocation == candidate.invocation
+            && self.target == candidate.target
+            && self.method == candidate.method
+            && self.arguments == candidate.arguments
+            && self.origin == candidate.origin
+            && self.authorization == candidate.authorization
+            && self.imported_blobs == candidate.imported_blobs
+            && self.proof_requested == candidate.proof_requested
+    }
+
+    pub fn matches_work(&self, work: &WorkEnvelopeV2) -> bool {
+        self.service == work.service
+            && self.invocation == work.invocation
+            && work.workflow_step == 0
+            && self.logical_timeslot == work.logical_timeslot
+            && self.target == work.target
+            && self.method == work.method
+            && self.arguments == work.arguments
+            && self.origin == work.origin
+            && self.authorization == work.authorization
+            && work.causal_parent.is_none()
+            && work.parent_call.is_none()
+            && work.awaited_reply.is_none()
+            && self.imported_blobs == work.imported_blobs
+            && self.proof_requested == work.proof_requested
+    }
+}
+
 /// Authenticated cross-root admission input. The destination service guest,
 /// not the native transport, validates the finalized source receipt and
 /// atomically creates the durable inbox row.
@@ -1009,6 +1064,7 @@ pub struct PublicationAckV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulateRequestV2 {
     Install(ServiceGenesisV2),
+    AdmitIngress(DirectIngressV2),
     Apply(AccumulationEnvelopeV2),
     PrepareAttested(AccumulationEnvelopeV2),
     Deliver(DeliveryEnvelopeV2),
@@ -1084,11 +1140,16 @@ impl AccumulationRejectionV2 {
     }
 }
 
-/// Guest output. Only `Installed` and `Accepted` authorize the local driver to
-/// commit its isolated transaction; `Prepared` and `Rejected` are read-only.
+/// Guest output. New installs, ingress admissions, accepted transitions, and
+/// publication acknowledgements authorize a commit when non-duplicate;
+/// `Prepared` and `Rejected` are read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulationResultV2 {
     Installed(ServiceInstallReceiptV2),
+    IngressAdmitted {
+        invocation: InvocationId,
+        duplicate: bool,
+    },
     Accepted {
         receipt: AccumulationReceiptV2,
         published: PublishedEffectsV2,
@@ -2170,6 +2231,48 @@ impl V2Wire for DeliveryEnvelopeV2 {
     }
 }
 
+impl V2Wire for DirectIngressV2 {
+    const MAGIC: [u8; 4] = *b"VDI2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.invocation.0);
+        e.u64(self.logical_timeslot);
+        e.fixed(&self.target.0);
+        e.string(&self.method);
+        e.bytes(&self.arguments);
+        encode_origin(&mut e, self.origin);
+        encode_auth(&mut e, &self.authorization);
+        e.list(&self.imported_blobs, encode_blob_ref);
+        e.bool(self.proof_requested);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            invocation: InvocationId(d.fixed()?),
+            logical_timeslot: d.u64()?,
+            target: ActorId(d.fixed()?),
+            method: d.string()?,
+            arguments: d.bytes()?,
+            origin: decode_origin(d)?,
+            authorization: decode_auth(d)?,
+            imported_blobs: d.list(decode_blob_ref)?,
+            proof_requested: d.bool()?,
+        };
+        ensure_sorted_unique(&value.imported_blobs, |blob| blob.hash.0)?;
+        if value.invocation == InvocationId::ZERO
+            || value.target == ActorId::ZERO
+            || value.method.is_empty()
+            || value.arguments.is_empty()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for CrdtSyncEnvelopeV2 {
     const MAGIC: [u8; 4] = *b"VCS2";
 
@@ -2273,6 +2376,10 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(0);
                 e.bytes(&genesis.encode());
             }
+            Self::AdmitIngress(ingress) => {
+                e.u8(6);
+                e.bytes(&ingress.encode());
+            }
             Self::Apply(envelope) => {
                 e.u8(1);
                 e.bytes(&envelope.encode());
@@ -2299,6 +2406,7 @@ impl V2Wire for AccumulateRequestV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         match d.u8()? {
             0 => Ok(Self::Install(ServiceGenesisV2::decode(&d.bytes()?)?)),
+            6 => Ok(Self::AdmitIngress(DirectIngressV2::decode(&d.bytes()?)?)),
             1 => Ok(Self::Apply(AccumulationEnvelopeV2::decode(&d.bytes()?)?)),
             2 => Ok(Self::PrepareAttested(AccumulationEnvelopeV2::decode(
                 &d.bytes()?,
@@ -2347,6 +2455,14 @@ impl V2Wire for AccumulationResultV2 {
                 e.u8(0);
                 encode_install_receipt(&mut e, receipt);
             }
+            Self::IngressAdmitted {
+                invocation,
+                duplicate,
+            } => {
+                e.u8(5);
+                e.fixed(&invocation.0);
+                e.bool(*duplicate);
+            }
             Self::Accepted {
                 receipt,
                 published,
@@ -2376,6 +2492,17 @@ impl V2Wire for AccumulationResultV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         match d.u8()? {
             0 => Ok(Self::Installed(decode_install_receipt(d)?)),
+            5 => {
+                let invocation = InvocationId(d.fixed()?);
+                let duplicate = d.bool()?;
+                if invocation == InvocationId::ZERO {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(Self::IngressAdmitted {
+                    invocation,
+                    duplicate,
+                })
+            }
             1 => {
                 let receipt = AccumulationReceiptV2::decode(&d.bytes()?)?;
                 let published = PublishedEffectsV2::decode(&d.bytes()?)?;
@@ -4038,6 +4165,23 @@ mod tests {
         });
         assert_eq!(AccumulateRequestV2::decode(&apply.encode()).unwrap(), apply);
 
+        let admission = AccumulateRequestV2::AdmitIngress(DirectIngressV2 {
+            service: service(),
+            invocation: InvocationId([18; 32]),
+            logical_timeslot: 7,
+            target: ActorId([5; 32]),
+            method: "set".into(),
+            arguments: vec![1],
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            imported_blobs: vec![],
+            proof_requested: false,
+        });
+        assert_eq!(
+            AccumulateRequestV2::decode(&admission.encode()).unwrap(),
+            admission
+        );
+
         let acknowledgement = AccumulateRequestV2::AcknowledgePublication(PublicationAckV2 {
             service: service(),
             input: work_input,
@@ -4187,6 +4331,15 @@ mod tests {
 
     #[test]
     fn accumulation_results_are_commit_decisions_on_the_wire() {
+        let admitted = AccumulationResultV2::IngressAdmitted {
+            invocation: InvocationId([11; 32]),
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&admitted.encode()).unwrap(),
+            admitted
+        );
+
         let receipt = AccumulationReceiptV2 {
             service: service(),
             accepted_transition: Hash([12; 32]),
