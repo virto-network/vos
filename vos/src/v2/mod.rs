@@ -78,7 +78,7 @@ pub use pvm::{
 pub use root_service::{
     CommittedDeliveryV2, CommittedRootTreeSliceV2, LocalRootTreeConfigErrorV2,
     LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2,
-    LocalRootTreeServiceV2, RootTreeInvocationV2,
+    LocalRootTreeServiceV2, RootTreeInvocationV2, RootTreeTransportV2,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};

@@ -68,6 +68,138 @@ impl V2Wire for RootTreeInvocationV2 {
     }
 }
 
+/// Node-to-node/root transport carrying only effects already committed by a
+/// source service guest. The destination still enters physical Accumulate;
+/// this wire is not permission to mutate a destination store natively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootTreeTransportV2 {
+    OutboxDelivery {
+        logical_timeslot: u64,
+        publication: PublicationRecordV2,
+        message: MessageRecordV2,
+    },
+    Reply {
+        logical_timeslot: u64,
+        caller_invocation: super::InvocationId,
+        publication: PublicationRecordV2,
+    },
+    PublicationAccepted {
+        input: WorkInputIdV2,
+        publication: super::Hash,
+        call: super::CallId,
+    },
+}
+
+impl V2Wire for RootTreeTransportV2 {
+    const MAGIC: [u8; 4] = *b"VRT2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        match self {
+            Self::OutboxDelivery {
+                logical_timeslot,
+                publication,
+                message,
+            } => {
+                encoder.u8(0);
+                encoder.u64(*logical_timeslot);
+                encoder.bytes(&publication.encode());
+                encoder.bytes(&message.encode());
+            }
+            Self::Reply {
+                logical_timeslot,
+                caller_invocation,
+                publication,
+            } => {
+                encoder.u8(1);
+                encoder.u64(*logical_timeslot);
+                encoder.fixed(&caller_invocation.0);
+                encoder.bytes(&publication.encode());
+            }
+            Self::PublicationAccepted {
+                input,
+                publication,
+                call,
+            } => {
+                encoder.u8(2);
+                encoder.fixed(&input.invocation.0);
+                encoder.u64(input.workflow_step);
+                encoder.fixed(&publication.0);
+                encoder.fixed(&call.0);
+            }
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = match decoder.u8()? {
+            0 => Self::OutboxDelivery {
+                logical_timeslot: decoder.u64()?,
+                publication: PublicationRecordV2::decode(&decoder.bytes()?)?,
+                message: MessageRecordV2::decode(&decoder.bytes()?)?,
+            },
+            1 => Self::Reply {
+                logical_timeslot: decoder.u64()?,
+                caller_invocation: super::InvocationId(decoder.fixed()?),
+                publication: PublicationRecordV2::decode(&decoder.bytes()?)?,
+            },
+            2 => Self::PublicationAccepted {
+                input: WorkInputIdV2 {
+                    invocation: super::InvocationId(decoder.fixed()?),
+                    workflow_step: decoder.u64()?,
+                },
+                publication: super::Hash(decoder.fixed()?),
+                call: super::CallId(decoder.fixed()?),
+            },
+            _ => return Err(DecodeError::InvalidTag),
+        };
+        if !value.is_canonical() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl RootTreeTransportV2 {
+    fn is_canonical(&self) -> bool {
+        match self {
+            Self::OutboxDelivery {
+                publication,
+                message,
+                ..
+            } => {
+                publication.published.reply.is_none()
+                    && publication.published.proof.is_none()
+                    && publication.published.exported_blobs.is_empty()
+                    && publication
+                        .published
+                        .outbox
+                        .binary_search_by_key(&message.call_id, |candidate| candidate.call_id)
+                        .is_ok()
+            }
+            Self::Reply {
+                caller_invocation,
+                publication,
+                ..
+            } => {
+                *caller_invocation != super::InvocationId::ZERO
+                    && publication.published.reply.is_some()
+                    && publication.published.outbox.is_empty()
+                    && publication.published.exported_blobs.is_empty()
+                    && publication.published.proof.is_none()
+            }
+            Self::PublicationAccepted {
+                input,
+                publication,
+                call,
+            } => {
+                input.invocation != super::InvocationId::ZERO
+                    && *publication != super::Hash::ZERO
+                    && *call != super::CallId::ZERO
+            }
+        }
+    }
+}
+
 /// Complete immutable installation input for one locally hosted root tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRootTreeConfigV2 {
@@ -594,6 +726,59 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
 mod tests {
     use super::*;
 
+    fn service_identity(byte: u8) -> ServiceIdentityV2 {
+        ServiceIdentityV2 {
+            space: super::super::SpaceId([1; 32]),
+            root_service: super::super::RootServiceId([byte; 32]),
+            deployment: super::super::DeploymentId([3; 32]),
+            service_program: ProgramId([4; 32]),
+            service_abi: super::super::ABI_VERSION,
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+        }
+    }
+
+    fn outbox_publication() -> (PublicationRecordV2, MessageRecordV2) {
+        let invocation = super::super::InvocationId([5; 32]);
+        let message = MessageRecordV2 {
+            call_id: invocation.call_id(0),
+            caller_invocation: invocation,
+            await_ordinal: 0,
+            from: ActorId([6; 32]),
+            to: ActorId([7; 32]),
+            parent: None,
+            payload: vec![8],
+            authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
+            deadline_timeslot: Some(20),
+        };
+        let input = WorkInputIdV2 {
+            invocation,
+            workflow_step: 0,
+        };
+        let receipt = AccumulationReceiptV2 {
+            service: service_identity(2),
+            accepted_transition: super::super::Hash([9; 32]),
+            reply_commitment: None,
+            outbox_commitment: MessageRecordV2::outbox_commitment(core::slice::from_ref(&message)),
+            resulting_state_root: Some(super::super::Hash([10; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        (
+            PublicationRecordV2 {
+                input,
+                receipt,
+                published: PublishedEffectsV2 {
+                    outbox: vec![message.clone()],
+                    ..PublishedEffectsV2::default()
+                },
+            },
+            message,
+        )
+    }
+
     #[test]
     fn ingress_wire_is_strict_and_binds_invocation_identity() {
         let ingress = RootTreeInvocationV2 {
@@ -613,5 +798,38 @@ mod tests {
         let mut invalid = ingress;
         invalid.invocation = super::super::InvocationId::ZERO;
         assert!(RootTreeInvocationV2::decode(&invalid.encode()).is_err());
+    }
+
+    #[test]
+    fn root_transport_carries_only_committed_canonical_publications() {
+        let (publication, message) = outbox_publication();
+        let delivery = RootTreeTransportV2::OutboxDelivery {
+            logical_timeslot: 11,
+            publication: publication.clone(),
+            message: message.clone(),
+        };
+        assert_eq!(
+            RootTreeTransportV2::decode(&delivery.encode()).unwrap(),
+            delivery
+        );
+
+        let accepted = RootTreeTransportV2::PublicationAccepted {
+            input: publication.input,
+            publication: publication.commitment(),
+            call: message.call_id,
+        };
+        assert_eq!(
+            RootTreeTransportV2::decode(&accepted.encode()).unwrap(),
+            accepted
+        );
+
+        let mut unrelated = message;
+        unrelated.call_id = super::super::CallId([12; 32]);
+        let invalid = RootTreeTransportV2::OutboxDelivery {
+            logical_timeslot: 11,
+            publication,
+            message: unrelated,
+        };
+        assert!(RootTreeTransportV2::decode(&invalid.encode()).is_err());
     }
 }
