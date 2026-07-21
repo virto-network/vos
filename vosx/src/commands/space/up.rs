@@ -1157,35 +1157,32 @@ fn spawn_installed_agents(
         }
         // Raft rows resolve their member seed first — see the
         // runtime reconciler for the full rationale.
-        let is_v2_package = blob_store::cache_get(&BlobHash(a.program_hash))?
-            .is_some_and(|artifact| artifact.get(..4) == Some(b"VOSP"));
-        let raft_members =
-            if consistency_from_u8(a.consistency) == Some(Consistency::Raft) && !is_v2_package {
-                if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
-                    tracing::warn!(
-                        "skipping agent '{}' — program blob {} not in local cache",
+        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
+            if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
+                tracing::warn!(
+                    "skipping agent '{}' — program blob {} not in local cache",
+                    a.instance_name,
+                    BlobHash(a.program_hash),
+                );
+                continue;
+            }
+            match raft_members_for_row(node, data_dir, &a, local_prefix, &mut boot_grace) {
+                Ok(RaftSeed::Members(m)) => Some(m),
+                Ok(RaftSeed::Defer(reason)) => {
+                    tracing::info!(
+                        "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
                         a.instance_name,
-                        BlobHash(a.program_hash),
                     );
                     continue;
                 }
-                match raft_members_for_row(node, data_dir, &a, local_prefix, &mut boot_grace) {
-                    Ok(RaftSeed::Members(m)) => Some(m),
-                    Ok(RaftSeed::Defer(reason)) => {
-                        tracing::info!(
-                            "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
-                            a.instance_name,
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
-                        continue;
-                    }
+                Err(e) => {
+                    tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
+                    continue;
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         match agent_config_from_row(data_dir, space_id, &a, policies, pinned_v2_service)? {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
@@ -1205,23 +1202,24 @@ fn spawn_installed_agents(
                 state_path,
                 network_reachable,
             } => {
-                let service = vos::v2::LocalRootTreeServiceV2::open(
-                    *config,
-                    vos::v2::FileCommittedImageStoreV2::new(state_path),
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!("open v2 root tree '{}': {error:?}", a.instance_name)
-                })?;
                 let svc_id = instance_service_id(&a.instance_name, local_prefix);
-                let id = node
-                    .register_v2_root_at_id(
-                        a.instance_name.clone(),
-                        service,
-                        svc_id,
-                        network_reachable,
-                    )
-                    .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))?;
-                tracing::info!("v2 root tree '{}' as {id} (local)", a.instance_name);
+                let id = register_v2_root_from_row(
+                    node,
+                    data_dir,
+                    a.instance_name.clone(),
+                    a.replication_id,
+                    *config,
+                    state_path,
+                    raft_members,
+                    local_prefix,
+                    svc_id,
+                    network_reachable,
+                )?;
+                tracing::info!(
+                    "v2 root tree '{}' as {id} ({})",
+                    a.instance_name,
+                    crate::commands::space::common::consistency_name(a.consistency),
+                );
             }
             RowConfig::MissingBlob => {
                 tracing::warn!(
@@ -1539,8 +1537,8 @@ fn v2_config_from_row(
             "{} requires the v2 CRDT anti-entropy driver, which is not attached to space up yet",
             row.instance_name
         ),
-        (_, Consistency::Raft) => anyhow::bail!(
-            "{} requires the v2 Raft request-log driver, which is not attached to space up yet",
+        (true, Consistency::Raft) => anyhow::bail!(
+            "{} is #[actor(crdt)] and must be installed with CRDT consistency",
             row.instance_name
         ),
         (_, Consistency::Ephemeral) => anyhow::bail!(
@@ -1551,7 +1549,7 @@ fn v2_config_from_row(
             "{} is #[actor(crdt)] and must be installed with CRDT consistency",
             row.instance_name
         ),
-        (false, Consistency::Local) => {}
+        (false, Consistency::Local | Consistency::Raft) => {}
     }
     if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
         anyhow::bail!(
@@ -1559,12 +1557,9 @@ fn v2_config_from_row(
             row.instance_name
         );
     }
-    if policies
-        .get(&row.instance_name)
-        .is_some_and(|policy| {
-            policy.tick_ms.is_some() || !policy.intra_caps.is_empty() || policy.device_secret
-        })
-    {
+    if policies.get(&row.instance_name).is_some_and(|policy| {
+        policy.tick_ms.is_some() || !policy.intra_caps.is_empty() || policy.device_secret
+    }) {
         anyhow::bail!(
             "{} uses legacy tick/intra_caps/device_secret policy; v2 timers, calls, and secrets use explicit durable inputs",
             row.instance_name
@@ -1593,7 +1588,11 @@ fn v2_config_from_row(
             },
             root_actor,
             actor_name: row.instance_name.clone(),
-            consistency: vos::v2::ConsistencyModeV2::Local,
+            consistency: match consistency {
+                Consistency::Local => vos::v2::ConsistencyModeV2::Local,
+                Consistency::Raft => vos::v2::ConsistencyModeV2::Raft,
+                _ => unreachable!("v2 consistency was validated above"),
+            },
             initial_state: vec![],
             external_actors: vec![],
             install_authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
@@ -1612,6 +1611,62 @@ fn v2_config_from_row(
         state_path,
         network_reachable: row.network_reachable,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_v2_root_from_row(
+    node: &mut VosNode,
+    data_dir: &Path,
+    instance_name: String,
+    replication_id: [u8; 32],
+    config: vos::v2::LocalRootTreeConfigV2,
+    state_path: PathBuf,
+    raft_members: Option<Vec<u16>>,
+    local_prefix: u16,
+    svc_id: ServiceId,
+    network_reachable: bool,
+) -> anyhow::Result<ServiceId> {
+    let backend = vos::v2::FileCommittedImageStoreV2::new(state_path);
+    if config.consistency == vos::v2::ConsistencyModeV2::Raft {
+        let members = raft_members.ok_or_else(|| {
+            anyhow::anyhow!("v2 Raft root tree '{instance_name}' has no resolved voter set")
+        })?;
+        let raft_path = raft_db_path(data_dir, svc_id);
+        if let Some(parent) = raft_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let db = std::sync::Arc::new(
+            redb::Database::create(&raft_path)
+                .map_err(|error| anyhow::anyhow!("open {}: {error}", raft_path.display()))?,
+        );
+        return node
+            .register_v2_raft_root_at_id(
+                instance_name,
+                config,
+                backend,
+                db,
+                vos::raft::RaftConfig {
+                    me: local_prefix,
+                    members,
+                    replication_id,
+                    ..vos::raft::RaftConfig::default()
+                },
+                svc_id,
+                network_reachable,
+            )
+            .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}"));
+    }
+
+    let service = vos::v2::LocalRootTreeServiceV2::open(config, backend)
+        .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error:?}"))?;
+    node.register_v2_root_at_id(instance_name, service, svc_id, network_reachable)
+        .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))
+}
+
+fn raft_db_path(data_dir: &Path, svc_id: ServiceId) -> PathBuf {
+    data_dir
+        .join("agents")
+        .join(format!("{:08x}.redb", svc_id.0))
 }
 
 fn verify_v2_package_signature(
@@ -1822,9 +1877,7 @@ fn raft_members_for_row(
     voters.dedup();
 
     let svc_id = instance_service_id(&a.instance_name, local_prefix);
-    let db_path = data_dir
-        .join("agents")
-        .join(format!("{:08x}.redb", svc_id.0));
+    let db_path = raft_db_path(data_dir, svc_id);
     let anchored = db_path.exists()
         && vos::raft::persisted_membership(&db_path)
             .unwrap_or_default()
@@ -2154,11 +2207,7 @@ fn reconcile_installed_agents(
         // fire when the spawn follows it. The blob probe comes
         // first for the same reason — joining a group we can't
         // spawn into would stall its quorum.
-        let is_v2_package = blob_store::cache_get(&BlobHash(a.program_hash))?
-            .is_some_and(|artifact| artifact.get(..4) == Some(b"VOSP"));
-        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft)
-            && !is_v2_package
-        {
+        let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
             if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
                 spawn_program_blob_fetch(node, a.program_hash, in_flight);
                 if damped.insert(key(RowNote::AwaitingBlob)) {
@@ -2231,24 +2280,15 @@ fn reconcile_installed_agents(
                 state_path,
                 network_reachable,
             }) => {
-                let service = match vos::v2::LocalRootTreeServiceV2::open(
-                    *config,
-                    vos::v2::FileCommittedImageStoreV2::new(state_path),
-                ) {
-                    Ok(service) => service,
-                    Err(error) => {
-                        if damped.insert(key(RowNote::Failed)) {
-                            tracing::warn!(
-                                "agent '{}' v2 service failed to open: {error:?}",
-                                a.instance_name
-                            );
-                        }
-                        continue;
-                    }
-                };
-                match node.register_v2_root_at_id(
+                match register_v2_root_from_row(
+                    node,
+                    data_dir,
                     a.instance_name.clone(),
-                    service,
+                    a.replication_id,
+                    *config,
+                    state_path,
+                    raft_members,
+                    local_prefix,
                     svc_id,
                     network_reachable,
                 ) {
@@ -2342,7 +2382,77 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::identity::Keypair;
+    use vos::metadata::{ActorMeta, MessageMeta};
     use vos::network::{RaftRole, RaftStatusReply};
+    use vos::v2::{
+        DeploymentSignatureV2, PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId,
+        V2Wire, VosPackageV2, artifact_hash,
+    };
+
+    const V2_META: ActorMeta = ActorMeta {
+        actor_name: "counter",
+        messages: &[MessageMeta {
+            name: "value",
+            is_query: true,
+            fields: &[],
+            returns: "u64",
+            doc: "",
+            timeout_ms: 0,
+            mode: 0,
+            attested: false,
+            space_role: None,
+        }],
+        constructor: &[],
+        kind: 0,
+        caps: &[],
+        cli_methods: &[],
+        doc: "",
+        crdt: false,
+    };
+
+    fn signed_v2_package(service_program: ProgramId) -> VosPackageV2 {
+        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        assembler
+            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .ecalli(0);
+        let actor_pvm = assembler.build();
+        let (buffer, length) = vos::metadata::encode::<512>(&V2_META);
+        let schemas = buffer[..length].to_vec();
+        let metadata = vos::metadata::decode(&schemas).unwrap();
+        let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
+            .unwrap()
+            .encode();
+        let keypair = Keypair::generate_ed25519();
+        let public_key = keypair.public().encode_protobuf();
+        let mut package = VosPackageV2 {
+            manifest: PackageManifestV2 {
+                name: "counter".into(),
+                version: "2.0.0".into(),
+                service_abi: vos::v2::ABI_VERSION,
+                snapshot_version: vos::v2::SNAPSHOT_VERSION,
+                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+                service_program,
+                actor_program: ProgramId::of_pvm(&actor_pvm),
+                crdt: false,
+                interfaces_hash: artifact_hash(b"interfaces", &[]),
+                role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+                schemas_hash: artifact_hash(b"schemas", &schemas),
+            },
+            actor_pvm,
+            generated_interfaces: vec![],
+            role_policies,
+            schemas,
+            diagnostics: None,
+            deployment_signature: DeploymentSignatureV2 {
+                producer: ProducerId::of_public_key(&public_key),
+                public_key,
+                signature: vec![0],
+            },
+        };
+        package.deployment_signature.signature = keypair.sign(&package.signing_message()).unwrap();
+        package
+    }
 
     #[test]
     fn signed_v2_packages_never_fall_through_to_the_legacy_actor_runtime() {
@@ -2353,6 +2463,47 @@ mod tests {
                 .to_string()
                 .contains("cannot run in the legacy actor runtime")
         );
+    }
+
+    #[test]
+    fn signed_ordinary_v2_packages_select_the_raft_root_driver() {
+        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        assembler
+            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .ecalli(0);
+        let service_pvm = assembler.build();
+        let service_program = ProgramId::of_pvm(&service_pvm);
+        let package = signed_v2_package(service_program);
+        let row = vos::registry::AgentRow {
+            instance_name: "counter".into(),
+            program_hash: [1; 32],
+            program_name: "counter".into(),
+            program_version: "2.0.0".into(),
+            replication_id: [2; 32],
+            consistency: Consistency::Raft as u8,
+            network_reachable: true,
+            sync_role: vos::registry::SyncFloor::Public,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let pinned = PinnedV2Service {
+            pvm: std::sync::Arc::new(service_pvm),
+            program: service_program,
+        };
+        let resolved = v2_config_from_row(
+            Path::new("/tmp/vos-v2-config-test"),
+            [3; 32],
+            &row,
+            &AgentPolicies::new(),
+            Consistency::Raft,
+            package.encode(),
+            Some(&pinned),
+        )
+        .expect("a signed ordinary v2 package may select Raft");
+        let RowConfig::V2 { config, .. } = resolved else {
+            panic!("v2 package fell through to the legacy runtime")
+        };
+        assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Raft);
     }
 
     #[test]

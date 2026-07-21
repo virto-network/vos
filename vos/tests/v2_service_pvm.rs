@@ -810,6 +810,84 @@ fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
 }
 
 #[test]
+fn node_runs_a_raft_root_through_the_canonical_request_log() {
+    let Some((mut config, _, actor, _)) = workflow_root_configs() else {
+        return;
+    };
+    config.consistency = ConsistencyModeV2::Raft;
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-node-raft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let db = Arc::new(redb::Database::create(&log_path).unwrap());
+    let member = 0xA109;
+    let route = ServiceId::new(member, 209);
+    let mut node = VosNode::new();
+    node.register_v2_raft_root_at_id(
+        "raft-root".into(),
+        config,
+        FailableCommittedImages::default(),
+        db,
+        RaftConfig {
+            me: member,
+            members: vec![member],
+            election_timeout_ms: (10, 30),
+            heartbeat_interval_ms: 5,
+            replication_id: [109; 32],
+            propose_timeout_ms: 2_000,
+        },
+        route,
+        true,
+    )
+    .expect("node attaches the v2 Raft worker and root-tree owner");
+    let handle = node.invoke_handle();
+    let shutdown = node.shutdown_handle();
+    let router = std::thread::spawn(move || {
+        node.run_forever();
+        node.collect()
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("peer_value").encode());
+    let ingress = vos::v2::RootTreeInvocationV2 {
+        invocation: InvocationId([110; 32]),
+        logical_timeslot: 1,
+        target: actor,
+        method: "peer_value".into(),
+        arguments,
+        proof_requested: false,
+    };
+    let reply = handle
+        .invoke_with_timeout(route, ingress.encode(), std::time::Duration::from_secs(20))
+        .expect("the elected root orders admission, apply, and ACK before replying");
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(7)));
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        router
+            .join()
+            .unwrap()
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(
+        log.applied_index().unwrap(),
+        5,
+        "the elected worker's empty leader no-op precedes four IC-5 requests"
+    );
+    drop(log);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("vos=debug")
