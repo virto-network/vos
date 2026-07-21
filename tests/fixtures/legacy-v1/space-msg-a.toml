@@ -1,0 +1,41 @@
+# E2EE messaging demo — host A's genesis recipe. Run both sides with
+# `just demo-msg-procs` (A installs the msg agents from this recipe; the
+# second node joins with an invite token and syncs them). Manual
+# step-by-step in docs/messaging.md.
+
+space = "msg-demo"
+version = "0.1.0"
+
+# One channel ("general") = a crdt envelope log + a raft MLS commit chain,
+# plus the per-space directory and the chronos randomness beacon (raft).
+[[agent]]
+name = "msg-general-log"
+path = "../../../actors/msg-log/target/riscv64em-javm/release/msg_log.elf"
+consistency = "crdt"
+
+[[agent]]
+name = "msg-general-ctl"
+path = "../../../actors/msg-ctl/target/riscv64em-javm/release/msg_ctl.elf"
+consistency = "raft"
+
+[[agent]]
+name = "msg-directory"
+path = "../../../actors/msg-directory/target/riscv64em-javm/release/msg_directory.elf"
+consistency = "raft"
+
+[[agent]]
+name = "chronos"
+path = "../../../actors/chronos/target/riscv64em-javm/release/chronos.elf"
+consistency = "raft"
+
+# The messenger is a device-local PVM agent: it holds this node's private MLS
+# state + CSPRNG seed (never replicated), encrypts/decrypts at the edge, and
+# relays the operator's role to the channel actors (member) and the registry
+# (admin — `messenger create` installs a channel's agent pair).
+[[agent]]
+name = "messenger"
+path = "../../../actors/messenger/target/riscv64em-javm/release/messenger.elf"
+consistency = "local"
+device_secret = true
+tick_ms = 500
+intra_caps = ["msg-*:member", "space-registry:admin"]

@@ -190,7 +190,7 @@ cd ../..
 cargo run -p vosx -- service-pvm \
   services/vos-service/target/riscv64em-javm/release/vos_service.elf \
   --out dist/vos-service.pvm
-cargo run -p vosx -- build examples/v2/counter \
+cargo run -p vosx -- build examples/actors/counter \
   --service-pvm dist/vos-service.pvm
 cargo run -p vosx -- run dist/Counter.vos \
   --service-pvm dist/vos-service.pvm \

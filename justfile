@@ -24,9 +24,20 @@ build-wasm:
     cd examples/wasm/echo; cargo build --target wasm32-unknown-unknown --release
     cd examples/wasm/fetcher; cargo build --target wasm32-unknown-unknown --release
 
-# Build all PVM actors and agents (riscv64 targets, requires custom toolchain).
-build-pvm:
-    cd examples; just build
+# Build the public v2 actors and the legacy PVM regression fixtures.
+build-pvm: build-examples build-legacy-pvm-fixtures
+
+# Build the four public v2 examples (private-age + age-gate is one scenario).
+build-examples:
+    cd examples/actors; cargo +nightly actor -p v2-counter
+    cd examples/actors; cargo +nightly actor -p v2-workflow
+    cd examples/actors; cargo +nightly actor -p v2-private-age
+    cd examples/actors; cargo +nightly actor -p v2-age-gate
+    cd examples/actors; cargo +nightly actor -p v2-shared-board
+
+# Build ELFs retained only by the old-host regression suite.
+build-legacy-pvm-fixtures:
+    cd tests/fixtures/legacy-v1; just build
 
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:
@@ -45,7 +56,7 @@ build-actors: (build-actor "space-registry") (build-actor "space-bridge") \
 
 # Build the voucher-check PVM guest used by Mode::External voucher proofs.
 build-voucher-check:
-    cd examples/actors/voucher-check; cargo +nightly build --release
+    cd tests/fixtures/legacy-v1/actors/voucher-check; cargo +nightly build --release
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")
@@ -99,9 +110,9 @@ bench filter="":
 
 # ── Run ───────────────────────────────────────────────────────────────
 
-# Run a single PVM actor as a one-shot, no space, no networking.
-run-actor name="greeter": build-pvm
-    cargo run --bin vosx -- run examples/actors/{{name}}/target/riscv64em-javm/release/{{name}}.elf
+# Run a retired single-actor fixture through the compatibility harness.
+run-legacy-fixture name="greeter": build-legacy-pvm-fixtures
+    cargo run --bin vosx -- run tests/fixtures/legacy-v1/actors/{{name}}/target/riscv64em-javm/release/{{name}}.elf
 
 # ── zkpvm verifier ──────────────────────────────────────────────────
 
@@ -150,7 +161,7 @@ fmt:
 # Clean build artifacts.
 clean:
     cargo clean
-    try { cd examples; cargo clean } catch { }
+    try { cd examples/actors; cargo clean } catch { }
 
 # Install git hooks (.githooks/pre-commit, .githooks/pre-push).
 install-hooks:

@@ -14,21 +14,21 @@ use zkpvm::{prove, verify};
 fn load_fibonacci_blob() -> Option<Vec<u8>> {
     let blob_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.pvm"
+        "/../tests/fixtures/legacy-v1/actors/fibonacci/target/riscv64em-javm/release/fibonacci.pvm"
     );
     if let Ok(data) = std::fs::read(blob_path) {
         return Some(data);
     }
     let elf_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.elf"
+        "/../tests/fixtures/legacy-v1/actors/fibonacci/target/riscv64em-javm/release/fibonacci.elf"
     );
     let elf_data = match std::fs::read(elf_path) {
         Ok(b) => b,
         Err(_) => {
             eprintln!(
                 "SKIP: fibonacci actor fixture absent; build with \
-                 `cd examples/actors/fibonacci && cargo actor` (or `just build-pvm`)"
+                 `cd tests/fixtures/legacy-v1/actors/fibonacci && cargo actor` (or `just build-pvm`)"
             );
             return None;
         }
@@ -71,7 +71,7 @@ fn trace_fibonacci_actor() {
     assert!(
         steps.len() > 1000 && !format!("{exit:?}").contains("Panic"),
         "fibonacci actor only traced {} steps (exit={exit:?}) — stale/mis-built \
-         ELF? rebuild with `cd examples/actors/fibonacci && cargo actor`",
+         ELF? rebuild with `cd tests/fixtures/legacy-v1/actors/fibonacci && cargo actor`",
         steps.len()
     );
     eprintln!("First: pc={} {:?}", steps[0].pc, steps[0].opcode);
@@ -109,7 +109,7 @@ fn trace_fibonacci_actor() {
 /// message is emitted here, so callers just `let Some(blob) = ... else
 /// { return; };`.
 fn load_actor_blob(name: &str) -> Option<Vec<u8>> {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/actors/");
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/legacy-v1/actors/");
     let pvm_path = format!("{base}{name}/target/riscv64em-javm/release/{name}.pvm");
     if let Ok(data) = std::fs::read(&pvm_path) {
         return Some(data);
@@ -365,7 +365,7 @@ fn trace_clerk_private_pay_bench() {
 fn profile_hash_variant(name: &str) {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/hash-bench/"
+        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
     );
     let pvm_path = format!("{base}hash-{name}.pvm");
     let elf_path = format!("{base}hash-{name}.elf");
@@ -446,7 +446,7 @@ fn compare_hash_algorithms() {
 fn debug_blake2s_prefix() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/hash-bench/"
+        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
     );
     let blob = match std::fs::read(format!("{base}hash-blake2s.pvm")) {
         Ok(b) => b,
@@ -521,7 +521,7 @@ fn debug_blake2s_prefix() {
 fn prove_diverse() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/hash-bench/"
+        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
     );
     let blob = match std::fs::read(format!("{base}hash-diverse.pvm")) {
         Ok(b) => b,
@@ -563,7 +563,7 @@ fn prove_diverse() {
 fn trace_diverse_steps() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/hash-bench/"
+        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
     );
     let blob = match std::fs::read(format!("{base}hash-diverse.pvm")) {
         Ok(b) => b,
@@ -592,7 +592,7 @@ fn trace_diverse_steps() {
 fn trace_keccak_steps() {
     let base = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/hash-bench/"
+        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
     );
     let blob = match std::fs::read(format!("{base}hash-keccak.pvm")) {
         Ok(b) => b,

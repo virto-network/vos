@@ -1,0 +1,63 @@
+[workspace]
+
+[package]
+name = "voucher-check"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `bin` gates the PVM entry-point block (`_start` + `accumulate`)
+# emitted by `#[actor]`. Default-on so a plain `cargo build` for
+# the riscv64em-javm target produces a non-empty ELF; turn off via
+# `default-features = false` when depending on this crate purely
+# as a typed Ref source (no symbols).
+default = ["bin"]
+bin = []
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
+
+# Mode::External voucher proof — the PVM guest binary whose execution
+# IS the zkpvm-proved witness for cipher_clerk::voucher::proof::check.
+#
+# Two ways the prover invokes this binary:
+#
+#   1. v0 smoke test — `start` builds a hardcoded (Public, Secret)
+#      and runs `check`. Validates the prove/verify pipeline against
+#      cipher-clerk semantics. Hardcoded inputs ⇒ same proof every
+#      call.
+#
+#   2. v1 production — `verify_check(public_bytes, secret_bytes)`
+#      decodes rkyv archives from message args. The prover writes
+#      the args into the actor's input buffer before TracingPvm
+#      runs, so each (Public, Secret) tuple produces a distinct
+#      trace and proof. The proof's `initial_state.memory_commitment`
+#      binds the witness bytes — a verifier reconstructs the same
+#      memory layout from `public_bytes(&public)` and checks the
+#      hash matches.
+#
+# Built via `cargo +nightly actor` (the alias in
+# `.cargo/config.toml`).
+[dependencies]
+vos = { path = "../../../../../vos", default-features = false, features = ["macros", "service"] }
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+    "viewing-keys",
+    "voucher",
+    "pvm-precompile",
+] }
+# `pvm-precompile` routes cipher-clerk's Ristretto / scalar ops through
+# zkpvm's precompile ECALLs (RistrettoEcall + comb chips) instead of dalek
+# software arithmetic — a much smaller prove trace. cipher-clerk owns its
+# own path-dep on zkpvm-precompiles via this feature; it is not pulled here
+# directly.
+#
+# `signing` is intentionally NOT enabled: the guest only DECODES and verifies
+# a witness, it never builds transitions, and `signing` would drag in
+# OsRng/getrandom plumbing the actor's PVM build can't satisfy. The voucher
+# feature pulls chacha20poly1305 → aead, none of which need getrandom.
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

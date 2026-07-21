@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "clerk-private-pay-bench"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `bin` gates the PVM entry-point block (`_start`/`accumulate`) the
+# `#[actor]` macro emits under `cfg(all(target_arch = "riscv64",
+# feature = "bin"))` — replaces the removed `vos::pvm_main!` macro.
+default = ["bin"]
+bin = []
+
+[dependencies]
+vos = { path = "../../../../../vos", default-features = false, features = ["macros", "service"] }
+cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["signing", "viewing-keys", "notes", "pvm-precompile"] }
+# cipher-clerk's `signing` feature pulls in rand_core/getrandom for OsRng;
+# we never actually invoke OsRng (we use a deterministic seeded RNG) but
+# need a custom backend so getrandom links on the riscv64em-javm target.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+rand_core = { version = "0.6", default-features = false }
+blake2 = { version = "0.10", default-features = false }
+# Step 1 verification: depend on zkpvm-precompiles (no_std, no
+# host-fallback feature) so the on-target inline-asm path
+# compiles for riscv64em-javm.
+# NOTE: path aligned to the exact one cipher-clerk hardcodes for its
+# own `pvm-precompile` zkpvm-precompiles dep (currently the byte-identical
+# `.wt_alt` worktree copy).  Both deps must reference the SAME path string
+# or cargo reports "package collision in the lockfile" (two `zkpvm-precompiles
+# v0.1.0` from different paths).  The real drift is cipher-clerk pinning a
+# worktree path; this keeps the actor buildable without editing cipher-clerk.
+zkpvm-precompiles = { path = "/home/daniel/src/virto/vos/.wt_alt/zkpvm/precompiles" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

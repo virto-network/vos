@@ -21,7 +21,8 @@ the user's critical path.
 | [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
 | [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
 | [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
-| [`examples/`](examples/) | Sample actors, agents, extensions, wasm guests, space recipes |
+| [`examples/`](examples/) | Four v2 actor examples plus extension and WASM API samples |
+| [`tests/acceptance/clerk/`](tests/acceptance/clerk/) | Complex replicated-payment acceptance application |
 | [`docs/`](docs/) | The VOS Book (architecture, protocols, applications) |
 
 The clean-break service, continuation, wire, package and CRDT contracts—and
@@ -31,40 +32,20 @@ their current implementation status—are documented in
 ## Quick start
 
 ```bash
-# Create a space. Generates per-space identity, runs the bundled
-# space-registry briefly to commit a genesis CrdtEvent, derives
-# space_id from the resulting DAG root. A `--recipe` TOML is
-# banked for genesis-apply on the space's first boot.
-vosx space new demo --recipe examples/space-crdt-a.toml
+# Build the protocol-pinned generic service once.
+cd services/vos-service && cargo +nightly actor && cd ../..
+cargo run -p vosx -- service-pvm \
+  services/vos-service/target/riscv64em-javm/release/vos_service.elf \
+  --out dist/vos-service.pvm
 
-# Run the daemon. Owns the redb, listens on libp2p (auto-port
-# loopback by default; pass --listen for a routable addr). The
-# first boot genesis-applies the banked recipe into the registry
-# (publishes blobs, installs agents, fires their `on_start`);
-# later boots resume the registry as-is. `space up` also accepts a
-# recipe path or a `vos1…` invite token in place of the name.
-vosx space up demo &
+# Build one canonical application PVM and its signed .vos package.
+cargo run -p vosx -- build examples/actors/counter \
+  --service-pvm dist/vos-service.pvm
 
-# Talk to it. `space call` is the floor primitive — any agent,
-# any handler. `space publish/install/agents/etc.` are typed
-# sugar on top.
-vosx space call demo counter inc
-vosx space agents demo
-
-# The ergonomic sibling: `vosx <agent> <method> k=v` dispatches
-# dynamically to any installed agent or extension, coercing args
-# against its schema. This is how you drive the dev/ai/prover/
-# messenger extensions now — e.g. `vosx dev compile project_id=… commit=…`
-# — instead of dedicated `vosx dev`/`vosx ai` verbs.
-vosx --space demo counter add a=2 b=3
-vosx space info demo                    # metadata + daemon liveness + RTT
-vosx space export demo > snapshot.toml  # round-trip back to TOML
-```
-
-Two-process CRDT convergence demo (one shell):
-
-```bash
-# TBD: standalone scripts for the two-process and in-process CRDT demos.
+# The local conformance runner installs and executes the same service PVM.
+cargo run -p vosx -- run dist/Counter.vos \
+  --service-pvm dist/vos-service.pvm \
+  --method value
 ```
 
 ## Consistency modes
@@ -84,8 +65,9 @@ Raft fits
 strictly sequenced state where divergence corrupts (ledgers,
 unique-name registries). Modes mix freely per-agent.
 
-Raft requires a cluster membership list (every replica's
-`node_prefix`). See `examples/space-raft.toml`.
+Raft requires a cluster membership list (every replica's `node_prefix`). The
+daemon driver and package flow are documented in
+[`docs/runtime-v2.md`](docs/runtime-v2.md).
 
 ```bash
 just test                              # rebuild artifacts + full integration suite
@@ -99,7 +81,7 @@ registry.
 
 ```bash
 # host A — create with a genesis recipe, boot, then invite a member
-vosx space new a --recipe space-crdt-a.toml
+vosx space new a --recipe ./my-space.toml
 vosx space up a --listen /ip4/0.0.0.0/tcp/4811 &   # first boot genesis-applies the recipe
 vosx space info a            # prints the node's bootnode hint:
                              #   /ip4/.../tcp/4811/p2p/<peer-id>

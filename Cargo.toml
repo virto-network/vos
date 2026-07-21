@@ -21,16 +21,17 @@ members = [
     "examples/extensions/*",
 ]
 exclude = [
-    "examples/agents/*",
-    "examples/actors/*",
+    # Retired single-actor programs are test fixtures, not public examples.
+    "tests/fixtures/legacy-v1/agents/*",
+    "tests/fixtures/legacy-v1/actors/*",
     # These specific actor/agent crates define their own `[workspace]` and
     # must be excluded individually so Cargo does not treat them as nested
     # workspace roots inside the main workspace.
-    "examples/actors/crdt-counter",
-    "examples/agents/scheduler",
-    "examples/actors/tally",
-    "examples/actors/big-map",
-    "examples/actors/committed-counter",
+    "tests/fixtures/legacy-v1/actors/crdt-counter",
+    "tests/fixtures/legacy-v1/agents/scheduler",
+    "tests/fixtures/legacy-v1/actors/tally",
+    "tests/fixtures/legacy-v1/actors/big-map",
+    "tests/fixtures/legacy-v1/actors/committed-counter",
     "examples/wasm/*",
     # Built-in PVM actors (riscv64em-javm target) live alongside
     # the workspace crates but build with their own toolchain.

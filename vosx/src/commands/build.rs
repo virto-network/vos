@@ -250,9 +250,12 @@ mod tests {
 
     #[test]
     fn workspace_member_builds_from_the_actor_workspace_root() {
-        let member = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/v2/counter");
+        let member = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/actors/counter");
         let root = actor_build_root(&member).unwrap();
-        assert_eq!(root.file_name().and_then(|name| name.to_str()), Some("v2"));
+        assert_eq!(
+            root.file_name().and_then(|name| name.to_str()),
+            Some("actors")
+        );
         assert_eq!(
             root.join("target/riscv64em-javm/release/v2_counter.elf"),
             root.join("target/riscv64em-javm/release")

@@ -430,7 +430,7 @@ impl Drop for TestClient {
 
 /// Minimal stateful counter actor — `inc` mutates + returns the
 /// new count, `get` is a read-only query. Same shape as the
-/// existing examples/actors/counter but with explicit `inc`/`get`
+/// existing tests/fixtures/legacy-v1/actors/counter but with explicit `inc`/`get`
 /// handlers so the assertions are observable from outside.
 const COUNTER_SOURCE: &str = r#"
 use vos::prelude::*;

@@ -400,7 +400,7 @@ end-to-end; 0x01 actors byte-for-byte unaffected.
   chained tick iterations, and cold restart all work with zero
   host-side metadata. Guest `CURRENT_ANCHOR` carries the blob hash
   separately (blob-moved ≠ anchor-moved under 0x02). Tasks stay on
-  0x01 until 4.3. Fixture: `examples/actors/committed-counter` + e2e.
+  0x01 until 4.3. Fixture: `tests/fixtures/legacy-v1/actors/committed-counter` + e2e.
   The guest-framework change took the expected re-pin (cheap half —
   floors unchanged; drift guard re-proved green), and the catalog
   lockstep test now also pins `unpatched_image_root` trace-only.

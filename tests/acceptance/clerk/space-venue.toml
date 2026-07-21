@@ -1,0 +1,28 @@
+# Settlement venue space manifest — the neutral third space both banks
+# federate over (the venue "stands in for" the on-chain settlement venue
+# Wave 2 promises). Run the venue's nodes with this manifest; the banks use
+# tests/acceptance/clerk/space-bank-a.toml / space-bank-b.toml.
+#
+# The venue does not hold either bank's ledger. It registers each bank's
+# clerk pubkey, accepts the banks' signed net-flow claims, and reconciles a
+# window's two claims (their Pedersen commitments must cancel). register_bank
+# / settle_window are Operator-gated; under Raft leader-forward the caller is
+# attributed to the forwarding node's peer, so the venue's voter node peers
+# must be granted Admin (the grant script in the bloque repo does this).
+# submit_claim is an OPEN handler — submitting banks are not venue members.
+space = "venue"
+version = "0.1.0"
+
+# Same hyperspace name as the banks so the venue's clerk-settle is advertised
+# into the shared registry and the banks' drivers can resolve it cross-space.
+hyperspace = "bank-federation"
+
+[[agent]]
+name = "clerk-settle"
+path = "../../../actors/clerk-settle/target/riscv64em-javm/release/clerk_settle.elf"
+# Raft from genesis — the registered banks + settled-window log are HA across
+# the venue operator's nodes. Raft answers the network by design (no opt-out
+# needed). Only one venue runs, and "clerk-settle" is a distinct name from the
+# banks' "clerk-ledger", so the auto replication_id does not collide — left on
+# the default.
+consistency = "raft"

@@ -129,19 +129,19 @@ blake2b_simd = { version = "1", default-features = false }
 # pulls vos's own default features (std + http + storage + network)
 # via the test crate's own resolution so the integration tests can
 # `use vos::runtime::*` etc.
-crdt-counter = { path = "../examples/actors/crdt-counter", default-features = false }
+crdt-counter = { path = "../tests/fixtures/legacy-v1/actors/crdt-counter", default-features = false }
 # Storage-type pressure fixture — the e2e drives a #[storage] map far
 # past the guest heap through the typed `BigMapRef`.
-big-map = { path = "../examples/actors/big-map", default-features = false }
+big-map = { path = "../tests/fixtures/legacy-v1/actors/big-map", default-features = false }
 # Committed-storage fixture — the e2e drives a #[storage(committed)]
 # map's anchor_kind 0x02 chain through the typed `CommittedCounterRef`.
-committed-counter = { path = "../examples/actors/committed-counter", default-features = false }
+committed-counter = { path = "../tests/fixtures/legacy-v1/actors/committed-counter", default-features = false }
 # Scheduler agent (the vos::agent::Tasks reference orchestrator) and
 # the tally Task fixture — dev-deps so host CI compiles their rlibs
 # even without the riscv toolchain; the e2e loads their pre-built ELFs
 # separately. `default-features = false` keeps the PVM bin glue out.
-scheduler = { path = "../examples/agents/scheduler", default-features = false }
-tally = { path = "../examples/actors/tally", default-features = false }
+scheduler = { path = "../tests/fixtures/legacy-v1/agents/scheduler", default-features = false }
+tally = { path = "../tests/fixtures/legacy-v1/actors/tally", default-features = false }
 # Built-in PVM actor — host tests need the typed `SpaceRegistryRef`
 # to drive the registry over the network. `default-features = false`
 # keeps the `bin` (PVM entry-point) glue out of the host link;

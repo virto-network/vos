@@ -233,12 +233,12 @@ fn service_elf() -> Option<Vec<u8>> {
 
 fn greeter_elf() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf");
+        .join("../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-javm/release/greeter.elf");
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(_) => {
             eprintln!(
-                "skipping: build the actor first with `cd examples/actors/greeter && cargo +nightly actor` ({})",
+                "skipping: build the actor first with `cd tests/fixtures/legacy-v1/actors/greeter && cargo +nightly actor` ({})",
                 path.display()
             );
             None
@@ -248,12 +248,12 @@ fn greeter_elf() -> Option<Vec<u8>> {
 
 fn probe_elf() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/probe/target/riscv64em-javm/release/probe.elf");
+        .join("../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-javm/release/probe.elf");
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(_) => {
             eprintln!(
-                "skipping: build the actor first with `cd examples/actors/probe && cargo +nightly actor` ({})",
+                "skipping: build the actor first with `cd tests/fixtures/legacy-v1/actors/probe && cargo +nightly actor` ({})",
                 path.display()
             );
             None
@@ -485,13 +485,13 @@ fn cycle_v2_elf() -> Option<Vec<u8>> {
 
 fn age_gate_v2_elf() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/v2/target/riscv64em-javm/release/v2_age_gate.elf");
+        .join("../examples/actors/target/riscv64em-javm/release/v2_age_gate.elf");
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(_) => {
             eprintln!(
                 "skipping: build the v2 age-gate example with \
-                 `cd examples/v2 && cargo +nightly actor -p v2-age-gate` ({})",
+                 `cd examples/actors && cargo +nightly actor -p v2-age-gate` ({})",
                 path.display()
             );
             None

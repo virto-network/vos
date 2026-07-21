@@ -1,0 +1,46 @@
+# Three-node Raft consensus demo.
+#
+# Unlike CRDT replication (eventually consistent, no leader), Raft
+# gives every state-changing dispatch strict linearizability: the
+# leader appends to the log, blocks until a majority of followers
+# acknowledge, and only then replies to the client. Reads from a
+# follower are NOT linearizable in this build (clients should
+# target the leader); CRDT is still the right pick when reads from
+# any replica are needed.
+#
+# ## Bootstrap
+#
+# One node creates the space and mints invite tokens; each joiner
+# redeems one with a single command. Voter enrollment stays an
+# explicit admin op (`space members add-node`); once enrolled,
+# replicas join the Raft group via joint consensus — no manual
+# `node_prefix` harvesting. (On one machine, give each node its own
+# XDG_DATA_HOME/XDG_CONFIG_HOME — see `just demo-crdt-procs`.)
+#
+#   # Bootstrap node A
+#   vosx space new a --recipe tests/fixtures/legacy-v1/space-raft.toml
+#   vosx space up a --listen /ip4/127.0.0.1/tcp/4811 &
+#   vosx space invite a          # prints a vos1… token per joiner
+#
+#   # hosts B and C — join + boot + auto-redeem, one command each
+#   vosx space up "<the vos1… token>" &
+#
+#   # enroll the joiners as voters (an admin op, from A)
+#   vosx space members a add-node <peer-id-b> --role voter
+#   vosx space members a add-node <peer-id-c> --role voter
+#
+#   # Drive the actor from any replica — only the leader will
+#   # accept writes; followers reply Unreachable until elected.
+#   vosx space call a ledger inc
+
+space = "raft-demo"
+version = "0.1.0"
+
+[[agent]]
+name = "ledger"
+path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
+consistency = "raft"
+# `replication_id` defaults to "auto" =
+# `blake2b(name || 0 || blob)` — every replica that names this
+# actor "ledger" with the same actor binary auto-shares a Raft
+# group, regardless of which addresses they dialed.

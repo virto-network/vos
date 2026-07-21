@@ -9,7 +9,7 @@ use vos::runtime::VosRuntime;
 fn example_elf(name: &str) -> Vec<u8> {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path = format!(
-        "{}/../examples/actors/{name}/target/riscv64em-javm/release/{name}.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-javm/release/{name}.elf",
         workspace
     );
     match std::fs::read(&path) {
@@ -79,7 +79,7 @@ fn agent_service_lifecycle() {
     // The scheduler agent is a service. Verify it inits and halts.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -123,7 +123,7 @@ fn cooperative_loop_with_greeter() {
     // Full cooperative test: scheduler agent invokes greeter.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -184,13 +184,13 @@ fn cooperative_loop_with_greeter() {
 /// Assertion: after N bounded `tick_blocking()` rounds the
 /// runtime still has work pending (scheduler hasn't stopped
 /// queuing self-`tick` messages) and nothing has panicked. The
-/// counter actor in `examples/actors/counter` is the canonical
-/// self-yielding fixture used by `examples/space.toml`.
+/// counter actor in `tests/fixtures/legacy-v1/actors/counter` is the canonical
+/// self-yielding fixture used by `tests/fixtures/legacy-v1/space.toml`.
 #[test]
 fn scheduler_keeps_driving_yielding_counter() {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let scheduler_data = match std::fs::read(&agent_path) {
@@ -268,7 +268,7 @@ fn refine_completes_and_clears_continuation() {
     // loop test.)
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -427,7 +427,7 @@ fn pvm_agent_invokes_extension_via_external_handler() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -515,7 +515,7 @@ fn recording_session_captures_invoke_replies() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -627,7 +627,7 @@ fn replay_session_short_circuits_external_invoke() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -765,7 +765,7 @@ fn crdt_consistency_without_data_dir_fails_loud() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -818,7 +818,7 @@ fn crdt_consistency_without_replication_id_fails_loud() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -878,7 +878,7 @@ fn cross_agent_invoke_returns_typed_reply() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let math_path = format!(
-        "{}/../examples/actors/math/target/riscv64em-javm/release/math.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/math/target/riscv64em-javm/release/math.elf",
         workspace,
     );
     let math_data = match std::fs::read(&math_path) {
@@ -1024,11 +1024,11 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let scheduler_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace,
     );
     let greeter_path = format!(
-        "{}/../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-javm/release/greeter.elf",
         workspace,
     );
     let scheduler_data = match std::fs::read(&scheduler_path) {
@@ -1146,11 +1146,11 @@ fn cross_agent_invoke_routes_through_node() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let scheduler_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace,
     );
     let greeter_path = format!(
-        "{}/../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-javm/release/greeter.elf",
         workspace,
     );
     let scheduler_data = match std::fs::read(&scheduler_path) {
@@ -1219,7 +1219,7 @@ fn recording_cap_truncates_oversized_invoke_output() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -1313,7 +1313,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -1553,7 +1553,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1634,7 +1634,7 @@ fn fetch_over_buf_size_boundary_is_refused() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1702,7 +1702,7 @@ fn crdt_counter_local_invoke_smoke() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&counter_path) {
@@ -1737,7 +1737,7 @@ fn crdt_counter_init_payloads_dispatch() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&counter_path) {
@@ -1835,7 +1835,7 @@ fn crdt_counter_converges_across_nodes_live() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2056,7 +2056,7 @@ fn crdt_scheduler_install_propagates_across_nodes() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let scheduler_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace,
     );
     let scheduler_data = match std::fs::read(&scheduler_path) {
@@ -2246,7 +2246,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2473,7 +2473,7 @@ fn crdt_counter_restart_replays_state_from_disk() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2614,7 +2614,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2764,7 +2764,7 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -2852,7 +2852,7 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2969,7 +2969,7 @@ fn crdt_counter_shutdown_under_active_load() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3130,7 +3130,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3384,7 +3384,7 @@ fn scheduler_drops_non_existent_children_and_keeps_others_running() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -3521,7 +3521,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3675,7 +3675,7 @@ fn raft_counter_single_node_replays_log_after_restart() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3822,7 +3822,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -4104,7 +4104,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -4356,7 +4356,7 @@ fn external_invoke_yielded_surfaces_as_invoke_yielded() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -4443,7 +4443,7 @@ fn invoked_child_storage_isolated_from_parent_journal() {
     // returns. Counter then progresses normally: 1, 2, 3, 4, ...
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -5943,7 +5943,7 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
         env!("CARGO_MANIFEST_DIR"),
     );
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
@@ -6865,7 +6865,7 @@ fn voucher_check_elf_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../examples/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }
@@ -11280,7 +11280,7 @@ fn replay_reabsorbs_task_effects() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11375,7 +11375,7 @@ fn task_storage_reads_come_from_the_witness() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11472,7 +11472,7 @@ fn task_invoke_live_equals_traced() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11625,7 +11625,7 @@ fn task_suspension_resumes_through_task_record() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11780,7 +11780,7 @@ fn voucher_check_catalog_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../examples/actors/voucher-check/catalog.toml",
+        "{}/../tests/fixtures/legacy-v1/actors/voucher-check/catalog.toml",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }
@@ -11869,7 +11869,7 @@ fn storage_map_outgrows_guest_heap() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path = format!(
-        "{}/../examples/actors/big-map/target/riscv64em-javm/release/big_map.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/big-map/target/riscv64em-javm/release/big_map.elf",
         workspace,
     );
     let data = match std::fs::read(&path) {
@@ -12183,7 +12183,7 @@ fn committed_map_anchors_with_smt_roots() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path = format!(
-        "{}/../examples/actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&path) {

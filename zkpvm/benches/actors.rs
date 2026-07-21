@@ -133,21 +133,21 @@ mod imp {
     fn load_fibonacci_blob() -> Option<Vec<u8>> {
         let blob_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.pvm"
+            "/../tests/fixtures/legacy-v1/actors/fibonacci/target/riscv64em-javm/release/fibonacci.pvm"
         );
         if let Ok(data) = std::fs::read(blob_path) {
             return Some(data);
         }
         let elf_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../examples/actors/fibonacci/target/riscv64em-javm/release/fibonacci.elf"
+            "/../tests/fixtures/legacy-v1/actors/fibonacci/target/riscv64em-javm/release/fibonacci.elf"
         );
         let elf_data = match std::fs::read(elf_path) {
             Ok(b) => b,
             Err(_) => {
                 eprintln!(
                     "SKIP: fibonacci actor fixture absent; build with \
-                     `cd examples/actors/fibonacci && cargo actor` (or `just build-pvm`)"
+                     `cd tests/fixtures/legacy-v1/actors/fibonacci && cargo actor` (or `just build-pvm`)"
                 );
                 return None;
             }
@@ -161,7 +161,7 @@ mod imp {
     /// message is emitted here, so callers just `let Some(blob) = ... else
     /// { return; };`.
     fn load_actor_blob(name: &str) -> Option<Vec<u8>> {
-        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/actors/");
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/legacy-v1/actors/");
         let pvm_path = format!("{base}{name}/target/riscv64em-javm/release/{name}.pvm");
         if let Ok(data) = std::fs::read(&pvm_path) {
             return Some(data);
@@ -447,7 +447,7 @@ mod imp {
     }
 
     /// Real-workload prove: clerk-refine-bench (vos macro style, see
-    /// examples/actors/clerk-refine-bench).  vos-macros special-case a
+    /// tests/fixtures/legacy-v1/actors/clerk-refine-bench).  vos-macros special-case a
     /// method named `start` as the on_start lifecycle hook, so the
     /// bare interpreter_from_blob path drives the workload via cold
     /// start without needing a FETCH-delivered invocation.

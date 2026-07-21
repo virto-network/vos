@@ -46,7 +46,7 @@ const RISCV_TARGET_JSON: &str = include_str!("../../../actors/dev-project/riscv6
 /// spec's current shape. Pinning the generic `nightly` channel
 /// means the synthesised build picks up whatever fresh nightly
 /// the operator's rustup default points at — same one the
-/// `examples/actors/*/cargo actor` recipes target.
+/// `tests/fixtures/legacy-v1/actors/*/cargo actor` recipes target.
 const RUST_TOOLCHAIN: &str = r#"[toolchain]
 channel = "nightly"
 components = ["rust-src"]
@@ -720,7 +720,7 @@ panic = "abort"
 }
 
 /// Cargo config baked into every synthesised project. Mirrors what
-/// `examples/actors/*/`.cargo/config.toml looks like — the rustflags
+/// `tests/fixtures/legacy-v1/actors/*/`.cargo/config.toml looks like — the rustflags
 /// inject the `no_std` / `no_main` crate attrs that PVM actors
 /// expect, and `json-target-spec` lets `--target X.json` resolve.
 const CARGO_CONFIG_TOML: &str = r#"[target.riscv64em-javm]
