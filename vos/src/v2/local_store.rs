@@ -479,6 +479,24 @@ impl LocalJamStoreV2 {
             .collect()
     }
 
+    /// Recover the guest-committed identity of an invocation for transport
+    /// retry validation. The returned checkpoint is read-only authenticated
+    /// service state; hosts cannot insert or rewrite it directly.
+    pub fn workflow_checkpoint(
+        &self,
+        invocation: super::InvocationId,
+    ) -> Result<Option<super::WorkflowCheckpointV2>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(None);
+        };
+        self.state_row(header.service_root, &StateKeyV2::Workflow(invocation))?
+            .map(|bytes| {
+                super::WorkflowCheckpointV2::decode(&bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptStateTree)
+            })
+            .transpose()
+    }
+
     /// Make an installation input available to guest Accumulate. This is a
     /// content-addressed import operation, not a service-state mutation.
     pub fn import_blob(&mut self, bytes: Vec<u8>) -> BlobRefV2 {

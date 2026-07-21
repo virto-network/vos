@@ -9,16 +9,63 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
     AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, DurableJamStoreV2,
     DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
-    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, NoRefineProtocolHostV2,
-    PackageError, ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    VosPackageV2, WorkInputIdV2,
+    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, PackageError, ProgramId, PublicationAckV2, PublicationRecordV2,
+    PublishedEffectsV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
+    StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
 };
+
+/// Strict host/network ingress for one direct root-tree invocation. Origin and
+/// authorization are deliberately absent: the receiving host derives them
+/// from its authenticated transport and grant state before scheduling work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootTreeInvocationV2 {
+    pub invocation: super::InvocationId,
+    pub logical_timeslot: u64,
+    pub target: ActorId,
+    pub method: String,
+    pub arguments: Vec<u8>,
+    pub proof_requested: bool,
+}
+
+impl V2Wire for RootTreeInvocationV2 {
+    const MAGIC: [u8; 4] = *b"VRI2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.fixed(&self.invocation.0);
+        encoder.u64(self.logical_timeslot);
+        encoder.fixed(&self.target.0);
+        encoder.string(&self.method);
+        encoder.bytes(&self.arguments);
+        encoder.bool(self.proof_requested);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            invocation: super::InvocationId(decoder.fixed()?),
+            logical_timeslot: decoder.u64()?,
+            target: ActorId(decoder.fixed()?),
+            method: decoder.string()?,
+            arguments: decoder.bytes()?,
+            proof_requested: decoder.bool()?,
+        };
+        if value.invocation == super::InvocationId::ZERO
+            || value.target == ActorId::ZERO
+            || value.method.is_empty()
+            || value.arguments.is_empty()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
 
 /// Complete immutable installation input for one locally hosted root tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +117,7 @@ pub enum LocalRootTreeInvokeErrorV2 {
     UnexpectedResult,
     CorruptStore(LocalStoreReadErrorV2),
     MissingPublication,
+    DivergentReplay,
 }
 
 /// Result made visible only after physical Accumulate committed the durable
@@ -272,6 +320,75 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.service.accumulate_host_mut()
     }
 
+    pub fn root_method_policy(
+        &self,
+        method: &str,
+    ) -> Result<Option<MethodPolicyV2>, LocalRootTreeInvokeErrorV2> {
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
+        let descriptor = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(self.root_actor),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
+        Ok(descriptor
+            .methods
+            .binary_search_by(|policy| policy.method.as_str().cmp(method))
+            .ok()
+            .map(|index| descriptor.methods[index].clone()))
+    }
+
+    /// Return a still-pending publication only when the retry is byte-for-byte
+    /// equivalent to the work identity already committed by the guest.
+    pub fn recover_publication(
+        &self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<Option<PublicationRecordV2>, LocalRootTreeInvokeErrorV2> {
+        let input = WorkInputIdV2 {
+            invocation: request.invocation,
+            workflow_step: request.workflow_step,
+        };
+        let publication = self
+            .pending_publications()?
+            .into_iter()
+            .find(|publication| publication.input == input);
+        let Some(publication) = publication else {
+            return Ok(None);
+        };
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(request.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::DivergentReplay)?;
+        let work = checkpoint.resume_work;
+        if work.input_id() != input
+            || work.logical_timeslot != request.logical_timeslot
+            || work.target != request.target
+            || work.method != request.method
+            || work.arguments != request.arguments
+            || work.origin != request.origin
+            || work.authorization != request.authorization
+            || work.causal_parent != request.causal_parent
+            || work.parent_call != request.parent_call
+            || work.awaited_reply != request.awaited_reply
+            || work.imported_blobs != request.imported_blobs
+            || work.proof_requested != request.proof_requested
+        {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+        }
+        Ok(Some(publication))
+    }
+
     /// Execute one ordinary slice. Attested work requires a configured proof
     /// producer and uses the separate proof-before-Accumulate path.
     pub fn invoke(
@@ -366,5 +483,31 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         let (_, store) = self.service.into_hosts();
         let (_, backend) = store.into_parts();
         backend
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingress_wire_is_strict_and_binds_invocation_identity() {
+        let ingress = RootTreeInvocationV2 {
+            invocation: super::super::InvocationId([1; 32]),
+            logical_timeslot: 7,
+            target: ActorId([2; 32]),
+            method: "value".into(),
+            arguments: vec![3],
+            proof_requested: false,
+        };
+        let bytes = ingress.encode();
+        assert_eq!(RootTreeInvocationV2::decode(&bytes).unwrap(), ingress);
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(RootTreeInvocationV2::decode(&trailing).is_err());
+
+        let mut invalid = ingress;
+        invalid.invocation = super::super::InvocationId::ZERO;
+        assert!(RootTreeInvocationV2::decode(&invalid.encode()).is_err());
     }
 }

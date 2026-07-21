@@ -83,6 +83,17 @@ guest state. Non-empty replies, outbox records, blobs, and proofs remain in the
 guest-owned publication table until the host submits their exact commitment to
 physical Accumulate for acknowledgement.
 
+`VosNode::register_v2_root_at_id` attaches that owner to the existing node
+transport without converting its `ActorId` into a route identifier. Direct v2
+calls use `RootTreeInvocationV2`, which carries the stable `InvocationId`,
+logical timeslot, exact actor, method, arguments, and proof mode. The service
+thread derives typed origin and authorization from the authenticated transport,
+checks them against the signed method policy, and rejects a retry whose durable
+workflow identity differs. A reply-only publication is acknowledged only after
+the consumer channel accepts it; outbox/blob/proof publications stay durable
+for their dedicated delivery paths. Attested ingress currently fails closed
+unless a proof producer is configured.
+
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an
 `EffectLog` or a leader-produced post-state image. `ReplicatedJamServiceV2`

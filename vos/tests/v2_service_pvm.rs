@@ -10,6 +10,7 @@ use vos::attestation::{
     ProducedAttestationProofV2,
 };
 use vos::network::RaftRpcHandler;
+use vos::node::VosNode;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
@@ -31,6 +32,7 @@ use vos::v2::{
 };
 use vos::{
     Attestation, AttestedMethod, Decode, Encode, StateCommitmentV3,
+    abi::service::ServiceId,
     value::{Msg, Value},
 };
 
@@ -557,22 +559,23 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
             .expect("fresh service installs through physical Accumulate");
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("start").encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([96; 32]),
+        workflow_step: 0,
+        logical_timeslot: 1,
+        target: actor,
+        method: "start".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
     let first = service
-        .invoke(LocalWorkRequestV2 {
-            invocation: InvocationId([96; 32]),
-            workflow_step: 0,
-            logical_timeslot: 1,
-            target: actor,
-            method: "start".into(),
-            arguments,
-            origin: Origin::Anonymous,
-            authorization: AuthorizationEvidenceV2::Public,
-            causal_parent: None,
-            parent_call: None,
-            awaited_reply: None,
-            imported_blobs: vec![],
-            proof_requested: false,
-        })
+        .invoke(request.clone())
         .expect("slice commits through physical Accumulate");
     let publication = first
         .publication
@@ -587,6 +590,16 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         restarted.pending_publications().unwrap(),
         vec![publication.clone()]
     );
+    assert_eq!(
+        restarted.recover_publication(&request).unwrap(),
+        Some(publication.clone())
+    );
+    let mut divergent = request;
+    divergent.method = "different".into();
+    assert!(matches!(
+        restarted.recover_publication(&divergent),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::DivergentReplay)
+    ));
     assert!(!restarted.acknowledge_publication(&publication).unwrap());
 
     let backend = restarted.into_backend();
@@ -594,6 +607,18 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         .expect("acknowledged image restores through the same service identity");
     assert!(restarted.pending_publications().unwrap().is_empty());
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("greeter".into(), restarted, ServiceId(77), true)
+        .expect("node registers the canonical actor identity without truncating it");
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    let reply = node
+        .invoke_actor(actor, arguments)
+        .expect("bound actor identity routes through strict v2 ingress");
+    assert!(reply.is_empty(), "unit replies retain the established host ABI");
+    node.shutdown();
+    assert!(node.collect().into_iter().all(|result| result.is_ok()));
 }
 
 #[test]

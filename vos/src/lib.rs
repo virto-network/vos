@@ -277,6 +277,21 @@ mod host_invoker {
                 }
             }
         }
+
+        fn invoke_actor(
+            &mut self,
+            target: crate::v2::ActorId,
+            payload: Vec<u8>,
+        ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
+            let outcome = VosNode::invoke_actor(self, target, payload);
+            async move {
+                match outcome {
+                    Some(bytes) if bytes.is_empty() => Ok(Value::Unit),
+                    Some(bytes) => Ok(<Value as Decode>::decode(&bytes)),
+                    None => Err(ClientError::Unreachable),
+                }
+            }
+        }
     }
 
     /// True iff `bytes` is the 5-byte `STATUS_FORBIDDEN` envelope
