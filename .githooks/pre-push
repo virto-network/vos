@@ -20,7 +20,7 @@ just build-pvm 2>&1 | tee "$LOG"
 if grep -q 'found to be present in multiple build targets' "$LOG"; then
     echo "✗ pre-push: cargo emitted the multi-target warning."
     echo "  Some actor crate has both lib.rs and main.rs. Drop main.rs and"
-    echo "  use \`cargo rustc --lib --crate-type bin\` (see examples/actors/*/.cargo/config.toml)."
+    echo "  use \`cargo rustc --lib --crate-type bin\` (see examples/actors/.cargo/config.toml)."
     exit 1
 fi
 

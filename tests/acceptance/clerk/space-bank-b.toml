@@ -1,0 +1,21 @@
+# Bank space manifest — bank-b, the second federating bank. Identical to
+# tests/acceptance/clerk/space-bank-a.toml except for the space name and the pinned ledger
+# replication_id (see that file's header for why the id must differ per bank).
+space = "bank-b"
+version = "0.1.0"
+
+hyperspace = "bank-federation"
+
+[[agent]]
+name = "clerk-ledger"
+path = "../../../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf"
+# Raft from genesis — HA across bank-b's nodes; distinct group from bank-a.
+consistency = "raft"
+replication_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[agent]]
+name = "clerk-bridge"
+path = "../../../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf"
+# Local + network_reachable — holds anchor/dedup/window state, must persist.
+consistency = "local"
+network_reachable = true

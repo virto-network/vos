@@ -2,7 +2,7 @@
 
 //! Mode::External voucher-proof pipeline smoke test.
 //!
-//! Loads `examples/actors/voucher-check`'s PVM ELF, traces a bare run
+//! Loads `tests/fixtures/legacy-v1/actors/voucher-check`'s PVM ELF, traces a bare run
 //! (no injected witness — the guest early-exits without proving),
 //! proves it, then verifies via `zkpvm_verifier::verify_standalone`
 //! against the program-commitment hash extracted from the proof.
@@ -28,7 +28,7 @@
 //! Build the actor first:
 //!     just build-voucher-check
 //! Or directly:
-//!     cd examples/actors/voucher-check && cargo +nightly build --release
+//!     cd tests/fixtures/legacy-v1/actors/voucher-check && cargo +nightly build --release
 
 use zkpvm::{SideNote, program_commitment_hex, program_commitment_of_proof, prove, prove_mobile};
 
@@ -42,7 +42,7 @@ fn load_voucher_check_blob() -> Option<Vec<u8>> {
     // `.wt_alt/` — single-up is the correct relative path either way.)
     let elf_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../examples/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
+        "/../tests/fixtures/legacy-v1/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
     );
     let elf = match std::fs::read(elf_path) {
         Ok(b) => b,

@@ -249,8 +249,9 @@ The `messenger` relays the **operator's** role to the actors it calls, bounded b
 `intra_caps`: `member` is the ceiling for posting and committing on the channel
 actors, and `space-registry:admin` lets an admin's `create` install a new
 channel's agent pair. A caller below the required role is refused downstream — the
-messenger grants no authority of its own. See `examples/space-msg-{a,b}.toml` for
-a runnable two-node demo (`just demo-msg-procs`).
+messenger grants no authority of its own. The retired single-actor recipe is
+retained at `tests/fixtures/legacy-v1/space-msg-a.toml` until this scenario is
+rebuilt on the v2 package flow.
 
 ## Security
 

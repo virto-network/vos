@@ -369,14 +369,14 @@ fn canonical_service_build_pins_path_independent_crate_identity() {
 
 fn greeter_elf() -> Vec<u8> {
     required_elf(
-        "../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        "../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-javm/release/greeter.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn probe_elf() -> Vec<u8> {
     required_elf(
-        "../examples/actors/probe/target/riscv64em-javm/release/probe.elf",
+        "../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-javm/release/probe.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }

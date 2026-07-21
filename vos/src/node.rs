@@ -10102,8 +10102,9 @@ mod tests {
         use std::sync::mpsc;
 
         let workspace = env!("CARGO_MANIFEST_DIR");
-        let elf_path =
-            format!("{workspace}/../examples/actors/probe/target/riscv64em-javm/release/probe.elf");
+        let elf_path = format!(
+            "{workspace}/../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-javm/release/probe.elf"
+        );
         let Ok(elf) = std::fs::read(&elf_path) else {
             eprintln!("SKIP: probe ELF not built — run: just build-pvm");
             return;

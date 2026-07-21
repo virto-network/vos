@@ -24,10 +24,20 @@ build-wasm:
     cd examples/wasm/echo; cargo build --target wasm32-unknown-unknown --release
     cd examples/wasm/fetcher; cargo build --target wasm32-unknown-unknown --release
 
-# Build all PVM actors and agents (riscv64 targets, requires custom toolchain).
-build-pvm:
-    cd examples; just build
-    cd tests/fixtures/legacy-v1/actors/crdt-counter; cargo +nightly actor
+# Build the public v2 actors and the legacy PVM regression fixtures.
+build-pvm: build-examples build-legacy-pvm-fixtures
+
+# Build the four public v2 examples (private-age + age-gate is one scenario).
+build-examples:
+    cd examples/actors; cargo +nightly actor -p v2-counter
+    cd examples/actors; cargo +nightly actor -p v2-workflow
+    cd examples/actors; cargo +nightly actor -p v2-private-age
+    cd examples/actors; cargo +nightly actor -p v2-age-gate
+    cd examples/actors; cargo +nightly actor -p v2-shared-board
+
+# Build ELFs retained only by the old-host regression suite.
+build-legacy-pvm-fixtures:
+    cd tests/fixtures/legacy-v1; just build
 
 # Build the protocol-pinned generic VOS service guest.
 build-vos-service:
@@ -35,8 +45,8 @@ build-vos-service:
 
 # Build every guest consumed by the physical v2 service-PVM gate.
 build-v2-pvm-test-artifacts: build-vos-service
-    cd examples/actors/greeter; cargo +nightly actor
-    cd examples/actors/probe; cargo +nightly actor
+    cd tests/fixtures/legacy-v1/actors/greeter; cargo +nightly actor
+    cd tests/fixtures/legacy-v1/actors/probe; cargo +nightly actor
     cd vos/tests/fixtures/crdt-counter-v2; cargo +nightly actor
     cd vos/tests/fixtures/workflow-v2; cargo +nightly actor
     cd vos/tests/fixtures/cycle-v2; cargo +nightly actor
@@ -58,7 +68,7 @@ build-actors: (build-actor "space-registry") (build-actor "space-bridge") \
 
 # Build the voucher-check PVM guest used by Mode::External voucher proofs.
 build-voucher-check:
-    cd examples/actors/voucher-check; cargo +nightly build --release
+    cd tests/fixtures/legacy-v1/actors/voucher-check; cargo +nightly build --release
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")
@@ -86,11 +96,12 @@ test: build-test-artifacts
 
 # Build and test the concise runtime-v2 examples in their nested workspace.
 test-v2-examples:
-    cd examples/v2; cargo test --workspace
-    cd examples/v2; cargo +nightly actor -p v2-counter
-    cd examples/v2; cargo +nightly actor -p v2-workflow
-    cd examples/v2; cargo +nightly actor -p v2-private-age
-    cd examples/v2; cargo +nightly actor -p v2-shared-board
+    cd examples/actors; cargo test --workspace
+    cd examples/actors; cargo +nightly actor -p v2-counter
+    cd examples/actors; cargo +nightly actor -p v2-workflow
+    cd examples/actors; cargo +nightly actor -p v2-private-age
+    cd examples/actors; cargo +nightly actor -p v2-age-gate
+    cd examples/actors; cargo +nightly actor -p v2-shared-board
 
 # Run extension tests.
 test-extensions: build-extensions
@@ -121,9 +132,9 @@ bench filter="":
 
 # ── Run ───────────────────────────────────────────────────────────────
 
-# Run a single PVM actor as a one-shot, no space, no networking.
+# Run a retired v1 fixture as a one-shot, no space, no networking.
 run-actor name="greeter": build-pvm
-    cargo run --bin vosx -- run examples/actors/{{name}}/target/riscv64em-javm/release/{{name}}.elf
+    cargo run --bin vosx -- run tests/fixtures/legacy-v1/actors/{{name}}/target/riscv64em-javm/release/{{name}}.elf
 
 # ── zkpvm verifier ──────────────────────────────────────────────────
 
@@ -175,8 +186,7 @@ fmt:
 # Clean build artifacts.
 clean:
     cargo clean
-    try { cd examples; cargo clean } catch { }
-    try { cd examples/v2; cargo clean } catch { }
+    try { cd examples/actors; cargo clean } catch { }
 
 # Install git hooks (.githooks/pre-commit, .githooks/pre-push).
 install-hooks:

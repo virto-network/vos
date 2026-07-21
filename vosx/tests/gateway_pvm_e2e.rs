@@ -32,7 +32,7 @@
 //! Build prerequisites
 //!
 //!   cargo build -p vosx -p http-gateway
-//!   cd examples && just build
+//!   cd tests/fixtures/legacy-v1 && just build
 //!
 //! The test panics with a helpful hint if any artifact is
 //! missing rather than trying to build it itself — keeps
@@ -67,7 +67,7 @@ fn gateway_so() -> PathBuf {
 
 fn actor_elf(name: &str) -> PathBuf {
     workspace().join(format!(
-        "examples/actors/{name}/target/riscv64em-javm/release/{name}.elf"
+        "tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-javm/release/{name}.elf"
     ))
 }
 
@@ -75,9 +75,18 @@ fn ensure_built() {
     for (path, hint) in [
         (vosx_bin(), "cargo build -p vosx"),
         (gateway_so(), "cargo build -p http-gateway"),
-        (actor_elf("greeter"), "cd examples && just build"),
-        (actor_elf("counter"), "cd examples && just build"),
-        (actor_elf("math"), "cd examples && just build"),
+        (
+            actor_elf("greeter"),
+            "cd tests/fixtures/legacy-v1 && just build",
+        ),
+        (
+            actor_elf("counter"),
+            "cd tests/fixtures/legacy-v1 && just build",
+        ),
+        (
+            actor_elf("math"),
+            "cd tests/fixtures/legacy-v1 && just build",
+        ),
     ] {
         if !path.exists() {
             panic!("test artifact missing: {}\nRun: {}", path.display(), hint,);

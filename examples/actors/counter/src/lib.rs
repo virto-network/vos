@@ -1,29 +1,40 @@
-//! Counter actor — increments and prints a count each iteration.
-//!
-//! Demonstrates a stateful refine-only actor with a yield loop.
-//! Each invocation runs one iteration: increment, print, yield.
-//! The agent re-invokes to drive subsequent iterations.
+//! Ordinary state uses Local or Raft consistency without CRDT overhead.
 
 use vos::prelude::*;
 
 #[actor]
-struct Counter {
-    count: u32,
+pub struct Counter {
+    value: u64,
+}
+
+fn increment_value(value: u64, by: u64) -> u64 {
+    value.saturating_add(by)
 }
 
 #[messages]
 impl Counter {
     fn new() -> Self {
-        Counter { count: 0 }
+        Self { value: 0 }
     }
 
     #[msg]
-    async fn start(&mut self, ctx: &mut Context<Self>) {
-        loop {
-            self.count += 1;
-            log::info!("counter: count = {}", self.count);
-            ctx.yield_now().await;
-        }
+    fn increment(&mut self, by: u64) -> u64 {
+        self.value = increment_value(self.value, by);
+        self.value
+    }
+
+    #[msg]
+    fn value(&self) -> u64 {
+        self.value
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn increment_is_deterministic_at_the_numeric_limit() {
+        assert_eq!(increment_value(u64::MAX, 1), u64::MAX);
+    }
+}

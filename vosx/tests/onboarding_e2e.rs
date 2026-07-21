@@ -353,10 +353,10 @@ fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
     let daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
     wait_for_endpoint(data_a.path(), &log_a, "A");
     let counter_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf");
+        .join("../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf");
     assert!(
         counter_elf.is_file(),
-        "build the onboarding CRDT fixture first: `cd examples/actors/crdt-counter && cargo actor`",
+        "build the onboarding CRDT fixture first: `cd tests/fixtures/legacy-v1/actors/crdt-counter && cargo actor`",
     );
     let counter_source = counter_elf.to_string_lossy().into_owned();
     vosx_ok(

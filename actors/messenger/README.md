@@ -223,5 +223,5 @@ tick_ms = 500
 intra_caps = ["msg-*:member", "space-registry:admin"]
 ```
 
-See `examples/space-msg-{a,b}.toml` for a runnable two-node demo
-(`just demo-msg-procs`).
+The retired single-actor recipe remains at
+`tests/fixtures/legacy-v1/space-msg-a.toml` for regression coverage.

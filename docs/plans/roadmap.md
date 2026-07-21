@@ -109,8 +109,9 @@ scripts only.)
   *forwarding node's* peer — grant each voter node's own peer `Admin`, or
   target the leader directly.
 
-**Reference manifests already exist**: `examples/space-bank-a.toml`,
-`space-bank-b.toml`, `space-venue.toml` — mirror their postures.
+**Reference manifests already exist** under `tests/acceptance/clerk`:
+`space-bank-a.toml`, `space-bank-b.toml`, and `space-venue.toml` — mirror their
+postures.
 
 **Beats:** intra-bank instant payment → Raft failover (kill bank-a's
 leader, payment still lands) → privacy (cross-bank ledger read →
