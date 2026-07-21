@@ -110,6 +110,23 @@ and signatures but includes the authoritative manifest and PVM bytes.
 Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
+Build the infrastructure artifact once with the pinned workspace and JAR
+revision, then give those exact bytes to every application package build:
+
+```sh
+cd services/vos-service && cargo +nightly actor
+cd ../..
+cargo run -p vosx -- service-pvm \
+  services/vos-service/target/riscv64em-javm/release/vos_service.elf \
+  --out dist/vos-service.pvm
+cargo run -p vosx -- build examples/v2/counter \
+  --service-pvm dist/vos-service.pvm
+```
+
+`service-pvm` rejects an ELF without the physical JAM Refine/Accumulate entry
+shape. `build` derives the service `ProgramId` from the validated PVM bytes; it
+never accepts a hand-entered service hash.
+
 The legacy `VosNode` actor loader deliberately refuses `.vos` v2 packages. It
 cannot extract and run the actor PVM directly without violating the root-tree
 service boundary. Production daemon installation remains disabled until that

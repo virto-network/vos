@@ -114,6 +114,14 @@ enum Command {
         #[arg(long)]
         crdt: bool,
     },
+    /// Transpile and validate the protocol-pinned generic service PVM.
+    ServicePvm {
+        /// `vos-service.elf` built with the pinned VOS/JAR revisions.
+        elf: PathBuf,
+        /// Output path; defaults to the input path with a `.pvm` extension.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Run a single PVM/ELF program with no recipe (one-shot).
     /// No registry, no networking — just boot the kernel,
     /// deliver the supplied work items, halt.
@@ -283,6 +291,11 @@ fn main() {
                 report_error(error);
             }
         }
+        Some(Command::ServicePvm { elf, out }) => {
+            if let Err(error) = commands::service_pvm::run(&elf, out) {
+                report_error(error);
+            }
+        }
         Some(Command::Run {
             program,
             payload,
@@ -389,6 +402,7 @@ fn should_dynamic_dispatch(argv: &[String]) -> bool {
     const BUILTIN_VERBS: &[&str] = &[
         "new",
         "build",
+        "service-pvm",
         "run",
         "space",
         "zk",

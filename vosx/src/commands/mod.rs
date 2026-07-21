@@ -1,6 +1,7 @@
 //! Per-subcommand implementations.
 //!
 //! - `run` — raw PVM/ELF execution, no space context.
+//! - `service_pvm` — build and validate the protocol infrastructure PVM.
 //! - `space::*` — everything space-related: lifecycle (new,
 //!   list, info, up, join, delete), program/agent management
 //!   (publish, install, upgrade, uninstall, programs, agents),
@@ -14,5 +15,6 @@ pub mod build;
 pub mod dynamic;
 pub mod new_project;
 pub mod run;
+pub mod service_pvm;
 pub mod space;
 pub mod zk;
