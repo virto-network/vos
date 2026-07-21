@@ -212,7 +212,7 @@ pub struct OnStartMsg {
 }
 
 fn default_consistency() -> String {
-    "crdt".to_string()
+    "local".to_string()
 }
 
 /// Reject host-owned v1 lifecycle hooks before a signed v2 package reaches
@@ -1356,6 +1356,10 @@ mod tests {
         let m: Recipe = toml::from_str(s).unwrap();
         assert_eq!(m.space.as_deref(), Some("bank-a"));
         assert_eq!(m.hyperspace.as_deref(), Some("bank-federation"));
+        assert_eq!(
+            m.agents[0].consistency, "local",
+            "ordinary actors default to local; CRDT requires an explicit opt-in",
+        );
     }
 
     #[test]

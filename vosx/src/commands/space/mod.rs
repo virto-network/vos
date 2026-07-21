@@ -227,7 +227,7 @@ pub enum SpaceCommand {
         #[arg(long, value_name = "KEY=VALUE")]
         init: Vec<String>,
         /// Consistency mode: ephemeral, local, crdt, or raft.
-        #[arg(long, default_value = "crdt")]
+        #[arg(long, default_value = "local")]
         consistency: String,
         /// Optional explicit replication id (64 hex). Default:
         /// blake2b("vos-replication-id/v1" || instance_name ||
