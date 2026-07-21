@@ -14,7 +14,7 @@ use super::{
     PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 7;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 8;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -22,6 +22,7 @@ const HEADER_STORAGE_KEY: &[u8] = b"\0vos/v2/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
+const ATTESTATION_ARCHIVE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/attestation-archive/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const INGRESS_STORAGE_PREFIX: &[u8] = b"\0vos/v2/ingress/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
@@ -518,6 +519,10 @@ pub fn publication_storage_key(input: WorkInputIdV2) -> Vec<u8> {
     input_storage_key(PUBLICATION_STORAGE_PREFIX, input)
 }
 
+pub fn attestation_archive_storage_key(input: WorkInputIdV2) -> Vec<u8> {
+    input_storage_key(ATTESTATION_ARCHIVE_STORAGE_PREFIX, input)
+}
+
 #[cfg(feature = "std")]
 pub(crate) const fn publication_storage_prefix() -> &'static [u8] {
     PUBLICATION_STORAGE_PREFIX
@@ -743,11 +748,15 @@ mod tests {
         let dedup = dedup_storage_key(input);
         let receipt = receipt_storage_key(input);
         let publication = publication_storage_key(input);
+        let attestation = attestation_archive_storage_key(input);
         let delivery = delivery_storage_key(CallId([7; 32]));
         let ingress = ingress_storage_key(input.invocation);
         assert_ne!(dedup, receipt);
         assert_ne!(publication, receipt);
         assert_ne!(publication, dedup);
+        assert_ne!(attestation, publication);
+        assert_ne!(attestation, receipt);
+        assert_ne!(attestation, dedup);
         assert_ne!(delivery, receipt);
         assert_ne!(delivery, dedup);
         assert_ne!(ingress, delivery);

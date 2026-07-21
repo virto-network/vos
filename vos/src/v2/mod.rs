@@ -99,9 +99,9 @@ pub use state_tree::{
 pub use storage::{
     DedupRecordV2, DeliveryRecordV2, IngressRecordV2, PublicationRecordV2,
     SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2,
-    crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
-    dedup_storage_key, delivery_storage_key, header_storage_key, ingress_storage_key,
-    publication_storage_key, receipt_storage_key,
+    attestation_archive_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
+    ingress_storage_key, publication_storage_key, receipt_storage_key,
 };
 pub use wire::{DecodeError, V2Wire};
 

@@ -468,6 +468,11 @@ pub enum RootTreeIngressRecoveryV2 {
     Completed {
         reply: super::ReplyRecordV2,
     },
+    /// A proof-bearing completed invocation retains its guest-owned physical
+    /// publication archive so an exact retry returns the identical package.
+    CompletedAttested {
+        publication: PublicationRecordV2,
+    },
 }
 
 /// A durable local host for exactly one logical JAM service/root actor tree.
@@ -1289,6 +1294,17 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                 ))
             })?;
         let Some(continuation) = continuation else {
+            if let Some(publication) = self
+                .service
+                .accumulate_host()
+                .archived_attestation(checkpoint.input)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            {
+                if publication.published.reply.as_ref() != checkpoint.reply.as_ref() {
+                    return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+                }
+                return Ok(RootTreeIngressRecoveryV2::CompletedAttested { publication });
+            }
             let reply = checkpoint
                 .reply
                 .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
@@ -1303,6 +1319,17 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             ))
         })?;
         if snapshot.invocation != request.invocation {
+            if let Some(publication) = self
+                .service
+                .accumulate_host()
+                .archived_attestation(checkpoint.input)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            {
+                if publication.published.reply.as_ref() != checkpoint.reply.as_ref() {
+                    return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+                }
+                return Ok(RootTreeIngressRecoveryV2::CompletedAttested { publication });
+            }
             let reply = checkpoint
                 .reply
                 .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
@@ -1816,12 +1843,18 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
     ) -> Result<CommittedAttestationPackageV2, LocalRootTreeInvokeErrorV2> {
         let canonical = PublicationRecordV2::decode(&publication.encode())
             .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidAttestationPublication)?;
-        if canonical != *publication
-            || !self
-                .pending_publications()?
-                .iter()
-                .any(|candidate| candidate == publication)
-        {
+        let is_pending = self
+            .pending_publications()?
+            .iter()
+            .any(|candidate| candidate == publication);
+        let is_archived = self
+            .service
+            .accumulate_host()
+            .archived_attestation(publication.input)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .as_ref()
+            == Some(publication);
+        if canonical != *publication || (!is_pending && !is_archived) {
             return Err(LocalRootTreeInvokeErrorV2::MissingPublication);
         }
         let statement = publication

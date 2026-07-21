@@ -4560,6 +4560,31 @@ where
                 );
                 continue;
             }
+            Ok(crate::v2::RootTreeIngressRecoveryV2::CompletedAttested { publication }) => {
+                debug!(
+                    %id,
+                    invocation = ?work.invocation,
+                    "replayed guest-retained attestation for completed v2 invocation"
+                );
+                let package = match service.committed_attestation_package(&publication) {
+                    Ok(package) => package,
+                    Err(error) => {
+                        error!(%id, ?error, "v2 attestation archive is unavailable");
+                        send_v2_status(request.reply, crate::actors::run::STATUS_PANICKED, id);
+                        continue;
+                    }
+                };
+                let _ = send_reply_capped(
+                    request.reply,
+                    encode_invoke_envelope(
+                        crate::actors::run::STATUS_DONE,
+                        &[],
+                        &package.encode(),
+                    ),
+                    id,
+                );
+                continue;
+            }
             Ok(crate::v2::RootTreeIngressRecoveryV2::Fresh) => {}
             Err(crate::v2::LocalRootTreeInvokeErrorV2::DivergentReplay) => {
                 warn!(%id, invocation = ?work.invocation, "rejected divergent v2 invocation retry");
@@ -4968,7 +4993,6 @@ fn publish_v2_slice<B>(
         if delivered
             && published.outbox.is_empty()
             && published.exported_blobs.is_empty()
-            && published.proof.is_none()
             && state.return_calls.get(&invocation).is_none()
             && let Err(error) = service.acknowledge_publication(&publication)
         {

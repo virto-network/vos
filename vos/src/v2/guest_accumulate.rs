@@ -24,7 +24,8 @@ use super::{
     StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
     WorkflowOperationV2, crdt_change_storage_key, crdt_node_receipt_storage_key,
     crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    ingress_storage_key, public_policy_hash, publication_storage_key, receipt_storage_key,
+    attestation_archive_storage_key, ingress_storage_key, public_policy_hash,
+    publication_storage_key, receipt_storage_key,
     space_role_for_policy,
 };
 
@@ -324,6 +325,20 @@ fn acknowledge_publication<S: GuestAccumulateStoreV2>(
     }
     let key = publication_storage_key(acknowledgement.input);
     let Some(bytes) = read(store, &key)? else {
+        if let Some(archived) = read(
+            store,
+            &attestation_archive_storage_key(acknowledgement.input),
+        )? {
+            let publication = PublicationRecordV2::decode(&archived)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?;
+            if publication.input != acknowledgement.input
+                || publication.commitment() != acknowledgement.publication
+                || publication.receipt.service != header.service
+                || publication.published.proof.is_none()
+            {
+                return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+            }
+        }
         return Ok(AccumulationResultV2::PublicationAcknowledged {
             input: acknowledgement.input,
             duplicate: true,
@@ -336,6 +351,16 @@ fn acknowledge_publication<S: GuestAccumulateStoreV2>(
         || publication.receipt.service != header.service
     {
         return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+    }
+    if publication.published.proof.is_some() {
+        let archive_key = attestation_archive_storage_key(publication.input);
+        if let Some(archived) = read(store, &archive_key)? {
+            if archived != bytes {
+                return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+            }
+        } else {
+            write(store, &archive_key, Some(&bytes))?;
+        }
     }
     write(store, &key, None)?;
     Ok(AccumulationResultV2::PublicationAcknowledged {

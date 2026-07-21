@@ -481,6 +481,28 @@ impl LocalJamStoreV2 {
             .collect()
     }
 
+    /// Recover a proof-bearing publication after external acknowledgement.
+    /// The archive is physical guest bookkeeping, excluded from the actor
+    /// state root to avoid a receipt/state-root commitment cycle.
+    pub fn archived_attestation(
+        &self,
+        input: super::WorkInputIdV2,
+    ) -> Result<Option<PublicationRecordV2>, LocalStoreReadErrorV2> {
+        self.row(&super::attestation_archive_storage_key(input))
+            .map(PublicationRecordV2::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptPublication)
+            .and_then(|publication| {
+                if publication.as_ref().is_some_and(|publication| {
+                    publication.input != input || publication.published.proof.is_none()
+                }) {
+                    Err(LocalStoreReadErrorV2::CorruptPublication)
+                } else {
+                    Ok(publication)
+                }
+            })
+    }
+
     /// Recover finalized inbox admissions which have not yet been consumed by
     /// actor execution. Delivery records are physical guest bookkeeping, so
     /// their original logical timeslot remains available after host restart.

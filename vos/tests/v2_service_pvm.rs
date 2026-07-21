@@ -1021,7 +1021,7 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
         calls: 0,
     };
     let committed = service
-        .invoke_attested(request, &mut producer)
+        .invoke_attested(request.clone(), &mut producer)
         .expect("the root owner proves and then commits the exact Refine output");
     assert_eq!(producer.calls, 1);
     assert_eq!(
@@ -1044,12 +1044,24 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
     assert_eq!(publication.published, committed.published);
 
     let backend = service.into_backend();
-    let restarted = LocalRootTreeServiceV2::open(config, backend)
+    let mut restarted = LocalRootTreeServiceV2::open(config, backend)
         .expect("the complete attestation package survives a root restart");
     assert_eq!(
         restarted.pending_publications().unwrap(),
-        vec![publication]
+        vec![publication.clone()]
     );
+    assert!(!restarted.acknowledge_publication(&publication).unwrap());
+    assert!(restarted.pending_publications().unwrap().is_empty());
+    assert_eq!(
+        restarted.recover_ingress(&request).unwrap(),
+        RootTreeIngressRecoveryV2::CompletedAttested {
+            publication: publication.clone(),
+        }
+    );
+    let archived_package = restarted
+        .committed_attestation_package(&publication)
+        .expect("guest acknowledgement retains the exact proof package for retry");
+    assert_eq!(archived_package.proof_blob.bytes, proof_bytes);
 
     let mut node = VosNode::new();
     node.register_v2_root_at_id_with_producer(
@@ -1075,6 +1087,35 @@ fn root_tree_proves_attested_refine_before_guest_commit() {
     assert_eq!(result.statement.actor_program, actor_program);
     assert_eq!(result.trace, Hash([110; 32]));
     assert_eq!(result.proof, b"node canonical proof");
+
+    let mut retry_arguments = vec![vos::value::TAG_DYNAMIC];
+    retry_arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let ingress = vos::v2::RootTreeInvocationV2 {
+        invocation: InvocationId([112; 32]),
+        logical_timeslot: 3,
+        target: actor,
+        method: "attested_value".into(),
+        arguments: retry_arguments,
+        proof_requested: true,
+    };
+    let first_package = node
+        .invoke_with_timeout(
+            ServiceId(108),
+            ingress.encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .expect("the first direct attestation is published after its commit");
+    let mut retry = ingress;
+    retry.logical_timeslot = 99;
+    assert_eq!(
+        node.invoke_with_timeout(
+            ServiceId(108),
+            retry.encode(),
+            std::time::Duration::from_secs(120),
+        ),
+        Some(first_package),
+        "an exact retry returns the archived package without proving again"
+    );
     node.shutdown();
     assert!(node.collect().into_iter().all(|result| result.is_ok()));
 }
