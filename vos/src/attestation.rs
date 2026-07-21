@@ -470,6 +470,7 @@ pub struct Attestation<T, M> {
     producer_name: String,
     producer: ProducerId,
     statement: AttestationStatementV3,
+    trace: Hash,
     claim_wire: Vec<u8>,
     preview: T,
     proof: Vec<u8>,
@@ -492,6 +493,7 @@ impl<T, M> Attestation<T, M> {
         producer_name: String,
         producer: ProducerId,
         statement: AttestationStatementV3,
+        trace: Hash,
         preview: T,
         proof: Vec<u8>,
     ) -> Result<Self, AttestationError>
@@ -503,6 +505,7 @@ impl<T, M> Attestation<T, M> {
             producer_name,
             producer,
             statement,
+            trace,
             claim_wire,
             preview,
             proof,
@@ -514,6 +517,7 @@ impl<T, M> Attestation<T, M> {
         producer_name: String,
         producer: ProducerId,
         statement: AttestationStatementV3,
+        trace: Hash,
         claim_wire: Vec<u8>,
         preview: T,
         proof: Vec<u8>,
@@ -525,6 +529,7 @@ impl<T, M> Attestation<T, M> {
             producer_name,
             producer,
             statement,
+            trace,
             claim_wire,
             preview,
             proof,
@@ -534,6 +539,12 @@ impl<T, M> Attestation<T, M> {
             return Err(AttestationError::WrongProducer);
         }
         package.statement.validate()?;
+        if package.trace == Hash::ZERO
+            || package.proof.is_empty()
+            || package.proof.len() > crate::v2::MAX_ATTESTATION_PROOF_BYTES
+        {
+            return Err(AttestationError::InvalidProof);
+        }
         if package.statement.method != M::METHOD {
             return Err(AttestationError::WrongMethod);
         }
@@ -589,6 +600,7 @@ impl<T, M> Attestation<T, M> {
         encoder.string(&self.producer_name);
         encoder.fixed(&self.producer.0);
         encoder.bytes(&statement);
+        encoder.fixed(&self.trace.0);
         encoder.bytes(&self.claim_wire);
         encoder.bytes(&self.proof);
         Ok(bytes)
@@ -611,6 +623,7 @@ impl<T, M> Attestation<T, M> {
         let producer = ProducerId(decoder.fixed().map_err(invalid_package)?);
         let statement = AttestationStatementV3::decode(&decoder.bytes().map_err(invalid_package)?)
             .map_err(invalid_package)?;
+        let trace = Hash(decoder.fixed().map_err(invalid_package)?);
         let claim_wire = decoder.bytes().map_err(invalid_package)?;
         if Hash::digest(b"vos/attestation-claim/v3", &[&claim_wire]) != statement.claim_commitment {
             return Err(AttestationError::ClaimCommitmentMismatch);
@@ -625,6 +638,7 @@ impl<T, M> Attestation<T, M> {
             producer_name,
             producer,
             statement,
+            trace,
             claim_wire,
             preview,
             proof,
@@ -1078,6 +1092,7 @@ mod tests {
             "private-age".to_string(),
             ProducerId([15; 32]),
             statement,
+            Hash([16; 32]),
             claim,
             vec![1],
         )
@@ -1303,6 +1318,7 @@ mod tests {
                 "private-age".to_string(),
                 package.producer,
                 package.statement,
+                package.trace,
                 package.preview,
                 package.proof,
             ),
@@ -1317,6 +1333,7 @@ mod tests {
         let decoded = Attestation::<u64, Method>::from_portable_bytes(&bytes).unwrap();
         assert_eq!(decoded.unverified_preview(), &27);
         assert_eq!(decoded.statement(), package.statement());
+        assert_eq!(decoded.trace, package.trace);
 
         let mut trailing = bytes.clone();
         trailing.push(0);
@@ -1393,6 +1410,7 @@ mod tests {
             base.producer_name,
             base.producer,
             statement,
+            base.trace,
             None,
             base.proof,
         )
@@ -1465,5 +1483,18 @@ mod tests {
             proof: vec![0; crate::v2::MAX_ATTESTATION_PROOF_BYTES + 1],
         };
         assert_eq!(proof.validate(), Err(AttestationError::InvalidProof));
+
+        let package = package(21);
+        assert!(matches!(
+            Attestation::<u64, Method>::__from_runtime(
+                package.producer_name,
+                package.producer,
+                package.statement,
+                Hash::ZERO,
+                package.preview,
+                package.proof,
+            ),
+            Err(AttestationError::InvalidProof)
+        ));
     }
 }

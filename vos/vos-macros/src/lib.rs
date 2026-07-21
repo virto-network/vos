@@ -1453,6 +1453,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                             producer_name: __producer_name,
                             producer: __producer,
                             statement: __statement,
+                            trace: __trace,
                             proof: __proof,
                         } = __inv.invoke_attested(self.target, __payload).await?;
                         let __claim_wire = vos::Encode::encode(&#value_ident);
@@ -1461,6 +1462,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                             __producer_name,
                             __producer,
                             __statement,
+                            __trace,
                             __claim_wire,
                             __preview,
                             __proof,
@@ -1531,6 +1533,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                             producer_name: __producer_name,
                             producer: __producer,
                             statement: __statement,
+                            trace: __trace,
                             proof: __proof,
                         } = match self.target {
                             vos::actors::client::ActorTarget::Actor(__actor) => self
@@ -1548,6 +1551,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                             __producer_name,
                             __producer,
                             __statement,
+                            __trace,
                             __claim_wire,
                             __preview,
                             __proof,
