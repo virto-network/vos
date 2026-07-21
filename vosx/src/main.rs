@@ -133,6 +133,12 @@ enum Command {
         /// Deliver hex-encoded bytes as a FETCH work item (repeatable).
         #[arg(long, value_name = "HEX")]
         hex: Vec<String>,
+        /// Invoke a no-argument method in a signed `.vos` package (repeatable).
+        #[arg(long, value_name = "METHOD")]
+        method: Vec<String>,
+        /// Exact generic service PVM; required for signed `.vos` packages.
+        #[arg(long)]
+        service_pvm: Option<PathBuf>,
         /// Set gas limit.
         #[arg(long, default_value_t = 100_000_000)]
         gas: u64,
@@ -300,9 +306,18 @@ fn main() {
             program,
             payload,
             hex,
+            method,
+            service_pvm,
             gas,
         }) => {
-            commands::run::run(&program, &payload, &hex, gas);
+            commands::run::run(
+                &program,
+                &payload,
+                &hex,
+                &method,
+                service_pvm.as_deref(),
+                gas,
+            );
         }
         Some(Command::Space { command }) => {
             if let Err(e) = commands::space::run(command) {
@@ -349,7 +364,7 @@ fn main() {
             }
         }
         None => match cli.file {
-            Some(p) => commands::run::run(&p, &[], &[], 100_000_000),
+            Some(p) => commands::run::run(&p, &[], &[], &[], None, 100_000_000),
             None => {
                 eprintln!(
                     "vosx: no command. Try `vosx space new foo`, \

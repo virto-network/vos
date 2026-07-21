@@ -121,11 +121,18 @@ cargo run -p vosx -- service-pvm \
   --out dist/vos-service.pvm
 cargo run -p vosx -- build examples/v2/counter \
   --service-pvm dist/vos-service.pvm
+cargo run -p vosx -- run dist/Counter.vos \
+  --service-pvm dist/vos-service.pvm \
+  --method value
 ```
 
 `service-pvm` rejects an ELF without the physical JAM Refine/Accumulate entry
 shape. `build` derives the service `ProgramId` from the validated PVM bytes; it
-never accepts a hand-entered service hash.
+never accepts a hand-entered service hash. `run` validates that same identity,
+installs the root tree through physical Accumulate, schedules Refine from
+guest-committed state, and publishes the reply only after physical Accumulate
+accepts the transition. Raw ELF/PVM inputs still use the explicitly legacy
+single-actor runner while the production daemon is being cut over.
 
 The legacy `VosNode` actor loader deliberately refuses `.vos` v2 packages. It
 cannot extract and run the actor PVM directly without violating the root-tree
