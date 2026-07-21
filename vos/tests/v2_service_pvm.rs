@@ -1173,6 +1173,151 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
 }
 
 #[test]
+fn two_nodes_route_cross_root_await_by_canonical_actor_identity() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("vos=debug")
+        .with_test_writer()
+        .try_init();
+    let Some((source_config, peer_config, source_actor, peer_actor)) = workflow_root_configs()
+    else {
+        return;
+    };
+    let source = LocalRootTreeServiceV2::open(source_config, FailableCommittedImages::default())
+        .expect("source root installs");
+    let peer = LocalRootTreeServiceV2::open(peer_config, FailableCommittedImages::default())
+        .expect("peer root installs");
+
+    let keypair_a = identity::Keypair::generate_ed25519();
+    let prefix_a = derive_node_prefix(&PeerId::from(keypair_a.public()));
+    let (keypair_b, prefix_b) = loop {
+        let candidate = identity::Keypair::generate_ed25519();
+        let prefix = derive_node_prefix(&PeerId::from(candidate.public()));
+        if prefix != prefix_a {
+            break (candidate, prefix);
+        }
+    };
+    let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let network_a = Network::start(NetworkConfig {
+        keypair: keypair_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let address_a = wait_for(
+        || network_a.listen_addrs().into_iter().next(),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("source peer binds");
+    let network_b = Network::start(NetworkConfig {
+        keypair: keypair_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![address_a.with(Protocol::P2p(network_a.peer_id()))],
+        auto_dial_mdns: false,
+    });
+
+    let source_route = ServiceId::new(prefix_a, 230);
+    let peer_route = ServiceId::new(prefix_b, 231);
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    node_a
+        .register_v2_root_at_id("source".into(), source, source_route, true)
+        .unwrap();
+    node_a
+        .bind_v2_actor_route(peer_actor, peer_route)
+        .expect("source host binds the authenticated peer actor route");
+    node_a
+        .bind_v2_actor_route(peer_actor, peer_route)
+        .expect("repeating the exact route binding is idempotent");
+    assert!(matches!(
+        node_a.bind_v2_actor_route(peer_actor, source_route),
+        Err(vos::node::V2NodeRegistrationError::ActorRouteOccupied(actor))
+            if actor == peer_actor
+    ));
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_b
+        .register_v2_root_at_id("peer".into(), peer, peer_route, true)
+        .unwrap();
+    node_b
+        .bind_v2_actor_route(source_actor, source_route)
+        .expect("peer host binds the authenticated source actor route");
+    node_a.attach_network(network_a);
+    node_b.attach_network(network_b);
+    let network_a = node_a.network().expect("source network remains attached");
+    let network_b = node_b.network().expect("peer network remains attached");
+    wait_for(
+        || {
+            (network_a.peer_for_prefix(prefix_b).is_some()
+                && network_b.peer_for_prefix(prefix_a).is_some())
+            .then_some(())
+        },
+        std::time::Duration::from_secs(45),
+    )
+    .expect("root-tree peers complete their prefix handshake");
+
+    let handle = node_a.invoke_handle();
+    let shutdown_a = node_a.shutdown_handle();
+    let shutdown_b = node_b.shutdown_handle();
+    let router_a = std::thread::spawn(move || {
+        node_a.run_forever();
+        node_a.collect()
+    });
+    let router_b = std::thread::spawn(move || {
+        node_b.run_forever();
+        node_b.collect()
+    });
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("child_await_peer").encode());
+    let ingress = vos::v2::RootTreeInvocationV2 {
+        invocation: InvocationId([0xD1; 32]),
+        logical_timeslot: 1,
+        target: source_actor,
+        method: "child_await_peer".into(),
+        arguments,
+        proof_requested: false,
+    };
+    let reply = handle
+        .invoke_with_timeout(
+            source_route,
+            ingress.encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .expect("the remote peer reply resumes the exact source continuation");
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(8)));
+
+    let mut retry = ingress;
+    retry.logical_timeslot = 99;
+    assert_eq!(
+        handle.invoke_with_timeout(
+            source_route,
+            retry.encode(),
+            std::time::Duration::from_secs(120),
+        ),
+        Some(reply),
+        "an exact retry returns the guest-retained reply without another remote call"
+    );
+
+    shutdown_a.store(true, std::sync::atomic::Ordering::Relaxed);
+    shutdown_b.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop((handle, network_a, network_b));
+    assert!(
+        router_a
+            .join()
+            .unwrap()
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    assert!(
+        router_b
+            .join()
+            .unwrap()
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+}
+
+#[test]
 fn node_reattaches_retried_ingress_to_a_restarted_cross_root_workflow() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("vos=debug")

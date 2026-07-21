@@ -3000,6 +3000,30 @@ impl VosNode {
         self.register_inner(config, id)
     }
 
+    /// Bind a canonical actor identity to a physical transport route.
+    ///
+    /// This is an advanced operator/runtime primitive used after authenticated
+    /// actor-route discovery. Application actors continue to resolve and call
+    /// only [`crate::v2::ActorId`]; the node adapter consults this binding when
+    /// publishing a committed cross-root outbox record. A binding is immutable
+    /// for the node lifetime so an unauthenticated retry cannot redirect a
+    /// durable call or its acknowledgement to another service route.
+    pub fn bind_v2_actor_route(
+        &mut self,
+        actor: crate::v2::ActorId,
+        route: ServiceId,
+    ) -> Result<(), V2NodeRegistrationError> {
+        let mut routes = self.v2_actor_routes.write().unwrap();
+        match routes.get(&actor) {
+            Some(existing) if *existing == route.0 => Ok(()),
+            Some(_) => Err(V2NodeRegistrationError::ActorRouteOccupied(actor)),
+            None => {
+                routes.insert(actor, route.0);
+                Ok(())
+            }
+        }
+    }
+
     /// Register one already-opened v2 root-tree service at the node's
     /// transport route. Actor execution and all state mutation stay inside
     /// the canonical service PVM owned by `service`; this adapter only derives

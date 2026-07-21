@@ -141,9 +141,13 @@ is acknowledged, a completed workflow returns the canonical reply retained in
 guest workflow state without executing the actor again. Continuation blob
 references may coexist with an outbox record
 because those pages are already committed in the source content store and
-never become destination state. Cross-node actor-route discovery and proof/blob
-publication drivers remain to be attached. Attested ingress currently fails
-closed unless a proof producer is configured.
+never become destination state. An authenticated operator/runtime may bind a
+canonical `ActorId` to an immutable physical `ServiceId` with
+`VosNode::bind_v2_actor_route`; the same guest-owned delivery, reply, and
+acknowledgement protocol then runs across connected libp2p nodes. Registry-backed
+automatic route discovery and proof/blob publication drivers remain to be
+attached. Attested ingress currently fails closed unless a proof producer is
+configured.
 
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an
