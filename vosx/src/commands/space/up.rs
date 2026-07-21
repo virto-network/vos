@@ -1398,31 +1398,20 @@ fn agent_config_from_row(
 
 /// Recover executable bytes from one content-addressed catalog artifact.
 ///
-/// Signed v2 packages are retained byte-for-byte by the registry/CAS and
-/// already contain the canonical actor PVM. Only pre-v2 infrastructure blobs
-/// may take the legacy ELF transpilation fallback.
+/// Resolve only artifacts that the legacy one-service-per-actor host may run.
+///
+/// A signed v2 package is a root-tree deployment input, not an actor blob for
+/// [`VosNode`]. Extracting its canonical actor PVM here would execute it in the
+/// native `RefinePayload`/`EffectLog` runtime and silently discard its pinned
+/// generic-service, deployment, and guest-Accumulate semantics. Fail closed
+/// until this daemon path installs the complete package through
+/// `vos-service.pvm`.
 fn actor_blob_from_catalog(artifact: Vec<u8>, instance_name: &str) -> anyhow::Result<Vec<u8>> {
     if artifact.get(..4) == Some(b"VOSP") {
-        use vos::v2::{V2Wire, VosPackageV2};
-
-        let package = VosPackageV2::decode(&artifact)
-            .map_err(|error| anyhow::anyhow!("decode {instance_name} .vos package: {error}"))?;
-        package
-            .validate()
-            .map_err(|error| anyhow::anyhow!("validate {instance_name} .vos package: {error}"))?;
-        let public_key = libp2p::identity::PublicKey::try_decode_protobuf(
-            &package.deployment_signature.public_key,
-        )
-        .map_err(|error| anyhow::anyhow!("decode {instance_name} deployment key: {error}"))?;
-        if !public_key.verify(
-            &package.signing_message(),
-            &package.deployment_signature.signature,
-        ) {
-            anyhow::bail!("{instance_name} deployment signature is invalid");
-        }
-        javm::program::parse_blob(&package.actor_pvm)
-            .ok_or_else(|| anyhow::anyhow!("{instance_name} package actor PVM is invalid"))?;
-        return Ok(package.actor_pvm);
+        anyhow::bail!(
+            "{instance_name} is a VOS v2 package and cannot run in the legacy actor runtime; \
+             install it through the root-tree vos-service.pvm host"
+        );
     }
     if artifact.get(..3) == Some(b"JAR") {
         javm::program::parse_blob(&artifact)
@@ -2074,6 +2063,17 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
 mod tests {
     use super::*;
     use vos::network::{RaftRole, RaftStatusReply};
+
+    #[test]
+    fn signed_v2_packages_never_fall_through_to_the_legacy_actor_runtime() {
+        let error = actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter")
+            .expect_err("v2 package must retain guest-owned service semantics");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot run in the legacy actor runtime")
+        );
+    }
 
     #[test]
     fn agent_policies_come_from_local_toml() {

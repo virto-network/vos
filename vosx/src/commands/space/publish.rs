@@ -113,10 +113,10 @@ fn canonical_program(
     ) {
         anyhow::bail!("deployment signature is invalid");
     }
-    // The catalog and CAS retain the exact signed deployment bytes. Runtime
-    // installation decodes this package and uses its canonical actor PVM
-    // directly; publishing must not replace package identity with an extracted
-    // program blob.
+    // The catalog and CAS retain the exact signed deployment bytes. Root-tree
+    // installation must consume this package through the pinned generic
+    // service; publishing must not replace package identity with an extracted
+    // actor program blob.
     Ok((source_hash, bytes, Some(package.schemas)))
 }
 

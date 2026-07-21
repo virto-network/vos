@@ -110,6 +110,12 @@ and signatures but includes the authoritative manifest and PVM bytes.
 Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
+The legacy `VosNode` actor loader deliberately refuses `.vos` v2 packages. It
+cannot extract and run the actor PVM directly without violating the root-tree
+service boundary. Production daemon installation remains disabled until that
+loader drives the pinned `vos-service.pvm`; this explicit refusal replaces the
+previous silent execution through `RefinePayload`/`EffectLog`.
+
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.
 
