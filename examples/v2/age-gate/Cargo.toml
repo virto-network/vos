@@ -3,6 +3,18 @@ name = "v2-age-gate"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 private-age = { package = "v2-private-age", path = "../private-age", default-features = false }
-vos.workspace = true
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { workspace = true, features = ["macros", "service"] }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+vos = { workspace = true, features = ["macros", "extension"] }
