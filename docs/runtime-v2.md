@@ -115,11 +115,19 @@ only after commitment-bound acknowledgements; retries recover their original
 logical timeslot from guest workflow state. After a host restart, a pending
 callee reply also reconstructs its caller actor and invocation from the
 authenticated workflow origin and causal parent rather than a process-local
-return table. Continuation blob references may coexist with an outbox record
+return table. A retried direct invocation is classified from the durable
+workflow row and the invocation embedded in the current continuation snapshot:
+it reattaches its caller channel to a suspended machine without replaying slice
+zero, or publishes the pending effect from the latest completed slice using
+that slice's committed timeslot. The retry timeslot is not part of stable
+ingress identity; actor, method, arguments, origin, authorization, causal
+binding, application blob references, and proof mode are. A completed workflow
+whose publication was already externally accepted is refused rather than
+executed again. Continuation blob references may coexist with an outbox record
 because those pages are already committed in the source content store and
-never become destination state. Cross-node actor-route discovery and
-proof/blob publication drivers remain to be attached. Attested ingress
-currently fails closed unless a proof producer is configured.
+never become destination state. Cross-node actor-route discovery and proof/blob
+publication drivers remain to be attached. Attested ingress currently fails
+closed unless a proof producer is configured.
 
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an

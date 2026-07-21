@@ -13,7 +13,7 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
     AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
-    BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, DurableJamStoreV2,
+    BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, ContinuationSnapshotV2, DurableJamStoreV2,
     DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
     LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
     MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId,
@@ -228,6 +228,28 @@ fn return_target_from_checkpoint(
     }
 }
 
+fn direct_ingress_matches_checkpoint(
+    request: &LocalWorkRequestV2,
+    checkpoint: &WorkflowCheckpointV2,
+) -> bool {
+    let work = &checkpoint.resume_work;
+    checkpoint.input.invocation == request.invocation
+        && work.invocation == request.invocation
+        && request.workflow_step == 0
+        && request.causal_parent.is_none()
+        && request.parent_call.is_none()
+        && request.awaited_reply.is_none()
+        && work.target == request.target
+        && work.method == request.method
+        && work.arguments == request.arguments
+        && work.origin == request.origin
+        && work.authorization == request.authorization
+        && work.causal_parent == request.causal_parent
+        && work.parent_call == request.parent_call
+        && work.imported_blobs == request.imported_blobs
+        && work.proof_requested == request.proof_requested
+}
+
 /// Complete immutable installation input for one locally hosted root tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRootTreeConfigV2 {
@@ -302,6 +324,24 @@ pub struct CommittedDeliveryV2 {
     pub receipt: AccumulationReceiptV2,
     pub duplicate: bool,
     pub accumulate_gas_used: u64,
+}
+
+/// Durable disposition of a retried direct root invocation.
+///
+/// The caller may attach to `Suspended` without executing slice zero again.
+/// A pending publication is returned with the timeslot committed by its
+/// actual slice, which can be later than the retried ingress timeslot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootTreeIngressRecoveryV2 {
+    Fresh,
+    Suspended,
+    PendingPublication {
+        publication: PublicationRecordV2,
+        logical_timeslot: u64,
+    },
+    /// The invocation finished and its externally accepted publication has
+    /// already been acknowledged. Its actor execution must not be replayed.
+    Completed,
 }
 
 /// A durable local host for exactly one logical JAM service/root actor tree.
@@ -517,46 +557,89 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .map(|index| descriptor.methods[index].clone()))
     }
 
-    /// Return a still-pending publication only when the retry is byte-for-byte
-    /// equivalent to the work identity already committed by the guest.
-    pub fn recover_publication(
+    /// Classify a direct invocation retry from guest-authenticated workflow
+    /// and continuation state. Volatile timeslots and continuation-step
+    /// inputs are deliberately excluded from the original-ingress identity.
+    pub fn recover_ingress(
         &self,
         request: &LocalWorkRequestV2,
-    ) -> Result<Option<PublicationRecordV2>, LocalRootTreeInvokeErrorV2> {
-        let input = WorkInputIdV2 {
-            invocation: request.invocation,
-            workflow_step: request.workflow_step,
-        };
-        let publication = self
-            .pending_publications()?
-            .into_iter()
-            .find(|publication| publication.input == input);
-        let Some(publication) = publication else {
-            return Ok(None);
-        };
-        let checkpoint = self
+    ) -> Result<RootTreeIngressRecoveryV2, LocalRootTreeInvokeErrorV2> {
+        if request.workflow_step != 0
+            || request.causal_parent.is_some()
+            || request.parent_call.is_some()
+            || request.awaited_reply.is_some()
+        {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+        }
+        let Some(checkpoint) = self
             .service
             .accumulate_host()
             .workflow_checkpoint(request.invocation)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
-            .ok_or(LocalRootTreeInvokeErrorV2::DivergentReplay)?;
-        let work = checkpoint.resume_work;
-        if work.input_id() != input
-            || work.logical_timeslot != request.logical_timeslot
-            || work.target != request.target
-            || work.method != request.method
-            || work.arguments != request.arguments
-            || work.origin != request.origin
-            || work.authorization != request.authorization
-            || work.causal_parent != request.causal_parent
-            || work.parent_call != request.parent_call
-            || work.awaited_reply != request.awaited_reply
-            || work.imported_blobs != request.imported_blobs
-            || work.proof_requested != request.proof_requested
-        {
+        else {
+            return Ok(RootTreeIngressRecoveryV2::Fresh);
+        };
+        if !direct_ingress_matches_checkpoint(request, &checkpoint) {
             return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
         }
-        Ok(Some(publication))
+
+        let mut publications = self
+            .pending_publications()?
+            .into_iter()
+            .filter(|publication| publication.input.invocation == request.invocation);
+        if let Some(publication) = publications.next() {
+            if publications.next().is_some() || publication.input != checkpoint.input {
+                return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+            }
+            return Ok(RootTreeIngressRecoveryV2::PendingPublication {
+                publication,
+                logical_timeslot: checkpoint.resume_work.logical_timeslot,
+            });
+        }
+
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::UnexpectedResult)?;
+        let continuation = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::Continuation(request.target),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .map(|bytes| BlobRefV2::decode(&bytes))
+            .transpose()
+            .map_err(|_| {
+                LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::InvalidContinuation(
+                    request.target,
+                ))
+            })?;
+        let Some(continuation) = continuation else {
+            return Ok(RootTreeIngressRecoveryV2::Completed);
+        };
+        let bytes = self.service.accumulate_host().blob(&continuation).ok_or(
+            LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::MissingBlob(continuation.hash)),
+        )?;
+        let snapshot = ContinuationSnapshotV2::decode(bytes).map_err(|_| {
+            LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::InvalidContinuation(
+                request.target,
+            ))
+        })?;
+        if snapshot.invocation != request.invocation {
+            return Ok(RootTreeIngressRecoveryV2::Completed);
+        }
+        snapshot
+            .validate_checkpoint_for(&checkpoint.resume_work)
+            .map_err(|_| {
+                LocalRootTreeInvokeErrorV2::Schedule(ScheduleErrorV2::InvalidContinuation(
+                    request.target,
+                ))
+            })?;
+        Ok(RootTreeIngressRecoveryV2::Suspended)
     }
 
     /// Execute one ordinary slice. Attested work requires a configured proof

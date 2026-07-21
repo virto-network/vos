@@ -3845,8 +3845,11 @@ where
             imported_blobs: vec![],
             proof_requested: ingress.proof_requested,
         };
-        match service.recover_publication(&work) {
-            Ok(Some(publication)) => {
+        match service.recover_ingress(&work) {
+            Ok(crate::v2::RootTreeIngressRecoveryV2::PendingPublication {
+                publication,
+                logical_timeslot,
+            }) => {
                 publish_v2_slice(
                     id,
                     &mut service,
@@ -3854,14 +3857,36 @@ where
                     publication.published.clone(),
                     Some(publication),
                     Some(request.reply),
-                    ingress.logical_timeslot,
+                    logical_timeslot,
                     &outbox,
                     &actor_routes,
                     &mut state,
                 );
                 continue;
             }
-            Ok(None) => {}
+            Ok(crate::v2::RootTreeIngressRecoveryV2::Suspended) => {
+                debug!(
+                    %id,
+                    invocation = ?work.invocation,
+                    "reattached caller to durable suspended v2 workflow"
+                );
+                state
+                    .pending_callers
+                    .entry(work.invocation)
+                    .or_default()
+                    .push(request.reply);
+                continue;
+            }
+            Ok(crate::v2::RootTreeIngressRecoveryV2::Completed) => {
+                warn!(
+                    %id,
+                    invocation = ?work.invocation,
+                    "refused replay of completed v2 invocation without a pending publication"
+                );
+                send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
+                continue;
+            }
+            Ok(crate::v2::RootTreeIngressRecoveryV2::Fresh) => {}
             Err(crate::v2::LocalRootTreeInvokeErrorV2::DivergentReplay) => {
                 warn!(%id, invocation = ?work.invocation, "rejected divergent v2 invocation retry");
                 send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
