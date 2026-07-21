@@ -22,6 +22,18 @@ impl CrdtCounterV2 {
     }
 
     #[msg]
+    async fn spawn_dynamic(&mut self, ctx: &mut Context<Self>) -> bool {
+        ctx.spawn::<CrdtCounterV2Ref, _>(
+            "dynamic",
+            &CrdtCounterV2 {
+                count: crdt::Counter::default(),
+            },
+        )
+        .await
+        .is_ok()
+    }
+
+    #[msg]
     async fn increment_child_twice(&mut self, amount: u64, ctx: &mut Context<Self>) -> i64 {
         let mut value = 0;
         let Ok(mut child) = ctx.child::<CrdtCounterV2Ref>("child").await else {

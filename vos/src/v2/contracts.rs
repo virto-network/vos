@@ -174,7 +174,8 @@ pub struct ActorSpawnRequestV2 {
     pub initial_state: Vec<u8>,
 }
 
-/// Canonical child creation committed atomically with one linear transition.
+/// Canonical child creation committed atomically with one transition. CRDT
+/// services also carry this value in their causal workflow payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSpawnV2 {
     pub actor: ActorId,
@@ -661,6 +662,10 @@ pub enum WorkflowOperationV2 {
     /// carry this as its own causal node so a busy or restarted replica can
     /// recover the queued invocation without relying on host memory.
     Ingress(CrdtIngressV2),
+    /// Monotonic owned-tree membership created by this causal slice. The
+    /// child's initial materialization is carried by the same CRDT node, so a
+    /// peer can reconstruct the descriptor and directory from DAG ancestry.
+    Spawn(ActorSpawnV2),
 }
 
 /// Stable caller-controlled portion of a causal direct-ingress admission.
@@ -875,6 +880,7 @@ impl TransitionV2 {
             1 + self.continuations.len()
                 + self.inbox.len()
                 + self.outbox.len()
+                + self.spawns.len()
                 + usize::from(consumed_outbox.is_some())
                 + usize::from(self.reply.is_some()),
         );
@@ -887,6 +893,7 @@ impl TransitionV2 {
         );
         operations.extend(self.inbox.iter().cloned().map(WorkflowOperationV2::Inbox));
         operations.extend(self.outbox.iter().cloned().map(WorkflowOperationV2::Outbox));
+        operations.extend(self.spawns.iter().cloned().map(WorkflowOperationV2::Spawn));
         operations.extend(consumed_outbox.map(WorkflowOperationV2::ConsumeOutbox));
         operations.extend(self.reply.iter().cloned().map(WorkflowOperationV2::Reply));
         operations.sort_by_key(workflow_operation_bytes);
@@ -2905,7 +2912,6 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
         (ConsistencyBaseV2::Crdt { heads }, Some(change))
             if value.work.consistency == ConsistencyModeV2::Crdt
                 && value.transition.writes.is_empty()
-                && value.transition.spawns.is_empty()
                 && Some(change.id) == CrdtChangeV2::derive_id(&value.work)
                 && change.causal_dependencies.as_slice() == heads.as_slice()
                 && value
@@ -2988,6 +2994,7 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
             WorkflowOperationV2::Ingress(ingress) => {
                 references.extend(ingress.imported_blobs.iter());
             }
+            WorkflowOperationV2::Spawn(spawn) => references.push(&spawn.initial_state),
             WorkflowOperationV2::Inbox(_)
             | WorkflowOperationV2::Outbox(_)
             | WorkflowOperationV2::ConsumeOutbox(_)
@@ -3442,6 +3449,10 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
             e.u8(6);
             encode_crdt_ingress(e, ingress);
         }
+        WorkflowOperationV2::Spawn(spawn) => {
+            e.u8(7);
+            encode_actor_spawn(e, spawn);
+        }
     }
 }
 
@@ -3458,6 +3469,7 @@ fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2,
         4 => Ok(WorkflowOperationV2::Reply(decode_reply(d)?)),
         5 => Ok(WorkflowOperationV2::ConsumeOutbox(CallId(d.fixed()?))),
         6 => Ok(WorkflowOperationV2::Ingress(decode_crdt_ingress(d)?)),
+        7 => Ok(WorkflowOperationV2::Spawn(decode_actor_spawn(d)?)),
         _ => Err(DecodeError::InvalidTag),
     }
 }

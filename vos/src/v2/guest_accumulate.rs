@@ -14,7 +14,7 @@ use super::causal::{CausalFrontierError, load_causal_frontier};
 use super::contracts::crdt_change_blob_references;
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
+    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId, ActorSpawnV2,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2,
     DeliveryRecordV2, DirectIngressV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash,
@@ -643,7 +643,54 @@ struct WorkflowMaterializationV2 {
     inbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
     outbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
     replies: BTreeMap<super::CallId, Vec<CausalValueV2<super::ReplyRecordV2>>>,
+    spawns: BTreeMap<ActorId, Vec<CausalValueV2<ActorSpawnV2>>>,
     actor_states: BTreeMap<ActorId, Vec<CausalValueV2<BlobRefV2>>>,
+}
+
+fn valid_crdt_spawn_materializations(
+    work: &super::WorkEnvelopeV2,
+    change: &CrdtChangeV2,
+) -> bool {
+    let mut spawns = BTreeMap::new();
+    for operation in &change.workflow {
+        let WorkflowOperationV2::Spawn(spawn) = operation else {
+            continue;
+        };
+        if spawn.actor != ActorId::owned_child(spawn.parent, &spawn.name)
+            || work
+                .imported_actors
+                .binary_search_by_key(&spawn.parent, |actor| actor.actor)
+                .is_err()
+            || work
+                .imported_actors
+                .binary_search_by_key(&spawn.actor, |actor| actor.actor)
+                .is_ok()
+            || work
+                .imported_actors
+                .iter()
+                .any(|actor| actor.parent == Some(spawn.parent) && actor.name == spawn.name)
+            || spawns.insert(spawn.actor, spawn).is_some()
+        {
+            return false;
+        }
+    }
+    if spawns.iter().any(|(actor, spawn)| {
+        change
+            .materializations
+            .binary_search_by_key(actor, |state| state.actor)
+            .ok()
+            .is_none_or(|index| change.materializations[index].state != spawn.initial_state)
+    }) {
+        return false;
+    }
+    change.materializations.iter().all(|materialization| {
+        work.imported_actors
+            .binary_search_by_key(&materialization.actor, |actor| actor.actor)
+            .is_ok()
+            || spawns
+                .get(&materialization.actor)
+                .is_some_and(|spawn| spawn.initial_state == materialization.state)
+    })
 }
 
 fn sync_crdt<S: GuestAccumulateStoreV2>(
@@ -848,11 +895,7 @@ fn materialize_workflow_crdt(
                             .binary_search_by_key(&operation.actor, |actor| actor.actor)
                             .is_ok()
                     })
-                    && change.materializations.iter().all(|materialization| {
-                        work.imported_actors
-                            .binary_search_by_key(&materialization.actor, |actor| actor.actor)
-                            .is_ok()
-                    })
+                    && valid_crdt_spawn_materializations(work, change)
                     && replies.len() <= 1
                     && replies.first().is_none_or(|reply| {
                         reply.producer == work.target
@@ -982,6 +1025,12 @@ fn materialize_workflow_crdt(
                     cid,
                     ingress.clone(),
                 ),
+                WorkflowOperationV2::Spawn(spawn) => insert_causal_value(
+                    frontier,
+                    result.spawns.entry(spawn.actor).or_default(),
+                    cid,
+                    spawn.clone(),
+                ),
             }
         }
     }
@@ -989,6 +1038,7 @@ fn materialize_workflow_crdt(
     validate_strict_frontiers(result.workflows.values())?;
     validate_strict_frontiers(result.continuations.values())?;
     validate_strict_frontiers(result.replies.values())?;
+    validate_strict_frontiers(result.spawns.values())?;
     for messages in result.inbox.values().chain(result.outbox.values()) {
         let mut visible = messages.iter().filter_map(|event| event.value.as_ref());
         if let Some(first) = visible.next()
@@ -1033,10 +1083,107 @@ fn validate_strict_frontiers<'a, T: PartialEq + 'a>(
     Ok(())
 }
 
+fn apply_spawn_materialization<S: StateTreeStore>(
+    tree: &mut ServiceStateTreeV2<'_, S>,
+    spawns: &BTreeMap<ActorId, Vec<CausalValueV2<ActorSpawnV2>>>,
+) -> GuestResult<(), S::Error> {
+    let Some(mut directory) =
+        tree_get_wire::<_, super::ActorDirectoryV2>(tree, &StateKeyV2::ActorDirectory)?
+    else {
+        return Err(GuestAccumulateError::CorruptStore);
+    };
+    let new_actor_count = spawns
+        .keys()
+        .filter(|actor| directory.actors.binary_search(actor).is_err())
+        .count();
+    if directory.actors.len().saturating_add(new_actor_count) > super::MAX_ROOT_TREE_ACTORS {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+
+    let mut pending = spawns
+        .values()
+        .map(|values| {
+            values
+                .first()
+                .expect("spawn frontier is never empty")
+                .value
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    while !pending.is_empty() {
+        let mut progressed = false;
+        let mut index = 0;
+        while index < pending.len() {
+            let spawn = &pending[index];
+            let Some(parent) = tree_get_wire::<_, ActorGenesisV2>(
+                tree,
+                &StateKeyV2::ActorDescriptor(spawn.parent),
+            )? else {
+                index += 1;
+                continue;
+            };
+            let mut descriptor = parent;
+            descriptor.actor = spawn.actor;
+            descriptor.name = spawn.name.clone();
+            descriptor.parent = Some(spawn.parent);
+            descriptor.initial_state = spawn.initial_state.clone();
+
+            if let Some(existing) = tree_get_wire::<_, ActorGenesisV2>(
+                tree,
+                &StateKeyV2::ActorDescriptor(spawn.actor),
+            )? && existing != descriptor
+            {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+            let name_key = StateKeyV2::ActorName {
+                parent: Some(spawn.parent),
+                name: spawn.name.clone(),
+            };
+            if let Some(existing) = tree
+                .get(&name_key)
+                .map_err(GuestAccumulateError::StateTree)?
+                && existing.as_slice() != spawn.actor.0
+            {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+            tree_apply(
+                tree,
+                &StateKeyV2::ActorDescriptor(spawn.actor),
+                Some(&descriptor.encode()),
+            )?;
+            tree_apply(tree, &name_key, Some(&spawn.actor.0))?;
+            for method in &descriptor.methods {
+                tree_apply(
+                    tree,
+                    &StateKeyV2::MethodPolicy {
+                        actor: spawn.actor,
+                        method: method.method.clone(),
+                    },
+                    Some(&method.encode()),
+                )?;
+            }
+            if let Err(insert_at) = directory.actors.binary_search(&spawn.actor) {
+                directory.actors.insert(insert_at, spawn.actor);
+            }
+            pending.remove(index);
+            progressed = true;
+        }
+        if !progressed {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+    }
+    tree_apply(
+        tree,
+        &StateKeyV2::ActorDirectory,
+        Some(&directory.encode()),
+    )
+}
+
 fn apply_workflow_materialization<S: StateTreeStore>(
     tree: &mut ServiceStateTreeV2<'_, S>,
     materialized: WorkflowMaterializationV2,
 ) -> GuestResult<(), S::Error> {
+    apply_spawn_materialization(tree, &materialized.spawns)?;
     for (invocation, values) in materialized.workflows {
         let value = values
             .first()
@@ -1138,6 +1285,7 @@ fn materialized_actors_exist<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
     materialized: &WorkflowMaterializationV2,
 ) -> GuestResult<bool, S::Error> {
+    let spawned = materialized.spawns.keys().copied().collect::<BTreeSet<_>>();
     let mut actors = materialized
         .ingresses
         .values()
@@ -1175,11 +1323,14 @@ fn materialized_actors_exist<S: StateTreeStore>(
                 .flatten()
                 .map(|event| event.value.producer),
         )
+        .chain(materialized.spawns.values().flatten().map(|event| event.value.parent))
         .collect::<Vec<_>>();
     actors.sort();
     actors.dedup();
     for actor in actors {
-        if tree_get_wire::<_, ActorGenesisV2>(tree, &StateKeyV2::ActorDescriptor(actor))?.is_none()
+        if !spawned.contains(&actor)
+            && tree_get_wire::<_, ActorGenesisV2>(tree, &StateKeyV2::ActorDescriptor(actor))?
+                .is_none()
         {
             return Ok(false);
         }
@@ -1452,7 +1603,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     if header.consistency == ConsistencyModeV2::Crdt
-        && (!transition.attestation_verifications.is_empty() || !transition.spawns.is_empty())
+        && !transition.attestation_verifications.is_empty()
     {
         // Once-only admission requires a linearizable service transaction.
         // CRDT applications must use an application-specific conflict-free
@@ -1532,6 +1683,10 @@ fn apply<S: GuestAccumulateStoreV2>(
                 &StateKeyV2::ActorDescriptor(materialization.actor),
             )?
             .is_none()
+                && transition
+                    .spawns
+                    .binary_search_by_key(&materialization.actor, |spawn| spawn.actor)
+                    .is_err()
             {
                 return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
             }
@@ -1582,47 +1737,49 @@ fn apply<S: GuestAccumulateStoreV2>(
         )?;
     }
 
-    for (spawn, descriptor) in transition.spawns.iter().zip(&spawn_descriptors) {
-        let insert_at = directory
-            .actors
-            .binary_search(&spawn.actor)
-            .expect_err("spawn actor collision was validated");
-        directory.actors.insert(insert_at, spawn.actor);
-        tree_apply(
-            &mut tree,
-            &StateKeyV2::ActorDescriptor(spawn.actor),
-            Some(&descriptor.encode()),
-        )?;
-        tree_apply(
-            &mut tree,
-            &StateKeyV2::ActorName {
-                parent: Some(spawn.parent),
-                name: spawn.name.clone(),
-            },
-            Some(&spawn.actor.0),
-        )?;
-        for method in &descriptor.methods {
+    if header.consistency != ConsistencyModeV2::Crdt {
+        for (spawn, descriptor) in transition.spawns.iter().zip(&spawn_descriptors) {
+            let insert_at = directory
+                .actors
+                .binary_search(&spawn.actor)
+                .expect_err("spawn actor collision was validated");
+            directory.actors.insert(insert_at, spawn.actor);
             tree_apply(
                 &mut tree,
-                &StateKeyV2::MethodPolicy {
-                    actor: spawn.actor,
-                    method: method.method.clone(),
+                &StateKeyV2::ActorDescriptor(spawn.actor),
+                Some(&descriptor.encode()),
+            )?;
+            tree_apply(
+                &mut tree,
+                &StateKeyV2::ActorName {
+                    parent: Some(spawn.parent),
+                    name: spawn.name.clone(),
                 },
-                Some(&method.encode()),
+                Some(&spawn.actor.0),
+            )?;
+            for method in &descriptor.methods {
+                tree_apply(
+                    &mut tree,
+                    &StateKeyV2::MethodPolicy {
+                        actor: spawn.actor,
+                        method: method.method.clone(),
+                    },
+                    Some(&method.encode()),
+                )?;
+            }
+            tree_apply(
+                &mut tree,
+                &actor_state_key(header.consistency, spawn.actor),
+                Some(&spawn.initial_state.encode()),
             )?;
         }
-        tree_apply(
-            &mut tree,
-            &actor_state_key(header.consistency, spawn.actor),
-            Some(&spawn.initial_state.encode()),
-        )?;
-    }
-    if !transition.spawns.is_empty() {
-        tree_apply(
-            &mut tree,
-            &StateKeyV2::ActorDirectory,
-            Some(&directory.encode()),
-        )?;
+        if !transition.spawns.is_empty() {
+            tree_apply(
+                &mut tree,
+                &StateKeyV2::ActorDirectory,
+                Some(&directory.encode()),
+            )?;
+        }
     }
 
     if header.consistency == ConsistencyModeV2::Crdt {
@@ -1949,6 +2106,7 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
         || Some(change.id) != CrdtChangeV2::derive_id(work)
         || change.causal_dependencies.as_slice() != heads.as_slice()
         || change.workflow != transition.workflow_operations(work)
+        || !valid_crdt_spawn_materializations(work, change)
         || change.operations.iter().any(|operation| {
             work.imported_actors
                 .binary_search_by_key(&operation.actor, |actor| actor.actor)
@@ -1962,6 +2120,10 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
             work.imported_actors
                 .binary_search_by_key(&materialization.actor, |actor| actor.actor)
                 .is_err()
+                && transition
+                    .spawns
+                    .binary_search_by_key(&materialization.actor, |spawn| spawn.actor)
+                    .is_err()
         })
     {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -4770,6 +4932,227 @@ mod tests {
         let workflow = transition.workflow_operations(&work);
         transition.crdt_change.as_mut().unwrap().workflow = workflow;
         transition
+    }
+
+    fn crdt_spawn_transition(
+        work: &WorkEnvelopeV2,
+        root_state: &[u8],
+        child_state: &[u8],
+        height: u64,
+    ) -> (TransitionV2, Vec<ImportedBlobV2>) {
+        let root_reference = BlobRefV2::of_bytes(root_state);
+        let child_reference = BlobRefV2::of_bytes(child_state);
+        let child = ActorId::owned_child(actor(), "child");
+        let mut transition = crdt_transition(work, root_reference.clone(), height);
+        transition.spawns.push(ActorSpawnV2 {
+            actor: child,
+            name: "child".into(),
+            parent: actor(),
+            initial_state: child_reference.clone(),
+        });
+        let change = transition.crdt_change.as_mut().unwrap();
+        change.materializations.push(CrdtMaterializationV2 {
+            actor: child,
+            state: child_reference.clone(),
+        });
+        change.materializations.sort_by_key(|state| state.actor);
+        let workflow = transition.workflow_operations(work);
+        transition.crdt_change.as_mut().unwrap().workflow = workflow;
+        let mut blobs = vec![
+            ImportedBlobV2 {
+                reference: root_reference,
+                bytes: root_state.to_vec(),
+            },
+            ImportedBlobV2 {
+                reference: child_reference,
+                bytes: child_state.to_vec(),
+            },
+        ];
+        blobs.sort_by_key(|blob| blob.reference.hash);
+        (transition, blobs)
+    }
+
+    fn assert_crdt_child_materialized(store: &mut MemStore, expected: &BlobRefV2) {
+        let child = ActorId::owned_child(actor(), "child");
+        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let tree = ServiceStateTreeV2::new(store, header.service_root);
+        let directory = tree_get_wire::<_, super::super::ActorDirectoryV2>(
+            &tree,
+            &StateKeyV2::ActorDirectory,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(directory.actors, {
+            let mut actors = vec![actor(), child];
+            actors.sort();
+            actors
+        });
+        let descriptor = tree_get_wire::<_, ActorGenesisV2>(
+            &tree,
+            &StateKeyV2::ActorDescriptor(child),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(descriptor.parent, Some(actor()));
+        assert_eq!(descriptor.name, "child");
+        assert_eq!(&descriptor.initial_state, expected);
+        assert_eq!(
+            tree_get_wire::<_, BlobRefV2>(
+                &tree,
+                &StateKeyV2::CrdtMaterialization(child),
+            )
+            .unwrap(),
+            Some(expected.clone())
+        );
+    }
+
+    #[test]
+    fn crdt_spawn_is_guest_committed_and_reconstructed_by_sync() {
+        let mut source = MemStore::default();
+        let mut destination = MemStore::default();
+        let (initial, _) = install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
+        install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
+        let work = crdt_work(initial, 18, vec![]);
+        let child_state = BlobRefV2::of_bytes(b"child-state");
+        let (transition, blobs) =
+            crdt_spawn_transition(&work, b"root-after-spawn", b"child-state", 1);
+        let change = transition.crdt_change.clone().unwrap();
+        let cid = change.cid();
+        let accepted = execute_guest_accumulate(
+            &mut source,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work,
+                transition,
+                provided_blobs: blobs.clone(),
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
+            panic!("CRDT spawn was rejected")
+        };
+        assert_crdt_child_materialized(&mut source, &child_state);
+
+        destination.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                receipt: receipt.clone(),
+            }
+            .hash(),
+        );
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut destination,
+                &AccumulateRequestV2::SyncCrdt(CrdtSyncEnvelopeV2 {
+                    service: identity(),
+                    advertised_heads: vec![cid],
+                    nodes: vec![super::super::CrdtSyncNodeV2 { change, receipt }],
+                    provided_blobs: blobs,
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        assert_crdt_child_materialized(&mut destination, &child_state);
+    }
+
+    #[test]
+    fn concurrent_crdt_spawns_deduplicate_or_reject_divergent_initial_state() {
+        fn branch(
+            invocation: u8,
+            root_state: &'static [u8],
+            child_state: &'static [u8],
+        ) -> (super::super::CrdtSyncNodeV2, Vec<ImportedBlobV2>) {
+            let mut source = MemStore::default();
+            let (initial, _) =
+                install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
+            let work = crdt_work(initial, invocation, vec![]);
+            let (transition, blobs) =
+                crdt_spawn_transition(&work, root_state, child_state, 1);
+            let change = transition.crdt_change.clone().unwrap();
+            let accepted = execute_guest_accumulate(
+                &mut source,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: blobs.clone(),
+                }),
+            )
+            .unwrap();
+            let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
+                panic!("source CRDT spawn was rejected")
+            };
+            (super::super::CrdtSyncNodeV2 { change, receipt }, blobs)
+        }
+
+        fn merge(
+            destination: &mut MemStore,
+            branches: Vec<(super::super::CrdtSyncNodeV2, Vec<ImportedBlobV2>)>,
+        ) -> AccumulationResultV2 {
+            let mut nodes = branches
+                .iter()
+                .map(|(node, _)| node.clone())
+                .collect::<Vec<_>>();
+            nodes.sort_by_key(|node| node.change.cid());
+            let advertised_heads = nodes.iter().map(|node| node.change.cid()).collect();
+            let mut provided_blobs = branches
+                .into_iter()
+                .flat_map(|(_, blobs)| blobs)
+                .collect::<Vec<_>>();
+            provided_blobs.sort_by_key(|blob| blob.reference.hash);
+            provided_blobs.dedup_by_key(|blob| blob.reference.hash);
+            for node in &nodes {
+                destination.receipt_allowlist.insert(
+                    ReceiptVerificationRequestV2 {
+                        receipt: node.receipt.clone(),
+                    }
+                    .hash(),
+                );
+            }
+            execute_guest_accumulate(
+                destination,
+                &AccumulateRequestV2::SyncCrdt(CrdtSyncEnvelopeV2 {
+                    service: identity(),
+                    advertised_heads,
+                    nodes,
+                    provided_blobs,
+                }),
+            )
+            .unwrap()
+        }
+
+        let identical = vec![
+            branch(91, b"left-root", b"same-child"),
+            branch(92, b"right-root", b"same-child"),
+        ];
+        let mut destination = MemStore::default();
+        install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
+        assert!(matches!(
+            merge(&mut destination, identical),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        assert_crdt_child_materialized(
+            &mut destination,
+            &BlobRefV2::of_bytes(b"same-child"),
+        );
+
+        let divergent = vec![
+            branch(93, b"left-root", b"left-child"),
+            branch(94, b"right-root", b"right-child"),
+        ];
+        let mut destination = MemStore::default();
+        install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
+        let before = destination.clone();
+        assert_eq!(
+            merge(&mut destination, divergent),
+            rejected(AccumulationRejectionV2::DivergentDuplicate)
+        );
+        assert_eq!(destination.rows, before.rows);
+        assert_eq!(destination.blobs, before.blobs);
     }
 
     #[test]

@@ -1199,8 +1199,7 @@ impl<A: Actor> Context<A> {
         if let Some(parent) = self.actor_id {
             #[cfg(feature = "pvm")]
             {
-                if self.actor_change.is_some()
-                    || name.is_empty()
+                if name.is_empty()
                     || self
                         .actor_tree
                         .binary_search_by_key(&parent, |actor| actor.actor)

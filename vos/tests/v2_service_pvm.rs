@@ -1109,6 +1109,50 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
 }
 
 #[test]
+fn physical_crdt_spawn_is_rebuilt_from_guest_owned_causal_state() {
+    let Some((config, actor)) = crdt_root_config() else {
+        return;
+    };
+    let mut service =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("CRDT root installs through physical Accumulate");
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("spawn_dynamic").encode());
+    let committed = service
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([121; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: actor,
+            method: "spawn_dynamic".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("canonical actor and service PVMs emit and commit a CRDT spawn");
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::Bool(true))
+    );
+    let child = ActorId::owned_child(actor, "dynamic");
+    assert!(service.actor_ids().unwrap().binary_search(&child).is_ok());
+
+    let backend = service.into_backend();
+    let restarted = LocalRootTreeServiceV2::open(config, backend)
+        .expect("restart rematerializes the causal spawn directory");
+    assert!(restarted.actor_ids().unwrap().binary_search(&child).is_ok());
+}
+
+#[test]
 fn two_node_crdt_roots_exchange_guest_owned_causal_state() {
     let Some((config, actor)) = crdt_root_config() else {
         return;

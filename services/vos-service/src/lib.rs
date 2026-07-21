@@ -255,7 +255,7 @@ mod guest {
                 (actor_output.writes, None, alloc::vec::Vec::new())
             }
             (ConsistencyBaseV2::Crdt { heads }, Some(base_height)) => {
-                if !actor_output.writes.is_empty() || !actor_spawns.is_empty() {
+                if !actor_output.writes.is_empty() {
                     fail_closed();
                 }
                 if actor_output.crdt_states.is_empty()
@@ -276,7 +276,7 @@ mod guest {
                 }
                 let causal_height = base_height.checked_add(1).unwrap_or_else(|| fail_closed());
                 let mut candidates = alloc::collections::BTreeMap::new();
-                let materializations = actor_output
+                let mut materializations = actor_output
                     .crdt_states
                     .into_iter()
                     .map(|state| {
@@ -292,7 +292,14 @@ mod guest {
                             state: reference,
                         }
                     })
-                    .collect();
+                    .collect::<alloc::vec::Vec<_>>();
+                materializations.extend(actor_spawns.iter().map(|spawn| {
+                    CrdtMaterializationV2 {
+                        actor: spawn.actor,
+                        state: BlobRefV2::of_bytes(&spawn.initial_state),
+                    }
+                }));
+                materializations.sort_by_key(|state| state.actor);
                 (
                     alloc::vec::Vec::new(),
                     Some(CrdtChangeV2 {
