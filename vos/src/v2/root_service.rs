@@ -19,7 +19,7 @@ use super::{
     MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId,
     PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    VosPackageV2, WorkInputIdV2,
+    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
 };
 
 /// Strict host/network ingress for one direct root-tree invocation. Origin and
@@ -196,6 +196,35 @@ impl RootTreeTransportV2 {
                     && *call != super::CallId::ZERO
             }
         }
+    }
+}
+
+fn return_target_from_checkpoint(
+    checkpoint: &WorkflowCheckpointV2,
+    publication: &PublicationRecordV2,
+) -> Result<Option<(ActorId, super::InvocationId)>, LocalRootTreeInvokeErrorV2> {
+    let Some(reply) = publication.published.reply.as_ref() else {
+        return Ok(None);
+    };
+    let work = &checkpoint.resume_work;
+    if checkpoint.input != publication.input || work.invocation != publication.input.invocation {
+        return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+    }
+    let Some(parent_call) = work.parent_call else {
+        return if reply.call_id == work.invocation.root_reply_id() {
+            Ok(None)
+        } else {
+            Err(LocalRootTreeInvokeErrorV2::DivergentReplay)
+        };
+    };
+    if parent_call != reply.call_id
+        || super::InvocationId::for_call(reply.call_id) != work.invocation
+    {
+        return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+    }
+    match (work.origin, work.causal_parent) {
+        (super::Origin::Actor(actor), Some(invocation)) => Ok(Some((actor, invocation))),
+        _ => Ok(None),
     }
 }
 
@@ -760,6 +789,25 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         Ok(checkpoint.resume_work.logical_timeslot)
     }
 
+    /// Reconstruct the caller of a pending callee reply from authenticated
+    /// workflow state. A host restart must not need a process-local return
+    /// route to retry a reply publication.
+    pub(crate) fn publication_return_target(
+        &self,
+        publication: &PublicationRecordV2,
+    ) -> Result<Option<(ActorId, super::InvocationId)>, LocalRootTreeInvokeErrorV2> {
+        if publication.published.reply.is_none() {
+            return Ok(None);
+        }
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(publication.input.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::DivergentReplay)?;
+        return_target_from_checkpoint(&checkpoint, publication)
+    }
+
     pub fn into_backend(self) -> B {
         let (_, store) = self.service.into_hosts();
         let (_, backend) = store.into_parts();
@@ -843,6 +891,95 @@ mod tests {
         let mut invalid = ingress;
         invalid.invocation = super::super::InvocationId::ZERO;
         assert!(RootTreeInvocationV2::decode(&invalid.encode()).is_err());
+    }
+
+    #[test]
+    fn pending_reply_recovers_its_caller_from_the_durable_workflow() {
+        let caller_invocation = super::super::InvocationId([21; 32]);
+        let call = caller_invocation.call_id(3);
+        let callee_invocation = super::super::InvocationId::for_call(call);
+        let callee = ActorId([22; 32]);
+        let caller = ActorId([23; 32]);
+        let input = WorkInputIdV2 {
+            invocation: callee_invocation,
+            workflow_step: 0,
+        };
+        let state = BlobRefV2::of_bytes(&[]);
+        let work = super::super::WorkEnvelopeV2 {
+            service: service_identity(24),
+            invocation: callee_invocation,
+            workflow_step: 0,
+            logical_timeslot: 9,
+            target: callee,
+            target_program: ProgramId([25; 32]),
+            method: "value".into(),
+            arguments: vec![26],
+            origin: super::super::Origin::Actor(caller),
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: Some(caller_invocation),
+            parent_call: Some(call),
+            awaited_reply: None,
+            consistency: ConsistencyModeV2::Local,
+            base: super::super::ConsistencyBaseV2::Linear {
+                revision: 1,
+                state_root: super::super::Hash([27; 32]),
+            },
+            base_causal_height: None,
+            imported_actors: vec![super::super::ImportedActorV2 {
+                actor: callee,
+                name: "callee".into(),
+                parent: None,
+                program: ProgramId([25; 32]),
+                state,
+                causal_states: vec![],
+                continuation: None,
+            }],
+            external_actors: vec![],
+            imported_blobs: vec![],
+            proof_requested: false,
+        };
+        let reply = super::super::ReplyRecordV2 {
+            call_id: call,
+            producer: callee,
+            result: vec![28],
+        };
+        let publication = PublicationRecordV2 {
+            input,
+            receipt: AccumulationReceiptV2 {
+                service: work.service.clone(),
+                accepted_transition: super::super::Hash([29; 32]),
+                reply_commitment: Some(reply.commitment()),
+                outbox_commitment: None,
+                resulting_state_root: Some(super::super::Hash([30; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 2,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
+            published: PublishedEffectsV2 {
+                reply: Some(reply),
+                ..PublishedEffectsV2::default()
+            },
+        };
+        let checkpoint = WorkflowCheckpointV2 {
+            input,
+            workflow_identity: work.workflow_identity(),
+            work_hash: work.hash(),
+            transition_commitment: publication.receipt.accepted_transition,
+            resume_work: work,
+        };
+
+        assert_eq!(
+            return_target_from_checkpoint(&checkpoint, &publication).unwrap(),
+            Some((caller, caller_invocation))
+        );
+
+        let mut divergent = publication;
+        divergent.published.reply.as_mut().unwrap().call_id = caller_invocation.call_id(4);
+        assert!(matches!(
+            return_target_from_checkpoint(&checkpoint, &divergent),
+            Err(LocalRootTreeInvokeErrorV2::DivergentReplay)
+        ));
     }
 
     #[test]

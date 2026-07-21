@@ -112,11 +112,14 @@ physical Accumulate, executed from the guest inbox, returned only after the
 callee's Refine/Accumulate commit, and injected at the caller's exact JAR
 snapshot boundary. The source outbox and callee reply publications are removed
 only after commitment-bound acknowledgements; retries recover their original
-logical timeslot from guest workflow state. Continuation blob references may
-coexist with an outbox record because those pages are already committed in the
-source content store and never become destination state. Cross-node actor-route
-discovery and proof/blob publication drivers remain to be attached. Attested
-ingress currently fails closed unless a proof producer is configured.
+logical timeslot from guest workflow state. After a host restart, a pending
+callee reply also reconstructs its caller actor and invocation from the
+authenticated workflow origin and causal parent rather than a process-local
+return table. Continuation blob references may coexist with an outbox record
+because those pages are already committed in the source content store and
+never become destination state. Cross-node actor-route discovery and
+proof/blob publication drivers remain to be attached. Attested ingress
+currently fails closed unless a proof producer is configured.
 
 Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
 continuation/blob byte required by that request. It does not replicate an

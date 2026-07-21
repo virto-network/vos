@@ -4306,6 +4306,34 @@ fn retry_v2_work<B>(
                     logical_timeslot,
                     outbox,
                 );
+            } else {
+                match service.publication_return_target(&publication) {
+                    Ok(Some((actor, caller_invocation))) => {
+                        if let Some(route) = v2_actor_route(actor_routes, actor) {
+                            let return_call = V2ReturnCall {
+                                route,
+                                caller_invocation,
+                            };
+                            state
+                                .return_calls
+                                .insert(publication.input.invocation, return_call);
+                            let _ = queue_v2_reply(
+                                id,
+                                return_call,
+                                &publication,
+                                logical_timeslot,
+                                outbox,
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!(
+                        %id,
+                        input = ?publication.input,
+                        ?error,
+                        "v2 reply retry could not reconstruct its durable caller"
+                    ),
+                }
             }
         }
     }
